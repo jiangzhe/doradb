@@ -1,4 +1,4 @@
-use event_listener::{Event, EventListener, Listener};
+use event_listener::{Event, EventListener};
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -67,21 +67,6 @@ impl ChangeNotifier {
     pub(crate) fn notify(&self) {
         self.epoch.fetch_add(1, Ordering::AcqRel);
         self.event.notify(usize::MAX);
-    }
-
-    /// Wait until the epoch differs from `observed_epoch`.
-    #[inline]
-    pub(crate) fn wait_since(&self, observed_epoch: u64) {
-        loop {
-            if self.epoch() != observed_epoch {
-                return;
-            }
-            let listener = self.event.listen();
-            if self.epoch() != observed_epoch {
-                return;
-            }
-            listener.wait();
-        }
     }
 
     /// Wait asynchronously until the epoch differs from `observed_epoch`.
@@ -170,6 +155,7 @@ impl MonotonicU64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use event_listener::Listener;
     use std::sync::{Arc, mpsc};
     use std::thread;
     use std::time::Duration;
@@ -181,48 +167,6 @@ mod tests {
         drop(ev);
         // event dropped, so listener.wait() will immediately return.
         listener.wait();
-    }
-
-    #[test]
-    fn test_change_notifier_wait_since_returns_after_prior_notify() {
-        let notifier = ChangeNotifier::new();
-        let observed_epoch = notifier.epoch();
-
-        notifier.notify();
-        notifier.wait_since(observed_epoch);
-
-        assert_ne!(notifier.epoch(), observed_epoch);
-    }
-
-    #[test]
-    fn test_change_notifier_wait_since_wakes_after_future_notify() {
-        let notifier = Arc::new(ChangeNotifier::new());
-        let observed_epoch = notifier.epoch();
-        let (ready_tx, ready_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel();
-
-        let waiter = {
-            let notifier = Arc::clone(&notifier);
-            thread::spawn(move || {
-                ready_tx.send(()).expect("waiter should report ready");
-                notifier.wait_since(observed_epoch);
-                done_tx.send(()).expect("waiter should report completion");
-            })
-        };
-
-        ready_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("waiter should start");
-        assert!(
-            done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
-            "waiter should block before a notification"
-        );
-
-        notifier.notify();
-        done_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("waiter should wake after a notification");
-        waiter.join().expect("waiter thread should finish");
     }
 
     #[test]

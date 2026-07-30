@@ -10,7 +10,7 @@ use crate::index::{
     ColumnBlockIndex, MemIndexEntry, NonUniqueMemIndex, ResolvedColumnRow, SecondaryIndex,
     UniqueMemIndex,
 };
-use crate::session::SessionPin;
+use crate::session::SessionOperationPin;
 use crate::trx::TrxReadProof;
 use crate::value::Val;
 use error_stack::{Report, ResultExt};
@@ -192,14 +192,14 @@ impl Table {
     /// are cleaned independently in either case.
     pub(crate) async fn cleanup_secondary_mem_indexes(
         &self,
-        session: &SessionPin,
+        session: &SessionOperationPin,
         clean_live_entries: bool,
     ) -> RuntimeOrFatalResult<MemIndexCleanupOutcome> {
         let trx_sys = session.engine.trx_sys.clone();
         let pool_guards = session.pool_guards();
         loop {
             let mut trx = session
-                .begin_trx()
+                .begin_private_trx()
                 .change_context(RuntimeError::TableAccess)
                 .attach_with(|| {
                     format!(
@@ -229,6 +229,12 @@ impl Table {
                     drop(snapshot);
                     drop(checkout);
                     trx.rollback_table_maintenance().await?;
+                    // The captured root was published after this transaction
+                    // started, so retry with a fresh STS. Transaction starts and
+                    // root fences share one monotonic timestamp source, making
+                    // the next STS newer than this fence unless another root
+                    // publication races again. The awaited rollback above keeps
+                    // this retry from becoming a tight busy loop.
                     continue;
                 }
                 let cleanup_res = self
@@ -1029,21 +1035,8 @@ mod tests {
             let lifecycle_error = err.report().downcast_ref::<LifecycleError>().copied();
             let was_in_trx = session.in_trx().unwrap();
 
-            let internal_err = table_for_internal_assertion(&engine, table_id)
-                .cleanup_secondary_mem_indexes(&session.pin_running_for_test(), true)
-                .await
-                .unwrap_err();
-            let RuntimeOrFatalError::Runtime(internal_err) = internal_err else {
-                panic!("existing transaction must remain a recoverable table-access failure");
-            };
-
             trx.rollback().await.unwrap();
             assert_eq!(lifecycle_error, Some(LifecycleError::ExistingTransaction));
-            assert_eq!(*internal_err.current_context(), RuntimeError::TableAccess);
-            assert_eq!(
-                internal_err.downcast_ref::<LifecycleError>().copied(),
-                Some(LifecycleError::ExistingTransaction)
-            );
             assert!(was_in_trx);
             assert!(!session.in_trx().unwrap());
         });

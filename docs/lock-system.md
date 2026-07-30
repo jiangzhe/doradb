@@ -285,11 +285,14 @@ struct GrantedLock {
 ```
 
 `LockOwner` contains a canonical `LockFamily(SessionID)` and an exact
-`LockScope`: `SessionExplicit`, `Transaction`, `Statement`, `Ddl`, or
-`Maintenance`. Owners from one family may therefore produce multiple granted
-entries for the same resource even though they are one external conflict
-participant. The resource side does not yet physically aggregate those
-entries.
+`LockScope`: `SessionExplicit`, `Transaction`, `Statement`, or
+`Operation(OperationID)`. `OperationID` is meaningful only within the owning
+session family; the exact owner therefore preserves both session and operation
+ids. Operation purpose is not encoded in the numeric id or scope. It remains in
+the stable `SessionOperationKind` and typed DDL/maintenance authority. Owners
+from one family may produce multiple granted entries for the same resource even
+though they are one external conflict participant. The resource side does not
+yet physically aggregate those entries.
 
 ### Owner-local cache
 
@@ -312,11 +315,13 @@ This cache is already useful:
 Session explicit locks do not yet have the equivalent cache and still use a
 global `release_owner()` scan during session cleanup.
 
-DDL and maintenance allocate distinct typed operation ids from one shared
-engine-local sequence. One public DDL call retains one `Ddl` owner through its
-`SessionDdlContext`; one `ScopedTableRuntimeAccess` retains one `Maintenance`
-owner. Their operation cleanup still uses fresh-lock and scoped guards rather
-than an authoritative `LockScopeState`.
+Transactions, DDL, maintenance, and explicit-lock mutations reserve ids from
+one plain session-local sequence. One public DDL call retains one
+`Operation` owner through its typed `SessionDdlContext`; one public maintenance
+workflow retains one `Operation` owner across every
+`ScopedTableRuntimeAccess`, bounded recheck, and internal retry. Operation
+cleanup still uses fresh-lock and scoped guards rather than an authoritative
+`LockScopeState`.
 
 Maintenance always records its own exact claims even when a covering
 `SessionExplicit` claim admits it. Releasing maintenance therefore cannot
@@ -333,31 +338,38 @@ serialize calls through one public session handle, but `begin_trx()` returns a
 detached `Transaction`, so the mutable borrow ends while that transaction
 remains active.
 
-The session registry closes that coexistence gap. Both normal and read-only
-runtime-backed public Session admission require `SessionLifecycle::RunningIdle`.
-`RunningActive` returns `LifecycleError::ExistingTransaction` with the session
-id, transaction id, and transaction-entry state. `Session::id()` remains a
-local observation, and `Drop` retains its nonblocking abandonment behavior.
+The session registry closes that coexistence gap with one operation
+coordinator. Session disposition (`Open`, `CloseRequested`, or `Abandoned`) is
+orthogonal to its single slot (`Idle`, `Active`, or `Closed`). Effectful public
+operations require an open idle slot. An active public transaction returns
+`LifecycleError::ExistingTransaction`; another active kind returns
+`ExistingOperation`, with exact key, kind, state, disposition, and optional
+transaction id in diagnostics. Independently drop-safe read-only observations
+and standalone progress waits use observer admission and allocate no operation
+id. `Session::id()` remains a local observation, and `Drop` retains its
+nonblocking abandonment behavior.
 
 The implemented authority transition is:
 
 ```text
-RunningIdle
-    -> begin_trx returns a detached Transaction
-RunningActive
+Open + Idle
+    -> reserve one (SessionID, OperationID) entry
+Open + Active(PublicTransaction)
     -> commit, rollback, or abandoned cleanup releases transaction locks
-RunningIdle
+Open + Idle
 ```
 
 An explicit session claim acquired before `begin_trx()` may remain held while
-the transaction owns its own claims. The Session cannot acquire, release, or
-observe runtime state again until transaction completion restores
-`RunningIdle`.
+the transaction owns its own claims. The Session cannot start another
+effectful operation until transaction completion restores `Idle`, but
+standalone observer operations remain available.
 
 DDL is an internal nesting exception, not a second public execution owner. A
-DDL call first obtains a Session pin while idle and retains its `&mut Session`
-borrow while that pin creates and completes a private catalog transaction.
-Later public Session admission cannot occur during that call.
+DDL call first reserves a typed DDL operation while idle and retains its
+`&mut Session` borrow while the same entry hosts a private catalog
+transaction. The private transaction inherits the operation key and allocates
+only a `TrxID`; terminal completion returns authority to the still-active outer
+operation.
 
 ### Wait and cancellation behavior
 
@@ -428,9 +440,9 @@ The redesign intentionally narrows one current manager behavior. Concurrent
 lock mutations in one session family are unsupported, so duplicate pending
 acquisitions no longer share a waiter. Public session `lock_table()` and
 `unlock_table()` already require `&mut self`, and public admission already
-rejects every runtime-backed Session operation while its detached transaction
-is active. A future parallel executor must route family lock mutations through
-one serial coordinator.
+rejects every effectful Session operation while its detached transaction is
+active. A future parallel executor must route family lock mutations through one
+serial coordinator.
 
 ### Proof-bound terminal cleanup ordering
 
@@ -490,18 +502,18 @@ enum LockScope {
     SessionExplicit,
     Transaction(TrxID),
     Statement(TrxID, StmtNo),
-    Ddl(DdlOperationID),
-    Maintenance(MaintenanceOperationID),
+    Operation(OperationID),
 }
 ```
 
 `LockOwner` is used for claims, waiters, cleanup, tokens, diagnostics, and
 purpose-specific policy. `LockFamily` is used for physical conflict
-aggregation and same-session policy.
+aggregation and same-session policy. Purpose-specific policy is selected by
+typed session-operation authority, never recovered from `OperationID`.
 
 Constructors must enforce that transaction and statement ids belong to the
-declared session family. DDL and maintenance operation ids must be unique for
-the engine lifetime.
+declared session family. Operation ids are monotonic only within one session;
+equal raw ids in different families remain distinct exact owners.
 
 ### Serialized family ownership
 
@@ -540,29 +552,30 @@ Transaction lock mutation also uses `&mut self`; DDL and mutating maintenance
 operations use exclusive Session access. These receivers serialize calls
 through one handle, but do not by themselves exclude the detached
 `Transaction` returned by `begin_trx()`. Registry admission supplies that
-missing proof: every runtime-backed public Session operation, including an
-immutable diagnostic, requires `RunningIdle` and fails with
-`LifecycleError::ExistingTransaction` while the transaction is active,
-checked out, terminal, abandoned, or being cleaned up.
+missing proof: every effectful public Session operation requires an open idle
+coordinator slot and fails with `LifecycleError::ExistingTransaction` while a
+public transaction is active, checked out, terminal-owned, abandoned, or being
+cleaned up. Read-only diagnostics and standalone progress waits are observer
+operations and do not enter the operation-id domain.
 
 The lifecycle transfers public family authority as follows:
 
 ```text
-RunningIdle: Session may admit one public operation
-    -> begin_trx
-RunningActive: Transaction and its checkout/terminal/cleanup carriers own it
+Open + Idle: Session may admit one public operation
+    -> reserve operation and begin transaction
+Open + Active(PublicTransaction): transaction leases/terminal/cleanup carriers own it
     -> release transaction claims
-    -> finish transaction lifecycle
-RunningIdle: Session admission resumes
+    -> finish exact operation
+Open + Idle: effectful Session admission resumes
 ```
 
-An already-admitted internal Session pin may create a private DDL catalog
-transaction while the outer `&mut Session` call remains borrowed. The normal
+An already-admitted typed DDL operation may create a private catalog
+transaction in its stable entry while the outer `&mut Session` call remains borrowed. The normal
 path is sequential, but cancellation of the whole DDL future can queue
 transaction cleanup while DDL scope guards unwind. The later exact-family
 redesign must define a cleanup handoff that serializes those two paths before
-it relies on the single-family mutation invariant; idle-only public admission
-does not solve that internal cancellation boundary.
+it relies on the single-family mutation invariant; idle-only effectful public
+admission does not solve that internal cancellation boundary.
 
 The public `Session` handle remains movable between threads but is not
 shareable: its local closed flag uses `Cell<bool>`, making the type `Send` and
@@ -1331,7 +1344,7 @@ independent parallel lock mutation within one family are outside this design.
 Session, transaction, statement, DDL, and maintenance work in one family may
 hold claims at the same time, but their lock-manager transitions are
 serialized. Session explicit lock and unlock already require mutable access,
-and public Session admission is idle-only while a detached transaction exists.
+and effectful public Session admission is idle-only while a detached transaction exists.
 Parallel workers may use protection acquired by their coordinator, but must
 send new acquisitions, conversions, releases, and cleanup through that single
 family execution owner. Internal DDL cancellation still requires the explicit
@@ -1449,7 +1462,7 @@ Migration must:
   identity and `LockFamilyConflict` error;
 - preserve the implemented `&mut self` session lock mutation APIs and
   `Session: Send + !Sync` boundary;
-- preserve idle-only public Session admission while a transaction is active or
+- preserve idle-only effectful public Session admission while a transaction is active or
   undergoing terminal/abandoned cleanup;
 - serialize lock mutation across all scopes in one family before removing
   duplicate-waiter support from the manager;
@@ -1458,8 +1471,9 @@ Migration must:
 
 ### 8. Nested DDL transaction cancellation
 
-DDL obtains an idle Session pin and then starts a private catalog transaction
-inside the same `&mut Session` call. Normal execution serializes DDL-scope and
+DDL reserves one typed operation authority and then starts a private catalog
+transaction inside the same stable entry and `&mut Session` call. Normal
+execution serializes DDL-scope and
 transaction-scope mutations, but dropping the outer future can abandon the
 transaction and queue asynchronous rollback while DDL guards synchronously
 release their claims.
@@ -1483,8 +1497,8 @@ These stages are a planning aid, not yet an accepted RFC plan.
 ### Stage A: canonical identity (implemented)
 
 - Introduce `LockOwner { family, scope }`.
-- Add DDL and maintenance operation ids.
-- Preserve idle-only public Session admission and the existing mutable
+- Use the session-local operation id shared by DDL and maintenance authorities.
+- Preserve idle-only effectful public Session admission and the existing mutable
   explicit-lock APIs.
 - Preserve the current vector/deque resource representation, guard-owned
   operation cleanup, duplicate waiters, and exact-owner release.
@@ -1544,7 +1558,7 @@ At minimum:
 1. Compatibility and coverage matrices for both resources.
 2. Directional same-family matrices.
 3. Session `X` covering transaction `IX`.
-4. An active transaction rejects every runtime-backed public Session operation
+4. An active transaction rejects every effectful public Session operation
    with `LifecycleError::ExistingTransaction` before lock-manager mutation.
 5. Session `S` rejects a later transaction `IX`; the reverse public Session
    request is rejected at lifecycle admission before reaching the manager.
@@ -1556,9 +1570,9 @@ At minimum:
 9. Fresh-versus-existing rollback retains older claims.
 10. Statement-to-transaction handoff has no protection gap.
 11. Session explicit lock and unlock require mutable access.
-12. Lock-free session observations accept immutable access but still require
-    idle lifecycle admission, while lock-bearing observations require mutable
-    access.
+12. Lock-free session observations accept immutable observer admission without
+    allocating an operation id, while lock-bearing operations require mutable
+    access and an idle coordinator slot.
 13. `Session` remains `Send` and is not `Sync`.
 14. Session, transaction, statement, DDL, and maintenance lock mutations in one
     family never overlap after the DDL cleanup handoff is implemented.

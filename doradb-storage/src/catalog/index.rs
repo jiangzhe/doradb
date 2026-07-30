@@ -23,7 +23,7 @@ use crate::log::redo::DDLRedo;
 use crate::obs;
 use crate::quiescent::QuiescentGuard;
 use crate::row::RowRead;
-use crate::session::{SessionDdlContext, SessionPin};
+use crate::session::{SessionDdlContext, SessionOperationPin};
 use crate::table::{DeleteMarker, Table, TableRuntimeLayout, secondary_disk_tree_encoder};
 use crate::trx::{Transaction, trx_is_committed};
 use crate::value::Val;
@@ -769,7 +769,7 @@ impl Drop for DropIndexProgress<'_> {
 
 /// Build and publish a new secondary index for a user-table session request.
 pub(crate) async fn create_index_for_session(
-    session: SessionPin,
+    session: SessionOperationPin,
     table_id: TableID,
     index_spec: IndexSpec,
 ) -> Result<IndexNo> {
@@ -843,7 +843,7 @@ pub(crate) async fn create_index_for_session(
     // 4. Start the implicit DDL transaction and let the progress state own all
     // rollback/destroy transitions from this point onward.
     let trx = session
-        .begin_trx()
+        .begin_private_trx()
         .attach("operation=create_index")
         .disclose()?;
     let mut progress = CreateIndexProgress::new(&engine, &guards, table_id, index_no, trx);
@@ -1002,7 +1002,7 @@ pub(crate) async fn create_index_for_session(
 
 /// Drop an active secondary index for a user-table session request.
 pub(crate) async fn drop_index_for_session(
-    session: SessionPin,
+    session: SessionOperationPin,
     table_id: TableID,
     index_no: IndexNo,
 ) -> Result<()> {
@@ -1072,7 +1072,7 @@ pub(crate) async fn drop_index_for_session(
         build_dropped_index_runtime_layout(&old_layout, Arc::clone(&new_metadata), index_no_usize);
 
     let trx = session
-        .begin_trx()
+        .begin_private_trx()
         .attach("operation=drop_index")
         .disclose()?;
     let mut progress = DropIndexProgress::new(&engine, table_id, index_no, trx);

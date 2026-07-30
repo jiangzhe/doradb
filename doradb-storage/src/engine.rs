@@ -16,7 +16,7 @@ use crate::error::{
     ConfigError, DiscloseError, DiscloseResultExt, LifecycleError, LifecycleResult, Result,
 };
 use crate::file::fs::{FileSystem, FileSystemWorkers};
-use crate::id::{DdlOperationID, MaintenanceOperationID, SessionID};
+use crate::id::{SessionID, SessionOperationKey, TrxID};
 use crate::lock::LockManager;
 use crate::obs;
 use crate::poison::EnginePoisoner;
@@ -112,7 +112,7 @@ impl EngineLifecycle {
     }
 
     #[inline]
-    fn state(&self) -> EngineLifecycleState {
+    fn inspect_state(&self) -> EngineLifecycleState {
         let state = self.state.load(Ordering::Acquire) & LIFECYCLE_STATE_MASK;
         EngineLifecycleState::try_from(state)
             .unwrap_or_else(|state| panic!("invalid engine lifecycle state: {state}"))
@@ -198,7 +198,7 @@ impl EngineLifecycle {
     fn release_runtime_ref(&self) {
         let refs = self.runtime_refs.fetch_sub(1, Ordering::AcqRel);
         assert!(refs > 0, "engine runtime ref count underflow");
-        if refs == 1 && self.state() != EngineLifecycleState::Running {
+        if refs == 1 && self.inspect_state() != EngineLifecycleState::Running {
             self.runtime_refs_released.notify(usize::MAX);
         }
     }
@@ -370,7 +370,7 @@ impl Engine {
     #[inline]
     fn try_shutdown_inner(&self) -> LifecycleResult<()> {
         let inner = self.inner();
-        if inner.lifecycle.state() == EngineLifecycleState::Shutdown {
+        if inner.lifecycle.inspect_state() == EngineLifecycleState::Shutdown {
             return Ok(());
         }
         obs::info!(
@@ -380,28 +380,31 @@ impl Engine {
         inner.lifecycle.wait_for_admissions_drained();
 
         let _shutdown = inner.lifecycle.shutdown_lock.lock();
-        if inner.lifecycle.state() == EngineLifecycleState::Shutdown {
+        if inner.lifecycle.inspect_state() == EngineLifecycleState::Shutdown {
             obs::info!(
                 "event=engine_lifecycle component=engine action=shutdown_finish result=ok mode=try already_shutdown=true"
             );
             return Ok(());
         }
 
-        let queued_cleanup = self.queue_shutdown_trx_cleanup(inner);
-        let active_transactions = inner.session_registry.active_transaction_count();
+        let blocker = inner.session_registry.first_shutdown_blocker();
+        let operation_blocked = blocker.is_some();
+        let cleanup_queued =
+            self.queue_shutdown_operation_cleanup(inner, blocker.and_then(|item| item.cleanup));
         let strong_count = Arc::strong_count(inner);
-        if strong_count != 1 || active_transactions != 0 || queued_cleanup != 0 {
-            let busy = (strong_count - 1)
-                .max(active_transactions)
-                .max(queued_cleanup);
+        if strong_count != 1 || operation_blocked {
+            let strong_refs = strong_count - 1;
+            let busy = strong_refs.max(usize::from(operation_blocked));
             obs::warn!(
-                "event=engine_lifecycle component=engine action=shutdown_finish result=busy mode=try busy={} strong_refs={} active_transactions={} queued_cleanup={}",
+                "event=engine_lifecycle component=engine action=shutdown_finish result=busy mode=try busy={} strong_refs={} operation_blocked={} cleanup_queued={}",
                 busy,
-                strong_count - 1,
-                active_transactions,
-                queued_cleanup
+                strong_refs,
+                operation_blocked,
+                cleanup_queued
             );
-            return Err(Report::new(LifecycleError::ShutdownBusy).attach(busy));
+            return Err(Report::new(LifecycleError::ShutdownBusy).attach(format!(
+                "strong_refs={strong_refs}, operation_blocked={operation_blocked}"
+            )));
         }
         self.finish_shutdown_locked(inner);
         obs::info!(
@@ -424,7 +427,7 @@ impl Engine {
     #[inline]
     fn shutdown_inner(&self) -> LifecycleResult<()> {
         let inner = self.inner();
-        if inner.lifecycle.state() == EngineLifecycleState::Shutdown {
+        if inner.lifecycle.inspect_state() == EngineLifecycleState::Shutdown {
             return Ok(());
         }
         obs::info!(
@@ -437,18 +440,16 @@ impl Engine {
             inner.lifecycle.wait_for_runtime_refs_drained();
 
             let _shutdown = inner.lifecycle.shutdown_lock.lock();
-            if inner.lifecycle.state() == EngineLifecycleState::Shutdown {
+            if inner.lifecycle.inspect_state() == EngineLifecycleState::Shutdown {
                 obs::info!(
                     "event=engine_lifecycle component=engine action=shutdown_finish result=ok mode=wait already_shutdown=true"
                 );
                 return Ok(());
             }
 
-            let trx_change_epoch = inner.session_registry.trx_change_epoch();
-            let queued_cleanup = self.queue_shutdown_trx_cleanup(inner);
-            let active_transactions = inner.session_registry.active_transaction_count();
+            let shutdown_wait = inner.session_registry.first_shutdown_wait();
             let strong_count = Arc::strong_count(inner);
-            if strong_count == 1 && active_transactions == 0 && queued_cleanup == 0 {
+            if strong_count == 1 && shutdown_wait.is_none() {
                 self.finish_shutdown_locked(inner);
                 obs::info!(
                     "event=engine_lifecycle component=engine action=shutdown_finish result=ok mode=wait"
@@ -457,25 +458,16 @@ impl Engine {
             }
             drop(_shutdown);
 
-            let runtime_refs = inner.lifecycle.runtime_refs();
-            if queued_cleanup != 0 && runtime_refs == 0 {
-                inner
-                    .session_registry
-                    .wait_for_trx_change_since(trx_change_epoch);
-                continue;
-            }
-
-            if active_transactions != 0 && queued_cleanup == 0 && runtime_refs == 0 {
-                inner
-                    .session_registry
-                    .wait_for_trx_change_since(trx_change_epoch);
+            if let Some(shutdown_wait) = shutdown_wait {
+                self.queue_shutdown_operation_cleanup(inner, shutdown_wait.cleanup);
+                shutdown_wait.listener.wait();
                 continue;
             }
 
             // A weak public handle can briefly upgrade to an `Arc<EngineInner>`
             // while it discovers admission is already closed. That raw Arc is
             // intentionally not a runtime ref, so there is no event to wait on.
-            if runtime_refs == 0 {
+            if inner.lifecycle.runtime_refs() == 0 {
                 yield_now();
             }
         }
@@ -492,23 +484,28 @@ impl Engine {
         inner.lifecycle.mark_shutdown();
     }
 
+    /// Queues rollback for one shutdown-discovered abandoned transaction.
+    ///
+    /// The operation key locates the stable outer entry, while the transaction
+    /// id identifies the exact public or private transaction to claim under the
+    /// entry mutex. The second identity prevents a stale hint from claiming a
+    /// newer private transaction installed under the same operation key. Other
+    /// active operation states only block shutdown; a later whole-operation
+    /// handoff transfers its owned task rather than using this identity pair.
     #[inline]
-    fn queue_shutdown_trx_cleanup(&self, inner: &Arc<EngineInner>) -> usize {
-        let cleanup = inner.session_registry.collect_shutdown_cleanup();
-        if cleanup.is_empty() {
-            return 0;
-        }
+    fn queue_shutdown_operation_cleanup(
+        &self,
+        inner: &Arc<EngineInner>,
+        cleanup: Option<(SessionOperationKey, TrxID)>,
+    ) -> bool {
+        let Some((operation_key, trx_id)) = cleanup else {
+            return false;
+        };
         let engine_ref = EngineRef::new(Arc::clone(inner));
-        let len = cleanup.len();
-        for (session_id, trx_id, reason) in cleanup {
-            inner.trx_sys.request_abandoned_trx_cleanup(
-                engine_ref.clone(),
-                session_id,
-                trx_id,
-                reason,
-            );
-        }
-        len
+        inner
+            .trx_sys
+            .request_abandoned_trx_cleanup(engine_ref, operation_key, trx_id);
+        true
     }
 }
 
@@ -685,8 +682,6 @@ pub(crate) struct EngineInner {
     pub(crate) session_registry: SessionRegistry,
     /// Monotonically increasing engine-local session identity source.
     next_session_id: AtomicU64,
-    /// Shared engine-local identity source for DDL and maintenance lock scopes.
-    next_lock_operation_id: AtomicU64,
     lifecycle: EngineLifecycle,
 }
 
@@ -720,23 +715,6 @@ impl EngineInner {
         SessionID::new(self.next_session_id.fetch_add(1, Ordering::Relaxed))
     }
 
-    /// Allocates an engine-local DDL lock operation identity.
-    #[inline]
-    pub(crate) fn next_ddl_operation_id(&self) -> DdlOperationID {
-        DdlOperationID::new(self.next_lock_operation_id())
-    }
-
-    /// Allocates an engine-local maintenance lock operation identity.
-    #[inline]
-    pub(crate) fn next_maintenance_operation_id(&self) -> MaintenanceOperationID {
-        MaintenanceOperationID::new(self.next_lock_operation_id())
-    }
-
-    #[inline]
-    fn next_lock_operation_id(&self) -> u64 {
-        self.next_lock_operation_id.fetch_add(1, Ordering::Relaxed)
-    }
-
     /// Enter one short engine operation while runtime admission is open.
     ///
     /// The returned token is a scoped admission proof only. Drop it before any
@@ -755,24 +733,10 @@ impl EngineInner {
         Ok(admission)
     }
 
-    /// Validate that engine admission is still open without checking storage
-    /// poison.
-    ///
-    /// This is only for cheap lifecycle state queries that must remain
-    /// observable after a fatal storage error. Real operations must use
-    /// [`Self::acquire_admission`].
-    #[inline]
-    pub(crate) fn ensure_admission_open_for_query(&self) -> LifecycleResult<()> {
-        if self.lifecycle.state() == EngineLifecycleState::Running {
-            return Ok(());
-        }
-        Err(Report::new(LifecycleError::Shutdown).attach("engine admission is closed"))
-    }
-
     /// Returns whether owner-side shutdown has started.
     #[inline]
     pub(crate) fn shutdown_started(&self) -> bool {
-        self.lifecycle.state() != EngineLifecycleState::Running
+        self.lifecycle.inspect_state() != EngineLifecycleState::Running
     }
 
     /// Registers for owner-side shutdown start.
@@ -930,7 +894,6 @@ async fn bootstrap_inner(config: EngineConfig) -> Result<Engine> {
         lock_manager,
         session_registry: SessionRegistry::new(),
         next_session_id: AtomicU64::new(FIRST_SESSION_ID.as_u64()),
-        next_lock_operation_id: AtomicU64::new(1),
         lifecycle: EngineLifecycle::new(),
     };
     Ok(Engine {
@@ -950,7 +913,7 @@ mod tests {
         ResourceError, RuntimeError,
     };
     use crate::file::fs::tests::io_backend_stats_handle_identity as fs_stats_handle_identity;
-    use crate::id::{TableID, TrxID};
+    use crate::id::{OperationID, SessionOperationKey, TableID, TrxID};
     use crate::io::{
         IOKind, StdIoResult, StorageBackendFileIdentity, StorageBackendOp, StorageBackendTestHook,
         install_storage_backend_test_hook,
@@ -1260,7 +1223,7 @@ mod tests {
 
     fn wait_until_shutdown_begins(engine: &Engine) {
         let deadline = Instant::now() + Duration::from_secs(5);
-        while engine.inner().lifecycle.state() == EngineLifecycleState::Running {
+        while engine.inner().lifecycle.inspect_state() == EngineLifecycleState::Running {
             assert!(
                 Instant::now() < deadline,
                 "shutdown did not close admission before timeout"
@@ -1355,48 +1318,6 @@ mod tests {
     }
 
     #[test]
-    fn test_lock_operation_ids_share_one_engine_local_sequence() {
-        smol::block_on(async {
-            let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
-                .await
-                .unwrap();
-
-            let ddl1 = engine.inner().next_ddl_operation_id();
-            let maintenance1 = engine.inner().next_maintenance_operation_id();
-            let ddl2 = engine.inner().next_ddl_operation_id();
-            let maintenance2 = engine.inner().next_maintenance_operation_id();
-
-            assert_eq!(
-                [
-                    ddl1.as_u64(),
-                    maintenance1.as_u64(),
-                    ddl2.as_u64(),
-                    maintenance2.as_u64(),
-                ],
-                [1, 2, 3, 4]
-            );
-        });
-    }
-
-    #[test]
-    fn test_lock_operation_id_sequences_are_engine_local() {
-        smol::block_on(async {
-            let first_root = TempDir::new().unwrap();
-            let first = Engine::bootstrap(test_engine_config_for(first_root.path()))
-                .await
-                .unwrap();
-            let second_root = TempDir::new().unwrap();
-            let second = Engine::bootstrap(test_engine_config_for(second_root.path()))
-                .await
-                .unwrap();
-
-            assert_eq!(first.inner().next_ddl_operation_id().as_u64(), 1);
-            assert_eq!(second.inner().next_maintenance_operation_id().as_u64(), 1);
-        });
-    }
-
-    #[test]
     fn test_engine_lock_manager_is_shared_across_runtime_handles() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
@@ -1476,8 +1397,10 @@ mod tests {
             let session_id = session.id();
             let resource = LockResource::TableData(TableID::new(91_204));
             let explicit_owner = LockOwner::session_explicit(session_id);
-            let maintenance_owner =
-                LockOwner::maintenance(session_id, MaintenanceOperationID::new(91_204));
+            let maintenance_owner = LockOwner::operation(SessionOperationKey::new(
+                session_id,
+                OperationID::new(91_204),
+            ));
 
             assert!(
                 try_acquire(
@@ -1959,7 +1882,10 @@ mod tests {
                 err.report().downcast_ref::<LifecycleError>().copied(),
                 Some(LifecycleError::ShutdownBusy)
             );
-            assert_eq!(err.report().downcast_ref::<usize>().copied(), Some(1));
+            assert_eq!(
+                err.report().downcast_ref::<String>().map(String::as_str),
+                Some("strong_refs=1, operation_blocked=false")
+            );
 
             let err = match engine_ref.new_session() {
                 Ok(_) => panic!("expected shutdown error"),
@@ -2025,7 +1951,7 @@ mod tests {
                 .await
                 .unwrap();
             let session_handle = engine.new_session().unwrap();
-            let session = session_handle.pin().unwrap();
+            let session = session_handle.pin_observer().unwrap();
             assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
 
             let err = match engine.try_shutdown() {
@@ -2037,7 +1963,10 @@ mod tests {
                 err.report().downcast_ref::<LifecycleError>().copied(),
                 Some(LifecycleError::ShutdownBusy)
             );
-            assert_eq!(err.report().downcast_ref::<usize>().copied(), Some(1));
+            assert_eq!(
+                err.report().downcast_ref::<String>().map(String::as_str),
+                Some("strong_refs=1, operation_blocked=false")
+            );
             assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
 
             drop(session);
@@ -2065,7 +1994,10 @@ mod tests {
                 err.report().downcast_ref::<LifecycleError>().copied(),
                 Some(LifecycleError::ShutdownBusy)
             );
-            assert_eq!(err.report().downcast_ref::<usize>().copied(), Some(1));
+            assert_eq!(
+                err.report().downcast_ref::<String>().map(String::as_str),
+                Some("strong_refs=0, operation_blocked=true")
+            );
 
             trx.rollback().await.unwrap();
             drop(session);
@@ -2093,7 +2025,10 @@ mod tests {
                 err.report().downcast_ref::<LifecycleError>().copied(),
                 Some(LifecycleError::ShutdownBusy)
             );
-            assert_eq!(err.report().downcast_ref::<usize>().copied(), Some(1));
+            assert_eq!(
+                err.report().downcast_ref::<String>().map(String::as_str),
+                Some("strong_refs=0, operation_blocked=true")
+            );
 
             let err = trx
                 .lock_table(table_id, TableLockMode::Shared)
@@ -2167,7 +2102,7 @@ mod tests {
         let engine =
             smol::block_on(Engine::bootstrap(test_engine_config_for(root.path()))).unwrap();
         let session_handle = engine.new_session().unwrap();
-        let session = session_handle.pin().unwrap();
+        let session = session_handle.pin_observer().unwrap();
         let (done_tx, done_rx) = mpsc::channel();
         assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
 
@@ -2183,14 +2118,14 @@ mod tests {
             wait_until_shutdown_begins(&engine);
             assert!(
                 done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
-                "shutdown must wait while a SessionPin is alive"
+                "shutdown must wait while a SessionObserverPin is alive"
             );
             assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
 
             drop(session);
             let result = done_rx
                 .recv_timeout(Duration::from_secs(5))
-                .expect("shutdown should complete after SessionPin drops");
+                .expect("shutdown should complete after SessionObserverPin drops");
             assert_eq!(result, Ok(()));
             assert_eq!(session_registry_len(&engine.inner().session_registry), 0);
             shutdown_handle.join().unwrap();
@@ -2430,8 +2365,12 @@ mod tests {
             let checkout = trx.checkout().unwrap();
             drop(trx);
             assert!(session.in_trx().unwrap());
-            let err = session.list_table_ids().unwrap_err();
-            assert_existing_transaction_error(&err, session.id(), trx_id, "checked_out_abandoned");
+            assert!(session.list_table_ids().is_ok());
+            let err = match session.begin_trx() {
+                Ok(_) => panic!("checked-out abandoned transaction must block a replacement"),
+                Err(err) => err,
+            };
+            assert_existing_transaction_error(&err, session.id(), trx_id, "foreground_running");
             assert!(lock_entry_count(&engine, owner) > 0);
 
             drop(checkout);

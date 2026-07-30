@@ -4608,7 +4608,8 @@ mod tests {
     };
     use crate::session::Session;
     use crate::session::tests::{
-        SessionTestExt, assert_checkpoint_published, wait_for_checkpoint_purge,
+        SessionTestExt, assert_checkpoint_published, remove_session_for_test,
+        wait_for_checkpoint_purge,
     };
     use crate::table::hot::{
         DeleteInternal, HotRowMutator, InsertRowIntoPage, RowInserter, UpdateRowInplace,
@@ -9482,10 +9483,14 @@ mod tests {
             );
             assert!(poison_error.downcast_ref::<ErrorKind>().is_none());
             assert_eq!(fatal_rollback_retention_count(&engine.inner().trx_sys), 1);
-            assert!(!session.in_trx().unwrap());
+            assert!(
+                session.in_trx().unwrap(),
+                "failed-retained operation must keep the session unavailable"
+            );
 
             let err = trx.rollback().await.unwrap_err();
             assert!(err.report().downcast_ref::<InternalError>().is_none());
+            remove_session_for_test(&engine.inner().session_registry, session.id());
         });
     }
 

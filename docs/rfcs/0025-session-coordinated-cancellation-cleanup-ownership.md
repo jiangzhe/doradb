@@ -97,7 +97,9 @@ actor, a second physical worker, or a physical lock-manager redesign. [D1]
 8. Preserve successful transaction and statement path cost: synchronize only at
    an ownership boundary that requires shared visibility, and add no second
    lookup, allocation, lock, atomic operation, notification, or queue hop around
-   existing transaction checkout/check-in. [D14] [C1] [C2] [C16] [U5]
+   existing transaction checkout/check-in. Shutdown observation is lazy and
+   session-local, not a foreground-maintained aggregate. [D14] [C1] [C2] [C16]
+   [U5] [U8]
 
 ### Non-goals
 
@@ -179,8 +181,9 @@ actor, a second physical worker, or a physical lock-manager redesign. [D1]
 - [C1] `doradb-storage/src/session.rs` - public session admission, DDL and
   maintenance scope guards, transaction-only `SessionLifecycle`, close,
   abandonment, and shutdown collection.
-- [C2] `doradb-storage/src/trx/mod.rs` - `Transaction::exec`, `TrxEntry`,
-  `TrxCheckout`, `TrxCompletionClaim`, transaction-handle drop, and
+- [C2] `doradb-storage/src/trx/mod.rs` - `Transaction::exec`,
+  `SessionOperationEntry`, `SessionOperationCheckout`,
+  `SessionOperationCompletionClaim`, transaction-handle drop, and
   `ReleasedTransactionLocks`.
 - [C3] `doradb-storage/src/trx/stmt.rs` - statement-local row undo, index undo,
   redo, statement locks, rollback order, fatal retention, and the non-empty
@@ -238,7 +241,7 @@ actor, a second physical worker, or a physical lock-manager redesign. [D1]
   based on backlog 000170, with cancellation and cleanup unified by defining and
   maintaining session state.
 - [U2] On 2026-07-28, the user approved the original-requirement-fit proposal:
-  stable session operation entries, foreground leases, the existing cleanup
+  stable session operation entries, foreground checkouts, the existing cleanup
   worker, whole-transaction cancellation after a polled statement is dropped,
   close waiting only after terminal cleanup ownership, and explicit continuation
   authority before irreversible DDL or maintenance gates. The DDL/maintenance
@@ -271,6 +274,18 @@ actor, a second physical worker, or a physical lock-manager redesign. [D1]
   drop is not cancellation, explicit client-side cancellation is deferred, the
   task itself owns `SessionPin`/`EngineRef`, and standalone observer waits remain
   ordinarily drop-cancellable.
+- [U8] On 2026-07-30, the user rejected mixed session/registry notification
+  ownership and selected on-demand session-local events. Explicit close and
+  blocking shutdown install or reuse only the event they need; shutdown scans
+  lazily, stops at the first blocker, waits for that session, and adds no
+  foreground statement or transaction overhead. Direct DashMap traversal may
+  retain its short shard read guard during the lifecycle/entry probe, but every
+  guard is released before waiting, queueing, notification, or removal.
+- [U9] On 2026-07-30, the user required registry transaction resolution to use
+  only `SessionOperationKey`. Because one outer operation entry may host
+  sequential private transactions, stale-handle protection remains an atomic
+  `TrxID` and state check at the entry mutation or claim boundary rather than a
+  separate registry lookup predicate.
 
 ### Source Backlogs
 
@@ -290,8 +305,8 @@ actor, a second physical worker, or a physical lock-manager redesign. [D1]
 entry reference; it does not store a checked-out mutable operation payload and
 is never held across `.await`. The entry follows the existing `TrxEntry`
 pattern: a short mutex protects payload ownership transfer, a registry-visible
-state identifies the current owner, and an event/epoch wakes close and shutdown
-waiters. [D4] [C1] [C2] [U1]
+state identifies the current owner, and a lazily installed session-local event
+wakes close and shutdown waiters. [D4] [C1] [C2] [U1] [U8]
 
 The conceptual outer state is:
 
@@ -358,13 +373,15 @@ proof remain in the outer whole-operation future. [D2] [C1] [C2] [C4] [U3]
 Identity and purpose are separate. `SessionOperationEntry` stores its
 `OperationID` and stable `SessionOperationKind`; nested transaction records
 store their `TrxID` and refer to the outer key. Transaction cleanup hints carry
-the outer `(SessionID, OperationID)` plus a reason, and the registry verifies
-that key before constructing a claim, so stale hints are neutral. A mandatory
-DDL/maintenance message instead carries the exact pinned task plus its key; the
-worker verifies `BackgroundQueued` before starting it. A nested transaction
-never independently publishes session state or replaces the outer key. The
-kind—not the numeric id—selects DDL, maintenance, transaction, or explicit-lock
-policy and diagnostics. [C1] [C4] [U3] [U4] [U7]
+the outer `(SessionID, OperationID)` plus `TrxID`. The registry resolves only
+the operation key; the entry claim then verifies the transaction identity and
+claimable state atomically under the entry mutex, so a stale hint cannot claim a
+newer private transaction under the same key. A mandatory DDL/maintenance
+message instead carries the exact pinned task plus its key; the worker verifies
+`BackgroundQueued` before starting it. A nested transaction never independently
+publishes session state or replaces the outer key. The kind—not the numeric
+id—selects DDL, maintenance, transaction, or explicit-lock policy and
+diagnostics. [C1] [C4] [U3] [U4] [U7] [U9]
 
 The identities have these non-interchangeable roles:
 
@@ -418,7 +435,7 @@ it must preserve these logical states and operation-kind restrictions: [D4]
 
 ```text
 ForegroundAvailable
-    a reusable public-transaction payload is checked in and may be leased
+    a reusable public-transaction payload is checked in and may be checked out
 
 ForegroundRunning
     one foreground authority owns a checked-out transaction payload or polls
@@ -523,7 +540,8 @@ the most recent internal phase. [D1] [D4] [C2] [U7]
 
 Public transactions retain stable checked-in payload ownership between calls.
 Their statement carrier, rather than a borrowed `Statement` facade, is the sole
-final owner of `TrxCheckout`, statement undo/redo, and statement-lock state.
+final owner of `SessionOperationCheckout`, statement undo/redo, and
+statement-lock state.
 Pending acquisition guards settle synchronously before a transaction payload
 becomes `CleanupReady`. Normal completion disarms each carrier only after it has
 returned the payload or published a terminal owner. [C2] [C3] [C5] [U4] [U6]
@@ -670,15 +688,16 @@ completion, error, panic, and entry-finalization supervision. The stable
 operation entry, not the detached task handle, remains the authoritative
 diagnostic and shutdown record. [D15] [C4] [U7]
 
-Transaction cleanup hints remain identity-and-reason messages. The worker
-resolves the stable entry and constructs a claim only if the transaction payload
-is claimable, so stale or duplicate hints are neutral. A whole-operation
-handoff is different: the mandatory message owns the exact non-cloneable pinned
-future and is correctness-critical. Its `EngineRef` runtime pin guarantees that
-normal shutdown cannot stop the receiver first. A mandatory send failure is
-therefore an internal worker-lifetime violation; it must poison the engine,
-publish failed retention, and preserve rather than drop the task. [D4] [C2]
-[C4] [C13] [U7]
+Transaction cleanup hints remain identity messages. The worker resolves the
+stable entry by operation key, then constructs a claim only if the message's
+`TrxID`, entry state, and transaction payload are claimable under one mutex
+acquisition, so stale or duplicate hints are neutral. A whole-operation handoff
+is different: the mandatory message owns the exact non-cloneable pinned future
+and is correctness-critical. Its `EngineRef` runtime pin guarantees that normal
+shutdown cannot stop the receiver first. A mandatory send failure is therefore
+an internal worker-lifetime violation; it must poison the engine, publish
+failed retention, and preserve rather than drop the task. [D4] [C2] [C4] [C13]
+[U7] [U9]
 
 `Stop` is a quiescence barrier, not permission to cancel executor tasks. After
 the producers that can create mandatory work are closed, the dispatcher drains
@@ -856,10 +875,11 @@ closes the session. [B1] [U2] [U7]
 `Session::close().await` preserves the current rejection of a still-live
 detached transaction and does not implicitly cancel it. A background
 DDL/maintenance task has no remaining caller capable of completing it, so close
-records `CloseRequested`, obtains a completion listener without holding the
-lifecycle mutex, and waits for `BackgroundQueued`, `BackgroundRunning`, or
+records `CloseRequested`, installs or reuses the session event and obtains a
+completion listener under the lifecycle mutex, then releases it before waiting
+for `BackgroundQueued`, `BackgroundRunning`, or
 `CompletionOwned` to publish closed or failed-retained terminal state. Closing
-an idle session remains idempotent. [D4] [C1] [U2] [U7]
+an idle session remains idempotent. [D4] [C1] [U2] [U7] [U8]
 
 A new operation attempted while a detached DDL/maintenance task owns the
 session returns an `ExistingOperation` lifecycle error rather than waiting or
@@ -872,21 +892,27 @@ Operation id, kind, state, and disposition are attached for diagnostics. [C14]
 ### Shutdown Drain
 
 `Engine::try_shutdown` and blocking `Engine::shutdown` remain synchronous.
-Closing engine admission precedes operation scanning. The session registry gains
-active-operation counts, state-change epochs, and collection of every
-claimable session operation, not only abandoned transactions. [D4] [D6] [C13]
-[B5]
+Closing engine admission precedes operation scanning. The registry lazily
+traverses sessions and stops at the first active operation. `try_shutdown`
+performs a non-observing probe; blocking shutdown installs or reuses an event
+only in the first session it must wait for and registers its listener under the
+lifecycle mutex before inspecting the active entry. [D4] [D6] [C13] [B5] [U8]
 
-`try_shutdown` queues claimable work and reports `ShutdownBusy` while a
+`try_shutdown` queues at most the first blocker's claimable work and reports
+`ShutdownBusy` while a
 foreground authority, commit owner, transaction cleanup claim, background
 whole-operation task, retained terminal payload, or runtime pin remains.
 Blocking shutdown waits for live foreground capabilities to finish or be
 dropped; it never commits or cancels a still-live public transaction on the
 user's behalf. Dropping a DDL/maintenance observer during that wait transfers
 the task, whose `EngineRef` keeps runtime drain and the cleanup worker alive
-until terminal completion. Shutdown repeatedly scans stable entries and waits
-on operation/runtime epochs rather than polling under a registry guard. [D4]
-[C13] [U7]
+until terminal completion. Blocking shutdown releases every registry,
+lifecycle, entry, and shutdown guard, queues at most that blocker's exact
+cleanup hint, waits on its local listener, and rescans. A complete traversal is
+performed only to prove that no operation remains. The short
+`DashMap shard read -> lifecycle -> entry` probe is safe because registry
+mutation occurs only after releasing the inner guards; shutdown never waits or
+queues under a registry guard. [D4] [C13] [U7] [U8]
 
 The cleanup worker receives `Stop` only after the log thread and every producer
 that can enqueue mandatory work are quiescent. It drains messages already queued
@@ -991,9 +1017,9 @@ Payload representation must not make the transaction hot path move or clear the
 size of a DDL/maintenance future. The checked-in transaction variant reuses the
 compact transaction core; cold DDL/maintenance state remains inside its pinned
 box and ownership transfer uses `Option::take` rather than phase extraction or
-deep copies. Normal transaction checkout/check-in does not advance a session
-change epoch or notify lifecycle waiters. Diagnostics and formatted attachments
-remain lazy on success. [C1] [C2] [C3] [U5] [U7]
+deep copies. Normal transaction checkout/check-in does not inspect or
+initialize the session-local event or notify lifecycle waiters. Diagnostics and
+formatted attachments remain lazy on success. [C1] [C2] [C3] [U5] [U7] [U8]
 
 Synchronous statement settlement is not required to be constant-time: moving
 residual undo entries, destroying redo, and releasing statement grants may
@@ -1069,9 +1095,10 @@ The implementation phases must add deterministic coverage for:
 16. mandatory queue closure, injected operational error, cleanup claim drop,
     foreground and worker task panic, fatal retention, and shutdown teardown,
     proving that no panic is silently swallowed by task detachment;
-17. stale `(SessionID, OperationID)` transaction hints and duplicate jobs
-    producing no second claim, while a whole-operation task is physically
-    non-cloneable and transferred exactly once;
+17. replaced `(SessionID, OperationID)` transaction hints, stale `TrxID` hints
+    against a reused outer operation entry, and duplicate jobs producing no
+    second claim, while a whole-operation task is physically non-cloneable and
+    transferred exactly once;
 18. successful statement, stream, DDL, and mutating-maintenance execution
     producing no cleanup-queue notification or worker task;
 19. every affected production future and deterministic test hook satisfying
@@ -1266,6 +1293,22 @@ maintenance, and benchmark modules. [D4] [D7] [C16]
   still requires Doradb-owned supervision and shutdown barriers around it.
 - References: [D15], [C4], [C18], [U7]
 
+### Alternative K: Registry-Wide Shutdown Epoch And Eager Arming
+
+- Summary: Keep one registry-level event/epoch, inspect and arm every session
+  on each shutdown pass, aggregate active-operation counts, and batch every
+  claimable cleanup hint.
+- Analysis: One shared wake channel makes aggregate diagnostics and cleanup
+  batching straightforward, but it spreads one wait protocol across registry,
+  session, and entry transitions. It also allocates work proportional to every
+  registered session before shutdown can wait on the first actual blocker.
+- Why Not Chosen: Explicit close and shutdown wait on session predicates, so
+  the notification belongs in `SessionState`. Lazy first-blocker traversal
+  installs no foreground-maintained aggregate, keeps ordinary statements and
+  unobserved completion silent, and performs a complete scan only to prove
+  quiescence.
+- References: [D4], [D6], [C1], [C13], [U5], [U8]
+
 ## Unsafe Considerations (If Applicable)
 
 This RFC does not require new unsafe code or change an existing unsafe
@@ -1298,17 +1341,18 @@ it does not change the successful-path baseline availability. [D16] [C16]
   - Scope: Add crate-private `OperationID`, a plain session-local monotonic
     allocator in `SessionState`, `(SessionID, OperationID)` operation keys,
     stable `SessionOperationKind`, orthogonal session disposition and operation
-    slot state, stable operation entries, transaction foreground
-    checkout/check-in leases and cleanup claims, whole-operation
-    foreground/background ownership labels, lifecycle events/epochs, queue
-    identity messages, `ExistingOperation`, and registry/shutdown inspection.
+    slot state, stable operation entries, `SessionOperationCheckout` and
+    transaction cleanup claims, whole-operation
+    foreground/background ownership labels, lazy session-local lifecycle
+    events, queue identity messages, `ExistingOperation`, and first-blocker
+    registry/shutdown inspection.
     Stable entries track but never store a whole-operation future. Replace
     `DdlOperationID`, `MaintenanceOperationID`,
     `EngineInner::next_lock_operation_id`, `LockScope::Ddl`, and
     `LockScope::Maintenance` with `LockScope::Operation(OperationID)`. Adapt the
     existing public transaction lifecycle through the new outer entry without
     changing statement cancellation yet. [D4] [D13] [C1] [C2] [C4] [C5]
-    [C13] [C14] [C15] [U3] [U5] [U7]
+    [C13] [C14] [C15] [U3] [U5] [U7] [U8] [U9]
   - Goals: Prove one active session operation, no registry lock across await, no
     registry-owned whole-operation task or engine strong cycle, neutral
     stale/duplicate transaction hints, independent session-local allocation,
@@ -1325,12 +1369,13 @@ it does not change the successful-path baseline availability. [D16] [C16]
     Task 000244's `stmt-noop` and `trx-noop` baselines are
     available for paired successful-path evidence. [D4] [D13] [D16] [U3]
   - Phase-local Choices: Choose the concrete entry-state enum or
-    atomic-plus-mutex layout, event epoch representation, diagnostic labels,
-    exhaustion error representation, and temporary adapter between legacy
-    transaction messages and session-operation messages. The operation counter
-    remains a plain session-local value under the lifecycle mutex, and operation
-    purpose must not be recovered from the numeric id. Cold payload layout must
-    not enlarge transaction checkout to a future or largest operation variant.
+    atomic-plus-mutex layout, diagnostic labels, exhaustion error
+    representation, and temporary adapter between legacy transaction messages
+    and session-operation messages. The operation counter remains a plain
+    session-local value under the lifecycle mutex, shutdown observation uses a
+    lazy session-local event rather than a registry epoch, and operation purpose
+    must not be recovered from the numeric id. Cold payload layout must not
+    enlarge transaction checkout to a future or largest operation variant.
   - Non-goals: Do not add statement cancellation settlement, the cooperative
     executor, or DDL/maintenance task transfer in this phase. Do not change the
     physical lock manager or add a physical worker.
@@ -1368,8 +1413,8 @@ it does not change the successful-path baseline availability. [D16] [C16]
     against their Phase 1 baselines, and use `index-stream` with fixed loaded
     data and `--range` to enforce the no-per-item stream budget across unique
     and non-unique index modes. [D16] [C16] [U5]
-  - Prerequisites: Phase 1 entry/lease/claim transitions are available, and task
-    000174 worker-owned terminal rollback plus task 000242 transaction-lock
+  - Prerequisites: Phase 1 entry checkout/claim transitions are available, and
+    task 000174 worker-owned terminal rollback plus task 000242 transaction-lock
     release proof remain intact. [D11] [D12]
   - Phase-local Choices: Choose the cancellation-guard layout, exact terminal
     transition, and efficient whole-buffer transfer representation. The guard

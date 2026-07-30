@@ -9,10 +9,10 @@ use crate::error::{
     DiscloseError, DiscloseResultExt, LifecycleError, LifecycleResult, MultiDomainResultExt,
     OperationResult, Result,
 };
-use crate::id::{SessionID, TableID, TrxID};
+use crate::id::{OperationID, SessionID, SessionOperationKey, TableID, TrxID};
 use crate::lock::{FreshLockGuard, LockManager, LockMode, LockOwner, LockResource, TableLockMode};
 use crate::map::{FastDashMap, FastHashMap};
-use crate::notify::ChangeNotifier;
+use crate::notify::EventNotifyOnDrop;
 use crate::quiescent::QuiescentGuard;
 use crate::stats::{
     BufferPoolStats, StorageIoStats, TransactionSystemStats, buffer_pool_runtime_stats_snapshot,
@@ -23,10 +23,11 @@ use crate::table::{
     MemIndexCleanupOutcome, Table,
 };
 use crate::trx::{
-    ReleasedTransactionLocks, StartedTransaction, Transaction, TrxCleanupReason, TrxEntry,
-    TrxEntryState,
+    ReleasedTransactionLocks, SessionOperationEntry, SessionOperationKind, SessionOperationState,
+    Transaction,
 };
 use error_stack::{Report, ResultExt};
+use event_listener::EventListener;
 use futures::future::select_all;
 use parking_lot::Mutex;
 use std::cell::Cell;
@@ -107,16 +108,20 @@ pub(crate) struct SessionDdlContext {
 }
 
 impl SessionDdlContext {
-    /// Creates DDL admission context from a pinned idle session.
+    /// Creates DDL context from a typed foreground operation authority.
     #[inline]
-    pub(crate) fn new(session: &SessionPin) -> OperationResult<Self> {
-        let id = session.id();
+    pub(crate) fn new(session: &SessionOperationPin) -> OperationResult<Self> {
+        assert!(
+            session.kind() == SessionOperationKind::Ddl,
+            "DDL context requires DDL operation authority: key={}, kind={}",
+            session.key(),
+            session.kind().label()
+        );
         let pool_guards = session.pool_guards();
-        let operation_id = session.engine.next_ddl_operation_id();
         Ok(Self {
             engine: session.engine.clone(),
             pool_guards,
-            owner: LockOwner::ddl(id, operation_id),
+            owner: session.operation_lock_owner(),
         })
     }
 }
@@ -137,7 +142,7 @@ impl MaintenanceBoundary {
     }
 
     #[inline]
-    fn observed(self, session: &SessionPin) -> TrxID {
+    fn observed(self, session: &SessionObserverPin) -> TrxID {
         match self {
             MaintenanceBoundary::GcHorizon => session.engine.trx_sys.published_gc_horizon(),
             MaintenanceBoundary::PurgeCompletion => session.engine.trx_sys.global_visible_sts(),
@@ -145,7 +150,7 @@ impl MaintenanceBoundary {
     }
 
     #[inline]
-    fn listener(self, session: &SessionPin) -> event_listener::EventListener {
+    fn listener(self, session: &SessionObserverPin) -> event_listener::EventListener {
         match self {
             MaintenanceBoundary::GcHorizon => session.engine.trx_sys.gc_horizon_listener(),
             MaintenanceBoundary::PurgeCompletion => {
@@ -168,9 +173,17 @@ struct ScopedTableRuntimeAccess<'lock> {
 
 impl<'lock> ScopedTableRuntimeAccess<'lock> {
     /// Acquires ordered metadata S/data IS admission and resolves a live table.
-    async fn acquire(session: &'lock SessionPin, table_id: TableID) -> OperationResult<Self> {
-        let owner =
-            LockOwner::maintenance(session.id(), session.engine.next_maintenance_operation_id());
+    async fn acquire(
+        session: &'lock SessionOperationPin,
+        table_id: TableID,
+    ) -> OperationResult<Self> {
+        assert!(
+            session.kind() == SessionOperationKind::Maintenance,
+            "scoped table runtime access requires maintenance authority: key={}, kind={}",
+            session.key(),
+            session.kind().label()
+        );
+        let owner = session.operation_lock_owner();
         let (metadata_lock, data_lock) = Self::acquire_locks(session, table_id, owner).await?;
         let table = session.resolve_user_table(table_id).await?;
         Ok(Self {
@@ -182,11 +195,10 @@ impl<'lock> ScopedTableRuntimeAccess<'lock> {
 
     /// Acquires retry-recheck access, treating absent or terminal state as obsolete.
     async fn acquire_for_retry(
-        session: &'lock SessionPin,
+        session: &'lock SessionOperationPin,
         table_id: TableID,
     ) -> OperationResult<Option<Self>> {
-        let owner =
-            LockOwner::maintenance(session.id(), session.engine.next_maintenance_operation_id());
+        let owner = session.operation_lock_owner();
         let (metadata_lock, data_lock) = Self::acquire_locks(session, table_id, owner).await?;
         let Some(table) = session.engine.catalog().current_live_user_table(table_id) else {
             return Ok(None);
@@ -204,7 +216,7 @@ impl<'lock> ScopedTableRuntimeAccess<'lock> {
 
     /// Acquires logical locks in the repository-wide table resource order.
     async fn acquire_locks(
-        session: &'lock SessionPin,
+        session: &'lock SessionOperationPin,
         table_id: TableID,
         owner: LockOwner,
     ) -> OperationResult<(Option<FreshLockGuard<'lock>>, Option<FreshLockGuard<'lock>>)> {
@@ -243,9 +255,9 @@ impl Drop for ScopedTableRuntimeAccess<'_> {
 /// guards before async work. A session may move between threads but cannot be
 /// shared between them. Lock-free observations use shared access; state
 /// mutation and every logical-lock transition require mutable access. Every
-/// runtime-backed public operation requires the registry lifecycle to be idle;
-/// a detached active transaction makes the Session unavailable until terminal
-/// or abandoned cleanup finishes.
+/// effectful public operation requires an open idle coordinator slot; detached
+/// observer reads and progress waits remain admissible while another operation
+/// is active.
 pub struct Session {
     id: SessionID,
     engine: WeakEngineRef,
@@ -273,9 +285,12 @@ impl Session {
         self.id
     }
 
-    /// Returns a pinned operation view of this idle session.
+    /// Returns a pinned observer view using normal healthy-runtime admission.
+    ///
+    /// This path rejects storage poison. Poison-observable read-only diagnostics
+    /// use [`Self::pin_inspection`] instead.
     #[inline]
-    pub(crate) fn pin(&self) -> LifecycleResult<SessionPin> {
+    pub(crate) fn pin_observer(&self) -> LifecycleResult<SessionObserverPin> {
         if self.closed.get() {
             return Err(Report::new(LifecycleError::SessionUnavailable)
                 .attach(format!("session_id={}", self.id)));
@@ -287,13 +302,46 @@ impl Session {
         let admission = engine
             .acquire_admission()
             .attach_with(|| format!("session_id={}", self.id))?;
-        let state = engine.session_registry.pin_idle(self.id)?;
+        let state = engine.session_registry.pin_observer(self.id)?;
         drop(admission);
-        Ok(SessionPin { engine, state })
+        Ok(SessionObserverPin { engine, state })
     }
 
+    /// Reserves one stable entry for an effectful public session operation.
     #[inline]
-    fn query_pin(&self) -> LifecycleResult<SessionQueryPin> {
+    fn pin_operation(&self, kind: SessionOperationKind) -> LifecycleResult<SessionOperationPin> {
+        if self.closed.get() {
+            return Err(Report::new(LifecycleError::SessionUnavailable)
+                .attach(format!("session_id={}", self.id)));
+        }
+        let engine = self.engine.upgrade().attach_with(|| {
+            format!(
+                "session_id={}, kind={}, phase=upgrade_engine_runtime",
+                self.id,
+                kind.label()
+            )
+        })?;
+        let admission = engine
+            .acquire_admission()
+            .attach_with(|| format!("session_id={}, kind={}", self.id, kind.label()))?;
+        let (state, entry) = engine.session_registry.reserve_operation(self.id, kind)?;
+        drop(admission);
+        Ok(SessionOperationPin {
+            engine,
+            state,
+            entry,
+            armed: true,
+        })
+    }
+
+    /// Returns a lifecycle-pinned view for poison-observable inspection.
+    ///
+    /// Unlike [`Self::pin_observer`], this path deliberately skips storage
+    /// health validation. It still requires an open engine lifecycle and a
+    /// registered, available session, and callers must restrict the resulting
+    /// pin to read-only diagnostic snapshots.
+    #[inline]
+    fn pin_inspection(&self) -> LifecycleResult<SessionObserverPin> {
         if self.closed.get() {
             return Err(Report::new(LifecycleError::SessionUnavailable)
                 .attach(format!("session_id={}", self.id)));
@@ -302,26 +350,30 @@ impl Session {
             .engine
             .upgrade()
             .attach_with(|| format!("session_id={}, phase=upgrade_engine_runtime", self.id))?;
-        engine.ensure_admission_open_for_query().attach_with(|| {
-            format!("session_id={}, phase=check_engine_query_admission", self.id)
-        })?;
-        let state = engine.session_registry.pin_idle(self.id)?;
-        Ok(SessionQueryPin {
-            engine,
-            _state: state,
-        })
+        // Inspection deliberately bypasses storage-poison validation, but it
+        // must not start after owner-side shutdown closes lifecycle admission.
+        // The EngineRef acquired above keeps components alive if shutdown begins
+        // after this check.
+        if engine.shutdown_started() {
+            return Err(Report::new(LifecycleError::Shutdown).attach(format!(
+                "session_id={}, phase=check_engine_inspection_admission, reason=engine_admission_closed",
+                self.id
+            )));
+        }
+        let state = engine.session_registry.pin_observer(self.id)?;
+        Ok(SessionObserverPin { engine, state })
     }
 
     /// Return sorted ids for currently loaded user-table runtimes.
     ///
     /// This read-only diagnostic remains observable after storage poison while
-    /// engine query admission is still open. It is not available after engine
+    /// the engine lifecycle is still running. It is not available after engine
     /// shutdown, session close, or registry removal. It does not expose
     /// in-flight DDL rows that have not installed a user-table runtime.
     #[inline]
     pub fn list_table_ids(&self) -> Result<Vec<TableID>> {
         let session = self
-            .query_pin()
+            .pin_inspection()
             .attach("operation=list_table_ids")
             .disclose()?;
         Ok(session.engine.catalog().list_user_table_ids_now())
@@ -330,17 +382,30 @@ impl Session {
     /// Begin a new transaction if the session is currently idle.
     #[inline]
     pub fn begin_trx(&mut self) -> Result<Transaction> {
-        let session = self
-            .pin()
+        if self.closed.get() {
+            return Err(Report::new(LifecycleError::SessionUnavailable)
+                .attach(format!("session_id={}", self.id))
+                .disclose());
+        }
+        let engine = self
+            .engine
+            .upgrade()
+            .attach_with(|| format!("session_id={}, phase=upgrade_engine_runtime", self.id))
+            .disclose()?;
+        let admission = engine
+            .acquire_admission()
+            .attach_with(|| format!("session_id={}", self.id))
+            .disclose()?;
+        let trx = engine
+            .session_registry
+            .begin_public_transaction(self.id, &engine)
             .attach("operation=begin_transaction")
             .disclose()?;
-        session
-            .begin_trx()
-            .attach("operation=begin_transaction")
-            .disclose()
+        drop(admission);
+        Ok(trx)
     }
 
-    /// Close this session when it has no active transaction.
+    /// Close this session when no caller-owned foreground operation is active.
     #[inline]
     pub async fn close(&mut self) -> Result<()> {
         if self.closed.get() {
@@ -356,13 +421,15 @@ impl Session {
                 )
             })
             .disclose()?;
-        let _admission = engine
+        let admission = engine
             .acquire_admission()
             .attach_with(|| format!("operation=close_session, session_id={}", self.id))
             .disclose()?;
+        drop(admission);
         engine
             .session_registry
-            .close_idle(self.id)
+            .close(self.id)
+            .await
             .attach("operation=close_session")
             .disclose()?;
         self.closed.set(true);
@@ -376,7 +443,10 @@ impl Session {
         table_spec: TableSpec,
         index_specs: Vec<IndexSpec>,
     ) -> Result<TableID> {
-        let session = self.pin().attach("operation=create_table").disclose()?;
+        let session = self
+            .pin_operation(SessionOperationKind::Ddl)
+            .attach("operation=create_table")
+            .disclose()?;
         create_table_for_session(session, table_spec, index_specs).await
     }
 
@@ -387,21 +457,30 @@ impl Session {
         table_id: TableID,
         index_spec: IndexSpec,
     ) -> Result<IndexNo> {
-        let session = self.pin().attach("operation=create_index").disclose()?;
+        let session = self
+            .pin_operation(SessionOperationKind::Ddl)
+            .attach("operation=create_index")
+            .disclose()?;
         create_index_for_session(session, table_id, index_spec).await
     }
 
     /// Logically drop an active secondary index from an existing user table.
     #[inline]
     pub async fn drop_index(&mut self, table_id: TableID, index_no: IndexNo) -> Result<()> {
-        let session = self.pin().attach("operation=drop_index").disclose()?;
+        let session = self
+            .pin_operation(SessionOperationKind::Ddl)
+            .attach("operation=drop_index")
+            .disclose()?;
         drop_index_for_session(session, table_id, index_no).await
     }
 
     /// Logically drop an existing user table.
     #[inline]
     pub async fn drop_table(&mut self, table_id: TableID) -> Result<()> {
-        let session = self.pin().attach("operation=drop_table").disclose()?;
+        let session = self
+            .pin_operation(SessionOperationKind::Ddl)
+            .attach("operation=drop_table")
+            .disclose()?;
         drop_table_for_session(session, table_id).await
     }
 
@@ -414,7 +493,7 @@ impl Session {
     #[inline]
     pub async fn checkpoint_catalog(&mut self) -> Result<()> {
         let session = self
-            .pin()
+            .pin_operation(SessionOperationKind::Maintenance)
             .attach("operation=checkpoint_catalog")
             .disclose()?;
         session
@@ -436,7 +515,7 @@ impl Session {
         &mut self,
     ) -> Result<CatalogRedoMaintenanceOutcome> {
         let session = self
-            .pin()
+            .pin_operation(SessionOperationKind::Maintenance)
             .attach("operation=checkpoint_catalog_and_truncate_redo_log")
             .disclose()?;
         session
@@ -456,7 +535,7 @@ impl Session {
     #[inline]
     pub async fn truncate_redo_log(&mut self) -> Result<RedoTruncationOutcome> {
         let session = self
-            .pin()
+            .pin_operation(SessionOperationKind::Maintenance)
             .attach("operation=truncate_redo_log")
             .disclose()?;
         session.engine.trx_sys.truncate_redo_log().await.disclose()
@@ -465,13 +544,13 @@ impl Session {
     /// Return a monotonic transaction-system statistics snapshot.
     ///
     /// This read-only diagnostic remains observable after storage poison while
-    /// engine query admission is still open. It is not available after engine
+    /// the engine lifecycle is still running. It is not available after engine
     /// shutdown, session close, or registry removal. Callers can compare
     /// snapshots to compute deltas.
     #[inline]
     pub fn transaction_system_stats(&self) -> Result<TransactionSystemStats> {
         let session = self
-            .query_pin()
+            .pin_inspection()
             .attach("operation=query_transaction_system_stats")
             .disclose()?;
         let engine = &session.engine;
@@ -483,13 +562,13 @@ impl Session {
     /// Return a monotonic shared-storage IO statistics snapshot.
     ///
     /// This read-only diagnostic remains observable after storage poison while
-    /// engine query admission is still open. It is not available after engine
+    /// the engine lifecycle is still running. It is not available after engine
     /// shutdown, session close, or registry removal. Callers can compare
     /// snapshots to compute deltas.
     #[inline]
     pub fn storage_io_stats(&self) -> Result<StorageIoStats> {
         let session = self
-            .query_pin()
+            .pin_inspection()
             .attach("operation=query_storage_io_stats")
             .disclose()?;
         let engine = &session.engine;
@@ -502,13 +581,13 @@ impl Session {
     /// Return point-in-time buffer-pool capacity, allocation, and counters.
     ///
     /// This read-only diagnostic remains observable after storage poison while
-    /// engine query admission is still open. It is not available after engine
+    /// the engine lifecycle is still running. It is not available after engine
     /// shutdown, session close, or registry removal. Counters are monotonic
     /// snapshots and callers can compare snapshots to compute deltas.
     #[inline]
     pub fn buffer_pool_stats(&self) -> Result<BufferPoolStats> {
         let session = self
-            .query_pin()
+            .pin_inspection()
             .attach("operation=query_buffer_pool_stats")
             .disclose()?;
         let engine = &session.engine;
@@ -543,7 +622,10 @@ impl Session {
         table_id: TableID,
         max_rows: usize,
     ) -> Result<FreezeOutcome> {
-        let session = self.pin().attach("operation=freeze_table").disclose()?;
+        let session = self
+            .pin_operation(SessionOperationKind::Maintenance)
+            .attach("operation=freeze_table")
+            .disclose()?;
         let access = ScopedTableRuntimeAccess::acquire(&session, table_id)
             .await
             .attach_with(|| format!("operation=freeze_table, table_id={table_id}"))
@@ -559,7 +641,10 @@ impl Session {
     /// Persist eligible state using the table-owned canonical frozen batch.
     #[inline]
     pub async fn checkpoint_table(&mut self, table_id: TableID) -> Result<CheckpointOutcome> {
-        let session = self.pin().attach("operation=checkpoint_table").disclose()?;
+        let session = self
+            .pin_operation(SessionOperationKind::Maintenance)
+            .attach("operation=checkpoint_table")
+            .disclose()?;
         let access = ScopedTableRuntimeAccess::acquire(&session, table_id)
             .await
             .attach_with(|| format!("operation=checkpoint_table, table_id={table_id}"))
@@ -578,7 +663,7 @@ impl Session {
     /// later checkpoint attempt can still encounter a different delay.
     pub async fn wait_for_checkpoint_retry(&mut self, reason: CheckpointDelayReason) -> Result<()> {
         let session = self
-            .pin()
+            .pin_observer()
             .attach("operation=wait_for_checkpoint_retry")
             .disclose()?;
         let table_id = match reason {
@@ -586,22 +671,20 @@ impl Session {
             | CheckpointDelayReason::FrozenPageCutoff { table_id, .. } => table_id,
         };
         loop {
-            let Some(access) = ScopedTableRuntimeAccess::acquire_for_retry(&session, table_id)
-                .await
-                .attach_with(|| format!("operation=wait_for_checkpoint_retry, table_id={table_id}"))
-                .disclose()?
-            else {
+            let Some(table) = session.engine.catalog().current_live_user_table(table_id) else {
                 return Ok(());
             };
-            let observation = access
-                .table()
+            if table.check_foreground_live().is_err() {
+                return Ok(());
+            }
+            session.state.cache_user_table(&table);
+            let observation = table
                 .checkpoint_retry_observation(&session, reason)
                 .await
                 .attach_with(|| format!("operation=wait_for_checkpoint_retry, table_id={table_id}"))
                 .disclose()?;
-            // The detached waiter owns only event-listener state. Release the
-            // table and fresh logical locks before an unbounded await.
-            drop(access);
+            // The detached waiter owns only event-listener state.
+            drop(table);
             match observation {
                 CheckpointRetryObservation::Ready => return Ok(()),
                 CheckpointRetryObservation::Wait(waiter) => waiter.wait().await,
@@ -617,10 +700,29 @@ impl Session {
         &mut self,
         table_id: TableID,
     ) -> Result<CheckpointOutcome> {
+        let session = self
+            .pin_operation(SessionOperationKind::Maintenance)
+            .attach("operation=checkpoint_table_with_wait")
+            .disclose()?;
         loop {
-            match self.checkpoint_table(table_id).await? {
+            let access = ScopedTableRuntimeAccess::acquire(&session, table_id)
+                .await
+                .attach_with(|| {
+                    format!("operation=checkpoint_table_with_wait, table_id={table_id}")
+                })
+                .disclose()?;
+            let outcome = access
+                .table()
+                .checkpoint(&session)
+                .await
+                .attach_with(|| {
+                    format!("operation=checkpoint_table_with_wait, table_id={table_id}")
+                })
+                .disclose()?;
+            drop(access);
+            match outcome {
                 CheckpointOutcome::Delayed { reason } => {
-                    self.wait_for_checkpoint_retry(reason).await?;
+                    wait_for_checkpoint_retry_in_operation(&session, reason).await?;
                 }
                 outcome => return Ok(outcome),
             }
@@ -633,7 +735,7 @@ impl Session {
     /// suitable for checkpoint cutoff and active-snapshot readiness decisions.
     pub async fn wait_for_gc_horizon_after(&self, ts: TrxID) -> Result<TrxID> {
         let session = self
-            .pin()
+            .pin_observer()
             .attach("operation=wait_for_gc_horizon")
             .disclose()?;
         wait_for_maintenance_boundary(&session, ts, MaintenanceBoundary::GcHorizon).await
@@ -645,7 +747,7 @@ impl Session {
     /// retired-page, retained-root, and coalesced cleanup work completes.
     pub async fn wait_for_purge_completion_after(&self, ts: TrxID) -> Result<TrxID> {
         let session = self
-            .pin()
+            .pin_observer()
             .attach("operation=wait_for_purge_completion")
             .disclose()?;
         wait_for_maintenance_boundary(&session, ts, MaintenanceBoundary::PurgeCompletion).await
@@ -655,7 +757,7 @@ impl Session {
     #[inline]
     pub async fn total_row_pages(&mut self, table_id: TableID) -> Result<usize> {
         let session = self
-            .pin()
+            .pin_operation(SessionOperationKind::Maintenance)
             .attach("operation=count_table_row_pages")
             .disclose()?;
         let access = ScopedTableRuntimeAccess::acquire(&session, table_id)
@@ -685,7 +787,7 @@ impl Session {
         clean_live_entries: bool,
     ) -> Result<MemIndexCleanupOutcome> {
         let session = self
-            .pin()
+            .pin_operation(SessionOperationKind::Maintenance)
             .attach("operation=cleanup_secondary_mem_indexes")
             .disclose()?;
         let access = ScopedTableRuntimeAccess::acquire(&session, table_id)
@@ -705,7 +807,7 @@ impl Session {
     pub async fn lock_table(&mut self, table_id: TableID, mode: TableLockMode) -> Result<()> {
         let mode = LockMode::from(mode);
         let session = self
-            .pin()
+            .pin_operation(SessionOperationKind::SessionExplicitLock)
             .attach("operation=lock_explicit_table")
             .disclose()?;
         session
@@ -719,7 +821,7 @@ impl Session {
     #[inline]
     pub fn unlock_table(&mut self, table_id: TableID) -> Result<()> {
         let session = self
-            .pin()
+            .pin_operation(SessionOperationKind::SessionExplicitLock)
             .attach("operation=unlock_explicit_table")
             .disclose()?;
         session
@@ -741,41 +843,117 @@ impl Drop for Session {
     }
 }
 
-/// Query-scoped strong pin for poison-observable public reads.
-struct SessionQueryPin {
-    /// Engine handle retained while the query reads shared runtime state.
-    engine: EngineRef,
-    /// Strong reference proving the session is still registered and running.
-    _state: Arc<SessionState>,
+/// Shared runtime view implemented by observer and foreground authorities.
+pub(crate) trait SessionRuntimeAccess {
+    /// Returns the retained engine runtime pin.
+    fn engine(&self) -> &EngineRef;
+    /// Returns registry-owned session state.
+    fn state(&self) -> &Arc<SessionState>;
+    /// Returns a cloned pool-guard bundle.
+    fn pool_guards(&self) -> PoolGuards {
+        self.state().pool_guards().clone()
+    }
 }
 
-/// One operation-scoped strong pin of a registry-owned session.
-pub(crate) struct SessionPin {
-    /// Engine handle retained for the duration of this operation.
+/// One strong runtime/session pin for observer or inspection work.
+///
+/// The creating `Session` method establishes whether normal healthy-runtime or
+/// lifecycle-only inspection admission applies.
+pub(crate) struct SessionObserverPin {
+    /// Engine handle retained for the duration of this observation.
     pub(crate) engine: EngineRef,
     /// Strong reference to registry-owned session state.
     pub(crate) state: Arc<SessionState>,
 }
 
-impl SessionPin {
+impl SessionRuntimeAccess for SessionObserverPin {
+    #[inline]
+    fn engine(&self) -> &EngineRef {
+        &self.engine
+    }
+
+    #[inline]
+    fn state(&self) -> &Arc<SessionState> {
+        &self.state
+    }
+}
+
+/// Non-cloneable foreground authority for one stable session operation.
+pub(crate) struct SessionOperationPin {
+    /// Engine runtime pin retained while foreground work owns this operation.
+    pub(crate) engine: EngineRef,
+    /// Registry-owned session state containing the active slot.
+    pub(crate) state: Arc<SessionState>,
+    /// Stable entry shared with transaction, cleanup, and terminal owners.
+    entry: Arc<SessionOperationEntry>,
+    /// Whether drop must publish the foreground release edge.
+    armed: bool,
+}
+
+impl SessionOperationPin {
     /// Returns the engine-local session identity.
     #[inline]
     pub(crate) fn id(&self) -> SessionID {
-        self.state.id()
+        self.entry.key().session_id()
     }
 
-    /// Returns a cloned guard bundle for this pinned operation.
+    /// Returns this operation's exact stable key.
+    #[inline]
+    pub(crate) fn key(&self) -> SessionOperationKey {
+        self.entry.key()
+    }
+
+    /// Returns this operation's stable purpose.
+    #[inline]
+    pub(crate) fn kind(&self) -> SessionOperationKind {
+        self.entry.kind()
+    }
+
+    /// Returns the exact logical-lock owner for DDL or maintenance work.
+    #[inline]
+    pub(crate) fn operation_lock_owner(&self) -> LockOwner {
+        assert!(
+            matches!(
+                self.kind(),
+                SessionOperationKind::Ddl | SessionOperationKind::Maintenance
+            ),
+            "operation lock owner requires DDL or maintenance authority: key={}, kind={}",
+            self.key(),
+            self.kind().label()
+        );
+        LockOwner::operation(self.key())
+    }
+
+    /// Returns a cloned guard bundle for this foreground operation.
     #[inline]
     pub(crate) fn pool_guards(&self) -> PoolGuards {
         self.state.pool_guards().clone()
     }
 
-    /// Begin a new transaction from this already pinned session operation.
+    /// Starts one private transaction inside this DDL or maintenance operation.
     #[inline]
-    pub(crate) fn begin_trx(&self) -> LifecycleResult<Transaction> {
-        let engine = &self.engine;
-        self.state
-            .begin_trx(|| engine.trx_sys.begin_trx(engine, &self.state))
+    pub(crate) fn begin_private_trx(&self) -> LifecycleResult<Transaction> {
+        let kind = self.kind();
+        assert!(
+            matches!(
+                kind,
+                SessionOperationKind::Ddl | SessionOperationKind::Maintenance
+            ),
+            "private transaction requires DDL or maintenance authority: key={}, kind={}",
+            self.key(),
+            kind.label()
+        );
+        Ok(self
+            .engine
+            .trx_sys
+            .begin_trx(
+                &self.engine,
+                &self.state,
+                self.key(),
+                kind,
+                Some(&self.entry),
+            )
+            .handle)
     }
 
     /// Resolve a live user table from authoritative current catalog state.
@@ -793,7 +971,7 @@ impl SessionPin {
         Ok(table)
     }
 
-    /// Acquires an explicit session-lifetime table lock from this pinned session.
+    /// Acquires an explicit session-lifetime table lock from this operation.
     #[inline]
     pub(crate) async fn lock_table(
         &self,
@@ -817,7 +995,7 @@ impl SessionPin {
         Ok(())
     }
 
-    /// Releases an explicit session-lifetime table lock from this pinned session.
+    /// Releases an explicit session-lifetime table lock from this operation.
     #[inline]
     pub(crate) fn unlock_table(&self, table_id: TableID) -> OperationResult<()> {
         let owner = LockOwner::session_explicit(self.id());
@@ -828,10 +1006,53 @@ impl SessionPin {
     }
 }
 
+impl SessionRuntimeAccess for SessionOperationPin {
+    #[inline]
+    fn engine(&self) -> &EngineRef {
+        &self.engine
+    }
+
+    #[inline]
+    fn state(&self) -> &Arc<SessionState> {
+        &self.state
+    }
+}
+
+impl Drop for SessionOperationPin {
+    #[inline]
+    fn drop(&mut self) {
+        if self.armed {
+            self.armed = false;
+            self.engine
+                .session_registry
+                .finish_foreground(&self.engine, self.key());
+        }
+    }
+}
+
+/// One active operation found by a nonblocking shutdown probe.
+pub(crate) struct SessionShutdownBlocker {
+    /// Exact claimable transaction cleanup hint, when one exists.
+    ///
+    /// The tuple locates the stable outer operation entry first and identifies
+    /// its currently attached transaction second.
+    pub(crate) cleanup: Option<(SessionOperationKey, TrxID)>,
+}
+
+/// One active operation observed by blocking shutdown.
+pub(crate) struct SessionShutdownWait {
+    /// Listener installed before the active entry was inspected.
+    pub(crate) listener: EventListener,
+    /// Exact claimable transaction cleanup hint, when one exists.
+    ///
+    /// The tuple locates the stable outer operation entry first and identifies
+    /// its currently attached transaction second.
+    pub(crate) cleanup: Option<(SessionOperationKey, TrxID)>,
+}
+
 /// Engine-owned registry for strong session state.
 pub(crate) struct SessionRegistry {
     entries: FastDashMap<SessionID, Arc<SessionState>>,
-    trx_changes: ChangeNotifier,
 }
 
 impl SessionRegistry {
@@ -840,7 +1061,6 @@ impl SessionRegistry {
     pub(crate) fn new() -> Self {
         Self {
             entries: FastDashMap::default(),
-            trx_changes: ChangeNotifier::new(),
         }
     }
 
@@ -864,139 +1084,162 @@ impl SessionRegistry {
         Session::new(WeakEngineRef::new(engine), id)
     }
 
-    /// Pin an idle session state for one public operation.
+    /// Pins one open session for a drop-safe observer operation.
     #[inline]
-    pub(crate) fn pin_idle(&self, id: SessionID) -> LifecycleResult<Arc<SessionState>> {
-        let state = self.session_state(id).ok_or_else(|| {
-            Report::new(LifecycleError::SessionUnavailable)
-                .attach(format!("session_id={id}, reason=session_missing"))
-        })?;
+    pub(crate) fn pin_observer(&self, id: SessionID) -> LifecycleResult<Arc<SessionState>> {
+        let state = self.session_or_unavailable(id)?;
         state
-            .ensure_idle()
+            .ensure_available()
             .attach_with(|| format!("session_id={id}"))?;
         Ok(state)
     }
 
-    /// Close an idle session and remove it from the registry.
+    /// Reserves one stable non-transaction operation entry.
     #[inline]
-    pub(crate) fn close_idle(&self, id: SessionID) -> LifecycleResult<()> {
-        let state = self.session_state(id).ok_or_else(|| {
-            Report::new(LifecycleError::SessionUnavailable)
-                .attach(format!("session_id={id}, reason=session_missing"))
-        })?;
-        let removal = state
-            .close_idle()
-            .attach_with(|| format!("session_id={id}"))?;
-        self.apply_removal(id, removal);
-        Ok(())
+    pub(crate) fn reserve_operation(
+        &self,
+        id: SessionID,
+        kind: SessionOperationKind,
+    ) -> LifecycleResult<(Arc<SessionState>, Arc<SessionOperationEntry>)> {
+        let state = self.session_or_unavailable(id)?;
+        let entry = state
+            .reserve_operation(kind)
+            .attach_with(|| format!("session_id={id}, kind={}", kind.label()))?;
+        Ok((state, entry))
+    }
+
+    /// Reserves and starts one public transaction under the lifecycle mutex.
+    #[inline]
+    pub(crate) fn begin_public_transaction(
+        &self,
+        id: SessionID,
+        engine: &EngineRef,
+    ) -> LifecycleResult<Transaction> {
+        let state = self.session_or_unavailable(id)?;
+        state.begin_public_trx(engine)
+    }
+
+    /// Explicitly closes this session, waiting only for authoritative owners.
+    pub(crate) async fn close(&self, id: SessionID) -> LifecycleResult<()> {
+        loop {
+            let Some(state) = self.session_state(id) else {
+                return Ok(());
+            };
+            let (decision, remove_from_registry) = state.request_close();
+            self.remove_if_requested(id, remove_from_registry);
+            match decision {
+                SessionCloseDecision::Closed => return Ok(()),
+                SessionCloseDecision::Wait(listener) => listener.await,
+                SessionCloseDecision::Rejected(err) => return Err(err),
+            }
+        }
     }
 
     /// Best-effort nonblocking abandonment from public session `Drop`.
     #[inline]
     pub(crate) fn abandon(&self, id: SessionID) {
-        self.modify_session(id, SessionState::abandon);
-        self.notify_trx_changed();
+        let Some(state) = self.session_state(id) else {
+            return;
+        };
+        let remove_from_registry = state.abandon();
+        self.remove_if_requested(id, remove_from_registry);
+    }
+
+    /// Finalizes or transfers one dropped foreground operation authority.
+    #[inline]
+    pub(crate) fn finish_foreground(&self, engine: &EngineRef, key: SessionOperationKey) {
+        let Some(state) = self.session_state(key.session_id()) else {
+            return;
+        };
+        let (remove_from_registry, cleanup) = state.finish_foreground(key);
+        self.remove_if_requested(key.session_id(), remove_from_registry);
+        if let Some(trx_id) = cleanup {
+            engine
+                .trx_sys
+                .request_abandoned_trx_cleanup(engine.clone(), key, trx_id);
+        }
     }
 
     /// Apply session cleanup after a transaction commits.
     #[inline]
-    fn finish_trx_commit(&self, id: SessionID, trx_id: TrxID, cts: TrxID) {
-        self.modify_session(id, |state| state.finish_trx_commit(trx_id, cts));
-        self.notify_trx_changed();
+    fn finish_trx_commit(&self, key: SessionOperationKey, trx_id: TrxID, cts: TrxID) {
+        let Some(state) = self.session_state(key.session_id()) else {
+            return;
+        };
+        let remove_from_registry = state.finish_trx_commit(key, trx_id, cts);
+        self.remove_if_requested(key.session_id(), remove_from_registry);
     }
 
     /// Apply session cleanup after a transaction rolls back.
     #[inline]
-    fn finish_trx_rollback(&self, id: SessionID, trx_id: TrxID) {
-        self.modify_session(id, |state| state.finish_trx_rollback(trx_id));
-        self.notify_trx_changed();
+    fn finish_trx_rollback(&self, key: SessionOperationKey, trx_id: TrxID) {
+        let Some(state) = self.session_state(key.session_id()) else {
+            return;
+        };
+        let remove_from_registry = state.finish_trx_rollback(key, trx_id);
+        self.remove_if_requested(key.session_id(), remove_from_registry);
     }
 
-    /// Resolve an active transaction by session and transaction id.
+    /// Resolves one exact operation key before its entry transition validates
+    /// the transaction id under the entry mutex.
     #[inline]
-    pub(crate) fn resolve_trx(
+    pub(crate) fn resolve_operation(
         &self,
-        session_id: SessionID,
-        trx_id: TrxID,
-    ) -> LifecycleResult<(Arc<TrxEntry>, Arc<SessionState>)> {
-        let session = self.session_state(session_id).ok_or_else(|| {
-            Report::new(LifecycleError::TransactionDiscarded).attach(format!(
-                "session_id={session_id}, trx_id={trx_id}, reason=session_missing"
-            ))
+        key: SessionOperationKey,
+    ) -> LifecycleResult<(Arc<SessionOperationEntry>, Arc<SessionState>)> {
+        let session = self.session_state(key.session_id()).ok_or_else(|| {
+            Report::new(LifecycleError::TransactionDiscarded)
+                .attach(format!("operation_key={key}, reason=session_missing"))
         })?;
-        let entry = session.resolve_trx(trx_id).ok_or_else(|| {
+        let entry = session.resolve_operation(key).ok_or_else(|| {
             Report::new(LifecycleError::TransactionDiscarded).attach(format!(
-                "session_id={session_id}, trx_id={trx_id}, reason=transaction_entry_missing"
+                "operation_key={key}, reason=operation_entry_missing"
             ))
         })?;
         Ok((entry, session))
     }
 
-    /// Resolves a cleanup hint without turning staleness into an error.
+    /// Resolves an active operation without turning staleness into an error.
     #[inline]
-    pub(crate) fn try_resolve_trx(
+    pub(crate) fn try_resolve_operation(
         &self,
-        session_id: SessionID,
-        trx_id: TrxID,
-    ) -> Option<(Arc<TrxEntry>, Arc<SessionState>)> {
-        let session = self.session_state(session_id)?;
-        let entry = session.resolve_trx(trx_id)?;
+        key: SessionOperationKey,
+    ) -> Option<(Arc<SessionOperationEntry>, Arc<SessionState>)> {
+        let session = self.session_state(key.session_id())?;
+        let entry = session.resolve_operation(key)?;
         Some((entry, session))
     }
 
     /// Mark a public transaction handle abandoned if it still names the active entry.
     #[inline]
-    pub(crate) fn abandon_trx_handle(&self, session_id: SessionID, trx_id: TrxID) -> bool {
-        let Some(session) = self.session_state(session_id) else {
+    pub(crate) fn abandon_trx_handle(&self, key: SessionOperationKey, trx_id: TrxID) -> bool {
+        let Some(session) = self.session_state(key.session_id()) else {
             return false;
         };
-        let abandoned = session.abandon_trx_handle(trx_id);
-        if abandoned {
-            self.notify_trx_changed();
-        }
-        abandoned
+        session.abandon_trx_handle(key, trx_id)
     }
 
-    /// Queue cleanup for abandoned transactions found during shutdown scanning.
+    /// Returns the first active session operation without installing a listener.
+    ///
+    /// The DashMap iterator retains a shard read guard while each session takes
+    /// its lifecycle and entry mutexes. Registry mutation occurs only after
+    /// callers release those inner guards, so this short probe cannot form a
+    /// lock cycle.
     #[inline]
-    pub(crate) fn collect_shutdown_cleanup(&self) -> Vec<(SessionID, TrxID, TrxCleanupReason)> {
-        let sessions = self
-            .entries
-            .iter()
-            .map(|entry| (*entry.key(), Arc::clone(entry.value())))
-            .collect::<Vec<_>>();
-        let mut cleanup = Vec::new();
-        for (session_id, session) in sessions {
-            if let Some(trx_id) = session.shutdown_cleanup_candidate() {
-                cleanup.push((session_id, trx_id, TrxCleanupReason::ShutdownDrain));
-            }
-        }
-        if !cleanup.is_empty() {
-            self.notify_trx_changed();
-        }
-        cleanup
-    }
-
-    /// Count registry-owned transactions that still block owner shutdown.
-    #[inline]
-    pub(crate) fn active_transaction_count(&self) -> usize {
+    pub(crate) fn first_shutdown_blocker(&self) -> Option<SessionShutdownBlocker> {
         self.entries
             .iter()
-            .map(|entry| Arc::clone(entry.value()))
-            .filter(|session| session.has_active_transaction())
-            .count()
+            .find_map(|entry| entry.value().shutdown_blocker())
     }
 
-    /// Returns the current transaction lifecycle change epoch.
+    /// Returns the first active session operation with a lossless local listener.
+    ///
+    /// The returned listener and cleanup hint own no registry or state guards.
     #[inline]
-    pub(crate) fn trx_change_epoch(&self) -> u64 {
-        self.trx_changes.epoch()
-    }
-
-    /// Wait for any transaction lifecycle change after the observed epoch.
-    #[inline]
-    pub(crate) fn wait_for_trx_change_since(&self, observed_epoch: u64) {
-        self.trx_changes.wait_since(observed_epoch);
+    pub(crate) fn first_shutdown_wait(&self) -> Option<SessionShutdownWait> {
+        self.entries
+            .iter()
+            .find_map(|entry| entry.value().shutdown_wait())
     }
 
     /// Remove idle and abandoned-idle sessions during engine shutdown.
@@ -1007,16 +1250,10 @@ impl SessionRegistry {
             .iter()
             .map(|entry| (*entry.key(), Arc::clone(entry.value())))
             .collect::<Vec<_>>();
-        let removed = sessions
-            .into_iter()
-            .filter_map(|(id, state)| {
-                state
-                    .shutdown_removal()
-                    .then(|| self.entries.remove(&id).map(|(_, state)| state))
-                    .flatten()
-            })
-            .collect::<Vec<_>>();
-        drop(removed);
+        for (id, state) in sessions {
+            let remove_from_registry = state.shutdown_removal();
+            self.remove_if_requested(id, remove_from_registry);
+        }
     }
 
     #[inline]
@@ -1025,26 +1262,18 @@ impl SessionRegistry {
     }
 
     #[inline]
-    fn modify_session(&self, id: SessionID, modify: impl FnOnce(&SessionState) -> SessionRemoval) {
-        let Some(state) = self.session_state(id) else {
-            return;
-        };
-        self.apply_removal(id, modify(&state));
+    fn session_or_unavailable(&self, id: SessionID) -> LifecycleResult<Arc<SessionState>> {
+        self.session_state(id).ok_or_else(|| {
+            Report::new(LifecycleError::SessionUnavailable)
+                .attach(format!("session_id={id}, reason=session_missing"))
+        })
     }
 
     #[inline]
-    fn apply_removal(&self, id: SessionID, removal: SessionRemoval) {
-        let removed = match removal {
-            SessionRemoval::Remove => self.entries.remove(&id).map(|(_, state)| state),
-            SessionRemoval::Keep => None,
-        };
-        drop(removed);
-    }
-
-    /// Notifies waiters about a transaction lifecycle change.
-    #[inline]
-    pub(crate) fn notify_trx_changed(&self) {
-        self.trx_changes.notify();
+    fn remove_if_requested(&self, id: SessionID, remove_from_registry: bool) {
+        if remove_from_registry {
+            drop(self.entries.remove(&id));
+        }
     }
 }
 
@@ -1084,7 +1313,12 @@ impl SessionState {
             id,
             pool_guards,
             lock_manager,
-            lifecycle: Mutex::new(SessionLifecycle::RunningIdle),
+            lifecycle: Mutex::new(SessionLifecycle {
+                disposition: SessionDisposition::Open,
+                slot: SessionOperationSlot::Idle,
+                next_operation_id: 1,
+                change_ev: None,
+            }),
             last_cts: AtomicU64::new(0),
             table_cache: Mutex::new(FastHashMap::default()),
         }
@@ -1103,230 +1337,369 @@ impl SessionState {
     }
 
     #[inline]
-    fn ensure_idle(&self) -> LifecycleResult<()> {
-        match &*self.lifecycle.lock() {
-            SessionLifecycle::RunningIdle => Ok(()),
-            SessionLifecycle::RunningActive { entry } => Err(self.active_transaction_err(entry)),
-            SessionLifecycle::AbandonedIdle
-            | SessionLifecycle::AbandonedActive { .. }
-            | SessionLifecycle::Closed => Err(Report::new(LifecycleError::SessionUnavailable)
-                .attach(format!("session_id={}", self.id))),
-        }
-    }
-
-    #[cfg(test)]
-    #[inline]
-    fn in_trx(&self) -> LifecycleResult<bool> {
-        match &*self.lifecycle.lock() {
-            SessionLifecycle::RunningIdle => Ok(false),
-            SessionLifecycle::RunningActive { entry } => Ok(entry.in_trx()),
-            SessionLifecycle::AbandonedIdle
-            | SessionLifecycle::AbandonedActive { .. }
-            | SessionLifecycle::Closed => Err(Report::new(LifecycleError::SessionUnavailable)
-                .attach(format!("session_id={}", self.id))),
+    fn ensure_available(&self) -> LifecycleResult<()> {
+        let lifecycle = self.lifecycle.lock();
+        if lifecycle.disposition == SessionDisposition::Open
+            && !matches!(&lifecycle.slot, SessionOperationSlot::Closed)
+        {
+            Ok(())
+        } else {
+            Err(self.unavailable_err(&lifecycle))
         }
     }
 
     #[inline]
-    fn active_transaction_err(&self, entry: &TrxEntry) -> Report<LifecycleError> {
-        Report::new(LifecycleError::ExistingTransaction).attach(format!(
-            "session_id={}, trx_id={}, state={}",
-            self.id,
-            entry.trx_id(),
-            entry.inspect_state().label()
+    fn active_operation_err(
+        &self,
+        disposition: SessionDisposition,
+        entry: &SessionOperationEntry,
+    ) -> Report<LifecycleError> {
+        let snapshot = entry.inspect();
+        let error = if snapshot.kind == SessionOperationKind::PublicTransaction {
+            LifecycleError::ExistingTransaction
+        } else {
+            LifecycleError::ExistingOperation
+        };
+        Report::new(error).attach(format!(
+            "operation_key={}, kind={}, state={}, disposition={}, trx_id={}",
+            entry.key(),
+            snapshot.kind.label(),
+            snapshot.state.label(),
+            disposition.label(),
+            snapshot
+                .trx_id
+                .map_or_else(|| "none".to_owned(), |trx_id| trx_id.to_string())
         ))
     }
 
     #[inline]
-    fn begin_trx(
+    fn unavailable_err(&self, lifecycle: &SessionLifecycle) -> Report<LifecycleError> {
+        Report::new(LifecycleError::SessionUnavailable).attach(format!(
+            "session_id={}, disposition={}, slot={}",
+            self.id,
+            lifecycle.disposition.label(),
+            lifecycle.slot.label()
+        ))
+    }
+
+    #[inline]
+    fn admit_idle(lifecycle: &SessionLifecycle) -> LifecycleResult<()> {
+        if lifecycle.disposition != SessionDisposition::Open {
+            return Err(Report::new(LifecycleError::SessionUnavailable)
+                .attach(format!("disposition={}", lifecycle.disposition.label())));
+        }
+        match &lifecycle.slot {
+            SessionOperationSlot::Idle => Ok(()),
+            SessionOperationSlot::Active(entry) => {
+                let snapshot = entry.inspect();
+                let error = if snapshot.kind == SessionOperationKind::PublicTransaction {
+                    LifecycleError::ExistingTransaction
+                } else {
+                    LifecycleError::ExistingOperation
+                };
+                Err(Report::new(error).attach(format!(
+                    "operation_key={}, kind={}, state={}, disposition={}, trx_id={}",
+                    entry.key(),
+                    snapshot.kind.label(),
+                    snapshot.state.label(),
+                    lifecycle.disposition.label(),
+                    snapshot
+                        .trx_id
+                        .map_or_else(|| "none".to_owned(), |trx_id| trx_id.to_string())
+                )))
+            }
+            SessionOperationSlot::Closed => Err(Report::new(LifecycleError::SessionUnavailable)
+                .attach(format!(
+                    "disposition={}, slot=closed",
+                    lifecycle.disposition.label()
+                ))),
+        }
+    }
+
+    #[inline]
+    fn next_operation_key(
+        lifecycle: &SessionLifecycle,
+        session_id: SessionID,
+    ) -> SessionOperationKey {
+        let operation_id = OperationID::new(lifecycle.next_operation_id);
+        lifecycle
+            .next_operation_id
+            .checked_add(1)
+            .unwrap_or_else(|| {
+                panic!(
+                    "session operation id exhausted before reservation: session_id={session_id}, operation_id={operation_id}"
+                )
+            });
+        SessionOperationKey::new(session_id, operation_id)
+    }
+
+    #[inline]
+    fn advance_operation_id(lifecycle: &mut SessionLifecycle) {
+        lifecycle.next_operation_id = lifecycle
+            .next_operation_id
+            .checked_add(1)
+            .expect("session operation id was checked before reservation");
+    }
+
+    #[inline]
+    fn reserve_operation(
         &self,
-        begin: impl FnOnce() -> StartedTransaction,
-    ) -> LifecycleResult<Transaction> {
+        kind: SessionOperationKind,
+    ) -> LifecycleResult<Arc<SessionOperationEntry>> {
+        assert!(
+            kind != SessionOperationKind::PublicTransaction,
+            "public transaction reservation requires transaction payload installation"
+        );
         let mut lifecycle = self.lifecycle.lock();
-        match &*lifecycle {
-            SessionLifecycle::RunningIdle => {}
-            SessionLifecycle::RunningActive { entry } => {
-                return Err(self.active_transaction_err(entry));
-            }
-            SessionLifecycle::AbandonedIdle
-            | SessionLifecycle::AbandonedActive { .. }
-            | SessionLifecycle::Closed => {
-                return Err(Report::new(LifecycleError::SessionUnavailable)
-                    .attach(format!("session_id={}", self.id)));
-            }
-        }
-        let trx = begin();
-        *lifecycle = SessionLifecycle::RunningActive {
-            entry: Arc::clone(&trx.entry),
-        };
-        Ok(trx.handle)
+        Self::admit_idle(&lifecycle).attach_with(|| format!("session_id={}", self.id))?;
+        let key = Self::next_operation_key(&lifecycle, self.id);
+        let entry = SessionOperationEntry::new(key, kind);
+        Self::advance_operation_id(&mut lifecycle);
+        lifecycle.slot = SessionOperationSlot::Active(Arc::clone(&entry));
+        Ok(entry)
     }
 
     #[inline]
-    fn close_idle(&self) -> LifecycleResult<SessionRemoval> {
+    fn begin_public_trx(self: &Arc<Self>, engine: &EngineRef) -> LifecycleResult<Transaction> {
         let mut lifecycle = self.lifecycle.lock();
-        match &*lifecycle {
-            SessionLifecycle::RunningIdle | SessionLifecycle::AbandonedIdle => {}
-            SessionLifecycle::RunningActive { entry } => {
-                return Err(self.active_transaction_err(entry));
-            }
-            SessionLifecycle::AbandonedActive { entry } => {
-                return Err(self.active_transaction_err(entry));
-            }
-            SessionLifecycle::Closed => return Ok(SessionRemoval::Remove),
+        Self::admit_idle(&lifecycle).attach_with(|| format!("session_id={}", self.id))?;
+        let key = Self::next_operation_key(&lifecycle, self.id);
+        let started = engine.trx_sys.begin_trx(
+            engine,
+            self,
+            key,
+            SessionOperationKind::PublicTransaction,
+            None,
+        );
+        Self::advance_operation_id(&mut lifecycle);
+        lifecycle.slot = SessionOperationSlot::Active(Arc::clone(&started.entry));
+        Ok(started.handle)
+    }
+
+    #[inline]
+    fn request_close(&self) -> (SessionCloseDecision, bool) {
+        let mut lifecycle = self.lifecycle.lock();
+        if lifecycle.disposition == SessionDisposition::Abandoned {
+            return (
+                SessionCloseDecision::Rejected(self.unavailable_err(&lifecycle)),
+                false,
+            );
         }
-        *lifecycle = SessionLifecycle::Closed;
+        match &lifecycle.slot {
+            SessionOperationSlot::Idle => {}
+            SessionOperationSlot::Closed => return (SessionCloseDecision::Closed, true),
+            SessionOperationSlot::Active(entry) => {
+                let snapshot = entry.inspect();
+                match snapshot.state {
+                    SessionOperationState::Terminal => {}
+                    SessionOperationState::CleanupReady
+                    | SessionOperationState::CleanupRunning
+                    | SessionOperationState::BackgroundQueued
+                    | SessionOperationState::BackgroundRunning
+                    | SessionOperationState::CompletionOwned => {
+                        lifecycle.disposition = SessionDisposition::CloseRequested;
+                        let listener = lifecycle.change_listener();
+                        return (SessionCloseDecision::Wait(listener), false);
+                    }
+                    SessionOperationState::FailedRetained => {
+                        return (
+                            SessionCloseDecision::Rejected(self.unavailable_err(&lifecycle)),
+                            false,
+                        );
+                    }
+                    SessionOperationState::ForegroundAvailable
+                    | SessionOperationState::ForegroundRunning(_) => {
+                        return (
+                            SessionCloseDecision::Rejected(
+                                self.active_operation_err(lifecycle.disposition, entry),
+                            ),
+                            false,
+                        );
+                    }
+                }
+            }
+        }
+        lifecycle.disposition = SessionDisposition::CloseRequested;
+        lifecycle.slot = SessionOperationSlot::Closed;
+        let notify = lifecycle.change_ev.clone();
+        drop(lifecycle);
         self.release_session_locks();
-        Ok(SessionRemoval::Remove)
+        Self::notify_operation_change(notify);
+        (SessionCloseDecision::Closed, true)
     }
 
     #[inline]
-    fn abandon(&self) -> SessionRemoval {
+    fn abandon(&self) -> bool {
         let mut lifecycle = self.lifecycle.lock();
-        let entry = match &*lifecycle {
-            SessionLifecycle::RunningIdle | SessionLifecycle::AbandonedIdle => {
-                *lifecycle = SessionLifecycle::AbandonedIdle;
-                self.release_session_locks();
-                return SessionRemoval::Remove;
+        if lifecycle.disposition == SessionDisposition::Open {
+            lifecycle.disposition = SessionDisposition::Abandoned;
+        }
+        let remove_from_registry = match lifecycle.slot {
+            SessionOperationSlot::Closed => return true,
+            SessionOperationSlot::Idle => {
+                lifecycle.slot = SessionOperationSlot::Closed;
+                true
             }
-            SessionLifecycle::RunningActive { entry }
-            | SessionLifecycle::AbandonedActive { entry } => Arc::clone(entry),
-            SessionLifecycle::Closed => return SessionRemoval::Remove,
+            SessionOperationSlot::Active(_) => false,
         };
-        *lifecycle = SessionLifecycle::AbandonedActive { entry };
-        SessionRemoval::Keep
+        let notify = lifecycle.change_ev.clone();
+        drop(lifecycle);
+        if remove_from_registry {
+            self.release_session_locks();
+        }
+        Self::notify_operation_change(notify);
+        remove_from_registry
     }
 
-    /// Finish this session's active-transaction lifecycle after commit.
     #[inline]
-    fn finish_trx_commit(&self, trx_id: TrxID, cts: TrxID) -> SessionRemoval {
-        self.finish_trx(trx_id, || {
+    fn finish_foreground(&self, key: SessionOperationKey) -> (bool, Option<TrxID>) {
+        let mut lifecycle = self.lifecycle.lock();
+        let Some(entry) = lifecycle.active_entry(key).cloned() else {
+            return (false, None);
+        };
+        let release = entry.release_foreground();
+        let remove_from_registry = if release.terminal {
+            lifecycle.finalize_terminal()
+        } else {
+            false
+        };
+        let notify = lifecycle.change_ev.clone();
+        drop(lifecycle);
+        if remove_from_registry {
+            self.release_session_locks();
+        }
+        Self::notify_operation_change(notify);
+        (remove_from_registry, release.cleanup)
+    }
+
+    /// Finish this session's exact transaction lifecycle after commit.
+    #[inline]
+    fn finish_trx_commit(&self, key: SessionOperationKey, trx_id: TrxID, cts: TrxID) -> bool {
+        self.finish_trx(key, trx_id, || {
             self.last_cts.store(cts.as_u64(), Ordering::SeqCst);
         })
     }
 
     /// Finish this session's active-transaction lifecycle after rollback.
     #[inline]
-    fn finish_trx_rollback(&self, trx_id: TrxID) -> SessionRemoval {
-        self.finish_trx(trx_id, || {})
+    fn finish_trx_rollback(&self, key: SessionOperationKey, trx_id: TrxID) -> bool {
+        self.finish_trx(key, trx_id, || {})
     }
 
     #[inline]
-    fn finish_trx(&self, trx_id: TrxID, mut on_finish: impl FnMut()) -> SessionRemoval {
+    fn finish_trx(
+        &self,
+        key: SessionOperationKey,
+        trx_id: TrxID,
+        on_finish: impl FnOnce(),
+    ) -> bool {
         let mut lifecycle = self.lifecycle.lock();
-        enum Finish {
-            Running(Arc<TrxEntry>),
-            Abandoned(Arc<TrxEntry>),
-            Stale,
-        }
-        let finish = match &*lifecycle {
-            SessionLifecycle::RunningActive { entry } if entry.trx_id() == trx_id => {
-                Finish::Running(Arc::clone(entry))
-            }
-            SessionLifecycle::AbandonedActive { entry } if entry.trx_id() == trx_id => {
-                Finish::Abandoned(Arc::clone(entry))
-            }
-            SessionLifecycle::RunningIdle
-            | SessionLifecycle::AbandonedIdle
-            | SessionLifecycle::Closed
-            | SessionLifecycle::RunningActive { .. }
-            | SessionLifecycle::AbandonedActive { .. } => Finish::Stale,
+        let Some(entry) = lifecycle.active_entry(key).cloned() else {
+            return false;
         };
-        match finish {
-            Finish::Running(entry) => {
-                on_finish();
-                entry.finish(TrxEntryState::Terminal);
-                *lifecycle = SessionLifecycle::RunningIdle;
-                SessionRemoval::Keep
-            }
-            Finish::Abandoned(entry) => {
-                on_finish();
-                entry.finish(TrxEntryState::Terminal);
-                *lifecycle = SessionLifecycle::Closed;
-                self.release_session_locks();
-                SessionRemoval::Remove
-            }
-            Finish::Stale => SessionRemoval::Keep,
+        let Some(operation_terminal) = entry.finish_transaction(trx_id) else {
+            return false;
+        };
+        on_finish();
+        if !operation_terminal {
+            return false;
+        }
+        let remove_from_registry = lifecycle.finalize_terminal();
+        let notify = lifecycle.change_ev.clone();
+        drop(lifecycle);
+        if remove_from_registry {
+            self.release_session_locks();
+        }
+        Self::notify_operation_change(notify);
+        remove_from_registry
+    }
+
+    #[inline]
+    fn notify_operation_change(event: Option<Arc<EventNotifyOnDrop>>) {
+        if let Some(event) = event {
+            event.notify(usize::MAX);
         }
     }
 
     #[inline]
-    fn resolve_trx(&self, trx_id: TrxID) -> Option<Arc<TrxEntry>> {
+    fn resolve_operation(&self, key: SessionOperationKey) -> Option<Arc<SessionOperationEntry>> {
         let lifecycle = self.lifecycle.lock();
-        match &*lifecycle {
-            SessionLifecycle::RunningActive { entry }
-            | SessionLifecycle::AbandonedActive { entry }
-                if entry.trx_id() == trx_id =>
-            {
-                Some(Arc::clone(entry))
-            }
-            SessionLifecycle::RunningActive { .. }
-            | SessionLifecycle::AbandonedActive { .. }
-            | SessionLifecycle::RunningIdle
-            | SessionLifecycle::AbandonedIdle
-            | SessionLifecycle::Closed => None,
-        }
+        lifecycle.active_entry(key).cloned()
     }
 
     #[inline]
-    fn abandon_trx_handle(&self, trx_id: TrxID) -> bool {
+    fn abandon_trx_handle(&self, key: SessionOperationKey, trx_id: TrxID) -> bool {
         let lifecycle = self.lifecycle.lock();
-        match &*lifecycle {
-            SessionLifecycle::RunningActive { entry }
-            | SessionLifecycle::AbandonedActive { entry }
-                if entry.trx_id() == trx_id =>
-            {
-                entry.abandon()
-            }
-            SessionLifecycle::RunningIdle
-            | SessionLifecycle::AbandonedIdle
-            | SessionLifecycle::Closed
-            | SessionLifecycle::RunningActive { .. }
-            | SessionLifecycle::AbandonedActive { .. } => false,
-        }
+        let abandoned = lifecycle
+            .active_entry(key)
+            .is_some_and(|entry| entry.abandon_transaction(trx_id));
+        let notify = if abandoned {
+            lifecycle.change_ev.clone()
+        } else {
+            None
+        };
+        drop(lifecycle);
+        Self::notify_operation_change(notify);
+        abandoned
     }
 
+    /// Wakes a close or shutdown observer for this exact active key.
     #[inline]
-    fn shutdown_cleanup_candidate(&self) -> Option<TrxID> {
+    fn notify_operation_transition(&self, key: SessionOperationKey) {
         let lifecycle = self.lifecycle.lock();
-        match &*lifecycle {
-            SessionLifecycle::RunningActive { entry } => matches!(
-                entry.inspect_state(),
-                TrxEntryState::Abandoned | TrxEntryState::CheckedOutAbandoned
-            )
-            .then(|| entry.trx_id()),
-            SessionLifecycle::AbandonedActive { entry } => entry.abandon().then(|| entry.trx_id()),
-            SessionLifecycle::RunningIdle
-            | SessionLifecycle::AbandonedIdle
-            | SessionLifecycle::Closed => None,
-        }
+        let notify = if lifecycle.active_entry(key).is_some() {
+            lifecycle.change_ev.clone()
+        } else {
+            None
+        };
+        drop(lifecycle);
+        Self::notify_operation_change(notify);
     }
 
     #[inline]
-    fn has_active_transaction(&self) -> bool {
-        match &*self.lifecycle.lock() {
-            SessionLifecycle::RunningActive { entry }
-            | SessionLifecycle::AbandonedActive { entry } => entry.in_trx(),
-            SessionLifecycle::RunningIdle
-            | SessionLifecycle::AbandonedIdle
-            | SessionLifecycle::Closed => false,
-        }
+    fn shutdown_blocker(&self) -> Option<SessionShutdownBlocker> {
+        let lifecycle = self.lifecycle.lock();
+        let entry = lifecycle.slot.active_entry()?;
+        Some(SessionShutdownBlocker {
+            cleanup: entry
+                .cleanup_candidate()
+                .map(|trx_id| (entry.key(), trx_id)),
+        })
+    }
+
+    #[inline]
+    fn shutdown_wait(&self) -> Option<SessionShutdownWait> {
+        let mut lifecycle = self.lifecycle.lock();
+        lifecycle.slot.active_entry()?;
+        let listener = lifecycle.change_listener();
+        let entry = lifecycle
+            .slot
+            .active_entry()
+            .expect("active session slot cannot change while lifecycle lock is held");
+        let cleanup = entry
+            .cleanup_candidate()
+            .map(|trx_id| (entry.key(), trx_id));
+        Some(SessionShutdownWait { listener, cleanup })
     }
 
     #[inline]
     fn shutdown_removal(&self) -> bool {
         let mut lifecycle = self.lifecycle.lock();
-        match &*lifecycle {
-            SessionLifecycle::RunningIdle | SessionLifecycle::AbandonedIdle => {
-                *lifecycle = SessionLifecycle::Closed;
-                self.release_session_locks();
+        let remove_from_registry = match lifecycle.slot {
+            SessionOperationSlot::Closed => return true,
+            SessionOperationSlot::Idle => {
+                lifecycle.slot = SessionOperationSlot::Closed;
                 true
             }
-            SessionLifecycle::Closed => true,
-            SessionLifecycle::RunningActive { .. } | SessionLifecycle::AbandonedActive { .. } => {
-                false
-            }
+            SessionOperationSlot::Active(_) => false,
+        };
+        let notify = lifecycle.change_ev.clone();
+        drop(lifecycle);
+        if remove_from_registry {
+            self.release_session_locks();
         }
+        Self::notify_operation_change(notify);
+        remove_from_registry
     }
 
     /// Remember a successfully resolved user-table runtime without extending its lifetime.
@@ -1389,18 +1762,92 @@ impl Drop for SessionState {
     }
 }
 
-enum SessionLifecycle {
-    RunningIdle,
-    RunningActive { entry: Arc<TrxEntry> },
-    AbandonedIdle,
-    AbandonedActive { entry: Arc<TrxEntry> },
-    Closed,
+struct SessionLifecycle {
+    disposition: SessionDisposition,
+    slot: SessionOperationSlot,
+    next_operation_id: u64,
+    change_ev: Option<Arc<EventNotifyOnDrop>>,
+}
+
+impl SessionLifecycle {
+    #[inline]
+    fn active_entry(&self, key: SessionOperationKey) -> Option<&Arc<SessionOperationEntry>> {
+        self.slot.active_entry().filter(|entry| entry.key() == key)
+    }
+
+    /// Publishes a terminal operation as idle for an open session or closed for
+    /// a session whose close or abandonment is already pending.
+    ///
+    /// Returns whether the closed session should be removed from the registry.
+    #[inline]
+    fn finalize_terminal(&mut self) -> bool {
+        match self.disposition {
+            SessionDisposition::Open => {
+                self.slot = SessionOperationSlot::Idle;
+                false
+            }
+            SessionDisposition::CloseRequested | SessionDisposition::Abandoned => {
+                self.slot = SessionOperationSlot::Closed;
+                true
+            }
+        }
+    }
+
+    #[inline]
+    fn change_listener(&mut self) -> EventListener {
+        self.change_ev
+            .get_or_insert_with(|| Arc::new(EventNotifyOnDrop::new()))
+            .listen()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SessionRemoval {
-    Keep,
-    Remove,
+enum SessionDisposition {
+    Open,
+    CloseRequested,
+    Abandoned,
+}
+
+impl SessionDisposition {
+    #[inline]
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::CloseRequested => "close_requested",
+            Self::Abandoned => "abandoned",
+        }
+    }
+}
+
+enum SessionOperationSlot {
+    Idle,
+    Active(Arc<SessionOperationEntry>),
+    Closed,
+}
+
+impl SessionOperationSlot {
+    #[inline]
+    fn active_entry(&self) -> Option<&Arc<SessionOperationEntry>> {
+        match self {
+            Self::Active(entry) => Some(entry),
+            Self::Idle | Self::Closed => None,
+        }
+    }
+
+    #[inline]
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Active(_) => "active",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+enum SessionCloseDecision {
+    Closed,
+    Wait(EventListener),
+    Rejected(Report<LifecycleError>),
 }
 
 /// Private transaction runtime attachment retained by checked-out transaction work.
@@ -1411,8 +1858,8 @@ enum SessionRemoval {
 pub(crate) struct TrxAttachment {
     /// Strong runtime handle kept until the transaction reaches a terminal path.
     engine: EngineRef,
-    /// Registry lookup key for terminal session cleanup.
-    session_id: SessionID,
+    /// Exact registry lookup key for terminal session-operation cleanup.
+    operation_key: SessionOperationKey,
     /// Active transaction id used to avoid finishing a replaced session state.
     trx_id: TrxID,
     /// Claim-local reachability for session-local caches.
@@ -1424,11 +1871,21 @@ pub(crate) struct TrxAttachment {
 impl TrxAttachment {
     /// Create a transaction runtime attachment without public handle ownership.
     #[inline]
-    pub(crate) fn new(engine: EngineRef, session: Arc<SessionState>, trx_id: TrxID) -> Self {
+    pub(crate) fn new(
+        engine: EngineRef,
+        session: Arc<SessionState>,
+        operation_key: SessionOperationKey,
+        trx_id: TrxID,
+    ) -> Self {
         let pool_guards = session.pool_guards().clone();
+        assert!(
+            session.id() == operation_key.session_id(),
+            "transaction attachment session/key mismatch: session_id={}, operation_key={operation_key}",
+            session.id()
+        );
         Self {
             engine,
-            session_id: session.id(),
+            operation_key,
             trx_id,
             session,
             pool_guards,
@@ -1445,7 +1902,13 @@ impl TrxAttachment {
     #[cfg(debug_assertions)]
     #[inline]
     pub(crate) fn session_id(&self) -> SessionID {
-        self.session_id
+        self.operation_key.session_id()
+    }
+
+    /// Returns the exact transaction identity carried by this attachment.
+    #[inline]
+    pub(crate) const fn trx_id(&self) -> TrxID {
+        self.trx_id
     }
 
     /// Returns the cloned session pool guards retained by this transaction.
@@ -1483,7 +1946,7 @@ impl TrxAttachment {
         );
         self.engine
             .session_registry
-            .finish_trx_commit(self.session_id, self.trx_id, cts);
+            .finish_trx_commit(self.operation_key, self.trx_id, cts);
     }
 
     /// Mark the owning session rolled back.
@@ -1497,23 +1960,56 @@ impl TrxAttachment {
         );
         self.engine
             .session_registry
-            .finish_trx_rollback(self.session_id, self.trx_id);
+            .finish_trx_rollback(self.operation_key, self.trx_id);
     }
 
     /// Queue rollback cleanup for an abandoned transaction.
     #[inline]
-    pub(crate) fn request_abandoned_cleanup(&self, reason: TrxCleanupReason) {
+    pub(crate) fn request_abandoned_cleanup(&self) {
         self.engine.trx_sys.request_abandoned_trx_cleanup(
             self.engine.clone(),
-            self.session_id,
+            self.operation_key,
             self.trx_id,
-            reason,
         );
+    }
+
+    /// Notifies close or shutdown only when this exact operation was armed.
+    #[inline]
+    pub(crate) fn notify_operation_transition(&self) {
+        self.session.notify_operation_transition(self.operation_key);
+    }
+}
+
+async fn wait_for_checkpoint_retry_in_operation(
+    session: &SessionOperationPin,
+    reason: CheckpointDelayReason,
+) -> Result<()> {
+    let table_id = match reason {
+        CheckpointDelayReason::ActiveRoot { table_id, .. }
+        | CheckpointDelayReason::FrozenPageCutoff { table_id, .. } => table_id,
+    };
+    loop {
+        let Some(access) = ScopedTableRuntimeAccess::acquire_for_retry(session, table_id)
+            .await
+            .disclose()?
+        else {
+            return Ok(());
+        };
+        let observation = access
+            .table()
+            .checkpoint_retry_observation(session, reason)
+            .await
+            .disclose()?;
+        drop(access);
+        match observation {
+            CheckpointRetryObservation::Ready => return Ok(()),
+            CheckpointRetryObservation::Wait(waiter) => waiter.wait().await,
+        }
     }
 }
 
 async fn wait_for_maintenance_boundary(
-    session: &SessionPin,
+    session: &SessionObserverPin,
     ts: TrxID,
     boundary: MaintenanceBoundary,
 ) -> Result<TrxID> {
@@ -1587,13 +2083,12 @@ pub(crate) mod tests {
     use std::cell::RefCell;
     use std::fs;
     use std::future::Future;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::path::{Path, PathBuf};
     use std::pin::Pin;
+    use std::sync::OnceLock;
     use std::sync::atomic::AtomicBool;
-    use std::sync::{OnceLock, mpsc};
     use std::task::{Context, Poll};
-    use std::thread;
-    use std::time::Duration;
     use tempfile::TempDir;
 
     const TRUNCATE_TEST_LOG_BLOCK_SIZE: usize = 4096;
@@ -1689,17 +2184,16 @@ pub(crate) mod tests {
         trx_id: TrxID,
         cts: TrxID,
     ) {
-        registry.finish_trx_commit(session_id, trx_id, cts);
-    }
-
-    /// Finishes a synthetic failed transaction directly for registry tests.
-    #[inline]
-    pub(crate) fn finish_trx_rollback_for_test(
-        registry: &SessionRegistry,
-        session_id: SessionID,
-        trx_id: TrxID,
-    ) {
-        registry.finish_trx_rollback(session_id, trx_id);
+        let state = registry
+            .session_state(session_id)
+            .expect("test session must remain registered");
+        let key = match &state.lifecycle.lock().slot {
+            SessionOperationSlot::Active(entry) => entry.key(),
+            SessionOperationSlot::Idle | SessionOperationSlot::Closed => {
+                panic!("test transaction requires active operation slot")
+            }
+        };
+        registry.finish_trx_commit(key, trx_id, cts);
     }
 
     type TotalRowPagesAfterAccessHook =
@@ -1733,19 +2227,27 @@ pub(crate) mod tests {
         }
     }
 
-    /// Wait asynchronously for a transaction lifecycle change in tests.
-    #[inline]
-    pub(crate) async fn wait_for_trx_change_since_async(
-        registry: &SessionRegistry,
-        observed_epoch: u64,
-    ) {
-        registry.trx_changes.wait_since_async(observed_epoch).await;
+    /// Wait asynchronously until one exact session no longer owns an operation.
+    pub(crate) async fn wait_for_session_idle(registry: &SessionRegistry, session_id: SessionID) {
+        loop {
+            let Some(state) = registry.session_state(session_id) else {
+                return;
+            };
+            let listener = {
+                let mut lifecycle = state.lifecycle.lock();
+                match lifecycle.slot {
+                    SessionOperationSlot::Active(_) => lifecycle.change_listener(),
+                    SessionOperationSlot::Idle | SessionOperationSlot::Closed => return,
+                }
+            };
+            listener.await;
+        }
     }
 
     /// Wait until ordered commit payloads through `ts` reach purge coordination.
     pub(crate) async fn wait_for_purge_handoff(session: &Session, ts: TrxID) -> Result<()> {
         let session = session
-            .pin()
+            .pin_observer()
             .attach("operation=wait_for_purge_handoff")
             .disclose()?;
         let trx_sys = &session.engine.trx_sys;
@@ -1988,6 +2490,45 @@ pub(crate) mod tests {
         registry.entries.len()
     }
 
+    /// Count registry-owned operations that still block owner shutdown.
+    #[inline]
+    pub(crate) fn active_operation_count(registry: &SessionRegistry) -> usize {
+        registry
+            .entries
+            .iter()
+            .map(|entry| Arc::clone(entry.value()))
+            .filter(|session| {
+                matches!(
+                    &session.lifecycle.lock().slot,
+                    SessionOperationSlot::Active(_)
+                )
+            })
+            .count()
+    }
+
+    /// Removes one synthetic or failed-retained test session before engine teardown.
+    #[inline]
+    pub(crate) fn remove_session_for_test(registry: &SessionRegistry, session_id: SessionID) {
+        drop(registry.entries.remove(&session_id));
+    }
+
+    #[inline]
+    fn active_operation_entry_for_test(
+        registry: &SessionRegistry,
+        session_id: SessionID,
+    ) -> Arc<SessionOperationEntry> {
+        let state = registry
+            .session_state(session_id)
+            .expect("test session must remain registered");
+        let lifecycle = state.lifecycle.lock();
+        match &lifecycle.slot {
+            SessionOperationSlot::Active(entry) => Arc::clone(entry),
+            SessionOperationSlot::Idle | SessionOperationSlot::Closed => {
+                panic!("test session must have an active operation")
+            }
+        }
+    }
+
     /// Create one registry-owned transaction with test-controlled ids.
     #[inline]
     pub(crate) fn create_test_transaction(
@@ -1999,44 +2540,35 @@ pub(crate) mod tests {
         gc_no: usize,
     ) -> (Transaction, Arc<SessionState>) {
         let state = Arc::new(SessionState::new(engine.clone(), session_id));
+        let key = SessionOperationKey::new(session_id, OperationID::new(1));
         let inner = TrxInner::new(trx_id, sts, gc_no, session_id);
-        let entry = TrxEntry::new(inner);
+        let entry = SessionOperationEntry::new_public_transaction(key, inner);
         {
             let mut lifecycle = state.lifecycle.lock();
-            *lifecycle = SessionLifecycle::RunningActive { entry };
+            lifecycle.next_operation_id = 2;
+            lifecycle.slot = SessionOperationSlot::Active(entry);
         }
         registry.insert(Arc::clone(&state));
         (
-            Transaction::new(engine.downgrade(), session_id, trx_id, sts),
+            Transaction::new(engine.downgrade(), key, trx_id, sts),
             state,
         )
     }
 
-    fn test_session_runtime(session: &Session) -> LifecycleResult<(EngineRef, Arc<SessionState>)> {
-        if session.closed.get() {
-            return Err(Report::new(LifecycleError::SessionUnavailable)
-                .attach(format!("session_id={}", session.id)));
+    fn inspect_session_in_trx(state: &SessionState) -> LifecycleResult<bool> {
+        let lifecycle = state.lifecycle.lock();
+        if lifecycle.disposition != SessionDisposition::Open {
+            return Err(state.unavailable_err(&lifecycle));
         }
-        let engine = session
-            .engine
-            .upgrade()
-            .attach_with(|| format!("session_id={}, phase=upgrade_engine_runtime", session.id))?;
-        engine.ensure_admission_open_for_query().attach_with(|| {
-            format!(
-                "session_id={}, phase=check_engine_query_admission",
-                session.id
-            )
-        })?;
-        let state = engine
-            .session_registry
-            .session_state(session.id)
-            .ok_or_else(|| {
-                Report::new(LifecycleError::SessionUnavailable)
-                    .attach(format!("session_id={}, reason=session_missing", session.id))
-            })?;
-        state
-            .in_trx()
-            .attach_with(|| format!("session_id={}", session.id))?;
+        Ok(matches!(
+            &lifecycle.slot,
+            SessionOperationSlot::Active(entry) if entry.inspect().trx_id.is_some()
+        ))
+    }
+
+    fn test_session_runtime(session: &Session) -> LifecycleResult<(EngineRef, Arc<SessionState>)> {
+        let SessionObserverPin { engine, state } = session.pin_inspection()?;
+        inspect_session_in_trx(&state).attach_with(|| format!("session_id={}", session.id))?;
         Ok((engine, state))
     }
 
@@ -2045,7 +2577,6 @@ pub(crate) mod tests {
         fn pool_guards(&self) -> PoolGuards;
         fn engine(&self) -> EngineRef;
         fn last_cts(&self) -> TrxID;
-        fn pin_running_for_test(&self) -> SessionPin;
         fn load_active_insert_page(&mut self, table_id: TableID) -> Option<VersionedPageID>;
         fn save_active_insert_page(&mut self, table_id: TableID, page_id: VersionedPageID);
     }
@@ -2057,8 +2588,7 @@ pub(crate) mod tests {
             let (_, state) = test_session_runtime(self)
                 .attach_with(|| format!("operation={OPERATION}"))
                 .disclose()?;
-            state
-                .in_trx()
+            inspect_session_in_trx(&state)
                 .attach_with(|| format!("operation={OPERATION}, session_id={}", self.id))
                 .disclose()
         }
@@ -2083,12 +2613,6 @@ pub(crate) mod tests {
         fn last_cts(&self) -> TrxID {
             let (_, state) = test_session_runtime(self).expect("test session must be running");
             TrxID::new(state.last_cts.load(Ordering::SeqCst))
-        }
-
-        #[inline]
-        fn pin_running_for_test(&self) -> SessionPin {
-            let (engine, state) = test_session_runtime(self).expect("test session must be running");
-            SessionPin { engine, state }
         }
 
         #[inline]
@@ -2126,7 +2650,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_active_transaction_rejects_every_runtime_backed_session_operation() {
+    fn test_active_transaction_allows_observers_and_rejects_effectful_operations() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
             let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
@@ -2147,14 +2671,45 @@ pub(crate) mod tests {
                             stringify!($result)
                         ),
                         Err(err) => {
-                            assert_existing_transaction_error(&err, session_id, trx_id, "active");
+                            assert_existing_transaction_error(
+                                &err,
+                                session_id,
+                                trx_id,
+                                "foreground_available",
+                            );
                         }
                     }
                 };
             }
 
             assert_eq!(session.id(), session_id);
-            assert_rejected!(session.list_table_ids());
+            assert_eq!(session.list_table_ids().unwrap(), table_ids_before);
+            assert!(session.transaction_system_stats().is_ok());
+            assert!(session.storage_io_stats().is_ok());
+            assert!(session.buffer_pool_stats().is_ok());
+            assert!(
+                session
+                    .wait_for_checkpoint_retry(CheckpointDelayReason::ActiveRoot {
+                        table_id,
+                        effective_ts: TrxID::new(0),
+                        min_active_sts: TrxID::new(0),
+                    })
+                    .await
+                    .is_ok()
+            );
+            assert!(
+                session
+                    .wait_for_gc_horizon_after(TrxID::new(0))
+                    .await
+                    .is_ok()
+            );
+            assert!(
+                session
+                    .wait_for_purge_completion_after(TrxID::new(0))
+                    .await
+                    .is_ok()
+            );
+
             assert_rejected!(session.begin_trx());
             assert_rejected!(session.close().await);
             assert_rejected!(
@@ -2182,23 +2737,9 @@ pub(crate) mod tests {
             assert_rejected!(session.checkpoint_catalog().await);
             assert_rejected!(session.checkpoint_catalog_and_truncate_redo_log().await);
             assert_rejected!(session.truncate_redo_log().await);
-            assert_rejected!(session.transaction_system_stats());
-            assert_rejected!(session.storage_io_stats());
-            assert_rejected!(session.buffer_pool_stats());
             assert_rejected!(session.freeze_table(table_id, usize::MAX).await);
             assert_rejected!(session.checkpoint_table(table_id).await);
-            assert_rejected!(
-                session
-                    .wait_for_checkpoint_retry(CheckpointDelayReason::ActiveRoot {
-                        table_id,
-                        effective_ts: TrxID::new(0),
-                        min_active_sts: TrxID::new(0),
-                    })
-                    .await
-            );
             assert_rejected!(session.checkpoint_table_with_wait(table_id).await);
-            assert_rejected!(session.wait_for_gc_horizon_after(TrxID::new(0)).await);
-            assert_rejected!(session.wait_for_purge_completion_after(TrxID::new(0)).await);
             assert_rejected!(session.total_row_pages(table_id).await);
             assert_rejected!(session.cleanup_secondary_mem_indexes(table_id, true).await);
             assert_rejected!(session.lock_table(table_id, TableLockMode::Exclusive).await);
@@ -2235,7 +2776,7 @@ pub(crate) mod tests {
             .unwrap();
             trx.commit().await.unwrap();
 
-            let pin = session.pin().unwrap();
+            let pin = session.pin_observer().unwrap();
             let cached_page = {
                 let cache = pin.state.table_cache.lock();
                 let entry = cache.get(&table_id).unwrap();
@@ -2283,7 +2824,7 @@ pub(crate) mod tests {
             let row_page_count = catalog_row_page_count(&catalog_tables, &guards1).await;
             assert!(row_page_count > 0);
             {
-                let pin = session1.pin().unwrap();
+                let pin = session1.pin_observer().unwrap();
                 assert!(
                     pin.state
                         .table_cache
@@ -2300,7 +2841,7 @@ pub(crate) mod tests {
                 catalog_row_page_count(&catalog_tables, &guards2).await,
                 row_page_count
             );
-            let pin = session2.pin().unwrap();
+            let pin = session2.pin_observer().unwrap();
             assert!(
                 pin.state
                     .table_cache
@@ -2312,7 +2853,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_shutdown_cleanup_candidate_claims_abandoned_active() {
+    fn test_shutdown_inspection_collects_exact_claimable_transaction() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
             let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
@@ -2321,21 +2862,28 @@ pub(crate) mod tests {
             let session_id = SessionID::new(1);
             let trx_id = MIN_ACTIVE_TRX_ID;
             let state = SessionState::new(engine.new_ref().unwrap(), session_id);
-            let entry = TrxEntry::new(TrxInner::new(trx_id, MIN_SNAPSHOT_TS, 0, session_id));
+            let key = SessionOperationKey::new(session_id, OperationID::new(1));
+            let entry = SessionOperationEntry::new_public_transaction(
+                key,
+                TrxInner::new(trx_id, MIN_SNAPSHOT_TS, 0, session_id),
+            );
+            assert!(entry.abandon_transaction(trx_id));
             {
                 let mut lifecycle = state.lifecycle.lock();
-                *lifecycle = SessionLifecycle::AbandonedActive {
-                    entry: Arc::clone(&entry),
-                };
+                lifecycle.disposition = SessionDisposition::Abandoned;
+                lifecycle.slot = SessionOperationSlot::Active(Arc::clone(&entry));
             }
 
-            assert_eq!(state.shutdown_cleanup_candidate(), Some(trx_id));
-            assert_eq!(entry.inspect_state(), TrxEntryState::Abandoned);
+            let blocker = state
+                .shutdown_blocker()
+                .expect("abandoned transaction must block shutdown");
+            assert_eq!(blocker.cleanup, Some((key, trx_id)));
+            assert_eq!(entry.inspect().state, SessionOperationState::CleanupReady);
         });
     }
 
     #[test]
-    fn test_shutdown_cleanup_candidate_skips_unclaimable_abandoned_active() {
+    fn test_shutdown_inspection_keeps_failed_retained_operation_active() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
             let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
@@ -2344,60 +2892,465 @@ pub(crate) mod tests {
             let session_id = SessionID::new(1);
             let trx_id = MIN_ACTIVE_TRX_ID;
             let state = SessionState::new(engine.new_ref().unwrap(), session_id);
-            let entry = TrxEntry::new(TrxInner::new(trx_id, MIN_SNAPSHOT_TS, 0, session_id));
-            entry.finish(TrxEntryState::Failed);
+            let key = SessionOperationKey::new(session_id, OperationID::new(1));
+            let entry = SessionOperationEntry::new_public_transaction(
+                key,
+                TrxInner::new(trx_id, MIN_SNAPSHOT_TS, 0, session_id),
+            );
+            entry.fail_retained();
             {
                 let mut lifecycle = state.lifecycle.lock();
-                *lifecycle = SessionLifecycle::AbandonedActive {
-                    entry: Arc::clone(&entry),
-                };
+                lifecycle.disposition = SessionDisposition::Abandoned;
+                lifecycle.slot = SessionOperationSlot::Active(Arc::clone(&entry));
             }
 
-            assert_eq!(state.shutdown_cleanup_candidate(), None);
-            assert_eq!(entry.inspect_state(), TrxEntryState::Failed);
+            let blocker = state
+                .shutdown_blocker()
+                .expect("failed-retained operation must block shutdown");
+            assert_eq!(blocker.cleanup, None);
+            assert_eq!(entry.inspect().state, SessionOperationState::FailedRetained);
         });
     }
 
     #[test]
-    fn test_wait_for_trx_change_since_returns_after_prior_change() {
-        let registry = SessionRegistry::new();
-        let observed_epoch = registry.trx_change_epoch();
+    fn test_shutdown_wait_installs_listener_before_transition() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let session_id = SessionID::new(1);
+            let trx_id = MIN_ACTIVE_TRX_ID;
+            let state = SessionState::new(engine.new_ref().unwrap(), session_id);
+            let key = SessionOperationKey::new(session_id, OperationID::new(1));
+            let entry = SessionOperationEntry::new_public_transaction(
+                key,
+                TrxInner::new(trx_id, MIN_SNAPSHOT_TS, 0, session_id),
+            );
+            state.lifecycle.lock().slot = SessionOperationSlot::Active(Arc::clone(&entry));
 
-        registry.notify_trx_changed();
-        registry.wait_for_trx_change_since(observed_epoch);
+            let shutdown_wait = state
+                .shutdown_wait()
+                .expect("active transaction must install a shutdown listener");
+            assert_eq!(shutdown_wait.cleanup, None);
+            assert!(state.lifecycle.lock().change_ev.is_some());
 
-        assert_ne!(registry.trx_change_epoch(), observed_epoch);
+            assert!(state.abandon_trx_handle(key, trx_id));
+            shutdown_wait.listener.await;
+            assert_eq!(entry.inspect().state, SessionOperationState::CleanupReady);
+        });
     }
 
     #[test]
-    fn test_wait_for_trx_change_since_wakes_on_change() {
-        let registry = Arc::new(SessionRegistry::new());
-        let observed_epoch = registry.trx_change_epoch();
-        let (ready_tx, ready_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel();
+    fn test_session_change_wakes_all_installed_listeners() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let session_id = SessionID::new(1);
+            let trx_id = MIN_ACTIVE_TRX_ID;
+            let state = SessionState::new(engine.new_ref().unwrap(), session_id);
+            let key = SessionOperationKey::new(session_id, OperationID::new(1));
+            let entry = SessionOperationEntry::new_public_transaction(
+                key,
+                TrxInner::new(trx_id, MIN_SNAPSHOT_TS, 0, session_id),
+            );
+            state.lifecycle.lock().slot = SessionOperationSlot::Active(entry);
 
-        let waiter = {
-            let registry = Arc::clone(&registry);
-            thread::spawn(move || {
-                ready_tx.send(()).expect("waiter should report ready");
-                registry.wait_for_trx_change_since(observed_epoch);
-                done_tx.send(()).expect("waiter should report completion");
-            })
-        };
+            let first = state
+                .shutdown_wait()
+                .expect("first shutdown listener must be installed");
+            let second = state
+                .shutdown_wait()
+                .expect("second shutdown listener must reuse the event");
+            assert!(state.abandon_trx_handle(key, trx_id));
 
-        ready_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("waiter should start");
-        assert!(
-            done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
-            "waiter should block before a transaction change"
-        );
+            futures::join!(first.listener, second.listener);
+        });
+    }
 
-        registry.notify_trx_changed();
-        done_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("waiter should wake after a transaction change");
-        waiter.join().expect("waiter thread should finish");
+    #[test]
+    fn test_registry_shutdown_wait_arms_only_first_blocker() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let registry = SessionRegistry::new();
+            let mut states = Vec::new();
+            let mut expected_cleanup = Vec::new();
+            for raw_id in 1..=2 {
+                let session_id = SessionID::new(raw_id);
+                let trx_id = TrxID::new(MIN_ACTIVE_TRX_ID.as_u64() + raw_id);
+                let state = Arc::new(SessionState::new(engine.new_ref().unwrap(), session_id));
+                let key = SessionOperationKey::new(session_id, OperationID::new(1));
+                let entry = SessionOperationEntry::new_public_transaction(
+                    key,
+                    TrxInner::new(trx_id, MIN_SNAPSHOT_TS, 0, session_id),
+                );
+                assert!(entry.abandon_transaction(trx_id));
+                {
+                    let mut lifecycle = state.lifecycle.lock();
+                    lifecycle.disposition = SessionDisposition::Abandoned;
+                    lifecycle.slot = SessionOperationSlot::Active(entry);
+                }
+                expected_cleanup.push((key, trx_id));
+                states.push(Arc::clone(&state));
+                registry.insert(state);
+            }
+
+            let shutdown_wait = registry
+                .first_shutdown_wait()
+                .expect("one active session must block shutdown");
+            assert!(
+                expected_cleanup.contains(
+                    &shutdown_wait
+                        .cleanup
+                        .expect("abandoned transaction must be claimable")
+                )
+            );
+            assert_eq!(
+                states
+                    .iter()
+                    .filter(|state| state.lifecycle.lock().change_ev.is_some())
+                    .count(),
+                1,
+                "lazy shutdown scan must stop after arming its first blocker"
+            );
+        });
+    }
+
+    #[test]
+    fn test_registry_shutdown_wait_lazily_drains_many_blockers() {
+        smol::block_on(async {
+            const SESSION_COUNT: u64 = 32;
+
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let registry = SessionRegistry::new();
+            let mut states = Vec::new();
+            for raw_id in 1..=SESSION_COUNT {
+                let session_id = SessionID::new(raw_id);
+                let trx_id = TrxID::new(MIN_ACTIVE_TRX_ID.as_u64() + raw_id);
+                let state = Arc::new(SessionState::new(engine.new_ref().unwrap(), session_id));
+                let key = SessionOperationKey::new(session_id, OperationID::new(1));
+                let entry = SessionOperationEntry::new_public_transaction(
+                    key,
+                    TrxInner::new(trx_id, MIN_SNAPSHOT_TS, 0, session_id),
+                );
+                assert!(entry.abandon_transaction(trx_id));
+                {
+                    let mut lifecycle = state.lifecycle.lock();
+                    lifecycle.disposition = SessionDisposition::Abandoned;
+                    lifecycle.slot = SessionOperationSlot::Active(entry);
+                }
+                states.push(Arc::clone(&state));
+                registry.insert(state);
+            }
+
+            let mut drained = Vec::new();
+            for expected_armed in 1..=SESSION_COUNT as usize {
+                let shutdown_wait = registry
+                    .first_shutdown_wait()
+                    .expect("one remaining active session must block shutdown");
+                let (key, _) = shutdown_wait
+                    .cleanup
+                    .expect("abandoned transaction must be claimable");
+                assert!(
+                    !drained.contains(&key),
+                    "a drained session must not block a later lazy pass"
+                );
+                assert_eq!(
+                    states
+                        .iter()
+                        .filter(|state| state.lifecycle.lock().change_ev.is_some())
+                        .count(),
+                    expected_armed,
+                    "each pass may arm only its first current blocker"
+                );
+
+                let state = registry
+                    .session_state(key.session_id())
+                    .expect("synthetic blocker must remain registered");
+                let notify = {
+                    let mut lifecycle = state.lifecycle.lock();
+                    lifecycle.slot = SessionOperationSlot::Closed;
+                    lifecycle.change_ev.clone()
+                };
+                SessionState::notify_operation_change(notify);
+                shutdown_wait.listener.await;
+                drained.push(key);
+            }
+
+            assert!(registry.first_shutdown_wait().is_none());
+            assert_eq!(drained.len(), SESSION_COUNT as usize);
+        });
+    }
+
+    #[test]
+    fn test_shutdown_probe_does_not_install_listener() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let state = engine
+                .inner()
+                .session_registry
+                .session_state(session.id())
+                .unwrap();
+            let trx = session.begin_trx().unwrap();
+
+            assert!(
+                engine
+                    .inner()
+                    .session_registry
+                    .first_shutdown_blocker()
+                    .is_some()
+            );
+            assert!(state.lifecycle.lock().change_ev.is_none());
+
+            trx.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_session_operation_ids_are_local_monotonic_and_kind_independent() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let state = engine
+                .inner()
+                .session_registry
+                .session_state(session.id())
+                .unwrap();
+            {
+                let lifecycle = state.lifecycle.lock();
+                assert_eq!(lifecycle.disposition, SessionDisposition::Open);
+                assert!(matches!(lifecycle.slot, SessionOperationSlot::Idle));
+                assert_eq!(lifecycle.next_operation_id, 1);
+                assert!(lifecycle.change_ev.is_none());
+            }
+
+            let trx = session.begin_trx().unwrap();
+            let public_key =
+                active_operation_entry_for_test(&engine.inner().session_registry, session.id())
+                    .key();
+            trx.rollback().await.unwrap();
+
+            let ddl = session.pin_operation(SessionOperationKind::Ddl).unwrap();
+            let ddl_key = ddl.key();
+            drop(ddl);
+            let maintenance = session
+                .pin_operation(SessionOperationKind::Maintenance)
+                .unwrap();
+            let maintenance_key = maintenance.key();
+            drop(maintenance);
+            let explicit = session
+                .pin_operation(SessionOperationKind::SessionExplicitLock)
+                .unwrap();
+            let explicit_key = explicit.key();
+            drop(explicit);
+
+            assert_eq!(
+                [
+                    public_key.operation_id().as_u64(),
+                    ddl_key.operation_id().as_u64(),
+                    maintenance_key.operation_id().as_u64(),
+                    explicit_key.operation_id().as_u64(),
+                ],
+                [1, 2, 3, 4]
+            );
+            assert!(
+                [public_key, ddl_key, maintenance_key, explicit_key]
+                    .into_iter()
+                    .all(|key| key.session_id() == session.id())
+            );
+            let lifecycle = state.lifecycle.lock();
+            assert!(matches!(lifecycle.slot, SessionOperationSlot::Idle));
+            assert_eq!(lifecycle.next_operation_id, 5);
+        });
+    }
+
+    #[test]
+    fn test_equal_raw_operation_ids_are_isolated_by_session_family() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let session1 = engine.new_session().unwrap();
+            let session2 = engine.new_session().unwrap();
+            let operation1 = session1
+                .pin_operation(SessionOperationKind::Maintenance)
+                .unwrap();
+            let operation2 = session2.pin_operation(SessionOperationKind::Ddl).unwrap();
+
+            assert_eq!(operation1.key().operation_id(), OperationID::new(1));
+            assert_eq!(operation2.key().operation_id(), OperationID::new(1));
+            assert_ne!(operation1.key(), operation2.key());
+            assert_eq!(
+                operation1.operation_lock_owner().scope(),
+                operation2.operation_lock_owner().scope()
+            );
+            assert_ne!(
+                operation1.operation_lock_owner(),
+                operation2.operation_lock_owner()
+            );
+        });
+    }
+
+    #[test]
+    fn test_operation_id_exhaustion_panics_before_reservation() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let session = engine.new_session().unwrap();
+            let state = engine
+                .inner()
+                .session_registry
+                .session_state(session.id())
+                .unwrap();
+            state.lifecycle.lock().next_operation_id = u64::MAX;
+
+            let panic = catch_unwind(AssertUnwindSafe(|| {
+                let _ = state.reserve_operation(SessionOperationKind::Maintenance);
+            }))
+            .expect_err("operation-id exhaustion must be a hard invariant failure");
+            let diagnostic = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&'static str>().copied())
+                .expect("overflow panic should retain its diagnostic");
+            assert!(diagnostic.contains("session operation id exhausted"));
+            let lifecycle = state.lifecycle.lock();
+            assert_eq!(lifecycle.next_operation_id, u64::MAX);
+            assert!(matches!(lifecycle.slot, SessionOperationSlot::Idle));
+        });
+    }
+
+    #[test]
+    fn test_private_transaction_inherits_stable_operation_entry() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let session = engine.new_session().unwrap();
+            let operation = session
+                .pin_operation(SessionOperationKind::Maintenance)
+                .unwrap();
+            let key = operation.key();
+            let entry = Arc::clone(&operation.entry);
+            let state = Arc::clone(&operation.state);
+            assert!(state.lifecycle.lock().change_ev.is_none());
+            let trx = operation.begin_private_trx().unwrap();
+
+            let (resolved, _) = engine
+                .inner()
+                .session_registry
+                .try_resolve_operation(key)
+                .expect("private transaction must remain registry-visible");
+            assert!(Arc::ptr_eq(&resolved, &entry));
+            assert_eq!(state.lifecycle.lock().next_operation_id, 2);
+
+            trx.rollback().await.unwrap();
+            let snapshot = entry.inspect();
+            assert_eq!(
+                snapshot.state,
+                SessionOperationState::ForegroundRunning(None)
+            );
+            assert_eq!(snapshot.trx_id, None);
+            {
+                let lifecycle = state.lifecycle.lock();
+                let SessionOperationSlot::Active(active) = &lifecycle.slot else {
+                    panic!("private transaction terminal must preserve the outer operation")
+                };
+                assert!(Arc::ptr_eq(active, &entry));
+                assert_eq!(lifecycle.next_operation_id, 2);
+            }
+            assert!(state.lifecycle.lock().change_ev.is_none());
+
+            drop(operation);
+            assert!(matches!(
+                state.lifecycle.lock().slot,
+                SessionOperationSlot::Idle
+            ));
+        });
+    }
+
+    #[test]
+    fn test_unobserved_transaction_and_statement_transitions_are_silent() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let state = engine
+                .inner()
+                .session_registry
+                .session_state(session.id())
+                .unwrap();
+            assert!(state.lifecycle.lock().change_ev.is_none());
+
+            let mut trx = session.begin_trx().unwrap();
+            trx.exec(async |_stmt| Ok(())).await.unwrap();
+            assert!(state.lifecycle.lock().change_ev.is_none());
+            trx.rollback().await.unwrap();
+            assert!(state.lifecycle.lock().change_ev.is_none());
+
+            let trx = session.begin_trx().unwrap();
+            assert_eq!(trx.commit().await.unwrap(), TrxID::new(0));
+            assert!(state.lifecycle.lock().change_ev.is_none());
+        });
+    }
+
+    #[test]
+    fn test_existing_operation_reports_exact_coordinator_identity() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let operation = session
+                .pin_operation(SessionOperationKind::Maintenance)
+                .unwrap();
+            let key = operation.key();
+
+            let err = match session.begin_trx() {
+                Ok(_) => panic!("active maintenance operation must block transaction admission"),
+                Err(err) => err,
+            };
+            assert_eq!(
+                err.report().downcast_ref::<LifecycleError>().copied(),
+                Some(LifecycleError::ExistingOperation)
+            );
+            let diagnostic = format!("{:?}", err.report());
+            assert!(diagnostic.contains(&format!("operation_key={key}")));
+            assert!(diagnostic.contains("kind=maintenance"));
+            assert!(diagnostic.contains("state=foreground_running"));
+            assert!(diagnostic.contains("disposition=open"));
+            assert!(diagnostic.contains("trx_id=none"));
+
+            let close_err = session.close().await.unwrap_err();
+            assert_eq!(
+                close_err.report().downcast_ref::<LifecycleError>().copied(),
+                Some(LifecycleError::ExistingOperation)
+            );
+            drop(operation);
+            session.close().await.unwrap();
+        });
     }
 
     #[test]
@@ -2521,7 +3474,7 @@ pub(crate) mod tests {
                 assert_ne!(maintenance_owner, explicit_owner);
                 assert!(matches!(
                     maintenance_owner.scope(),
-                    crate::lock::LockScope::Maintenance(_)
+                    crate::lock::LockScope::Operation(_)
                 ));
                 assert!(has_lock_entry(
                     &engine,
@@ -2557,7 +3510,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_session_maintenance_progress_waits_and_idle_requirement() {
+    fn test_session_maintenance_progress_waits_are_observers() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
             let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
@@ -2577,29 +3530,27 @@ pub(crate) mod tests {
 
             let mut active_session = engine.new_session().unwrap();
             let trx = active_session.begin_trx().unwrap();
-            let horizon_err = active_session
-                .wait_for_gc_horizon_after(target)
-                .await
-                .unwrap_err();
-            assert_eq!(
-                horizon_err
-                    .report()
-                    .downcast_ref::<LifecycleError>()
-                    .copied(),
-                Some(LifecycleError::ExistingTransaction)
+            assert!(
+                active_session
+                    .wait_for_gc_horizon_after(target)
+                    .await
+                    .is_ok()
             );
-            let retry_err = active_session
+            assert!(
+                active_session
+                    .wait_for_purge_completion_after(target)
+                    .await
+                    .is_ok()
+            );
+            active_session
                 .wait_for_checkpoint_retry(CheckpointDelayReason::ActiveRoot {
                     table_id: TableID::new(1),
                     effective_ts: target,
                     min_active_sts: target,
                 })
                 .await
-                .unwrap_err();
-            assert_eq!(
-                retry_err.report().downcast_ref::<LifecycleError>().copied(),
-                Some(LifecycleError::ExistingTransaction)
-            );
+                .unwrap();
+            assert!(active_session.in_trx().unwrap());
             trx.rollback().await.unwrap();
         });
     }
@@ -3636,7 +4587,8 @@ pub(crate) mod tests {
             engine
                 .inner()
                 .session_registry
-                .close_idle(session.id())
+                .close(session.id())
+                .await
                 .unwrap();
 
             for err in [
@@ -3688,6 +4640,12 @@ pub(crate) mod tests {
                 .inner()
                 .poisoner
                 .poison(Report::new(FatalError::RedoWrite).attach("test redo write failure"));
+
+            let err = match session.pin_observer().disclose() {
+                Ok(_) => panic!("normal observer admission must reject storage poison"),
+                Err(err) => err,
+            };
+            assert_runtime_unavailable_after_fatal(err, FatalError::RedoWrite);
 
             assert_eq!(session.list_table_ids().unwrap(), vec![table_id]);
             assert!(session.transaction_system_stats().is_ok());

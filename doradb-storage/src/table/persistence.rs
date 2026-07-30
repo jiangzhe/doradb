@@ -23,7 +23,7 @@ use crate::index::{
 use crate::lwc::LwcBuilder;
 use crate::obs;
 use crate::row::RowPage;
-use crate::session::SessionPin;
+use crate::session::{SessionOperationPin, SessionRuntimeAccess};
 use crate::table::{
     CheckpointCancelReason, FreezeOutcome, FrozenPage, FrozenPageBatch, Table,
     TableRedoReplayFloor, TableRuntimeLayout,
@@ -121,7 +121,7 @@ impl DetachedCheckpointRetryWait {
 /// Owns one table checkpoint attempt and its reversible-to-fatal boundary.
 struct TableCheckpointer<'table, 'session> {
     table: &'table Table,
-    session: &'session SessionPin,
+    session: &'session SessionOperationPin,
     // Declaration order preserves publication -> root mutation -> attempt
     // release ordering when this owner is dropped.
     publish_lease: Option<CheckpointPublishLease<'table>>,
@@ -134,7 +134,7 @@ impl<'table, 'session> TableCheckpointer<'table, 'session> {
     #[inline]
     fn new(
         table: &'table Table,
-        session: &'session SessionPin,
+        session: &'session SessionOperationPin,
         attempt: CheckpointAttempt<'table>,
     ) -> Self {
         Self {
@@ -1477,9 +1477,12 @@ impl Table {
     }
 
     #[inline]
-    fn active_root_checkpoint_delay(&self, session: &SessionPin) -> Option<CheckpointDelayReason> {
+    fn active_root_checkpoint_delay<S>(&self, session: &S) -> Option<CheckpointDelayReason>
+    where
+        S: SessionRuntimeAccess + ?Sized,
+    {
         let active_root = self.file().active_root_unchecked();
-        let min_active_sts = session.engine.trx_sys.calc_min_active_sts_for_gc();
+        let min_active_sts = session.engine().trx_sys.calc_min_active_sts_for_gc();
         let effective_ts = active_root.effective_ts();
         (effective_ts >= min_active_sts).then_some(CheckpointDelayReason::ActiveRoot {
             table_id: self.table_id(),
@@ -1489,11 +1492,14 @@ impl Table {
     }
 
     /// Observes one checkpoint retry predicate and returns runtime-free wait state.
-    pub(crate) async fn checkpoint_retry_observation(
+    pub(crate) async fn checkpoint_retry_observation<S>(
         &self,
-        session: &SessionPin,
+        session: &S,
         reason: CheckpointDelayReason,
-    ) -> RuntimeOrFatalResult<CheckpointRetryObservation> {
+    ) -> RuntimeOrFatalResult<CheckpointRetryObservation>
+    where
+        S: SessionRuntimeAccess + ?Sized,
+    {
         match reason {
             CheckpointDelayReason::ActiveRoot {
                 table_id,
@@ -1512,12 +1518,16 @@ impl Table {
         }
     }
 
-    async fn observe_active_root_retry(
+    async fn observe_active_root_retry<S>(
         &self,
-        session: &SessionPin,
+        session: &S,
         effective_ts: TrxID,
-    ) -> RuntimeOrFatalResult<CheckpointRetryObservation> {
-        let trx_sys = &session.engine.trx_sys;
+    ) -> RuntimeOrFatalResult<CheckpointRetryObservation>
+    where
+        S: SessionRuntimeAccess + ?Sized,
+    {
+        let engine = session.engine();
+        let trx_sys = &engine.trx_sys;
         ensure_maintenance_wait_running(session, "observe active-root checkpoint retry")?;
         if self.active_root_retry_ready(effective_ts, trx_sys.published_gc_horizon()) {
             return Ok(CheckpointRetryObservation::Ready);
@@ -1526,8 +1536,8 @@ impl Table {
         let listeners = vec![
             trx_sys.gc_horizon_listener(),
             self.lifecycle.listener(),
-            session.engine.poisoner.listener(),
-            session.engine.shutdown_listener(),
+            engine.poisoner.listener(),
+            engine.shutdown_listener(),
         ];
         #[cfg(test)]
         test_hooks::run_test_checkpoint_retry_after_listener_registration_hook().await;
@@ -1548,11 +1558,14 @@ impl Table {
             || gc_horizon > effective_ts
     }
 
-    async fn observe_frozen_page_retry(
+    async fn observe_frozen_page_retry<S>(
         &self,
-        session: &SessionPin,
+        session: &S,
         page_id: PageID,
-    ) -> RuntimeOrFatalResult<CheckpointRetryObservation> {
+    ) -> RuntimeOrFatalResult<CheckpointRetryObservation>
+    where
+        S: SessionRuntimeAccess + ?Sized,
+    {
         ensure_maintenance_wait_running(session, "observe frozen-page checkpoint retry")?;
         let mut attempt = match self.checkpoint_workflow.begin_checkpoint(&self.lifecycle) {
             Ok(attempt) => attempt,
@@ -1567,7 +1580,8 @@ impl Table {
         let Some(page_idx) = batch.pages.iter().position(|page| page.page_id == page_id) else {
             return Ok(CheckpointRetryObservation::Ready);
         };
-        let trx_sys = &session.engine.trx_sys;
+        let engine = session.engine();
+        let trx_sys = &engine.trx_sys;
 
         loop {
             ensure_maintenance_wait_running(session, "observe frozen-page checkpoint retry")?;
@@ -1607,8 +1621,8 @@ impl Table {
                         continue;
                     }
                     listeners.push(self.lifecycle.listener());
-                    listeners.push(session.engine.poisoner.listener());
-                    listeners.push(session.engine.shutdown_listener());
+                    listeners.push(engine.poisoner.listener());
+                    listeners.push(engine.shutdown_listener());
                     #[cfg(test)]
                     test_hooks::run_test_checkpoint_retry_after_listener_registration_hook().await;
 
@@ -1637,8 +1651,8 @@ impl Table {
                     let listeners = vec![
                         trx_sys.gc_horizon_listener(),
                         self.lifecycle.listener(),
-                        session.engine.poisoner.listener(),
-                        session.engine.shutdown_listener(),
+                        engine.poisoner.listener(),
+                        engine.shutdown_listener(),
                     ];
                     #[cfg(test)]
                     test_hooks::run_test_checkpoint_retry_after_listener_registration_hook().await;
@@ -1662,12 +1676,15 @@ impl Table {
         }
     }
 
-    async fn reanalyze_frozen_page_retry(
+    async fn reanalyze_frozen_page_retry<S>(
         &self,
-        session: &SessionPin,
+        session: &S,
         attempt: &mut CheckpointAttempt<'_>,
         page_idx: usize,
-    ) -> RuntimeOrFatalResult<()> {
+    ) -> RuntimeOrFatalResult<()>
+    where
+        S: SessionRuntimeAccess + ?Sized,
+    {
         let page_info = attempt
             .batch()
             .and_then(|batch| batch.pages.get(page_idx))
@@ -1689,7 +1706,7 @@ impl Table {
                 page_info.page_id
             )
         });
-        let cutoff_ts = session.engine.trx_sys.published_gc_horizon();
+        let cutoff_ts = session.engine().trx_sys.published_gc_horizon();
         let batch = attempt.batch_mut().unwrap_or_else(|| {
             panic!(
                 "frozen-page retry invariant violated: admitted frozen attempt lost batch during analysis, table_id={}, page_id={}",
@@ -1704,7 +1721,7 @@ impl Table {
     /// Claim and freeze a contiguous hot-page prefix up to the requested row budget.
     pub(crate) async fn freeze(
         &self,
-        session: &SessionPin,
+        session: &SessionOperationPin,
         max_rows: usize,
     ) -> RuntimeResult<FreezeOutcome> {
         let mut attempt = match self.checkpoint_workflow.begin_freeze(&self.lifecycle) {
@@ -1913,7 +1930,7 @@ impl Table {
     /// Execute one user-table checkpoint attempt against table-owned workflow state.
     pub(crate) async fn checkpoint(
         &self,
-        session: &SessionPin,
+        session: &SessionOperationPin,
     ) -> RuntimeOrFatalResult<CheckpointOutcome> {
         let table_id = self.table_id();
         let result = match self.checkpoint_workflow.begin_checkpoint(&self.lifecycle) {
@@ -1991,12 +2008,16 @@ fn silent_watermark_floor(
 }
 
 #[inline]
-fn ensure_maintenance_wait_running(
-    session: &SessionPin,
+fn ensure_maintenance_wait_running<S>(
+    session: &S,
     operation: &'static str,
-) -> RuntimeOrFatalResult<()> {
-    session.engine.poisoner.ensure_healthy()?;
-    if session.engine.shutdown_started() {
+) -> RuntimeOrFatalResult<()>
+where
+    S: SessionRuntimeAccess + ?Sized,
+{
+    let engine = session.engine();
+    engine.poisoner.ensure_healthy()?;
+    if engine.shutdown_started() {
         return Err(RuntimeOrFatalError::from(
             Report::new(LifecycleError::Shutdown)
                 .change_context(RuntimeError::CheckpointExecution)
@@ -2232,8 +2253,8 @@ mod tests {
         Session,
         tests::{
             SessionTestExt, assert_checkpoint_published, assert_existing_transaction_error,
-            wait_for_checkpoint_purge, wait_for_checkpoint_root_ready, wait_for_purge_handoff,
-            wait_for_trx_change_since_async,
+            remove_session_for_test, wait_for_checkpoint_purge, wait_for_checkpoint_root_ready,
+            wait_for_purge_handoff, wait_for_session_idle,
         },
     };
     use crate::table::checkpoint_workflow::FrozenPageValidationState;
@@ -2277,7 +2298,7 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "maintenance-wait-shutdown").await;
             let session = engine.new_session().unwrap();
-            let pin = session.pin().unwrap();
+            let pin = session.pin_observer().unwrap();
 
             thread::scope(|scope| {
                 let shutdown = scope.spawn(|| engine.shutdown());
@@ -2308,7 +2329,7 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "maintenance-wait-poison").await;
             let session = engine.new_session().unwrap();
-            let pin = session.pin().unwrap();
+            let pin = session.pin_observer().unwrap();
             engine
                 .inner()
                 .poisoner
@@ -2400,13 +2421,7 @@ mod tests {
     }
 
     async fn wait_session_idle(engine: &Engine, session: &mut Session) {
-        loop {
-            let observed_epoch = engine.inner().session_registry.trx_change_epoch();
-            if !session.in_trx().unwrap() {
-                return;
-            }
-            wait_for_trx_change_since_async(&engine.inner().session_registry, observed_epoch).await;
-        }
+        wait_for_session_idle(&engine.inner().session_registry, session.id()).await;
     }
 
     async fn assert_drop_waits_for_no_page_publication(
@@ -4216,7 +4231,7 @@ mod tests {
                 .await
                 .unwrap();
             let table = table_for_internal_assertion(&engine, table_id);
-            let pin = session.pin().unwrap();
+            let pin = session.pin_observer().unwrap();
             assert!(table.active_root_checkpoint_delay(&pin).is_none());
         });
     }
@@ -4263,7 +4278,7 @@ mod tests {
                 .wait_for_gc_horizon_after(active_root_effective_ts)
                 .await
                 .unwrap();
-            let pin = session.pin().unwrap();
+            let pin = session.pin_observer().unwrap();
             let table = table_for_internal_assertion(&engine, table_id);
             assert!(table.active_root_checkpoint_delay(&pin).is_none());
         });
@@ -4347,7 +4362,7 @@ mod tests {
                 .wait_for_gc_horizon_after(effective_ts)
                 .await
                 .unwrap();
-            let pin = session.pin().unwrap();
+            let pin = session.pin_observer().unwrap();
             let table = table_for_internal_assertion(&engine, table_id);
             assert!(table.active_root_checkpoint_delay(&pin).is_none());
         });
@@ -4379,7 +4394,12 @@ mod tests {
             let checkpoint_trx_id = checkpoint_trx.trx_id();
             assert!(session.in_trx().unwrap());
             let err = session.checkpoint_table(table_id).await.unwrap_err();
-            assert_existing_transaction_error(&err, session.id(), checkpoint_trx_id, "active");
+            assert_existing_transaction_error(
+                &err,
+                session.id(),
+                checkpoint_trx_id,
+                "foreground_available",
+            );
             let report = format!("{err:?}");
             assert!(report.contains("operation=checkpoint_table"), "{report}");
             assert!(session.in_trx().unwrap());
@@ -5725,6 +5745,9 @@ mod tests {
 
             discard_transaction_after_fatal_rollback(&mut update_trx);
             discard_transaction_after_fatal_rollback(&mut delete_trx);
+            remove_session_for_test(&engine.inner().session_registry, checkpoint_session.id());
+            remove_session_for_test(&engine.inner().session_registry, update_session.id());
+            remove_session_for_test(&engine.inner().session_registry, delete_session.id());
             drop(update_trx);
             drop(delete_trx);
             drop(update_session);

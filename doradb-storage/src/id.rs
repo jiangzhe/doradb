@@ -339,15 +339,53 @@ impl_id! {
 }
 
 impl_id! {
-    /// Engine-local identity for one DDL operation.
-    pub(crate) struct DdlOperationID;
+    /// Session-local identity for one enclosing effectful operation.
+    pub(crate) struct OperationID;
     methods pub(crate)
 }
 
-impl_id! {
-    /// Engine-local identity for one scoped maintenance operation.
-    pub(crate) struct MaintenanceOperationID;
-    methods pub(crate)
+/// Canonical engine-lifetime identity for one session operation.
+///
+/// The raw operation value is meaningful only inside its owning session and
+/// must never be used as a registry or cleanup key on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct SessionOperationKey {
+    session_id: SessionID,
+    operation_id: OperationID,
+}
+
+impl SessionOperationKey {
+    /// Creates an exact operation key for one session-local allocation.
+    #[inline]
+    pub(crate) const fn new(session_id: SessionID, operation_id: OperationID) -> Self {
+        Self {
+            session_id,
+            operation_id,
+        }
+    }
+
+    /// Returns the owning engine-local session identity.
+    #[inline]
+    pub(crate) const fn session_id(self) -> SessionID {
+        self.session_id
+    }
+
+    /// Returns the session-local operation identity.
+    #[inline]
+    pub(crate) const fn operation_id(self) -> OperationID {
+        self.operation_id
+    }
+}
+
+impl fmt::Display for SessionOperationKey {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "session_operation(session_id={},operation_id={})",
+            self.session_id, self.operation_id
+        )
+    }
 }
 
 impl_id! {

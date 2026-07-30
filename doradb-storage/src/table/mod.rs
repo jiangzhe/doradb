@@ -2251,7 +2251,7 @@ pub(crate) mod tests {
             .iter()
             .find(|entry| {
                 entry.owner.family() == LockFamily::new(session_id)
-                    && matches!(entry.owner.scope(), LockScope::Ddl(_))
+                    && matches!(entry.owner.scope(), LockScope::Operation(_))
                     && entry.resource == resource
             })
             .map(|entry| entry.owner)
@@ -2277,7 +2277,7 @@ pub(crate) mod tests {
             .iter()
             .find(|entry| {
                 entry.owner.family() == LockFamily::new(session_id)
-                    && matches!(entry.owner.scope(), LockScope::Maintenance(_))
+                    && matches!(entry.owner.scope(), LockScope::Operation(_))
                     && entry.resource == resource
                     && entry.mode == mode
                     && entry.state == state

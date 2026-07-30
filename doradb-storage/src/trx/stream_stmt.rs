@@ -9,7 +9,7 @@ use crate::index::{
 use crate::lock::OwnerLockState;
 use crate::row::ops::SelectMvcc;
 use crate::table::{DmlValidator, Table, TableRuntimeLayout};
-use crate::trx::{TableAdmissionRequest, Transaction, TrxCheckout, TrxRuntime};
+use crate::trx::{SessionOperationCheckout, TableAdmissionRequest, Transaction, TrxRuntime};
 use crate::value::Val;
 use error_stack::ResultExt;
 use std::collections::VecDeque;
@@ -22,13 +22,13 @@ use super::admission::admit_user_table;
 const INDEX_SCAN_STREAM_OPERATION: &str = "table_index_scan_mvcc";
 
 struct StreamStmtState {
-    checkout: TrxCheckout,
+    checkout: SessionOperationCheckout,
     stmt_locks: OwnerLockState,
 }
 
 impl StreamStmtState {
     #[inline]
-    fn new(checkout: TrxCheckout, stmt_locks: OwnerLockState) -> Self {
+    fn new(checkout: SessionOperationCheckout, stmt_locks: OwnerLockState) -> Self {
         Self {
             checkout,
             stmt_locks,

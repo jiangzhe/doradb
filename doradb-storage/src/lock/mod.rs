@@ -8,7 +8,7 @@ mod state;
 
 use crate::component::{Component, ComponentRegistry, ShelfScope};
 use crate::error::{OperationError, OperationResult};
-use crate::id::{DdlOperationID, MaintenanceOperationID, SessionID, TableID, TrxID};
+use crate::id::{OperationID, SessionID, SessionOperationKey, TableID, TrxID};
 use crate::map::FastDashMap;
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
 use error_stack::Report;
@@ -166,10 +166,8 @@ pub(crate) enum LockScope {
     Transaction(TrxID),
     /// Locks retained for one statement inside a transaction.
     Statement(TrxID, StmtNo),
-    /// Locks retained for one public DDL operation.
-    Ddl(DdlOperationID),
-    /// Locks retained for one scoped table-runtime access.
-    Maintenance(MaintenanceOperationID),
+    /// Locks retained for one enclosing DDL or maintenance operation.
+    Operation(OperationID),
 }
 
 /// Canonical exact logical lock owner independent from Rust object lifetimes.
@@ -198,24 +196,12 @@ impl LockOwner {
         }
     }
 
-    /// Creates the DDL owner for one session operation.
+    /// Creates the exact lock owner for one enclosing session operation.
     #[inline]
-    pub(crate) const fn ddl(session_id: SessionID, operation_id: DdlOperationID) -> Self {
+    pub(crate) const fn operation(key: SessionOperationKey) -> Self {
         Self {
-            family: LockFamily::new(session_id),
-            scope: LockScope::Ddl(operation_id),
-        }
-    }
-
-    /// Creates the maintenance owner for one scoped table-runtime access.
-    #[inline]
-    pub(crate) const fn maintenance(
-        session_id: SessionID,
-        operation_id: MaintenanceOperationID,
-    ) -> Self {
-        Self {
-            family: LockFamily::new(session_id),
-            scope: LockScope::Maintenance(operation_id),
+            family: LockFamily::new(key.session_id()),
+            scope: LockScope::Operation(key.operation_id()),
         }
     }
 
@@ -261,15 +247,9 @@ impl fmt::Display for LockOwner {
                 f,
                 "statement(session_id={session_id},trx_id={trx_id},stmt_no={stmt_no})"
             ),
-            LockScope::Ddl(operation_id) => {
-                write!(
-                    f,
-                    "ddl(session_id={session_id},operation_id={operation_id})"
-                )
-            }
-            LockScope::Maintenance(operation_id) => write!(
+            LockScope::Operation(operation_id) => write!(
                 f,
-                "maintenance(session_id={session_id},operation_id={operation_id})"
+                "operation(session_id={session_id},operation_id={operation_id})"
             ),
         }
     }
@@ -1375,8 +1355,10 @@ pub(crate) mod tests {
         let explicit = LockOwner::session_explicit(session_id);
         let trx_owner = LockOwner::transaction(session_id, trx_id);
         let stmt_owner = trx_owner.statement(3);
-        let ddl_owner = LockOwner::ddl(session_id, DdlOperationID::new(5));
-        let maintenance_owner = LockOwner::maintenance(session_id, MaintenanceOperationID::new(6));
+        let ddl_owner =
+            LockOwner::operation(SessionOperationKey::new(session_id, OperationID::new(5)));
+        let maintenance_owner =
+            LockOwner::operation(SessionOperationKey::new(session_id, OperationID::new(6)));
 
         for owner in [
             explicit,
@@ -1399,10 +1381,13 @@ pub(crate) mod tests {
             stmt_owner.to_string(),
             "statement(session_id=7,trx_id=11,stmt_no=3)"
         );
-        assert_eq!(ddl_owner.to_string(), "ddl(session_id=7,operation_id=5)");
+        assert_eq!(
+            ddl_owner.to_string(),
+            "operation(session_id=7,operation_id=5)"
+        );
         assert_eq!(
             maintenance_owner.to_string(),
-            "maintenance(session_id=7,operation_id=6)"
+            "operation(session_id=7,operation_id=6)"
         );
     }
 
@@ -1417,7 +1402,10 @@ pub(crate) mod tests {
         smol::block_on(async {
             let manager = LockManager::new();
             let table_id = TableID::new(42);
-            let owner = LockOwner::ddl(SessionID::new(7), DdlOperationID::new(1));
+            let owner = LockOwner::operation(SessionOperationKey::new(
+                SessionID::new(7),
+                OperationID::new(1),
+            ));
             let guard = manager
                 .acquire_create_table_metadata_lock(table_id, owner)
                 .await
