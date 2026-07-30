@@ -387,6 +387,7 @@ pub(crate) mod tests {
         println!("file created, logical size={logical_size}, allocated size={allocated_size}");
         assert_eq!(logical_size, 1024 * 1024);
         assert_eq!(allocated_size, 0);
+        file.extend_to(1024 * 1024).unwrap();
         file.extend_to(1024 * 1024 * 2).unwrap();
         let (logical_size, allocated_size) = file.size().unwrap();
         println!("file grown, logical size={logical_size}, allocated_size={allocated_size}");

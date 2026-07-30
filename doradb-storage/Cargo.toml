@@ -37,7 +37,6 @@ byte-unit = { workspace = true }
 ahash = { workspace = true }
 glob = { workspace = true }
 futures = { workspace = true }
-scopeguard = { workspace = true }
 blake3 = { workspace = true }
 crc32fast = { workspace = true }
 ordered-float = { workspace = true }
