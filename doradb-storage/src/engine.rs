@@ -929,6 +929,7 @@ mod tests {
     use crate::trx::tests::add_pseudo_redo_log_entry;
     use smol::Timer;
     use std::fs;
+    use std::future::pending;
     use std::io::Error as StdIoError;
     use std::os::unix::fs::symlink;
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -2222,6 +2223,49 @@ mod tests {
             let result = done_rx
                 .recv_timeout(Duration::from_secs(5))
                 .expect("shutdown should complete after checkout returns");
+            assert_eq!(result, Ok(()));
+            shutdown_handle.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_engine_shutdown_waits_for_cancelled_statement_return() {
+        let root = TempDir::new().unwrap();
+        let engine =
+            smol::block_on(Engine::bootstrap(test_engine_config_for(root.path()))).unwrap();
+        let mut session = engine.new_session().unwrap();
+        let mut trx = session.begin_trx().unwrap();
+        let mut exec = Box::pin(trx.exec(async |_| {
+            pending::<()>().await;
+            Ok::<(), Error>(())
+        }));
+        smol::block_on(async {
+            assert!(matches!(
+                futures::poll!(exec.as_mut()),
+                std::task::Poll::Pending
+            ));
+        });
+        let (done_tx, done_rx) = mpsc::channel();
+
+        thread::scope(|scope| {
+            let shutdown_engine = &engine;
+            let shutdown_handle = scope.spawn(move || {
+                let result = shutdown_engine
+                    .shutdown()
+                    .map_err(|err| err.report().downcast_ref::<LifecycleError>().copied());
+                done_tx.send(result).unwrap();
+            });
+
+            wait_until_shutdown_begins(&engine);
+            assert!(
+                done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+                "shutdown must wait until the cancelled statement returns its checkout"
+            );
+
+            drop(exec);
+            let result = done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("shutdown should complete after statement cancellation cleanup");
             assert_eq!(result, Ok(()));
             shutdown_handle.join().unwrap();
         });

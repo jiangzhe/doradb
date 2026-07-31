@@ -58,7 +58,10 @@ impl IndexUndoLogs {
                     .last()
                     .expect("non-empty index undo buffer must have a last entry");
                 #[cfg(test)]
-                super::test_hooks::maybe_pause_index_rollback().await;
+                {
+                    use super::tests::maybe_pause_index_rollback;
+                    maybe_pause_index_rollback().await;
+                }
                 if is_catalog_table(entry.table_id) {
                     let table = table_cache.must_get_catalog_table(entry.table_id);
                     table.rollback_index_entry(entry, guards, ts).await?;

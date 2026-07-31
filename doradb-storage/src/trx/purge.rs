@@ -1438,8 +1438,9 @@ mod tests {
     use crate::table::tests::bound_unique_index;
     use crate::table::{DeleteMarker, TableRedoReplayFloor};
     use crate::trx::stmt::Statement;
+    use crate::trx::tests::shared_trx_status;
     use crate::trx::undo::{OwnedRowUndo, RowUndoKind, RowUndoLogs};
-    use crate::trx::{CommittedTrxPayload, MIN_ACTIVE_TRX_ID, SharedTrxStatus, SysTrxPayload};
+    use crate::trx::{CommittedTrxPayload, MIN_ACTIVE_TRX_ID, SysTrxPayload};
     use crate::value::Val;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::path::Path;
@@ -2461,7 +2462,7 @@ mod tests {
             else {
                 panic!("row should exist");
             };
-            let status = Arc::new(SharedTrxStatus::new(TrxID::new(100)));
+            let status = Arc::new(shared_trx_status(TrxID::new(100)));
             table
                 .deletion_buffer()
                 .put_ref(row_id, status.clone(), MAX_SNAPSHOT_TS)
@@ -2545,7 +2546,7 @@ mod tests {
             else {
                 panic!("row should exist");
             };
-            let status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 1));
+            let status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 1));
             table
                 .deletion_buffer()
                 .put_ref(row_id, status.clone(), MAX_SNAPSHOT_TS)
@@ -2656,7 +2657,7 @@ mod tests {
                 generation: page_guard.bf().generation().saturating_add(1),
             };
             drop(page_guard);
-            let status = Arc::new(SharedTrxStatus::new(TrxID::new(100)));
+            let status = Arc::new(shared_trx_status(TrxID::new(100)));
             table
                 .deletion_buffer()
                 .put_ref(row_id, status.clone(), MAX_SNAPSHOT_TS)
@@ -2763,7 +2764,7 @@ mod tests {
                 generation: page_guard.bf().generation().saturating_add(1),
             };
             drop(page_guard);
-            let status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 1));
+            let status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 1));
             table
                 .deletion_buffer()
                 .put_ref(row_id, status.clone(), MAX_SNAPSHOT_TS)

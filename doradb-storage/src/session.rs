@@ -24,7 +24,7 @@ use crate::table::{
 };
 use crate::trx::{
     ReleasedTransactionLocks, SessionOperationEntry, SessionOperationKind, SessionOperationState,
-    Transaction,
+    Transaction, TrxInner,
 };
 use error_stack::{Report, ResultExt};
 use event_listener::EventListener;
@@ -943,6 +943,7 @@ impl SessionOperationPin {
             self.key(),
             kind.label()
         );
+        let inner = Box::new(TrxInner::private());
         Ok(self
             .engine
             .trx_sys
@@ -952,6 +953,7 @@ impl SessionOperationPin {
                 self.key(),
                 kind,
                 Some(&self.entry),
+                inner,
             )
             .handle)
     }
@@ -1318,6 +1320,7 @@ impl SessionState {
                 slot: SessionOperationSlot::Idle,
                 next_operation_id: 1,
                 change_ev: None,
+                public_trx_cache: Some(Box::new(TrxInner::public_cached())),
             }),
             last_cts: AtomicU64::new(0),
             table_cache: Mutex::new(FastHashMap::default()),
@@ -1383,40 +1386,6 @@ impl SessionState {
     }
 
     #[inline]
-    fn admit_idle(lifecycle: &SessionLifecycle) -> LifecycleResult<()> {
-        if lifecycle.disposition != SessionDisposition::Open {
-            return Err(Report::new(LifecycleError::SessionUnavailable)
-                .attach(format!("disposition={}", lifecycle.disposition.label())));
-        }
-        match &lifecycle.slot {
-            SessionOperationSlot::Idle => Ok(()),
-            SessionOperationSlot::Active(entry) => {
-                let snapshot = entry.inspect();
-                let error = if snapshot.kind == SessionOperationKind::PublicTransaction {
-                    LifecycleError::ExistingTransaction
-                } else {
-                    LifecycleError::ExistingOperation
-                };
-                Err(Report::new(error).attach(format!(
-                    "operation_key={}, kind={}, state={}, disposition={}, trx_id={}",
-                    entry.key(),
-                    snapshot.kind.label(),
-                    snapshot.state.label(),
-                    lifecycle.disposition.label(),
-                    snapshot
-                        .trx_id
-                        .map_or_else(|| "none".to_owned(), |trx_id| trx_id.to_string())
-                )))
-            }
-            SessionOperationSlot::Closed => Err(Report::new(LifecycleError::SessionUnavailable)
-                .attach(format!(
-                    "disposition={}, slot=closed",
-                    lifecycle.disposition.label()
-                ))),
-        }
-    }
-
-    #[inline]
     fn next_operation_key(
         lifecycle: &SessionLifecycle,
         session_id: SessionID,
@@ -1434,14 +1403,6 @@ impl SessionState {
     }
 
     #[inline]
-    fn advance_operation_id(lifecycle: &mut SessionLifecycle) {
-        lifecycle.next_operation_id = lifecycle
-            .next_operation_id
-            .checked_add(1)
-            .expect("session operation id was checked before reservation");
-    }
-
-    #[inline]
     fn reserve_operation(
         &self,
         kind: SessionOperationKind,
@@ -1451,10 +1412,12 @@ impl SessionState {
             "public transaction reservation requires transaction payload installation"
         );
         let mut lifecycle = self.lifecycle.lock();
-        Self::admit_idle(&lifecycle).attach_with(|| format!("session_id={}", self.id))?;
+        lifecycle
+            .admit_idle()
+            .attach_with(|| format!("session_id={}", self.id))?;
         let key = Self::next_operation_key(&lifecycle, self.id);
         let entry = SessionOperationEntry::new(key, kind);
-        Self::advance_operation_id(&mut lifecycle);
+        lifecycle.advance_operation_id();
         lifecycle.slot = SessionOperationSlot::Active(Arc::clone(&entry));
         Ok(entry)
     }
@@ -1462,18 +1425,47 @@ impl SessionState {
     #[inline]
     fn begin_public_trx(self: &Arc<Self>, engine: &EngineRef) -> LifecycleResult<Transaction> {
         let mut lifecycle = self.lifecycle.lock();
-        Self::admit_idle(&lifecycle).attach_with(|| format!("session_id={}", self.id))?;
+        lifecycle
+            .admit_idle()
+            .attach_with(|| format!("session_id={}", self.id))?;
         let key = Self::next_operation_key(&lifecycle, self.id);
+        let inner = lifecycle.public_trx_cache.take().unwrap_or_else(|| {
+            panic!(
+                "idle session must retain one ready public transaction core: session_id={}",
+                self.id
+            )
+        });
         let started = engine.trx_sys.begin_trx(
             engine,
             self,
             key,
             SessionOperationKind::PublicTransaction,
             None,
+            inner,
         );
-        Self::advance_operation_id(&mut lifecycle);
+        lifecycle.advance_operation_id();
         lifecycle.slot = SessionOperationSlot::Active(Arc::clone(&started.entry));
         Ok(started.handle)
+    }
+
+    /// Recycle a cached public core or directly drop an ephemeral private core.
+    #[inline]
+    fn finish_trx_inner(&self, key: SessionOperationKey, trx_id: TrxID, mut inner: Box<TrxInner>) {
+        if !inner.cache_on_terminal() {
+            return;
+        }
+        let mut lifecycle = self.lifecycle.lock();
+        if lifecycle.disposition != SessionDisposition::Open {
+            return;
+        }
+        assert!(
+            lifecycle.public_trx_cache.is_none(),
+            "active public transaction must own the session's reusable core: \
+             session_id={}, operation_key={key}, trx_id={trx_id}",
+            self.id
+        );
+        inner.reset();
+        lifecycle.public_trx_cache = Some(inner);
     }
 
     #[inline]
@@ -1767,9 +1759,53 @@ struct SessionLifecycle {
     slot: SessionOperationSlot,
     next_operation_id: u64,
     change_ev: Option<Arc<EventNotifyOnDrop>>,
+    /// Reusable public transaction core, checked out only by a public transaction.
+    public_trx_cache: Option<Box<TrxInner>>,
 }
 
 impl SessionLifecycle {
+    #[inline]
+    fn admit_idle(&self) -> LifecycleResult<()> {
+        if self.disposition != SessionDisposition::Open {
+            return Err(Report::new(LifecycleError::SessionUnavailable)
+                .attach(format!("disposition={}", self.disposition.label())));
+        }
+        match &self.slot {
+            SessionOperationSlot::Idle => Ok(()),
+            SessionOperationSlot::Active(entry) => {
+                let snapshot = entry.inspect();
+                let error = if snapshot.kind == SessionOperationKind::PublicTransaction {
+                    LifecycleError::ExistingTransaction
+                } else {
+                    LifecycleError::ExistingOperation
+                };
+                Err(Report::new(error).attach(format!(
+                    "operation_key={}, kind={}, state={}, disposition={}, trx_id={}",
+                    entry.key(),
+                    snapshot.kind.label(),
+                    snapshot.state.label(),
+                    self.disposition.label(),
+                    snapshot
+                        .trx_id
+                        .map_or_else(|| "none".to_owned(), |trx_id| trx_id.to_string())
+                )))
+            }
+            SessionOperationSlot::Closed => Err(Report::new(LifecycleError::SessionUnavailable)
+                .attach(format!(
+                    "disposition={}, slot=closed",
+                    self.disposition.label()
+                ))),
+        }
+    }
+
+    #[inline]
+    fn advance_operation_id(&mut self) {
+        self.next_operation_id = self
+            .next_operation_id
+            .checked_add(1)
+            .expect("session operation id was checked before reservation");
+    }
+
     #[inline]
     fn active_entry(&self, key: SessionOperationKey) -> Option<&Arc<SessionOperationEntry>> {
         self.slot.active_entry().filter(|entry| entry.key() == key)
@@ -1937,8 +1973,15 @@ impl TrxAttachment {
 
     /// Mark the owning session committed.
     #[inline]
-    pub(crate) fn commit(&self, released: ReleasedTransactionLocks, cts: TrxID) {
+    pub(crate) fn commit(
+        &self,
+        released: ReleasedTransactionLocks,
+        cts: TrxID,
+        inner: Box<TrxInner>,
+    ) {
         released.assert_validated_for(self.trx_id);
+        self.session
+            .finish_trx_inner(self.operation_key, self.trx_id, inner);
         #[cfg(test)]
         tests::run_terminal_attachment_test_hook(
             self.trx_id,
@@ -1951,8 +1994,22 @@ impl TrxAttachment {
 
     /// Mark the owning session rolled back.
     #[inline]
-    pub(crate) fn rollback(&self, released: ReleasedTransactionLocks) {
+    pub(crate) fn rollback(&self, released: ReleasedTransactionLocks, inner: Box<TrxInner>) {
         released.assert_validated_for(self.trx_id);
+        self.session
+            .finish_trx_inner(self.operation_key, self.trx_id, inner);
+        self.finish_rollback();
+    }
+
+    /// Mark the owning session rolled back without recycling a failed core.
+    #[inline]
+    pub(crate) fn rollback_without_reuse(&self, released: ReleasedTransactionLocks) {
+        released.assert_validated_for(self.trx_id);
+        self.finish_rollback();
+    }
+
+    #[inline]
+    fn finish_rollback(&self) {
         #[cfg(test)]
         tests::run_terminal_attachment_test_hook(
             self.trx_id,
@@ -2077,6 +2134,7 @@ pub(crate) mod tests {
     use crate::trx::retention::{
         RedoTruncationBlocker, tests::install_redo_cleanup_before_unlink_hook,
     };
+    use crate::trx::tests::trx_inner;
     use crate::trx::{MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, TrxInner};
     use crate::value::{Val, ValKind};
     use futures::task::noop_waker;
@@ -2506,6 +2564,17 @@ pub(crate) mod tests {
             .count()
     }
 
+    /// Returns whether a registered session currently owns its public transaction cache.
+    #[inline]
+    pub(crate) fn session_has_public_trx_cache(
+        registry: &SessionRegistry,
+        session_id: SessionID,
+    ) -> bool {
+        registry
+            .session_state(session_id)
+            .is_some_and(|state| state.lifecycle.lock().public_trx_cache.is_some())
+    }
+
     /// Removes one synthetic or failed-retained test session before engine teardown.
     #[inline]
     pub(crate) fn remove_session_for_test(registry: &SessionRegistry, session_id: SessionID) {
@@ -2541,7 +2610,13 @@ pub(crate) mod tests {
     ) -> (Transaction, Arc<SessionState>) {
         let state = Arc::new(SessionState::new(engine.clone(), session_id));
         let key = SessionOperationKey::new(session_id, OperationID::new(1));
-        let inner = TrxInner::new(trx_id, sts, gc_no, session_id);
+        let mut inner = state
+            .lifecycle
+            .lock()
+            .public_trx_cache
+            .take()
+            .expect("test session must start with one public transaction cache");
+        inner.init(trx_id, sts, gc_no, session_id);
         let entry = SessionOperationEntry::new_public_transaction(key, inner);
         {
             let mut lifecycle = state.lifecycle.lock();
@@ -2865,7 +2940,7 @@ pub(crate) mod tests {
             let key = SessionOperationKey::new(session_id, OperationID::new(1));
             let entry = SessionOperationEntry::new_public_transaction(
                 key,
-                TrxInner::new(trx_id, MIN_SNAPSHOT_TS, 0, session_id),
+                Box::new(trx_inner(trx_id, MIN_SNAPSHOT_TS, 0, session_id)),
             );
             assert!(entry.abandon_transaction(trx_id));
             {
@@ -2895,7 +2970,7 @@ pub(crate) mod tests {
             let key = SessionOperationKey::new(session_id, OperationID::new(1));
             let entry = SessionOperationEntry::new_public_transaction(
                 key,
-                TrxInner::new(trx_id, MIN_SNAPSHOT_TS, 0, session_id),
+                Box::new(trx_inner(trx_id, MIN_SNAPSHOT_TS, 0, session_id)),
             );
             entry.fail_retained();
             {
@@ -2925,7 +3000,7 @@ pub(crate) mod tests {
             let key = SessionOperationKey::new(session_id, OperationID::new(1));
             let entry = SessionOperationEntry::new_public_transaction(
                 key,
-                TrxInner::new(trx_id, MIN_SNAPSHOT_TS, 0, session_id),
+                Box::new(trx_inner(trx_id, MIN_SNAPSHOT_TS, 0, session_id)),
             );
             state.lifecycle.lock().slot = SessionOperationSlot::Active(Arc::clone(&entry));
 
@@ -2954,7 +3029,7 @@ pub(crate) mod tests {
             let key = SessionOperationKey::new(session_id, OperationID::new(1));
             let entry = SessionOperationEntry::new_public_transaction(
                 key,
-                TrxInner::new(trx_id, MIN_SNAPSHOT_TS, 0, session_id),
+                Box::new(trx_inner(trx_id, MIN_SNAPSHOT_TS, 0, session_id)),
             );
             state.lifecycle.lock().slot = SessionOperationSlot::Active(entry);
 
@@ -2987,7 +3062,7 @@ pub(crate) mod tests {
                 let key = SessionOperationKey::new(session_id, OperationID::new(1));
                 let entry = SessionOperationEntry::new_public_transaction(
                     key,
-                    TrxInner::new(trx_id, MIN_SNAPSHOT_TS, 0, session_id),
+                    Box::new(trx_inner(trx_id, MIN_SNAPSHOT_TS, 0, session_id)),
                 );
                 assert!(entry.abandon_transaction(trx_id));
                 {
@@ -3039,7 +3114,7 @@ pub(crate) mod tests {
                 let key = SessionOperationKey::new(session_id, OperationID::new(1));
                 let entry = SessionOperationEntry::new_public_transaction(
                     key,
-                    TrxInner::new(trx_id, MIN_SNAPSHOT_TS, 0, session_id),
+                    Box::new(trx_inner(trx_id, MIN_SNAPSHOT_TS, 0, session_id)),
                 );
                 assert!(entry.abandon_transaction(trx_id));
                 {
@@ -3239,7 +3314,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_private_transaction_inherits_stable_operation_entry() {
+    fn test_private_transaction_preserves_stable_entry_and_public_cache() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
             let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
@@ -3253,7 +3328,31 @@ pub(crate) mod tests {
             let entry = Arc::clone(&operation.entry);
             let state = Arc::clone(&operation.state);
             assert!(state.lifecycle.lock().change_ev.is_none());
+            let public_cache_ptr = state
+                .lifecycle
+                .lock()
+                .public_trx_cache
+                .as_deref()
+                .map(|inner| inner as *const TrxInner as usize)
+                .expect("session must retain its public transaction cache");
             let trx = operation.begin_private_trx().unwrap();
+            let first_inner = entry
+                .inner_ptr_for_test()
+                .expect("private transaction entry must retain its checked-in core");
+            assert_ne!(
+                first_inner, public_cache_ptr,
+                "private transaction must use a core distinct from the parked public cache"
+            );
+            assert_eq!(
+                state
+                    .lifecycle
+                    .lock()
+                    .public_trx_cache
+                    .as_deref()
+                    .map(|inner| inner as *const TrxInner as usize),
+                Some(public_cache_ptr),
+                "private begin must leave the public transaction cache untouched"
+            );
 
             let (resolved, _) = engine
                 .inner()
@@ -3277,8 +3376,36 @@ pub(crate) mod tests {
                 };
                 assert!(Arc::ptr_eq(active, &entry));
                 assert_eq!(lifecycle.next_operation_id, 2);
+                assert_eq!(
+                    lifecycle
+                        .public_trx_cache
+                        .as_deref()
+                        .map(|inner| inner as *const TrxInner as usize),
+                    Some(public_cache_ptr),
+                    "private terminal must not replace the public transaction cache"
+                );
             }
             assert!(state.lifecycle.lock().change_ev.is_none());
+
+            let replacement = operation.begin_private_trx().unwrap();
+            let second_inner = entry
+                .inner_ptr_for_test()
+                .expect("replacement private transaction must retain its checked-in core");
+            assert_ne!(
+                second_inner, public_cache_ptr,
+                "each private transaction must remain separate from the public cache"
+            );
+            assert_eq!(
+                state
+                    .lifecycle
+                    .lock()
+                    .public_trx_cache
+                    .as_deref()
+                    .map(|inner| inner as *const TrxInner as usize),
+                Some(public_cache_ptr),
+                "sequential private transactions must leave the public cache parked"
+            );
+            replacement.rollback().await.unwrap();
 
             drop(operation);
             assert!(matches!(

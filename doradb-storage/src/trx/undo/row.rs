@@ -139,7 +139,10 @@ impl RowUndoLogs {
                     .last_mut()
                     .expect("non-empty row undo buffer must have a last entry");
                 #[cfg(test)]
-                super::test_hooks::maybe_pause_row_rollback().await;
+                {
+                    use super::tests::maybe_pause_row_rollback;
+                    maybe_pause_row_rollback().await;
+                }
                 if is_catalog_table(entry.table_id) {
                     let table = table_cache.must_get_catalog_table(entry.table_id);
                     table.mem.rollback_row_undo(entry, guards, |_| {}).await?;

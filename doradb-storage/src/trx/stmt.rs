@@ -7,7 +7,7 @@ use crate::error::{
     OperationOrFatalResult, OperationOrRuntimeError, OperationOrRuntimeResult, OperationResult,
     Result, RuntimeError, RuntimeResult,
 };
-use crate::lock::{LockMode, LockOwner, LockResource, OwnerLockState};
+use crate::lock::{LockMode, LockResource, OwnerLockState};
 use crate::log::redo::{DDLRedo, RedoLogs, RowRedo};
 use crate::obs;
 use crate::row::ops::{
@@ -19,7 +19,10 @@ use crate::table::{DmlValidator, LazyRow, Table, TableRuntimeLayout};
 use crate::trx::undo::{
     IndexUndo, IndexUndoKind, IndexUndoLogs, OwnedRowUndo, RowUndoKind, RowUndoLogs,
 };
-use crate::trx::{FatalRollbackRetention, TableAdmissionRequest, TrxEffects, TrxInner, TrxRuntime};
+use crate::trx::{
+    FatalRollbackRetention, SessionOperationCheckout, TableAdmissionRequest, TrxEffects, TrxInner,
+    TrxRuntime,
+};
 use crate::value::Val;
 use error_stack::ResultExt;
 use std::mem;
@@ -194,6 +197,18 @@ impl StmtEffects {
         );
     }
 
+    /// Folds residual cancelled-statement undo into whole-transaction rollback.
+    ///
+    /// Redo from a statement that did not complete is never commit-visible.
+    /// Undo remains ordered after prior successful statements so whole-
+    /// transaction rollback unwinds this statement first.
+    #[inline]
+    fn fold_cancelled_into_trx_effects(&mut self, trx_effects: &mut TrxEffects) {
+        self.redo.clear();
+        trx_effects.row_undo_mut().merge(&mut self.row_undo);
+        trx_effects.index_undo_mut().merge(&mut self.index_undo);
+    }
+
     /// Rolls back statement-local row effects in reverse effect order.
     #[inline]
     pub(crate) async fn rollback_row(
@@ -236,13 +251,132 @@ impl StmtEffects {
     }
 }
 
-impl Drop for StmtEffects {
+#[derive(Clone, Copy)]
+enum StmtDropAction {
+    CancelPublicTransaction,
+    PrivateMustComplete,
+    Settled,
+}
+
+/// Lifetime-free owner of one checked-out statement operation.
+///
+/// The carrier keeps the transaction core, statement effects, and statement
+/// locks together across callback await points. It lends direct disjoint
+/// borrows to [`Statement`] and owns the final policy when that callback future
+/// is dropped.
+pub(crate) struct StmtState {
+    effects: StmtEffects,
+    stmt_locks: OwnerLockState,
+    drop_action: StmtDropAction,
+    checkout: Option<SessionOperationCheckout>,
+}
+
+impl StmtState {
+    /// Arms public statement cancellation after a successful checkout.
+    #[inline]
+    pub(crate) fn public(mut checkout: SessionOperationCheckout) -> Self {
+        let owner = checkout.inner_mut().next_statement_owner();
+        Self {
+            effects: StmtEffects::empty(),
+            stmt_locks: OwnerLockState::new(owner),
+            drop_action: StmtDropAction::CancelPublicTransaction,
+            checkout: Some(checkout),
+        }
+    }
+
+    /// Preserves the current must-complete invariant for private catalog work.
+    #[inline]
+    pub(crate) fn private(mut checkout: SessionOperationCheckout) -> Self {
+        let owner = checkout.inner_mut().next_statement_owner();
+        Self {
+            effects: StmtEffects::empty(),
+            stmt_locks: OwnerLockState::new(owner),
+            drop_action: StmtDropAction::PrivateMustComplete,
+            checkout: Some(checkout),
+        }
+    }
+
+    /// Lends one direct callback-facing statement facade.
+    #[inline]
+    pub(crate) fn statement(&mut self) -> Statement<'_> {
+        let Self {
+            effects,
+            stmt_locks,
+            checkout,
+            ..
+        } = self;
+        let checkout = checkout
+            .as_mut()
+            .expect("active statement state must own its transaction checkout");
+        let (inner, attachment) = checkout.inner_and_attachment_mut();
+        Statement {
+            inner,
+            attachment,
+            effects,
+            stmt_locks,
+            disable_dml_validation: false,
+        }
+    }
+
+    /// Releases statement locks and ordinarily checks the core back in.
+    #[inline]
+    pub(crate) fn return_ordinary(mut self) {
+        self.drop_action = StmtDropAction::Settled;
+        self.release_statement_locks();
+        self.checkout = None;
+    }
+
+    /// Publishes fatal rollback retention after statement effects were retained.
+    #[inline]
+    pub(crate) fn discard_after_fatal_rollback(mut self) {
+        self.drop_action = StmtDropAction::Settled;
+        self.release_statement_locks();
+        if let Some(checkout) = self.checkout.as_mut() {
+            checkout.discard_after_fatal_rollback();
+        }
+        self.checkout = None;
+    }
+
+    #[inline]
+    fn release_statement_locks(&mut self) {
+        if let Some(checkout) = self.checkout.as_ref() {
+            self.stmt_locks
+                .release_all(checkout.attachment().engine().lock_manager());
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn settle_armed_drop(&mut self) {
+        match self.drop_action {
+            StmtDropAction::CancelPublicTransaction => {
+                let Some(mut checkout) = self.checkout.take() else {
+                    return;
+                };
+                self.effects
+                    .fold_cancelled_into_trx_effects(checkout.inner_mut().effects_mut());
+                self.stmt_locks
+                    .release_all(checkout.attachment().engine().lock_manager());
+                checkout.return_cancelled();
+            }
+            StmtDropAction::PrivateMustComplete => {
+                self.release_statement_locks();
+                assert!(
+                    self.effects.is_empty(),
+                    "private statement must complete effect settlement before drop"
+                );
+            }
+            StmtDropAction::Settled => {}
+        }
+    }
+}
+
+impl Drop for StmtState {
     #[inline]
     fn drop(&mut self) {
-        assert!(
-            self.is_empty(),
-            "statement effects should be merged, rolled back, or discarded before drop"
-        );
+        if !matches!(self.drop_action, StmtDropAction::Settled) {
+            self.settle_armed_drop();
+        }
     }
 }
 
@@ -250,33 +384,18 @@ impl Drop for StmtEffects {
 ///
 /// `Transaction::exec` owns the statement lifecycle. It passes this facade to the
 /// callback with transaction context, statement-local effects, and
-/// statement-owned logical locks. Dropping this value releases every
-/// statement-owned lock, so success and rollback paths cannot forget cleanup.
+/// statement-owned logical locks. The enclosing statement state retains
+/// ownership and settles those resources on every completion or cancellation
+/// path.
 pub struct Statement<'stmt> {
     inner: &'stmt mut TrxInner,
     attachment: &'stmt TrxAttachment,
-    effects: StmtEffects,
-    stmt_locks: OwnerLockState,
+    effects: &'stmt mut StmtEffects,
+    stmt_locks: &'stmt mut OwnerLockState,
     disable_dml_validation: bool,
 }
 
 impl<'stmt> Statement<'stmt> {
-    /// Create a new statement.
-    #[inline]
-    pub(crate) fn new(
-        inner: &'stmt mut TrxInner,
-        attachment: &'stmt TrxAttachment,
-        owner: LockOwner,
-    ) -> Self {
-        Statement {
-            inner,
-            attachment,
-            effects: StmtEffects::empty(),
-            stmt_locks: OwnerLockState::new(owner),
-            disable_dml_validation: false,
-        }
-    }
-
     /// Disable default DML shape, type, nullability, sparse-update, key, and
     /// index-scan validation for this statement.
     ///
@@ -300,14 +419,14 @@ impl<'stmt> Statement<'stmt> {
     /// Returns mutable access to this statement's effect accumulator.
     #[inline]
     pub(crate) fn effects_mut(&mut self) -> &mut StmtEffects {
-        &mut self.effects
+        self.effects
     }
 
     #[inline]
     fn runtime_and_effects_mut(&mut self) -> (TrxRuntime<'_>, &mut StmtEffects) {
         (
             TrxRuntime::new(self.inner.ctx(), self.attachment),
-            &mut self.effects,
+            self.effects,
         )
     }
 
@@ -372,7 +491,7 @@ impl<'stmt> Statement<'stmt> {
         admit_user_table(
             self.inner,
             self.attachment,
-            &mut self.stmt_locks,
+            self.stmt_locks,
             table_id,
             request,
             operation,
@@ -808,7 +927,7 @@ impl<'stmt> Statement<'stmt> {
     ///
     /// Index effects roll back before row effects so index entries stop
     /// pointing at uncommitted row state before row undo is unwound. Statement
-    /// locks stay held until this method returns and `Statement` drops.
+    /// locks stay held until this method returns and the carrier finalizes.
     #[inline]
     pub(crate) async fn rollback_effects(&mut self) -> FatalResult<()> {
         let sts = self.inner.sts();
@@ -852,14 +971,6 @@ impl<'stmt> Statement<'stmt> {
     }
 }
 
-impl Drop for Statement<'_> {
-    #[inline]
-    fn drop(&mut self) {
-        self.stmt_locks
-            .release_all(self.attachment.engine().lock_manager());
-    }
-}
-
 /// Catalog mutations use internally derived keys and validated row shapes.
 /// An Operation failure therefore means a catalog key, row shape, transaction,
 /// or lock invariant was violated; only Runtime failures may leave this boundary.
@@ -885,21 +996,22 @@ pub(crate) mod tests {
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{
-        DiscloseError, DiscloseResultExt, ErrorKind, FatalError, InternalError, OperationError,
-        ResourceError,
+        DiscloseError, DiscloseResultExt, ErrorKind, FatalError, InternalError, LifecycleError,
+        OperationError, ResourceError,
     };
     use crate::id::TrxID;
-    use crate::lock::LockManager;
     use crate::lock::tests::{debug_snapshot, try_acquire};
+    use crate::lock::{LockManager, LockOwner};
     use crate::session::{SessionState, tests as session_tests};
     use crate::trx::sys::tests as sys_tests;
-    use crate::trx::undo::test_hooks::{pause_next_index_rollback, pause_next_row_rollback};
+    use crate::trx::undo::tests::{pause_next_index_rollback, pause_next_row_rollback};
     use crate::trx::undo::{OwnedRowUndo, RowUndoKind};
     use crate::trx::{MIN_ACTIVE_TRX_ID, Transaction};
     use error_stack::Report;
     use futures::FutureExt;
     use std::cell::Cell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::ptr::from_ref;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -931,7 +1043,7 @@ pub(crate) mod tests {
         mode: LockMode,
     ) -> Result<bool> {
         try_acquire_owner_lock_state(
-            &mut stmt.stmt_locks,
+            stmt.stmt_locks,
             stmt.attachment.engine().lock_manager(),
             resource,
             mode,
@@ -1046,13 +1158,46 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_stmt_effects_drop_rejects_leaked_effects() {
-        let res = catch_unwind(|| {
-            let mut effects = StmtEffects::empty();
-            effects.set_ddl_redo(DDLRedo::CreateTable(TableID::new(42)));
+    fn test_cancelled_stmt_effects_fold_undo_and_discard_redo() {
+        let mut trx_effects = TrxEffects::empty();
+        trx_effects.row_undo_mut().push(OwnedRowUndo::new(
+            TableID::new(41),
+            None,
+            RowID::new(1),
+            RowUndoKind::Delete,
+        ));
+        trx_effects.index_undo_mut().push(IndexUndo {
+            table_id: TableID::new(41),
+            row_id: RowID::new(1),
+            kind: IndexUndoKind::DeferDelete(SelectKey::new(0, vec![]), true),
         });
 
-        assert!(res.is_err());
+        let mut effects = StmtEffects::empty();
+        effects.push_row_undo(OwnedRowUndo::new(
+            TableID::new(42),
+            None,
+            RowID::new(2),
+            RowUndoKind::Insert,
+        ));
+        effects.push_delete_index_undo(
+            TableID::new(42),
+            RowID::new(2),
+            SelectKey::new(0, vec![]),
+            true,
+        );
+        effects.set_ddl_redo(DDLRedo::CreateTable(TableID::new(42)));
+        let cancelled_row_undo = from_ref(&*effects.row_undo[0]);
+
+        effects.fold_cancelled_into_trx_effects(&mut trx_effects);
+
+        assert!(effects.is_empty());
+        assert_eq!(trx_effects.row_undo.len(), 2);
+        assert_eq!(trx_effects.row_undo[0].table_id, TableID::new(41));
+        assert_eq!(trx_effects.row_undo[1].table_id, TableID::new(42));
+        assert_eq!(from_ref(&*trx_effects.row_undo[1]), cancelled_row_undo);
+        assert_eq!(trx_effects.index_undo.len(), 2);
+        assert!(trx_effects.redo.is_empty());
+        trx_effects.clear_for_rollback();
     }
 
     #[test]
@@ -1161,7 +1306,14 @@ pub(crate) mod tests {
                 message.contains("catalog mutation invariant violated"),
                 "unexpected panic: {message}"
             );
-            trx.rollback().await.unwrap();
+            let err = trx.rollback().await.unwrap_err();
+            assert_eq!(
+                err.report().downcast_ref::<LifecycleError>().copied(),
+                Some(LifecycleError::TransactionDiscarded)
+            );
+            session_tests::wait_for_session_idle(&engine.inner().session_registry, session.id())
+                .await;
+            engine.shutdown().unwrap();
         });
     }
 

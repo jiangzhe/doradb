@@ -171,22 +171,51 @@ checkout or terminal claim then validates the handle's independent `TrxID`
 against the entry under the entry mutex.
 
 `SessionState` has orthogonal disposition (`Open`, `CloseRequested`, or
-`Abandoned`) and one operation slot (`Idle`, `Active`, or `Closed`). An active
-slot owns exactly one `Arc<SessionOperationEntry>`. This is the direct
-generalization of the former transaction entry, not an outer wrapper: immutable
-key and kind fields sit beside one compact mutex containing operation state,
-optional `TrxID`, optional checked-in `TrxInner`, cleanup intent, and foreground
-ownership. The entry contains no whole operation future and no strong engine
-reference.
+`Abandoned`) and one operation slot (`Idle`, `Active`, or `Closed`). Its
+existing lifecycle mutex also protects one optional `public_trx_cache`
+containing a ready `Box<TrxInner>`. A public transaction takes that box, and
+successful terminal processing resets and returns it before publishing the
+idle lifecycle state. DDL and maintenance leave the public cache parked while
+their private transaction owns a separately allocated core.
+An active slot owns exactly one `Arc<SessionOperationEntry>`. This is the
+direct generalization of the former transaction entry, not an outer wrapper:
+immutable key and kind fields sit beside one compact mutex containing operation
+state, optional `TrxID`, an optional checked-in `Box<TrxInner>`, cleanup
+intent, and foreground ownership. The entry contains no whole operation future
+and no strong engine reference.
 
-The mutable transaction core is checked out for one non-terminal operation
-through `SessionOperationCheckout`; ordinary checkout drop returns the core
-through the same entry mutex. The checkout owns the operation-local
-`TrxAttachment` and exposes a copyable `TrxRuntime` value that pairs immutable
-`TrxContext` with runtime access to the engine, pool guards, and session-local
-user-table cache. `TrxContext` never stores the attachment. Normal statement
-checkout/check-in does not reacquire the session lifecycle mutex, allocate,
-touch the operation change notifier, or send cleanup work.
+The reusable public transaction core box is allocated eagerly once per
+session. A ready core has zero identity fields, no lock state, empty
+zero-capacity effect containers, and one uniquely owned zero-valued
+`SharedTrxStatus`. Public transaction begin calls `TrxInner::init` after
+allocating the new STS/transaction id: `Arc::get_mut` proves the ready status
+was never shared, then initialization stores the active transaction id, STS,
+GC bucket, lock owner, and statement counter without allocating either the core
+or its status.
+
+Successful terminal processing carries the emptied box through
+`PreparedTrx`/`PrecommitTrx` where necessary. After the old status is terminal,
+all effects and locks are released, and prepare state is cleared. A public
+transaction calls `TrxInner::reset`, which drops retained container capacity
+and replaces the context with a newly allocated zero-valued status for the next
+transaction. A private transaction drops its fresh core directly without
+resetting it or taking an additional cache-related lifecycle lock. Each core
+records this terminal cache policy when it is created, so transaction
+attachments need no additional kind field. The old status identity is never
+reused: undo, deletion, transition, or checkpoint owners that cloned it
+continue observing the old terminal result. Fatal retention drops the failed
+core instead of returning it to the session.
+
+During an active transaction, the owning box is checked out for one
+non-terminal operation through `SessionOperationCheckout`; ordinary checkout
+drop returns the same box through the entry mutex. This keeps repeated ownership
+transfers pointer-sized without allocating during statement execution. The
+checkout owns the operation-local `TrxAttachment` and exposes a copyable
+`TrxRuntime` value that pairs immutable `TrxContext` with runtime access to the
+engine, pool guards, and session-local user-table cache. `TrxContext` never
+stores the attachment. Normal statement checkout/check-in does not reacquire
+the session lifecycle mutex, allocate, touch the operation change notifier, or
+send cleanup work.
 
 Each session user-table cache entry contains one weak `Table` runtime hint and
 an optional `VersionedPageID`. The weak runtime is never authoritative for
@@ -207,20 +236,41 @@ versioned page tokens through the catalog table's shared insert free list, so
 catalog insert capacity remains available across sessions without requiring a
 user-table runtime cache entry.
 
-`Statement` borrows the checkout for statement execution. Explicit commit and
-rollback consume the public handle, suppress drop abandonment, and claim the
-same entry and core through `SessionOperationCompletionClaim`. Dropping a
-public transaction handle never rolls back inline; it records cleanup intent
-on the exact entry and queues transaction-system cleanup when the engine is
-still reachable.
+`StmtState` owns the per-operation checkout, statement effects, and
+statement-lock state while `Transaction::exec` is active. It lends one
+`Statement` facade with direct disjoint borrows of the checked-out
+`TrxInner`, operation attachment, effects, and locks; DML methods therefore do
+not resolve the entry or unwrap the carrier. Normal statement finish releases
+statement locks and returns the core to `ForegroundAvailable`. This check-in
+ends only the operation-local lease, not the semantic transaction lifetime;
+the weak public `Transaction` remains reusable for its next call.
+
+Dropping an unpolled `Transaction::exec` future performs no checkout. Once
+checkout succeeds, dropping the future is terminal for that public
+transaction. The callback and any pending acquisition guard are destroyed
+first. `StmtState` then discards statement redo, appends residual row and index
+undo after prior transaction undo, releases statement locks, and returns the
+complete core directly as `CleanupReady`. It never exposes an intervening
+`ForegroundAvailable` state. The existing identity cleanup job claims the
+core and performs whole-transaction rollback; later calls through the stale
+public facade return `TransactionDiscarded`. An ordinary callback error is
+different: statement-local rollback completes before ordinary check-in, so
+the transaction remains reusable.
+
+Explicit commit and rollback consume the public handle, suppress drop
+abandonment, and claim the same entry and core through
+`SessionOperationCompletionClaim`. Dropping a public transaction handle never
+rolls back inline; it records cleanup intent on the exact entry and queues
+transaction-system cleanup when the engine is still reachable.
 
 DDL and maintenance start private transactions through their already-reserved
-operation authority. A private transaction allocates a new `TrxID` but inherits
-the outer operation key, installs its `TrxInner` in the same entry mutex, and
-does not replace the active slot. While the outer foreground authority remains
-attached, `ForegroundRunning(Some(InternalTrxState))` records the private
-transaction's available, checked-out, cleanup, or completion position. Public
-transactions use the outer operation states directly and therefore use
+operation authority. A private transaction allocates a new `TrxID` and boxed
+core but inherits the outer operation key, installs that box in the same entry
+mutex, and does not replace the active slot. While the outer foreground
+authority remains attached, `ForegroundRunning(Some(InternalTrxState))`
+records the private transaction's available, checked-out, cleanup, or
+completion position. Public transactions use the outer operation states
+directly and therefore use
 `ForegroundRunning(None)` only while checked out. A private transaction's terminal
 callback clears the child and returns the entry to `ForegroundRunning(None)`;
 only dropping the outer foreground authority can publish the operation terminal
@@ -248,8 +298,9 @@ duplicate hints are neutral. Registry resolution uses only the operation key;
 the cleanup claim atomically validates the message's `TrxID`, claimable state,
 and physical payload ownership under the entry mutex.
 
-`Statement` is a borrowed facade over operation-local runtime access and owned
-statement-local `StmtEffects`; callers cannot construct or finish it directly.
+`Statement` is a borrowed facade over operation-local runtime access and
+carrier-owned statement-local `StmtEffects`; callers cannot construct or
+finish it directly.
 Foreground table APIs receive `TrxRuntime` by value when they need pool guards,
 insert-page cache access, or runtime lock assertions, while pure row MVCC
 helpers continue to receive `&TrxContext`. When the callback succeeds,
@@ -263,15 +314,15 @@ later commit or rollback attempts return an error.
 
 Logical lock ownership is tracked outside `TrxContext`. `Transaction` owns an
 `OwnerLockState` for the transaction owner that caches the strongest granted
-mode per logical resource. `Statement` owns its statement-owner
-`OwnerLockState` and releases statement-owned locks from its drop guard after
-statement success or after statement rollback/fatal cleanup. The caches do not
-own the lock manager; acquisition and release receive the engine's
-`LockManager` component guard at the lifecycle boundary. Transaction-owned
-locks are released on commit, rollback, no-op discard, or fatal transaction
-discard. Session-owned logical locks are released when the session state is
-dropped. See [Lock System](./lock-system.md) for the resource and mode model,
-the implemented manager structures, and the pre-RFC redesign study.
+mode per logical resource. `StmtState` owns the statement-owner
+`OwnerLockState` and releases statement-owned locks after success, ordinary
+rollback, fatal cleanup, or public cancellation. The caches do not own the
+lock manager; acquisition and release receive the engine's `LockManager`
+component guard at the lifecycle boundary. Transaction-owned locks are
+released on commit, rollback, no-op discard, or fatal transaction discard.
+Session-owned logical locks are released when the session state is dropped.
+See [Lock System](./lock-system.md) for the resource and mode model, the
+implemented manager structures, and the pre-RFC redesign study.
 
 Foreground table access enters through lock-aware `Statement` APIs and a
 positive transaction-lifetime `TransactionTableBinding`. A binding hit is

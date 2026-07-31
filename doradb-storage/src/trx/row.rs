@@ -1476,6 +1476,7 @@ pub(crate) mod tests {
     use crate::catalog::{
         ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec,
     };
+    use crate::trx::tests::{commit_shared_trx_status, shared_trx_status};
     use crate::trx::undo::RowUndoHead;
     use crate::trx::{MIN_ACTIVE_TRX_ID, ver_map::RowVersionMap};
     use crate::value::ValKind;
@@ -1519,7 +1520,7 @@ pub(crate) mod tests {
 
     fn test_trx_context(sts: TrxID) -> TrxContext {
         TrxContext {
-            status: Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + sts.as_u64())),
+            status: Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + sts.as_u64())),
             sts,
             gc_no: 0,
         }
@@ -1565,8 +1566,8 @@ pub(crate) mod tests {
         let metadata = sparse_metadata();
         let page = row_page(&metadata);
         let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
-        let status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 99));
-        status.commit_for_test(TrxID::new(10));
+        let status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 99));
+        commit_shared_trx_status(&status, TrxID::new(10));
         install_test_undo_head(&row_ver, status);
         let access = test_row_read_access(&page, &row_ver, 0);
         let trx_ctx = test_trx_context(TrxID::new(1));
@@ -1592,7 +1593,7 @@ pub(crate) mod tests {
 
         install_test_undo_head(
             &row_ver,
-            Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 100)),
+            Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 100)),
         );
         let access = test_row_read_access(&page, &row_ver, 0);
         assert_eq!(access.read_latest(&trx_ctx), ReadLatestRow::WriteConflict);
@@ -1604,13 +1605,13 @@ pub(crate) mod tests {
         let page = row_page(&metadata);
         assert!(page.set_deleted(0, true));
         let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
-        let status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 99));
+        let status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 99));
         install_test_undo_head(&row_ver, Arc::clone(&status));
         let access = test_row_read_access(&page, &row_ver, 0);
         let trx_ctx = test_trx_context(TrxID::new(1));
 
         assert_eq!(access.read_latest(&trx_ctx), ReadLatestRow::WriteConflict);
-        status.commit_for_test(TrxID::new(10));
+        commit_shared_trx_status(&status, TrxID::new(10));
         assert_eq!(access.read_latest(&trx_ctx), ReadLatestRow::NotFound);
     }
 
@@ -1724,7 +1725,7 @@ pub(crate) mod tests {
             access.delete_row();
         }
 
-        let rollback_status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 10));
+        let rollback_status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 10));
         let mut rollback_undo =
             OwnedRowUndo::new(TableID::new(1), None, RowID::new(100), RowUndoKind::Lock);
         *row_ver.write_latch(0) = Some(Box::new(RowUndoHead::new(
@@ -1738,7 +1739,7 @@ pub(crate) mod tests {
         let mut trx_rollback_undo =
             OwnedRowUndo::new(TableID::new(1), None, RowID::new(100), RowUndoKind::Lock);
         *row_ver.write_latch(0) = Some(Box::new(RowUndoHead::new(
-            Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 11)),
+            Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 11)),
             trx_rollback_undo.leak(),
         )));
         test_row_write_access(&page, &row_ver, &dirty, 0)
@@ -1747,7 +1748,7 @@ pub(crate) mod tests {
         let purge_undo =
             OwnedRowUndo::new(TableID::new(1), None, RowID::new(101), RowUndoKind::Lock);
         *row_ver.write_latch(1) = Some(Box::new(RowUndoHead::new(
-            Arc::new(SharedTrxStatus::new(TrxID::new(20))),
+            Arc::new(shared_trx_status(TrxID::new(20))),
             purge_undo.leak(),
         )));
         test_row_write_access(&page, &row_ver, &dirty, 1).purge_undo_chain(TrxID::new(21));
@@ -1762,7 +1763,7 @@ pub(crate) mod tests {
         let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
         *row_ver.write_state() = RowPageState::Frozen;
         let dirty = AtomicBool::new(false);
-        let repeated_status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 9));
+        let repeated_status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 9));
         let repeated_first_undo =
             OwnedRowUndo::new(TableID::new(1), None, RowID::new(100), RowUndoKind::Lock);
         let repeated_second_undo =
@@ -1789,7 +1790,7 @@ pub(crate) mod tests {
         }
         assert_eq!(row_ver.frozen_mutation_version(), 4);
 
-        let rollback_status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 10));
+        let rollback_status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 10));
         let mut rollback_undo =
             OwnedRowUndo::new(TableID::new(1), None, RowID::new(100), RowUndoKind::Lock);
         *row_ver.write_latch(0) = Some(Box::new(RowUndoHead::new(
@@ -1808,7 +1809,7 @@ pub(crate) mod tests {
         let mut trx_rollback_undo =
             OwnedRowUndo::new(TableID::new(1), None, RowID::new(100), RowUndoKind::Lock);
         *row_ver.write_latch(0) = Some(Box::new(RowUndoHead::new(
-            Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 11)),
+            Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 11)),
             trx_rollback_undo.leak(),
         )));
         let prepared_version = row_ver.frozen_mutation_version();
@@ -1820,7 +1821,7 @@ pub(crate) mod tests {
         let purge_undo =
             OwnedRowUndo::new(TableID::new(1), None, RowID::new(101), RowUndoKind::Lock);
         *row_ver.write_latch(1) = Some(Box::new(RowUndoHead::new(
-            Arc::new(SharedTrxStatus::new(TrxID::new(20))),
+            Arc::new(shared_trx_status(TrxID::new(20))),
             purge_undo.leak(),
         )));
         let prepared_version = row_ver.frozen_mutation_version();
@@ -1861,7 +1862,7 @@ pub(crate) mod tests {
             }]),
         );
         *row_ver.write_latch(0) = Some(Box::new(RowUndoHead::new(
-            Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 99)),
+            Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 99)),
             undo.leak(),
         )));
         let access = test_row_read_access(&page, &row_ver, 0);
