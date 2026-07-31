@@ -12,6 +12,17 @@ A 50-million-operation 4-thread/16-session perf profile attributed 49.86% of can
 
 Static review found that session operation entries already block component teardown for active transaction work, while `runtime_refs` remains necessary in the current design for detached pins such as `SessionObserverPin` and as a waitable notification layer over `Arc` ownership. The current counter is therefore broader than the hot-path lifetime proof requires.
 
+The fresh task-resolution matrix reproduced the contended result. Against
+`origin/main` `768842e8e8c1`, the candidate reduced median `stmt-noop` latency
+at 1 thread/1 session from 84.354 ns to 71.944 ns, but increased it at
+4 threads/16 sessions from 112.856 ns to 118.719 ns. The same matrix found
+small `index-stream` regressions at the statement boundary: +1.99% and +2.94%
+for unique 1/1 and 4/16, and +5.54% and +2.10% for non-unique 1/1 and 4/16.
+A second seven-sample non-unique 1/1 trial remained 3.96% slower. RFC-0025
+Phase 2 accepted this fixed boundary cost as explicit performance debt because
+its cancellation-ownership prerequisite is complete; this backlog owns the
+performance correction rather than treating the original budget as passed.
+
 ## Deferred From (Optional)
 
 docs/tasks/000247-statement-public-transaction-cancellation-ownership.md; docs/rfcs/0025-session-coordinated-cancellation-cleanup-ownership.md Phase 2

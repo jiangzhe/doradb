@@ -42,3 +42,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented cancellation-safe ownership for every polled public Transaction::exec future: synchronous statement settlement, direct CleanupReady check-in, and worker-owned whole-transaction rollback.
+- Closed By: backlog close
+- Reference: docs/tasks/000247-statement-public-transaction-cancellation-ownership.md; GitHub issue #917; docs/rfcs/0025-session-coordinated-cancellation-cleanup-ownership.md Phase 2
+- Closed At: 2026-07-31

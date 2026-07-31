@@ -1,7 +1,7 @@
 ---
 id: 000247
 title: Statement and Public Transaction Cancellation Ownership
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-07-30
 github_issue: 917
 ---
@@ -40,10 +40,12 @@ existing checkout/check-in. Use the existing `stmt-noop`, `trx-noop`, and
 bounded `index-stream` workloads for paired optimized measurements.
 
 Retain one eagerly allocated, ready-to-initialize `Box<TrxInner>` in each
-session lifecycle. Transaction begin takes that exact box and initializes its
-zero-valued status and identity fields; successful terminal processing resets
-the core, installs a fresh zero-valued `SharedTrxStatus`, and returns it to the
-session. Status identity is never reused, and fatal terminal paths do not
+session lifecycle for public transactions. Public transaction begin takes that
+exact box and initializes its zero-valued status and identity fields; successful
+terminal processing resets the core, installs a fresh zero-valued
+`SharedTrxStatus`, and returns it to the session. Private transactions allocate
+fresh boxed cores and drop them at terminal completion without touching the
+public cache. Status identity is never reused, and fatal terminal paths do not
 recycle their failed core.
 
 ## Context
@@ -58,7 +60,7 @@ RFC Relationship:
 
 Source Backlogs:
 
-- `docs/backlogs/000124-statement-execution-cancellation-safety.md`
+- `docs/backlogs/closed/000124-statement-execution-cancellation-safety.md`
 
 Prerequisites:
 
@@ -660,6 +662,120 @@ the race.
 
 ## Implementation Notes
 
+### Cancellation ownership
+
+- Added the lifetime-free `StmtState` carrier. It owns the concrete boxed
+  `SessionOperationCheckout`, `StmtEffects`, and statement
+  `OwnerLockState`, while the public `Statement<'_>` remains a direct borrowed
+  facade over disjoint carrier fields.
+- Dropping an unpolled `Transaction::exec` future remains a no-op. Once checkout
+  succeeds, callback/acquisition state is destroyed before `StmtState::Drop`;
+  public cancellation then discards statement redo, appends residual row and
+  index undo after transaction undo, releases statement locks, and returns the
+  complete core directly as `CleanupReady`.
+- Cancellation queues only the existing identity cleanup hint. The worker
+  claims the complete transaction core and performs ordinary whole-transaction
+  rollback; it receives no statement payload or statement rollback phase.
+  Later calls through the public facade return `TransactionDiscarded`.
+- Successful statements and ordinary callback errors retain their prior
+  semantics. Errors finish index-then-row statement rollback and return the
+  core to `ForegroundAvailable`; private catalog statements retain their
+  must-complete carrier policy until RFC-0025 Phase 3.
+- Audited first-touch mutation ordering and retained transaction-lifetime table
+  bindings/locks before row, index, or redo effects become reachable. Added
+  deterministic tests for no-effect and effectful cancellation, residual undo
+  ownership, rollback cancellation, queued and promoted lock acquisition,
+  cleanup/session/shutdown races, stale facades/jobs, terminal commit/rollback
+  ownership, and fatal retention.
+
+### Boxed transaction cores and the public session cache
+
+- Moved `Box<TrxInner>` through session entries, checkouts, completion claims,
+  prepared/precommit ownership, and terminal processing so repeated ownership
+  transfers are pointer-sized. Entry installation takes the concrete box type;
+  production APIs do not use an implicit conversion parameter.
+- Added one eager `public_trx_cache` to `SessionLifecycle`. Public begin takes
+  and initializes that box. Successful public commit/rollback resets it,
+  installs a fresh uniquely owned zero-valued `SharedTrxStatus`, and returns it
+  before idle publication. Fatal paths do not recycle the core.
+- Private transactions allocate a fresh boxed core, leave
+  `public_trx_cache` parked, and drop the private core directly at terminal
+  completion. The core's creation policy makes this deterministic without
+  adding transaction-kind state to public/runtime handles.
+- Kept lifecycle-only admission and operation-id mutation on
+  `SessionLifecycle`. Test inspection is implemented by free helpers in test
+  modules rather than test-only methods on production `TrxInner` or
+  `SharedTrxStatus` types.
+
+### Performance evidence
+
+Measurements used optimized binaries built from `origin/main`
+`768842e8e8c1` and the candidate working tree at `410a086a61f9`, Rust
+1.97.1 (`8bab26f4f`) on `aarch64-unknown-linux-gnu`. Each pair used separate
+equivalent prepared roots, `--log-sync none`, one unreported warmup, and seven
+alternating samples. `index-stream` roots contained `[0, 100000)` and used
+`--num 100 --range 1000 --seed 1`; no-op counts were 1,000,000 statements or
+100,000 transactions. Latency is average nanoseconds per operation for each
+sample. IQR uses the sixth minus the second sorted sample for seven values.
+
+| Workload | Threads/sessions | Index | Origin median ns (IQR) | Origin median ops/s | Candidate median ns (IQR) | Candidate median ops/s | Latency delta |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| `stmt-noop` | 1/1 | unique prepared root | 84.354 (0.980) | 11,854,802 | 71.944 (0.742) | 13,899,700 | -14.71% |
+| `stmt-noop` | 4/16 | unique prepared root | 112.856 (6.234) | 8,860,849 | 118.719 (15.258) | 8,423,252 | +5.20% |
+| `trx-noop` | 1/1 | unique prepared root | 354.767 (33.240) | 2,818,751 | 307.630 (27.299) | 3,250,658 | -13.29% |
+| `trx-noop` | 4/16 | unique prepared root | 357.209 (21.820) | 2,799,482 | 350.853 (72.317) | 2,850,197 | -1.78% |
+| `index-stream` | 1/1 | unique | 236,943.710 (10,128.760) | 4,220.412 | 241,662.890 (13,455.850) | 4,137.996 | +1.99% |
+| `index-stream` | 4/16 | unique | 88,591.390 (19,591.270) | 11,287.779 | 91,197.640 (15,378.770) | 10,965.196 | +2.94% |
+| `index-stream` | 1/1 | non-unique | 237,594.970 (9,885.020) | 4,208.843 | 250,753.320 (5,541.680) | 3,987.983 | +5.54% |
+| `index-stream` | 4/16 | non-unique | 86,368.890 (15,535.860) | 11,578.243 | 88,182.640 (27,507.960) | 11,340.101 | +2.10% |
+
+Raw average-latency samples, in execution-order association within each
+revision, were:
+
+| Workload/configuration | Origin ns | Candidate ns |
+| --- | --- | --- |
+| `stmt-noop` 1/1 | 83.998, 84.578, 83.052, 85.537, 83.884, 84.354, 84.864 | 72.099, 71.942, 72.684, 71.943, 71.944, 71.738, 72.918 |
+| `stmt-noop` 4/16 | 111.189, 112.856, 110.624, 117.423, 118.701, 117.023, 111.807 | 110.853, 123.341, 113.076, 137.893, 128.334, 118.719, 113.135 |
+| `trx-noop` 1/1 | 338.844, 323.097, 356.337, 355.698, 284.750, 368.658, 354.767 | 275.423, 327.346, 292.665, 302.365, 319.964, 307.630, 313.542 |
+| `trx-noop` 4/16 | 357.209, 360.106, 378.105, 375.154, 352.194, 353.334, 356.303 | 352.272, 409.271, 350.853, 336.954, 420.474, 297.440, 340.638 |
+| unique `index-stream` 1/1 | 236943.710, 237898.300, 247749.560, 243344.560, 233215.800, 230526.200, 234152.040 | 269717.520, 241662.890, 245741.230, 238679.970, 238620.390, 252076.240, 234842.040 |
+| unique `index-stream` 4/16 | 80893.050, 100443.070, 80851.800, 128081.870, 94667.650, 79413.880, 88591.390 | 91197.640, 101496.830, 90622.230, 86118.060, 92634.320, 84801.380, 115724.770 |
+| non-unique `index-stream` 1/1 | 237594.970, 246262.480, 236377.460, 233618.300, 237420.380, 243113.730, 249453.320 | 250753.320, 249272.490, 245462.070, 248233.310, 264040.010, 253774.990, 253575.410 |
+| non-unique `index-stream` 4/16 | 81975.130, 97510.990, 106865.170, 81547.630, 93436.810, 86368.890, 82033.460 | 88801.390, 111997.260, 82580.130, 87266.810, 88182.640, 133298.970, 84489.300 |
+
+The non-unique 1/1 stream result was repeated because its first paired IQRs did
+not overlap. The repeat remained slower: origin median 241,601.210 ns
+(IQR 17,450.030) versus candidate 251,171.220 ns (IQR 41,894.650), a 3.96%
+latency increase.
+
+The boxed-core flamegraph comparison showed the intended local result:
+per-transaction `TrxInner` allocation/free stacks disappeared and inline-core
+`memcpy` fell from 23.06% to 0.67%; the one `SharedTrxStatus` reset allocation
+remains. It also exposed the dominant contended cost: aggregate
+`__aarch64_ldadd8_acq_rel` samples rose from 25.04% on `origin/main` to 49.86%
+on the candidate, attributed to weak-engine runtime retain (16.59%), admission
+release (13.74%), and attachment/runtime release (19.54%).
+
+RFC-0025 Phase 2 is explicitly amended at resolution to accept the
+cancellation-ownership implementation despite the repeatable contended
+statement-boundary and stream-operation regressions. The amendment does not
+claim that the original successful-path budget passed: it records the fixed
+boundary cost as performance debt and defers eliminating unnecessary hot-path
+lifetime traffic, plus the broader shared-resource lifetime design, to
+`docs/backlogs/000175-scalable-shared-resource-lifetime-management.md`.
+Phase 3's cancellation ownership prerequisite is unchanged.
+
+### Validation
+
+- `rtk cargo fmt --all -- --check`
+- `rtk cargo nextest run --workspace`: 1,606 tests passed.
+- `rtk cargo clippy --workspace --all-targets -- -D warnings`
+- `rtk cargo nextest run -p doradb-storage --no-default-features --features libaio`:
+  1,513 tests passed.
+- `rtk cargo clippy -p doradb-storage --no-default-features --features libaio --all-targets -- -D warnings`
+- `tools/style_audit.rs --diff-base origin/main`: passed for all 20
+  branch-diff Rust files.
+
 ## Impacts
 
 - `doradb-storage/src/trx/mod.rs`
@@ -705,7 +821,7 @@ the race.
   - statement/transaction lock release and proof order
 - `docs/rfcs/0025-session-coordinated-cancellation-cleanup-ownership.md`
   - resolve-time Phase 2 synchronization only
-- `docs/backlogs/000124-statement-execution-cancellation-safety.md`
+- `docs/backlogs/closed/000124-statement-execution-cancellation-safety.md`
   - resolve-time closure as implemented
 - `doradb-bench`
   - no benchmark implementation change expected; run the existing
@@ -845,17 +961,15 @@ There are no unresolved implementation choices for this task.
 
 The following are explicit follow-ups rather than Phase 2 decisions:
 
-1. If absolute `stmt-noop` results show that the existing Phase 1
-   per-operation resolution/check-in cost is too high despite a negligible
-   candidate delta, plan a separate optimization around cached weak exact-entry
-   capabilities. Do not move the transaction core into the public handle as an
-   incidental Phase 2 optimization.
+1. Resolution measurements show contended statement-boundary and stream
+   operation regressions after local boxed-core work removed allocation and
+   copy costs. `docs/backlogs/000175-scalable-shared-resource-lifetime-management.md`
+   owns both the narrow removal of unnecessary session-coordinated hot-path
+   lifetime-counter traffic and the broader engine/buffer-pool/transaction-
+   system lifetime design. Do not move the transaction core into the public
+   handle as an incidental Phase 2 optimization.
 2. Phase 3 replaces the private must-complete fallback with reliable
    whole-DDL/maintenance future ownership and background continuation.
 3. A later task may add `DiscardOnly` cleanup only after proving absence of
    undo, redo, bindings, logical locks, and external publication. Phase 2 uses
    the existing rollback claim uniformly.
-4. During `$task-resolve`, close source backlog 000124 as implemented and sync
-   RFC-0025 Phase 2's task path, issue, status, implementation summary, and
-   measurement evidence. Do not change Phase 3 prerequisites unless
-   implementation findings invalidate an accepted assumption.
