@@ -310,7 +310,8 @@ This cache is already useful:
 - repeated covered requests are local;
 - release iterates resources known to that owner;
 - transaction locks can move through prepare/precommit ownership; and
-- statement drop releases statement-owned resources deterministically.
+- statement-state completion or cancellation releases statement-owned
+  resources deterministically.
 
 Session explicit locks do not yet have the equivalent cache and still use a
 global `release_owner()` scan during session cleanup.
@@ -479,6 +480,26 @@ abandoned session:
     -> close the session
     -> release explicit session-owned logical locks
 ```
+
+Public statement-future cancellation composes with the same terminal proof
+boundary:
+
+```text
+drop callback and pending acquisition
+    -> fold residual statement undo into transaction undo and discard statement redo
+    -> release statement-owned logical locks
+    -> check the complete transaction core in as CleanupReady
+    -> worker rolls back transaction effects
+    -> release transaction table bindings
+    -> release transaction-owned logical locks
+    -> consume ReleasedTransactionLocks at session rollback completion
+```
+
+The callback future is destroyed before its `StmtState`, so a queued waiter is
+removed, or a promoted-but-unobserved grant is released, before the core becomes
+cleanup-claimable. Statement cancellation does not release transaction-owned
+metadata/data locks or table bindings inline; those remain attached to
+`TrxInner` until whole-transaction rollback reaches the ordering above.
 
 The proof covers the current owner-local cache contract, not the future scope
 representation. A redesign may evolve it into a closed-scope proof, but must

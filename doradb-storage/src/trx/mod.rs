@@ -64,6 +64,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub(crate) use admission::TableAdmissionRequest;
 pub use stmt::Statement;
+use stmt::StmtState;
 pub use stream_stmt::{IndexScanMvccStream, StreamStmt};
 /// Minimum snapshot timestamp assigned by the transaction system.
 pub(crate) const MIN_SNAPSHOT_TS: TrxID = TrxID::new(1);
@@ -230,28 +231,28 @@ impl Transaction {
     /// Successful callbacks merge statement-local row undo, index undo, and
     /// redo effects into the transaction. Ordinary callback errors roll back
     /// only the current statement and leave previous successful statements
-    /// transaction-owned. Once the returned future has been polled, callers
-    /// must drive it to completion; dropping a non-empty statement future is
-    /// detected by the `StmtEffects` leak guard rather than repaired by async
-    /// rollback from `Drop`.
+    /// transaction-owned. Dropping the future before its first poll performs no
+    /// checkout. Dropping it after checkout synchronously settles
+    /// statement-local ownership, terminally cancels the transaction, and
+    /// queues whole-transaction rollback. The public transaction facade is
+    /// discarded after that cancellation.
     #[inline]
     pub async fn exec<T, F>(&mut self, f: F) -> Result<T>
     where
         F: for<'borrow> AsyncFnOnce(&'borrow mut Statement<'_>) -> Result<T>,
     {
-        let mut checkout = self
+        let checkout = self
             .checkout()
             .attach("operation=execute_statement")
             .disclose()?;
-        let stmt_owner = checkout.inner_mut().next_statement_owner();
+        let mut stmt_state = StmtState::public(checkout);
         enum ExecOutcome<T> {
             Success(T),
             StatementError(Error),
             FatalRollback(Report<FatalError>),
         }
         let outcome = {
-            let (inner, attachment) = checkout.inner_and_attachment_mut();
-            let mut stmt = Statement::new(inner, attachment, stmt_owner);
+            let mut stmt = stmt_state.statement();
             match f(&mut stmt).await {
                 Ok(value) => {
                     stmt.merge_effects();
@@ -264,10 +265,16 @@ impl Transaction {
             }
         };
         match outcome {
-            ExecOutcome::Success(value) => Ok(value),
-            ExecOutcome::StatementError(err) => Err(err),
+            ExecOutcome::Success(value) => {
+                stmt_state.return_ordinary();
+                Ok(value)
+            }
+            ExecOutcome::StatementError(err) => {
+                stmt_state.return_ordinary();
+                Err(err)
+            }
             ExecOutcome::FatalRollback(err) => {
-                checkout.discard_after_fatal_rollback();
+                stmt_state.discard_after_fatal_rollback();
                 Err(err.disclose())
             }
         }
@@ -285,18 +292,19 @@ impl Transaction {
     where
         F: for<'borrow> AsyncFnOnce(&'borrow mut Statement<'_>) -> RuntimeResult<T>,
     {
-        let mut checkout = self
+        let checkout = self
             .checkout()
             .change_context(RuntimeError::CatalogAccess)
             .attach("operation=stage_catalog_statement")?;
-        let stmt_owner = checkout.inner_mut().next_statement_owner();
-        {
-            let (inner, attachment) = checkout.inner_and_attachment_mut();
-            let mut stmt = Statement::new(inner, attachment, stmt_owner);
+        let mut stmt_state = StmtState::private(checkout);
+        let result = {
+            let mut stmt = stmt_state.statement();
             let result = f(&mut stmt).await;
             stmt.merge_effects();
             result
-        }
+        };
+        stmt_state.return_ordinary();
+        result
     }
 
     /// Commit the transaction.
@@ -477,39 +485,51 @@ pub(crate) struct SharedTrxStatus {
 }
 
 impl SharedTrxStatus {
-    /// Create a new shared transaction status for given transaction id.
+    /// Create a uniquely owned zero-valued status for a ready transaction core.
+    ///
+    /// It is initialized with an active transaction id before the core is
+    /// installed into a session-operation entry and becomes shareable.
     #[inline]
-    pub(crate) fn new(trx_id: TrxID) -> Self {
-        let terminal = trx_is_committed(trx_id);
+    fn ready() -> Self {
         SharedTrxStatus {
-            ts: AtomicU64::new(trx_id.as_u64()),
+            ts: AtomicU64::new(0),
             preparing: AtomicBool::new(false),
             prepare_ev: Mutex::new(None),
-            terminal: AtomicBool::new(terminal),
+            terminal: AtomicBool::new(false),
             terminal_ev: Event::new(),
         }
+    }
+
+    /// Initialize a uniquely owned ready status with an active transaction id.
+    #[inline]
+    fn init(&mut self, trx_id: TrxID) {
+        assert!(
+            trx_id >= MIN_ACTIVE_TRX_ID,
+            "ready transaction status requires an active transaction id: trx_id={trx_id}"
+        );
+        assert!(
+            *self.ts.get_mut() == 0,
+            "ready transaction status timestamp must be zero before initialization"
+        );
+        assert!(
+            !*self.preparing.get_mut(),
+            "ready transaction status cannot be preparing"
+        );
+        assert!(
+            self.prepare_ev.get_mut().is_none(),
+            "ready transaction status cannot retain a prepare notifier"
+        );
+        assert!(
+            !*self.terminal.get_mut(),
+            "ready transaction status cannot be terminal"
+        );
+        *self.ts.get_mut() = trx_id.as_u64();
     }
 
     /// Returns the timestamp of current transaction.
     #[inline]
     pub(crate) fn ts(&self) -> TrxID {
         TrxID::new(self.ts.load(Ordering::Acquire))
-    }
-
-    /// Publishes a committed status for deterministic undo-marker tests.
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn commit_for_test(&self, cts: TrxID) {
-        debug_assert!(trx_is_committed(cts));
-        self.ts.store(cts.as_u64(), Ordering::SeqCst);
-        self.finish_terminal();
-    }
-
-    /// Publishes successful rollback resolution for deterministic status tests.
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn rollback_for_test(&self) {
-        self.finish_terminal();
     }
 
     /// Returns whether commit or successful rollback reached its terminal boundary.
@@ -608,14 +628,28 @@ pub(crate) struct TrxContext {
 }
 
 impl TrxContext {
-    /// Create a transaction context from session, status, and GC bucket identity.
+    /// Create a uniquely owned zero-valued context for an inactive core.
     #[inline]
-    pub(crate) fn new(trx_id: TrxID, sts: TrxID, gc_no: usize) -> Self {
+    fn ready() -> Self {
         TrxContext {
-            status: Arc::new(SharedTrxStatus::new(trx_id)),
-            sts,
-            gc_no,
+            status: Arc::new(SharedTrxStatus::ready()),
+            sts: TrxID::new(0),
+            gc_no: 0,
         }
+    }
+
+    /// Initialize a ready context before it becomes visible to transaction work.
+    #[inline]
+    fn init(&mut self, trx_id: TrxID, sts: TrxID, gc_no: usize) {
+        let status = Arc::get_mut(&mut self.status).unwrap_or_else(|| {
+            panic!(
+                "ready transaction status must be uniquely owned before initialization: \
+                 trx_id={trx_id}"
+            )
+        });
+        status.init(trx_id);
+        self.sts = sts;
+        self.gc_no = gc_no;
     }
 
     /// Returns a clone of the shared transaction status handle.
@@ -943,6 +977,7 @@ pub(crate) enum InternalTrxState {
 /// | `ForegroundAvailable` | abandonment | `CleanupReady` |
 /// | `ForegroundRunning(None)` | abandonment | unchanged, with cleanup intent |
 /// | `ForegroundRunning(None)` | return with cleanup intent | `CleanupReady` |
+/// | `ForegroundRunning(None)` | statement cancellation return | `CleanupReady` |
 /// | `CleanupReady` | cleanup claim | `CleanupRunning` |
 /// | `CompletionOwned` or `CleanupRunning` | transaction finish | `Terminal` |
 ///
@@ -1050,7 +1085,11 @@ struct SessionOperationEntryInner {
     /// transactions, so this changes with payload installation and completion
     /// under the same mutex rather than being immutable entry identity.
     trx_id: Option<TrxID>,
-    trx_inner: Option<TrxInner>,
+    /// Heap-stable transaction core allocated once at installation.
+    ///
+    /// Checkout and terminal ownership transfer this box rather than copying
+    /// the substantially larger core between entry and async-future storage.
+    trx_inner: Option<Box<TrxInner>>,
     /// Deferred cleanup intent for the attached transaction.
     ///
     /// This may be true in a running state while `trx_inner` is checked
@@ -1113,7 +1152,10 @@ impl SessionOperationEntry {
 
     /// Creates the single stable entry for one public transaction.
     #[inline]
-    pub(crate) fn new_public_transaction(key: SessionOperationKey, inner: TrxInner) -> Arc<Self> {
+    pub(crate) fn new_public_transaction(
+        key: SessionOperationKey,
+        inner: Box<TrxInner>,
+    ) -> Arc<Self> {
         let trx_id = inner.trx_id();
         Arc::new(Self {
             key,
@@ -1153,9 +1195,20 @@ impl SessionOperationEntry {
         }
     }
 
+    /// Returns the checked-in core allocation address for lifecycle tests.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn inner_ptr_for_test(&self) -> Option<usize> {
+        self.inner
+            .lock()
+            .trx_inner
+            .as_deref()
+            .map(|inner| inner as *const TrxInner as usize)
+    }
+
     /// Installs one private transaction inside a DDL or maintenance entry.
     #[inline]
-    pub(crate) fn install_private_transaction(&self, trx_inner: TrxInner) {
+    pub(crate) fn install_private_transaction(&self, trx_inner: Box<TrxInner>) {
         assert!(
             matches!(
                 self.kind,
@@ -1183,7 +1236,7 @@ impl SessionOperationEntry {
     }
 
     #[inline]
-    fn take_for_checkout(&self, trx_id: TrxID) -> LifecycleResult<TrxInner> {
+    fn take_for_checkout(&self, trx_id: TrxID) -> LifecycleResult<Box<TrxInner>> {
         let mut inner = self.inner.lock();
         if inner.trx_id != Some(trx_id) {
             return Err(
@@ -1230,7 +1283,7 @@ impl SessionOperationEntry {
     }
 
     #[inline]
-    fn take_for_terminal(&self, trx_id: TrxID) -> LifecycleResult<TrxInner> {
+    fn take_for_terminal(&self, trx_id: TrxID) -> LifecycleResult<Box<TrxInner>> {
         let mut inner = self.inner.lock();
         if inner.trx_id != Some(trx_id) {
             return Err(
@@ -1277,7 +1330,7 @@ impl SessionOperationEntry {
     }
 
     #[inline]
-    fn take_for_cleanup(&self, trx_id: TrxID) -> LifecycleResult<TrxInner> {
+    fn take_for_cleanup(&self, trx_id: TrxID) -> LifecycleResult<Box<TrxInner>> {
         let mut inner = self.inner.lock();
         if inner.trx_id != Some(trx_id) {
             return Err(
@@ -1337,7 +1390,7 @@ impl SessionOperationEntry {
     /// the transition and queues cleanup using its authoritative
     /// [`TrxAttachment`] identity.
     #[inline]
-    fn return_inner(&self, trx_inner: TrxInner) -> bool {
+    fn return_inner(&self, trx_inner: Box<TrxInner>) -> bool {
         let mut inner = self.inner.lock();
         let running = match self.kind {
             SessionOperationKind::PublicTransaction => {
@@ -1404,6 +1457,31 @@ impl SessionOperationEntry {
             };
             false
         }
+    }
+
+    /// Returns a cancelled public statement directly to terminal cleanup.
+    #[inline]
+    fn return_cancelled(&self, trx_inner: Box<TrxInner>) {
+        let mut inner = self.inner.lock();
+        assert!(
+            self.kind == SessionOperationKind::PublicTransaction
+                && inner.state == SessionOperationState::ForegroundRunning(None)
+                && inner.trx_inner.is_none(),
+            "cancelled statement return requires one checked-out public transaction core: key={}, kind={}, state={}",
+            self.key,
+            self.kind.label(),
+            inner.state.label()
+        );
+        let trx_id = trx_inner.trx_id();
+        assert!(
+            inner.trx_id == Some(trx_id),
+            "cancelled statement identity mismatch: key={}, expected_trx_id={:?}, returned_trx_id={trx_id}",
+            self.key,
+            inner.trx_id
+        );
+        inner.trx_inner = Some(trx_inner);
+        inner.cleanup_requested = true;
+        inner.state = SessionOperationState::CleanupReady;
     }
 
     /// Marks the exact attached transaction abandoned after its owning handle
@@ -1637,13 +1715,15 @@ impl SessionOperationEntry {
 
 /// Private RAII checkout for one non-terminal transaction operation.
 ///
-/// `SessionOperationCheckout` is mechanical ownership plumbing: it moves [`TrxInner`] out of
-/// the stable entry, owns the operation-local runtime attachment, and restores
-/// the core on ordinary drop. Statement semantics live in [`Statement`];
-/// terminal commit and rollback use private completion claims.
+/// `SessionOperationCheckout` is mechanical ownership plumbing: it moves the
+/// heap-stable [`TrxInner`] box out of the stable entry, owns the operation-local
+/// runtime attachment, and restores the same box on ordinary drop. Statement
+/// ownership policy lives in
+/// [`StmtState`], its callback facade is [`Statement`], and terminal commit and
+/// rollback use private completion claims.
 pub(crate) struct SessionOperationCheckout {
     entry: Arc<SessionOperationEntry>,
-    inner: Option<TrxInner>,
+    inner: Option<Box<TrxInner>>,
     attachment: TrxAttachment,
 }
 
@@ -1719,6 +1799,18 @@ impl SessionOperationCheckout {
         self.entry.fail_retained();
         self.attachment.notify_operation_transition();
     }
+
+    /// Returns a cancelled public statement directly to cleanup ownership.
+    #[inline]
+    pub(crate) fn return_cancelled(mut self) {
+        let inner = self
+            .inner
+            .take()
+            .expect("cancelled statement checkout must retain its transaction core");
+        self.entry.return_cancelled(inner);
+        self.attachment.notify_operation_transition();
+        self.attachment.request_abandoned_cleanup();
+    }
 }
 
 impl Drop for SessionOperationCheckout {
@@ -1737,7 +1829,7 @@ impl Drop for SessionOperationCheckout {
 /// Private ownership claim for explicit terminal and cleanup paths.
 pub(crate) struct SessionOperationCompletionClaim {
     entry: Arc<SessionOperationEntry>,
-    inner: TrxInner,
+    inner: Box<TrxInner>,
     attachment: TrxAttachment,
 }
 
@@ -1771,7 +1863,7 @@ impl SessionOperationCompletionClaim {
 
     /// Consume and return the claimed stable entry, mutable core, and attachment.
     #[inline]
-    pub(crate) fn into_parts(self) -> (Arc<SessionOperationEntry>, TrxInner, TrxAttachment) {
+    pub(crate) fn into_parts(self) -> (Arc<SessionOperationEntry>, Box<TrxInner>, TrxAttachment) {
         (self.entry, self.inner, self.attachment)
     }
 
@@ -1985,7 +2077,10 @@ impl TrxTableLockGuards<'_> {
     }
 }
 
-/// Checked-out mutable transaction core.
+/// Mutable transaction core allocated once per installed transaction.
+///
+/// Stable entries, foreground checkouts, and terminal claims move its owning
+/// box so repeated operations do not copy this payload.
 pub(crate) struct TrxInner {
     ctx: TrxContext,
     effects: TrxEffects,
@@ -1993,22 +2088,129 @@ pub(crate) struct TrxInner {
     lock_state: Option<OwnerLockState>,
     next_stmt_no: StmtNo,
     active: bool,
+    /// Whether successful terminal processing returns this core to the session.
+    cache_on_terminal: bool,
 }
 
 impl TrxInner {
-    /// Create a checked-in mutable transaction core.
+    /// Create one reusable zero-valued core for a session's public cache.
     #[inline]
-    pub(crate) fn new(trx_id: TrxID, sts: TrxID, gc_no: usize, session_id: SessionID) -> Self {
+    pub(crate) fn public_cached() -> Self {
+        Self::ready(true)
+    }
+
+    /// Create one ephemeral zero-valued core for a private transaction.
+    #[inline]
+    pub(crate) fn private() -> Self {
+        Self::ready(false)
+    }
+
+    #[inline]
+    fn ready(cache_on_terminal: bool) -> Self {
         TrxInner {
-            ctx: TrxContext::new(trx_id, sts, gc_no),
+            ctx: TrxContext::ready(),
             effects: TrxEffects::empty(),
             table_bindings: FastHashMap::default(),
-            lock_state: Some(OwnerLockState::new(LockOwner::transaction(
-                session_id, trx_id,
-            ))),
-            next_stmt_no: 1,
-            active: true,
+            lock_state: None,
+            next_stmt_no: 0,
+            active: false,
+            cache_on_terminal,
         }
+    }
+
+    /// Returns whether successful terminal processing returns this core to the session.
+    #[inline]
+    pub(crate) const fn cache_on_terminal(&self) -> bool {
+        self.cache_on_terminal
+    }
+
+    /// Initialize a ready core for one new transaction.
+    #[inline]
+    pub(crate) fn init(&mut self, trx_id: TrxID, sts: TrxID, gc_no: usize, session_id: SessionID) {
+        assert!(
+            !self.active,
+            "transaction initialization requires an inactive ready core"
+        );
+        self.effects.assert_cleared();
+        assert!(
+            self.table_bindings.is_empty(),
+            "ready transaction core cannot retain table bindings"
+        );
+        assert!(
+            self.lock_state.is_none(),
+            "ready transaction core cannot retain transaction lock state"
+        );
+        assert!(
+            self.next_stmt_no == 0,
+            "ready transaction statement number must be zero"
+        );
+        self.ctx.init(trx_id, sts, gc_no);
+        self.lock_state = Some(OwnerLockState::new(LockOwner::transaction(
+            session_id, trx_id,
+        )));
+        self.next_stmt_no = 1;
+        self.active = true;
+    }
+
+    /// Reset one successfully terminal public transaction into a reusable core.
+    #[inline]
+    pub(crate) fn reset(&mut self) {
+        assert!(
+            self.cache_on_terminal,
+            "ephemeral private transaction core cannot enter the public cache"
+        );
+        assert!(
+            !self.active,
+            "transaction reset requires an inactive terminal core: trx_id={}",
+            self.trx_id()
+        );
+        assert!(
+            self.ctx.status.terminal(),
+            "transaction reset requires terminal shared status: trx_id={}",
+            self.trx_id()
+        );
+        assert!(
+            !self.ctx.status.preparing(),
+            "transaction reset cannot retain prepare state: trx_id={}",
+            self.trx_id()
+        );
+        self.effects.assert_cleared();
+        assert!(
+            self.table_bindings.is_empty(),
+            "transaction reset cannot retain table bindings: trx_id={}",
+            self.trx_id()
+        );
+        if let Some(lock_state) = self.lock_state.take() {
+            lock_state.assert_cleared();
+        }
+        // Replace containers rather than clearing them so an idle session does
+        // not pin capacity accumulated by its previous transaction.
+        self.effects = TrxEffects::empty();
+        self.table_bindings = FastHashMap::default();
+        self.ctx = TrxContext::ready();
+        self.next_stmt_no = 0;
+    }
+
+    /// Mark a prepared transaction's emptied core as inactive.
+    #[inline]
+    fn finish_prepare(&mut self) {
+        assert!(
+            self.active,
+            "transaction prepare completion requires an active core: trx_id={}",
+            self.trx_id()
+        );
+        self.effects.assert_cleared();
+        assert!(
+            self.table_bindings.is_empty(),
+            "prepared transaction cannot retain table bindings: trx_id={}",
+            self.trx_id()
+        );
+        assert!(
+            self.lock_state.is_none(),
+            "prepared transaction cannot retain transaction lock state: trx_id={}",
+            self.trx_id()
+        );
+        self.active = false;
     }
 
     /// Returns this transaction's immutable context.
@@ -2226,17 +2428,6 @@ impl TrxInner {
         self.effects.require_ordered_commit()
     }
 
-    /// Rolls back the attached session without taking the attachment.
-    #[inline]
-    pub(crate) fn finish_session_rollback(
-        &mut self,
-        attachment: &TrxAttachment,
-        released: ReleasedTransactionLocks,
-    ) {
-        attachment.rollback(released);
-        self.active = false;
-    }
-
     /// Retain remaining effects and roll back the attached session after rollback failure.
     #[inline]
     pub(in crate::trx) fn retain_and_discard_after_fatal_rollback(
@@ -2245,13 +2436,14 @@ impl TrxInner {
     ) -> FatalRollbackRetention {
         let retention = self.effects.take_for_fatal_retention();
         let released = self.release_transaction_locks(attachment);
-        self.finish_session_rollback(attachment, released);
+        self.active = false;
+        attachment.rollback_without_reuse(released);
         retention
     }
 
     /// Prepare current transaction for committing.
     #[inline]
-    fn prepare(mut self, attachment: TrxAttachment) -> PreparedTrx {
+    fn prepare(mut self: Box<Self>, attachment: TrxAttachment) -> PreparedTrx {
         assert!(
             self.active,
             "terminal transaction claim must retain its active core through prepare: trx_id={}",
@@ -2264,18 +2456,22 @@ impl TrxInner {
             // there should be no ref count of transaction status.
             debug_assert!(Arc::strong_count(&self.ctx.status) == 1);
             debug_assert!(self.effects.index_undo.is_empty());
+            let payload = PreparedTrxPayload::User {
+                status: self.ctx.status(),
+                sts: self.ctx.sts(),
+                gc_no: self.ctx.gc_no(),
+                row_undo: RowUndoLogs::empty(),
+                index_undo: IndexUndoLogs::empty(),
+            };
+            let lock_state = self.lock_state.take();
+            self.finish_prepare();
             return PreparedTrx {
                 redo_bin: None,
-                payload: Some(PreparedTrxPayload::User {
-                    status: self.ctx.status(),
-                    sts: self.ctx.sts(),
-                    gc_no: self.ctx.gc_no(),
-                    row_undo: RowUndoLogs::empty(),
-                    index_undo: IndexUndoLogs::empty(),
-                }),
+                payload: Some(payload),
                 attachment: Some(attachment),
                 lock_manager,
-                lock_state: self.lock_state.take(),
+                lock_state,
+                trx_inner: Some(self),
             };
         }
 
@@ -2289,18 +2485,22 @@ impl TrxInner {
         };
         let (row_undo, index_undo) = self.effects.take_payload_parts();
         let lock_manager = self.clone_lock_manager_guard(&attachment);
+        let payload = PreparedTrxPayload::User {
+            status: self.ctx.status(),
+            sts: self.ctx.sts(),
+            gc_no: self.ctx.gc_no(),
+            row_undo,
+            index_undo,
+        };
+        let lock_state = self.lock_state.take();
+        self.finish_prepare();
         PreparedTrx {
             redo_bin,
-            payload: Some(PreparedTrxPayload::User {
-                status: self.ctx.status(),
-                sts: self.ctx.sts(),
-                gc_no: self.ctx.gc_no(),
-                row_undo,
-                index_undo,
-            }),
+            payload: Some(payload),
             attachment: Some(attachment),
             lock_manager,
-            lock_state: self.lock_state.take(),
+            lock_state,
+            trx_inner: Some(self),
         }
     }
 }
@@ -2358,6 +2558,8 @@ pub(crate) struct PreparedTrx {
     pub(crate) attachment: Option<TrxAttachment>,
     lock_manager: Option<QuiescentGuard<LockManager>>,
     lock_state: Option<OwnerLockState>,
+    /// Emptied session transaction core retained until the terminal outcome.
+    trx_inner: Option<Box<TrxInner>>,
 }
 
 impl PreparedTrx {
@@ -2424,6 +2626,7 @@ impl PreparedTrx {
             attachment: self.attachment.take(),
             lock_manager: self.lock_manager.take(),
             lock_state: self.lock_state.take(),
+            trx_inner: self.trx_inner.take(),
         }
     }
 
@@ -2445,6 +2648,10 @@ impl Drop for PreparedTrx {
             "lock manager should be cleared"
         );
         assert!(self.lock_state.is_none(), "lock state should be cleared");
+        assert!(
+            self.trx_inner.is_none(),
+            "prepared transaction core should be cleared"
+        );
     }
 }
 
@@ -2547,6 +2754,8 @@ pub(crate) struct PrecommitTrx {
     pub(crate) lock_manager: Option<QuiescentGuard<LockManager>>,
     /// Transaction-owned lock state retained until terminal cleanup.
     pub(crate) lock_state: Option<OwnerLockState>,
+    /// Emptied session transaction core retained until the terminal outcome.
+    pub(crate) trx_inner: Option<Box<TrxInner>>,
 }
 
 impl PrecommitTrx {
@@ -2582,32 +2791,25 @@ impl PrecommitTrx {
                         index_gc,
                     }),
                 };
-                let released = self.release_transaction_locks();
-                match (self.attachment.take(), released) {
-                    (Some(attachment), Some(released)) => {
-                        attachment.commit(released, self.cts);
-                    }
-                    (Some(_), None) => {
-                        panic!(
-                            "user precommit attachment requires released transaction-lock proof: \
-                             cts={}",
-                            self.cts
-                        );
-                    }
-                    (None, Some(_)) => {
-                        panic!(
-                            "released transaction-lock proof requires user precommit attachment: \
-                             cts={}",
-                            self.cts
-                        );
-                    }
-                    (None, None) => {
-                        panic!(
-                            "user precommit requires attachment and transaction-lock state: cts={}",
-                            self.cts
-                        );
-                    }
-                }
+                let released = self.release_transaction_locks().unwrap_or_else(|| {
+                    panic!(
+                        "user precommit requires released transaction-lock proof: cts={}",
+                        self.cts
+                    )
+                });
+                let attachment = self.attachment.take().unwrap_or_else(|| {
+                    panic!(
+                        "user precommit requires terminal attachment: cts={}",
+                        self.cts
+                    )
+                });
+                let inner = self.trx_inner.take().unwrap_or_else(|| {
+                    panic!(
+                        "user precommit requires reusable transaction core: cts={}",
+                        self.cts
+                    )
+                });
+                attachment.commit(released, self.cts, inner);
                 committed
             }
             Some(PrecommitTrxPayload::System(payload)) => {
@@ -2619,6 +2821,11 @@ impl PrecommitTrx {
                 assert!(
                     self.release_transaction_locks().is_none(),
                     "system precommit must not produce a transaction-lock proof: cts={}",
+                    self.cts
+                );
+                assert!(
+                    self.trx_inner.is_none(),
+                    "system precommit must not carry a session transaction core: cts={}",
                     self.cts
                 );
                 CommittedTrx {
@@ -2635,6 +2842,11 @@ impl PrecommitTrx {
                 assert!(
                     self.release_transaction_locks().is_none(),
                     "empty system precommit must not produce a transaction-lock proof: cts={}",
+                    self.cts
+                );
+                assert!(
+                    self.trx_inner.is_none(),
+                    "empty system precommit must not carry a session transaction core: cts={}",
                     self.cts
                 );
                 // A system transaction without GC pages has no purge payload.
@@ -2675,11 +2887,11 @@ impl PrecommitTrx {
             }
             payload.record_rollback_for_purge(attachment);
         }
-        let released = self.release_transaction_locks();
-        self.finish_carried_session_rollback(released);
         if let Some(payload) = self.payload.take() {
             payload.finish_successful_rollback();
         }
+        let released = self.release_transaction_locks();
+        self.finish_carried_session_rollback(released);
         FailedPrecommitRollbackOutcome::RolledBack
     }
 
@@ -2697,7 +2909,7 @@ impl PrecommitTrx {
     #[inline]
     fn finish_failed_precommit_with_retention(&mut self, engine: Option<EngineRef>) {
         let released = self.release_transaction_locks();
-        self.finish_carried_session_rollback(released);
+        self.finish_carried_session_rollback_without_reuse(released);
         if let Some(payload) = self.payload.take() {
             payload.release_prepare_waiters();
             if let Some(engine) = engine {
@@ -2735,6 +2947,11 @@ impl PrecommitTrx {
             "rejected system precommit must not produce a transaction-lock proof: cts={}",
             self.cts
         );
+        assert!(
+            self.trx_inner.is_none(),
+            "rejected system precommit must not carry a session transaction core: cts={}",
+            self.cts
+        );
     }
 
     #[inline]
@@ -2744,25 +2961,54 @@ impl PrecommitTrx {
 
     #[inline]
     fn finish_carried_session_rollback(&mut self, released: Option<ReleasedTransactionLocks>) {
-        match (self.attachment.take(), released) {
-            (Some(attachment), Some(released)) => attachment.rollback(released),
-            (None, None) => {
+        match (self.attachment.take(), released, self.trx_inner.take()) {
+            (Some(attachment), Some(released), Some(inner)) => attachment.rollback(released, inner),
+            (None, None, None) => {
                 assert!(
                     !matches!(self.payload, Some(PrecommitTrxPayload::User { .. })),
-                    "user precommit requires attachment and transaction-lock state: cts={}",
+                    "user precommit requires attachment, transaction-lock state, and core: cts={}",
                     self.cts
                 );
             }
-            (Some(_), None) => {
+            (attachment, released, inner) => {
                 panic!(
-                    "precommit attachment requires released transaction-lock proof: cts={}",
+                    "precommit terminal ownership mismatch: cts={}, attachment={}, released={}, \
+                     trx_inner={}",
+                    self.cts,
+                    attachment.is_some(),
+                    released.is_some(),
+                    inner.is_some()
+                );
+            }
+        }
+    }
+
+    #[inline]
+    fn finish_carried_session_rollback_without_reuse(
+        &mut self,
+        released: Option<ReleasedTransactionLocks>,
+    ) {
+        let inner = self.trx_inner.take();
+        match (self.attachment.take(), released) {
+            (Some(attachment), Some(released)) => {
+                attachment.rollback_without_reuse(released);
+                drop(inner);
+            }
+            (None, None) => {
+                assert!(
+                    inner.is_none(),
+                    "system precommit cannot carry a session transaction core: cts={}",
                     self.cts
                 );
             }
-            (None, Some(_)) => {
+            (attachment, released) => {
                 panic!(
-                    "released transaction-lock proof requires precommit attachment: cts={}",
-                    self.cts
+                    "precommit fatal terminal ownership mismatch: cts={}, attachment={}, \
+                     released={}, trx_inner={}",
+                    self.cts,
+                    attachment.is_some(),
+                    released.is_some(),
+                    inner.is_some()
                 );
             }
         }
@@ -2780,6 +3026,10 @@ impl Drop for PrecommitTrx {
             "lock manager should be cleared"
         );
         assert!(self.lock_state.is_none(), "lock state should be cleared");
+        assert!(
+            self.trx_inner.is_none(),
+            "precommit transaction core should be cleared"
+        );
     }
 }
 
@@ -2875,10 +3125,10 @@ fn session_operation_entry_state_err(
     let error = match inner.state {
         SessionOperationState::ForegroundRunning(_)
         | SessionOperationState::CompletionOwned
-        | SessionOperationState::CleanupRunning
         | SessionOperationState::BackgroundQueued
         | SessionOperationState::BackgroundRunning => LifecycleError::ExistingTransaction,
         SessionOperationState::CleanupReady
+        | SessionOperationState::CleanupRunning
         | SessionOperationState::Terminal
         | SessionOperationState::FailedRetained => LifecycleError::TransactionDiscarded,
         SessionOperationState::ForegroundAvailable => {
@@ -2966,7 +3216,8 @@ pub(crate) mod tests {
         tests::{
             SessionTestExt, TerminalAttachmentOutcome, TerminalAttachmentTestHookGuard,
             active_operation_count, assert_existing_transaction_error,
-            install_terminal_attachment_test_hook, remove_session_for_test, session_registry_len,
+            install_terminal_attachment_test_hook, remove_session_for_test,
+            session_has_public_trx_cache, session_registry_len, wait_for_session_idle,
         },
     };
     use crate::table::test_user_table_id;
@@ -2975,18 +3226,65 @@ pub(crate) mod tests {
         TerminalRollbackTestHookGuard, fatal_rollback_retention_count,
         install_terminal_rollback_test_hook, retains_precommit_row_undo,
     };
+    use crate::trx::undo::tests::{
+        index_rollback_paused, pause_next_index_rollback, pause_next_row_rollback,
+        row_rollback_paused,
+    };
     use crate::trx::undo::{IndexUndo, IndexUndoKind, OwnedRowUndo, RowUndoKind};
     use crate::value::{Val, ValKind};
     use event_listener::Listener;
     use smol::Timer;
+    use smol::future::yield_now;
     use std::cell::Cell;
+    use std::future::{Future, pending};
     use std::io::Error as IoError;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::pin::Pin;
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
     use std::thread::{scope, sleep, spawn};
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
+
+    /// Create one test-controlled shared transaction status.
+    #[inline]
+    pub(crate) fn shared_trx_status(trx_id: TrxID) -> SharedTrxStatus {
+        let terminal = trx_is_committed(trx_id);
+        SharedTrxStatus {
+            ts: AtomicU64::new(trx_id.as_u64()),
+            preparing: AtomicBool::new(false),
+            prepare_ev: parking_lot::Mutex::new(None),
+            terminal: AtomicBool::new(terminal),
+            terminal_ev: Event::new(),
+        }
+    }
+
+    /// Publish one committed result on a test-controlled shared status.
+    #[inline]
+    pub(crate) fn commit_shared_trx_status(status: &SharedTrxStatus, cts: TrxID) {
+        debug_assert!(trx_is_committed(cts));
+        status.ts.store(cts.as_u64(), Ordering::SeqCst);
+        status.finish_terminal();
+    }
+
+    /// Publish one rolled-back result on a test-controlled shared status.
+    #[inline]
+    pub(crate) fn rollback_shared_trx_status(status: &SharedTrxStatus) {
+        status.finish_terminal();
+    }
+
+    /// Create one initialized, public-cacheable transaction core for tests.
+    #[inline]
+    pub(crate) fn trx_inner(
+        trx_id: TrxID,
+        sts: TrxID,
+        gc_no: usize,
+        session_id: SessionID,
+    ) -> TrxInner {
+        let mut inner = TrxInner::public_cached();
+        inner.init(trx_id, sts, gc_no, session_id);
+        inner
+    }
 
     async fn test_engine(log_file_stem: &str) -> (TempDir, Engine) {
         test_engine_with_mem_size(log_file_stem, 64usize * 1024 * 1024).await
@@ -2995,21 +3293,100 @@ pub(crate) mod tests {
     #[test]
     fn test_shared_status_terminal_resolution_is_sticky_and_wakeable() {
         smol::block_on(async {
-            let committed = SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 1);
+            let committed = shared_trx_status(MIN_ACTIVE_TRX_ID + 1);
             let mut commit_listener = Box::pin(committed.terminal_listener().unwrap());
             assert!(futures::poll!(commit_listener.as_mut()).is_pending());
-            committed.commit_for_test(TrxID::new(10));
+            commit_shared_trx_status(&committed, TrxID::new(10));
             commit_listener.await;
             assert!(committed.terminal());
             assert!(committed.terminal_listener().is_none());
 
-            let rolled_back = SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 2);
+            let rolled_back = shared_trx_status(MIN_ACTIVE_TRX_ID + 2);
             let mut rollback_listener = Box::pin(rolled_back.terminal_listener().unwrap());
             assert!(futures::poll!(rollback_listener.as_mut()).is_pending());
-            rolled_back.rollback_for_test();
+            rollback_shared_trx_status(&rolled_back);
             rollback_listener.await;
             assert!(rolled_back.terminal());
             assert!(rolled_back.terminal_listener().is_none());
+        });
+    }
+
+    #[test]
+    fn test_transaction_core_reset_installs_fresh_ready_status_before_init() {
+        let session_id = SessionID::new(71);
+        let first_trx_id = MIN_ACTIVE_TRX_ID + 71;
+        let mut inner = trx_inner(first_trx_id, TrxID::new(71), 3, session_id);
+        let old_status = inner.ctx().status();
+        inner.table_bindings.reserve(128);
+        assert!(inner.table_bindings.capacity() >= 128);
+
+        old_status.finish_terminal();
+        inner.active = false;
+        inner.reset();
+
+        assert!(old_status.terminal());
+        assert_eq!(old_status.ts(), first_trx_id);
+        assert_eq!(inner.ctx.status.ts(), TrxID::new(0));
+        assert!(!inner.ctx.status.terminal());
+        assert!(!inner.ctx.status.preparing());
+        assert_eq!(Arc::strong_count(&inner.ctx.status), 1);
+        assert_eq!(inner.table_bindings.capacity(), 0);
+        assert!(inner.lock_state.is_none());
+        assert_eq!(inner.next_stmt_no, 0);
+        assert!(!inner.active);
+        let ready_status_ptr = Arc::as_ptr(&inner.ctx.status);
+
+        let second_trx_id = MIN_ACTIVE_TRX_ID + 72;
+        inner.init(second_trx_id, TrxID::new(72), 4, session_id);
+        assert_eq!(Arc::as_ptr(&inner.ctx.status), ready_status_ptr);
+        assert!(!Arc::ptr_eq(&old_status, &inner.ctx.status));
+        assert_eq!(inner.trx_id(), second_trx_id);
+        assert_eq!(inner.sts(), TrxID::new(72));
+        assert_eq!(inner.gc_no(), 4);
+        assert_eq!(inner.next_stmt_no, 1);
+        assert!(inner.active);
+
+        let second_status = inner.ctx().status();
+        second_status.finish_terminal();
+        inner.active = false;
+        inner.reset();
+    }
+
+    #[test]
+    fn test_session_reuses_transaction_core_with_fresh_status_identity() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("trx_session_ready_core_reuse").await;
+            let mut session = engine.new_session().unwrap();
+
+            let first = session.begin_trx().unwrap();
+            let first_trx_id = first.trx_id();
+            let (first_inner, first_status) = with_transaction_inner(
+                &first,
+                "observe_first_reusable_transaction_core",
+                |inner| (inner as *const TrxInner as usize, inner.ctx().status()),
+            )
+            .unwrap();
+            first.rollback().await.unwrap();
+            assert!(first_status.terminal());
+            assert_eq!(first_status.ts(), first_trx_id);
+            assert!(session_has_public_trx_cache(
+                &engine.inner().session_registry,
+                session.id()
+            ));
+
+            let second = session.begin_trx().unwrap();
+            let second_trx_id = second.trx_id();
+            let (second_inner, second_status) = with_transaction_inner(
+                &second,
+                "observe_second_reusable_transaction_core",
+                |inner| (inner as *const TrxInner as usize, inner.ctx().status()),
+            )
+            .unwrap();
+            assert_eq!(second_inner, first_inner);
+            assert!(!Arc::ptr_eq(&first_status, &second_status));
+            assert_eq!(second_status.ts(), second_trx_id);
+            assert!(!second_status.terminal());
+            second.rollback().await.unwrap();
         });
     }
 
@@ -3119,7 +3496,7 @@ pub(crate) mod tests {
         let trx_id = MIN_ACTIVE_TRX_ID + 100;
         let entry = SessionOperationEntry::new_public_transaction(
             SessionOperationKey::new(session_id, OperationID::new(1)),
-            TrxInner::new(trx_id, TrxID::new(100), 0, session_id),
+            Box::new(trx_inner(trx_id, TrxID::new(100), 0, session_id)),
         );
         let inner = entry
             .take_for_checkout(trx_id)
@@ -3144,6 +3521,32 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_cancelled_statement_return_publishes_cleanup_ready_directly() {
+        for preexisting_cleanup in [false, true] {
+            let id = 105 + u64::from(preexisting_cleanup);
+            let session_id = SessionID::new(id);
+            let trx_id = MIN_ACTIVE_TRX_ID + id;
+            let entry = SessionOperationEntry::new_public_transaction(
+                SessionOperationKey::new(session_id, OperationID::new(1)),
+                Box::new(trx_inner(trx_id, TrxID::new(id), 0, session_id)),
+            );
+            let inner = entry
+                .take_for_checkout(trx_id)
+                .expect("active entry can be checked out");
+            if preexisting_cleanup {
+                assert!(entry.abandon_transaction(trx_id));
+            }
+
+            entry.return_cancelled(inner);
+
+            let snapshot = entry.inspect();
+            assert_eq!(snapshot.trx_id, Some(trx_id));
+            assert_eq!(snapshot.state, SessionOperationState::CleanupReady);
+            assert!(snapshot.cleanup_requested);
+        }
+    }
+
+    #[test]
     fn test_private_transaction_state_is_nested_under_foreground_operation() {
         let session_id = SessionID::new(101);
         let trx_id = MIN_ACTIVE_TRX_ID + 101;
@@ -3156,7 +3559,12 @@ pub(crate) mod tests {
             entry.inspect().state,
             SessionOperationState::ForegroundRunning(None)
         );
-        entry.install_private_transaction(TrxInner::new(trx_id, TrxID::new(101), 0, session_id));
+        entry.install_private_transaction(Box::new(trx_inner(
+            trx_id,
+            TrxID::new(101),
+            0,
+            session_id,
+        )));
         assert_eq!(
             entry.inspect().state,
             SessionOperationState::ForegroundRunning(Some(InternalTrxState::Available))
@@ -3208,24 +3616,24 @@ pub(crate) mod tests {
             SessionOperationKind::Maintenance,
         );
 
-        entry.install_private_transaction(TrxInner::new(
+        entry.install_private_transaction(Box::new(trx_inner(
             first_trx_id,
             TrxID::new(200),
             0,
             session_id,
-        ));
+        )));
         let first_inner = entry
             .take_for_terminal(first_trx_id)
             .expect("first private transaction can be completed");
         assert_eq!(entry.finish_transaction(first_trx_id), Some(false));
         drop(first_inner);
 
-        entry.install_private_transaction(TrxInner::new(
+        entry.install_private_transaction(Box::new(trx_inner(
             second_trx_id,
             TrxID::new(201),
             0,
             session_id,
-        ));
+        )));
         assert!(
             !entry.abandon_transaction(first_trx_id),
             "a stale handle must not abandon the replacement transaction"
@@ -3253,12 +3661,12 @@ pub(crate) mod tests {
             SessionOperationKey::new(session_id, OperationID::new(1)),
             SessionOperationKind::Maintenance,
         );
-        available_entry.install_private_transaction(TrxInner::new(
+        available_entry.install_private_transaction(Box::new(trx_inner(
             available_trx_id,
             TrxID::new(102),
             0,
             session_id,
-        ));
+        )));
         let release = available_entry.release_foreground();
         assert!(!release.terminal);
         assert_eq!(release.cleanup, Some(available_trx_id));
@@ -3273,12 +3681,12 @@ pub(crate) mod tests {
             SessionOperationKey::new(session_id, OperationID::new(2)),
             SessionOperationKind::Ddl,
         );
-        terminal_entry.install_private_transaction(TrxInner::new(
+        terminal_entry.install_private_transaction(Box::new(trx_inner(
             terminal_trx_id,
             TrxID::new(103),
             0,
             session_id,
-        ));
+        )));
         let _inner = terminal_entry
             .take_for_terminal(terminal_trx_id)
             .expect("private transaction terminal ownership can be claimed");
@@ -3307,12 +3715,12 @@ pub(crate) mod tests {
             SessionOperationKey::new(session_id, OperationID::new(3)),
             SessionOperationKind::Maintenance,
         );
-        running_entry.install_private_transaction(TrxInner::new(
+        running_entry.install_private_transaction(Box::new(trx_inner(
             running_trx_id,
             TrxID::new(104),
             0,
             session_id,
-        ));
+        )));
         let inner = running_entry
             .take_for_checkout(running_trx_id)
             .expect("private transaction can be checked out");
@@ -3555,26 +3963,37 @@ pub(crate) mod tests {
 
     #[inline]
     fn discard_production_prepared_for_test(mut prepared: PreparedTrx) {
-        if let Some(payload) = prepared.payload.take()
-            && let Some(attachment) = prepared.attachment.as_ref()
-        {
+        if let Some(payload) = prepared.payload.take() {
+            let attachment = prepared
+                .attachment
+                .as_ref()
+                .expect("production prepared transaction must carry attachment");
             let trx_sys = &attachment.engine().trx_sys;
-            let PreparedTrxPayload::User { gc_no, sts, .. } = payload else {
+            let PreparedTrxPayload::User {
+                status, gc_no, sts, ..
+            } = payload
+            else {
                 panic!("production prepared transaction must carry user payload")
             };
             trx_sys.record_rollback_for_purge(gc_no, sts);
+            status.finish_terminal();
+            status.finish_preparing();
         }
         prepared.redo_bin.take();
         let released = prepared.release_transaction_locks();
-        match (prepared.attachment.take(), released) {
-            (Some(attachment), Some(released)) => attachment.rollback(released),
-            (Some(_), None) => {
-                panic!("production prepared attachment requires transaction-lock proof")
+        match (
+            prepared.attachment.take(),
+            released,
+            prepared.trx_inner.take(),
+        ) {
+            (Some(attachment), Some(released), Some(inner)) => attachment.rollback(released, inner),
+            (None, None, None) => {}
+            _ => {
+                panic!(
+                    "production prepared terminal ownership requires matching attachment, \
+                     transaction-lock proof, and core"
+                )
             }
-            (None, Some(_)) => {
-                panic!("production prepared transaction-lock proof requires attachment")
-            }
-            (None, None) => {}
         }
     }
 
@@ -4134,6 +4553,279 @@ pub(crate) mod tests {
 
             discard_production_transaction_after_fatal_rollback(&mut trx);
         });
+    }
+
+    #[test]
+    fn test_unpolled_statement_future_leaves_transaction_reusable() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("trx_unpolled_stmt_cancel").await;
+            let (_session, mut trx) = begin_production_test_transaction(&engine);
+            let entry = transaction_entry(&trx);
+
+            let exec = trx.exec(async |_| Ok::<(), Error>(()));
+            drop(exec);
+
+            let snapshot = entry.inspect();
+            assert_eq!(snapshot.state, SessionOperationState::ForegroundAvailable);
+            assert!(!snapshot.cleanup_requested);
+            trx.exec(async |_| Ok::<(), Error>(())).await.unwrap();
+            trx.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_dropped_polled_statement_future_terminally_cancels_transaction() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("trx_polled_stmt_cancel").await;
+            let (session, mut trx) = begin_production_test_transaction(&engine);
+            let session_id = session.id();
+            let entry = transaction_entry(&trx);
+            let mut exec = Box::pin(trx.exec(async |_| {
+                pending::<()>().await;
+                Ok::<(), Error>(())
+            }));
+
+            assert!(matches!(
+                futures::poll!(exec.as_mut()),
+                std::task::Poll::Pending
+            ));
+            assert_eq!(
+                entry.inspect().state,
+                SessionOperationState::ForegroundRunning(None)
+            );
+            drop(exec);
+
+            assert_ne!(
+                entry.inspect().state,
+                SessionOperationState::ForegroundAvailable
+            );
+            let err = trx.exec(async |_| Ok::<(), Error>(())).await.unwrap_err();
+            assert_eq!(
+                err.report().downcast_ref::<LifecycleError>().copied(),
+                Some(LifecycleError::TransactionDiscarded)
+            );
+            wait_for_session_idle(&engine.inner().session_registry, session_id).await;
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_dropped_effectful_statement_discards_redo_and_releases_locks() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("trx_effectful_stmt_cancel").await;
+            let (session, mut trx) = begin_production_test_transaction(&engine);
+            let session_id = session.id();
+            let stmt_owner = lock_owner(&trx).unwrap().statement(1);
+            let resource = LockResource::TableMetadata(TableID::new(91_430));
+            let mut exec = Box::pin(trx.exec(async |stmt| {
+                stmt_tests::acquire_statement_lock(stmt, resource, LockMode::Shared).await?;
+                stmt.effects_mut().insert_row_redo(
+                    TableID::new(91_430),
+                    RowRedo {
+                        row_id: RowID::new(1),
+                        kind: RowRedoKind::Delete(Some(PageID::new(0))),
+                    },
+                );
+                pending::<()>().await;
+                Ok::<(), Error>(())
+            }));
+
+            assert!(matches!(
+                futures::poll!(exec.as_mut()),
+                std::task::Poll::Pending
+            ));
+            assert!(has_lock_entry(
+                &engine,
+                stmt_owner,
+                resource,
+                LockMode::Shared,
+                LockDebugEntryState::Granted,
+            ));
+            drop(exec);
+
+            assert!(!has_lock_resource(&engine, stmt_owner, resource));
+            let err = trx.commit().await.unwrap_err();
+            assert_eq!(
+                err.report().downcast_ref::<LifecycleError>().copied(),
+                Some(LifecycleError::TransactionDiscarded)
+            );
+            wait_for_session_idle(&engine.inner().session_registry, session_id).await;
+            engine.shutdown().unwrap();
+        });
+    }
+
+    async fn poll_until_statement_rollback_pauses<F>(mut exec: Pin<&mut F>, paused: fn() -> bool)
+    where
+        F: Future,
+    {
+        for _ in 0..512 {
+            assert!(matches!(
+                futures::poll!(exec.as_mut()),
+                std::task::Poll::Pending
+            ));
+            if paused() {
+                return;
+            }
+            yield_now().await;
+        }
+        panic!("statement rollback did not reach the requested pause predicate");
+    }
+
+    async fn assert_dropped_statement_rollback_residuals_are_transaction_owned(
+        log_file_stem: &str,
+        value: i32,
+        pause_index: bool,
+    ) {
+        let (_temp_dir, engine) = test_engine(log_file_stem).await;
+        let table_id = catalog_tests::table2(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        let session_id = session.id();
+        let mut trx = session.begin_trx().unwrap();
+        if pause_index {
+            pause_next_index_rollback();
+        } else {
+            pause_next_row_rollback();
+        }
+        let mut exec = Box::pin(trx.exec(async |stmt| {
+            stmt.table_insert_mvcc(table_id, vec![Val::from(value), Val::from("cancelled")])
+                .await?;
+            Err::<(), Error>(Report::new(OperationError::InvalidDmlInput).disclose())
+        }));
+
+        poll_until_statement_rollback_pauses(
+            exec.as_mut(),
+            if pause_index {
+                index_rollback_paused
+            } else {
+                row_rollback_paused
+            },
+        )
+        .await;
+        drop(exec);
+
+        let err = trx.exec(async |_| Ok::<(), Error>(())).await.unwrap_err();
+        assert_eq!(
+            err.report().downcast_ref::<LifecycleError>().copied(),
+            Some(LifecycleError::TransactionDiscarded)
+        );
+        wait_for_session_idle(&engine.inner().session_registry, session_id).await;
+
+        let mut verify = session.begin_trx().unwrap();
+        let select = verify
+            .exec(async |stmt| {
+                stmt.table_lookup_unique_mvcc(table_id, 0, &[Val::from(value)], &[0, 1])
+                    .await
+            })
+            .await
+            .unwrap();
+        assert!(
+            select.not_found(),
+            "whole-transaction cleanup must consume the residual statement insert"
+        );
+        verify.rollback().await.unwrap();
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_cancelled_index_rollback_folds_index_and_row_residuals() {
+        smol::block_on(
+            assert_dropped_statement_rollback_residuals_are_transaction_owned(
+                "trx_cancel_index_rollback",
+                91_433,
+                true,
+            ),
+        );
+    }
+
+    #[test]
+    fn test_cancelled_row_rollback_folds_remaining_row_residual() {
+        smol::block_on(
+            assert_dropped_statement_rollback_residuals_are_transaction_owned(
+                "trx_cancel_row_rollback",
+                91_434,
+                false,
+            ),
+        );
+    }
+
+    async fn assert_dropped_statement_waiter_released(
+        log_file_stem: &str,
+        id: u64,
+        promote_before_drop: bool,
+    ) {
+        let (_temp_dir, engine) = test_engine(log_file_stem).await;
+        let (session, mut trx) = begin_production_test_transaction(&engine);
+        let session_id = session.id();
+        let stmt_owner = lock_owner(&trx).unwrap().statement(1);
+        let resource = LockResource::TableMetadata(TableID::new(id));
+        let blocker = LockOwner::transaction(SessionID::new(id), TrxID::new(id));
+        assert!(
+            try_acquire(
+                engine.lock_manager(),
+                resource,
+                LockMode::Exclusive,
+                blocker
+            )
+            .unwrap()
+        );
+        let mut exec = Box::pin(trx.exec(async |stmt| {
+            stmt_tests::acquire_statement_lock(stmt, resource, LockMode::Shared).await?;
+            Ok::<(), Error>(())
+        }));
+
+        assert!(matches!(
+            futures::poll!(exec.as_mut()),
+            std::task::Poll::Pending
+        ));
+        assert!(has_lock_entry(
+            &engine,
+            stmt_owner,
+            resource,
+            LockMode::Shared,
+            LockDebugEntryState::Waiting,
+        ));
+        if promote_before_drop {
+            assert_eq!(engine.lock_manager().release(resource, blocker), 1);
+            assert!(has_lock_entry(
+                &engine,
+                stmt_owner,
+                resource,
+                LockMode::Shared,
+                LockDebugEntryState::Granted,
+            ));
+        }
+
+        drop(exec);
+
+        assert!(!has_lock_resource(&engine, stmt_owner, resource));
+        if !promote_before_drop {
+            assert_eq!(engine.lock_manager().release(resource, blocker), 1);
+        }
+        let err = trx.rollback().await.unwrap_err();
+        assert_eq!(
+            err.report().downcast_ref::<LifecycleError>().copied(),
+            Some(LifecycleError::TransactionDiscarded)
+        );
+        wait_for_session_idle(&engine.inner().session_registry, session_id).await;
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_dropped_statement_removes_queued_lock_before_cleanup() {
+        smol::block_on(assert_dropped_statement_waiter_released(
+            "trx_queued_stmt_lock_cancel",
+            91_431,
+            false,
+        ));
+    }
+
+    #[test]
+    fn test_dropped_statement_releases_promoted_unobserved_lock_before_cleanup() {
+        smol::block_on(assert_dropped_statement_waiter_released(
+            "trx_promoted_stmt_lock_cancel",
+            91_432,
+            true,
+        ));
     }
 
     #[test]
@@ -5248,6 +5940,10 @@ pub(crate) mod tests {
             let session_id = session.id();
             let mut trx = session.begin_trx().unwrap();
             discard_transaction_after_fatal_rollback(&mut trx);
+            assert!(
+                !session_has_public_trx_cache(&engine.inner().session_registry, session_id),
+                "fatal rollback must not recycle the failed transaction core"
+            );
             let replacement_err = match session.begin_trx() {
                 Ok(_) => panic!("failed-retained operation must block session reuse"),
                 Err(err) => err,

@@ -268,6 +268,7 @@ mod tests {
             attachment: None,
             lock_manager: None,
             lock_state: None,
+            trx_inner: None,
         }
     }
 
@@ -279,6 +280,7 @@ mod tests {
             attachment: None,
             lock_manager: None,
             lock_state: None,
+            trx_inner: None,
         }
     }
 
@@ -290,6 +292,7 @@ mod tests {
             attachment: None,
             lock_manager: None,
             lock_state: None,
+            trx_inner: None,
         }
     }
 

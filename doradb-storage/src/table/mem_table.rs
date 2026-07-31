@@ -3303,7 +3303,7 @@ mod tests {
     };
     use crate::engine::Engine;
     use crate::error::{
-        DataIntegrityError, DiscloseResultExt, InternalError, OperationError,
+        DataIntegrityError, DiscloseResultExt, InternalError, LifecycleError, OperationError,
         OperationOrRuntimeError, ResourceError, RuntimeError,
     };
     use crate::file::cow_file::SUPER_BLOCK_ID;
@@ -3313,7 +3313,7 @@ mod tests {
     use crate::row::ops::{DeleteMvcc, SelectKey, UpdateCol, UpdateMvcc, UpsertMvcc};
     use crate::session::{
         Session,
-        tests::{SessionTestExt, assert_checkpoint_published},
+        tests::{SessionTestExt, assert_checkpoint_published, wait_for_session_idle},
     };
     use crate::table::tests::*;
     use crate::trx::MIN_SNAPSHOT_TS;
@@ -4759,7 +4759,12 @@ mod tests {
                 message.contains("standalone MemTable update observed TRANSITION row page"),
                 "unexpected panic: {message}"
             );
-            trx.rollback().await.unwrap();
+            let err = trx.rollback().await.unwrap_err();
+            assert_eq!(
+                err.report().downcast_ref::<LifecycleError>().copied(),
+                Some(LifecycleError::TransactionDiscarded)
+            );
+            wait_for_session_idle(&engine.inner().session_registry, session.id()).await;
 
             let mut trx = session.begin_trx().unwrap();
             let panic = AssertUnwindSafe(trx.exec(async |stmt| {
@@ -4787,7 +4792,13 @@ mod tests {
                 message.contains("standalone MemTable delete observed TRANSITION row page"),
                 "unexpected panic: {message}"
             );
-            trx.rollback().await.unwrap();
+            let err = trx.rollback().await.unwrap_err();
+            assert_eq!(
+                err.report().downcast_ref::<LifecycleError>().copied(),
+                Some(LifecycleError::TransactionDiscarded)
+            );
+            wait_for_session_idle(&engine.inner().session_registry, session.id()).await;
+            engine.shutdown().unwrap();
         });
     }
 

@@ -2274,13 +2274,13 @@ mod tests {
     };
     use crate::table::tests::*;
     use crate::table::{DeleteMarker, TableTerminal};
+    use crate::trx::MIN_ACTIVE_TRX_ID;
     use crate::trx::Transaction;
     use crate::trx::purge::PurgeTestEvent;
     use crate::trx::stmt::tests as stmt_tests;
-    use crate::trx::tests::discard_transaction_after_fatal_rollback;
+    use crate::trx::tests::{discard_transaction_after_fatal_rollback, shared_trx_status};
     use crate::trx::undo::{OwnedRowUndo, RowUndoHead, RowUndoKind};
     use crate::trx::ver_map::RowPageState;
-    use crate::trx::{MIN_ACTIVE_TRX_ID, SharedTrxStatus};
     use futures::FutureExt;
     use futures::future::pending;
     use std::cell::{Cell, RefCell};
@@ -5541,7 +5541,7 @@ mod tests {
             let hook_undo_owner = Rc::clone(&undo_owner);
             let hook_first_page = Rc::clone(&first_page);
             let pre_fence_sts = batch.frozen_ts().saturating_sub(2);
-            let ownership_status = Arc::new(SharedTrxStatus::new(
+            let ownership_status = Arc::new(shared_trx_status(
                 MIN_ACTIVE_TRX_ID + pre_fence_sts.as_u64(),
             ));
             let hook_ownership_status = Arc::clone(&ownership_status);
@@ -5605,7 +5605,7 @@ mod tests {
             let hook_undo_owner = Rc::clone(&undo_owner);
             let hook_first_page = Rc::clone(&first_page);
             let pre_fence_sts = batch.frozen_ts().saturating_sub(2);
-            let ownership_status = Arc::new(SharedTrxStatus::new(
+            let ownership_status = Arc::new(shared_trx_status(
                 MIN_ACTIVE_TRX_ID + pre_fence_sts.as_u64(),
             ));
             let hook_ownership_status = Arc::clone(&ownership_status);

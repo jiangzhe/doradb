@@ -280,6 +280,7 @@ impl ColumnDeletionBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trx::tests::shared_trx_status;
     use crate::trx::{MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -300,7 +301,7 @@ mod tests {
         buffer
             .put_ref(
                 RowID::new(1),
-                Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 1)),
+                Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 1)),
                 MAX_SNAPSHOT_TS,
             )
             .unwrap();
@@ -334,7 +335,7 @@ mod tests {
     #[test]
     fn test_put_ref_respects_snapshot_for_committed_markers() {
         let buffer = ColumnDeletionBuffer::new();
-        let status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 1));
+        let status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 1));
 
         buffer.put_committed(RowID::new(1), TrxID::new(20)).unwrap();
         assert_eq!(
@@ -346,7 +347,7 @@ mod tests {
             Err(DeletionError::WriteConflict)
         );
 
-        let committed_ref = Arc::new(SharedTrxStatus::new(TrxID::new(30)));
+        let committed_ref = Arc::new(shared_trx_status(TrxID::new(30)));
         buffer
             .put_ref(RowID::new(2), committed_ref, MAX_SNAPSHOT_TS)
             .unwrap();

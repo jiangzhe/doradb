@@ -286,15 +286,26 @@ actor, a second physical worker, or a physical lock-manager redesign. [D1]
   sequential private transactions, stale-handle protection remains an atomic
   `TrxID` and state check at the entry mutation or claim boundary rather than a
   separate registry lookup predicate.
+- [U10] On 2026-07-31, the user selected one reusable boxed public transaction
+  core per session: reset it at successful terminal completion with a fresh
+  zero-valued status, initialize it at the next public begin, use concrete
+  boxed-core production parameters, and allocate/drop private transaction cores
+  independently.
+- [U11] On 2026-07-31, the user deferred the exposed global lifetime-counter
+  contention to a separate backlog with two scopes: remove unnecessary hot-path
+  overhead first, then reconsider ref-counted lifetime management across
+  long-lived resources through sharding, centralized arena/owner destruction,
+  or another measured design.
 
 ### Source Backlogs
 
 - [B1] `docs/backlogs/closed/000170-session-coordinated-cancellation-cleanup.md`
-- [B2] `docs/backlogs/000124-statement-execution-cancellation-safety.md`
+- [B2] `docs/backlogs/closed/000124-statement-execution-cancellation-safety.md`
 - [B3] `docs/backlogs/000171-exact-family-lock-system-redesign.md`
 - [B4] `docs/backlogs/000123-adaptive-background-worker-runtime.md`
 - [B5] `docs/backlogs/000114-evaluate-async-engine-shutdown-api.md`
 - [B6] `docs/backlogs/closed/000169-separate-session-operation-lock-scopes.md`
+- [B7] `docs/backlogs/000175-scalable-shared-resource-lifetime-management.md`
 
 ## Decision
 
@@ -1414,32 +1425,50 @@ it does not change the successful-path baseline availability. [D16] [C16]
     commit-owned completion; return `TransactionDiscarded` after cancellation;
     and consume `ReleasedTransactionLocks` before outer operation completion.
     Prove that the worker receives no statement payload or statement rollback
-    phase. Preserve the hard successful `Transaction::exec` and `StreamStmt`
-    cost budgets.
+    phase. Structurally add no second lookup, allocation, shared lock, atomic,
+    notification, or queue operation to successful statement execution and no
+    per-item stream check. Measure and explicitly account for the existing
+    operation-boundary lifetime traffic. [B7] [U5] [U11]
   - Measurement Evidence: Compare `stmt-noop` and `trx-noop`
     against their Phase 1 baselines, and use `index-stream` with fixed loaded
     data and `--range` to enforce the no-per-item stream budget across unique
-    and non-unique index modes. [D16] [C16] [U5]
+    and non-unique index modes. Resolution measurements against `origin/main`
+    improved median 1/1 `stmt-noop` latency by 14.71% and 1/1 `trx-noop` by
+    13.29%, but regressed 4/16 `stmt-noop` by 5.20%. Unique stream medians were
+    1.99% and 2.94% slower at 1/1 and 4/16; non-unique medians were 5.54% and
+    2.10% slower, with a repeated non-unique 1/1 trial remaining 3.96% slower.
+    Flamegraphs showed boxed-core allocation/free removal and `memcpy` falling
+    from 23.06% to 0.67%, while contended global lifetime-counter atomics
+    dominated the remaining 4/16 boundary cost. Phase 2 accepts that measured
+    fixed cost as explicit debt in backlog 000175 rather than claiming the
+    original paired budget passed; the no-per-item structural rule remains.
+    [D16] [C16] [B7] [U5] [U11]
   - Prerequisites: Phase 1 entry checkout/claim transitions are available, and
     task 000174 worker-owned terminal rollback plus task 000242 transaction-lock
     release proof remain intact. [D11] [D12]
-  - Phase-local Choices: Choose the cancellation-guard layout, exact terminal
-    transition, and efficient whole-buffer transfer representation. The guard
-    must compose with, not duplicate, the current checkout ownership transfer;
-    borrowed `Statement` facades cannot be unguarded final payload owners. The
-    residual undo buffers encode rollback progress, so the stable entry must not
-    add a statement payload or phase enum. The task may optimize the proven
-    no-effect path, but may not return a cancelled transaction to reusable
-    `Active`.
+  - Phase-local Choices: Resolved as a lifetime-free `StmtState` owning the
+    boxed checkout, statement effects, statement locks, and a public-cancel,
+    private-must-complete, or settled Drop action. It lends direct disjoint
+    borrows to the existing `Statement<'_>` facade. Public Drop settles
+    acquisition first, folds residual undo, discards redo, releases statement
+    locks, and checks the complete core directly into `CleanupReady`; the
+    stable entry adds no statement payload or phase enum. Each session eagerly
+    owns one `public_trx_cache`; public begin initializes and successful
+    terminal completion resets/returns that exact box with a fresh status,
+    while private transactions allocate and drop separate boxed cores. [U6]
+    [U10]
   - Non-goals: Do not migrate DDL or maintenance progress and do not redesign
     statement APIs, MVCC undo formats, or group commit. Do not add worker-side
-    statement rollback.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+    statement rollback. Do not redesign shared-resource lifetime management in
+    this phase; backlog 000175 owns hot-path counter removal and the broader
+    sharded-counter versus centralized-destruction decision. [B7] [U11]
+  - Task Doc: `docs/tasks/000247-statement-public-transaction-cancellation-ownership.md`
+  - Task Issue: `#917`
+  - Phase Status: done
+  - Implementation Summary: Implemented cancellation-safe public statement ownership with synchronous residual-effect settlement and whole-transaction cleanup, boxed transaction cores, and a public-only session core cache. Paired benchmarks improved 1/1 no-op paths but exposed contended statement-boundary and stream regressions; Phase 2 accepts these as explicit debt tracked by backlog 000175. [Task Resolve Sync: docs/tasks/000247-statement-public-transaction-cancellation-ownership.md @ 2026-07-31]
   - Related Backlogs:
-    - `docs/backlogs/000124-statement-execution-cancellation-safety.md`
+    - `docs/backlogs/closed/000124-statement-execution-cancellation-safety.md`
+    - `docs/backlogs/000175-scalable-shared-resource-lifetime-management.md`
 
 - **Phase 3: Mandatory Operation Driver And Concurrent Cleanup Executor**
   - Scope: Add `async-executor` as a direct storage dependency. Introduce the
@@ -1694,13 +1723,18 @@ purpose, ownership, gate, and ordering contracts above.
   id/token plus cooperative safe points: accept and compensate only before a
   proven irreversible gate, and return too-late/deferred while required
   post-gate continuation wins. It must not call `Task::cancel`.
+- Eliminate unnecessary session-coordinated hot-path lifetime-counter traffic
+  and then reassess ref-counted lifetime management for long-lived shared
+  resources through backlog 000175. Compare sharded counters with centralized
+  arena/owner destruction under explicit shutdown and reclamation proofs.
 - Revisit parallel work within one session only with an explicit family
   coordinator and operation submission model.
 
 ## References
 
 - `docs/backlogs/closed/000170-session-coordinated-cancellation-cleanup.md`
-- `docs/backlogs/000124-statement-execution-cancellation-safety.md`
+- `docs/backlogs/closed/000124-statement-execution-cancellation-safety.md`
+- `docs/backlogs/000175-scalable-shared-resource-lifetime-management.md`
 - `docs/backlogs/000171-exact-family-lock-system-redesign.md`
 - `docs/backlogs/000123-adaptive-background-worker-runtime.md`
 - `docs/backlogs/000114-evaluate-async-engine-shutdown-api.md`

@@ -761,11 +761,12 @@ mod tests {
     use crate::id::RowID;
     use crate::table::test_hooks;
     use crate::trx::row::tests::test_row_write_access;
+    use crate::trx::tests::{commit_shared_trx_status, shared_trx_status};
     use crate::trx::undo::{
         MainBranch, NextRowUndo, OwnedRowUndo, RowUndoHead, RowUndoKind, UndoStatus,
     };
     use crate::trx::ver_map::{RowPageState, RowVersionMap};
-    use crate::trx::{MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, SharedTrxStatus};
+    use crate::trx::{MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS};
     use crate::value::{Val, ValKind};
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
@@ -953,7 +954,7 @@ mod tests {
             let fixture = frozen_analyzer_fixture(
                 vec![(
                     kind,
-                    UndoStatus::Ref(Arc::new(SharedTrxStatus::new(active_ts))),
+                    UndoStatus::Ref(Arc::new(shared_trx_status(active_ts))),
                 )],
                 deleted,
             );
@@ -970,7 +971,7 @@ mod tests {
     fn test_stable_frozen_analyzer_represents_pre_fence_ownership() {
         let cutoff_ts = TrxID::new(50);
         for (kind, latest_deleted) in [(RowUndoKind::Lock, false), (RowUndoKind::Delete, true)] {
-            let status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 10));
+            let status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 10));
             let fixture = frozen_analyzer_fixture(
                 vec![
                     (kind, UndoStatus::Ref(Arc::clone(&status))),
@@ -993,7 +994,7 @@ mod tests {
             let fixture = frozen_analyzer_fixture(
                 vec![(
                     kind,
-                    UndoStatus::Ref(Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 10))),
+                    UndoStatus::Ref(Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 10))),
                 )],
                 false,
             );
@@ -1003,7 +1004,7 @@ mod tests {
 
     #[test]
     fn test_frozen_analyzer_retains_status_ref_across_commit_after_preparation() {
-        let status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 30));
+        let status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 30));
         let fixture = frozen_analyzer_fixture(
             vec![
                 (RowUndoKind::Delete, UndoStatus::Ref(Arc::clone(&status))),
@@ -1021,13 +1022,13 @@ mod tests {
         assert_eq!(*row_id, RowID::new(100));
         assert!(Arc::ptr_eq(marker_status, &status));
 
-        status.commit_for_test(TrxID::new(25));
+        commit_shared_trx_status(&status, TrxID::new(25));
         assert_eq!(marker_status.ts(), TrxID::new(25));
     }
 
     #[test]
     fn test_frozen_analyzer_leading_lock_delete_chain_selects_first_marker() {
-        let lock_status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 30));
+        let lock_status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 30));
         let fixture = frozen_analyzer_fixture(
             vec![
                 (RowUndoKind::Lock, UndoStatus::Ref(Arc::clone(&lock_status))),
@@ -1045,7 +1046,7 @@ mod tests {
         };
         assert!(Arc::ptr_eq(marker_status, &lock_status));
 
-        let delete_status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 31));
+        let delete_status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 31));
         let fixture = frozen_analyzer_fixture(
             vec![
                 (RowUndoKind::Lock, UndoStatus::Committed(TrxID::new(30))),

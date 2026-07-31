@@ -354,6 +354,9 @@ pub(super) async fn admit_user_table(
         .await
         .attach_with(|| format!("operation={operation}, table_id={table_id}"))?;
 
+    #[cfg(test)]
+    tests::maybe_pause_after_statement_metadata_grant().await;
+
     let binding = resolve_table_binding(attachment, inner.sts(), table_id, request, operation)?;
     // Installation acquires transaction metadata S before releasing statement
     // metadata S, leaving no unprotected gap in the binding's lifetime.
@@ -378,14 +381,30 @@ mod tests {
     use crate::catalog::{IndexAttributes, IndexKey, IndexSpec};
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
-    use crate::error::{Error, OperationError};
+    use crate::error::{Error, LifecycleError, OperationError};
     use crate::lock::tests::{LockDebugEntryState, debug_snapshot};
     use crate::lock::{LockOwner, LockScope};
+    use crate::session::tests::wait_for_session_idle;
     use crate::table::TableTerminal;
     use crate::value::Val;
-    use std::future::Future;
+    use std::cell::Cell;
+    use std::future::{Future, pending};
     use std::pin::Pin;
     use tempfile::TempDir;
+
+    thread_local! {
+        static PAUSE_AFTER_STATEMENT_METADATA_GRANT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    fn pause_after_statement_metadata_grant() {
+        PAUSE_AFTER_STATEMENT_METADATA_GRANT.set(true);
+    }
+
+    pub(super) async fn maybe_pause_after_statement_metadata_grant() {
+        if PAUSE_AFTER_STATEMENT_METADATA_GRANT.replace(false) {
+            pending::<()>().await;
+        }
+    }
 
     async fn test_engine(log_file_stem: &str) -> (TempDir, Engine) {
         let temp_dir = TempDir::new().unwrap();
@@ -515,6 +534,52 @@ mod tests {
                 "terminal rollback must release the binding metadata lock"
             );
             drop(session);
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn cancelled_first_touch_releases_statement_grant_before_terminal_cleanup() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("admission_cancel_first_touch").await;
+            let table_id = table2(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let session_id = session.id();
+            let mut trx = session.begin_trx().unwrap();
+            let trx_owner = LockOwner::transaction(session_id, trx.trx_id());
+            let stmt_owner = trx_owner.statement(1);
+            let metadata = LockResource::TableMetadata(table_id);
+            pause_after_statement_metadata_grant();
+            let mut exec = Box::pin(
+                trx.exec(async |stmt| stmt.table_scan_mvcc(table_id, &[0], |_| true).await),
+            );
+
+            assert!(matches!(
+                futures::poll!(exec.as_mut()),
+                std::task::Poll::Pending
+            ));
+            assert!(owner_has_grant(
+                &engine,
+                stmt_owner,
+                metadata,
+                LockMode::Shared
+            ));
+            assert!(!owner_has_grant(
+                &engine,
+                trx_owner,
+                metadata,
+                LockMode::Shared
+            ));
+
+            drop(exec);
+
+            assert_no_table_locks(&engine, table_id);
+            let err = trx.exec(async |_| Ok::<(), Error>(())).await.unwrap_err();
+            assert_eq!(
+                err.report().downcast_ref::<LifecycleError>().copied(),
+                Some(LifecycleError::TransactionDiscarded)
+            );
+            wait_for_session_idle(&engine.inner().session_registry, session_id).await;
             engine.shutdown().unwrap();
         });
     }

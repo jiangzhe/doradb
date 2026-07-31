@@ -4620,9 +4620,10 @@ mod tests {
     use crate::trx::row::{LockRowForWrite, ReadLatestRow};
     use crate::trx::stmt::tests as stmt_tests;
     use crate::trx::sys::tests::fatal_rollback_retention_count;
+    use crate::trx::tests::shared_trx_status;
     use crate::trx::undo::RowUndoKind;
     use crate::trx::ver_map::RowPageState;
-    use crate::trx::{MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID, SharedTrxStatus, Transaction};
+    use crate::trx::{MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID, Transaction};
     use crate::value::{Val, ValKind};
     use error_stack::Report;
     use smol::Timer;
@@ -7222,7 +7223,7 @@ mod tests {
     #[test]
     fn test_read_latest_cold_row_checks_delete_ownership() {
         let deletion_buffer = ColumnDeletionBuffer::new();
-        let reader_status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 1));
+        let reader_status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 1));
         let assert_latest = |row_id, persisted_deleted, expected| {
             assert_eq!(
                 read_latest_cold_row(
@@ -7246,7 +7247,7 @@ mod tests {
         deletion_buffer
             .put_ref(
                 RowID::new(3),
-                Arc::new(SharedTrxStatus::new(TrxID::new(30))),
+                Arc::new(shared_trx_status(TrxID::new(30))),
                 MAX_SNAPSHOT_TS,
             )
             .unwrap();
@@ -7260,7 +7261,7 @@ mod tests {
         deletion_buffer
             .put_ref(
                 RowID::new(5),
-                Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 2)),
+                Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 2)),
                 MAX_SNAPSHOT_TS,
             )
             .unwrap();

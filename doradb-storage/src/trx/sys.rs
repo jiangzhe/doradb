@@ -1123,6 +1123,7 @@ impl TransactionSystem {
         operation_key: SessionOperationKey,
         kind: SessionOperationKind,
         enclosing_entry: Option<&Arc<SessionOperationEntry>>,
+        mut inner: Box<TrxInner>,
     ) -> StartedTransaction {
         let gc_no = self.next_gc_no();
         let gc_bucket = &self.gc_buckets[gc_no];
@@ -1146,7 +1147,7 @@ impl TransactionSystem {
                 .store(sts.as_u64(), Ordering::Relaxed);
         }
         drop(g); // release bucket lock.
-        let inner = TrxInner::new(trx_id, sts, gc_no, session_state.id());
+        inner.init(trx_id, sts, gc_no, session_state.id());
         let entry = match kind {
             SessionOperationKind::PublicTransaction => {
                 assert!(
@@ -1416,8 +1417,8 @@ impl TransactionSystem {
         claim: SessionOperationCompletionClaim,
         operation: &'static str,
     ) -> FatalResult<()> {
-        let (entry, mut inner, attachment) = claim.into_parts();
-        self.rollback_inner(entry.as_ref(), &mut inner, &attachment, operation)
+        let (entry, inner, attachment) = claim.into_parts();
+        self.rollback_inner(entry.as_ref(), inner, attachment, operation)
             .await
     }
 
@@ -1425,8 +1426,8 @@ impl TransactionSystem {
     async fn rollback_inner(
         &self,
         entry: &SessionOperationEntry,
-        inner: &mut TrxInner,
-        attachment: &TrxAttachment,
+        mut inner: Box<TrxInner>,
+        attachment: TrxAttachment,
         operation: &'static str,
     ) -> FatalResult<()> {
         let sts = inner.sts();
@@ -1444,7 +1445,7 @@ impl TransactionSystem {
             // detach this operation from the registry.
             entry.fail_retained();
             attachment.notify_operation_transition();
-            let retention = inner.retain_and_discard_after_fatal_rollback(attachment);
+            let retention = inner.retain_and_discard_after_fatal_rollback(&attachment);
             self.retain_fatal_rollback(retention);
             let report = err
                 .change_context(FatalError::RollbackAccess)
@@ -1466,7 +1467,7 @@ impl TransactionSystem {
             // detach this operation from the registry.
             entry.fail_retained();
             attachment.notify_operation_transition();
-            let retention = inner.retain_and_discard_after_fatal_rollback(attachment);
+            let retention = inner.retain_and_discard_after_fatal_rollback(&attachment);
             self.retain_fatal_rollback(retention);
             let report = err
                 .change_context(FatalError::RollbackAccess)
@@ -1484,9 +1485,10 @@ impl TransactionSystem {
         inner.effects_mut().clear_for_rollback();
         inner.clear_table_bindings();
         self.record_rollback_for_purge(gc_no, sts);
-        let released = inner.release_transaction_locks(attachment);
-        inner.finish_session_rollback(attachment, released);
+        let released = inner.release_transaction_locks(&attachment);
+        inner.active = false;
         status.finish_terminal();
+        attachment.rollback(released, inner);
         Ok(())
     }
 
@@ -1510,31 +1512,27 @@ impl TransactionSystem {
         };
         self.record_rollback_for_purge(gc_no, sts);
         let released = trx.release_transaction_locks();
-        match (trx.attachment.take(), released) {
-            (Some(attachment), Some(released)) => attachment.rollback(released),
-            (Some(_), None) => {
-                panic!(
-                    "unordered user attachment requires released transaction-lock proof: \
-                     trx_id={}",
-                    status.ts()
-                );
-            }
-            (None, Some(_)) => {
-                panic!(
-                    "released transaction-lock proof requires unordered user attachment: \
-                     trx_id={}",
-                    status.ts()
-                );
-            }
-            (None, None) => {
-                panic!(
-                    "unordered user transaction requires attachment and transaction-lock state: \
-                     trx_id={}",
-                    status.ts()
-                );
-            }
-        }
         status.finish_terminal();
+        let attachment = trx.attachment.take().unwrap_or_else(|| {
+            panic!(
+                "unordered user transaction requires terminal attachment: trx_id={}",
+                status.ts()
+            )
+        });
+        let released = released.unwrap_or_else(|| {
+            panic!(
+                "unordered user transaction requires released transaction-lock proof: \
+                 trx_id={}",
+                status.ts()
+            )
+        });
+        let inner = trx.trx_inner.take().unwrap_or_else(|| {
+            panic!(
+                "unordered user transaction requires reusable transaction core: trx_id={}",
+                status.ts()
+            )
+        });
+        attachment.rollback(released, inner);
     }
 
     /// Returns statistics of group commit.
