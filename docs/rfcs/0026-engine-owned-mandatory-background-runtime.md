@@ -4,6 +4,7 @@ title: Engine-Owned Mandatory Background Runtime
 status: proposal
 tags: [storage-engine, runtime, ddl, maintenance, cleanup, lifecycle]
 created: 2026-07-31
+github_issue: 920
 ---
 
 # RFC-0026: Engine-Owned Mandatory Background Runtime
