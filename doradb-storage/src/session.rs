@@ -6,8 +6,8 @@ use crate::catalog::{
 };
 use crate::engine::{EngineInner, EngineRef, WeakEngineRef};
 use crate::error::{
-    DiscloseError, DiscloseResultExt, LifecycleError, LifecycleResult, MultiDomainResultExt,
-    OperationResult, Result,
+    DiscloseError, DiscloseResultExt, FatalError, LifecycleError, LifecycleResult,
+    MultiDomainResultExt, OperationResult, Result,
 };
 use crate::id::{OperationID, SessionID, SessionOperationKey, TableID, TrxID};
 use crate::lock::{FreshLockGuard, LockManager, LockMode, LockOwner, LockResource, TableLockMode};
@@ -930,6 +930,26 @@ impl SessionOperationPin {
         self.state.pool_guards().clone()
     }
 
+    /// Consume voluntary authority at the exact mandatory ownership handoff.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Phase 1 proves production handoff with synthetic adapters"
+        )
+    )]
+    #[inline]
+    pub(crate) fn into_mandatory(mut self) -> MandatoryOperationGuard {
+        self.state.accept_mandatory(self.key());
+        self.armed = false;
+        MandatoryOperationGuard {
+            engine: self.engine.clone(),
+            state: Arc::clone(&self.state),
+            entry: Arc::clone(&self.entry),
+            armed: true,
+        }
+    }
+
     /// Starts one private transaction inside this DDL or maintenance operation.
     #[inline]
     pub(crate) fn begin_private_trx(&self) -> LifecycleResult<Transaction> {
@@ -1032,8 +1052,106 @@ impl Drop for SessionOperationPin {
     }
 }
 
+/// Sole terminal authority for one accepted session operation.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Phase 1 proves production handoff with synthetic adapters"
+    )
+)]
+pub(crate) struct MandatoryOperationGuard {
+    engine: EngineRef,
+    state: Arc<SessionState>,
+    entry: Arc<SessionOperationEntry>,
+    armed: bool,
+}
+
+impl MandatoryOperationGuard {
+    /// Return the accepted operation key.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Phase 1 proves production handoff with synthetic adapters"
+        )
+    )]
+    #[inline]
+    pub(crate) fn key(&self) -> SessionOperationKey {
+        self.entry.key()
+    }
+
+    /// Publish normal terminal state after transferred resources are released.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Phase 1 proves production handoff with synthetic adapters"
+        )
+    )]
+    #[inline]
+    pub(crate) fn finish(&mut self) {
+        assert!(
+            self.armed,
+            "mandatory operation guard finishes exactly once"
+        );
+        let remove_from_registry = self.state.finish_mandatory(self.key());
+        self.engine
+            .session_registry
+            .remove_if_requested(self.key().session_id(), remove_from_registry);
+        self.armed = false;
+    }
+
+    /// Publish retained fatal state after domain-specific panic handling.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Phase 1 proves production handoff with synthetic adapters"
+        )
+    )]
+    #[inline]
+    pub(crate) fn fail_retained(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        self.state.fail_mandatory_retained(self.key());
+    }
+}
+
+impl SessionRuntimeAccess for MandatoryOperationGuard {
+    #[inline]
+    fn engine(&self) -> &EngineRef {
+        &self.engine
+    }
+
+    #[inline]
+    fn state(&self) -> &Arc<SessionState> {
+        &self.state
+    }
+}
+
+impl Drop for MandatoryOperationGuard {
+    #[inline]
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        self.state.fail_mandatory_retained(self.key());
+        let report = Report::new(FatalError::MandatoryTaskPanic).attach(format!(
+            "mandatory operation authority dropped unexpectedly: operation_key={}",
+            self.key()
+        ));
+        self.engine.poisoner.poison(report);
+    }
+}
+
 /// One active operation found by a nonblocking shutdown probe.
 pub(crate) struct SessionShutdownBlocker {
+    /// Current operation ownership class.
+    pub(crate) state: SessionOperationState,
     /// Exact claimable transaction cleanup hint, when one exists.
     ///
     /// The tuple locates the stable outer operation entry first and identifies
@@ -1485,10 +1603,8 @@ impl SessionState {
                 match snapshot.state {
                     SessionOperationState::Terminal => {}
                     SessionOperationState::CleanupReady
-                    | SessionOperationState::CleanupRunning
-                    | SessionOperationState::BackgroundQueued
-                    | SessionOperationState::BackgroundRunning
-                    | SessionOperationState::CompletionOwned => {
+                    | SessionOperationState::Completing
+                    | SessionOperationState::Mandatory(_) => {
                         lifecycle.disposition = SessionDisposition::CloseRequested;
                         let listener = lifecycle.change_listener();
                         return (SessionCloseDecision::Wait(listener), false);
@@ -1499,8 +1615,7 @@ impl SessionState {
                             false,
                         );
                     }
-                    SessionOperationState::ForegroundAvailable
-                    | SessionOperationState::ForegroundRunning(_) => {
+                    SessionOperationState::Voluntary(_) => {
                         return (
                             SessionCloseDecision::Rejected(
                                 self.active_operation_err(lifecycle.disposition, entry),
@@ -1562,6 +1677,67 @@ impl SessionState {
         }
         Self::notify_operation_change(notify);
         (remove_from_registry, release.cleanup)
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Phase 1 proves production handoff with synthetic adapters"
+        )
+    )]
+    #[inline]
+    fn accept_mandatory(&self, key: SessionOperationKey) {
+        let lifecycle = self.lifecycle.lock();
+        let entry = lifecycle.active_entry(key).unwrap_or_else(|| {
+            panic!("mandatory acceptance requires exact active operation: operation_key={key}")
+        });
+        entry.accept_mandatory();
+        let notify = lifecycle.change_ev.clone();
+        drop(lifecycle);
+        Self::notify_operation_change(notify);
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Phase 1 proves production handoff with synthetic adapters"
+        )
+    )]
+    #[inline]
+    fn finish_mandatory(&self, key: SessionOperationKey) -> bool {
+        let mut lifecycle = self.lifecycle.lock();
+        let entry = lifecycle.active_entry(key).cloned().unwrap_or_else(|| {
+            panic!("mandatory completion requires exact active operation: operation_key={key}")
+        });
+        entry.finish_mandatory();
+        let remove_from_registry = lifecycle.finalize_terminal();
+        let notify = lifecycle.change_ev.clone();
+        drop(lifecycle);
+        if remove_from_registry {
+            self.release_session_locks();
+        }
+        Self::notify_operation_change(notify);
+        remove_from_registry
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Phase 1 proves production handoff with synthetic adapters"
+        )
+    )]
+    #[inline]
+    fn fail_mandatory_retained(&self, key: SessionOperationKey) {
+        let lifecycle = self.lifecycle.lock();
+        if let Some(entry) = lifecycle.active_entry(key) {
+            entry.fail_mandatory_retained();
+        }
+        let notify = lifecycle.change_ev.clone();
+        drop(lifecycle);
+        Self::notify_operation_change(notify);
     }
 
     /// Finish this session's exact transaction lifecycle after commit.
@@ -1652,7 +1828,9 @@ impl SessionState {
     fn shutdown_blocker(&self) -> Option<SessionShutdownBlocker> {
         let lifecycle = self.lifecycle.lock();
         let entry = lifecycle.slot.active_entry()?;
+        let state = entry.inspect().state;
         Some(SessionShutdownBlocker {
+            state,
             cleanup: entry
                 .cleanup_candidate()
                 .map(|trx_id| (entry.key(), trx_id)),
@@ -2750,7 +2928,7 @@ pub(crate) mod tests {
                                 &err,
                                 session_id,
                                 trx_id,
-                                "foreground_available",
+                                "voluntary",
                             );
                         }
                     }
@@ -3255,6 +3433,43 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_operation_pin_consumes_into_mandatory_terminal_authority() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let session = engine.new_session().unwrap();
+
+            let pin = session
+                .pin_operation(SessionOperationKind::Maintenance)
+                .unwrap();
+            let key = pin.key();
+            let entry = Arc::clone(&pin.entry);
+            let mut mandatory = pin.into_mandatory();
+            assert_eq!(mandatory.key(), key);
+            assert_eq!(
+                entry.inspect().state,
+                SessionOperationState::Mandatory(None)
+            );
+            mandatory.finish();
+            assert_eq!(entry.inspect().state, SessionOperationState::Terminal);
+            drop(mandatory);
+
+            let pin = session.pin_operation(SessionOperationKind::Ddl).unwrap();
+            let entry = Arc::clone(&pin.entry);
+            let mut mandatory = pin.into_mandatory();
+            mandatory.fail_retained();
+            assert_eq!(entry.inspect().state, SessionOperationState::FailedRetained);
+            drop(mandatory);
+
+            remove_session_for_test(&engine.inner().session_registry, session.id());
+            drop(session);
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
     fn test_equal_raw_operation_ids_are_isolated_by_session_family() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
@@ -3364,10 +3579,7 @@ pub(crate) mod tests {
 
             trx.rollback().await.unwrap();
             let snapshot = entry.inspect();
-            assert_eq!(
-                snapshot.state,
-                SessionOperationState::ForegroundRunning(None)
-            );
+            assert_eq!(snapshot.state, SessionOperationState::Voluntary(None));
             assert_eq!(snapshot.trx_id, None);
             {
                 let lifecycle = state.lifecycle.lock();
@@ -3466,7 +3678,7 @@ pub(crate) mod tests {
             let diagnostic = format!("{:?}", err.report());
             assert!(diagnostic.contains(&format!("operation_key={key}")));
             assert!(diagnostic.contains("kind=maintenance"));
-            assert!(diagnostic.contains("state=foreground_running"));
+            assert!(diagnostic.contains("state=voluntary"));
             assert!(diagnostic.contains("disposition=open"));
             assert!(diagnostic.contains("trx_id=none"));
 

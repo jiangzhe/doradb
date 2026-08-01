@@ -83,7 +83,7 @@ failed-retained terminal outcome. [C3] [C4] [U2] [U3]
 Acceptance must not make the runtime a lock-waiting domain. Public
 transactions continue to acquire and hold transaction-lifetime table locks on
 the caller executor. If DDL/maintenance lock acquisition also occurred inside
-accepted tasks, external runtime capacity could be filled by operations
+accepted tasks, mandatory runtime concurrency could be filled by operations
 waiting on clients that the engine cannot schedule. Instead, the caller-owned
 preparation future acquires every operation lock/gate needed by the workflow,
 then submits only execution-ready work. A live preparation future may retain
@@ -132,7 +132,7 @@ supervision, and drain contracts. The crate-private `runtime::block_on` and
    caller-owned, drop-cancellable preparation stage, then admit only work that
    can execute without acquiring or reacquiring an operation lock. [C3] [C6]
    [C7] [C8] [C9] [U4] [U5] [U6]
-6. Bound externally initiated queued work without allowing external
+6. Bound caller-initiated queued work without allowing mandatory-concurrency
    backpressure to reject or block correctness-critical terminal cleanup.
    [D10] [C5] [B1]
 7. Guarantee memory safety and resource ownership when an observer disappears,
@@ -142,9 +142,9 @@ supervision, and drain contracts. The crate-private `runtime::block_on` and
    of mandatory-runtime scheduling, task allocation, queue, counter, or
    notification overhead. [D1] [D2] [D10] [C4] [U2]
 9. Establish extension points for fixed-pool parallel recovery, checkpoint,
-   purge, and index-build task groups without implementing adaptive scheduling,
-   priorities, or algorithm-level parallelism in this RFC. [D4] [D6] [B1]
-   [U2]
+   purge, and index-build work without predefining child-task groups, adaptive
+   scheduling, priorities, or algorithm-level parallelism in this RFC. [D4]
+   [D6] [B1] [U2]
 10. Preserve synchronous `Engine::shutdown` and the component registry's
    reverse-order teardown proof. [D3] [C1] [C2]
 
@@ -270,7 +270,7 @@ supervision, and drain contracts. The crate-private `runtime::block_on` and
   pool with efficient future submission, memory/resource safety, and an
   extension path for recovery, checkpoint, index build, and other maintenance.
 - [U3] The user approved the recommended first-principles direction: a narrow
-  mandatory-runtime contract with bounded external admission, non-lossy
+  mandatory-runtime contract with bounded caller-operation admission, non-lossy
   internal cleanup, runtime-first DDL/maintenance execution, and phased
   migration rather than a full scheduler in the first task.
 - [U4] During Round 2, the user requested an explicit operation prepare stage
@@ -297,6 +297,18 @@ supervision, and drain contracts. The crate-private `runtime::block_on` and
   one active `Completing` state for claimed terminal work, and a distinct
   non-active `Terminal` tombstone. `Idle` remains a session-slot state rather
   than an operation-entry state.
+- [U9] During Phase 1 task design, the user selected a minimal runtime:
+  `MandatoryRuntime` and its workers use component-owned `QuiescentBox`/
+  `QuiescentGuard` lifetimes without outer `Arc` wrappers; caller admission is
+  named mandatory concurrency and defaults to four permits; and RAII admission
+  accounting replaces a central per-task registry and queued/running
+  diagnostics.
+- [U10] The user rejected a generic task-group abstraction in Phase 1. Caller
+  operations use bounded `MandatoryAdmission`/`MandatoryPermit`; unbounded
+  internal cleanup uses separate closeable
+  `MandatoryInternalAdmission`/`MandatoryInternalPermit` accounting. Internal
+  cleanup tasks are leaves, `TransactionSystem` submits through its runtime
+  guard, and generic groups or child barriers remain future work.
 
 ### Source Backlogs
 
@@ -319,14 +331,15 @@ future drop, observer drop, session-handle drop, nor engine shutdown may cancel
 the task. Process termination remains outside the in-process guarantee. [D3]
 [D7] [D14] [C1] [C3] [U2]
 
-The runtime accepts only owned `Send + 'static` futures. External
+The runtime accepts only owned `Send + 'static` futures. Caller-facing
 DDL/maintenance adapters submit them through the `PreparedExecution` boundary;
-internal terminal producers use their non-lossy capability. The runtime never
-lends the executor's `Task` handle to a caller. It wraps every task in a
-supervised `Future<Output = ()>`, spawns it, and explicitly detaches the
-executor handle before returning an observer or acknowledging an internal
-submission. The wrapper, not the detached executor output, owns completion,
-panic, accounting, and terminal-publication behavior. [D14] [C4] [C5] [U5]
+internal terminal callers submit through a runtime guard's non-lossy
+crate-private method. The runtime never lends the executor's `Task` handle to a
+caller. It wraps every task in a supervised `Future<Output = ()>`, spawns it,
+and explicitly detaches the executor handle before returning an observer or
+acknowledging an internal submission. The wrapper, not the detached executor
+output, owns completion, panic, its caller or internal permit, and
+terminal-publication behavior. [D14] [C4] [C5] [U5] [U9] [U10]
 
 The initial executor is one `async_executor::Executor<'static>` shared by a
 fixed number of named OS runner threads. Multiple runners may poll different
@@ -342,7 +355,7 @@ supervision, shutdown, and bounded-poll requirements may submit work. [D3]
 
 ### 2. Caller preparation is cancellable; accepted execution is engine-owned
 
-Externally initiated DDL and maintenance have a caller-owned preparation stage
+Caller-initiated DDL and maintenance have a caller-owned preparation stage
 followed by one atomic ownership handoff to mandatory execution. Preparation
 may wait for and retain operation locks; execution receives the complete
 resource plan and performs no operation-lock acquisition or reacquisition.
@@ -363,7 +376,7 @@ resource plan and performs no operation-lock acquisition or reacquisition.
    while this guard owns partial or complete resources. Dropping the future
    cancels pending acquisition and releases all acquired resources.
 4. **Runtime-capacity admission:** Only a completely prepared,
-   execution-ready operation waits for external runtime capacity. A successful
+   execution-ready operation waits for mandatory runtime concurrency. A successful
    capacity poll proceeds directly to lifecycle recheck, future construction,
    and submission without another `.await`. The caller may retain its prepared
    lock guards while capacity is unavailable, but it does not consume runtime
@@ -389,7 +402,7 @@ drop the future. Doradb guarantees cancellation-safe release on `Drop`; it
 does not infer abandonment from polling inactivity, revoke a live future's
 locks, or add a preparation lease. [D2] [C1] [C3] [C4] [C13] [U5] [U6]
 
-The capacity interface must not return `Pending` after handing an external
+The capacity interface must not return `Pending` after handing a mandatory
 permit to the caller. Once a poll obtains capacity, lifecycle recheck and
 submission occur in the same non-yielding section. A construction,
 lifecycle, or registration failure before acceptance leaves the rollback guard
@@ -432,24 +445,25 @@ acceptance, the exact same move-only guard belongs to the runtime
 execute/finalize scope and is never handed back to the caller or observer.
 [C3] [C4] [C13] [U5] [U6]
 
-### 3. External capacity admits prepared work; terminal cleanup is non-lossy
+### 3. Mandatory concurrency admits prepared work; terminal cleanup is non-lossy
 
 A fixed-size runner pool does not by itself bound queued task memory. The
-runtime therefore has a configurable maximum number of outstanding external
-root tasks. This permit is an accepted-operation concurrency limit, not a
-precise running-thread limit: it covers execution-ready tasks that are queued,
-executing, awaiting execution-internal IO/events, or finalizing. It does not
-cover caller preparation or operation-lock waiting. Runner count separately
-bounds how many task polls can execute at once. [C12] [D10] [B1] [U5]
+runtime therefore has a configurable maximum number of outstanding accepted
+caller operations. This mandatory permit is an accepted-operation concurrency
+limit, not a precise running-thread limit: it covers execution-ready tasks that
+are queued, executing, awaiting execution-internal IO/events, or finalizing. It
+does not cover caller preparation or operation-lock waiting. Runner count
+separately bounds how many task polls can execute at once. [C12] [D10] [B1]
+[U5] [U9]
 
-The external permit is acquired only after all operation authority required by
+The mandatory permit is acquired only after all operation authority required by
 runtime execution is ready. It is held from acceptance through terminal
-accounting and released only after transferred resources are released or
+publication and released only after transferred resources are released or
 safely retained. Configuration is validated at bootstrap and fixed for one
-engine instance. Exact default and
-supported bounds are Phase 1 choices, but both worker count and external
-capacity must be nonzero and deterministic tests must be able to select small
-values. [C12] [D10] [B1] [U5]
+engine instance. Phase 1 names the setting `concurrency_limit`, defaults
+`worker_threads` to two and `concurrency_limit` to four, and rejects zero for
+either value. Deterministic tests can select smaller values. [C12] [D10] [B1]
+[U5] [U9]
 
 A prepared caller may hold operation locks while waiting for runtime capacity.
 Public transactions may also delay preparation, but neither form of
@@ -462,9 +476,9 @@ ownership boundary, not a general deadlock-prevention policy. [D1] [D2] [C3]
 The acceptance contract requires only that runtime capacity be requested after
 the operation is execution-ready, lifecycle recheck and submission do not
 await after capacity is obtained, runtime execution does not acquire or
-reacquire an operation lock/gate, and child terminal continuations use their
-accepted task group or the non-lossy internal capability. [C3] [C5] [D10]
-[U5] [U7]
+reacquire an operation lock/gate, and an accepted root remains accounted until
+its nested terminal proof while independent terminal cleanup uses the
+non-lossy internal capability. [C3] [C5] [D10] [U5] [U7] [U10]
 
 This RFC deliberately does not choose how caller preparation handles arbitrary
 multi-resource waits. Acquisition order, batching, timeout, prevention,
@@ -493,18 +507,38 @@ rejectable quota. A saturated DDL queue must not prevent rollback required by a
 DDL task, failed precommit, or abandoned transaction. The runtime therefore
 exposes a distinct crate-private internal submission capability for
 already-existing correctness obligations. It is synchronous and non-lossy
-while its producer capability is open. Internal jobs still contribute to
-active-task accounting and observability, but bypass the external root quota.
-[D2] [C4] [C5] [B1]
+while internal admission is open. Internal submission increments a separate
+unbounded active count and constructs a non-cloneable
+`MandatoryInternalPermit` before detached spawn. The supervised job retains
+that permit through terminal handling, bypassing the caller-operation
+concurrency limit. Submission after closure returns the original job to its
+caller. [D2] [C4] [C5] [B1] [U9] [U10]
 
-An internal send/registration failure after ownership has moved is an invariant
-failure. The producer must retain or deliberately leak the returned payload
-before failing; it may not drop rollback-capable undo or another resource whose
-address remains reachable. Existing failed-precommit and fatal rollback
-retention rules remain normative. [D2] [C4] [C5]
+The initial runtime has no central per-task registry, monotonic task ID, or
+mutable queued/running phase. A `MandatoryPermit` is the authoritative
+active-work token for a caller operation; `MandatoryInternalPermit` is the
+authoritative token for an internal obligation. Immutable task context—class,
+label, and optional session key—travels with the supervisor for completion and
+error logs but does not participate in scheduling or drain. Caller and
+internal counts remain separate, avoiding duplicate accounting whose state
+could disagree with the actual ownership tokens. [D10] [C1] [C4] [C5] [U9]
+[U10]
+
+`MandatoryInternalAdmission` owns only an open flag, active count, change
+event, and their narrow synchronization. Runtime workers exclusively close and
+drain it after redo has joined. Phase 1 internal cleanup jobs are leaf tasks,
+so no recursive internal submission must remain possible after that closure.
+Generic task-group identities, producer/owner capability pairs, and child
+barriers are not part of the initial design. [C2] [C5] [U10]
+
+An internal submission failure after ownership has moved is an invariant
+failure. The submission caller must retain or deliberately leak the returned
+payload before failing; it may not drop rollback-capable undo or another
+resource whose address remains reachable. Existing failed-precommit and fatal
+rollback retention rules remain normative. [D2] [C4] [C5]
 
 This RFC does not add scheduler priority lanes. Fairness in the initial runtime
-comes from multiple runners, a shared ready queue, bounded external roots, and
+comes from multiple runners, a shared ready queue, bounded caller roots, and
 the requirement that every task poll be finite and nonblocking. Correctness-
 critical code may not perform blocking waits or unbounded CPU loops inside one
 poll. Known long loops must be chunked and use `runtime::yield_now()` or an
@@ -527,16 +561,16 @@ The completion cell distinguishes:
 
 Dropping the observer updates only this cell. If a result arrives without an
 observer, values are released normally, ordinary operation errors are logged
-with task metadata, and fatal errors have already poisoned/retained through
+with immutable task context, and fatal errors have already poisoned/retained through
 their domain terminal policy. A successful result may be silently discarded
 after its resources are dropped. No observer state is stored in
 `SessionOperationEntry`, and an unconsumed result does not keep a session busy
 after the operation itself becomes terminal. The observer also retains no
-`EngineRef`, session-operation authority, external-capacity permit, or
+`EngineRef`, session-operation authority, mandatory permit, or
 component guard: submission moves those resources into the task or releases
 them before the public wrapper awaits. A client that stops polling but keeps
 the observer allocated therefore cannot block engine shutdown after the task
-itself finishes. [C1] [C3] [C4] [U2]
+itself finishes. [C1] [C3] [C4] [U2] [U9]
 
 Concrete cell/type names and whether the adapter uses a custom event cell or a
 one-shot channel are Phase 1 choices. The contract is not: the observer owns no
@@ -571,7 +605,7 @@ The mapping from the implemented RFC-0025 representation is:
 | Current state | Revised state | Reason |
 | --- | --- | --- |
 | `ForegroundAvailable`, `ForegroundRunning(private)` | `Voluntary(private)` | Caller authority is the relevant outer fact; checked-in versus leased public transaction payload is already represented by `trx_inner` under the entry mutex. |
-| `BackgroundQueued`, `BackgroundRunning` | `Mandatory(private)` | Acceptance transfers authority once; queue and poll position belong to runtime metadata. |
+| `BackgroundQueued`, `BackgroundRunning` | `Mandatory(private)` | Acceptance transfers authority once; queue and poll position are not ownership states and need no replacement transition. |
 | `CleanupReady` | `CleanupReady` | An abandoned checked-in transaction is claimable but has no terminal owner yet. |
 | `CleanupRunning`, `CompletionOwned` | `Completing` | Both move the transaction payload to exactly one terminal claim; rollback versus normal completion belongs to that claim. |
 | `Terminal` | `Terminal` | Every transaction and outer-operation obligation is complete. |
@@ -627,8 +661,10 @@ panic-caught domain future. The entry remains `Mandatory` while the task is
 queued, executing, or waiting for a private transaction or other nested
 terminal proof. Only after that proof and resource release may it move directly
 to `Terminal`; unsafe residual ownership moves to `FailedRetained`.
-Queue/execution diagnostics come from runtime task metadata and accounting
-rather than extra entry-mutex transitions. [C3] [C4] [C5] [D10] [U7] [U8]
+Phase 1 does not centrally track queued-versus-running position. Shutdown
+diagnostics use session ownership plus aggregate mandatory-permit and
+internal-task counts rather than extra entry-mutex transitions or a per-task
+registry. [C3] [C4] [C5] [D10] [U7] [U8] [U9] [U10]
 
 Explicit session-lock operations remain caller-controlled under `Voluntary`.
 Standalone progress waits and read-only diagnostics do not allocate mandatory
@@ -655,13 +691,16 @@ a stale hint as neutral. Failed-precommit payload handoff remains non-lossy,
 and rollback failure still poisons and retains any undo ownership required for
 raw MVCC references. [D2] [D7] [C4] [C5]
 
-All transaction cleanup submissions join one closeable runtime task group.
-Transaction worker ownership is split so component order proves its lifetime:
-the redo owner closes group-commit admission, joins redo, and then relinquishes
-its failed-precommit cleanup producer; the runtime owner drains the cleanup
-group and joins its runners; only afterward does the purge owner stop purge.
-This preserves redo-before-cleanup-before-purge ordering after cleanup
-execution moves to the shared runtime. [D2] [C5] [U7]
+Every transaction cleanup submission acquires one internal permit before
+spawn. `TransactionSystem` stores a cloned
+`QuiescentGuard<MandatoryRuntime>` and calls the runtime's crate-private
+internal-submission method; no dedicated producer or group-owner type is
+needed. Transaction worker ownership is split so component order proves the
+lifetime: the redo owner closes group-commit admission and joins redo; the
+runtime-worker owner then closes internal admission, drains internal permits,
+and joins its runners; only afterward does the purge owner stop purge. This
+preserves redo-before-cleanup-before-purge ordering after cleanup execution
+moves to the shared runtime. [D2] [C5] [U7] [U10]
 
 Concurrent execution requires a focused audit of state previously observed
 only through one cleanup worker. The transaction, lock, catalog, buffer-pool,
@@ -698,24 +737,35 @@ MandatoryRuntimeWorkers
 TransactionRedoWorkers
 ```
 
-`MandatoryRuntime::build` validates configuration, constructs the shared
-executor/lifecycle core, starts the fixed runner threads, registers the
-cloneable access handle, and puts a pending worker-owner provision on the
-component shelf. Starting runners at this early point leaves a future path for
-catalog bootstrap and parallel recovery task groups without requiring another
-runtime or changing which executor owns them. Initial phases need not submit
-recovery work. [D3] [D4] [C2] [C10] [U2]
+`MandatoryRuntime` is an ordinary component with `Owned = Self` and
+`Access = QuiescentGuard<Self>`; the registry's `QuiescentBox` owns the plain
+runtime core. Its build validates configuration, constructs and registers the
+executor/lifecycle core, obtains the published guard, and puts a deferred
+runner-startup provision with the configured thread count on the component
+shelf. `MandatoryRuntimeWorkers` consumes that provision, starts each fixed
+runner with a direct guard clone, retains rollback-safe partial ownership
+during spawning, and registers the completed worker owner. Runtime stop state
+lives in the registered core, so neither the core nor the startup/worker owner
+needs an outer `Arc` or `Arc<Event>`. Bootstrap work may submit to this executor
+only after `MandatoryRuntimeWorkers` initializes. [D3] [D4] [C2] [C10] [U2]
+[U9] [U10]
 
 The current `TransactionSystemWorkers` component is split.
 `TransactionPurgeWorkers` owns purge dispatch/executor handles and is
 registered before the runtime worker owner. `TransactionRedoWorkers` owns
 group-commit admission and the redo thread and is registered afterward.
-`MandatoryRuntimeWorkers` consumes the pending runtime provision between them.
-Registration order controls reverse shutdown; it does not require purge to
-start before redo. Redo may still start first and make the initial redo header
-durable before purge startup, with partially built handles retained by
-rollback-safe component-shelf provisions until their owners are registered.
-Exact startup provision wiring is a Phase 1 choice. [C2] [C5] [U7]
+`MandatoryRuntimeWorkers` consumes the deferred runner-startup provision
+between them.
+All three are marker components whose plain registered owners directly retain
+their quiescent dependencies, channels, and join handles rather than
+`Arc`-wrapping worker owners. Existing shared result cells and domain values
+with independent endpoints remain unchanged.
+Registration order controls reverse shutdown independently from thread-start
+order. `TransactionSystem` publishes sibling purge and redo startup provisions.
+Purge may start first and block on its empty channel; the later redo component
+makes the initial redo header durable before engine bootstrap returns. Each
+fallible worker build retains rollback-safe ownership of any threads it starts.
+[C2] [C5] [U7] [U9]
 
 Normal reverse shutdown is:
 
@@ -723,10 +773,11 @@ Normal reverse shutdown is:
 TransactionRedoWorkers:
     close group commit
     -> join redo
-    -> close/release redo-side cleanup production
+    -> finish final failed-precommit cleanup submission
 MandatoryRuntimeWorkers:
-    close remaining internal submission
-    -> drain transaction cleanup and other accepted tasks
+    assert caller admission is closed and drained
+    close internal admission
+    -> drain internal tasks
     -> stop/join runners
 TransactionPurgeWorkers:
     drain/stop/join purge
@@ -735,11 +786,11 @@ TransactionSystem and Catalog:
 ```
 
 Before this component sequence begins, engine lifecycle shutdown must have
-drained every external/session root task that could still use redo. Work
+drained every caller/session root task that could still use redo. Work
 remaining or produced after redo join is therefore terminal cleanup that does
 not require redo but may still update GC state while purge remains live. The
-component sequence is the final producer/owner proof even when normal lifecycle
-drain already made the executor empty. [C1] [C2] [C5] [U7]
+component sequence is the final submission-lifetime proof even when normal
+lifecycle drain already made the executor empty. [C1] [C2] [C5] [U7]
 
 If bootstrap fails before any pending runtime, redo, or purge worker provision
 is registered, provision drop must signal and join every successfully started
@@ -751,39 +802,44 @@ detach an OS thread. [C2] [D3] [C5]
 
 `Engine::try_shutdown` and blocking `Engine::shutdown` remain synchronous.
 Their lifecycle model expands from runtime references and session blockers to
-include mandatory-runtime root admission and active-task accounting. [D3] [C1]
+include separate caller-operation and internal-cleanup admission accounting.
+[D3] [C1] [U9] [U10]
 
 Shutdown proceeds in this order:
 
-1. close engine/root-operation admission and wake external capacity waiters;
+1. close engine/root-operation admission and wake mandatory-concurrency waiters;
 2. wait for short admission tokens to drain;
-3. prevent any new external mandatory root from being accepted;
+3. prevent any new caller mandatory root from being accepted;
 4. allow already-accepted tasks, transaction completion, and their internal
    cleanup continuations to run;
 5. wait until caller-owned preparation entries, runtime references,
-   session-operation entries, and mandatory active-task accounting reach a
-   fixed point with no outstanding work;
+   session-operation entries, caller permits, and active internal tasks reach
+   a fixed point with no outstanding work;
 6. remove idle/abandoned session state;
 7. invoke reverse component shutdown:
    `TransactionRedoWorkers -> MandatoryRuntimeWorkers ->
    TransactionPurgeWorkers`, followed by the transaction/catalog owners.
 
-`try_shutdown` reports busy if any foreground preparation or accepted mandatory
-task remains and includes at least its operation/task class plus
-session-operation key when available. Closing admission wakes preparation and
-capacity waiters, but a wakeup cannot force a client executor to poll or drop
-its future. A retained, unpolled foreground preparation may therefore delay
-blocking shutdown indefinitely while it owns locks or session authority. This
-is the documented pre-acceptance caller-liveness caveat, not a reason to revoke
-locks or cancel accepted work. Blocking shutdown installs listeners before
-inspecting both session and runtime state so an actual release cannot race with
-an unregistered wait. Storage poison closes new healthy admission but does not
-cancel accepted work or skip worker joins. [C1] [C3] [C5] [U5] [U6]
+`try_shutdown` reports busy for foreground preparation, `Mandatory` session
+work, nonzero caller permits, or active internal tasks. It reports session keys
+where session state provides them and reports caller-permit and internal-task
+counts separately, but it does not promise an exact queued-versus-running task
+snapshot. Closing caller admission wakes preparation and concurrency waiters,
+but a wakeup cannot force a client executor to poll or drop its future. A
+retained, unpolled foreground preparation may therefore delay blocking
+shutdown indefinitely while it owns locks or session authority. This is the
+documented pre-acceptance caller-liveness caveat, not a reason to revoke locks
+or cancel accepted work. Blocking shutdown installs listeners before
+inspecting both session and runtime state so an actual release cannot race
+with an unregistered wait. Storage poison closes new healthy admission but
+does not cancel accepted work or skip worker joins. [C1] [C3] [C5] [U5] [U6]
+[U9] [U10]
 
-The executor owner may be dropped only after submission is closed, active-task
-count is zero, its ready queue is empty, and all runners are joined. Dropping a
-nonempty executor would cancel futures and violates this RFC. A fatal
-`Engine::drop` with externally retained live work cannot safely invoke normal
+The executor owner may be dropped only after mandatory admission is closed
+with zero caller permits, internal admission is closed with zero active tasks,
+all runners are joined, and the executor is empty. Dropping a nonempty
+executor would cancel futures and violates this RFC. A fatal
+`Engine::drop` with caller-retained live work cannot safely invoke normal
 reverse worker shutdown because an accepted DDL task may still need redo,
 cleanup, catalog, or file workers. That misuse path must retain the component
 registry and live worker/task graph without calling their cancelling teardown,
@@ -808,14 +864,13 @@ executor's detached task boundary. A task panic:
    terminal proof;
 6. completes any attached observer with a fatal runtime error;
 7. publishes outer/session terminal state in proof order;
-8. decrements runtime active accounting and returns the external permit
-   exactly once.
+8. releases its internal permit or returns its caller permit exactly once.
 
 This prevents a detached executor handle from silently swallowing task panic
 and keeps runner threads available for other cleanup. Supervisor code itself
-must be panic-minimal; terminal accounting uses armed guards so a secondary
-panic cannot make a task disappear from shutdown observation. [D3] [D14] [C4]
-[C5]
+must be panic-minimal; caller and internal permits use armed guards so a
+secondary panic cannot make accepted work disappear from shutdown
+observation. [D3] [D14] [C4] [C5] [U9] [U10]
 
 Known storage/operation failures remain ordinary typed results and follow each
 DDL or maintenance workflow's existing pre/post-gate policy. Runtime
@@ -919,19 +974,20 @@ execution pays no mandatory-runtime scheduling cost. [D10] [U2] [U5] [U6]
 
 ### 11. Extensibility is designed in, not preimplemented
 
-The initial runtime records a small task class/metadata value and supports
-typed observed roots, unobserved internal terminal tasks, and explicit
-task-group completion. Scheduling treats classes uniformly in Phase 1; metadata
-exists for diagnostics and later policy without changing ownership semantics.
-[B1] [U2]
+The initial runtime carries small immutable task context and supports typed
+observed roots and unobserved internal terminal tasks. Scheduling treats
+classes uniformly in Phase 1; context exists for supervision and logs without
+becoming central lifecycle state. Later scheduling policy can introduce its
+own evidence-based metadata rather than making Phase 1 preinstall a task
+registry or generic group model. [B1] [U2] [U9] [U10]
 
 Future parallel recovery, checkpoint, or index build may decompose one logical
-operation into several mandatory child tasks and await a group barrier. Child
-submission must inherit an accepted parent/build scope so shutdown cannot close
-the runtime between parent and child. The early-started runners allow such
-startup groups, but this RFC does not choose decomposition algorithms,
-priorities, CPU blocking pools, or fairness weights. Those changes require
-their own task or RFC evidence. [D4] [D6] [C10] [U2]
+operation into several mandatory child tasks and await a structured barrier.
+That later design must preserve parent/build scope across child submission so
+shutdown cannot close the runtime between parent and child. Phase 1 does not
+choose a group API, decomposition algorithm, priority policy, CPU blocking
+pool, or fairness weight. Those changes require their own task or RFC evidence.
+[D4] [D6] [C10] [U2] [U10]
 
 No future extension may weaken the base contract: an accepted mandatory task
 has one engine owner, is never cancelled for capacity or shutdown, and remains
@@ -979,6 +1035,27 @@ observable until its resources are released or safely retained.
 - Why Not Chosen: A fixed runtime establishes the ownership model without
   prematurely fixing future scheduling policy. [U2] [U3]
 
+### Alternative E: Per-task lifecycle registry
+
+- Summary: Track every task ID and queued/running phase in a central map.
+- Analysis: This improves detailed shutdown snapshots but duplicates the
+  authoritative caller/internal permit ownership tokens and adds lifecycle
+  writes. [D10] [U9] [U10]
+- Why Not Chosen: Phase 1 needs exact drain correctness, not per-task scheduler
+  diagnostics; session state and separate aggregate token counts are
+  sufficient. [U9] [U10]
+
+### Alternative F: Generic task groups in Phase 1
+
+- Summary: Give every internal producer a named closeable group with child
+  membership and a group owner.
+- Analysis: Groups can support later structured parallel work, but transaction
+  cleanup currently needs only one open flag, one active count, and one drain
+  boundary.
+- Why Not Chosen: Dedicated internal admission proves Phase 1 shutdown with
+  fewer states and capabilities; a group API can be designed when a real child
+  workflow needs it. [U10]
+
 ## Unsafe Considerations
 
 This RFC requires no new `unsafe` block, raw-pointer type, leaked lifetime, or
@@ -1012,21 +1089,24 @@ focused validation.
 - **Phase 1: Mandatory Operation Driver And Concurrent Cleanup Executor**
   - Scope: Add `async-executor` as a direct production dependency; add
     `MandatoryRuntimeConfig`, the early runtime core and late worker-owner
-    components, fixed runner startup/rollback, bounded external permits,
+    components using quiescent ownership, deferred fixed-runner
+    startup/rollback, bounded mandatory permits,
     non-lossy internal submission, supervised detached envelopes, move-once
-    completion observers, closeable task groups, active-task drain, and runtime
-    diagnostics. Add the generic caller-preparation/`PreparedExecution`
+    completion observers, separate closeable internal admission, caller and
+    internal permit drain, and aggregate runtime diagnostics. Add the generic
+    caller-preparation/`PreparedExecution`
     handoff, RAII resource scope, and compact
     `Voluntary`/`Mandatory`/terminal session-operation states needed by later
     adapters. Replace the sequential
     transaction cleanup channel/thread with directly submitted concurrent
     runtime tasks. Split `TransactionSystemWorkers` into redo and purge owners
-    registered on opposite sides of `MandatoryRuntimeWorkers`, while preserving
-    redo-first startup and partial-build rollback. Use synthetic preparation
+    registered on opposite sides of `MandatoryRuntimeWorkers`, with independent
+    startup provisions and partial-build rollback. Require initial redo-header
+    durability before engine bootstrap returns. Use synthetic preparation
     resources to prove Drop, transfer, observer, and terminal semantics; do not
     migrate production DDL/maintenance or add a production `LockManager`
     adapter yet. [C1] [C2] [C3] [C4] [C5] [C13] [D14] [B1] [U5] [U6]
-    [U7] [U8]
+    [U7] [U8] [U9] [U10]
   - Goals: Prove that unpolled calls start nothing; caller `Drop` releases
     synthetic pending/acquired resources; a retained unpolled preparation keeps
     its guard by documented design; capacity is requested only after
@@ -1034,26 +1114,33 @@ focused validation.
     `Mandatory` owner exactly once; nested cleanup remains under that owner;
     observer drop cannot cancel work; executor task handles never escape;
     independent cleanup jobs make concurrent progress; critical cleanup
-    bypasses external saturation; task panic is supervised; partial startup
-    joins every started worker; and reverse component shutdown proves
+    bypasses mandatory-concurrency saturation; task panic is supervised;
+    partial startup joins every started worker; and reverse component shutdown proves
     redo-before-runtime-before-purge ordering. [B1] [U2] [U5] [U6] [U7]
-    [U8]
+    [U8] [U9] [U10]
   - Prerequisites: RFC-0025 Phases 1 and 2 are implemented, and their stable
     entry/private transaction/public statement ownership remains the baseline.
     [D12] [D13]
-  - Phase-local Choices: Select concrete runtime/permit/observer type names,
-    fixed default worker count and external-capacity bounds, completion
-    cell implementation, operation-resource-scope storage, task metadata
-    representation, capacity-wait wakeup implementation, worker-startup
-    provision wiring, and deterministic concurrency hooks. These choices may
-    not weaken caller-side Drop release, prepared-only capacity admission,
-    compact `Voluntary`/`Mandatory` ownership, atomic guard transfer,
-    non-cancellation,
-    non-lossy internal submission, or redo-runtime-purge drain contracts.
+  - Phase-local Choices: Use `MandatoryRuntime`/`MandatoryAdmission`/
+    `MandatoryPermit` for bounded caller work and
+    `MandatoryInternalAdmission`/`MandatoryInternalPermit` for unbounded
+    internal work; default `worker_threads` to two and `concurrency_limit` to
+    four; and use direct `QuiescentGuard` component access without outer
+    runtime/worker `Arc` wrappers. Select the completion cell implementation,
+    operation-resource-scope storage,
+    mandatory-concurrency wakeup implementation, worker-startup provision
+    wiring, and deterministic concurrency hooks. Use immutable task context
+    for logs, while caller and internal permits are the sole drain accounting;
+    do not add a central task registry, generic task groups, or queued/running
+    phases.
+    These choices may not weaken caller-side Drop release, prepared-only
+    admission, compact `Voluntary`/`Mandatory` ownership, atomic guard
+    transfer, non-cancellation, non-lossy internal submission, or
+    redo-runtime-purge drain contracts.
   - Non-goals: Do not migrate production DDL/maintenance, parallelize cleanup
     inside one transaction, redesign `LockManager`, add priorities/adaptive
     resizing, or migrate other component workers.
-  - Task Doc: `docs/tasks/TBD.md`
+  - Task Doc: `docs/tasks/000248-mandatory-operation-driver-and-concurrent-cleanup-executor.md`
   - Task Issue: `#0`
   - Phase Status: `pending`
   - Implementation Summary: `pending`
@@ -1165,9 +1252,10 @@ focused validation.
     evidence. [D3] [D7] [D9] [B1]
   - Goals: Demonstrate one execution owner, no dropped accepted payload,
     lossless shutdown wakeups, no transaction/statement hot-path overhead,
-    bounded external backlog, progress for cleanup under DDL/maintenance load,
-    no operation-lock acquisition inside runtime execution, and a documented
-    extension boundary for future task groups. [D10] [B1] [U5]
+    bounded caller-operation backlog, progress for cleanup under
+    DDL/maintenance load, no operation-lock acquisition inside runtime
+    execution, and a documented extension boundary for future task groups.
+    [D10] [B1] [U5]
   - Prerequisites: Every production DDL and mandatory-maintenance path uses
     caller preparation plus atomic prepared-runtime submission; no legacy
     foreground handoff or runtime-side operation-lock acquisition remains.
@@ -1195,7 +1283,7 @@ proof of ownership or progress. [D9]
 
 Phase 1 minimum focused coverage:
 
-1. an unpolled external operation future creates no permit, entry, or task;
+1. an unpolled caller operation future creates no permit, entry, or task;
 2. invalid pure preflight creates no permit, entry, engine identity, or lock
    waiter;
 3. a synthetic preparation future may own partial or complete RAII resources
@@ -1204,9 +1292,9 @@ Phase 1 minimum focused coverage:
 4. retaining an unpolled synthetic `Voluntary` preparation retains its
    guard and makes `try_shutdown` busy by documented design; dropping it
    unblocks progress;
-5. while external capacity is saturated, an execution-ready caller retains its
-   preparation guard but creates no runtime task and consumes no accepted-task
-   permit;
+5. while mandatory concurrency is saturated, an execution-ready caller
+   retains its preparation guard but creates no runtime task and consumes no
+   mandatory permit;
 6. successful capacity acquisition and submission move the preparation guard
    exactly once in one non-yielding poll, while injected pre-acceptance
    construction, lifecycle, and registration failures release the permit and
@@ -1218,12 +1306,13 @@ Phase 1 minimum focused coverage:
 8. submission moves `Voluntary` to `Mandatory` exactly once even if a runner
    polls before the public method returns its observer; queueing, first poll,
    and nested finalization add no outer ownership-state transition;
-9. dropping observers while runtime metadata reports queued, executing,
-   waiting on execution-internal IO/event, nested cleanup, or completed never
-   changes task execution;
+9. deterministic hooks hold accepted work before first poll, executing,
+   waiting on execution-internal IO/event, nested cleanup, and completed;
+   dropping observers in each position never changes task execution;
 10. transferred resources remain owned through execution and any injected
    nested cleanup, then release before session terminal publication;
-11. external saturation cannot block an internal terminal cleanup submission;
+11. mandatory-concurrency saturation cannot block an internal terminal cleanup
+    submission;
 12. at least two gated cleanup jobs overlap under a multi-runner configuration,
     while one-runner tests still demonstrate cooperative progress;
 13. `CleanupReady -> Completing -> Terminal` is single-owner, `Completing`
@@ -1233,13 +1322,14 @@ Phase 1 minimum focused coverage:
     injected execution failure;
 15. a panicking task poisons, completes/detaches correctly, transfers or
     releases its operation resource scope in terminal order, releases
-    accounting, and does not kill an executor runner; an injected unsafe
-    residual path publishes active `FailedRetained`;
+    its caller or internal permit, and does not kill an
+    executor runner; an injected unsafe residual path publishes active
+    `FailedRetained`;
 16. partial runtime, redo, or purge startup failure stops and joins every
     previously started worker;
-17. `try_shutdown` distinguishes `Voluntary` preparation from `Mandatory`,
-    while detailed queued/executing diagnostics come from
-    runtime metadata;
+17. `try_shutdown` distinguishes `Voluntary` preparation from `Mandatory`
+    session work and reports caller-permit and internal-task blockers
+    separately without a central task registry;
 18. shutdown drains all redo-using roots, joins redo, accepts and completes an
     injected final failed-precommit cleanup on the runtime, joins runtime
     runners, and only then stops purge; blocking shutdown has no lost wakeup
@@ -1311,12 +1401,12 @@ measurements must remain visible rather than being dismissed as cold-path cost.
   long rollback.
 - Split redo and purge worker owners make
   redo-before-runtime-before-purge teardown explicit in component order.
-- External backlog memory is bounded without making terminal cleanup
+- Caller-operation backlog memory is bounded without making terminal cleanup
   rejectable.
 - Runtime ownership, panic supervision, shutdown drain, and result observation
   have one engine-wide contract.
 - Catalog, transaction, and future startup work gain a reusable engine
-  component and task-group extension point.
+  component and a narrow internal-submission extension point.
 - Public transaction and statement execution retain caller-runtime
   flexibility and avoid new scheduler overhead.
 
@@ -1373,8 +1463,8 @@ redo-runtime-purge shutdown contracts.
   cleanup starvation despite bounded cooperative polling.
 - Adaptive pool sizing after fixed-pool behavior and resource costs are
   measured.
-- Structured parallel recovery using the early runtime and build-scoped task
-  groups.
+- Structured parallel recovery scheduled after mandatory-runtime worker
+  initialization with a future build-scoped child-task/barrier design.
 - Parallel checkpoint scanning/publication preparation with one ordered
   publication owner.
 - Parallel hot/cold index collection/build with deterministic merge and

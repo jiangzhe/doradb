@@ -160,6 +160,10 @@ pub(crate) enum ConfigError {
     InvalidLatchFallbackMode,
     #[error("invalid B-tree compact ratio")]
     InvalidBTreeCompactRatio,
+    #[error("invalid mandatory runtime worker thread count")]
+    InvalidMandatoryWorkerThreads,
+    #[error("invalid mandatory runtime concurrency limit")]
+    InvalidMandatoryConcurrencyLimit,
 }
 
 /// Fieldless data-integrity-domain errors carried underneath `ErrorKind::DataIntegrity`.
@@ -314,6 +318,8 @@ pub(crate) enum FatalError {
     PurgeAccess,
     #[error("rollback access failed")]
     RollbackAccess,
+    #[error("mandatory task panicked")]
+    MandatoryTaskPanic,
 }
 
 /// Fieldless internal-domain errors used beneath typed crate-private owners.
@@ -361,6 +367,8 @@ impl From<IoErrorKind> for IoError {
 
 /// Closed registry of typed report roots permitted to cross a completion handoff.
 pub(crate) enum CompletionSourceReport {
+    /// Operation-domain completion source.
+    Operation(Report<OperationError>),
     /// IO-domain completion source.
     Io(Report<IoError>),
     /// Resource-domain completion source.
@@ -373,6 +381,13 @@ pub(crate) enum CompletionSourceReport {
     Runtime(Report<RuntimeError>),
     /// Fatal-domain completion source.
     Fatal(Report<FatalError>),
+}
+
+impl From<Report<OperationError>> for CompletionSourceReport {
+    #[inline]
+    fn from(report: Report<OperationError>) -> Self {
+        Self::Operation(report)
+    }
 }
 
 impl From<Report<IoError>> for CompletionSourceReport {
@@ -421,6 +436,7 @@ impl Debug for CompletionSourceReport {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Operation(report) => Debug::fmt(report, f),
             Self::Io(report) => Debug::fmt(report, f),
             Self::Resource(report) => Debug::fmt(report, f),
             Self::DataIntegrity(report) => Debug::fmt(report, f),
@@ -439,6 +455,7 @@ impl CompletionSourceReport {
         T: Send + Sync + 'static,
     {
         match self {
+            Self::Operation(report) => report.downcast_ref(),
             Self::Io(report) => report.downcast_ref(),
             Self::Resource(report) => report.downcast_ref(),
             Self::DataIntegrity(report) => report.downcast_ref(),
@@ -452,7 +469,8 @@ impl CompletionSourceReport {
     fn fatal_context(&self) -> Option<FatalError> {
         match self {
             Self::Fatal(report) => Some(*report.current_context()),
-            Self::Io(_)
+            Self::Operation(_)
+            | Self::Io(_)
             | Self::Resource(_)
             | Self::DataIntegrity(_)
             | Self::Lifecycle(_)
@@ -619,6 +637,7 @@ impl CompletionErrorBridge {
 
     fn capture_replay(report: &CompletionSourceReport) -> Box<[ReplayFrame]> {
         match report {
+            CompletionSourceReport::Operation(report) => Self::capture_typed_replay(report),
             CompletionSourceReport::Io(report) => Self::capture_typed_replay(report),
             CompletionSourceReport::Resource(report) => Self::capture_typed_replay(report),
             CompletionSourceReport::DataIntegrity(report) => Self::capture_typed_replay(report),

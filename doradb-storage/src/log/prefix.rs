@@ -1,8 +1,8 @@
 use super::{
     LogRequestKind, LogWriteKind, LogWriteSubmission, ReadyGroupPrefix, RedoLogFile, SyncGroup,
 };
+use crate::completion::Completion;
 use crate::error::SharedFatalError;
-use crate::io::Completion;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Instant;
@@ -402,9 +402,9 @@ pub(super) enum LogPrefixKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::completion::Completion;
     use crate::error::FatalError;
     use crate::id::TrxID;
-    use crate::io::Completion;
     use crate::log::LogSync;
     use crate::trx::FailedPrecommitReason;
     use crate::trx::PrecommitTrx;

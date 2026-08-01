@@ -1,5 +1,6 @@
+use crate::completion::Completion;
 use crate::id::TrxID;
-use crate::io::{Completion, DirectBuf};
+use crate::io::DirectBuf;
 use crate::log::block_group::LogBlockGroup;
 use crate::log::{
     LogWriteSubmission, RedoGroupWriteAlloc, RedoGroupWriteMeta, RedoLogFile, SyncGroup,
@@ -209,8 +210,8 @@ impl CommitGroup {
 mod tests {
     use super::*;
     use crate::buffer::test_page_id;
+    use crate::completion::Completion;
     use crate::id::{RowID, TableID};
-    use crate::io::Completion;
     use crate::log::block_group::TrxLog;
     use crate::log::redo::{RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind, TableDML};
     use crate::value::Val;

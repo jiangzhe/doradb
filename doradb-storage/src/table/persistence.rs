@@ -4394,12 +4394,7 @@ mod tests {
             let checkpoint_trx_id = checkpoint_trx.trx_id();
             assert!(session.in_trx().unwrap());
             let err = session.checkpoint_table(table_id).await.unwrap_err();
-            assert_existing_transaction_error(
-                &err,
-                session.id(),
-                checkpoint_trx_id,
-                "foreground_available",
-            );
+            assert_existing_transaction_error(&err, session.id(), checkpoint_trx_id, "voluntary");
             let report = format!("{err:?}");
             assert!(report.contains("operation=checkpoint_table"), "{report}");
             assert!(session.in_trx().unwrap());

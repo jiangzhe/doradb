@@ -5,7 +5,6 @@ compile_error!("One storage IO backend feature must be enabled: `libaio` or `iou
 
 mod backend;
 mod buf;
-mod completion;
 #[cfg(feature = "iouring")]
 mod iouring_backend;
 #[cfg(feature = "libaio")]
@@ -24,7 +23,6 @@ use std::time::Duration;
 
 pub(crate) use backend::*;
 pub(crate) use buf::*;
-pub(crate) use completion::Completion;
 
 /// Canonical storage backend selected by cargo features.
 #[cfg(feature = "iouring")]

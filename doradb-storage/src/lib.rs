@@ -5,6 +5,7 @@ mod io;
 pub mod error;
 mod buffer;
 mod catalog;
+mod completion;
 mod component;
 mod compression;
 pub mod conf;
@@ -42,7 +43,10 @@ pub use catalog::{
     CatalogCheckpointOutcome, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexNo,
     IndexOrder, IndexSpec, TableSpec,
 };
-pub use conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, LogSync, TrxSysConfig};
+pub use conf::{
+    EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, LogSync, MandatoryRuntimeConfig,
+    TrxSysConfig,
+};
 pub use engine::Engine;
 pub use error::{Error, ErrorKind, Result};
 pub use lock::TableLockMode;

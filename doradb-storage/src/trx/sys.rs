@@ -1,6 +1,7 @@
 use crate::DiskPool;
 use crate::buffer::PoolGuards;
 use crate::catalog::{Catalog, CatalogCheckpointScanConfig, TableCache};
+use crate::completion::Completion;
 use crate::component::{
     Component, ComponentRegistry, EnginePools, IndexPool, MemPool, MetaPool, ShelfScope, Supplier,
 };
@@ -14,7 +15,6 @@ use crate::error::{
 use crate::file::fs::FileSystem;
 use crate::file::table_file::{MutableTableFile, OldRoot, TableFile};
 use crate::id::{SessionOperationKey, TrxID};
-use crate::io::Completion;
 use crate::log::redo::RedoLogs;
 use crate::log::{EnqueuePrecommitError, LogFileSealer, LogWriteDriver, RedoLog, RedoLogWriter};
 use crate::notify::MonotonicU64;
@@ -23,7 +23,9 @@ use crate::poison::EnginePoisoner;
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
 use crate::recovery::RecoveryResources;
 use crate::recovery::stream::CatalogSafeRedoSegment;
-use crate::runtime;
+use crate::runtime::mandatory::{
+    MandatoryInternalTask, MandatoryRuntime, MandatoryTaskMetadata, submit_internal,
+};
 use crate::session::{SessionState, TrxAttachment};
 use crate::thread;
 #[cfg(test)]
@@ -36,8 +38,9 @@ use crate::trx::sys_trx::SysTrx;
 use crate::trx::{
     FailedPrecommitCleanupJob, FailedPrecommitReason, FatalRollbackRetention, MAX_COMMIT_TS,
     MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, PrecommitTrx, PreparedTrx,
-    PreparedTrxPayload, SessionOperationCleanupJob, SessionOperationCompletionClaim,
-    SessionOperationEntry, SessionOperationKind, StartedTransaction, Transaction, TrxInner,
+    PreparedTrxPayload, ReleasedTransactionLocks, SessionOperationCleanupJob,
+    SessionOperationCompletionClaim, SessionOperationEntry, SessionOperationKind,
+    StartedTransaction, Transaction, TrxInner,
 };
 use crossbeam_utils::CachePadded;
 use either::Either::{Left, Right};
@@ -175,16 +178,16 @@ struct CommitRejection {
     reason: FailedPrecommitReason,
 }
 
-/// Marker component that owns transaction-system background workers.
-pub(crate) struct TransactionSystemWorkers;
+/// Marker component that owns purge workers.
+pub(crate) struct TransactionPurgeWorkers;
 
-impl Component for TransactionSystemWorkers {
+impl Component for TransactionPurgeWorkers {
     type Config = ();
-    type Owned = TransactionSystemWorkersOwned;
+    type Owned = TransactionPurgeWorkersOwned;
     type Access = ();
     type Error = RuntimeOrFatalError;
 
-    const NAME: &'static str = "trx_sys_workers";
+    const NAME: &'static str = "trx_purge_workers";
 
     #[inline]
     async fn build(
@@ -194,7 +197,7 @@ impl Component for TransactionSystemWorkers {
     ) -> RuntimeOrFatalResult<()> {
         let trx_sys = registry.dependency::<TransactionSystem>();
         let startup = shelf.take::<TransactionSystem>();
-        registry.register::<Self>(startup.start(trx_sys).await?);
+        registry.register::<Self>(startup.start(trx_sys)?);
         Ok(())
     }
 
@@ -203,246 +206,100 @@ impl Component for TransactionSystemWorkers {
 
     #[inline]
     fn shutdown(component: &Self::Owned) {
-        if component.shutdown_started.swap(true, Ordering::AcqRel) {
-            return;
-        }
-
-        // Shutdown is independent from storage poison. A poisoned runtime may
-        // have already caused one worker to exit early, but owner-side teardown
-        // still has to signal every channel and join every worker handle.
-        //
-        // Cleanup lifetime invariant:
-        // 1. Close group-commit admission and wake the log thread.
-        // 2. Join the log thread, so all queued/inflight failed-precommit groups
-        //    have either handed committed payloads to purge or rollback jobs to cleanup.
-        // 3. Send cleanup Stop; the cleanup worker drains already queued
-        //    abandoned, terminal rollback, and failed-precommit jobs before it exits.
-        // 4. Send purge Stop; purge drains committed payloads accepted before
-        //    the stop marker and then exits.
-        //
-        // This keeps rollback-capable terminal and precommit payloads alive
-        // until cleanup resolves them, keeps committed payload analysis ahead
-        // of purge shutdown, and keeps cleanup/purge ahead of Catalog/pool/file
-        // teardown because TransactionSystemWorkers shuts down before those
-        // components.
-        component.workers.shutdown(&component.trx_sys);
+        component.shutdown();
     }
 }
 
-/// Deferred transaction-system startup resources produced after recovery.
-pub(crate) struct PendingTransactionSystemStartup {
-    initial_redo_header: Arc<Completion<()>>,
+/// Deferred transaction-worker startup resources produced after recovery.
+pub(crate) struct PendingTransactionWorkerStartups {
+    purge: PendingTransactionPurgeStartup,
+    redo: PendingTransactionRedoStartup,
+}
+
+impl PendingTransactionWorkerStartups {
+    #[inline]
+    fn into_parts(
+        self,
+    ) -> (
+        PendingTransactionPurgeStartup,
+        PendingTransactionRedoStartup,
+    ) {
+        (self.purge, self.redo)
+    }
+}
+
+/// Deferred purge-worker startup resources.
+pub(crate) struct PendingTransactionPurgeStartup {
     purge_tx: Sender<Purge>,
     purge_rx: Receiver<Purge>,
-    cleanup_tx: Sender<SessionOperationCleanupMessage>,
-    cleanup_rx: Receiver<SessionOperationCleanupMessage>,
     pool_guards: PoolGuards,
 }
 
-impl PendingTransactionSystemStartup {
-    /// Start transaction-system background workers after recovery is durable.
+impl PendingTransactionPurgeStartup {
+    /// Start purge workers from transaction-system recovery resources.
     #[inline]
-    pub(crate) async fn start(
+    fn start(
         self,
         trx_sys: QuiescentGuard<TransactionSystem>,
-    ) -> RuntimeOrFatalResult<TransactionSystemWorkersOwned> {
-        // Start the log thread first because it owns the redo write driver and
-        // must process the initial redo header write submitted during recovery.
+    ) -> RuntimeOrFatalResult<TransactionPurgeWorkersOwned> {
+        let purge_threads =
+            TransactionSystem::start_purge_threads(trx_sys, self.pool_guards, self.purge_rx)
+                .attach("phase=start_transaction_purge_workers")
+                .map_err(RuntimeOrFatalError::from)?;
+        Ok(TransactionPurgeWorkersOwned {
+            purge_tx: self.purge_tx,
+            purge_threads: Mutex::new(purge_threads),
+            shutdown_started: AtomicBool::new(false),
+        })
+    }
+}
+
+/// Deferred redo-worker startup and initial-header durability barrier.
+pub(crate) struct PendingTransactionRedoStartup {
+    initial_redo_header: Arc<Completion<()>>,
+}
+
+impl PendingTransactionRedoStartup {
+    /// Start redo and wait until its initial super-block is durable.
+    #[inline]
+    async fn start(
+        self,
+        trx_sys: QuiescentGuard<TransactionSystem>,
+    ) -> RuntimeOrFatalResult<TransactionRedoWorkersOwned> {
         let log_thread = TransactionSystem::start_log_thread(trx_sys.clone())
             .attach("phase=start_transaction_log_worker")
             .map_err(RuntimeOrFatalError::from)?;
-        // Wait until the initial header is durable before exposing transaction
-        // workers; later redo records must not be accepted until the active log
-        // file has a valid super-block.
+        let pending = PendingTransactionRedoWorkers::new(trx_sys.into_sync(), log_thread);
+        // Engine bootstrap cannot expose runtime admission until the active redo
+        // file has a durable super-block.
         if let Err(report) = self.initial_redo_header.wait_result().await {
             let mut err = report
                 .into_runtime_or_fatal(RuntimeError::RedoLogAccess)
                 .attach("wait for initial redo super-block write");
-            if !trx_sys.rollback_log_thread_startup(log_thread) {
+            if !pending.rollback() {
                 err = err.attach(
                     "phase=rollback_initial_redo_header_failure, cleanup=join_log_worker, result=panic",
                 );
             }
             return Err(err);
         }
-        let purge_threads = match TransactionSystem::start_purge_threads(
-            trx_sys.clone(),
-            self.pool_guards,
-            self.purge_rx,
-        ) {
-            Ok(handles) => handles,
-            Err(mut report) => {
-                if !trx_sys.rollback_log_thread_startup(log_thread) {
-                    report = report.attach(
-                        "phase=rollback_purge_spawn_failure, cleanup=join_log_worker, result=panic",
-                    );
-                }
-                return Err(RuntimeOrFatalError::from(
-                    report.attach("phase=start_transaction_purge_workers"),
-                ));
-            }
-        };
-        let cleanup_thread = match TransactionSystem::start_cleanup_thread(self.cleanup_rx) {
-            Ok(handle) => handle,
-            Err(mut report) => {
-                if !trx_sys.rollback_log_thread_startup(log_thread) {
-                    report = report.attach(
-                        "phase=rollback_cleanup_spawn_failure, cleanup=join_log_worker, result=panic",
-                    );
-                }
-                if self.purge_tx.send(Purge::Stop).is_err() {
-                    report = report.attach(
-                        "phase=rollback_cleanup_spawn_failure, cleanup=signal_purge_stop, result=receiver_closed",
-                    );
-                }
-                let mut join_panics = 0usize;
-                for handle in purge_threads {
-                    if handle.join().is_err() {
-                        join_panics += 1;
-                    }
-                }
-                if join_panics != 0 {
-                    report = report.attach(format!(
-                        "phase=rollback_cleanup_spawn_failure, cleanup=join_purge_workers, join_panics={join_panics}"
-                    ));
-                }
-                return Err(RuntimeOrFatalError::from(
-                    report.attach("phase=start_transaction_cleanup_worker"),
-                ));
-            }
-        };
-        Ok(TransactionSystemWorkersOwned::new(
-            trx_sys.into_sync(),
-            self.purge_tx,
-            self.cleanup_tx,
-            log_thread,
-            purge_threads,
-            cleanup_thread,
-        ))
+        Ok(pending.into_owned())
     }
 }
 
-/// Owned transaction-system workers retained by the component registry.
-pub(crate) struct TransactionSystemWorkersOwned {
-    /// Transaction system guarded for worker shutdown.
-    pub(crate) trx_sys: SyncQuiescentGuard<TransactionSystem>,
-    workers: TransactionBackgroundWorkers,
-    /// Flag that makes component shutdown idempotent.
-    pub(crate) shutdown_started: AtomicBool,
-}
-
-impl TransactionSystemWorkersOwned {
-    /// Create owned worker handles after transaction-system startup.
-    #[inline]
-    pub(crate) fn new(
-        trx_sys: SyncQuiescentGuard<TransactionSystem>,
-        purge_tx: Sender<Purge>,
-        cleanup_tx: Sender<SessionOperationCleanupMessage>,
-        log_thread: JoinHandle<()>,
-        purge_threads: Vec<JoinHandle<()>>,
-        cleanup_thread: JoinHandle<()>,
-    ) -> Self {
-        Self {
-            trx_sys,
-            workers: TransactionBackgroundWorkers {
-                purge_tx,
-                cleanup_tx,
-                log_thread: Mutex::new(Some(log_thread)),
-                purge_threads: Mutex::new(purge_threads),
-                cleanup_thread: Mutex::new(Some(cleanup_thread)),
-            },
-            shutdown_started: AtomicBool::new(false),
-        }
-    }
-}
-
-/// Background worker handles and stop channels for transaction services.
-pub(crate) struct TransactionBackgroundWorkers {
+/// Owned purge workers retained below the mandatory runtime.
+pub(crate) struct TransactionPurgeWorkersOwned {
     purge_tx: Sender<Purge>,
-    cleanup_tx: Sender<SessionOperationCleanupMessage>,
-    log_thread: Mutex<Option<JoinHandle<()>>>,
     purge_threads: Mutex<Vec<JoinHandle<()>>>,
-    cleanup_thread: Mutex<Option<JoinHandle<()>>>,
+    shutdown_started: AtomicBool,
 }
 
-impl TransactionBackgroundWorkers {
+impl TransactionPurgeWorkersOwned {
     #[inline]
-    fn shutdown(&self, trx_sys: &TransactionSystem) {
-        let redo_log = &*trx_sys.redo_log;
-        obs::info!("event=worker_shutdown component=trx action=start result=ok");
-
-        // This shutdown order is a correctness contract, not only a resource
-        // cleanup preference. Redo owns the final commit/fail-precommit outcome
-        // after group-commit handoff, cleanup owns rollback-capable failed
-        // precommit payloads, and purge owns committed-payload GC analysis.
-        // Changing this sequence can drop or strand transaction-owned undo that
-        // MVCC structures may still reference.
-
-        // First close group-commit admission and wake redo. Any transaction
-        // already accepted by group commit must still reach one terminal owner:
-        // successful ordered completion hands committed payloads to purge, and
-        // failed ordered completion hands rollback payloads to cleanup.
-        {
-            let mut group_commit_g = redo_log.group_commit.lock();
-            group_commit_g.close(FailedPrecommitReason::Shutdown);
-            group_commit_g.queue.push_back(Commit::Shutdown);
-            redo_log.group_commit.notify_one();
+    fn shutdown(&self) {
+        if self.shutdown_started.swap(true, Ordering::AcqRel) {
+            return;
         }
-
-        // Join redo before stopping cleanup or purge. After this point no new
-        // committed-payload handoff and no new failed-precommit cleanup job can
-        // be produced by redo.
-        if let Some(handle) = self.log_thread.lock().take() {
-            match handle.join().inspect_err(|_| {
-                obs::error!(
-                    "event=worker_shutdown component=trx worker=Log-Thread action=join result=error reason=panic"
-                );
-            }) {
-                Ok(()) => {}
-                Err(payload) => {
-                    // Known redo failures poison storage before thread exit. A
-                    // join panic is an invariant failure; do not downgrade it
-                    // to a successful shutdown.
-                    resume_unwind(payload);
-                }
-            }
-        }
-
-        // Cleanup can update GC bucket state while rolling back failed,
-        // terminal, or abandoned transactions. Stop it only after redo has
-        // finished producing failed-precommit jobs, and join it before purge
-        // shutdown so purge does not exit while cleanup can still move the GC
-        // horizon.
-        if self
-            .cleanup_tx
-            .send(SessionOperationCleanupMessage::Stop)
-            .is_err()
-        {
-            obs::warn!(
-                "event=worker_shutdown component=trx worker=Trx-Cleanup-Thread action=signal_stop result=ignored reason=receiver_closed"
-            );
-        }
-        if let Some(handle) = self.cleanup_thread.lock().take() {
-            match handle.join().inspect_err(|_| {
-                obs::error!(
-                    "event=worker_shutdown component=trx worker=Trx-Cleanup-Thread action=join result=error reason=panic"
-                );
-            }) {
-                Ok(()) => {}
-                Err(payload) => {
-                    // Cleanup handles known messages explicitly. A thread panic
-                    // means its ownership invariants may be broken.
-                    resume_unwind(payload);
-                }
-            }
-        }
-
-        // Purge receives non-lossy committed-payload batches from redo. Its
-        // stop marker is sent after redo and cleanup have joined, so messages
-        // accepted before shutdown are recorded before the coordinator exits.
-        // The purge coalescer treats Stop as terminal and may skip a final scan,
-        // so this ordering is not optional: there must be no later committed
-        // handoff behind Stop.
         if self.purge_tx.send(Purge::Stop).is_err() {
             obs::warn!(
                 "event=worker_shutdown component=trx worker=purge action=signal_stop result=ignored reason=receiver_closed"
@@ -461,49 +318,132 @@ impl TransactionBackgroundWorkers {
                 resume_unwind(payload);
             }
         }
-
-        // Close the active redo file last. Redo has stopped using it, and
-        // cleanup/purge have finished the in-memory ownership transitions that
-        // depend on ordered completion.
-        let mut group_commit_g = redo_log.group_commit.lock();
-        if let Some(log_file) = group_commit_g.log_file.take() {
-            drop(log_file);
-        }
-        obs::info!("event=worker_shutdown component=trx action=finish result=ok");
     }
 }
 
-/// Message consumed by the single transaction cleanup worker.
-///
-/// The worker serializes cleanup that cannot be performed from `Drop`, from
-/// user-cancellable terminal futures, or from the log thread. `Stop` is a
-/// drain barrier, not an immediate cancellation: after it is received, the
-/// worker runs any messages already pending behind the marker before exiting.
-pub(crate) enum SessionOperationCleanupMessage {
-    /// Best-effort rollback for a dropped or shutdown-discovered active transaction.
-    Job(SessionOperationCleanupJob),
-    /// Mandatory rollback for an explicit terminal rollback claim.
-    TerminalRollback(Box<TerminalRollbackCleanupJob>),
-    /// Mandatory rollback for transactions that reached precommit but cannot commit.
-    FailedPrecommit(FailedPrecommitCleanupJob),
-    /// Shutdown marker consumed after the log thread can no longer enqueue cleanup.
-    Stop,
+/// Armed redo owner retained while initial-header durability is pending.
+struct PendingTransactionRedoWorkers {
+    trx_sys: Option<SyncQuiescentGuard<TransactionSystem>>,
+    log_thread: Option<JoinHandle<()>>,
 }
 
-/// Startup queues consumed by the transaction system and worker owner.
+impl PendingTransactionRedoWorkers {
+    #[inline]
+    fn new(trx_sys: SyncQuiescentGuard<TransactionSystem>, log_thread: JoinHandle<()>) -> Self {
+        Self {
+            trx_sys: Some(trx_sys),
+            log_thread: Some(log_thread),
+        }
+    }
+
+    #[inline]
+    fn rollback(mut self) -> bool {
+        let trx_sys = self
+            .trx_sys
+            .take()
+            .expect("pending redo owner retains transaction system");
+        let log_thread = self
+            .log_thread
+            .take()
+            .expect("pending redo owner retains log thread");
+        trx_sys.rollback_log_thread_startup(log_thread)
+    }
+
+    #[inline]
+    fn into_owned(mut self) -> TransactionRedoWorkersOwned {
+        TransactionRedoWorkersOwned {
+            trx_sys: self
+                .trx_sys
+                .take()
+                .expect("pending redo owner retains transaction system"),
+            log_thread: Mutex::new(self.log_thread.take()),
+            shutdown_started: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Drop for PendingTransactionRedoWorkers {
+    #[inline]
+    fn drop(&mut self) {
+        if let (Some(trx_sys), Some(log_thread)) = (self.trx_sys.take(), self.log_thread.take()) {
+            let _ = trx_sys.rollback_log_thread_startup(log_thread);
+        }
+    }
+}
+
+/// Marker component registered last so redo shuts down first.
+pub(crate) struct TransactionRedoWorkers;
+
+impl Component for TransactionRedoWorkers {
+    type Config = ();
+    type Owned = TransactionRedoWorkersOwned;
+    type Access = ();
+    type Error = RuntimeOrFatalError;
+
+    const NAME: &'static str = "trx_redo_workers";
+
+    #[inline]
+    async fn build(
+        _config: Self::Config,
+        registry: &mut ComponentRegistry,
+        mut shelf: ShelfScope<'_, Self>,
+    ) -> RuntimeOrFatalResult<()> {
+        let trx_sys = registry.dependency::<TransactionSystem>();
+        let startup = shelf.take::<TransactionSystem>();
+        registry.register::<Self>(startup.start(trx_sys).await?);
+        Ok(())
+    }
+
+    #[inline]
+    fn access(_owner: &QuiescentBox<Self::Owned>) -> Self::Access {}
+
+    #[inline]
+    fn shutdown(component: &Self::Owned) {
+        component.shutdown();
+    }
+}
+
+/// Redo worker and transaction-system guard retained for ordered shutdown.
+pub(crate) struct TransactionRedoWorkersOwned {
+    trx_sys: SyncQuiescentGuard<TransactionSystem>,
+    log_thread: Mutex<Option<JoinHandle<()>>>,
+    shutdown_started: AtomicBool,
+}
+
+impl TransactionRedoWorkersOwned {
+    #[inline]
+    fn shutdown(&self) {
+        if self.shutdown_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let redo_log = &*self.trx_sys.redo_log;
+        {
+            let mut group_commit = redo_log.group_commit.lock();
+            group_commit.close(FailedPrecommitReason::Shutdown);
+            group_commit.queue.push_back(Commit::Shutdown);
+            redo_log.group_commit.notify_one();
+        }
+        if let Some(handle) = self.log_thread.lock().take()
+            && let Err(payload) = handle.join()
+        {
+            resume_unwind(payload);
+        }
+        drop(redo_log.group_commit.lock().log_file.take());
+    }
+}
+
+/// Startup queues consumed by the transaction system.
 struct TransactionSystemQueues {
     /// Wakeup channel for purge coordination.
     purge_tx: Sender<Purge>,
-    /// Transaction cleanup queue for rollback work.
-    cleanup_tx: Sender<SessionOperationCleanupMessage>,
 }
 
-/// Terminal rollback job owned by the transaction cleanup worker.
+/// Terminal rollback job submitted to the mandatory runtime.
 ///
 /// Once a terminal rollback claim is created, the claimed mutable transaction
 /// core owns rollback-capable undo and session cleanup obligations. This job
-/// transfers that ownership to the cleanup worker before any rollback await
-/// point, so dropping the public rollback waiter cannot cancel cleanup.
+/// transfers that ownership to a supervised cleanup task before any rollback
+/// await point, so dropping the public rollback waiter cannot cancel cleanup.
 pub(crate) struct TerminalRollbackCleanupJob {
     claim: SessionOperationCompletionClaim,
     completion: Arc<Completion<()>>,
@@ -512,13 +452,15 @@ pub(crate) struct TerminalRollbackCleanupJob {
 
 impl TerminalRollbackCleanupJob {
     #[inline]
-    async fn run(self) {
+    async fn run(&mut self) {
         #[cfg(test)]
         let trx_id = self.claim.trx_id();
         let trx_sys = self.claim.engine().trx_sys.clone();
         #[cfg(test)]
         tests::run_terminal_rollback_test_hook(trx_id, self.operation);
-        let result = trx_sys.rollback_claim(self.claim, self.operation).await;
+        let result = trx_sys
+            .rollback_claim(&mut self.claim, self.operation)
+            .await;
         match result {
             Ok(()) => self.completion.complete(Ok(())),
             Err(err) => self
@@ -528,6 +470,30 @@ impl TerminalRollbackCleanupJob {
                     self.operation
                 ))))),
         }
+    }
+}
+
+impl MandatoryInternalTask for TerminalRollbackCleanupJob {
+    const LABEL: &'static str = "terminal_rollback";
+
+    #[inline]
+    fn metadata(&self) -> MandatoryTaskMetadata {
+        MandatoryTaskMetadata::transaction_cleanup(Self::LABEL, None)
+    }
+
+    #[inline]
+    async fn run(&mut self) {
+        TerminalRollbackCleanupJob::run(self).await;
+    }
+
+    #[inline]
+    fn preserve_after_panic(&mut self) {
+        self.claim.preserve_after_panic();
+    }
+
+    #[inline]
+    fn publish_panic(&mut self, error: CompletionErrorBridge) {
+        self.completion.complete(Err(error));
     }
 }
 
@@ -640,13 +606,13 @@ pub(crate) struct TransactionSystem {
     pub(super) table_fs: QuiescentGuard<FileSystem>,
     /// Engine-level fatal runtime poison state.
     pub(super) poisoner: QuiescentGuard<EnginePoisoner>,
+    /// Engine-owned runtime for mandatory transaction cleanup.
+    mandatory_runtime: QuiescentGuard<MandatoryRuntime>,
     /// Wakeup channel for purge coordination.
     pub(super) purge_tx: CachePadded<Sender<Purge>>,
     /// Narrow per-engine purge scheduling hook for deterministic tests.
     #[cfg(test)]
     pub(super) purge_test_hook: CachePadded<Mutex<Option<PurgeTestHook>>>,
-    /// Transaction cleanup queue for abandoned and mandatory rollback work.
-    cleanup_tx: CachePadded<Sender<SessionOperationCleanupMessage>>,
     /// Swapped table roots retained until post-publish readers drain.
     pub(super) table_roots: CachePadded<Mutex<TableRootQueue>>,
     /// Advisory queue for dropped table files waiting on catalog checkpoint safety.
@@ -679,10 +645,11 @@ impl TransactionSystem {
     pub(crate) async fn bootstrap(
         config: TrxSysConfig,
         poisoner: QuiescentGuard<EnginePoisoner>,
+        mandatory_runtime: QuiescentGuard<MandatoryRuntime>,
         pools: EnginePools,
         table_fs: QuiescentGuard<FileSystem>,
         catalog: QuiescentGuard<Catalog>,
-    ) -> Result<(Self, PendingTransactionSystemStartup)> {
+    ) -> Result<(Self, PendingTransactionWorkerStartups)> {
         debug_assert!(config.purge_threads != 0);
         debug_assert!(
             (1..=256).contains(&config.gc_buckets) && config.gc_buckets.is_power_of_two()
@@ -693,7 +660,6 @@ impl TransactionSystem {
 
         let pool_guards = pools.pool_guards();
         let (purge_tx, purge_rx) = flume::unbounded();
-        let (cleanup_tx, cleanup_rx) = flume::unbounded();
         let file_prefix = config.file_prefix().disclose()?;
         let recovery_resources = RecoveryResources::new(pools, table_fs.clone(), &catalog);
         let coordinator = recovery_resources
@@ -709,33 +675,40 @@ impl TransactionSystem {
         let trx_sys = Self::new(
             config,
             poisoner,
+            mandatory_runtime,
             catalog,
             table_fs,
             redo_log,
             initial_trx_ts,
             TransactionSystemQueues {
                 purge_tx: purge_tx.clone(),
-                cleanup_tx: cleanup_tx.clone(),
             },
         );
         Ok((
             trx_sys,
-            PendingTransactionSystemStartup {
-                initial_redo_header,
-                purge_tx,
-                purge_rx,
-                cleanup_tx,
-                cleanup_rx,
-                pool_guards,
+            PendingTransactionWorkerStartups {
+                purge: PendingTransactionPurgeStartup {
+                    purge_tx,
+                    purge_rx,
+                    pool_guards,
+                },
+                redo: PendingTransactionRedoStartup {
+                    initial_redo_header,
+                },
             },
         ))
     }
 
     /// Create a transaction system with redo, catalog, and background queues.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "bootstrap assembles fixed component guards and recovered redo state"
+    )]
     #[inline]
     fn new(
         config: TrxSysConfig,
         poisoner: QuiescentGuard<EnginePoisoner>,
+        mandatory_runtime: QuiescentGuard<MandatoryRuntime>,
         catalog: QuiescentGuard<Catalog>,
         table_fs: QuiescentGuard<FileSystem>,
         redo_log: CachePadded<RedoLog>,
@@ -763,10 +736,10 @@ impl TransactionSystem {
             catalog,
             table_fs,
             poisoner,
+            mandatory_runtime,
             purge_tx: CachePadded::new(queues.purge_tx),
             #[cfg(test)]
             purge_test_hook: CachePadded::new(Mutex::new(None)),
-            cleanup_tx: CachePadded::new(queues.cleanup_tx),
             table_roots: CachePadded::new(Mutex::new(TableRootQueue::default())),
             dropped_table_files: CachePadded::new(Mutex::new(dropped_table_files)),
             fatal_rollback_retention: CachePadded::new(Mutex::new(Vec::new())),
@@ -1359,18 +1332,13 @@ impl TransactionSystem {
             completion: Arc::clone(&completion),
             operation,
         };
-        if let Err(err) = self
-            .cleanup_tx
-            .send(SessionOperationCleanupMessage::TerminalRollback(Box::new(
-                job,
-            )))
-        {
+        if let Err(job) = submit_internal(&self.mandatory_runtime, job) {
             // The returned job owns an already-claimed terminal transaction.
             // Do not drop, discard, or run it from this caller. A closed
-            // receiver means the cleanup-worker lifetime invariant is broken,
-            // so leak the payload and fail at that boundary.
-            forget(err.0);
-            panic!("terminal rollback cleanup receiver closed before transaction-system shutdown");
+            // internal admission means the mandatory-runtime lifetime invariant
+            // is broken, so leak the payload and fail at that boundary.
+            forget(job);
+            panic!("mandatory internal admission closed before terminal rollback submission");
         }
         completion
     }
@@ -1405,7 +1373,7 @@ impl TransactionSystem {
     #[inline]
     pub(crate) async fn cleanup_abandoned_transaction(
         &self,
-        claim: SessionOperationCompletionClaim,
+        claim: &mut SessionOperationCompletionClaim,
     ) -> FatalResult<()> {
         self.rollback_claim(claim, "cleanup abandoned transaction")
             .await
@@ -1414,22 +1382,28 @@ impl TransactionSystem {
     #[inline]
     async fn rollback_claim(
         &self,
-        claim: SessionOperationCompletionClaim,
+        claim: &mut SessionOperationCompletionClaim,
         operation: &'static str,
     ) -> FatalResult<()> {
-        let (entry, inner, attachment) = claim.into_parts();
-        self.rollback_inner(entry.as_ref(), inner, attachment, operation)
-            .await
+        let released = {
+            let (entry, inner, attachment) = claim.parts_mut();
+            self.rollback_inner(entry.as_ref(), inner, attachment, operation)
+                .await?
+        };
+        let (_entry, mut inner, attachment) = claim.take_parts();
+        inner.active = false;
+        attachment.rollback(released, inner);
+        Ok(())
     }
 
     #[inline]
     async fn rollback_inner(
         &self,
         entry: &SessionOperationEntry,
-        mut inner: Box<TrxInner>,
-        attachment: TrxAttachment,
+        inner: &mut TrxInner,
+        attachment: &TrxAttachment,
         operation: &'static str,
-    ) -> FatalResult<()> {
+    ) -> FatalResult<ReleasedTransactionLocks> {
         let sts = inner.sts();
         let gc_no = inner.gc_no();
         let status = inner.ctx().status();
@@ -1445,7 +1419,7 @@ impl TransactionSystem {
             // detach this operation from the registry.
             entry.fail_retained();
             attachment.notify_operation_transition();
-            let retention = inner.retain_and_discard_after_fatal_rollback(&attachment);
+            let retention = inner.retain_and_discard_after_fatal_rollback(attachment);
             self.retain_fatal_rollback(retention);
             let report = err
                 .change_context(FatalError::RollbackAccess)
@@ -1467,7 +1441,7 @@ impl TransactionSystem {
             // detach this operation from the registry.
             entry.fail_retained();
             attachment.notify_operation_transition();
-            let retention = inner.retain_and_discard_after_fatal_rollback(&attachment);
+            let retention = inner.retain_and_discard_after_fatal_rollback(attachment);
             self.retain_fatal_rollback(retention);
             let report = err
                 .change_context(FatalError::RollbackAccess)
@@ -1485,11 +1459,9 @@ impl TransactionSystem {
         inner.effects_mut().clear_for_rollback();
         inner.clear_table_bindings();
         self.record_rollback_for_purge(gc_no, sts);
-        let released = inner.release_transaction_locks(&attachment);
-        inner.active = false;
+        let released = inner.release_transaction_locks(attachment);
         status.finish_terminal();
-        attachment.rollback(released, inner);
-        Ok(())
+        Ok(released)
     }
 
     /// Discard a prepared transaction that has no runtime effects.
@@ -1671,34 +1643,7 @@ impl TransactionSystem {
             .is_ok()
     }
 
-    /// Start the transaction cleanup worker.
-    ///
-    /// The thread blocks once at the top level, then handles cleanup messages
-    /// through async rollback code. It exits only when the sender side is gone
-    /// or when it receives `Stop`; in the `Stop` case it drains any messages
-    /// already queued behind the marker. Worker shutdown relies on this drain
-    /// behavior to let failed-precommit handoffs finish before lower-level
-    /// table, pool, and file components are torn down.
-    #[inline]
-    pub(crate) fn start_cleanup_thread(
-        cleanup_rx: Receiver<SessionOperationCleanupMessage>,
-    ) -> RuntimeResult<JoinHandle<()>> {
-        thread::spawn_named("Trx-Cleanup-Thread", move || {
-            runtime::block_on(async move {
-                while let Ok(message) = cleanup_rx.recv_async().await {
-                    if run_trx_cleanup_message(message).await {
-                        continue;
-                    }
-                    while let Ok(message) = cleanup_rx.try_recv() {
-                        let _ = run_trx_cleanup_message(message).await;
-                    }
-                    return;
-                }
-            })
-        })
-    }
-
-    /// Queue abandoned transaction rollback cleanup.
+    /// Submit abandoned transaction rollback cleanup.
     ///
     /// This is a best-effort signal from public-handle drop or owner shutdown
     /// scanning. During normal operation the receiver is alive; during owner
@@ -1711,38 +1656,38 @@ impl TransactionSystem {
         operation_key: SessionOperationKey,
         trx_id: TrxID,
     ) {
-        let _ = self.cleanup_tx.send(SessionOperationCleanupMessage::Job(
+        let _ = submit_internal(
+            &self.mandatory_runtime,
             SessionOperationCleanupJob {
                 engine,
                 operation_key,
                 trx_id,
+                claim: None,
             },
-        ));
+        );
     }
 
-    /// Queue failed-precommit rollback cleanup.
+    /// Submit failed-precommit rollback cleanup.
     ///
     /// Unlike abandoned cleanup, this is not best effort. A user precommit
     /// transaction owns undo memory that in-memory MVCC structures can still
     /// reference until rollback runs. Therefore every failed-precommit producer
-    /// must enqueue cleanup before waiters are completed.
+    /// must submit cleanup before waiters are completed.
     ///
-    /// Send failure means the cleanup receiver is gone. That should be
-    /// unreachable for normal shutdown: transaction-system worker shutdown
-    /// first closes group-commit admission, wakes and joins the log thread,
-    /// and only then sends cleanup `Stop` and joins the cleanup worker.
+    /// Internal-admission rejection is unreachable during normal shutdown.
+    /// `TransactionRedoWorkers` closes group-commit admission and joins the log
+    /// thread before `MandatoryRuntimeWorkers` closes and drains internal
+    /// admission, so redo can submit every final failed-precommit job.
     #[inline]
     pub(crate) fn request_failed_precommit_cleanup(&self, job: FailedPrecommitCleanupJob) {
-        if let Err(err) = self
-            .cleanup_tx
-            .send(SessionOperationCleanupMessage::FailedPrecommit(job))
-        {
+        if let Err(job) = submit_internal(&self.mandatory_runtime, job) {
             // The returned job may own rollback-capable `PrecommitTrx` payloads.
             // Do not drop, discard, or run it from this synchronous caller. The
-            // closed receiver means the worker-lifetime invariant is already
-            // broken, so leak the payload and fail at the invariant boundary.
-            forget(err.0);
-            panic!("failed-precommit cleanup receiver closed before log thread stopped");
+            // closed internal admission means the runtime-lifetime invariant is
+            // already broken, so leak the payload and fail at the invariant
+            // boundary.
+            forget(job);
+            panic!("mandatory internal admission closed before redo stopped");
         }
     }
 
@@ -1774,8 +1719,12 @@ impl TransactionSystem {
     }
 }
 
-impl Supplier<TransactionSystemWorkers> for TransactionSystem {
-    type Provision = PendingTransactionSystemStartup;
+impl Supplier<TransactionPurgeWorkers> for TransactionSystem {
+    type Provision = PendingTransactionPurgeStartup;
+}
+
+impl Supplier<TransactionRedoWorkers> for TransactionSystem {
+    type Provision = PendingTransactionRedoStartup;
 }
 
 impl Component for TransactionSystem {
@@ -1802,10 +1751,12 @@ impl Component for TransactionSystem {
         let disk_pool = registry.dependency::<DiskPool>();
         let catalog = registry.dependency::<Catalog>();
         let poisoner = registry.dependency::<EnginePoisoner>();
+        let mandatory_runtime = registry.dependency::<MandatoryRuntime>();
 
-        let (trx_sys, startup) = TransactionSystem::bootstrap(
+        let (trx_sys, startups) = TransactionSystem::bootstrap(
             config,
             poisoner,
+            mandatory_runtime,
             EnginePools::new(
                 meta_pool.clone_inner(),
                 index_pool.clone_inner(),
@@ -1817,7 +1768,9 @@ impl Component for TransactionSystem {
         )
         .await?;
         registry.register::<Self>(trx_sys);
-        shelf.put::<TransactionSystemWorkers>(startup);
+        let (purge, redo) = startups.into_parts();
+        shelf.put::<TransactionPurgeWorkers>(purge);
+        shelf.put::<TransactionRedoWorkers>(redo);
         Ok(())
     }
 
@@ -1843,25 +1796,33 @@ fn recovery_initial_trx_ts(max_recovered_cts: TrxID) -> DataIntegrityResult<TrxI
 }
 
 #[inline]
-async fn run_trx_cleanup_job(job: SessionOperationCleanupJob) {
-    let SessionOperationCleanupJob {
-        engine,
-        operation_key,
-        trx_id,
-    } = job;
-    // A stale cleanup hint is a neutral outcome: another owner already moved
-    // the session/transaction pair beyond the abandoned state.
-    let (entry, session) = match engine.session_registry.try_resolve_operation(operation_key) {
-        Some(parts) => parts,
-        None => return,
-    };
+async fn run_trx_cleanup_job(job: &mut SessionOperationCleanupJob) {
+    let engine = job.engine.clone();
+    let operation_key = job.operation_key;
+    let trx_id = job.trx_id;
+    if job.claim.is_none() {
+        // A stale cleanup hint is a neutral outcome: another owner already
+        // moved the session/transaction pair beyond the abandoned state.
+        let (entry, session) = match engine.session_registry.try_resolve_operation(operation_key) {
+            Some(parts) => parts,
+            None => return,
+        };
+        let attachment = TrxAttachment::new(engine.clone(), session, operation_key, trx_id);
+        let claim = match SessionOperationCompletionClaim::cleanup(entry, attachment) {
+            Ok(claim) => claim,
+            Err(_) => return,
+        };
+        job.claim = Some(claim);
+    }
     let trx_sys = engine.trx_sys.clone();
-    let attachment = TrxAttachment::new(engine, session, operation_key, trx_id);
-    let claim = match SessionOperationCompletionClaim::cleanup(entry, attachment) {
-        Ok(claim) => claim,
-        Err(_) => return,
-    };
-    if let Err(report) = trx_sys.cleanup_abandoned_transaction(claim).await {
+    let result = trx_sys
+        .cleanup_abandoned_transaction(
+            job.claim
+                .as_mut()
+                .expect("claimed abandoned cleanup retains terminal ownership"),
+        )
+        .await;
+    if let Err(report) = result {
         let report = report.attach(format!(
             "terminal abandoned transaction cleanup failed: operation_key={operation_key}, trx_id={trx_id}"
         ));
@@ -1869,24 +1830,54 @@ async fn run_trx_cleanup_job(job: SessionOperationCleanupJob) {
             "event=transaction_cleanup component=transaction_system action=rollback_abandoned result=error error={report:?}"
         );
     }
+    job.claim.take();
 }
 
-#[inline]
-async fn run_trx_cleanup_message(message: SessionOperationCleanupMessage) -> bool {
-    match message {
-        SessionOperationCleanupMessage::Job(job) => {
-            run_trx_cleanup_job(job).await;
-            true
+impl MandatoryInternalTask for SessionOperationCleanupJob {
+    const LABEL: &'static str = "abandoned_transaction";
+
+    #[inline]
+    fn metadata(&self) -> MandatoryTaskMetadata {
+        MandatoryTaskMetadata::transaction_cleanup(Self::LABEL, Some(self.operation_key))
+    }
+
+    #[inline]
+    async fn run(&mut self) {
+        run_trx_cleanup_job(self).await;
+    }
+
+    #[inline]
+    fn preserve_after_panic(&mut self) {
+        if let Some(claim) = self.claim.as_mut() {
+            claim.preserve_after_panic();
         }
-        SessionOperationCleanupMessage::TerminalRollback(job) => {
-            job.run().await;
-            true
-        }
-        SessionOperationCleanupMessage::FailedPrecommit(job) => {
-            job.run().await;
-            true
-        }
-        SessionOperationCleanupMessage::Stop => false,
+    }
+
+    #[inline]
+    fn publish_panic(&mut self, _error: CompletionErrorBridge) {}
+}
+
+impl MandatoryInternalTask for FailedPrecommitCleanupJob {
+    const LABEL: &'static str = "failed_precommit";
+
+    #[inline]
+    fn metadata(&self) -> MandatoryTaskMetadata {
+        MandatoryTaskMetadata::transaction_cleanup(Self::LABEL, None)
+    }
+
+    #[inline]
+    async fn run(&mut self) {
+        FailedPrecommitCleanupJob::run(self).await;
+    }
+
+    #[inline]
+    fn preserve_after_panic(&mut self) {
+        FailedPrecommitCleanupJob::preserve_after_panic(self);
+    }
+
+    #[inline]
+    fn publish_panic(&mut self, error: CompletionErrorBridge) {
+        FailedPrecommitCleanupJob::publish_panic(self, error);
     }
 }
 
@@ -1915,26 +1906,19 @@ pub(crate) mod tests {
         engine: &Engine,
         config: TrxSysConfig,
         redo_log: RedoLog,
-    ) -> (
-        TransactionSystem,
-        Receiver<Purge>,
-        Receiver<SessionOperationCleanupMessage>,
-    ) {
+    ) -> (TransactionSystem, Receiver<Purge>) {
         let (purge_tx, purge_rx) = flume::unbounded();
-        let (cleanup_tx, cleanup_rx) = flume::unbounded();
         let trx_sys = TransactionSystem::new(
             config,
             engine.inner().poisoner.clone(),
+            engine.inner().mandatory_runtime.clone(),
             engine.inner().catalog.clone(),
             engine.inner().table_fs.clone(),
             CachePadded::new(redo_log),
             MIN_SNAPSHOT_TS,
-            TransactionSystemQueues {
-                purge_tx,
-                cleanup_tx,
-            },
+            TransactionSystemQueues { purge_tx },
         );
-        (trx_sys, purge_rx, cleanup_rx)
+        (trx_sys, purge_rx)
     }
 
     type TerminalRollbackTestHook = Arc<dyn Fn(TrxID, &'static str) + Send + Sync + 'static>;

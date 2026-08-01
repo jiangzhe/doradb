@@ -99,19 +99,22 @@ impl<C: Component> ErasedComponentBox for TypedComponentBox<C> {
 /// Current engine registration order:
 /// 1. `StorageRootLease`
 /// 2. `EnginePoisoner`
-/// 3. `FileSystem`
-/// 4. `DiskPool` -> `FileSystem`
-/// 5. `MetaPool`
-/// 6. `IndexPool` -> `FileSystem`
-/// 7. `MemPool` -> `FileSystem`
-/// 8. `FileSystemWorkers` -> `EnginePoisoner`, `FileSystem`, `IndexPool`,
+/// 3. `MandatoryRuntime` -> `EnginePoisoner`
+/// 4. `FileSystem`
+/// 5. `DiskPool` -> `FileSystem`
+/// 6. `MetaPool`
+/// 7. `IndexPool` -> `FileSystem`
+/// 8. `MemPool` -> `FileSystem`
+/// 9. `FileSystemWorkers` -> `EnginePoisoner`, `FileSystem`, `IndexPool`,
 ///    `MemPool`
-/// 9. `SharedPoolEvictorWorkers` -> `DiskPool`, `IndexPool`, `MemPool`
-/// 10. `LockManager`
-/// 11. `Catalog` -> `EnginePoisoner`, `MetaPool`, `FileSystem`, `DiskPool`
-/// 12. `TransactionSystem` -> `EnginePoisoner`, `MetaPool`, `IndexPool`,
-///     `MemPool`, `FileSystem`, `DiskPool`, `Catalog`
-/// 13. `TransactionSystemWorkers` -> `TransactionSystem`
+/// 10. `SharedPoolEvictorWorkers` -> `DiskPool`, `IndexPool`, `MemPool`
+/// 11. `LockManager`
+/// 12. `Catalog` -> `EnginePoisoner`, `MetaPool`, `FileSystem`, `DiskPool`
+/// 13. `TransactionSystem` -> `EnginePoisoner`, `MandatoryRuntime`,
+///     `MetaPool`, `IndexPool`, `MemPool`, `FileSystem`, `DiskPool`, `Catalog`
+/// 14. `TransactionPurgeWorkers` -> `TransactionSystem`
+/// 15. `MandatoryRuntimeWorkers` -> `MandatoryRuntime`
+/// 16. `TransactionRedoWorkers` -> `TransactionSystem`
 ///
 /// Every entry above is an explicit [`RegistryBuilder::build`] call in the
 /// engine build program; component builds do not invoke downstream component
@@ -122,10 +125,11 @@ impl<C: Component> ErasedComponentBox for TypedComponentBox<C> {
 ///
 /// Each arrow points from a component to a direct registry dependency fetched
 /// during its build. `FileSystemWorkers` also consumes shelf provisions from
-/// `FileSystem`, `IndexPool`, and `MemPool`; `TransactionSystemWorkers`
-/// consumes one from `TransactionSystem`. Those build-time provision edges
-/// follow the same registration order but are transferred through
-/// [`ShelfScope`] rather than fetched from the registry.
+/// `FileSystem`, `IndexPool`, and `MemPool`; the transaction system supplies
+/// independent purge and redo startup resources, and the early mandatory
+/// runtime supplies deferred runner-startup state. Those build-time provision
+/// edges are transferred through [`ShelfScope`] rather than fetched from the
+/// registry.
 ///
 /// In addition to the direct component edges above, `Catalog` owns user-table
 /// runtimes that retain guards into `MemPool`, `IndexPool`, `FileSystem`,

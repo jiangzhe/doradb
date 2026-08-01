@@ -2134,6 +2134,7 @@ pub(crate) mod tests {
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, USER_TABLE_ID_START,
     };
+    use crate::completion::Completion;
     use crate::component::{DiskPoolConfig, IndexPoolConfig, MetaPoolConfig, RegistryBuilder};
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
@@ -2143,8 +2144,8 @@ pub(crate) mod tests {
     use crate::file::{BlockKey, UNTRACKED_FILE_ID};
     use crate::id::BlockID;
     use crate::io::{
-        BackendError, BackendResult, Completion, DirectBuf, IOBuf, IOKind,
-        StorageBackendFileIdentity, StorageBackendOp, StorageBackendTestHook, SubmittedIoCleanup,
+        BackendError, BackendResult, DirectBuf, IOBuf, IOKind, StorageBackendFileIdentity,
+        StorageBackendOp, StorageBackendTestHook, SubmittedIoCleanup,
         install_storage_backend_test_hook,
     };
     use crate::latch::LatchFallbackMode;

@@ -22,8 +22,10 @@ use crate::obs;
 use crate::poison::EnginePoisoner;
 use crate::quiescent::QuiescentGuard;
 use crate::root::{StorageRootLease, StorageRootLeaseAttempt};
+use crate::runtime::block_on;
+use crate::runtime::mandatory::{MandatoryRuntime, MandatoryRuntimeWorkers};
 use crate::session::{Session, SessionRegistry};
-use crate::trx::sys::{TransactionSystem, TransactionSystemWorkers};
+use crate::trx::sys::{TransactionPurgeWorkers, TransactionRedoWorkers, TransactionSystem};
 use crate::{DiskPool, IndexPool, MemPool, MetaPool};
 use error_stack::{Report, ResultExt};
 use event_listener::{Event, EventListener, Listener, listener};
@@ -377,6 +379,7 @@ impl Engine {
             "event=engine_lifecycle component=engine action=shutdown_start result=ok mode=try"
         );
         inner.lifecycle.close_admission();
+        inner.mandatory_runtime.close_admission();
         inner.lifecycle.wait_for_admissions_drained();
 
         let _shutdown = inner.lifecycle.shutdown_lock.lock();
@@ -389,21 +392,42 @@ impl Engine {
 
         let blocker = inner.session_registry.first_shutdown_blocker();
         let operation_blocked = blocker.is_some();
+        let voluntary_blocked = blocker.as_ref().is_some_and(|blocker| {
+            matches!(
+                blocker.state,
+                crate::trx::SessionOperationState::Voluntary(_)
+            )
+        });
+        let mandatory_session_blocked = blocker.as_ref().is_some_and(|blocker| {
+            matches!(
+                blocker.state,
+                crate::trx::SessionOperationState::Mandatory(_)
+            )
+        });
         let cleanup_queued =
             self.queue_shutdown_operation_cleanup(inner, blocker.and_then(|item| item.cleanup));
         let strong_count = Arc::strong_count(inner);
-        if strong_count != 1 || operation_blocked {
+        let (mandatory_callers, mandatory_internal) = inner.mandatory_runtime.blocker_counts();
+        if strong_count != 1
+            || operation_blocked
+            || mandatory_callers != 0
+            || mandatory_internal != 0
+        {
             let strong_refs = strong_count - 1;
             let busy = strong_refs.max(usize::from(operation_blocked));
             obs::warn!(
-                "event=engine_lifecycle component=engine action=shutdown_finish result=busy mode=try busy={} strong_refs={} operation_blocked={} cleanup_queued={}",
+                "event=engine_lifecycle component=engine action=shutdown_finish result=busy mode=try busy={} strong_refs={} operation_blocked={} voluntary_blocked={} mandatory_session_blocked={} cleanup_queued={} mandatory_callers={} mandatory_internal={}",
                 busy,
                 strong_refs,
                 operation_blocked,
-                cleanup_queued
+                voluntary_blocked,
+                mandatory_session_blocked,
+                cleanup_queued,
+                mandatory_callers,
+                mandatory_internal
             );
             return Err(Report::new(LifecycleError::ShutdownBusy).attach(format!(
-                "strong_refs={strong_refs}, operation_blocked={operation_blocked}"
+                "strong_refs={strong_refs}, operation_blocked={operation_blocked}, voluntary_blocked={voluntary_blocked}, mandatory_session_blocked={mandatory_session_blocked}, mandatory_callers={mandatory_callers}, mandatory_internal={mandatory_internal}"
             )));
         }
         self.finish_shutdown_locked(inner);
@@ -434,7 +458,9 @@ impl Engine {
             "event=engine_lifecycle component=engine action=shutdown_start result=ok mode=wait"
         );
         inner.lifecycle.close_admission();
+        inner.mandatory_runtime.close_admission();
         inner.lifecycle.wait_for_admissions_drained();
+        block_on(inner.mandatory_runtime.drain_callers());
 
         loop {
             inner.lifecycle.wait_for_runtime_refs_drained();
@@ -513,21 +539,38 @@ impl Drop for Engine {
     #[inline]
     fn drop(&mut self) {
         if let Err(err) = self.try_shutdown_inner() {
+            if *err.current_context() == LifecycleError::ShutdownBusy {
+                let blocker = self.inner().session_registry.first_shutdown_blocker();
+                let (mandatory_callers, mandatory_internal) =
+                    self.inner().mandatory_runtime.blocker_counts();
+                let engine_owned_blocker = blocker.as_ref().is_some_and(|blocker| {
+                    matches!(
+                        blocker.state,
+                        crate::trx::SessionOperationState::Mandatory(_)
+                            | crate::trx::SessionOperationState::CleanupReady
+                            | crate::trx::SessionOperationState::Completing
+                    )
+                }) || mandatory_callers != 0
+                    || mandatory_internal != 0;
+                if engine_owned_blocker {
+                    if let Err(drain_error) = self.shutdown_inner() {
+                        panic!("fatal: engine-owned shutdown drain failed: {drain_error}");
+                    }
+                    return;
+                }
+            }
             obs::error!(
                 "event=engine_lifecycle component=engine action=shutdown_finish result=error mode=drop error={}",
                 err
             );
             if *err.current_context() == LifecycleError::ShutdownBusy {
-                // Fatal owner-drop violations still need to stop background
-                // workers, but the owner registry cannot be dropped while
-                // leaked runtime refs still retain component guards. This keeps
-                // worker threads from escaping even after poison, while avoiding
-                // quiescent owner teardown that could otherwise wait forever.
+                // Accepted mandatory work may still need every registered
+                // component. Retain the complete live graph rather than
+                // dispatching teardown that would cancel correctness work.
                 let components = self
                     .components
                     .take()
                     .expect("engine component registry is present until drop");
-                components.shutdown_all();
                 forget(components);
             }
             panic!("fatal: engine shutdown failed: {err}");
@@ -662,6 +705,8 @@ impl WeakEngineRef {
 pub(crate) struct EngineInner {
     /// Engine-level fatal runtime poison state.
     pub(crate) poisoner: QuiescentGuard<EnginePoisoner>,
+    /// Engine-owned scheduler for accepted caller and internal obligations.
+    pub(crate) mandatory_runtime: QuiescentGuard<MandatoryRuntime>,
     /// Shared catalog handle.
     pub(crate) catalog: QuiescentGuard<Catalog>,
     /// Shared transaction-system handle.
@@ -814,6 +859,10 @@ async fn bootstrap_inner(config: EngineConfig) -> Result<Engine> {
         .build::<EnginePoisoner>(())
         .await
         .unwrap_or_else(|never| match never {});
+    builder
+        .build::<MandatoryRuntime>(config.mandatory_runtime.clone())
+        .await
+        .disclose()?;
     builder.build::<FileSystem>(file).await.disclose()?;
     builder
         .build::<DiskPool>(DiskPoolConfig::new(readonly_buffer_size))
@@ -856,7 +905,15 @@ async fn bootstrap_inner(config: EngineConfig) -> Result<Engine> {
     builder.build::<Catalog>(catalog_cfg).await.disclose()?;
     builder.build::<TransactionSystem>(trx_cfg).await?;
     builder
-        .build::<TransactionSystemWorkers>(())
+        .build::<TransactionPurgeWorkers>(())
+        .await
+        .disclose()?;
+    builder
+        .build::<MandatoryRuntimeWorkers>(())
+        .await
+        .disclose()?;
+    builder
+        .build::<TransactionRedoWorkers>(())
         .await
         .disclose()?;
 
@@ -874,6 +931,7 @@ async fn bootstrap_inner(config: EngineConfig) -> Result<Engine> {
     }
     let registry = builder.finish();
     let poisoner = registry.dependency::<EnginePoisoner>();
+    let mandatory_runtime = registry.dependency::<MandatoryRuntime>();
     let catalog = registry.dependency::<Catalog>();
     let trx_sys = registry.dependency::<TransactionSystem>();
     let meta_pool = registry.dependency::<MetaPool>();
@@ -884,6 +942,7 @@ async fn bootstrap_inner(config: EngineConfig) -> Result<Engine> {
     let lock_manager = registry.dependency::<LockManager>();
     let engine_inner = EngineInner {
         poisoner,
+        mandatory_runtime,
         catalog,
         trx_sys,
         meta_pool,
@@ -1032,8 +1091,12 @@ mod tests {
             ("Purge-Executor-1", "phase=start_transaction_purge_workers"),
             ("Purge-Dispatcher", "phase=start_transaction_purge_workers"),
             (
-                "Trx-Cleanup-Thread",
-                "phase=start_transaction_cleanup_worker",
+                "Mandatory-Runtime-1",
+                "phase=start_mandatory_runtime_runner",
+            ),
+            (
+                "Mandatory-Runtime-2",
+                "phase=start_mandatory_runtime_runner",
             ),
         ] {
             let root = TempDir::new().unwrap();
@@ -1076,11 +1139,27 @@ mod tests {
                 "startup returned before reclaiming all workers for failure at {worker}"
             );
             assert!(!started.iter().any(|name| name == worker));
+            if worker.starts_with("Mandatory-Runtime-") {
+                assert!(
+                    started.iter().any(|name| name == "Purge-Dispatcher"),
+                    "purge did not start before mandatory workers: started={started:?}"
+                );
+                assert!(
+                    !started.iter().any(|name| name == "Log-Thread"),
+                    "redo started after mandatory worker startup failed: started={started:?}"
+                );
+            }
+            if worker == "Mandatory-Runtime-2" {
+                assert!(
+                    started.iter().any(|name| name == "Mandatory-Runtime-1"),
+                    "first mandatory runner did not start: started={started:?}"
+                );
+            }
         }
     }
 
     #[test]
-    fn test_initial_redo_header_failure_reclaims_log_worker_before_startup_returns() {
+    fn test_initial_redo_header_failure_reclaims_started_workers_before_startup_returns() {
         let root = TempDir::new().unwrap();
         let log_started = Arc::new(AtomicBool::new(false));
         let hook = Arc::new(FailInitialRedoHeaderWriteHook::new(
@@ -1127,18 +1206,18 @@ mod tests {
             started, finished,
             "startup returned before reclaiming workers after initial redo-header failure"
         );
-        for expected in ["IO-Thread", "Log-Thread", "Shared-Pool-Evictor"] {
+        for expected in [
+            "IO-Thread",
+            "Log-Thread",
+            "Purge-Dispatcher",
+            "Purge-Executor-1",
+            "Shared-Pool-Evictor",
+        ] {
             assert!(
                 started.iter().any(|name| name == expected),
                 "expected worker did not start: {expected}, started={started:?}"
             );
         }
-        assert!(
-            !started
-                .iter()
-                .any(|name| name.starts_with("Purge-") || name == "Trx-Cleanup-Thread"),
-            "transaction workers started before initial redo header became durable: {started:?}"
-        );
     }
 
     #[test]
@@ -1190,6 +1269,10 @@ mod tests {
         assert!(
             !started.iter().any(|name| name == "Purge-Dispatcher"),
             "purge dispatcher started after executor startup failed: {started:?}"
+        );
+        assert!(
+            !started.iter().any(|name| name == "Log-Thread"),
+            "redo started after purge startup had already failed: {started:?}"
         );
     }
 
@@ -1885,7 +1968,9 @@ mod tests {
             );
             assert_eq!(
                 err.report().downcast_ref::<String>().map(String::as_str),
-                Some("strong_refs=1, operation_blocked=false")
+                Some(
+                    "strong_refs=1, operation_blocked=false, voluntary_blocked=false, mandatory_session_blocked=false, mandatory_callers=0, mandatory_internal=0"
+                )
             );
 
             let err = match engine_ref.new_session() {
@@ -1966,7 +2051,9 @@ mod tests {
             );
             assert_eq!(
                 err.report().downcast_ref::<String>().map(String::as_str),
-                Some("strong_refs=1, operation_blocked=false")
+                Some(
+                    "strong_refs=1, operation_blocked=false, voluntary_blocked=false, mandatory_session_blocked=false, mandatory_callers=0, mandatory_internal=0"
+                )
             );
             assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
 
@@ -1997,7 +2084,9 @@ mod tests {
             );
             assert_eq!(
                 err.report().downcast_ref::<String>().map(String::as_str),
-                Some("strong_refs=0, operation_blocked=true")
+                Some(
+                    "strong_refs=0, operation_blocked=true, voluntary_blocked=true, mandatory_session_blocked=false, mandatory_callers=0, mandatory_internal=0"
+                )
             );
 
             trx.rollback().await.unwrap();
@@ -2028,7 +2117,9 @@ mod tests {
             );
             assert_eq!(
                 err.report().downcast_ref::<String>().map(String::as_str),
-                Some("strong_refs=0, operation_blocked=true")
+                Some(
+                    "strong_refs=0, operation_blocked=true, voluntary_blocked=true, mandatory_session_blocked=false, mandatory_callers=0, mandatory_internal=0"
+                )
             );
 
             let err = trx
@@ -2414,7 +2505,7 @@ mod tests {
                 Ok(_) => panic!("checked-out abandoned transaction must block a replacement"),
                 Err(err) => err,
             };
-            assert_existing_transaction_error(&err, session.id(), trx_id, "foreground_running");
+            assert_existing_transaction_error(&err, session.id(), trx_id, "voluntary");
             assert!(lock_entry_count(&engine, owner) > 0);
 
             drop(checkout);
@@ -2759,6 +2850,7 @@ mod tests {
             let (trx_sys, startup) = TransactionSystem::bootstrap(
                 config,
                 engine.inner().poisoner.clone(),
+                engine.inner().mandatory_runtime.clone(),
                 engine.inner().pools(),
                 engine.inner().table_fs.clone(),
                 engine.inner().catalog.clone(),

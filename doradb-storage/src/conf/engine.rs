@@ -1,6 +1,7 @@
-use crate::error::ConfigResult;
+use crate::error::{ConfigError, ConfigResult};
 use crate::root::{ResolvedStoragePaths, StoragePathResolveInput};
 use byte_unit::Byte;
+use error_stack::Report;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -10,6 +11,55 @@ use super::consts::{
 };
 use super::{EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
 
+/// Fixed engine-owned mandatory runtime configuration.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MandatoryRuntimeConfig {
+    /// Number of operating-system threads driving the mandatory executor.
+    pub worker_threads: usize,
+    /// Maximum number of accepted caller operations.
+    pub concurrency_limit: usize,
+}
+
+impl Default for MandatoryRuntimeConfig {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            worker_threads: 2,
+            concurrency_limit: 4,
+        }
+    }
+}
+
+impl MandatoryRuntimeConfig {
+    /// Set the number of mandatory-runtime runner threads.
+    #[inline]
+    pub fn worker_threads(mut self, worker_threads: usize) -> Self {
+        self.worker_threads = worker_threads;
+        self
+    }
+
+    /// Set the maximum number of accepted caller operations.
+    #[inline]
+    pub fn concurrency_limit(mut self, concurrency_limit: usize) -> Self {
+        self.concurrency_limit = concurrency_limit;
+        self
+    }
+
+    /// Validate immutable runtime sizing.
+    #[inline]
+    pub(crate) fn validate(&self) -> ConfigResult<()> {
+        if self.worker_threads == 0 {
+            return Err(Report::new(ConfigError::InvalidMandatoryWorkerThreads)
+                .attach("mandatory_runtime.worker_threads=0"));
+        }
+        if self.concurrency_limit == 0 {
+            return Err(Report::new(ConfigError::InvalidMandatoryConcurrencyLimit)
+                .attach("mandatory_runtime.concurrency_limit=0"));
+        }
+        Ok(())
+    }
+}
+
 /// Storage-engine configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
@@ -17,6 +67,9 @@ pub struct EngineConfig {
     pub(crate) storage_root: PathBuf,
     /// Transaction-system configuration.
     pub(crate) trx: TrxSysConfig,
+    /// Engine-owned mandatory runtime configuration.
+    #[serde(default)]
+    pub(crate) mandatory_runtime: MandatoryRuntimeConfig,
     /// Metadata buffer-pool size.
     pub(crate) meta_buffer: Byte,
     /// Index buffer-pool memory size.
@@ -37,6 +90,7 @@ impl Default for EngineConfig {
         EngineConfig {
             storage_root: PathBuf::from("."),
             trx: TrxSysConfig::default(),
+            mandatory_runtime: MandatoryRuntimeConfig::default(),
             meta_buffer: Byte::from_u64(DEFAULT_ENGINE_META_BUFFER as u64),
             index_buffer: Byte::from_u64(DEFAULT_ENGINE_INDEX_BUFFER as u64),
             index_swap_file: PathBuf::from(DEFAULT_ENGINE_INDEX_SWAP_FILE),
@@ -59,6 +113,13 @@ impl EngineConfig {
     #[inline]
     pub fn trx(mut self, trx: TrxSysConfig) -> Self {
         self.trx = trx;
+        self
+    }
+
+    /// Set the engine-owned mandatory runtime configuration.
+    #[inline]
+    pub fn mandatory_runtime(mut self, mandatory_runtime: MandatoryRuntimeConfig) -> Self {
+        self.mandatory_runtime = mandatory_runtime;
         self
     }
 
@@ -116,5 +177,44 @@ impl EngineConfig {
             self.data_buffer.data_swap_file_ref(),
             &self.index_swap_file,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_engine_config_defaults_mandatory_runtime() {
+        let mut value =
+            toml::Value::try_from(EngineConfig::default()).expect("serialize engine config");
+        value
+            .as_table_mut()
+            .expect("engine config serializes as table")
+            .remove("mandatory_runtime");
+        let decoded: EngineConfig = value.try_into().expect("deserialize legacy engine config");
+        assert_eq!(decoded.mandatory_runtime.worker_threads, 2);
+        assert_eq!(decoded.mandatory_runtime.concurrency_limit, 4);
+    }
+
+    #[test]
+    fn mandatory_runtime_rejects_zero_sizes() {
+        let error = MandatoryRuntimeConfig::default()
+            .worker_threads(0)
+            .validate()
+            .unwrap_err();
+        assert_eq!(
+            error.current_context(),
+            &ConfigError::InvalidMandatoryWorkerThreads
+        );
+
+        let error = MandatoryRuntimeConfig::default()
+            .concurrency_limit(0)
+            .validate()
+            .unwrap_err();
+        assert_eq!(
+            error.current_context(),
+            &ConfigError::InvalidMandatoryConcurrencyLimit
+        );
     }
 }

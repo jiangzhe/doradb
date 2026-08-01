@@ -37,6 +37,7 @@ pub(crate) use readonly::{ReadonlyBlockGuard, ReadonlyBufferPool};
 use crate::DiskPool;
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageSharedGuard};
 use crate::buffer::page::{BufferPage, VersionedPageID};
+use crate::completion::Completion;
 use crate::component::{
     Component, ComponentRegistry, DiskPoolConfig, IndexPool, IndexPoolConfig, MemPool, MetaPool,
     MetaPoolConfig, ShelfScope,
@@ -47,7 +48,6 @@ use crate::error::{DataIntegrityResult, RuntimeError, RuntimeResult};
 use crate::file::FileKind;
 use crate::file::fs::{FileSystem, FileSystemWorkers};
 use crate::id::{BlockID, PageID};
-use crate::io::Completion;
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::QuiescentBox;
 use crate::stats::BufferPoolCounters;
