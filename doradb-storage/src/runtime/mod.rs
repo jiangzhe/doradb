@@ -3,6 +3,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+pub(crate) mod mandatory;
+
 /// One-shot cooperative yield future.
 pub(crate) struct YieldNow {
     yielded: bool,

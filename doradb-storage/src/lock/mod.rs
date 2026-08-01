@@ -540,7 +540,7 @@ impl LockManager {
     /// Releases locks and waiters for one owner/resource pair.
     ///
     /// This method is also the cancellation path for lifecycle cleanup: a
-    /// session, transaction, statement, rollback, or admin cleanup thread may
+    /// session, transaction, statement, rollback, or admin cleanup task may
     /// call it while the original task is still blocked in [`Self::acquire`].
     /// In that case, any queued waiter for `owner` on `resource` is removed and
     /// the blocked acquisition wakes with `LockWaiterReleased`.

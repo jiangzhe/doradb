@@ -22,14 +22,15 @@ use crate::obs;
 use crate::poison::EnginePoisoner;
 use crate::quiescent::QuiescentGuard;
 use crate::root::{StorageRootLease, StorageRootLeaseAttempt};
+use crate::runtime::block_on;
+use crate::runtime::mandatory::{MandatoryRuntime, MandatoryRuntimeWorkers};
 use crate::session::{Session, SessionRegistry};
-use crate::trx::sys::{TransactionSystem, TransactionSystemWorkers};
+use crate::trx::sys::{TransactionPurgeWorkers, TransactionRedoWorkers, TransactionSystem};
 use crate::{DiskPool, IndexPool, MemPool, MetaPool};
 use error_stack::{Report, ResultExt};
 use event_listener::{Event, EventListener, Listener, listener};
 use parking_lot::Mutex;
 use std::marker::PhantomData;
-use std::mem::forget;
 use std::ops::Deref;
 use std::result;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -377,6 +378,7 @@ impl Engine {
             "event=engine_lifecycle component=engine action=shutdown_start result=ok mode=try"
         );
         inner.lifecycle.close_admission();
+        inner.mandatory_runtime.close_admission();
         inner.lifecycle.wait_for_admissions_drained();
 
         let _shutdown = inner.lifecycle.shutdown_lock.lock();
@@ -389,21 +391,44 @@ impl Engine {
 
         let blocker = inner.session_registry.first_shutdown_blocker();
         let operation_blocked = blocker.is_some();
+        let voluntary_blocked = blocker.as_ref().is_some_and(|blocker| {
+            matches!(
+                blocker.state,
+                crate::trx::SessionOperationState::Voluntary(_)
+            )
+        });
+        let mandatory_session_blocked = blocker.as_ref().is_some_and(|blocker| {
+            matches!(
+                blocker.state,
+                crate::trx::SessionOperationState::Mandatory(_)
+                    | crate::trx::SessionOperationState::CleanupReady
+                    | crate::trx::SessionOperationState::Completing
+            )
+        });
         let cleanup_queued =
             self.queue_shutdown_operation_cleanup(inner, blocker.and_then(|item| item.cleanup));
         let strong_count = Arc::strong_count(inner);
-        if strong_count != 1 || operation_blocked {
+        let (mandatory_callers, mandatory_internal) = inner.mandatory_runtime.blocker_counts();
+        if strong_count != 1
+            || operation_blocked
+            || mandatory_callers != 0
+            || mandatory_internal != 0
+        {
             let strong_refs = strong_count - 1;
             let busy = strong_refs.max(usize::from(operation_blocked));
             obs::warn!(
-                "event=engine_lifecycle component=engine action=shutdown_finish result=busy mode=try busy={} strong_refs={} operation_blocked={} cleanup_queued={}",
+                "event=engine_lifecycle component=engine action=shutdown_finish result=busy mode=try busy={} strong_refs={} operation_blocked={} voluntary_blocked={} mandatory_session_blocked={} cleanup_queued={} mandatory_callers={} mandatory_internal={}",
                 busy,
                 strong_refs,
                 operation_blocked,
-                cleanup_queued
+                voluntary_blocked,
+                mandatory_session_blocked,
+                cleanup_queued,
+                mandatory_callers,
+                mandatory_internal
             );
             return Err(Report::new(LifecycleError::ShutdownBusy).attach(format!(
-                "strong_refs={strong_refs}, operation_blocked={operation_blocked}"
+                "strong_refs={strong_refs}, operation_blocked={operation_blocked}, voluntary_blocked={voluntary_blocked}, mandatory_session_blocked={mandatory_session_blocked}, mandatory_callers={mandatory_callers}, mandatory_internal={mandatory_internal}"
             )));
         }
         self.finish_shutdown_locked(inner);
@@ -420,21 +445,23 @@ impl Engine {
     /// pins to drain, removes idle registry-owned sessions, then dispatches
     /// component shutdown in reverse registration order.
     #[inline]
-    pub fn shutdown(&self) -> Result<()> {
-        self.shutdown_inner().disclose()
+    pub fn shutdown(&self) {
+        self.shutdown_inner();
     }
 
     #[inline]
-    fn shutdown_inner(&self) -> LifecycleResult<()> {
+    fn shutdown_inner(&self) {
         let inner = self.inner();
         if inner.lifecycle.inspect_state() == EngineLifecycleState::Shutdown {
-            return Ok(());
+            return;
         }
         obs::info!(
             "event=engine_lifecycle component=engine action=shutdown_start result=ok mode=wait"
         );
         inner.lifecycle.close_admission();
+        inner.mandatory_runtime.close_admission();
         inner.lifecycle.wait_for_admissions_drained();
+        block_on(inner.mandatory_runtime.drain_callers());
 
         loop {
             inner.lifecycle.wait_for_runtime_refs_drained();
@@ -444,7 +471,7 @@ impl Engine {
                 obs::info!(
                     "event=engine_lifecycle component=engine action=shutdown_finish result=ok mode=wait already_shutdown=true"
                 );
-                return Ok(());
+                return;
             }
 
             let shutdown_wait = inner.session_registry.first_shutdown_wait();
@@ -454,7 +481,7 @@ impl Engine {
                 obs::info!(
                     "event=engine_lifecycle component=engine action=shutdown_finish result=ok mode=wait"
                 );
-                return Ok(());
+                return;
             }
             drop(_shutdown);
 
@@ -512,26 +539,10 @@ impl Engine {
 impl Drop for Engine {
     #[inline]
     fn drop(&mut self) {
-        if let Err(err) = self.try_shutdown_inner() {
-            obs::error!(
-                "event=engine_lifecycle component=engine action=shutdown_finish result=error mode=drop error={}",
-                err
-            );
-            if *err.current_context() == LifecycleError::ShutdownBusy {
-                // Fatal owner-drop violations still need to stop background
-                // workers, but the owner registry cannot be dropped while
-                // leaked runtime refs still retain component guards. This keeps
-                // worker threads from escaping even after poison, while avoiding
-                // quiescent owner teardown that could otherwise wait forever.
-                let components = self
-                    .components
-                    .take()
-                    .expect("engine component registry is present until drop");
-                components.shutdown_all();
-                forget(components);
-            }
-            panic!("fatal: engine shutdown failed: {err}");
-        }
+        // Implicit owner drop runs the same synchronous drain as explicit
+        // shutdown. An unintended drop may therefore block until every
+        // foreground operation and engine-owned background task completes.
+        self.shutdown_inner();
 
         // Field order releases the owner runtime ref before registry-owned
         // component owners.
@@ -662,6 +673,8 @@ impl WeakEngineRef {
 pub(crate) struct EngineInner {
     /// Engine-level fatal runtime poison state.
     pub(crate) poisoner: QuiescentGuard<EnginePoisoner>,
+    /// Engine-owned scheduler for accepted caller and internal obligations.
+    pub(crate) mandatory_runtime: QuiescentGuard<MandatoryRuntime>,
     /// Shared catalog handle.
     pub(crate) catalog: QuiescentGuard<Catalog>,
     /// Shared transaction-system handle.
@@ -814,6 +827,10 @@ async fn bootstrap_inner(config: EngineConfig) -> Result<Engine> {
         .build::<EnginePoisoner>(())
         .await
         .unwrap_or_else(|never| match never {});
+    builder
+        .build::<MandatoryRuntime>(config.mandatory_runtime.clone())
+        .await
+        .disclose()?;
     builder.build::<FileSystem>(file).await.disclose()?;
     builder
         .build::<DiskPool>(DiskPoolConfig::new(readonly_buffer_size))
@@ -856,7 +873,15 @@ async fn bootstrap_inner(config: EngineConfig) -> Result<Engine> {
     builder.build::<Catalog>(catalog_cfg).await.disclose()?;
     builder.build::<TransactionSystem>(trx_cfg).await?;
     builder
-        .build::<TransactionSystemWorkers>(())
+        .build::<TransactionPurgeWorkers>(())
+        .await
+        .disclose()?;
+    builder
+        .build::<MandatoryRuntimeWorkers>(())
+        .await
+        .disclose()?;
+    builder
+        .build::<TransactionRedoWorkers>(())
         .await
         .disclose()?;
 
@@ -874,6 +899,7 @@ async fn bootstrap_inner(config: EngineConfig) -> Result<Engine> {
     }
     let registry = builder.finish();
     let poisoner = registry.dependency::<EnginePoisoner>();
+    let mandatory_runtime = registry.dependency::<MandatoryRuntime>();
     let catalog = registry.dependency::<Catalog>();
     let trx_sys = registry.dependency::<TransactionSystem>();
     let meta_pool = registry.dependency::<MetaPool>();
@@ -884,6 +910,7 @@ async fn bootstrap_inner(config: EngineConfig) -> Result<Engine> {
     let lock_manager = registry.dependency::<LockManager>();
     let engine_inner = EngineInner {
         poisoner,
+        mandatory_runtime,
         catalog,
         trx_sys,
         meta_pool,
@@ -932,7 +959,6 @@ mod tests {
     use std::future::pending;
     use std::io::Error as StdIoError;
     use std::os::unix::fs::symlink;
-    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicBool;
     use std::sync::{Barrier, mpsc};
@@ -1032,8 +1058,12 @@ mod tests {
             ("Purge-Executor-1", "phase=start_transaction_purge_workers"),
             ("Purge-Dispatcher", "phase=start_transaction_purge_workers"),
             (
-                "Trx-Cleanup-Thread",
-                "phase=start_transaction_cleanup_worker",
+                "Mandatory-Runtime-1",
+                "phase=start_mandatory_runtime_runner",
+            ),
+            (
+                "Mandatory-Runtime-2",
+                "phase=start_mandatory_runtime_runner",
             ),
         ] {
             let root = TempDir::new().unwrap();
@@ -1076,11 +1106,27 @@ mod tests {
                 "startup returned before reclaiming all workers for failure at {worker}"
             );
             assert!(!started.iter().any(|name| name == worker));
+            if worker.starts_with("Mandatory-Runtime-") {
+                assert!(
+                    started.iter().any(|name| name == "Purge-Dispatcher"),
+                    "purge did not start before mandatory workers: started={started:?}"
+                );
+                assert!(
+                    !started.iter().any(|name| name == "Log-Thread"),
+                    "redo started after mandatory worker startup failed: started={started:?}"
+                );
+            }
+            if worker == "Mandatory-Runtime-2" {
+                assert!(
+                    started.iter().any(|name| name == "Mandatory-Runtime-1"),
+                    "first mandatory runner did not start: started={started:?}"
+                );
+            }
         }
     }
 
     #[test]
-    fn test_initial_redo_header_failure_reclaims_log_worker_before_startup_returns() {
+    fn test_initial_redo_header_failure_reclaims_started_workers_before_startup_returns() {
         let root = TempDir::new().unwrap();
         let log_started = Arc::new(AtomicBool::new(false));
         let hook = Arc::new(FailInitialRedoHeaderWriteHook::new(
@@ -1127,18 +1173,18 @@ mod tests {
             started, finished,
             "startup returned before reclaiming workers after initial redo-header failure"
         );
-        for expected in ["IO-Thread", "Log-Thread", "Shared-Pool-Evictor"] {
+        for expected in [
+            "IO-Thread",
+            "Log-Thread",
+            "Purge-Dispatcher",
+            "Purge-Executor-1",
+            "Shared-Pool-Evictor",
+        ] {
             assert!(
                 started.iter().any(|name| name == expected),
                 "expected worker did not start: {expected}, started={started:?}"
             );
         }
-        assert!(
-            !started
-                .iter()
-                .any(|name| name.starts_with("Purge-") || name == "Trx-Cleanup-Thread"),
-            "transaction workers started before initial redo header became durable: {started:?}"
-        );
     }
 
     #[test]
@@ -1190,6 +1236,10 @@ mod tests {
         assert!(
             !started.iter().any(|name| name == "Purge-Dispatcher"),
             "purge dispatcher started after executor startup failed: {started:?}"
+        );
+        assert!(
+            !started.iter().any(|name| name == "Log-Thread"),
+            "redo started after purge startup had already failed: {started:?}"
         );
     }
 
@@ -1718,7 +1768,7 @@ mod tests {
             assert!(output.contains("owner_pid="), "{output}");
             assert!(!alternate_data.exists());
 
-            engine.shutdown().unwrap();
+            engine.shutdown();
             let replacement = Engine::bootstrap(test_engine_config_for(&root))
                 .await
                 .unwrap();
@@ -1848,8 +1898,8 @@ mod tests {
                 .await
                 .unwrap();
 
-            engine.shutdown().unwrap();
-            engine.shutdown().unwrap();
+            engine.shutdown();
+            engine.shutdown();
 
             let err = match engine.new_session() {
                 Ok(_) => panic!("expected shutdown error"),
@@ -1885,7 +1935,9 @@ mod tests {
             );
             assert_eq!(
                 err.report().downcast_ref::<String>().map(String::as_str),
-                Some("strong_refs=1, operation_blocked=false")
+                Some(
+                    "strong_refs=1, operation_blocked=false, voluntary_blocked=false, mandatory_session_blocked=false, mandatory_callers=0, mandatory_internal=0"
+                )
             );
 
             let err = match engine_ref.new_session() {
@@ -1901,7 +1953,7 @@ mod tests {
             assert_runtime_unavailable_after_shutdown(err);
 
             drop(engine_ref);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -1915,7 +1967,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
 
-            engine.shutdown().unwrap();
+            engine.shutdown();
             assert_eq!(session_registry_len(&engine.inner().session_registry), 0);
 
             let err = match engine.new_session() {
@@ -1940,7 +1992,7 @@ mod tests {
             assert_runtime_unavailable_after_shutdown(err);
 
             drop(session);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -1966,12 +2018,14 @@ mod tests {
             );
             assert_eq!(
                 err.report().downcast_ref::<String>().map(String::as_str),
-                Some("strong_refs=1, operation_blocked=false")
+                Some(
+                    "strong_refs=1, operation_blocked=false, voluntary_blocked=false, mandatory_session_blocked=false, mandatory_callers=0, mandatory_internal=0"
+                )
             );
             assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
 
             drop(session);
-            engine.shutdown().unwrap();
+            engine.shutdown();
             assert_eq!(session_registry_len(&engine.inner().session_registry), 0);
         });
     }
@@ -1997,12 +2051,14 @@ mod tests {
             );
             assert_eq!(
                 err.report().downcast_ref::<String>().map(String::as_str),
-                Some("strong_refs=0, operation_blocked=true")
+                Some(
+                    "strong_refs=0, operation_blocked=true, voluntary_blocked=true, mandatory_session_blocked=false, mandatory_callers=0, mandatory_internal=0"
+                )
             );
 
             trx.rollback().await.unwrap();
             drop(session);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -2028,7 +2084,9 @@ mod tests {
             );
             assert_eq!(
                 err.report().downcast_ref::<String>().map(String::as_str),
-                Some("strong_refs=0, operation_blocked=true")
+                Some(
+                    "strong_refs=0, operation_blocked=true, voluntary_blocked=true, mandatory_session_blocked=false, mandatory_callers=0, mandatory_internal=0"
+                )
             );
 
             let err = trx
@@ -2039,7 +2097,7 @@ mod tests {
 
             trx.rollback().await.unwrap();
             drop(session);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -2061,7 +2119,7 @@ mod tests {
             );
 
             trx.rollback().await.unwrap();
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -2076,10 +2134,8 @@ mod tests {
         thread::scope(|scope| {
             let shutdown_engine = &engine;
             let shutdown_handle = scope.spawn(move || {
-                let result = shutdown_engine
-                    .shutdown()
-                    .map_err(|err| err.report().downcast_ref::<LifecycleError>().copied());
-                done_tx.send(result).unwrap();
+                shutdown_engine.shutdown();
+                done_tx.send(()).unwrap();
             });
 
             wait_until_shutdown_begins(&engine);
@@ -2089,10 +2145,9 @@ mod tests {
             );
 
             drop(engine_ref);
-            let result = done_rx
+            done_rx
                 .recv_timeout(Duration::from_secs(5))
                 .expect("shutdown should complete after EngineRef drops");
-            assert_eq!(result, Ok(()));
             shutdown_handle.join().unwrap();
         });
     }
@@ -2110,10 +2165,8 @@ mod tests {
         thread::scope(|scope| {
             let shutdown_engine = &engine;
             let shutdown_handle = scope.spawn(move || {
-                let result = shutdown_engine
-                    .shutdown()
-                    .map_err(|err| err.report().downcast_ref::<LifecycleError>().copied());
-                done_tx.send(result).unwrap();
+                shutdown_engine.shutdown();
+                done_tx.send(()).unwrap();
             });
 
             wait_until_shutdown_begins(&engine);
@@ -2124,10 +2177,9 @@ mod tests {
             assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
 
             drop(session);
-            let result = done_rx
+            done_rx
                 .recv_timeout(Duration::from_secs(5))
                 .expect("shutdown should complete after SessionObserverPin drops");
-            assert_eq!(result, Ok(()));
             assert_eq!(session_registry_len(&engine.inner().session_registry), 0);
             shutdown_handle.join().unwrap();
         });
@@ -2152,7 +2204,7 @@ mod tests {
                 );
             });
             started_rx.recv().unwrap();
-            engine.shutdown().unwrap();
+            engine.shutdown();
             waiter.join().unwrap();
         });
     }
@@ -2169,10 +2221,8 @@ mod tests {
         thread::scope(|scope| {
             let shutdown_engine = &engine;
             let shutdown_handle = scope.spawn(move || {
-                let result = shutdown_engine
-                    .shutdown()
-                    .map_err(|err| err.report().downcast_ref::<LifecycleError>().copied());
-                done_tx.send(result).unwrap();
+                shutdown_engine.shutdown();
+                done_tx.send(()).unwrap();
             });
 
             wait_until_shutdown_begins(&engine);
@@ -2183,10 +2233,9 @@ mod tests {
 
             smol::block_on(trx.rollback()).unwrap();
             drop(session);
-            let result = done_rx
+            done_rx
                 .recv_timeout(Duration::from_secs(5))
                 .expect("shutdown should complete after transaction rollback");
-            assert_eq!(result, Ok(()));
             shutdown_handle.join().unwrap();
         });
     }
@@ -2207,10 +2256,8 @@ mod tests {
         thread::scope(|scope| {
             let shutdown_engine = &engine;
             let shutdown_handle = scope.spawn(move || {
-                let result = shutdown_engine
-                    .shutdown()
-                    .map_err(|err| err.report().downcast_ref::<LifecycleError>().copied());
-                done_tx.send(result).unwrap();
+                shutdown_engine.shutdown();
+                done_tx.send(()).unwrap();
             });
 
             wait_until_shutdown_begins(&engine);
@@ -2220,10 +2267,9 @@ mod tests {
             );
 
             drop(checkout);
-            let result = done_rx
+            done_rx
                 .recv_timeout(Duration::from_secs(5))
                 .expect("shutdown should complete after checkout returns");
-            assert_eq!(result, Ok(()));
             shutdown_handle.join().unwrap();
         });
     }
@@ -2250,10 +2296,8 @@ mod tests {
         thread::scope(|scope| {
             let shutdown_engine = &engine;
             let shutdown_handle = scope.spawn(move || {
-                let result = shutdown_engine
-                    .shutdown()
-                    .map_err(|err| err.report().downcast_ref::<LifecycleError>().copied());
-                done_tx.send(result).unwrap();
+                shutdown_engine.shutdown();
+                done_tx.send(()).unwrap();
             });
 
             wait_until_shutdown_begins(&engine);
@@ -2263,10 +2307,9 @@ mod tests {
             );
 
             drop(exec);
-            let result = done_rx
+            done_rx
                 .recv_timeout(Duration::from_secs(5))
                 .expect("shutdown should complete after statement cancellation cleanup");
-            assert_eq!(result, Ok(()));
             shutdown_handle.join().unwrap();
         });
     }
@@ -2294,7 +2337,7 @@ mod tests {
             session.close().await.unwrap();
             session.close().await.unwrap();
             assert_eq!(session_registry_len(&engine.inner().session_registry), 0);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -2316,7 +2359,7 @@ mod tests {
                 err.report().downcast_ref::<LifecycleError>().copied(),
                 Some(LifecycleError::SessionUnavailable)
             );
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -2330,7 +2373,7 @@ mod tests {
             let session = engine.new_session().unwrap();
 
             assert!(!session.in_trx().unwrap());
-            engine.shutdown().unwrap();
+            engine.shutdown();
 
             let err = session.in_trx().unwrap_err();
             assert_runtime_unavailable_after_shutdown(err);
@@ -2352,7 +2395,7 @@ mod tests {
             assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
             trx.rollback().await.unwrap();
             assert_eq!(session_registry_len(&engine.inner().session_registry), 0);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -2383,7 +2426,7 @@ mod tests {
 
             let replacement = session.begin_trx().unwrap();
             replacement.rollback().await.unwrap();
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -2414,7 +2457,7 @@ mod tests {
                 Ok(_) => panic!("checked-out abandoned transaction must block a replacement"),
                 Err(err) => err,
             };
-            assert_existing_transaction_error(&err, session.id(), trx_id, "foreground_running");
+            assert_existing_transaction_error(&err, session.id(), trx_id, "voluntary");
             assert!(lock_entry_count(&engine, owner) > 0);
 
             drop(checkout);
@@ -2427,7 +2470,7 @@ mod tests {
 
             let replacement = session.begin_trx().unwrap();
             replacement.rollback().await.unwrap();
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -2448,7 +2491,7 @@ mod tests {
             assert!(trx.commit().await.unwrap() > TrxID::new(0));
             assert_eq!(session_registry_len(&engine.inner().session_registry), 0);
 
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -2471,7 +2514,7 @@ mod tests {
                 "abandoned session was not removed after transaction cleanup",
             );
 
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -2489,7 +2532,7 @@ mod tests {
             thread::scope(|scope| {
                 let shutdown_handle = scope.spawn(|| {
                     started_tx.send(()).unwrap();
-                    engine.shutdown().unwrap();
+                    engine.shutdown();
                     done_tx.send(()).unwrap();
                 });
 
@@ -2599,7 +2642,7 @@ mod tests {
             assert_eq!(session.last_cts(), TrxID::new(0));
 
             replacement.rollback().await.unwrap();
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -2651,24 +2694,74 @@ mod tests {
                 .await
                 .unwrap();
 
-            let res = catch_unwind(AssertUnwindSafe(|| drop(engine)));
-            assert!(res.is_ok());
+            drop(engine);
         });
     }
 
     #[test]
-    fn test_drop_engine_panics_when_extra_refs_exist() {
+    fn test_drop_engine_waits_for_extra_refs_to_finish() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
             let engine = Engine::bootstrap(test_engine_config_for(root.path()))
                 .await
                 .unwrap();
-            let leaked_ref = engine.new_ref().unwrap();
+            let retained_ref = engine.new_ref().unwrap();
+            let (done_tx, done_rx) = mpsc::channel();
 
-            let res = catch_unwind(AssertUnwindSafe(|| drop(engine)));
-            assert!(res.is_err());
+            thread::scope(|scope| {
+                let drop_handle = scope.spawn(move || {
+                    drop(engine);
+                    done_tx.send(()).unwrap();
+                });
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !retained_ref.shutdown_started() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "engine drop did not close admission before timeout"
+                    );
+                    yield_now();
+                }
+                assert!(
+                    done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+                    "engine drop must wait while an EngineRef is alive"
+                );
 
-            drop(leaked_ref);
+                drop(retained_ref);
+                done_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("engine drop should complete after EngineRef drops");
+                drop_handle.join().unwrap();
+            });
+        });
+    }
+
+    #[test]
+    fn test_drop_engine_waits_for_active_transaction_to_finish() {
+        let root = TempDir::new().unwrap();
+        let engine =
+            smol::block_on(Engine::bootstrap(test_engine_config_for(root.path()))).unwrap();
+        let mut session = engine.new_session().unwrap();
+        let trx = session.begin_trx().unwrap();
+        let shutdown_started = engine.inner().shutdown_listener();
+        let (done_tx, done_rx) = mpsc::channel();
+
+        thread::scope(|scope| {
+            let drop_handle = scope.spawn(move || {
+                drop(engine);
+                done_tx.send(()).unwrap();
+            });
+            shutdown_started.wait();
+            assert!(
+                done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+                "engine drop must wait while an active transaction is alive"
+            );
+
+            smol::block_on(trx.rollback()).unwrap();
+            drop(session);
+            done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("engine drop should complete after transaction rollback");
+            drop_handle.join().unwrap();
         });
     }
 
@@ -2709,7 +2802,7 @@ mod tests {
                             == Some(LifecycleError::ShutdownBusy) =>
                     {
                         drop(engine_ref);
-                        engine.shutdown().unwrap();
+                        engine.shutdown();
                     }
                     (Ok(()), Ok(engine_ref)) => {
                         drop(engine_ref);
@@ -2759,6 +2852,7 @@ mod tests {
             let (trx_sys, startup) = TransactionSystem::bootstrap(
                 config,
                 engine.inner().poisoner.clone(),
+                engine.inner().mandatory_runtime.clone(),
                 engine.inner().pools(),
                 engine.inner().table_fs.clone(),
                 engine.inner().catalog.clone(),

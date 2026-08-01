@@ -135,6 +135,26 @@ This system employs a unique persistence and recovery model (No-Steal / No-Force
 See [Transaction System](./transaction-system.md). Table-level metadata and
 data coordination is described in [Lock System](./lock-system.md).
 
+## Mandatory Background Runtime
+
+The engine owns one fixed-thread asynchronous executor for obligations that
+must reach a supervised terminal outcome after acceptance. Caller preparation
+and operation-lock waiting remain outside runtime capacity and are
+cancellable. A synchronous consuming acceptance edge transfers all prepared
+resources into mandatory ownership before the task is detached.
+
+The same executor replaces the former sequential transaction-cleanup thread.
+Abandoned transactions, explicit terminal rollback, and failed-precommit
+rollback are independent accounted tasks, so different transactions may
+progress concurrently. Rollback within one transaction remains sequential,
+and fatal residual undo ownership is retained before poison is published.
+
+Caller operation admission and engine-internal cleanup admission have separate
+RAII counters. Shutdown closes caller admission first, lets redo submit its
+final cleanup, drains the runtime, and stops purge last. See
+[Engine Component Lifetime](./engine-component-lifetime.md) for the exact
+component ordering and observer ownership contract.
+
 ## Logging, Checkpoint and Recovery
 
 This system adopts logging and recovery strategy of in-memory database system, which uses value logging and redo-only recovery.

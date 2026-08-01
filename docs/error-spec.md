@@ -135,8 +135,8 @@ for manufacturing a storage error.
 A public facade is normally a thin adapter over a typed operation:
 
 ```rust,ignore
-pub fn shutdown(&self) -> Result<()> {
-    self.shutdown_inner().disclose()
+pub fn try_shutdown(&self) -> Result<()> {
+    self.try_shutdown_inner().disclose()
 }
 ```
 

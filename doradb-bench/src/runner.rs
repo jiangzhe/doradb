@@ -37,7 +37,7 @@ pub async fn prepare(storage_root: PathBuf, args: PrepareArgs) -> Result<()> {
         .create_table(benchmark_table_spec(), benchmark_index_specs(args.index))
         .await?;
     session.close().await?;
-    engine.shutdown()?;
+    engine.shutdown();
 
     let manifest = Manifest::new_with_defaults(table_id.as_u64(), args.index, defaults);
     write_manifest_exclusive(&storage_root, &manifest)?;
@@ -194,12 +194,8 @@ async fn open_engine(storage_root: &Path, log_sync: LogSyncMode) -> Result<Engin
 }
 
 fn finish_engine<T>(engine: &Engine, operation_result: Result<T>) -> Result<T> {
-    let shutdown_result = engine.shutdown();
-    match (operation_result, shutdown_result) {
-        (Ok(result), Ok(())) => Ok(result),
-        (Err(err), _) => Err(err),
-        (Ok(_), Err(err)) => Err(err.into()),
-    }
+    engine.shutdown();
+    operation_result
 }
 
 fn run_session_workers<R: WorkloadRunner>(

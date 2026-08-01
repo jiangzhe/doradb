@@ -81,7 +81,7 @@ Related Follow-ups:
 
 - `docs/backlogs/000124-statement-execution-cancellation-safety.md`
 - `docs/backlogs/000171-exact-family-lock-system-redesign.md`
-- `docs/backlogs/000123-adaptive-background-worker-runtime.md`
+- `docs/backlogs/closed/000123-adaptive-background-worker-runtime.md`
 
 Issue Labels:
 

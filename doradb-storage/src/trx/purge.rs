@@ -1664,7 +1664,7 @@ mod tests {
             assert!(message.contains(&format!("strong_count={expected_strong_count}")));
 
             drop(table);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -2259,7 +2259,7 @@ mod tests {
                 trx.rollback().await.unwrap();
             }
             drop(sessions);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -2276,7 +2276,7 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(engine.inner().trx_sys.gc_buckets.len(), 2);
-            engine.shutdown().unwrap();
+            engine.shutdown();
 
             let engine = Engine::bootstrap(purge_test_engine_config(
                 temp_dir.path(),
@@ -2287,7 +2287,7 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(engine.inner().trx_sys.gc_buckets.len(), 4);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -2836,7 +2836,7 @@ mod tests {
                 ))
             );
             assert_eq!(engine.inner().trx_sys.global_visible_sts(), completed);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -2920,7 +2920,7 @@ mod tests {
                     .iter()
                     .any(|event| matches!(event, PurgeTestEvent::CompletedHorizonPublished { .. }))
             );
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -2965,7 +2965,7 @@ mod tests {
 
             drop(oldest_session);
             drop(later_session);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -3023,7 +3023,7 @@ mod tests {
             replacement.rollback().await.unwrap();
             drop(oldest_session);
             drop(replacement_session);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -3081,7 +3081,7 @@ mod tests {
             })
             .await;
             assert!(engine.inner().trx_sys.global_visible_sts() > initial_completed);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -3129,7 +3129,7 @@ mod tests {
                     engine.inner().trx_sys.global_visible_sts(),
                     initial_completed
                 );
-                engine.shutdown().unwrap();
+                engine.shutdown();
 
                 let events = event_rx.try_iter().collect::<Vec<_>>();
                 assert!(events.iter().all(|event| !matches!(
@@ -3201,7 +3201,7 @@ mod tests {
                     .iter()
                     .any(|event| matches!(event, PurgeTestEvent::CompletedHorizonPublished { .. }))
             );
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -3240,7 +3240,7 @@ mod tests {
             completed.sort_unstable();
             assert_eq!(started, vec![0, 1]);
             assert_eq!(completed, vec![0, 1]);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 

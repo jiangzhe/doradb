@@ -1802,7 +1802,7 @@ pub(crate) mod tests {
             assert_eq!(Arc::strong_count(&table), owners_before);
 
             drop(table);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 

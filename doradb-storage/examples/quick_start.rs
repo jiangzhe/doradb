@@ -146,7 +146,7 @@ async fn run() -> ExampleResult<()> {
     session.drop_table(table_id).await?;
     assert!(!session.list_table_ids()?.contains(&table_id));
     session.close().await?;
-    engine.shutdown()?;
+    engine.shutdown();
 
     println!("quick start example completed");
     Ok(())

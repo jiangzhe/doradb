@@ -14,14 +14,15 @@ pub(crate) use self::tests::{test_block_id, test_file_id};
 use crate::id::{BlockID, FileID};
 
 use crate::buffer::{ReadSubmission, ReadonlyWriteLease};
+use crate::completion::Completion;
 use crate::error::{
     CompletionErrorBridge, CompletionResult, IoError, IoResult, ResourceError, ResourceResult,
 };
 use crate::free_list::FreeList;
 use crate::io::DirectBuf;
 use crate::io::{
-    BackendError, Completion, IOClient, IOKind, IOQueue, IOSubmission, Operation,
-    STORAGE_SECTOR_SIZE, StdIoResult, align_to_sector_size,
+    BackendError, IOClient, IOKind, IOQueue, IOSubmission, Operation, STORAGE_SECTOR_SIZE,
+    StdIoResult, align_to_sector_size,
 };
 use error_stack::Report;
 use libc::{O_CREAT, O_DIRECT, O_EXCL, O_RDWR, O_TRUNC, close, fstat, ftruncate, open, stat};

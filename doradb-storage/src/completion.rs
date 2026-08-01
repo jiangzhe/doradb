@@ -1,19 +1,45 @@
-//! One-shot completion cells for asynchronous storage IO flows.
+//! One-shot completion cells for asynchronous engine flows.
 //!
-//! `Completion<T>` stores a `CompletionResult<T>` so IO, redo, and commit
-//! fanout paths can move detailed domain reports across thread boundaries
-//! without promoting them to the public `Error` type too early. A completion
-//! failure stores one cloneable bridge. Fanout clones only its inner `Arc`;
-//! final error owners reconstruct independent reports with their own context
-//! after leaving the state lock.
+//! `Completion<T>` stores a `CompletionResult<T>` so IO, redo, commit, and
+//! mandatory-runtime paths can move detailed domain reports across thread
+//! boundaries without promoting them to the public `Error` type too early. A
+//! completion failure stores one cloneable bridge. Fanout clones only its inner
+//! `Arc`; final error owners reconstruct independent reports with their own
+//! context after leaving the state lock.
 
 use crate::error::CompletionResult;
 use event_listener::{Event, listener};
 use parking_lot::Mutex;
+use std::mem::replace;
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "exclusive take is reserved for prepared mandatory adapters"
+    )
+)]
 enum CompletionState<T> {
     Running,
     Completed(CompletionResult<T>),
+    Consumed,
+}
+
+/// Result of an exclusive completion take attempt.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "exclusive take is reserved for prepared mandatory adapters"
+    )
+)]
+pub(crate) enum CompletionTake<T> {
+    /// The producer has not completed yet.
+    Pending,
+    /// The terminal result was moved to the exclusive observer.
+    Ready(CompletionResult<T>),
+    /// Another API already consumed this exclusive completion.
+    Consumed,
 }
 
 /// Shared terminal-status cell for one asynchronous IO flow.
@@ -61,6 +87,9 @@ impl<T> Completion<T> {
         match &*state {
             CompletionState::Running => None,
             CompletionState::Completed(value) => Some(propagate_result(value)),
+            CompletionState::Consumed => {
+                panic!("shared completion observation after exclusive result consumption")
+            }
         }
     }
 
@@ -76,6 +105,49 @@ impl<T> Completion<T> {
                 return value;
             }
             listener.await;
+        }
+    }
+
+    /// Exclusively moves the terminal result out of this completion.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "exclusive take is reserved for prepared mandatory adapters"
+        )
+    )]
+    #[inline]
+    pub(crate) fn try_take_result(&self) -> CompletionTake<T> {
+        let mut state = self.state.lock();
+        match replace(&mut *state, CompletionState::Consumed) {
+            CompletionState::Running => {
+                *state = CompletionState::Running;
+                CompletionTake::Pending
+            }
+            CompletionState::Completed(value) => CompletionTake::Ready(value),
+            CompletionState::Consumed => CompletionTake::Consumed,
+        }
+    }
+
+    /// Waits for and exclusively moves the terminal result.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "exclusive take is reserved for prepared mandatory adapters"
+        )
+    )]
+    #[inline]
+    pub(crate) async fn wait_take_result(&self) -> CompletionResult<T> {
+        loop {
+            listener!(self.ev => listener);
+            match self.try_take_result() {
+                CompletionTake::Pending => listener.await,
+                CompletionTake::Ready(value) => return value,
+                CompletionTake::Consumed => {
+                    panic!("completion result consumed more than once")
+                }
+            }
         }
     }
 }

@@ -215,7 +215,7 @@ as replaced: this task implements the terminal rollback portion, remaining
 statement execution cancellation safety is tracked by
 `docs/backlogs/000124-statement-execution-cancellation-safety.md`, and adaptive
 cleanup/runtime worker scheduling is tracked by
-`docs/backlogs/000123-adaptive-background-worker-runtime.md`.
+`docs/backlogs/closed/000123-adaptive-background-worker-runtime.md`.
 
 Validation completed:
 - `cargo fmt`
@@ -316,6 +316,6 @@ Validation commands:
   likely requires a broader statement operation ownership model.
 - Adaptive processing for long rollback or cleanup work remains intentionally
   out of scope. It is tracked as
-  `docs/backlogs/000123-adaptive-background-worker-runtime.md` because several
+  `docs/backlogs/closed/000123-adaptive-background-worker-runtime.md` because several
   large worker-owned rollbacks can monopolize the single cleanup worker even
   though rollback is expected to be rare enough for this task's safety fix.

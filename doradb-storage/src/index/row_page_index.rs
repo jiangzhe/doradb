@@ -2981,7 +2981,7 @@ mod tests {
                     .expect("test insert-page allocation should succeed");
                 assert_eq!(reused_page.page_id(), page_id);
             }
-            engine.shutdown().unwrap();
+            engine.shutdown();
 
             let mut create_row_page_logs = 0usize;
             let file_prefix = temp_dir.path().join("redo_row_page_idx");
@@ -3136,7 +3136,7 @@ mod tests {
                 });
                 join_all(jobs).await;
             }
-            engine.shutdown().unwrap();
+            engine.shutdown();
 
             let file_prefix = temp_dir.path().join("redo_row_page_order");
             let file_prefix = file_prefix.to_str().unwrap();

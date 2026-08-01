@@ -31,6 +31,7 @@ The runtime uses an explicit owner/runtime split:
 - `EngineInner` owns only crate-private shared runtime handles and the
   lifecycle gate:
   - engine poisoner
+  - mandatory runtime
   - catalog
   - transaction system
   - logical lock manager
@@ -55,17 +56,20 @@ one fixed dependency order:
 
 1. `StorageRootLease`
 2. `EnginePoisoner`
-3. `FileSystem`
-4. `DiskPool`
-5. `MetaPool`
-6. `IndexPool`
-7. `MemPool`
-8. `FileSystemWorkers`
-9. `SharedPoolEvictorWorkers`
-10. `LockManager`
-11. `Catalog`
-12. `TransactionSystem`
-13. `TransactionSystemWorkers`
+3. `MandatoryRuntime`
+4. `FileSystem`
+5. `DiskPool`
+6. `MetaPool`
+7. `IndexPool`
+8. `MemPool`
+9. `FileSystemWorkers`
+10. `SharedPoolEvictorWorkers`
+11. `LockManager`
+12. `Catalog`
+13. `TransactionSystem`
+14. `TransactionPurgeWorkers`
+15. `MandatoryRuntimeWorkers`
+16. `TransactionRedoWorkers`
 
 Every entry is an explicit `RegistryBuilder::build` call in
 `bootstrap_inner`. Components register only themselves. Upstream
@@ -96,6 +100,13 @@ can poison the engine without depending on `TransactionSystem`; components
 that publish or inspect fatal state retain their own direct poisoner
 dependency.
 
+`MandatoryRuntime` is registered immediately after the poisoner. Catalog,
+transaction, recovery, and future operation adapters can therefore retain its
+direct `QuiescentGuard` without owning `EngineRef` or another runtime `Arc`.
+Its build shelves only the runtime guard and configured runner count. The later
+`MandatoryRuntimeWorkers` build starts the fixed runners and registers their
+join-handle owner at the required shutdown position.
+
 Registration order is the dependency order. Reverse registration order is both:
 
 - the explicit shutdown order
@@ -117,7 +128,7 @@ guards before the component owner is released. Statement, transaction, and
 session lifecycle code release owner entries explicitly before runtime handles
 are dropped.
 
-The two storage-runtime worker components currently own:
+The storage-runtime worker components include:
 
 - `FileSystemWorkers`
   - the shared storage-I/O thread;
@@ -131,6 +142,54 @@ The two storage-runtime worker components currently own:
     `index_pool`;
   - wakeup/shutdown orchestration for those three domains; and
   - the shared-evictor stats handle published through the component registry.
+- `TransactionRedoWorkers`
+  - closes group-commit admission and joins redo before mandatory cleanup
+    admission closes.
+- `MandatoryRuntimeWorkers`
+  - closes and drains internal cleanup admission, then stops and joins every
+    executor runner.
+- `TransactionPurgeWorkers`
+  - stops purge only after mandatory cleanup can no longer update transaction
+    GC state.
+
+The last three registrations intentionally produce reverse shutdown
+`TransactionRedoWorkers -> MandatoryRuntimeWorkers ->
+TransactionPurgeWorkers`. `TransactionSystem` supplies independent purge and
+redo startup provisions. Purge starts first and blocks on its empty channel;
+the later redo build makes the initial redo header durable before engine
+bootstrap returns. Registration order, rather than thread-start order, defines
+the teardown dependency.
+
+## Mandatory Runtime
+
+The engine owns one `async_executor::Executor` driven by a fixed number of
+named, joined OS threads (two by default). Caller operations acquire one of
+four bounded permits by default only after preparation is complete. Their
+synchronous consuming `accept` call is the ownership handoff from
+caller-cancellable `Voluntary` state to runtime-owned `Mandatory` state; there
+is no await between a ready permit and detached spawn.
+
+Internal rollback and abandoned-transaction obligations use a separate,
+unbounded-but-accounted admission counter. They bypass caller capacity and are
+submitted synchronously without a lossy channel. Independent transactions can
+therefore clean up concurrently, while each transaction's rollback remains
+sequential.
+
+Mandatory results reuse the common completion cell through a move-once take
+path. The single observer owns no task, permit, engine reference, session
+authority, or prepared resource. Dropping it cannot cancel execution. A
+retained observer may retain a completed value, but it cannot block engine
+shutdown. Conversely, a prepared caller future retained without being polled
+still owns its voluntary resources and can block shutdown until it resumes or
+drops.
+
+The supervisor catches both synchronous future construction and polling
+unwinds while the accepted operation or cleanup job remains in an outer owner.
+Its domain policy first releases or moves residual unsafe ownership into fatal
+retention, then engine poison is published, terminal or `FailedRetained` state
+and completion waiters are published, and the permit is released exactly once.
+If the domain panic policy itself unwinds, the panic-minimal fallback retains
+the whole armed owner instead of dropping raw-reference-sensitive undo.
 
 ## Admission, Shutdown, And Drop
 
@@ -140,18 +199,19 @@ The engine lifecycle has three states:
 2. `ShuttingDown`
 3. `Shutdown`
 
-Shutdown closes admission for new work and then requires active session
-operations, abandoned transaction cleanup, and internal `EngineRef` runtime
-pins to drain before owner-side component shutdown can proceed.
+Shutdown closes engine and mandatory caller admission for new work and then
+requires active session operations, caller permits, internal cleanup permits,
+and internal `EngineRef` runtime pins to drain before owner-side component
+shutdown can proceed.
 `Engine::try_shutdown()` performs that check once and returns `ShutdownBusy` if
-work remains. `Engine::shutdown()` waits for the same work to drain and then
-completes final teardown.
+work remains. The infallible `Engine::shutdown()` waits for the same work to
+drain and returns only after final teardown completes.
 
 Normal shutdown is:
 
-1. close the admission gate and flip `Running -> ShuttingDown`
-2. wait for active admission tokens to drain
-3. wait for scoped `EngineRef` runtime pins to drain
+1. close engine and mandatory caller admission and flip `Running -> ShuttingDown`
+2. wait for active admission tokens and accepted caller permits to drain
+3. wait for scoped `EngineRef` runtime pins and internal mandatory tasks to drain
 4. acquire the owner-side shutdown lock and lazily traverse registered sessions
    until the first active operation is found
 5. for blocking shutdown, install or reuse that session's event and register
@@ -167,15 +227,15 @@ Normal shutdown is:
 
 `Engine::try_shutdown()` uses the same first-blocker traversal without
 installing an event or listener. It queues at most that blocker's cleanup hint
-and returns `ShutdownBusy`; its attachment labels the retained engine-reference
-count and whether a blocking operation was discovered rather than presenting
-one ambiguous aggregate number.
+and returns `ShutdownBusy`; its attachment separately labels retained engine
+references, voluntary preparation, accepted mandatory session work, caller
+permits, and internal tasks.
 
 The numbered owner-teardown steps follow the coordinator drain above. Session
 disposition (`Open`, `CloseRequested`, or `Abandoned`) is separate from the
-single operation slot (`Idle`, `Active`, or `Closed`). Active foreground,
-cleanup, reserved background, completion-owned, and failed-retained labels all
-block shutdown. Cleanup queue messages carry the exact
+single operation slot (`Idle`, `Active`, or `Closed`). `Voluntary`,
+`Mandatory`, `CleanupReady`, `Completing`, and `FailedRetained` all block
+shutdown; only `Terminal` does not. Cleanup tasks carry the exact
 `(SessionOperationKey, TrxID)` pair, so stale or duplicate work cannot claim a
 replacement operation.
 
@@ -194,12 +254,12 @@ transaction completion performs no event allocation, atomic update, or wake.
 The lazy traversal may hold one DashMap shard read guard during the short
 `lifecycle -> entry` probe. Registry insertion or removal never occurs while
 either inner mutex is held, so there is no reverse lock edge. The iterator is
-dropped before cleanup queueing, event waiting, notification, or removal.
+dropped before cleanup submission, event waiting, notification, or removal.
 
 The registry owns `Arc<SessionState>`, and an active slot owns
 `Arc<SessionOperationEntry>`. Neither object owns a strong engine runtime
 handle. `EngineRef` exists only in scoped foreground authorities, transaction
-attachments, claims, and queued cleanup jobs, preventing a
+attachments, claims, and submitted cleanup jobs, preventing a
 registry-to-engine strong reference cycle.
 
 The final reverse-order shutdown step releases `StorageRootLease`. A later
@@ -218,10 +278,13 @@ sequence deterministic:
 Dropping `EngineInner` first releases the runtime-held quiescent guards before
 registry-owned component owners start their final `QuiescentBox<T>` drains.
 
-If `Engine::drop` detects leaked runtime refs, that is a fatal owner-contract
-violation. The implementation still stops worker threads, but it intentionally
-leaks the registry instead of dropping component owners while leaked guards are
-still alive.
+`Engine::drop` invokes the same synchronous drain as `Engine::shutdown()`.
+An unintended owner drop can therefore block indefinitely while
+caller-retained foreground work, runtime references, or engine-owned
+background work remains live. Callers should finish foreground work and invoke
+explicit shutdown at a controlled point when blocking there is operationally
+important. Drop does not cancel accepted work or tear down components before
+that work reaches terminal state.
 
 ## Quiescent Ownership
 

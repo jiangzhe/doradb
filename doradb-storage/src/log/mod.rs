@@ -6,6 +6,7 @@ mod seal;
 
 use self::prefix::{LogPrefixEntry, LogPrefixId, LogPrefixKind, LogPrefixTracker};
 pub(crate) use self::seal::LogFileSealer;
+use crate::completion::Completion;
 use crate::conf::TrxSysConfig;
 use crate::error::{
     ConfigError, DataIntegrityError, DataIntegrityResult, DiscloseError, Error, FatalError,
@@ -17,8 +18,8 @@ use crate::free_list::FreeList;
 use crate::id::TrxID;
 use crate::io::{
     Backend, BackendError, BackendResult, BackendStats, BackendStatsHandle, CompletedSubmission,
-    Completion, DirectBuf, IOBuf, IOKind, IOSubmission, Operation, StorageBackend,
-    SubmissionDriver, SubmitAttempt, SubmitRetry,
+    DirectBuf, IOBuf, IOKind, IOSubmission, Operation, StorageBackend, SubmissionDriver,
+    SubmitAttempt, SubmitRetry,
 };
 use crate::log::block_group::{LogBlockGroup, TrxLog};
 use crate::log::format::{
@@ -951,8 +952,9 @@ impl SyncGroup {
 
     /// Transfers failed precommit payloads to mandatory rollback ownership.
     ///
-    /// The cleanup worker completes the shared waiter only after rollback or
-    /// fatal retention has settled every transaction in the group.
+    /// The mandatory-runtime cleanup task completes the shared waiter only
+    /// after rollback or fatal retention has settled every transaction in the
+    /// group.
     #[inline]
     fn handoff_failed_precommit(
         &mut self,
@@ -2461,7 +2463,6 @@ mod tests {
     use crate::recovery::stream::{RedoLogSegment, RedoReplayPlanner};
     use crate::session::tests::SessionTestExt;
     use crate::trx::MAX_SNAPSHOT_TS;
-    use crate::trx::sys::SessionOperationCleanupMessage;
     use crate::trx::sys::tests::manual_log_processor_transaction_system;
     use crate::value::Val;
     use event_listener::Event;
@@ -3028,7 +3029,6 @@ mod tests {
         trx_sys: TransactionSystem,
         poisoner: QuiescentGuard<EnginePoisoner>,
         _purge_rx: flume::Receiver<Purge>,
-        cleanup_rx: flume::Receiver<SessionOperationCleanupMessage>,
     }
 
     fn manual_log_processor_harness(
@@ -3036,13 +3036,11 @@ mod tests {
         config: TrxSysConfig,
         redo_log: RedoLog,
     ) -> ManualLogProcessorHarness {
-        let (trx_sys, purge_rx, cleanup_rx) =
-            manual_log_processor_transaction_system(engine, config, redo_log);
+        let (trx_sys, purge_rx) = manual_log_processor_transaction_system(engine, config, redo_log);
         ManualLogProcessorHarness {
             trx_sys,
             poisoner: engine.inner().poisoner.clone(),
             _purge_rx: purge_rx,
-            cleanup_rx,
         }
     }
 
@@ -3223,7 +3221,7 @@ mod tests {
             wait_for(|| session.in_trx().is_ok_and(|active| !active)).await;
 
             drop(session);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -3282,7 +3280,7 @@ mod tests {
                     started_tx
                         .send(())
                         .expect("shutdown thread should report start");
-                    shutdown_engine.shutdown().unwrap();
+                    shutdown_engine.shutdown();
                     done_tx.send(()).expect("shutdown should report completion");
                 });
 
@@ -3342,7 +3340,7 @@ mod tests {
             assert!(!session.in_trx().unwrap());
 
             drop(session);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -3697,7 +3695,7 @@ mod tests {
             );
 
             drop(harness);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -3779,7 +3777,7 @@ mod tests {
             );
 
             drop(harness);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -3843,13 +3841,8 @@ mod tests {
                     .as_ref()
                     .is_some_and(|err| *err.current_context() == FatalError::RedoSync)
             );
-            assert!(matches!(
-                harness.cleanup_rx.try_recv().unwrap(),
-                SessionOperationCleanupMessage::FailedPrecommit(_)
-            ));
-
             drop(harness);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -3900,7 +3893,7 @@ mod tests {
                 cts.as_u64()
             );
             drop(harness);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -4005,7 +3998,7 @@ mod tests {
                 cts.as_u64()
             );
             drop(harness);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -4103,7 +4096,7 @@ mod tests {
             }
 
             drop(harness);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -4179,7 +4172,7 @@ mod tests {
             }
 
             drop(harness);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -4213,7 +4206,7 @@ mod tests {
             finish_prefix_seal_for_test(&harness, &mut write_driver, &mut sealer, ended_log_file);
 
             drop(harness);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -4280,7 +4273,7 @@ mod tests {
             }
 
             drop(harness);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -4344,7 +4337,7 @@ mod tests {
             );
 
             drop(harness);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -4386,7 +4379,7 @@ mod tests {
             );
 
             drop(harness);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -4434,7 +4427,7 @@ mod tests {
             );
 
             drop(harness);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -4453,7 +4446,7 @@ mod tests {
             );
             let cts = engine.inner().trx_sys.commit_sys(sys_trx).unwrap();
 
-            engine.shutdown().unwrap();
+            engine.shutdown();
 
             let bytes = fs::read(format!("{file_prefix}.00000000")).unwrap();
             let sealed = parse_redo_super_block(
@@ -4519,7 +4512,7 @@ mod tests {
             assert!(header_completion.completed_result().unwrap().is_err());
 
             drop(harness);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -4980,7 +4973,7 @@ mod tests {
             assert_eq!(sealed.max_redo_cts, 72);
 
             drop(harness);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -5453,7 +5446,7 @@ mod tests {
             hook.wait_started(1).await;
             assert!(engine.inner().trx_sys.persisted_watermark_cts() < cts);
             hook.release();
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 }

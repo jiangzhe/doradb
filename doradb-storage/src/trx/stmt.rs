@@ -1313,7 +1313,7 @@ pub(crate) mod tests {
             );
             session_tests::wait_for_session_idle(&engine.inner().session_registry, session.id())
                 .await;
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
