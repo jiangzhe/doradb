@@ -3317,7 +3317,7 @@ pub(crate) mod tests {
             drop(pool_guard);
             drop(pool);
             drop(table_file);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 

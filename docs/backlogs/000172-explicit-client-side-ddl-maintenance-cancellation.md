@@ -6,7 +6,7 @@ Design an explicit client-requested cancellation mechanism for long-running DDL 
 
 ## Reference
 
-Deferred from docs/rfcs/0025-session-coordinated-cancellation-cleanup-ownership.md, especially the DDL and maintenance continuation model, explicit cancellation non-goal, and Future Work section; related to docs/backlogs/000170-session-coordinated-cancellation-cleanup.md and docs/backlogs/000123-adaptive-background-worker-runtime.md.
+Deferred from docs/rfcs/0025-session-coordinated-cancellation-cleanup-ownership.md, especially the DDL and maintenance continuation model, explicit cancellation non-goal, and Future Work section; related to docs/backlogs/000170-session-coordinated-cancellation-cleanup.md and docs/backlogs/closed/000123-adaptive-background-worker-runtime.md.
 
 ## Deferred From (Optional)
 

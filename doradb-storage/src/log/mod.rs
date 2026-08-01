@@ -3221,7 +3221,7 @@ mod tests {
             wait_for(|| session.in_trx().is_ok_and(|active| !active)).await;
 
             drop(session);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -3280,7 +3280,7 @@ mod tests {
                     started_tx
                         .send(())
                         .expect("shutdown thread should report start");
-                    shutdown_engine.shutdown().unwrap();
+                    shutdown_engine.shutdown();
                     done_tx.send(()).expect("shutdown should report completion");
                 });
 
@@ -3340,7 +3340,7 @@ mod tests {
             assert!(!session.in_trx().unwrap());
 
             drop(session);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -3695,7 +3695,7 @@ mod tests {
             );
 
             drop(harness);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -3777,7 +3777,7 @@ mod tests {
             );
 
             drop(harness);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -3842,7 +3842,7 @@ mod tests {
                     .is_some_and(|err| *err.current_context() == FatalError::RedoSync)
             );
             drop(harness);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -3893,7 +3893,7 @@ mod tests {
                 cts.as_u64()
             );
             drop(harness);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -3998,7 +3998,7 @@ mod tests {
                 cts.as_u64()
             );
             drop(harness);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -4096,7 +4096,7 @@ mod tests {
             }
 
             drop(harness);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -4172,7 +4172,7 @@ mod tests {
             }
 
             drop(harness);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -4206,7 +4206,7 @@ mod tests {
             finish_prefix_seal_for_test(&harness, &mut write_driver, &mut sealer, ended_log_file);
 
             drop(harness);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -4273,7 +4273,7 @@ mod tests {
             }
 
             drop(harness);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -4337,7 +4337,7 @@ mod tests {
             );
 
             drop(harness);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -4379,7 +4379,7 @@ mod tests {
             );
 
             drop(harness);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -4427,7 +4427,7 @@ mod tests {
             );
 
             drop(harness);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -4446,7 +4446,7 @@ mod tests {
             );
             let cts = engine.inner().trx_sys.commit_sys(sys_trx).unwrap();
 
-            engine.shutdown().unwrap();
+            engine.shutdown();
 
             let bytes = fs::read(format!("{file_prefix}.00000000")).unwrap();
             let sealed = parse_redo_super_block(
@@ -4512,7 +4512,7 @@ mod tests {
             assert!(header_completion.completed_result().unwrap().is_err());
 
             drop(harness);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -4973,7 +4973,7 @@ mod tests {
             assert_eq!(sealed.max_redo_cts, 72);
 
             drop(harness);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -5446,7 +5446,7 @@ mod tests {
             hook.wait_started(1).await;
             assert!(engine.inner().trx_sys.persisted_watermark_cts() < cts);
             hook.release();
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 }

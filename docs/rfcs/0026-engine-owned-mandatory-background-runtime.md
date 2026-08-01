@@ -312,7 +312,7 @@ supervision, and drain contracts. The crate-private `runtime::block_on` and
 
 ### Source Backlogs
 
-- [B1] `docs/backlogs/000123-adaptive-background-worker-runtime.md` - single
+- [B1] `docs/backlogs/closed/000123-adaptive-background-worker-runtime.md` - single
   cleanup-worker head-of-line blocking and the direction hint to evaluate a
   shared background async runtime with explicit fairness, backpressure,
   shutdown, and ownership rules.
@@ -800,10 +800,11 @@ detach an OS thread. [C2] [D3] [C5]
 
 ### 8. Engine shutdown closes roots, drains obligations, then tears down
 
-`Engine::try_shutdown` and blocking `Engine::shutdown` remain synchronous.
-Their lifecycle model expands from runtime references and session blockers to
-include separate caller-operation and internal-cleanup admission accounting.
-[D3] [C1] [U9] [U10]
+`Engine::try_shutdown`, blocking `Engine::shutdown`, and the blocking shutdown
+invoked by `Engine::drop` remain synchronous. Their lifecycle model expands
+from runtime references and session blockers to include separate
+caller-operation and internal-cleanup admission accounting. [D3] [C1] [U9]
+[U10]
 
 Shutdown proceeds in this order:
 
@@ -838,16 +839,14 @@ does not cancel accepted work or skip worker joins. [C1] [C3] [C5] [U5] [U6]
 The executor owner may be dropped only after mandatory admission is closed
 with zero caller permits, internal admission is closed with zero active tasks,
 all runners are joined, and the executor is empty. Dropping a nonempty
-executor would cancel futures and violates this RFC. A fatal
-`Engine::drop` with caller-retained live work cannot safely invoke normal
-reverse worker shutdown because an accepted DDL task may still need redo,
-cleanup, catalog, or file workers. That misuse path must retain the component
-registry and live worker/task graph without calling their cancelling teardown,
-then preserve the existing fatal panic. This is an intentional leak on a
-programmer-contract violation; valid explicit or implicit shutdown still joins
-and releases every worker. Apparent resource cleanup is never obtained by
-cancelling mandatory tasks or tearing down their dependencies first. [D3] [D7]
-[C1] [C2]
+executor would cancel futures and violates this RFC. `Engine::drop` therefore
+uses the same blocking drain and reverse component shutdown as explicit
+`Engine::shutdown`. An unintended owner Drop may block indefinitely while
+caller-retained foreground work, accepted mandatory work, internal cleanup, or
+runtime references remain live. `try_shutdown` is the nonblocking alternative
+for callers that need a busy diagnostic. Apparent resource cleanup is never
+obtained by cancelling mandatory tasks, leaking their worker graph, or tearing
+down dependencies first. [D3] [D7] [C1] [C2]
 
 ### 9. Panic and failure supervision are part of the task envelope
 
@@ -1141,11 +1140,11 @@ focused validation.
     inside one transaction, redesign `LockManager`, add priorities/adaptive
     resizing, or migrate other component workers.
   - Task Doc: `docs/tasks/000248-mandatory-operation-driver-and-concurrent-cleanup-executor.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Issue: `#922`
+  - Phase Status: done
+  - Implementation Summary: Implemented the fixed mandatory runtime, concurrent transaction cleanup, supervised completion, prepared-to-mandatory handoff, and ordered redo-runtime-purge shutdown. Engine owner Drop now uses the same blocking drain as explicit shutdown. [Task Resolve Sync: docs/tasks/000248-mandatory-operation-driver-and-concurrent-cleanup-executor.md @ 2026-08-01]
   - Related Backlogs:
-    - `docs/backlogs/000123-adaptive-background-worker-runtime.md`
+    - `docs/backlogs/closed/000123-adaptive-background-worker-runtime.md`
 
 - **Phase 2: Runtime-Owned Table DDL**
   - Scope: Refactor create/drop table into caller-owned preparation followed by
@@ -1245,11 +1244,11 @@ focused validation.
 - **Phase 5: Lifecycle, Fairness, And Evolution Readiness**
   - Scope: Remove superseded foreground-handoff transitions and queue paths;
     finalize engine/session/runtime shutdown diagnostics, task/result
-    observability, fatal owner-drop retention, bounded-poll audits,
+    observability, blocking owner-drop drain, bounded-poll audits,
     configuration documentation, cross-operation stress tests, and paired
     performance measurements. Synchronize RFC-0025 Phases 3 through 7 as
-    superseded by this RFC and decide backlog 000123 closure from implementation
-    evidence. [D3] [D7] [D9] [B1]
+    superseded by this RFC and preserve the fixed-runtime implementation
+    evidence that closed backlog 000123. [D3] [D7] [D9] [B1]
   - Goals: Demonstrate one execution owner, no dropped accepted payload,
     lossless shutdown wakeups, no transaction/statement hot-path overhead,
     bounded caller-operation backlog, progress for cleanup under
@@ -1271,7 +1270,7 @@ focused validation.
   - Phase Status: `pending`
   - Implementation Summary: `pending`
   - Related Backlogs:
-    - `docs/backlogs/000123-adaptive-background-worker-runtime.md`
+    - `docs/backlogs/closed/000123-adaptive-background-worker-runtime.md`
 
 ## Test Strategy
 
@@ -1333,7 +1332,10 @@ Phase 1 minimum focused coverage:
 18. shutdown drains all redo-using roots, joins redo, accepts and completes an
     injected final failed-precommit cleanup on the runtime, joins runtime
     runners, and only then stops purge; blocking shutdown has no lost wakeup
-    and executor destruction observes an empty task set.
+    and executor destruction observes an empty task set;
+19. owner Drop uses the same blocking drain, remains blocked while a
+    foreground or accepted-background obligation is retained, and completes
+    after that blocker releases without cancelling component teardown.
 
 DDL and maintenance phases add deterministic coverage for Drop during each
 lock/gate wait and after each partial acquisition, retained-live preparation,
@@ -1486,7 +1488,7 @@ redo-runtime-purge shutdown contracts.
 ## References
 
 - `docs/rfcs/0025-session-coordinated-cancellation-cleanup-ownership.md`
-- `docs/backlogs/000123-adaptive-background-worker-runtime.md`
+- `docs/backlogs/closed/000123-adaptive-background-worker-runtime.md`
 - `docs/backlogs/000167-logical-lock-deadlock-handling.md`
 - `docs/tasks/000209-remove-smol-production-dependency.md`
 - `docs/tasks/000246-session-operation-coordinator-foundation.md`

@@ -2318,7 +2318,7 @@ mod tests {
                 );
 
                 drop(pin);
-                shutdown.join().unwrap().unwrap();
+                shutdown.join().unwrap();
             });
         });
     }
@@ -2343,7 +2343,7 @@ mod tests {
 
             drop(pin);
             drop(session);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -3987,7 +3987,7 @@ mod tests {
                 wait_session_idle(&engine, &mut session).await;
                 drop(table);
                 drop(session);
-                engine.shutdown().unwrap();
+                engine.shutdown();
             }
         });
     }
@@ -4209,7 +4209,7 @@ mod tests {
 
             drop(table);
             drop(session);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -4563,7 +4563,7 @@ mod tests {
             assert!(hook_ran.get());
 
             reader.rollback().await.unwrap();
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -4601,7 +4601,7 @@ mod tests {
             wait_for_dropped_table_floor(&engine, table_id).await;
 
             wait.await.unwrap();
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -5012,7 +5012,7 @@ mod tests {
             wait_for_dropped_table_floor(&engine, table_id).await;
 
             wait.await.unwrap();
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -5749,7 +5749,7 @@ mod tests {
             drop(delete_session);
             drop(table);
             drop(checkpoint_session);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -6003,7 +6003,7 @@ mod tests {
                 "Publishing"
             );
             drop(session);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -6050,7 +6050,7 @@ mod tests {
                 "Publishing"
             );
             drop(session);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -7053,7 +7053,7 @@ mod tests {
             drop(table);
             drop(old_session);
             drop(session);
-            engine.shutdown().unwrap();
+            engine.shutdown();
 
             let recovered = Engine::bootstrap(lightweight_test_engine_config(
                 main_dir,

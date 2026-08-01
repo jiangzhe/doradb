@@ -839,7 +839,7 @@ mod tests {
             drop_table.await.unwrap();
             wait_for_dropped_table_floor(&engine, table_id).await;
 
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 

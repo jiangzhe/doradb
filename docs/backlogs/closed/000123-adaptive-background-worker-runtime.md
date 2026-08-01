@@ -42,3 +42,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented by task 000248 and RFC-0026 Phase 1: selected a configurable fixed shared runtime, removed sequential cleanup head-of-line blocking, and established separate admission plus ordered shutdown. Adaptive resizing was evaluated and not selected for the accepted design.
+- Closed By: backlog close
+- Reference: docs/tasks/000248-mandatory-operation-driver-and-concurrent-cleanup-executor.md; docs/rfcs/0026-engine-owned-mandatory-background-runtime.md Phase 1
+- Closed At: 2026-08-01

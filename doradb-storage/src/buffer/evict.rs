@@ -2187,7 +2187,7 @@ pub(crate) mod tests {
         }
 
         fn shutdown(&self) {
-            self.engine.shutdown().unwrap();
+            self.engine.shutdown();
         }
     }
 
@@ -2201,7 +2201,7 @@ pub(crate) mod tests {
 
     impl Drop for StartedEvictPool {
         fn drop(&mut self) {
-            let _ = self.engine.shutdown();
+            self.engine.shutdown();
         }
     }
 

@@ -204,8 +204,8 @@ requires active session operations, caller permits, internal cleanup permits,
 and internal `EngineRef` runtime pins to drain before owner-side component
 shutdown can proceed.
 `Engine::try_shutdown()` performs that check once and returns `ShutdownBusy` if
-work remains. `Engine::shutdown()` waits for the same work to drain and then
-completes final teardown.
+work remains. The infallible `Engine::shutdown()` waits for the same work to
+drain and returns only after final teardown completes.
 
 Normal shutdown is:
 
@@ -278,12 +278,13 @@ sequence deterministic:
 Dropping `EngineInner` first releases the runtime-held quiescent guards before
 registry-owned component owners start their final `QuiescentBox<T>` drains.
 
-If `Engine::drop` detects caller-retained voluntary work or leaked runtime
-refs, that is a fatal owner-contract violation. It intentionally retains the
-complete registry and live task/worker graph before panicking; cancelling
-component teardown cannot run while an accepted task may still need redo,
-catalog, file, cleanup, or purge services. Engine-owned terminal cleanup is
-drained normally rather than misclassified as caller misuse.
+`Engine::drop` invokes the same synchronous drain as `Engine::shutdown()`.
+An unintended owner drop can therefore block indefinitely while
+caller-retained foreground work, runtime references, or engine-owned
+background work remains live. Callers should finish foreground work and invoke
+explicit shutdown at a controlled point when blocking there is operationally
+important. Drop does not cancel accepted work or tear down components before
+that work reaches terminal state.
 
 ## Quiescent Ownership
 

@@ -3869,7 +3869,7 @@ pub(crate) mod tests {
             drop(trx);
             remove_session_for_test(&engine.inner().session_registry, session.id());
             drop(session);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -3963,7 +3963,7 @@ pub(crate) mod tests {
 
             drop(trx);
             drop(session);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -4694,7 +4694,7 @@ pub(crate) mod tests {
                 Some(LifecycleError::TransactionDiscarded)
             );
             wait_for_session_idle(&engine.inner().session_registry, session_id).await;
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -4739,7 +4739,7 @@ pub(crate) mod tests {
                 Some(LifecycleError::TransactionDiscarded)
             );
             wait_for_session_idle(&engine.inner().session_registry, session_id).await;
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -4812,7 +4812,7 @@ pub(crate) mod tests {
             "whole-transaction cleanup must consume the residual statement insert"
         );
         verify.rollback().await.unwrap();
-        engine.shutdown().unwrap();
+        engine.shutdown();
     }
 
     #[test]
@@ -4896,7 +4896,7 @@ pub(crate) mod tests {
             Some(LifecycleError::TransactionDiscarded)
         );
         wait_for_session_idle(&engine.inner().session_registry, session_id).await;
-        engine.shutdown().unwrap();
+        engine.shutdown();
     }
 
     #[test]
@@ -5682,7 +5682,7 @@ pub(crate) mod tests {
                 },
                 "terminal rollback cleanup did not finish after waiter drop",
             );
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -5723,7 +5723,7 @@ pub(crate) mod tests {
                 let (done_tx, done_rx) = mpsc::channel();
                 let shutdown_engine = &engine;
                 let shutdown = scope.spawn(move || {
-                    shutdown_engine.shutdown().unwrap();
+                    shutdown_engine.shutdown();
                     done_tx.send(()).expect("shutdown should report completion");
                 });
 
@@ -5798,7 +5798,7 @@ pub(crate) mod tests {
                 },
                 "terminal rollback cleanup did not finish after duplicate cleanup attempt",
             );
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -5857,7 +5857,7 @@ pub(crate) mod tests {
                 },
                 "poisoned commit rollback cleanup did not finish after waiter drop",
             );
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 

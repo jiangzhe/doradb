@@ -299,7 +299,7 @@ async fn run_baseline(args: &Args) -> StorageResult<Vec<BenchRow>> {
         );
     }
 
-    engine.shutdown()?;
+    engine.shutdown();
     Ok(rows)
 }
 

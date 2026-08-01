@@ -1,7 +1,7 @@
 ---
 id: 000248
 title: Mandatory Operation Driver And Concurrent Cleanup Executor
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-07-31
 github_issue: 922
 ---
@@ -52,7 +52,7 @@ RFC Relationship:
 
 Source Backlogs:
 
-- `docs/backlogs/000123-adaptive-background-worker-runtime.md`
+- `docs/backlogs/closed/000123-adaptive-background-worker-runtime.md`
 
 Prerequisites:
 
@@ -822,7 +822,7 @@ TransactionPurgeWorkers
 Every pending provision owns rollback-safe stop/join behavior until registered.
 No partial path may leave a detached thread.
 
-### 10. Integrate engine shutdown and fatal owner Drop
+### 10. Integrate engine shutdown and blocking owner Drop
 
 Extend engine shutdown admission and observation:
 
@@ -861,13 +861,12 @@ retention, resource release, or fatal publication starts, generic supervision
 cannot determine which ownership remains safe; no second-recovery protocol is
 defined.
 
-Change fatal `Engine::drop` behavior for caller-retained live work. It may
-not call cancelling component teardown while an accepted task can still need
-redo, catalog, cleanup, file, or purge components. Retain the component
-registry and live worker/task graph, then preserve the fatal panic. Test this
-misuse in an isolated subprocess so intentionally retained threads do not
-pollute the test process. Valid shutdown continues joining and releasing every
-worker.
+Use the same blocking shutdown path from `Engine::drop`. An unintended owner
+Drop may block until all foreground operations, accepted mandatory work,
+internal cleanup, runtime references, and component workers drain. This keeps
+every dependency alive until its accepted work completes and avoids both
+cancelling teardown and a deliberately leaked live graph. `try_shutdown`
+remains the nonblocking API for callers that need a busy diagnostic.
 
 ### 11. Preserve and measure successful-path performance
 
@@ -905,6 +904,100 @@ fixed-runtime foundation fully resolves its currently requested scope.
 
 ## Implementation Notes
 
+### Runtime, ownership, and cleanup
+
+- Added an engine-owned `MandatoryRuntime` with configurable fixed runner
+  threads, bounded caller admission, separate non-lossy internal admission,
+  caller/internal drain accounting, panic-supervised task envelopes, and
+  deterministic runner stop/join.
+- Kept runner startup in a dedicated worker provision. Engine construction
+  shelves the runtime and transaction systems first, then independently builds
+  purge, mandatory-runtime, and redo workers so reverse component shutdown is
+  redo, runtime, then purge. Partial startup owners stop and join every thread
+  they started.
+- Added the consuming `PreparedExecution` handoff and synthetic Phase 1
+  coverage for preparation Drop, capacity waiting, atomic
+  `Voluntary -> Mandatory` acceptance, observer independence, terminal
+  publication, and fatal retention.
+- Extended `Completion<T>` with an exclusive move-once result path and added
+  mandatory producer/observer wrappers that serialize completion with
+  observer Drop.
+- Replaced the sequential transaction cleanup thread with independent
+  internal runtime jobs. Abandoned cleanup, terminal rollback, and failed
+  precommit cleanup can now overlap across transactions while each
+  transaction's rollback remains sequential.
+
+### Review outcomes and plan deviation
+
+- Changed the proposed fatal busy `Engine::drop` policy after CI exposed a
+  shutdown-busy panic in an ordinary test teardown. Both explicit
+  `Engine::shutdown` and implicit owner Drop now use the same synchronous
+  drain and reverse component shutdown. An unintended owner Drop may block
+  indefinitely until foreground and background obligations finish.
+  `Engine::shutdown` and its private blocking helper return unit;
+  `try_shutdown` retains its result because its purpose is to report a
+  recoverable busy blocker without waiting.
+- Aligned shutdown blocker classification with owner Drop:
+  `Mandatory(_)`, `CleanupReady`, and `Completing` are mandatory-session
+  blockers, while only `Voluntary(_)` is a voluntary blocker.
+- Verified that failed-precommit cleanup submission cannot encounter closed
+  internal admission in the current component order: redo joins and performs
+  its final submissions before runtime internal admission closes. The
+  rejection branch therefore keeps its invariant panic and payload-retention
+  policy instead of adding a blocking fallback.
+- Verified that the runtime executor emptiness assertion occurs only after
+  caller admission drain, internal admission drain, stop signaling, and all
+  runner joins. The runner stop wake can therefore reach quiescence before the
+  assertion; focused shutdown tests repeated 100 times without failure.
+- Updated lifecycle, public-error, benchmark, example, and subsystem comments
+  and documents to describe the actual initialization, cleanup, and blocking
+  shutdown behavior.
+
+### Performance evidence
+
+Measurements used optimized isolated binaries from `origin/main` at
+`da136ef` and the candidate at `9af9b23` plus the reviewed working-tree fixes,
+Rust 1.97.1 (`8bab26f4f`) on `aarch64-unknown-linux-gnu`. Each pair used
+separate equivalent roots, `--log-sync none`, one unreported warmup, and seven
+alternating samples. No-op counts were 1,000,000 statements or 100,000
+transactions. `index-stream` roots contained `[0, 100000)` and used
+`--num 100000 --range 100 --seed 1`, scanning 10,000,000 rows per sample.
+Latency is average nanoseconds per operation; IQR is the sixth minus the
+second sorted sample for seven values.
+
+| Workload | Threads/sessions | Index | Origin median ns (IQR) | Origin median ops/s | Candidate median ns (IQR) | Candidate median ops/s | Latency delta |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| `stmt-noop` | 1/1 | unique | 74.163 (0.567) | 13,483,829 | 74.269 (2.115) | 13,464,478 | +0.14% |
+| `stmt-noop` | 4/16 | unique | 95.211 (19.020) | 10,503,010 | 106.426 (3.555) | 9,396,194 | +11.78% |
+| `trx-noop` | 1/1 | unique | 295.593 (11.549) | 3,383,035 | 302.354 (17.374) | 3,307,378 | +2.29% |
+| `trx-noop` | 4/16 | unique | 343.466 (65.265) | 2,911,492 | 333.162 (16.979) | 3,001,545 | -3.00% |
+| `index-stream` | 1/1 | unique | 30,122.532 (1,274.548) | 33,197.741 | 30,119.362 (282.777) | 33,201.234 | -0.01% |
+| `index-stream` | 4/16 | unique | 9,232.458 (166.162) | 108,313.518 | 9,386.734 (526.073) | 106,533.327 | +1.67% |
+| `index-stream` | 1/1 | non-unique | 31,243.610 (566.614) | 32,006.545 | 31,294.689 (601.471) | 31,954.304 | +0.16% |
+| `index-stream` | 4/16 | non-unique | 9,841.557 (316.883) | 101,609.939 | 9,715.075 (281.055) | 102,932.809 | -1.29% |
+
+The long range-100 stream measurements are stable and remain within
+approximately +/-1.7%. The contended statement no-op median was repeated
+because the first pair was noisy; the repeat still showed a slower candidate
+median, but the baseline was bimodal and its 19.020 ns IQR overlaps the
+candidate distribution. No mandatory-runtime access occurs on the public
+statement/transaction hot path, so this does not establish a deterministic
+Phase 1 regression. Existing backlog 000175 continues to own the broader
+contended shared-resource lifetime performance work.
+
+### Validation
+
+- `tools/style_audit.rs --diff-base origin/main` passed for all 35
+  branch-diff Rust files, including formatting and strict workspace Clippy.
+- `rtk cargo build --workspace` passed.
+- `rtk cargo nextest run --workspace` passed: 1,617 tests.
+- `rtk cargo nextest run -p doradb-storage --no-default-features --features libaio`
+  passed: 1,524 tests.
+- `rtk cargo clippy -p doradb-storage --no-default-features --features libaio --all-targets -- -D warnings`
+  passed.
+- Focused mandatory-runtime shutdown tests repeated 100 times, and focused
+  mandatory lifecycle transition coverage passed.
+
 ## Impacts
 
 - `Cargo.toml`
@@ -936,7 +1029,7 @@ fixed-runtime foundation fully resolves its currently requested scope.
     worker ownership.
 - `doradb-storage/src/engine.rs`
   - Register early runtime access, reorder worker components, integrate
-    shutdown admission/drain, and retain the live graph on fatal busy Drop.
+    shutdown admission/drain, and use blocking shutdown from owner Drop.
 - `doradb-storage/src/component.rs`
   - Use or narrowly extend shelf provisions for deferred runtime and transaction
     worker startup.
@@ -1057,8 +1150,9 @@ for compilation-only adjustments required by the consolidated state names.
     without a task registry.
 39. Poison storage with accepted work present; verify new healthy admission
     closes but accepted work and cleanup drain before runner join.
-40. Run fatal busy `Engine::drop` in a subprocess; verify it panics without
-    invoking cancelling component teardown on the live graph.
+40. Hold foreground or accepted background work across `Engine::drop`; verify
+    owner Drop blocks without cancelling component teardown and finishes after
+    the blocker releases.
 41. Verify explicit normal shutdown leaves zero caller permits, closed
     internal admission with zero active tasks, an empty executor, and no live
     runner, redo, cleanup, or purge thread.
@@ -1077,6 +1171,11 @@ and hang-detection authority.
 ## Open Questions
 
 None within Phase 1.
+
+The noisy contended `stmt-noop` comparison does not establish a
+mandatory-runtime regression, but it also does not close the broader
+shared-lifetime contention question. That work remains linked to
+`docs/backlogs/000175-scalable-shared-resource-lifetime-management.md`.
 
 Future DDL and maintenance tasks must implement `PreparedExecution` with their
 own operation-specific preparation guards and accepted compensation/panic

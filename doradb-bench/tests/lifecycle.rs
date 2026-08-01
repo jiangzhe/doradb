@@ -60,7 +60,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let table_count = session.list_table_ids().unwrap().len();
             session.close().await.unwrap();
-            engine.shutdown().unwrap();
+            engine.shutdown();
             table_count
         })
     }

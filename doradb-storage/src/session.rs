@@ -3465,7 +3465,7 @@ pub(crate) mod tests {
 
             remove_session_for_test(&engine.inner().session_registry, session.id());
             drop(session);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -3765,7 +3765,7 @@ pub(crate) mod tests {
             drop_table.await.unwrap();
             wait_for_dropped_table_floor(&engine, table_id).await;
 
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -3843,7 +3843,7 @@ pub(crate) mod tests {
                 assert_eq!(lock_entry_count(&engine, explicit_owner), 2);
 
                 session.unlock_table(table_id).unwrap();
-                engine.shutdown().unwrap();
+                engine.shutdown();
             }
         });
     }
@@ -4954,7 +4954,7 @@ pub(crate) mod tests {
                 .unwrap();
             let session = engine.new_session().unwrap();
 
-            engine.shutdown().unwrap();
+            engine.shutdown();
 
             assert_runtime_unavailable_after_shutdown(session.list_table_ids().unwrap_err());
             assert_runtime_unavailable_after_shutdown(

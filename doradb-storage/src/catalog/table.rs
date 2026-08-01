@@ -3656,7 +3656,7 @@ mod tests {
             drop(root_lease);
             drop(table);
             drop(drop_session);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 

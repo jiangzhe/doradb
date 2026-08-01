@@ -534,7 +534,7 @@ mod tests {
                 "terminal rollback must release the binding metadata lock"
             );
             drop(session);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -580,7 +580,7 @@ mod tests {
                 Some(LifecycleError::TransactionDiscarded)
             );
             wait_for_session_idle(&engine.inner().session_registry, session_id).await;
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -650,7 +650,7 @@ mod tests {
                 old_trx.rollback().await.unwrap();
                 drop(ddl_session);
                 drop(old_session);
-                engine.shutdown().unwrap();
+                engine.shutdown();
             }
         });
     }
@@ -782,7 +782,7 @@ mod tests {
                 drop(fresh_session);
                 drop(ddl_session);
                 drop(old_session);
-                engine.shutdown().unwrap();
+                engine.shutdown();
             }
         });
     }
@@ -837,7 +837,7 @@ mod tests {
 
             drop(ddl_session);
             drop(bound_session);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -918,7 +918,7 @@ mod tests {
 
             drop(ddl_session);
             drop(bound_session);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -986,7 +986,7 @@ mod tests {
 
             drop(ddl_session);
             drop(bound_session);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -1057,7 +1057,7 @@ mod tests {
             assert_no_table_locks(&engine, table_id);
             drop(ddl_session);
             drop(old_session);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 
@@ -1119,7 +1119,7 @@ mod tests {
             assert_no_table_locks(&engine, table_id);
             drop(ddl_session);
             drop(old_session);
-            engine.shutdown().unwrap();
+            engine.shutdown();
         });
     }
 }
