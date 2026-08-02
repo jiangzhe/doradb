@@ -183,17 +183,19 @@ shutdown. Conversely, a prepared caller future retained without being polled
 still owns its voluntary resources and can block shutdown until it resumes or
 drops.
 
-`CREATE TABLE` and `DROP TABLE` are the first production users of this caller
-contract. The session validates input, reserves its DDL operation, and acquires
-the complete target/catalog lock set while the future is still cancellable.
+Table and index DDL use this caller contract. The session validates pure input,
+reserves its DDL operation, and acquires the complete target/catalog lock set
+while the future is still cancellable.
 After caller capacity is available, synchronous acceptance transfers the
-operation entry, locks, immutable execution plan, and exact table runtime (for
-DROP) to the mandatory owner. The public future then waits only through the
-execution-inert observer. Normal completion drops settled progress, releases
-the prepared locks, and only then publishes the outer operation terminal.
-Unexpected execution unwind instead retains `FailedRetained`, publishes
-mandatory-runtime poison, and releases the caller permit after the accepted
-owner is dropped.
+operation entry, locks, immutable execution plan, and any exact table runtime
+or metadata-gate admissions to the mandatory owner. For index DDL, preparation
+acquires table then catalog metadata-change admission and acceptance transfers
+both in one lifetime-free scope. The public future then waits only through the
+execution-inert observer. Normal completion settles nested ownership, releases
+index gates in catalog-then-table order, releases prepared locks, and only then
+publishes the outer operation terminal. Unexpected execution unwind instead
+retains `FailedRetained`, publishes mandatory-runtime poison, and releases the
+caller permit after the accepted owner is dropped.
 
 The supervisor catches both synchronous future construction and polling
 unwinds while the accepted operation or cleanup job remains in an outer owner.

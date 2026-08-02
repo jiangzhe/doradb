@@ -7,6 +7,8 @@
 use crate::buffer::PoolRole;
 use crate::buffer::SharedPoolEvictorWorkers;
 #[cfg(test)]
+use crate::catalog::index::tests::IndexDdlTestController;
+#[cfg(test)]
 use crate::catalog::table::tests::TableDdlTestController;
 use crate::catalog::{Catalog, CatalogConfig};
 use crate::component::{
@@ -593,6 +595,12 @@ impl EngineRef {
         &self.0.catalog
     }
 
+    /// Clone the catalog component guard for transferable runtime authority.
+    #[inline]
+    pub(crate) fn catalog_guard(&self) -> QuiescentGuard<Catalog> {
+        self.0.catalog.clone()
+    }
+
     /// Return the shared logical lock manager.
     #[inline]
     pub(crate) fn lock_manager(&self) -> &QuiescentGuard<LockManager> {
@@ -700,6 +708,9 @@ pub(crate) struct EngineInner {
     /// Per-engine table-DDL fault and phase controller.
     #[cfg(test)]
     pub(crate) table_ddl_test: TableDdlTestController,
+    /// Per-engine index-DDL fault and phase controller.
+    #[cfg(test)]
+    pub(crate) index_ddl_test: IndexDdlTestController,
     lifecycle: EngineLifecycle,
 }
 
@@ -928,6 +939,8 @@ async fn bootstrap_inner(config: EngineConfig) -> Result<Engine> {
         next_session_id: AtomicU64::new(FIRST_SESSION_ID.as_u64()),
         #[cfg(test)]
         table_ddl_test: TableDdlTestController::default(),
+        #[cfg(test)]
+        index_ddl_test: IndexDdlTestController::default(),
         lifecycle: EngineLifecycle::new(),
     };
     Ok(Engine {

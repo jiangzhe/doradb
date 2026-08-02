@@ -1,15 +1,13 @@
-use super::table::{
-    reject_non_user_table_id, reject_user_table_primary_key_index, validated_index_ddl_target,
-};
 use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards};
 use crate::catalog::{
-    IndexColumnObject, IndexNo, IndexObject, IndexSpec, TableMetadata, TableObject,
+    Catalog, IndexColumnObject, IndexNo, IndexObject, IndexSpec, TableMetadata, TableObject,
+    catalog_table_id_from_slot,
 };
 use crate::engine::EngineRef;
 use crate::error::{
-    DataIntegrityError, DataIntegrityResult, DiscloseError, DiscloseResultExt, FatalError,
-    OperationError, OperationOrRuntimeResult, OperationResult, Result, RuntimeError,
-    RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
+    CompletionErrorBridge, CompletionResult, DataIntegrityError, DataIntegrityResult,
+    DiscloseResultExt, FatalError, OperationError, OperationOrRuntimeResult, OperationResult,
+    Result, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
 };
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::file::table_file::{ActiveRoot, MutableTableFile};
@@ -23,13 +21,28 @@ use crate::log::redo::DDLRedo;
 use crate::obs;
 use crate::quiescent::QuiescentGuard;
 use crate::row::RowRead;
-use crate::session::{SessionDdlContext, SessionOperationPin};
+use crate::runtime::mandatory::{AcceptedExecution, MandatoryTaskMetadata, PreparedExecution};
+use crate::runtime::yield_now;
+use crate::session::{AcceptedDdlScope, PreparedDdlScope};
 use crate::table::{DeleteMarker, Table, TableRuntimeLayout, secondary_disk_tree_encoder};
-use crate::trx::{Transaction, trx_is_committed};
+use crate::trx::{PreparedCatalogWriteAuthority, Transaction, trx_is_committed};
 use crate::value::Val;
 use error_stack::{Report, ResultExt};
+use std::any::Any;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+#[cfg(test)]
+pub(crate) use tests::IndexDdlTestController;
+#[cfg(test)]
+use tests::{CreateIndexTestFailure, IndexDdlTestPhase};
+
+const CREATE_INDEX_CATALOG_WRITE_TARGETS: [TableID; 3] = [
+    catalog_table_id_from_slot(0),
+    catalog_table_id_from_slot(2),
+    catalog_table_id_from_slot(3),
+];
+const DROP_INDEX_CATALOG_WRITE_TARGETS: [TableID; 2] =
+    [catalog_table_id_from_slot(2), catalog_table_id_from_slot(3)];
 
 /// Index DDL operation kind used for root-publish durability proof.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,6 +64,138 @@ pub(crate) enum IndexDdlRootProof {
     DurableAllocationOnly,
     /// The root proves the dropped index is inactive and its root slot is empty.
     DurableFinalDrop,
+}
+
+/// Transferable admission to the table and catalog metadata-change gates.
+pub(crate) struct IndexDdlGateScope {
+    table: Arc<Table>,
+    catalog: QuiescentGuard<Catalog>,
+    table_active: bool,
+    catalog_active: bool,
+}
+
+impl IndexDdlGateScope {
+    /// Acquires table admission first and catalog admission second.
+    pub(crate) async fn acquire(
+        table: Arc<Table>,
+        catalog: QuiescentGuard<Catalog>,
+    ) -> OperationResult<Self> {
+        table.acquire_index_metadata_change().await?;
+        let mut scope = Self {
+            table,
+            catalog,
+            table_active: true,
+            catalog_active: false,
+        };
+        scope.catalog.acquire_index_metadata_change().await;
+        scope.catalog_active = true;
+        Ok(scope)
+    }
+}
+
+impl Drop for IndexDdlGateScope {
+    #[inline]
+    fn drop(&mut self) {
+        if self.catalog_active {
+            self.catalog_active = false;
+            self.catalog.release_index_metadata_change();
+        }
+        if self.table_active {
+            self.table_active = false;
+            self.table.release_index_metadata_change();
+        }
+    }
+}
+
+/// Owned, caller-validated CREATE INDEX execution plan.
+pub(crate) struct CreateIndexPlan {
+    table_id: TableID,
+    table: Arc<Table>,
+    old_layout: Arc<TableRuntimeLayout>,
+    active_root: ActiveRoot,
+    index_no: IndexNo,
+    new_metadata: Arc<TableMetadata>,
+    new_index_spec: IndexSpec,
+    secondary_index_roots: Vec<BlockID>,
+}
+
+impl CreateIndexPlan {
+    /// Captures the stable layout, root, and allocated metadata shape.
+    pub(crate) fn new(table_id: TableID, table: Arc<Table>, index_spec: IndexSpec) -> Result<Self> {
+        let old_layout = table.layout_snapshot();
+        let old_metadata = old_layout.metadata();
+        let active_root = table.file().active_root_unchecked().clone();
+        validate_create_index_root_shape(table_id, &active_root, old_metadata).disclose()?;
+        let (index_no, new_metadata_value) =
+            old_metadata.try_with_created_index(index_spec).disclose()?;
+        let new_metadata = Arc::new(new_metadata_value);
+        let index_no_usize = usize::from(index_no);
+        let new_index_spec = new_metadata
+            .idx
+            .require_index_spec(index_no_usize)
+            .expect("newly created index metadata must contain its allocated slot")
+            .clone();
+        let mut secondary_index_roots = active_root.secondary_index_roots.clone();
+        secondary_index_roots.resize(new_metadata.idx.index_slot_count(), SUPER_BLOCK_ID);
+        Ok(Self {
+            table_id,
+            table,
+            old_layout,
+            active_root,
+            index_no,
+            new_metadata,
+            new_index_spec,
+            secondary_index_roots,
+        })
+    }
+}
+
+/// Owned, caller-validated DROP INDEX execution plan.
+pub(crate) struct DropIndexPlan {
+    table_id: TableID,
+    table: Arc<Table>,
+    old_layout: Arc<TableRuntimeLayout>,
+    index_no: IndexNo,
+    old_index_spec: IndexSpec,
+    new_metadata: Arc<TableMetadata>,
+    secondary_index_roots: Vec<BlockID>,
+}
+
+impl DropIndexPlan {
+    /// Captures the stable active slot, layout, and replacement root shape.
+    pub(crate) fn new(table_id: TableID, table: Arc<Table>, index_no: IndexNo) -> Result<Self> {
+        let old_layout = table.layout_snapshot();
+        let old_metadata = old_layout.metadata();
+        let index_no_usize = usize::from(index_no);
+        let old_index_spec = old_metadata
+            .idx
+            .index_spec(index_no_usize)
+            .ok_or_else(|| {
+                Report::new(OperationError::IndexNotFound).attach(format!(
+                    "drop index target not found: table_id={table_id}, index_no={index_no}, reason=inactive_metadata_slot"
+                ))
+            })
+            .disclose()?
+            .clone();
+        old_layout
+            .secondary_index(index_no_usize)
+            .expect("active index metadata must have a matching runtime index");
+        let active_root = table.file().active_root_unchecked().clone();
+        validate_drop_index_root_shape(table_id, index_no_usize, &active_root, old_metadata)
+            .disclose()?;
+        let new_metadata = Arc::new(old_metadata.without_index(index_no));
+        let mut secondary_index_roots = active_root.secondary_index_roots.clone();
+        secondary_index_roots[index_no_usize] = SUPER_BLOCK_ID;
+        Ok(Self {
+            table_id,
+            table,
+            old_layout,
+            index_no,
+            old_index_spec,
+            new_metadata,
+            secondary_index_roots,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -258,6 +403,7 @@ impl<'a> CreateIndexCollector<'a> {
                 let key = self.encode_key(&key_vals, row_id);
                 rows.push(CreateIndexRowEntry { key, row_id });
             }
+            yield_now().await;
         }
         Ok(rows)
     }
@@ -301,6 +447,8 @@ struct CreateIndexRuntimeBuilder<'a> {
     metadata: &'a TableMetadata,
     index_spec: &'a IndexSpec,
     build_ts: TrxID,
+    #[cfg(test)]
+    test: tests::IndexDdlTestController,
 }
 
 impl<'a> CreateIndexRuntimeBuilder<'a> {
@@ -318,6 +466,8 @@ impl<'a> CreateIndexRuntimeBuilder<'a> {
             metadata,
             index_spec,
             build_ts,
+            #[cfg(test)]
+            test: engine.index_ddl_test.clone(),
         }
     }
 
@@ -332,6 +482,8 @@ impl<'a> CreateIndexRuntimeBuilder<'a> {
             metadata,
             index_spec,
             build_ts,
+            #[cfg(test)]
+                test: _,
         } = self;
         let ty_infer = |col_no| metadata.col.col_type(col_no);
         let mem =
@@ -362,7 +514,7 @@ impl<'a> CreateIndexRuntimeBuilder<'a> {
         hot_rows: Vec<CreateIndexRowEntry>,
     ) -> OperationOrRuntimeResult<SecondaryIndex<EvictableBufferPool>> {
         #[cfg(test)]
-        use tests::{CreateIndexTestFailure, maybe_fail_create_index};
+        use tests::CreateIndexTestFailure;
 
         let Self {
             index_pool,
@@ -370,13 +522,15 @@ impl<'a> CreateIndexRuntimeBuilder<'a> {
             metadata,
             index_spec,
             build_ts,
+            #[cfg(test)]
+            test,
         } = self;
         let ty_infer = |col_no| metadata.col.col_type(col_no);
         let mem =
             NonUniqueMemIndex::new(index_pool, index_guard, index_spec, ty_infer, build_ts).await?;
         #[cfg(test)]
         let forced_population_failure =
-            maybe_fail_create_index(CreateIndexTestFailure::PopulateNonUnique);
+            test.maybe_fail_create(CreateIndexTestFailure::PopulateNonUnique);
         #[cfg(not(test))]
         let forced_population_failure: RuntimeResult<()> = Ok(());
         let insert_res = match forced_population_failure {
@@ -415,9 +569,9 @@ enum CreateIndexBuildPhase {
     Aborted,
 }
 
-struct CreateIndexProgress<'a> {
-    engine: &'a EngineRef,
-    guards: &'a PoolGuards,
+struct CreateIndexProgress {
+    engine: EngineRef,
+    guards: PoolGuards,
     table_id: TableID,
     index_no: IndexNo,
     build_ts: TrxID,
@@ -427,11 +581,11 @@ struct CreateIndexProgress<'a> {
     new_layout: Option<TableRuntimeLayout>,
 }
 
-impl<'a> CreateIndexProgress<'a> {
+impl CreateIndexProgress {
     #[inline]
     fn new(
-        engine: &'a EngineRef,
-        guards: &'a PoolGuards,
+        engine: EngineRef,
+        guards: PoolGuards,
         table_id: TableID,
         index_no: IndexNo,
         trx: Transaction,
@@ -492,6 +646,7 @@ impl<'a> CreateIndexProgress<'a> {
 
     async fn execute_catalog_update(
         &mut self,
+        authority: PreparedCatalogWriteAuthority<'_>,
         metadata: &TableMetadata,
         index_spec: &IndexSpec,
     ) -> RuntimeOrFatalResult<()> {
@@ -503,8 +658,9 @@ impl<'a> CreateIndexProgress<'a> {
             )
         });
         let res = execute_create_index_catalog_update(
-            self.engine,
+            &self.engine,
             trx,
+            authority,
             self.table_id,
             self.index_no,
             metadata,
@@ -571,21 +727,21 @@ impl<'a> CreateIndexProgress<'a> {
         Ok(())
     }
 
-    async fn cleanup_after_catalog_commit_failure<T>(
+    async fn cleanup_after_catalog_commit_failure(
         &mut self,
         operation: &'static str,
         source: RuntimeOrFatalError,
-    ) -> RuntimeOrFatalResult<T> {
+    ) -> RuntimeOrFatalError {
         self.cleanup_staged_runtime().await;
         self.phase = CreateIndexBuildPhase::Aborted;
-        Err(poison_index_after_catalog_commit_with_source(
-            self.engine,
+        poison_index_after_catalog_commit_with_source(
+            &self.engine,
             IndexDdlKind::Create,
             self.table_id,
             self.index_no,
             operation,
             source,
-        ))
+        )
     }
 
     async fn cleanup_staged_runtime(&mut self) {
@@ -593,7 +749,7 @@ impl<'a> CreateIndexProgress<'a> {
         if let Some(index) = self.staged_index.take() {
             // Preserve the existing best-effort cleanup policy. A destroy
             // failure is observed but does not replace the DDL source.
-            if let Err(report) = destroy_uninstalled_staged_index(index, self.guards).await {
+            if let Err(report) = destroy_uninstalled_staged_index(index, &self.guards).await {
                 let report = report.attach(format!(
                     "operation=cleanup_create_index_staged_runtime, table_id={}, index_no={}",
                     self.table_id, self.index_no
@@ -606,20 +762,6 @@ impl<'a> CreateIndexProgress<'a> {
     }
 }
 
-impl Drop for CreateIndexProgress<'_> {
-    #[inline]
-    fn drop(&mut self) {
-        debug_assert!(
-            matches!(
-                self.phase,
-                CreateIndexBuildPhase::Installed | CreateIndexBuildPhase::Aborted
-            ),
-            "create index build state dropped before terminal cleanup: {:?}",
-            self.phase
-        );
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DropIndexBuildPhase {
     LayoutStaged,
@@ -628,8 +770,8 @@ enum DropIndexBuildPhase {
     Aborted,
 }
 
-struct DropIndexProgress<'a> {
-    engine: &'a EngineRef,
+struct DropIndexProgress {
+    engine: EngineRef,
     table_id: TableID,
     index_no: IndexNo,
     phase: DropIndexBuildPhase,
@@ -637,9 +779,9 @@ struct DropIndexProgress<'a> {
     new_layout: Option<TableRuntimeLayout>,
 }
 
-impl<'a> DropIndexProgress<'a> {
+impl DropIndexProgress {
     #[inline]
-    fn new(engine: &'a EngineRef, table_id: TableID, index_no: IndexNo, trx: Transaction) -> Self {
+    fn new(engine: EngineRef, table_id: TableID, index_no: IndexNo, trx: Transaction) -> Self {
         Self {
             engine,
             table_id,
@@ -659,6 +801,7 @@ impl<'a> DropIndexProgress<'a> {
 
     async fn execute_catalog_update(
         &mut self,
+        authority: PreparedCatalogWriteAuthority<'_>,
         old_index_spec: &IndexSpec,
     ) -> RuntimeOrFatalResult<()> {
         debug_assert_eq!(self.phase, DropIndexBuildPhase::LayoutStaged);
@@ -669,8 +812,9 @@ impl<'a> DropIndexProgress<'a> {
             )
         });
         let res = execute_drop_index_catalog_update(
-            self.engine,
+            &self.engine,
             trx,
+            authority,
             self.table_id,
             self.index_no,
             old_index_spec,
@@ -735,403 +879,659 @@ impl<'a> DropIndexProgress<'a> {
         Ok(())
     }
 
-    async fn cleanup_after_catalog_commit_failure<T>(
+    async fn cleanup_after_catalog_commit_failure(
         &mut self,
         operation: &'static str,
         source: RuntimeOrFatalError,
-    ) -> RuntimeOrFatalResult<T> {
+    ) -> RuntimeOrFatalError {
         self.new_layout = None;
         self.phase = DropIndexBuildPhase::Aborted;
-        Err(poison_index_after_catalog_commit_with_source(
-            self.engine,
+        poison_index_after_catalog_commit_with_source(
+            &self.engine,
             IndexDdlKind::Drop,
             self.table_id,
             self.index_no,
             operation,
             source,
-        ))
+        )
     }
 }
 
-impl Drop for DropIndexProgress<'_> {
+/// Caller-prepared CREATE INDEX awaiting mandatory runtime capacity.
+pub(crate) struct PreparedCreateIndex {
+    gates: IndexDdlGateScope,
+    scope: PreparedDdlScope,
+    plan: CreateIndexPlan,
+    metadata: MandatoryTaskMetadata,
+}
+
+impl PreparedCreateIndex {
+    /// Builds one fully prepared CREATE INDEX carrier.
     #[inline]
-    fn drop(&mut self) {
-        debug_assert!(
-            matches!(
-                self.phase,
-                DropIndexBuildPhase::Installed | DropIndexBuildPhase::Aborted
-            ),
-            "drop index state dropped before terminal cleanup: {:?}",
-            self.phase
+    pub(crate) fn new(
+        gates: IndexDdlGateScope,
+        scope: PreparedDdlScope,
+        plan: CreateIndexPlan,
+    ) -> Self {
+        let metadata = MandatoryTaskMetadata::table_operation(
+            <Self as PreparedExecution>::LABEL,
+            scope.key(),
+            plan.table_id,
         );
+        Self {
+            gates,
+            scope,
+            plan,
+            metadata,
+        }
     }
 }
 
-/// Build and publish a new secondary index for a user-table session request.
-pub(crate) async fn create_index_for_session(
-    session: SessionOperationPin,
-    table_id: TableID,
-    index_spec: IndexSpec,
-) -> Result<IndexNo> {
-    #[cfg(test)]
-    use tests::{CreateIndexTestFailure, maybe_fail_create_index};
+impl PreparedExecution for PreparedCreateIndex {
+    type Output = IndexNo;
+    type Accepted = AcceptedCreateIndex;
 
-    let ctx = SessionDdlContext::new(&session)
-        .attach("operation=create_index")
-        .disclose()?;
-    let engine = ctx.engine.clone();
-    let guards = ctx.pool_guards.clone();
-    let lock_manager = engine.lock_manager();
-    reject_user_table_primary_key_index(&index_spec, "create_index").disclose()?;
+    const LABEL: &'static str = "create_index";
 
-    // 1. Validate the target and acquire table-local DDL exclusion before
-    // deriving any new metadata or touching mutable table roots.
-    reject_non_user_table_id(table_id, "create_index").disclose()?;
-    lock_manager
-        .reject_table_ddl_explicit_session_lock(table_id, ctx.owner)
-        .attach("operation=create_index")
-        .disclose()?;
-    // Keep these DDL locks alive through root publish and runtime layout
-    // install so foreground readers/writers cannot observe a partial index.
-    let _table_locks = lock_manager
-        .acquire_table_ddl_locks(table_id, ctx.owner)
-        .await
-        .attach_with(|| format!("operation=create_index, table_id={table_id}"))
-        .disclose()?;
-    let table = validated_index_ddl_target(&guards, &engine, table_id, "create_index")
-        .await
-        .disclose()?;
-    engine.poisoner.ensure_healthy().disclose()?;
-    table
-        .check_foreground_live()
-        .attach("operation=create_index")
-        .disclose()?;
-
-    // 2. Exclude table and catalog checkpoints while catalog metadata,
-    // table-file roots, and runtime layout are temporarily out of sync.
-    // Keep both metadata-change leases alive until after the matching table
-    // root is published and the new runtime layout is installed.
-    let _table_metadata_lease = table.begin_metadata_change().await.disclose()?;
-    let _catalog_metadata_lease = engine.catalog().begin_metadata_change().await;
-
-    // 3. Allocate the stable table-local index number and prepare the new
-    // metadata/root shape, preserving existing sparse index slots.
-    let old_layout = table.layout_snapshot();
-    let old_metadata = old_layout.metadata();
-    let active_root = table.file().active_root_unchecked().clone();
-    validate_create_index_root_shape(table_id, &active_root, old_metadata).disclose()?;
-    let (index_no, new_metadata_value) =
-        old_metadata.try_with_created_index(index_spec).disclose()?;
-    let new_metadata = Arc::new(new_metadata_value);
-    let index_no_usize = usize::from(index_no);
-    let new_index_spec = new_metadata
-        .idx
-        .require_index_spec(index_no_usize)
-        .expect("newly created index metadata must contain its allocated slot")
-        .clone();
-
-    let mut secondary_index_roots = active_root.secondary_index_roots.clone();
-    secondary_index_roots.resize(new_metadata.idx.index_slot_count(), SUPER_BLOCK_ID);
-    let disk_runtime = SecondaryDiskTreeRuntime::new(
-        index_no_usize,
-        Arc::clone(&new_metadata),
-        Arc::clone(table.file()),
-        table.disk_pool().clone(),
-    )
-    .disclose()?;
-
-    // 4. Start the implicit DDL transaction and let the progress state own all
-    // rollback/destroy transitions from this point onward.
-    let trx = session
-        .begin_private_trx()
-        .attach("operation=create_index")
-        .disclose()?;
-    let mut progress = CreateIndexProgress::new(&engine, &guards, table_id, index_no, trx);
-    let build_ts = progress.build_ts();
-    let key_validator = CreateIndexKeyValidator::new(&new_index_spec);
-    let collector = CreateIndexCollector::new(
-        &table,
-        &guards,
-        old_layout.as_ref(),
-        &new_index_spec,
-        &active_root,
-    );
-
-    let mut mutable_file = MutableTableFile::fork(
-        table.file(),
-        engine.table_fs.background_writes(),
-        table.disk_pool().clone(),
-    );
-
-    // 5. Build the cold DiskTree from the currently persisted live rows and
-    // stage the resulting root in the forked table file.
-    let mut cold_rows = match collector.collect_current_cold().await {
-        Ok(cold_rows) => cold_rows,
-        Err(err) => {
-            progress.rollback_before_catalog_commit().await.disclose()?;
-            return Err(err.disclose());
-        }
-    };
-    if let Err(err) = key_validator.prepare_cold(&mut cold_rows) {
-        progress.rollback_before_catalog_commit().await.disclose()?;
-        return Err(err.disclose());
+    #[inline]
+    fn metadata(&self) -> MandatoryTaskMetadata {
+        self.metadata.clone()
     }
 
-    let cold_root = match build_create_index_disk_tree(
-        &mut mutable_file,
-        &disk_runtime,
-        &guards,
-        &new_index_spec,
-        &cold_rows,
-        build_ts,
-    )
-    .await
-    {
-        Ok(res) => res,
-        Err(err) => {
-            progress.rollback_before_catalog_commit().await.disclose()?;
-            return Err(err.disclose());
-        }
-    };
-    secondary_index_roots[index_no_usize] = cold_root;
-    mutable_file.replace_metadata_and_secondary_index_roots(
-        Arc::clone(&new_metadata),
-        secondary_index_roots,
-    );
-
-    // 6. Build the hot MemIndex from row-store rows and assemble a runtime
-    // layout that future readers can install atomically.
-    let runtime_builder = CreateIndexRuntimeBuilder::new(
-        &engine,
-        &guards,
-        new_metadata.as_ref(),
-        &new_index_spec,
-        build_ts,
-    );
-    let mut hot_rows = match collector.collect_current_hot().await {
-        Ok(hot_rows) => hot_rows,
-        Err(err) => {
-            progress.rollback_before_catalog_commit().await.disclose()?;
-            return Err(err.disclose());
-        }
-    };
-    if let Err(err) = key_validator.prepare_hot(&mut hot_rows, &cold_rows) {
-        progress.rollback_before_catalog_commit().await.disclose()?;
-        return Err(err.disclose());
-    }
-    let runtime_index = if new_index_spec.unique() {
-        runtime_builder.build_unique(disk_runtime, hot_rows).await
-    } else {
-        runtime_builder
-            .build_non_unique(disk_runtime, hot_rows)
-            .await
-    };
-    match runtime_index {
-        Ok(index) => {
-            progress.stage_runtime_index(index);
-        }
-        Err(err) => {
-            progress.rollback_before_catalog_commit().await.disclose()?;
-            return Err(err.disclose());
-        }
-    }
-    #[cfg(test)]
-    if let Err(err) = maybe_fail_create_index(CreateIndexTestFailure::AfterRuntimeStaged) {
-        progress.rollback_before_catalog_commit().await.disclose()?;
-        return Err(err.disclose());
-    }
-    let new_layout = build_created_index_runtime_layout(
-        &old_layout,
-        Arc::clone(&new_metadata),
-        index_no_usize,
-        progress.clone_staged_index_for_layout(),
-    );
-    progress.stage_layout(new_layout);
-
-    // 7. Persist catalog metadata and DDL redo in the implicit transaction.
-    // Until the table root publishes below, recovery treats this redo as
-    // provisional.
-    progress
-        .execute_catalog_update(new_metadata.as_ref(), &new_index_spec)
-        .await
-        .disclose()?;
-
-    let create_cts = progress.commit_catalog().await.disclose()?;
-
-    // 8. Publish the table root that proves the new index metadata durable.
-    // Failure after catalog commit poisons storage per the RFC 0018 policy.
-    let root_publish = engine
-        .trx_sys
-        .publish_table_file_root(mutable_file, create_cts, false)
-        .await;
-    match root_publish {
-        Ok(_table_file) => {}
-        Err(err) => {
-            return progress
-                .cleanup_after_catalog_commit_failure("table_root_publish", err.into())
-                .await
-                .disclose();
-        }
-    }
-
-    // 9. Install the new runtime layout last. Existing snapshots keep their old
-    // layout Arcs, while later foreground work observes the new index.
-    let new_layout = progress.take_layout_for_install();
-    let installed_layout = table.install_runtime_layout(old_layout.generation(), new_layout);
-    let history_published = engine.catalog().publish_user_table_metadata(
-        table_id,
-        create_cts,
-        &table,
-        old_layout.metadata_arc(),
-        Arc::clone(installed_layout.metadata_arc()),
-    );
-    progress.mark_installed();
-    if !history_published {
-        return Err(poison_index_publication_invariant(
-            &engine,
-            IndexDdlKind::Create,
+    #[inline]
+    fn accept(self) -> Self::Accepted {
+        let Self {
+            gates,
+            scope,
+            plan,
+            metadata: _,
+        } = self;
+        let table_id = plan.table_id;
+        let index_no = plan.index_no;
+        AcceptedCreateIndex {
+            gates: Some(gates),
+            scope: scope.accept(),
             table_id,
             index_no,
-        )
-        .disclose());
+            plan: Some(plan),
+            progress: None,
+        }
     }
-    engine.trx_sys.request_metadata_history_purge();
-
-    Ok(index_no)
 }
 
-/// Drop an active secondary index for a user-table session request.
-pub(crate) async fn drop_index_for_session(
-    session: SessionOperationPin,
+/// Mandatory-runtime owner of accepted CREATE INDEX execution.
+pub(crate) struct AcceptedCreateIndex {
+    gates: Option<IndexDdlGateScope>,
+    scope: AcceptedDdlScope,
     table_id: TableID,
     index_no: IndexNo,
-) -> Result<()> {
-    let ctx = SessionDdlContext::new(&session)
-        .attach("operation=drop_index")
-        .disclose()?;
-    let engine = ctx.engine.clone();
-    let guards = ctx.pool_guards.clone();
-    let lock_manager = engine.lock_manager();
+    plan: Option<CreateIndexPlan>,
+    progress: Option<CreateIndexProgress>,
+}
 
-    reject_non_user_table_id(table_id, "drop_index").disclose()?;
-    lock_manager
-        .reject_table_ddl_explicit_session_lock(table_id, ctx.owner)
-        .attach("operation=drop_index")
-        .disclose()?;
-    let _table_locks = lock_manager
-        .acquire_table_ddl_locks(table_id, ctx.owner)
+impl AcceptedExecution for AcceptedCreateIndex {
+    type Output = IndexNo;
+
+    #[inline]
+    async fn execute(&mut self) -> CompletionResult<Self::Output> {
+        let result = self.execute_inner().await;
+        self.scope.mark_terminal_ready();
+        result
+    }
+
+    #[inline]
+    fn finish(&mut self) {
+        drop(self.progress.take());
+        drop(self.plan.take());
+        drop(self.gates.take());
+        self.scope.finish();
+    }
+
+    #[inline]
+    async fn handle_panic(&mut self, _panic: Box<dyn Any + Send>) -> CompletionErrorBridge {
+        self.scope.handle_panic();
+        let phase = self
+            .progress
+            .as_ref()
+            .map_or(CreateIndexBuildPhase::Building, |progress| progress.phase);
+        CompletionErrorBridge::capture(Report::new(FatalError::MandatoryTaskPanic).attach(format!(
+            "accepted CREATE INDEX panicked: table_id={}, index_no={}, phase={phase:?}",
+            self.table_id, self.index_no
+        )))
+    }
+}
+
+impl AcceptedCreateIndex {
+    async fn execute_inner(&mut self) -> CompletionResult<IndexNo> {
+        let plan = self
+            .plan
+            .take()
+            .unwrap_or_else(|| panic!("accepted CREATE INDEX plan exists during execution"));
+        let engine = self.scope.engine().clone();
+        let guards = self.scope.pool_guards();
+        let table_id = plan.table_id;
+        let index_no = plan.index_no;
+        let index_no_usize = usize::from(index_no);
+
+        #[cfg(test)]
+        engine
+            .index_ddl_test
+            .reach_phase(IndexDdlTestPhase::CreateBeforeFirstEffect)
+            .await;
+
+        let trx = self.scope.begin_private_trx().map_err(|err| {
+            CompletionErrorBridge::capture(
+                err.attach("operation=create_index, phase=begin_private_transaction"),
+            )
+        })?;
+        self.progress = Some(CreateIndexProgress::new(
+            engine.clone(),
+            guards.clone(),
+            table_id,
+            index_no,
+            trx,
+        ));
+        let progress = self
+            .progress
+            .as_mut()
+            .unwrap_or_else(|| panic!("accepted CREATE INDEX progress exists after transaction"));
+
+        #[cfg(test)]
+        engine
+            .index_ddl_test
+            .reach_phase(IndexDdlTestPhase::CreatePrivateTransactionBegun)
+            .await;
+
+        let build_ts = progress.build_ts();
+        let key_validator = CreateIndexKeyValidator::new(&plan.new_index_spec);
+        let collector = CreateIndexCollector::new(
+            &plan.table,
+            &guards,
+            plan.old_layout.as_ref(),
+            &plan.new_index_spec,
+            &plan.active_root,
+        );
+        let mut mutable_file = MutableTableFile::fork(
+            plan.table.file(),
+            engine.table_fs.background_writes(),
+            plan.table.disk_pool().clone(),
+        );
+        let disk_runtime = match SecondaryDiskTreeRuntime::new(
+            index_no_usize,
+            Arc::clone(&plan.new_metadata),
+            Arc::clone(plan.table.file()),
+            plan.table.disk_pool().clone(),
+        ) {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                if let Err(cleanup) = progress.rollback_before_catalog_commit().await {
+                    return Err(CompletionErrorBridge::capture_runtime_or_fatal(cleanup));
+                }
+                return Err(CompletionErrorBridge::capture(err));
+            }
+        };
+
+        let mut cold_rows = match collector.collect_current_cold().await {
+            Ok(cold_rows) => cold_rows,
+            Err(err) => {
+                if let Err(cleanup) = progress.rollback_before_catalog_commit().await {
+                    return Err(CompletionErrorBridge::capture_runtime_or_fatal(cleanup));
+                }
+                return Err(CompletionErrorBridge::capture_operation_or_runtime(err));
+            }
+        };
+        #[cfg(test)]
+        engine
+            .index_ddl_test
+            .reach_phase(IndexDdlTestPhase::CreateColdCollectionComplete)
+            .await;
+        if let Err(err) = key_validator.prepare_cold(&mut cold_rows) {
+            if let Err(cleanup) = progress.rollback_before_catalog_commit().await {
+                return Err(CompletionErrorBridge::capture_runtime_or_fatal(cleanup));
+            }
+            return Err(CompletionErrorBridge::capture(err));
+        }
+
+        let cold_root = match build_create_index_disk_tree(
+            &mut mutable_file,
+            &disk_runtime,
+            &guards,
+            &plan.new_index_spec,
+            &cold_rows,
+            build_ts,
+        )
         .await
-        .attach_with(|| format!("operation=drop_index, table_id={table_id}"))
-        .disclose()?;
-    let table = validated_index_ddl_target(&guards, &engine, table_id, "drop_index")
-        .await
-        .disclose()?;
-    engine.poisoner.ensure_healthy().disclose()?;
-    table
-        .check_foreground_live()
-        .attach("operation=drop_index")
-        .disclose()?;
+        {
+            Ok(root) => root,
+            Err(err) => {
+                if let Err(cleanup) = progress.rollback_before_catalog_commit().await {
+                    return Err(CompletionErrorBridge::capture_runtime_or_fatal(cleanup));
+                }
+                return Err(CompletionErrorBridge::capture_runtime_or_fatal(err));
+            }
+        };
+        #[cfg(test)]
+        engine
+            .index_ddl_test
+            .reach_phase(IndexDdlTestPhase::CreateDiskTreeBuilt)
+            .await;
+        let mut secondary_index_roots = plan.secondary_index_roots;
+        secondary_index_roots[index_no_usize] = cold_root;
+        mutable_file.replace_metadata_and_secondary_index_roots(
+            Arc::clone(&plan.new_metadata),
+            secondary_index_roots,
+        );
 
-    let _table_metadata_lease = table.begin_metadata_change().await.disclose()?;
-    let _catalog_metadata_lease = engine.catalog().begin_metadata_change().await;
-
-    let old_layout = table.layout_snapshot();
-    let old_generation = old_layout.generation();
-    let old_metadata = old_layout.metadata();
-    let index_no_usize = usize::from(index_no);
-    let old_index_spec = old_metadata
-        .idx
-        .index_spec(index_no_usize)
-        .ok_or_else(|| drop_index_not_found(table_id, index_no, "inactive_metadata_slot"))
-        .disclose()?
-        .clone();
-    old_layout
-        .secondary_index(index_no_usize)
-        .expect("active index metadata must have a matching runtime index");
-
-    let active_root = table.file().active_root_unchecked().clone();
-    validate_drop_index_root_shape(table_id, index_no_usize, &active_root, old_metadata)
-        .disclose()?;
-    // The active slot was required above while holding the metadata-change
-    // lease, so rebuilding without that exact slot is infallible.
-    let new_metadata = Arc::new(old_metadata.without_index(index_no));
-
-    let mut secondary_index_roots = active_root.secondary_index_roots.clone();
-    secondary_index_roots[index_no_usize] = SUPER_BLOCK_ID;
-    let mut mutable_file = MutableTableFile::fork(
-        table.file(),
-        engine.table_fs.background_writes(),
-        table.disk_pool().clone(),
-    );
-    mutable_file.replace_metadata_and_secondary_index_roots(
-        Arc::clone(&new_metadata),
-        secondary_index_roots,
-    );
-
-    let new_layout =
-        build_dropped_index_runtime_layout(&old_layout, Arc::clone(&new_metadata), index_no_usize);
-
-    let trx = session
-        .begin_private_trx()
-        .attach("operation=drop_index")
-        .disclose()?;
-    let mut progress = DropIndexProgress::new(&engine, table_id, index_no, trx);
-    progress.stage_layout(new_layout);
-    progress
-        .execute_catalog_update(&old_index_spec)
-        .await
-        .disclose()?;
-    let drop_cts = progress.commit_catalog().await.disclose()?;
-
-    let root_publish = engine
-        .trx_sys
-        .publish_table_file_root(mutable_file, drop_cts, false)
-        .await;
-    match root_publish {
-        Ok(_table_file) => {}
-        Err(err) => {
-            return progress
-                .cleanup_after_catalog_commit_failure("table_root_publish", err.into())
+        let runtime_builder = CreateIndexRuntimeBuilder::new(
+            &engine,
+            &guards,
+            plan.new_metadata.as_ref(),
+            &plan.new_index_spec,
+            build_ts,
+        );
+        let mut hot_rows = match collector.collect_current_hot().await {
+            Ok(hot_rows) => hot_rows,
+            Err(err) => {
+                if let Err(cleanup) = progress.rollback_before_catalog_commit().await {
+                    return Err(CompletionErrorBridge::capture_runtime_or_fatal(cleanup));
+                }
+                return Err(CompletionErrorBridge::capture(err));
+            }
+        };
+        #[cfg(test)]
+        engine
+            .index_ddl_test
+            .reach_phase(IndexDdlTestPhase::CreateHotCollectionComplete)
+            .await;
+        if let Err(err) = key_validator.prepare_hot(&mut hot_rows, &cold_rows) {
+            if let Err(cleanup) = progress.rollback_before_catalog_commit().await {
+                return Err(CompletionErrorBridge::capture_runtime_or_fatal(cleanup));
+            }
+            return Err(CompletionErrorBridge::capture(err));
+        }
+        let runtime_index = if plan.new_index_spec.unique() {
+            runtime_builder.build_unique(disk_runtime, hot_rows).await
+        } else {
+            runtime_builder
+                .build_non_unique(disk_runtime, hot_rows)
                 .await
-                .disclose();
+        };
+        match runtime_index {
+            Ok(index) => progress.stage_runtime_index(index),
+            Err(err) => {
+                if let Err(cleanup) = progress.rollback_before_catalog_commit().await {
+                    return Err(CompletionErrorBridge::capture_runtime_or_fatal(cleanup));
+                }
+                return Err(CompletionErrorBridge::capture_operation_or_runtime(err));
+            }
+        }
+        #[cfg(test)]
+        engine
+            .index_ddl_test
+            .reach_phase(IndexDdlTestPhase::CreateRuntimeStaged)
+            .await;
+
+        #[cfg(test)]
+        if let Err(err) = engine
+            .index_ddl_test
+            .maybe_fail_create(CreateIndexTestFailure::AfterRuntimeStaged)
+        {
+            if let Err(cleanup) = progress.rollback_before_catalog_commit().await {
+                return Err(CompletionErrorBridge::capture_runtime_or_fatal(cleanup));
+            }
+            return Err(CompletionErrorBridge::capture(err));
+        }
+
+        let new_layout = build_created_index_runtime_layout(
+            &plan.old_layout,
+            Arc::clone(&plan.new_metadata),
+            index_no_usize,
+            progress.clone_staged_index_for_layout(),
+        );
+        progress.stage_layout(new_layout);
+
+        let authority = self.scope.catalog_write_authority();
+        if let Err(err) = progress
+            .execute_catalog_update(authority, plan.new_metadata.as_ref(), &plan.new_index_spec)
+            .await
+        {
+            return Err(CompletionErrorBridge::capture_runtime_or_fatal(err));
+        }
+        #[cfg(test)]
+        engine
+            .index_ddl_test
+            .reach_phase(IndexDdlTestPhase::CreateCatalogStaged)
+            .await;
+        let create_cts = progress
+            .commit_catalog()
+            .await
+            .map_err(CompletionErrorBridge::capture_runtime_or_fatal)?;
+        #[cfg(test)]
+        engine
+            .index_ddl_test
+            .reach_phase(IndexDdlTestPhase::CreateCatalogCommitted)
+            .await;
+
+        if let Err(err) = engine
+            .trx_sys
+            .publish_table_file_root(mutable_file, create_cts, false)
+            .await
+        {
+            return Err(CompletionErrorBridge::capture_runtime_or_fatal(
+                progress
+                    .cleanup_after_catalog_commit_failure(
+                        "table_root_publish",
+                        RuntimeOrFatalError::from(err),
+                    )
+                    .await,
+            ));
+        }
+        #[cfg(test)]
+        engine
+            .index_ddl_test
+            .reach_phase(IndexDdlTestPhase::CreateRootPublished)
+            .await;
+
+        let new_layout = progress.take_layout_for_install();
+        if engine
+            .catalog()
+            .install_index_layout_and_publish_history(
+                table_id,
+                create_cts,
+                &plan.table,
+                &plan.old_layout,
+                new_layout,
+                #[cfg(test)]
+                (&engine.index_ddl_test, IndexDdlKind::Create),
+            )
+            .is_none()
+        {
+            progress.cleanup_staged_runtime().await;
+            progress.phase = CreateIndexBuildPhase::Aborted;
+            return Err(CompletionErrorBridge::capture_runtime_or_fatal(
+                poison_index_publication_invariant(
+                    &engine,
+                    IndexDdlKind::Create,
+                    table_id,
+                    index_no,
+                ),
+            ));
+        }
+        progress.mark_installed();
+        #[cfg(test)]
+        engine
+            .index_ddl_test
+            .reach_phase(IndexDdlTestPhase::CreateLayoutHistoryPublished)
+            .await;
+        engine.trx_sys.request_metadata_history_purge();
+        Ok(index_no)
+    }
+}
+
+/// Caller-prepared DROP INDEX awaiting mandatory runtime capacity.
+pub(crate) struct PreparedDropIndex {
+    gates: IndexDdlGateScope,
+    scope: PreparedDdlScope,
+    plan: DropIndexPlan,
+    metadata: MandatoryTaskMetadata,
+}
+
+impl PreparedDropIndex {
+    /// Builds one fully prepared DROP INDEX carrier.
+    #[inline]
+    pub(crate) fn new(
+        gates: IndexDdlGateScope,
+        scope: PreparedDdlScope,
+        plan: DropIndexPlan,
+    ) -> Self {
+        let metadata = MandatoryTaskMetadata::table_operation(
+            <Self as PreparedExecution>::LABEL,
+            scope.key(),
+            plan.table_id,
+        );
+        Self {
+            gates,
+            scope,
+            plan,
+            metadata,
         }
     }
+}
 
-    let new_layout = progress.take_layout_for_install();
-    let installed_layout = table.install_runtime_layout(old_generation, new_layout);
-    let history_published = engine.catalog().publish_user_table_metadata(
-        table_id,
-        drop_cts,
-        &table,
-        old_layout.metadata_arc(),
-        Arc::clone(installed_layout.metadata_arc()),
-    );
-    progress.mark_installed();
-    if !history_published {
-        return Err(poison_index_publication_invariant(
-            &engine,
-            IndexDdlKind::Drop,
-            table_id,
-            index_no,
-        )
-        .disclose());
-    }
-    engine.trx_sys.request_metadata_history_purge();
-    drop(old_layout);
+impl PreparedExecution for PreparedDropIndex {
+    type Output = ();
+    type Accepted = AcceptedDropIndex;
 
-    if let Err(err) = table.cleanup_retired_secondary_indexes(&guards).await {
-        return Err(poison_index_after_catalog_commit_with_source(
-            &engine,
-            IndexDdlKind::Drop,
-            table_id,
-            index_no,
-            "retired_secondary_index_cleanup",
-            err.into(),
-        )
-        .disclose());
+    const LABEL: &'static str = "drop_index";
+
+    #[inline]
+    fn metadata(&self) -> MandatoryTaskMetadata {
+        self.metadata.clone()
     }
 
-    Ok(())
+    #[inline]
+    fn accept(self) -> Self::Accepted {
+        let Self {
+            gates,
+            scope,
+            plan,
+            metadata: _,
+        } = self;
+        let table_id = plan.table_id;
+        let index_no = plan.index_no;
+        AcceptedDropIndex {
+            gates: Some(gates),
+            scope: scope.accept(),
+            table_id,
+            index_no,
+            plan: Some(plan),
+            progress: None,
+        }
+    }
+}
+
+/// Mandatory-runtime owner of accepted DROP INDEX execution.
+pub(crate) struct AcceptedDropIndex {
+    gates: Option<IndexDdlGateScope>,
+    scope: AcceptedDdlScope,
+    table_id: TableID,
+    index_no: IndexNo,
+    plan: Option<DropIndexPlan>,
+    progress: Option<DropIndexProgress>,
+}
+
+impl AcceptedExecution for AcceptedDropIndex {
+    type Output = ();
+
+    #[inline]
+    async fn execute(&mut self) -> CompletionResult<Self::Output> {
+        let result = self.execute_inner().await;
+        self.scope.mark_terminal_ready();
+        result
+    }
+
+    #[inline]
+    fn finish(&mut self) {
+        drop(self.progress.take());
+        drop(self.plan.take());
+        drop(self.gates.take());
+        self.scope.finish();
+    }
+
+    #[inline]
+    async fn handle_panic(&mut self, _panic: Box<dyn Any + Send>) -> CompletionErrorBridge {
+        self.scope.handle_panic();
+        let phase = self
+            .progress
+            .as_ref()
+            .map_or(DropIndexBuildPhase::LayoutStaged, |progress| progress.phase);
+        CompletionErrorBridge::capture(Report::new(FatalError::MandatoryTaskPanic).attach(format!(
+            "accepted DROP INDEX panicked: table_id={}, index_no={}, phase={phase:?}",
+            self.table_id, self.index_no
+        )))
+    }
+}
+
+impl AcceptedDropIndex {
+    async fn execute_inner(&mut self) -> CompletionResult<()> {
+        let plan = self
+            .plan
+            .take()
+            .unwrap_or_else(|| panic!("accepted DROP INDEX plan exists during execution"));
+        let engine = self.scope.engine().clone();
+        let guards = self.scope.pool_guards();
+        let table_id = plan.table_id;
+        let index_no = plan.index_no;
+        let index_no_usize = usize::from(index_no);
+
+        #[cfg(test)]
+        engine
+            .index_ddl_test
+            .reach_phase(IndexDdlTestPhase::DropBeforeFirstEffect)
+            .await;
+
+        let trx = self.scope.begin_private_trx().map_err(|err| {
+            CompletionErrorBridge::capture(
+                err.attach("operation=drop_index, phase=begin_private_transaction"),
+            )
+        })?;
+        self.progress = Some(DropIndexProgress::new(
+            engine.clone(),
+            table_id,
+            index_no,
+            trx,
+        ));
+        let progress = self
+            .progress
+            .as_mut()
+            .unwrap_or_else(|| panic!("accepted DROP INDEX progress exists after transaction"));
+        #[cfg(test)]
+        engine
+            .index_ddl_test
+            .reach_phase(IndexDdlTestPhase::DropPrivateTransactionBegun)
+            .await;
+
+        let mut mutable_file = MutableTableFile::fork(
+            plan.table.file(),
+            engine.table_fs.background_writes(),
+            plan.table.disk_pool().clone(),
+        );
+        mutable_file.replace_metadata_and_secondary_index_roots(
+            Arc::clone(&plan.new_metadata),
+            plan.secondary_index_roots,
+        );
+        progress.stage_layout(build_dropped_index_runtime_layout(
+            &plan.old_layout,
+            Arc::clone(&plan.new_metadata),
+            index_no_usize,
+        ));
+        #[cfg(test)]
+        engine
+            .index_ddl_test
+            .reach_phase(IndexDdlTestPhase::DropRuntimeStaged)
+            .await;
+
+        let authority = self.scope.catalog_write_authority();
+        if let Err(err) = progress
+            .execute_catalog_update(authority, &plan.old_index_spec)
+            .await
+        {
+            return Err(CompletionErrorBridge::capture_runtime_or_fatal(err));
+        }
+        #[cfg(test)]
+        engine
+            .index_ddl_test
+            .reach_phase(IndexDdlTestPhase::DropCatalogStaged)
+            .await;
+        let drop_cts = progress
+            .commit_catalog()
+            .await
+            .map_err(CompletionErrorBridge::capture_runtime_or_fatal)?;
+        #[cfg(test)]
+        engine
+            .index_ddl_test
+            .reach_phase(IndexDdlTestPhase::DropCatalogCommitted)
+            .await;
+
+        if let Err(err) = engine
+            .trx_sys
+            .publish_table_file_root(mutable_file, drop_cts, false)
+            .await
+        {
+            return Err(CompletionErrorBridge::capture_runtime_or_fatal(
+                progress
+                    .cleanup_after_catalog_commit_failure(
+                        "table_root_publish",
+                        RuntimeOrFatalError::from(err),
+                    )
+                    .await,
+            ));
+        }
+        #[cfg(test)]
+        engine
+            .index_ddl_test
+            .reach_phase(IndexDdlTestPhase::DropRootPublished)
+            .await;
+
+        let new_layout = progress.take_layout_for_install();
+        if engine
+            .catalog()
+            .install_index_layout_and_publish_history(
+                table_id,
+                drop_cts,
+                &plan.table,
+                &plan.old_layout,
+                new_layout,
+                #[cfg(test)]
+                (&engine.index_ddl_test, IndexDdlKind::Drop),
+            )
+            .is_none()
+        {
+            progress.phase = DropIndexBuildPhase::Aborted;
+            return Err(CompletionErrorBridge::capture_runtime_or_fatal(
+                poison_index_publication_invariant(&engine, IndexDdlKind::Drop, table_id, index_no),
+            ));
+        }
+        progress.mark_installed();
+        #[cfg(test)]
+        engine
+            .index_ddl_test
+            .reach_phase(IndexDdlTestPhase::DropLayoutHistoryPublished)
+            .await;
+        engine.trx_sys.request_metadata_history_purge();
+        drop(plan.old_layout);
+
+        if let Err(err) = plan.table.cleanup_retired_secondary_indexes(&guards).await {
+            return Err(CompletionErrorBridge::capture_runtime_or_fatal(
+                poison_index_after_catalog_commit_with_source(
+                    &engine,
+                    IndexDdlKind::Drop,
+                    table_id,
+                    index_no,
+                    "retired_secondary_index_cleanup",
+                    RuntimeOrFatalError::from(err),
+                ),
+            ));
+        }
+        #[cfg(test)]
+        engine
+            .index_ddl_test
+            .reach_phase(IndexDdlTestPhase::DropRetiredCleanupComplete)
+            .await;
+        Ok(())
+    }
+}
+
+/// Return the fixed catalog tables written by CREATE INDEX.
+#[inline]
+pub(crate) const fn create_index_catalog_write_targets() -> &'static [TableID] {
+    &CREATE_INDEX_CATALOG_WRITE_TARGETS
+}
+
+/// Return the fixed catalog tables written by DROP INDEX.
+#[inline]
+pub(crate) const fn drop_index_catalog_write_targets() -> &'static [TableID] {
+    &DROP_INDEX_CATALOG_WRITE_TARGETS
 }
 
 /// Classify whether an active table root proves one index DDL redo durable.
@@ -1233,17 +1633,6 @@ async fn rollback_active_ddl_trx(trx: &mut Option<Transaction>) -> RuntimeOrFata
         trx.rollback_catalog_ddl().await?;
     }
     Ok(())
-}
-
-#[inline]
-fn drop_index_not_found(
-    table_id: TableID,
-    index_no: IndexNo,
-    reason: &'static str,
-) -> Report<OperationError> {
-    Report::new(OperationError::IndexNotFound).attach(format!(
-        "drop index target not found: table_id={table_id}, index_no={index_no}, reason={reason}"
-    ))
 }
 
 #[inline]
@@ -1419,7 +1808,7 @@ async fn insert_create_index_unique_hot_rows(
     hot_rows: &[CreateIndexRowEntry],
     build_ts: TrxID,
 ) -> OperationOrRuntimeResult<()> {
-    for row in hot_rows {
+    for (row_no, row) in hot_rows.iter().enumerate() {
         match mem
             .bind(index_guard)
             .insert_encoded_if_not_exists(&row.key, row.row_id, false, build_ts)
@@ -1434,6 +1823,9 @@ async fn insert_create_index_unique_hot_rows(
                 .into());
             }
         }
+        if row_no % 64 == 63 {
+            yield_now().await;
+        }
     }
     Ok(())
 }
@@ -1444,7 +1836,7 @@ async fn insert_create_index_non_unique_hot_rows(
     hot_rows: &[CreateIndexRowEntry],
     build_ts: TrxID,
 ) -> RuntimeResult<()> {
-    for row in hot_rows {
+    for (row_no, row) in hot_rows.iter().enumerate() {
         match mem
             .bind(index_guard)
             .insert_encoded_if_not_exists(&row.key, row.row_id, false, build_ts)
@@ -1457,6 +1849,9 @@ async fn insert_create_index_non_unique_hot_rows(
                     row.row_id
                 );
             }
+        }
+        if row_no % 64 == 63 {
+            yield_now().await;
         }
     }
     Ok(())
@@ -1530,11 +1925,12 @@ async fn destroy_uninstalled_staged_index(
 async fn execute_drop_index_catalog_update(
     engine: &EngineRef,
     trx: &mut Transaction,
+    authority: PreparedCatalogWriteAuthority<'_>,
     table_id: TableID,
     index_no: IndexNo,
     old_index_spec: &IndexSpec,
 ) -> RuntimeResult<()> {
-    trx.stage_catalog_statement(async |stmt| {
+    trx.stage_prepared_catalog_statement(authority, async |stmt| {
         let deleted_columns = engine
             .catalog()
             .storage
@@ -1579,12 +1975,13 @@ async fn execute_drop_index_catalog_update(
 async fn execute_create_index_catalog_update(
     engine: &EngineRef,
     trx: &mut Transaction,
+    authority: PreparedCatalogWriteAuthority<'_>,
     table_id: TableID,
     index_no: IndexNo,
     metadata: &TableMetadata,
     index_spec: &IndexSpec,
 ) -> RuntimeResult<()> {
-    trx.stage_catalog_statement(async |stmt| {
+    trx.stage_prepared_catalog_statement(authority, async |stmt| {
         let table_deleted = engine
             .catalog()
             .storage
@@ -1697,7 +2094,7 @@ fn poison_index_publication_invariant(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::buffer::{BufferPool, PoolRole};
     use crate::catalog::{
@@ -1712,15 +2109,19 @@ mod tests {
     use crate::index::IndexBatchStream;
     use crate::row::ops::{DeleteMvcc, SelectKey, UpdateCol, UpdateMvcc};
     use crate::session::Session;
-    use crate::session::tests::{SessionTestExt, assert_checkpoint_published};
+    use crate::session::tests::{
+        SessionTestExt, active_operation_count, assert_checkpoint_published,
+        remove_session_for_test,
+    };
     use crate::table::tests::assert_freeze_created;
     use crate::trx::{MAX_SNAPSHOT_TS, Transaction};
     use crate::value::{Val, ValKind};
     use smol::Timer;
-    use std::cell::Cell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::mpsc::sync_channel;
+    use std::thread::spawn;
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -1734,13 +2135,156 @@ mod tests {
         AfterRuntimeStaged,
     }
 
-    thread_local! {
-        static CREATE_INDEX_FAILURE: Cell<Option<CreateIndexTestFailure>> =
-            const { Cell::new(None) };
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum IndexDdlTestPhase {
+        CreateBeforeFirstEffect,
+        CreatePrivateTransactionBegun,
+        CreateColdCollectionComplete,
+        CreateDiskTreeBuilt,
+        CreateHotCollectionComplete,
+        CreateRuntimeStaged,
+        CreateCatalogStaged,
+        CreateCatalogCommitted,
+        CreateRootPublished,
+        CreateLayoutHistoryPublished,
+        DropBeforeFirstEffect,
+        DropPrivateTransactionBegun,
+        DropRuntimeStaged,
+        DropCatalogStaged,
+        DropCatalogCommitted,
+        DropRootPublished,
+        DropLayoutHistoryPublished,
+        DropRetiredCleanupComplete,
     }
 
-    fn set_create_index_failure(failure: Option<CreateIndexTestFailure>) {
-        CREATE_INDEX_FAILURE.with(|slot| slot.set(failure));
+    struct IndexDdlTestGate {
+        phase: IndexDdlTestPhase,
+        entered: flume::Sender<()>,
+        release: flume::Receiver<()>,
+    }
+
+    struct IndexDdlPublicationGate {
+        kind: IndexDdlKind,
+        entered: flume::Sender<()>,
+        release: flume::Receiver<()>,
+    }
+
+    #[derive(Default)]
+    struct IndexDdlTestState {
+        create_failure: parking_lot::Mutex<Option<CreateIndexTestFailure>>,
+        panic_phase: parking_lot::Mutex<Option<IndexDdlTestPhase>>,
+        gate: parking_lot::Mutex<Option<IndexDdlTestGate>>,
+        publication_gate: parking_lot::Mutex<Option<IndexDdlPublicationGate>>,
+    }
+
+    #[derive(Clone, Default)]
+    pub(crate) struct IndexDdlTestController {
+        state: Arc<IndexDdlTestState>,
+    }
+
+    impl IndexDdlTestController {
+        pub(super) fn maybe_fail_create(
+            &self,
+            failure: CreateIndexTestFailure,
+        ) -> RuntimeResult<()> {
+            if *self.state.create_failure.lock() == Some(failure) {
+                return Err(Report::new(RuntimeError::IndexAccess)
+                    .attach("operation=test_create_index_phase_failure"));
+            }
+            Ok(())
+        }
+
+        fn set_create_failure(&self, failure: Option<CreateIndexTestFailure>) {
+            *self.state.create_failure.lock() = failure;
+        }
+
+        fn install_gate(
+            &self,
+            phase: IndexDdlTestPhase,
+        ) -> (flume::Receiver<()>, flume::Sender<()>) {
+            let (entered_tx, entered_rx) = flume::bounded(1);
+            let (release_tx, release_rx) = flume::bounded(1);
+            let previous = self.state.gate.lock().replace(IndexDdlTestGate {
+                phase,
+                entered: entered_tx,
+                release: release_rx,
+            });
+            assert!(
+                previous.is_none(),
+                "index DDL test gate is already installed"
+            );
+            (entered_rx, release_tx)
+        }
+
+        fn set_panic_phase(&self, phase: Option<IndexDdlTestPhase>) {
+            *self.state.panic_phase.lock() = phase;
+        }
+
+        fn install_publication_gate(
+            &self,
+            kind: IndexDdlKind,
+        ) -> (flume::Receiver<()>, flume::Sender<()>) {
+            let (entered_tx, entered_rx) = flume::bounded(1);
+            let (release_tx, release_rx) = flume::bounded(1);
+            let previous = self
+                .state
+                .publication_gate
+                .lock()
+                .replace(IndexDdlPublicationGate {
+                    kind,
+                    entered: entered_tx,
+                    release: release_rx,
+                });
+            assert!(
+                previous.is_none(),
+                "index DDL publication test gate is already installed"
+            );
+            (entered_rx, release_tx)
+        }
+
+        pub(crate) fn reach_publication_interval(&self, kind: IndexDdlKind) {
+            let gate = {
+                let mut slot = self.state.publication_gate.lock();
+                if slot.as_ref().is_some_and(|gate| gate.kind == kind) {
+                    slot.take()
+                } else {
+                    None
+                }
+            };
+            let Some(gate) = gate else {
+                return;
+            };
+            let _ = gate.entered.send(());
+            let _ = gate.release.recv();
+        }
+
+        pub(super) async fn reach_phase(&self, phase: IndexDdlTestPhase) {
+            let should_panic = {
+                let mut panic_phase = self.state.panic_phase.lock();
+                if *panic_phase == Some(phase) {
+                    *panic_phase = None;
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_panic {
+                panic!("injected accepted index DDL panic: phase={phase:?}");
+            }
+            let gate = {
+                let mut slot = self.state.gate.lock();
+                if slot.as_ref().is_some_and(|gate| gate.phase == phase) {
+                    slot.take()
+                } else {
+                    None
+                }
+            };
+            let Some(gate) = gate else {
+                return;
+            };
+            let _ = gate.entered.send_async(()).await;
+            let _ = gate.release.recv_async().await;
+        }
     }
 
     struct IndexDdlSnapshot {
@@ -1820,14 +2364,6 @@ mod tests {
             table.has_retired_secondary_indexes(),
             before.has_retired_runtime
         );
-    }
-
-    pub(super) fn maybe_fail_create_index(failure: CreateIndexTestFailure) -> RuntimeResult<()> {
-        if CREATE_INDEX_FAILURE.with(|slot| slot.get()) == Some(failure) {
-            return Err(Report::new(RuntimeError::IndexAccess)
-                .attach("operation=test_create_index_phase_failure"));
-        }
-        Ok(())
     }
 
     fn columns() -> Vec<ColumnSpec> {
@@ -2144,6 +2680,234 @@ mod tests {
             .await;
             rows.sort_unstable();
             assert_eq!(rows, vec![row1, row3, row4]);
+        });
+    }
+
+    #[test]
+    fn test_abandoned_create_index_future_after_acceptance_is_inert() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "create_index_observer_drop").await;
+            let table_id = table2(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let (entered, release) = engine
+                .inner()
+                .index_ddl_test
+                .install_gate(IndexDdlTestPhase::CreateBeforeFirstEffect);
+            let mut session = engine.new_session().unwrap();
+            let mut create_fut = Box::pin(session.create_index(
+                table_id,
+                IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+            ));
+
+            assert!(matches!(
+                futures::poll!(create_fut.as_mut()),
+                std::task::Poll::Pending
+            ));
+            entered.recv_async().await.unwrap();
+            let (published, finish_publication) = engine
+                .inner()
+                .index_ddl_test
+                .install_gate(IndexDdlTestPhase::CreateLayoutHistoryPublished);
+            drop(create_fut);
+            release.send_async(()).await.unwrap();
+            published.recv_async().await.unwrap();
+
+            let layout = table.layout_snapshot();
+            assert!(layout.metadata().idx.index_spec(1).is_some());
+            assert!(layout.secondary_indexes()[1].is_some());
+            let CurrentTableState::Live { metadata, .. } = engine
+                .catalog()
+                .resolve_user_table_current(table_id)
+                .unwrap()
+            else {
+                panic!("CREATE INDEX must retain a live current table");
+            };
+            assert!(Arc::ptr_eq(layout.metadata_arc(), &metadata));
+            finish_publication.send_async(()).await.unwrap();
+            let mut verify_session = engine.new_session().unwrap();
+            verify_session.drop_index(table_id, 1).await.unwrap();
+            assert!(engine.inner().poisoner.poison_error().is_none());
+        });
+    }
+
+    #[test]
+    fn test_abandoned_drop_index_future_after_acceptance_is_inert() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "drop_index_observer_drop").await;
+            let table_id = table2(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let mut session = engine.new_session().unwrap();
+            let index_no = session
+                .create_index(
+                    table_id,
+                    IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                )
+                .await
+                .unwrap();
+            let (entered, release) = engine
+                .inner()
+                .index_ddl_test
+                .install_gate(IndexDdlTestPhase::DropBeforeFirstEffect);
+            let mut drop_fut = Box::pin(session.drop_index(table_id, index_no));
+
+            assert!(matches!(
+                futures::poll!(drop_fut.as_mut()),
+                std::task::Poll::Pending
+            ));
+            entered.recv_async().await.unwrap();
+            let (published, finish_publication) = engine
+                .inner()
+                .index_ddl_test
+                .install_gate(IndexDdlTestPhase::DropLayoutHistoryPublished);
+            drop(drop_fut);
+            release.send_async(()).await.unwrap();
+            published.recv_async().await.unwrap();
+
+            let layout = table.layout_snapshot();
+            assert!(
+                layout
+                    .metadata()
+                    .idx
+                    .index_spec(usize::from(index_no))
+                    .is_none()
+            );
+            assert!(layout.secondary_indexes()[usize::from(index_no)].is_none());
+            finish_publication.send_async(()).await.unwrap();
+            assert!(engine.inner().poisoner.poison_error().is_none());
+        });
+    }
+
+    #[test]
+    fn test_create_index_execution_panic_before_first_effect_is_supervised() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "create_index_panic").await;
+            let table_id = table2(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let session_id = session.id();
+            engine
+                .inner()
+                .index_ddl_test
+                .set_panic_phase(Some(IndexDdlTestPhase::CreateBeforeFirstEffect));
+
+            let err = session
+                .create_index(
+                    table_id,
+                    IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                )
+                .await
+                .unwrap_err();
+
+            assert_eq!(
+                err.report().downcast_ref::<FatalError>().copied(),
+                Some(FatalError::MandatoryTaskPanic)
+            );
+            assert_eq!(
+                engine
+                    .inner()
+                    .poisoner
+                    .poison_error()
+                    .as_ref()
+                    .map(|error| *error.current_context()),
+                Some(FatalError::MandatoryTaskPanic)
+            );
+            assert_eq!(active_operation_count(&engine.inner().session_registry), 1);
+            remove_session_for_test(&engine.inner().session_registry, session_id);
+            drop(session);
+            engine.shutdown();
+        });
+    }
+
+    #[test]
+    fn test_index_layout_history_publication_excludes_metadata_purge() {
+        smol::block_on(async {
+            for kind in [IndexDdlKind::Create, IndexDdlKind::Drop] {
+                let temp_dir = TempDir::new().unwrap();
+                let engine = lightweight_test_engine(
+                    &temp_dir,
+                    match kind {
+                        IndexDdlKind::Create => "create_index_atomic_publication",
+                        IndexDdlKind::Drop => "drop_index_atomic_publication",
+                    },
+                )
+                .await;
+                let table_id = table2(&engine).await;
+                let table = table_for_internal_assertion(&engine, table_id);
+                let mut session = engine.new_session().unwrap();
+                let drop_index_no = if kind == IndexDdlKind::Drop {
+                    Some(
+                        session
+                            .create_index(
+                                table_id,
+                                IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                            )
+                            .await
+                            .unwrap(),
+                    )
+                } else {
+                    None
+                };
+                let (publication_entered, publication_release) =
+                    engine.inner().index_ddl_test.install_publication_gate(kind);
+                let mut ddl_fut = Box::pin(async {
+                    match kind {
+                        IndexDdlKind::Create => session
+                            .create_index(
+                                table_id,
+                                IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                            )
+                            .await
+                            .map(|_| ()),
+                        IndexDdlKind::Drop => {
+                            session
+                                .drop_index(
+                                    table_id,
+                                    drop_index_no
+                                        .expect("DROP atomic-publication case has an active index"),
+                                )
+                                .await
+                        }
+                    }
+                });
+
+                assert!(matches!(
+                    futures::poll!(ddl_fut.as_mut()),
+                    std::task::Poll::Pending
+                ));
+                publication_entered.recv_async().await.unwrap();
+
+                let catalog = engine.new_ref().unwrap().catalog_guard();
+                let (started_tx, started_rx) = sync_channel(1);
+                let (done_tx, done_rx) = sync_channel(1);
+                let purge = spawn(move || {
+                    started_tx.send(()).unwrap();
+                    catalog.purge_user_table_history(MAX_SNAPSHOT_TS);
+                    done_tx.send(()).unwrap();
+                });
+                started_rx.recv().unwrap();
+                assert_eq!(
+                    done_rx.recv_timeout(Duration::from_millis(20)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+                    "metadata purge entered the catalog item during {kind:?} split publication"
+                );
+
+                publication_release.send_async(()).await.unwrap();
+                done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                purge.join().unwrap();
+                ddl_fut.await.unwrap();
+
+                let layout = table.layout_snapshot();
+                let CurrentTableState::Live { metadata, .. } = engine
+                    .catalog()
+                    .resolve_user_table_current(table_id)
+                    .unwrap()
+                else {
+                    panic!("{kind:?} publication must retain a live current table");
+                };
+                assert!(Arc::ptr_eq(layout.metadata_arc(), &metadata));
+            }
         });
     }
 
@@ -3160,14 +3924,17 @@ mod tests {
         let before = index_ddl_snapshot(&engine, table_id, &table);
         let allocated_before = engine.inner().index_pool.allocated();
 
-        set_create_index_failure(Some(failure));
+        engine
+            .inner()
+            .index_ddl_test
+            .set_create_failure(Some(failure));
         let result = session
             .create_index(
                 table_id,
                 IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
             )
             .await;
-        set_create_index_failure(None);
+        engine.inner().index_ddl_test.set_create_failure(None);
         let err = result.unwrap_err();
 
         assert_eq!(

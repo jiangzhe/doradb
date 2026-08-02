@@ -148,12 +148,11 @@ impl TableHistoryEntry {
     }
 
     #[inline]
-    fn publish_live(
+    fn prepare_publish_live(
         &mut self,
         effective_cts: TrxID,
         expected_table: &Arc<Table>,
         expected_metadata: &Arc<TableMetadata>,
-        new_metadata: Arc<TableMetadata>,
     ) -> bool {
         let CurrentTableState::Live {
             effective_cts: current_cts,
@@ -169,22 +168,31 @@ impl TableHistoryEntry {
         {
             return false;
         }
-        let installed_layout = expected_table.layout_snapshot();
-        if !Arc::ptr_eq(installed_layout.metadata_arc(), &new_metadata) {
-            return false;
-        }
+        self.versions.reserve(1);
+        true
+    }
 
+    #[inline]
+    fn commit_publish_live(&mut self, effective_cts: TrxID, new_metadata: Arc<TableMetadata>) {
+        let CurrentTableState::Live {
+            effective_cts: current_cts,
+            metadata: current_metadata,
+            table,
+        } = &self.current
+        else {
+            unreachable!("prepared live publication requires live current state");
+        };
         let old_cts = *current_cts;
         let old_metadata = Arc::clone(current_metadata);
+        let table = Arc::clone(table);
         self.versions
             .push(TableMetadataVersion::new(old_cts, old_metadata));
         self.current = CurrentTableState::Live {
             effective_cts,
             metadata: new_metadata,
-            table: Arc::clone(expected_table),
+            table,
         };
         self.assert_valid();
-        true
     }
 
     #[inline]
@@ -367,30 +375,32 @@ impl UserTableEntry {
         }
     }
 
-    /// Publishes a new current live metadata version after layout installation.
+    /// Prevalidates and reserves one coordinated live metadata publication.
     #[inline]
-    pub(crate) fn publish_live(
+    pub(crate) fn prepare_publish_live(
         &mut self,
         effective_cts: TrxID,
         expected_table: &Arc<Table>,
         expected_metadata: &Arc<TableMetadata>,
-        new_metadata: Arc<TableMetadata>,
     ) -> bool {
-        if self.dropped.is_some() {
-            return false;
-        }
-        let published = self.history.as_mut().is_some_and(|history| {
-            history.publish_live(
-                effective_cts,
-                expected_table,
-                expected_metadata,
-                new_metadata,
-            )
-        });
-        if published {
-            self.assert_valid();
-        }
-        published
+        self.dropped.is_none()
+            && self.history.as_mut().is_some_and(|history| {
+                history.prepare_publish_live(effective_cts, expected_table, expected_metadata)
+            })
+    }
+
+    /// Commits a previously prepared live publication without rejection.
+    #[inline]
+    pub(crate) fn commit_publish_live(
+        &mut self,
+        effective_cts: TrxID,
+        new_metadata: Arc<TableMetadata>,
+    ) {
+        self.history
+            .as_mut()
+            .unwrap_or_else(|| unreachable!("prepared live publication requires logical history"))
+            .commit_publish_live(effective_cts, new_metadata);
+        self.assert_valid();
     }
 
     /// Publishes a terminal tombstone and installs the sibling retained runtime.

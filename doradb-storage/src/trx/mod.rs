@@ -282,33 +282,6 @@ impl Transaction {
         }
     }
 
-    /// Stages one catalog DDL statement without widening Runtime errors.
-    ///
-    /// Statement effects are merged into the transaction even when `f` returns
-    /// an error. The catalog DDL owner must therefore terminate and roll back
-    /// the whole transaction after an error instead of continuing to use it.
-    /// Catalog insert Operation failures are asserted at the statement boundary
-    /// because catalog key construction guarantees uniqueness.
-    #[inline]
-    pub(crate) async fn stage_catalog_statement<T, F>(&mut self, f: F) -> RuntimeResult<T>
-    where
-        F: for<'borrow> AsyncFnOnce(&'borrow mut Statement<'_>) -> RuntimeResult<T>,
-    {
-        let checkout = self
-            .checkout()
-            .change_context(RuntimeError::CatalogAccess)
-            .attach("operation=stage_catalog_statement")?;
-        let mut stmt_state = StmtState::private(checkout);
-        let result = {
-            let mut stmt = stmt_state.statement();
-            let result = f(&mut stmt).await;
-            stmt.merge_effects();
-            result
-        };
-        stmt_state.return_ordinary();
-        result
-    }
-
     /// Stages catalog DDL under an accepted operation's prepared logical locks.
     ///
     /// This is a narrow bridge for the current exact-owner lock manager.

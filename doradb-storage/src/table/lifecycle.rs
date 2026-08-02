@@ -382,12 +382,11 @@ impl TableLifecycle {
         }
     }
 
-    /// Acquires the reversible table metadata-change gate for future index DDL.
-    #[inline]
-    pub(crate) async fn begin_metadata_change(
-        &self,
-        table_id: TableID,
-    ) -> OperationResult<TableMetadataChangeLease<'_>> {
+    /// Acquires metadata-change admission without constructing a borrowed lease.
+    ///
+    /// The caller must retain the owning table and eventually call
+    /// [`Self::release_metadata_change`].
+    pub(crate) async fn acquire_metadata_change(&self, table_id: TableID) -> OperationResult<()> {
         let mut pending = None;
         loop {
             let mut should_wait = true;
@@ -407,7 +406,7 @@ impl TableLifecycle {
                         next.metadata_change = MetadataChangePhase::Active;
                         next.debug_assert_valid("begin metadata change active");
                         if self.compare_exchange_state(raw, next) {
-                            return Ok(TableMetadataChangeLease { lifecycle: self });
+                            return Ok(());
                         }
                         should_wait = false;
                     }
@@ -431,7 +430,7 @@ impl TableLifecycle {
                             if let Some(pending) = &mut pending {
                                 pending.disarm();
                             }
-                            return Ok(TableMetadataChangeLease { lifecycle: self });
+                            return Ok(());
                         }
                         should_wait = false;
                     }
@@ -533,11 +532,11 @@ impl TableLifecycle {
         }
     }
 
+    /// Releases metadata-change admission when it is active.
     #[inline]
-    fn release_metadata_change(&self) {
+    pub(crate) fn release_metadata_change(&self) {
         loop {
             let (raw, state) = self.inspect_state("release metadata change enter");
-            debug_assert_eq!(state.metadata_change, MetadataChangePhase::Active);
             if state.metadata_change != MetadataChangePhase::Active {
                 return;
             }
@@ -661,26 +660,6 @@ impl Drop for CheckpointPublishLease<'_> {
     }
 }
 
-/// RAII guard for a reversible table metadata-change section.
-pub(crate) struct TableMetadataChangeLease<'a> {
-    lifecycle: &'a TableLifecycle,
-}
-
-impl Debug for TableMetadataChangeLease<'_> {
-    #[inline]
-    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        f.debug_struct("TableMetadataChangeLease")
-            .finish_non_exhaustive()
-    }
-}
-
-impl Drop for TableMetadataChangeLease<'_> {
-    #[inline]
-    fn drop(&mut self) {
-        self.lifecycle.release_metadata_change();
-    }
-}
-
 /// RAII guard for checkpoint table-root mutation before root publication.
 pub(crate) struct TableCheckpointRootMutationLease<'a> {
     lifecycle: &'a TableLifecycle,
@@ -791,7 +770,10 @@ mod tests {
                 Ok(_lease) => panic!("root mutation should be blocked by drop gate"),
                 Err(reason) => assert_eq!(reason, CheckpointCancelReason::TableDropping),
             }
-            let err = lifecycle.begin_metadata_change(TABLE_ID).await.unwrap_err();
+            let err = lifecycle
+                .acquire_metadata_change(TABLE_ID)
+                .await
+                .unwrap_err();
             assert_eq!(
                 err.downcast_ref::<OperationError>().copied(),
                 Some(OperationError::TableDropping)
@@ -835,10 +817,9 @@ mod tests {
     fn test_begin_drop_rejects_active_metadata_change() {
         smol::block_on(async {
             let lifecycle = TableLifecycle::new();
-            let metadata_lease = lifecycle.begin_metadata_change(TABLE_ID).await.unwrap();
+            lifecycle.acquire_metadata_change(TABLE_ID).await.unwrap();
 
             let _ = lifecycle.start_drop(TABLE_ID);
-            drop(metadata_lease);
         });
     }
 
@@ -864,14 +845,14 @@ mod tests {
     fn test_metadata_change_blocks_checkpoint_root_mutation() {
         smol::block_on(async {
             let lifecycle = TableLifecycle::new();
-            let metadata_lease = lifecycle.begin_metadata_change(TABLE_ID).await.unwrap();
+            lifecycle.acquire_metadata_change(TABLE_ID).await.unwrap();
 
             match lifecycle.try_begin_checkpoint_root_mutation() {
                 Ok(_lease) => panic!("checkpoint root mutation should be cancelled"),
                 Err(reason) => assert_eq!(reason, CheckpointCancelReason::TableMetadataChanging),
             }
 
-            drop(metadata_lease);
+            lifecycle.release_metadata_change();
             let _root_lease = lifecycle.try_begin_checkpoint_root_mutation().unwrap();
         });
     }
@@ -895,7 +876,7 @@ mod tests {
         smol::block_on(async {
             let lifecycle = TableLifecycle::new();
             let root_lease = lifecycle.try_begin_checkpoint_root_mutation().unwrap();
-            let mut metadata_fut = Box::pin(lifecycle.begin_metadata_change(TABLE_ID));
+            let mut metadata_fut = Box::pin(lifecycle.acquire_metadata_change(TABLE_ID));
 
             assert!(matches!(
                 futures::poll!(metadata_fut.as_mut()),
@@ -909,12 +890,12 @@ mod tests {
             drop(publish_lease);
 
             drop(root_lease);
-            let metadata_lease = metadata_fut.await.unwrap();
+            metadata_fut.await.unwrap();
             match lifecycle.try_begin_checkpoint_root_mutation() {
                 Ok(_lease) => panic!("active metadata change should block checkpoint roots"),
                 Err(reason) => assert_eq!(reason, CheckpointCancelReason::TableMetadataChanging),
             }
-            drop(metadata_lease);
+            lifecycle.release_metadata_change();
             let _root_lease = lifecycle.try_begin_checkpoint_root_mutation().unwrap();
         });
     }
@@ -924,7 +905,7 @@ mod tests {
         smol::block_on(async {
             let lifecycle = TableLifecycle::new();
             let root_lease = lifecycle.try_begin_checkpoint_root_mutation().unwrap();
-            let mut metadata_fut = Box::pin(lifecycle.begin_metadata_change(TABLE_ID));
+            let mut metadata_fut = Box::pin(lifecycle.acquire_metadata_change(TABLE_ID));
 
             assert!(matches!(
                 futures::poll!(metadata_fut.as_mut()),

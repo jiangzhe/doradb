@@ -1,10 +1,12 @@
 use crate::buffer::page::VersionedPageID;
 use crate::buffer::{BufferPool, PoolGuards};
 use crate::catalog::{
-    CatalogCheckpointOutcome, DropTablePlan, IndexNo, IndexSpec, PreparedCreateTable,
-    PreparedDropTable, TableSpec, ValidatedCreateTable, create_index_for_session,
-    create_table_catalog_write_targets, drop_index_for_session, drop_table_catalog_write_targets,
-    reject_non_user_table_id,
+    CatalogCheckpointOutcome, CreateIndexPlan, DropIndexPlan, DropTablePlan, IndexDdlGateScope,
+    IndexNo, IndexSpec, PreparedCreateIndex, PreparedCreateTable, PreparedDropIndex,
+    PreparedDropTable, TableSpec, ValidatedCreateTable, create_index_catalog_write_targets,
+    create_table_catalog_write_targets, drop_index_catalog_write_targets,
+    drop_table_catalog_write_targets, reject_non_user_table_id,
+    reject_user_table_primary_key_index, validated_index_ddl_target,
 };
 use crate::engine::{EngineInner, EngineRef, WeakEngineRef};
 use crate::error::{
@@ -102,42 +104,13 @@ pub struct CatalogRedoMaintenanceOutcome {
     pub redo_truncation: RedoTruncationOutcome,
 }
 
-/// Shared session-level DDL admission context.
-pub(crate) struct SessionDdlContext {
-    /// Engine handle used for catalog and table access.
-    pub(crate) engine: EngineRef,
-    /// Pool guards retained for DDL work.
-    pub(crate) pool_guards: PoolGuards,
-    /// Exact DDL-operation lock owner.
-    pub(crate) owner: LockOwner,
-}
-
-impl SessionDdlContext {
-    /// Creates DDL context from a typed foreground operation authority.
-    #[inline]
-    pub(crate) fn new(session: &SessionOperationPin) -> OperationResult<Self> {
-        assert!(
-            session.kind() == SessionOperationKind::Ddl,
-            "DDL context requires DDL operation authority: key={}, kind={}",
-            session.key(),
-            session.kind().label()
-        );
-        let pool_guards = session.pool_guards();
-        Ok(Self {
-            engine: session.engine.clone(),
-            pool_guards,
-            owner: session.operation_lock_owner(),
-        })
-    }
-}
-
-/// Lifetime-free logical-lock scope prepared for one table DDL operation.
-pub(crate) struct PreparedTableDdlLocks {
+/// Lifetime-free logical-lock scope prepared for one DDL operation.
+pub(crate) struct PreparedDdlLocks {
     lock_manager: QuiescentGuard<LockManager>,
     locks: OwnerLockState,
 }
 
-impl PreparedTableDdlLocks {
+impl PreparedDdlLocks {
     #[inline]
     fn new(operation: &SessionOperationPin) -> Self {
         Self {
@@ -181,7 +154,7 @@ impl PreparedTableDdlLocks {
     }
 
     #[inline]
-    async fn acquire_drop(
+    async fn acquire_existing(
         &mut self,
         table_id: TableID,
         catalog_targets: &[TableID],
@@ -227,7 +200,7 @@ impl PreparedTableDdlLocks {
     }
 }
 
-impl Drop for PreparedTableDdlLocks {
+impl Drop for PreparedDdlLocks {
     #[inline]
     fn drop(&mut self) {
         self.locks.release_all(&self.lock_manager);
@@ -238,12 +211,12 @@ impl Drop for PreparedTableDdlLocks {
 ///
 /// Lock fields precede the foreground pin so ordinary cancellation releases
 /// grants before publishing the outer foreground terminal edge.
-pub(crate) struct PreparedTableDdlScope {
-    locks: PreparedTableDdlLocks,
+pub(crate) struct PreparedDdlScope {
+    locks: PreparedDdlLocks,
     operation: SessionOperationPin,
 }
 
-impl PreparedTableDdlScope {
+impl PreparedDdlScope {
     /// Prepare the fixed CREATE TABLE lock set in canonical resource order.
     #[inline]
     pub(crate) async fn create(
@@ -251,7 +224,7 @@ impl PreparedTableDdlScope {
         table_id: TableID,
         catalog_targets: &[TableID],
     ) -> OperationResult<Self> {
-        let mut locks = PreparedTableDdlLocks::new(&operation);
+        let mut locks = PreparedDdlLocks::new(&operation);
         locks.acquire_create(table_id, catalog_targets).await?;
         Ok(Self { locks, operation })
     }
@@ -263,8 +236,32 @@ impl PreparedTableDdlScope {
         table_id: TableID,
         catalog_targets: &[TableID],
     ) -> OperationResult<Self> {
-        let mut locks = PreparedTableDdlLocks::new(&operation);
-        locks.acquire_drop(table_id, catalog_targets).await?;
+        let mut locks = PreparedDdlLocks::new(&operation);
+        locks.acquire_existing(table_id, catalog_targets).await?;
+        Ok(Self { locks, operation })
+    }
+
+    /// Prepare the fixed CREATE INDEX lock set in canonical resource order.
+    #[inline]
+    pub(crate) async fn create_index(
+        operation: SessionOperationPin,
+        table_id: TableID,
+        catalog_targets: &[TableID],
+    ) -> OperationResult<Self> {
+        let mut locks = PreparedDdlLocks::new(&operation);
+        locks.acquire_existing(table_id, catalog_targets).await?;
+        Ok(Self { locks, operation })
+    }
+
+    /// Prepare the fixed DROP INDEX lock set in canonical resource order.
+    #[inline]
+    pub(crate) async fn drop_index(
+        operation: SessionOperationPin,
+        table_id: TableID,
+        catalog_targets: &[TableID],
+    ) -> OperationResult<Self> {
+        let mut locks = PreparedDdlLocks::new(&operation);
+        locks.acquire_existing(table_id, catalog_targets).await?;
         Ok(Self { locks, operation })
     }
 
@@ -280,32 +277,38 @@ impl PreparedTableDdlScope {
         &self.operation.engine
     }
 
+    /// Return cloned buffer-pool guards while caller preparation owns the scope.
+    #[inline]
+    pub(crate) fn pool_guards(&self) -> PoolGuards {
+        self.operation.pool_guards()
+    }
+
     /// Synchronously consume caller preparation into accepted authority.
     #[inline]
-    pub(crate) fn accept(self) -> AcceptedTableDdlScope {
+    pub(crate) fn accept(self) -> AcceptedDdlScope {
         let Self { locks, operation } = self;
-        AcceptedTableDdlScope {
+        AcceptedDdlScope {
             operation: operation.into_mandatory(),
             locks: Some(locks),
-            finish_state: TableDdlFinishState::Executing,
+            finish_state: DdlFinishState::Executing,
         }
     }
 }
 
-enum TableDdlFinishState {
+enum DdlFinishState {
     Executing,
     TerminalReady,
     FailedRetained,
 }
 
 /// Runtime-owned table-DDL operation and its transferred logical locks.
-pub(crate) struct AcceptedTableDdlScope {
+pub(crate) struct AcceptedDdlScope {
     operation: MandatoryOperationGuard,
-    locks: Option<PreparedTableDdlLocks>,
-    finish_state: TableDdlFinishState,
+    locks: Option<PreparedDdlLocks>,
+    finish_state: DdlFinishState,
 }
 
-impl AcceptedTableDdlScope {
+impl AcceptedDdlScope {
     /// Return the retained engine runtime.
     #[inline]
     pub(crate) fn engine(&self) -> &EngineRef {
@@ -329,7 +332,7 @@ impl AcceptedTableDdlScope {
     pub(crate) fn catalog_write_authority(&self) -> PreparedCatalogWriteAuthority<'_> {
         self.locks
             .as_ref()
-            .map(PreparedTableDdlLocks::catalog_write_authority)
+            .map(PreparedDdlLocks::catalog_write_authority)
             .unwrap_or_else(|| {
                 panic!("accepted table DDL must retain prepared locks during execution")
             })
@@ -339,26 +342,26 @@ impl AcceptedTableDdlScope {
     #[inline]
     pub(crate) fn mark_terminal_ready(&mut self) {
         self.operation.assert_finish_ready();
-        self.finish_state = TableDdlFinishState::TerminalReady;
+        self.finish_state = DdlFinishState::TerminalReady;
     }
 
     /// Publish normal completion or defensively retain an invalid finish state.
     #[inline]
     pub(crate) fn finish(&mut self) {
-        let state = replace(&mut self.finish_state, TableDdlFinishState::FailedRetained);
+        let state = replace(&mut self.finish_state, DdlFinishState::FailedRetained);
         match state {
-            TableDdlFinishState::TerminalReady => {
+            DdlFinishState::TerminalReady => {
                 drop(self.locks.take());
                 self.operation.finish();
             }
-            TableDdlFinishState::Executing => {
+            DdlFinishState::Executing => {
                 self.operation.fail_retained();
                 let report = Report::new(FatalError::MandatoryTaskPanic)
                     .attach("accepted table DDL finished without terminal-ready state");
                 self.operation.engine.poisoner.poison(report);
                 drop(self.locks.take());
             }
-            TableDdlFinishState::FailedRetained => {
+            DdlFinishState::FailedRetained => {
                 drop(self.locks.take());
             }
         }
@@ -368,7 +371,7 @@ impl AcceptedTableDdlScope {
     #[inline]
     pub(crate) fn handle_panic(&mut self) {
         self.operation.fail_retained();
-        self.finish_state = TableDdlFinishState::FailedRetained;
+        self.finish_state = DdlFinishState::FailedRetained;
     }
 }
 
@@ -716,21 +719,87 @@ impl Session {
         table_id: TableID,
         index_spec: IndexSpec,
     ) -> Result<IndexNo> {
-        let session = self
+        reject_user_table_primary_key_index(&index_spec, "create_index").disclose()?;
+        reject_non_user_table_id(table_id, "create_index").disclose()?;
+        let operation = self
             .pin_operation(SessionOperationKind::Ddl)
             .attach("operation=create_index")
             .disclose()?;
-        create_index_for_session(session, table_id, index_spec).await
+        let mandatory_runtime = operation.engine.mandatory_runtime.clone();
+        let owner = operation.operation_lock_owner();
+        operation
+            .engine
+            .lock_manager()
+            .reject_table_ddl_explicit_session_lock(table_id, owner)
+            .attach("operation=create_index")
+            .disclose()?;
+        let scope = PreparedDdlScope::create_index(
+            operation,
+            table_id,
+            create_index_catalog_write_targets(),
+        )
+        .await
+        .attach_with(|| format!("prepare CREATE INDEX locks: table_id={table_id}"))
+        .disclose()?;
+        let engine = scope.engine().clone();
+        let guards = scope.pool_guards();
+        let table = validated_index_ddl_target(&guards, &engine, table_id, "create_index")
+            .await
+            .disclose()?;
+        engine.poisoner.ensure_healthy().disclose()?;
+        let gates = IndexDdlGateScope::acquire(Arc::clone(&table), engine.catalog_guard())
+            .await
+            .attach("operation=create_index")
+            .disclose()?;
+        let plan = CreateIndexPlan::new(table_id, table, index_spec)?;
+        let observer = mandatory_runtime
+            .submit(PreparedCreateIndex::new(gates, scope, plan))
+            .await
+            .attach("operation=create_index")
+            .disclose()?;
+        drop(mandatory_runtime);
+        observer.wait().await
     }
 
     /// Logically drop an active secondary index from an existing user table.
     #[inline]
     pub async fn drop_index(&mut self, table_id: TableID, index_no: IndexNo) -> Result<()> {
-        let session = self
+        reject_non_user_table_id(table_id, "drop_index").disclose()?;
+        let operation = self
             .pin_operation(SessionOperationKind::Ddl)
             .attach("operation=drop_index")
             .disclose()?;
-        drop_index_for_session(session, table_id, index_no).await
+        let mandatory_runtime = operation.engine.mandatory_runtime.clone();
+        let owner = operation.operation_lock_owner();
+        operation
+            .engine
+            .lock_manager()
+            .reject_table_ddl_explicit_session_lock(table_id, owner)
+            .attach("operation=drop_index")
+            .disclose()?;
+        let scope =
+            PreparedDdlScope::drop_index(operation, table_id, drop_index_catalog_write_targets())
+                .await
+                .attach_with(|| format!("prepare DROP INDEX locks: table_id={table_id}"))
+                .disclose()?;
+        let engine = scope.engine().clone();
+        let guards = scope.pool_guards();
+        let table = validated_index_ddl_target(&guards, &engine, table_id, "drop_index")
+            .await
+            .disclose()?;
+        engine.poisoner.ensure_healthy().disclose()?;
+        let gates = IndexDdlGateScope::acquire(Arc::clone(&table), engine.catalog_guard())
+            .await
+            .attach("operation=drop_index")
+            .disclose()?;
+        let plan = DropIndexPlan::new(table_id, table, index_no)?;
+        let observer = mandatory_runtime
+            .submit(PreparedDropIndex::new(gates, scope, plan))
+            .await
+            .attach("operation=drop_index")
+            .disclose()?;
+        drop(mandatory_runtime);
+        observer.wait().await
     }
 
     /// Logically drop an existing user table.
@@ -1232,10 +1301,9 @@ impl SessionOperationPin {
     ) -> OperationResult<PreparedCreateTable> {
         let table_id = self.engine.catalog().next_table_id();
         let plan = validated.into_plan(table_id);
-        let scope =
-            PreparedTableDdlScope::create(self, table_id, create_table_catalog_write_targets())
-                .await
-                .attach_with(|| format!("prepare CREATE TABLE locks: table_id={table_id}"))?;
+        let scope = PreparedDdlScope::create(self, table_id, create_table_catalog_write_targets())
+            .await
+            .attach_with(|| format!("prepare CREATE TABLE locks: table_id={table_id}"))?;
         Ok(PreparedCreateTable::new(scope, plan))
     }
 
@@ -1247,7 +1315,7 @@ impl SessionOperationPin {
             .reject_table_ddl_explicit_session_lock(table_id, owner)
             .attach("prepare DROP TABLE explicit-session-lock check")?;
         let scope =
-            PreparedTableDdlScope::drop_table(self, table_id, drop_table_catalog_write_targets())
+            PreparedDdlScope::drop_table(self, table_id, drop_table_catalog_write_targets())
                 .await
                 .attach_with(|| format!("prepare DROP TABLE locks: table_id={table_id}"))?;
         let table = scope
@@ -4650,16 +4718,16 @@ pub(crate) mod tests {
                     }
                     hook_flag.store(true, Ordering::SeqCst);
                     let catalog = hook_engine.catalog();
-                    let mut metadata_fut = Box::pin(catalog.begin_metadata_change());
+                    let mut metadata_fut = Box::pin(catalog.acquire_index_metadata_change());
                     let waker = noop_waker();
                     let mut cx = Context::from_waker(&waker);
-                    let metadata_lease = match metadata_fut.as_mut().poll(&mut cx) {
-                        Poll::Ready(lease) => lease,
+                    match metadata_fut.as_mut().poll(&mut cx) {
+                        Poll::Ready(()) => {}
                         Poll::Pending => {
                             panic!("catalog gate should be released before redo cleanup")
                         }
-                    };
-                    drop(metadata_lease);
+                    }
+                    catalog.release_index_metadata_change();
                 }));
 
             let mut session = engine.new_session().unwrap();
@@ -4807,7 +4875,8 @@ pub(crate) mod tests {
             let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
                 .await
                 .unwrap();
-            let metadata_lease = engine.catalog().begin_metadata_change().await;
+            let catalog = engine.catalog();
+            catalog.acquire_index_metadata_change().await;
             let mut session = engine.new_session().unwrap();
             let mut truncate_fut = Box::pin(session.truncate_redo_log());
 
@@ -4816,7 +4885,7 @@ pub(crate) mod tests {
                 std::task::Poll::Pending
             ));
 
-            drop(metadata_lease);
+            catalog.release_index_metadata_change();
             let outcome = truncate_fut.await.unwrap();
             assert_eq!(outcome.previous_first_retained_file_seq, 0);
             assert_eq!(outcome.new_first_retained_file_seq, 0);
@@ -5007,16 +5076,16 @@ pub(crate) mod tests {
                     }
                     hook_flag.store(true, Ordering::SeqCst);
                     let catalog = hook_engine.catalog();
-                    let mut metadata_fut = Box::pin(catalog.begin_metadata_change());
+                    let mut metadata_fut = Box::pin(catalog.acquire_index_metadata_change());
                     let waker = noop_waker();
                     let mut cx = Context::from_waker(&waker);
-                    let metadata_lease = match metadata_fut.as_mut().poll(&mut cx) {
-                        Poll::Ready(lease) => lease,
+                    match metadata_fut.as_mut().poll(&mut cx) {
+                        Poll::Ready(()) => {}
                         Poll::Pending => {
                             panic!("catalog gate should be released before redo cleanup")
                         }
-                    };
-                    drop(metadata_lease);
+                    }
+                    catalog.release_index_metadata_change();
                 }));
 
             let mut session = engine.new_session().unwrap();

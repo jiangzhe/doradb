@@ -538,6 +538,24 @@ impl CompletionErrorBridge {
         }))
     }
 
+    /// Captures either native report in an Operation-or-Runtime carrier.
+    #[inline]
+    pub(crate) fn capture_operation_or_runtime(error: OperationOrRuntimeError) -> Self {
+        match error {
+            OperationOrRuntimeError::Operation(report) => Self::capture(report),
+            OperationOrRuntimeError::Runtime(report) => Self::capture(report),
+        }
+    }
+
+    /// Captures either native report in a Runtime-or-Fatal carrier.
+    #[inline]
+    pub(crate) fn capture_runtime_or_fatal(error: RuntimeOrFatalError) -> Self {
+        match error {
+            RuntimeOrFatalError::Runtime(report) => Self::capture(report),
+            RuntimeOrFatalError::Fatal(report) => Self::capture(report),
+        }
+    }
+
     /// Reconstructs the physical report and installs the caller-owned context
     /// instead of retaining the completion transport as a report frame.
     #[inline]
@@ -2306,6 +2324,49 @@ mod tests {
             send.downcast_ref::<IoError>().copied().map(IoError::kind),
             Some(IoErrorKind::BrokenPipe)
         );
+    }
+
+    #[test]
+    fn test_completion_bridge_captures_multi_domain_carriers() {
+        let operation = CompletionErrorBridge::capture_operation_or_runtime(
+            OperationOrRuntimeError::Operation(
+                Report::new(OperationError::IndexNotFound).attach("operation carrier"),
+            ),
+        );
+        assert_eq!(
+            operation.downcast_ref::<OperationError>().copied(),
+            Some(OperationError::IndexNotFound)
+        );
+        assert!(format!("{operation:?}").contains("operation carrier"));
+
+        let operation_runtime =
+            CompletionErrorBridge::capture_operation_or_runtime(OperationOrRuntimeError::Runtime(
+                Report::new(RuntimeError::IndexAccess).attach("operation runtime carrier"),
+            ));
+        assert_eq!(
+            operation_runtime.downcast_ref::<RuntimeError>().copied(),
+            Some(RuntimeError::IndexAccess)
+        );
+        assert!(format!("{operation_runtime:?}").contains("operation runtime carrier"));
+
+        let runtime =
+            CompletionErrorBridge::capture_runtime_or_fatal(RuntimeOrFatalError::Runtime(
+                Report::new(RuntimeError::CatalogAccess).attach("runtime carrier"),
+            ));
+        assert_eq!(
+            runtime.downcast_ref::<RuntimeError>().copied(),
+            Some(RuntimeError::CatalogAccess)
+        );
+        assert!(format!("{runtime:?}").contains("runtime carrier"));
+
+        let fatal = CompletionErrorBridge::capture_runtime_or_fatal(RuntimeOrFatalError::Fatal(
+            Report::new(FatalError::Poisoned).attach("fatal carrier"),
+        ));
+        assert_eq!(
+            fatal.downcast_ref::<FatalError>().copied(),
+            Some(FatalError::Poisoned)
+        );
+        assert!(format!("{fatal:?}").contains("fatal carrier"));
     }
 
     #[test]

@@ -6214,26 +6214,26 @@ mod tests {
             let table = table_for_internal_assertion(&engine, table_id);
             let frozen_page_ids = table.checkpoint_workflow.frozen_page_ids().unwrap();
 
-            let metadata_change = table.begin_metadata_change();
+            let metadata_change = table.acquire_index_metadata_change();
             futures::pin_mut!(metadata_change);
-            let metadata_lease = match futures::poll!(metadata_change.as_mut()) {
+            match futures::poll!(metadata_change.as_mut()) {
                 Poll::Ready(result) => result.unwrap(),
                 Poll::Pending => {
                     panic!("a merely frozen batch must not block metadata change")
                 }
-            };
+            }
             assert_eq!(table.checkpoint_workflow.state_name(), "Frozen");
             assert_eq!(
                 table.checkpoint_workflow.frozen_page_ids().unwrap(),
                 frozen_page_ids
             );
-            drop(metadata_lease);
+            table.release_index_metadata_change();
 
             let target_ts = session.last_cts();
             session.wait_for_gc_horizon_after(target_ts).await.unwrap();
             assert_checkpoint_published(&mut session, table_id).await;
             insert_rows(table_id, &mut session, 100, 1, "active").await;
-            let metadata_lease = table.begin_metadata_change().await.unwrap();
+            table.acquire_index_metadata_change().await.unwrap();
             assert_eq!(
                 session.freeze_table(table_id, usize::MAX).await.unwrap(),
                 FreezeOutcome::Cancelled {
@@ -6250,7 +6250,7 @@ mod tests {
             let states = row_page_states(&table, &session.pool_guards()).await;
             assert!(!states.is_empty());
             assert!(states.iter().all(|state| *state == RowPageState::Active));
-            drop(metadata_lease);
+            table.release_index_metadata_change();
         });
     }
 
@@ -6942,7 +6942,7 @@ mod tests {
 
             wait_for_checkpoint_root_ready(&mut checkpoint_session, table_id).await;
             let table = table_for_internal_assertion(&engine, table_id);
-            let _metadata_lease = table.begin_metadata_change().await.unwrap();
+            table.acquire_index_metadata_change().await.unwrap();
 
             let outcome = checkpoint_session
                 .checkpoint_table(table_id)
@@ -6955,6 +6955,7 @@ mod tests {
                     reason: CheckpointCancelReason::TableMetadataChanging,
                 }
             );
+            table.release_index_metadata_change();
         })
     }
 
