@@ -298,6 +298,7 @@ mod tests {
                 .trx_sys
                 .set_purge_test_observer(purge_event_tx);
             let table_id = create_table2_for_test(&engine).await;
+            engine.inner().trx_sys.request_purge_observation();
             let mut create_commit_recorded = false;
             loop {
                 match purge_event_rx.recv_async().await.unwrap() {

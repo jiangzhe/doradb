@@ -1177,10 +1177,12 @@ focused validation.
     only where one poll has materially unbounded work.
   - Non-goals: Do not migrate index DDL, redesign table lifecycle/catalog
     semantics, or parallelize one table DDL.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000249-runtime-owned-table-ddl.md`
+  - Task Issue: `#924`
+  - Phase Status: done
+  - Implementation Summary: Implemented caller-prepared, mandatory-runtime-owned CREATE TABLE and DROP TABLE with complete operation lock scopes, nested private transactions, supervised completion and panic retention, deterministic cross-thread tests, and validated benchmark parity. [Task Resolve Sync: docs/tasks/000249-runtime-owned-table-ddl.md @ 2026-08-02]
+  - Related Backlogs:
+    - `docs/backlogs/000171-exact-family-lock-system-redesign.md`
 
 - **Phase 3: Runtime-Owned Index DDL**
   - Scope: Prepare create/drop index on the caller, including authoritative

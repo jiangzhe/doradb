@@ -1375,10 +1375,11 @@ impl AcceptedCreateTable {
         let trx = match scope.begin_private_trx() {
             Ok(trx) => trx,
             Err(err) => {
+                let source_debug = format!("{err:?}");
                 progress.phase = CreateTablePhase::Aborted;
                 if let Err(cleanup_err) = progress.delete_provisional_file(&engine) {
                     return Err(CompletionErrorBridge::capture(cleanup_err.attach(format!(
-                    "create table provisional-file cleanup failed after transaction begin: table_id={table_id}"
+                    "create table provisional-file cleanup failed after transaction begin: table_id={table_id}, source_error={source_debug}"
                 ))));
                 }
                 return Err(CompletionErrorBridge::capture(
@@ -1683,11 +1684,16 @@ impl AcceptedDropTable {
         let drain = match table.start_drop_lifecycle() {
             Ok(drain) => drain,
             Err(err) => {
+                let source_debug = format!("{err:?}");
                 let trx = progress.trx.take().unwrap_or_else(|| {
                     panic!("DROP lifecycle failure requires private transaction")
                 });
                 if let Err(rollback_err) = trx.rollback_catalog_ddl().await {
-                    return Err(capture_runtime_or_fatal(rollback_err));
+                    return Err(capture_runtime_or_fatal(rollback_err.attach_with(|| {
+                        format!(
+                            "drop table rollback failed after lifecycle rejection: table_id={table_id}, source_error={source_debug}"
+                        )
+                    })));
                 }
                 return Err(CompletionErrorBridge::capture(err));
             }

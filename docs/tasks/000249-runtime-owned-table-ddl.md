@@ -1,7 +1,7 @@
 ---
 id: 000249
 title: Runtime-Owned Table DDL
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-08-01
 github_issue: 924
 ---
@@ -941,6 +941,20 @@ The principal correctness risks and required mitigations are:
   operation locks without fallible destructor cleanup. Test-only DDL phases,
   gates, and failure injection are engine-scoped helpers inside
   `catalog::table::tests`.
+- Implementation review simplified ownership without changing behavior:
+  CREATE file ownership is one mutually exclusive progress enum; public and
+  private transaction initialization return only the values their callers
+  need; finish readiness is represented directly by the accepted-scope state;
+  and DDL preparation plus mandatory submission/supervision are inherent
+  methods on their owning guards. The mandatory operation guard intentionally
+  retains the exact stable entry so nested transaction state does not require
+  lifecycle relookup.
+- `PreparedCatalogWriteAuthority` remains a deliberate phase-local bridge.
+  Reacquiring the catalog claims for the nested transaction is correctness-safe
+  under current same-family coverage but would duplicate manager grants and
+  owner-cache entries and weaken the prepared no-reacquisition boundary.
+  Backlog `000171` owns unifying operation and transaction claims in the
+  exact-family lock redesign and removing this special path afterward.
 - Release measurements on 2026-08-01 used one thread/session, `log-sync=none`,
   and equivalent fresh roots. Seven one-cycle `table-ddl` samples had a
   candidate median of 585,711 ns per create/drop cycle (range
@@ -953,6 +967,9 @@ The principal correctness risks and required mitigations are:
   reports caller-visible aggregate latency, so the mandatory queue and
   execution contribution remains included rather than split into synthetic
   sub-measurements.
+- Final verification passed 1,621 workspace tests, 1,528 alternate-`libaio`
+  tests, focused preparation/acceptance/panic/cleanup coverage, formatting and
+  diff checks, and the mandatory style audit over 11 branch-diff Rust files.
 
 ## Impacts
 
@@ -1255,8 +1272,7 @@ The principal correctness risks and required mitigations are:
 
 No blocking design questions remain.
 
-At `$task-resolve`, record implementation-discovered follow-ups as backlog
-items rather than widening this phase, and synchronize RFC-0026 Phase 2 task
-path, issue, status, implementation summary, and any related backlog. Preserve
-Phase 3 prerequisites unless concrete implementation evidence requires an
-explicit parent-RFC correction.
+- `docs/backlogs/000171-exact-family-lock-system-redesign.md` owns the deferred
+  unification of operation and nested-transaction lock claims and eventual
+  removal of the phase-local prepared catalog-write authority. This does not
+  change RFC-0026 Phase 3 prerequisites.
