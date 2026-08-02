@@ -6,6 +6,8 @@
 //! model that this module enforces with the component registry.
 use crate::buffer::PoolRole;
 use crate::buffer::SharedPoolEvictorWorkers;
+#[cfg(test)]
+use crate::catalog::table::tests::TableDdlTestController;
 use crate::catalog::{Catalog, CatalogConfig};
 use crate::component::{
     ComponentRegistry, DiskPoolConfig, EnginePools, IndexPoolConfig, MetaPoolConfig,
@@ -695,6 +697,9 @@ pub(crate) struct EngineInner {
     pub(crate) session_registry: SessionRegistry,
     /// Monotonically increasing engine-local session identity source.
     next_session_id: AtomicU64,
+    /// Per-engine table-DDL fault and phase controller.
+    #[cfg(test)]
+    pub(crate) table_ddl_test: TableDdlTestController,
     lifecycle: EngineLifecycle,
 }
 
@@ -921,6 +926,8 @@ async fn bootstrap_inner(config: EngineConfig) -> Result<Engine> {
         lock_manager,
         session_registry: SessionRegistry::new(),
         next_session_id: AtomicU64::new(FIRST_SESSION_ID.as_u64()),
+        #[cfg(test)]
+        table_ddl_test: TableDdlTestController::default(),
         lifecycle: EngineLifecycle::new(),
     };
     Ok(Engine {

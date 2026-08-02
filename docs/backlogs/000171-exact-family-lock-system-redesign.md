@@ -10,9 +10,27 @@ Prerequisites docs/backlogs/000169-separate-session-operation-lock-scopes.md and
 
 ## Deferred From (Optional)
 
+docs/tasks/000249-runtime-owned-table-ddl.md;
+docs/rfcs/0026-engine-owned-mandatory-background-runtime.md Phase 2
 
 ## Deferral Context (Optional)
 
+- Defer Reason: Task 000249 must establish complete caller-prepared table-DDL
+  authority without widening RFC-0026 Phase 2 into the cross-cutting lock
+  representation redesign. The broader redesign should begin after the current
+  mandatory-runtime RFC phases establish their operation ownership patterns.
+- Findings: Accepted table DDL owns catalog metadata-S and data-IX claims under
+  its operation owner, while its nested private transaction performs the
+  catalog writes. Reacquiring those claims for the transaction is
+  correctness-safe through current same-family coverage, but duplicates lock
+  manager grants and owner-cache entries. `PreparedCatalogWriteAuthority`
+  therefore remains a narrow borrowed proof that reuses the operation claims
+  and preserves the no-reacquisition acceptance boundary.
+- Direction Hint: Unify operation and nested-transaction claims under one
+  exact-family authority model, then remove the special prepared catalog-write
+  path without adding duplicate grants, a generic lock-bypass flag, or another
+  ownership-transfer protocol. Preserve the prepared-statement panic settlement
+  introduced by task 000249 independently of the lock representation.
 
 ## Scope Hint
 

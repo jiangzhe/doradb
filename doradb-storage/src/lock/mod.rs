@@ -398,27 +398,6 @@ impl LockManager {
         Ok((metadata_guard, data_guard))
     }
 
-    /// Acquires metadata-X for one freshly allocated CREATE TABLE id.
-    #[inline]
-    pub(crate) async fn acquire_create_table_metadata_lock<'a>(
-        &'a self,
-        table_id: TableID,
-        owner: LockOwner,
-    ) -> OperationResult<FreshLockGuard<'a>> {
-        let resource = LockResource::TableMetadata(table_id);
-        let grant = self
-            .acquire_with_grant(resource, LockMode::Exclusive, owner)
-            .await?;
-        FreshLockGuard::new(self, resource, owner, grant).map_or_else(
-            || {
-                panic!(
-                    "create-table metadata lock invariant violated: fresh table id reused an existing owner grant, table_id={table_id}, owner={owner:?}"
-                )
-            },
-            Ok,
-        )
-    }
-
     /// Acquires scoped exclusive table DDL locks.
     #[inline]
     pub(crate) async fn acquire_table_ddl_locks<'a>(
@@ -1395,36 +1374,6 @@ pub(crate) mod tests {
     #[should_panic(expected = "statement lock owner requires a transaction source")]
     fn statement_owner_requires_transaction_source() {
         let _ = LockOwner::session_explicit(SessionID::new(7)).statement(1);
-    }
-
-    #[test]
-    fn create_table_metadata_guard_holds_only_fresh_metadata_x() {
-        smol::block_on(async {
-            let manager = LockManager::new();
-            let table_id = TableID::new(42);
-            let owner = LockOwner::operation(SessionOperationKey::new(
-                SessionID::new(7),
-                OperationID::new(1),
-            ));
-            let guard = manager
-                .acquire_create_table_metadata_lock(table_id, owner)
-                .await
-                .unwrap();
-
-            assert_eq!(
-                debug_snapshot(&manager).entries,
-                vec![LockDebugEntry {
-                    resource: table_metadata(table_id),
-                    mode: LockMode::Exclusive,
-                    owner,
-                    state: LockDebugEntryState::Granted,
-                    queue_order: None,
-                }]
-            );
-
-            drop(guard);
-            assert!(debug_snapshot(&manager).entries.is_empty());
-        });
     }
 
     fn count_entries(

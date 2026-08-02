@@ -120,8 +120,8 @@ The current implementation uses the following table-level mapping:
 | Explicit shared table lock | session `S` | session `S` | explicit session |
 | Explicit exclusive table lock | session `S` | session `X` | explicit session |
 | Freeze/checkpoint | scoped `S` | scoped `IS` | maintenance operation |
-| CREATE TABLE on a new id | scoped `X` | none | DDL operation |
-| DROP TABLE | scoped `X` | scoped `X` | DDL operation |
+| CREATE TABLE on a new id | target `X`; catalog slots 0-3 `S` | catalog slots 0-3 `IX` | prepared DDL operation, then mandatory owner |
+| DROP TABLE | target `X`; catalog slots 0-4 `S` | target `X`; catalog slots 0-4 `IX` | prepared DDL operation, then mandatory owner |
 | CREATE/DROP INDEX | scoped `X` | scoped `X` | DDL operation |
 
 On first touch, statement metadata protection is handed to the transaction
@@ -137,6 +137,15 @@ statement acquires Metadata(S)
 Successfully bound reads therefore retain metadata protection until transaction
 commit or rollback. Repeated operations use the transaction binding and lock
 cache.
+
+Table CREATE/DROP acquire their complete fixed lock sequences while the public
+session future is still cancellable. Winning mandatory capacity synchronously
+transfers the same `OwnerLockState` and operation owner to accepted execution;
+there is no release/reacquire window. Catalog statements receive a typed
+prepared-write authority that proves metadata S plus data IX for each catalog
+table and bypasses ordinary transaction lock acquisition. Index DDL,
+maintenance, and ordinary catalog statements continue through their existing
+lock-manager paths.
 
 Recovery, purge, and no-transaction replay do not acquire logical locks. They
 run at lifecycle boundaries where foreground lock owners do not exist. Logical
