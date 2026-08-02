@@ -270,7 +270,7 @@ doradb-bench --root target/doradb-bench/index-scan run index-scan --num 10000 --
 doradb-bench --root target/doradb-bench/index-scan cleanup
 ```
 
-## RFC-0025 Successful-Path Measurements
+## RFC-0025 and RFC-0026 Successful-Path Measurements
 
 The new workloads complete the pre-RFC successful-path shapes needed by
 RFC-0025:
@@ -278,7 +278,7 @@ RFC-0025:
 - Phase 1/2 statement and transaction evidence uses `stmt-noop` and
   `trx-noop`.
 - Phase 2's no-per-item stream budget uses `index-stream`.
-- Phase 4's successful table-DDL path uses `table-ddl`.
+- RFC-0026 Phase 2's runtime-owned table-DDL path uses `table-ddl`.
 - Phase 5's successful index-DDL path uses `index-ddl`.
 - Existing insert, lookup, table-scan, and index-scan workloads remain the
   row/index/page-loop evidence.

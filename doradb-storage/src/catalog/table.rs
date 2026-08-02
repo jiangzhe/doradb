@@ -1,11 +1,14 @@
 use crate::buffer::PoolGuards;
 use crate::catalog::spec::{ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexNo, IndexSpec};
-use crate::catalog::{ColumnObject, IndexColumnObject, IndexObject, TableObject, is_user_table};
+use crate::catalog::{
+    ColumnObject, IndexColumnObject, IndexObject, TableObject, catalog_table_id_from_slot,
+    is_user_table,
+};
 use crate::engine::EngineRef;
 use crate::error::{
-    DiscloseError, DiscloseResultExt, FatalError, FatalResult, InternalError, InternalResult,
-    IoResult, OperationError, OperationOrRuntimeResult, OperationResult, Result, RuntimeError,
-    RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
+    CompletionErrorBridge, CompletionResult, FatalError, FatalResult, InternalError,
+    InternalResult, IoResult, OperationError, OperationOrRuntimeResult, OperationResult,
+    RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
 };
 use crate::file::table_file::{MutableTableFile, TableFile};
 use crate::id::{TableID, TrxID};
@@ -15,26 +18,151 @@ use crate::map::FastHashSet;
 use crate::obs;
 use crate::row::ops::SelectKey;
 use crate::row::{Row, RowRead};
+use crate::runtime::mandatory::{AcceptedExecution, MandatoryTaskMetadata, PreparedExecution};
 use crate::serde::{Deser, DeserResult, MinBytesHint, Ser, Serde, min_bytes_hint};
-use crate::session::{SessionDdlContext, SessionOperationPin};
+use crate::session::{AcceptedTableDdlScope, PreparedTableDdlScope};
 use crate::table::{Table, TableRedoReplayFloor};
-use crate::trx::Transaction;
+use crate::trx::{PreparedCatalogWriteAuthority, Transaction};
 use crate::value::{Val, ValKind, ValType};
 use error_stack::{Report, ResultExt};
 use semistr::SemiStr;
+use std::any::Any;
 use std::mem;
 use std::ops::Index;
 use std::result::Result as StdResult;
 use std::sync::Arc;
 #[cfg(test)]
-use tests::{
-    CreateTableTestFailure, maybe_fail_create_table,
-    maybe_poison_before_create_table_catalog_commit,
-};
+use tests::{CreateTableTestFailure, TableDdlTestPhase};
+
+const CREATE_TABLE_CATALOG_WRITE_TARGETS: [TableID; 4] = [
+    catalog_table_id_from_slot(0),
+    catalog_table_id_from_slot(1),
+    catalog_table_id_from_slot(2),
+    catalog_table_id_from_slot(3),
+];
+const DROP_TABLE_CATALOG_WRITE_TARGETS: [TableID; 5] = [
+    catalog_table_id_from_slot(0),
+    catalog_table_id_from_slot(1),
+    catalog_table_id_from_slot(2),
+    catalog_table_id_from_slot(3),
+    catalog_table_id_from_slot(4),
+];
+
+/// Purely validated public CREATE TABLE input.
+pub(crate) struct ValidatedCreateTable {
+    table_spec: super::TableSpec,
+    metadata: Arc<TableMetadata>,
+}
+
+impl ValidatedCreateTable {
+    /// Validate public metadata before reserving a session operation or table id.
+    #[inline]
+    pub(crate) fn try_new(
+        table_spec: super::TableSpec,
+        index_specs: Vec<IndexSpec>,
+    ) -> OperationResult<Self> {
+        reject_user_table_primary_key_indexes(&index_specs, "create_table")?;
+        let metadata = Arc::new(TableMetadata::try_new(
+            table_spec.columns.clone(),
+            index_specs,
+        )?);
+        Ok(Self {
+            table_spec,
+            metadata,
+        })
+    }
+
+    /// Bind validated metadata to one gap-tolerant allocated table id.
+    #[inline]
+    pub(crate) fn into_plan(self, table_id: TableID) -> CreateTablePlan {
+        let table_object = TableObject {
+            table_id,
+            next_index_no: self.metadata.idx.next_index_no(),
+        };
+        let column_objects = self
+            .table_spec
+            .columns
+            .into_iter()
+            .enumerate()
+            .map(|(col_no, col_spec)| ColumnObject {
+                table_id,
+                column_no: col_no as u16,
+                column_name: col_spec.column_name,
+                column_type: col_spec.column_type,
+                column_attributes: col_spec.column_attributes,
+            })
+            .collect();
+        let mut index_objects = Vec::new();
+        let mut index_column_objects = Vec::new();
+        for (index_no, index_spec) in self.metadata.idx.active_indexes() {
+            index_objects.push(IndexObject {
+                table_id,
+                index_no: index_no as u16,
+                index_attributes: index_spec.attributes,
+            });
+            for (index_column_no, key) in index_spec.cols.iter().enumerate() {
+                index_column_objects.push(IndexColumnObject {
+                    table_id,
+                    index_no: index_no as u16,
+                    index_column_no: index_column_no as u16,
+                    column_no: key.col_no,
+                    index_order: key.order,
+                });
+            }
+        }
+        CreateTablePlan {
+            table_id,
+            metadata: self.metadata,
+            table_object: Some(table_object),
+            column_objects,
+            index_objects,
+            index_column_objects,
+        }
+    }
+}
+
+/// Owned CREATE TABLE execution plan transferred across mandatory acceptance.
+pub(crate) struct CreateTablePlan {
+    table_id: TableID,
+    metadata: Arc<TableMetadata>,
+    table_object: Option<TableObject>,
+    column_objects: Vec<ColumnObject>,
+    index_objects: Vec<IndexObject>,
+    index_column_objects: Vec<IndexColumnObject>,
+}
+
+/// Owned DROP TABLE target selected under complete target exclusion.
+pub(crate) struct DropTablePlan {
+    table_id: TableID,
+    table: Option<Arc<Table>>,
+}
+
+impl DropTablePlan {
+    /// Retain the exact current-live runtime selected during preparation.
+    #[inline]
+    pub(crate) fn new(table_id: TableID, table: Arc<Table>) -> Self {
+        Self {
+            table_id,
+            table: Some(table),
+        }
+    }
+
+    #[inline]
+    fn take_table(&mut self) -> Arc<Table> {
+        self.table.take().unwrap_or_else(|| {
+            panic!(
+                "drop-table plan runtime moves exactly once: table_id={}",
+                self.table_id
+            )
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CreateTablePhase {
-    Init,
+    Prepared,
+    FileCreated,
+    PrivateTransactionActive,
     CatalogStaged,
     FilePublished,
     RuntimeBuilt,
@@ -43,77 +171,80 @@ enum CreateTablePhase {
     Aborted,
 }
 
-impl CreateTablePhase {
-    #[inline]
-    fn is_terminal(self) -> bool {
-        matches!(self, Self::Installed | Self::Aborted)
-    }
+struct CreateTableCatalogObjects {
+    table: TableObject,
+    columns: Vec<ColumnObject>,
+    indexes: Vec<IndexObject>,
+    index_columns: Vec<IndexColumnObject>,
 }
 
-struct DropTableProgressGuard {
-    engine: EngineRef,
-    table_id: TableID,
-    armed: bool,
-}
-
-impl DropTableProgressGuard {
-    #[inline]
-    fn new(engine: EngineRef, table_id: TableID) -> Self {
-        Self {
-            engine,
-            table_id,
-            armed: true,
-        }
-    }
-
-    #[inline]
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for DropTableProgressGuard {
-    #[inline]
-    fn drop(&mut self) {
-        if self.armed {
-            let _ =
-                poison_drop_table_after_gate(&self.engine, self.table_id, "drop_future_abandoned");
-        }
-    }
+enum CreateTableFile {
+    Mutable(MutableTableFile),
+    Published(Arc<TableFile>),
 }
 
 struct CreateTableProgress {
+    plan: CreateTablePlan,
     table_id: TableID,
     phase: CreateTablePhase,
-    mutable_file: Option<MutableTableFile>,
+    file: Option<CreateTableFile>,
     trx: Option<Transaction>,
-    table_file: Option<Arc<TableFile>>,
     staged_table: Option<Arc<Table>>,
 }
 
 impl CreateTableProgress {
     #[inline]
-    fn new(table_id: TableID, mutable_file: MutableTableFile) -> Self {
+    fn new(plan: CreateTablePlan) -> Self {
+        let table_id = plan.table_id;
         Self {
+            plan,
             table_id,
-            phase: CreateTablePhase::Init,
-            mutable_file: Some(mutable_file),
+            phase: CreateTablePhase::Prepared,
+            file: None,
             trx: None,
-            table_file: None,
             staged_table: None,
         }
     }
 
     #[inline]
+    fn metadata(&self) -> &Arc<TableMetadata> {
+        &self.plan.metadata
+    }
+
+    #[inline]
+    fn set_provisional_file(&mut self, mutable_file: MutableTableFile) {
+        assert_eq!(self.phase, CreateTablePhase::Prepared);
+        self.file = Some(CreateTableFile::Mutable(mutable_file));
+        self.phase = CreateTablePhase::FileCreated;
+    }
+
+    #[inline]
     fn set_catalog_transaction(&mut self, trx: Transaction) {
-        debug_assert!(self.trx.is_none());
+        assert_eq!(self.phase, CreateTablePhase::FileCreated);
+        assert!(self.trx.is_none());
         self.trx = Some(trx);
+        self.phase = CreateTablePhase::PrivateTransactionActive;
     }
 
     #[inline]
     fn mark_catalog_staged(&mut self) {
-        debug_assert_eq!(self.phase, CreateTablePhase::Init);
+        assert_eq!(self.phase, CreateTablePhase::PrivateTransactionActive);
         self.phase = CreateTablePhase::CatalogStaged;
+    }
+
+    #[inline]
+    fn take_catalog_objects(&mut self) -> CreateTableCatalogObjects {
+        CreateTableCatalogObjects {
+            table: self.plan.table_object.take().unwrap_or_else(|| {
+                panic!(
+                    "create-table plan object moves exactly once: table_id={}",
+                    self.table_id
+                )
+            }),
+            columns: mem::take(&mut self.plan.column_objects),
+            indexes: mem::take(&mut self.plan.index_objects),
+            index_columns: mem::take(&mut self.plan.index_column_objects),
+        }
     }
 
     #[inline]
@@ -124,10 +255,13 @@ impl CreateTableProgress {
             .as_ref()
             .expect("catalog transaction is staged before file publish")
             .sts();
-        let mutable_file = self
-            .mutable_file
+        let file = self
+            .file
             .take()
             .expect("mutable create-table file is present before publish");
+        let CreateTableFile::Mutable(mutable_file) = file else {
+            panic!("create-table file is mutable before publish");
+        };
         let table_file = engine
             .trx_sys
             .publish_table_file_root(mutable_file, root_ts, true)
@@ -139,7 +273,7 @@ impl CreateTableProgress {
                     self.table_id
                 )
             })?;
-        self.table_file = Some(table_file);
+        self.file = Some(CreateTableFile::Published(table_file));
         self.phase = CreateTablePhase::FilePublished;
         Ok(())
     }
@@ -151,11 +285,10 @@ impl CreateTableProgress {
         engine: &EngineRef,
     ) -> RuntimeResult<()> {
         debug_assert_eq!(self.phase, CreateTablePhase::FilePublished);
-        let table_file = Arc::clone(
-            self.table_file
-                .as_ref()
-                .expect("published table file is present before runtime build"),
-        );
+        let Some(CreateTableFile::Published(table_file)) = self.file.as_ref() else {
+            panic!("published table file is present before runtime build");
+        };
+        let table_file = Arc::clone(table_file);
         let active_root = table_file.active_root_unchecked();
         let blk_idx = BlockIndex::new(
             engine.meta_pool.clone_inner(),
@@ -228,10 +361,13 @@ impl CreateTableProgress {
 
     #[inline]
     fn delete_provisional_file(&mut self, engine: &EngineRef) -> IoResult<()> {
-        if let Some(mutable_file) = self.mutable_file.take() {
-            let _ = mutable_file.try_delete();
+        match self.file.take() {
+            Some(CreateTableFile::Mutable(mutable_file)) => {
+                let _ = mutable_file.try_delete();
+            }
+            Some(CreateTableFile::Published(table_file)) => drop(table_file),
+            None => {}
         }
-        let _ = self.table_file.take();
         engine.table_fs.delete_user_table_file(self.table_id)
     }
 
@@ -330,18 +466,6 @@ impl CreateTableProgress {
                 self.table_id
             ),
         )
-    }
-}
-
-impl Drop for CreateTableProgress {
-    #[inline]
-    fn drop(&mut self) {
-        debug_assert!(
-            self.phase.is_terminal(),
-            "create-table progress dropped in non-terminal phase: table_id={}, phase={:?}",
-            self.table_id,
-            self.phase
-        );
     }
 }
 
@@ -1131,259 +1255,557 @@ impl Deser for TableBriefMetadata {
     }
 }
 
-/// Create a new user table for a session-level DDL request.
-pub(crate) async fn create_table_for_session(
-    session: SessionOperationPin,
-    table_spec: super::TableSpec,
-    index_specs: Vec<IndexSpec>,
-) -> Result<TableID> {
-    let ctx = SessionDdlContext::new(&session)
-        .attach("operation=create_table")
-        .disclose()?;
-    let engine = ctx.engine.clone();
-    let guards = ctx.pool_guards.clone();
-    reject_user_table_primary_key_indexes(&index_specs, "create_table").disclose()?;
-    let metadata = Arc::new(
-        TableMetadata::try_new(table_spec.columns.clone(), index_specs.clone()).disclose()?,
-    );
-    let table_id = engine.catalog().next_table_id();
-    let _metadata_lock = engine
-        .lock_manager()
-        .acquire_create_table_metadata_lock(table_id, ctx.owner)
-        .await
-        .attach_with(|| format!("operation=create_table, table_id={table_id}"))
-        .disclose()?;
-    let uninit_table_file = engine
-        .table_fs
-        .create_table_file(table_id, Arc::clone(&metadata), false)
-        .disclose()?;
-
-    let table_object = TableObject {
-        table_id,
-        next_index_no: metadata.idx.next_index_no(),
-    };
-    let column_objects: Vec<_> = table_spec
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(col_no, col_spec)| ColumnObject {
-            table_id,
-            column_no: col_no as u16,
-            column_name: col_spec.column_name.clone(),
-            column_type: col_spec.column_type,
-            column_attributes: col_spec.column_attributes,
-        })
-        .collect();
-
-    let mut index_objects = Vec::new();
-    let mut index_column_objects = Vec::new();
-    for (index_no, index_spec) in metadata.idx.active_indexes() {
-        index_objects.push(IndexObject {
-            table_id,
-            index_no: index_no as u16,
-            index_attributes: index_spec.attributes,
-        });
-        for (index_column_no, ik) in index_spec.cols.iter().enumerate() {
-            index_column_objects.push(IndexColumnObject {
-                table_id,
-                index_no: index_no as u16,
-                index_column_no: index_column_no as u16,
-                column_no: ik.col_no,
-                index_order: ik.order,
-            });
-        }
-    }
-
-    let mut progress = CreateTableProgress::new(table_id, uninit_table_file);
-    let mut trx = match session.begin_private_trx().attach("operation=create_table") {
-        Ok(trx) => trx,
-        Err(err) => {
-            let err = match progress.delete_provisional_file(&engine) {
-                Ok(()) => err,
-                Err(cleanup_err) => err.attach(cleanup_err.attach(format!(
-                    "create table provisional-file cleanup failed: table_id={table_id}"
-                ))),
-            };
-            progress.phase = CreateTablePhase::Aborted;
-            return Err(err.disclose());
-        }
-    };
-
-    let exec_res = execute_create_table_catalog_staging(
-        &engine,
-        &mut trx,
-        table_id,
-        table_object,
-        column_objects,
-        index_objects,
-        index_column_objects,
-    )
-    .await;
-    progress.set_catalog_transaction(trx);
-    if let Err(err) = exec_res {
-        return Err(progress
-            .abort_before_catalog_commit(&engine, &guards, "catalog_staging", err)
-            .await
-            .disclose());
-    }
-    progress.mark_catalog_staged();
-
-    #[cfg(test)]
-    if let Err(err) = maybe_fail_create_table(CreateTableTestFailure::AfterCatalogStaged) {
-        return Err(progress
-            .abort_before_catalog_commit(&engine, &guards, "test_after_catalog_staging", err)
-            .await
-            .disclose());
-    }
-
-    if let Err(err) = progress.publish_file(&engine).await {
-        return Err(progress
-            .abort_before_catalog_commit(&engine, &guards, "file_publish", err)
-            .await
-            .disclose());
-    }
-
-    #[cfg(test)]
-    if let Err(err) = maybe_fail_create_table(CreateTableTestFailure::AfterFilePublished) {
-        return Err(progress
-            .abort_before_catalog_commit(&engine, &guards, "test_after_file_publish", err)
-            .await
-            .disclose());
-    }
-
-    if let Err(err) = progress.build_runtime(&guards, &engine).await {
-        return Err(progress
-            .abort_before_catalog_commit(&engine, &guards, "runtime_build", err)
-            .await
-            .disclose());
-    }
-
-    #[cfg(test)]
-    if let Err(err) = maybe_fail_create_table(CreateTableTestFailure::AfterRuntimeBuilt) {
-        return Err(progress
-            .abort_before_catalog_commit(&engine, &guards, "test_after_runtime_build", err)
-            .await
-            .disclose());
-    }
-
-    #[cfg(test)]
-    maybe_poison_before_create_table_catalog_commit(&engine);
-
-    let create_cts = match progress.commit_catalog().await {
-        Ok(create_cts) => create_cts,
-        Err(err) => {
-            return Err(progress
-                .abort_after_root_publish_commit_error(&engine, &guards, "catalog_commit", err)
-                .await
-                .disclose());
-        }
-    };
-
-    if !progress.install_runtime(&engine, create_cts) {
-        return Err(
-            poison_create_table_after_commit(&engine, table_id, "runtime_install").disclose(),
-        );
-    }
-
-    Ok(table_id)
+/// Caller-prepared CREATE TABLE awaiting mandatory runtime capacity.
+pub(crate) struct PreparedCreateTable {
+    scope: PreparedTableDdlScope,
+    plan: CreateTablePlan,
+    metadata: MandatoryTaskMetadata,
 }
 
-/// Logically drop an existing user table for a session-level DDL request.
-pub(crate) async fn drop_table_for_session(
-    session: SessionOperationPin,
-    table_id: TableID,
-) -> Result<()> {
-    let ctx = SessionDdlContext::new(&session)
-        .attach("operation=drop_table")
-        .disclose()?;
-    let engine = ctx.engine.clone();
-    let lock_manager = engine.lock_manager();
-    reject_non_user_table_id(table_id, "drop_table").disclose()?;
-    lock_manager
-        .reject_table_ddl_explicit_session_lock(table_id, ctx.owner)
-        .attach("operation=drop_table")
-        .disclose()?;
-    let _table_locks = lock_manager
-        .acquire_table_ddl_locks(table_id, ctx.owner)
-        .await
-        .attach_with(|| format!("operation=drop_table, table_id={table_id}"))
-        .disclose()?;
-    let table = validated_drop_table_target(&ctx.pool_guards, &engine, table_id)
-        .await
-        .disclose()?;
-    engine.poisoner.ensure_healthy().disclose()?;
-
-    let mut trx = session
-        .begin_private_trx()
-        .attach("operation=drop_table")
-        .disclose()?;
-
-    let drain = match table.start_drop_lifecycle() {
-        Ok(drain) => drain,
-        Err(err) => {
-            if let Err(rollback_err) = trx.rollback_catalog_ddl().await {
-                return Err(rollback_err.disclose());
-            }
-            return Err(err.disclose());
+impl PreparedCreateTable {
+    /// Build one fully prepared CREATE TABLE carrier.
+    #[inline]
+    pub(crate) fn new(scope: PreparedTableDdlScope, plan: CreateTablePlan) -> Self {
+        let metadata = MandatoryTaskMetadata::table_operation(
+            <Self as PreparedExecution>::LABEL,
+            scope.key(),
+            plan.table_id,
+        );
+        Self {
+            scope,
+            plan,
+            metadata,
         }
-    };
-    let mut drop_progress = DropTableProgressGuard::new(engine.clone(), table_id);
-    drain.wait().await;
+    }
+}
 
-    let metadata = table.metadata().clone();
-    let exec_res = execute_drop_table_catalog_cascade(&engine, &mut trx, table_id, &metadata).await;
-    if let Err(err) = exec_res {
-        // The lifecycle gate is already irreversible. Preserve the catalog
-        // cascade failure as the poison source; rollback is best-effort cleanup
-        // and its error must not replace the failure that crossed the gate.
-        if let Err(rollback_err) = trx.rollback_catalog_ddl().await {
-            let rollback_err = rollback_err.attach_with(|| {
+impl PreparedExecution for PreparedCreateTable {
+    type Output = TableID;
+    type Accepted = AcceptedCreateTable;
+
+    const LABEL: &'static str = "create_table";
+
+    #[inline]
+    fn metadata(&self) -> MandatoryTaskMetadata {
+        self.metadata.clone()
+    }
+
+    #[inline]
+    fn accept(self) -> Self::Accepted {
+        let Self {
+            scope,
+            plan,
+            metadata: _,
+        } = self;
+        let table_id = plan.table_id;
+        AcceptedCreateTable {
+            scope: scope.accept(),
+            table_id,
+            progress: Some(CreateTableProgress::new(plan)),
+        }
+    }
+}
+
+/// Mandatory-runtime owner of accepted CREATE TABLE execution.
+pub(crate) struct AcceptedCreateTable {
+    scope: AcceptedTableDdlScope,
+    table_id: TableID,
+    progress: Option<CreateTableProgress>,
+}
+
+impl AcceptedExecution for AcceptedCreateTable {
+    type Output = TableID;
+
+    #[inline]
+    async fn execute(&mut self) -> CompletionResult<Self::Output> {
+        let result = self.execute_inner().await;
+        self.scope.mark_terminal_ready();
+        result
+    }
+
+    #[inline]
+    fn finish(&mut self) {
+        drop(self.progress.take());
+        self.scope.finish();
+    }
+
+    #[inline]
+    async fn handle_panic(&mut self, _panic: Box<dyn Any + Send>) -> CompletionErrorBridge {
+        self.scope.handle_panic();
+        let phase = match self.progress.as_ref() {
+            Some(progress) => progress.phase,
+            None => CreateTablePhase::Aborted,
+        };
+        CompletionErrorBridge::capture(Report::new(FatalError::MandatoryTaskPanic).attach(format!(
+            "accepted CREATE TABLE panicked: table_id={}, phase={:?}",
+            self.table_id, phase
+        )))
+    }
+}
+
+impl AcceptedCreateTable {
+    async fn execute_inner(&mut self) -> CompletionResult<TableID> {
+        let scope = &mut self.scope;
+        let progress = self
+            .progress
+            .as_mut()
+            .unwrap_or_else(|| panic!("accepted CREATE progress exists during execution"));
+        let engine = scope.engine().clone();
+        let guards = scope.pool_guards();
+        let table_id = progress.table_id;
+
+        #[cfg(test)]
+        engine
+            .table_ddl_test
+            .reach_phase(TableDdlTestPhase::CreateBeforeFirstEffect)
+            .await;
+
+        let mutable_file = engine
+            .table_fs
+            .create_table_file(table_id, Arc::clone(progress.metadata()), false)
+            .map_err(CompletionErrorBridge::capture)?;
+        progress.set_provisional_file(mutable_file);
+
+        #[cfg(test)]
+        engine
+            .table_ddl_test
+            .reach_phase(TableDdlTestPhase::CreateFileCreated)
+            .await;
+
+        let trx = match scope.begin_private_trx() {
+            Ok(trx) => trx,
+            Err(err) => {
+                progress.phase = CreateTablePhase::Aborted;
+                if let Err(cleanup_err) = progress.delete_provisional_file(&engine) {
+                    return Err(CompletionErrorBridge::capture(cleanup_err.attach(format!(
+                    "create table provisional-file cleanup failed after transaction begin: table_id={table_id}"
+                ))));
+                }
+                return Err(CompletionErrorBridge::capture(
+                    err.attach("operation=create_table, phase=begin_private_transaction"),
+                ));
+            }
+        };
+        progress.set_catalog_transaction(trx);
+
+        #[cfg(test)]
+        engine
+            .table_ddl_test
+            .reach_phase(TableDdlTestPhase::CreatePrivateTransactionBegun)
+            .await;
+
+        let catalog_objects = progress.take_catalog_objects();
+        let authority = scope.catalog_write_authority();
+        let exec_res = execute_create_table_catalog_staging(
+            &engine,
+            progress
+                .trx
+                .as_mut()
+                .unwrap_or_else(|| panic!("CREATE staging requires private transaction")),
+            authority,
+            table_id,
+            catalog_objects,
+        )
+        .await;
+        if let Err(err) = exec_res {
+            return Err(capture_runtime_or_fatal(
+                progress
+                    .abort_before_catalog_commit(&engine, &guards, "catalog_staging", err)
+                    .await,
+            ));
+        }
+        progress.mark_catalog_staged();
+
+        #[cfg(test)]
+        engine
+            .table_ddl_test
+            .reach_phase(TableDdlTestPhase::CreateCatalogStaged)
+            .await;
+
+        #[cfg(test)]
+        if let Err(err) = engine
+            .table_ddl_test
+            .maybe_fail_create(CreateTableTestFailure::AfterCatalogStaged)
+        {
+            return Err(capture_runtime_or_fatal(
+                progress
+                    .abort_before_catalog_commit(
+                        &engine,
+                        &guards,
+                        "test_after_catalog_staging",
+                        err,
+                    )
+                    .await,
+            ));
+        }
+
+        if let Err(err) = progress.publish_file(&engine).await {
+            return Err(capture_runtime_or_fatal(
+                progress
+                    .abort_before_catalog_commit(&engine, &guards, "file_publish", err)
+                    .await,
+            ));
+        }
+
+        #[cfg(test)]
+        engine
+            .table_ddl_test
+            .reach_phase(TableDdlTestPhase::CreateFilePublished)
+            .await;
+
+        #[cfg(test)]
+        if let Err(err) = engine
+            .table_ddl_test
+            .maybe_fail_create(CreateTableTestFailure::AfterFilePublished)
+        {
+            return Err(capture_runtime_or_fatal(
+                progress
+                    .abort_before_catalog_commit(&engine, &guards, "test_after_file_publish", err)
+                    .await,
+            ));
+        }
+
+        if let Err(err) = progress.build_runtime(&guards, &engine).await {
+            return Err(capture_runtime_or_fatal(
+                progress
+                    .abort_before_catalog_commit(&engine, &guards, "runtime_build", err)
+                    .await,
+            ));
+        }
+
+        #[cfg(test)]
+        engine
+            .table_ddl_test
+            .reach_phase(TableDdlTestPhase::CreateRuntimeBuilt)
+            .await;
+
+        #[cfg(test)]
+        if let Err(err) = engine
+            .table_ddl_test
+            .maybe_fail_create(CreateTableTestFailure::AfterRuntimeBuilt)
+        {
+            return Err(capture_runtime_or_fatal(
+                progress
+                    .abort_before_catalog_commit(&engine, &guards, "test_after_runtime_build", err)
+                    .await,
+            ));
+        }
+
+        #[cfg(test)]
+        engine
+            .table_ddl_test
+            .maybe_poison_before_create_commit(&engine);
+
+        let create_cts = match progress.commit_catalog().await {
+            Ok(create_cts) => create_cts,
+            Err(err) => {
+                return Err(capture_runtime_or_fatal(
+                    progress
+                        .abort_after_root_publish_commit_error(
+                            &engine,
+                            &guards,
+                            "catalog_commit",
+                            err,
+                        )
+                        .await,
+                ));
+            }
+        };
+
+        #[cfg(test)]
+        engine
+            .table_ddl_test
+            .reach_phase(TableDdlTestPhase::CreateCatalogCommitted)
+            .await;
+
+        assert!(
+            progress.install_runtime(&engine, create_cts),
+            "allocated CREATE TABLE id duplicated current runtime during accepted execution: table_id={table_id}"
+        );
+
+        #[cfg(test)]
+        engine
+            .table_ddl_test
+            .reach_phase(TableDdlTestPhase::CreateRuntimeInstalled)
+            .await;
+
+        Ok(table_id)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DropTablePhase {
+    Prepared,
+    PrivateTransactionActive,
+    LifecycleClosed,
+    DrainComplete,
+    CatalogStaged,
+    CatalogCommitted,
+    RuntimeRetained,
+}
+
+struct DropTableProgress {
+    plan: DropTablePlan,
+    phase: DropTablePhase,
+    trx: Option<Transaction>,
+}
+
+impl DropTableProgress {
+    #[inline]
+    fn new(plan: DropTablePlan) -> Self {
+        Self {
+            plan,
+            phase: DropTablePhase::Prepared,
+            trx: None,
+        }
+    }
+}
+
+/// Caller-prepared DROP TABLE awaiting mandatory runtime capacity.
+pub(crate) struct PreparedDropTable {
+    scope: PreparedTableDdlScope,
+    plan: DropTablePlan,
+    metadata: MandatoryTaskMetadata,
+}
+
+impl PreparedDropTable {
+    /// Build one fully prepared DROP TABLE carrier.
+    #[inline]
+    pub(crate) fn new(scope: PreparedTableDdlScope, plan: DropTablePlan) -> Self {
+        let metadata = MandatoryTaskMetadata::table_operation(
+            <Self as PreparedExecution>::LABEL,
+            scope.key(),
+            plan.table_id,
+        );
+        Self {
+            scope,
+            plan,
+            metadata,
+        }
+    }
+}
+
+impl PreparedExecution for PreparedDropTable {
+    type Output = ();
+    type Accepted = AcceptedDropTable;
+
+    const LABEL: &'static str = "drop_table";
+
+    #[inline]
+    fn metadata(&self) -> MandatoryTaskMetadata {
+        self.metadata.clone()
+    }
+
+    #[inline]
+    fn accept(self) -> Self::Accepted {
+        let Self {
+            scope,
+            plan,
+            metadata: _,
+        } = self;
+        let table_id = plan.table_id;
+        AcceptedDropTable {
+            scope: scope.accept(),
+            table_id,
+            progress: Some(DropTableProgress::new(plan)),
+        }
+    }
+}
+
+/// Mandatory-runtime owner of accepted DROP TABLE execution.
+pub(crate) struct AcceptedDropTable {
+    scope: AcceptedTableDdlScope,
+    table_id: TableID,
+    progress: Option<DropTableProgress>,
+}
+
+impl AcceptedExecution for AcceptedDropTable {
+    type Output = ();
+
+    #[inline]
+    async fn execute(&mut self) -> CompletionResult<Self::Output> {
+        let result = self.execute_inner().await;
+        self.scope.mark_terminal_ready();
+        result
+    }
+
+    #[inline]
+    fn finish(&mut self) {
+        drop(self.progress.take());
+        self.scope.finish();
+    }
+
+    #[inline]
+    async fn handle_panic(&mut self, _panic: Box<dyn Any + Send>) -> CompletionErrorBridge {
+        self.scope.handle_panic();
+        let phase = match self.progress.as_ref() {
+            Some(progress) => progress.phase,
+            None => DropTablePhase::Prepared,
+        };
+        CompletionErrorBridge::capture(Report::new(FatalError::MandatoryTaskPanic).attach(format!(
+            "accepted DROP TABLE panicked: table_id={}, phase={:?}",
+            self.table_id, phase
+        )))
+    }
+}
+
+impl AcceptedDropTable {
+    async fn execute_inner(&mut self) -> CompletionResult<()> {
+        let scope = &mut self.scope;
+        let progress = self
+            .progress
+            .as_mut()
+            .unwrap_or_else(|| panic!("accepted DROP progress exists during execution"));
+        let engine = scope.engine().clone();
+        let table_id = progress.plan.table_id;
+        let table = progress.plan.take_table();
+
+        #[cfg(test)]
+        engine
+            .table_ddl_test
+            .reach_phase(TableDdlTestPhase::DropBeforeFirstEffect)
+            .await;
+
+        let trx = scope.begin_private_trx().map_err(|err| {
+            CompletionErrorBridge::capture(
+                err.attach("operation=drop_table, phase=begin_private_transaction"),
+            )
+        })?;
+        progress.trx = Some(trx);
+        progress.phase = DropTablePhase::PrivateTransactionActive;
+
+        #[cfg(test)]
+        engine
+            .table_ddl_test
+            .reach_phase(TableDdlTestPhase::DropPrivateTransactionBegun)
+            .await;
+
+        let drain = match table.start_drop_lifecycle() {
+            Ok(drain) => drain,
+            Err(err) => {
+                let trx = progress.trx.take().unwrap_or_else(|| {
+                    panic!("DROP lifecycle failure requires private transaction")
+                });
+                if let Err(rollback_err) = trx.rollback_catalog_ddl().await {
+                    return Err(capture_runtime_or_fatal(rollback_err));
+                }
+                return Err(CompletionErrorBridge::capture(err));
+            }
+        };
+        progress.phase = DropTablePhase::LifecycleClosed;
+
+        #[cfg(test)]
+        engine
+            .table_ddl_test
+            .reach_phase(TableDdlTestPhase::DropLifecycleClosed)
+            .await;
+
+        drain.wait().await;
+        progress.phase = DropTablePhase::DrainComplete;
+
+        #[cfg(test)]
+        engine
+            .table_ddl_test
+            .reach_phase(TableDdlTestPhase::DropDrainComplete)
+            .await;
+
+        let metadata = table.metadata().clone();
+        let authority = scope.catalog_write_authority();
+        let exec_res = execute_drop_table_catalog_cascade(
+            &engine,
+            progress
+                .trx
+                .as_mut()
+                .unwrap_or_else(|| panic!("DROP cascade requires private transaction")),
+            authority,
+            table_id,
+            &metadata,
+        )
+        .await;
+        if let Err(err) = exec_res {
+            if let Some(trx) = progress.trx.take()
+                && let Err(rollback_err) = trx.rollback_catalog_ddl().await
+            {
+                let rollback_err = rollback_err.attach_with(|| {
                 format!(
                     "best-effort DROP TABLE rollback failed after lifecycle gate: table_id={table_id}"
                 )
             });
-            obs::error!(
-                "event=ddl_cleanup component=catalog action=rollback_drop_table result=error error={rollback_err:?}"
-            );
-        }
-        return Err(poison_error_source(
-            &engine,
-            RuntimeOrFatalError::from(err),
-            FatalError::Poisoned,
-            format!(
-                "drop table failed after lifecycle gate: table_id={table_id}, operation=catalog_cascade"
-            ),
-        )
-        .disclose());
-    }
-
-    let drop_cts = match trx.commit_catalog_ddl().await {
-        Ok(drop_cts) => drop_cts,
-        Err(err) => {
-            return Err(poison_error_source(
+                obs::error!(
+                    "event=ddl_cleanup component=catalog action=rollback_drop_table result=error error={rollback_err:?}"
+                );
+            }
+            return Err(capture_runtime_or_fatal(poison_error_source(
                 &engine,
-                err,
+                RuntimeOrFatalError::from(err),
                 FatalError::Poisoned,
                 format!(
-                    "drop table failed after lifecycle gate: table_id={table_id}, operation=commit"
+                    "drop table failed after lifecycle gate: table_id={table_id}, operation=catalog_cascade"
                 ),
-            )
-            .disclose());
+            )));
         }
-    };
+        progress.phase = DropTablePhase::CatalogStaged;
 
-    let replay_floor = engine
-        .catalog()
-        .effective_user_table_redo_replay_floor(table_id, table.redo_replay_floor_snapshot());
-    finish_drop_table_runtime_retention(&engine, table_id, table, drop_cts, replay_floor)
-        .disclose()?;
-    drop_progress.disarm();
-    // Foreground DROP TABLE stops at logical removal. The catalog map retains
-    // the dropped runtime and replay floor until purge and catalog checkpoint
-    // finish the physical cleanup obligations.
-    engine.trx_sys.request_dropped_table_purge();
-    engine.trx_sys.request_metadata_history_purge();
-    Ok(())
+        #[cfg(test)]
+        engine
+            .table_ddl_test
+            .reach_phase(TableDdlTestPhase::DropCatalogStaged)
+            .await;
+
+        let trx = progress
+            .trx
+            .take()
+            .unwrap_or_else(|| panic!("DROP commit requires private transaction"));
+        let drop_cts = match trx.commit_catalog_ddl().await {
+            Ok(drop_cts) => drop_cts,
+            Err(err) => {
+                return Err(capture_runtime_or_fatal(poison_error_source(
+                    &engine,
+                    err,
+                    FatalError::Poisoned,
+                    format!(
+                        "drop table failed after lifecycle gate: table_id={table_id}, operation=commit"
+                    ),
+                )));
+            }
+        };
+        progress.phase = DropTablePhase::CatalogCommitted;
+
+        #[cfg(test)]
+        engine
+            .table_ddl_test
+            .reach_phase(TableDdlTestPhase::DropCatalogCommitted)
+            .await;
+
+        let replay_floor = engine
+            .catalog()
+            .effective_user_table_redo_replay_floor(table_id, table.redo_replay_floor_snapshot());
+        finish_drop_table_runtime_retention(&engine, table_id, table, drop_cts, replay_floor)
+            .map_err(CompletionErrorBridge::capture)?;
+        progress.phase = DropTablePhase::RuntimeRetained;
+
+        #[cfg(test)]
+        engine
+            .table_ddl_test
+            .reach_phase(TableDdlTestPhase::DropRuntimeRetained)
+            .await;
+
+        engine.trx_sys.request_dropped_table_purge();
+        engine.trx_sys.request_metadata_history_purge();
+        Ok(())
+    }
+}
+
+/// Return the fixed catalog tables written by CREATE TABLE.
+#[inline]
+pub(crate) const fn create_table_catalog_write_targets() -> &'static [TableID] {
+    &CREATE_TABLE_CATALOG_WRITE_TARGETS
+}
+
+/// Return the fixed catalog tables written by DROP TABLE.
+#[inline]
+pub(crate) const fn drop_table_catalog_write_targets() -> &'static [TableID] {
+    &DROP_TABLE_CATALOG_WRITE_TARGETS
 }
 
 /// Reject table ids outside user-managed catalog space.
@@ -1455,6 +1877,14 @@ pub(crate) fn reject_user_table_primary_key_index(
 }
 
 #[inline]
+fn capture_runtime_or_fatal(error: RuntimeOrFatalError) -> CompletionErrorBridge {
+    match error {
+        RuntimeOrFatalError::Runtime(report) => CompletionErrorBridge::capture(report),
+        RuntimeOrFatalError::Fatal(report) => CompletionErrorBridge::capture(report),
+    }
+}
+
+#[inline]
 fn reject_user_table_primary_key_indexes(
     index_specs: &[IndexSpec],
     operation: &'static str,
@@ -1463,21 +1893,6 @@ fn reject_user_table_primary_key_indexes(
         reject_user_table_primary_key_index(index_spec, operation)?;
     }
     Ok(())
-}
-
-async fn validated_drop_table_target(
-    guards: &PoolGuards,
-    engine: &EngineRef,
-    table_id: TableID,
-) -> OperationOrRuntimeResult<Arc<Table>> {
-    reject_non_user_table_id(table_id, "drop_table")?;
-    let Some(table) = engine.catalog().get_table(table_id).await else {
-        return Err(Report::new(OperationError::TableNotFound)
-            .attach(format!("drop table runtime lookup: table_id={table_id}"))
-            .into());
-    };
-    ensure_user_table_catalog_row(guards, engine, table_id, "drop_table").await?;
-    Ok(table)
 }
 
 /// Stage the catalog rows for a newly allocated table.
@@ -1489,21 +1904,25 @@ async fn validated_drop_table_target(
 async fn execute_create_table_catalog_staging(
     engine: &EngineRef,
     trx: &mut Transaction,
+    authority: PreparedCatalogWriteAuthority<'_>,
     table_id: TableID,
-    table_object: TableObject,
-    column_objects: Vec<ColumnObject>,
-    index_objects: Vec<IndexObject>,
-    index_column_objects: Vec<IndexColumnObject>,
+    catalog_objects: CreateTableCatalogObjects,
 ) -> RuntimeResult<()> {
-    trx.stage_catalog_statement(async |stmt| {
+    let CreateTableCatalogObjects {
+        table,
+        columns,
+        indexes,
+        index_columns,
+    } = catalog_objects;
+    trx.stage_prepared_catalog_statement(authority, async |stmt| {
         engine
             .catalog()
             .storage
             .tables()
-            .insert(stmt, &table_object)
+            .insert(stmt, &table)
             .await?;
 
-        for column_object in column_objects {
+        for column_object in columns {
             engine
                 .catalog()
                 .storage
@@ -1511,7 +1930,7 @@ async fn execute_create_table_catalog_staging(
                 .insert(stmt, &column_object)
                 .await?;
         }
-        for index_object in index_objects {
+        for index_object in indexes {
             engine
                 .catalog()
                 .storage
@@ -1519,7 +1938,7 @@ async fn execute_create_table_catalog_staging(
                 .insert(stmt, &index_object)
                 .await?;
         }
-        for index_column_object in index_column_objects {
+        for index_column_object in index_columns {
             engine
                 .catalog()
                 .storage
@@ -1546,10 +1965,11 @@ async fn execute_create_table_catalog_staging(
 async fn execute_drop_table_catalog_cascade(
     engine: &EngineRef,
     trx: &mut Transaction,
+    authority: PreparedCatalogWriteAuthority<'_>,
     table_id: TableID,
     metadata: &TableMetadata,
 ) -> RuntimeResult<()> {
-    trx.stage_catalog_statement(async |stmt| {
+    trx.stage_prepared_catalog_statement(authority, async |stmt| {
         let index_columns_deleted = engine
             .catalog()
             .storage
@@ -1675,22 +2095,6 @@ fn poison_drop_table_after_gate(
     engine.poisoner.poison(report).into_report()
 }
 
-#[inline]
-fn poison_create_table_after_commit(
-    engine: &EngineRef,
-    table_id: TableID,
-    operation: &'static str,
-) -> Report<FatalError> {
-    let report = Report::new(FatalError::Poisoned).attach(format!(
-        "create table failed after catalog commit: table_id={table_id}, operation={operation}"
-    ));
-    obs::error!(
-        "event=engine_poison component=catalog_table action=poison result=error error={:?}",
-        report
-    );
-    engine.poisoner.poison(report).into_report()
-}
-
 /// Fatalizes a typed catalog source while retaining its physical evidence.
 #[inline]
 fn poison_error_source(
@@ -1753,7 +2157,7 @@ fn validate_primary_key_contract(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::catalog::storage::tables::TABLE_ID_TABLES;
     use crate::catalog::tests::{
@@ -1771,10 +2175,10 @@ mod tests {
     };
     use crate::id::{SessionID, TrxID};
     use crate::io::install_storage_backend_test_hook;
-    use crate::lock::tests::{LockDebugEntryState, try_acquire};
-    use crate::lock::{LockMode, LockOwner, LockResource, TableLockMode};
+    use crate::lock::tests::{LockDebugEntryState, debug_snapshot, try_acquire};
+    use crate::lock::{LockMode, LockOwner, LockResource, LockScope, TableLockMode};
     use crate::log::redo::DDLRedo;
-    use crate::session::tests::{SessionTestExt, active_operation_count};
+    use crate::session::tests::{SessionTestExt, active_operation_count, remove_session_for_test};
     use crate::table::TableTerminal;
     use crate::table::tests::*;
     use crate::trx::MAX_SNAPSHOT_TS;
@@ -1795,30 +2199,121 @@ mod tests {
         PoisonBeforeCatalogCommit,
     }
 
-    thread_local! {
-        static CREATE_TABLE_FAILURE: Cell<Option<CreateTableTestFailure>> = const { Cell::new(None) };
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum TableDdlTestPhase {
+        CreateBeforeFirstEffect,
+        CreateFileCreated,
+        CreatePrivateTransactionBegun,
+        CreateCatalogStaged,
+        CreateFilePublished,
+        CreateRuntimeBuilt,
+        CreateCatalogCommitted,
+        CreateRuntimeInstalled,
+        DropBeforeFirstEffect,
+        DropPrivateTransactionBegun,
+        DropLifecycleClosed,
+        DropDrainComplete,
+        DropCatalogStaged,
+        DropCatalogCommitted,
+        DropRuntimeRetained,
     }
 
-    fn set_create_table_failure(failure: Option<CreateTableTestFailure>) {
-        CREATE_TABLE_FAILURE.with(|slot| slot.set(failure));
+    struct TableDdlTestGate {
+        phase: TableDdlTestPhase,
+        entered: flume::Sender<()>,
+        release: flume::Receiver<()>,
     }
 
-    pub(super) fn maybe_fail_create_table(failure: CreateTableTestFailure) -> RuntimeResult<()> {
-        if CREATE_TABLE_FAILURE.with(|slot| slot.get()) == Some(failure) {
-            return Err(Report::new(RuntimeError::CatalogAccess)
-                .attach("operation=test_create_table_phase_failure"));
+    /// Per-engine CREATE/DROP fault controller shared across runtime threads.
+    #[derive(Default)]
+    pub(crate) struct TableDdlTestController {
+        create_failure: parking_lot::Mutex<Option<CreateTableTestFailure>>,
+        panic_phase: parking_lot::Mutex<Option<TableDdlTestPhase>>,
+        gate: parking_lot::Mutex<Option<TableDdlTestGate>>,
+    }
+
+    impl TableDdlTestController {
+        #[inline]
+        fn set_create_failure(&self, failure: Option<CreateTableTestFailure>) {
+            *self.create_failure.lock() = failure;
         }
-        Ok(())
+
+        #[inline]
+        pub(super) fn maybe_fail_create(
+            &self,
+            failure: CreateTableTestFailure,
+        ) -> RuntimeResult<()> {
+            if *self.create_failure.lock() == Some(failure) {
+                return Err(Report::new(RuntimeError::CatalogAccess)
+                    .attach("operation=test_create_table_phase_failure"));
+            }
+            Ok(())
+        }
+
+        #[inline]
+        pub(super) fn maybe_poison_before_create_commit(&self, engine: &EngineRef) {
+            if *self.create_failure.lock()
+                == Some(CreateTableTestFailure::PoisonBeforeCatalogCommit)
+            {
+                let _ = engine
+                    .poisoner
+                    .poison(Report::new(FatalError::Poisoned).attach("forced create-table poison"));
+            }
+        }
+
+        fn install_gate(
+            &self,
+            phase: TableDdlTestPhase,
+        ) -> (flume::Receiver<()>, flume::Sender<()>) {
+            let (entered_tx, entered_rx) = flume::bounded(1);
+            let (release_tx, release_rx) = flume::bounded(1);
+            let previous = self.gate.lock().replace(TableDdlTestGate {
+                phase,
+                entered: entered_tx,
+                release: release_rx,
+            });
+            assert!(
+                previous.is_none(),
+                "table DDL test gate is already installed"
+            );
+            (entered_rx, release_tx)
+        }
+
+        fn set_panic_phase(&self, phase: Option<TableDdlTestPhase>) {
+            *self.panic_phase.lock() = phase;
+        }
+
+        pub(super) async fn reach_phase(&self, phase: TableDdlTestPhase) {
+            let should_panic = {
+                let mut panic_phase = self.panic_phase.lock();
+                if *panic_phase == Some(phase) {
+                    *panic_phase = None;
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_panic {
+                panic!("injected accepted table DDL panic: phase={phase:?}");
+            }
+            let gate = {
+                let mut slot = self.gate.lock();
+                if slot.as_ref().is_some_and(|gate| gate.phase == phase) {
+                    slot.take()
+                } else {
+                    None
+                }
+            };
+            let Some(gate) = gate else {
+                return;
+            };
+            let _ = gate.entered.send_async(()).await;
+            let _ = gate.release.recv_async().await;
+        }
     }
 
-    pub(super) fn maybe_poison_before_create_table_catalog_commit(engine: &EngineRef) {
-        if CREATE_TABLE_FAILURE.with(|slot| slot.get())
-            == Some(CreateTableTestFailure::PoisonBeforeCatalogCommit)
-        {
-            let _ = engine
-                .poisoner
-                .poison(Report::new(FatalError::Poisoned).attach("forced create-table poison"));
-        }
+    fn set_create_table_failure(engine: &Engine, failure: Option<CreateTableTestFailure>) {
+        engine.inner().table_ddl_test.set_create_failure(failure);
     }
 
     fn assert_invalid_metadata(err: Error, expected_message: &str) {
@@ -1844,6 +2339,16 @@ mod tests {
                 PurgeTestEvent::CycleCompleted if dropped_table_started => return,
                 _ => {}
             }
+        }
+    }
+
+    async fn wait_for_table_terminal(table: &Table, expected: TableTerminal) {
+        loop {
+            let changed = table.lifecycle.listener();
+            if table.lifecycle.inspect_terminal() == expected {
+                return;
+            }
+            changed.await;
         }
     }
 
@@ -2665,9 +3170,9 @@ mod tests {
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
             let (table_spec, index_specs) = drop_table_test_spec();
 
-            set_create_table_failure(Some(CreateTableTestFailure::AfterCatalogStaged));
+            set_create_table_failure(&engine, Some(CreateTableTestFailure::AfterCatalogStaged));
             let res = session.create_table(table_spec, index_specs).await;
-            set_create_table_failure(None);
+            set_create_table_failure(&engine, None);
 
             let err = res.unwrap_err();
             assert_eq!(
@@ -2750,9 +3255,9 @@ mod tests {
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
             let (table_spec, index_specs) = drop_table_test_spec();
 
-            set_create_table_failure(Some(CreateTableTestFailure::AfterFilePublished));
+            set_create_table_failure(&engine, Some(CreateTableTestFailure::AfterFilePublished));
             let res = session.create_table(table_spec, index_specs).await;
-            set_create_table_failure(None);
+            set_create_table_failure(&engine, None);
 
             let err = res.unwrap_err();
             assert_eq!(
@@ -2782,9 +3287,9 @@ mod tests {
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
             let (table_spec, index_specs) = drop_table_test_spec();
 
-            set_create_table_failure(Some(CreateTableTestFailure::AfterRuntimeBuilt));
+            set_create_table_failure(&engine, Some(CreateTableTestFailure::AfterRuntimeBuilt));
             let res = session.create_table(table_spec, index_specs).await;
-            set_create_table_failure(None);
+            set_create_table_failure(&engine, None);
 
             let err = res.unwrap_err();
             assert_eq!(
@@ -2814,9 +3319,12 @@ mod tests {
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
             let (table_spec, index_specs) = drop_table_test_spec();
 
-            set_create_table_failure(Some(CreateTableTestFailure::PoisonBeforeCatalogCommit));
+            set_create_table_failure(
+                &engine,
+                Some(CreateTableTestFailure::PoisonBeforeCatalogCommit),
+            );
             let res = session.create_table(table_spec, index_specs).await;
-            set_create_table_failure(None);
+            set_create_table_failure(&engine, None);
 
             let err = res.unwrap_err();
             assert_eq!(
@@ -3380,7 +3888,7 @@ mod tests {
     }
 
     #[test]
-    fn test_drop_table_rejects_runtime_missing_catalog_row_before_gate() {
+    fn test_drop_table_missing_catalog_row_panics_under_mandatory_supervision() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
@@ -3410,17 +3918,88 @@ mod tests {
 
             let mut drop_session = engine.new_session().unwrap();
             let table = table_for_internal_assertion(&engine, table_id);
-            let before = table_ddl_snapshot(&engine, table_id, &table);
             let err = drop_session.drop_table(table_id).await.unwrap_err();
 
             assert_eq!(
-                err.report().downcast_ref::<OperationError>().copied(),
-                Some(OperationError::TableNotFound)
+                err.report().downcast_ref::<FatalError>().copied(),
+                Some(FatalError::MandatoryTaskPanic)
             );
-            assert_table_ddl_snapshot_unchanged(&before, &engine, table_id, &table);
-            assert!(!drop_session.in_trx().unwrap());
-            assert!(engine.inner().poisoner.poison_error().is_none());
+            assert_eq!(
+                engine
+                    .inner()
+                    .poisoner
+                    .poison_error()
+                    .as_ref()
+                    .map(|error| *error.current_context()),
+                Some(FatalError::MandatoryTaskPanic)
+            );
+            assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Dropping);
+            assert_checkpoint_workflow_closed(&table);
             assert!(engine.catalog().get_table(table_id).await.is_some());
+            assert_eq!(active_operation_count(&engine.inner().session_registry), 1);
+            let shutdown_err = engine.try_shutdown().unwrap_err();
+            assert_eq!(
+                shutdown_err
+                    .report()
+                    .downcast_ref::<LifecycleError>()
+                    .copied(),
+                Some(LifecycleError::ShutdownBusy)
+            );
+
+            // FailedRetained deliberately keeps rollback-owned row state alive
+            // and blocks destructive component teardown. This test process is
+            // the final owner of the poisoned synthetic engine.
+            mem::forget((engine, temp_dir, drop_session, table));
+        });
+    }
+
+    #[test]
+    fn test_create_table_execution_panic_before_first_effect_is_supervised() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = engine.catalog().curr_next_table_id();
+            let mut session = engine.new_session().unwrap();
+            let session_id = session.id();
+            let (table_spec, index_specs) = drop_table_test_spec();
+            engine
+                .inner()
+                .table_ddl_test
+                .set_panic_phase(Some(TableDdlTestPhase::CreateBeforeFirstEffect));
+
+            let err = session
+                .create_table(table_spec, index_specs)
+                .await
+                .unwrap_err();
+
+            assert_eq!(
+                err.report().downcast_ref::<FatalError>().copied(),
+                Some(FatalError::MandatoryTaskPanic)
+            );
+            assert_eq!(
+                engine
+                    .inner()
+                    .poisoner
+                    .poison_error()
+                    .as_ref()
+                    .map(|error| *error.current_context()),
+                Some(FatalError::MandatoryTaskPanic)
+            );
+            assert_no_user_table_publication(&engine, table_id);
+            assert!(!Path::new(&engine.inner().table_fs.user_table_file_path(table_id)).exists());
+            assert_eq!(active_operation_count(&engine.inner().session_registry), 1);
+            let shutdown_err = engine.try_shutdown().unwrap_err();
+            assert_eq!(
+                shutdown_err
+                    .report()
+                    .downcast_ref::<LifecycleError>()
+                    .copied(),
+                Some(LifecycleError::ShutdownBusy)
+            );
+
+            remove_session_for_test(&engine.inner().session_registry, session_id);
+            drop(session);
+            engine.shutdown();
         });
     }
 
@@ -3491,6 +4070,8 @@ mod tests {
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
             let table_id = create_table2_for_test(&engine).await;
             let other_table_id = create_table2_for_test(&engine).await;
+            let mut purge_blocker_session = engine.new_session().unwrap();
+            let purge_blocker = purge_blocker_session.begin_trx().unwrap();
             let table = table_for_internal_assertion(&engine, table_id);
             let (root_lease, publish_lease) = begin_checkpoint_publish_for_test(&table);
 
@@ -3500,6 +4081,7 @@ mod tests {
                 futures::poll!(waiting_drop.as_mut()),
                 std::task::Poll::Pending
             ));
+            wait_for_table_terminal(&table, TableTerminal::Dropping).await;
             assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Dropping);
 
             let mut other_session = engine.new_session().unwrap();
@@ -3511,6 +4093,7 @@ mod tests {
             drop(publish_lease);
             drop(table);
             waiting_drop.await.unwrap();
+            purge_blocker.rollback().await.unwrap();
         });
     }
 
@@ -3520,6 +4103,8 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
             let table_id = create_table2_for_test(&engine).await;
+            let mut purge_blocker_session = engine.new_session().unwrap();
+            let purge_blocker = purge_blocker_session.begin_trx().unwrap();
             let table = table_for_internal_assertion(&engine, table_id);
             let (root_lease, publish_lease) = begin_checkpoint_publish_for_test(&table);
 
@@ -3529,6 +4114,7 @@ mod tests {
                 futures::poll!(waiting_drop.as_mut()),
                 std::task::Poll::Pending
             ));
+            wait_for_table_terminal(&table, TableTerminal::Dropping).await;
             assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Dropping);
 
             let mut create_session = engine.new_session().unwrap();
@@ -3554,6 +4140,7 @@ mod tests {
             drop(publish_lease);
             drop(table);
             waiting_drop.await.unwrap();
+            purge_blocker.rollback().await.unwrap();
         });
     }
 
@@ -3563,6 +4150,8 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
             let table_id = create_table2_for_test(&engine).await;
+            let mut purge_blocker_session = engine.new_session().unwrap();
+            let purge_blocker = purge_blocker_session.begin_trx().unwrap();
             let table = table_for_internal_assertion(&engine, table_id);
             let (root_lease, publish_lease) = begin_checkpoint_publish_for_test(&table);
             let mut drop_session = engine.new_session().unwrap();
@@ -3620,41 +4209,270 @@ mod tests {
                 lock_owner,
                 LockResource::TableData(table_id),
             ));
+            purge_blocker.rollback().await.unwrap();
         });
     }
 
     #[test]
-    fn test_abandoned_drop_future_after_terminal_gate_poisons_storage() {
+    fn test_abandoned_create_future_before_first_effect_is_inert() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = engine.catalog().curr_next_table_id();
+            let (entered, release) = engine
+                .inner()
+                .table_ddl_test
+                .install_gate(TableDdlTestPhase::CreateBeforeFirstEffect);
+            let mut create_session = engine.new_session().unwrap();
+            let (table_spec, index_specs) = drop_table_test_spec();
+            let mut create_fut = Box::pin(create_session.create_table(table_spec, index_specs));
+
+            assert!(matches!(
+                futures::poll!(create_fut.as_mut()),
+                std::task::Poll::Pending
+            ));
+            entered.recv_async().await.unwrap();
+            drop(create_fut);
+            release.send_async(()).await.unwrap();
+
+            let mut verify_session = engine.new_session().unwrap();
+            verify_session
+                .lock_table(table_id, TableLockMode::Shared)
+                .await
+                .unwrap();
+            assert!(engine.catalog().get_table_now(table_id).is_some());
+            verify_session.unlock_table(table_id).unwrap();
+            verify_session.drop_table(table_id).await.unwrap();
+            assert!(engine.inner().poisoner.poison_error().is_none());
+        });
+    }
+
+    #[test]
+    fn test_abandoned_drop_future_before_first_effect_is_inert() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
             let table_id = create_table2_for_test(&engine).await;
-            let table = table_for_internal_assertion(&engine, table_id);
-            let (root_lease, publish_lease) = begin_checkpoint_publish_for_test(&table);
+            let (entered, release) = engine
+                .inner()
+                .table_ddl_test
+                .install_gate(TableDdlTestPhase::DropBeforeFirstEffect);
             let mut drop_session = engine.new_session().unwrap();
-            let before = table_ddl_snapshot(&engine, table_id, &table);
             let mut drop_fut = Box::pin(drop_session.drop_table(table_id));
 
             assert!(matches!(
                 futures::poll!(drop_fut.as_mut()),
                 std::task::Poll::Pending
             ));
+            entered.recv_async().await.unwrap();
+            drop(drop_fut);
+            release.send_async(()).await.unwrap();
+
+            let mut verify_session = engine.new_session().unwrap();
+            let err = verify_session
+                .lock_table(table_id, TableLockMode::Shared)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::TableNotFound)
+            );
+            assert!(engine.inner().poisoner.poison_error().is_none());
+        });
+    }
+
+    #[test]
+    fn test_accepted_table_ddl_owns_exact_prepared_lock_sets() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+
+            let create_table_id = engine.catalog().curr_next_table_id();
+            let (create_entered, create_release) = engine
+                .inner()
+                .table_ddl_test
+                .install_gate(TableDdlTestPhase::CreateBeforeFirstEffect);
+            let mut create_session = engine.new_session().unwrap();
+            let create_session_id = create_session.id();
+            let (table_spec, index_specs) = drop_table_test_spec();
+            let mut create_fut = Box::pin(create_session.create_table(table_spec, index_specs));
+            assert!(matches!(
+                futures::poll!(create_fut.as_mut()),
+                std::task::Poll::Pending
+            ));
+            create_entered.recv_async().await.unwrap();
+
+            let create_owner = ddl_lock_owner(
+                &engine,
+                create_session_id,
+                LockResource::TableMetadata(create_table_id),
+            )
+            .expect("accepted CREATE should retain its operation owner");
+            assert_eq!(lock_entry_count(&engine, create_owner), 9);
+            assert!(has_lock_entry(
+                &engine,
+                create_owner,
+                LockResource::TableMetadata(create_table_id),
+                LockMode::Exclusive,
+                LockDebugEntryState::Granted,
+            ));
+            for &catalog_table_id in create_table_catalog_write_targets() {
+                assert!(has_lock_entry(
+                    &engine,
+                    create_owner,
+                    LockResource::TableMetadata(catalog_table_id),
+                    LockMode::Shared,
+                    LockDebugEntryState::Granted,
+                ));
+                assert!(has_lock_entry(
+                    &engine,
+                    create_owner,
+                    LockResource::TableData(catalog_table_id),
+                    LockMode::IntentExclusive,
+                    LockDebugEntryState::Granted,
+                ));
+            }
+            let (create_staged, create_staged_release) = engine
+                .inner()
+                .table_ddl_test
+                .install_gate(TableDdlTestPhase::CreateCatalogStaged);
+            create_release.send_async(()).await.unwrap();
+            create_staged.recv_async().await.unwrap();
+            assert_eq!(lock_entry_count(&engine, create_owner), 9);
+            assert!(
+                debug_snapshot(engine.inner().lock_manager())
+                    .entries
+                    .into_iter()
+                    .filter(|entry| entry.owner.family().session_id() == create_session_id)
+                    .all(|entry| matches!(entry.owner.scope(), LockScope::Operation(_))),
+                "accepted CREATE must not acquire transaction/statement catalog locks"
+            );
+            create_staged_release.send_async(()).await.unwrap();
+            assert_eq!(create_fut.await.unwrap(), create_table_id);
+
+            let (drop_entered, drop_release) = engine
+                .inner()
+                .table_ddl_test
+                .install_gate(TableDdlTestPhase::DropBeforeFirstEffect);
+            let mut drop_session = engine.new_session().unwrap();
+            let drop_session_id = drop_session.id();
+            let mut drop_fut = Box::pin(drop_session.drop_table(create_table_id));
+            assert!(matches!(
+                futures::poll!(drop_fut.as_mut()),
+                std::task::Poll::Pending
+            ));
+            drop_entered.recv_async().await.unwrap();
+
+            let drop_owner = ddl_lock_owner(
+                &engine,
+                drop_session_id,
+                LockResource::TableMetadata(create_table_id),
+            )
+            .expect("accepted DROP should retain its operation owner");
+            assert_eq!(lock_entry_count(&engine, drop_owner), 12);
+            assert!(has_lock_entry(
+                &engine,
+                drop_owner,
+                LockResource::TableMetadata(create_table_id),
+                LockMode::Exclusive,
+                LockDebugEntryState::Granted,
+            ));
+            assert!(has_lock_entry(
+                &engine,
+                drop_owner,
+                LockResource::TableData(create_table_id),
+                LockMode::Exclusive,
+                LockDebugEntryState::Granted,
+            ));
+            for &catalog_table_id in drop_table_catalog_write_targets() {
+                assert!(has_lock_entry(
+                    &engine,
+                    drop_owner,
+                    LockResource::TableMetadata(catalog_table_id),
+                    LockMode::Shared,
+                    LockDebugEntryState::Granted,
+                ));
+                assert!(has_lock_entry(
+                    &engine,
+                    drop_owner,
+                    LockResource::TableData(catalog_table_id),
+                    LockMode::IntentExclusive,
+                    LockDebugEntryState::Granted,
+                ));
+            }
+            let (drop_staged, drop_staged_release) = engine
+                .inner()
+                .table_ddl_test
+                .install_gate(TableDdlTestPhase::DropCatalogStaged);
+            drop_release.send_async(()).await.unwrap();
+            drop_staged.recv_async().await.unwrap();
+            assert_eq!(lock_entry_count(&engine, drop_owner), 12);
+            assert!(
+                debug_snapshot(engine.inner().lock_manager())
+                    .entries
+                    .into_iter()
+                    .filter(|entry| entry.owner.family().session_id() == drop_session_id)
+                    .all(|entry| matches!(entry.owner.scope(), LockScope::Operation(_))),
+                "accepted DROP must not acquire transaction/statement catalog locks"
+            );
+            drop_staged_release.send_async(()).await.unwrap();
+            drop_fut.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_abandoned_drop_future_after_acceptance_is_inert() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut purge_blocker_session = engine.new_session().unwrap();
+            let purge_blocker = purge_blocker_session.begin_trx().unwrap();
+            let table = table_for_internal_assertion(&engine, table_id);
+            let (root_lease, publish_lease) = begin_checkpoint_publish_for_test(&table);
+            let (lifecycle_closed, lifecycle_release) = engine
+                .inner()
+                .table_ddl_test
+                .install_gate(TableDdlTestPhase::DropLifecycleClosed);
+            let mut drop_session = engine.new_session().unwrap();
+            let mut drop_fut = Box::pin(drop_session.drop_table(table_id));
+
+            assert!(matches!(
+                futures::poll!(drop_fut.as_mut()),
+                std::task::Poll::Pending
+            ));
+            lifecycle_closed.recv_async().await.unwrap();
             assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Dropping);
             assert_checkpoint_workflow_closed(&table);
 
             drop(drop_fut);
-            let poison = engine
-                .inner()
-                .poisoner
-                .poison_error()
-                .expect("abandoned terminal drop should poison storage");
-            assert_eq!(*poison.current_context(), FatalError::Poisoned);
-            assert_table_logical_snapshot_unchanged(&before, &engine, table_id);
+            assert!(
+                engine.inner().poisoner.poison_error().is_none(),
+                "dropping the observer must not poison accepted DDL"
+            );
             assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Dropping);
+            lifecycle_release.send_async(()).await.unwrap();
+
+            let mut lock_session = engine.new_session().unwrap();
+            let mut lock_fut = Box::pin(lock_session.lock_table(table_id, TableLockMode::Shared));
+            assert!(matches!(
+                futures::poll!(lock_fut.as_mut()),
+                std::task::Poll::Pending
+            ));
 
             drop(publish_lease);
             drop(root_lease);
             drop(table);
+            let err = lock_fut.await.unwrap_err();
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::TableNotFound)
+            );
+            assert!(
+                engine.inner().poisoner.poison_error().is_none(),
+                "accepted DROP should complete after its observer is dropped"
+            );
+            purge_blocker.rollback().await.unwrap();
             drop(drop_session);
             engine.shutdown();
         });

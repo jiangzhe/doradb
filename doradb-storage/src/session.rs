@@ -1,16 +1,20 @@
 use crate::buffer::page::VersionedPageID;
 use crate::buffer::{BufferPool, PoolGuards};
 use crate::catalog::{
-    CatalogCheckpointOutcome, IndexNo, IndexSpec, TableSpec, create_index_for_session,
-    create_table_for_session, drop_index_for_session, drop_table_for_session,
+    CatalogCheckpointOutcome, DropTablePlan, IndexNo, IndexSpec, PreparedCreateTable,
+    PreparedDropTable, TableSpec, ValidatedCreateTable, create_index_for_session,
+    create_table_catalog_write_targets, drop_index_for_session, drop_table_catalog_write_targets,
+    reject_non_user_table_id,
 };
 use crate::engine::{EngineInner, EngineRef, WeakEngineRef};
 use crate::error::{
     DiscloseError, DiscloseResultExt, FatalError, LifecycleError, LifecycleResult,
-    MultiDomainResultExt, OperationResult, Result,
+    MultiDomainResultExt, OperationError, OperationResult, Result,
 };
 use crate::id::{OperationID, SessionID, SessionOperationKey, TableID, TrxID};
-use crate::lock::{FreshLockGuard, LockManager, LockMode, LockOwner, LockResource, TableLockMode};
+use crate::lock::{
+    FreshLockGuard, LockManager, LockMode, LockOwner, LockResource, OwnerLockState, TableLockMode,
+};
 use crate::map::{FastDashMap, FastHashMap};
 use crate::notify::EventNotifyOnDrop;
 use crate::quiescent::QuiescentGuard;
@@ -23,14 +27,15 @@ use crate::table::{
     MemIndexCleanupOutcome, Table,
 };
 use crate::trx::{
-    ReleasedTransactionLocks, SessionOperationEntry, SessionOperationKind, SessionOperationState,
-    Transaction, TrxInner,
+    PreparedCatalogWriteAuthority, ReleasedTransactionLocks, SessionOperationEntry,
+    SessionOperationKind, SessionOperationState, Transaction, TrxInner,
 };
 use error_stack::{Report, ResultExt};
 use event_listener::EventListener;
 use futures::future::select_all;
 use parking_lot::Mutex;
 use std::cell::Cell;
+use std::mem::replace;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -123,6 +128,247 @@ impl SessionDdlContext {
             pool_guards,
             owner: session.operation_lock_owner(),
         })
+    }
+}
+
+/// Lifetime-free logical-lock scope prepared for one table DDL operation.
+pub(crate) struct PreparedTableDdlLocks {
+    lock_manager: QuiescentGuard<LockManager>,
+    locks: OwnerLockState,
+}
+
+impl PreparedTableDdlLocks {
+    #[inline]
+    fn new(operation: &SessionOperationPin) -> Self {
+        Self {
+            lock_manager: operation.engine.lock_manager().clone(),
+            locks: OwnerLockState::new(operation.operation_lock_owner()),
+        }
+    }
+
+    #[inline]
+    async fn acquire_create(
+        &mut self,
+        table_id: TableID,
+        catalog_targets: &[TableID],
+    ) -> OperationResult<()> {
+        self.locks
+            .acquire(
+                &self.lock_manager,
+                LockResource::TableMetadata(table_id),
+                LockMode::Exclusive,
+            )
+            .await?;
+        for &catalog_table_id in catalog_targets {
+            self.locks
+                .acquire(
+                    &self.lock_manager,
+                    LockResource::TableMetadata(catalog_table_id),
+                    LockMode::Shared,
+                )
+                .await?;
+        }
+        for &catalog_table_id in catalog_targets {
+            self.locks
+                .acquire(
+                    &self.lock_manager,
+                    LockResource::TableData(catalog_table_id),
+                    LockMode::IntentExclusive,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    async fn acquire_drop(
+        &mut self,
+        table_id: TableID,
+        catalog_targets: &[TableID],
+    ) -> OperationResult<()> {
+        self.locks
+            .acquire(
+                &self.lock_manager,
+                LockResource::TableMetadata(table_id),
+                LockMode::Exclusive,
+            )
+            .await?;
+        for &catalog_table_id in catalog_targets {
+            self.locks
+                .acquire(
+                    &self.lock_manager,
+                    LockResource::TableMetadata(catalog_table_id),
+                    LockMode::Shared,
+                )
+                .await?;
+        }
+        self.locks
+            .acquire(
+                &self.lock_manager,
+                LockResource::TableData(table_id),
+                LockMode::Exclusive,
+            )
+            .await?;
+        for &catalog_table_id in catalog_targets {
+            self.locks
+                .acquire(
+                    &self.lock_manager,
+                    LockResource::TableData(catalog_table_id),
+                    LockMode::IntentExclusive,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn catalog_write_authority(&self) -> PreparedCatalogWriteAuthority<'_> {
+        PreparedCatalogWriteAuthority::new(&self.locks)
+    }
+}
+
+impl Drop for PreparedTableDdlLocks {
+    #[inline]
+    fn drop(&mut self) {
+        self.locks.release_all(&self.lock_manager);
+    }
+}
+
+/// Caller-owned DDL preparation transferred atomically at mandatory acceptance.
+///
+/// Lock fields precede the foreground pin so ordinary cancellation releases
+/// grants before publishing the outer foreground terminal edge.
+pub(crate) struct PreparedTableDdlScope {
+    locks: PreparedTableDdlLocks,
+    operation: SessionOperationPin,
+}
+
+impl PreparedTableDdlScope {
+    /// Prepare the fixed CREATE TABLE lock set in canonical resource order.
+    #[inline]
+    pub(crate) async fn create(
+        operation: SessionOperationPin,
+        table_id: TableID,
+        catalog_targets: &[TableID],
+    ) -> OperationResult<Self> {
+        let mut locks = PreparedTableDdlLocks::new(&operation);
+        locks.acquire_create(table_id, catalog_targets).await?;
+        Ok(Self { locks, operation })
+    }
+
+    /// Prepare the fixed DROP TABLE lock set in canonical resource order.
+    #[inline]
+    pub(crate) async fn drop_table(
+        operation: SessionOperationPin,
+        table_id: TableID,
+        catalog_targets: &[TableID],
+    ) -> OperationResult<Self> {
+        let mut locks = PreparedTableDdlLocks::new(&operation);
+        locks.acquire_drop(table_id, catalog_targets).await?;
+        Ok(Self { locks, operation })
+    }
+
+    /// Return the exact operation key carried into mandatory diagnostics.
+    #[inline]
+    pub(crate) fn key(&self) -> SessionOperationKey {
+        self.operation.key()
+    }
+
+    /// Return the retained engine while caller preparation still owns the scope.
+    #[inline]
+    pub(crate) fn engine(&self) -> &EngineRef {
+        &self.operation.engine
+    }
+
+    /// Synchronously consume caller preparation into accepted authority.
+    #[inline]
+    pub(crate) fn accept(self) -> AcceptedTableDdlScope {
+        let Self { locks, operation } = self;
+        AcceptedTableDdlScope {
+            operation: operation.into_mandatory(),
+            locks: Some(locks),
+            finish_state: TableDdlFinishState::Executing,
+        }
+    }
+}
+
+enum TableDdlFinishState {
+    Executing,
+    TerminalReady,
+    FailedRetained,
+}
+
+/// Runtime-owned table-DDL operation and its transferred logical locks.
+pub(crate) struct AcceptedTableDdlScope {
+    operation: MandatoryOperationGuard,
+    locks: Option<PreparedTableDdlLocks>,
+    finish_state: TableDdlFinishState,
+}
+
+impl AcceptedTableDdlScope {
+    /// Return the retained engine runtime.
+    #[inline]
+    pub(crate) fn engine(&self) -> &EngineRef {
+        &self.operation.engine
+    }
+
+    /// Return cloned buffer-pool guards for catalog/table lifecycle work.
+    #[inline]
+    pub(crate) fn pool_guards(&self) -> PoolGuards {
+        self.operation.state.pool_guards().clone()
+    }
+
+    /// Start one mandatory-owned nested private transaction.
+    #[inline]
+    pub(crate) fn begin_private_trx(&self) -> LifecycleResult<Transaction> {
+        self.operation.begin_private_trx()
+    }
+
+    /// Borrow the prepared proof used by catalog statement mutation.
+    #[inline]
+    pub(crate) fn catalog_write_authority(&self) -> PreparedCatalogWriteAuthority<'_> {
+        self.locks
+            .as_ref()
+            .map(PreparedTableDdlLocks::catalog_write_authority)
+            .unwrap_or_else(|| {
+                panic!("accepted table DDL must retain prepared locks during execution")
+            })
+    }
+
+    /// Verify the nested state before returning from accepted execution.
+    #[inline]
+    pub(crate) fn mark_terminal_ready(&mut self) {
+        self.operation.assert_finish_ready();
+        self.finish_state = TableDdlFinishState::TerminalReady;
+    }
+
+    /// Publish normal completion or defensively retain an invalid finish state.
+    #[inline]
+    pub(crate) fn finish(&mut self) {
+        let state = replace(&mut self.finish_state, TableDdlFinishState::FailedRetained);
+        match state {
+            TableDdlFinishState::TerminalReady => {
+                drop(self.locks.take());
+                self.operation.finish();
+            }
+            TableDdlFinishState::Executing => {
+                self.operation.fail_retained();
+                let report = Report::new(FatalError::MandatoryTaskPanic)
+                    .attach("accepted table DDL finished without terminal-ready state");
+                self.operation.engine.poisoner.poison(report);
+                drop(self.locks.take());
+            }
+            TableDdlFinishState::FailedRetained => {
+                drop(self.locks.take());
+            }
+        }
+    }
+
+    /// Retain unsafe nested ownership before the supervisor publishes poison.
+    #[inline]
+    pub(crate) fn handle_panic(&mut self) {
+        self.operation.fail_retained();
+        self.finish_state = TableDdlFinishState::FailedRetained;
     }
 }
 
@@ -443,11 +689,24 @@ impl Session {
         table_spec: TableSpec,
         index_specs: Vec<IndexSpec>,
     ) -> Result<TableID> {
-        let session = self
+        let validated = ValidatedCreateTable::try_new(table_spec, index_specs).disclose()?;
+        let operation = self
             .pin_operation(SessionOperationKind::Ddl)
             .attach("operation=create_table")
             .disclose()?;
-        create_table_for_session(session, table_spec, index_specs).await
+        let mandatory_runtime = operation.engine.mandatory_runtime.clone();
+        let prepared = operation
+            .prepare_create_table(validated)
+            .await
+            .attach("operation=create_table")
+            .disclose()?;
+        let observer = mandatory_runtime
+            .submit(prepared)
+            .await
+            .attach("operation=create_table")
+            .disclose()?;
+        drop(mandatory_runtime);
+        observer.wait().await
     }
 
     /// Build and publish a new secondary index for an existing user table.
@@ -477,11 +736,24 @@ impl Session {
     /// Logically drop an existing user table.
     #[inline]
     pub async fn drop_table(&mut self, table_id: TableID) -> Result<()> {
-        let session = self
+        reject_non_user_table_id(table_id, "drop_table").disclose()?;
+        let operation = self
             .pin_operation(SessionOperationKind::Ddl)
             .attach("operation=drop_table")
             .disclose()?;
-        drop_table_for_session(session, table_id).await
+        let mandatory_runtime = operation.engine.mandatory_runtime.clone();
+        let prepared = operation
+            .prepare_drop_table(table_id)
+            .await
+            .attach("operation=drop_table")
+            .disclose()?;
+        let observer = mandatory_runtime
+            .submit(prepared)
+            .await
+            .attach("operation=drop_table")
+            .disclose()?;
+        drop(mandatory_runtime);
+        observer.wait().await
     }
 
     /// Run one online catalog checkpoint.
@@ -931,16 +1203,13 @@ impl SessionOperationPin {
     }
 
     /// Consume voluntary authority at the exact mandatory ownership handoff.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Phase 1 proves production handoff with synthetic adapters"
-        )
-    )]
+    ///
+    /// The lifecycle slot remains `Active` with this same entry; only the
+    /// entry's owner label changes from voluntary to mandatory. No later
+    /// operation can replace that active identity before terminal publication.
     #[inline]
     pub(crate) fn into_mandatory(mut self) -> MandatoryOperationGuard {
-        self.state.accept_mandatory(self.key());
+        self.state.accept_mandatory(&self.entry);
         self.armed = false;
         MandatoryOperationGuard {
             engine: self.engine.clone(),
@@ -953,29 +1222,47 @@ impl SessionOperationPin {
     /// Starts one private transaction inside this DDL or maintenance operation.
     #[inline]
     pub(crate) fn begin_private_trx(&self) -> LifecycleResult<Transaction> {
-        let kind = self.kind();
-        assert!(
-            matches!(
-                kind,
-                SessionOperationKind::Ddl | SessionOperationKind::Maintenance
-            ),
-            "private transaction requires DDL or maintenance authority: key={}, kind={}",
-            self.key(),
-            kind.label()
-        );
-        let inner = Box::new(TrxInner::private());
-        Ok(self
-            .engine
-            .trx_sys
-            .begin_trx(
-                &self.engine,
-                &self.state,
-                self.key(),
-                kind,
-                Some(&self.entry),
-                inner,
-            )
-            .handle)
+        begin_private_transaction(&self.engine, &self.entry)
+    }
+
+    /// Prepare CREATE TABLE while consuming this foreground operation.
+    async fn prepare_create_table(
+        self,
+        validated: ValidatedCreateTable,
+    ) -> OperationResult<PreparedCreateTable> {
+        let table_id = self.engine.catalog().next_table_id();
+        let plan = validated.into_plan(table_id);
+        let scope =
+            PreparedTableDdlScope::create(self, table_id, create_table_catalog_write_targets())
+                .await
+                .attach_with(|| format!("prepare CREATE TABLE locks: table_id={table_id}"))?;
+        Ok(PreparedCreateTable::new(scope, plan))
+    }
+
+    /// Prepare DROP TABLE while consuming this foreground operation.
+    async fn prepare_drop_table(self, table_id: TableID) -> OperationResult<PreparedDropTable> {
+        let owner = self.operation_lock_owner();
+        self.engine
+            .lock_manager()
+            .reject_table_ddl_explicit_session_lock(table_id, owner)
+            .attach("prepare DROP TABLE explicit-session-lock check")?;
+        let scope =
+            PreparedTableDdlScope::drop_table(self, table_id, drop_table_catalog_write_targets())
+                .await
+                .attach_with(|| format!("prepare DROP TABLE locks: table_id={table_id}"))?;
+        let table = scope
+            .engine()
+            .catalog()
+            .current_live_user_table(table_id)
+            .ok_or_else(|| {
+                Report::new(OperationError::TableNotFound).attach(format!(
+                    "drop table current-live lookup: table_id={table_id}"
+                ))
+            })?;
+        Ok(PreparedDropTable::new(
+            scope,
+            DropTablePlan::new(table_id, table),
+        ))
     }
 
     /// Resolve a live user table from authoritative current catalog state.
@@ -1053,49 +1340,56 @@ impl Drop for SessionOperationPin {
 }
 
 /// Sole terminal authority for one accepted session operation.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Phase 1 proves production handoff with synthetic adapters"
-    )
-)]
+///
+/// `state` coordinates session-wide disposition, observation, and terminal
+/// slot publication. `entry` is the exact operation retained by that slot.
+/// The slot identity stays stable while this guard is armed, although close or
+/// abandonment may still change lifecycle disposition or install listeners.
+/// Nested private-transaction state can therefore move directly through
+/// `entry` without locking the outer lifecycle.
 pub(crate) struct MandatoryOperationGuard {
     engine: EngineRef,
     state: Arc<SessionState>,
+    /// Intentionally redundant with the `Arc` retained by `Active(entry)`.
+    ///
+    /// This direct reference is the guard's exact operation authority. It
+    /// avoids lifecycle relookup and lets nested transaction state move through
+    /// the stable entry without taking the outer lifecycle lock.
     entry: Arc<SessionOperationEntry>,
     armed: bool,
 }
 
 impl MandatoryOperationGuard {
     /// Return the accepted operation key.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Phase 1 proves production handoff with synthetic adapters"
-        )
-    )]
     #[inline]
     pub(crate) fn key(&self) -> SessionOperationKey {
         self.entry.key()
     }
 
+    /// Starts one private transaction owned by accepted mandatory execution.
+    ///
+    /// Mandatory ownership keeps the active slot bound to `entry`, so private
+    /// installation needs only the entry mutex rather than the lifecycle lock.
+    #[inline]
+    pub(crate) fn begin_private_trx(&self) -> LifecycleResult<Transaction> {
+        begin_private_transaction(&self.engine, &self.entry)
+    }
+
+    /// Verify that accepted execution settled every nested transaction.
+    ///
+    /// This assertion-bearing check must run only from `AcceptedExecution::execute`.
+    #[inline]
+    pub(crate) fn assert_finish_ready(&self) {
+        self.entry.assert_mandatory_finish_ready();
+    }
+
     /// Publish normal terminal state after transferred resources are released.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Phase 1 proves production handoff with synthetic adapters"
-        )
-    )]
     #[inline]
     pub(crate) fn finish(&mut self) {
-        assert!(
-            self.armed,
-            "mandatory operation guard finishes exactly once"
-        );
-        let remove_from_registry = self.state.finish_mandatory(self.key());
+        if !self.armed {
+            return;
+        }
+        let remove_from_registry = self.state.finish_mandatory(&self.entry);
         self.engine
             .session_registry
             .remove_if_requested(self.key().session_id(), remove_from_registry);
@@ -1103,20 +1397,13 @@ impl MandatoryOperationGuard {
     }
 
     /// Publish retained fatal state after domain-specific panic handling.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Phase 1 proves production handoff with synthetic adapters"
-        )
-    )]
     #[inline]
     pub(crate) fn fail_retained(&mut self) {
         if !self.armed {
             return;
         }
         self.armed = false;
-        self.state.fail_mandatory_retained(self.key());
+        self.state.fail_mandatory_retained(&self.entry);
     }
 }
 
@@ -1139,7 +1426,7 @@ impl Drop for MandatoryOperationGuard {
             return;
         }
         self.armed = false;
-        self.state.fail_mandatory_retained(self.key());
+        self.state.fail_mandatory_retained(&self.entry);
         let report = Report::new(FatalError::MandatoryTaskPanic).attach(format!(
             "mandatory operation authority dropped unexpectedly: operation_key={}",
             self.key()
@@ -1553,17 +1840,10 @@ impl SessionState {
                 self.id
             )
         });
-        let started = engine.trx_sys.begin_trx(
-            engine,
-            self,
-            key,
-            SessionOperationKind::PublicTransaction,
-            None,
-            inner,
-        );
+        let (trx, entry) = engine.trx_sys.begin_public_trx(engine, key, inner);
         lifecycle.advance_operation_id();
-        lifecycle.slot = SessionOperationSlot::Active(Arc::clone(&started.entry));
-        Ok(started.handle)
+        lifecycle.slot = SessionOperationSlot::Active(entry);
+        Ok(trx)
     }
 
     /// Recycle a cached public core or directly drop an ephemeral private core.
@@ -1679,39 +1959,29 @@ impl SessionState {
         (remove_from_registry, release.cleanup)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Phase 1 proves production handoff with synthetic adapters"
-        )
-    )]
+    /// Transfer the retained active entry to mandatory ownership.
+    ///
+    /// `entry` is pointer-identical to the lifecycle slot entry by reservation
+    /// and pin construction. The lifecycle lock serializes the ownership edge
+    /// and notification; it is not used to resolve the entry again.
     #[inline]
-    fn accept_mandatory(&self, key: SessionOperationKey) {
+    fn accept_mandatory(&self, entry: &Arc<SessionOperationEntry>) {
         let lifecycle = self.lifecycle.lock();
-        let entry = lifecycle.active_entry(key).unwrap_or_else(|| {
-            panic!("mandatory acceptance requires exact active operation: operation_key={key}")
-        });
         entry.accept_mandatory();
         let notify = lifecycle.change_ev.clone();
         drop(lifecycle);
         Self::notify_operation_change(notify);
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Phase 1 proves production handoff with synthetic adapters"
-        )
-    )]
+    /// Publish the retained mandatory entry and its outer slot atomically.
+    ///
+    /// The armed guard supplies the same entry still stored in `Active`. The
+    /// lifecycle lock orders entry publication with concurrent close or
+    /// abandonment before changing the slot to `Idle` or `Closed`.
     #[inline]
-    fn finish_mandatory(&self, key: SessionOperationKey) -> bool {
+    fn finish_mandatory(&self, entry: &Arc<SessionOperationEntry>) -> bool {
         let mut lifecycle = self.lifecycle.lock();
-        let entry = lifecycle.active_entry(key).cloned().unwrap_or_else(|| {
-            panic!("mandatory completion requires exact active operation: operation_key={key}")
-        });
-        entry.finish_mandatory();
+        entry.publish_mandatory_terminal();
         let remove_from_registry = lifecycle.finalize_terminal();
         let notify = lifecycle.change_ev.clone();
         drop(lifecycle);
@@ -1722,19 +1992,11 @@ impl SessionState {
         remove_from_registry
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Phase 1 proves production handoff with synthetic adapters"
-        )
-    )]
+    /// Retain failure on the same stable entry while notifying lifecycle waiters.
     #[inline]
-    fn fail_mandatory_retained(&self, key: SessionOperationKey) {
+    fn fail_mandatory_retained(&self, entry: &Arc<SessionOperationEntry>) {
         let lifecycle = self.lifecycle.lock();
-        if let Some(entry) = lifecycle.active_entry(key) {
-            entry.fail_mandatory_retained();
-        }
+        entry.fail_mandatory_retained();
         let notify = lifecycle.change_ev.clone();
         drop(lifecycle);
         Self::notify_operation_change(notify);
@@ -2033,8 +2295,10 @@ impl SessionDisposition {
     }
 }
 
+/// Registry-visible ownership slot for one session's effectful operation.
 enum SessionOperationSlot {
     Idle,
+    /// Exact active entry, stable until its terminal lifecycle publication.
     Active(Arc<SessionOperationEntry>),
     Closed,
 }
@@ -2213,6 +2477,26 @@ impl TrxAttachment {
     pub(crate) fn notify_operation_transition(&self) {
         self.session.notify_operation_transition(self.operation_key);
     }
+}
+
+/// Starts one private transaction under an existing DDL or maintenance owner.
+#[inline]
+fn begin_private_transaction(
+    engine: &EngineRef,
+    entry: &Arc<SessionOperationEntry>,
+) -> LifecycleResult<Transaction> {
+    let kind = entry.kind();
+    assert!(
+        matches!(
+            kind,
+            SessionOperationKind::Ddl | SessionOperationKind::Maintenance
+        ),
+        "private transaction requires DDL or maintenance authority: key={}, kind={}",
+        entry.key(),
+        kind.label()
+    );
+    let inner = Box::new(TrxInner::private());
+    Ok(engine.trx_sys.begin_private_trx(engine, entry, inner))
 }
 
 async fn wait_for_checkpoint_retry_in_operation(
@@ -3452,6 +3736,7 @@ pub(crate) mod tests {
                 entry.inspect().state,
                 SessionOperationState::Mandatory(None)
             );
+            mandatory.assert_finish_ready();
             mandatory.finish();
             assert_eq!(entry.inspect().state, SessionOperationState::Terminal);
             drop(mandatory);

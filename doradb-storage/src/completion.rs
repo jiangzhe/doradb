@@ -12,13 +12,6 @@ use event_listener::{Event, listener};
 use parking_lot::Mutex;
 use std::mem::replace;
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "exclusive take is reserved for prepared mandatory adapters"
-    )
-)]
 enum CompletionState<T> {
     Running,
     Completed(CompletionResult<T>),
@@ -26,13 +19,6 @@ enum CompletionState<T> {
 }
 
 /// Result of an exclusive completion take attempt.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "exclusive take is reserved for prepared mandatory adapters"
-    )
-)]
 pub(crate) enum CompletionTake<T> {
     /// The producer has not completed yet.
     Pending,
@@ -109,13 +95,6 @@ impl<T> Completion<T> {
     }
 
     /// Exclusively moves the terminal result out of this completion.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "exclusive take is reserved for prepared mandatory adapters"
-        )
-    )]
     #[inline]
     pub(crate) fn try_take_result(&self) -> CompletionTake<T> {
         let mut state = self.state.lock();
@@ -130,13 +109,6 @@ impl<T> Completion<T> {
     }
 
     /// Waits for and exclusively moves the terminal result.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "exclusive take is reserved for prepared mandatory adapters"
-        )
-    )]
     #[inline]
     pub(crate) async fn wait_take_result(&self) -> CompletionResult<T> {
         loop {

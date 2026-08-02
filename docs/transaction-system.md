@@ -267,17 +267,30 @@ DDL and maintenance start private transactions through their already-reserved
 operation authority. A private transaction allocates a new `TrxID` and boxed
 core but inherits the outer operation key, installs that box in the same entry
 mutex, and does not replace the active slot. While the outer foreground
-authority remains attached, `ForegroundRunning(Some(InternalTrxState))`
+authority remains attached, `Voluntary(Some(InternalTrxState))`
 records the private transaction's available, checked-out, cleanup, or
 completion position. Public transactions use the outer operation states
 directly and therefore use
-`ForegroundRunning(None)` only while checked out. A private transaction's terminal
-callback clears the child and returns the entry to `ForegroundRunning(None)`;
-only dropping the outer foreground authority can publish the operation terminal
-and return an open session to idle. One outer operation may run sequential
-private transactions, so the entry's optional `TrxID` changes only at
-installation and terminal completion while remaining protected by that same
-mutex.
+`Voluntary(None)` only while checked out.
+
+Accepted table DDL transfers the same entry to `Mandatory(None)` before the
+runtime task is detached. Its nested catalog transaction follows
+`Mandatory(None) -> Mandatory(Some(Available)) ->
+Mandatory(Some(Running)) -> Mandatory(Some(Available))`; commit or rollback
+claims `Mandatory(Some(Completing))` and clears the child back to
+`Mandatory(None)`. That child terminal edge never publishes the outer
+operation terminal. Successful accepted execution first proves the exact empty
+mandatory state, releases its complete prepared lock scope, and consumes that
+proof to publish `Terminal`. A supervised unwind moves any still-owned nested
+state to `FailedRetained`; this remains registry-visible and blocks shutdown
+instead of exposing an idle session or scheduling competing abandoned cleanup.
+
+Unmigrated index DDL and maintenance retain the voluntary private-transaction
+path. Their private terminal callback clears the child and returns the entry to
+`Voluntary(None)`; only dropping the outer foreground authority publishes the
+operation terminal and returns an open session to idle. One outer operation
+may run sequential private transactions, so the entry's optional `TrxID`
+changes only at installation and terminal completion under that same mutex.
 
 After explicit rollback claims terminal ownership and publishes `RollingBack`,
 the claimed transaction core, undo buffers, locks, and session cleanup
@@ -381,18 +394,23 @@ guards, table/layout owners, and logical locks, and then sleeps. This lets
 same-table DROP acquire metadata X and publish terminal lifecycle state; the
 listener carries that change into the next bounded recheck.
 
-`CREATE TABLE` allocates a distinct id and then holds `TableMetadata(X)` for
-that id while it creates the deterministic table file, stages catalog rows,
-builds the per-id runtime, commits the catalog transaction, and publishes the
-current history/runtime entry. The initial table-file root uses the create
-transaction STS as `root_ts`. Keeping metadata X through current publication
-prevents first touch from observing a partially published table.
+`CREATE TABLE` validates metadata before reservation, allocates a distinct
+gap-tolerant id, and caller-prepares target metadata X plus metadata-S/data-IX
+authority for the four catalog tables it writes. Mandatory acceptance then
+owns those locks while it creates the deterministic table file, runs its nested
+catalog transaction without further manager acquisition, builds the per-id
+runtime, commits, and publishes the current history/runtime entry. The initial
+table-file root uses the create transaction STS as `root_ts`.
 
-`DROP TABLE` prechecks the id-only runtime and catalog row, acquires
-`TableMetadata(X)` followed by `TableData(X)`, and then revalidates the target
-under those table-local locks before crossing the terminal lifecycle gate. A
-drop that waits for an already-admitted checkpoint publisher therefore does
-not delay CREATE or DROP for unrelated table ids. Transaction and statement
+`DROP TABLE` rejects non-user ids and same-session explicit target locks before
+waiting, then caller-prepares target metadata/data X plus metadata-S/data-IX
+authority for all five cascade catalog tables. Under target exclusion it
+selects the exact current-live `Arc<Table>` without an extra catalog-row scan.
+Mandatory execution begins the nested transaction, closes and drains the
+terminal lifecycle, performs the catalog cascade, commits, and publishes
+dropped-runtime/replay-floor retention. A drop waiting for an already-admitted
+checkpoint publisher therefore does not delay CREATE or DROP for unrelated
+table ids when runner capacity is available. Transaction and statement
 rollback drop their operation-local table caches and transaction bindings
 before releasing the logical locks that authorize those runtime owners.
 CREATE INDEX and DROP INDEX also take same-table `TableMetadata(X)`. That grant

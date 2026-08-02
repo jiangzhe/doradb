@@ -5,7 +5,7 @@ use crate::error::{
     CompletionErrorBridge, CompletionResult, ConfigError, ConfigResult, DiscloseError, FatalError,
     LifecycleError, LifecycleResult, Result, RuntimeError, RuntimeResult, SharedFatalError,
 };
-use crate::id::SessionOperationKey;
+use crate::id::{SessionOperationKey, TableID};
 use crate::obs;
 use crate::poison::EnginePoisoner;
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
@@ -28,13 +28,6 @@ use std::thread::JoinHandle;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MandatoryTaskClass {
     /// Caller-submitted DDL or maintenance operation.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Phase 1 proves caller operation adapters synthetically"
-        )
-    )]
     Operation,
     /// Engine-internal transaction cleanup obligation.
     TransactionCleanup,
@@ -56,6 +49,7 @@ pub(crate) struct MandatoryTaskMetadata {
     class: MandatoryTaskClass,
     label: &'static str,
     session_operation: Option<SessionOperationKey>,
+    table_id: Option<TableID>,
 }
 
 impl MandatoryTaskMetadata {
@@ -76,6 +70,22 @@ impl MandatoryTaskMetadata {
             class: MandatoryTaskClass::Operation,
             label,
             session_operation,
+            table_id: None,
+        }
+    }
+
+    /// Build caller table-DDL metadata.
+    #[inline]
+    pub(crate) const fn table_operation(
+        label: &'static str,
+        session_operation: SessionOperationKey,
+        table_id: TableID,
+    ) -> Self {
+        Self {
+            class: MandatoryTaskClass::Operation,
+            label,
+            session_operation: Some(session_operation),
+            table_id: Some(table_id),
         }
     }
 
@@ -89,17 +99,20 @@ impl MandatoryTaskMetadata {
             class: MandatoryTaskClass::TransactionCleanup,
             label,
             session_operation,
+            table_id: None,
         }
     }
 
     #[inline]
     fn diagnostic(&self) -> String {
         format!(
-            "task_class={}, task_label={}, session_operation={}",
+            "task_class={}, task_label={}, session_operation={}, table_id={}",
             self.class.label(),
             self.label,
             self.session_operation
-                .map_or_else(|| "none".to_owned(), |key| key.to_string())
+                .map_or_else(|| "none".to_owned(), |key| key.to_string()),
+            self.table_id
+                .map_or_else(|| "none".to_owned(), |table_id| table_id.to_string())
         )
     }
 }
@@ -110,13 +123,6 @@ struct MandatoryAdmissionState {
 }
 
 struct MandatoryAdmission {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Phase 1 proves caller operation adapters synthetically"
-        )
-    )]
     limit: usize,
     state: Mutex<MandatoryAdmissionState>,
     changed: Event,
@@ -135,13 +141,6 @@ impl MandatoryAdmission {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Phase 1 proves caller operation adapters synthetically"
-        )
-    )]
     async fn acquire(
         &self,
         runtime: QuiescentGuard<MandatoryRuntime>,
@@ -165,13 +164,6 @@ impl MandatoryAdmission {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Phase 1 proves caller operation adapters synthetically"
-        )
-    )]
     #[inline]
     fn release(&self) {
         let mut state = self.state.lock();
@@ -210,13 +202,6 @@ impl MandatoryAdmission {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Phase 1 proves caller operation adapters synthetically"
-    )
-)]
 struct MandatoryPermit {
     runtime: Option<QuiescentGuard<MandatoryRuntime>>,
 }
@@ -318,13 +303,6 @@ impl Drop for MandatoryInternalPermit {
 }
 
 /// Completely caller-prepared execution awaiting mandatory admission.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Phase 1 defines the Phase 2 production adapter boundary"
-    )
-)]
 pub(crate) trait PreparedExecution: Send + 'static {
     /// Terminal output delivered to the sole observer.
     type Output: Send + 'static;
@@ -342,13 +320,6 @@ pub(crate) trait PreparedExecution: Send + 'static {
 }
 
 /// Accepted execution whose resources remain outside its panic-caught future.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Phase 1 defines the Phase 2 production adapter boundary"
-    )
-)]
 pub(crate) trait AcceptedExecution: Send + 'static {
     /// Terminal output delivered to the sole observer.
     type Output: Send + 'static;
@@ -396,26 +367,12 @@ pub(crate) trait MandatoryInternalTask: Send + 'static {
     fn publish_panic(&mut self, error: CompletionErrorBridge);
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Phase 1 proves caller operation adapters synthetically"
-    )
-)]
 enum ObservationState {
     Attached,
     Detached,
     Consumed,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Phase 1 proves caller operation adapters synthetically"
-    )
-)]
 struct MandatoryCompletion<T> {
     completion: Completion<T>,
     observation: Mutex<ObservationState>,
@@ -424,13 +381,6 @@ struct MandatoryCompletion<T> {
 
 impl<T> MandatoryCompletion<T> {
     #[inline]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Phase 1 proves caller operation adapters synthetically"
-        )
-    )]
     fn endpoints(
         metadata: MandatoryTaskMetadata,
     ) -> (CompletionProducer<T>, CompletionObserver<T>) {
@@ -447,13 +397,6 @@ impl<T> MandatoryCompletion<T> {
         )
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Phase 1 proves caller operation adapters synthetically"
-        )
-    )]
     #[inline]
     fn handle_unobserved(&self, result: CompletionResult<T>) {
         match result {
@@ -468,25 +411,16 @@ impl<T> MandatoryCompletion<T> {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Phase 1 proves caller operation adapters synthetically"
-    )
-)]
 struct CompletionProducer<T> {
     inner: Arc<MandatoryCompletion<T>>,
 }
 
 impl<T> CompletionProducer<T> {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Phase 1 proves caller operation adapters synthetically"
-        )
-    )]
+    #[inline]
+    fn metadata(&self) -> &MandatoryTaskMetadata {
+        &self.inner.metadata
+    }
+
     #[inline]
     fn complete(self, result: CompletionResult<T>) {
         let observation = self.inner.observation.lock();
@@ -513,13 +447,6 @@ impl<T> CompletionProducer<T> {
 }
 
 /// Sole, execution-inert observer for one mandatory caller operation.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Phase 1 proves caller operation adapters synthetically"
-    )
-)]
 pub(crate) struct CompletionObserver<T> {
     inner: Arc<MandatoryCompletion<T>>,
     armed: bool,
@@ -527,13 +454,6 @@ pub(crate) struct CompletionObserver<T> {
 
 impl<T> CompletionObserver<T> {
     /// Wait for the mandatory task and disclose its terminal result.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Phase 1 proves caller operation adapters synthetically"
-        )
-    )]
     #[inline]
     pub(crate) async fn wait(mut self) -> Result<T> {
         let result = self.inner.completion.wait_take_result().await;
@@ -849,141 +769,124 @@ impl MandatoryRuntimeWorkersOwned {
     }
 }
 
-/// Submit a fully prepared caller operation.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Phase 1 proves caller operation adapters synthetically"
-    )
-)]
-pub(crate) async fn submit<E>(
-    runtime: &QuiescentGuard<MandatoryRuntime>,
-    prepared: E,
-) -> LifecycleResult<CompletionObserver<E::Output>>
-where
-    E: PreparedExecution,
-{
-    let poison_listener = runtime.poisoner.listener();
-    if let Err(error) = runtime.poisoner.ensure_healthy() {
-        runtime.admission.close();
-        return Err(error
-            .change_context(LifecycleError::RuntimeUnavailable)
-            .attach("phase=mandatory_admission_health_check"));
-    }
-    let acquire = runtime.admission.acquire(runtime.clone());
-    futures::pin_mut!(acquire);
-    futures::pin_mut!(poison_listener);
-    let permit = match select(acquire, poison_listener).await {
-        Either::Left((result, _)) => result?,
-        Either::Right((_, _)) => {
-            runtime.admission.close();
-            return Err(runtime
-                .poisoner
-                .ensure_healthy()
-                .expect_err("poison event requires a published fatal reason")
-                .change_context(LifecycleError::RuntimeUnavailable)
-                .attach("phase=mandatory_admission_poison_wake"));
-        }
-    };
-    // Winning admission is the poison-race linearization point. A later
-    // poison does not cancel work that is already admitted and accounted.
-    let metadata = prepared.metadata();
-    let (producer, observer) = MandatoryCompletion::endpoints(metadata.clone());
-
-    // No await or expected rejection exists below this ownership edge.
-    let accepted = prepared.accept();
-    let task_runtime = runtime.clone();
-    runtime
-        .executor
-        .spawn(supervise_accepted(
-            task_runtime,
-            accepted,
-            producer,
-            metadata,
-            permit,
-        ))
-        .detach();
-    Ok(observer)
-}
-
-/// Synchronously submit an existing internal correctness obligation.
-#[inline]
-pub(crate) fn submit_internal<J>(
-    runtime: &QuiescentGuard<MandatoryRuntime>,
-    job: J,
-) -> StdResult<(), J>
-where
-    J: MandatoryInternalTask,
-{
-    let Some(permit) = runtime.internal_admission.try_acquire(runtime.clone()) else {
-        return Err(job);
-    };
-    let metadata = job.metadata();
-    let task_runtime = runtime.clone();
-    runtime
-        .executor
-        .spawn(supervise_internal(task_runtime, job, metadata, permit))
-        .detach();
-    Ok(())
-}
-
-/// Supervise one accepted caller operation through terminal publication.
-///
-/// The accepted owner remains outside the unwind-caught borrowed execution
-/// future. Normal finish and panic policy methods are non-unwinding by
-/// contract. The owner drops before its permit releases caller capacity.
-async fn supervise_accepted<A>(
-    runtime: QuiescentGuard<MandatoryRuntime>,
-    mut accepted: A,
-    producer: CompletionProducer<A::Output>,
-    metadata: MandatoryTaskMetadata,
-    permit: MandatoryPermit,
-) where
-    A: AcceptedExecution,
-{
-    let outcome = AssertUnwindSafe(async { accepted.execute().await })
-        .catch_unwind()
-        .await;
-    match outcome {
-        Ok(result) => {
-            accepted.finish();
-            producer.complete(result);
-        }
-        Err(panic) => {
-            let error = accepted.handle_panic(panic).await;
-            runtime.poison_mandatory_panic(&metadata);
-            producer.complete(Err::<A::Output, _>(error));
-        }
-    }
-    drop(accepted);
-    drop(permit);
-}
-
-/// Supervise one engine-internal obligation through terminal handling.
-///
-/// Only the borrowed run future is unwind-caught. Preservation and panic
-/// publication are non-unwinding by contract. The job drops before its
-/// permit publishes internal-admission drain progress.
-async fn supervise_internal<J>(
-    runtime: QuiescentGuard<MandatoryRuntime>,
-    mut job: J,
-    metadata: MandatoryTaskMetadata,
-    permit: MandatoryInternalPermit,
-) where
-    J: MandatoryInternalTask,
-{
-    if AssertUnwindSafe(async { job.run().await })
-        .catch_unwind()
-        .await
-        .is_err()
+impl QuiescentGuard<MandatoryRuntime> {
+    /// Submit a fully prepared caller operation.
+    pub(crate) async fn submit<E>(
+        &self,
+        prepared: E,
+    ) -> LifecycleResult<CompletionObserver<E::Output>>
+    where
+        E: PreparedExecution,
     {
-        job.preserve_after_panic();
-        let fatal = runtime.poison_mandatory_panic(&metadata);
-        job.publish_panic(fatal.into_completion_bridge());
+        let poison_listener = self.poisoner.listener();
+        if let Err(error) = self.poisoner.ensure_healthy() {
+            self.admission.close();
+            return Err(error
+                .change_context(LifecycleError::RuntimeUnavailable)
+                .attach("phase=mandatory_admission_health_check"));
+        }
+        let acquire = self.admission.acquire(self.clone());
+        futures::pin_mut!(acquire);
+        futures::pin_mut!(poison_listener);
+        let permit = match select(acquire, poison_listener).await {
+            Either::Left((result, _)) => result?,
+            Either::Right((_, _)) => {
+                self.admission.close();
+                return Err(self
+                    .poisoner
+                    .ensure_healthy()
+                    .expect_err("poison event requires a published fatal reason")
+                    .change_context(LifecycleError::RuntimeUnavailable)
+                    .attach("phase=mandatory_admission_poison_wake"));
+            }
+        };
+        // Winning admission is the poison-race linearization point. A later
+        // poison does not cancel work that is already admitted and accounted.
+        let metadata = prepared.metadata();
+        let (producer, observer) = MandatoryCompletion::endpoints(metadata);
+
+        // No await or expected rejection exists below this ownership edge.
+        let accepted = prepared.accept();
+        let task_runtime = self.clone();
+        self.executor
+            .spawn(task_runtime.supervise_accepted(accepted, producer, permit))
+            .detach();
+        Ok(observer)
     }
-    drop(job);
-    drop(permit);
+
+    /// Synchronously submit an existing internal correctness obligation.
+    #[inline]
+    pub(crate) fn submit_internal<J>(&self, job: J) -> StdResult<(), J>
+    where
+        J: MandatoryInternalTask,
+    {
+        let Some(permit) = self.internal_admission.try_acquire(self.clone()) else {
+            return Err(job);
+        };
+        let metadata = job.metadata();
+        let task_runtime = self.clone();
+        self.executor
+            .spawn(task_runtime.supervise_internal(job, metadata, permit))
+            .detach();
+        Ok(())
+    }
+
+    /// Supervise one accepted caller operation through terminal publication.
+    ///
+    /// The accepted owner remains outside the unwind-caught borrowed execution
+    /// future. Normal finish and panic policy methods are non-unwinding by
+    /// contract. The owner drops before its permit releases caller capacity.
+    async fn supervise_accepted<A>(
+        self,
+        mut accepted: A,
+        producer: CompletionProducer<A::Output>,
+        permit: MandatoryPermit,
+    ) where
+        A: AcceptedExecution,
+    {
+        let outcome = AssertUnwindSafe(async { accepted.execute().await })
+            .catch_unwind()
+            .await;
+        match outcome {
+            Ok(result) => {
+                accepted.finish();
+                producer.complete(result);
+            }
+            Err(panic) => {
+                let error = accepted.handle_panic(panic).await;
+                self.poison_mandatory_panic(producer.metadata());
+                producer.complete(Err::<A::Output, _>(error));
+            }
+        }
+        drop(accepted);
+        drop(permit);
+    }
+
+    /// Supervise one engine-internal obligation through terminal handling.
+    ///
+    /// Only the borrowed run future is unwind-caught. Preservation and panic
+    /// publication are non-unwinding by contract. The job drops before its
+    /// permit publishes internal-admission drain progress.
+    async fn supervise_internal<J>(
+        self,
+        mut job: J,
+        metadata: MandatoryTaskMetadata,
+        permit: MandatoryInternalPermit,
+    ) where
+        J: MandatoryInternalTask,
+    {
+        if AssertUnwindSafe(async { job.run().await })
+            .catch_unwind()
+            .await
+            .is_err()
+        {
+            job.preserve_after_panic();
+            let fatal = self.poison_mandatory_panic(&metadata);
+            job.publish_panic(fatal.into_completion_bridge());
+        }
+        drop(job);
+        drop(permit);
+    }
 }
 
 #[cfg(test)]
@@ -1243,15 +1146,13 @@ mod tests {
             let moves = Arc::new(AtomicUsize::new(0));
             let finishes = Arc::new(AtomicUsize::new(0));
 
-            let observer = submit(
-                &mandatory,
-                SyntheticPrepared {
+            let observer = mandatory
+                .submit(SyntheticPrepared {
                     moves: Arc::clone(&moves),
                     finishes: Arc::clone(&finishes),
-                },
-            )
-            .await
-            .unwrap();
+                })
+                .await
+                .unwrap();
             assert_eq!(observer.wait().await.unwrap().0, 1);
             assert_eq!(moves.load(Ordering::Relaxed), 1);
             assert_eq!(finishes.load(Ordering::Relaxed), 1);
@@ -1285,16 +1186,14 @@ mod tests {
             let completion = Arc::new(Completion::new());
 
             assert!(
-                submit_internal(
-                    &mandatory,
-                    SyntheticPanicInternal {
+                mandatory
+                    .submit_internal(SyntheticPanicInternal {
                         preserved: Arc::clone(&preserved),
                         published: Arc::clone(&published),
                         dropped: Arc::clone(&dropped),
                         completion: Arc::clone(&completion),
-                    },
-                )
-                .is_ok(),
+                    })
+                    .is_ok(),
                 "open internal admission accepts the task"
             );
             let error = completion.wait_result().await.unwrap_err();
@@ -1333,20 +1232,22 @@ mod tests {
             let registry = builder.finish();
             let mandatory = registry.dependency::<MandatoryRuntime>();
 
-            let observer = submit(
-                &mandatory,
-                ExecutePanicPrepared {
+            let observer = mandatory
+                .submit(ExecutePanicPrepared {
                     dropped: Arc::clone(&dropped),
                     finishes: Arc::clone(&finishes),
                     handled: Arc::clone(&handled),
-                },
-            )
-            .await
-            .unwrap();
+                })
+                .await
+                .unwrap();
             let error = observer.wait().await.unwrap_err();
             assert_eq!(error.kind(), ErrorKind::Fatal);
             assert_eq!(finishes.load(Ordering::Relaxed), 0);
             assert_eq!(handled.load(Ordering::Relaxed), 1);
+            let poison = mandatory.poisoner.poison_error().unwrap();
+            let poison = format!("{poison:?}");
+            assert!(poison.contains("task_class=operation"), "{poison}");
+            assert!(poison.contains("task_label=execute_panic"), "{poison}");
 
             (registry, mandatory)
         });

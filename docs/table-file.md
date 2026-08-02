@@ -202,6 +202,18 @@ publication or enqueue handoff. Consequently `DROP TABLE` either closes a
 reversible workflow immediately or asynchronously drains the publisher that
 already won admission.
 
+Public table DDL owns only preparation. `CREATE TABLE` validates its schema and
+prepares all logical locks before mandatory acceptance; the runtime-owned task
+then creates the provisional file, starts the private catalog transaction,
+publishes the initial root, builds the runtime, and preserves the existing
+precommit compensation policy. `DROP TABLE` similarly transfers the exact
+current-live runtime and complete lock scope before it closes the lifecycle and
+waits for any admitted publisher. Dropping the public future after acceptance
+does not abandon either file workflow. Ordinary failures still compensate
+inside accepted CREATE execution, while a panic or unsafe post-gate DROP
+failure is retained and poisons storage rather than running fallible cleanup
+from a destructor.
+
 ### 7.1 Data Checkpoint Publication
 
 Data checkpoint publishes:

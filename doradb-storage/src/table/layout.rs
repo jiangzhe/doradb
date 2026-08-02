@@ -168,6 +168,7 @@ mod tests {
     };
     use crate::id::TrxID;
     use crate::table::tests::*;
+    use crate::trx::purge::PurgeTestEvent;
     use crate::value::ValKind;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use tempfile::TempDir;
@@ -291,7 +292,22 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let (purge_event_tx, purge_event_rx) = flume::unbounded();
+            engine
+                .inner()
+                .trx_sys
+                .set_purge_test_observer(purge_event_tx);
             let table_id = create_table2_for_test(&engine).await;
+            let mut create_commit_recorded = false;
+            loop {
+                match purge_event_rx.recv_async().await.unwrap() {
+                    PurgeTestEvent::CommittedRecorded { .. } => {
+                        create_commit_recorded = true;
+                    }
+                    PurgeTestEvent::CycleCompleted if create_commit_recorded => break,
+                    _ => {}
+                }
+            }
             let table = table_for_internal_assertion(&engine, table_id);
             let old_layout = table.layout_snapshot();
             assert_eq!(old_layout.metadata().idx.active_index_count(), 1);

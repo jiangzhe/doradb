@@ -14,7 +14,7 @@ use crate::error::{
 };
 use crate::file::fs::FileSystem;
 use crate::file::table_file::{MutableTableFile, OldRoot, TableFile};
-use crate::id::{SessionOperationKey, TrxID};
+use crate::id::{SessionID, SessionOperationKey, TrxID};
 use crate::log::redo::RedoLogs;
 use crate::log::{EnqueuePrecommitError, LogFileSealer, LogWriteDriver, RedoLog, RedoLogWriter};
 use crate::notify::MonotonicU64;
@@ -23,10 +23,8 @@ use crate::poison::EnginePoisoner;
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
 use crate::recovery::RecoveryResources;
 use crate::recovery::stream::CatalogSafeRedoSegment;
-use crate::runtime::mandatory::{
-    MandatoryInternalTask, MandatoryRuntime, MandatoryTaskMetadata, submit_internal,
-};
-use crate::session::{SessionState, TrxAttachment};
+use crate::runtime::mandatory::{MandatoryInternalTask, MandatoryRuntime, MandatoryTaskMetadata};
+use crate::session::TrxAttachment;
 use crate::thread;
 #[cfg(test)]
 use crate::trx::SessionOperationState;
@@ -39,8 +37,7 @@ use crate::trx::{
     FailedPrecommitCleanupJob, FailedPrecommitReason, FatalRollbackRetention, MAX_COMMIT_TS,
     MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, PrecommitTrx, PreparedTrx,
     PreparedTrxPayload, ReleasedTransactionLocks, SessionOperationCleanupJob,
-    SessionOperationCompletionClaim, SessionOperationEntry, SessionOperationKind,
-    StartedTransaction, Transaction, TrxInner,
+    SessionOperationCompletionClaim, SessionOperationEntry, Transaction, TrxInner,
 };
 use crossbeam_utils::CachePadded;
 use either::Either::{Left, Right};
@@ -1087,17 +1084,9 @@ impl TransactionSystem {
         Ok(table_file)
     }
 
-    /// Create a new transaction.
+    /// Initialize one ready transaction core and register its active snapshot.
     #[inline]
-    pub(crate) fn begin_trx(
-        &self,
-        engine: &EngineRef,
-        session_state: &Arc<SessionState>,
-        operation_key: SessionOperationKey,
-        kind: SessionOperationKind,
-        enclosing_entry: Option<&Arc<SessionOperationEntry>>,
-        mut inner: Box<TrxInner>,
-    ) -> StartedTransaction {
+    fn init_trx(&self, session_id: SessionID, inner: &mut TrxInner) -> (TrxID, TrxID) {
         let gc_no = self.next_gc_no();
         let gc_bucket = &self.gc_buckets[gc_no];
         // Add to active sts list.
@@ -1120,38 +1109,36 @@ impl TransactionSystem {
                 .store(sts.as_u64(), Ordering::Relaxed);
         }
         drop(g); // release bucket lock.
-        inner.init(trx_id, sts, gc_no, session_state.id());
-        let entry = match kind {
-            SessionOperationKind::PublicTransaction => {
-                assert!(
-                    enclosing_entry.is_none(),
-                    "public transaction must allocate its stable operation entry directly: key={operation_key}"
-                );
-                SessionOperationEntry::new_public_transaction(operation_key, inner)
-            }
-            SessionOperationKind::Ddl | SessionOperationKind::Maintenance => {
-                let entry = enclosing_entry.unwrap_or_else(|| {
-                    panic!(
-                        "private transaction requires enclosing operation entry: key={operation_key}, kind={}",
-                        kind.label()
-                    )
-                });
-                assert!(
-                    entry.key() == operation_key && entry.kind() == kind,
-                    "private transaction enclosing entry mismatch: expected_key={operation_key}, actual_key={}, expected_kind={}, actual_kind={}",
-                    entry.key(),
-                    kind.label(),
-                    entry.kind().label()
-                );
-                entry.install_private_transaction(inner);
-                Arc::clone(entry)
-            }
-            SessionOperationKind::SessionExplicitLock => {
-                panic!("explicit-lock operation cannot own a transaction: key={operation_key}")
-            }
-        };
+        inner.init(trx_id, sts, gc_no, session_id);
+        (trx_id, sts)
+    }
+
+    /// Create a public transaction and its new stable session entry.
+    #[inline]
+    pub(crate) fn begin_public_trx(
+        &self,
+        engine: &EngineRef,
+        operation_key: SessionOperationKey,
+        mut inner: Box<TrxInner>,
+    ) -> (Transaction, Arc<SessionOperationEntry>) {
+        let (trx_id, sts) = self.init_trx(operation_key.session_id(), inner.as_mut());
+        let entry = SessionOperationEntry::new_public_transaction(operation_key, inner);
         let handle = Transaction::new(engine.downgrade(), operation_key, trx_id, sts);
-        StartedTransaction { handle, entry }
+        (handle, entry)
+    }
+
+    /// Create a private transaction inside an existing stable operation entry.
+    #[inline]
+    pub(crate) fn begin_private_trx(
+        &self,
+        engine: &EngineRef,
+        enclosing_entry: &Arc<SessionOperationEntry>,
+        mut inner: Box<TrxInner>,
+    ) -> Transaction {
+        let operation_key = enclosing_entry.key();
+        let (trx_id, sts) = self.init_trx(operation_key.session_id(), inner.as_mut());
+        enclosing_entry.install_private_transaction(inner);
+        Transaction::new(engine.downgrade(), operation_key, trx_id, sts)
     }
 
     /// Allocate a timestamp fence for a runtime state transition.
@@ -1332,7 +1319,7 @@ impl TransactionSystem {
             completion: Arc::clone(&completion),
             operation,
         };
-        if let Err(job) = submit_internal(&self.mandatory_runtime, job) {
+        if let Err(job) = self.mandatory_runtime.submit_internal(job) {
             // The returned job owns an already-claimed terminal transaction.
             // Do not drop, discard, or run it from this caller. A closed
             // internal admission means the mandatory-runtime lifetime invariant
@@ -1656,15 +1643,14 @@ impl TransactionSystem {
         operation_key: SessionOperationKey,
         trx_id: TrxID,
     ) {
-        let _ = submit_internal(
-            &self.mandatory_runtime,
-            SessionOperationCleanupJob {
+        let _ = self
+            .mandatory_runtime
+            .submit_internal(SessionOperationCleanupJob {
                 engine,
                 operation_key,
                 trx_id,
                 claim: None,
-            },
-        );
+            });
     }
 
     /// Submit failed-precommit rollback cleanup.
@@ -1680,7 +1666,7 @@ impl TransactionSystem {
     /// admission, so redo can submit every final failed-precommit job.
     #[inline]
     pub(crate) fn request_failed_precommit_cleanup(&self, job: FailedPrecommitCleanupJob) {
-        if let Err(job) = submit_internal(&self.mandatory_runtime, job) {
+        if let Err(job) = self.mandatory_runtime.submit_internal(job) {
             // The returned job may own rollback-capable `PrecommitTrx` payloads.
             // Do not drop, discard, or run it from this synchronous caller. The
             // closed internal admission means the runtime-lifetime invariant is

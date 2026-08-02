@@ -183,6 +183,18 @@ shutdown. Conversely, a prepared caller future retained without being polled
 still owns its voluntary resources and can block shutdown until it resumes or
 drops.
 
+`CREATE TABLE` and `DROP TABLE` are the first production users of this caller
+contract. The session validates input, reserves its DDL operation, and acquires
+the complete target/catalog lock set while the future is still cancellable.
+After caller capacity is available, synchronous acceptance transfers the
+operation entry, locks, immutable execution plan, and exact table runtime (for
+DROP) to the mandatory owner. The public future then waits only through the
+execution-inert observer. Normal completion drops settled progress, releases
+the prepared locks, and only then publishes the outer operation terminal.
+Unexpected execution unwind instead retains `FailedRetained`, publishes
+mandatory-runtime poison, and releases the caller permit after the accepted
+owner is dropped.
+
 The supervisor catches both synchronous future construction and polling
 unwinds while the accepted operation or cleanup job remains in an outer owner.
 Its domain policy first releases or moves residual unsafe ownership into fatal

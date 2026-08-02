@@ -5078,22 +5078,20 @@ mod tests {
                 release_rx.recv_async().await.unwrap();
             });
 
-            let checkpoint = checkpoint_session.checkpoint_table(table_id).fuse();
-            futures::pin_mut!(checkpoint);
-            let entered = entered_rx.recv_async().fuse();
-            futures::pin_mut!(entered);
+            let mut checkpoint = Box::pin(checkpoint_session.checkpoint_table(table_id).fuse());
+            let mut entered = Box::pin(entered_rx.recv_async().fuse());
             futures::select! {
-                result = checkpoint => {
+                result = checkpoint.as_mut() => {
                     panic!("checkpoint completed before transition hook: {result:?}");
                 }
-                result = entered => result.unwrap(),
+                result = entered.as_mut() => result.unwrap(),
             }
+            drop(entered);
 
             let mut drop_session = engine.new_session().unwrap();
             let table = table_for_internal_assertion(&engine, table_id);
             let checkpoint_redo_cts = {
-                let drop_table = drop_session.drop_table(table_id).fuse();
-                futures::pin_mut!(drop_table);
+                let mut drop_table = Box::pin(drop_session.drop_table(table_id).fuse());
                 assert!(matches!(
                     futures::poll!(drop_table.as_mut()),
                     std::task::Poll::Pending

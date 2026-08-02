@@ -54,10 +54,12 @@ use crate::session::TrxAttachment;
 use crate::trx::undo::{IndexPurgeEntry, IndexUndoLogs, RowUndoHead, RowUndoLogs, UndoStatus};
 use error_stack::{Report, ResultExt};
 use event_listener::{Event, EventListener};
+use futures::FutureExt;
 use parking_lot::Mutex;
 use std::marker::PhantomData;
 use std::mem;
 use std::ops::AsyncFnOnce;
+use std::panic::{AssertUnwindSafe, resume_unwind};
 use std::ptr::addr_eq;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -307,6 +309,53 @@ impl Transaction {
         result
     }
 
+    /// Stages catalog DDL under an accepted operation's prepared logical locks.
+    ///
+    /// This is a narrow bridge for the current exact-owner lock manager.
+    /// Reacquiring the same catalog claims for the nested transaction would be
+    /// correctness-safe through same-family coverage, but would add duplicate
+    /// manager grants and owner-cache entries. A future exact-family lock
+    /// design should unify operation and transaction claims and remove this
+    /// special authority path while preserving the panic settlement below.
+    ///
+    /// A callback panic is settled while the statement carrier still owns its
+    /// partial effects. Incomplete redo is discarded, residual undo returns to
+    /// the nested transaction core, and the original unwind resumes for the
+    /// mandatory supervisor.
+    #[inline]
+    pub(crate) async fn stage_prepared_catalog_statement<T, F>(
+        &mut self,
+        authority: PreparedCatalogWriteAuthority<'_>,
+        f: F,
+    ) -> RuntimeResult<T>
+    where
+        F: for<'borrow> AsyncFnOnce(&'borrow mut Statement<'_>) -> RuntimeResult<T>,
+    {
+        let checkout = self
+            .checkout()
+            .change_context(RuntimeError::CatalogAccess)
+            .attach("operation=stage_prepared_catalog_statement")?;
+        let mut stmt_state = StmtState::private(checkout);
+        let outcome = AssertUnwindSafe(async {
+            let mut stmt = stmt_state.prepared_catalog_statement(authority);
+            let result = f(&mut stmt).await;
+            stmt.merge_effects();
+            result
+        })
+        .catch_unwind()
+        .await;
+        match outcome {
+            Ok(result) => {
+                stmt_state.return_ordinary();
+                result
+            }
+            Err(panic) => {
+                stmt_state.return_after_mandatory_panic();
+                resume_unwind(panic);
+            }
+        }
+    }
+
     /// Commit the transaction.
     #[inline]
     pub async fn commit(self) -> Result<TrxID> {
@@ -465,14 +514,6 @@ impl Drop for Transaction {
             }
         }
     }
-}
-
-/// Transaction begin result with separate public handle and registry entry.
-pub(crate) struct StartedTransaction {
-    /// Public transaction handle returned to the session.
-    pub(crate) handle: Transaction,
-    /// Stable session-registry entry for the mutable transaction core.
-    pub(crate) entry: Arc<SessionOperationEntry>,
 }
 
 /// Shared transaction timestamp state referenced by row undo heads.
@@ -698,22 +739,90 @@ impl TrxContext {
     }
 }
 
+/// Borrowed proof that accepted table DDL prepared catalog write locks.
+///
+/// The enclosing operation owns metadata-S and data-IX claims for longer than
+/// its nested catalog transaction. This temporary capability lets that
+/// transaction reuse those covering claims without registering duplicate
+/// exact-owner grants. It is deliberately not a general lock-bypass flag: the
+/// borrow ties its lifetime to the prepared lock scope and every catalog-table
+/// write still asserts exact coverage.
+#[derive(Clone, Copy)]
+pub(crate) struct PreparedCatalogWriteAuthority<'a> {
+    locks: &'a OwnerLockState,
+}
+
+impl<'a> PreparedCatalogWriteAuthority<'a> {
+    /// Create a borrowed proof over one accepted operation's prepared locks.
+    #[inline]
+    pub(crate) fn new(locks: &'a OwnerLockState) -> Self {
+        Self { locks }
+    }
+
+    /// Assert that the prepared owner covers one catalog-table write.
+    #[inline]
+    pub(crate) fn assert_table_write(self, table_id: TableID) {
+        assert!(
+            self.covers_table_write(table_id),
+            "prepared catalog-write authority is incomplete: table_id={table_id}, owner={}",
+            self.locks.owner()
+        );
+    }
+
+    /// Return whether metadata-S and data-IX are both present.
+    #[inline]
+    pub(crate) fn covers_table_write(self, table_id: TableID) -> bool {
+        self.locks
+            .cached_covers(LockResource::TableMetadata(table_id), LockMode::Shared)
+            && self
+                .locks
+                .cached_covers(LockResource::TableData(table_id), LockMode::IntentExclusive)
+    }
+}
+
 /// Operation-local transaction runtime view.
 ///
-/// `TrxRuntime` pairs immutable MVCC identity with the checked-out operation's
-/// runtime attachment. It is borrowed from scoped foreground statement or
-/// terminal work; checked-in transaction state never stores it.
+/// Prepared catalog authority is present only for accepted table DDL. Ordinary
+/// statements continue proving writes with transaction-owned logical locks.
+/// The optional authority exists only to carry the temporary operation-claim
+/// proof into lower-level write assertions.
 #[derive(Clone, Copy)]
 pub(crate) struct TrxRuntime<'r> {
     ctx: &'r TrxContext,
     attachment: &'r TrxAttachment,
+    #[cfg_attr(
+        not(debug_assertions),
+        expect(
+            dead_code,
+            reason = "prepared authority participates in debug-only lower-level lock assertions"
+        )
+    )]
+    prepared_catalog_write: Option<PreparedCatalogWriteAuthority<'r>>,
 }
 
 impl<'r> TrxRuntime<'r> {
     /// Create an operation-local runtime view.
     #[inline]
     pub(crate) fn new(ctx: &'r TrxContext, attachment: &'r TrxAttachment) -> Self {
-        Self { ctx, attachment }
+        Self {
+            ctx,
+            attachment,
+            prepared_catalog_write: None,
+        }
+    }
+
+    /// Create a runtime view backed by prepared operation-level catalog locks.
+    #[inline]
+    pub(crate) fn new_prepared_catalog(
+        ctx: &'r TrxContext,
+        attachment: &'r TrxAttachment,
+        authority: PreparedCatalogWriteAuthority<'r>,
+    ) -> Self {
+        Self {
+            ctx,
+            attachment,
+            prepared_catalog_write: Some(authority),
+        }
     }
 
     /// Returns this runtime's immutable transaction context.
@@ -767,6 +876,12 @@ impl<'r> TrxRuntime<'r> {
     pub(crate) fn debug_assert_table_write_lock_held(&self, table_id: TableID) {
         #[cfg(debug_assertions)]
         {
+            if self
+                .prepared_catalog_write
+                .is_some_and(|authority| authority.covers_table_write(table_id))
+            {
+                return;
+            }
             let resource = LockResource::TableData(table_id);
             let owner = LockOwner::transaction(self.attachment.session_id(), self.ctx.trx_id());
             let held = self.engine().lock_manager().owner_holds(
@@ -974,13 +1089,6 @@ pub(crate) enum SessionOperationState {
     /// Caller-owned preparation or foreground execution.
     Voluntary(Option<InternalTrxState>),
     /// Runtime-owned accepted execution.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Phase 1 proves production handoff with synthetic adapters"
-        )
-    )]
     Mandatory(Option<InternalTrxState>),
     /// A checked-in abandoned transaction may be claimed for cleanup.
     CleanupReady,
@@ -1170,17 +1278,28 @@ impl SessionOperationEntry {
         );
         let trx_id = trx_inner.trx_id();
         let mut inner = self.inner.lock();
+        let next_state = match inner.state {
+            SessionOperationState::Voluntary(None) if inner.outer_foreground_alive => {
+                SessionOperationState::Voluntary(Some(InternalTrxState::Available))
+            }
+            SessionOperationState::Mandatory(None) if !inner.outer_foreground_alive => {
+                SessionOperationState::Mandatory(Some(InternalTrxState::Available))
+            }
+            _ => panic!(
+                "private transaction installation requires empty voluntary or mandatory authority: key={}, state={}, trx_id={:?}",
+                self.key,
+                inner.state.label(),
+                inner.trx_id
+            ),
+        };
         assert!(
-            inner.outer_foreground_alive
-                && inner.state == SessionOperationState::Voluntary(None)
-                && inner.trx_id.is_none()
-                && inner.trx_inner.is_none(),
-            "private transaction installation requires an empty foreground entry: key={}, state={}, trx_id={:?}",
+            inner.trx_id.is_none() && inner.trx_inner.is_none(),
+            "private transaction installation requires an empty payload slot: key={}, state={}, trx_id={:?}",
             self.key,
             inner.state.label(),
             inner.trx_id
         );
-        inner.state = SessionOperationState::Voluntary(Some(InternalTrxState::Available));
+        inner.state = next_state;
         inner.trx_id = Some(trx_id);
         inner.trx_inner = Some(trx_inner);
     }
@@ -1211,6 +1330,14 @@ impl SessionOperationEntry {
                     == SessionOperationState::Voluntary(Some(InternalTrxState::Available)) =>
             {
                 Some(SessionOperationState::Voluntary(Some(
+                    InternalTrxState::Running,
+                )))
+            }
+            SessionOperationKind::Ddl | SessionOperationKind::Maintenance
+                if inner.state
+                    == SessionOperationState::Mandatory(Some(InternalTrxState::Available)) =>
+            {
+                Some(SessionOperationState::Mandatory(Some(
                     InternalTrxState::Running,
                 )))
             }
@@ -1261,6 +1388,12 @@ impl SessionOperationEntry {
                     == SessionOperationState::Voluntary(Some(InternalTrxState::Available)) =>
             {
                 SessionOperationState::Voluntary(Some(InternalTrxState::Completing))
+            }
+            SessionOperationKind::Ddl | SessionOperationKind::Maintenance
+                if inner.state
+                    == SessionOperationState::Mandatory(Some(InternalTrxState::Available)) =>
+            {
+                SessionOperationState::Mandatory(Some(InternalTrxState::Completing))
             }
             SessionOperationKind::PublicTransaction
             | SessionOperationKind::Ddl
@@ -1349,7 +1482,11 @@ impl SessionOperationEntry {
                 inner.state == SessionOperationState::Voluntary(None)
             }
             SessionOperationKind::Ddl | SessionOperationKind::Maintenance => {
-                inner.state == SessionOperationState::Voluntary(Some(InternalTrxState::Running))
+                matches!(
+                    inner.state,
+                    SessionOperationState::Voluntary(Some(InternalTrxState::Running))
+                        | SessionOperationState::Mandatory(Some(InternalTrxState::Running))
+                )
             }
             SessionOperationKind::SessionExplicitLock => false,
         };
@@ -1390,12 +1527,23 @@ impl SessionOperationEntry {
         if self.kind != SessionOperationKind::PublicTransaction {
             inner.state = match self.kind {
                 SessionOperationKind::Ddl | SessionOperationKind::Maintenance => {
-                    assert!(
-                        inner.outer_foreground_alive,
-                        "detached private transaction return requires cleanup intent: key={}",
-                        self.key
-                    );
-                    SessionOperationState::Voluntary(Some(InternalTrxState::Available))
+                    match inner.state {
+                        SessionOperationState::Voluntary(Some(InternalTrxState::Running))
+                            if inner.outer_foreground_alive =>
+                        {
+                            SessionOperationState::Voluntary(Some(InternalTrxState::Available))
+                        }
+                        SessionOperationState::Mandatory(Some(InternalTrxState::Running))
+                            if !inner.outer_foreground_alive =>
+                        {
+                            SessionOperationState::Mandatory(Some(InternalTrxState::Available))
+                        }
+                        _ => panic!(
+                            "private transaction return requires matching outer authority: key={}, state={}",
+                            self.key,
+                            inner.state.label()
+                        ),
+                    }
                 }
                 SessionOperationKind::SessionExplicitLock => {
                     panic!(
@@ -1601,6 +1749,12 @@ impl SessionOperationEntry {
                     SessionOperationState::Voluntary(Some(InternalTrxState::Completing))
                 )
             }
+            SessionOperationKind::Ddl | SessionOperationKind::Maintenance
+                if inner.state
+                    == SessionOperationState::Mandatory(Some(InternalTrxState::Completing)) =>
+            {
+                true
+            }
             SessionOperationKind::Ddl | SessionOperationKind::Maintenance => {
                 inner.state == SessionOperationState::Completing
             }
@@ -1612,12 +1766,20 @@ impl SessionOperationEntry {
         inner.trx_inner.take();
         inner.trx_id = None;
         inner.cleanup_requested = false;
-        if self.kind == SessionOperationKind::PublicTransaction || !inner.outer_foreground_alive {
-            inner.state = SessionOperationState::Terminal;
-            Some(true)
-        } else {
-            inner.state = SessionOperationState::Voluntary(None);
-            Some(false)
+        match inner.state {
+            SessionOperationState::Mandatory(Some(InternalTrxState::Completing)) => {
+                inner.state = SessionOperationState::Mandatory(None);
+                Some(false)
+            }
+            SessionOperationState::Voluntary(Some(InternalTrxState::Completing)) => {
+                inner.state = SessionOperationState::Voluntary(None);
+                Some(false)
+            }
+            SessionOperationState::Completing => {
+                inner.state = SessionOperationState::Terminal;
+                Some(true)
+            }
+            _ => None,
         }
     }
 
@@ -1649,46 +1811,17 @@ impl SessionOperationEntry {
     ///
     /// The caller holds the session lifecycle mutex, preserving the global
     /// `lifecycle -> entry` lock order.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Phase 1 proves production handoff with synthetic adapters"
-        )
-    )]
     #[inline]
     pub(crate) fn accept_mandatory(&self) {
-        assert!(
-            self.kind != SessionOperationKind::PublicTransaction,
-            "public transactions cannot become mandatory operations: key={}",
-            self.key
-        );
         let mut inner = self.inner.lock();
-        assert!(
-            inner.outer_foreground_alive
-                && inner.state == SessionOperationState::Voluntary(None)
-                && inner.trx_id.is_none()
-                && inner.trx_inner.is_none(),
-            "mandatory acceptance requires empty voluntary authority: key={}, state={}, trx_id={:?}",
-            self.key,
-            inner.state.label(),
-            inner.trx_id
-        );
         inner.outer_foreground_alive = false;
         inner.state = SessionOperationState::Mandatory(None);
     }
 
-    /// Publish successful mandatory completion after all nested work is gone.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Phase 1 proves production handoff with synthetic adapters"
-        )
-    )]
+    /// Verify successful mandatory completion while execution is supervised.
     #[inline]
-    pub(crate) fn finish_mandatory(&self) {
-        let mut inner = self.inner.lock();
+    pub(crate) fn assert_mandatory_finish_ready(&self) {
+        let inner = self.inner.lock();
         assert!(
             inner.state == SessionOperationState::Mandatory(None)
                 && inner.trx_id.is_none()
@@ -1698,17 +1831,15 @@ impl SessionOperationEntry {
             inner.state.label(),
             inner.trx_id
         );
-        inner.state = SessionOperationState::Terminal;
+    }
+
+    /// Publish terminal state after execution-side validation succeeded.
+    #[inline]
+    pub(crate) fn publish_mandatory_terminal(&self) {
+        self.inner.lock().state = SessionOperationState::Terminal;
     }
 
     /// Publish safe fatal retention for an unexpectedly lost mandatory owner.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Phase 1 proves production handoff with synthetic adapters"
-        )
-    )]
     #[inline]
     pub(crate) fn fail_mandatory_retained(&self) {
         let mut inner = self.inner.lock();
@@ -3694,6 +3825,63 @@ pub(crate) mod tests {
         let release = entry.release_foreground();
         assert!(release.terminal);
         assert!(release.cleanup.is_none());
+        assert_eq!(entry.inspect().state, SessionOperationState::Terminal);
+    }
+
+    #[test]
+    fn test_private_transaction_state_is_nested_under_mandatory_operation() {
+        let session_id = SessionID::new(102);
+        let trx_id = MIN_ACTIVE_TRX_ID + 102;
+        let entry = SessionOperationEntry::new(
+            SessionOperationKey::new(session_id, OperationID::new(1)),
+            SessionOperationKind::Ddl,
+        );
+
+        entry.accept_mandatory();
+        assert_eq!(
+            entry.inspect().state,
+            SessionOperationState::Mandatory(None)
+        );
+        entry.install_private_transaction(Box::new(trx_inner(
+            trx_id,
+            TrxID::new(102),
+            0,
+            session_id,
+        )));
+        assert_eq!(
+            entry.inspect().state,
+            SessionOperationState::Mandatory(Some(InternalTrxState::Available))
+        );
+
+        let inner = entry
+            .take_for_checkout(trx_id)
+            .expect("mandatory private transaction can be checked out");
+        assert_eq!(
+            entry.inspect().state,
+            SessionOperationState::Mandatory(Some(InternalTrxState::Running))
+        );
+        assert!(!entry.return_inner(inner));
+        assert_eq!(
+            entry.inspect().state,
+            SessionOperationState::Mandatory(Some(InternalTrxState::Available))
+        );
+
+        let inner = entry
+            .take_for_terminal(trx_id)
+            .expect("mandatory private transaction terminal can be claimed");
+        assert_eq!(
+            entry.inspect().state,
+            SessionOperationState::Mandatory(Some(InternalTrxState::Completing))
+        );
+        drop(inner);
+        assert_eq!(entry.finish_transaction(trx_id), Some(false));
+        assert_eq!(
+            entry.inspect().state,
+            SessionOperationState::Mandatory(None)
+        );
+
+        entry.assert_mandatory_finish_ready();
+        entry.publish_mandatory_terminal();
         assert_eq!(entry.inspect().state, SessionOperationState::Terminal);
     }
 
