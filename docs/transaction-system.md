@@ -273,8 +273,8 @@ completion position. Public transactions use the outer operation states
 directly and therefore use
 `Voluntary(None)` only while checked out.
 
-Accepted table DDL transfers the same entry to `Mandatory(None)` before the
-runtime task is detached. Its nested catalog transaction follows
+Accepted table and index DDL transfer the same entry to `Mandatory(None)`
+before the runtime task is detached. Their nested catalog transaction follows
 `Mandatory(None) -> Mandatory(Some(Available)) ->
 Mandatory(Some(Running)) -> Mandatory(Some(Available))`; commit or rollback
 claims `Mandatory(Some(Completing))` and clears the child back to
@@ -285,12 +285,12 @@ proof to publish `Terminal`. A supervised unwind moves any still-owned nested
 state to `FailedRetained`; this remains registry-visible and blocks shutdown
 instead of exposing an idle session or scheduling competing abandoned cleanup.
 
-Unmigrated index DDL and maintenance retain the voluntary private-transaction
-path. Their private terminal callback clears the child and returns the entry to
-`Voluntary(None)`; only dropping the outer foreground authority publishes the
-operation terminal and returns an open session to idle. One outer operation
-may run sequential private transactions, so the entry's optional `TrxID`
-changes only at installation and terminal completion under that same mutex.
+Maintenance retains the voluntary private-transaction path. Its private
+terminal callback clears the child and returns the entry to `Voluntary(None)`;
+only dropping the outer foreground authority publishes the operation terminal
+and returns an open session to idle. One outer operation may run sequential
+private transactions, so the entry's optional `TrxID` changes only at
+installation and terminal completion under that same mutex.
 
 After explicit rollback claims terminal ownership and publishes `RollingBack`,
 the claimed transaction core, undo buffers, locks, and session cleanup
@@ -413,6 +413,17 @@ checkpoint publisher therefore does not delay CREATE or DROP for unrelated
 table ids when runner capacity is available. Transaction and statement
 rollback drop their operation-local table caches and transaction bindings
 before releasing the logical locks that authorize those runtime owners.
+
+`CREATE INDEX` and `DROP INDEX` prepare their full target and catalog lock
+sets, exact live table, table/catalog metadata-gate admissions, layout, active
+root, and metadata/root plan before mandatory admission. Accepted execution
+starts the private catalog transaction and uses prepared catalog-write
+authority, so it does not reacquire logical locks. Catalog commit remains
+followed by table-root publication. The final runtime-layout and catalog
+history transition holds the user-table catalog entry before the table layout
+mutex, exposing only the old/old or new/new metadata pointer pair to history
+purge.
+
 CREATE INDEX and DROP INDEX also take same-table `TableMetadata(X)`. That grant
 waits for every transaction that successfully bound the table, but an older
 transaction that never touched it holds no metadata grant and does not delay

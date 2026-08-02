@@ -1,6 +1,6 @@
 mod checkpoint;
 mod history;
-mod index;
+pub(crate) mod index;
 pub(crate) mod spec;
 pub(crate) mod storage;
 pub(crate) mod table;
@@ -607,10 +607,16 @@ impl Catalog {
         self.checkpoint_gate.begin_checkpoint().await
     }
 
-    /// Acquires the catalog metadata-change gate for future index DDL.
+    /// Acquires transferable index-DDL metadata admission.
     #[inline]
-    pub(crate) async fn begin_metadata_change(&self) -> CatalogMetadataChangeLease<'_> {
-        self.checkpoint_gate.begin_metadata_change().await
+    pub(crate) async fn acquire_index_metadata_change(&self) {
+        self.checkpoint_gate.acquire_metadata_change().await;
+    }
+
+    /// Releases transferable index-DDL metadata admission.
+    #[inline]
+    pub(crate) fn release_index_metadata_change(&self) {
+        self.checkpoint_gate.release_metadata_change();
     }
 
     /// Validates that a user-table runtime exists and still admits foreground work.
@@ -658,24 +664,45 @@ impl Catalog {
         }
     }
 
-    /// Publish one live metadata transition after runtime-layout installation.
+    /// Atomically coordinates index layout and catalog-history publication.
+    ///
+    /// The occupied catalog entry is held before the table layout mutex, which
+    /// is the same nesting order used by metadata-history purge.
     #[inline]
-    pub(crate) fn publish_user_table_metadata(
+    pub(crate) fn install_index_layout_and_publish_history(
         &self,
         table_id: TableID,
         effective_cts: TrxID,
-        table: &Arc<Table>,
-        expected_metadata: &Arc<TableMetadata>,
-        new_metadata: Arc<TableMetadata>,
-    ) -> bool {
-        match self.user_tables.entry(table_id) {
+        expected_table: &Arc<Table>,
+        expected_old_layout: &Arc<TableRuntimeLayout>,
+        new_layout: TableRuntimeLayout,
+        #[cfg(test)] test_hook: (&IndexDdlTestController, IndexDdlKind),
+    ) -> Option<Arc<TableRuntimeLayout>> {
+        new_layout.assert_valid();
+        let new_layout = Arc::new(new_layout);
+        let retired = match self.user_tables.entry(table_id) {
             Occupied(mut entry) => {
+                let expected_metadata = expected_old_layout.metadata_arc();
+                if !entry.get_mut().prepare_publish_live(
+                    effective_cts,
+                    expected_table,
+                    expected_metadata,
+                ) {
+                    return None;
+                }
+                let retired = expected_table
+                    .try_replace_runtime_layout(expected_old_layout, Arc::clone(&new_layout))?;
+                #[cfg(test)]
+                test_hook.0.reach_publication_interval(test_hook.1);
                 entry
                     .get_mut()
-                    .publish_live(effective_cts, table, expected_metadata, new_metadata)
+                    .commit_publish_live(effective_cts, Arc::clone(new_layout.metadata_arc()));
+                retired
             }
-            Vacant(_) => false,
-        }
+            Vacant(_) => return None,
+        };
+        expected_table.queue_retired_secondary_indexes(retired);
+        Some(new_layout)
     }
 
     /// Publish a tombstone and retain the dropped runtime operationally.

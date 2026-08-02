@@ -164,7 +164,8 @@ mod tests {
     use super::*;
     use crate::buffer::{BufferPool, PoolGuards, PoolRole};
     use crate::catalog::{
-        ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec,
+        ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexAttributes, IndexDdlKind, IndexKey,
+        IndexSpec,
     };
     use crate::id::TrxID;
     use crate::table::tests::*;
@@ -333,19 +334,22 @@ mod tests {
                 inactive_slots.into_boxed_slice(),
             );
 
-            let installed = table.install_runtime_layout(old_layout.generation(), new_layout);
             let current_cts = engine
                 .catalog()
                 .resolve_user_table_current(table_id)
                 .unwrap()
                 .effective_cts();
-            assert!(engine.catalog().publish_user_table_metadata(
-                table_id,
-                TrxID::new(current_cts.as_u64() + 1),
-                &table,
-                old_layout.metadata_arc(),
-                Arc::clone(installed.metadata_arc()),
-            ));
+            let installed = engine
+                .catalog()
+                .install_index_layout_and_publish_history(
+                    table_id,
+                    TrxID::new(current_cts.as_u64() + 1),
+                    &table,
+                    &old_layout,
+                    new_layout,
+                    (&engine.inner().index_ddl_test, IndexDdlKind::Drop),
+                )
+                .expect("test runtime layout publication must succeed");
             assert_eq!(old_layout.metadata().idx.active_index_count(), 1);
             assert_eq!(installed.metadata().idx.active_index_count(), 0);
             assert_eq!(

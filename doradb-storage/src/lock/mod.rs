@@ -312,29 +312,6 @@ impl Drop for FreshLockGuard<'_> {
     }
 }
 
-/// Scoped table DDL lock guard for metadata and data resources.
-pub(crate) struct ScopedTableDdlLocks<'a> {
-    lock_manager: &'a LockManager,
-    table_id: TableID,
-    owner: LockOwner,
-    metadata_fresh: bool,
-    data_fresh: bool,
-}
-
-impl Drop for ScopedTableDdlLocks<'_> {
-    #[inline]
-    fn drop(&mut self) {
-        if self.data_fresh {
-            self.lock_manager
-                .release(LockResource::TableData(self.table_id), self.owner);
-        }
-        if self.metadata_fresh {
-            self.lock_manager
-                .release(LockResource::TableMetadata(self.table_id), self.owner);
-        }
-    }
-}
-
 /// Standalone logical lock manager.
 pub(crate) struct LockManager {
     resources: Arc<FastDashMap<LockResource, ResourceState>>,
@@ -396,37 +373,6 @@ impl LockManager {
         let data_guard = FreshLockGuard::new(self, data_resource, owner, data_grant);
 
         Ok((metadata_guard, data_guard))
-    }
-
-    /// Acquires scoped exclusive table DDL locks.
-    #[inline]
-    pub(crate) async fn acquire_table_ddl_locks<'a>(
-        &'a self,
-        table_id: TableID,
-        owner: LockOwner,
-    ) -> OperationResult<ScopedTableDdlLocks<'a>> {
-        let metadata_resource = LockResource::TableMetadata(table_id);
-        let metadata_grant = self
-            .acquire_with_grant(metadata_resource, LockMode::Exclusive, owner)
-            .await?;
-        let mut metadata_guard =
-            FreshLockGuard::new(self, metadata_resource, owner, metadata_grant);
-
-        let data_resource = LockResource::TableData(table_id);
-        let data_grant = self
-            .acquire_with_grant(data_resource, LockMode::Exclusive, owner)
-            .await?;
-        if let Some(guard) = metadata_guard.as_mut() {
-            guard.disarm();
-        }
-
-        Ok(ScopedTableDdlLocks {
-            lock_manager: self,
-            table_id,
-            owner,
-            metadata_fresh: metadata_grant == LockGrant::Fresh,
-            data_fresh: data_grant == LockGrant::Fresh,
-        })
     }
 
     /// Rejects table DDL when the session already holds explicit table locks.

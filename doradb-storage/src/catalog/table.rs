@@ -20,7 +20,7 @@ use crate::row::ops::SelectKey;
 use crate::row::{Row, RowRead};
 use crate::runtime::mandatory::{AcceptedExecution, MandatoryTaskMetadata, PreparedExecution};
 use crate::serde::{Deser, DeserResult, MinBytesHint, Ser, Serde, min_bytes_hint};
-use crate::session::{AcceptedTableDdlScope, PreparedTableDdlScope};
+use crate::session::{AcceptedDdlScope, PreparedDdlScope};
 use crate::table::{Table, TableRedoReplayFloor};
 use crate::trx::{PreparedCatalogWriteAuthority, Transaction};
 use crate::value::{Val, ValKind, ValType};
@@ -1257,7 +1257,7 @@ impl Deser for TableBriefMetadata {
 
 /// Caller-prepared CREATE TABLE awaiting mandatory runtime capacity.
 pub(crate) struct PreparedCreateTable {
-    scope: PreparedTableDdlScope,
+    scope: PreparedDdlScope,
     plan: CreateTablePlan,
     metadata: MandatoryTaskMetadata,
 }
@@ -1265,7 +1265,7 @@ pub(crate) struct PreparedCreateTable {
 impl PreparedCreateTable {
     /// Build one fully prepared CREATE TABLE carrier.
     #[inline]
-    pub(crate) fn new(scope: PreparedTableDdlScope, plan: CreateTablePlan) -> Self {
+    pub(crate) fn new(scope: PreparedDdlScope, plan: CreateTablePlan) -> Self {
         let metadata = MandatoryTaskMetadata::table_operation(
             <Self as PreparedExecution>::LABEL,
             scope.key(),
@@ -1308,7 +1308,7 @@ impl PreparedExecution for PreparedCreateTable {
 
 /// Mandatory-runtime owner of accepted CREATE TABLE execution.
 pub(crate) struct AcceptedCreateTable {
-    scope: AcceptedTableDdlScope,
+    scope: AcceptedDdlScope,
     table_id: TableID,
     progress: Option<CreateTableProgress>,
 }
@@ -1409,7 +1409,7 @@ impl AcceptedCreateTable {
         )
         .await;
         if let Err(err) = exec_res {
-            return Err(capture_runtime_or_fatal(
+            return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                 progress
                     .abort_before_catalog_commit(&engine, &guards, "catalog_staging", err)
                     .await,
@@ -1428,7 +1428,7 @@ impl AcceptedCreateTable {
             .table_ddl_test
             .maybe_fail_create(CreateTableTestFailure::AfterCatalogStaged)
         {
-            return Err(capture_runtime_or_fatal(
+            return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                 progress
                     .abort_before_catalog_commit(
                         &engine,
@@ -1441,7 +1441,7 @@ impl AcceptedCreateTable {
         }
 
         if let Err(err) = progress.publish_file(&engine).await {
-            return Err(capture_runtime_or_fatal(
+            return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                 progress
                     .abort_before_catalog_commit(&engine, &guards, "file_publish", err)
                     .await,
@@ -1459,7 +1459,7 @@ impl AcceptedCreateTable {
             .table_ddl_test
             .maybe_fail_create(CreateTableTestFailure::AfterFilePublished)
         {
-            return Err(capture_runtime_or_fatal(
+            return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                 progress
                     .abort_before_catalog_commit(&engine, &guards, "test_after_file_publish", err)
                     .await,
@@ -1467,7 +1467,7 @@ impl AcceptedCreateTable {
         }
 
         if let Err(err) = progress.build_runtime(&guards, &engine).await {
-            return Err(capture_runtime_or_fatal(
+            return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                 progress
                     .abort_before_catalog_commit(&engine, &guards, "runtime_build", err)
                     .await,
@@ -1485,7 +1485,7 @@ impl AcceptedCreateTable {
             .table_ddl_test
             .maybe_fail_create(CreateTableTestFailure::AfterRuntimeBuilt)
         {
-            return Err(capture_runtime_or_fatal(
+            return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                 progress
                     .abort_before_catalog_commit(&engine, &guards, "test_after_runtime_build", err)
                     .await,
@@ -1500,7 +1500,7 @@ impl AcceptedCreateTable {
         let create_cts = match progress.commit_catalog().await {
             Ok(create_cts) => create_cts,
             Err(err) => {
-                return Err(capture_runtime_or_fatal(
+                return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                     progress
                         .abort_after_root_publish_commit_error(
                             &engine,
@@ -1564,7 +1564,7 @@ impl DropTableProgress {
 
 /// Caller-prepared DROP TABLE awaiting mandatory runtime capacity.
 pub(crate) struct PreparedDropTable {
-    scope: PreparedTableDdlScope,
+    scope: PreparedDdlScope,
     plan: DropTablePlan,
     metadata: MandatoryTaskMetadata,
 }
@@ -1572,7 +1572,7 @@ pub(crate) struct PreparedDropTable {
 impl PreparedDropTable {
     /// Build one fully prepared DROP TABLE carrier.
     #[inline]
-    pub(crate) fn new(scope: PreparedTableDdlScope, plan: DropTablePlan) -> Self {
+    pub(crate) fn new(scope: PreparedDdlScope, plan: DropTablePlan) -> Self {
         let metadata = MandatoryTaskMetadata::table_operation(
             <Self as PreparedExecution>::LABEL,
             scope.key(),
@@ -1615,7 +1615,7 @@ impl PreparedExecution for PreparedDropTable {
 
 /// Mandatory-runtime owner of accepted DROP TABLE execution.
 pub(crate) struct AcceptedDropTable {
-    scope: AcceptedTableDdlScope,
+    scope: AcceptedDdlScope,
     table_id: TableID,
     progress: Option<DropTableProgress>,
 }
@@ -1689,11 +1689,13 @@ impl AcceptedDropTable {
                     panic!("DROP lifecycle failure requires private transaction")
                 });
                 if let Err(rollback_err) = trx.rollback_catalog_ddl().await {
-                    return Err(capture_runtime_or_fatal(rollback_err.attach_with(|| {
-                        format!(
-                            "drop table rollback failed after lifecycle rejection: table_id={table_id}, source_error={source_debug}"
-                        )
-                    })));
+                    return Err(CompletionErrorBridge::capture_runtime_or_fatal(
+                        rollback_err.attach_with(|| {
+                            format!(
+                                "drop table rollback failed after lifecycle rejection: table_id={table_id}, source_error={source_debug}"
+                            )
+                        }),
+                    ));
                 }
                 return Err(CompletionErrorBridge::capture(err));
             }
@@ -1741,14 +1743,16 @@ impl AcceptedDropTable {
                     "event=ddl_cleanup component=catalog action=rollback_drop_table result=error error={rollback_err:?}"
                 );
             }
-            return Err(capture_runtime_or_fatal(poison_error_source(
-                &engine,
-                RuntimeOrFatalError::from(err),
-                FatalError::Poisoned,
-                format!(
-                    "drop table failed after lifecycle gate: table_id={table_id}, operation=catalog_cascade"
+            return Err(CompletionErrorBridge::capture_runtime_or_fatal(
+                poison_error_source(
+                    &engine,
+                    RuntimeOrFatalError::from(err),
+                    FatalError::Poisoned,
+                    format!(
+                        "drop table failed after lifecycle gate: table_id={table_id}, operation=catalog_cascade"
+                    ),
                 ),
-            )));
+            ));
         }
         progress.phase = DropTablePhase::CatalogStaged;
 
@@ -1765,14 +1769,16 @@ impl AcceptedDropTable {
         let drop_cts = match trx.commit_catalog_ddl().await {
             Ok(drop_cts) => drop_cts,
             Err(err) => {
-                return Err(capture_runtime_or_fatal(poison_error_source(
-                    &engine,
-                    err,
-                    FatalError::Poisoned,
-                    format!(
-                        "drop table failed after lifecycle gate: table_id={table_id}, operation=commit"
+                return Err(CompletionErrorBridge::capture_runtime_or_fatal(
+                    poison_error_source(
+                        &engine,
+                        err,
+                        FatalError::Poisoned,
+                        format!(
+                            "drop table failed after lifecycle gate: table_id={table_id}, operation=commit"
+                        ),
                     ),
-                )));
+                ));
             }
         };
         progress.phase = DropTablePhase::CatalogCommitted;
@@ -1880,14 +1886,6 @@ pub(crate) fn reject_user_table_primary_key_index(
     Err(Report::new(OperationError::InvalidMetadata).attach(format!(
         "{operation} does not support user-table primary keys"
     )))
-}
-
-#[inline]
-fn capture_runtime_or_fatal(error: RuntimeOrFatalError) -> CompletionErrorBridge {
-    match error {
-        RuntimeOrFatalError::Runtime(report) => CompletionErrorBridge::capture(report),
-        RuntimeOrFatalError::Fatal(report) => CompletionErrorBridge::capture(report),
-    }
 }
 
 #[inline]

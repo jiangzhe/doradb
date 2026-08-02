@@ -134,7 +134,10 @@ table's `logical_key` column per cycle. It requires `prepare --index none`,
 uses the exact index number returned by each create for the paired drop, and
 accepts an empty or preloaded benchmark table. Loading first includes
 index-build work in the measurement. `--num` defaults to `1`; one cycle reports
-two operations.
+two operations. The empty and preloaded variants are the RFC-0026 Phase 3
+runtime-owned index-DDL measurements: both include mandatory admission and
+accepted execution, while the preloaded case additionally measures the
+existing all-row collection, sort, and index-build architecture.
 
 `--batch-size` sets the number of operations per transaction. For insert
 workloads it means rows per commit. For read workloads it means lookup requests,

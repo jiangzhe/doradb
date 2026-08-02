@@ -26,9 +26,7 @@ pub(crate) use layout::{RetiredSecondaryIndex, TableRuntimeLayout};
 pub use lifecycle::CheckpointCancelReason;
 #[cfg(test)]
 pub(crate) use lifecycle::TableTerminal;
-pub(crate) use lifecycle::{
-    TableCheckpointRootMutationLease, TableDropDrain, TableLifecycle, TableMetadataChangeLease,
-};
+pub(crate) use lifecycle::{TableCheckpointRootMutationLease, TableDropDrain, TableLifecycle};
 pub(crate) use mem_table::{MemTable, NoTrxUpsertChange, RowPageDescriptor};
 pub use persistence::*;
 pub(crate) use rollback::IndexRollback;
@@ -53,6 +51,7 @@ use crate::obs;
 use crate::quiescent::QuiescentGuard;
 use crate::row::ops::{RowUpdateInput, RowUpdateView, SelectKey, UpdateCol};
 use crate::row::{RowPage, RowRead, var_len_for_insert};
+use crate::runtime::yield_now;
 use crate::trx::{TrxContext, TrxReadProof};
 use crate::value::{PAGE_VAR_LEN_INLINE, Val};
 use error_stack::{Report, ResultExt};
@@ -179,12 +178,18 @@ impl Table {
             .attach_with(|| format!("table_id={}", self.table_id()))
     }
 
-    /// Acquires the reversible metadata-change gate for future index DDL.
+    /// Acquires transferable index-DDL metadata admission.
     #[inline]
-    pub(crate) async fn begin_metadata_change(
-        &self,
-    ) -> OperationResult<TableMetadataChangeLease<'_>> {
-        self.lifecycle.begin_metadata_change(self.table_id()).await
+    pub(crate) async fn acquire_index_metadata_change(&self) -> OperationResult<()> {
+        self.lifecycle
+            .acquire_metadata_change(self.table_id())
+            .await
+    }
+
+    /// Releases transferable index-DDL metadata admission.
+    #[inline]
+    pub(crate) fn release_index_metadata_change(&self) {
+        self.lifecycle.release_metadata_change();
     }
 
     /// Attempts to enter the checkpoint table-root mutation section.
@@ -355,42 +360,27 @@ impl Table {
         !self.retired_secondary_indexes.lock().is_empty()
     }
 
-    /// Installs a new user-table runtime layout for future index DDL paths.
+    /// Replaces the layout only when the exact prepared snapshot remains current.
+    ///
+    /// All rejectable checks and retirement allocation complete before the
+    /// pointer swap. The caller may therefore pair the swap with another
+    /// infallible volatile publication while holding its coordinating lock.
     #[inline]
-    pub(crate) fn install_runtime_layout(
+    pub(crate) fn try_replace_runtime_layout(
         &self,
-        expected_generation: u64,
-        new_layout: TableRuntimeLayout,
-    ) -> Arc<TableRuntimeLayout> {
-        new_layout.assert_valid();
-        assert!(
-            new_layout.generation() > expected_generation,
-            "table runtime layout install invariant violated: generation did not advance, expected_generation={expected_generation}, new_generation={}",
-            new_layout.generation()
-        );
-
-        let new_layout = Arc::new(new_layout);
-        let old_layout = {
-            let mut guard = self.layout.lock();
-            assert_eq!(
-                guard.generation(),
-                expected_generation,
-                "table runtime layout install invariant violated: stale generation, expected_generation={expected_generation}, actual_generation={}",
-                guard.generation()
-            );
-            assert!(
-                new_layout.index_slot_count() >= guard.index_slot_count(),
-                "table runtime layout install invariant violated: sparse slots shrank, old_slots={}, new_slots={}",
-                guard.index_slot_count(),
-                new_layout.index_slot_count()
-            );
-            let old_layout = Arc::clone(&guard);
-            *guard = Arc::clone(&new_layout);
-            old_layout
-        };
+        expected_layout: &Arc<TableRuntimeLayout>,
+        new_layout: Arc<TableRuntimeLayout>,
+    ) -> Option<Vec<RetiredSecondaryIndex>> {
+        let mut guard = self.layout.lock();
+        if !Arc::ptr_eq(&guard, expected_layout)
+            || new_layout.generation() <= expected_layout.generation()
+            || new_layout.index_slot_count() < expected_layout.index_slot_count()
+        {
+            return None;
+        }
 
         let mut retired = Vec::new();
-        for (index_no, old_index) in old_layout.secondary_indexes().iter().enumerate() {
+        for (index_no, old_index) in expected_layout.secondary_indexes().iter().enumerate() {
             let Some(old_index) = old_index else {
                 continue;
             };
@@ -402,15 +392,21 @@ impl Table {
             if !unchanged {
                 retired.push(RetiredSecondaryIndex {
                     index_no,
-                    retired_generation: old_layout.generation(),
+                    retired_generation: expected_layout.generation(),
                     index: Arc::clone(old_index),
                 });
             }
         }
+        *guard = new_layout;
+        Some(retired)
+    }
+
+    /// Enqueues retirement records prepared before a coordinated layout swap.
+    #[inline]
+    pub(crate) fn queue_retired_secondary_indexes(&self, retired: Vec<RetiredSecondaryIndex>) {
         if !retired.is_empty() {
             self.retired_secondary_indexes.lock().extend(retired);
         }
-        new_layout
     }
 
     /// Destroys retired secondary-index runtimes whose old layout snapshots drained.
@@ -459,6 +455,7 @@ impl Table {
             }
             let _destroyed_identity = (index_no, retired_generation);
             cleaned += 1;
+            yield_now().await;
         }
         Ok(cleaned)
     }

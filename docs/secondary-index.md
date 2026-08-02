@@ -541,6 +541,14 @@ transaction-lifetime metadata S; data X drains foreground writers before the
 operation captures the active root, runtime layout, column-block root, and
 pivot.
 
+Input validation, the complete target/catalog logical-lock set, table then
+catalog metadata-gate admission, authoritative table resolution, and stable
+layout/root planning remain caller-owned and cancellable. After bounded
+mandatory admission, the engine runtime owns collection, sorting, DiskTree and
+MemIndex construction, the private catalog transaction, root publication, and
+volatile publication. Dropping the public future after that acceptance point
+does not cancel or roll back the build.
+
 The captured boundary partitions the build input:
 
 - current, non-deleted cold rows below the pivot populate the new `DiskTree`
@@ -569,6 +577,13 @@ current layout, but it cannot admit the new stable index number. A stale writer
 must also match the exact visible/current metadata version before acquiring a
 data lock or creating row, index, undo, or redo effects. These admission rules
 make build-created historical candidates unnecessary for either index kind.
+
+Catalog commit and the matching table-root publish retain the existing durable
+proof order. The final volatile transition holds the table's occupied catalog
+entry while replacing the runtime layout and then publishing metadata history.
+History purge therefore observes pointer-identical old metadata/old layout or
+new metadata/new layout, never a split pair. Dropped runtime indexes are queued
+for asynchronous cleanup only after that coordinated transition.
 
 ## 8. Write Path
 
