@@ -100,6 +100,18 @@ Relevant paths:
 
 ## Notes (Optional)
 
+- 2026-08-02 partial implementation via
+  `docs/tasks/000250-runtime-owned-index-ddl.md` and issue `#926`: CREATE INDEX
+  and DROP INDEX now publish the runtime layout and pointer-identical catalog
+  history through one catalog-coordinated boundary. The boundary holds the
+  occupied user-table entry before the table layout mutex, prevalidates the
+  history transition, performs the layout/history commit without awaiting, and
+  queues retired runtimes afterward. A deterministic test forces purge to
+  overlap the internal publication interval for both DDL directions and proves
+  purge cannot observe a split pointer pair.
+- The component-shutdown panic-safety scope and its teardown tests were not
+  implemented by task `000250`. This backlog therefore remains open for that
+  half of the original acceptance criteria.
 
 ## Close Reason (Added When Closed)
 

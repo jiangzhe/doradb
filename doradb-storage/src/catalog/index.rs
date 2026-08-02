@@ -1003,10 +1003,9 @@ impl AcceptedExecution for AcceptedCreateIndex {
 
 impl AcceptedCreateIndex {
     async fn execute_inner(&mut self) -> CompletionResult<IndexNo> {
-        let plan = self
-            .plan
-            .take()
-            .unwrap_or_else(|| panic!("accepted CREATE INDEX plan exists during execution"));
+        let plan = self.plan.take().unwrap_or_else(|| {
+            panic!("accepted CREATE INDEX invariant violated: execution plan is missing")
+        });
         let engine = self.scope.engine().clone();
         let guards = self.scope.pool_guards();
         let table_id = plan.table_id;
@@ -1034,7 +1033,11 @@ impl AcceptedCreateIndex {
         let progress = self
             .progress
             .as_mut()
-            .unwrap_or_else(|| panic!("accepted CREATE INDEX progress exists after transaction"));
+            .unwrap_or_else(|| {
+                panic!(
+                    "accepted CREATE INDEX invariant violated: progress state is missing after transaction initialization"
+                )
+            });
 
         #[cfg(test)]
         engine
@@ -1374,10 +1377,9 @@ impl AcceptedExecution for AcceptedDropIndex {
 
 impl AcceptedDropIndex {
     async fn execute_inner(&mut self) -> CompletionResult<()> {
-        let plan = self
-            .plan
-            .take()
-            .unwrap_or_else(|| panic!("accepted DROP INDEX plan exists during execution"));
+        let plan = self.plan.take().unwrap_or_else(|| {
+            panic!("accepted DROP INDEX invariant violated: execution plan is missing")
+        });
         let engine = self.scope.engine().clone();
         let guards = self.scope.pool_guards();
         let table_id = plan.table_id;
@@ -1404,7 +1406,11 @@ impl AcceptedDropIndex {
         let progress = self
             .progress
             .as_mut()
-            .unwrap_or_else(|| panic!("accepted DROP INDEX progress exists after transaction"));
+            .unwrap_or_else(|| {
+                panic!(
+                    "accepted DROP INDEX invariant violated: progress state is missing after transaction initialization"
+                )
+            });
         #[cfg(test)]
         engine
             .index_ddl_test

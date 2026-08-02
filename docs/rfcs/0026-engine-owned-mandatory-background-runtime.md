@@ -1206,10 +1206,10 @@ focused validation.
     commit, root publication, layout install, and retired-index cleanup.
   - Non-goals: Do not redesign index formats/algorithms, parallelize one index
     build, or add scheduler priority lanes.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000250-runtime-owned-index-ddl.md`
+  - Task Issue: `#926`
+  - Phase Status: done
+  - Implementation Summary: Implemented caller-prepared, mandatory-runtime-owned CREATE INDEX and DROP INDEX with generalized fixed DDL scopes, prepared catalog authority, one transferable table/catalog gate scope, atomic layout/history publication, supervised completion, and local cooperative yields; the Phase 2 prerequisite and Phase 4 assumptions remain satisfied. Backlog 000104 remains deferred, and the atomic-publication half of backlog 000174 is complete while its shutdown half remains open. [Task Resolve Sync: docs/tasks/000250-runtime-owned-index-ddl.md @ 2026-08-02]
 
 - **Phase 4: Runtime-Owned Mandatory Maintenance**
   - Scope: Migrate effectful table freeze/checkpoint, catalog checkpoint,

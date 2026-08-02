@@ -1,7 +1,7 @@
 ---
 id: 000250
 title: Runtime-Owned Index DDL
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-08-02
 github_issue: 926
 ---
@@ -170,8 +170,8 @@ Relevant design, process, implementation, and backlog sources:
 - `docs/tasks/000248-mandatory-operation-driver-and-concurrent-cleanup-executor.md`
 - `docs/tasks/000249-runtime-owned-table-ddl.md`
 - `docs/rfcs/0018-create-drop-index.md`
-- `docs/backlogs/000104-stream-and-parallelize-create-index-cold-row-builds.md`
-- `docs/backlogs/000174-make-index-metadata-publication-atomic-and-component-shutdown-panic-safe.md`
+- `docs/backlogs/000104-stream-parallel-create-index-cold-build.md`
+- `docs/backlogs/000174-atomic-index-metadata-publication-and-panic-safe-shutdown.md`
 - `docs/architecture.md`
 - `docs/index-design.md`
 - `docs/secondary-index.md`
@@ -806,6 +806,58 @@ separate planning rather than silently broadening Phase 3.
 
 ## Implementation Notes
 
+- `CREATE INDEX` and `DROP INDEX` now prepare public validation, the complete
+  fixed logical-lock set, authoritative table/layout state, and both metadata
+  gate admissions on the caller before submitting owned plans to the mandatory
+  runtime. The accepted carriers start their private transactions only after
+  acceptance and own build/drop execution, catalog/root/layout publication,
+  cleanup, supervision, and typed completion independently of the caller or
+  completion observer.
+- The Phase 2 common DDL scope now serves table and index DDL. Accepted catalog
+  statements consume `PreparedCatalogWriteAuthority` and do not reacquire
+  catalog operation locks. `IndexDdlGateScope` transfers table-then-catalog
+  admission and releases catalog before table; implementation review removed
+  the superseded borrowed metadata-change entry points and redundant
+  operation-specific lock-acquisition wrappers.
+- `Catalog::install_index_layout_and_publish_history` now holds the occupied
+  user-table entry before replacing the table layout and committing catalog
+  history. This preserves the established entry-to-layout lock order and
+  pointer-identity invariant, exposes only old/old or new/new pairs to purge,
+  and queues retired runtimes after leaving the publication critical section.
+  This completes the atomic-publication half of backlog `000174`; component
+  shutdown panic safety remains open.
+- The existing all-row vectors, unstable sort, uniqueness checks, DiskTree and
+  MemIndex builders, root format, sparse index slots, and recovery proof remain
+  unchanged. Cooperative scheduling yields once per cold block and every 64
+  hot-row insertions without holding the publication locks. Backlog `000104`
+  continues to own bounded-memory, streaming, and parallel index construction.
+- Engine-scoped deterministic controls cover accepted execution phases,
+  observer-drop inertness, panic supervision, reversible build cleanup, and the
+  synchronous publication/purge overlap for both CREATE and DROP. Caller
+  preparation cancellation continues to use the generalized Phase 2 lock/gate
+  RAII machinery and existing admission/lock tests rather than duplicating a
+  separate index hook around every individual grant.
+- Implementation review consolidated completion error bridging as inherent
+  `CompletionErrorBridge` methods, removed obsolete split publication helpers,
+  simplified invariant paths and diagnostics, and retained operation-specific
+  prepared DDL constructors as the semantic boundary. Public Session APIs,
+  ordinary error variants, catalog rows, redo, roots, and recovery formats did
+  not change. The implementation is recorded by issue `#926` and branch commit
+  `ae8a86c`.
+- Release measurements on 2026-08-02 used one thread/session,
+  `log-sync=none`, five fresh roots per case, and one create/drop cycle per
+  root. Empty-table `index-ddl` had a candidate median of 233,959.5 ns/op
+  (range 213,230-338,293.5) versus 218,918 ns/op on `origin/main` (range
+  211,022-307,731). With 10,000 preloaded rows, the candidate median was
+  1,114,443 ns/op (range 1,068,401-1,299,861) versus 1,150,693.5 ns/op
+  (range 1,048,943-1,163,964.5). The overlapping distributions show no
+  repeatable regression.
+- Five control samples had candidate medians of 73.366 ns/op for `stmt-noop`
+  and 300.872 ns/op for `trx-noop`, versus 79.074 ns/op and 306.016 ns/op on
+  `origin/main`. Final verification passed 1,626 workspace tests, 1,533
+  alternate-`libaio` tests, the 32-test catalog-index suite, workspace build,
+  diff checks, and the mandatory style audit over 14 branch-diff Rust files.
+
 ## Impacts
 
 ### Production code
@@ -868,9 +920,9 @@ into backlog `000104`.
 - `docs/lock-system.md`
 - `docs/secondary-index.md`
 - benchmark-tool documentation covering `index-ddl`
-- `docs/backlogs/000104-stream-and-parallelize-create-index-cold-row-builds.md`
+- `docs/backlogs/000104-stream-parallel-create-index-cold-build.md`
   as an unchanged deferral reference
-- `docs/backlogs/000174-make-index-metadata-publication-atomic-and-component-shutdown-panic-safe.md`
+- `docs/backlogs/000174-atomic-index-metadata-publication-and-panic-safe-shutdown.md`
   for partial outcome recording during task resolution
 
 ### Compatibility and performance
