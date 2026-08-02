@@ -1,4 +1,4 @@
 interface:
   display_name: "Task Resolve"
-  short_description: "Resolve task documents and synchronize outcomes"
-  default_prompt: "Use $task-resolve after implementation, tests, and review to run the style gate, update the task document, close source backlogs, and synchronize any parent RFC phase."
+  short_description: "Compact and resolve completed task records"
+  default_prompt: "Use $task-resolve after implementation, tests, and review to run the style gate, compact the task document into a durable historical record, close source backlogs, and synchronize any parent RFC phase."

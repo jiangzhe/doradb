@@ -1,6 +1,6 @@
 ---
 name: task-resolve
-description: Resolve implemented Doradb task documents after code, tests, review, and behavior verification are complete. Use when running the mandatory style gate, recording implementation outcomes, managing deferred or source backlogs, refreshing task ids, and synchronizing a parent RFC phase without committing or pushing.
+description: Resolve implemented Doradb task documents after code, tests, review, and behavior verification are complete. Use when running the mandatory style gate, compacting design-heavy task documents into durable historical records, recording implementation outcomes, managing deferred or source backlogs, refreshing task ids, and synchronizing a parent RFC phase without committing or pushing.
 ---
 
 # Task Resolve Workflow
@@ -32,17 +32,58 @@ auto-format or edit implementation code as part of resolution.
 Confirm known implementation and review issues are fixed or explicitly
 accepted or deferred.
 
-### 3. Synchronize the Task Document
+### 3. Compact and Synchronize the Task Document
 
-Edit the task document directly and preserve the structure of
-`docs/tasks/000000-template.md`.
+Edit the task document directly. Preserve its frontmatter, title, and the
+section structure of `docs/tasks/000000-template.md`, but rewrite the content
+as a concise historical record of the shipped work rather than leaving it as
+an implementation guide.
 
-- Fill `Implementation Notes` with material implementation, test, review, and
-  verification outcomes plus plan deviations.
-- Omit small internal fixes unless they changed the plan, user-visible
-  behavior, acceptance criteria, RFC or backlog synchronization, or follow-up
-  decisions.
-- Add unresolved future improvements to `Open Questions` when appropriate.
+Before removing design-phase detail, inspect the final branch diff and capture
+the material implementation, test, review, verification, and plan-deviation
+outcomes in `Implementation Notes`. Preserve explicit `Parent RFC:`,
+`Source Backlogs:`, issue metadata, and follow-up paths so later resolve tools
+and future readers retain traceability.
+
+Compact every section according to its historical purpose:
+
+- `Summary`: retain the problem, shipped solution, and resulting behavior.
+- `Context`: retain motivating evidence, durable constraints, and relevant
+  RFC, task, issue, or backlog relationships.
+- `Goals` and `Non-Goals`: retain delivered contracts and meaningful scope
+  boundaries that remain useful in later design or investigation.
+- `Plan`: replace step-by-step implementation instructions with the final
+  architecture, interfaces, data flow, correctness invariants, and material
+  rationale or rejected alternatives.
+- `Implementation Notes`: retain actual outcomes, material deviations, review
+  discoveries, benchmark findings, and final verification evidence. Omit small
+  internal fixes unless they changed the plan, user-visible behavior,
+  acceptance criteria, RFC or backlog synchronization, or follow-up decisions.
+- `Impacts`: retain affected subsystems plus public API, data-format, schema,
+  compatibility, performance, or operational effects; remove exhaustive
+  symbol and file inventories.
+- `Test Cases`: retain concise acceptance scenarios and the coverage actually
+  completed; remove duplicated test mechanics, routine command listings, and
+  raw output.
+- `Open Questions`: retain only unresolved questions or future improvements,
+  with linked backlogs when actionable. Remove questions resolved by the
+  implementation.
+
+Remove code snippets already represented by the codebase, granular edit
+instructions, obsolete implementation caveats, proposal-round scaffolding,
+large reference inventories, and repeated content. Retain a short snippet only
+when it is the durable record of a protocol, format, invariant, or decision not
+documented adequately elsewhere.
+
+Aim for 200 to 300 lines in a normally complex resolved task:
+
+- do not pad an already concise task to reach the range;
+- exceed 300 lines only when further reduction would lose durable context, and
+  explain the reason in the resolve handoff;
+- check the final size with `wc -l docs/tasks/000042-example.md`;
+- re-read the compacted task for consistency with the shipped implementation
+  and ensure `Implementation Notes` starts with a meaningful outcome suitable
+  for the default RFC synchronization summary.
 
 ### 4. Record Deferred Work
 
