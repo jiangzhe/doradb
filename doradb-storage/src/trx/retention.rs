@@ -1,7 +1,7 @@
-use crate::catalog::CatalogCheckpointOutcome;
+use crate::catalog::{CatalogCheckpointOutcome, CatalogCheckpointScope};
 use crate::error::{
-    DataIntegrityError, DataIntegrityResult, FatalError, IoError, RuntimeError,
-    RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
+    CompletionErrorBridge, CompletionResult, DataIntegrityError, DataIntegrityResult, FatalError,
+    IoError, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
 };
 use crate::id::{TableID, TrxID};
 use crate::log::{
@@ -11,12 +11,17 @@ use crate::obs;
 use crate::recovery::stream::{
     RedoReplayPlanner, RedoRetentionSegment, RedoRetentionSegmentState, RedoSegmentCtsRange,
 };
+use crate::runtime::mandatory::{AcceptedExecution, MandatoryTaskMetadata, PreparedExecution};
 use crate::session::{
-    CatalogRedoMaintenanceOutcome, RedoTruncationBlockerInfo, RedoTruncationOutcome,
+    AcceptedMaintenanceScope, CatalogRedoMaintenanceOutcome, PreparedMaintenanceScope,
+    RedoTruncationBlockerInfo, RedoTruncationOutcome,
 };
+#[cfg(test)]
+use crate::table::tests::MaintenanceTestController;
 use crate::table::{LiveTableRedoReplayFloor, TableRedoReplayFloor};
-use crate::trx::sys::{CatalogRedoRetentionProgress, TransactionSystem};
+use crate::trx::sys::{CatalogRedoRetentionProgress, RedoRetentionScope, TransactionSystem};
 use error_stack::{Report, ResultExt};
+use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::ErrorKind as IoErrorKind;
@@ -112,6 +117,201 @@ impl PendingDroppedTableRedoFloor {
     }
 }
 
+/// Caller-prepared redo truncation awaiting mandatory capacity.
+pub(crate) struct PreparedRedoTruncationOperation {
+    catalog_scope: CatalogCheckpointScope,
+    redo_scope: RedoRetentionScope,
+    scope: PreparedMaintenanceScope,
+    metadata: MandatoryTaskMetadata,
+}
+
+impl PreparedRedoTruncationOperation {
+    /// Build one truncation with catalog and redo authority held.
+    pub(crate) fn new(
+        catalog_scope: CatalogCheckpointScope,
+        redo_scope: RedoRetentionScope,
+        scope: PreparedMaintenanceScope,
+    ) -> Self {
+        let metadata =
+            MandatoryTaskMetadata::operation(<Self as PreparedExecution>::LABEL, Some(scope.key()));
+        Self {
+            catalog_scope,
+            redo_scope,
+            scope,
+            metadata,
+        }
+    }
+}
+
+impl PreparedExecution for PreparedRedoTruncationOperation {
+    type Output = RedoTruncationOutcome;
+    type Accepted = AcceptedRedoTruncationOperation;
+
+    const LABEL: &'static str = "truncate_redo_log";
+
+    #[inline]
+    fn metadata(&self) -> MandatoryTaskMetadata {
+        self.metadata.clone()
+    }
+
+    #[inline]
+    fn accept(self) -> Self::Accepted {
+        let Self {
+            catalog_scope,
+            redo_scope,
+            scope,
+            metadata: _,
+        } = self;
+        AcceptedRedoTruncationOperation {
+            catalog_scope: Some(catalog_scope),
+            redo_scope: Some(redo_scope),
+            scope: scope.accept(),
+        }
+    }
+}
+
+/// Mandatory-runtime owner of accepted redo truncation.
+pub(crate) struct AcceptedRedoTruncationOperation {
+    catalog_scope: Option<CatalogCheckpointScope>,
+    redo_scope: Option<RedoRetentionScope>,
+    scope: AcceptedMaintenanceScope,
+}
+
+impl AcceptedExecution for AcceptedRedoTruncationOperation {
+    type Output = RedoTruncationOutcome;
+
+    async fn execute(&mut self) -> CompletionResult<Self::Output> {
+        let engine = self.scope.engine().clone();
+        let catalog_scope = self
+            .catalog_scope
+            .as_mut()
+            .unwrap_or_else(|| panic!("accepted redo truncation catalog scope is missing"));
+        let result = engine
+            .trx_sys
+            .truncate_redo_log_prepared(
+                || catalog_scope.release(),
+                #[cfg(test)]
+                &engine.maintenance_test,
+            )
+            .await
+            .map_err(CompletionErrorBridge::capture_runtime_or_fatal);
+        self.scope.mark_terminal_ready();
+        result
+    }
+
+    #[inline]
+    fn finish(&mut self) {
+        drop(self.catalog_scope.take());
+        drop(self.redo_scope.take());
+        self.scope.finish();
+    }
+
+    async fn handle_panic(&mut self, _panic: Box<dyn Any + Send>) -> CompletionErrorBridge {
+        self.scope.handle_panic();
+        CompletionErrorBridge::capture(
+            Report::new(FatalError::MandatoryTaskPanic).attach("accepted redo truncation panicked"),
+        )
+    }
+}
+
+/// Caller-prepared combined catalog checkpoint and redo truncation.
+pub(crate) struct PreparedCatalogRedoMaintenanceOperation {
+    catalog_scope: CatalogCheckpointScope,
+    redo_scope: RedoRetentionScope,
+    scope: PreparedMaintenanceScope,
+    metadata: MandatoryTaskMetadata,
+}
+
+impl PreparedCatalogRedoMaintenanceOperation {
+    /// Build one combined operation with both authorities held.
+    pub(crate) fn new(
+        catalog_scope: CatalogCheckpointScope,
+        redo_scope: RedoRetentionScope,
+        scope: PreparedMaintenanceScope,
+    ) -> Self {
+        let metadata =
+            MandatoryTaskMetadata::operation(<Self as PreparedExecution>::LABEL, Some(scope.key()));
+        Self {
+            catalog_scope,
+            redo_scope,
+            scope,
+            metadata,
+        }
+    }
+}
+
+impl PreparedExecution for PreparedCatalogRedoMaintenanceOperation {
+    type Output = CatalogRedoMaintenanceOutcome;
+    type Accepted = AcceptedCatalogRedoMaintenanceOperation;
+
+    const LABEL: &'static str = "checkpoint_catalog_and_truncate_redo_log";
+
+    #[inline]
+    fn metadata(&self) -> MandatoryTaskMetadata {
+        self.metadata.clone()
+    }
+
+    #[inline]
+    fn accept(self) -> Self::Accepted {
+        let Self {
+            catalog_scope,
+            redo_scope,
+            scope,
+            metadata: _,
+        } = self;
+        AcceptedCatalogRedoMaintenanceOperation {
+            catalog_scope: Some(catalog_scope),
+            redo_scope: Some(redo_scope),
+            scope: scope.accept(),
+        }
+    }
+}
+
+/// Mandatory-runtime owner of accepted combined catalog/redo maintenance.
+pub(crate) struct AcceptedCatalogRedoMaintenanceOperation {
+    catalog_scope: Option<CatalogCheckpointScope>,
+    redo_scope: Option<RedoRetentionScope>,
+    scope: AcceptedMaintenanceScope,
+}
+
+impl AcceptedExecution for AcceptedCatalogRedoMaintenanceOperation {
+    type Output = CatalogRedoMaintenanceOutcome;
+
+    async fn execute(&mut self) -> CompletionResult<Self::Output> {
+        let engine = self.scope.engine().clone();
+        let catalog_scope = self
+            .catalog_scope
+            .as_mut()
+            .unwrap_or_else(|| panic!("accepted combined maintenance catalog scope is missing"));
+        let result = engine
+            .trx_sys
+            .checkpoint_catalog_and_truncate_redo_log_prepared(
+                || catalog_scope.release(),
+                #[cfg(test)]
+                &engine.maintenance_test,
+            )
+            .await
+            .map_err(CompletionErrorBridge::capture_runtime_or_fatal);
+        self.scope.mark_terminal_ready();
+        result
+    }
+
+    #[inline]
+    fn finish(&mut self) {
+        drop(self.catalog_scope.take());
+        drop(self.redo_scope.take());
+        self.scope.finish();
+    }
+
+    async fn handle_panic(&mut self, _panic: Box<dyn Any + Send>) -> CompletionErrorBridge {
+        self.scope.handle_panic();
+        CompletionErrorBridge::capture(
+            Report::new(FatalError::MandatoryTaskPanic)
+                .attach("accepted combined catalog/redo maintenance panicked"),
+        )
+    }
+}
+
 impl TransactionSystem {
     /// Compute a side-effect-free redo truncation plan.
     #[inline]
@@ -174,9 +374,14 @@ impl TransactionSystem {
     /// progress cache, and cleanup below the marker. They are separate because
     /// the marker is catalog bootstrap metadata, but unlink races are about the
     /// redo file family rather than catalog metadata shape.
-    pub(crate) async fn truncate_redo_log(&self) -> RuntimeOrFatalResult<RedoTruncationOutcome> {
-        let catalog_checkpoint_lease = self.catalog.begin_checkpoint().await;
-        let _redo_retention_lease = self.begin_redo_retention().await;
+    async fn truncate_redo_log_prepared<F>(
+        &self,
+        release_catalog: F,
+        #[cfg(test)] maintenance_test: &MaintenanceTestController,
+    ) -> RuntimeOrFatalResult<RedoTruncationOutcome>
+    where
+        F: FnOnce(),
+    {
         // Session admission happens before the async gate waits above. Recheck
         // here so poison published while truncation was queued prevents marker
         // publication and physical redo cleanup.
@@ -220,14 +425,19 @@ impl TransactionSystem {
             previous_first_retained_file_seq
         };
 
-        drop(catalog_checkpoint_lease);
+        release_catalog();
         let file_prefix = self
             .config
             .file_prefix()
             .change_context(RuntimeError::RedoLogAccess)
             .map_err(RuntimeOrFatalError::from)?;
-        let cleanup = cleanup_obsolete_redo_files(&file_prefix, new_first_retained_file_seq)
-            .map_err(RuntimeOrFatalError::from)?;
+        let cleanup = cleanup_obsolete_redo_files(
+            &file_prefix,
+            new_first_retained_file_seq,
+            #[cfg(test)]
+            maintenance_test,
+        )
+        .map_err(RuntimeOrFatalError::from)?;
 
         Ok(RedoTruncationOutcome {
             previous_first_retained_file_seq,
@@ -245,14 +455,14 @@ impl TransactionSystem {
     }
 
     /// Run catalog checkpoint and redo truncation from one gated retention observation.
-    pub(crate) async fn checkpoint_catalog_and_truncate_redo_log(
+    async fn checkpoint_catalog_and_truncate_redo_log_prepared<F>(
         &self,
-    ) -> RuntimeOrFatalResult<CatalogRedoMaintenanceOutcome> {
-        // 1. Acquire gates in the same order as standalone truncation. The
-        // catalog gate protects the `catalog.mtb` root writer, while the redo
-        // retention gate stays held until obsolete-file cleanup is finished.
-        let catalog_checkpoint_lease = self.catalog.begin_checkpoint().await;
-        let _redo_retention_lease = self.begin_redo_retention().await;
+        release_catalog: F,
+        #[cfg(test)] maintenance_test: &MaintenanceTestController,
+    ) -> RuntimeOrFatalResult<CatalogRedoMaintenanceOutcome>
+    where
+        F: FnOnce(),
+    {
         // Session admission happened before these async waits. Recheck after
         // the gates so queued storage poison cannot publish metadata or unlink
         // redo files.
@@ -419,14 +629,19 @@ impl TransactionSystem {
         // 7. Release only the catalog gate before filesystem cleanup. The redo
         // retention lease remains held through cleanup so checkpoint scans
         // cannot race disappearing retained redo files.
-        drop(catalog_checkpoint_lease);
+        release_catalog();
         let file_prefix = self
             .config
             .file_prefix()
             .change_context(RuntimeError::RedoLogAccess)
             .map_err(RuntimeOrFatalError::from)?;
-        let cleanup = cleanup_obsolete_redo_files(&file_prefix, new_first_retained_file_seq)
-            .map_err(RuntimeOrFatalError::from)?;
+        let cleanup = cleanup_obsolete_redo_files(
+            &file_prefix,
+            new_first_retained_file_seq,
+            #[cfg(test)]
+            maintenance_test,
+        )
+        .map_err(RuntimeOrFatalError::from)?;
 
         // 8. Return both halves of the maintenance result. The redo outcome
         // reports marker advancement, retryable cleanup counts, and the
@@ -527,12 +742,13 @@ fn catalog_progress_for_final_marker(
 fn cleanup_obsolete_redo_files(
     file_prefix: &str,
     first_retained_file_seq: u32,
+    #[cfg(test)] maintenance_test: &MaintenanceTestController,
 ) -> RuntimeResult<RedoCleanupCounts> {
     let mut counts = RedoCleanupCounts::default();
     for descriptor in obsolete_redo_log_files_below_marker(file_prefix, first_retained_file_seq)? {
         debug_assert!(descriptor.seq < first_retained_file_seq);
         #[cfg(test)]
-        tests::run_redo_cleanup_before_unlink_hook(descriptor.seq, &descriptor.path);
+        maintenance_test.run_redo_cleanup_before_unlink_hook(descriptor.seq, &descriptor.path);
         match fs::remove_file(&descriptor.path) {
             Ok(()) => counts.removed_files = counts.removed_files.saturating_add(1),
             Err(err) if err.kind() == IoErrorKind::NotFound => {
@@ -796,62 +1012,32 @@ pub(crate) mod tests {
         CatalogSafeRedoSegment, RedoRetentionSegment, RedoRetentionSegmentState,
         RedoSegmentCtsRange,
     };
+    use crate::table::tests::{MaintenanceTestController, RedoCleanupBeforeUnlinkHook};
     use crate::table::{LiveTableRedoReplayFloor, TableRedoReplayFloor};
     use crate::trx::sys::CatalogRedoRetentionProgress;
-    use parking_lot::{Mutex, MutexGuard};
-    use std::path::Path;
-    use std::sync::{Arc, OnceLock, mpsc};
-    use std::thread;
-    use std::time::Duration;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::Arc;
 
-    type BeforeUnlinkHook = Arc<dyn Fn(u32, &Path) + Send + Sync + 'static>;
-
-    fn before_unlink_hook_slot() -> &'static Mutex<Option<BeforeUnlinkHook>> {
-        static HOOK: OnceLock<Mutex<Option<BeforeUnlinkHook>>> = OnceLock::new();
-        HOOK.get_or_init(|| Mutex::new(None))
-    }
-
-    fn before_unlink_hook_install_lock() -> &'static Mutex<()> {
-        static INSTALL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        INSTALL_LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    /// Guard that restores the previous redo cleanup before-unlink hook on drop.
-    ///
-    /// The process-wide install lock is held for the guard lifetime so parallel
-    /// tests cannot overwrite each other's global hook state.
+    /// Guard that clears one engine's redo cleanup hook on drop.
     pub(crate) struct RedoCleanupBeforeUnlinkHookGuard {
-        previous: Option<BeforeUnlinkHook>,
-        _install_guard: MutexGuard<'static, ()>,
+        test: MaintenanceTestController,
     }
 
     impl Drop for RedoCleanupBeforeUnlinkHookGuard {
         #[inline]
         fn drop(&mut self) {
-            *before_unlink_hook_slot().lock() = self.previous.take();
+            self.test.clear_redo_cleanup_before_unlink_hook();
         }
     }
 
     /// Install a hook invoked after obsolete redo discovery and before unlink.
     #[inline]
     pub(crate) fn install_redo_cleanup_before_unlink_hook(
-        hook: BeforeUnlinkHook,
+        test: &MaintenanceTestController,
+        hook: RedoCleanupBeforeUnlinkHook,
     ) -> RedoCleanupBeforeUnlinkHookGuard {
-        let install_guard = before_unlink_hook_install_lock().lock();
-        let mut slot = before_unlink_hook_slot().lock();
-        let previous = slot.replace(hook);
-        RedoCleanupBeforeUnlinkHookGuard {
-            previous,
-            _install_guard: install_guard,
-        }
-    }
-
-    #[inline]
-    pub(crate) fn run_redo_cleanup_before_unlink_hook(file_seq: u32, path: &Path) {
-        let hook = before_unlink_hook_slot().lock().clone();
-        if let Some(hook) = hook {
-            hook(file_seq, path);
-        }
+        test.install_redo_cleanup_before_unlink_hook(hook);
+        RedoCleanupBeforeUnlinkHookGuard { test: test.clone() }
     }
 
     #[inline]
@@ -938,27 +1124,16 @@ pub(crate) mod tests {
 
     #[test]
     fn redo_cleanup_before_unlink_hook_installation_is_exclusive() {
-        let first = install_redo_cleanup_before_unlink_hook(Arc::new(|_, _| {}));
-        let (started_tx, started_rx) = mpsc::channel();
-        let (installed_tx, installed_rx) = mpsc::channel();
+        let first_test = MaintenanceTestController::default();
+        let second_test = MaintenanceTestController::default();
+        let _first = install_redo_cleanup_before_unlink_hook(&first_test, Arc::new(|_, _| {}));
+        let _second = install_redo_cleanup_before_unlink_hook(&second_test, Arc::new(|_, _| {}));
 
-        let installer = thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            let _second = install_redo_cleanup_before_unlink_hook(Arc::new(|_, _| {}));
-            installed_tx.send(()).unwrap();
-        });
-
-        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert!(
-            installed_rx
-                .recv_timeout(Duration::from_millis(50))
-                .is_err(),
-            "second hook installer should wait for the first guard"
-        );
-
-        drop(first);
-        installed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        installer.join().unwrap();
+        catch_unwind(AssertUnwindSafe(|| {
+            let _duplicate =
+                install_redo_cleanup_before_unlink_hook(&first_test, Arc::new(|_, _| {}));
+        }))
+        .expect_err("one engine must reject a duplicate redo cleanup hook");
     }
 
     #[test]

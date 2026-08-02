@@ -1,9 +1,11 @@
+use super::Table;
 use crate::error::{OperationError, OperationResult};
 use crate::id::TableID;
 use error_stack::Report;
 use event_listener::{Event, EventListener, listener};
 use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::result::Result as StdResult;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 const TERMINAL_MASK: u32 = 0b11;
@@ -458,11 +460,8 @@ impl TableLifecycle {
         }
     }
 
-    /// Attempts to enter the checkpoint root-mutation section.
-    #[inline]
-    pub(crate) fn try_begin_checkpoint_root_mutation(
-        &self,
-    ) -> StdResult<TableCheckpointRootMutationLease<'_>, CheckpointCancelReason> {
+    /// Acquires checkpoint root-mutation admission without borrowing a lease.
+    fn try_acquire_checkpoint_root_mutation(&self) -> StdResult<(), CheckpointCancelReason> {
         loop {
             let (raw, state) = self.inspect_state("begin checkpoint root mutation enter");
             check_terminal_for_checkpoint(state.terminal)?;
@@ -477,7 +476,7 @@ impl TableLifecycle {
             next.root_mutation_active = true;
             next.debug_assert_valid("begin checkpoint root mutation exit");
             if self.compare_exchange_state(raw, next) {
-                return Ok(TableCheckpointRootMutationLease { lifecycle: self });
+                return Ok(());
             }
         }
     }
@@ -660,23 +659,42 @@ impl Drop for CheckpointPublishLease<'_> {
     }
 }
 
-/// RAII guard for checkpoint table-root mutation before root publication.
-pub(crate) struct TableCheckpointRootMutationLease<'a> {
-    lifecycle: &'a TableLifecycle,
+/// Lifetime-free checkpoint root-mutation authority.
+///
+/// The retained table keeps the lifecycle owner alive until admission is
+/// released, allowing this scope to cross mandatory acceptance.
+pub(crate) struct TableCheckpointRootMutationScope {
+    table: Arc<Table>,
+    active: bool,
 }
 
-impl Debug for TableCheckpointRootMutationLease<'_> {
-    #[inline]
-    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        f.debug_struct("TableCheckpointRootMutationLease")
-            .finish_non_exhaustive()
+impl TableCheckpointRootMutationScope {
+    /// Attempt to acquire root-mutation authority for an owned table runtime.
+    pub(crate) fn acquire(table: Arc<Table>) -> StdResult<Self, CheckpointCancelReason> {
+        table.lifecycle.try_acquire_checkpoint_root_mutation()?;
+        Ok(Self {
+            table,
+            active: true,
+        })
     }
 }
 
-impl Drop for TableCheckpointRootMutationLease<'_> {
+impl Debug for TableCheckpointRootMutationScope {
+    #[inline]
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        f.debug_struct("TableCheckpointRootMutationScope")
+            .field("table_id", &self.table.table_id())
+            .finish()
+    }
+}
+
+impl Drop for TableCheckpointRootMutationScope {
     #[inline]
     fn drop(&mut self) {
-        self.lifecycle.release_checkpoint_root_mutation();
+        if self.active {
+            self.active = false;
+            self.table.lifecycle.release_checkpoint_root_mutation();
+        }
     }
 }
 
@@ -752,7 +770,7 @@ mod tests {
     fn test_drop_gate_waits_for_active_publish_lease_before_completing() {
         smol::block_on(async {
             let lifecycle = Arc::new(TableLifecycle::new());
-            let root_lease = lifecycle.try_begin_checkpoint_root_mutation().unwrap();
+            lifecycle.try_acquire_checkpoint_root_mutation().unwrap();
             let lease = lifecycle.try_begin_checkpoint_publish().unwrap();
             let drain = lifecycle.start_drop(TABLE_ID).unwrap();
             let mut drop_fut = Box::pin(drain.wait());
@@ -766,8 +784,8 @@ mod tests {
                 Ok(_lease) => panic!("publish lease should be blocked by drop gate"),
                 Err(reason) => assert_eq!(reason, CheckpointCancelReason::TableDropping),
             }
-            match lifecycle.try_begin_checkpoint_root_mutation() {
-                Ok(_lease) => panic!("root mutation should be blocked by drop gate"),
+            match lifecycle.try_acquire_checkpoint_root_mutation() {
+                Ok(()) => panic!("root mutation should be blocked by drop gate"),
                 Err(reason) => assert_eq!(reason, CheckpointCancelReason::TableDropping),
             }
             let err = lifecycle
@@ -782,7 +800,7 @@ mod tests {
             drop(lease);
             drop_fut.await;
             assert_eq!(lifecycle.inspect_terminal(), TableTerminal::Dropping);
-            drop(root_lease);
+            lifecycle.release_checkpoint_root_mutation();
         });
     }
 
@@ -791,7 +809,7 @@ mod tests {
     fn test_mark_dropped_requires_drained_publish_gate() {
         smol::block_on(async {
             let lifecycle = Arc::new(TableLifecycle::new());
-            let root_lease = lifecycle.try_begin_checkpoint_root_mutation().unwrap();
+            lifecycle.try_acquire_checkpoint_root_mutation().unwrap();
             let publish_lease = lifecycle.try_begin_checkpoint_publish().unwrap();
             let drain = lifecycle.start_drop(TABLE_ID).unwrap();
             let mut drop_fut = Box::pin(drain.wait());
@@ -801,7 +819,7 @@ mod tests {
                 std::task::Poll::Pending
             ));
             lifecycle.mark_dropped(TABLE_ID);
-            drop((publish_lease, drop_fut, root_lease));
+            drop((publish_lease, drop_fut));
         });
     }
 
@@ -847,56 +865,59 @@ mod tests {
             let lifecycle = TableLifecycle::new();
             lifecycle.acquire_metadata_change(TABLE_ID).await.unwrap();
 
-            match lifecycle.try_begin_checkpoint_root_mutation() {
-                Ok(_lease) => panic!("checkpoint root mutation should be cancelled"),
+            match lifecycle.try_acquire_checkpoint_root_mutation() {
+                Ok(()) => panic!("checkpoint root mutation should be cancelled"),
                 Err(reason) => assert_eq!(reason, CheckpointCancelReason::TableMetadataChanging),
             }
 
             lifecycle.release_metadata_change();
-            let _root_lease = lifecycle.try_begin_checkpoint_root_mutation().unwrap();
+            lifecycle.try_acquire_checkpoint_root_mutation().unwrap();
+            lifecycle.release_checkpoint_root_mutation();
         });
     }
 
     #[test]
     fn test_active_checkpoint_root_mutation_blocks_concurrent_checkpoint() {
         let lifecycle = TableLifecycle::new();
-        let root_lease = lifecycle.try_begin_checkpoint_root_mutation().unwrap();
+        lifecycle.try_acquire_checkpoint_root_mutation().unwrap();
 
-        match lifecycle.try_begin_checkpoint_root_mutation() {
-            Ok(_lease) => panic!("concurrent checkpoint root mutation should be cancelled"),
+        match lifecycle.try_acquire_checkpoint_root_mutation() {
+            Ok(()) => panic!("concurrent checkpoint root mutation should be cancelled"),
             Err(reason) => assert_eq!(reason, CheckpointCancelReason::CheckpointInProgress),
         }
 
-        drop(root_lease);
-        let _root_lease = lifecycle.try_begin_checkpoint_root_mutation().unwrap();
+        lifecycle.release_checkpoint_root_mutation();
+        lifecycle.try_acquire_checkpoint_root_mutation().unwrap();
+        lifecycle.release_checkpoint_root_mutation();
     }
 
     #[test]
     fn test_metadata_change_waits_for_active_checkpoint_root_mutation() {
         smol::block_on(async {
             let lifecycle = TableLifecycle::new();
-            let root_lease = lifecycle.try_begin_checkpoint_root_mutation().unwrap();
+            lifecycle.try_acquire_checkpoint_root_mutation().unwrap();
             let mut metadata_fut = Box::pin(lifecycle.acquire_metadata_change(TABLE_ID));
 
             assert!(matches!(
                 futures::poll!(metadata_fut.as_mut()),
                 std::task::Poll::Pending
             ));
-            match lifecycle.try_begin_checkpoint_root_mutation() {
-                Ok(_lease) => panic!("pending metadata change should block new checkpoint roots"),
+            match lifecycle.try_acquire_checkpoint_root_mutation() {
+                Ok(()) => panic!("pending metadata change should block new checkpoint roots"),
                 Err(reason) => assert_eq!(reason, CheckpointCancelReason::TableMetadataChanging),
             }
             let publish_lease = lifecycle.try_begin_checkpoint_publish().unwrap();
             drop(publish_lease);
 
-            drop(root_lease);
+            lifecycle.release_checkpoint_root_mutation();
             metadata_fut.await.unwrap();
-            match lifecycle.try_begin_checkpoint_root_mutation() {
-                Ok(_lease) => panic!("active metadata change should block checkpoint roots"),
+            match lifecycle.try_acquire_checkpoint_root_mutation() {
+                Ok(()) => panic!("active metadata change should block checkpoint roots"),
                 Err(reason) => assert_eq!(reason, CheckpointCancelReason::TableMetadataChanging),
             }
             lifecycle.release_metadata_change();
-            let _root_lease = lifecycle.try_begin_checkpoint_root_mutation().unwrap();
+            lifecycle.try_acquire_checkpoint_root_mutation().unwrap();
+            lifecycle.release_checkpoint_root_mutation();
         });
     }
 
@@ -904,7 +925,7 @@ mod tests {
     fn test_pending_metadata_change_cancellation_reopens_checkpoint_root_mutation() {
         smol::block_on(async {
             let lifecycle = TableLifecycle::new();
-            let root_lease = lifecycle.try_begin_checkpoint_root_mutation().unwrap();
+            lifecycle.try_acquire_checkpoint_root_mutation().unwrap();
             let mut metadata_fut = Box::pin(lifecycle.acquire_metadata_change(TABLE_ID));
 
             assert!(matches!(
@@ -913,8 +934,9 @@ mod tests {
             ));
 
             drop(metadata_fut);
-            drop(root_lease);
-            let _root_lease = lifecycle.try_begin_checkpoint_root_mutation().unwrap();
+            lifecycle.release_checkpoint_root_mutation();
+            lifecycle.try_acquire_checkpoint_root_mutation().unwrap();
+            lifecycle.release_checkpoint_root_mutation();
         });
     }
 

@@ -2,7 +2,8 @@ use super::{Table, TableRootSnapshot, TableRuntimeLayout};
 use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuard, PoolGuards};
 use crate::catalog::TableMetadata;
 use crate::error::{
-    DataIntegrityError, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
+    CompletionErrorBridge, CompletionResult, DataIntegrityError, FatalError, RuntimeError,
+    RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
 };
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::id::{BlockID, RowID, TableID, TrxID};
@@ -10,10 +11,12 @@ use crate::index::{
     ColumnBlockIndex, MemIndexEntry, NonUniqueMemIndex, ResolvedColumnRow, SecondaryIndex,
     UniqueMemIndex,
 };
-use crate::session::SessionOperationPin;
-use crate::trx::TrxReadProof;
+use crate::runtime::mandatory::{AcceptedExecution, MandatoryTaskMetadata, PreparedExecution};
+use crate::session::{AcceptedMaintenanceScope, PreparedMaintenanceScope};
+use crate::trx::{Transaction, TrxReadProof};
 use crate::value::Val;
 use error_stack::{Report, ResultExt};
+use std::any::Any;
 use std::sync::Arc;
 
 /// Aggregate result for a full-scan user-table secondary MemIndex cleanup pass.
@@ -177,82 +180,203 @@ enum DeleteOverlayProof {
     ColdRowValues(Vec<Val>),
 }
 
-impl Table {
-    /// Full-scan cleanup for user-table secondary MemIndex entries.
-    ///
-    /// This pass removes only entries proven redundant or obsolete against one
-    /// captured table-file root. It never mutates DiskTree state, and it treats
-    /// missing delete proof as a retention decision for delete overlays.
-    ///
-    /// When `clean_live_entries` is `true`, redundant live MemIndex entries are
-    /// removed only after the captured root is older than every active snapshot.
-    /// Otherwise live entries are retained and [`MemIndexCleanupOutcome::live_delay`]
-    /// reports the retry boundary. When `false`, live MemIndex cache entries are
-    /// retained by policy and no live delay is reported. Obsolete delete overlays
-    /// are cleaned independently in either case.
-    pub(crate) async fn cleanup_secondary_mem_indexes(
-        &self,
-        session: &SessionOperationPin,
+/// Caller-prepared secondary MemIndex cleanup awaiting mandatory capacity.
+pub(crate) struct PreparedMemIndexCleanupOperation {
+    table: Arc<Table>,
+    scope: PreparedMaintenanceScope,
+    clean_live_entries: bool,
+    metadata: MandatoryTaskMetadata,
+}
+
+impl PreparedMemIndexCleanupOperation {
+    /// Build one cleanup operation for an exact live table runtime.
+    pub(crate) fn new(
+        scope: PreparedMaintenanceScope,
+        table: Arc<Table>,
         clean_live_entries: bool,
-    ) -> RuntimeOrFatalResult<MemIndexCleanupOutcome> {
-        let trx_sys = session.engine.trx_sys.clone();
-        let pool_guards = session.pool_guards();
+    ) -> Self {
+        let metadata = MandatoryTaskMetadata::table_operation(
+            <Self as PreparedExecution>::LABEL,
+            scope.key(),
+            table.table_id(),
+        );
+        Self {
+            table,
+            scope,
+            clean_live_entries,
+            metadata,
+        }
+    }
+}
+
+impl PreparedExecution for PreparedMemIndexCleanupOperation {
+    type Output = MemIndexCleanupOutcome;
+    type Accepted = AcceptedMemIndexCleanupOperation;
+
+    const LABEL: &'static str = "cleanup_secondary_mem_indexes";
+
+    #[inline]
+    fn metadata(&self) -> MandatoryTaskMetadata {
+        self.metadata.clone()
+    }
+
+    #[inline]
+    fn accept(self) -> Self::Accepted {
+        let Self {
+            table,
+            scope,
+            clean_live_entries,
+            metadata: _,
+        } = self;
+        AcceptedMemIndexCleanupOperation {
+            table: Some(table),
+            active_trx: None,
+            scope: scope.accept(),
+            clean_live_entries,
+            phase: MemIndexCleanupPhase::Starting,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MemIndexCleanupPhase {
+    Starting,
+    TransactionActive,
+    Scanning,
+    RollingBack,
+    Finished,
+}
+
+enum CleanupIteration {
+    Retry,
+    Finished(RuntimeResult<MemIndexCleanupOutcome>),
+}
+
+/// Mandatory-runtime owner of accepted secondary MemIndex cleanup.
+pub(crate) struct AcceptedMemIndexCleanupOperation {
+    table: Option<Arc<Table>>,
+    active_trx: Option<Transaction>,
+    scope: AcceptedMaintenanceScope,
+    clean_live_entries: bool,
+    phase: MemIndexCleanupPhase,
+}
+
+impl AcceptedExecution for AcceptedMemIndexCleanupOperation {
+    type Output = MemIndexCleanupOutcome;
+
+    async fn execute(&mut self) -> CompletionResult<Self::Output> {
+        let result = self
+            .execute_inner()
+            .await
+            .map_err(CompletionErrorBridge::capture_runtime_or_fatal);
+        self.scope.mark_terminal_ready();
+        self.phase = MemIndexCleanupPhase::Finished;
+        result
+    }
+
+    #[inline]
+    fn finish(&mut self) {
+        drop(self.active_trx.take());
+        drop(self.table.take());
+        self.scope.finish();
+    }
+
+    async fn handle_panic(&mut self, _panic: Box<dyn Any + Send>) -> CompletionErrorBridge {
+        self.scope.handle_panic();
+        CompletionErrorBridge::capture(Report::new(FatalError::MandatoryTaskPanic).attach(format!(
+            "accepted secondary MemIndex cleanup panicked: phase={:?}",
+            self.phase
+        )))
+    }
+}
+
+impl AcceptedMemIndexCleanupOperation {
+    async fn execute_inner(&mut self) -> RuntimeOrFatalResult<MemIndexCleanupOutcome> {
+        let table = self
+            .table
+            .clone()
+            .unwrap_or_else(|| panic!("accepted MemIndex cleanup table is missing"));
+        let trx_sys = self.scope.engine().trx_sys.clone();
+        let pool_guards = self.scope.pool_guards();
         loop {
-            let mut trx = session
+            let trx = self
+                .scope
                 .begin_private_trx()
                 .change_context(RuntimeError::TableAccess)
                 .attach_with(|| {
                     format!(
                         "operation=cleanup_secondary_mem_indexes, table_id={}, phase=begin_transaction",
-                        self.table_id()
+                        table.table_id()
                     )
-                })
-                .map_err(RuntimeOrFatalError::from)?;
-            let cleanup_sts = trx.sts();
+                })?;
+            self.active_trx = Some(trx);
+            self.phase = MemIndexCleanupPhase::TransactionActive;
+            let cleanup_sts = self
+                .active_trx
+                .as_ref()
+                .unwrap_or_else(|| panic!("cleanup transaction disappeared after installation"))
+                .sts();
             let min_active_sts = trx_sys.calc_min_active_sts_for_gc();
             #[cfg(test)]
-            tests::run_test_cleanup_after_trx_start_hook().await;
-            let cleanup_res = {
+            self.scope
+                .engine()
+                .maintenance_test
+                .run_cleanup_after_trx_start_hook()
+                .await;
+            self.phase = MemIndexCleanupPhase::Scanning;
+            let iteration = {
+                let trx = self
+                    .active_trx
+                    .as_mut()
+                    .unwrap_or_else(|| panic!("cleanup transaction disappeared before checkout"));
                 let checkout = trx
                     .checkout()
                     .change_context(RuntimeError::TableAccess)
                     .attach_with(|| {
                         format!(
                             "operation=cleanup_secondary_mem_indexes, table_id={}, phase=checkout_transaction",
-                            self.table_id()
+                            table.table_id()
                         )
                     })
                     .map_err(RuntimeOrFatalError::from)?;
                 let proof = checkout.inner().ctx().read_proof();
-                let snapshot = self.capture_mem_index_cleanup_snapshot(min_active_sts, &proof);
+                let snapshot = table.capture_mem_index_cleanup_snapshot(min_active_sts, &proof);
                 if !snapshot.is_visible_to(cleanup_sts) {
                     drop(snapshot);
                     drop(checkout);
-                    trx.rollback_table_maintenance().await?;
-                    // The captured root was published after this transaction
-                    // started, so retry with a fresh STS. Transaction starts and
-                    // root fences share one monotonic timestamp source, making
-                    // the next STS newer than this fence unless another root
-                    // publication races again. The awaited rollback above keeps
-                    // this retry from becoming a tight busy loop.
-                    continue;
+                    CleanupIteration::Retry
+                } else {
+                    let cleanup_res = table
+                        .cleanup_secondary_mem_indexes_at_snapshot(
+                            &pool_guards,
+                            &snapshot,
+                            self.clean_live_entries,
+                        )
+                        .await;
+                    drop(snapshot);
+                    drop(checkout);
+                    CleanupIteration::Finished(cleanup_res)
                 }
-                let cleanup_res = self
-                    .cleanup_secondary_mem_indexes_at_snapshot(
-                        &pool_guards,
-                        &snapshot,
-                        clean_live_entries,
-                    )
-                    .await;
-                drop(snapshot);
-                drop(checkout);
-                cleanup_res
             };
+            self.phase = MemIndexCleanupPhase::RollingBack;
+            let trx = self
+                .active_trx
+                .take()
+                .unwrap_or_else(|| panic!("cleanup transaction missing before rollback"));
             let rollback_res = trx.rollback_table_maintenance().await;
-            return finish_secondary_mem_index_cleanup(cleanup_res, rollback_res);
+            match iteration {
+                CleanupIteration::Retry => {
+                    rollback_res?;
+                }
+                CleanupIteration::Finished(cleanup_res) => {
+                    return finish_secondary_mem_index_cleanup(cleanup_res, rollback_res);
+                }
+            }
         }
     }
+}
 
+impl Table {
     #[inline]
     fn capture_mem_index_cleanup_snapshot<'ctx>(
         &self,
@@ -706,54 +830,33 @@ mod tests {
     use super::finish_secondary_mem_index_cleanup;
     use crate::catalog::IndexNo;
     use crate::catalog::tests::wait_for_dropped_table_floor;
+    use crate::engine::Engine;
     use crate::error::{DataIntegrityError, LifecycleError, RuntimeError, RuntimeOrFatalError};
     use crate::id::{RowID, TrxID};
     use crate::index::IndexMask;
-    use crate::session::Session;
     use crate::session::tests::{
         SessionTestExt, assert_checkpoint_published, wait_for_checkpoint_purge,
+        wait_for_session_idle,
     };
     use crate::table::CheckpointOutcome;
     use crate::table::persistence::test_hooks::set_test_checkpoint_after_trx_start_hook;
     use crate::table::tests::*;
-    use crate::trx::{MAX_SNAPSHOT_TS, Transaction};
+    use crate::trx::MAX_SNAPSHOT_TS;
     use crate::value::Val;
     use error_stack::Report;
-    use std::cell::{Cell, RefCell};
     use std::future::Future;
-    use std::pin::Pin;
-    use std::rc::Rc;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
-    type CleanupAfterTrxStartHook =
-        Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + 'static>> + 'static>;
-
-    thread_local! {
-        static TEST_CLEANUP_AFTER_TRX_START_HOOK:
-            RefCell<Option<CleanupAfterTrxStartHook>> = RefCell::new(None);
-    }
-
-    fn set_test_cleanup_after_trx_start_hook<F, Fut>(hook: F)
+    fn set_test_cleanup_after_trx_start_hook<F, Fut>(engine: &Engine, hook: F)
     where
-        F: FnOnce() -> Fut + 'static,
-        Fut: Future<Output = ()> + 'static,
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
     {
-        TEST_CLEANUP_AFTER_TRX_START_HOOK.with(|slot| {
-            let old = slot
-                .borrow_mut()
-                .replace(Box::new(move || Box::pin(hook())));
-            assert!(
-                old.is_none(),
-                "MemIndex cleanup transaction-start hook already installed"
-            );
-        });
-    }
-
-    pub(super) async fn run_test_cleanup_after_trx_start_hook() {
-        let hook = TEST_CLEANUP_AFTER_TRX_START_HOOK.with(|slot| slot.borrow_mut().take());
-        if let Some(hook) = hook {
-            hook().await;
-        }
+        engine
+            .inner()
+            .maintenance_test
+            .install_cleanup_after_trx_start_hook(hook);
     }
 
     #[test]
@@ -794,7 +897,7 @@ mod tests {
             );
 
             let mut checkpoint_session = engine.new_session().unwrap();
-            set_test_cleanup_after_trx_start_hook(move || async move {
+            set_test_cleanup_after_trx_start_hook(&engine, move || async move {
                 assert_checkpoint_published(&mut checkpoint_session, table_id).await;
             });
 
@@ -811,7 +914,7 @@ mod tests {
     }
 
     #[test]
-    fn test_secondary_mem_index_cleanup_scoped_access_blocks_drop() {
+    fn test_dropped_mem_index_cleanup_observer_still_blocks_drop_until_terminal() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine =
@@ -820,7 +923,7 @@ mod tests {
             let mut cleanup_session = engine.new_session().unwrap();
             let (entered_tx, entered_rx) = flume::bounded(1);
             let (release_tx, release_rx) = flume::bounded(1);
-            set_test_cleanup_after_trx_start_hook(move || async move {
+            set_test_cleanup_after_trx_start_hook(&engine, move || async move {
                 entered_tx.send_async(()).await.unwrap();
                 release_rx.recv_async().await.unwrap();
             });
@@ -829,13 +932,15 @@ mod tests {
                 Box::pin(cleanup_session.cleanup_secondary_mem_indexes(table_id, true));
             assert!(futures::poll!(cleanup.as_mut()).is_pending());
             entered_rx.recv_async().await.unwrap();
+            drop(cleanup);
 
             let mut drop_session = engine.new_session().unwrap();
             let mut drop_table = Box::pin(drop_session.drop_table(table_id));
             assert!(futures::poll!(drop_table.as_mut()).is_pending());
 
             release_tx.send_async(()).await.unwrap();
-            cleanup.await.unwrap();
+            wait_for_session_idle(&engine.inner().session_registry, cleanup_session.id()).await;
+            assert!(!cleanup_session.in_trx().unwrap());
             drop_table.await.unwrap();
             wait_for_dropped_table_floor(&engine, table_id).await;
 
@@ -876,17 +981,16 @@ mod tests {
                 .0;
 
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            let reader_holder: Rc<RefCell<Option<(Session, Transaction)>>> =
-                Rc::new(RefCell::new(None));
-            let reader_sts = Rc::new(Cell::new(TrxID::new(0)));
-            let hook_reader_holder = Rc::clone(&reader_holder);
-            let hook_reader_sts = Rc::clone(&reader_sts);
+            let reader_holder = Arc::new(parking_lot::Mutex::new(None));
+            let reader_sts = Arc::new(parking_lot::Mutex::new(TrxID::new(0)));
+            let hook_reader_holder = Arc::clone(&reader_holder);
+            let hook_reader_sts = Arc::clone(&reader_sts);
             let hook_engine = engine.new_ref().unwrap();
-            set_test_checkpoint_after_trx_start_hook(move || async move {
+            set_test_checkpoint_after_trx_start_hook(&engine, move || async move {
                 let mut reader_session = hook_engine.new_session().unwrap();
                 let reader = reader_session.begin_trx().unwrap();
-                hook_reader_sts.set(reader.sts());
-                *hook_reader_holder.borrow_mut() = Some((reader_session, reader));
+                *hook_reader_sts.lock() = reader.sts();
+                *hook_reader_holder.lock() = Some((reader_session, reader));
             });
 
             let checkpoint = session.checkpoint_table(table_id).await.unwrap();
@@ -895,8 +999,8 @@ mod tests {
             };
             let published_root = table.file().active_root_unchecked().clone();
             let effective_ts = published_root.effective_ts();
-            assert!(checkpoint_ts < reader_sts.get());
-            assert!(reader_sts.get() < effective_ts);
+            assert!(checkpoint_ts < *reader_sts.lock());
+            assert!(*reader_sts.lock() < effective_ts);
 
             let delayed = session
                 .cleanup_secondary_mem_indexes(table_id, true)
@@ -907,7 +1011,7 @@ mod tests {
                 .expect("old root reader must delay live-entry cleanup");
             assert_eq!(delay.table_id, table_id);
             assert_eq!(delay.effective_ts, effective_ts);
-            assert!(delay.min_active_sts <= reader_sts.get());
+            assert!(delay.min_active_sts <= *reader_sts.lock());
             assert_eq!(delayed.stats.indexes.len(), 2);
             for index_stats in &delayed.stats.indexes {
                 assert_eq!(index_stats.scanned, 0);
@@ -932,7 +1036,7 @@ mod tests {
             assert_eq!(old_root_rows, vec![row_id]);
 
             let (_, reader) = reader_holder
-                .borrow_mut()
+                .lock()
                 .take()
                 .expect("checkpoint hook must retain the old-root reader");
             reader.commit().await.unwrap();

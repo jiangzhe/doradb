@@ -4,18 +4,23 @@ use crate::catalog::{
     is_user_table,
 };
 use crate::error::{
-    DataIntegrityError, DataIntegrityResult, FatalError, IoError, RuntimeError,
-    RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
+    CompletionErrorBridge, CompletionResult, DataIntegrityError, DataIntegrityResult, FatalError,
+    IoError, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
 };
 use crate::id::{TableID, TrxID};
 use crate::log::discover_redo_log_files;
 use crate::log::redo::{DDLRedo, RowRedoKind, TableDML};
 use crate::obs;
+use crate::quiescent::QuiescentGuard;
 use crate::recovery::stream::{CatalogSafeRedoSegment, RedoReplayPlanner};
+use crate::runtime::mandatory::{AcceptedExecution, MandatoryTaskMetadata, PreparedExecution};
+use crate::session::{AcceptedMaintenanceScope, PreparedMaintenanceScope};
+use crate::trx::RedoRetentionScope;
 use crate::trx::sys::{CatalogRedoRetentionProgress, TransactionSystem};
 use error_stack::{Report, ResultExt};
 use event_listener::{Event, listener};
 use parking_lot::Mutex;
+use std::any::Any;
 use std::collections::BTreeMap;
 
 /// One catalog-row redo operation extracted from persisted logs.
@@ -170,14 +175,8 @@ impl CatalogCheckpointGate {
         }
     }
 
-    /// Acquire a catalog checkpoint/marker-publish lease.
-    ///
-    /// The lease waits until no catalog metadata change is active or pending,
-    /// and also serializes overlapping catalog checkpoints or redo marker
-    /// publishes. It does not protect the retained redo suffix itself; callers
-    /// that scan retained redo, publish a marker, or unlink obsolete files must
-    /// also hold the transaction-system redo-retention lease.
-    pub(crate) async fn begin_checkpoint(&self) -> CatalogCheckpointLease<'_> {
+    /// Acquire checkpoint admission without constructing a borrowed lease.
+    async fn acquire_checkpoint(&self) {
         loop {
             {
                 let mut state = self.state.lock();
@@ -185,7 +184,7 @@ impl CatalogCheckpointGate {
                     && !state.checkpoint_active
                 {
                     state.checkpoint_active = true;
-                    return CatalogCheckpointLease { gate: self };
+                    return;
                 }
             }
             listener!(self.changed => listener);
@@ -319,86 +318,138 @@ impl Drop for PendingCatalogMetadataChange<'_> {
     }
 }
 
-/// RAII guard for one catalog checkpoint scan/apply section.
-///
-/// While held, other catalog checkpoints and catalog metadata DDL wait on the
-/// catalog checkpoint gate.
-pub(crate) struct CatalogCheckpointLease<'a> {
-    gate: &'a CatalogCheckpointGate,
+/// Lifetime-free catalog checkpoint exclusion scope.
+pub(crate) struct CatalogCheckpointScope {
+    catalog: QuiescentGuard<Catalog>,
+    active: bool,
 }
 
-impl Drop for CatalogCheckpointLease<'_> {
+impl CatalogCheckpointScope {
+    /// Acquire catalog checkpoint authority for mandatory preparation.
+    pub(crate) async fn acquire(catalog: QuiescentGuard<Catalog>) -> Self {
+        catalog.checkpoint_gate.acquire_checkpoint().await;
+        Self {
+            catalog,
+            active: true,
+        }
+    }
+
+    /// Release catalog authority before redo-file cleanup.
+    #[inline]
+    pub(crate) fn release(&mut self) {
+        if self.active {
+            self.active = false;
+            self.catalog.checkpoint_gate.release_checkpoint();
+        }
+    }
+}
+
+impl Drop for CatalogCheckpointScope {
     #[inline]
     fn drop(&mut self) {
-        self.gate.release_checkpoint();
+        self.release();
+    }
+}
+
+/// Caller-prepared catalog checkpoint awaiting mandatory capacity.
+pub(crate) struct PreparedCatalogCheckpointOperation {
+    catalog_scope: CatalogCheckpointScope,
+    redo_scope: RedoRetentionScope,
+    scope: PreparedMaintenanceScope,
+    metadata: MandatoryTaskMetadata,
+}
+
+impl PreparedCatalogCheckpointOperation {
+    /// Build a catalog checkpoint with both exclusion scopes held.
+    pub(crate) fn new(
+        catalog_scope: CatalogCheckpointScope,
+        redo_scope: RedoRetentionScope,
+        scope: PreparedMaintenanceScope,
+    ) -> Self {
+        let metadata =
+            MandatoryTaskMetadata::operation(<Self as PreparedExecution>::LABEL, Some(scope.key()));
+        Self {
+            catalog_scope,
+            redo_scope,
+            scope,
+            metadata,
+        }
+    }
+}
+
+impl PreparedExecution for PreparedCatalogCheckpointOperation {
+    type Output = CatalogCheckpointOutcome;
+    type Accepted = AcceptedCatalogCheckpointOperation;
+
+    const LABEL: &'static str = "checkpoint_catalog";
+
+    #[inline]
+    fn metadata(&self) -> MandatoryTaskMetadata {
+        self.metadata.clone()
+    }
+
+    #[inline]
+    fn accept(self) -> Self::Accepted {
+        let Self {
+            catalog_scope,
+            redo_scope,
+            scope,
+            metadata: _,
+        } = self;
+        AcceptedCatalogCheckpointOperation {
+            catalog_scope: Some(catalog_scope),
+            redo_scope: Some(redo_scope),
+            scope: scope.accept(),
+        }
+    }
+}
+
+/// Mandatory-runtime owner of one accepted catalog checkpoint.
+pub(crate) struct AcceptedCatalogCheckpointOperation {
+    catalog_scope: Option<CatalogCheckpointScope>,
+    redo_scope: Option<RedoRetentionScope>,
+    scope: AcceptedMaintenanceScope,
+}
+
+impl AcceptedExecution for AcceptedCatalogCheckpointOperation {
+    type Output = CatalogCheckpointOutcome;
+
+    async fn execute(&mut self) -> CompletionResult<Self::Output> {
+        let engine = self.scope.engine().clone();
+        let result = engine
+            .catalog()
+            .checkpoint_prepared(&engine.trx_sys)
+            .await
+            .map_err(CompletionErrorBridge::capture_runtime_or_fatal);
+        self.scope.mark_terminal_ready();
+        result
+    }
+
+    #[inline]
+    fn finish(&mut self) {
+        drop(self.catalog_scope.take());
+        drop(self.redo_scope.take());
+        self.scope.finish();
+    }
+
+    async fn handle_panic(&mut self, _panic: Box<dyn Any + Send>) -> CompletionErrorBridge {
+        self.scope.handle_panic();
+        CompletionErrorBridge::capture(
+            Report::new(FatalError::MandatoryTaskPanic)
+                .attach("accepted catalog checkpoint panicked"),
+        )
     }
 }
 
 impl Catalog {
-    /// Trigger one ad-hoc catalog checkpoint publish.
-    ///
-    /// Normal overlap with another catalog checkpoint, catalog metadata DDL, or
-    /// redo truncation waits through the catalog checkpoint gate and the
-    /// transaction-system redo-retention gate.
-    ///
-    /// # Panics
-    ///
-    /// A panic indicates an internal invariant violation, such as bypassing the
-    /// required gates and reaching the shared `CatalogStorage`/`MultiTableFile`
-    /// with multiple mutable writers.
-    #[inline]
-    pub(crate) async fn checkpoint_now(
+    /// Execute one checkpoint with catalog and redo authority already held.
+    async fn checkpoint_prepared(
         &self,
         trx_sys: &TransactionSystem,
     ) -> RuntimeOrFatalResult<CatalogCheckpointOutcome> {
         obs::info!("event=checkpoint_publish component=catalog action=start result=ok");
-        async {
-            let _checkpoint_lease = self.checkpoint_gate.begin_checkpoint().await;
-            let _redo_retention_lease = trx_sys.begin_redo_retention().await;
-            let scan_cfg = trx_sys.catalog_checkpoint_scan_config()?;
-            let batch = self
-                .scan_checkpoint_batch(trx_sys.persisted_watermark_cts(), scan_cfg)
-                .await?;
-            let publishable_progress = batch.redo_retention_progress();
-            match self.apply_checkpoint_batch(batch).await {
-                Ok(CatalogCheckpointOutcome::Published {
-                    catalog_replay_start_ts,
-                }) => {
-                    if let Some(progress) = publishable_progress {
-                        debug_assert_eq!(progress.catalog_replay_start_ts, catalog_replay_start_ts);
-                        trx_sys.record_catalog_redo_retention_progress(progress);
-                    }
-                    trx_sys.request_dropped_table_purge();
-                    Ok(CatalogCheckpointOutcome::Published {
-                        catalog_replay_start_ts,
-                    })
-                }
-                Ok(CatalogCheckpointOutcome::Noop) => Ok(CatalogCheckpointOutcome::Noop),
-                Err(err) => {
-                    let has_io_source = match &err {
-                        RuntimeOrFatalError::Runtime(report) => {
-                            report.downcast_ref::<IoError>().is_some()
-                        }
-                        RuntimeOrFatalError::Fatal(report) => {
-                            report.downcast_ref::<IoError>().is_some()
-                        }
-                    };
-                    if !has_io_source {
-                        return Err(err);
-                    }
-                    // Preserve the existing policy: any apply failure carrying
-                    // an IO source is poisoned as a checkpoint-write failure.
-                    // An already-Fatal source retains its original Fatal reason.
-                    let report = err
-                        .into_fatal_report(FatalError::CheckpointWrite)
-                        .attach("catalog checkpoint publish IO failure");
-                    Err(RuntimeOrFatalError::from(
-                        self.poisoner.poison(report).into_report(),
-                    ))
-                }
-            }
-        }
-        .await
+        self.checkpoint_prepared_inner(trx_sys)
+            .await
         .inspect(|outcome| match outcome {
             CatalogCheckpointOutcome::Published {
                 catalog_replay_start_ts,
@@ -420,6 +471,54 @@ impl Catalog {
                 report
             ),
         })
+    }
+
+    async fn checkpoint_prepared_inner(
+        &self,
+        trx_sys: &TransactionSystem,
+    ) -> RuntimeOrFatalResult<CatalogCheckpointOutcome> {
+        let scan_cfg = trx_sys.catalog_checkpoint_scan_config()?;
+        let batch = self
+            .scan_checkpoint_batch(trx_sys.persisted_watermark_cts(), scan_cfg)
+            .await?;
+        let publishable_progress = batch.redo_retention_progress();
+        match self.apply_checkpoint_batch(batch).await {
+            Ok(CatalogCheckpointOutcome::Published {
+                catalog_replay_start_ts,
+            }) => {
+                if let Some(progress) = publishable_progress {
+                    debug_assert_eq!(progress.catalog_replay_start_ts, catalog_replay_start_ts);
+                    trx_sys.record_catalog_redo_retention_progress(progress);
+                }
+                trx_sys.request_dropped_table_purge();
+                Ok(CatalogCheckpointOutcome::Published {
+                    catalog_replay_start_ts,
+                })
+            }
+            Ok(CatalogCheckpointOutcome::Noop) => Ok(CatalogCheckpointOutcome::Noop),
+            Err(err) => {
+                let has_io_source = match &err {
+                    RuntimeOrFatalError::Runtime(report) => {
+                        report.downcast_ref::<IoError>().is_some()
+                    }
+                    RuntimeOrFatalError::Fatal(report) => {
+                        report.downcast_ref::<IoError>().is_some()
+                    }
+                };
+                if !has_io_source {
+                    return Err(err);
+                }
+                // Preserve the existing policy: any apply failure carrying
+                // an IO source is poisoned as a checkpoint-write failure.
+                // An already-Fatal source retains its original Fatal reason.
+                let report = err
+                    .into_fatal_report(FatalError::CheckpointWrite)
+                    .attach("catalog checkpoint publish IO failure");
+                Err(RuntimeOrFatalError::from(
+                    self.poisoner.poison(report).into_report(),
+                ))
+            }
+        }
     }
 
     /// Scan persisted redo logs and collect one safe catalog checkpoint batch.
@@ -779,7 +878,7 @@ mod tests {
     fn test_catalog_metadata_change_waits_for_active_checkpoint() {
         smol::block_on(async {
             let gate = CatalogCheckpointGate::new();
-            let checkpoint_lease = gate.begin_checkpoint().await;
+            gate.acquire_checkpoint().await;
             let mut metadata_fut = Box::pin(gate.acquire_metadata_change());
 
             assert!(matches!(
@@ -787,16 +886,17 @@ mod tests {
                 std::task::Poll::Pending
             ));
 
-            drop(checkpoint_lease);
+            gate.release_checkpoint();
             metadata_fut.await;
-            let mut checkpoint_fut = Box::pin(gate.begin_checkpoint());
+            let mut checkpoint_fut = Box::pin(gate.acquire_checkpoint());
             assert!(matches!(
                 futures::poll!(checkpoint_fut.as_mut()),
                 std::task::Poll::Pending
             ));
 
             gate.release_metadata_change();
-            let _checkpoint_lease = checkpoint_fut.await;
+            checkpoint_fut.await;
+            gate.release_checkpoint();
         });
     }
 
@@ -805,7 +905,7 @@ mod tests {
         smol::block_on(async {
             let gate = CatalogCheckpointGate::new();
             gate.acquire_metadata_change().await;
-            let mut checkpoint_fut = Box::pin(gate.begin_checkpoint());
+            let mut checkpoint_fut = Box::pin(gate.acquire_checkpoint());
 
             assert!(matches!(
                 futures::poll!(checkpoint_fut.as_mut()),
@@ -813,7 +913,8 @@ mod tests {
             ));
 
             gate.release_metadata_change();
-            let _checkpoint_lease = checkpoint_fut.await;
+            checkpoint_fut.await;
+            gate.release_checkpoint();
         });
     }
 
@@ -821,16 +922,17 @@ mod tests {
     fn test_catalog_checkpoint_waits_for_active_checkpoint() {
         smol::block_on(async {
             let gate = CatalogCheckpointGate::new();
-            let checkpoint_lease = gate.begin_checkpoint().await;
-            let mut checkpoint_fut = Box::pin(gate.begin_checkpoint());
+            gate.acquire_checkpoint().await;
+            let mut checkpoint_fut = Box::pin(gate.acquire_checkpoint());
 
             assert!(matches!(
                 futures::poll!(checkpoint_fut.as_mut()),
                 std::task::Poll::Pending
             ));
 
-            drop(checkpoint_lease);
-            let _checkpoint_lease = checkpoint_fut.await;
+            gate.release_checkpoint();
+            checkpoint_fut.await;
+            gate.release_checkpoint();
         });
     }
 
@@ -838,20 +940,20 @@ mod tests {
     fn test_catalog_checkpoint_waits_behind_pending_metadata_change() {
         smol::block_on(async {
             let gate = CatalogCheckpointGate::new();
-            let checkpoint_lease = gate.begin_checkpoint().await;
+            gate.acquire_checkpoint().await;
             let mut metadata_fut = Box::pin(gate.acquire_metadata_change());
             assert!(matches!(
                 futures::poll!(metadata_fut.as_mut()),
                 std::task::Poll::Pending
             ));
 
-            let mut checkpoint_fut = Box::pin(gate.begin_checkpoint());
+            let mut checkpoint_fut = Box::pin(gate.acquire_checkpoint());
             assert!(matches!(
                 futures::poll!(checkpoint_fut.as_mut()),
                 std::task::Poll::Pending
             ));
 
-            drop(checkpoint_lease);
+            gate.release_checkpoint();
             metadata_fut.await;
             assert!(matches!(
                 futures::poll!(checkpoint_fut.as_mut()),
@@ -859,7 +961,8 @@ mod tests {
             ));
 
             gate.release_metadata_change();
-            let _checkpoint_lease = checkpoint_fut.await;
+            checkpoint_fut.await;
+            gate.release_checkpoint();
         });
     }
 
@@ -867,7 +970,7 @@ mod tests {
     fn test_catalog_pending_metadata_change_cancellation_reopens_checkpoint() {
         smol::block_on(async {
             let gate = CatalogCheckpointGate::new();
-            let checkpoint_lease = gate.begin_checkpoint().await;
+            gate.acquire_checkpoint().await;
             let mut metadata_fut = Box::pin(gate.acquire_metadata_change());
 
             assert!(matches!(
@@ -876,8 +979,9 @@ mod tests {
             ));
 
             drop(metadata_fut);
-            drop(checkpoint_lease);
-            let _checkpoint_lease = gate.begin_checkpoint().await;
+            gate.release_checkpoint();
+            gate.acquire_checkpoint().await;
+            gate.release_checkpoint();
         });
     }
 
@@ -962,7 +1066,7 @@ mod tests {
     fn test_catalog_second_metadata_change_completes_after_pending_waiter_cancelled() {
         smol::block_on(async {
             let gate = CatalogCheckpointGate::new();
-            let checkpoint_lease = gate.begin_checkpoint().await;
+            gate.acquire_checkpoint().await;
             let mut pending_owner = Box::pin(gate.acquire_metadata_change());
             let mut second_waiter = Box::pin(gate.acquire_metadata_change());
 
@@ -976,7 +1080,7 @@ mod tests {
             ));
 
             drop(pending_owner);
-            drop(checkpoint_lease);
+            gate.release_checkpoint();
 
             let waiter = async {
                 second_waiter.await;

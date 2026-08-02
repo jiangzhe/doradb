@@ -15,6 +15,7 @@ use crate::error::{
 use crate::file::fs::FileSystem;
 use crate::file::table_file::{MutableTableFile, OldRoot, TableFile};
 use crate::id::{SessionID, SessionOperationKey, TrxID};
+use crate::latch::ExclusiveGate;
 use crate::log::redo::RedoLogs;
 use crate::log::{EnqueuePrecommitError, LogFileSealer, LogWriteDriver, RedoLog, RedoLogWriter};
 use crate::notify::MonotonicU64;
@@ -42,7 +43,7 @@ use crate::trx::{
 use crossbeam_utils::CachePadded;
 use either::Either::{Left, Right};
 use error_stack::{Report, ResultExt};
-use event_listener::{Event, EventListener, listener};
+use event_listener::EventListener;
 use flume::{Receiver, Sender};
 use parking_lot::{Mutex, MutexGuard};
 use std::collections::BTreeMap;
@@ -86,81 +87,42 @@ impl CatalogRedoRetentionProgress {
     }
 }
 
-#[derive(Debug, Default)]
-struct RedoRetentionGateState {
-    active: bool,
-}
-
-/// Transaction-system-wide gate for marker-based redo retention work.
+/// Lifetime-free redo-retention exclusion scope.
 ///
 /// Catalog checkpoint and redo truncation both reason about the durable
 /// first-retained redo marker, the retained redo suffix on disk, and the
-/// in-memory catalog-safe segment progress cache. The gate serializes those
+/// in-memory catalog-safe segment progress cache. This scope serializes those
 /// sections so a checkpoint cannot scan one marker/suffix while truncation
 /// publishes another marker or unlinks files below it.
 ///
-/// This intentionally remains separate from `CatalogCheckpointGate`. The
-/// catalog gate excludes `catalog.mtb` root writers and metadata DDL, but it is
-/// released before redo truncation performs filesystem cleanup; this gate stays
-/// held through cleanup so retained-redo scans never race disappearing files.
-struct RedoRetentionGate {
-    state: Mutex<RedoRetentionGateState>,
-    changed: Event,
+/// This authority intentionally remains separate from catalog checkpoint
+/// admission. Catalog admission excludes `catalog.mtb` root writers and
+/// metadata DDL, but is released before redo truncation performs filesystem
+/// cleanup; redo retention stays held through cleanup so retained-redo scans
+/// never race disappearing files.
+pub(crate) struct RedoRetentionScope {
+    trx_sys: QuiescentGuard<TransactionSystem>,
+    active: bool,
 }
 
-impl RedoRetentionGate {
-    #[inline]
-    fn new() -> Self {
+impl RedoRetentionScope {
+    /// Acquire redo-retention authority during caller preparation.
+    pub(crate) async fn acquire(trx_sys: QuiescentGuard<TransactionSystem>) -> Self {
+        trx_sys.redo_retention_gate.acquire().await;
         Self {
-            state: Mutex::new(RedoRetentionGateState::default()),
-            changed: Event::new(),
+            trx_sys,
+            active: true,
         }
-    }
-
-    /// Acquire exclusive access to redo-retention planning or publication.
-    async fn acquire(&self) -> RedoRetentionLease<'_> {
-        loop {
-            {
-                let mut state = self.state.lock();
-                if !state.active {
-                    state.active = true;
-                    return RedoRetentionLease { gate: self };
-                }
-            }
-            listener!(self.changed => listener);
-            {
-                let state = self.state.lock();
-                if !state.active {
-                    continue;
-                }
-            }
-            listener.await;
-        }
-    }
-
-    #[inline]
-    fn release(&self) {
-        let mut state = self.state.lock();
-        debug_assert!(state.active);
-        state.active = false;
-        drop(state);
-        self.changed.notify(usize::MAX);
     }
 }
 
-/// RAII lease for a redo-retention planning/publication/cleanup section.
-///
-/// While held, catalog checkpoint retained-redo scans, catalog-safe progress
-/// publication, redo truncation planning, marker publication, and obsolete-file
-/// cleanup run as one serialized retention observation.
-pub(crate) struct RedoRetentionLease<'a> {
-    gate: &'a RedoRetentionGate,
-}
-
-impl Drop for RedoRetentionLease<'_> {
+impl Drop for RedoRetentionScope {
     #[inline]
     fn drop(&mut self) {
-        self.gate.release();
+        if self.active {
+            self.active = false;
+            self.trx_sys.redo_retention_gate.release();
+        }
     }
 }
 
@@ -630,7 +592,7 @@ pub(crate) struct TransactionSystem {
     ///
     /// This is separate from the catalog checkpoint gate: it protects redo
     /// marker/suffix/progress consistency, not catalog metadata DDL ordering.
-    redo_retention_gate: CachePadded<RedoRetentionGate>,
+    redo_retention_gate: CachePadded<ExclusiveGate>,
 }
 
 impl TransactionSystem {
@@ -741,7 +703,7 @@ impl TransactionSystem {
             dropped_table_files: CachePadded::new(Mutex::new(dropped_table_files)),
             fatal_rollback_retention: CachePadded::new(Mutex::new(Vec::new())),
             catalog_redo_retention: CachePadded::new(Mutex::new(None)),
-            redo_retention_gate: CachePadded::new(RedoRetentionGate::new()),
+            redo_retention_gate: CachePadded::new(ExclusiveGate::new()),
         }
     }
 
@@ -765,16 +727,6 @@ impl TransactionSystem {
     #[inline]
     pub(crate) fn catalog_redo_retention_progress(&self) -> Option<CatalogRedoRetentionProgress> {
         self.catalog_redo_retention.lock().clone()
-    }
-
-    /// Acquire the exclusive redo-retention gate.
-    ///
-    /// Use this around code that observes or changes the durable first-retained
-    /// redo marker together with retained redo files or catalog-safe segment
-    /// progress.
-    #[inline]
-    pub(crate) async fn begin_redo_retention(&self) -> RedoRetentionLease<'_> {
-        self.redo_retention_gate.acquire().await
     }
 
     /// Retain undo/effect ownership after rollback can no longer finish safely.
@@ -2109,23 +2061,6 @@ pub(crate) mod tests {
                     ],
                 })
             );
-        });
-    }
-
-    #[test]
-    fn test_redo_retention_gate_serializes_leases() {
-        smol::block_on(async {
-            let gate = RedoRetentionGate::new();
-            let lease = gate.acquire().await;
-            let mut waiter = Box::pin(gate.acquire());
-
-            assert!(matches!(
-                futures::poll!(waiter.as_mut()),
-                std::task::Poll::Pending
-            ));
-
-            drop(lease);
-            let _next_lease = waiter.await;
         });
     }
 

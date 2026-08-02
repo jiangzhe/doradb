@@ -660,8 +660,9 @@ mod tests {
             let (table_spec, index_specs) = drop_table_test_spec();
             let _ = session.create_table(table_spec, index_specs).await.unwrap();
             engine
-                .catalog()
-                .checkpoint_now(&engine.inner().trx_sys)
+                .new_session()
+                .unwrap()
+                .checkpoint_catalog()
                 .await
                 .unwrap();
             wait_path_exists(&table_file_path, false).await;

@@ -1,11 +1,11 @@
 use crate::buffer::page::VersionedPageID;
 use crate::buffer::{BufferPool, PoolGuards};
 use crate::catalog::{
-    CatalogCheckpointOutcome, CreateIndexPlan, DropIndexPlan, DropTablePlan, IndexDdlGateScope,
-    IndexNo, IndexSpec, PreparedCreateIndex, PreparedCreateTable, PreparedDropIndex,
-    PreparedDropTable, TableSpec, ValidatedCreateTable, create_index_catalog_write_targets,
-    create_table_catalog_write_targets, drop_index_catalog_write_targets,
-    drop_table_catalog_write_targets, reject_non_user_table_id,
+    CatalogCheckpointOutcome, CatalogCheckpointScope, CreateIndexPlan, DropIndexPlan,
+    DropTablePlan, IndexDdlGateScope, IndexNo, IndexSpec, PreparedCatalogCheckpointOperation,
+    PreparedCreateIndex, PreparedCreateTable, PreparedDropIndex, PreparedDropTable, TableSpec,
+    ValidatedCreateTable, create_index_catalog_write_targets, create_table_catalog_write_targets,
+    drop_index_catalog_write_targets, drop_table_catalog_write_targets, reject_non_user_table_id,
     reject_user_table_primary_key_index, validated_index_ddl_target,
 };
 use crate::engine::{EngineInner, EngineRef, WeakEngineRef};
@@ -26,11 +26,13 @@ use crate::stats::{
 };
 use crate::table::{
     CheckpointDelayReason, CheckpointOutcome, CheckpointRetryObservation, FreezeOutcome,
-    MemIndexCleanupOutcome, Table,
+    MemIndexCleanupOutcome, PreparedCheckpointTableOperation, PreparedFreezeTableOperation,
+    PreparedMemIndexCleanupOperation, Table,
 };
 use crate::trx::{
-    PreparedCatalogWriteAuthority, ReleasedTransactionLocks, SessionOperationEntry,
-    SessionOperationKind, SessionOperationState, Transaction, TrxInner,
+    PreparedCatalogRedoMaintenanceOperation, PreparedCatalogWriteAuthority,
+    PreparedRedoTruncationOperation, RedoRetentionScope, ReleasedTransactionLocks,
+    SessionOperationEntry, SessionOperationKind, SessionOperationState, Transaction, TrxInner,
 };
 use error_stack::{Report, ResultExt};
 use event_listener::EventListener;
@@ -375,6 +377,202 @@ impl AcceptedDdlScope {
     }
 }
 
+/// Lifetime-free logical-lock scope prepared for one maintenance operation.
+pub(crate) struct PreparedMaintenanceLocks {
+    lock_manager: QuiescentGuard<LockManager>,
+    locks: OwnerLockState,
+}
+
+impl PreparedMaintenanceLocks {
+    #[inline]
+    fn new(operation: &SessionOperationPin) -> Self {
+        Self {
+            lock_manager: operation.engine.lock_manager().clone(),
+            locks: OwnerLockState::new(operation.operation_lock_owner()),
+        }
+    }
+
+    /// Acquire table metadata S followed by table data IS.
+    async fn acquire_table(&mut self, table_id: TableID) -> OperationResult<()> {
+        self.locks
+            .acquire(
+                &self.lock_manager,
+                LockResource::TableMetadata(table_id),
+                LockMode::Shared,
+            )
+            .await?;
+        self.locks
+            .acquire(
+                &self.lock_manager,
+                LockResource::TableData(table_id),
+                LockMode::IntentShared,
+            )
+            .await
+    }
+}
+
+impl Drop for PreparedMaintenanceLocks {
+    #[inline]
+    fn drop(&mut self) {
+        self.locks.release_all(&self.lock_manager);
+    }
+}
+
+/// Caller-owned maintenance preparation transferred atomically at acceptance.
+///
+/// Prepared locks precede the voluntary operation pin so cancellation releases
+/// every logical-lock claim before publishing the foreground terminal edge.
+pub(crate) struct PreparedMaintenanceScope {
+    locks: Option<PreparedMaintenanceLocks>,
+    operation: SessionOperationPin,
+}
+
+impl PreparedMaintenanceScope {
+    /// Prepare one table-scoped maintenance lock set.
+    pub(crate) async fn table(
+        operation: SessionOperationPin,
+        table_id: TableID,
+    ) -> OperationResult<Self> {
+        let mut locks = PreparedMaintenanceLocks::new(&operation);
+        locks.acquire_table(table_id).await?;
+        Ok(Self {
+            locks: Some(locks),
+            operation,
+        })
+    }
+
+    /// Prepare one catalog/redo-wide maintenance operation.
+    #[inline]
+    pub(crate) fn global(operation: SessionOperationPin) -> Self {
+        Self {
+            locks: None,
+            operation,
+        }
+    }
+
+    /// Return the exact operation key carried into mandatory diagnostics.
+    #[inline]
+    pub(crate) fn key(&self) -> SessionOperationKey {
+        self.operation.key()
+    }
+
+    /// Return the retained engine while caller preparation owns the scope.
+    #[inline]
+    pub(crate) fn engine(&self) -> &EngineRef {
+        &self.operation.engine
+    }
+
+    /// Resolve and retain the authoritative current-live table under locks.
+    pub(crate) async fn resolve_user_table(
+        &self,
+        table_id: TableID,
+    ) -> OperationResult<Arc<Table>> {
+        let table = self
+            .operation
+            .engine
+            .catalog()
+            .validate_user_table_live(table_id)
+            .await?;
+        self.operation.state.cache_user_table(&table);
+        Ok(table)
+    }
+
+    /// Synchronously consume caller preparation into accepted authority.
+    #[inline]
+    pub(crate) fn accept(self) -> AcceptedMaintenanceScope {
+        let Self { locks, operation } = self;
+        AcceptedMaintenanceScope {
+            operation: operation.into_mandatory(),
+            locks,
+            finish_state: MaintenanceFinishState::Executing,
+        }
+    }
+}
+
+enum MaintenanceFinishState {
+    Executing,
+    TerminalReady,
+    FailedRetained,
+}
+
+/// Runtime-owned maintenance operation and its transferred logical locks.
+pub(crate) struct AcceptedMaintenanceScope {
+    operation: MandatoryOperationGuard,
+    locks: Option<PreparedMaintenanceLocks>,
+    finish_state: MaintenanceFinishState,
+}
+
+impl AcceptedMaintenanceScope {
+    /// Return the retained engine runtime.
+    #[inline]
+    pub(crate) fn engine(&self) -> &EngineRef {
+        &self.operation.engine
+    }
+
+    /// Return cloned buffer-pool guards for maintenance work.
+    #[inline]
+    pub(crate) fn pool_guards(&self) -> PoolGuards {
+        self.operation.state.pool_guards().clone()
+    }
+
+    /// Start one mandatory-owned nested private transaction.
+    #[inline]
+    pub(crate) fn begin_private_trx(&self) -> LifecycleResult<Transaction> {
+        self.operation.begin_private_trx()
+    }
+
+    /// Verify nested state before returning from accepted execution.
+    #[inline]
+    pub(crate) fn mark_terminal_ready(&mut self) {
+        self.operation.assert_finish_ready();
+        self.finish_state = MaintenanceFinishState::TerminalReady;
+    }
+
+    /// Publish normal completion or retain an invalid finish state.
+    #[inline]
+    pub(crate) fn finish(&mut self) {
+        let state = replace(
+            &mut self.finish_state,
+            MaintenanceFinishState::FailedRetained,
+        );
+        match state {
+            MaintenanceFinishState::TerminalReady => {
+                drop(self.locks.take());
+                self.operation.finish();
+            }
+            MaintenanceFinishState::Executing => {
+                self.operation.fail_retained();
+                let report = Report::new(FatalError::MandatoryTaskPanic)
+                    .attach("accepted maintenance finished without terminal-ready state");
+                self.operation.engine.poisoner.poison(report);
+                drop(self.locks.take());
+            }
+            MaintenanceFinishState::FailedRetained => {
+                drop(self.locks.take());
+            }
+        }
+    }
+
+    /// Retain unsafe nested ownership before the supervisor publishes poison.
+    #[inline]
+    pub(crate) fn handle_panic(&mut self) {
+        self.operation.fail_retained();
+        self.finish_state = MaintenanceFinishState::FailedRetained;
+    }
+}
+
+impl SessionRuntimeAccess for AcceptedMaintenanceScope {
+    #[inline]
+    fn engine(&self) -> &EngineRef {
+        &self.operation.engine
+    }
+
+    #[inline]
+    fn state(&self) -> &Arc<SessionState> {
+        &self.operation.state
+    }
+}
+
 #[derive(Clone, Copy)]
 enum MaintenanceBoundary {
     GcHorizon,
@@ -440,27 +638,6 @@ impl<'lock> ScopedTableRuntimeAccess<'lock> {
             metadata_lock,
             data_lock,
         })
-    }
-
-    /// Acquires retry-recheck access, treating absent or terminal state as obsolete.
-    async fn acquire_for_retry(
-        session: &'lock SessionOperationPin,
-        table_id: TableID,
-    ) -> OperationResult<Option<Self>> {
-        let owner = session.operation_lock_owner();
-        let (metadata_lock, data_lock) = Self::acquire_locks(session, table_id, owner).await?;
-        let Some(table) = session.engine.catalog().current_live_user_table(table_id) else {
-            return Ok(None);
-        };
-        if table.check_foreground_live().is_err() {
-            return Ok(None);
-        }
-        session.state.cache_user_table(&table);
-        Ok(Some(Self {
-            table: Some(table),
-            metadata_lock,
-            data_lock,
-        }))
     }
 
     /// Acquires logical locks in the repository-wide table resource order.
@@ -833,17 +1010,26 @@ impl Session {
     /// truncation planning.
     #[inline]
     pub async fn checkpoint_catalog(&mut self) -> Result<()> {
-        let session = self
+        let operation = self
             .pin_operation(SessionOperationKind::Maintenance)
             .attach("operation=checkpoint_catalog")
             .disclose()?;
-        session
-            .engine
-            .catalog()
-            .checkpoint_now(&session.engine.trx_sys)
+        let mandatory_runtime = operation.engine.mandatory_runtime.clone();
+        let scope = PreparedMaintenanceScope::global(operation);
+        let catalog_scope = CatalogCheckpointScope::acquire(scope.engine().catalog_guard()).await;
+        let redo_scope = RedoRetentionScope::acquire(scope.engine().trx_sys.clone()).await;
+        scope.engine().poisoner.ensure_healthy().disclose()?;
+        let observer = mandatory_runtime
+            .submit(PreparedCatalogCheckpointOperation::new(
+                catalog_scope,
+                redo_scope,
+                scope,
+            ))
             .await
-            .disclose()
-            .map(|_| ())
+            .attach("operation=checkpoint_catalog")
+            .disclose()?;
+        drop(mandatory_runtime);
+        observer.wait().await.map(|_| ())
     }
 
     /// Run catalog checkpoint and redo-log truncation as one maintenance operation.
@@ -855,16 +1041,26 @@ impl Session {
     pub async fn checkpoint_catalog_and_truncate_redo_log(
         &mut self,
     ) -> Result<CatalogRedoMaintenanceOutcome> {
-        let session = self
+        let operation = self
             .pin_operation(SessionOperationKind::Maintenance)
             .attach("operation=checkpoint_catalog_and_truncate_redo_log")
             .disclose()?;
-        session
-            .engine
-            .trx_sys
-            .checkpoint_catalog_and_truncate_redo_log()
+        let mandatory_runtime = operation.engine.mandatory_runtime.clone();
+        let scope = PreparedMaintenanceScope::global(operation);
+        let catalog_scope = CatalogCheckpointScope::acquire(scope.engine().catalog_guard()).await;
+        let redo_scope = RedoRetentionScope::acquire(scope.engine().trx_sys.clone()).await;
+        scope.engine().poisoner.ensure_healthy().disclose()?;
+        let observer = mandatory_runtime
+            .submit(PreparedCatalogRedoMaintenanceOperation::new(
+                catalog_scope,
+                redo_scope,
+                scope,
+            ))
             .await
-            .disclose()
+            .attach("operation=checkpoint_catalog_and_truncate_redo_log")
+            .disclose()?;
+        drop(mandatory_runtime);
+        observer.wait().await
     }
 
     /// Physically remove recovery-obsolete sealed redo prefix files.
@@ -875,11 +1071,26 @@ impl Session {
     /// summarized in the returned outcome and can be retried by a later call.
     #[inline]
     pub async fn truncate_redo_log(&mut self) -> Result<RedoTruncationOutcome> {
-        let session = self
+        let operation = self
             .pin_operation(SessionOperationKind::Maintenance)
             .attach("operation=truncate_redo_log")
             .disclose()?;
-        session.engine.trx_sys.truncate_redo_log().await.disclose()
+        let mandatory_runtime = operation.engine.mandatory_runtime.clone();
+        let scope = PreparedMaintenanceScope::global(operation);
+        let catalog_scope = CatalogCheckpointScope::acquire(scope.engine().catalog_guard()).await;
+        let redo_scope = RedoRetentionScope::acquire(scope.engine().trx_sys.clone()).await;
+        scope.engine().poisoner.ensure_healthy().disclose()?;
+        let observer = mandatory_runtime
+            .submit(PreparedRedoTruncationOperation::new(
+                catalog_scope,
+                redo_scope,
+                scope,
+            ))
+            .await
+            .attach("operation=truncate_redo_log")
+            .disclose()?;
+        drop(mandatory_runtime);
+        observer.wait().await
     }
 
     /// Return a monotonic transaction-system statistics snapshot.
@@ -963,39 +1174,63 @@ impl Session {
         table_id: TableID,
         max_rows: usize,
     ) -> Result<FreezeOutcome> {
-        let session = self
+        let operation = self
             .pin_operation(SessionOperationKind::Maintenance)
             .attach("operation=freeze_table")
             .disclose()?;
-        let access = ScopedTableRuntimeAccess::acquire(&session, table_id)
+        let mandatory_runtime = operation.engine.mandatory_runtime.clone();
+        let scope = PreparedMaintenanceScope::table(operation, table_id)
             .await
             .attach_with(|| format!("operation=freeze_table, table_id={table_id}"))
             .disclose()?;
-        access
-            .table()
-            .freeze(&session, max_rows)
+        let table = scope
+            .resolve_user_table(table_id)
             .await
             .attach_with(|| format!("operation=freeze_table, table_id={table_id}"))
-            .disclose()
+            .disclose()?;
+        scope.engine().poisoner.ensure_healthy().disclose()?;
+        let prepared = match PreparedFreezeTableOperation::prepare(scope, table, max_rows) {
+            Ok(prepared) => prepared,
+            Err(outcome) => return Ok(outcome),
+        };
+        let observer = mandatory_runtime
+            .submit(prepared)
+            .await
+            .attach_with(|| format!("operation=freeze_table, table_id={table_id}"))
+            .disclose()?;
+        drop(mandatory_runtime);
+        observer.wait().await
     }
 
     /// Persist eligible state using the table-owned canonical frozen batch.
     #[inline]
     pub async fn checkpoint_table(&mut self, table_id: TableID) -> Result<CheckpointOutcome> {
-        let session = self
+        let operation = self
             .pin_operation(SessionOperationKind::Maintenance)
             .attach("operation=checkpoint_table")
             .disclose()?;
-        let access = ScopedTableRuntimeAccess::acquire(&session, table_id)
+        let mandatory_runtime = operation.engine.mandatory_runtime.clone();
+        let scope = PreparedMaintenanceScope::table(operation, table_id)
             .await
             .attach_with(|| format!("operation=checkpoint_table, table_id={table_id}"))
             .disclose()?;
-        access
-            .table()
-            .checkpoint(&session)
+        let table = scope
+            .resolve_user_table(table_id)
             .await
             .attach_with(|| format!("operation=checkpoint_table, table_id={table_id}"))
-            .disclose()
+            .disclose()?;
+        scope.engine().poisoner.ensure_healthy().disclose()?;
+        let prepared = match PreparedCheckpointTableOperation::prepare(scope, table) {
+            Ok(prepared) => prepared,
+            Err(outcome) => return Ok(outcome),
+        };
+        let observer = mandatory_runtime
+            .submit(prepared)
+            .await
+            .attach_with(|| format!("operation=checkpoint_table, table_id={table_id}"))
+            .disclose()?;
+        drop(mandatory_runtime);
+        observer.wait().await
     }
 
     /// Wait until retry may be useful for one self-identifying checkpoint delay.
@@ -1041,29 +1276,11 @@ impl Session {
         &mut self,
         table_id: TableID,
     ) -> Result<CheckpointOutcome> {
-        let session = self
-            .pin_operation(SessionOperationKind::Maintenance)
-            .attach("operation=checkpoint_table_with_wait")
-            .disclose()?;
         loop {
-            let access = ScopedTableRuntimeAccess::acquire(&session, table_id)
-                .await
-                .attach_with(|| {
-                    format!("operation=checkpoint_table_with_wait, table_id={table_id}")
-                })
-                .disclose()?;
-            let outcome = access
-                .table()
-                .checkpoint(&session)
-                .await
-                .attach_with(|| {
-                    format!("operation=checkpoint_table_with_wait, table_id={table_id}")
-                })
-                .disclose()?;
-            drop(access);
+            let outcome = self.checkpoint_table(table_id).await?;
             match outcome {
                 CheckpointOutcome::Delayed { reason } => {
-                    wait_for_checkpoint_retry_in_operation(&session, reason).await?;
+                    self.wait_for_checkpoint_retry(reason).await?;
                 }
                 outcome => return Ok(outcome),
             }
@@ -1127,20 +1344,32 @@ impl Session {
         table_id: TableID,
         clean_live_entries: bool,
     ) -> Result<MemIndexCleanupOutcome> {
-        let session = self
+        let operation = self
             .pin_operation(SessionOperationKind::Maintenance)
             .attach("operation=cleanup_secondary_mem_indexes")
             .disclose()?;
-        let access = ScopedTableRuntimeAccess::acquire(&session, table_id)
+        let mandatory_runtime = operation.engine.mandatory_runtime.clone();
+        let scope = PreparedMaintenanceScope::table(operation, table_id)
             .await
             .attach("operation=cleanup_secondary_mem_indexes")
             .disclose()?;
-        access
-            .table()
-            .cleanup_secondary_mem_indexes(&session, clean_live_entries)
+        let table = scope
+            .resolve_user_table(table_id)
             .await
             .attach_with(|| format!("operation=cleanup_secondary_mem_indexes, table_id={table_id}"))
-            .disclose()
+            .disclose()?;
+        scope.engine().poisoner.ensure_healthy().disclose()?;
+        let observer = mandatory_runtime
+            .submit(PreparedMemIndexCleanupOperation::new(
+                scope,
+                table,
+                clean_live_entries,
+            ))
+            .await
+            .attach_with(|| format!("operation=cleanup_secondary_mem_indexes, table_id={table_id}"))
+            .disclose()?;
+        drop(mandatory_runtime);
+        observer.wait().await
     }
 
     /// Acquires an explicit session-lifetime table lock.
@@ -1286,12 +1515,6 @@ impl SessionOperationPin {
             entry: Arc::clone(&self.entry),
             armed: true,
         }
-    }
-
-    /// Starts one private transaction inside this DDL or maintenance operation.
-    #[inline]
-    pub(crate) fn begin_private_trx(&self) -> LifecycleResult<Transaction> {
-        begin_private_transaction(&self.engine, &self.entry)
     }
 
     /// Prepare CREATE TABLE while consuming this foreground operation.
@@ -2565,34 +2788,6 @@ fn begin_private_transaction(
     );
     let inner = Box::new(TrxInner::private());
     Ok(engine.trx_sys.begin_private_trx(engine, entry, inner))
-}
-
-async fn wait_for_checkpoint_retry_in_operation(
-    session: &SessionOperationPin,
-    reason: CheckpointDelayReason,
-) -> Result<()> {
-    let table_id = match reason {
-        CheckpointDelayReason::ActiveRoot { table_id, .. }
-        | CheckpointDelayReason::FrozenPageCutoff { table_id, .. } => table_id,
-    };
-    loop {
-        let Some(access) = ScopedTableRuntimeAccess::acquire_for_retry(session, table_id)
-            .await
-            .disclose()?
-        else {
-            return Ok(());
-        };
-        let observation = access
-            .table()
-            .checkpoint_retry_observation(session, reason)
-            .await
-            .disclose()?;
-        drop(access);
-        match observation {
-            CheckpointRetryObservation::Ready => return Ok(()),
-            CheckpointRetryObservation::Wait(waiter) => waiter.wait().await,
-        }
-    }
 }
 
 async fn wait_for_maintenance_boundary(
@@ -3882,7 +4077,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_private_transaction_preserves_stable_entry_and_public_cache() {
+    fn test_mandatory_private_transaction_preserves_stable_entry_and_public_cache() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
             let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
@@ -3903,6 +4098,11 @@ pub(crate) mod tests {
                 .as_deref()
                 .map(|inner| inner as *const TrxInner as usize)
                 .expect("session must retain its public transaction cache");
+            let mut operation = operation.into_mandatory();
+            assert_eq!(
+                entry.inspect().state,
+                SessionOperationState::Mandatory(None)
+            );
             let trx = operation.begin_private_trx().unwrap();
             let first_inner = entry
                 .inner_ptr_for_test()
@@ -3932,7 +4132,7 @@ pub(crate) mod tests {
 
             trx.rollback().await.unwrap();
             let snapshot = entry.inspect();
-            assert_eq!(snapshot.state, SessionOperationState::Voluntary(None));
+            assert_eq!(snapshot.state, SessionOperationState::Mandatory(None));
             assert_eq!(snapshot.trx_id, None);
             {
                 let lifecycle = state.lifecycle.lock();
@@ -3972,6 +4172,9 @@ pub(crate) mod tests {
             );
             replacement.rollback().await.unwrap();
 
+            operation.assert_finish_ready();
+            operation.finish();
+            assert_eq!(entry.inspect().state, SessionOperationState::Terminal);
             drop(operation);
             assert!(matches!(
                 state.lifecycle.lock().slot,
@@ -4578,14 +4781,15 @@ pub(crate) mod tests {
             let catalog_path = engine.inner().table_fs.catalog_mtb_file_path();
             let publish_hook = Arc::new(FailingFirstWriteHook::new(catalog_path));
             let _publish_hook_guard = install_storage_backend_test_hook(publish_hook.clone());
-            let _cleanup_hook_guard = install_redo_cleanup_before_unlink_hook(Arc::new(
-                |file_seq, path| {
+            let _cleanup_hook_guard = install_redo_cleanup_before_unlink_hook(
+                &engine.inner().maintenance_test,
+                Arc::new(|file_seq, path| {
                     panic!(
                         "redo cleanup must not run after combined checkpoint failure: file_seq={file_seq}, path={}",
                         path.display()
                     );
-                },
-            ));
+                }),
+            );
 
             let err = session
                 .checkpoint_catalog_and_truncate_redo_log()
@@ -4651,14 +4855,15 @@ pub(crate) mod tests {
             let catalog_path = engine.inner().table_fs.catalog_mtb_file_path();
             let publish_hook = Arc::new(FailingFirstWriteHook::new(catalog_path));
             let _publish_hook_guard = install_storage_backend_test_hook(publish_hook.clone());
-            let _cleanup_hook_guard = install_redo_cleanup_before_unlink_hook(Arc::new(
-                |file_seq, path| {
+            let _cleanup_hook_guard = install_redo_cleanup_before_unlink_hook(
+                &engine.inner().maintenance_test,
+                Arc::new(|file_seq, path| {
                     panic!(
                         "redo cleanup must not run after combined marker failure: file_seq={file_seq}, path={}",
                         path.display()
                     );
-                },
-            ));
+                }),
+            );
 
             let err = session
                 .checkpoint_catalog_and_truncate_redo_log()
@@ -4711,8 +4916,9 @@ pub(crate) mod tests {
             let hook_called = Arc::new(AtomicBool::new(false));
             let hook_flag = Arc::clone(&hook_called);
             let hook_engine = engine.new_ref().unwrap();
-            let hook_guard =
-                install_redo_cleanup_before_unlink_hook(Arc::new(move |file_seq, _path| {
+            let hook_guard = install_redo_cleanup_before_unlink_hook(
+                &engine.inner().maintenance_test,
+                Arc::new(move |file_seq, _path| {
                     if file_seq != 0 {
                         return;
                     }
@@ -4728,7 +4934,8 @@ pub(crate) mod tests {
                         }
                     }
                     catalog.release_index_metadata_change();
-                }));
+                }),
+            );
 
             let mut session = engine.new_session().unwrap();
             let outcome = session
@@ -4769,7 +4976,8 @@ pub(crate) mod tests {
             let obsolete_path = redo_file_path(&main_dir, log_file_stem, 0);
             assert!(obsolete_path.exists());
 
-            let redo_retention_lease = engine.inner().trx_sys.begin_redo_retention().await;
+            let redo_retention_scope =
+                RedoRetentionScope::acquire(engine.inner().trx_sys.clone()).await;
             let mut session = engine.new_session().unwrap();
             let mut maintenance_fut = Box::pin(session.checkpoint_catalog_and_truncate_redo_log());
 
@@ -4782,7 +4990,7 @@ pub(crate) mod tests {
                 .inner()
                 .poisoner
                 .poison(Report::new(FatalError::RedoWrite).attach("test redo write failure"));
-            drop(redo_retention_lease);
+            drop(redo_retention_scope);
 
             let err = maintenance_fut.await.unwrap_err();
             assert_eq!(err.kind(), ErrorKind::Fatal);
@@ -5011,14 +5219,15 @@ pub(crate) mod tests {
             let catalog_path = engine.inner().table_fs.catalog_mtb_file_path();
             let publish_hook = Arc::new(FailingFirstWriteHook::new(catalog_path));
             let _publish_hook_guard = install_storage_backend_test_hook(publish_hook.clone());
-            let _cleanup_hook_guard = install_redo_cleanup_before_unlink_hook(Arc::new(
-                |file_seq, path| {
+            let _cleanup_hook_guard = install_redo_cleanup_before_unlink_hook(
+                &engine.inner().maintenance_test,
+                Arc::new(|file_seq, path| {
                     panic!(
                         "redo cleanup must not run after marker publication failure: file_seq={file_seq}, path={}",
                         path.display()
                     );
-                },
-            ));
+                }),
+            );
 
             let err = session.truncate_redo_log().await.unwrap_err();
 
@@ -5069,8 +5278,9 @@ pub(crate) mod tests {
             let hook_called = Arc::new(AtomicBool::new(false));
             let hook_flag = Arc::clone(&hook_called);
             let hook_engine = engine.new_ref().unwrap();
-            let hook_guard =
-                install_redo_cleanup_before_unlink_hook(Arc::new(move |file_seq, _path| {
+            let hook_guard = install_redo_cleanup_before_unlink_hook(
+                &engine.inner().maintenance_test,
+                Arc::new(move |file_seq, _path| {
                     if file_seq != 0 {
                         return;
                     }
@@ -5086,7 +5296,8 @@ pub(crate) mod tests {
                         }
                     }
                     catalog.release_index_metadata_change();
-                }));
+                }),
+            );
 
             let mut session = engine.new_session().unwrap();
             let outcome = session.truncate_redo_log().await.unwrap();
@@ -5097,6 +5308,54 @@ pub(crate) mod tests {
             assert_eq!(outcome.advanced_files, 0);
             assert_eq!(outcome.removed_files, 1);
             assert_eq!(outcome.failed_unlink_files, 0);
+            assert!(!obsolete_path.exists());
+            drop(hook_guard);
+        });
+    }
+
+    #[test]
+    fn test_dropped_redo_truncation_observer_does_not_cancel_unlink() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let main_dir = root.path().to_path_buf();
+            let log_file_stem = "redo_truncate_observer_drop";
+            let engine = Engine::bootstrap(redo_truncation_engine_config(&main_dir, log_file_stem))
+                .await
+                .unwrap();
+            create_rotated_redo_table(&engine, &main_dir, log_file_stem, 1).await;
+            engine
+                .catalog()
+                .storage
+                .publish_first_redo_log_seq(1)
+                .await
+                .unwrap();
+            let obsolete_path = redo_file_path(&main_dir, log_file_stem, 0);
+            assert!(obsolete_path.exists());
+
+            let (entered_tx, entered_rx) = flume::bounded(1);
+            let (release_tx, release_rx) = flume::bounded(1);
+            let hook_guard = install_redo_cleanup_before_unlink_hook(
+                &engine.inner().maintenance_test,
+                Arc::new(move |file_seq, _path| {
+                    if file_seq == 0 {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    }
+                }),
+            );
+
+            let mut session = engine.new_session().unwrap();
+            let session_id = session.id();
+            let mut truncate = Box::pin(session.truncate_redo_log());
+            assert!(matches!(
+                futures::poll!(truncate.as_mut()),
+                std::task::Poll::Pending
+            ));
+            entered_rx.recv_async().await.unwrap();
+            drop(truncate);
+
+            release_tx.send_async(()).await.unwrap();
+            wait_for_session_idle(&engine.inner().session_registry, session_id).await;
             assert!(!obsolete_path.exists());
             drop(hook_guard);
         });
@@ -5121,7 +5380,8 @@ pub(crate) mod tests {
             let obsolete_path = redo_file_path(&main_dir, log_file_stem, 0);
             assert!(obsolete_path.exists());
 
-            let redo_retention_lease = engine.inner().trx_sys.begin_redo_retention().await;
+            let redo_retention_scope =
+                RedoRetentionScope::acquire(engine.inner().trx_sys.clone()).await;
             let mut session = engine.new_session().unwrap();
             let mut truncate_fut = Box::pin(session.truncate_redo_log());
 
@@ -5134,7 +5394,7 @@ pub(crate) mod tests {
                 .inner()
                 .poisoner
                 .poison(Report::new(FatalError::RedoWrite).attach("test redo write failure"));
-            drop(redo_retention_lease);
+            drop(redo_retention_scope);
 
             let err = truncate_fut.await.unwrap_err();
             assert_eq!(err.kind(), ErrorKind::Fatal);
@@ -5169,13 +5429,15 @@ pub(crate) mod tests {
             let hook_removed_file = Arc::new(AtomicBool::new(false));
             let hook_flag = Arc::clone(&hook_removed_file);
             let hook_path = obsolete_path.clone();
-            let hook_guard =
-                install_redo_cleanup_before_unlink_hook(Arc::new(move |file_seq, path| {
+            let hook_guard = install_redo_cleanup_before_unlink_hook(
+                &engine.inner().maintenance_test,
+                Arc::new(move |file_seq, path| {
                     if file_seq == 0 && path == hook_path && !hook_flag.swap(true, Ordering::SeqCst)
                     {
                         fs::remove_file(path).unwrap();
                     }
-                }));
+                }),
+            );
 
             let mut session = engine.new_session().unwrap();
             let missing = session.truncate_redo_log().await.unwrap();

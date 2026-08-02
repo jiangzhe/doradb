@@ -4821,8 +4821,9 @@ pub(crate) mod tests {
             assert!(Path::new(&table_file_path).exists());
 
             engine
-                .catalog()
-                .checkpoint_now(&engine.inner().trx_sys)
+                .new_session()
+                .unwrap()
+                .checkpoint_catalog()
                 .await
                 .unwrap();
             wait_path_exists(&table_file_path, false).await;
@@ -5071,8 +5072,9 @@ pub(crate) mod tests {
 
             session.drop_table(table_id).await.unwrap();
             engine
-                .catalog()
-                .checkpoint_now(&engine.inner().trx_sys)
+                .new_session()
+                .unwrap()
+                .checkpoint_catalog()
                 .await
                 .unwrap();
             assert!(

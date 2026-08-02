@@ -3530,8 +3530,9 @@ pub(crate) mod tests {
             assert_eq!(catalog_indexes.len(), 1);
             assert_eq!(catalog_indexes[0].index_no, 0);
             engine
-                .catalog()
-                .checkpoint_now(&engine.inner().trx_sys)
+                .new_session()
+                .unwrap()
+                .checkpoint_catalog()
                 .await
                 .unwrap();
             drop(session);

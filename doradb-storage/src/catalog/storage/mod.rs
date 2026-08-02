@@ -1961,8 +1961,9 @@ pub(crate) mod tests {
 
             let _ = table1(&engine).await;
             engine
-                .catalog()
-                .checkpoint_now(&engine.inner().trx_sys)
+                .new_session()
+                .unwrap()
+                .checkpoint_catalog()
                 .await
                 .unwrap();
 
@@ -1998,8 +1999,9 @@ pub(crate) mod tests {
 
             let _ = table1(&engine).await;
             engine
-                .catalog()
-                .checkpoint_now(&engine.inner().trx_sys)
+                .new_session()
+                .unwrap()
+                .checkpoint_catalog()
                 .await
                 .unwrap();
 
@@ -2212,8 +2214,9 @@ pub(crate) mod tests {
 
             let table_id = table1(&engine).await;
             engine
-                .catalog()
-                .checkpoint_now(&engine.inner().trx_sys)
+                .new_session()
+                .unwrap()
+                .checkpoint_catalog()
                 .await
                 .unwrap();
 
@@ -2348,8 +2351,9 @@ pub(crate) mod tests {
 
             let _ = table1(&engine).await;
             engine
-                .catalog()
-                .checkpoint_now(&engine.inner().trx_sys)
+                .new_session()
+                .unwrap()
+                .checkpoint_catalog()
                 .await
                 .unwrap();
 
@@ -2394,8 +2398,9 @@ pub(crate) mod tests {
 
             let _ = table1(&engine).await;
             engine
-                .catalog()
-                .checkpoint_now(&engine.inner().trx_sys)
+                .new_session()
+                .unwrap()
+                .checkpoint_catalog()
                 .await
                 .unwrap();
 
@@ -2449,8 +2454,9 @@ pub(crate) mod tests {
 
             let table1_id = table1(&engine).await;
             engine
-                .catalog()
-                .checkpoint_now(&engine.inner().trx_sys)
+                .new_session()
+                .unwrap()
+                .checkpoint_catalog()
                 .await
                 .unwrap();
 
@@ -2461,8 +2467,9 @@ pub(crate) mod tests {
 
             let table2_id = table2(&engine).await;
             engine
-                .catalog()
-                .checkpoint_now(&engine.inner().trx_sys)
+                .new_session()
+                .unwrap()
+                .checkpoint_catalog()
                 .await
                 .unwrap();
 

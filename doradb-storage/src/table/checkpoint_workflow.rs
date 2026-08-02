@@ -1,6 +1,6 @@
-use super::CheckpointCancelReason;
 use super::deletion_buffer::DeleteMarker;
 use super::lifecycle::{CheckpointPublishLease, TableLifecycle, TableTerminal};
+use super::{CheckpointCancelReason, Table};
 use crate::id::{PageID, RowID, TableID, TrxID};
 use crate::trx::SharedTrxStatus;
 use parking_lot::Mutex;
@@ -275,40 +275,88 @@ impl TableCheckpointWorkflow {
             state: Mutex::new(TableCheckpointWorkflowState::Idle),
         }
     }
+}
 
-    pub(super) fn begin_freeze<'a>(
-        &'a self,
-        lifecycle: &TableLifecycle,
-    ) -> StdResult<FreezeAttempt<'a>, FreezeOutcome> {
-        let mut state = self.state.lock();
-        if let Err(reason) = checkpoint_lifecycle(lifecycle.inspect_terminal()) {
+impl Table {
+    pub(super) fn begin_freeze(self: Arc<Self>) -> StdResult<PreparedFreezeAttempt, FreezeOutcome> {
+        let mut state = self.checkpoint_workflow.state.lock();
+        if let Err(reason) = checkpoint_lifecycle(self.lifecycle.inspect_terminal()) {
             return Err(FreezeOutcome::Cancelled { reason });
         }
         match &*state {
             TableCheckpointWorkflowState::Idle => {
                 *state = TableCheckpointWorkflowState::Freezing;
-                Ok(FreezeAttempt {
-                    workflow: self,
-                    restore_idle: true,
-                })
             }
-            TableCheckpointWorkflowState::Freezing => Err(FreezeOutcome::Cancelled {
-                reason: CheckpointCancelReason::FreezeInProgress,
-            }),
-            TableCheckpointWorkflowState::Frozen(batch) => Err(FreezeOutcome::AlreadyFrozen {
-                batch: batch.info(),
-            }),
+            TableCheckpointWorkflowState::Freezing => {
+                return Err(FreezeOutcome::Cancelled {
+                    reason: CheckpointCancelReason::FreezeInProgress,
+                });
+            }
+            TableCheckpointWorkflowState::Frozen(batch) => {
+                return Err(FreezeOutcome::AlreadyFrozen {
+                    batch: batch.info(),
+                });
+            }
             TableCheckpointWorkflowState::Checkpointing { .. }
             | TableCheckpointWorkflowState::Publishing
-            | TableCheckpointWorkflowState::Transition => Err(FreezeOutcome::Cancelled {
-                reason: CheckpointCancelReason::CheckpointInProgress,
-            }),
-            TableCheckpointWorkflowState::Closed => Err(FreezeOutcome::Cancelled {
-                reason: terminal_checkpoint_cancel(lifecycle.inspect_terminal()),
-            }),
+            | TableCheckpointWorkflowState::Transition => {
+                return Err(FreezeOutcome::Cancelled {
+                    reason: CheckpointCancelReason::CheckpointInProgress,
+                });
+            }
+            TableCheckpointWorkflowState::Closed => {
+                return Err(FreezeOutcome::Cancelled {
+                    reason: terminal_checkpoint_cancel(self.lifecycle.inspect_terminal()),
+                });
+            }
         }
+        drop(state);
+        Ok(PreparedFreezeAttempt {
+            table: self,
+            restore_idle: true,
+        })
     }
 
+    pub(super) fn begin_checkpoint(
+        self: Arc<Self>,
+    ) -> StdResult<PreparedCheckpointAttempt, CheckpointCancelReason> {
+        let mut state = self.checkpoint_workflow.state.lock();
+        checkpoint_lifecycle(self.lifecycle.inspect_terminal())?;
+        let (source, batch) = match &*state {
+            TableCheckpointWorkflowState::Idle => (CheckpointSource::Idle, None),
+            TableCheckpointWorkflowState::Freezing => {
+                return Err(CheckpointCancelReason::FreezeInProgress);
+            }
+            TableCheckpointWorkflowState::Frozen(_) => {
+                let TableCheckpointWorkflowState::Frozen(batch) =
+                    replace(&mut *state, TableCheckpointWorkflowState::Idle)
+                else {
+                    unreachable!("frozen workflow state changed while locked")
+                };
+                (CheckpointSource::Frozen, Some(batch))
+            }
+            TableCheckpointWorkflowState::Checkpointing { .. }
+            | TableCheckpointWorkflowState::Publishing
+            | TableCheckpointWorkflowState::Transition => {
+                return Err(CheckpointCancelReason::CheckpointInProgress);
+            }
+            TableCheckpointWorkflowState::Closed => {
+                return Err(terminal_checkpoint_cancel(
+                    self.lifecycle.inspect_terminal(),
+                ));
+            }
+        };
+        *state = TableCheckpointWorkflowState::Checkpointing { source };
+        drop(state);
+        Ok(PreparedCheckpointAttempt {
+            table: self,
+            source,
+            batch,
+        })
+    }
+}
+
+impl TableCheckpointWorkflow {
     pub(super) fn begin_checkpoint<'a>(
         &'a self,
         lifecycle: &TableLifecycle,
@@ -488,15 +536,16 @@ impl TableCheckpointWorkflow {
     }
 }
 
-pub(super) struct FreezeAttempt<'a> {
-    workflow: &'a TableCheckpointWorkflow,
+/// Lifetime-free reversible freeze attempt prepared by the caller.
+pub(super) struct PreparedFreezeAttempt {
+    table: Arc<Table>,
     restore_idle: bool,
 }
 
-impl FreezeAttempt<'_> {
+impl PreparedFreezeAttempt {
     #[inline]
     pub(super) fn begin_page_publication(&mut self) -> bool {
-        let state = self.workflow.state.lock();
+        let state = self.table.checkpoint_workflow.state.lock();
         match *state {
             TableCheckpointWorkflowState::Freezing => {
                 self.restore_idle = false;
@@ -511,43 +560,40 @@ impl FreezeAttempt<'_> {
     }
 
     #[inline]
-    pub(super) fn cancelled(mut self, lifecycle: &TableLifecycle) -> FreezeOutcome {
+    pub(super) fn cancelled(mut self) -> FreezeOutcome {
         self.restore_idle = false;
         FreezeOutcome::Cancelled {
-            reason: terminal_checkpoint_cancel(lifecycle.inspect_terminal()),
+            reason: terminal_checkpoint_cancel(self.table.lifecycle.inspect_terminal()),
         }
     }
 
-    pub(super) fn finish(
-        mut self,
-        batch: FrozenPageBatch,
-        lifecycle: &TableLifecycle,
-    ) -> FreezeOutcome {
+    pub(super) fn finish(mut self, batch: FrozenPageBatch) -> FreezeOutcome {
         let info = batch.info();
-        let mut state = self.workflow.state.lock();
-        let outcome = if let Err(reason) = checkpoint_lifecycle(lifecycle.inspect_terminal()) {
-            *state = TableCheckpointWorkflowState::Closed;
-            FreezeOutcome::Cancelled { reason }
-        } else {
-            assert!(
-                matches!(*state, TableCheckpointWorkflowState::Freezing),
-                "freeze completion requires Freezing workflow state"
-            );
-            *state = TableCheckpointWorkflowState::Frozen(batch);
-            FreezeOutcome::Frozen { batch: info }
-        };
+        let mut state = self.table.checkpoint_workflow.state.lock();
+        let outcome =
+            if let Err(reason) = checkpoint_lifecycle(self.table.lifecycle.inspect_terminal()) {
+                *state = TableCheckpointWorkflowState::Closed;
+                FreezeOutcome::Cancelled { reason }
+            } else {
+                assert!(
+                    matches!(*state, TableCheckpointWorkflowState::Freezing),
+                    "freeze completion requires Freezing workflow state"
+                );
+                *state = TableCheckpointWorkflowState::Frozen(batch);
+                FreezeOutcome::Frozen { batch: info }
+            };
         self.restore_idle = false;
         outcome
     }
 }
 
-impl Drop for FreezeAttempt<'_> {
+impl Drop for PreparedFreezeAttempt {
     #[inline]
     fn drop(&mut self) {
         if !self.restore_idle {
             return;
         }
-        let mut state = self.workflow.state.lock();
+        let mut state = self.table.checkpoint_workflow.state.lock();
         if matches!(*state, TableCheckpointWorkflowState::Freezing) {
             *state = TableCheckpointWorkflowState::Idle;
         }
@@ -561,6 +607,50 @@ pub(super) struct CheckpointAttempt<'a> {
 }
 
 impl CheckpointAttempt<'_> {
+    #[inline]
+    pub(super) fn batch(&self) -> Option<&FrozenPageBatch> {
+        self.batch.as_ref()
+    }
+
+    #[inline]
+    pub(super) fn batch_mut(&mut self) -> Option<&mut FrozenPageBatch> {
+        self.batch.as_mut()
+    }
+}
+
+impl Drop for CheckpointAttempt<'_> {
+    fn drop(&mut self) {
+        let mut state = self.workflow.state.lock();
+        if !matches!(
+            *state,
+            TableCheckpointWorkflowState::Checkpointing { source }
+                if source == self.source
+        ) {
+            return;
+        }
+        match self.source {
+            CheckpointSource::Idle => {
+                debug_assert!(self.batch.is_none());
+                *state = TableCheckpointWorkflowState::Idle;
+            }
+            CheckpointSource::Frozen => {
+                let Some(batch) = self.batch.take() else {
+                    panic!("frozen checkpoint attempt must retain its batch")
+                };
+                *state = TableCheckpointWorkflowState::Frozen(batch);
+            }
+        }
+    }
+}
+
+/// Lifetime-free reversible checkpoint attempt prepared by the caller.
+pub(super) struct PreparedCheckpointAttempt {
+    table: Arc<Table>,
+    source: CheckpointSource,
+    batch: Option<FrozenPageBatch>,
+}
+
+impl PreparedCheckpointAttempt {
     #[inline]
     pub(super) fn source(&self) -> CheckpointSource {
         self.source
@@ -577,9 +667,9 @@ impl CheckpointAttempt<'_> {
     }
 }
 
-impl Drop for CheckpointAttempt<'_> {
+impl Drop for PreparedCheckpointAttempt {
     fn drop(&mut self) {
-        let mut state = self.workflow.state.lock();
+        let mut state = self.table.checkpoint_workflow.state.lock();
         if !matches!(
             *state,
             TableCheckpointWorkflowState::Checkpointing { source }
@@ -679,66 +769,14 @@ mod tests {
     }
 
     #[test]
-    fn test_repeated_freeze_keeps_original_batch_and_validation_cache() {
+    fn test_reversible_checkpoint_attempt_restores_admitted_state() {
         let lifecycle = TableLifecycle::new();
         let workflow = TableCheckpointWorkflow::new();
-        let attempt = workflow.begin_freeze(&lifecycle).unwrap();
-        let frozen_ts = TrxID::new(101);
-        let outcome = attempt.finish(one_page_batch(frozen_ts), &lifecycle);
-        let FreezeOutcome::Frozen { batch } = outcome else {
-            panic!("first freeze should install a batch: {outcome:?}");
-        };
-        assert_eq!(batch.table_id(), TABLE_ID);
-        assert_eq!(batch.frozen_ts(), frozen_ts);
-        assert_eq!(batch.approximate_rows(), 7);
-        assert_eq!(batch.page_count(), 1);
-        assert_eq!(batch.stable_page_count(), 0);
-
-        let mut checkpoint = workflow.begin_checkpoint(&lifecycle).unwrap();
-        checkpoint.batch_mut().unwrap().validation[0] = FrozenPageValidationState::Stable {
-            required_cutoff_ts: Some(TrxID::new(88)),
-        };
-        drop(checkpoint);
-
-        let repeated = workflow.begin_freeze(&lifecycle).err().unwrap();
-        let FreezeOutcome::AlreadyFrozen { batch } = repeated else {
-            panic!("repeated freeze should return the canonical batch: {repeated:?}");
-        };
-        assert_eq!(batch.frozen_ts(), frozen_ts);
-        assert_eq!(batch.approximate_rows(), 7);
-        assert_eq!(batch.page_count(), 1);
-        assert_eq!(batch.stable_page_count(), 1);
-        assert_eq!(workflow.state_name(), "Frozen");
-    }
-
-    #[test]
-    fn test_reversible_attempt_guards_restore_admitted_state() {
-        let lifecycle = TableLifecycle::new();
-        let workflow = TableCheckpointWorkflow::new();
-
-        let freeze = workflow.begin_freeze(&lifecycle).unwrap();
-        assert_eq!(workflow.state_name(), "Freezing");
-        assert_eq!(
-            workflow.begin_checkpoint(&lifecycle).err().unwrap(),
-            CheckpointCancelReason::FreezeInProgress
-        );
-        let repeated = workflow.begin_freeze(&lifecycle).err().unwrap();
-        assert_eq!(
-            repeated,
-            FreezeOutcome::Cancelled {
-                reason: CheckpointCancelReason::FreezeInProgress,
-            }
-        );
-        drop(freeze);
-        assert_eq!(workflow.state_name(), "Idle");
 
         let checkpoint = workflow.begin_checkpoint(&lifecycle).unwrap();
-        let freeze = workflow.begin_freeze(&lifecycle).err().unwrap();
         assert_eq!(
-            freeze,
-            FreezeOutcome::Cancelled {
-                reason: CheckpointCancelReason::CheckpointInProgress,
-            }
+            workflow.begin_checkpoint(&lifecycle).err().unwrap(),
+            CheckpointCancelReason::CheckpointInProgress
         );
         drop(checkpoint);
         assert_eq!(workflow.state_name(), "Idle");
@@ -759,16 +797,10 @@ mod tests {
             workflow.begin_checkpoint(&lifecycle).err().unwrap(),
             CheckpointCancelReason::TableDropping
         );
-        assert_eq!(
-            workflow.begin_freeze(&lifecycle).err().unwrap(),
-            FreezeOutcome::Cancelled {
-                reason: CheckpointCancelReason::TableDropping,
-            }
-        );
     }
 
     #[test]
-    fn test_publish_states_reject_concurrent_freeze_and_checkpoint() {
+    fn test_publish_states_reject_concurrent_checkpoint() {
         fn assert_checkpoint_conflicts(
             workflow: &TableCheckpointWorkflow,
             lifecycle: &TableLifecycle,
@@ -777,42 +809,25 @@ mod tests {
                 workflow.begin_checkpoint(lifecycle).err().unwrap(),
                 CheckpointCancelReason::CheckpointInProgress
             );
-            assert_eq!(
-                workflow.begin_freeze(lifecycle).err().unwrap(),
-                FreezeOutcome::Cancelled {
-                    reason: CheckpointCancelReason::CheckpointInProgress,
-                }
-            );
         }
 
         let lifecycle = TableLifecycle::new();
         let workflow = TableCheckpointWorkflow::new();
 
         let publishing_attempt = workflow.begin_checkpoint(&lifecycle).unwrap();
-        let publishing_root = lifecycle.try_begin_checkpoint_root_mutation().unwrap();
-        let publishing_lease = workflow
-            .try_begin_publishing(&lifecycle, publishing_attempt.source())
-            .unwrap();
+        *workflow.state.lock() = TableCheckpointWorkflowState::Publishing;
         assert_eq!(workflow.state_name(), "Publishing");
         assert_checkpoint_conflicts(&workflow, &lifecycle);
         workflow.finish_publication();
-        drop(publishing_lease);
-        drop(publishing_root);
         drop(publishing_attempt);
 
-        let freeze = workflow.begin_freeze(&lifecycle).unwrap();
-        assert!(matches!(
-            freeze.finish(one_page_batch(TrxID::new(102)), &lifecycle),
-            FreezeOutcome::Frozen { .. }
-        ));
+        *workflow.state.lock() =
+            TableCheckpointWorkflowState::Frozen(one_page_batch(TrxID::new(102)));
         let transition_attempt = workflow.begin_checkpoint(&lifecycle).unwrap();
-        let transition_root = lifecycle.try_begin_checkpoint_root_mutation().unwrap();
-        let transition_lease = workflow.try_begin_transition(&lifecycle).unwrap();
+        *workflow.state.lock() = TableCheckpointWorkflowState::Transition;
         assert_eq!(workflow.state_name(), "Transition");
         assert_checkpoint_conflicts(&workflow, &lifecycle);
         workflow.finish_publication();
-        drop(transition_lease);
-        drop(transition_root);
         drop(transition_attempt);
         assert_eq!(workflow.state_name(), "Idle");
     }

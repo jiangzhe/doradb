@@ -54,13 +54,6 @@ pub(crate) struct MandatoryTaskMetadata {
 
 impl MandatoryTaskMetadata {
     /// Build caller-operation metadata.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Phase 1 proves caller operation adapters synthetically"
-        )
-    )]
     #[inline]
     pub(crate) const fn operation(
         label: &'static str,

@@ -15,9 +15,10 @@ mod storage;
 pub use access::LazyRow;
 pub(crate) use access::*;
 pub use checkpoint_workflow::{FreezeOutcome, FrozenPageBatchInfo};
-use checkpoint_workflow::{FrozenPage, FrozenPageBatch, TableCheckpointWorkflow};
+use checkpoint_workflow::{FrozenPage, TableCheckpointWorkflow};
 pub(crate) use deletion_buffer::*;
 pub(crate) use dml_validator::*;
+pub(crate) use gc::PreparedMemIndexCleanupOperation;
 pub use gc::{
     MemIndexCleanupDelay, MemIndexCleanupOutcome, MemIndexCleanupStats,
     SecondaryMemIndexCleanupIndexStats,
@@ -26,7 +27,7 @@ pub(crate) use layout::{RetiredSecondaryIndex, TableRuntimeLayout};
 pub use lifecycle::CheckpointCancelReason;
 #[cfg(test)]
 pub(crate) use lifecycle::TableTerminal;
-pub(crate) use lifecycle::{TableCheckpointRootMutationLease, TableDropDrain, TableLifecycle};
+pub(crate) use lifecycle::{TableDropDrain, TableLifecycle};
 pub(crate) use mem_table::{MemTable, NoTrxUpsertChange, RowPageDescriptor};
 pub use persistence::*;
 pub(crate) use rollback::IndexRollback;
@@ -58,7 +59,6 @@ use error_stack::{Report, ResultExt};
 use parking_lot::Mutex;
 use std::marker::PhantomData;
 use std::mem::take;
-use std::result::Result as StdResult;
 use std::sync::Arc;
 
 /// Copied replay floor fields from one user-table active root.
@@ -190,14 +190,6 @@ impl Table {
     #[inline]
     pub(crate) fn release_index_metadata_change(&self) {
         self.lifecycle.release_metadata_change();
-    }
-
-    /// Attempts to enter the checkpoint table-root mutation section.
-    #[inline]
-    pub(crate) fn try_begin_checkpoint_root_mutation(
-        &self,
-    ) -> StdResult<TableCheckpointRootMutationLease<'_>, CheckpointCancelReason> {
-        self.lifecycle.try_begin_checkpoint_root_mutation()
     }
 
     /// Starts terminal drop admission and closes the checkpoint workflow.
@@ -1140,7 +1132,7 @@ fn unique_key_from_full_row(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::lifecycle::CheckpointPublishLease;
+    use super::lifecycle::{CheckpointPublishLease, TableCheckpointRootMutationScope};
     use crate::buffer::page::PAGE_SIZE;
     use crate::buffer::{PoolGuard, PoolGuards, PoolRole, ReadonlyBufferPool};
     use crate::catalog::tests::table2;
@@ -1173,77 +1165,491 @@ pub(crate) mod tests {
     use crate::session::{Session, tests::SessionTestExt};
     use crate::table::{
         DeleteMarker, DmlValidationError, FreezeOutcome, FrozenPageBatchInfo, Table,
-        TableCheckpointRootMutationLease, TableRuntimeLayout,
+        TableRuntimeLayout,
     };
     use crate::trx::Transaction;
     use crate::trx::stmt::Statement;
     use crate::value::{Val, ValKind};
     use smol::Timer;
     use std::fs::OpenOptions;
+    use std::future::Future;
     use std::io::{Error as IoError, Read, Seek, SeekFrom, Write};
     use std::path::{Path, PathBuf};
+    use std::pin::Pin;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
     use tempfile::TempDir;
 
+    type MaintenanceAsyncHook =
+        Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> + Send + 'static>;
+    type MaintenanceFallibleAsyncHook = Box<
+        dyn FnOnce() -> Pin<Box<dyn Future<Output = RuntimeResult<()>> + Send + 'static>>
+            + Send
+            + 'static,
+    >;
+    pub(crate) type RedoCleanupBeforeUnlinkHook = Arc<dyn Fn(u32, &Path) + Send + Sync + 'static>;
+    type FreezePageHook = Box<dyn FnOnce(PageID) + Send + 'static>;
+    type FrozenPageScanHook = Box<dyn FnMut(PageID) + Send + 'static>;
+    type FrozenPageRowScanHook = Box<dyn FnMut(PageID, usize) + Send + 'static>;
+    type OptimisticPagePlanComparisonHook = Box<dyn FnMut(PageID, u64, u64, bool) + Send + 'static>;
+    type FrozenPagePhaseHook = Box<dyn FnOnce() + Send + 'static>;
+    type TransitionPageHook = Box<dyn FnOnce(PageID) + Send + 'static>;
+
+    #[derive(Default)]
+    struct MaintenanceTestState {
+        force_secondary_sidecar_error: AtomicBool,
+        force_post_publish_checkpoint_error: AtomicBool,
+        force_checkpoint_commit_error: AtomicBool,
+        freeze_after_loading_hook: parking_lot::Mutex<Option<MaintenanceAsyncHook>>,
+        checkpoint_after_trx_start_hook: parking_lot::Mutex<Option<MaintenanceAsyncHook>>,
+        checkpoint_after_publish_admission_hook: parking_lot::Mutex<Option<MaintenanceAsyncHook>>,
+        checkpoint_retry_after_listener_registration_hook:
+            parking_lot::Mutex<Option<MaintenanceAsyncHook>>,
+        silent_watermark_mutation_hook: parking_lot::Mutex<Option<MaintenanceFallibleAsyncHook>>,
+        cleanup_after_trx_start_hook: parking_lot::Mutex<Option<MaintenanceAsyncHook>>,
+        redo_cleanup_before_unlink_hook: parking_lot::Mutex<Option<RedoCleanupBeforeUnlinkHook>>,
+        force_lwc_build_error: AtomicBool,
+        freeze_page_state_locked_hook: parking_lot::Mutex<Option<FreezePageHook>>,
+        frozen_page_scan_hook: parking_lot::Mutex<Option<FrozenPageScanHook>>,
+        frozen_page_row_scan_hook: parking_lot::Mutex<Option<FrozenPageRowScanHook>>,
+        optimistic_page_plan_comparison_hook:
+            parking_lot::Mutex<Option<OptimisticPagePlanComparisonHook>>,
+        frozen_pages_ready_hook: parking_lot::Mutex<Option<FrozenPagePhaseHook>>,
+        stable_page_plans_refreshed_hook: parking_lot::Mutex<Option<FrozenPagePhaseHook>>,
+        locked_page_plan_rebuild_hook: parking_lot::Mutex<Option<TransitionPageHook>>,
+        transition_page_published_hook: parking_lot::Mutex<Option<TransitionPageHook>>,
+    }
+
+    /// Per-engine maintenance fault and phase controller shared across runners.
+    #[derive(Clone, Default)]
+    pub(crate) struct MaintenanceTestController {
+        state: Arc<MaintenanceTestState>,
+    }
+
+    impl MaintenanceTestController {
+        #[inline]
+        pub(crate) fn set_force_secondary_sidecar_error(&self, enabled: bool) {
+            self.state
+                .force_secondary_sidecar_error
+                .store(enabled, Ordering::Relaxed);
+        }
+
+        #[inline]
+        pub(crate) fn force_secondary_sidecar_error(&self) -> bool {
+            self.state
+                .force_secondary_sidecar_error
+                .load(Ordering::Relaxed)
+        }
+
+        #[inline]
+        pub(crate) fn set_force_post_publish_checkpoint_error(&self, enabled: bool) {
+            self.state
+                .force_post_publish_checkpoint_error
+                .store(enabled, Ordering::Relaxed);
+        }
+
+        #[inline]
+        pub(crate) fn force_post_publish_checkpoint_error(&self) -> bool {
+            self.state
+                .force_post_publish_checkpoint_error
+                .load(Ordering::Relaxed)
+        }
+
+        #[inline]
+        pub(crate) fn set_force_checkpoint_commit_error(&self, enabled: bool) {
+            self.state
+                .force_checkpoint_commit_error
+                .store(enabled, Ordering::Relaxed);
+        }
+
+        #[inline]
+        pub(crate) fn force_checkpoint_commit_error(&self) -> bool {
+            self.state
+                .force_checkpoint_commit_error
+                .load(Ordering::Relaxed)
+        }
+
+        pub(crate) fn install_freeze_after_loading_hook<F, Fut>(&self, hook: F)
+        where
+            F: FnOnce() -> Fut + Send + 'static,
+            Fut: Future<Output = ()> + Send + 'static,
+        {
+            let old = self
+                .state
+                .freeze_after_loading_hook
+                .lock()
+                .replace(Box::new(move || Box::pin(hook())));
+            assert!(old.is_none(), "freeze loading hook already installed");
+        }
+
+        pub(crate) fn install_checkpoint_after_trx_start_hook<F, Fut>(&self, hook: F)
+        where
+            F: FnOnce() -> Fut + Send + 'static,
+            Fut: Future<Output = ()> + Send + 'static,
+        {
+            let old = self
+                .state
+                .checkpoint_after_trx_start_hook
+                .lock()
+                .replace(Box::new(move || Box::pin(hook())));
+            assert!(
+                old.is_none(),
+                "checkpoint transaction-start hook already installed"
+            );
+        }
+
+        pub(crate) fn install_checkpoint_after_publish_admission_hook<F, Fut>(&self, hook: F)
+        where
+            F: FnOnce() -> Fut + Send + 'static,
+            Fut: Future<Output = ()> + Send + 'static,
+        {
+            let old = self
+                .state
+                .checkpoint_after_publish_admission_hook
+                .lock()
+                .replace(Box::new(move || Box::pin(hook())));
+            assert!(
+                old.is_none(),
+                "checkpoint publish-admission hook already installed"
+            );
+        }
+
+        pub(crate) fn install_checkpoint_retry_after_listener_registration_hook<F, Fut>(
+            &self,
+            hook: F,
+        ) where
+            F: FnOnce() -> Fut + Send + 'static,
+            Fut: Future<Output = ()> + Send + 'static,
+        {
+            let old = self
+                .state
+                .checkpoint_retry_after_listener_registration_hook
+                .lock()
+                .replace(Box::new(move || Box::pin(hook())));
+            assert!(
+                old.is_none(),
+                "checkpoint retry listener-registration hook already installed"
+            );
+        }
+
+        pub(crate) fn install_silent_watermark_mutation_hook<F, Fut>(&self, hook: F)
+        where
+            F: FnOnce() -> Fut + Send + 'static,
+            Fut: Future<Output = RuntimeResult<()>> + Send + 'static,
+        {
+            let old = self
+                .state
+                .silent_watermark_mutation_hook
+                .lock()
+                .replace(Box::new(move || Box::pin(hook())));
+            assert!(
+                old.is_none(),
+                "silent watermark mutation hook already installed"
+            );
+        }
+
+        pub(crate) fn install_cleanup_after_trx_start_hook<F, Fut>(&self, hook: F)
+        where
+            F: FnOnce() -> Fut + Send + 'static,
+            Fut: Future<Output = ()> + Send + 'static,
+        {
+            let old = self
+                .state
+                .cleanup_after_trx_start_hook
+                .lock()
+                .replace(Box::new(move || Box::pin(hook())));
+            assert!(
+                old.is_none(),
+                "MemIndex cleanup transaction-start hook already installed"
+            );
+        }
+
+        pub(crate) async fn run_freeze_after_loading_hook(&self) {
+            let hook = self.state.freeze_after_loading_hook.lock().take();
+            if let Some(hook) = hook {
+                hook().await;
+            }
+        }
+
+        pub(crate) async fn run_checkpoint_after_trx_start_hook(&self) {
+            let hook = self.state.checkpoint_after_trx_start_hook.lock().take();
+            if let Some(hook) = hook {
+                hook().await;
+            }
+        }
+
+        pub(crate) async fn run_checkpoint_after_publish_admission_hook(&self) {
+            let hook = self
+                .state
+                .checkpoint_after_publish_admission_hook
+                .lock()
+                .take();
+            if let Some(hook) = hook {
+                hook().await;
+            }
+        }
+
+        pub(crate) async fn run_checkpoint_retry_after_listener_registration_hook(&self) {
+            let hook = self
+                .state
+                .checkpoint_retry_after_listener_registration_hook
+                .lock()
+                .take();
+            if let Some(hook) = hook {
+                hook().await;
+            }
+        }
+
+        pub(crate) async fn run_silent_watermark_mutation_hook(&self) -> RuntimeResult<()> {
+            let hook = self.state.silent_watermark_mutation_hook.lock().take();
+            match hook {
+                Some(hook) => hook().await,
+                None => Ok(()),
+            }
+        }
+
+        pub(crate) async fn run_cleanup_after_trx_start_hook(&self) {
+            let hook = self.state.cleanup_after_trx_start_hook.lock().take();
+            if let Some(hook) = hook {
+                hook().await;
+            }
+        }
+
+        pub(crate) fn install_redo_cleanup_before_unlink_hook(
+            &self,
+            hook: RedoCleanupBeforeUnlinkHook,
+        ) {
+            let mut slot = self.state.redo_cleanup_before_unlink_hook.lock();
+            assert!(
+                slot.is_none(),
+                "redo cleanup before-unlink hook already installed"
+            );
+            *slot = Some(hook);
+        }
+
+        pub(crate) fn clear_redo_cleanup_before_unlink_hook(&self) {
+            self.state.redo_cleanup_before_unlink_hook.lock().take();
+        }
+
+        pub(crate) fn run_redo_cleanup_before_unlink_hook(&self, file_seq: u32, path: &Path) {
+            let hook = self.state.redo_cleanup_before_unlink_hook.lock().clone();
+            if let Some(hook) = hook {
+                hook(file_seq, path);
+            }
+        }
+
+        pub(crate) fn set_force_lwc_build_error(&self, enabled: bool) {
+            self.state
+                .force_lwc_build_error
+                .store(enabled, Ordering::Relaxed);
+        }
+
+        pub(crate) fn force_lwc_build_error(&self) -> bool {
+            self.state.force_lwc_build_error.load(Ordering::Relaxed)
+        }
+
+        pub(crate) fn install_freeze_page_state_locked_hook<F>(&self, hook: F)
+        where
+            F: FnOnce(PageID) + Send + 'static,
+        {
+            let old = self
+                .state
+                .freeze_page_state_locked_hook
+                .lock()
+                .replace(Box::new(hook));
+            assert!(old.is_none(), "freeze page-state hook already installed");
+        }
+
+        pub(crate) fn run_freeze_page_state_locked_hook(&self, page_id: PageID) {
+            let hook = self.state.freeze_page_state_locked_hook.lock().take();
+            if let Some(hook) = hook {
+                hook(page_id);
+            }
+        }
+
+        pub(crate) fn install_locked_page_plan_rebuild_hook<F>(&self, hook: F)
+        where
+            F: FnOnce(PageID) + Send + 'static,
+        {
+            let old = self
+                .state
+                .locked_page_plan_rebuild_hook
+                .lock()
+                .replace(Box::new(hook));
+            assert!(old.is_none(), "locked page-plan hook already installed");
+        }
+
+        pub(crate) fn run_locked_page_plan_rebuild_hook(&self, page_id: PageID) {
+            let hook = self.state.locked_page_plan_rebuild_hook.lock().take();
+            if let Some(hook) = hook {
+                hook(page_id);
+            }
+        }
+
+        pub(crate) fn install_transition_page_published_hook<F>(&self, hook: F)
+        where
+            F: FnOnce(PageID) + Send + 'static,
+        {
+            let old = self
+                .state
+                .transition_page_published_hook
+                .lock()
+                .replace(Box::new(hook));
+            assert!(old.is_none(), "transition page hook already installed");
+        }
+
+        pub(crate) fn run_transition_page_published_hook(&self, page_id: PageID) {
+            let hook = self.state.transition_page_published_hook.lock().take();
+            if let Some(hook) = hook {
+                hook(page_id);
+            }
+        }
+
+        pub(crate) fn install_frozen_page_scan_hook<F>(&self, hook: F)
+        where
+            F: FnMut(PageID) + Send + 'static,
+        {
+            let old = self
+                .state
+                .frozen_page_scan_hook
+                .lock()
+                .replace(Box::new(hook));
+            assert!(old.is_none(), "frozen-page scan hook already installed");
+        }
+
+        pub(crate) fn run_frozen_page_scan_hook(&self, page_id: PageID) {
+            if let Some(hook) = self.state.frozen_page_scan_hook.lock().as_mut() {
+                hook(page_id);
+            }
+        }
+
+        pub(crate) fn install_frozen_page_row_scan_hook<F>(&self, hook: F)
+        where
+            F: FnMut(PageID, usize) + Send + 'static,
+        {
+            let old = self
+                .state
+                .frozen_page_row_scan_hook
+                .lock()
+                .replace(Box::new(hook));
+            assert!(old.is_none(), "frozen-page row-scan hook already installed");
+        }
+
+        pub(crate) fn run_frozen_page_row_scan_hook(&self, page_id: PageID, row_idx: usize) {
+            if let Some(hook) = self.state.frozen_page_row_scan_hook.lock().as_mut() {
+                hook(page_id, row_idx);
+            }
+        }
+
+        pub(crate) fn install_optimistic_page_plan_comparison_hook<F>(&self, hook: F)
+        where
+            F: FnMut(PageID, u64, u64, bool) + Send + 'static,
+        {
+            let old = self
+                .state
+                .optimistic_page_plan_comparison_hook
+                .lock()
+                .replace(Box::new(hook));
+            assert!(
+                old.is_none(),
+                "optimistic page-plan comparison hook already installed"
+            );
+        }
+
+        pub(crate) fn run_optimistic_page_plan_comparison_hook(
+            &self,
+            page_id: PageID,
+            version_before: u64,
+            version_after: u64,
+            retained: bool,
+        ) {
+            if let Some(hook) = self
+                .state
+                .optimistic_page_plan_comparison_hook
+                .lock()
+                .as_mut()
+            {
+                hook(page_id, version_before, version_after, retained);
+            }
+        }
+
+        pub(crate) fn install_frozen_pages_ready_hook<F>(&self, hook: F)
+        where
+            F: FnOnce() + Send + 'static,
+        {
+            let old = self
+                .state
+                .frozen_pages_ready_hook
+                .lock()
+                .replace(Box::new(hook));
+            assert!(old.is_none(), "frozen-pages-ready hook already installed");
+        }
+
+        pub(crate) fn run_frozen_pages_ready_hook(&self) {
+            let hook = self.state.frozen_pages_ready_hook.lock().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+
+        pub(crate) fn install_stable_page_plans_refreshed_hook<F>(&self, hook: F)
+        where
+            F: FnOnce() + Send + 'static,
+        {
+            let old = self
+                .state
+                .stable_page_plans_refreshed_hook
+                .lock()
+                .replace(Box::new(hook));
+            assert!(old.is_none(), "stable page-plans hook already installed");
+        }
+
+        pub(crate) fn run_stable_page_plans_refreshed_hook(&self) {
+            let hook = self.state.stable_page_plans_refreshed_hook.lock().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+    }
+
     pub(crate) mod test_hooks {
+        use super::MaintenanceTestController;
+        use crate::engine::Engine;
         use crate::error::{InternalError, RuntimeError, RuntimeResult};
         use crate::id::PageID;
         use error_stack::Report;
-        use std::cell::{Cell, RefCell};
+        use std::cell::RefCell;
 
-        type FreezePageHook = Box<dyn FnOnce(PageID) + 'static>;
-        type FrozenPageScanHook = Box<dyn FnMut(PageID) + 'static>;
-        type FrozenPageRowScanHook = Box<dyn FnMut(PageID, usize) + 'static>;
-        type OptimisticPagePlanComparisonHook = Box<dyn FnMut(PageID, u64, u64, bool) + 'static>;
-        type FrozenPagePhaseHook = Box<dyn FnOnce() + 'static>;
-        type TransitionPageHook = Box<dyn FnOnce(PageID) + 'static>;
         type HotRowWriteHook = Box<dyn FnOnce() + 'static>;
 
         thread_local! {
-            static TEST_FORCE_LWC_BUILD_ERROR: Cell<bool> = const { Cell::new(false) };
-            static TEST_FREEZE_PAGE_STATE_LOCKED_HOOK: RefCell<Option<FreezePageHook>> =
-                const { RefCell::new(None) };
-            static TEST_FROZEN_PAGE_SCAN_HOOK: RefCell<Option<FrozenPageScanHook>> =
-                const { RefCell::new(None) };
-            static TEST_FROZEN_PAGE_ROW_SCAN_HOOK: RefCell<Option<FrozenPageRowScanHook>> =
-                const { RefCell::new(None) };
-            static TEST_OPTIMISTIC_PAGE_PLAN_COMPARISON_HOOK:
-                RefCell<Option<OptimisticPagePlanComparisonHook>> = const { RefCell::new(None) };
-            static TEST_FROZEN_PAGES_READY_HOOK: RefCell<Option<FrozenPagePhaseHook>> =
-                const { RefCell::new(None) };
-            static TEST_STABLE_PAGE_PLANS_REFRESHED_HOOK: RefCell<Option<FrozenPagePhaseHook>> =
-                const { RefCell::new(None) };
-            static TEST_LOCKED_PAGE_PLAN_REBUILD_HOOK: RefCell<Option<TransitionPageHook>> =
-                const { RefCell::new(None) };
-            static TEST_TRANSITION_PAGE_PUBLISHED_HOOK: RefCell<Option<TransitionPageHook>> =
-                const { RefCell::new(None) };
             static TEST_HOT_ROW_WRITE_BEFORE_STATE_LOCK_HOOK: RefCell<Option<HotRowWriteHook>> =
                 const { RefCell::new(None) };
         }
 
-        pub(crate) fn set_test_force_lwc_build_error(enabled: bool) {
-            TEST_FORCE_LWC_BUILD_ERROR.with(|flag| flag.set(enabled));
+        pub(crate) struct ForceLwcBuildErrorGuard {
+            test: MaintenanceTestController,
         }
 
-        pub(crate) struct ForceLwcBuildErrorGuard;
-
         impl ForceLwcBuildErrorGuard {
-            pub(crate) fn new() -> Self {
-                set_test_force_lwc_build_error(true);
-                Self
+            pub(crate) fn new(engine: &Engine) -> Self {
+                let test = engine.inner().maintenance_test.clone();
+                test.set_force_lwc_build_error(true);
+                Self { test }
             }
         }
 
         impl Drop for ForceLwcBuildErrorGuard {
             fn drop(&mut self) {
-                set_test_force_lwc_build_error(false);
+                self.test.set_force_lwc_build_error(false);
             }
         }
 
-        pub(crate) fn maybe_force_lwc_build_error() -> RuntimeResult<()> {
-            if TEST_FORCE_LWC_BUILD_ERROR.with(|flag| flag.get()) {
+        pub(crate) fn maybe_force_lwc_build_error(
+            test: &MaintenanceTestController,
+        ) -> RuntimeResult<()> {
+            if test.force_lwc_build_error() {
                 return Err(Report::new(InternalError::LwcBuilderMisuse)
                     .attach("test LWC build failure")
                     .change_context(RuntimeError::TableAccess));
@@ -1251,151 +1657,133 @@ pub(crate) mod tests {
             Ok(())
         }
 
-        pub(crate) fn set_test_freeze_page_state_locked_hook<F>(hook: F)
+        pub(crate) fn run_test_freeze_page_state_locked_hook(
+            test: &MaintenanceTestController,
+            page_id: PageID,
+        ) {
+            test.run_freeze_page_state_locked_hook(page_id);
+        }
+
+        pub(crate) fn set_test_locked_page_plan_rebuild_hook<F>(engine: &Engine, hook: F)
         where
-            F: FnOnce(PageID) + 'static,
+            F: FnOnce(PageID) + Send + 'static,
         {
-            TEST_FREEZE_PAGE_STATE_LOCKED_HOOK.with(|slot| {
-                let old = slot.borrow_mut().replace(Box::new(hook));
-                assert!(old.is_none(), "freeze page-state hook already installed");
-            });
+            engine
+                .inner()
+                .maintenance_test
+                .install_locked_page_plan_rebuild_hook(hook);
         }
 
-        pub(crate) fn run_test_freeze_page_state_locked_hook(page_id: PageID) {
-            let hook = TEST_FREEZE_PAGE_STATE_LOCKED_HOOK.with(|slot| slot.borrow_mut().take());
-            if let Some(hook) = hook {
-                hook(page_id);
-            }
+        pub(crate) fn run_test_locked_page_plan_rebuild_hook(
+            test: &MaintenanceTestController,
+            page_id: PageID,
+        ) {
+            test.run_locked_page_plan_rebuild_hook(page_id);
         }
 
-        pub(crate) fn set_test_locked_page_plan_rebuild_hook<F>(hook: F)
+        pub(crate) fn set_test_transition_page_published_hook<F>(engine: &Engine, hook: F)
         where
-            F: FnOnce(PageID) + 'static,
+            F: FnOnce(PageID) + Send + 'static,
         {
-            TEST_LOCKED_PAGE_PLAN_REBUILD_HOOK.with(|slot| {
-                let old = slot.borrow_mut().replace(Box::new(hook));
-                assert!(old.is_none(), "locked page-plan hook already installed");
-            });
+            engine
+                .inner()
+                .maintenance_test
+                .install_transition_page_published_hook(hook);
         }
 
-        pub(crate) fn run_test_locked_page_plan_rebuild_hook(page_id: PageID) {
-            let hook = TEST_LOCKED_PAGE_PLAN_REBUILD_HOOK.with(|slot| slot.borrow_mut().take());
-            if let Some(hook) = hook {
-                hook(page_id);
-            }
-        }
-
-        pub(crate) fn set_test_transition_page_published_hook<F>(hook: F)
+        pub(crate) fn set_test_frozen_page_scan_hook<F>(engine: &Engine, hook: F)
         where
-            F: FnOnce(PageID) + 'static,
+            F: FnMut(PageID) + Send + 'static,
         {
-            TEST_TRANSITION_PAGE_PUBLISHED_HOOK.with(|slot| {
-                let old = slot.borrow_mut().replace(Box::new(hook));
-                assert!(old.is_none(), "transition page hook already installed");
-            });
+            engine
+                .inner()
+                .maintenance_test
+                .install_frozen_page_scan_hook(hook);
         }
 
-        pub(crate) fn set_test_frozen_page_scan_hook<F>(hook: F)
+        pub(crate) fn run_test_frozen_page_scan_hook(
+            test: &MaintenanceTestController,
+            page_id: PageID,
+        ) {
+            test.run_frozen_page_scan_hook(page_id);
+        }
+
+        pub(crate) fn set_test_frozen_page_row_scan_hook<F>(engine: &Engine, hook: F)
         where
-            F: FnMut(PageID) + 'static,
+            F: FnMut(PageID, usize) + Send + 'static,
         {
-            TEST_FROZEN_PAGE_SCAN_HOOK.with(|slot| {
-                let old = slot.borrow_mut().replace(Box::new(hook));
-                assert!(old.is_none(), "frozen-page scan hook already installed");
-            });
+            engine
+                .inner()
+                .maintenance_test
+                .install_frozen_page_row_scan_hook(hook);
         }
 
-        pub(crate) fn run_test_frozen_page_scan_hook(page_id: PageID) {
-            TEST_FROZEN_PAGE_SCAN_HOOK.with(|slot| {
-                if let Some(hook) = slot.borrow_mut().as_mut() {
-                    hook(page_id);
-                }
-            });
+        pub(crate) fn run_test_frozen_page_row_scan_hook(
+            test: &MaintenanceTestController,
+            page_id: PageID,
+            row_idx: usize,
+        ) {
+            test.run_frozen_page_row_scan_hook(page_id, row_idx);
         }
 
-        pub(crate) fn set_test_frozen_page_row_scan_hook<F>(hook: F)
+        pub(crate) fn set_test_optimistic_page_plan_comparison_hook<F>(engine: &Engine, hook: F)
         where
-            F: FnMut(PageID, usize) + 'static,
+            F: FnMut(PageID, u64, u64, bool) + Send + 'static,
         {
-            TEST_FROZEN_PAGE_ROW_SCAN_HOOK.with(|slot| {
-                let old = slot.borrow_mut().replace(Box::new(hook));
-                assert!(old.is_none(), "frozen-page row-scan hook already installed");
-            });
-        }
-
-        pub(crate) fn run_test_frozen_page_row_scan_hook(page_id: PageID, row_idx: usize) {
-            TEST_FROZEN_PAGE_ROW_SCAN_HOOK.with(|slot| {
-                if let Some(hook) = slot.borrow_mut().as_mut() {
-                    hook(page_id, row_idx);
-                }
-            });
-        }
-
-        pub(crate) fn set_test_optimistic_page_plan_comparison_hook<F>(hook: F)
-        where
-            F: FnMut(PageID, u64, u64, bool) + 'static,
-        {
-            TEST_OPTIMISTIC_PAGE_PLAN_COMPARISON_HOOK.with(|slot| {
-                let old = slot.borrow_mut().replace(Box::new(hook));
-                assert!(
-                    old.is_none(),
-                    "optimistic page-plan comparison hook already installed"
-                );
-            });
+            engine
+                .inner()
+                .maintenance_test
+                .install_optimistic_page_plan_comparison_hook(hook);
         }
 
         pub(crate) fn run_test_optimistic_page_plan_comparison_hook(
+            test: &MaintenanceTestController,
             page_id: PageID,
             version_before: u64,
             version_after: u64,
             retained: bool,
         ) {
-            TEST_OPTIMISTIC_PAGE_PLAN_COMPARISON_HOOK.with(|slot| {
-                if let Some(hook) = slot.borrow_mut().as_mut() {
-                    hook(page_id, version_before, version_after, retained);
-                }
-            });
+            test.run_optimistic_page_plan_comparison_hook(
+                page_id,
+                version_before,
+                version_after,
+                retained,
+            );
         }
 
-        pub(crate) fn set_test_frozen_pages_ready_hook<F>(hook: F)
+        pub(crate) fn set_test_frozen_pages_ready_hook<F>(engine: &Engine, hook: F)
         where
-            F: FnOnce() + 'static,
+            F: FnOnce() + Send + 'static,
         {
-            TEST_FROZEN_PAGES_READY_HOOK.with(|slot| {
-                let old = slot.borrow_mut().replace(Box::new(hook));
-                assert!(old.is_none(), "frozen-pages-ready hook already installed");
-            });
+            engine
+                .inner()
+                .maintenance_test
+                .install_frozen_pages_ready_hook(hook);
         }
 
-        pub(crate) fn run_test_frozen_pages_ready_hook() {
-            let hook = TEST_FROZEN_PAGES_READY_HOOK.with(|slot| slot.borrow_mut().take());
-            if let Some(hook) = hook {
-                hook();
-            }
+        pub(crate) fn run_test_frozen_pages_ready_hook(test: &MaintenanceTestController) {
+            test.run_frozen_pages_ready_hook();
         }
 
-        pub(crate) fn set_test_stable_page_plans_refreshed_hook<F>(hook: F)
+        pub(crate) fn set_test_stable_page_plans_refreshed_hook<F>(engine: &Engine, hook: F)
         where
-            F: FnOnce() + 'static,
+            F: FnOnce() + Send + 'static,
         {
-            TEST_STABLE_PAGE_PLANS_REFRESHED_HOOK.with(|slot| {
-                let old = slot.borrow_mut().replace(Box::new(hook));
-                assert!(old.is_none(), "stable page-plans hook already installed");
-            });
+            engine
+                .inner()
+                .maintenance_test
+                .install_stable_page_plans_refreshed_hook(hook);
         }
 
-        pub(crate) fn run_test_stable_page_plans_refreshed_hook() {
-            let hook = TEST_STABLE_PAGE_PLANS_REFRESHED_HOOK.with(|slot| slot.borrow_mut().take());
-            if let Some(hook) = hook {
-                hook();
-            }
+        pub(crate) fn run_test_stable_page_plans_refreshed_hook(test: &MaintenanceTestController) {
+            test.run_stable_page_plans_refreshed_hook();
         }
 
-        pub(crate) fn run_test_transition_page_published_hook(page_id: PageID) {
-            let hook = TEST_TRANSITION_PAGE_PUBLISHED_HOOK.with(|slot| slot.borrow_mut().take());
-            if let Some(hook) = hook {
-                hook(page_id);
-            }
+        pub(crate) fn run_test_transition_page_published_hook(
+            test: &MaintenanceTestController,
+            page_id: PageID,
+        ) {
+            test.run_transition_page_published_hook(page_id);
         }
 
         pub(crate) fn set_test_hot_row_write_before_state_lock_hook<F>(hook: F)
@@ -1429,12 +1817,9 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn begin_checkpoint_publish_for_test(
-        table: &Table,
-    ) -> (
-        TableCheckpointRootMutationLease<'_>,
-        CheckpointPublishLease<'_>,
-    ) {
-        let root_lease = table.try_begin_checkpoint_root_mutation().unwrap();
+        table: &Arc<Table>,
+    ) -> (TableCheckpointRootMutationScope, CheckpointPublishLease<'_>) {
+        let root_lease = TableCheckpointRootMutationScope::acquire(Arc::clone(table)).unwrap();
         let publish_lease = table.lifecycle.try_begin_checkpoint_publish().unwrap();
         (root_lease, publish_lease)
     }

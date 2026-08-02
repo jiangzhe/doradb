@@ -1,6 +1,9 @@
 use super::checkpoint_workflow::{
-    FreezeAttempt, FrozenPage, FrozenPageBatch, FrozenPageValidationState, PreparedTransitionPage,
+    FrozenPage, FrozenPageBatch, FrozenPageValidationState, PreparedFreezeAttempt,
+    PreparedTransitionPage,
 };
+#[cfg(test)]
+use super::tests::MaintenanceTestController;
 use super::{DeleteMarker, Table};
 use crate::bitmap::Bitmap;
 use crate::buffer::PoolGuards;
@@ -126,7 +129,8 @@ impl Table {
         &self,
         page_guards: &[PageSharedGuard<RowPage>],
         pages: &[FrozenPage],
-        attempt: &mut FreezeAttempt<'_>,
+        attempt: &mut PreparedFreezeAttempt,
+        #[cfg(test)] maintenance_test: &MaintenanceTestController,
     ) -> bool {
         #[cfg(test)]
         use super::test_hooks;
@@ -182,7 +186,7 @@ impl Table {
                 page_info.page_id
             );
             #[cfg(test)]
-            test_hooks::run_test_freeze_page_state_locked_hook(page_info.page_id);
+            test_hooks::run_test_freeze_page_state_locked_hook(maintenance_test, page_info.page_id);
             *state = RowPageState::Frozen;
         }
         true
@@ -193,6 +197,7 @@ impl Table {
         page_guards: &[PageSharedGuard<RowPage>],
         batch: &mut FrozenPageBatch,
         cutoff_ts: TrxID,
+        #[cfg(test)] maintenance_test: &MaintenanceTestController,
     ) -> Option<FrozenPageValidationDelay> {
         #[cfg(test)]
         use super::test_hooks;
@@ -205,18 +210,30 @@ impl Table {
         );
         // Phase 1 advances the cached ready prefix only. A delayed attempt
         // returns before doing work on pages beyond its first blocker.
-        if let Some(delay) = validate_frozen_pages_incrementally(page_guards, batch, cutoff_ts) {
+        if let Some(delay) = validate_frozen_pages_incrementally(
+            page_guards,
+            batch,
+            cutoff_ts,
+            #[cfg(test)]
+            maintenance_test,
+        ) {
             return Some(delay);
         }
         #[cfg(test)]
-        test_hooks::run_test_frozen_pages_ready_hook();
+        test_hooks::run_test_frozen_pages_ready_hook(maintenance_test);
 
         // Phase 2 refreshes cutoff- and version-specific plans for the entire
         // ready batch. Readiness is now monotonic: later frozen-page ownership
         // changes may invalidate plans but cannot reintroduce a cutoff delay.
-        refresh_frozen_page_plans_optimistically(page_guards, batch, cutoff_ts);
+        refresh_frozen_page_plans_optimistically(
+            page_guards,
+            batch,
+            cutoff_ts,
+            #[cfg(test)]
+            maintenance_test,
+        );
         #[cfg(test)]
-        test_hooks::run_test_stable_page_plans_refreshed_hook();
+        test_hooks::run_test_stable_page_plans_refreshed_hook(maintenance_test);
         None
     }
 
@@ -227,6 +244,7 @@ impl Table {
         batch: &mut FrozenPageBatch,
         page_idx: usize,
         cutoff_ts: TrxID,
+        #[cfg(test)] maintenance_test: &MaintenanceTestController,
     ) -> FrozenPageValidationState {
         let page_info = batch.pages[page_idx];
         match batch.validation[page_idx] {
@@ -240,7 +258,14 @@ impl Table {
                 state
             }
             FrozenPageValidationState::Unchecked | FrozenPageValidationState::Blocked { .. } => {
-                analyze_frozen_page_readiness(page_guard, batch, page_idx, cutoff_ts)
+                analyze_frozen_page_readiness(
+                    page_guard,
+                    batch,
+                    page_idx,
+                    cutoff_ts,
+                    #[cfg(test)]
+                    maintenance_test,
+                )
             }
         }
     }
@@ -250,6 +275,7 @@ impl Table {
         page_guards: &[PageSharedGuard<RowPage>],
         batch: &mut FrozenPageBatch,
         cutoff_ts: TrxID,
+        #[cfg(test)] maintenance_test: &MaintenanceTestController,
     ) {
         #[cfg(test)]
         use super::test_hooks;
@@ -300,13 +326,18 @@ impl Table {
                 Some(plan) => plan,
                 None => {
                     #[cfg(test)]
-                    test_hooks::run_test_locked_page_plan_rebuild_hook(page_info.page_id);
+                    test_hooks::run_test_locked_page_plan_rebuild_hook(
+                        maintenance_test,
+                        page_info.page_id,
+                    );
                     scan_frozen_page(
                         page,
                         map,
                         page_info,
                         FrozenPageScanMode::RefreshStablePlan,
                         cutoff_ts,
+                        #[cfg(test)]
+                        maintenance_test,
                     )
                     .into_plan(cutoff_ts, version)
                     .expect("stable frozen page must yield a transition plan under its state lock")
@@ -319,7 +350,10 @@ impl Table {
             // suffix are not stalled behind the whole batch transition.
             drop(state);
             #[cfg(test)]
-            test_hooks::run_test_transition_page_published_hook(page_info.page_id);
+            test_hooks::run_test_transition_page_published_hook(
+                maintenance_test,
+                page_info.page_id,
+            );
         }
     }
 
@@ -367,6 +401,7 @@ fn validate_frozen_pages_incrementally(
     page_guards: &[PageSharedGuard<RowPage>],
     batch: &mut FrozenPageBatch,
     cutoff_ts: TrxID,
+    #[cfg(test)] maintenance_test: &MaintenanceTestController,
 ) -> Option<FrozenPageValidationDelay> {
     // Stop at the first delay. Stable pages in the preceding prefix retain
     // their readiness proof, while the unchecked suffix is deferred until a
@@ -391,7 +426,14 @@ fn validate_frozen_pages_incrementally(
                 // Unchecked pages need their first proof; blocked pages must be
                 // revisited because transaction resolution may have made the
                 // image checkpointable since the previous attempt.
-                analyze_frozen_page_readiness(page_guard, batch, page_idx, cutoff_ts)
+                analyze_frozen_page_readiness(
+                    page_guard,
+                    batch,
+                    page_idx,
+                    cutoff_ts,
+                    #[cfg(test)]
+                    maintenance_test,
+                )
             }
         };
         record_frozen_page_readiness(
@@ -414,13 +456,21 @@ fn refresh_frozen_page_plans_optimistically(
     page_guards: &[PageSharedGuard<RowPage>],
     batch: &mut FrozenPageBatch,
     cutoff_ts: TrxID,
+    #[cfg(test)] maintenance_test: &MaintenanceTestController,
 ) {
     // Once cached readiness says the whole batch can proceed, refresh every
     // cutoff-specific plan before acquiring the first page state write lock.
     // Later mutations observed the Frozen state, so they can change bitmap or
     // overlay output but cannot invalidate the established image proof.
     for (page_idx, page_guard) in page_guards.iter().enumerate() {
-        refresh_stable_page_plan(page_guard, batch, page_idx, cutoff_ts);
+        refresh_stable_page_plan(
+            page_guard,
+            batch,
+            page_idx,
+            cutoff_ts,
+            #[cfg(test)]
+            maintenance_test,
+        );
     }
 }
 
@@ -429,6 +479,7 @@ fn analyze_frozen_page_readiness(
     batch: &mut FrozenPageBatch,
     page_idx: usize,
     cutoff_ts: TrxID,
+    #[cfg(test)] maintenance_test: &MaintenanceTestController,
 ) -> FrozenPageValidationState {
     let page_info = batch.pages[page_idx];
     let page = page_guard.page();
@@ -445,6 +496,8 @@ fn analyze_frozen_page_readiness(
             frozen_ts: batch.frozen_ts,
         },
         cutoff_ts,
+        #[cfg(test)]
+        maintenance_test,
     )
     .into_readiness_analysis(cutoff_ts, version_before);
     // A mutation that overlaps analysis can start and finish before the final
@@ -475,6 +528,8 @@ fn analyze_frozen_page_readiness(
         version_before,
         version_after,
         analysis.plan,
+        #[cfg(test)]
+        maintenance_test,
     );
     analysis.validation
 }
@@ -484,6 +539,7 @@ fn refresh_stable_page_plan(
     batch: &mut FrozenPageBatch,
     page_idx: usize,
     cutoff_ts: TrxID,
+    #[cfg(test)] maintenance_test: &MaintenanceTestController,
 ) {
     let page_info = batch.pages[page_idx];
     let page = page_guard.page();
@@ -512,11 +568,21 @@ fn refresh_stable_page_plan(
                 page_info,
                 FrozenPageScanMode::RefreshStablePlan,
                 cutoff_ts,
+                #[cfg(test)]
+                maintenance_test,
             )
             .into_plan(cutoff_ts, version_before)
         });
     let version_after = map.frozen_mutation_version();
-    retain_optimistic_page_plan(batch, page_idx, version_before, version_after, plan);
+    retain_optimistic_page_plan(
+        batch,
+        page_idx,
+        version_before,
+        version_after,
+        plan,
+        #[cfg(test)]
+        maintenance_test,
+    );
 }
 
 fn retain_optimistic_page_plan(
@@ -525,6 +591,7 @@ fn retain_optimistic_page_plan(
     version_before: u64,
     version_after: u64,
     plan: Option<PreparedTransitionPage>,
+    #[cfg(test)] maintenance_test: &MaintenanceTestController,
 ) {
     batch.prepared[page_idx] = (version_before == version_after).then_some(plan).flatten();
     #[cfg(test)]
@@ -532,6 +599,7 @@ fn retain_optimistic_page_plan(
         use super::test_hooks::run_test_optimistic_page_plan_comparison_hook;
 
         run_test_optimistic_page_plan_comparison_hook(
+            maintenance_test,
             batch.pages[page_idx].page_id,
             version_before,
             version_after,
@@ -583,12 +651,13 @@ fn scan_frozen_page(
     page_info: FrozenPage,
     mode: FrozenPageScanMode,
     cutoff_ts: TrxID,
+    #[cfg(test)] maintenance_test: &MaintenanceTestController,
 ) -> FrozenPageScan {
     #[cfg(test)]
     use super::test_hooks;
 
     #[cfg(test)]
-    test_hooks::run_test_frozen_page_scan_hook(page_info.page_id);
+    test_hooks::run_test_frozen_page_scan_hook(maintenance_test, page_info.page_id);
     let row_count = page.header.row_count();
     // Start from the current physical image. Undo inspection below only
     // adjusts rows whose cutoff visibility differs from that latest image.
@@ -602,7 +671,11 @@ fn scan_frozen_page(
         let Some(head) = undo_guard.as_ref() else {
             drop(undo_guard);
             #[cfg(test)]
-            test_hooks::run_test_frozen_page_row_scan_hook(page_info.page_id, row_idx);
+            test_hooks::run_test_frozen_page_row_scan_hook(
+                maintenance_test,
+                page_info.page_id,
+                row_idx,
+            );
             continue;
         };
         // Walk the main branch from newest to oldest. Leading locks and deletes
@@ -701,7 +774,11 @@ fn scan_frozen_page(
         }
         drop(undo_guard);
         #[cfg(test)]
-        test_hooks::run_test_frozen_page_row_scan_hook(page_info.page_id, row_idx);
+        test_hooks::run_test_frozen_page_row_scan_hook(
+            maintenance_test,
+            page_info.page_id,
+            row_idx,
+        );
     }
     FrozenPageScan {
         page_info,
@@ -759,7 +836,6 @@ mod tests {
     use crate::bitmap::Bitmap;
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
     use crate::id::RowID;
-    use crate::table::test_hooks;
     use crate::trx::row::tests::test_row_write_access;
     use crate::trx::tests::{commit_shared_trx_status, shared_trx_status};
     use crate::trx::undo::{
@@ -850,12 +926,14 @@ mod tests {
         cutoff_ts: TrxID,
     ) -> FrozenPageReadinessAnalysis {
         let observed_version = fixture.map.frozen_mutation_version();
+        let maintenance_test = MaintenanceTestController::default();
         scan_frozen_page(
             &fixture.page,
             &fixture.map,
             fixture.page_info,
             FrozenPageScanMode::EstablishReadiness { frozen_ts },
             cutoff_ts,
+            &maintenance_test,
         )
         .into_readiness_analysis(cutoff_ts, observed_version)
     }
@@ -865,12 +943,14 @@ mod tests {
         cutoff_ts: TrxID,
     ) -> Option<PreparedTransitionPage> {
         let observed_version = fixture.map.frozen_mutation_version();
+        let maintenance_test = MaintenanceTestController::default();
         scan_frozen_page(
             &fixture.page,
             &fixture.map,
             fixture.page_info,
             FrozenPageScanMode::RefreshStablePlan,
             cutoff_ts,
+            &maintenance_test,
         )
         .into_plan(cutoff_ts, observed_version)
     }
@@ -905,6 +985,7 @@ mod tests {
         };
         let (entered_tx, entered_rx) = flume::bounded(1);
         let (release_tx, release_rx) = flume::bounded(1);
+        let maintenance_test = MaintenanceTestController::default();
 
         thread::scope(|scope| {
             let writer = scope.spawn(|| {
@@ -917,7 +998,7 @@ mod tests {
             entered_rx.recv().unwrap();
             let version_before = row_ver.frozen_mutation_version();
             assert_eq!(version_before, 1);
-            test_hooks::set_test_frozen_page_scan_hook(move |_| {
+            maintenance_test.install_frozen_page_scan_hook(move |_| {
                 release_tx.send(()).unwrap();
             });
             let analysis = scan_frozen_page(
@@ -928,6 +1009,7 @@ mod tests {
                     frozen_ts: TrxID::new(20),
                 },
                 TrxID::new(20),
+                &maintenance_test,
             )
             .into_readiness_analysis(TrxID::new(20), version_before);
             writer.join().unwrap();

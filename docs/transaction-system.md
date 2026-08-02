@@ -263,15 +263,16 @@ abandonment, and claim the same entry and core through
 rolls back inline; it records cleanup intent on the exact entry and queues
 transaction-system cleanup when the engine is still reachable.
 
-DDL and maintenance start private transactions through their already-reserved
-operation authority. A private transaction allocates a new `TrxID` and boxed
-core but inherits the outer operation key, installs that box in the same entry
-mutex, and does not replace the active slot. While the outer foreground
-authority remains attached, `Voluntary(Some(InternalTrxState))`
-records the private transaction's available, checked-out, cleanup, or
-completion position. Public transactions use the outer operation states
-directly and therefore use
-`Voluntary(None)` only while checked out.
+DDL and effectful maintenance start private transactions through their
+already-reserved operation authority. A private transaction allocates a new
+`TrxID` and boxed core but inherits the outer operation key, installs that box
+in the same entry mutex, and does not replace the active slot. During caller
+preparation the entry remains `Voluntary(None)`; accepted DDL and maintenance
+transfer it to `Mandatory(None)` before starting a child. While mandatory
+execution owns that child, `Mandatory(Some(InternalTrxState))` records its
+available, checked-out, cleanup, or completion position. Public transactions
+use the outer operation states directly and therefore use `Voluntary(None)`
+only while checked out.
 
 Accepted table and index DDL transfer the same entry to `Mandatory(None)`
 before the runtime task is detached. Their nested catalog transaction follows
@@ -285,12 +286,13 @@ proof to publish `Terminal`. A supervised unwind moves any still-owned nested
 state to `FailedRetained`; this remains registry-visible and blocks shutdown
 instead of exposing an idle session or scheduling competing abandoned cleanup.
 
-Maintenance retains the voluntary private-transaction path. Its private
-terminal callback clears the child and returns the entry to `Voluntary(None)`;
-only dropping the outer foreground authority publishes the operation terminal
-and returns an open session to idle. One outer operation may run sequential
-private transactions, so the entry's optional `TrxID` changes only at
-installation and terminal completion under that same mutex.
+Accepted maintenance uses the same mandatory child transitions as accepted
+DDL. Secondary `MemIndex` cleanup installs its private transaction into the
+stable entry before any hook, scan, or await. A root-capture race settles that
+child completely back to `Mandatory(None)` before a retry installs a fresh
+`TrxID`. Normal completion releases the prepared maintenance resources before
+publishing the outer terminal state; supervised unwind retains unsafe child
+state in `FailedRetained`.
 
 After explicit rollback claims terminal ownership and publishes `RollingBack`,
 the claimed transaction core, undo buffers, locks, and session cleanup
@@ -371,20 +373,18 @@ readers remain admitted. A transaction that already holds `TableData(IX)` can
 convert to `X` only when conversion is immediately compatible; otherwise the
 operation returns `LockUpgradeWouldBlock` before invoking the callback.
 
-Finite session maintenance reserves one outer `Maintenance` operation and uses
-that operation's exact lock owner for every scoped runtime admission:
-`TableMetadata(S)` followed by `TableData(IS)`, then current live-runtime
-resolution. Freeze, checkpoint, hot-row-page counting, secondary `MemIndex`
-cleanup, and each bounded checkpoint-retry recheck keep this scope through
-their last table/layout/index use. The table runtime owner is explicitly
-released before fresh lock guards. These calls preserve ordinary `IX` DML and
-explicit `S` table-reader concurrency while excluding same-table DROP and
-serializing page freeze/transition against full-table mutation `X`. Grants
-admitted by a covering explicit session lock are still recorded under a
-distinct `Operation(operation_id)` owner. Returning from the scoped access
-releases only that maintenance owner's fresh grants and preserves the exact
-`SessionExplicit` claims. Retries reuse the same outer owner rather than
-allocating another operation id.
+Finite effectful session maintenance reserves one outer `Maintenance`
+operation, acquires owned `TableMetadata(S)` followed by `TableData(IS)`, and
+resolves the exact live runtime before mandatory admission. Freeze, checkpoint,
+and secondary `MemIndex` cleanup transfer that complete scope into accepted
+execution and retain it through their last table/layout/index use. Hot-row-page
+counting remains a caller-owned, cancellable scoped observation. These calls
+preserve ordinary `IX` DML and explicit `S` table-reader concurrency while
+excluding same-table DROP and serializing page freeze/transition against
+full-table mutation `X`. Grants admitted by a covering explicit session lock
+are still recorded under a distinct `Operation(operation_id)` owner. Scope
+release consumes only that maintenance owner's fresh grants and preserves the
+exact `SessionExplicit` claims.
 
 Checkpoint retry never keeps that scope across its indefinite sleep. One
 recheck registers the relevant lifecycle, transaction-terminal, GC-horizon,
@@ -392,7 +392,10 @@ poison, and shutdown listeners and then verifies the predicate again. It
 returns only detached listener state, releases checkpoint attempts, page
 guards, table/layout owners, and logical locks, and then sleeps. This lets
 same-table DROP acquire metadata X and publish terminal lifecycle state; the
-listener carries that change into the next bounded recheck.
+listener carries that change into the next bounded recheck. The completed
+checkpoint operation is not retained across this sleep: each retry starts a
+new outer operation id and prepares new logical-lock, table, workflow, and
+root-mutation authority.
 
 `CREATE TABLE` validates metadata before reservation, allocates a distinct
 gap-tolerant id, and caller-prepares target metadata X plus metadata-S/data-IX

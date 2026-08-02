@@ -4614,6 +4614,7 @@ mod tests {
     use crate::table::hot::{
         DeleteInternal, HotRowMutator, InsertRowIntoPage, RowInserter, UpdateRowInplace,
     };
+    use crate::table::lifecycle::TableCheckpointRootMutationScope;
     use crate::table::tests::*;
     use crate::table::{CheckpointOutcome, FreezeOutcome};
     use crate::table::{ColumnDeletionBuffer, DeleteMarker};
@@ -8760,7 +8761,8 @@ mod tests {
                         .checkpoint_workflow
                         .begin_checkpoint(&table.lifecycle)
                         .unwrap();
-                    let root_lease = table.try_begin_checkpoint_root_mutation().unwrap();
+                    let root_lease =
+                        TableCheckpointRootMutationScope::acquire(Arc::clone(&table)).unwrap();
                     let frozen_pages = checkpoint_attempt.batch().unwrap().pages.clone();
                     let transition_pages = table
                         .load_frozen_pages_for_transition(&session.pool_guards(), &frozen_pages)
@@ -8770,6 +8772,7 @@ mod tests {
                         &transition_pages,
                         checkpoint_attempt.batch_mut().unwrap(),
                         stmt.runtime().sts(),
+                        &engine.inner().maintenance_test,
                     );
                     assert!(delay.is_none());
                     let transition_lease = table
@@ -8780,6 +8783,7 @@ mod tests {
                         &transition_pages,
                         checkpoint_attempt.batch_mut().unwrap(),
                         stmt.runtime().sts(),
+                        &engine.inner().maintenance_test,
                     );
 
                     let marker = table_for_internal_assertion(&engine, table_id)
