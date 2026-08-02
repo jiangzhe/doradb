@@ -1,0 +1,4 @@
+interface:
+  display_name: "RFC Resolve"
+  short_description: "Compact and resolve completed RFC records"
+  default_prompt: "Use $rfc-resolve after implementation phases finish to compact the RFC into a durable historical record, synchronize phase and backlog outcomes, update final status, and run the strict completion precheck."

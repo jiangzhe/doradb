@@ -13,7 +13,8 @@ Read `references/workflow.md` completely before executing this workflow.
 ## Required Flow
 
 1. Research relevant architecture and process documents, then inspect impacted code paths.
-2. Apply the strict complexity gate and escalate program-level work to `$rfc`.
+2. Apply the strict complexity gate and escalate program-level work to
+   `$rfc-create`.
 3. Run Round 1 with current-state analysis, evidence references, and materially different proposals.
 4. Require user feedback on the recommendation.
 5. Run Round 2 to finalize scope, interfaces, implementation details, tests, and open questions.

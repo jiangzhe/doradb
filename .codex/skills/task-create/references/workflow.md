@@ -55,7 +55,7 @@ updates required by the proposed task.
 
 ## Strict RFC Escalation Gate
 
-Escalate to `$rfc` when any condition is true:
+Escalate to `$rfc-create` when any condition is true:
 
 1. The work crosses multiple major subsystems with architecture-level coupling.
 2. The work introduces an incompatible API or data-model migration.
