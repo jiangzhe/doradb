@@ -99,10 +99,10 @@ Retain a short snippet only when it is the durable record of a protocol,
 format, state machine, invariant, or decision not documented adequately
 elsewhere.
 
-Aim for at most 400 lines:
+Aim for at most 500 lines:
 
 - do not pad an already concise RFC;
-- exceed 400 lines only when further reduction would lose durable program
+- exceed 500 lines only when further reduction would lose durable program
   context, and explain the reason in the resolve handoff;
 - check the final size with `wc -l docs/rfcs/0006-example.md`;
 - re-read the compacted RFC for consistency with the implemented or
