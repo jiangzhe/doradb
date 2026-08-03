@@ -58,8 +58,8 @@ pub use session::{
     CatalogRedoMaintenanceOutcome, RedoTruncationBlockerInfo, RedoTruncationOutcome, Session,
 };
 pub use stats::{
-    BufferPoolCounters, BufferPoolRuntimeStats, BufferPoolStats, IoBackendStats, StorageIoStats,
-    TransactionSystemStats,
+    BufferPoolCounters, BufferPoolRuntimeStats, BufferPoolStats, IoBackendStats,
+    MandatoryRuntimeStats, MandatoryTaskStats, StorageIoStats, TransactionSystemStats,
 };
 pub use table::{
     CheckpointCancelReason, CheckpointDelayReason, CheckpointOutcome, FreezeOutcome,

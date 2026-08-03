@@ -241,7 +241,8 @@ statement-lock state while `Transaction::exec` is active. It lends one
 `Statement` facade with direct disjoint borrows of the checked-out
 `TrxInner`, operation attachment, effects, and locks; DML methods therefore do
 not resolve the entry or unwrap the carrier. Normal statement finish releases
-statement locks and returns the core to `ForegroundAvailable`. This check-in
+statement locks and returns the core to the available payload position inside
+outer `Voluntary` ownership. This check-in
 ends only the operation-local lease, not the semantic transaction lifetime;
 the weak public `Transaction` remains reusable for its next call.
 
@@ -250,8 +251,8 @@ checkout succeeds, dropping the future is terminal for that public
 transaction. The callback and any pending acquisition guard are destroyed
 first. `StmtState` then discards statement redo, appends residual row and index
 undo after prior transaction undo, releases statement locks, and returns the
-complete core directly as `CleanupReady`. It never exposes an intervening
-`ForegroundAvailable` state. The existing identity cleanup job claims the
+complete core directly as outer `CleanupReady`. It never exposes an intervening
+available payload position. The exact-identity cleanup job claims the
 core and performs whole-transaction rollback; later calls through the stale
 public facade return `TransactionDiscarded`. An ordinary callback error is
 different: statement-local rollback completes before ordinary check-in, so
@@ -294,20 +295,25 @@ child completely back to `Mandatory(None)` before a retry installs a fresh
 publishing the outer terminal state; supervised unwind retains unsafe child
 state in `FailedRetained`.
 
-After explicit rollback claims terminal ownership and publishes `RollingBack`,
+After explicit rollback claims terminal ownership and publishes `Completing`,
 the claimed transaction core, undo buffers, locks, and session cleanup
-attachment are handed to the transaction-system cleanup worker before rollback
-awaits row or index storage work. The public `rollback().await` future only
-waits on the worker-owned completion cell; dropping that waiter does not cancel
+attachment are synchronously submitted as a `terminal_rollback` task to the
+engine-owned mandatory runtime before rollback awaits row or index storage
+work. Abandoned transactions use `abandoned_transaction` tasks, and redo groups
+that fail after precommit use `failed_precommit` tasks. These independently
+accounted cleanup tasks bypass caller-operation capacity; cleanup within one
+transaction remains sequential. The public `rollback().await` future only
+waits on the task-owned completion cell; dropping that waiter does not cancel
 rollback cleanup or release rollback-capable undo without making ownership
 explicit.
 
-The coherent outer labels are `ForegroundAvailable`, `ForegroundRunning`,
-`CleanupReady`, `CleanupRunning`, `BackgroundQueued`, `BackgroundRunning`,
-`CompletionOwned`, `Terminal`, and `FailedRetained`. The background labels are
-reserved for later RFC-0025 phases; Phase 1 does not store or transfer whole
-DDL/maintenance futures. Handle-drop intent is orthogonal while a transaction
-core is checked out, so checkout return publishes `CleanupReady` exactly once.
+The coherent outer labels are `Voluntary`, `Mandatory`, `CleanupReady`,
+`Completing`, `Terminal`, and `FailedRetained`. `Voluntary` and `Mandatory`
+optionally contain the nested private-transaction positions `Available`,
+`Running`, `CleanupReady`, and `Completing`; public transaction checkout is
+represented by payload ownership within `Voluntary(None)`. Handle-drop intent
+is orthogonal while a transaction core is checked out, so checkout return
+publishes outer `CleanupReady` exactly once.
 Cleanup messages carry `(SessionOperationKey, TrxID)` and stale, replaced, or
 duplicate hints are neutral. Registry resolution uses only the operation key;
 the cleanup claim atomically validates the message's `TrxID`, claimable state,

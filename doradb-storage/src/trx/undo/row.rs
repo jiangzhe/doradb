@@ -4,6 +4,7 @@ use crate::catalog::{TableCache, is_catalog_table};
 use crate::error::RuntimeResult as Result;
 use crate::id::{RowID, TableID, TrxID};
 use crate::row::ops::{SelectKey, UndoCol, UpdateCol};
+use crate::runtime::{POLL_BUDGET, yield_now};
 use crate::trx::{MIN_SNAPSHOT_TS, SharedTrxStatus, trx_is_committed};
 use crate::value::Val;
 use event_listener::EventListener;
@@ -128,6 +129,7 @@ impl RowUndoLogs {
         table_cache: &mut TableCache<'_>,
         guards: &PoolGuards,
     ) -> Result<()> {
+        let mut budget = POLL_BUDGET;
         while !self.0.is_empty() {
             {
                 // Keep the current entry vector-owned across every await. Its
@@ -157,6 +159,11 @@ impl RowUndoLogs {
                 }
             }
             self.0.pop();
+            budget -= 1;
+            if budget == 0 && !self.0.is_empty() {
+                yield_now().await;
+                budget = POLL_BUDGET;
+            }
         }
         Ok(())
     }

@@ -23,8 +23,9 @@ use crate::notify::EventNotifyOnDrop;
 use crate::quiescent::QuiescentGuard;
 use crate::runtime::mandatory::{AcceptedExecution, MandatoryTaskMetadata, PreparedExecution};
 use crate::stats::{
-    BufferPoolStats, StorageIoStats, TransactionSystemStats, buffer_pool_runtime_stats_snapshot,
-    storage_io_stats_snapshot, transaction_system_stats_snapshot,
+    BufferPoolStats, MandatoryRuntimeStats, StorageIoStats, TransactionSystemStats,
+    buffer_pool_runtime_stats_snapshot, storage_io_stats_snapshot,
+    transaction_system_stats_snapshot,
 };
 use crate::table::{
     CheckpointDelayReason, CheckpointOutcome, CheckpointRetryObservation, FreezeOutcome,
@@ -1315,6 +1316,21 @@ impl Session {
                 engine.disk_pool.stats(),
             ),
         })
+    }
+
+    /// Return mandatory-runtime task and timing statistics by fixed task class.
+    ///
+    /// This read-only diagnostic remains observable after storage poison while
+    /// the engine lifecycle is still running. It is not available after engine
+    /// shutdown, session close, or registry removal. Monotonic fields and
+    /// current active counts are independently sampled.
+    #[inline]
+    pub fn mandatory_runtime_stats(&self) -> Result<MandatoryRuntimeStats> {
+        let session = self
+            .pin_inspection()
+            .attach("operation=query_mandatory_runtime_stats")
+            .disclose()?;
+        Ok(session.engine.mandatory_runtime.stats())
     }
 
     /// Freeze a row-page prefix or report the existing table-owned batch.
@@ -3001,7 +3017,10 @@ pub(crate) mod tests {
     use crate::lock::tests::LockDebugEntryState;
     use crate::log::LogSync;
     use crate::log::format::REDO_DEFAULT_DATA_START_OFFSET;
-    use crate::stats::{BufferPoolCounters, BufferPoolRuntimeStats, TransactionSystemStats};
+    use crate::stats::{
+        BufferPoolCounters, BufferPoolRuntimeStats, MandatoryRuntimeStats, MandatoryTaskStats,
+        TransactionSystemStats,
+    };
     use crate::table::tests::{
         FailingFirstWriteHook, assert_freeze_created, has_lock_entry,
         lightweight_test_engine_config, lock_entry_count, maintenance_lock_owner,
@@ -3637,6 +3656,7 @@ pub(crate) mod tests {
             assert!(session.transaction_system_stats().is_ok());
             assert!(session.storage_io_stats().is_ok());
             assert!(session.buffer_pool_stats().is_ok());
+            assert!(session.mandatory_runtime_stats().is_ok());
             assert!(
                 session
                     .wait_for_checkpoint_retry(CheckpointDelayReason::ActiveRoot {
@@ -5688,6 +5708,7 @@ pub(crate) mod tests {
             let trx0 = session.transaction_system_stats().unwrap();
             let storage0 = session.storage_io_stats().unwrap();
             let pools0 = session.buffer_pool_stats().unwrap();
+            let mandatory0 = session.mandatory_runtime_stats().unwrap();
             assert_eq!(trx0.commit_count, 0);
             assert_eq!(trx0.trx_count, 0);
             assert_eq!(trx0.log_bytes, 0);
@@ -5695,11 +5716,13 @@ pub(crate) mod tests {
             assert!(pools0.mem.capacity > 0);
             assert!(pools0.index.capacity > 0);
             assert!(pools0.disk.capacity > 0);
+            assert_eq!(mandatory0, MandatoryRuntimeStats::default());
 
             let _table_id = table1(&engine).await;
             let trx1 = session.transaction_system_stats().unwrap();
             let storage1 = session.storage_io_stats().unwrap();
             let pools1 = session.buffer_pool_stats().unwrap();
+            let mandatory1 = session.mandatory_runtime_stats().unwrap();
             // Commit waiters can complete before the redo thread publishes
             // aggregate stats, so this test verifies monotonic snapshots
             // rather than immediate progress from the preceding operation.
@@ -5709,6 +5732,17 @@ pub(crate) mod tests {
             assert!(storage1.pool_read_requests >= storage0.pool_read_requests);
             assert!(storage1.background_write_requests >= storage0.background_write_requests);
             assert_buffer_pool_stats_monotonic(&pools0, &pools1);
+            assert_eq!(mandatory1.operation.submitted_count, 1);
+            assert_eq!(mandatory1.operation.started_count, 1);
+            assert_eq!(mandatory1.operation.completed_count, 1);
+            assert_eq!(mandatory1.operation.error_count, 0);
+            assert_eq!(mandatory1.operation.panic_count, 0);
+            assert_eq!(mandatory1.operation.detached_observer_count, 0);
+            assert_eq!(mandatory1.operation.active_count, 0);
+            assert_eq!(
+                mandatory1.transaction_cleanup,
+                MandatoryTaskStats::default()
+            );
         });
     }
 
@@ -5733,6 +5767,7 @@ pub(crate) mod tests {
                 session.transaction_system_stats().unwrap_err(),
                 session.storage_io_stats().unwrap_err(),
                 session.buffer_pool_stats().unwrap_err(),
+                session.mandatory_runtime_stats().unwrap_err(),
             ] {
                 assert_eq!(err.kind(), ErrorKind::Lifecycle);
                 assert_eq!(
@@ -5760,6 +5795,9 @@ pub(crate) mod tests {
             );
             assert_runtime_unavailable_after_shutdown(session.storage_io_stats().unwrap_err());
             assert_runtime_unavailable_after_shutdown(session.buffer_pool_stats().unwrap_err());
+            assert_runtime_unavailable_after_shutdown(
+                session.mandatory_runtime_stats().unwrap_err(),
+            );
         });
     }
 
@@ -5788,6 +5826,7 @@ pub(crate) mod tests {
             assert!(session.transaction_system_stats().is_ok());
             assert!(session.storage_io_stats().is_ok());
             assert!(session.buffer_pool_stats().is_ok());
+            assert!(session.mandatory_runtime_stats().is_ok());
 
             let err = session.truncate_redo_log().await.unwrap_err();
             assert_runtime_unavailable_after_fatal(err, FatalError::RedoWrite);

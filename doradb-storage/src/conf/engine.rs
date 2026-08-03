@@ -11,12 +11,26 @@ use super::consts::{
 };
 use super::{EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
 
-/// Fixed engine-owned mandatory runtime configuration.
+/// Immutable sizing for the engine-owned mandatory runtime.
+///
+/// The default is two fixed operating-system runner threads and four accepted
+/// caller-operation permits. One runner provides concurrency only when tasks
+/// reach cooperative await or yield points; multiple runners allow overlap but
+/// do not provide a fairness or queue-latency guarantee.
+///
+/// `concurrency_limit` does not count caller-side preparation futures or
+/// engine-internal transaction cleanup. Internal cleanup bypasses caller quota
+/// so correctness obligations are not lost, while shutdown still waits for
+/// both classes. Raising the caller limit may retain more locks, memory, and
+/// publication work without raising executor throughput. Raising the runner
+/// count may increase storage and metadata contention and cannot repair
+/// blocking task code. Sizing is validated once during engine startup; a
+/// running engine cannot be resized.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MandatoryRuntimeConfig {
-    /// Number of operating-system threads driving the mandatory executor.
+    /// Number of fixed operating-system threads driving the shared executor.
     pub worker_threads: usize,
-    /// Maximum number of accepted caller operations.
+    /// Maximum accepted caller obligations, excluding internal cleanup.
     pub concurrency_limit: usize,
 }
 
@@ -31,14 +45,14 @@ impl Default for MandatoryRuntimeConfig {
 }
 
 impl MandatoryRuntimeConfig {
-    /// Set the number of mandatory-runtime runner threads.
+    /// Set the fixed number of mandatory-runtime runner threads.
     #[inline]
     pub fn worker_threads(mut self, worker_threads: usize) -> Self {
         self.worker_threads = worker_threads;
         self
     }
 
-    /// Set the maximum number of accepted caller operations.
+    /// Set accepted caller capacity without limiting internal cleanup.
     #[inline]
     pub fn concurrency_limit(mut self, concurrency_limit: usize) -> Self {
         self.concurrency_limit = concurrency_limit;

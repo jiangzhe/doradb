@@ -3,6 +3,7 @@ use crate::catalog::{TableCache, is_catalog_table};
 use crate::error::RuntimeResult as Result;
 use crate::id::{RowID, TableID, TrxID};
 use crate::row::ops::SelectKey;
+use crate::runtime::{POLL_BUDGET, yield_now};
 use crate::table::IndexRollback;
 
 /// Buffer of index undo entries accumulated for rollback and GC handoff.
@@ -47,6 +48,7 @@ impl IndexUndoLogs {
         guards: &PoolGuards,
         ts: TrxID,
     ) -> Result<()> {
+        let mut budget = POLL_BUDGET;
         while !self.0.is_empty() {
             {
                 // Keep the current entry vector-owned across every await. If
@@ -71,6 +73,11 @@ impl IndexUndoLogs {
                 }
             }
             self.0.pop();
+            budget -= 1;
+            if budget == 0 && !self.0.is_empty() {
+                yield_now().await;
+                budget = POLL_BUDGET;
+            }
         }
         Ok(())
     }

@@ -85,6 +85,22 @@ impl TryFrom<usize> for EngineLifecycleState {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ShutdownOrigin {
+    Explicit,
+    OwnerDrop,
+}
+
+impl ShutdownOrigin {
+    #[inline]
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::OwnerDrop => "owner_drop",
+        }
+    }
+}
+
 struct EngineLifecycle {
     /// Packed lifecycle state and active admission count.
     ///
@@ -381,7 +397,7 @@ impl Engine {
             return Ok(());
         }
         obs::info!(
-            "event=engine_lifecycle component=engine action=shutdown_start result=ok mode=try"
+            "event=engine_lifecycle component=engine action=shutdown_start result=ok mode=try origin=explicit"
         );
         inner.lifecycle.close_admission();
         inner.mandatory_runtime.close_admission();
@@ -390,13 +406,16 @@ impl Engine {
         let _shutdown = inner.lifecycle.shutdown_lock.lock();
         if inner.lifecycle.inspect_state() == EngineLifecycleState::Shutdown {
             obs::info!(
-                "event=engine_lifecycle component=engine action=shutdown_finish result=ok mode=try already_shutdown=true"
+                "event=engine_lifecycle component=engine action=shutdown_finish result=ok mode=try origin=explicit already_shutdown=true"
             );
             return Ok(());
         }
 
         let blocker = inner.session_registry.first_shutdown_blocker();
         let operation_blocked = blocker.is_some();
+        let operation_state = blocker
+            .as_ref()
+            .map_or("none", |blocker| blocker.state.label());
         let voluntary_blocked = blocker.as_ref().is_some_and(|blocker| {
             matches!(
                 blocker.state,
@@ -423,10 +442,11 @@ impl Engine {
             let strong_refs = strong_count - 1;
             let busy = strong_refs.max(usize::from(operation_blocked));
             obs::warn!(
-                "event=engine_lifecycle component=engine action=shutdown_finish result=busy mode=try busy={} strong_refs={} operation_blocked={} voluntary_blocked={} mandatory_session_blocked={} cleanup_queued={} mandatory_callers={} mandatory_internal={}",
+                "event=engine_lifecycle component=engine action=shutdown_finish result=busy mode=try origin=explicit busy={} strong_refs={} operation_blocked={} operation_state={} voluntary_blocked={} mandatory_session_blocked={} cleanup_queued={} mandatory_callers={} mandatory_internal={}",
                 busy,
                 strong_refs,
                 operation_blocked,
+                operation_state,
                 voluntary_blocked,
                 mandatory_session_blocked,
                 cleanup_queued,
@@ -434,12 +454,12 @@ impl Engine {
                 mandatory_internal
             );
             return Err(Report::new(LifecycleError::ShutdownBusy).attach(format!(
-                "strong_refs={strong_refs}, operation_blocked={operation_blocked}, voluntary_blocked={voluntary_blocked}, mandatory_session_blocked={mandatory_session_blocked}, mandatory_callers={mandatory_callers}, mandatory_internal={mandatory_internal}"
+                "strong_refs={strong_refs}, operation_blocked={operation_blocked}, operation_state={operation_state}, voluntary_blocked={voluntary_blocked}, mandatory_session_blocked={mandatory_session_blocked}, cleanup_queued={cleanup_queued}, mandatory_callers={mandatory_callers}, mandatory_internal={mandatory_internal}"
             )));
         }
         self.finish_shutdown_locked(inner);
         obs::info!(
-            "event=engine_lifecycle component=engine action=shutdown_finish result=ok mode=try"
+            "event=engine_lifecycle component=engine action=shutdown_finish result=ok mode=try origin=explicit"
         );
         Ok(())
     }
@@ -452,17 +472,18 @@ impl Engine {
     /// component shutdown in reverse registration order.
     #[inline]
     pub fn shutdown(&self) {
-        self.shutdown_inner();
+        self.shutdown_inner(ShutdownOrigin::Explicit);
     }
 
     #[inline]
-    fn shutdown_inner(&self) {
+    fn shutdown_inner(&self, origin: ShutdownOrigin) {
         let inner = self.inner();
         if inner.lifecycle.inspect_state() == EngineLifecycleState::Shutdown {
             return;
         }
         obs::info!(
-            "event=engine_lifecycle component=engine action=shutdown_start result=ok mode=wait"
+            "event=engine_lifecycle component=engine action=shutdown_start result=ok mode=wait origin={}",
+            origin.label(),
         );
         inner.lifecycle.close_admission();
         inner.mandatory_runtime.close_admission();
@@ -475,7 +496,8 @@ impl Engine {
             let _shutdown = inner.lifecycle.shutdown_lock.lock();
             if inner.lifecycle.inspect_state() == EngineLifecycleState::Shutdown {
                 obs::info!(
-                    "event=engine_lifecycle component=engine action=shutdown_finish result=ok mode=wait already_shutdown=true"
+                    "event=engine_lifecycle component=engine action=shutdown_finish result=ok mode=wait origin={} already_shutdown=true",
+                    origin.label(),
                 );
                 return;
             }
@@ -485,7 +507,8 @@ impl Engine {
             if strong_count == 1 && shutdown_wait.is_none() {
                 self.finish_shutdown_locked(inner);
                 obs::info!(
-                    "event=engine_lifecycle component=engine action=shutdown_finish result=ok mode=wait"
+                    "event=engine_lifecycle component=engine action=shutdown_finish result=ok mode=wait origin={}",
+                    origin.label(),
                 );
                 return;
             }
@@ -523,8 +546,8 @@ impl Engine {
     /// id identifies the exact public or private transaction to claim under the
     /// entry mutex. The second identity prevents a stale hint from claiming a
     /// newer private transaction installed under the same operation key. Other
-    /// active operation states only block shutdown; a later whole-operation
-    /// handoff transfers its owned task rather than using this identity pair.
+    /// active operation states only block shutdown; accepted mandatory work
+    /// already owns its cleanup authority through the stable operation entry.
     #[inline]
     fn queue_shutdown_operation_cleanup(
         &self,
@@ -548,7 +571,7 @@ impl Drop for Engine {
         // Implicit owner drop runs the same synchronous drain as explicit
         // shutdown. An unintended drop may therefore block until every
         // foreground operation and engine-owned background task completes.
-        self.shutdown_inner();
+        self.shutdown_inner(ShutdownOrigin::OwnerDrop);
 
         // Field order releases the owner runtime ref before registry-owned
         // component owners.
@@ -1963,7 +1986,7 @@ mod tests {
             assert_eq!(
                 err.report().downcast_ref::<String>().map(String::as_str),
                 Some(
-                    "strong_refs=1, operation_blocked=false, voluntary_blocked=false, mandatory_session_blocked=false, mandatory_callers=0, mandatory_internal=0"
+                    "strong_refs=1, operation_blocked=false, operation_state=none, voluntary_blocked=false, mandatory_session_blocked=false, cleanup_queued=false, mandatory_callers=0, mandatory_internal=0"
                 )
             );
 
@@ -2046,7 +2069,7 @@ mod tests {
             assert_eq!(
                 err.report().downcast_ref::<String>().map(String::as_str),
                 Some(
-                    "strong_refs=1, operation_blocked=false, voluntary_blocked=false, mandatory_session_blocked=false, mandatory_callers=0, mandatory_internal=0"
+                    "strong_refs=1, operation_blocked=false, operation_state=none, voluntary_blocked=false, mandatory_session_blocked=false, cleanup_queued=false, mandatory_callers=0, mandatory_internal=0"
                 )
             );
             assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
@@ -2079,7 +2102,7 @@ mod tests {
             assert_eq!(
                 err.report().downcast_ref::<String>().map(String::as_str),
                 Some(
-                    "strong_refs=0, operation_blocked=true, voluntary_blocked=true, mandatory_session_blocked=false, mandatory_callers=0, mandatory_internal=0"
+                    "strong_refs=0, operation_blocked=true, operation_state=voluntary, voluntary_blocked=true, mandatory_session_blocked=false, cleanup_queued=false, mandatory_callers=0, mandatory_internal=0"
                 )
             );
 
@@ -2112,7 +2135,7 @@ mod tests {
             assert_eq!(
                 err.report().downcast_ref::<String>().map(String::as_str),
                 Some(
-                    "strong_refs=0, operation_blocked=true, voluntary_blocked=true, mandatory_session_blocked=false, mandatory_callers=0, mandatory_internal=0"
+                    "strong_refs=0, operation_blocked=true, operation_state=voluntary, voluntary_blocked=true, mandatory_session_blocked=false, cleanup_queued=false, mandatory_callers=0, mandatory_internal=0"
                 )
             );
 
