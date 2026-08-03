@@ -601,12 +601,6 @@ impl Catalog {
         )
     }
 
-    /// Acquires the catalog checkpoint side of the catalog metadata gate.
-    #[inline]
-    pub(crate) async fn begin_checkpoint(&self) -> CatalogCheckpointLease<'_> {
-        self.checkpoint_gate.begin_checkpoint().await
-    }
-
     /// Acquires transferable index-DDL metadata admission.
     #[inline]
     pub(crate) async fn acquire_index_metadata_change(&self) {
@@ -1304,6 +1298,31 @@ pub(crate) mod tests {
         assert_dropped_table_floor(engine.catalog(), table_id);
     }
 
+    /// Waits for targeted purge completion after dropped-table file cleanup becomes eligible.
+    pub(crate) async fn wait_for_no_dropped_table_operational_state(
+        engine: &Engine,
+        table_id: TableID,
+    ) {
+        let (event_tx, event_rx) = flume::unbounded();
+        engine.inner().trx_sys.set_purge_test_observer(event_tx);
+        while engine
+            .catalog()
+            .retained_dropped_table_ids_now()
+            .contains(&table_id)
+        {
+            engine.inner().trx_sys.request_dropped_table_purge();
+            let mut dropped_table_started = false;
+            loop {
+                match event_rx.recv_async().await.unwrap() {
+                    PurgeTestEvent::DroppedTableStarted => dropped_table_started = true,
+                    PurgeTestEvent::CycleCompleted if dropped_table_started => break,
+                    _ => {}
+                }
+            }
+        }
+        assert_no_dropped_table_operational_state(engine.catalog(), table_id);
+    }
+
     #[inline]
     pub(crate) fn assert_no_dropped_table_operational_state(catalog: &Catalog, table_id: TableID) {
         assert!(!catalog.retained_dropped_table_ids_now().contains(&table_id));
@@ -1785,8 +1804,9 @@ pub(crate) mod tests {
             );
             drop(table);
             engine
-                .catalog()
-                .checkpoint_now(&engine.inner().trx_sys)
+                .new_session()
+                .unwrap()
+                .checkpoint_catalog()
                 .await
                 .unwrap();
             drop(engine);
@@ -1834,7 +1854,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_catalog_checkpoint_now_publish_and_noop() {
+    fn test_session_catalog_checkpoint_publish_and_noop() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
@@ -1853,8 +1873,9 @@ pub(crate) mod tests {
 
             let _ = table1(&engine).await;
             engine
-                .catalog()
-                .checkpoint_now(&engine.inner().trx_sys)
+                .new_session()
+                .unwrap()
+                .checkpoint_catalog()
                 .await
                 .unwrap();
             let snap1 = engine.catalog().storage.checkpoint_snapshot();
@@ -1879,8 +1900,9 @@ pub(crate) mod tests {
             );
 
             engine
-                .catalog()
-                .checkpoint_now(&engine.inner().trx_sys)
+                .new_session()
+                .unwrap()
+                .checkpoint_catalog()
                 .await
                 .unwrap();
             let snap2 = engine.catalog().storage.checkpoint_snapshot();
@@ -1903,8 +1925,9 @@ pub(crate) mod tests {
 
             let _ = table1(&engine).await;
             engine
-                .catalog()
-                .checkpoint_now(&engine.inner().trx_sys)
+                .new_session()
+                .unwrap()
+                .checkpoint_catalog()
                 .await
                 .unwrap();
 
@@ -1964,8 +1987,9 @@ pub(crate) mod tests {
 
             let _ = table1(&engine).await;
             engine
-                .catalog()
-                .checkpoint_now(&engine.inner().trx_sys)
+                .new_session()
+                .unwrap()
+                .checkpoint_catalog()
                 .await
                 .unwrap();
 
@@ -2015,7 +2039,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_catalog_checkpoint_now_heartbeat_without_catalog_ops() {
+    fn test_session_catalog_checkpoint_heartbeat_without_catalog_ops() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
@@ -2025,8 +2049,9 @@ pub(crate) mod tests {
 
             let table_id = table1(&engine).await;
             engine
-                .catalog()
-                .checkpoint_now(&engine.inner().trx_sys)
+                .new_session()
+                .unwrap()
+                .checkpoint_catalog()
                 .await
                 .unwrap();
             let snap1 = engine.catalog().storage.checkpoint_snapshot();
@@ -2044,8 +2069,9 @@ pub(crate) mod tests {
             trx.commit().await.unwrap();
 
             engine
-                .catalog()
-                .checkpoint_now(&engine.inner().trx_sys)
+                .new_session()
+                .unwrap()
+                .checkpoint_catalog()
                 .await
                 .unwrap();
             let snap2 = engine.catalog().storage.checkpoint_snapshot();
@@ -2112,7 +2138,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_catalog_checkpoint_now_heartbeat_with_mixed_user_table_checkpoint_states() {
+    fn test_session_catalog_checkpoint_heartbeat_with_mixed_user_table_checkpoint_states() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
@@ -2125,8 +2151,9 @@ pub(crate) mod tests {
             let replay_only_table_id = table2(&engine).await;
 
             engine
-                .catalog()
-                .checkpoint_now(&engine.inner().trx_sys)
+                .new_session()
+                .unwrap()
+                .checkpoint_catalog()
                 .await
                 .unwrap();
             let snap1 = engine.catalog().storage.checkpoint_snapshot();
@@ -2207,8 +2234,9 @@ pub(crate) mod tests {
             );
 
             engine
-                .catalog()
-                .checkpoint_now(&engine.inner().trx_sys)
+                .new_session()
+                .unwrap()
+                .checkpoint_catalog()
                 .await
                 .unwrap();
             let snap2 = engine.catalog().storage.checkpoint_snapshot();

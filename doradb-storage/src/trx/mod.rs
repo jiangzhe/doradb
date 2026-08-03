@@ -27,6 +27,10 @@ mod sys_trx;
 pub(crate) mod undo;
 pub(crate) mod ver_map;
 
+pub(crate) use retention::{
+    prepare_catalog_redo_maintenance_operation, prepare_redo_truncation_operation,
+};
+pub(crate) use sys::RedoRetentionScope;
 pub(crate) use sys_trx::{RetiredRowPageBatch, SysTrxPayload};
 
 use crate::buffer::PoolGuards;

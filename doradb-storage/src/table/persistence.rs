@@ -1,14 +1,15 @@
 use super::checkpoint_workflow::{
-    CheckpointAttempt, FrozenPageValidationState, PreparedTransitionPage,
+    CheckpointAttempt, FrozenPageBatch, FrozenPageValidationState, PreparedCheckpointAttempt,
+    PreparedFreezeAttempt, PreparedTransitionPage,
 };
-use super::lifecycle::{CheckpointPublishLease, TableCheckpointRootMutationLease, TableTerminal};
+use super::lifecycle::{CheckpointPublishLease, TableCheckpointRootMutationScope, TableTerminal};
 use crate::buffer::PoolGuards;
 use crate::buffer::guard::PageGuard;
 use crate::catalog::{IndexSpec, SilentWatermarkObject, TableColumnLayout, TableMetadata};
 use crate::error::{
-    DataIntegrityError, DataIntegrityResult, FatalError, InternalError, LifecycleError,
-    MultiDomainResultExt, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult,
-    RuntimeOrFatalResultExt, RuntimeResult,
+    CompletionErrorBridge, CompletionResult, DataIntegrityError, DataIntegrityResult, FatalError,
+    InternalError, LifecycleError, MultiDomainResultExt, RuntimeError, RuntimeOrFatalError,
+    RuntimeOrFatalResult, RuntimeOrFatalResultExt, RuntimeResult,
 };
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::file::table_file::{ActiveRoot, LwcBlockPersist, MutableTableFile};
@@ -23,10 +24,16 @@ use crate::index::{
 use crate::lwc::LwcBuilder;
 use crate::obs;
 use crate::row::RowPage;
-use crate::session::{SessionOperationPin, SessionRuntimeAccess};
+use crate::runtime::mandatory::PreparedExecution;
+use crate::session::{
+    AcceptedMaintenanceScope, MaintenanceExecutionSpec, PreparedMaintenanceExecution,
+    PreparedMaintenanceScope, SessionRuntimeAccess,
+};
+#[cfg(test)]
+use crate::table::tests::MaintenanceTestController;
 use crate::table::{
-    CheckpointCancelReason, FreezeOutcome, FrozenPage, FrozenPageBatch, Table,
-    TableRedoReplayFloor, TableRuntimeLayout,
+    CheckpointCancelReason, FreezeOutcome, FrozenPage, Table, TableRedoReplayFloor,
+    TableRuntimeLayout,
 };
 use crate::trx::RetiredRowPageBatch;
 use crate::value::{Val, ValKind, ValType};
@@ -35,6 +42,7 @@ use event_listener::EventListener;
 use futures::future::select_all;
 use std::collections::BTreeSet;
 use std::result::Result as StdResult;
+use std::sync::Arc;
 
 #[cfg(test)]
 pub(crate) use tests::test_hooks;
@@ -118,30 +126,95 @@ impl DetachedCheckpointRetryWait {
     }
 }
 
+struct FreezeTableResources {
+    attempt: Option<PreparedFreezeAttempt>,
+    _root_mutation: TableCheckpointRootMutationScope,
+    table: Arc<Table>,
+    max_rows: usize,
+}
+
+struct FreezeTableExecution;
+
+impl MaintenanceExecutionSpec for FreezeTableExecution {
+    type Output = FreezeOutcome;
+    type Resources = FreezeTableResources;
+    type PanicLabel = &'static str;
+
+    const LABEL: &'static str = "freeze_table";
+
+    async fn execute(
+        scope: &mut AcceptedMaintenanceScope,
+        resources: &mut Self::Resources,
+        _panic_label: &mut Self::PanicLabel,
+    ) -> CompletionResult<Self::Output> {
+        let attempt = resources
+            .attempt
+            .take()
+            .unwrap_or_else(|| panic!("accepted freeze attempt is missing"));
+        let result = resources
+            .table
+            .freeze_prepared(scope, resources.max_rows, attempt)
+            .await
+            .map_err(CompletionErrorBridge::capture);
+        scope.mark_terminal_ready();
+        result
+    }
+}
+
+struct CheckpointTableResources {
+    attempt: Option<PreparedCheckpointAttempt>,
+    _root_mutation: TableCheckpointRootMutationScope,
+    table: Arc<Table>,
+}
+
+struct CheckpointTableExecution;
+
+impl MaintenanceExecutionSpec for CheckpointTableExecution {
+    type Output = CheckpointOutcome;
+    type Resources = CheckpointTableResources;
+    type PanicLabel = &'static str;
+
+    const LABEL: &'static str = "checkpoint_table";
+
+    async fn execute(
+        scope: &mut AcceptedMaintenanceScope,
+        resources: &mut Self::Resources,
+        _panic_label: &mut Self::PanicLabel,
+    ) -> CompletionResult<Self::Output> {
+        let attempt = resources
+            .attempt
+            .take()
+            .unwrap_or_else(|| panic!("accepted checkpoint attempt is missing"));
+        let result = resources
+            .table
+            .checkpoint_prepared(scope, attempt)
+            .await
+            .map_err(CompletionErrorBridge::capture_runtime_or_fatal);
+        scope.mark_terminal_ready();
+        result
+    }
+}
+
 /// Owns one table checkpoint attempt and its reversible-to-fatal boundary.
-struct TableCheckpointer<'table, 'session> {
+struct TableCheckpointer<'table, 'session, S: SessionRuntimeAccess + ?Sized> {
     table: &'table Table,
-    session: &'session SessionOperationPin,
-    // Declaration order preserves publication -> root mutation -> attempt
-    // release ordering when this owner is dropped.
+    session: &'session S,
+    // Declaration order preserves publication -> attempt release ordering.
     publish_lease: Option<CheckpointPublishLease<'table>>,
-    root_mutation_lease: Option<TableCheckpointRootMutationLease<'table>>,
-    attempt: CheckpointAttempt<'table>,
+    attempt: PreparedCheckpointAttempt,
     irreversible: Option<FatalError>,
 }
 
-impl<'table, 'session> TableCheckpointer<'table, 'session> {
+impl<'table, 'session, S> TableCheckpointer<'table, 'session, S>
+where
+    S: SessionRuntimeAccess + ?Sized,
+{
     #[inline]
-    fn new(
-        table: &'table Table,
-        session: &'session SessionOperationPin,
-        attempt: CheckpointAttempt<'table>,
-    ) -> Self {
+    fn new(table: &'table Table, session: &'session S, attempt: PreparedCheckpointAttempt) -> Self {
         Self {
             table,
             session,
             publish_lease: None,
-            root_mutation_lease: None,
             attempt,
             irreversible: None,
         }
@@ -153,13 +226,9 @@ impl<'table, 'session> TableCheckpointer<'table, 'session> {
         let table_id = table.table_id();
         let table_file = table.file();
         let disk_pool = table.disk_pool();
-        let trx_sys = session.engine.trx_sys.clone();
-        let table_writes = session.engine.table_fs.background_writes().clone();
+        let trx_sys = session.engine().trx_sys.clone();
+        let table_writes = session.engine().table_fs.background_writes().clone();
         let pool_guards = session.pool_guards();
-        match table.try_begin_checkpoint_root_mutation() {
-            Ok(lease) => self.root_mutation_lease = Some(lease),
-            Err(reason) => return Ok(CheckpointOutcome::Cancelled { reason }),
-        }
         if let Some(reason) = table.active_root_checkpoint_delay(session) {
             return Ok(CheckpointOutcome::Delayed { reason });
         }
@@ -189,7 +258,8 @@ impl<'table, 'session> TableCheckpointer<'table, 'session> {
         let checkpoint_ts = trx_sys.allocate_checkpoint_ts();
         let mut sys_trx = trx_sys.begin_sys_trx();
         #[cfg(test)]
-        test_hooks::run_test_checkpoint_after_trx_start_hook().await;
+        test_hooks::run_test_checkpoint_after_trx_start_hook(&session.engine().maintenance_test)
+            .await;
         // If freeze did not observe a successor page, resolve the current hot
         // boundary only after allocating checkpoint STS. A page appended after
         // an empty boundary scan must then have create_cts above the fallback.
@@ -229,7 +299,13 @@ impl<'table, 'session> TableCheckpointer<'table, 'session> {
                 let Some(batch) = self.attempt.batch_mut() else {
                     panic!("non-empty checkpoint page list requires frozen source")
                 };
-                table.prepare_page_transition(&transition_pages, batch, cutoff_ts)
+                table.prepare_page_transition(
+                    &transition_pages,
+                    batch,
+                    cutoff_ts,
+                    #[cfg(test)]
+                    &session.engine().maintenance_test,
+                )
             };
             if let Some(delay) = delay {
                 return Ok(CheckpointOutcome::Delayed {
@@ -252,11 +328,20 @@ impl<'table, 'session> TableCheckpointer<'table, 'session> {
             let Some(batch) = self.attempt.batch_mut() else {
                 panic!("non-empty checkpoint page list requires frozen source")
             };
-            table.apply_page_transition(&transition_pages, batch, cutoff_ts);
+            table.apply_page_transition(
+                &transition_pages,
+                batch,
+                cutoff_ts,
+                #[cfg(test)]
+                &session.engine().maintenance_test,
+            );
         }
         #[cfg(test)]
         if !pages.is_empty() {
-            test_hooks::run_test_checkpoint_after_publish_admission_hook().await;
+            test_hooks::run_test_checkpoint_after_publish_admission_hook(
+                &session.engine().maintenance_test,
+            )
+            .await;
         }
 
         // Step 4: build LWC blocks from transition pages using the cutoff
@@ -283,6 +368,8 @@ impl<'table, 'session> TableCheckpointer<'table, 'session> {
                     .map(|batch| batch.prepared.as_slice())
                     .unwrap_or_default(),
                 collect_visible_row,
+                #[cfg(test)]
+                &session.engine().maintenance_test,
             )
             .await
             .change_context(RuntimeError::CheckpointExecution)
@@ -342,6 +429,8 @@ impl<'table, 'session> TableCheckpointer<'table, 'session> {
                 &layout,
                 &mut secondary_sidecar,
                 checkpoint_ts,
+                #[cfg(test)]
+                &session.engine().maintenance_test,
             )
             .await
             .change_runtime_context(RuntimeError::CheckpointExecution)
@@ -369,7 +458,10 @@ impl<'table, 'session> TableCheckpointer<'table, 'session> {
             match self.begin_publishing() {
                 Ok(true) => {
                     #[cfg(test)]
-                    test_hooks::run_test_checkpoint_after_publish_admission_hook().await;
+                    test_hooks::run_test_checkpoint_after_publish_admission_hook(
+                        &session.engine().maintenance_test,
+                    )
+                    .await;
                 }
                 Ok(false) => {}
                 Err(reason) => return Ok(CheckpointOutcome::Cancelled { reason }),
@@ -381,7 +473,9 @@ impl<'table, 'session> TableCheckpointer<'table, 'session> {
             };
             self.set_irreversible(FatalError::CatalogWrite);
             #[cfg(test)]
-            test_hooks::run_test_silent_watermark_mutation_hook()
+            test_hooks::run_test_silent_watermark_mutation_hook(
+                &session.engine().maintenance_test,
+            )
                 .await
                 .change_context(RuntimeError::CheckpointExecution)
                 .attach_with(|| {
@@ -390,7 +484,7 @@ impl<'table, 'session> TableCheckpointer<'table, 'session> {
                     )
                 })?;
             sys_trx
-                .upsert_silent_watermark(session.engine.catalog(), &pool_guards, watermark)
+                .upsert_silent_watermark(session.engine().catalog(), &pool_guards, watermark)
                 .await
                 .change_context(RuntimeError::CheckpointExecution)
                 .attach_with(|| {
@@ -400,7 +494,7 @@ impl<'table, 'session> TableCheckpointer<'table, 'session> {
                 })?;
             self.set_irreversible(FatalError::CheckpointWrite);
             #[cfg(test)]
-            test_hooks::maybe_force_checkpoint_commit_error()?;
+            test_hooks::maybe_force_checkpoint_commit_error(&session.engine().maintenance_test)?;
             let redo_cts = trx_sys
                 .commit_sys(sys_trx)
                 .change_runtime_context(RuntimeError::CheckpointExecution)
@@ -439,7 +533,10 @@ impl<'table, 'session> TableCheckpointer<'table, 'session> {
         match self.begin_publishing() {
             Ok(true) => {
                 #[cfg(test)]
-                test_hooks::run_test_checkpoint_after_publish_admission_hook().await;
+                test_hooks::run_test_checkpoint_after_publish_admission_hook(
+                    &session.engine().maintenance_test,
+                )
+                .await;
             }
             Ok(false) => {}
             Err(reason) => return Ok(CheckpointOutcome::Cancelled { reason }),
@@ -461,10 +558,10 @@ impl<'table, 'session> TableCheckpointer<'table, 'session> {
             .update_column_root(published_pivot_row_id, published_column_root)
             .await;
         #[cfg(test)]
-        test_hooks::maybe_force_post_publish_checkpoint_error()?;
+        test_hooks::maybe_force_post_publish_checkpoint_error(&session.engine().maintenance_test)?;
 
         #[cfg(test)]
-        test_hooks::maybe_force_checkpoint_commit_error()?;
+        test_hooks::maybe_force_checkpoint_commit_error(&session.engine().maintenance_test)?;
         let redo_cts = trx_sys
             .commit_sys(sys_trx)
             .change_runtime_context(RuntimeError::CheckpointExecution)
@@ -549,7 +646,7 @@ impl<'table, 'session> TableCheckpointer<'table, 'session> {
             Err(err) => {
                 if let Some(reason) = self.irreversible.take() {
                     let report = err.into_fatal_report(reason);
-                    let poison = self.session.engine.poisoner.poison(report);
+                    let poison = self.session.engine().poisoner.poison(report);
                     drop(self.publish_lease.take());
                     Err(poison.into())
                 } else {
@@ -564,7 +661,7 @@ impl<'table, 'session> TableCheckpointer<'table, 'session> {
     }
 }
 
-impl Drop for TableCheckpointer<'_, '_> {
+impl<S: SessionRuntimeAccess + ?Sized> Drop for TableCheckpointer<'_, '_, S> {
     fn drop(&mut self) {
         debug_assert!(self.irreversible.is_none() || self.publish_lease.is_some());
         let Some(_) = self.publish_lease else {
@@ -577,7 +674,7 @@ impl Drop for TableCheckpointer<'_, '_> {
                 "event=engine_poison component=table action=poison result=error error={:?}",
                 report
             );
-            let _ = self.session.engine.poisoner.poison(report);
+            let _ = self.session.engine().poisoner.poison(report);
         } else {
             self.table.checkpoint_workflow.finish_publication();
         }
@@ -806,6 +903,59 @@ impl SecondaryCheckpointSidecar {
         );
         active.sidecar.add_delete(key, row_id);
     }
+}
+
+/// Prepare reversible table-freeze workflow and root-mutation authority.
+pub(crate) fn prepare_freeze_table_operation(
+    scope: PreparedMaintenanceScope,
+    table: Arc<Table>,
+    max_rows: usize,
+) -> StdResult<impl PreparedExecution<Output = FreezeOutcome>, FreezeOutcome> {
+    let attempt = Arc::clone(&table).begin_freeze()?;
+    let root_mutation = match TableCheckpointRootMutationScope::acquire(Arc::clone(&table)) {
+        Ok(root_mutation) => root_mutation,
+        Err(reason) => return Err(FreezeOutcome::Cancelled { reason }),
+    };
+    let table_id = table.table_id();
+    Ok(PreparedMaintenanceExecution::<FreezeTableExecution>::table(
+        scope,
+        FreezeTableResources {
+            attempt: Some(attempt),
+            _root_mutation: root_mutation,
+            table,
+            max_rows,
+        },
+        "accepted table freeze panicked",
+        table_id,
+    ))
+}
+
+/// Prepare reversible table-checkpoint workflow and root-mutation authority.
+pub(crate) fn prepare_checkpoint_table_operation(
+    scope: PreparedMaintenanceScope,
+    table: Arc<Table>,
+) -> StdResult<impl PreparedExecution<Output = CheckpointOutcome>, CheckpointOutcome> {
+    let attempt = match Arc::clone(&table).begin_checkpoint() {
+        Ok(attempt) => attempt,
+        Err(reason) => return Err(CheckpointOutcome::Cancelled { reason }),
+    };
+    let root_mutation = match TableCheckpointRootMutationScope::acquire(Arc::clone(&table)) {
+        Ok(root_mutation) => root_mutation,
+        Err(reason) => return Err(CheckpointOutcome::Cancelled { reason }),
+    };
+    let table_id = table.table_id();
+    Ok(
+        PreparedMaintenanceExecution::<CheckpointTableExecution>::table(
+            scope,
+            CheckpointTableResources {
+                attempt: Some(attempt),
+                _root_mutation: root_mutation,
+                table,
+            },
+            "accepted table checkpoint panicked",
+            table_id,
+        ),
+    )
 }
 
 /// Builds the durable secondary DiskTree key encoder for one index spec.
@@ -1226,6 +1376,7 @@ impl Table {
         layout: &TableRuntimeLayout,
         sidecar: &mut SecondaryCheckpointSidecar,
         checkpoint_ts: TrxID,
+        #[cfg(test)] maintenance_test: &MaintenanceTestController,
     ) -> RuntimeOrFatalResult<()> {
         let metadata = layout.metadata();
         sidecar.assert_matches_metadata(metadata);
@@ -1236,7 +1387,7 @@ impl Table {
         // file fork as LWC and delete metadata. A later error abandons the
         // fork, so no secondary root can be published on its own.
         #[cfg(test)]
-        test_hooks::maybe_force_secondary_sidecar_error()?;
+        test_hooks::maybe_force_secondary_sidecar_error(maintenance_test)?;
 
         if mutable_file.secondary_index_roots().len() != metadata.idx.index_slot_count() {
             return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
@@ -1540,7 +1691,10 @@ impl Table {
             engine.shutdown_listener(),
         ];
         #[cfg(test)]
-        test_hooks::run_test_checkpoint_retry_after_listener_registration_hook().await;
+        test_hooks::run_test_checkpoint_retry_after_listener_registration_hook(
+            &session.engine().maintenance_test,
+        )
+        .await;
 
         ensure_maintenance_wait_running(session, "observe active-root checkpoint retry")?;
         if self.active_root_retry_ready(effective_ts, trx_sys.published_gc_horizon()) {
@@ -1624,7 +1778,10 @@ impl Table {
                     listeners.push(engine.poisoner.listener());
                     listeners.push(engine.shutdown_listener());
                     #[cfg(test)]
-                    test_hooks::run_test_checkpoint_retry_after_listener_registration_hook().await;
+                    test_hooks::run_test_checkpoint_retry_after_listener_registration_hook(
+                        &session.engine().maintenance_test,
+                    )
+                    .await;
 
                     ensure_maintenance_wait_running(
                         session,
@@ -1655,7 +1812,10 @@ impl Table {
                         engine.shutdown_listener(),
                     ];
                     #[cfg(test)]
-                    test_hooks::run_test_checkpoint_retry_after_listener_registration_hook().await;
+                    test_hooks::run_test_checkpoint_retry_after_listener_registration_hook(
+                        &session.engine().maintenance_test,
+                    )
+                    .await;
                     ensure_maintenance_wait_running(
                         session,
                         "observe frozen-page checkpoint retry",
@@ -1714,24 +1874,27 @@ impl Table {
                 page_info.page_id
             )
         });
-        self.refresh_frozen_page_readiness(&page_guard, batch, page_idx, cutoff_ts);
+        self.refresh_frozen_page_readiness(
+            &page_guard,
+            batch,
+            page_idx,
+            cutoff_ts,
+            #[cfg(test)]
+            &session.engine().maintenance_test,
+        );
         Ok(())
     }
 
-    /// Claim and freeze a contiguous hot-page prefix up to the requested row budget.
-    pub(crate) async fn freeze(
+    /// Execute a freeze using caller-prepared workflow and root authority.
+    async fn freeze_prepared<S>(
         &self,
-        session: &SessionOperationPin,
+        session: &S,
         max_rows: usize,
-    ) -> RuntimeResult<FreezeOutcome> {
-        let mut attempt = match self.checkpoint_workflow.begin_freeze(&self.lifecycle) {
-            Ok(attempt) => attempt,
-            Err(outcome) => return Ok(outcome),
-        };
-        let _root_mutation_lease = match self.try_begin_checkpoint_root_mutation() {
-            Ok(lease) => lease,
-            Err(reason) => return Ok(FreezeOutcome::Cancelled { reason }),
-        };
+        mut attempt: PreparedFreezeAttempt,
+    ) -> RuntimeResult<FreezeOutcome>
+    where
+        S: SessionRuntimeAccess + ?Sized,
+    {
         let guards = session.pool_guards();
         let mut rows = 0usize;
         let mut pages = Vec::new();
@@ -1757,18 +1920,23 @@ impl Table {
             .load_frozen_pages_for_transition(&guards, &pages)
             .await?;
         #[cfg(test)]
-        test_hooks::run_test_freeze_after_loading_hook().await;
-        let publish =
-            self.validate_and_publish_loaded_pages_frozen(&page_guards, &pages, &mut attempt);
+        test_hooks::run_test_freeze_after_loading_hook(&session.engine().maintenance_test).await;
+        let publish = self.validate_and_publish_loaded_pages_frozen(
+            &page_guards,
+            &pages,
+            &mut attempt,
+            #[cfg(test)]
+            &session.engine().maintenance_test,
+        );
         if !publish {
-            return Ok(attempt.cancelled(&self.lifecycle));
+            return Ok(attempt.cancelled());
         }
-        // The fence is allocated only after every selected page has published
+        // Allocate the fence only after every selected page has published
         // FROZEN under its state lock.
-        let frozen_ts = session.engine.trx_sys.allocate_snapshot_fence();
+        let frozen_ts = session.engine().trx_sys.allocate_snapshot_fence();
         let batch =
             FrozenPageBatch::new(self.table_id(), frozen_ts, heap_redo_start_ts, rows, pages);
-        Ok(attempt.finish(batch, &self.lifecycle))
+        Ok(attempt.finish(batch))
     }
 
     async fn heap_redo_start_from(
@@ -1792,6 +1960,7 @@ impl Table {
         guards: &PoolGuards,
         prepared_pages: &[Option<PreparedTransitionPage>],
         mut collect_visible_row: Option<C>,
+        #[cfg(test)] maintenance_test: &MaintenanceTestController,
     ) -> RuntimeResult<Vec<LwcBlockPersist>>
     where
         C: FnMut(&RowPage, usize, RowID),
@@ -1800,7 +1969,7 @@ impl Table {
         use super::test_hooks as table_test_hooks;
 
         #[cfg(test)]
-        table_test_hooks::maybe_force_lwc_build_error()?;
+        table_test_hooks::maybe_force_lwc_build_error(maintenance_test)?;
         let mut lwc_blocks = Vec::new();
         if !prepared_pages.is_empty() {
             let mut builder = LwcBuilder::new(metadata.col.as_ref());
@@ -1927,21 +2096,20 @@ impl Table {
         Ok(lwc_blocks)
     }
 
-    /// Execute one user-table checkpoint attempt against table-owned workflow state.
-    pub(crate) async fn checkpoint(
+    /// Execute one checkpoint with caller-prepared workflow/root authority.
+    async fn checkpoint_prepared<S>(
         &self,
-        session: &SessionOperationPin,
-    ) -> RuntimeOrFatalResult<CheckpointOutcome> {
+        session: &S,
+        attempt: PreparedCheckpointAttempt,
+    ) -> RuntimeOrFatalResult<CheckpointOutcome>
+    where
+        S: SessionRuntimeAccess + ?Sized,
+    {
         let table_id = self.table_id();
-        let result = match self.checkpoint_workflow.begin_checkpoint(&self.lifecycle) {
-            Ok(attempt) => {
-                let mut checkpointer = TableCheckpointer::new(self, session, attempt);
-                let result = checkpointer.run().await;
-                checkpointer.resolve(result)
-            }
-            Err(reason) => Ok(CheckpointOutcome::Cancelled { reason }),
-        };
-        result
+        let mut checkpointer = TableCheckpointer::new(self, session, attempt);
+        let result = checkpointer.run().await;
+        checkpointer
+            .resolve(result)
             .inspect(|outcome| match outcome {
                 CheckpointOutcome::Published {
                     checkpoint_ts,
@@ -2030,208 +2198,171 @@ where
 #[cfg(test)]
 mod tests {
     pub(crate) mod test_hooks {
+        use crate::engine::Engine;
         use crate::error::{FatalError, FatalResult, RuntimeError, RuntimeResult};
+        use crate::table::tests::MaintenanceTestController;
         use error_stack::Report;
-        use std::cell::{Cell, RefCell};
         use std::future::Future;
-        use std::pin::Pin;
 
-        type TableHook = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + 'static>> + 'static>;
-        type FallibleTableHook = Box<
-            dyn FnOnce() -> Pin<Box<dyn Future<Output = RuntimeResult<()>> + 'static>> + 'static,
-        >;
-
-        thread_local! {
-            static TEST_FORCE_SECONDARY_SIDECAR_ERROR: Cell<bool> = const { Cell::new(false) };
-            static TEST_FORCE_POST_PUBLISH_CHECKPOINT_ERROR: Cell<bool> = const { Cell::new(false) };
-            static TEST_FORCE_CHECKPOINT_COMMIT_ERROR: Cell<bool> = const { Cell::new(false) };
-            static TEST_FREEZE_AFTER_LOADING_HOOK: RefCell<Option<TableHook>> =
-                const { RefCell::new(None) };
-            static TEST_CHECKPOINT_AFTER_TRX_START_HOOK: RefCell<Option<TableHook>> =
-                const { RefCell::new(None) };
-            static TEST_CHECKPOINT_AFTER_PUBLISH_ADMISSION_HOOK: RefCell<Option<TableHook>> =
-                const { RefCell::new(None) };
-            static TEST_CHECKPOINT_RETRY_AFTER_LISTENER_REGISTRATION_HOOK:
-                RefCell<Option<TableHook>> = const { RefCell::new(None) };
-            static TEST_SILENT_WATERMARK_MUTATION_HOOK: RefCell<Option<FallibleTableHook>> =
-                const { RefCell::new(None) };
+        pub(crate) fn set_test_force_secondary_sidecar_error(engine: &Engine, enabled: bool) {
+            engine
+                .inner()
+                .maintenance_test
+                .set_force_secondary_sidecar_error(enabled);
         }
 
-        pub(crate) fn set_test_force_secondary_sidecar_error(enabled: bool) {
-            TEST_FORCE_SECONDARY_SIDECAR_ERROR.with(|flag| flag.set(enabled));
-        }
-
-        pub(crate) fn maybe_force_secondary_sidecar_error() -> RuntimeResult<()> {
-            if TEST_FORCE_SECONDARY_SIDECAR_ERROR.with(|flag| flag.get()) {
+        pub(crate) fn maybe_force_secondary_sidecar_error(
+            test: &MaintenanceTestController,
+        ) -> RuntimeResult<()> {
+            if test.force_secondary_sidecar_error() {
                 return Err(Report::new(RuntimeError::CheckpointExecution)
                     .attach("injected secondary-index sidecar failure"));
             }
             Ok(())
         }
 
-        pub(crate) fn set_test_force_post_publish_checkpoint_error(enabled: bool) {
-            TEST_FORCE_POST_PUBLISH_CHECKPOINT_ERROR.with(|flag| flag.set(enabled));
+        pub(crate) struct ForcePostPublishCheckpointErrorGuard {
+            test: MaintenanceTestController,
         }
 
-        pub(crate) struct ForcePostPublishCheckpointErrorGuard;
-
         impl ForcePostPublishCheckpointErrorGuard {
-            pub(crate) fn new() -> Self {
-                set_test_force_post_publish_checkpoint_error(true);
-                Self
+            pub(crate) fn new(engine: &Engine) -> Self {
+                let test = engine.inner().maintenance_test.clone();
+                test.set_force_post_publish_checkpoint_error(true);
+                Self { test }
             }
         }
 
         impl Drop for ForcePostPublishCheckpointErrorGuard {
             fn drop(&mut self) {
-                set_test_force_post_publish_checkpoint_error(false);
+                self.test.set_force_post_publish_checkpoint_error(false);
             }
         }
 
-        pub(crate) fn maybe_force_post_publish_checkpoint_error() -> FatalResult<()> {
-            if TEST_FORCE_POST_PUBLISH_CHECKPOINT_ERROR.with(Cell::get) {
+        pub(crate) fn maybe_force_post_publish_checkpoint_error(
+            test: &MaintenanceTestController,
+        ) -> FatalResult<()> {
+            if test.force_post_publish_checkpoint_error() {
                 return Err(Report::new(FatalError::CheckpointWrite)
                     .attach("forced post-publication table checkpoint failure"));
             }
             Ok(())
         }
 
-        pub(crate) struct ForceCheckpointCommitErrorGuard;
+        pub(crate) struct ForceCheckpointCommitErrorGuard {
+            test: MaintenanceTestController,
+        }
 
         impl ForceCheckpointCommitErrorGuard {
-            pub(crate) fn new() -> Self {
-                TEST_FORCE_CHECKPOINT_COMMIT_ERROR.with(|flag| flag.set(true));
-                Self
+            pub(crate) fn new(engine: &Engine) -> Self {
+                let test = engine.inner().maintenance_test.clone();
+                test.set_force_checkpoint_commit_error(true);
+                Self { test }
             }
         }
 
         impl Drop for ForceCheckpointCommitErrorGuard {
             fn drop(&mut self) {
-                TEST_FORCE_CHECKPOINT_COMMIT_ERROR.with(|flag| flag.set(false));
+                self.test.set_force_checkpoint_commit_error(false);
             }
         }
 
-        pub(crate) fn maybe_force_checkpoint_commit_error() -> FatalResult<()> {
-            if TEST_FORCE_CHECKPOINT_COMMIT_ERROR.with(Cell::get) {
+        pub(crate) fn maybe_force_checkpoint_commit_error(
+            test: &MaintenanceTestController,
+        ) -> FatalResult<()> {
+            if test.force_checkpoint_commit_error() {
                 return Err(Report::new(FatalError::CheckpointWrite)
                     .attach("forced table checkpoint commit failure"));
             }
             Ok(())
         }
 
-        pub(crate) fn set_test_freeze_after_loading_hook<F, Fut>(hook: F)
+        pub(crate) fn set_test_freeze_after_loading_hook<F, Fut>(engine: &Engine, hook: F)
         where
-            F: FnOnce() -> Fut + 'static,
-            Fut: Future<Output = ()> + 'static,
+            F: FnOnce() -> Fut + Send + 'static,
+            Fut: Future<Output = ()> + Send + 'static,
         {
-            TEST_FREEZE_AFTER_LOADING_HOOK.with(|slot| {
-                let old = slot
-                    .borrow_mut()
-                    .replace(Box::new(move || Box::pin(hook())));
-                assert!(old.is_none(), "freeze loading hook already installed");
-            });
+            engine
+                .inner()
+                .maintenance_test
+                .install_freeze_after_loading_hook(hook);
         }
 
-        pub(crate) fn set_test_checkpoint_after_trx_start_hook<F, Fut>(hook: F)
+        pub(crate) fn set_test_checkpoint_after_trx_start_hook<F, Fut>(engine: &Engine, hook: F)
         where
-            F: FnOnce() -> Fut + 'static,
-            Fut: Future<Output = ()> + 'static,
+            F: FnOnce() -> Fut + Send + 'static,
+            Fut: Future<Output = ()> + Send + 'static,
         {
-            TEST_CHECKPOINT_AFTER_TRX_START_HOOK.with(|slot| {
-                let old = slot
-                    .borrow_mut()
-                    .replace(Box::new(move || Box::pin(hook())));
-                assert!(
-                    old.is_none(),
-                    "checkpoint transaction-start hook already installed"
-                );
-            });
+            engine
+                .inner()
+                .maintenance_test
+                .install_checkpoint_after_trx_start_hook(hook);
         }
 
-        pub(crate) fn set_test_checkpoint_after_publish_admission_hook<F, Fut>(hook: F)
+        pub(crate) fn set_test_checkpoint_after_publish_admission_hook<F, Fut>(
+            engine: &Engine,
+            hook: F,
+        ) where
+            F: FnOnce() -> Fut + Send + 'static,
+            Fut: Future<Output = ()> + Send + 'static,
+        {
+            engine
+                .inner()
+                .maintenance_test
+                .install_checkpoint_after_publish_admission_hook(hook);
+        }
+
+        pub(crate) fn set_test_checkpoint_retry_after_listener_registration_hook<F, Fut>(
+            engine: &Engine,
+            hook: F,
+        ) where
+            F: FnOnce() -> Fut + Send + 'static,
+            Fut: Future<Output = ()> + Send + 'static,
+        {
+            engine
+                .inner()
+                .maintenance_test
+                .install_checkpoint_retry_after_listener_registration_hook(hook);
+        }
+
+        pub(crate) fn set_test_silent_watermark_mutation_hook<F, Fut>(engine: &Engine, hook: F)
         where
-            F: FnOnce() -> Fut + 'static,
-            Fut: Future<Output = ()> + 'static,
+            F: FnOnce() -> Fut + Send + 'static,
+            Fut: Future<Output = RuntimeResult<()>> + Send + 'static,
         {
-            TEST_CHECKPOINT_AFTER_PUBLISH_ADMISSION_HOOK.with(|slot| {
-                let old = slot
-                    .borrow_mut()
-                    .replace(Box::new(move || Box::pin(hook())));
-                assert!(
-                    old.is_none(),
-                    "checkpoint publish-admission hook already installed"
-                );
-            });
+            engine
+                .inner()
+                .maintenance_test
+                .install_silent_watermark_mutation_hook(hook);
         }
 
-        pub(crate) fn set_test_checkpoint_retry_after_listener_registration_hook<F, Fut>(hook: F)
-        where
-            F: FnOnce() -> Fut + 'static,
-            Fut: Future<Output = ()> + 'static,
-        {
-            TEST_CHECKPOINT_RETRY_AFTER_LISTENER_REGISTRATION_HOOK.with(|slot| {
-                let old = slot
-                    .borrow_mut()
-                    .replace(Box::new(move || Box::pin(hook())));
-                assert!(
-                    old.is_none(),
-                    "checkpoint retry listener-registration hook already installed"
-                );
-            });
+        pub(crate) async fn run_test_checkpoint_after_trx_start_hook(
+            test: &MaintenanceTestController,
+        ) {
+            test.run_checkpoint_after_trx_start_hook().await;
         }
 
-        pub(crate) fn set_test_silent_watermark_mutation_hook<F, Fut>(hook: F)
-        where
-            F: FnOnce() -> Fut + 'static,
-            Fut: Future<Output = RuntimeResult<()>> + 'static,
-        {
-            TEST_SILENT_WATERMARK_MUTATION_HOOK.with(|slot| {
-                let old = slot
-                    .borrow_mut()
-                    .replace(Box::new(move || Box::pin(hook())));
-                assert!(
-                    old.is_none(),
-                    "silent watermark mutation hook already installed"
-                );
-            });
+        pub(crate) async fn run_test_checkpoint_after_publish_admission_hook(
+            test: &MaintenanceTestController,
+        ) {
+            test.run_checkpoint_after_publish_admission_hook().await;
         }
 
-        pub(crate) async fn run_test_checkpoint_after_trx_start_hook() {
-            let hook = TEST_CHECKPOINT_AFTER_TRX_START_HOOK.with(|slot| slot.borrow_mut().take());
-            if let Some(hook) = hook {
-                hook().await;
-            }
+        pub(crate) async fn run_test_checkpoint_retry_after_listener_registration_hook(
+            test: &MaintenanceTestController,
+        ) {
+            test.run_checkpoint_retry_after_listener_registration_hook()
+                .await;
         }
 
-        pub(crate) async fn run_test_checkpoint_after_publish_admission_hook() {
-            let hook =
-                TEST_CHECKPOINT_AFTER_PUBLISH_ADMISSION_HOOK.with(|slot| slot.borrow_mut().take());
-            if let Some(hook) = hook {
-                hook().await;
-            }
+        pub(crate) async fn run_test_silent_watermark_mutation_hook(
+            test: &MaintenanceTestController,
+        ) -> RuntimeResult<()> {
+            test.run_silent_watermark_mutation_hook().await
         }
 
-        pub(crate) async fn run_test_checkpoint_retry_after_listener_registration_hook() {
-            let hook = TEST_CHECKPOINT_RETRY_AFTER_LISTENER_REGISTRATION_HOOK
-                .with(|slot| slot.borrow_mut().take());
-            if let Some(hook) = hook {
-                hook().await;
-            }
-        }
-
-        pub(crate) async fn run_test_silent_watermark_mutation_hook() -> RuntimeResult<()> {
-            let hook = TEST_SILENT_WATERMARK_MUTATION_HOOK.with(|slot| slot.borrow_mut().take());
-            match hook {
-                Some(hook) => hook().await,
-                None => Ok(()),
-            }
-        }
-
-        pub(crate) async fn run_test_freeze_after_loading_hook() {
-            let hook = TEST_FREEZE_AFTER_LOADING_HOOK.with(|slot| slot.borrow_mut().take());
-            if let Some(hook) = hook {
-                hook().await;
-            }
+        pub(crate) async fn run_test_freeze_after_loading_hook(test: &MaintenanceTestController) {
+            test.run_freeze_after_loading_hook().await;
         }
     }
 
@@ -2266,28 +2397,24 @@ mod tests {
         set_test_silent_watermark_mutation_hook,
     };
     use crate::table::test_hooks::{
-        ForceLwcBuildErrorGuard, set_test_freeze_page_state_locked_hook,
-        set_test_frozen_page_row_scan_hook, set_test_frozen_page_scan_hook,
-        set_test_frozen_pages_ready_hook, set_test_hot_row_write_before_state_lock_hook,
-        set_test_locked_page_plan_rebuild_hook, set_test_optimistic_page_plan_comparison_hook,
-        set_test_stable_page_plans_refreshed_hook, set_test_transition_page_published_hook,
+        ForceLwcBuildErrorGuard, set_test_frozen_page_row_scan_hook,
+        set_test_frozen_page_scan_hook, set_test_frozen_pages_ready_hook,
+        set_test_hot_row_write_before_state_lock_hook, set_test_locked_page_plan_rebuild_hook,
+        set_test_optimistic_page_plan_comparison_hook, set_test_stable_page_plans_refreshed_hook,
+        set_test_transition_page_published_hook,
     };
     use crate::table::tests::*;
     use crate::table::{DeleteMarker, TableTerminal};
     use crate::trx::MIN_ACTIVE_TRX_ID;
-    use crate::trx::Transaction;
     use crate::trx::purge::PurgeTestEvent;
     use crate::trx::stmt::tests as stmt_tests;
     use crate::trx::tests::{discard_transaction_after_fatal_rollback, shared_trx_status};
     use crate::trx::undo::{OwnedRowUndo, RowUndoHead, RowUndoKind};
     use crate::trx::ver_map::RowPageState;
     use futures::FutureExt;
-    use futures::future::pending;
-    use std::cell::{Cell, RefCell};
     use std::cmp::Ordering;
-    use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::rc::Rc;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::task::Poll;
     use std::thread;
     use tempfile::TempDir;
@@ -2433,7 +2560,7 @@ mod tests {
         let table = table_for_internal_assertion(engine, table_id);
         let (entered_tx, entered_rx) = flume::bounded(1);
         let (release_tx, release_rx) = flume::bounded(1);
-        set_test_checkpoint_after_publish_admission_hook(move || async move {
+        set_test_checkpoint_after_publish_admission_hook(engine, move || async move {
             entered_tx.send_async(()).await.unwrap();
             release_rx.recv_async().await.unwrap();
         });
@@ -2774,6 +2901,7 @@ mod tests {
                     &guards,
                     &[Some(prepared)],
                     None::<fn(&RowPage, usize, RowID)>,
+                    &engine.inner().maintenance_test,
                 )
                 .await
             {
@@ -2815,21 +2943,27 @@ mod tests {
                 .frozen_page_ids()
                 .unwrap()
                 .len();
-            let analysis_count = Rc::new(Cell::new(0usize));
-            let hook_analysis_count = Rc::clone(&analysis_count);
-            set_test_frozen_page_scan_hook(move |_| {
-                hook_analysis_count.set(hook_analysis_count.get() + 1);
+            let analysis_count = Arc::new(AtomicUsize::new(0));
+            let hook_analysis_count = Arc::clone(&analysis_count);
+            set_test_frozen_page_scan_hook(&engine, move |_| {
+                hook_analysis_count.fetch_add(1, AtomicOrdering::Relaxed);
             });
-            let analysis_count_at_build = Rc::new(Cell::new(usize::MAX));
-            let hook_analysis_count = Rc::clone(&analysis_count);
-            let hook_analysis_count_at_build = Rc::clone(&analysis_count_at_build);
-            set_test_checkpoint_after_publish_admission_hook(move || async move {
-                hook_analysis_count_at_build.set(hook_analysis_count.get());
+            let analysis_count_at_build = Arc::new(AtomicUsize::new(usize::MAX));
+            let hook_analysis_count = Arc::clone(&analysis_count);
+            let hook_analysis_count_at_build = Arc::clone(&analysis_count_at_build);
+            set_test_checkpoint_after_publish_admission_hook(&engine, move || async move {
+                hook_analysis_count_at_build.store(
+                    hook_analysis_count.load(AtomicOrdering::Relaxed),
+                    AtomicOrdering::Relaxed,
+                );
             });
             let outcome = session.checkpoint_table(table_id).await.unwrap();
             assert!(matches!(outcome, CheckpointOutcome::Published { .. }));
-            assert!(analysis_count.get() >= frozen_page_count);
-            assert_eq!(analysis_count.get(), analysis_count_at_build.get());
+            assert!(analysis_count.load(AtomicOrdering::Relaxed) >= frozen_page_count);
+            assert_eq!(
+                analysis_count.load(AtomicOrdering::Relaxed),
+                analysis_count_at_build.load(AtomicOrdering::Relaxed)
+            );
 
             let name_key = name_key(&name);
             let table = table_for_internal_assertion(&engine, table_id);
@@ -2907,19 +3041,19 @@ mod tests {
             let deleted_row_id = page_guard
                 .page()
                 .row_id(page_guard.page().header.row_count() - 1);
-            let hook_page = Rc::new(RefCell::new(Some(page_guard)));
-            let refreshed_hook_page = Rc::clone(&hook_page);
-            let refreshed_hook_ran = Rc::new(Cell::new(false));
-            let hook_refreshed_hook_ran = Rc::clone(&refreshed_hook_ran);
-            set_test_stable_page_plans_refreshed_hook(move || {
-                hook_refreshed_hook_ran.set(true);
-                let page_guard = refreshed_hook_page.borrow_mut().take().unwrap();
+            let hook_page = Arc::new(parking_lot::Mutex::new(Some(page_guard)));
+            let refreshed_hook_page = Arc::clone(&hook_page);
+            let refreshed_hook_ran = Arc::new(AtomicBool::new(false));
+            let hook_refreshed_hook_ran = Arc::clone(&refreshed_hook_ran);
+            set_test_stable_page_plans_refreshed_hook(&engine, move || {
+                hook_refreshed_hook_ran.store(true, AtomicOrdering::Relaxed);
+                let page_guard = refreshed_hook_page.lock().take().unwrap();
                 delete_last_frozen_row_image(page_guard);
             });
 
             let outcome = session.checkpoint_table(table_id).await.unwrap();
             assert!(matches!(outcome, CheckpointOutcome::Published { .. }));
-            assert!(refreshed_hook_ran.get());
+            assert!(refreshed_hook_ran.load(AtomicOrdering::Relaxed));
             assert!(
                 table
                     .file()
@@ -3081,11 +3215,11 @@ mod tests {
 
     #[test]
     fn test_secondary_sidecar_failure_keeps_checkpoint_root_atomic() {
-        struct ResetSidecarHook;
+        struct ResetSidecarHook(MaintenanceTestController);
 
         impl Drop for ResetSidecarHook {
             fn drop(&mut self) {
-                set_test_force_secondary_sidecar_error(false);
+                self.0.set_force_secondary_sidecar_error(false);
             }
         }
 
@@ -3121,8 +3255,8 @@ mod tests {
                 .clone();
             wait_for_checkpoint_root_ready(&mut session, table_id).await;
 
-            set_test_force_secondary_sidecar_error(true);
-            let _reset = ResetSidecarHook;
+            set_test_force_secondary_sidecar_error(&engine, true);
+            let _reset = ResetSidecarHook(engine.inner().maintenance_test.clone());
             session.checkpoint_table(table_id).await.unwrap_err();
 
             let root_after = table_for_internal_assertion(&engine, table_id)
@@ -3763,6 +3897,36 @@ mod tests {
     }
 
     #[test]
+    fn test_prepared_freeze_attempt_drop_restores_idle() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "prepared-freeze-drop").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+
+            let attempt = Arc::clone(&table).begin_freeze().unwrap();
+            assert_eq!(table.checkpoint_workflow.state_name(), "Freezing");
+            assert_eq!(
+                Arc::clone(&table).begin_freeze().err().unwrap(),
+                FreezeOutcome::Cancelled {
+                    reason: CheckpointCancelReason::FreezeInProgress,
+                }
+            );
+            assert_eq!(
+                table
+                    .checkpoint_workflow
+                    .begin_checkpoint(&table.lifecycle)
+                    .err()
+                    .unwrap(),
+                CheckpointCancelReason::FreezeInProgress
+            );
+
+            drop(attempt);
+            assert_eq!(table.checkpoint_workflow.state_name(), "Idle");
+        });
+    }
+
+    #[test]
     fn test_repeated_freeze_returns_original_table_owned_batch() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
@@ -3790,7 +3954,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cancelled_freeze_loading_restores_idle_and_active_pages() {
+    fn test_dropped_freeze_observer_does_not_cancel_loading() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine =
@@ -3800,8 +3964,8 @@ mod tests {
             insert_rows(table_id, &mut first_session, 0, 200, "cancel-freeze").await;
 
             let (entered_tx, entered_rx) = flume::bounded(1);
-            let (_release_tx, release_rx) = flume::bounded::<()>(1);
-            set_test_freeze_after_loading_hook(move || async move {
+            let (release_tx, release_rx) = flume::bounded::<()>(1);
+            set_test_freeze_after_loading_hook(&engine, move || async move {
                 entered_tx.send_async(()).await.unwrap();
                 release_rx.recv_async().await.unwrap();
             });
@@ -3836,22 +4000,24 @@ mod tests {
                 );
             }
 
+            release_tx.send_async(()).await.unwrap();
+            wait_session_idle(&engine, &mut first_session).await;
             let table = table_for_internal_assertion(&engine, table_id);
-            assert_eq!(table.checkpoint_workflow.state_name(), "Idle");
-            assert!(table.checkpoint_workflow.frozen_page_ids().is_none());
+            assert_eq!(table.checkpoint_workflow.state_name(), "Frozen");
+            assert!(table.checkpoint_workflow.frozen_page_ids().is_some());
             let page_states = row_page_states(&table, &first_session.pool_guards()).await;
             assert!(!page_states.is_empty());
             assert!(
                 page_states
                     .iter()
-                    .all(|state| *state == RowPageState::Active)
+                    .all(|state| *state == RowPageState::Frozen)
             );
             assert!(matches!(
                 first_session
                     .freeze_table(table_id, usize::MAX)
                     .await
                     .unwrap(),
-                FreezeOutcome::Frozen { .. }
+                FreezeOutcome::AlreadyFrozen { .. }
             ));
         });
     }
@@ -3897,43 +4063,52 @@ mod tests {
 
     #[test]
     fn test_freeze_panics_on_non_active_selected_page() {
-        for unexpected in [RowPageState::Frozen, RowPageState::Transition] {
-            let panic = catch_unwind(AssertUnwindSafe(|| {
-                smol::block_on(async {
-                    let temp_dir = TempDir::new().unwrap();
-                    let engine = lightweight_test_engine(&temp_dir, "freeze-invariant").await;
-                    let table_id = create_table2_for_test(&engine).await;
-                    let mut session = engine.new_session().unwrap();
-                    insert_rows(table_id, &mut session, 0, 1, "invariant").await;
-                    let table = table_for_internal_assertion(&engine, table_id);
-                    let page_id = hot_page_ids(&table, &session.pool_guards()).await[0];
-                    let page_guard = table
-                        .mem
-                        .must_get_row_page_shared(&session.pool_guards(), page_id)
-                        .await
-                        .unwrap();
-                    *page_guard.unwrap_vmap().write_state() = unexpected;
-                    drop(page_guard);
+        smol::block_on(async {
+            for unexpected in [RowPageState::Frozen, RowPageState::Transition] {
+                let temp_dir = TempDir::new().unwrap();
+                let engine = lightweight_test_engine(&temp_dir, "freeze-invariant").await;
+                let table_id = create_table2_for_test(&engine).await;
+                let mut session = engine.new_session().unwrap();
+                insert_rows(table_id, &mut session, 0, 1, "invariant").await;
+                let table = table_for_internal_assertion(&engine, table_id);
+                let page_id = hot_page_ids(&table, &session.pool_guards()).await[0];
+                let page_guard = table
+                    .mem
+                    .must_get_row_page_shared(&session.pool_guards(), page_id)
+                    .await
+                    .unwrap();
+                *page_guard.unwrap_vmap().write_state() = unexpected;
+                drop(page_guard);
 
-                    // The selected-page invariant must panic before an outcome is returned.
-                    let _ = session.freeze_table(table_id, usize::MAX).await;
-                });
-            }))
-            .expect_err("freeze must reject an unexpected selected-page state");
-            let message = panic
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| panic.downcast_ref::<&str>().copied())
-                .unwrap_or("unknown panic");
-            assert!(
-                message.contains("admitted freeze requires ACTIVE page"),
-                "unexpected panic for {unexpected:?}: {message}"
-            );
-        }
+                // The selected-page invariant must panic before an ordinary
+                // freeze outcome can be returned.
+                let err = session
+                    .freeze_table(table_id, usize::MAX)
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    err.report().downcast_ref::<FatalError>().copied(),
+                    Some(FatalError::MandatoryTaskPanic)
+                );
+                assert_eq!(
+                    engine
+                        .inner()
+                        .poisoner
+                        .poison_error()
+                        .as_ref()
+                        .map(|error| *error.current_context()),
+                    Some(FatalError::MandatoryTaskPanic)
+                );
+                remove_session_for_test(&engine.inner().session_registry, session.id());
+                drop(table);
+                drop(session);
+                engine.shutdown();
+            }
+        });
     }
 
     #[test]
-    fn test_cancelled_checkpoint_before_publish_restores_source_state() {
+    fn test_dropped_checkpoint_observer_completes_source_publication() {
         smol::block_on(async {
             for frozen_source in [false, true] {
                 let temp_dir = TempDir::new().unwrap();
@@ -3941,20 +4116,19 @@ mod tests {
                 let table_id = create_table2_for_test(&engine).await;
                 let mut session = engine.new_session().unwrap();
                 insert_rows(table_id, &mut session, 0, 8, "cancel").await;
+                let target_ts = session.last_cts();
                 let table = table_for_internal_assertion(&engine, table_id);
-                let frozen_page_ids = if frozen_source {
+                if frozen_source {
                     assert_freeze_created(
                         session.freeze_table(table_id, usize::MAX).await.unwrap(),
                     );
-                    table.checkpoint_workflow.frozen_page_ids().unwrap()
-                } else {
-                    Vec::new()
-                };
+                }
+                session.wait_for_gc_horizon_after(target_ts).await.unwrap();
                 wait_for_checkpoint_root_ready(&mut session, table_id).await;
 
                 let (entered_tx, entered_rx) = flume::bounded(1);
-                let (_release_tx, release_rx) = flume::bounded::<()>(1);
-                set_test_checkpoint_after_trx_start_hook(move || async move {
+                let (release_tx, release_rx) = flume::bounded::<()>(1);
+                set_test_checkpoint_after_trx_start_hook(&engine, move || async move {
                     entered_tx.send_async(()).await.unwrap();
                     release_rx.recv_async().await.unwrap();
                 });
@@ -3971,20 +4145,10 @@ mod tests {
                     }
                 }
 
-                if frozen_source {
-                    assert_eq!(table.checkpoint_workflow.state_name(), "Frozen");
-                    assert_eq!(
-                        table.checkpoint_workflow.frozen_page_ids().unwrap(),
-                        frozen_page_ids
-                    );
-                    let states = row_page_states(&table, &session.pool_guards()).await;
-                    assert!(states.iter().all(|state| *state == RowPageState::Frozen));
-                } else {
-                    assert_eq!(table.checkpoint_workflow.state_name(), "Idle");
-                    let states = row_page_states(&table, &session.pool_guards()).await;
-                    assert!(states.iter().all(|state| *state == RowPageState::Active));
-                }
+                release_tx.send_async(()).await.unwrap();
                 wait_session_idle(&engine, &mut session).await;
+                assert_eq!(table.checkpoint_workflow.state_name(), "Idle");
+                assert!(table.checkpoint_workflow.frozen_page_ids().is_none());
                 drop(table);
                 drop(session);
                 engine.shutdown();
@@ -4030,8 +4194,9 @@ mod tests {
             let (locked_tx, locked_rx) = flume::bounded(1);
             let (release_tx, release_rx) = flume::bounded(1);
             let mut freeze_session = engine.new_session().unwrap();
+            let maintenance_test = engine.inner().maintenance_test.clone();
             let freeze_handle = thread::spawn(move || {
-                set_test_freeze_page_state_locked_hook(move |page_id| {
+                maintenance_test.install_freeze_page_state_locked_hook(move |page_id| {
                     locked_tx.send(page_id).unwrap();
                     release_rx.recv().unwrap();
                 });
@@ -4169,7 +4334,7 @@ mod tests {
             wait_for_checkpoint_root_ready(&mut session, table_id).await;
 
             let res = {
-                let _guard = ForcePostPublishCheckpointErrorGuard::new();
+                let _guard = ForcePostPublishCheckpointErrorGuard::new(&engine);
                 session.checkpoint_table(table_id).await
             };
 
@@ -4197,7 +4362,7 @@ mod tests {
             let root_before = table.file().active_root_unchecked().clone();
 
             let result = {
-                let _failure = ForceCheckpointCommitErrorGuard::new();
+                let _failure = ForceCheckpointCommitErrorGuard::new(&engine);
                 session.checkpoint_table(table_id).await
             };
             let err = result.unwrap_err();
@@ -4297,17 +4462,16 @@ mod tests {
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             let target_ts = session.last_cts();
             session.wait_for_gc_horizon_after(target_ts).await.unwrap();
-            let reader_holder: Rc<RefCell<Option<(Session, Transaction)>>> =
-                Rc::new(RefCell::new(None));
-            let reader_sts = Rc::new(Cell::new(TrxID::new(0)));
-            let hook_reader_holder = Rc::clone(&reader_holder);
-            let hook_reader_sts = Rc::clone(&reader_sts);
+            let reader_holder = Arc::new(parking_lot::Mutex::new(None));
+            let reader_sts = Arc::new(parking_lot::Mutex::new(TrxID::new(0)));
+            let hook_reader_holder = Arc::clone(&reader_holder);
+            let hook_reader_sts = Arc::clone(&reader_sts);
             let hook_engine = engine.new_ref().unwrap();
-            set_test_checkpoint_after_trx_start_hook(move || async move {
+            set_test_checkpoint_after_trx_start_hook(&engine, move || async move {
                 let mut reader_session = hook_engine.new_session().unwrap();
                 let reader = reader_session.begin_trx().unwrap();
-                hook_reader_sts.set(reader.sts());
-                *hook_reader_holder.borrow_mut() = Some((reader_session, reader));
+                *hook_reader_sts.lock() = reader.sts();
+                *hook_reader_holder.lock() = Some((reader_session, reader));
             });
 
             let outcome = session.checkpoint_table(table_id).await.unwrap();
@@ -4319,8 +4483,8 @@ mod tests {
                 .active_root_unchecked()
                 .clone();
             let effective_ts = active_root.effective_ts();
-            assert!(checkpoint_ts < reader_sts.get());
-            assert!(effective_ts > reader_sts.get());
+            assert!(checkpoint_ts < *reader_sts.lock());
+            assert!(effective_ts > *reader_sts.lock());
 
             let delayed = session.checkpoint_table(table_id).await.unwrap();
             let CheckpointOutcome::Delayed { reason } = delayed else {
@@ -4336,11 +4500,11 @@ mod tests {
             };
             assert_eq!(delayed_table_id, table_id);
             assert_eq!(delayed_effective_ts, effective_ts);
-            assert!(min_active_sts <= reader_sts.get());
+            assert!(min_active_sts <= *reader_sts.lock());
             assert!(delayed_effective_ts >= min_active_sts);
 
             let (_, mut reader) = reader_holder
-                .borrow_mut()
+                .lock()
                 .take()
                 .expect("reader hook should install an active transaction");
             reader
@@ -4549,18 +4713,21 @@ mod tests {
                 panic!("expected active-root delay: {reason:?}");
             };
 
-            let hook_ran = Rc::new(Cell::new(false));
-            let hook_flag = Rc::clone(&hook_ran);
+            let hook_ran = Arc::new(AtomicBool::new(false));
+            let hook_flag = Arc::clone(&hook_ran);
             let trx_sys = engine.inner().trx_sys.clone();
-            set_test_checkpoint_retry_after_listener_registration_hook(move || async move {
-                hook_flag.set(true);
-                assert!(trx_sys.publish_gc_horizon(effective_ts.saturating_add(1)));
-            });
+            set_test_checkpoint_retry_after_listener_registration_hook(
+                &engine,
+                move || async move {
+                    hook_flag.store(true, AtomicOrdering::Relaxed);
+                    assert!(trx_sys.publish_gc_horizon(effective_ts.saturating_add(1)));
+                },
+            );
             checkpoint_session
                 .wait_for_checkpoint_retry(reason)
                 .await
                 .unwrap();
-            assert!(hook_ran.get());
+            assert!(hook_ran.load(AtomicOrdering::Relaxed));
 
             reader.rollback().await.unwrap();
             engine.shutdown();
@@ -4677,7 +4844,7 @@ mod tests {
 
             let (entered_tx, entered_rx) = flume::bounded(1);
             let (release_tx, release_rx) = flume::bounded(1);
-            set_test_checkpoint_after_trx_start_hook(move || async move {
+            set_test_checkpoint_after_trx_start_hook(&engine, move || async move {
                 entered_tx.send_async(()).await.unwrap();
                 release_rx.recv_async().await.unwrap();
             });
@@ -4740,7 +4907,7 @@ mod tests {
 
             let (entered_tx, entered_rx) = flume::bounded(1);
             let (release_tx, release_rx) = flume::bounded(1);
-            set_test_checkpoint_after_trx_start_hook(move || async move {
+            set_test_checkpoint_after_trx_start_hook(&engine, move || async move {
                 entered_tx.send_async(()).await.unwrap();
                 release_rx.recv_async().await.unwrap();
             });
@@ -4796,7 +4963,7 @@ mod tests {
                 .checkpoint_workflow
                 .begin_checkpoint(&table.lifecycle)
                 .unwrap();
-            let root_lease = table.try_begin_checkpoint_root_mutation().unwrap();
+            let root_lease = TableCheckpointRootMutationScope::acquire(Arc::clone(&table)).unwrap();
             let frozen_pages = attempt.batch().unwrap().pages.clone();
             let transition_pages = table
                 .load_frozen_pages_for_transition(&session.pool_guards(), &frozen_pages)
@@ -4804,13 +4971,14 @@ mod tests {
                 .unwrap();
             let cutoff_ts = engine.inner().trx_sys.published_gc_horizon();
             let drop_table = Arc::clone(&table);
-            set_test_stable_page_plans_refreshed_hook(move || {
+            set_test_stable_page_plans_refreshed_hook(&engine, move || {
                 let _drain = drop_table.start_drop_lifecycle().unwrap();
             });
             let delay = table.prepare_page_transition(
                 &transition_pages,
                 attempt.batch_mut().unwrap(),
                 cutoff_ts,
+                &engine.inner().maintenance_test,
             );
             assert!(delay.is_none());
             let result = table
@@ -4840,7 +5008,7 @@ mod tests {
 
             let (entered_tx, entered_rx) = flume::bounded(1);
             let (release_tx, release_rx) = flume::bounded(1);
-            set_test_freeze_after_loading_hook(move || async move {
+            set_test_freeze_after_loading_hook(&engine, move || async move {
                 entered_tx.send_async(()).await.unwrap();
                 release_rx.recv_async().await.unwrap();
             });
@@ -4944,8 +5112,9 @@ mod tests {
 
             engine.inner().trx_sys.request_dropped_table_purge();
             engine
-                .catalog()
-                .checkpoint_now(&engine.inner().trx_sys)
+                .new_session()
+                .unwrap()
+                .checkpoint_catalog()
                 .await
                 .unwrap();
             wait_path_exists(&table_file_path, false).await;
@@ -5073,7 +5242,7 @@ mod tests {
 
             let (entered_tx, entered_rx) = flume::bounded(1);
             let (release_tx, release_rx) = flume::bounded(1);
-            set_test_checkpoint_after_publish_admission_hook(move || async move {
+            set_test_checkpoint_after_publish_admission_hook(&engine, move || async move {
                 entered_tx.send_async(()).await.unwrap();
                 release_rx.recv_async().await.unwrap();
             });
@@ -5160,27 +5329,27 @@ mod tests {
                 .must_get_row_page_shared(&frozen_foreground.pool_guards(), frozen_page_ids[1])
                 .await
                 .unwrap();
-            let analysis_count = Rc::new(Cell::new(0usize));
-            let first_page_analysis_count = Rc::new(Cell::new(0usize));
-            let mutation_started = Rc::new(Cell::new(false));
-            let hook_analysis_count = Rc::clone(&analysis_count);
-            let hook_first_page_analysis_count = Rc::clone(&first_page_analysis_count);
-            set_test_frozen_page_scan_hook(move |page_id| {
-                hook_analysis_count.set(hook_analysis_count.get() + 1);
+            let analysis_count = Arc::new(AtomicUsize::new(0));
+            let first_page_analysis_count = Arc::new(AtomicUsize::new(0));
+            let mutation_started = Arc::new(AtomicBool::new(false));
+            let hook_analysis_count = Arc::clone(&analysis_count);
+            let hook_first_page_analysis_count = Arc::clone(&first_page_analysis_count);
+            set_test_frozen_page_scan_hook(&engine, move |page_id| {
+                hook_analysis_count.fetch_add(1, AtomicOrdering::Relaxed);
                 if page_id != first_frozen_page_id {
                     return;
                 }
-                hook_first_page_analysis_count.set(hook_first_page_analysis_count.get() + 1);
+                hook_first_page_analysis_count.fetch_add(1, AtomicOrdering::Relaxed);
             });
-            let first_frozen_page = Rc::new(RefCell::new(Some(first_frozen_page)));
-            let row_hook_page = Rc::clone(&first_frozen_page);
-            let row_hook_mutation_started = Rc::clone(&mutation_started);
-            set_test_frozen_page_row_scan_hook(move |page_id, row_idx| {
+            let first_frozen_page = Arc::new(parking_lot::Mutex::new(Some(first_frozen_page)));
+            let row_hook_page = Arc::clone(&first_frozen_page);
+            let row_hook_mutation_started = Arc::clone(&mutation_started);
+            set_test_frozen_page_row_scan_hook(&engine, move |page_id, row_idx| {
                 if page_id == first_frozen_page_id
                     && row_idx == 0
-                    && !row_hook_mutation_started.replace(true)
+                    && !row_hook_mutation_started.swap(true, AtomicOrdering::Relaxed)
                 {
-                    let page_guard = row_hook_page.borrow();
+                    let page_guard = row_hook_page.lock();
                     page_guard
                         .as_ref()
                         .unwrap()
@@ -5188,15 +5357,16 @@ mod tests {
                         .begin_frozen_mutation();
                 }
             });
-            let comparison_hook_page = Rc::clone(&first_frozen_page);
+            let comparison_hook_page = Arc::clone(&first_frozen_page);
             set_test_optimistic_page_plan_comparison_hook(
+                &engine,
                 move |page_id, version_before, version_after, retained| {
                     if page_id != first_frozen_page_id || version_before == version_after {
                         return;
                     }
                     assert_eq!(version_after, version_before + 1);
                     assert!(!retained);
-                    let page_guard = comparison_hook_page.borrow();
+                    let page_guard = comparison_hook_page.lock();
                     let guard_ref = page_guard.as_ref().unwrap();
                     let page = guard_ref.page();
                     let row_idx = page.header.row_count() - 1;
@@ -5204,7 +5374,7 @@ mod tests {
                     page.inc_approx_deleted();
                     guard_ref.unwrap_vmap().finish_frozen_mutation();
                     drop(page_guard);
-                    comparison_hook_page.borrow_mut().take();
+                    comparison_hook_page.lock().take();
                 },
             );
             let suffix_key = {
@@ -5285,7 +5455,7 @@ mod tests {
             });
             let hook_prefix_update_done_rx = prefix_update_done_rx.clone();
             let hook_prefix_delete_done_rx = prefix_delete_done_rx.clone();
-            set_test_transition_page_published_hook(move |page_id| {
+            set_test_transition_page_published_hook(&engine, move |page_id| {
                 assert_eq!(page_id, first_frozen_page_id);
                 assert_eq!(
                     second_frozen_page.unwrap_vmap().inspect_state(),
@@ -5307,7 +5477,7 @@ mod tests {
 
             let (entered_tx, entered_rx) = flume::bounded(1);
             let (release_tx, release_rx) = flume::bounded(1);
-            set_test_checkpoint_after_publish_admission_hook(move || async move {
+            set_test_checkpoint_after_publish_admission_hook(&engine, move || async move {
                 entered_tx.send_async(()).await.unwrap();
                 release_rx.recv_async().await.unwrap();
             });
@@ -5350,8 +5520,11 @@ mod tests {
                 checkpoint.await.unwrap()
             };
             assert!(matches!(outcome, CheckpointOutcome::Published { .. }));
-            assert_eq!(analysis_count.get(), frozen_page_count + 2);
-            assert_eq!(first_page_analysis_count.get(), 2);
+            assert_eq!(
+                analysis_count.load(AtomicOrdering::Relaxed),
+                frozen_page_count + 2
+            );
+            assert_eq!(first_page_analysis_count.load(AtomicOrdering::Relaxed), 2);
             prefix_update_thread.join().unwrap();
             prefix_delete_thread.join().unwrap();
             suffix_delete_thread.join().unwrap();
@@ -5408,49 +5581,48 @@ mod tests {
                 .must_get_row_page_shared(&session.pool_guards(), second_page_id)
                 .await
                 .unwrap();
-            let first_page = Rc::new(RefCell::new(Some(first_page)));
-            let second_page = Rc::new(RefCell::new(Some(second_page)));
-            let total_analysis_count = Rc::new(Cell::new(0usize));
-            let first_analysis_count = Rc::new(Cell::new(0usize));
-            let second_analysis_count = Rc::new(Cell::new(0usize));
-            let cross_page_delete_completed = Rc::new(Cell::new(false));
+            let first_page = Arc::new(parking_lot::Mutex::new(Some(first_page)));
+            let second_page = Arc::new(parking_lot::Mutex::new(Some(second_page)));
+            let total_analysis_count = Arc::new(AtomicUsize::new(0));
+            let first_analysis_count = Arc::new(AtomicUsize::new(0));
+            let second_analysis_count = Arc::new(AtomicUsize::new(0));
+            let cross_page_delete_completed = Arc::new(AtomicBool::new(false));
 
-            let refreshed_first_page = Rc::clone(&first_page);
-            set_test_stable_page_plans_refreshed_hook(move || {
-                let page_guard = refreshed_first_page.borrow_mut().take().unwrap();
+            let refreshed_first_page = Arc::clone(&first_page);
+            set_test_stable_page_plans_refreshed_hook(&engine, move || {
+                let page_guard = refreshed_first_page.lock().take().unwrap();
                 delete_last_frozen_row_image(page_guard);
             });
 
-            let hook_total_analysis_count = Rc::clone(&total_analysis_count);
-            let hook_first_analysis_count = Rc::clone(&first_analysis_count);
-            let hook_second_analysis_count = Rc::clone(&second_analysis_count);
-            let hook_second_page = Rc::clone(&second_page);
-            let hook_cross_page_delete_completed = Rc::clone(&cross_page_delete_completed);
-            set_test_frozen_page_scan_hook(move |page_id| {
-                hook_total_analysis_count.set(hook_total_analysis_count.get() + 1);
+            let hook_total_analysis_count = Arc::clone(&total_analysis_count);
+            let hook_first_analysis_count = Arc::clone(&first_analysis_count);
+            let hook_second_analysis_count = Arc::clone(&second_analysis_count);
+            let hook_second_page = Arc::clone(&second_page);
+            let hook_cross_page_delete_completed = Arc::clone(&cross_page_delete_completed);
+            set_test_frozen_page_scan_hook(&engine, move |page_id| {
+                hook_total_analysis_count.fetch_add(1, AtomicOrdering::Relaxed);
                 if page_id == first_page_id {
-                    let count = hook_first_analysis_count.get() + 1;
-                    hook_first_analysis_count.set(count);
+                    let count = hook_first_analysis_count.fetch_add(1, AtomicOrdering::Relaxed) + 1;
                     if count == 2 {
-                        let page_guard = hook_second_page.borrow_mut().take().unwrap();
+                        let page_guard = hook_second_page.lock().take().unwrap();
                         assert_eq!(
                             page_guard.unwrap_vmap().inspect_state(),
                             RowPageState::Frozen
                         );
                         delete_last_frozen_row_image(page_guard);
-                        hook_cross_page_delete_completed.set(true);
+                        hook_cross_page_delete_completed.store(true, AtomicOrdering::Relaxed);
                     }
                 } else if page_id == second_page_id {
-                    hook_second_analysis_count.set(hook_second_analysis_count.get() + 1);
+                    hook_second_analysis_count.fetch_add(1, AtomicOrdering::Relaxed);
                 }
             });
 
             let outcome = session.checkpoint_table(table_id).await.unwrap();
             assert!(matches!(outcome, CheckpointOutcome::Published { .. }));
-            assert!(cross_page_delete_completed.get());
-            assert!(first_analysis_count.get() >= 2);
-            assert!(second_analysis_count.get() >= 2);
-            assert!(total_analysis_count.get() >= page_ids.len() + 2);
+            assert!(cross_page_delete_completed.load(AtomicOrdering::Relaxed));
+            assert!(first_analysis_count.load(AtomicOrdering::Relaxed) >= 2);
+            assert!(second_analysis_count.load(AtomicOrdering::Relaxed) >= 2);
+            assert!(total_analysis_count.load(AtomicOrdering::Relaxed) >= page_ids.len() + 2);
         });
     }
 
@@ -5480,29 +5652,29 @@ mod tests {
                         .unwrap(),
                 ));
             }
-            let page_guards = Rc::new(RefCell::new(page_guards));
-            let analysis_counts = Rc::new(RefCell::new(vec![0usize; page_ids.len()]));
+            let page_guards = Arc::new(parking_lot::Mutex::new(page_guards));
+            let analysis_counts = Arc::new(parking_lot::Mutex::new(vec![0usize; page_ids.len()]));
 
-            let refreshed_page_guards = Rc::clone(&page_guards);
-            set_test_stable_page_plans_refreshed_hook(move || {
-                for page_guard in refreshed_page_guards.borrow_mut().iter_mut() {
+            let refreshed_page_guards = Arc::clone(&page_guards);
+            set_test_stable_page_plans_refreshed_hook(&engine, move || {
+                for page_guard in refreshed_page_guards.lock().iter_mut() {
                     let page_guard = page_guard.take().unwrap();
                     delete_last_frozen_row_image(page_guard);
                 }
             });
             let hook_page_ids = page_ids.clone();
-            let hook_analysis_counts = Rc::clone(&analysis_counts);
-            set_test_frozen_page_scan_hook(move |page_id| {
+            let hook_analysis_counts = Arc::clone(&analysis_counts);
+            set_test_frozen_page_scan_hook(&engine, move |page_id| {
                 let page_idx = hook_page_ids
                     .iter()
                     .position(|candidate| *candidate == page_id)
                     .unwrap();
-                hook_analysis_counts.borrow_mut()[page_idx] += 1;
+                hook_analysis_counts.lock()[page_idx] += 1;
             });
 
             let outcome = session.checkpoint_table(table_id).await.unwrap();
             assert!(matches!(outcome, CheckpointOutcome::Published { .. }));
-            assert!(analysis_counts.borrow().iter().all(|count| *count >= 2));
+            assert!(analysis_counts.lock().iter().all(|count| *count >= 2));
         });
     }
 
@@ -5529,17 +5701,17 @@ mod tests {
                 .await
                 .unwrap();
             let row_id = first_page.page().row_id(0);
-            let first_page = Rc::new(RefCell::new(Some(first_page)));
-            let undo_owner = Rc::new(RefCell::new(None));
-            let hook_undo_owner = Rc::clone(&undo_owner);
-            let hook_first_page = Rc::clone(&first_page);
+            let first_page = Arc::new(parking_lot::Mutex::new(Some(first_page)));
+            let undo_owner = Arc::new(parking_lot::Mutex::new(None));
+            let hook_undo_owner = Arc::clone(&undo_owner);
+            let hook_first_page = Arc::clone(&first_page);
             let pre_fence_sts = batch.frozen_ts().saturating_sub(2);
             let ownership_status = Arc::new(shared_trx_status(
                 MIN_ACTIVE_TRX_ID + pre_fence_sts.as_u64(),
             ));
             let hook_ownership_status = Arc::clone(&ownership_status);
-            set_test_frozen_pages_ready_hook(move || {
-                let page_guard = hook_first_page.borrow_mut().take().unwrap();
+            set_test_frozen_pages_ready_hook(&engine, move || {
+                let page_guard = hook_first_page.lock().take().unwrap();
                 let page = page_guard.page();
                 let map = page_guard.unwrap_vmap();
                 let undo = OwnedRowUndo::new(table_id, None, page.row_id(0), RowUndoKind::Lock);
@@ -5549,24 +5721,24 @@ mod tests {
                     undo.leak(),
                 )));
                 map.finish_frozen_mutation();
-                hook_undo_owner.borrow_mut().replace(undo);
+                hook_undo_owner.lock().replace(undo);
                 drop(page_guard);
             });
-            let publish_admitted = Rc::new(Cell::new(false));
-            let hook_publish_admitted = Rc::clone(&publish_admitted);
-            set_test_checkpoint_after_publish_admission_hook(move || async move {
-                hook_publish_admitted.set(true);
+            let publish_admitted = Arc::new(AtomicBool::new(false));
+            let hook_publish_admitted = Arc::clone(&publish_admitted);
+            set_test_checkpoint_after_publish_admission_hook(&engine, move || async move {
+                hook_publish_admitted.store(true, AtomicOrdering::Relaxed);
             });
 
             let outcome = session.checkpoint_table(table_id).await.unwrap();
             assert!(matches!(outcome, CheckpointOutcome::Published { .. }));
-            assert!(publish_admitted.get());
+            assert!(publish_admitted.load(AtomicOrdering::Relaxed));
             assert_eq!(table.checkpoint_workflow.state_name(), "Idle");
             let Some(DeleteMarker::Ref(marker_status)) = table.deletion_buffer().get(row_id) else {
                 panic!("stable-plan refresh must install the ownership marker");
             };
             assert!(Arc::ptr_eq(&marker_status, &ownership_status));
-            undo_owner.borrow_mut().take();
+            undo_owner.lock().take();
         });
     }
 
@@ -5593,17 +5765,17 @@ mod tests {
                 .await
                 .unwrap();
             let row_id = first_page.page().row_id(0);
-            let first_page = Rc::new(RefCell::new(Some(first_page)));
-            let undo_owner = Rc::new(RefCell::new(None));
-            let hook_undo_owner = Rc::clone(&undo_owner);
-            let hook_first_page = Rc::clone(&first_page);
+            let first_page = Arc::new(parking_lot::Mutex::new(Some(first_page)));
+            let undo_owner = Arc::new(parking_lot::Mutex::new(None));
+            let hook_undo_owner = Arc::clone(&undo_owner);
+            let hook_first_page = Arc::clone(&first_page);
             let pre_fence_sts = batch.frozen_ts().saturating_sub(2);
             let ownership_status = Arc::new(shared_trx_status(
                 MIN_ACTIVE_TRX_ID + pre_fence_sts.as_u64(),
             ));
             let hook_ownership_status = Arc::clone(&ownership_status);
-            set_test_stable_page_plans_refreshed_hook(move || {
-                let page_guard = hook_first_page.borrow_mut().take().unwrap();
+            set_test_stable_page_plans_refreshed_hook(&engine, move || {
+                let page_guard = hook_first_page.lock().take().unwrap();
                 let page = page_guard.page();
                 let map = page_guard.unwrap_vmap();
                 let undo = OwnedRowUndo::new(table_id, None, page.row_id(0), RowUndoKind::Lock);
@@ -5613,13 +5785,13 @@ mod tests {
                     undo.leak(),
                 )));
                 map.finish_frozen_mutation();
-                hook_undo_owner.borrow_mut().replace(undo);
+                hook_undo_owner.lock().replace(undo);
                 drop(page_guard);
             });
-            let locked_rebuild_observed = Rc::new(Cell::new(false));
-            let hook_locked_rebuild_observed = Rc::clone(&locked_rebuild_observed);
+            let locked_rebuild_observed = Arc::new(AtomicBool::new(false));
+            let hook_locked_rebuild_observed = Arc::clone(&locked_rebuild_observed);
             let hook_table = Arc::downgrade(&table);
-            set_test_locked_page_plan_rebuild_hook(move |page_id| {
+            set_test_locked_page_plan_rebuild_hook(&engine, move |page_id| {
                 assert_eq!(page_id, first_page_id);
                 assert_eq!(
                     hook_table
@@ -5629,24 +5801,24 @@ mod tests {
                         .state_name(),
                     "Transition"
                 );
-                hook_locked_rebuild_observed.set(true);
+                hook_locked_rebuild_observed.store(true, AtomicOrdering::Relaxed);
             });
-            let publish_admitted = Rc::new(Cell::new(false));
-            let hook_publish_admitted = Rc::clone(&publish_admitted);
-            set_test_checkpoint_after_publish_admission_hook(move || async move {
-                hook_publish_admitted.set(true);
+            let publish_admitted = Arc::new(AtomicBool::new(false));
+            let hook_publish_admitted = Arc::clone(&publish_admitted);
+            set_test_checkpoint_after_publish_admission_hook(&engine, move || async move {
+                hook_publish_admitted.store(true, AtomicOrdering::Relaxed);
             });
 
             let outcome = session.checkpoint_table(table_id).await.unwrap();
             assert!(matches!(outcome, CheckpointOutcome::Published { .. }));
-            assert!(publish_admitted.get());
-            assert!(locked_rebuild_observed.get());
+            assert!(publish_admitted.load(AtomicOrdering::Relaxed));
+            assert!(locked_rebuild_observed.load(AtomicOrdering::Relaxed));
             assert_eq!(table.checkpoint_workflow.state_name(), "Idle");
             let Some(DeleteMarker::Ref(marker_status)) = table.deletion_buffer().get(row_id) else {
                 panic!("locked rebuild must install the ownership marker");
             };
             assert!(Arc::ptr_eq(&marker_status, &ownership_status));
-            undo_owner.borrow_mut().take();
+            undo_owner.lock().take();
         });
     }
 
@@ -5673,7 +5845,7 @@ mod tests {
 
             let (entered_tx, entered_rx) = flume::bounded(1);
             let (release_tx, release_rx) = flume::bounded(1);
-            set_test_checkpoint_after_publish_admission_hook(move || async move {
+            set_test_checkpoint_after_publish_admission_hook(&engine, move || async move {
                 entered_tx.send_async(()).await.unwrap();
                 release_rx.recv_async().await.unwrap();
             });
@@ -5682,7 +5854,7 @@ mod tests {
             let mut delete_session = engine.new_session().unwrap();
             let mut delete_trx = delete_session.begin_trx().unwrap();
             let (update_err, delete_err) = {
-                let _failure = ForceLwcBuildErrorGuard::new();
+                let _failure = ForceLwcBuildErrorGuard::new(&engine);
                 let checkpoint = checkpoint_session.checkpoint_table(table_id).fuse();
                 futures::pin_mut!(checkpoint);
                 let entered = entered_rx.recv_async().fuse();
@@ -5935,16 +6107,17 @@ mod tests {
     }
 
     #[test]
-    fn test_publication_admission_cancellation_remains_reversible() {
+    fn test_dropped_publication_observer_does_not_cancel_accepted_checkpoint() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "publish-admission-cancel").await;
             let mut session = engine.new_session().unwrap();
             let (table_id, _) = prepare_silent_checkpoint_failure(&engine, &mut session).await;
             let (entered_tx, entered_rx) = flume::bounded(1);
-            set_test_checkpoint_after_publish_admission_hook(move || async move {
+            let (release_tx, release_rx) = flume::bounded(1);
+            set_test_checkpoint_after_publish_admission_hook(&engine, move || async move {
                 entered_tx.send_async(()).await.unwrap();
-                pending().await
+                release_rx.recv_async().await.unwrap();
             });
             let mut checkpoint = Box::pin(session.checkpoint_table(table_id).fuse());
             let mut entered = Box::pin(entered_rx.recv_async().fuse());
@@ -5956,18 +6129,23 @@ mod tests {
             }
 
             drop(checkpoint);
-
             assert!(engine.inner().poisoner.poison_error().is_none());
+            release_tx.send_async(()).await.unwrap();
+            wait_session_idle(&engine, &mut session).await;
             assert_eq!(
                 table_for_internal_assertion(&engine, table_id)
                     .checkpoint_workflow
                     .state_name(),
                 "Idle"
             );
-            assert!(matches!(
-                session.checkpoint_table(table_id).await.unwrap(),
-                CheckpointOutcome::Published { silent: true, .. }
-            ));
+            let watermark = engine
+                .catalog()
+                .storage
+                .table_replay_silent_watermarks()
+                .find_uncommitted_by_table_id(&session.pool_guards(), table_id)
+                .await
+                .unwrap();
+            assert!(watermark.is_some());
         });
     }
 
@@ -5980,7 +6158,7 @@ mod tests {
             let (table_id, root_before) =
                 prepare_silent_checkpoint_failure(&engine, &mut session).await;
             let guards = session.pool_guards();
-            set_test_silent_watermark_mutation_hook(|| async {
+            set_test_silent_watermark_mutation_hook(&engine, || async {
                 Err(Report::new(InternalError::SecondaryIndexBindingMismatch)
                     .attach("test silent-watermark mutation failure")
                     .change_context(RuntimeError::CatalogAccess))
@@ -6006,7 +6184,7 @@ mod tests {
     }
 
     #[test]
-    fn test_silent_watermark_mutation_cancellation_poisons_catalog_write() {
+    fn test_dropped_observer_preserves_silent_watermark_mutation_failure() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "silent-mutation-cancel").await;
@@ -6015,9 +6193,13 @@ mod tests {
                 prepare_silent_checkpoint_failure(&engine, &mut session).await;
             let guards = session.pool_guards();
             let (entered_tx, entered_rx) = flume::bounded(1);
-            set_test_silent_watermark_mutation_hook(move || async move {
+            let (release_tx, release_rx) = flume::bounded(1);
+            set_test_silent_watermark_mutation_hook(&engine, move || async move {
                 entered_tx.send_async(()).await.unwrap();
-                pending().await
+                release_rx.recv_async().await.unwrap();
+                Err(Report::new(InternalError::SecondaryIndexBindingMismatch)
+                    .attach("test observer-dropped silent-watermark mutation failure")
+                    .change_context(RuntimeError::CatalogAccess))
             });
             let mut checkpoint = Box::pin(session.checkpoint_table(table_id).fuse());
             let mut entered = Box::pin(entered_rx.recv_async().fuse());
@@ -6029,12 +6211,13 @@ mod tests {
             }
 
             drop(checkpoint);
-
+            release_tx.send_async(()).await.unwrap();
+            wait_session_idle(&engine, &mut session).await;
             let poison = engine
                 .inner()
                 .poisoner
                 .poison_error()
-                .expect("cancelled silent mutation should poison storage");
+                .expect("observer-dropped silent mutation failure should poison storage");
             assert_eq!(*poison.current_context(), FatalError::CatalogWrite);
             assert_silent_watermark_absent(&engine, &guards, table_id).await;
             assert_root_metadata_unchanged(
@@ -6486,16 +6669,16 @@ mod tests {
                     .await
                     .unwrap(),
             );
-            let analysis_count = Rc::new(Cell::new(0usize));
-            let hook_analysis_count = Rc::clone(&analysis_count);
-            set_test_frozen_page_scan_hook(move |_| {
-                hook_analysis_count.set(hook_analysis_count.get() + 1);
+            let analysis_count = Arc::new(AtomicUsize::new(0));
+            let hook_analysis_count = Arc::clone(&analysis_count);
+            set_test_frozen_page_scan_hook(&engine, move |_| {
+                hook_analysis_count.fetch_add(1, AtomicOrdering::Relaxed);
             });
             let outcome = checkpoint_session.checkpoint_table(table_id).await.unwrap();
             let CheckpointOutcome::Delayed { reason } = outcome else {
                 panic!("two unresolved images should delay checkpoint: {outcome:?}");
             };
-            assert_eq!(analysis_count.get(), 1);
+            assert_eq!(analysis_count.load(AtomicOrdering::Relaxed), 1);
             assert!(matches!(
                 reason,
                 CheckpointDelayReason::FrozenPageCutoff {
@@ -6508,7 +6691,7 @@ mod tests {
             let frozen_page_ids = table.checkpoint_workflow.frozen_page_ids().unwrap();
             let mut cancelled_wait = Box::pin(checkpoint_session.wait_for_checkpoint_retry(reason));
             assert!(futures::poll!(cancelled_wait.as_mut()).is_pending());
-            assert_eq!(analysis_count.get(), 1);
+            assert_eq!(analysis_count.load(AtomicOrdering::Relaxed), 1);
             assert_eq!(table.checkpoint_workflow.state_name(), "Frozen");
             drop(cancelled_wait);
             assert_eq!(table.checkpoint_workflow.state_name(), "Frozen");
@@ -6519,20 +6702,20 @@ mod tests {
 
             let mut wait = Box::pin(checkpoint_session.wait_for_checkpoint_retry(reason));
             assert!(futures::poll!(wait.as_mut()).is_pending());
-            assert_eq!(analysis_count.get(), 1);
+            assert_eq!(analysis_count.load(AtomicOrdering::Relaxed), 1);
             writer1.rollback().await.unwrap();
             assert!(futures::poll!(wait.as_mut()).is_pending());
-            assert_eq!(analysis_count.get(), 1);
+            assert_eq!(analysis_count.load(AtomicOrdering::Relaxed), 1);
 
             let mut unrelated_session = engine.new_session().unwrap();
             let unrelated = unrelated_session.begin_trx().unwrap();
             unrelated.rollback().await.unwrap();
             assert!(futures::poll!(wait.as_mut()).is_pending());
-            assert_eq!(analysis_count.get(), 1);
+            assert_eq!(analysis_count.load(AtomicOrdering::Relaxed), 1);
 
             writer2.rollback().await.unwrap();
             wait.await.unwrap();
-            assert_eq!(analysis_count.get(), 2);
+            assert_eq!(analysis_count.load(AtomicOrdering::Relaxed), 2);
             assert!(matches!(
                 checkpoint_session
                     .checkpoint_table_with_wait(table_id)
@@ -6592,11 +6775,11 @@ mod tests {
                 .unwrap();
             let cutoff_ts = trx_sys.published_gc_horizon();
             assert!(cutoff_ts <= writer_cts);
-            let analysis_count = Rc::new(Cell::new(0usize));
-            let hook_analysis_count = Rc::clone(&analysis_count);
-            set_test_frozen_page_scan_hook(move |page_id| {
+            let analysis_count = Arc::new(AtomicUsize::new(0));
+            let hook_analysis_count = Arc::clone(&analysis_count);
+            set_test_frozen_page_scan_hook(&engine, move |page_id| {
                 assert_eq!(page_id, frozen_page_id);
-                hook_analysis_count.set(hook_analysis_count.get() + 1);
+                hook_analysis_count.fetch_add(1, AtomicOrdering::Relaxed);
             });
 
             let outcome = checkpoint_session.checkpoint_table(table_id).await.unwrap();
@@ -6622,7 +6805,7 @@ mod tests {
                 panic!("delayed checkpoint should retain its frozen batch: {repeated:?}");
             };
             assert_eq!(batch.stable_page_count(), 1);
-            assert_eq!(analysis_count.get(), 1);
+            assert_eq!(analysis_count.load(AtomicOrdering::Relaxed), 1);
 
             let same_cutoff_retry = checkpoint_session.checkpoint_table(table_id).await.unwrap();
             let CheckpointOutcome::Delayed { reason } = same_cutoff_retry else {
@@ -6636,7 +6819,7 @@ mod tests {
                     ..
                 } if retry_cutoff_ts == cutoff_ts
             ));
-            assert_eq!(analysis_count.get(), 1);
+            assert_eq!(analysis_count.load(AtomicOrdering::Relaxed), 1);
 
             reader.commit().await.unwrap();
             checkpoint_session
@@ -6648,7 +6831,7 @@ mod tests {
                 retry,
                 CheckpointOutcome::Published { silent: false, .. }
             ));
-            assert!(analysis_count.get() >= 2);
+            assert!(analysis_count.load(AtomicOrdering::Relaxed) >= 2);
         });
     }
 
@@ -6693,25 +6876,25 @@ mod tests {
                 .unwrap();
             wait_for_checkpoint_root_ready(&mut setup, table_id).await;
 
-            let analysis_counts = Rc::new(RefCell::new(vec![0usize; page_ids.len()]));
+            let analysis_counts = Arc::new(parking_lot::Mutex::new(vec![0usize; page_ids.len()]));
             let hook_page_ids = page_ids.clone();
-            let hook_analysis_counts = Rc::clone(&analysis_counts);
-            set_test_frozen_page_scan_hook(move |page_id| {
+            let hook_analysis_counts = Arc::clone(&analysis_counts);
+            set_test_frozen_page_scan_hook(&engine, move |page_id| {
                 let page_idx = hook_page_ids
                     .iter()
                     .position(|candidate| *candidate == page_id)
                     .unwrap();
-                hook_analysis_counts.borrow_mut()[page_idx] += 1;
+                hook_analysis_counts.lock()[page_idx] += 1;
             });
-            let ready_hook_ran = Rc::new(Cell::new(false));
-            let hook_ready_hook_ran = Rc::clone(&ready_hook_ran);
-            let counts_at_first_delay = Rc::new(RefCell::new(Vec::new()));
-            let hook_counts_at_first_delay = Rc::clone(&counts_at_first_delay);
-            let ready_hook_analysis_counts = Rc::clone(&analysis_counts);
-            set_test_frozen_pages_ready_hook(move || {
-                hook_ready_hook_ran.set(true);
-                let before_retry = hook_counts_at_first_delay.borrow();
-                let after_readiness = ready_hook_analysis_counts.borrow();
+            let ready_hook_ran = Arc::new(AtomicBool::new(false));
+            let hook_ready_hook_ran = Arc::clone(&ready_hook_ran);
+            let counts_at_first_delay = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let hook_counts_at_first_delay = Arc::clone(&counts_at_first_delay);
+            let ready_hook_analysis_counts = Arc::clone(&analysis_counts);
+            set_test_frozen_pages_ready_hook(&engine, move || {
+                hook_ready_hook_ran.store(true, AtomicOrdering::Relaxed);
+                let before_retry = hook_counts_at_first_delay.lock();
+                let after_readiness = ready_hook_analysis_counts.lock();
                 assert_eq!(before_retry.len(), after_readiness.len());
                 for (page_idx, (before, after)) in
                     before_retry.iter().zip(after_readiness.iter()).enumerate()
@@ -6741,18 +6924,18 @@ mod tests {
             assert_eq!(page_id, delayed_page_id);
             assert_eq!(stable_page_count, delayed_page_idx);
             assert!(unresolved_status);
-            assert!(!ready_hook_ran.get());
+            assert!(!ready_hook_ran.load(AtomicOrdering::Relaxed));
             assert!(
-                analysis_counts.borrow()[..=delayed_page_idx]
+                analysis_counts.lock()[..=delayed_page_idx]
                     .iter()
                     .all(|count| *count == 1)
             );
             assert!(
-                analysis_counts.borrow()[delayed_page_idx + 1..]
+                analysis_counts.lock()[delayed_page_idx + 1..]
                     .iter()
                     .all(|count| *count == 0)
             );
-            *counts_at_first_delay.borrow_mut() = analysis_counts.borrow().clone();
+            *counts_at_first_delay.lock() = analysis_counts.lock().clone();
 
             let validation = table.checkpoint_workflow.frozen_page_validation().unwrap();
             assert_eq!(validation.len(), page_ids.len());
@@ -6783,10 +6966,10 @@ mod tests {
             setup.wait_for_checkpoint_retry(reason).await.unwrap();
             let retry = setup.checkpoint_table(table_id).await.unwrap();
             assert!(matches!(retry, CheckpointOutcome::Published { .. }));
-            assert!(ready_hook_ran.get());
-            assert!(analysis_counts.borrow()[delayed_page_idx] >= 2);
+            assert!(ready_hook_ran.load(AtomicOrdering::Relaxed));
+            assert!(analysis_counts.lock()[delayed_page_idx] >= 2);
             assert!(
-                analysis_counts.borrow()[delayed_page_idx + 1..]
+                analysis_counts.lock()[delayed_page_idx + 1..]
                     .iter()
                     .all(|count| *count >= 1)
             );
@@ -6898,7 +7081,7 @@ mod tests {
             wait_for_checkpoint_root_ready(&mut session, table_id).await;
 
             let res = {
-                let _guard = ForceLwcBuildErrorGuard::new();
+                let _guard = ForceLwcBuildErrorGuard::new(&engine);
                 session.checkpoint_table(table_id).await
             };
             assert!(res.is_err());

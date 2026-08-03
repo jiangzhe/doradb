@@ -73,10 +73,14 @@ silently changing the batch or its snapshot boundary.
 
 One checkpoint attempt follows these conceptual phases:
 
-1. From an idle session, acquire scoped `TableMetadata(S)` and `TableData(IS)`
-   locks, revalidate the live table, and claim its checkpoint workflow.
-2. Hold root-mutation exclusion and verify that the currently active root is no
-   longer visible to an active snapshot before forking a mutable CoW root.
+1. From an idle session, acquire owned `TableMetadata(S)` and `TableData(IS)`
+   locks, revalidate the live table, claim its checkpoint workflow, and acquire
+   lifetime-free root-mutation exclusion while the caller future remains
+   cancellable.
+2. After the complete table, workflow, and root authority is prepared, transfer
+   it synchronously to the mandatory runtime. Accepted execution acquires none
+   of those resources and verifies that the currently active root is no longer
+   visible to an active snapshot before forking a mutable CoW root.
 3. Use the purge-published GC horizon as the exclusive cutoff for both frozen
    row images and cold-row delete selection, then allocate `checkpoint_ts`.
 4. Convert a ready frozen-page prefix into LWC blocks and collect matching
@@ -134,7 +138,12 @@ checkpoint attempt and returns listener-only wait state, so the subsequent
 sleep owns no table runtime, layout, frozen page, page guard, checkpoint
 attempt, or logical table lock. Completion only means a retry may be useful.
 `checkpoint_table_with_wait` retries delayed outcomes and returns published,
-cancelled, or error outcomes unchanged.
+cancelled, or error outcomes unchanged. Each delayed checkpoint attempt first
+reaches its own terminal operation state and releases its mandatory permit,
+table runtime, workflow/root authority, and logical locks. The standalone
+observer wait then owns only listener state. A useful wake starts a new
+checkpoint operation with a fresh operation key and freshly prepared
+authority; retries never reuse the completed attempt's operation owner.
 
 ### Root Liveness and Reclamation
 

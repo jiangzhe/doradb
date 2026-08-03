@@ -29,6 +29,8 @@ use crate::root::{StorageRootLease, StorageRootLeaseAttempt};
 use crate::runtime::block_on;
 use crate::runtime::mandatory::{MandatoryRuntime, MandatoryRuntimeWorkers};
 use crate::session::{Session, SessionRegistry};
+#[cfg(test)]
+use crate::table::tests::MaintenanceTestController;
 use crate::trx::sys::{TransactionPurgeWorkers, TransactionRedoWorkers, TransactionSystem};
 use crate::{DiskPool, IndexPool, MemPool, MetaPool};
 use error_stack::{Report, ResultExt};
@@ -711,6 +713,9 @@ pub(crate) struct EngineInner {
     /// Per-engine index-DDL fault and phase controller.
     #[cfg(test)]
     pub(crate) index_ddl_test: IndexDdlTestController,
+    /// Per-engine maintenance fault and phase controller.
+    #[cfg(test)]
+    pub(crate) maintenance_test: MaintenanceTestController,
     lifecycle: EngineLifecycle,
 }
 
@@ -941,6 +946,8 @@ async fn bootstrap_inner(config: EngineConfig) -> Result<Engine> {
         table_ddl_test: TableDdlTestController::default(),
         #[cfg(test)]
         index_ddl_test: IndexDdlTestController::default(),
+        #[cfg(test)]
+        maintenance_test: MaintenanceTestController::default(),
         lifecycle: EngineLifecycle::new(),
     };
     Ok(Engine {

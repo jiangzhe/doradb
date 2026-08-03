@@ -197,6 +197,19 @@ publishes the outer operation terminal. Unexpected execution unwind instead
 retains `FailedRetained`, publishes mandatory-runtime poison, and releases the
 caller permit after the accepted owner is dropped.
 
+Effectful maintenance uses the same contract. Table freeze/checkpoint transfer
+the exact live table, owned maintenance locks, workflow attempt, and checkpoint
+root-mutation scope. Catalog checkpoint and redo maintenance transfer their
+catalog-checkpoint and redo-retention scopes; combined maintenance preserves
+both through catalog publication, releases catalog admission before unlink,
+and retains redo exclusion until unlink accounting finishes. Secondary
+`MemIndex` cleanup transfers its table scope and stores each private
+transaction in accepted progress before scanning or awaiting. On normal
+completion domain workflow/gate and private-transaction resources release
+first, then prepared maintenance locks, and only then the outer session entry
+publishes `Terminal`. A dropped result observer owns none of these resources
+and cannot cancel accepted work.
+
 The supervisor catches both synchronous future construction and polling
 unwinds while the accepted operation or cleanup job remains in an outer owner.
 Its domain policy first releases or moves residual unsafe ownership into fatal

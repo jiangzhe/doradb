@@ -138,10 +138,14 @@ data coordination is described in [Lock System](./lock-system.md).
 ## Mandatory Background Runtime
 
 The engine owns one fixed-thread asynchronous executor for obligations that
-must reach a supervised terminal outcome after acceptance. Caller preparation
-and operation-lock waiting remain outside runtime capacity and are
-cancellable. A synchronous consuming acceptance edge transfers all prepared
-resources into mandatory ownership before the task is detached.
+must reach a supervised terminal outcome after acceptance. Effectful session
+maintenance uses this runtime beside table and index DDL: table freeze and
+checkpoint, catalog checkpoint, redo truncation, combined catalog/redo
+maintenance, and secondary `MemIndex` cleanup all prepare their complete
+authority before mandatory admission. Caller preparation and operation-lock
+waiting remain outside runtime capacity and are cancellable. A synchronous
+consuming acceptance edge transfers all prepared resources into mandatory
+ownership before the task is detached.
 
 The same executor replaces the former sequential transaction-cleanup thread.
 Abandoned transactions, explicit terminal rollback, and failed-precommit

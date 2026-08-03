@@ -119,7 +119,7 @@ The current implementation uses the following table-level mapping:
 | Full-table MVCC mutation | transaction `S` | transaction `X` | transaction |
 | Explicit shared table lock | session `S` | session `S` | explicit session |
 | Explicit exclusive table lock | session `S` | session `X` | explicit session |
-| Freeze/checkpoint | scoped `S` | scoped `IS` | maintenance operation |
+| Freeze/checkpoint | prepared owned `S` | prepared owned `IS` | prepared maintenance operation, then mandatory owner |
 | CREATE TABLE on a new id | target `X`; catalog slots 0-3 `S` | catalog slots 0-3 `IX` | prepared DDL operation, then mandatory owner |
 | DROP TABLE | target `X`; catalog slots 0-4 `S` | target `X`; catalog slots 0-4 `IX` | prepared DDL operation, then mandatory owner |
 | CREATE INDEX | target `X`; catalog slots 0,2,3 `S` | target `X`; catalog slots 0,2,3 `IX` | prepared DDL operation, then mandatory owner |
@@ -145,7 +145,10 @@ synchronously transfers the same `OwnerLockState` and operation owner to
 accepted execution; there is no release/reacquire window. Catalog statements
 receive a typed prepared-write authority that proves metadata S plus data IX
 for each catalog table and bypasses ordinary transaction lock acquisition.
-Maintenance continues through its scoped lock-manager path.
+Effectful maintenance likewise prepares an owned lock scope before mandatory
+admission and transfers the exact `OwnerLockState` without a release/reacquire
+window. The read-only `total_row_pages` observation remains caller-owned and
+uses the borrowed scoped lock-manager path.
 
 Recovery, purge, and no-transaction replay do not acquire logical locks. They
 run at lifecycle boundaries where foreground lock owners do not exist. Logical
@@ -327,11 +330,12 @@ global `release_owner()` scan during session cleanup.
 
 Transactions, DDL, maintenance, and explicit-lock mutations reserve ids from
 one plain session-local sequence. One public DDL call retains one
-`Operation` owner through its typed `SessionDdlContext`; one public maintenance
-workflow retains one `Operation` owner across every
-`ScopedTableRuntimeAccess`, bounded recheck, and internal retry. Operation
-cleanup still uses fresh-lock and scoped guards rather than an authoritative
-`LockScopeState`.
+`Operation` owner through its typed `SessionDdlContext`; one effectful public
+maintenance call retains one `Operation` owner through its prepared and
+accepted owned scope. A delayed checkpoint completes that operation before its
+observer-only wait and allocates a fresh operation owner for the next attempt.
+The caller-owned `total_row_pages` observation continues to use
+`ScopedTableRuntimeAccess`.
 
 Maintenance always records its own exact claims even when a covering
 `SessionExplicit` claim admits it. Releasing maintenance therefore cannot
