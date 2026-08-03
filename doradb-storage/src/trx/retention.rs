@@ -117,12 +117,12 @@ impl PendingDroppedTableRedoFloor {
     }
 }
 
-struct RedoTruncationExecution;
-
 struct RedoTruncationResources {
     catalog_scope: CatalogCheckpointScope,
     _redo_scope: RedoRetentionScope,
 }
+
+struct RedoTruncationExecution;
 
 impl MaintenanceExecutionSpec for RedoTruncationExecution {
     type Output = RedoTruncationOutcome;
@@ -151,28 +151,12 @@ impl MaintenanceExecutionSpec for RedoTruncationExecution {
     }
 }
 
-/// Prepare one redo truncation with catalog and redo authority held.
-pub(crate) fn prepare_redo_truncation_operation(
-    catalog_scope: CatalogCheckpointScope,
-    redo_scope: RedoRetentionScope,
-    scope: PreparedMaintenanceScope,
-) -> impl PreparedExecution<Output = RedoTruncationOutcome> {
-    PreparedMaintenanceExecution::<RedoTruncationExecution>::global(
-        scope,
-        RedoTruncationResources {
-            catalog_scope,
-            _redo_scope: redo_scope,
-        },
-        "accepted redo truncation panicked",
-    )
-}
-
-struct CatalogRedoMaintenanceExecution;
-
 struct CatalogRedoMaintenanceResources {
     catalog_scope: CatalogCheckpointScope,
     _redo_scope: RedoRetentionScope,
 }
+
+struct CatalogRedoMaintenanceExecution;
 
 impl MaintenanceExecutionSpec for CatalogRedoMaintenanceExecution {
     type Output = CatalogRedoMaintenanceOutcome;
@@ -199,6 +183,29 @@ impl MaintenanceExecutionSpec for CatalogRedoMaintenanceExecution {
         scope.mark_terminal_ready();
         result
     }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RedoCleanupCounts {
+    removed_files: usize,
+    already_missing_files: usize,
+    failed_unlink_files: usize,
+}
+
+/// Prepare one redo truncation with catalog and redo authority held.
+pub(crate) fn prepare_redo_truncation_operation(
+    catalog_scope: CatalogCheckpointScope,
+    redo_scope: RedoRetentionScope,
+    scope: PreparedMaintenanceScope,
+) -> impl PreparedExecution<Output = RedoTruncationOutcome> {
+    PreparedMaintenanceExecution::<RedoTruncationExecution>::global(
+        scope,
+        RedoTruncationResources {
+            catalog_scope,
+            _redo_scope: redo_scope,
+        },
+        "accepted redo truncation panicked",
+    )
 }
 
 /// Prepare combined catalog checkpoint and redo truncation authority.
@@ -272,13 +279,15 @@ impl TransactionSystem {
 
     /// Advance the durable redo retention marker and unlink obsolete redo files.
     ///
-    /// Lock ordering matches catalog checkpoint: acquire the catalog checkpoint
-    /// lease before the redo-retention lease. The catalog lease protects the
-    /// `catalog.mtb` root fork used to publish `first_redo_log_seq`, while the
-    /// redo-retention lease protects the retained redo suffix, catalog-safe
-    /// progress cache, and cleanup below the marker. They are separate because
-    /// the marker is catalog bootstrap metadata, but unlink races are about the
-    /// redo file family rather than catalog metadata shape.
+    /// The caller holds [`CatalogCheckpointScope`] acquired before
+    /// [`RedoRetentionScope`]. Catalog authority protects the `catalog.mtb` root
+    /// fork used to publish `first_redo_log_seq`, while redo-retention authority
+    /// protects the retained redo suffix, catalog-safe progress cache, and
+    /// cleanup below the marker.
+    ///
+    /// This method acquires neither scope. After marker publication, it invokes
+    /// `release_catalog` to release only catalog authority; the caller retains
+    /// redo-retention authority through obsolete-file cleanup.
     async fn truncate_redo_log_prepared<F>(
         &self,
         release_catalog: F,
@@ -568,13 +577,6 @@ impl TransactionSystem {
             },
         })
     }
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct RedoCleanupCounts {
-    removed_files: usize,
-    already_missing_files: usize,
-    failed_unlink_files: usize,
 }
 
 fn projected_catalog_redo_retention_progress(

@@ -210,13 +210,13 @@ enum CleanupIteration {
     Finished(RuntimeResult<MemIndexCleanupOutcome>),
 }
 
-struct MemIndexCleanupExecution;
-
 struct MemIndexCleanupResources {
     active_trx: Option<Transaction>,
     table: Arc<Table>,
     clean_live_entries: bool,
 }
+
+struct MemIndexCleanupExecution;
 
 impl MaintenanceExecutionSpec for MemIndexCleanupExecution {
     type Output = MemIndexCleanupOutcome;
@@ -258,6 +258,18 @@ pub(crate) fn prepare_mem_index_cleanup_operation(
     )
 }
 
+/// Full-scan cleanup for user-table secondary MemIndex entries.
+///
+/// This pass removes only entries proven redundant or obsolete against one
+/// captured table-file root. It never mutates DiskTree state, and it treats
+/// missing delete proof as a retention decision for delete overlays.
+///
+/// When `clean_live_entries` is `true`, redundant live MemIndex entries are
+/// removed only after the captured root is older than every active snapshot.
+/// Otherwise live entries are retained and [`MemIndexCleanupOutcome::live_delay`]
+/// reports the retry boundary. When `false`, live MemIndex cache entries are
+/// retained by policy and no live delay is reported. Obsolete delete overlays
+/// are cleaned independently in either case.
 async fn execute_mem_index_cleanup_inner(
     scope: &mut AcceptedMaintenanceScope,
     resources: &mut MemIndexCleanupResources,
@@ -335,6 +347,13 @@ async fn execute_mem_index_cleanup_inner(
         match iteration {
             CleanupIteration::Retry => {
                 rollback_res?;
+                // This retry is intentionally unbounded. The captured root was
+                // published after the transaction started, so retry with a
+                // fresh STS. Transaction starts and root fences share one
+                // monotonic timestamp source, making the next STS newer than
+                // this fence unless another root publication races again. The
+                // awaited rollback above keeps retries from becoming a tight
+                // busy loop.
             }
             CleanupIteration::Finished(cleanup_res) => {
                 return finish_secondary_mem_index_cleanup(cleanup_res, rollback_res);

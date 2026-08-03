@@ -126,14 +126,14 @@ impl DetachedCheckpointRetryWait {
     }
 }
 
-struct FreezeTableExecution;
-
 struct FreezeTableResources {
     attempt: Option<PreparedFreezeAttempt>,
     _root_mutation: TableCheckpointRootMutationScope,
     table: Arc<Table>,
     max_rows: usize,
 }
+
+struct FreezeTableExecution;
 
 impl MaintenanceExecutionSpec for FreezeTableExecution {
     type Output = FreezeOutcome;
@@ -161,38 +161,13 @@ impl MaintenanceExecutionSpec for FreezeTableExecution {
     }
 }
 
-/// Prepare reversible table-freeze workflow and root-mutation authority.
-pub(crate) fn prepare_freeze_table_operation(
-    scope: PreparedMaintenanceScope,
-    table: Arc<Table>,
-    max_rows: usize,
-) -> StdResult<impl PreparedExecution<Output = FreezeOutcome>, FreezeOutcome> {
-    let attempt = Arc::clone(&table).begin_freeze()?;
-    let root_mutation = match TableCheckpointRootMutationScope::acquire(Arc::clone(&table)) {
-        Ok(root_mutation) => root_mutation,
-        Err(reason) => return Err(FreezeOutcome::Cancelled { reason }),
-    };
-    let table_id = table.table_id();
-    Ok(PreparedMaintenanceExecution::<FreezeTableExecution>::table(
-        scope,
-        FreezeTableResources {
-            attempt: Some(attempt),
-            _root_mutation: root_mutation,
-            table,
-            max_rows,
-        },
-        "accepted table freeze panicked",
-        table_id,
-    ))
-}
-
-struct CheckpointTableExecution;
-
 struct CheckpointTableResources {
     attempt: Option<PreparedCheckpointAttempt>,
     _root_mutation: TableCheckpointRootMutationScope,
     table: Arc<Table>,
 }
+
+struct CheckpointTableExecution;
 
 impl MaintenanceExecutionSpec for CheckpointTableExecution {
     type Output = CheckpointOutcome;
@@ -218,34 +193,6 @@ impl MaintenanceExecutionSpec for CheckpointTableExecution {
         scope.mark_terminal_ready();
         result
     }
-}
-
-/// Prepare reversible table-checkpoint workflow and root-mutation authority.
-pub(crate) fn prepare_checkpoint_table_operation(
-    scope: PreparedMaintenanceScope,
-    table: Arc<Table>,
-) -> StdResult<impl PreparedExecution<Output = CheckpointOutcome>, CheckpointOutcome> {
-    let attempt = match Arc::clone(&table).begin_checkpoint() {
-        Ok(attempt) => attempt,
-        Err(reason) => return Err(CheckpointOutcome::Cancelled { reason }),
-    };
-    let root_mutation = match TableCheckpointRootMutationScope::acquire(Arc::clone(&table)) {
-        Ok(root_mutation) => root_mutation,
-        Err(reason) => return Err(CheckpointOutcome::Cancelled { reason }),
-    };
-    let table_id = table.table_id();
-    Ok(
-        PreparedMaintenanceExecution::<CheckpointTableExecution>::table(
-            scope,
-            CheckpointTableResources {
-                attempt: Some(attempt),
-                _root_mutation: root_mutation,
-                table,
-            },
-            "accepted table checkpoint panicked",
-            table_id,
-        ),
-    )
 }
 
 /// Owns one table checkpoint attempt and its reversible-to-fatal boundary.
@@ -956,6 +903,59 @@ impl SecondaryCheckpointSidecar {
         );
         active.sidecar.add_delete(key, row_id);
     }
+}
+
+/// Prepare reversible table-freeze workflow and root-mutation authority.
+pub(crate) fn prepare_freeze_table_operation(
+    scope: PreparedMaintenanceScope,
+    table: Arc<Table>,
+    max_rows: usize,
+) -> StdResult<impl PreparedExecution<Output = FreezeOutcome>, FreezeOutcome> {
+    let attempt = Arc::clone(&table).begin_freeze()?;
+    let root_mutation = match TableCheckpointRootMutationScope::acquire(Arc::clone(&table)) {
+        Ok(root_mutation) => root_mutation,
+        Err(reason) => return Err(FreezeOutcome::Cancelled { reason }),
+    };
+    let table_id = table.table_id();
+    Ok(PreparedMaintenanceExecution::<FreezeTableExecution>::table(
+        scope,
+        FreezeTableResources {
+            attempt: Some(attempt),
+            _root_mutation: root_mutation,
+            table,
+            max_rows,
+        },
+        "accepted table freeze panicked",
+        table_id,
+    ))
+}
+
+/// Prepare reversible table-checkpoint workflow and root-mutation authority.
+pub(crate) fn prepare_checkpoint_table_operation(
+    scope: PreparedMaintenanceScope,
+    table: Arc<Table>,
+) -> StdResult<impl PreparedExecution<Output = CheckpointOutcome>, CheckpointOutcome> {
+    let attempt = match Arc::clone(&table).begin_checkpoint() {
+        Ok(attempt) => attempt,
+        Err(reason) => return Err(CheckpointOutcome::Cancelled { reason }),
+    };
+    let root_mutation = match TableCheckpointRootMutationScope::acquire(Arc::clone(&table)) {
+        Ok(root_mutation) => root_mutation,
+        Err(reason) => return Err(CheckpointOutcome::Cancelled { reason }),
+    };
+    let table_id = table.table_id();
+    Ok(
+        PreparedMaintenanceExecution::<CheckpointTableExecution>::table(
+            scope,
+            CheckpointTableResources {
+                attempt: Some(attempt),
+                _root_mutation: root_mutation,
+                table,
+            },
+            "accepted table checkpoint panicked",
+            table_id,
+        ),
+    )
 }
 
 /// Builds the durable secondary DiskTree key encoder for one index spec.
@@ -1931,6 +1931,8 @@ impl Table {
         if !publish {
             return Ok(attempt.cancelled());
         }
+        // Allocate the fence only after every selected page has published
+        // FROZEN under its state lock.
         let frozen_ts = session.engine().trx_sys.allocate_snapshot_fence();
         let batch =
             FrozenPageBatch::new(self.table_id(), frozen_ts, heap_redo_start_ts, rows, pages);
@@ -4078,6 +4080,8 @@ mod tests {
                 *page_guard.unwrap_vmap().write_state() = unexpected;
                 drop(page_guard);
 
+                // The selected-page invariant must panic before an ordinary
+                // freeze outcome can be returned.
                 let err = session
                     .freeze_table(table_id, usize::MAX)
                     .await

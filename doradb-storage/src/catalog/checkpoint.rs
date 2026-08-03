@@ -178,6 +178,12 @@ impl CatalogCheckpointGate {
     }
 
     /// Acquire checkpoint admission without constructing a borrowed lease.
+    ///
+    /// Admission waits until no catalog metadata change is active or pending
+    /// and serializes overlapping catalog checkpoints or redo marker
+    /// publishers. It does not protect the retained redo suffix itself;
+    /// retained-redo scans, marker publication, and obsolete-file cleanup must
+    /// also hold [`RedoRetentionScope`].
     async fn acquire_checkpoint(&self) {
         loop {
             {
@@ -321,6 +327,9 @@ impl Drop for PendingCatalogMetadataChange<'_> {
 }
 
 /// Lifetime-free catalog checkpoint exclusion scope.
+///
+/// While held, other catalog checkpoints, redo marker publishers, and catalog
+/// metadata DDL wait on the catalog checkpoint gate.
 pub(crate) struct CatalogCheckpointScope {
     catalog: QuiescentGuard<Catalog>,
     active: bool,
@@ -353,12 +362,19 @@ impl Drop for CatalogCheckpointScope {
     }
 }
 
-struct CatalogCheckpointExecution;
-
 struct CatalogCheckpointResources {
     _catalog_scope: CatalogCheckpointScope,
     _redo_scope: RedoRetentionScope,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CatalogCheckpointTxnAction {
+    Include,
+    Skip,
+    Stop(CatalogCheckpointScanStopReason),
+}
+
+struct CatalogCheckpointExecution;
 
 impl MaintenanceExecutionSpec for CatalogCheckpointExecution {
     type Output = CatalogCheckpointOutcome;
@@ -401,6 +417,10 @@ pub(crate) fn prepare_catalog_checkpoint_operation(
 
 impl Catalog {
     /// Execute one checkpoint with catalog and redo authority already held.
+    ///
+    /// The caller must retain both exclusion scopes for the whole call so the
+    /// shared catalog root cannot acquire concurrent mutable writers and the
+    /// retained redo observation remains stable.
     async fn checkpoint_prepared(
         &self,
         trx_sys: &TransactionSystem,
@@ -692,13 +712,6 @@ impl Catalog {
             ) => unreachable!("index DDL root proof kind mismatch"),
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CatalogCheckpointTxnAction {
-    Include,
-    Skip,
-    Stop(CatalogCheckpointScanStopReason),
 }
 
 fn drop_table_has_catalog_table_delete(

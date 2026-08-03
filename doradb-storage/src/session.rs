@@ -1172,15 +1172,13 @@ impl Session {
             .disclose()?;
         let mandatory_runtime = operation.engine.mandatory_runtime.clone();
         let scope = PreparedMaintenanceScope::global(operation);
-        let catalog_scope = CatalogCheckpointScope::acquire(scope.engine().catalog_guard()).await;
-        let redo_scope = RedoRetentionScope::acquire(scope.engine().trx_sys.clone()).await;
-        scope.engine().poisoner.ensure_healthy().disclose()?;
+        let engine = scope.engine().clone();
+        let catalog_scope = CatalogCheckpointScope::acquire(engine.catalog_guard()).await;
+        let redo_scope = RedoRetentionScope::acquire(engine.trx_sys.clone()).await;
+        let prepared = prepare_catalog_checkpoint_operation(catalog_scope, redo_scope, scope);
+        engine.poisoner.ensure_healthy().disclose()?;
         let observer = mandatory_runtime
-            .submit(prepare_catalog_checkpoint_operation(
-                catalog_scope,
-                redo_scope,
-                scope,
-            ))
+            .submit(prepared)
             .await
             .attach("operation=checkpoint_catalog")
             .disclose()?;
@@ -1203,15 +1201,13 @@ impl Session {
             .disclose()?;
         let mandatory_runtime = operation.engine.mandatory_runtime.clone();
         let scope = PreparedMaintenanceScope::global(operation);
-        let catalog_scope = CatalogCheckpointScope::acquire(scope.engine().catalog_guard()).await;
-        let redo_scope = RedoRetentionScope::acquire(scope.engine().trx_sys.clone()).await;
-        scope.engine().poisoner.ensure_healthy().disclose()?;
+        let engine = scope.engine().clone();
+        let catalog_scope = CatalogCheckpointScope::acquire(engine.catalog_guard()).await;
+        let redo_scope = RedoRetentionScope::acquire(engine.trx_sys.clone()).await;
+        let prepared = prepare_catalog_redo_maintenance_operation(catalog_scope, redo_scope, scope);
+        engine.poisoner.ensure_healthy().disclose()?;
         let observer = mandatory_runtime
-            .submit(prepare_catalog_redo_maintenance_operation(
-                catalog_scope,
-                redo_scope,
-                scope,
-            ))
+            .submit(prepared)
             .await
             .attach("operation=checkpoint_catalog_and_truncate_redo_log")
             .disclose()?;
@@ -1233,15 +1229,13 @@ impl Session {
             .disclose()?;
         let mandatory_runtime = operation.engine.mandatory_runtime.clone();
         let scope = PreparedMaintenanceScope::global(operation);
-        let catalog_scope = CatalogCheckpointScope::acquire(scope.engine().catalog_guard()).await;
-        let redo_scope = RedoRetentionScope::acquire(scope.engine().trx_sys.clone()).await;
-        scope.engine().poisoner.ensure_healthy().disclose()?;
+        let engine = scope.engine().clone();
+        let catalog_scope = CatalogCheckpointScope::acquire(engine.catalog_guard()).await;
+        let redo_scope = RedoRetentionScope::acquire(engine.trx_sys.clone()).await;
+        let prepared = prepare_redo_truncation_operation(catalog_scope, redo_scope, scope);
+        engine.poisoner.ensure_healthy().disclose()?;
         let observer = mandatory_runtime
-            .submit(prepare_redo_truncation_operation(
-                catalog_scope,
-                redo_scope,
-                scope,
-            ))
+            .submit(prepared)
             .await
             .attach("operation=truncate_redo_log")
             .disclose()?;
@@ -5135,12 +5129,25 @@ pub(crate) mod tests {
             let redo_retention_scope =
                 RedoRetentionScope::acquire(engine.inner().trx_sys.clone()).await;
             let mut session = engine.new_session().unwrap();
+            let session_id = session.id();
+            let state = engine
+                .inner()
+                .session_registry
+                .session_state(session_id)
+                .unwrap();
             let mut maintenance_fut = Box::pin(session.checkpoint_catalog_and_truncate_redo_log());
 
             assert!(matches!(
                 futures::poll!(maintenance_fut.as_mut()),
                 std::task::Poll::Pending
             ));
+            let entry =
+                active_operation_entry_for_test(&engine.inner().session_registry, session_id);
+            assert_eq!(
+                entry.inspect().state,
+                SessionOperationState::Voluntary(None)
+            );
+            assert_eq!(engine.inner().mandatory_runtime.blocker_counts(), (0, 0));
 
             let _ = engine
                 .inner()
@@ -5154,6 +5161,25 @@ pub(crate) mod tests {
                 err.report().downcast_ref::<FatalError>().copied(),
                 Some(FatalError::RedoWrite)
             );
+            assert_eq!(entry.inspect().state, SessionOperationState::Terminal);
+            assert!(matches!(
+                state.lifecycle.lock().slot,
+                SessionOperationSlot::Idle
+            ));
+            assert_eq!(engine.inner().mandatory_runtime.blocker_counts(), (0, 0));
+            let mut catalog_acquire = Box::pin(CatalogCheckpointScope::acquire(
+                engine.inner().catalog.clone(),
+            ));
+            let Poll::Ready(catalog_scope) = futures::poll!(catalog_acquire.as_mut()) else {
+                panic!("failed preparation must release catalog checkpoint authority")
+            };
+            let mut redo_acquire =
+                Box::pin(RedoRetentionScope::acquire(engine.inner().trx_sys.clone()));
+            let Poll::Ready(redo_scope) = futures::poll!(redo_acquire.as_mut()) else {
+                panic!("failed preparation must release redo retention authority")
+            };
+            drop(catalog_scope);
+            drop(redo_scope);
             assert!(
                 obsolete_path.exists(),
                 "obsolete redo file should not be removed after poison"

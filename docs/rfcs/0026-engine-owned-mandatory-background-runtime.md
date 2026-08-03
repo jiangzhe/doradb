@@ -1238,10 +1238,10 @@ focused validation.
     completion.
   - Non-goals: Do not migrate standalone wait/diagnostic APIs, change
     checkpoint/redo policy or formats, or parallelize recovery/checkpoint.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000251-runtime-owned-mandatory-maintenance.md`
+  - Task Issue: `#928`
+  - Phase Status: done
+  - Implementation Summary: Implemented all six effectful maintenance roots as caller-prepared, mandatory-runtime-owned operations while preserving observer-only waits and finite read-only observations. [Task Resolve Sync: docs/tasks/000251-runtime-owned-mandatory-maintenance.md @ 2026-08-03]
 
 - **Phase 5: Lifecycle, Fairness, And Evolution Readiness**
   - Scope: Remove superseded foreground-handoff transitions and queue paths;
