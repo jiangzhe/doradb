@@ -5722,6 +5722,7 @@ pub(crate) mod tests {
             let trx1 = session.transaction_system_stats().unwrap();
             let storage1 = session.storage_io_stats().unwrap();
             let pools1 = session.buffer_pool_stats().unwrap();
+            engine.inner().mandatory_runtime.drain_callers().await;
             let mandatory1 = session.mandatory_runtime_stats().unwrap();
             // Commit waiters can complete before the redo thread publishes
             // aggregate stats, so this test verifies monotonic snapshots

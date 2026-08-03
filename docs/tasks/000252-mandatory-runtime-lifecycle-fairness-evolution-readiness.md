@@ -301,10 +301,12 @@ The interface has the following fixed semantics:
    after internal admission closes is not submitted.
 3. `started_count` advances when the supervised task receives its first runtime
    poll.
-4. `completed_count` advances after normal finish or panic preservation/result
-   publication and before the task owner and permit are released. A panic
+4. `completed_count` advances after normal finish or panic preservation and
+   before the task owner and permit are released. Caller completion and outcome
+   counters advance before result publication wakes the observer; internal
+   counters advance after job terminal handling or panic publication. A panic
    counted here may leave a session in `FailedRetained`; completion means the
-   supervisor published its terminal handling outcome, not that engine shutdown
+   supervisor reached its terminal handling outcome, not that engine shutdown
    is necessarily unblocked.
 5. `error_count` counts an accepted caller execution returning an ordinary
    completion error. `panic_count` counts supervised caller or internal task
@@ -321,7 +323,8 @@ The interface has the following fixed semantics:
 9. `queue_wait_nanos` covers successful acceptance/submission through the first
    supervised poll.
 10. `execution_nanos` covers the first supervised poll through normal finish or
-    panic preservation and result publication.
+    panic preservation immediately before caller result publication; internal
+    timing covers the job's terminal handling.
 11. Snapshot fields are independently sampled diagnostics. Concurrent
     snapshots do not promise a transactionally consistent equation among
     submitted, started, completed, and active counts.

@@ -440,7 +440,10 @@ impl Engine {
             || mandatory_internal != 0
         {
             let strong_refs = strong_count - 1;
-            let busy = strong_refs.max(usize::from(operation_blocked));
+            let busy = strong_refs
+                .max(usize::from(operation_blocked))
+                .max(mandatory_callers)
+                .max(mandatory_internal);
             obs::warn!(
                 "event=engine_lifecycle component=engine action=shutdown_finish result=busy mode=try origin=explicit busy={} strong_refs={} operation_blocked={} operation_state={} voluntary_blocked={} mandatory_session_blocked={} cleanup_queued={} mandatory_callers={} mandatory_internal={}",
                 busy,
@@ -454,7 +457,7 @@ impl Engine {
                 mandatory_internal
             );
             return Err(Report::new(LifecycleError::ShutdownBusy).attach(format!(
-                "strong_refs={strong_refs}, operation_blocked={operation_blocked}, operation_state={operation_state}, voluntary_blocked={voluntary_blocked}, mandatory_session_blocked={mandatory_session_blocked}, cleanup_queued={cleanup_queued}, mandatory_callers={mandatory_callers}, mandatory_internal={mandatory_internal}"
+                "origin=explicit, strong_refs={strong_refs}, operation_blocked={operation_blocked}, operation_state={operation_state}, voluntary_blocked={voluntary_blocked}, mandatory_session_blocked={mandatory_session_blocked}, cleanup_queued={cleanup_queued}, mandatory_callers={mandatory_callers}, mandatory_internal={mandatory_internal}"
             )));
         }
         self.finish_shutdown_locked(inner);
@@ -1986,7 +1989,7 @@ mod tests {
             assert_eq!(
                 err.report().downcast_ref::<String>().map(String::as_str),
                 Some(
-                    "strong_refs=1, operation_blocked=false, operation_state=none, voluntary_blocked=false, mandatory_session_blocked=false, cleanup_queued=false, mandatory_callers=0, mandatory_internal=0"
+                    "origin=explicit, strong_refs=1, operation_blocked=false, operation_state=none, voluntary_blocked=false, mandatory_session_blocked=false, cleanup_queued=false, mandatory_callers=0, mandatory_internal=0"
                 )
             );
 
@@ -2069,7 +2072,7 @@ mod tests {
             assert_eq!(
                 err.report().downcast_ref::<String>().map(String::as_str),
                 Some(
-                    "strong_refs=1, operation_blocked=false, operation_state=none, voluntary_blocked=false, mandatory_session_blocked=false, cleanup_queued=false, mandatory_callers=0, mandatory_internal=0"
+                    "origin=explicit, strong_refs=1, operation_blocked=false, operation_state=none, voluntary_blocked=false, mandatory_session_blocked=false, cleanup_queued=false, mandatory_callers=0, mandatory_internal=0"
                 )
             );
             assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
@@ -2102,7 +2105,7 @@ mod tests {
             assert_eq!(
                 err.report().downcast_ref::<String>().map(String::as_str),
                 Some(
-                    "strong_refs=0, operation_blocked=true, operation_state=voluntary, voluntary_blocked=true, mandatory_session_blocked=false, cleanup_queued=false, mandatory_callers=0, mandatory_internal=0"
+                    "origin=explicit, strong_refs=0, operation_blocked=true, operation_state=voluntary, voluntary_blocked=true, mandatory_session_blocked=false, cleanup_queued=false, mandatory_callers=0, mandatory_internal=0"
                 )
             );
 
@@ -2135,7 +2138,7 @@ mod tests {
             assert_eq!(
                 err.report().downcast_ref::<String>().map(String::as_str),
                 Some(
-                    "strong_refs=0, operation_blocked=true, operation_state=voluntary, voluntary_blocked=true, mandatory_session_blocked=false, cleanup_queued=false, mandatory_callers=0, mandatory_internal=0"
+                    "origin=explicit, strong_refs=0, operation_blocked=true, operation_state=voluntary, voluntary_blocked=true, mandatory_session_blocked=false, cleanup_queued=false, mandatory_callers=0, mandatory_internal=0"
                 )
             );
 

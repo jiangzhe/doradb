@@ -244,6 +244,10 @@ monotonic `submitted_count`, `started_count`, `completed_count`,
 `admission_wait_nanos`, `queue_wait_nanos`, and `execution_nanos` fields plus
 the current authoritative `active_count`. Fields are independently sampled;
 concurrent snapshots do not promise a transactionally consistent equation.
+Caller terminal counts, outcomes, and execution time are recorded before
+completion publication wakes the observer, so a snapshot taken immediately
+after an observed result includes that result. `active_count` remains
+independently sampled until the supervisor releases its permit.
 The inspection remains available after poison while engine/session lifecycle
 inspection is admitted and creates no runtime work.
 

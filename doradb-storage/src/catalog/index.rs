@@ -2147,11 +2147,12 @@ pub(crate) mod tests {
     use crate::table::tests::assert_freeze_created;
     use crate::trx::{MAX_SNAPSHOT_TS, Transaction};
     use crate::value::{Val, ValKind};
-    use smol::Timer;
+    use smol::{Timer, future::race};
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::mpsc::sync_channel;
+    use std::task::Poll;
     use std::thread::spawn;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -2834,33 +2835,73 @@ pub(crate) mod tests {
             insert_rows(&table, &mut ddl_session, 0, 129, "fairness").await;
             let before = ddl_session.mandatory_runtime_stats().unwrap();
 
-            for _ in 0..8 {
-                let (entered, release) = engine
-                    .inner()
-                    .index_ddl_test
-                    .install_gate(IndexDdlTestPhase::CreateHotBuildBatchComplete);
-                let mut create = Box::pin(ddl_session.create_index(
-                    table_id,
-                    IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
-                ));
-                assert!(matches!(
-                    futures::poll!(create.as_mut()),
-                    std::task::Poll::Pending
-                ));
-                entered.recv_async().await.unwrap();
+            for iteration in 0..8 {
+                let expected_cleanup_submitted =
+                    before.transaction_cleanup.submitted_count + iteration + 1;
+                race(
+                    async {
+                        let (entered, release) = engine
+                            .inner()
+                            .index_ddl_test
+                            .install_gate(IndexDdlTestPhase::CreateHotBuildBatchComplete);
+                        let mut create = Box::pin(ddl_session.create_index(
+                            table_id,
+                            IndexSpec::new(
+                                vec![IndexKey::new(1)],
+                                IndexAttributes::empty(),
+                            ),
+                        ));
+                        assert!(matches!(
+                            futures::poll!(create.as_mut()),
+                            Poll::Pending
+                        ));
+                        entered.recv_async().await.unwrap();
 
-                let mut cleanup_session = engine.new_session().unwrap();
-                cleanup_session
-                    .begin_trx()
-                    .unwrap()
-                    .rollback()
-                    .await
-                    .unwrap();
-                cleanup_session.close().await.unwrap();
+                        let mut cleanup_session = engine.new_session().unwrap();
+                        let mut rollback =
+                            Box::pin(cleanup_session.begin_trx().unwrap().rollback());
+                        let mut rollback_result = None;
+                        loop {
+                            if rollback_result.is_none()
+                                && let Poll::Ready(result) = futures::poll!(rollback.as_mut())
+                            {
+                                rollback_result = Some(result);
+                            }
+                            let cleanup_submitted = engine
+                                .inner()
+                                .mandatory_runtime
+                                .stats()
+                                .transaction_cleanup
+                                .submitted_count;
+                            if cleanup_submitted >= expected_cleanup_submitted {
+                                break;
+                            }
+                            assert!(
+                                rollback_result.is_none(),
+                                "rollback completed before mandatory cleanup submission"
+                            );
+                            Timer::after(Duration::from_millis(1)).await;
+                        }
 
-                release.send_async(()).await.unwrap();
-                let index_no = create.await.unwrap();
-                ddl_session.drop_index(table_id, index_no).await.unwrap();
+                        release.send_async(()).await.unwrap();
+                        match rollback_result {
+                            Some(result) => result,
+                            None => rollback.await,
+                        }
+                        .unwrap();
+                        cleanup_session.close().await.unwrap();
+
+                        let index_no = create.await.unwrap();
+                        ddl_session.drop_index(table_id, index_no).await.unwrap();
+                    },
+                    async {
+                        Timer::after(Duration::from_secs(5)).await;
+                        panic!(
+                            "one-runner index DDL and cleanup scheduling timed out: iteration={iteration}"
+                        );
+                    },
+                )
+                .await;
             }
 
             let after = ddl_session.mandatory_runtime_stats().unwrap();

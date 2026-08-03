@@ -1000,10 +1000,10 @@ impl QuiescentGuard<MandatoryRuntime> {
         let metadata = job.metadata();
         let queued_at = Instant::now();
         let task_runtime = self.clone();
+        self.transaction_cleanup_counters.record_submitted(0);
         self.executor
             .spawn(task_runtime.supervise_internal(job, metadata, permit, queued_at))
             .detach();
-        self.transaction_cleanup_counters.record_submitted(0);
         Ok(())
     }
 
@@ -1039,27 +1039,27 @@ impl QuiescentGuard<MandatoryRuntime> {
         let outcome = AssertUnwindSafe(async { accepted.execute().await })
             .catch_unwind()
             .await;
-        let (result, observer) = match outcome {
-            Ok(result) => {
-                let task_result = if result.is_ok() {
+        let (result, completion_result) = match outcome {
+            Ok(completion_result) => {
+                let task_result = if completion_result.is_ok() {
                     MandatoryTaskResult::Ok
                 } else {
                     MandatoryTaskResult::Error
                 };
                 accepted.finish();
-                (task_result, producer.complete(result))
+                (task_result, completion_result)
             }
             Err(panic) => {
                 let error = accepted.handle_panic(panic).await;
                 self.poison_mandatory_panic(&metadata);
-                (
-                    MandatoryTaskResult::Panic,
-                    producer.complete(Err::<A::Output, _>(error)),
-                )
+                (MandatoryTaskResult::Panic, Err::<A::Output, _>(error))
             }
         };
         let execution_nanos = elapsed_nanos(started_at);
         counters.record_completed(result, execution_nanos);
+        // Publish terminal metrics before waking the observer so an immediate
+        // statistics snapshot includes the completion that it just consumed.
+        let observer = producer.complete(completion_result);
         obs::debug!(
             "event=mandatory_task component=mandatory_runtime action=finish result={} task_class={} task_label={} session_operation={} table_id={} execution_nanos={} observer={}",
             result.label(),
@@ -1146,7 +1146,6 @@ mod tests {
     use crate::conf::MandatoryRuntimeConfig;
     use crate::error::{ErrorKind, OperationError};
     use crate::thread::fail_spawn_named;
-    use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
@@ -1379,12 +1378,37 @@ mod tests {
         completed: Arc<Completion<()>>,
     }
 
+    struct OverlapRendezvous {
+        registrations: AtomicUsize,
+        ready: Completion<()>,
+    }
+
+    impl OverlapRendezvous {
+        #[inline]
+        fn new() -> Self {
+            Self {
+                registrations: AtomicUsize::new(0),
+                ready: Completion::new(),
+            }
+        }
+
+        #[inline]
+        async fn arrive(&self) -> CompletionResult<()> {
+            let registrations = self.registrations.fetch_add(1, Ordering::AcqRel) + 1;
+            assert!(registrations <= 2, "overlap task registered more than once");
+            if registrations == 2 {
+                self.ready.complete(Ok(()));
+            }
+            self.ready.wait_result().await
+        }
+    }
+
     struct OverlapPrepared {
-        barrier: Arc<Barrier>,
+        rendezvous: Arc<OverlapRendezvous>,
     }
 
     struct OverlapAccepted {
-        barrier: Arc<Barrier>,
+        rendezvous: Arc<OverlapRendezvous>,
     }
 
     impl PreparedExecution for OverlapPrepared {
@@ -1401,7 +1425,7 @@ mod tests {
         #[inline]
         fn accept(self) -> Self::Accepted {
             OverlapAccepted {
-                barrier: self.barrier,
+                rendezvous: self.rendezvous,
             }
         }
     }
@@ -1411,10 +1435,7 @@ mod tests {
 
         #[inline]
         async fn execute(&mut self) -> CompletionResult<Self::Output> {
-            // Test-only blocking rendezvous proves two OS runners poll accepted
-            // tasks concurrently rather than interleaving them on one runner.
-            self.barrier.wait();
-            Ok(())
+            self.rendezvous.arrive().await
         }
 
         #[inline]
@@ -1562,7 +1583,6 @@ mod tests {
             assert_eq!(observer.wait().await.unwrap().0, 1);
             assert_eq!(moves.load(Ordering::Relaxed), 1);
             assert_eq!(finishes.load(Ordering::Relaxed), 1);
-            mandatory.drain_callers().await;
             let stats = mandatory.stats();
             assert_eq!(stats.operation.submitted_count, 1);
             assert_eq!(stats.operation.started_count, 1);
@@ -1570,8 +1590,9 @@ mod tests {
             assert_eq!(stats.operation.error_count, 0);
             assert_eq!(stats.operation.panic_count, 0);
             assert_eq!(stats.operation.detached_observer_count, 0);
-            assert_eq!(stats.operation.active_count, 0);
             assert_eq!(stats.transaction_cleanup, MandatoryTaskStats::default());
+            mandatory.drain_callers().await;
+            assert_eq!(mandatory.stats().operation.active_count, 0);
 
             (registry, mandatory)
         });
@@ -1611,6 +1632,12 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(error.kind(), ErrorKind::Operation);
+            let stats = mandatory.stats().operation;
+            assert_eq!(stats.submitted_count, 1);
+            assert_eq!(stats.started_count, 1);
+            assert_eq!(stats.completed_count, 1);
+            assert_eq!(stats.error_count, 1);
+            assert_eq!(stats.panic_count, 0);
             mandatory.drain_callers().await;
 
             let observer = mandatory
@@ -1719,7 +1746,7 @@ mod tests {
     }
 
     #[test]
-    fn two_runners_poll_independent_accepted_tasks_concurrently() {
+    fn independent_accepted_tasks_overlap_without_blocking_runners() {
         let (registry, mandatory) = runtime::block_on(async {
             let mut builder = RegistryBuilder::new();
             builder.build::<EnginePoisoner>(()).await.unwrap();
@@ -1735,23 +1762,23 @@ mod tests {
             let registry = builder.finish();
             let mandatory = registry.dependency::<MandatoryRuntime>();
             for _ in 0..32 {
-                let barrier = Arc::new(Barrier::new(3));
+                let rendezvous = Arc::new(OverlapRendezvous::new());
                 let first = mandatory
                     .submit(OverlapPrepared {
-                        barrier: Arc::clone(&barrier),
+                        rendezvous: Arc::clone(&rendezvous),
                     })
                     .await
                     .unwrap();
                 let second = mandatory
                     .submit(OverlapPrepared {
-                        barrier: Arc::clone(&barrier),
+                        rendezvous: Arc::clone(&rendezvous),
                     })
                     .await
                     .unwrap();
 
-                barrier.wait();
                 first.wait().await.unwrap();
                 second.wait().await.unwrap();
+                assert_eq!(rendezvous.registrations.load(Ordering::Acquire), 2);
                 mandatory.drain_callers().await;
             }
             let stats = mandatory.stats().operation;

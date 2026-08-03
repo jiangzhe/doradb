@@ -225,7 +225,9 @@ errors are written to stderr.
   mandatory snapshot is captured once per engine, not summed once per session;
   its fixed names are `mandatory.operation.*` and
   `mandatory.transaction_cleanup.*`. Monotonic fields are deltas and active
-  counts are the independently sampled ending values.
+  counts are the independently sampled ending values. Caller terminal counters
+  are published before their result waiters wake, so the ending snapshot
+  includes the final observed mandatory operation.
 - `Final Result`: operation count, inserted rows, found count, not-found count,
   returned rows, elapsed time, throughput, average nanoseconds per operation,
   and failures.
