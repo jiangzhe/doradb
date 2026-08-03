@@ -1270,17 +1270,18 @@ focused validation.
     scheduling-policy RFC or separate work on backlog 000167. Missing
     checkpoint/freeze/shutdown-reopen performance coverage remains backlog
     000147; missing large rollback and heterogeneous mandatory-runtime coverage
-    is recorded as a separate deferred `doradb-bench` backlog.
+    is recorded in backlog 000176 as separate deferred `doradb-bench` design.
   - Non-goals: Do not implement adaptive resizing, priority lanes, parallel
     recovery/checkpoint/index algorithms, forced shutdown, or explicit
     operation cancellation.
   - Task Doc: `docs/tasks/000252-mandatory-runtime-lifecycle-fairness-evolution-readiness.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Issue: `#931`
+  - Phase Status: done
+  - Implementation Summary: Implemented fixed-class observability, cooperative cleanup progress, coherent shutdown diagnostics, and the final RFC-0026 runtime evidence without changing accepted-operation ownership or adding scheduler policy. [Task Resolve Sync: docs/tasks/000252-mandatory-runtime-lifecycle-fairness-evolution-readiness.md @ 2026-08-03]
   - Related Backlogs:
     - `docs/backlogs/closed/000123-adaptive-background-worker-runtime.md`
     - `docs/backlogs/000147-doradb-bench-checkpoint-lifecycle-scenarios.md`
+    - `docs/backlogs/000176-quantify-rollback-saturation-alongside-mandatory-ddl.md`
 
 ## Test Strategy
 
