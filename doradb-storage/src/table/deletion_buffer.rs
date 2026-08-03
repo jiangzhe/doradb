@@ -13,8 +13,9 @@
 
 use crate::id::{RowID, TrxID};
 use crate::map::FastDashMap;
-use crate::trx::{SharedTrxStatus, trx_is_committed};
+use crate::trx::{PrepareListenerResult, SharedTrxStatus, trx_is_committed};
 use dashmap::mapref::entry::Entry;
+use event_listener::EventListener;
 use std::sync::Arc;
 
 /// Result of attempting to claim or seed a cold-row delete marker.
@@ -25,6 +26,23 @@ pub(crate) enum DeletionError {
     WriteConflict,
     /// A committed delete already exists and is visible to the caller.
     AlreadyDeleted,
+}
+
+/// Result of a foreground cold-row ownership claim.
+pub(crate) enum DeletionClaim {
+    /// The caller installed or already owns the delete marker.
+    Acquired,
+    /// A foreign owner is preparing; wait when a listener was registered, then
+    /// retry from authoritative row and marker state.
+    Preparing(Option<EventListener>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingDeletion {
+    Acquired,
+    AlreadyDeleted,
+    WriteConflict,
+    ForeignActive,
 }
 
 /// Delete state stored for a logical row that currently belongs to column
@@ -85,28 +103,10 @@ impl ColumnDeletionBuffer {
         match self.entries.entry(row_id) {
             Entry::Occupied(entry) => match entry.get() {
                 DeleteMarker::Ref(existing) => {
-                    let ts = existing.ts();
-                    if trx_is_committed(ts) {
-                        // A committed Ref is semantically identical to a compact
-                        // committed marker until a maintenance path promotes it.
-                        if ts <= snapshot_sts {
-                            return Err(DeletionError::AlreadyDeleted);
-                        }
-                        return Err(DeletionError::WriteConflict);
-                    }
-                    if Arc::ptr_eq(existing, &status) {
-                        return Ok(());
-                    }
-                    // Any live Ref owned by another transaction is the cold-row
-                    // write lock.
-                    Err(DeletionError::WriteConflict)
+                    Self::no_wait_result(Self::classify_ref(existing, &status, snapshot_sts))
                 }
                 DeleteMarker::Committed(ts) => {
-                    if *ts <= snapshot_sts {
-                        Err(DeletionError::AlreadyDeleted)
-                    } else {
-                        Err(DeletionError::WriteConflict)
-                    }
+                    Self::no_wait_result(Self::classify_committed(*ts, snapshot_sts))
                 }
             },
             Entry::Vacant(entry) => {
@@ -114,6 +114,118 @@ impl ColumnDeletionBuffer {
                 Ok(())
             }
         }
+    }
+
+    /// Claims a cold row for a foreground update or delete.
+    ///
+    /// Unlike [`ColumnDeletionBuffer::put_ref`], a foreign preparing owner
+    /// returns its shared prepare listener. The returned listener is owned and
+    /// the deletion-buffer entry guard has already been released.
+    #[inline]
+    pub(crate) fn claim_ref(
+        &self,
+        row_id: RowID,
+        status: Arc<SharedTrxStatus>,
+        snapshot_sts: TrxID,
+    ) -> Result<DeletionClaim, DeletionError> {
+        match self.entries.entry(row_id) {
+            Entry::Occupied(entry) => match entry.get() {
+                DeleteMarker::Ref(existing) => {
+                    match Self::classify_ref(existing, &status, snapshot_sts) {
+                        ExistingDeletion::Acquired => Ok(DeletionClaim::Acquired),
+                        ExistingDeletion::AlreadyDeleted => Err(DeletionError::AlreadyDeleted),
+                        ExistingDeletion::WriteConflict => Err(DeletionError::WriteConflict),
+                        ExistingDeletion::ForeignActive => {
+                            match existing.prepare_listener() {
+                                PrepareListenerResult::NotPreparing => {
+                                    // Commit can publish its timestamp just before
+                                    // prepare completion clears the flag.
+                                    Self::foreground_committed_result(existing.ts(), snapshot_sts)
+                                        .unwrap_or(Err(DeletionError::WriteConflict))
+                                }
+                                PrepareListenerResult::Registered(listener) => {
+                                    Ok(DeletionClaim::Preparing(Some(listener)))
+                                }
+                                PrepareListenerResult::Completed => {
+                                    // Completion won registration. Reclassify a
+                                    // committed owner under the CDB entry guard; an
+                                    // active timestamp requires an immediate retry so
+                                    // rollback removal or fatal poison can be observed.
+                                    Self::foreground_committed_result(existing.ts(), snapshot_sts)
+                                        .unwrap_or(Ok(DeletionClaim::Preparing(None)))
+                                }
+                            }
+                        }
+                    }
+                }
+                DeleteMarker::Committed(ts) => {
+                    Self::foreground_result(Self::classify_committed(*ts, snapshot_sts))
+                }
+            },
+            Entry::Vacant(entry) => {
+                entry.insert(DeleteMarker::Ref(status));
+                Ok(DeletionClaim::Acquired)
+            }
+        }
+    }
+
+    #[inline]
+    fn classify_ref(
+        existing: &Arc<SharedTrxStatus>,
+        status: &Arc<SharedTrxStatus>,
+        snapshot_sts: TrxID,
+    ) -> ExistingDeletion {
+        let ts = existing.ts();
+        if trx_is_committed(ts) {
+            // A committed Ref is semantically identical to a compact marker
+            // until a maintenance path promotes it.
+            return Self::classify_committed(ts, snapshot_sts);
+        }
+        if Arc::ptr_eq(existing, status) {
+            ExistingDeletion::Acquired
+        } else {
+            ExistingDeletion::ForeignActive
+        }
+    }
+
+    #[inline]
+    fn classify_committed(ts: TrxID, snapshot_sts: TrxID) -> ExistingDeletion {
+        if ts <= snapshot_sts {
+            ExistingDeletion::AlreadyDeleted
+        } else {
+            ExistingDeletion::WriteConflict
+        }
+    }
+
+    #[inline]
+    fn no_wait_result(classification: ExistingDeletion) -> Result<(), DeletionError> {
+        match classification {
+            ExistingDeletion::Acquired => Ok(()),
+            ExistingDeletion::AlreadyDeleted => Err(DeletionError::AlreadyDeleted),
+            ExistingDeletion::WriteConflict | ExistingDeletion::ForeignActive => {
+                Err(DeletionError::WriteConflict)
+            }
+        }
+    }
+
+    #[inline]
+    fn foreground_result(classification: ExistingDeletion) -> Result<DeletionClaim, DeletionError> {
+        match classification {
+            ExistingDeletion::Acquired => Ok(DeletionClaim::Acquired),
+            ExistingDeletion::AlreadyDeleted => Err(DeletionError::AlreadyDeleted),
+            ExistingDeletion::WriteConflict | ExistingDeletion::ForeignActive => {
+                Err(DeletionError::WriteConflict)
+            }
+        }
+    }
+
+    #[inline]
+    fn foreground_committed_result(
+        ts: TrxID,
+        snapshot_sts: TrxID,
+    ) -> Option<Result<DeletionClaim, DeletionError>> {
+        trx_is_committed(ts)
+            .then(|| Self::foreground_result(Self::classify_committed(ts, snapshot_sts)))
     }
 
     /// Inserts a compact committed delete marker for a cold row.
@@ -280,10 +392,17 @@ impl ColumnDeletionBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::trx::tests::shared_trx_status;
+    use crate::trx::tests::{
+        commit_preparing_shared_trx_status, install_prepare_listener_before_lock_hook,
+        prepare_event_is_installed, prepare_shared_trx_status,
+        rollback_preparing_shared_trx_status, shared_trx_status,
+    };
     use crate::trx::{MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID};
+    use event_listener::Listener;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::thread::spawn;
 
     #[test]
     fn test_delete_marker_is_globally_purgeable_with_is_lazy() {
@@ -359,5 +478,129 @@ mod tests {
             buffer.put_ref(RowID::new(2), status, TrxID::new(29)),
             Err(DeletionError::WriteConflict)
         );
+    }
+
+    #[test]
+    fn test_foreground_claim_waits_for_shared_preparing_owner() {
+        let buffer = ColumnDeletionBuffer::new();
+        let owner = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 10));
+        let first_waiter = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 11));
+        let second_waiter = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 12));
+        buffer
+            .put_ref(RowID::new(1), Arc::clone(&owner), MAX_SNAPSHOT_TS)
+            .unwrap();
+        prepare_shared_trx_status(&owner);
+        assert!(!prepare_event_is_installed(&owner));
+
+        let first = match buffer
+            .claim_ref(RowID::new(1), first_waiter, MAX_SNAPSHOT_TS)
+            .unwrap()
+        {
+            DeletionClaim::Preparing(Some(listener)) => listener,
+            _ => panic!("preparing owner should return an installed listener"),
+        };
+        assert!(prepare_event_is_installed(&owner));
+        let second = match buffer
+            .claim_ref(RowID::new(1), second_waiter, MAX_SNAPSHOT_TS)
+            .unwrap()
+        {
+            DeletionClaim::Preparing(Some(listener)) => listener,
+            _ => panic!("later waiter should reuse the installed listener"),
+        };
+
+        let cts = TrxID::new(40);
+        commit_preparing_shared_trx_status(&owner, cts);
+        first.wait();
+        second.wait();
+        assert!(!prepare_event_is_installed(&owner));
+        let requester = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 13));
+        assert!(matches!(
+            buffer.claim_ref(RowID::new(1), requester, cts),
+            Err(DeletionError::AlreadyDeleted)
+        ));
+    }
+
+    #[test]
+    fn test_no_wait_claim_does_not_inject_prepare_event() {
+        let buffer = ColumnDeletionBuffer::new();
+        let owner = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 20));
+        let requester = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 21));
+        buffer
+            .put_ref(RowID::new(1), Arc::clone(&owner), MAX_SNAPSHOT_TS)
+            .unwrap();
+        assert!(matches!(
+            buffer.claim_ref(RowID::new(1), Arc::clone(&requester), MAX_SNAPSHOT_TS),
+            Err(DeletionError::WriteConflict)
+        ));
+        assert!(
+            !prepare_event_is_installed(&owner),
+            "ordinary active foreground conflict must not install an event"
+        );
+        prepare_shared_trx_status(&owner);
+
+        assert_eq!(
+            buffer.put_ref(RowID::new(1), requester, MAX_SNAPSHOT_TS),
+            Err(DeletionError::WriteConflict)
+        );
+        assert!(!prepare_event_is_installed(&owner));
+        rollback_preparing_shared_trx_status(&owner);
+    }
+
+    #[test]
+    fn test_rollback_marker_removal_does_not_deadlock_listener_registration() {
+        let buffer = Arc::new(ColumnDeletionBuffer::new());
+        let row_id = RowID::new(1);
+        let owner = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 30));
+        buffer
+            .put_ref(row_id, Arc::clone(&owner), MAX_SNAPSHOT_TS)
+            .unwrap();
+        prepare_shared_trx_status(&owner);
+
+        let (loaded_tx, loaded_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let claimant_buffer = Arc::clone(&buffer);
+        let claimant = spawn(move || {
+            install_prepare_listener_before_lock_hook(move || {
+                loaded_tx
+                    .send(())
+                    .expect("claimant should report its optimistic prepare load");
+                release_rx
+                    .recv()
+                    .expect("claimant registration should be released");
+            });
+            let requester = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 31));
+            let claim = claimant_buffer
+                .claim_ref(row_id, requester, MAX_SNAPSHOT_TS)
+                .expect("preparing owner should produce a foreground wait");
+            let DeletionClaim::Preparing(Some(listener)) = claim else {
+                panic!("claimant should install the shared prepare listener")
+            };
+            listener.wait();
+        });
+
+        loaded_rx
+            .recv()
+            .expect("claimant should hold the CDB entry before prepare registration");
+        let (rollback_tx, rollback_rx) = mpsc::channel();
+        let rollback_buffer = Arc::clone(&buffer);
+        let rollback_owner = Arc::clone(&owner);
+        let rollback = spawn(move || {
+            rollback_tx
+                .send(())
+                .expect("rollback should report marker-removal attempt");
+            rollback_buffer.remove(row_id);
+            rollback_preparing_shared_trx_status(&rollback_owner);
+        });
+        rollback_rx
+            .recv()
+            .expect("rollback should start in production lock order");
+        release_tx
+            .send(())
+            .expect("claimant registration should resume");
+
+        claimant.join().expect("claimant should wake");
+        rollback.join().expect("rollback should finish");
+        assert!(buffer.get(row_id).is_none());
+        assert!(!prepare_event_is_installed(&owner));
     }
 }

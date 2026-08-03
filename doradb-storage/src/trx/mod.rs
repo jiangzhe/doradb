@@ -493,6 +493,16 @@ impl Drop for Transaction {
     }
 }
 
+/// Result of registering for a transaction's prepare completion.
+pub(crate) enum PrepareListenerResult {
+    /// The transaction was not preparing when registration started.
+    NotPreparing,
+    /// Registration succeeded and the listener must be awaited.
+    Registered(EventListener),
+    /// Prepare completion won the race with first-listener registration.
+    Completed,
+}
+
 /// Shared transaction timestamp state referenced by row undo heads.
 pub(crate) struct SharedTrxStatus {
     ts: AtomicU64,
@@ -572,33 +582,48 @@ impl SharedTrxStatus {
         self.preparing.load(Ordering::Acquire)
     }
 
-    /// Returns notifier if the transaction is in prepare phase.
+    /// Registers a listener if the transaction is in prepare phase.
     ///
     /// Preparing means commit ordering has started but the transaction has not
     /// reached its terminal commit or failed-precommit rollback outcome.
     /// Waiters must wake for either terminal result and recheck the shared
     /// transaction status.
     #[inline]
-    pub(crate) fn prepare_listener(&self) -> Option<EventListener> {
-        let g = self.prepare_ev.lock();
-        if self.preparing.load(Ordering::Acquire) {
-            g.as_ref().map(|event| event.listen())
-        } else {
-            None
+    pub(crate) fn prepare_listener(&self) -> PrepareListenerResult {
+        if !self.preparing.load(Ordering::Acquire) {
+            return PrepareListenerResult::NotPreparing;
         }
+        #[cfg(test)]
+        tests::run_prepare_listener_before_lock_hook();
+        let mut g = self.prepare_ev.lock();
+        if let Some(event) = g.as_ref() {
+            // Completion must take an installed event while holding this same
+            // mutex, so finding one here proves notification is still owed.
+            return PrepareListenerResult::Registered(event.listen());
+        }
+        if !self.preparing.load(Ordering::Acquire) {
+            // Completion won between the optimistic load and mutex acquisition.
+            return PrepareListenerResult::Completed;
+        }
+        let event = EventNotifyOnDrop::new();
+        let listener = event.listen();
+        *g = Some(event);
+        PrepareListenerResult::Registered(listener)
     }
 
-    /// Marks the transaction as preparing and installs a completion notifier.
+    /// Marks the transaction as preparing without allocating a notifier.
     #[inline]
     fn mark_preparing(&self) {
-        let mut g = self.prepare_ev.lock();
-        debug_assert!(
-            !self.preparing.load(Ordering::Acquire),
+        assert!(
+            !self.terminal(),
+            "terminal transaction cannot enter prepare"
+        );
+        assert!(
+            self.preparing
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok(),
             "transaction is already preparing"
         );
-        debug_assert!(g.is_none(), "prepare notifier should not be installed");
-        *g = Some(EventNotifyOnDrop::new());
-        self.preparing.store(true, Ordering::SeqCst);
     }
 
     /// Publish the commit timestamp and wake prepare waiters.
@@ -670,10 +695,10 @@ impl TrxContext {
         self.gc_no = gc_no;
     }
 
-    /// Returns a clone of the shared transaction status handle.
+    /// Returns the borrowed shared transaction status handle.
     #[inline]
-    pub(crate) fn status(&self) -> Arc<SharedTrxStatus> {
-        self.status.clone()
+    pub(crate) fn status(&self) -> &Arc<SharedTrxStatus> {
+        &self.status
     }
 
     /// Returns whether the row undo head belongs to this transaction.
@@ -820,9 +845,9 @@ impl<'r> TrxRuntime<'r> {
         self.attachment.pool_guards()
     }
 
-    /// Returns a clone of the shared transaction status handle.
+    /// Returns the borrowed shared transaction status handle.
     #[inline]
-    pub(crate) fn status(&self) -> Arc<SharedTrxStatus> {
+    pub(crate) fn status(&self) -> &'r Arc<SharedTrxStatus> {
         self.ctx.status()
     }
 
@@ -2662,7 +2687,7 @@ impl TrxInner {
             debug_assert!(Arc::strong_count(&self.ctx.status) == 1);
             debug_assert!(self.effects.index_undo.is_empty());
             let payload = PreparedTrxPayload::User {
-                status: self.ctx.status(),
+                status: Arc::clone(self.ctx.status()),
                 sts: self.ctx.sts(),
                 gc_no: self.ctx.gc_no(),
                 row_undo: RowUndoLogs::empty(),
@@ -2691,7 +2716,7 @@ impl TrxInner {
         let (row_undo, index_undo) = self.effects.take_payload_parts();
         let lock_manager = self.clone_lock_manager_guard(&attachment);
         let payload = PreparedTrxPayload::User {
-            status: self.ctx.status(),
+            status: Arc::clone(self.ctx.status()),
             sts: self.ctx.sts(),
             gc_no: self.ctx.gc_no(),
             row_undo,
@@ -3445,6 +3470,31 @@ pub(crate) mod tests {
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
+    std::thread_local! {
+        static PREPARE_LISTENER_BEFORE_LOCK_HOOK:
+            std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    }
+
+    /// Installs a thread-local pause after the optimistic prepare load.
+    #[inline]
+    pub(crate) fn install_prepare_listener_before_lock_hook(hook: impl FnOnce() + 'static) {
+        PREPARE_LISTENER_BEFORE_LOCK_HOOK.with(|slot| {
+            assert!(
+                slot.borrow_mut().replace(Box::new(hook)).is_none(),
+                "prepare-listener test hook is already installed"
+            );
+        });
+    }
+
+    /// Runs and clears the thread-local prepare-listener pause.
+    #[inline]
+    pub(super) fn run_prepare_listener_before_lock_hook() {
+        let hook = PREPARE_LISTENER_BEFORE_LOCK_HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     /// Create one test-controlled shared transaction status.
     #[inline]
     pub(crate) fn shared_trx_status(trx_id: TrxID) -> SharedTrxStatus {
@@ -3470,6 +3520,32 @@ pub(crate) mod tests {
     #[inline]
     pub(crate) fn rollback_shared_trx_status(status: &SharedTrxStatus) {
         status.finish_terminal();
+    }
+
+    /// Enter prepare on one test-controlled shared status.
+    #[inline]
+    pub(crate) fn prepare_shared_trx_status(status: &SharedTrxStatus) {
+        status.mark_preparing();
+    }
+
+    /// Publish one committed prepare result on a test-controlled shared status.
+    #[inline]
+    pub(crate) fn commit_preparing_shared_trx_status(status: &SharedTrxStatus, cts: TrxID) {
+        debug_assert!(trx_is_committed(cts));
+        status.commit_prepared(cts);
+    }
+
+    /// Publish one successful rollback prepare result on a test-controlled status.
+    #[inline]
+    pub(crate) fn rollback_preparing_shared_trx_status(status: &SharedTrxStatus) {
+        status.finish_terminal();
+        status.finish_preparing();
+    }
+
+    /// Returns whether a test-controlled status has an injected prepare event.
+    #[inline]
+    pub(crate) fn prepare_event_is_installed(status: &SharedTrxStatus) -> bool {
+        status.prepare_ev.lock().is_some()
     }
 
     /// Create one initialized, public-cacheable transaction core for tests.
@@ -3515,7 +3591,7 @@ pub(crate) mod tests {
         let session_id = SessionID::new(71);
         let first_trx_id = MIN_ACTIVE_TRX_ID + 71;
         let mut inner = trx_inner(first_trx_id, TrxID::new(71), 3, session_id);
-        let old_status = inner.ctx().status();
+        let old_status = Arc::clone(inner.ctx().status());
         inner.table_bindings.reserve(128);
         assert!(inner.table_bindings.capacity() >= 128);
 
@@ -3545,7 +3621,7 @@ pub(crate) mod tests {
         assert_eq!(inner.next_stmt_no, 1);
         assert!(inner.active);
 
-        let second_status = inner.ctx().status();
+        let second_status = Arc::clone(inner.ctx().status());
         second_status.finish_terminal();
         inner.active = false;
         inner.reset();
@@ -3562,7 +3638,12 @@ pub(crate) mod tests {
             let (first_inner, first_status) = with_transaction_inner(
                 &first,
                 "observe_first_reusable_transaction_core",
-                |inner| (inner as *const TrxInner as usize, inner.ctx().status()),
+                |inner| {
+                    (
+                        inner as *const TrxInner as usize,
+                        Arc::clone(inner.ctx().status()),
+                    )
+                },
             )
             .unwrap();
             first.rollback().await.unwrap();
@@ -3578,7 +3659,12 @@ pub(crate) mod tests {
             let (second_inner, second_status) = with_transaction_inner(
                 &second,
                 "observe_second_reusable_transaction_core",
-                |inner| (inner as *const TrxInner as usize, inner.ctx().status()),
+                |inner| {
+                    (
+                        inner as *const TrxInner as usize,
+                        Arc::clone(inner.ctx().status()),
+                    )
+                },
             )
             .unwrap();
             assert_eq!(second_inner, first_inner);
@@ -4666,15 +4752,15 @@ pub(crate) mod tests {
             add_pseudo_redo_log_entry(&mut trx).await;
             let status =
                 with_transaction_inner(&trx, "test_prepare_commit_waiter_status", |inner| {
-                    inner.ctx().status()
+                    Arc::clone(inner.ctx().status())
                 })
                 .unwrap();
 
             let prepared = prepare_transaction(trx).unwrap();
             assert!(status.preparing());
-            let listener = status
-                .prepare_listener()
-                .expect("preparing transaction should expose a listener");
+            let PrepareListenerResult::Registered(listener) = status.prepare_listener() else {
+                panic!("preparing transaction should expose a listener");
+            };
             let waiter_status = Arc::clone(&status);
             let (ready_tx, ready_rx) = mpsc::channel();
             let (done_tx, done_rx) = mpsc::channel();
@@ -4708,8 +4794,112 @@ pub(crate) mod tests {
             waiter.join().expect("waiter thread should finish");
             assert_eq!(status.ts(), cts);
             assert!(!status.preparing());
-            assert!(status.prepare_listener().is_none());
+            assert!(matches!(
+                status.prepare_listener(),
+                PrepareListenerResult::NotPreparing
+            ));
         });
+    }
+
+    #[test]
+    fn test_prepare_listener_is_injected_only_by_waiters() {
+        let status = shared_trx_status(MIN_ACTIVE_TRX_ID + 90_000);
+        status.mark_preparing();
+        assert!(
+            status.prepare_ev.lock().is_none(),
+            "uncontended prepare must not allocate a notifier"
+        );
+
+        let PrepareListenerResult::Registered(first) = status.prepare_listener() else {
+            panic!("first prepare waiter should install a listener");
+        };
+        let event_addr = {
+            let guard = status.prepare_ev.lock();
+            guard.as_ref().expect("prepare event") as *const EventNotifyOnDrop
+        };
+        let PrepareListenerResult::Registered(second) = status.prepare_listener() else {
+            panic!("later prepare waiter should share the listener event");
+        };
+        let shared_event_addr = {
+            let guard = status.prepare_ev.lock();
+            guard.as_ref().expect("prepare event") as *const EventNotifyOnDrop
+        };
+        assert_eq!(event_addr, shared_event_addr);
+
+        status.finish_preparing();
+        first.wait();
+        second.wait();
+        assert!(!status.preparing());
+        assert!(status.prepare_ev.lock().is_none());
+    }
+
+    #[test]
+    fn test_prepare_without_waiters_keeps_event_slot_empty() {
+        let status = shared_trx_status(MIN_ACTIVE_TRX_ID + 90_001);
+        status.mark_preparing();
+        assert!(status.prepare_ev.lock().is_none());
+        status.finish_preparing();
+        assert!(status.prepare_ev.lock().is_none());
+        assert!(matches!(
+            status.prepare_listener(),
+            PrepareListenerResult::NotPreparing
+        ));
+    }
+
+    #[test]
+    fn test_prepare_completion_wins_first_listener_registration() {
+        let status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 90_002));
+        status.mark_preparing();
+        let (loaded_tx, loaded_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let waiter_status = Arc::clone(&status);
+        let waiter = spawn(move || {
+            install_prepare_listener_before_lock_hook(move || {
+                loaded_tx
+                    .send(())
+                    .expect("waiter should report its optimistic prepare load");
+                release_rx
+                    .recv()
+                    .expect("waiter registration should be released");
+            });
+            result_tx
+                .send(matches!(
+                    waiter_status.prepare_listener(),
+                    PrepareListenerResult::Completed
+                ))
+                .expect("waiter should report registration outcome");
+        });
+
+        loaded_rx
+            .recv()
+            .expect("waiter should pause before acquiring the prepare mutex");
+        status.finish_preparing();
+        release_tx
+            .send(())
+            .expect("waiter registration should resume");
+        assert!(
+            result_rx.recv().expect("waiter should finish registration"),
+            "completion must be distinguished from the not-preparing fast path"
+        );
+        waiter.join().expect("waiter thread should finish");
+        assert!(status.prepare_ev.lock().is_none());
+    }
+
+    #[test]
+    fn test_cancelled_prepare_listener_leaves_event_for_completion() {
+        let status = shared_trx_status(MIN_ACTIVE_TRX_ID + 90_003);
+        status.mark_preparing();
+        let PrepareListenerResult::Registered(listener) = status.prepare_listener() else {
+            panic!("preparing status should install a listener");
+        };
+        drop(listener);
+        assert!(
+            status.prepare_ev.lock().is_some(),
+            "listener cancellation must not remove the shared event"
+        );
+        status.finish_preparing();
+        assert!(status.prepare_ev.lock().is_none());
     }
 
     #[test]
@@ -4721,15 +4911,15 @@ pub(crate) mod tests {
             add_pseudo_redo_log_entry(&mut trx).await;
             let status =
                 with_transaction_inner(&trx, "test_prepare_rollback_waiter_status", |inner| {
-                    inner.ctx().status()
+                    Arc::clone(inner.ctx().status())
                 })
                 .unwrap();
 
             let prepared = prepare_transaction(trx).unwrap();
             assert!(status.preparing());
-            let listener = status
-                .prepare_listener()
-                .expect("preparing transaction should expose a listener");
+            let PrepareListenerResult::Registered(listener) = status.prepare_listener() else {
+                panic!("preparing transaction should expose a listener");
+            };
             let waiter_status = Arc::clone(&status);
             let (ready_tx, ready_rx) = mpsc::channel();
             let (done_tx, done_rx) = mpsc::channel();
@@ -4737,7 +4927,10 @@ pub(crate) mod tests {
                 ready_tx.send(()).expect("waiter should report ready");
                 listener.wait();
                 done_tx
-                    .send(waiter_status.prepare_listener().is_none())
+                    .send(matches!(
+                        waiter_status.prepare_listener(),
+                        PrepareListenerResult::NotPreparing
+                    ))
                     .expect("waiter should report completion state");
             });
 
@@ -4762,7 +4955,10 @@ pub(crate) mod tests {
             );
             waiter.join().expect("waiter thread should finish");
             assert!(!status.preparing());
-            assert!(status.prepare_listener().is_none());
+            assert!(matches!(
+                status.prepare_listener(),
+                PrepareListenerResult::NotPreparing
+            ));
         });
     }
 
@@ -5554,7 +5750,7 @@ pub(crate) mod tests {
             );
             add_pseudo_redo_log_entry(&mut trx).await;
             let status = with_transaction_inner(&trx, "observe_ordered_commit_status", |inner| {
-                inner.ctx().status()
+                Arc::clone(inner.ctx().status())
             })
             .unwrap();
             let (hook, observed_rx) = install_terminal_boundary_observer(

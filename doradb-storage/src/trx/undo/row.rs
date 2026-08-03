@@ -5,9 +5,8 @@ use crate::error::RuntimeResult as Result;
 use crate::id::{RowID, TableID, TrxID};
 use crate::row::ops::{SelectKey, UndoCol, UpdateCol};
 use crate::runtime::{POLL_BUDGET, yield_now};
-use crate::trx::{MIN_SNAPSHOT_TS, SharedTrxStatus, trx_is_committed};
+use crate::trx::{MIN_SNAPSHOT_TS, PrepareListenerResult, SharedTrxStatus, trx_is_committed};
 use crate::value::Val;
-use event_listener::EventListener;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
@@ -550,21 +549,12 @@ impl RowUndoHead {
         self.next.main.status.ts()
     }
 
-    /// Return whether the owning transaction is in prepare state.
-    #[inline]
-    pub(crate) fn preparing(&self) -> bool {
-        match &self.next.main.status {
-            UndoStatus::Ref(status) => status.preparing(),
-            _ => false,
-        }
-    }
-
     /// Register a listener for the owning transaction's prepare completion.
     #[inline]
-    pub(crate) fn prepare_listener(&self) -> Option<EventListener> {
+    pub(crate) fn prepare_listener(&self) -> PrepareListenerResult {
         match &self.next.main.status {
             UndoStatus::Ref(status) => status.prepare_listener(),
-            _ => None,
+            _ => PrepareListenerResult::NotPreparing,
         }
     }
 }
