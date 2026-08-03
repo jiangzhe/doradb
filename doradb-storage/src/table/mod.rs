@@ -18,7 +18,7 @@ pub use checkpoint_workflow::{FreezeOutcome, FrozenPageBatchInfo};
 use checkpoint_workflow::{FrozenPage, TableCheckpointWorkflow};
 pub(crate) use deletion_buffer::*;
 pub(crate) use dml_validator::*;
-pub(crate) use gc::PreparedMemIndexCleanupOperation;
+pub(crate) use gc::prepare_mem_index_cleanup_operation;
 pub use gc::{
     MemIndexCleanupDelay, MemIndexCleanupOutcome, MemIndexCleanupStats,
     SecondaryMemIndexCleanupIndexStats,

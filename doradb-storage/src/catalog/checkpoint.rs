@@ -13,14 +13,16 @@ use crate::log::redo::{DDLRedo, RowRedoKind, TableDML};
 use crate::obs;
 use crate::quiescent::QuiescentGuard;
 use crate::recovery::stream::{CatalogSafeRedoSegment, RedoReplayPlanner};
-use crate::runtime::mandatory::{AcceptedExecution, MandatoryTaskMetadata, PreparedExecution};
-use crate::session::{AcceptedMaintenanceScope, PreparedMaintenanceScope};
+use crate::runtime::mandatory::PreparedExecution;
+use crate::session::{
+    AcceptedMaintenanceScope, MaintenanceExecutionSpec, PreparedMaintenanceExecution,
+    PreparedMaintenanceScope,
+};
 use crate::trx::RedoRetentionScope;
 use crate::trx::sys::{CatalogRedoRetentionProgress, TransactionSystem};
 use error_stack::{Report, ResultExt};
 use event_listener::{Event, listener};
 use parking_lot::Mutex;
-use std::any::Any;
 use std::collections::BTreeMap;
 
 /// One catalog-row redo operation extracted from persisted logs.
@@ -351,94 +353,50 @@ impl Drop for CatalogCheckpointScope {
     }
 }
 
-/// Caller-prepared catalog checkpoint awaiting mandatory capacity.
-pub(crate) struct PreparedCatalogCheckpointOperation {
-    catalog_scope: CatalogCheckpointScope,
-    redo_scope: RedoRetentionScope,
-    scope: PreparedMaintenanceScope,
-    metadata: MandatoryTaskMetadata,
+struct CatalogCheckpointExecution;
+
+struct CatalogCheckpointResources {
+    _catalog_scope: CatalogCheckpointScope,
+    _redo_scope: RedoRetentionScope,
 }
 
-impl PreparedCatalogCheckpointOperation {
-    /// Build a catalog checkpoint with both exclusion scopes held.
-    pub(crate) fn new(
-        catalog_scope: CatalogCheckpointScope,
-        redo_scope: RedoRetentionScope,
-        scope: PreparedMaintenanceScope,
-    ) -> Self {
-        let metadata =
-            MandatoryTaskMetadata::operation(<Self as PreparedExecution>::LABEL, Some(scope.key()));
-        Self {
-            catalog_scope,
-            redo_scope,
-            scope,
-            metadata,
-        }
-    }
-}
-
-impl PreparedExecution for PreparedCatalogCheckpointOperation {
+impl MaintenanceExecutionSpec for CatalogCheckpointExecution {
     type Output = CatalogCheckpointOutcome;
-    type Accepted = AcceptedCatalogCheckpointOperation;
+    type Resources = CatalogCheckpointResources;
+    type PanicLabel = &'static str;
 
     const LABEL: &'static str = "checkpoint_catalog";
 
-    #[inline]
-    fn metadata(&self) -> MandatoryTaskMetadata {
-        self.metadata.clone()
-    }
-
-    #[inline]
-    fn accept(self) -> Self::Accepted {
-        let Self {
-            catalog_scope,
-            redo_scope,
-            scope,
-            metadata: _,
-        } = self;
-        AcceptedCatalogCheckpointOperation {
-            catalog_scope: Some(catalog_scope),
-            redo_scope: Some(redo_scope),
-            scope: scope.accept(),
-        }
-    }
-}
-
-/// Mandatory-runtime owner of one accepted catalog checkpoint.
-pub(crate) struct AcceptedCatalogCheckpointOperation {
-    catalog_scope: Option<CatalogCheckpointScope>,
-    redo_scope: Option<RedoRetentionScope>,
-    scope: AcceptedMaintenanceScope,
-}
-
-impl AcceptedExecution for AcceptedCatalogCheckpointOperation {
-    type Output = CatalogCheckpointOutcome;
-
-    async fn execute(&mut self) -> CompletionResult<Self::Output> {
-        let engine = self.scope.engine().clone();
+    async fn execute(
+        scope: &mut AcceptedMaintenanceScope,
+        _resources: &mut Self::Resources,
+        _panic_label: &mut Self::PanicLabel,
+    ) -> CompletionResult<Self::Output> {
+        let engine = scope.engine().clone();
         let result = engine
             .catalog()
             .checkpoint_prepared(&engine.trx_sys)
             .await
             .map_err(CompletionErrorBridge::capture_runtime_or_fatal);
-        self.scope.mark_terminal_ready();
+        scope.mark_terminal_ready();
         result
     }
+}
 
-    #[inline]
-    fn finish(&mut self) {
-        drop(self.catalog_scope.take());
-        drop(self.redo_scope.take());
-        self.scope.finish();
-    }
-
-    async fn handle_panic(&mut self, _panic: Box<dyn Any + Send>) -> CompletionErrorBridge {
-        self.scope.handle_panic();
-        CompletionErrorBridge::capture(
-            Report::new(FatalError::MandatoryTaskPanic)
-                .attach("accepted catalog checkpoint panicked"),
-        )
-    }
+/// Prepare a catalog checkpoint with both exclusion scopes held.
+pub(crate) fn prepare_catalog_checkpoint_operation(
+    catalog_scope: CatalogCheckpointScope,
+    redo_scope: RedoRetentionScope,
+    scope: PreparedMaintenanceScope,
+) -> impl PreparedExecution<Output = CatalogCheckpointOutcome> {
+    PreparedMaintenanceExecution::<CatalogCheckpointExecution>::global(
+        scope,
+        CatalogCheckpointResources {
+            _catalog_scope: catalog_scope,
+            _redo_scope: redo_scope,
+        },
+        "accepted catalog checkpoint panicked",
+    )
 }
 
 impl Catalog {

@@ -24,8 +24,11 @@ use crate::index::{
 use crate::lwc::LwcBuilder;
 use crate::obs;
 use crate::row::RowPage;
-use crate::runtime::mandatory::{AcceptedExecution, MandatoryTaskMetadata, PreparedExecution};
-use crate::session::{AcceptedMaintenanceScope, PreparedMaintenanceScope, SessionRuntimeAccess};
+use crate::runtime::mandatory::PreparedExecution;
+use crate::session::{
+    AcceptedMaintenanceScope, MaintenanceExecutionSpec, PreparedMaintenanceExecution,
+    PreparedMaintenanceScope, SessionRuntimeAccess,
+};
 #[cfg(test)]
 use crate::table::tests::MaintenanceTestController;
 use crate::table::{
@@ -37,7 +40,6 @@ use crate::value::{Val, ValKind, ValType};
 use error_stack::{Report, ResultExt};
 use event_listener::EventListener;
 use futures::future::select_all;
-use std::any::Any;
 use std::collections::BTreeSet;
 use std::result::Result as StdResult;
 use std::sync::Arc;
@@ -124,228 +126,126 @@ impl DetachedCheckpointRetryWait {
     }
 }
 
-/// Caller-prepared table freeze awaiting mandatory runtime capacity.
-pub(crate) struct PreparedFreezeTableOperation {
-    attempt: PreparedFreezeAttempt,
-    root_mutation: TableCheckpointRootMutationScope,
+struct FreezeTableExecution;
+
+struct FreezeTableResources {
+    attempt: Option<PreparedFreezeAttempt>,
+    _root_mutation: TableCheckpointRootMutationScope,
     table: Arc<Table>,
-    scope: PreparedMaintenanceScope,
     max_rows: usize,
-    metadata: MandatoryTaskMetadata,
 }
 
-impl PreparedFreezeTableOperation {
-    /// Prepare reversible workflow and root-mutation authority.
-    pub(crate) fn prepare(
-        scope: PreparedMaintenanceScope,
-        table: Arc<Table>,
-        max_rows: usize,
-    ) -> StdResult<Self, FreezeOutcome> {
-        let attempt = Arc::clone(&table).begin_freeze()?;
-        let root_mutation = match TableCheckpointRootMutationScope::acquire(Arc::clone(&table)) {
-            Ok(root_mutation) => root_mutation,
-            Err(reason) => return Err(FreezeOutcome::Cancelled { reason }),
-        };
-        let metadata = MandatoryTaskMetadata::table_operation(
-            <Self as PreparedExecution>::LABEL,
-            scope.key(),
-            table.table_id(),
-        );
-        Ok(Self {
-            attempt,
-            root_mutation,
-            table,
-            scope,
-            max_rows,
-            metadata,
-        })
-    }
-}
-
-impl PreparedExecution for PreparedFreezeTableOperation {
+impl MaintenanceExecutionSpec for FreezeTableExecution {
     type Output = FreezeOutcome;
-    type Accepted = AcceptedFreezeTableOperation;
+    type Resources = FreezeTableResources;
+    type PanicLabel = &'static str;
 
     const LABEL: &'static str = "freeze_table";
 
-    #[inline]
-    fn metadata(&self) -> MandatoryTaskMetadata {
-        self.metadata.clone()
-    }
-
-    #[inline]
-    fn accept(self) -> Self::Accepted {
-        let Self {
-            attempt,
-            root_mutation,
-            table,
-            scope,
-            max_rows,
-            metadata: _,
-        } = self;
-        AcceptedFreezeTableOperation {
-            attempt: Some(attempt),
-            root_mutation: Some(root_mutation),
-            table: Some(table),
-            scope: scope.accept(),
-            max_rows,
-        }
-    }
-}
-
-/// Mandatory-runtime owner of one accepted table freeze.
-pub(crate) struct AcceptedFreezeTableOperation {
-    attempt: Option<PreparedFreezeAttempt>,
-    root_mutation: Option<TableCheckpointRootMutationScope>,
-    table: Option<Arc<Table>>,
-    scope: AcceptedMaintenanceScope,
-    max_rows: usize,
-}
-
-impl AcceptedExecution for AcceptedFreezeTableOperation {
-    type Output = FreezeOutcome;
-
-    async fn execute(&mut self) -> CompletionResult<Self::Output> {
-        let attempt = self
+    async fn execute(
+        scope: &mut AcceptedMaintenanceScope,
+        resources: &mut Self::Resources,
+        _panic_label: &mut Self::PanicLabel,
+    ) -> CompletionResult<Self::Output> {
+        let attempt = resources
             .attempt
             .take()
             .unwrap_or_else(|| panic!("accepted freeze attempt is missing"));
-        let result = self
+        let result = resources
             .table
-            .as_ref()
-            .unwrap_or_else(|| panic!("accepted freeze table is missing"))
-            .freeze_prepared(&self.scope, self.max_rows, attempt)
+            .freeze_prepared(scope, resources.max_rows, attempt)
             .await
             .map_err(CompletionErrorBridge::capture);
-        self.scope.mark_terminal_ready();
+        scope.mark_terminal_ready();
         result
     }
-
-    #[inline]
-    fn finish(&mut self) {
-        drop(self.attempt.take());
-        drop(self.root_mutation.take());
-        drop(self.table.take());
-        self.scope.finish();
-    }
-
-    async fn handle_panic(&mut self, _panic: Box<dyn Any + Send>) -> CompletionErrorBridge {
-        self.scope.handle_panic();
-        CompletionErrorBridge::capture(
-            Report::new(FatalError::MandatoryTaskPanic).attach("accepted table freeze panicked"),
-        )
-    }
 }
 
-/// Caller-prepared one-shot table checkpoint awaiting mandatory capacity.
-pub(crate) struct PreparedCheckpointTableOperation {
-    attempt: PreparedCheckpointAttempt,
-    root_mutation: TableCheckpointRootMutationScope,
-    table: Arc<Table>,
+/// Prepare reversible table-freeze workflow and root-mutation authority.
+pub(crate) fn prepare_freeze_table_operation(
     scope: PreparedMaintenanceScope,
-    metadata: MandatoryTaskMetadata,
-}
-
-impl PreparedCheckpointTableOperation {
-    /// Prepare reversible workflow and root-mutation authority.
-    pub(crate) fn prepare(
-        scope: PreparedMaintenanceScope,
-        table: Arc<Table>,
-    ) -> StdResult<Self, CheckpointOutcome> {
-        let attempt = match Arc::clone(&table).begin_checkpoint() {
-            Ok(attempt) => attempt,
-            Err(reason) => return Err(CheckpointOutcome::Cancelled { reason }),
-        };
-        let root_mutation = match TableCheckpointRootMutationScope::acquire(Arc::clone(&table)) {
-            Ok(root_mutation) => root_mutation,
-            Err(reason) => return Err(CheckpointOutcome::Cancelled { reason }),
-        };
-        let metadata = MandatoryTaskMetadata::table_operation(
-            <Self as PreparedExecution>::LABEL,
-            scope.key(),
-            table.table_id(),
-        );
-        Ok(Self {
-            attempt,
-            root_mutation,
+    table: Arc<Table>,
+    max_rows: usize,
+) -> StdResult<impl PreparedExecution<Output = FreezeOutcome>, FreezeOutcome> {
+    let attempt = Arc::clone(&table).begin_freeze()?;
+    let root_mutation = match TableCheckpointRootMutationScope::acquire(Arc::clone(&table)) {
+        Ok(root_mutation) => root_mutation,
+        Err(reason) => return Err(FreezeOutcome::Cancelled { reason }),
+    };
+    let table_id = table.table_id();
+    Ok(PreparedMaintenanceExecution::<FreezeTableExecution>::table(
+        scope,
+        FreezeTableResources {
+            attempt: Some(attempt),
+            _root_mutation: root_mutation,
             table,
-            scope,
-            metadata,
-        })
-    }
+            max_rows,
+        },
+        "accepted table freeze panicked",
+        table_id,
+    ))
 }
 
-impl PreparedExecution for PreparedCheckpointTableOperation {
+struct CheckpointTableExecution;
+
+struct CheckpointTableResources {
+    attempt: Option<PreparedCheckpointAttempt>,
+    _root_mutation: TableCheckpointRootMutationScope,
+    table: Arc<Table>,
+}
+
+impl MaintenanceExecutionSpec for CheckpointTableExecution {
     type Output = CheckpointOutcome;
-    type Accepted = AcceptedCheckpointTableOperation;
+    type Resources = CheckpointTableResources;
+    type PanicLabel = &'static str;
 
     const LABEL: &'static str = "checkpoint_table";
 
-    #[inline]
-    fn metadata(&self) -> MandatoryTaskMetadata {
-        self.metadata.clone()
-    }
-
-    #[inline]
-    fn accept(self) -> Self::Accepted {
-        let Self {
-            attempt,
-            root_mutation,
-            table,
-            scope,
-            metadata: _,
-        } = self;
-        AcceptedCheckpointTableOperation {
-            attempt: Some(attempt),
-            root_mutation: Some(root_mutation),
-            table: Some(table),
-            scope: scope.accept(),
-        }
-    }
-}
-
-/// Mandatory-runtime owner of one accepted table checkpoint.
-pub(crate) struct AcceptedCheckpointTableOperation {
-    attempt: Option<PreparedCheckpointAttempt>,
-    root_mutation: Option<TableCheckpointRootMutationScope>,
-    table: Option<Arc<Table>>,
-    scope: AcceptedMaintenanceScope,
-}
-
-impl AcceptedExecution for AcceptedCheckpointTableOperation {
-    type Output = CheckpointOutcome;
-
-    async fn execute(&mut self) -> CompletionResult<Self::Output> {
-        let attempt = self
+    async fn execute(
+        scope: &mut AcceptedMaintenanceScope,
+        resources: &mut Self::Resources,
+        _panic_label: &mut Self::PanicLabel,
+    ) -> CompletionResult<Self::Output> {
+        let attempt = resources
             .attempt
             .take()
             .unwrap_or_else(|| panic!("accepted checkpoint attempt is missing"));
-        let result = self
+        let result = resources
             .table
-            .as_ref()
-            .unwrap_or_else(|| panic!("accepted checkpoint table is missing"))
-            .checkpoint_prepared(&self.scope, attempt)
+            .checkpoint_prepared(scope, attempt)
             .await
             .map_err(CompletionErrorBridge::capture_runtime_or_fatal);
-        self.scope.mark_terminal_ready();
+        scope.mark_terminal_ready();
         result
     }
+}
 
-    #[inline]
-    fn finish(&mut self) {
-        drop(self.attempt.take());
-        drop(self.root_mutation.take());
-        drop(self.table.take());
-        self.scope.finish();
-    }
-
-    async fn handle_panic(&mut self, _panic: Box<dyn Any + Send>) -> CompletionErrorBridge {
-        self.scope.handle_panic();
-        CompletionErrorBridge::capture(
-            Report::new(FatalError::MandatoryTaskPanic)
-                .attach("accepted table checkpoint panicked"),
-        )
-    }
+/// Prepare reversible table-checkpoint workflow and root-mutation authority.
+pub(crate) fn prepare_checkpoint_table_operation(
+    scope: PreparedMaintenanceScope,
+    table: Arc<Table>,
+) -> StdResult<impl PreparedExecution<Output = CheckpointOutcome>, CheckpointOutcome> {
+    let attempt = match Arc::clone(&table).begin_checkpoint() {
+        Ok(attempt) => attempt,
+        Err(reason) => return Err(CheckpointOutcome::Cancelled { reason }),
+    };
+    let root_mutation = match TableCheckpointRootMutationScope::acquire(Arc::clone(&table)) {
+        Ok(root_mutation) => root_mutation,
+        Err(reason) => return Err(CheckpointOutcome::Cancelled { reason }),
+    };
+    let table_id = table.table_id();
+    Ok(
+        PreparedMaintenanceExecution::<CheckpointTableExecution>::table(
+            scope,
+            CheckpointTableResources {
+                attempt: Some(attempt),
+                _root_mutation: root_mutation,
+                table,
+            },
+            "accepted table checkpoint panicked",
+            table_id,
+        ),
+    )
 }
 
 /// Owns one table checkpoint attempt and its reversible-to-fatal boundary.

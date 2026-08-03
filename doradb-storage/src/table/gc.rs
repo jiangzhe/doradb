@@ -2,8 +2,8 @@ use super::{Table, TableRootSnapshot, TableRuntimeLayout};
 use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuard, PoolGuards};
 use crate::catalog::TableMetadata;
 use crate::error::{
-    CompletionErrorBridge, CompletionResult, DataIntegrityError, FatalError, RuntimeError,
-    RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
+    CompletionErrorBridge, CompletionResult, DataIntegrityError, RuntimeError, RuntimeOrFatalError,
+    RuntimeOrFatalResult, RuntimeResult,
 };
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::id::{BlockID, RowID, TableID, TrxID};
@@ -11,12 +11,15 @@ use crate::index::{
     ColumnBlockIndex, MemIndexEntry, NonUniqueMemIndex, ResolvedColumnRow, SecondaryIndex,
     UniqueMemIndex,
 };
-use crate::runtime::mandatory::{AcceptedExecution, MandatoryTaskMetadata, PreparedExecution};
-use crate::session::{AcceptedMaintenanceScope, PreparedMaintenanceScope};
+use crate::runtime::mandatory::PreparedExecution;
+use crate::session::{
+    AcceptedMaintenanceScope, MaintenanceExecutionSpec, PreparedMaintenanceExecution,
+    PreparedMaintenanceScope,
+};
 use crate::trx::{Transaction, TrxReadProof};
 use crate::value::Val;
 use error_stack::{Report, ResultExt};
-use std::any::Any;
+use std::fmt;
 use std::sync::Arc;
 
 /// Aggregate result for a full-scan user-table secondary MemIndex cleanup pass.
@@ -180,64 +183,6 @@ enum DeleteOverlayProof {
     ColdRowValues(Vec<Val>),
 }
 
-/// Caller-prepared secondary MemIndex cleanup awaiting mandatory capacity.
-pub(crate) struct PreparedMemIndexCleanupOperation {
-    table: Arc<Table>,
-    scope: PreparedMaintenanceScope,
-    clean_live_entries: bool,
-    metadata: MandatoryTaskMetadata,
-}
-
-impl PreparedMemIndexCleanupOperation {
-    /// Build one cleanup operation for an exact live table runtime.
-    pub(crate) fn new(
-        scope: PreparedMaintenanceScope,
-        table: Arc<Table>,
-        clean_live_entries: bool,
-    ) -> Self {
-        let metadata = MandatoryTaskMetadata::table_operation(
-            <Self as PreparedExecution>::LABEL,
-            scope.key(),
-            table.table_id(),
-        );
-        Self {
-            table,
-            scope,
-            clean_live_entries,
-            metadata,
-        }
-    }
-}
-
-impl PreparedExecution for PreparedMemIndexCleanupOperation {
-    type Output = MemIndexCleanupOutcome;
-    type Accepted = AcceptedMemIndexCleanupOperation;
-
-    const LABEL: &'static str = "cleanup_secondary_mem_indexes";
-
-    #[inline]
-    fn metadata(&self) -> MandatoryTaskMetadata {
-        self.metadata.clone()
-    }
-
-    #[inline]
-    fn accept(self) -> Self::Accepted {
-        let Self {
-            table,
-            scope,
-            clean_live_entries,
-            metadata: _,
-        } = self;
-        AcceptedMemIndexCleanupOperation {
-            table: Some(table),
-            active_trx: None,
-            scope: scope.accept(),
-            clean_live_entries,
-            phase: MemIndexCleanupPhase::Starting,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 enum MemIndexCleanupPhase {
     Starting,
@@ -247,130 +192,152 @@ enum MemIndexCleanupPhase {
     Finished,
 }
 
+struct MemIndexCleanupPanicLabel(MemIndexCleanupPhase);
+
+impl fmt::Display for MemIndexCleanupPanicLabel {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "accepted secondary MemIndex cleanup panicked: phase={:?}",
+            self.0
+        )
+    }
+}
+
 enum CleanupIteration {
     Retry,
     Finished(RuntimeResult<MemIndexCleanupOutcome>),
 }
 
-/// Mandatory-runtime owner of accepted secondary MemIndex cleanup.
-pub(crate) struct AcceptedMemIndexCleanupOperation {
-    table: Option<Arc<Table>>,
+struct MemIndexCleanupExecution;
+
+struct MemIndexCleanupResources {
     active_trx: Option<Transaction>,
-    scope: AcceptedMaintenanceScope,
+    table: Arc<Table>,
     clean_live_entries: bool,
-    phase: MemIndexCleanupPhase,
 }
 
-impl AcceptedExecution for AcceptedMemIndexCleanupOperation {
+impl MaintenanceExecutionSpec for MemIndexCleanupExecution {
     type Output = MemIndexCleanupOutcome;
+    type Resources = MemIndexCleanupResources;
+    type PanicLabel = MemIndexCleanupPanicLabel;
 
-    async fn execute(&mut self) -> CompletionResult<Self::Output> {
-        let result = self
-            .execute_inner()
+    const LABEL: &'static str = "cleanup_secondary_mem_indexes";
+
+    async fn execute(
+        scope: &mut AcceptedMaintenanceScope,
+        resources: &mut Self::Resources,
+        panic_label: &mut Self::PanicLabel,
+    ) -> CompletionResult<Self::Output> {
+        let result = execute_mem_index_cleanup_inner(scope, resources, &mut panic_label.0)
             .await
             .map_err(CompletionErrorBridge::capture_runtime_or_fatal);
-        self.scope.mark_terminal_ready();
-        self.phase = MemIndexCleanupPhase::Finished;
+        scope.mark_terminal_ready();
+        panic_label.0 = MemIndexCleanupPhase::Finished;
         result
-    }
-
-    #[inline]
-    fn finish(&mut self) {
-        drop(self.active_trx.take());
-        drop(self.table.take());
-        self.scope.finish();
-    }
-
-    async fn handle_panic(&mut self, _panic: Box<dyn Any + Send>) -> CompletionErrorBridge {
-        self.scope.handle_panic();
-        CompletionErrorBridge::capture(Report::new(FatalError::MandatoryTaskPanic).attach(format!(
-            "accepted secondary MemIndex cleanup panicked: phase={:?}",
-            self.phase
-        )))
     }
 }
 
-impl AcceptedMemIndexCleanupOperation {
-    async fn execute_inner(&mut self) -> RuntimeOrFatalResult<MemIndexCleanupOutcome> {
-        let table = self
-            .table
-            .clone()
-            .unwrap_or_else(|| panic!("accepted MemIndex cleanup table is missing"));
-        let trx_sys = self.scope.engine().trx_sys.clone();
-        let pool_guards = self.scope.pool_guards();
-        loop {
-            let trx = self
-                .scope
-                .begin_private_trx()
+/// Prepare secondary MemIndex cleanup for an exact live table runtime.
+pub(crate) fn prepare_mem_index_cleanup_operation(
+    scope: PreparedMaintenanceScope,
+    table: Arc<Table>,
+    clean_live_entries: bool,
+) -> impl PreparedExecution<Output = MemIndexCleanupOutcome> {
+    let table_id = table.table_id();
+    PreparedMaintenanceExecution::<MemIndexCleanupExecution>::table(
+        scope,
+        MemIndexCleanupResources {
+            active_trx: None,
+            table,
+            clean_live_entries,
+        },
+        MemIndexCleanupPanicLabel(MemIndexCleanupPhase::Starting),
+        table_id,
+    )
+}
+
+async fn execute_mem_index_cleanup_inner(
+    scope: &mut AcceptedMaintenanceScope,
+    resources: &mut MemIndexCleanupResources,
+    phase: &mut MemIndexCleanupPhase,
+) -> RuntimeOrFatalResult<MemIndexCleanupOutcome> {
+    let table = Arc::clone(&resources.table);
+    let clean_live_entries = resources.clean_live_entries;
+    let trx_sys = scope.engine().trx_sys.clone();
+    let pool_guards = scope.pool_guards();
+    loop {
+        let trx = scope
+            .begin_private_trx()
+            .change_context(RuntimeError::TableAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=cleanup_secondary_mem_indexes, table_id={}, phase=begin_transaction",
+                    table.table_id()
+                )
+            })?;
+        resources.active_trx = Some(trx);
+        *phase = MemIndexCleanupPhase::TransactionActive;
+        let cleanup_sts = resources
+            .active_trx
+            .as_ref()
+            .unwrap_or_else(|| panic!("cleanup transaction disappeared after installation"))
+            .sts();
+        let min_active_sts = trx_sys.calc_min_active_sts_for_gc();
+        #[cfg(test)]
+        scope
+            .engine()
+            .maintenance_test
+            .run_cleanup_after_trx_start_hook()
+            .await;
+        *phase = MemIndexCleanupPhase::Scanning;
+        let iteration = {
+            let trx = resources
+                .active_trx
+                .as_mut()
+                .unwrap_or_else(|| panic!("cleanup transaction disappeared before checkout"));
+            let checkout = trx
+                .checkout()
                 .change_context(RuntimeError::TableAccess)
                 .attach_with(|| {
                     format!(
-                        "operation=cleanup_secondary_mem_indexes, table_id={}, phase=begin_transaction",
+                        "operation=cleanup_secondary_mem_indexes, table_id={}, phase=checkout_transaction",
                         table.table_id()
                     )
-                })?;
-            self.active_trx = Some(trx);
-            self.phase = MemIndexCleanupPhase::TransactionActive;
-            let cleanup_sts = self
-                .active_trx
-                .as_ref()
-                .unwrap_or_else(|| panic!("cleanup transaction disappeared after installation"))
-                .sts();
-            let min_active_sts = trx_sys.calc_min_active_sts_for_gc();
-            #[cfg(test)]
-            self.scope
-                .engine()
-                .maintenance_test
-                .run_cleanup_after_trx_start_hook()
-                .await;
-            self.phase = MemIndexCleanupPhase::Scanning;
-            let iteration = {
-                let trx = self
-                    .active_trx
-                    .as_mut()
-                    .unwrap_or_else(|| panic!("cleanup transaction disappeared before checkout"));
-                let checkout = trx
-                    .checkout()
-                    .change_context(RuntimeError::TableAccess)
-                    .attach_with(|| {
-                        format!(
-                            "operation=cleanup_secondary_mem_indexes, table_id={}, phase=checkout_transaction",
-                            table.table_id()
-                        )
-                    })
-                    .map_err(RuntimeOrFatalError::from)?;
-                let proof = checkout.inner().ctx().read_proof();
-                let snapshot = table.capture_mem_index_cleanup_snapshot(min_active_sts, &proof);
-                if !snapshot.is_visible_to(cleanup_sts) {
-                    drop(snapshot);
-                    drop(checkout);
-                    CleanupIteration::Retry
-                } else {
-                    let cleanup_res = table
-                        .cleanup_secondary_mem_indexes_at_snapshot(
-                            &pool_guards,
-                            &snapshot,
-                            self.clean_live_entries,
-                        )
-                        .await;
-                    drop(snapshot);
-                    drop(checkout);
-                    CleanupIteration::Finished(cleanup_res)
-                }
-            };
-            self.phase = MemIndexCleanupPhase::RollingBack;
-            let trx = self
-                .active_trx
-                .take()
-                .unwrap_or_else(|| panic!("cleanup transaction missing before rollback"));
-            let rollback_res = trx.rollback_table_maintenance().await;
-            match iteration {
-                CleanupIteration::Retry => {
-                    rollback_res?;
-                }
-                CleanupIteration::Finished(cleanup_res) => {
-                    return finish_secondary_mem_index_cleanup(cleanup_res, rollback_res);
-                }
+                })
+                .map_err(RuntimeOrFatalError::from)?;
+            let proof = checkout.inner().ctx().read_proof();
+            let snapshot = table.capture_mem_index_cleanup_snapshot(min_active_sts, &proof);
+            if !snapshot.is_visible_to(cleanup_sts) {
+                drop(snapshot);
+                drop(checkout);
+                CleanupIteration::Retry
+            } else {
+                let cleanup_res = table
+                    .cleanup_secondary_mem_indexes_at_snapshot(
+                        &pool_guards,
+                        &snapshot,
+                        clean_live_entries,
+                    )
+                    .await;
+                drop(snapshot);
+                drop(checkout);
+                CleanupIteration::Finished(cleanup_res)
+            }
+        };
+        *phase = MemIndexCleanupPhase::RollingBack;
+        let trx = resources
+            .active_trx
+            .take()
+            .unwrap_or_else(|| panic!("cleanup transaction missing before rollback"));
+        let rollback_res = trx.rollback_table_maintenance().await;
+        match iteration {
+            CleanupIteration::Retry => {
+                rollback_res?;
+            }
+            CleanupIteration::Finished(cleanup_res) => {
+                return finish_secondary_mem_index_cleanup(cleanup_res, rollback_res);
             }
         }
     }

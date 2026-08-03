@@ -1298,6 +1298,31 @@ pub(crate) mod tests {
         assert_dropped_table_floor(engine.catalog(), table_id);
     }
 
+    /// Waits for targeted purge completion after dropped-table file cleanup becomes eligible.
+    pub(crate) async fn wait_for_no_dropped_table_operational_state(
+        engine: &Engine,
+        table_id: TableID,
+    ) {
+        let (event_tx, event_rx) = flume::unbounded();
+        engine.inner().trx_sys.set_purge_test_observer(event_tx);
+        while engine
+            .catalog()
+            .retained_dropped_table_ids_now()
+            .contains(&table_id)
+        {
+            engine.inner().trx_sys.request_dropped_table_purge();
+            let mut dropped_table_started = false;
+            loop {
+                match event_rx.recv_async().await.unwrap() {
+                    PurgeTestEvent::DroppedTableStarted => dropped_table_started = true,
+                    PurgeTestEvent::CycleCompleted if dropped_table_started => break,
+                    _ => {}
+                }
+            }
+        }
+        assert_no_dropped_table_operational_state(engine.catalog(), table_id);
+    }
+
     #[inline]
     pub(crate) fn assert_no_dropped_table_operational_state(catalog: &Catalog, table_id: TableID) {
         assert!(!catalog.retained_dropped_table_ids_now().contains(&table_id));

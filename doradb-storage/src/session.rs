@@ -2,16 +2,17 @@ use crate::buffer::page::VersionedPageID;
 use crate::buffer::{BufferPool, PoolGuards};
 use crate::catalog::{
     CatalogCheckpointOutcome, CatalogCheckpointScope, CreateIndexPlan, DropIndexPlan,
-    DropTablePlan, IndexDdlGateScope, IndexNo, IndexSpec, PreparedCatalogCheckpointOperation,
-    PreparedCreateIndex, PreparedCreateTable, PreparedDropIndex, PreparedDropTable, TableSpec,
-    ValidatedCreateTable, create_index_catalog_write_targets, create_table_catalog_write_targets,
-    drop_index_catalog_write_targets, drop_table_catalog_write_targets, reject_non_user_table_id,
+    DropTablePlan, IndexDdlGateScope, IndexNo, IndexSpec, PreparedCreateIndex, PreparedCreateTable,
+    PreparedDropIndex, PreparedDropTable, TableSpec, ValidatedCreateTable,
+    create_index_catalog_write_targets, create_table_catalog_write_targets,
+    drop_index_catalog_write_targets, drop_table_catalog_write_targets,
+    prepare_catalog_checkpoint_operation, reject_non_user_table_id,
     reject_user_table_primary_key_index, validated_index_ddl_target,
 };
 use crate::engine::{EngineInner, EngineRef, WeakEngineRef};
 use crate::error::{
-    DiscloseError, DiscloseResultExt, FatalError, LifecycleError, LifecycleResult,
-    MultiDomainResultExt, OperationError, OperationResult, Result,
+    CompletionErrorBridge, CompletionResult, DiscloseError, DiscloseResultExt, FatalError,
+    LifecycleError, LifecycleResult, MultiDomainResultExt, OperationError, OperationResult, Result,
 };
 use crate::id::{OperationID, SessionID, SessionOperationKey, TableID, TrxID};
 use crate::lock::{
@@ -20,25 +21,30 @@ use crate::lock::{
 use crate::map::{FastDashMap, FastHashMap};
 use crate::notify::EventNotifyOnDrop;
 use crate::quiescent::QuiescentGuard;
+use crate::runtime::mandatory::{AcceptedExecution, MandatoryTaskMetadata, PreparedExecution};
 use crate::stats::{
     BufferPoolStats, StorageIoStats, TransactionSystemStats, buffer_pool_runtime_stats_snapshot,
     storage_io_stats_snapshot, transaction_system_stats_snapshot,
 };
 use crate::table::{
     CheckpointDelayReason, CheckpointOutcome, CheckpointRetryObservation, FreezeOutcome,
-    MemIndexCleanupOutcome, PreparedCheckpointTableOperation, PreparedFreezeTableOperation,
-    PreparedMemIndexCleanupOperation, Table,
+    MemIndexCleanupOutcome, Table, prepare_checkpoint_table_operation,
+    prepare_freeze_table_operation, prepare_mem_index_cleanup_operation,
 };
 use crate::trx::{
-    PreparedCatalogRedoMaintenanceOperation, PreparedCatalogWriteAuthority,
-    PreparedRedoTruncationOperation, RedoRetentionScope, ReleasedTransactionLocks,
+    PreparedCatalogWriteAuthority, RedoRetentionScope, ReleasedTransactionLocks,
     SessionOperationEntry, SessionOperationKind, SessionOperationState, Transaction, TrxInner,
+    prepare_catalog_redo_maintenance_operation, prepare_redo_truncation_operation,
 };
 use error_stack::{Report, ResultExt};
 use event_listener::EventListener;
 use futures::future::select_all;
 use parking_lot::Mutex;
+use std::any::Any;
 use std::cell::Cell;
+use std::fmt::Display;
+use std::future::Future;
+use std::marker::PhantomData;
 use std::mem::replace;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -573,6 +579,156 @@ impl SessionRuntimeAccess for AcceptedMaintenanceScope {
     }
 }
 
+/// Operation-specific execution specification used by the shared maintenance carrier.
+pub(crate) trait MaintenanceExecutionSpec: Send + 'static {
+    /// Terminal output delivered to the maintenance observer.
+    type Output: Send + 'static;
+    /// Domain resources retained outside the panic-caught execution future.
+    type Resources: Send + 'static;
+    /// Mutable diagnostic data attached after an unexpected execution panic.
+    type PanicLabel: Display + Send + 'static;
+
+    /// Stable mandatory-runtime diagnostic label.
+    const LABEL: &'static str;
+
+    /// Execute one accepted operation while borrowing its retained resources.
+    fn execute(
+        scope: &mut AcceptedMaintenanceScope,
+        resources: &mut Self::Resources,
+        panic_label: &mut Self::PanicLabel,
+    ) -> impl Future<Output = CompletionResult<Self::Output>> + Send;
+}
+
+/// Shared caller-prepared carrier for one maintenance execution body.
+///
+/// Resource declaration before the maintenance scope preserves domain-resource
+/// release before logical locks and the voluntary operation terminal edge.
+pub(crate) struct PreparedMaintenanceExecution<S>
+where
+    S: MaintenanceExecutionSpec,
+{
+    resources: S::Resources,
+    scope: PreparedMaintenanceScope,
+    panic_label: S::PanicLabel,
+    metadata: MandatoryTaskMetadata,
+    spec: PhantomData<S>,
+}
+
+impl<S> PreparedMaintenanceExecution<S>
+where
+    S: MaintenanceExecutionSpec,
+{
+    /// Build one global catalog/redo maintenance operation.
+    #[inline]
+    pub(crate) fn global(
+        scope: PreparedMaintenanceScope,
+        resources: S::Resources,
+        panic_label: S::PanicLabel,
+    ) -> Self {
+        let metadata = MandatoryTaskMetadata::operation(S::LABEL, Some(scope.key()));
+        Self {
+            resources,
+            scope,
+            panic_label,
+            metadata,
+            spec: PhantomData,
+        }
+    }
+
+    /// Build one table-scoped maintenance operation.
+    #[inline]
+    pub(crate) fn table(
+        scope: PreparedMaintenanceScope,
+        resources: S::Resources,
+        panic_label: S::PanicLabel,
+        table_id: TableID,
+    ) -> Self {
+        let metadata = MandatoryTaskMetadata::table_operation(S::LABEL, scope.key(), table_id);
+        Self {
+            resources,
+            scope,
+            panic_label,
+            metadata,
+            spec: PhantomData,
+        }
+    }
+}
+
+impl<S> PreparedExecution for PreparedMaintenanceExecution<S>
+where
+    S: MaintenanceExecutionSpec,
+{
+    type Output = S::Output;
+    type Accepted = AcceptedMaintenanceExecution<S>;
+
+    const LABEL: &'static str = S::LABEL;
+
+    #[inline]
+    fn metadata(&self) -> MandatoryTaskMetadata {
+        self.metadata.clone()
+    }
+
+    #[inline]
+    fn accept(self) -> Self::Accepted {
+        let Self {
+            resources,
+            scope,
+            panic_label,
+            metadata: _,
+            spec: _,
+        } = self;
+        AcceptedMaintenanceExecution {
+            resources: Some(resources),
+            scope: scope.accept(),
+            panic_label,
+            spec: PhantomData,
+        }
+    }
+}
+
+/// Shared mandatory-runtime owner for one accepted maintenance execution.
+pub(crate) struct AcceptedMaintenanceExecution<S>
+where
+    S: MaintenanceExecutionSpec,
+{
+    resources: Option<S::Resources>,
+    scope: AcceptedMaintenanceScope,
+    panic_label: S::PanicLabel,
+    spec: PhantomData<S>,
+}
+
+impl<S> AcceptedExecution for AcceptedMaintenanceExecution<S>
+where
+    S: MaintenanceExecutionSpec,
+{
+    type Output = S::Output;
+
+    #[inline]
+    fn execute(&mut self) -> impl Future<Output = CompletionResult<Self::Output>> + Send {
+        S::execute(
+            &mut self.scope,
+            self.resources
+                .as_mut()
+                .unwrap_or_else(|| panic!("accepted maintenance resources are missing")),
+            &mut self.panic_label,
+        )
+    }
+
+    #[inline]
+    fn finish(&mut self) {
+        drop(self.resources.take());
+        self.scope.finish();
+    }
+
+    #[inline]
+    async fn handle_panic(&mut self, _panic: Box<dyn Any + Send>) -> CompletionErrorBridge {
+        self.scope.handle_panic();
+        CompletionErrorBridge::capture(
+            Report::new(FatalError::MandatoryTaskPanic).attach(self.panic_label.to_string()),
+        )
+    }
+}
+
 #[derive(Clone, Copy)]
 enum MaintenanceBoundary {
     GcHorizon,
@@ -1020,7 +1176,7 @@ impl Session {
         let redo_scope = RedoRetentionScope::acquire(scope.engine().trx_sys.clone()).await;
         scope.engine().poisoner.ensure_healthy().disclose()?;
         let observer = mandatory_runtime
-            .submit(PreparedCatalogCheckpointOperation::new(
+            .submit(prepare_catalog_checkpoint_operation(
                 catalog_scope,
                 redo_scope,
                 scope,
@@ -1051,7 +1207,7 @@ impl Session {
         let redo_scope = RedoRetentionScope::acquire(scope.engine().trx_sys.clone()).await;
         scope.engine().poisoner.ensure_healthy().disclose()?;
         let observer = mandatory_runtime
-            .submit(PreparedCatalogRedoMaintenanceOperation::new(
+            .submit(prepare_catalog_redo_maintenance_operation(
                 catalog_scope,
                 redo_scope,
                 scope,
@@ -1081,7 +1237,7 @@ impl Session {
         let redo_scope = RedoRetentionScope::acquire(scope.engine().trx_sys.clone()).await;
         scope.engine().poisoner.ensure_healthy().disclose()?;
         let observer = mandatory_runtime
-            .submit(PreparedRedoTruncationOperation::new(
+            .submit(prepare_redo_truncation_operation(
                 catalog_scope,
                 redo_scope,
                 scope,
@@ -1189,7 +1345,7 @@ impl Session {
             .attach_with(|| format!("operation=freeze_table, table_id={table_id}"))
             .disclose()?;
         scope.engine().poisoner.ensure_healthy().disclose()?;
-        let prepared = match PreparedFreezeTableOperation::prepare(scope, table, max_rows) {
+        let prepared = match prepare_freeze_table_operation(scope, table, max_rows) {
             Ok(prepared) => prepared,
             Err(outcome) => return Ok(outcome),
         };
@@ -1220,7 +1376,7 @@ impl Session {
             .attach_with(|| format!("operation=checkpoint_table, table_id={table_id}"))
             .disclose()?;
         scope.engine().poisoner.ensure_healthy().disclose()?;
-        let prepared = match PreparedCheckpointTableOperation::prepare(scope, table) {
+        let prepared = match prepare_checkpoint_table_operation(scope, table) {
             Ok(prepared) => prepared,
             Err(outcome) => return Ok(outcome),
         };
@@ -1360,7 +1516,7 @@ impl Session {
             .disclose()?;
         scope.engine().poisoner.ensure_healthy().disclose()?;
         let observer = mandatory_runtime
-            .submit(PreparedMemIndexCleanupOperation::new(
+            .submit(prepare_mem_index_cleanup_operation(
                 scope,
                 table,
                 clean_live_entries,

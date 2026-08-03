@@ -11,17 +11,17 @@ use crate::obs;
 use crate::recovery::stream::{
     RedoReplayPlanner, RedoRetentionSegment, RedoRetentionSegmentState, RedoSegmentCtsRange,
 };
-use crate::runtime::mandatory::{AcceptedExecution, MandatoryTaskMetadata, PreparedExecution};
+use crate::runtime::mandatory::PreparedExecution;
 use crate::session::{
-    AcceptedMaintenanceScope, CatalogRedoMaintenanceOutcome, PreparedMaintenanceScope,
-    RedoTruncationBlockerInfo, RedoTruncationOutcome,
+    AcceptedMaintenanceScope, CatalogRedoMaintenanceOutcome, MaintenanceExecutionSpec,
+    PreparedMaintenanceExecution, PreparedMaintenanceScope, RedoTruncationBlockerInfo,
+    RedoTruncationOutcome,
 };
 #[cfg(test)]
 use crate::table::tests::MaintenanceTestController;
 use crate::table::{LiveTableRedoReplayFloor, TableRedoReplayFloor};
 use crate::trx::sys::{CatalogRedoRetentionProgress, RedoRetentionScope, TransactionSystem};
 use error_stack::{Report, ResultExt};
-use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::ErrorKind as IoErrorKind;
@@ -117,199 +117,104 @@ impl PendingDroppedTableRedoFloor {
     }
 }
 
-/// Caller-prepared redo truncation awaiting mandatory capacity.
-pub(crate) struct PreparedRedoTruncationOperation {
+struct RedoTruncationExecution;
+
+struct RedoTruncationResources {
     catalog_scope: CatalogCheckpointScope,
-    redo_scope: RedoRetentionScope,
-    scope: PreparedMaintenanceScope,
-    metadata: MandatoryTaskMetadata,
+    _redo_scope: RedoRetentionScope,
 }
 
-impl PreparedRedoTruncationOperation {
-    /// Build one truncation with catalog and redo authority held.
-    pub(crate) fn new(
-        catalog_scope: CatalogCheckpointScope,
-        redo_scope: RedoRetentionScope,
-        scope: PreparedMaintenanceScope,
-    ) -> Self {
-        let metadata =
-            MandatoryTaskMetadata::operation(<Self as PreparedExecution>::LABEL, Some(scope.key()));
-        Self {
-            catalog_scope,
-            redo_scope,
-            scope,
-            metadata,
-        }
-    }
-}
-
-impl PreparedExecution for PreparedRedoTruncationOperation {
+impl MaintenanceExecutionSpec for RedoTruncationExecution {
     type Output = RedoTruncationOutcome;
-    type Accepted = AcceptedRedoTruncationOperation;
+    type Resources = RedoTruncationResources;
+    type PanicLabel = &'static str;
 
     const LABEL: &'static str = "truncate_redo_log";
 
-    #[inline]
-    fn metadata(&self) -> MandatoryTaskMetadata {
-        self.metadata.clone()
-    }
-
-    #[inline]
-    fn accept(self) -> Self::Accepted {
-        let Self {
-            catalog_scope,
-            redo_scope,
-            scope,
-            metadata: _,
-        } = self;
-        AcceptedRedoTruncationOperation {
-            catalog_scope: Some(catalog_scope),
-            redo_scope: Some(redo_scope),
-            scope: scope.accept(),
-        }
-    }
-}
-
-/// Mandatory-runtime owner of accepted redo truncation.
-pub(crate) struct AcceptedRedoTruncationOperation {
-    catalog_scope: Option<CatalogCheckpointScope>,
-    redo_scope: Option<RedoRetentionScope>,
-    scope: AcceptedMaintenanceScope,
-}
-
-impl AcceptedExecution for AcceptedRedoTruncationOperation {
-    type Output = RedoTruncationOutcome;
-
-    async fn execute(&mut self) -> CompletionResult<Self::Output> {
-        let engine = self.scope.engine().clone();
-        let catalog_scope = self
-            .catalog_scope
-            .as_mut()
-            .unwrap_or_else(|| panic!("accepted redo truncation catalog scope is missing"));
+    async fn execute(
+        scope: &mut AcceptedMaintenanceScope,
+        resources: &mut Self::Resources,
+        _panic_label: &mut Self::PanicLabel,
+    ) -> CompletionResult<Self::Output> {
+        let engine = scope.engine().clone();
         let result = engine
             .trx_sys
             .truncate_redo_log_prepared(
-                || catalog_scope.release(),
+                || resources.catalog_scope.release(),
                 #[cfg(test)]
                 &engine.maintenance_test,
             )
             .await
             .map_err(CompletionErrorBridge::capture_runtime_or_fatal);
-        self.scope.mark_terminal_ready();
+        scope.mark_terminal_ready();
         result
-    }
-
-    #[inline]
-    fn finish(&mut self) {
-        drop(self.catalog_scope.take());
-        drop(self.redo_scope.take());
-        self.scope.finish();
-    }
-
-    async fn handle_panic(&mut self, _panic: Box<dyn Any + Send>) -> CompletionErrorBridge {
-        self.scope.handle_panic();
-        CompletionErrorBridge::capture(
-            Report::new(FatalError::MandatoryTaskPanic).attach("accepted redo truncation panicked"),
-        )
     }
 }
 
-/// Caller-prepared combined catalog checkpoint and redo truncation.
-pub(crate) struct PreparedCatalogRedoMaintenanceOperation {
+/// Prepare one redo truncation with catalog and redo authority held.
+pub(crate) fn prepare_redo_truncation_operation(
     catalog_scope: CatalogCheckpointScope,
     redo_scope: RedoRetentionScope,
     scope: PreparedMaintenanceScope,
-    metadata: MandatoryTaskMetadata,
-}
-
-impl PreparedCatalogRedoMaintenanceOperation {
-    /// Build one combined operation with both authorities held.
-    pub(crate) fn new(
-        catalog_scope: CatalogCheckpointScope,
-        redo_scope: RedoRetentionScope,
-        scope: PreparedMaintenanceScope,
-    ) -> Self {
-        let metadata =
-            MandatoryTaskMetadata::operation(<Self as PreparedExecution>::LABEL, Some(scope.key()));
-        Self {
+) -> impl PreparedExecution<Output = RedoTruncationOutcome> {
+    PreparedMaintenanceExecution::<RedoTruncationExecution>::global(
+        scope,
+        RedoTruncationResources {
             catalog_scope,
-            redo_scope,
-            scope,
-            metadata,
-        }
-    }
+            _redo_scope: redo_scope,
+        },
+        "accepted redo truncation panicked",
+    )
 }
 
-impl PreparedExecution for PreparedCatalogRedoMaintenanceOperation {
+struct CatalogRedoMaintenanceExecution;
+
+struct CatalogRedoMaintenanceResources {
+    catalog_scope: CatalogCheckpointScope,
+    _redo_scope: RedoRetentionScope,
+}
+
+impl MaintenanceExecutionSpec for CatalogRedoMaintenanceExecution {
     type Output = CatalogRedoMaintenanceOutcome;
-    type Accepted = AcceptedCatalogRedoMaintenanceOperation;
+    type Resources = CatalogRedoMaintenanceResources;
+    type PanicLabel = &'static str;
 
     const LABEL: &'static str = "checkpoint_catalog_and_truncate_redo_log";
 
-    #[inline]
-    fn metadata(&self) -> MandatoryTaskMetadata {
-        self.metadata.clone()
-    }
-
-    #[inline]
-    fn accept(self) -> Self::Accepted {
-        let Self {
-            catalog_scope,
-            redo_scope,
-            scope,
-            metadata: _,
-        } = self;
-        AcceptedCatalogRedoMaintenanceOperation {
-            catalog_scope: Some(catalog_scope),
-            redo_scope: Some(redo_scope),
-            scope: scope.accept(),
-        }
-    }
-}
-
-/// Mandatory-runtime owner of accepted combined catalog/redo maintenance.
-pub(crate) struct AcceptedCatalogRedoMaintenanceOperation {
-    catalog_scope: Option<CatalogCheckpointScope>,
-    redo_scope: Option<RedoRetentionScope>,
-    scope: AcceptedMaintenanceScope,
-}
-
-impl AcceptedExecution for AcceptedCatalogRedoMaintenanceOperation {
-    type Output = CatalogRedoMaintenanceOutcome;
-
-    async fn execute(&mut self) -> CompletionResult<Self::Output> {
-        let engine = self.scope.engine().clone();
-        let catalog_scope = self
-            .catalog_scope
-            .as_mut()
-            .unwrap_or_else(|| panic!("accepted combined maintenance catalog scope is missing"));
+    async fn execute(
+        scope: &mut AcceptedMaintenanceScope,
+        resources: &mut Self::Resources,
+        _panic_label: &mut Self::PanicLabel,
+    ) -> CompletionResult<Self::Output> {
+        let engine = scope.engine().clone();
         let result = engine
             .trx_sys
             .checkpoint_catalog_and_truncate_redo_log_prepared(
-                || catalog_scope.release(),
+                || resources.catalog_scope.release(),
                 #[cfg(test)]
                 &engine.maintenance_test,
             )
             .await
             .map_err(CompletionErrorBridge::capture_runtime_or_fatal);
-        self.scope.mark_terminal_ready();
+        scope.mark_terminal_ready();
         result
     }
+}
 
-    #[inline]
-    fn finish(&mut self) {
-        drop(self.catalog_scope.take());
-        drop(self.redo_scope.take());
-        self.scope.finish();
-    }
-
-    async fn handle_panic(&mut self, _panic: Box<dyn Any + Send>) -> CompletionErrorBridge {
-        self.scope.handle_panic();
-        CompletionErrorBridge::capture(
-            Report::new(FatalError::MandatoryTaskPanic)
-                .attach("accepted combined catalog/redo maintenance panicked"),
-        )
-    }
+/// Prepare combined catalog checkpoint and redo truncation authority.
+pub(crate) fn prepare_catalog_redo_maintenance_operation(
+    catalog_scope: CatalogCheckpointScope,
+    redo_scope: RedoRetentionScope,
+    scope: PreparedMaintenanceScope,
+) -> impl PreparedExecution<Output = CatalogRedoMaintenanceOutcome> {
+    PreparedMaintenanceExecution::<CatalogRedoMaintenanceExecution>::global(
+        scope,
+        CatalogRedoMaintenanceResources {
+            catalog_scope,
+            _redo_scope: redo_scope,
+        },
+        "accepted combined catalog/redo maintenance panicked",
+    )
 }
 
 impl TransactionSystem {

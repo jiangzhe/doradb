@@ -260,6 +260,7 @@ mod tests {
     use crate::buffer::page::PAGE_SIZE;
     use crate::catalog::tests::{
         assert_dropped_table_floor, assert_no_dropped_table_operational_state,
+        wait_for_no_dropped_table_operational_state,
     };
     use crate::catalog::{TableMetadata, USER_TABLE_ID_START};
     use crate::engine::Engine;
@@ -665,7 +666,8 @@ mod tests {
                 .checkpoint_catalog()
                 .await
                 .unwrap();
-            wait_path_exists(&table_file_path, false).await;
+            wait_for_no_dropped_table_operational_state(&engine, table_id).await;
+            assert!(!std::path::Path::new(&table_file_path).exists());
             assert!(engine.catalog().retained_dropped_table_ids_now().is_empty());
             assert_no_dropped_table_operational_state(engine.catalog(), table_id);
             assert_eq!(
