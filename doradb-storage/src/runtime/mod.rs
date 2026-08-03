@@ -5,6 +5,9 @@ use std::task::{Context, Poll};
 
 pub(crate) mod mandatory;
 
+/// Logical work items completed between cooperative executor yields.
+pub(crate) const POLL_BUDGET: usize = 128;
+
 /// One-shot cooperative yield future.
 pub(crate) struct YieldNow {
     yielded: bool,

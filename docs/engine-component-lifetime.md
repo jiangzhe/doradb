@@ -175,6 +175,23 @@ submitted synchronously without a lossy channel. Independent transactions can
 therefore clean up concurrently, while each transaction's rollback remains
 sequential.
 
+`MandatoryRuntimeConfig::worker_threads` controls OS runners, not the accepted
+caller count. `concurrency_limit` bounds accepted caller obligations, not
+caller-side preparation futures or internal cleanup. Increasing caller
+capacity can retain more logical locks, memory, and publication work without
+increasing runner throughput. Increasing runners can increase storage and
+metadata contention and cannot make blocking code cooperative. Configuration
+is validated once during startup, rejects zero sizes, and cannot resize a
+running engine.
+
+One runner provides concurrency only when accepted work reaches an await or
+explicit yield that returns scheduler control. Multiple runners allow true
+overlap, but neither configuration promises executor ordering, a queue-latency
+bound, or a general fairness SLA. Internal admission is non-lossy and separate
+from caller backpressure; it intentionally does not create a bounded cleanup
+backlog because correctness obligations cannot be rejected after ownership is
+claimed.
+
 Mandatory results reuse the common completion cell through a move-once take
 path. The single observer owns no task, permit, engine reference, session
 authority, or prepared resource. Dropping it cannot cancel execution. A
@@ -218,6 +235,64 @@ and completion waiters are published, and the permit is released exactly once.
 If the domain panic policy itself unwinds, the panic-minimal fallback retains
 the whole armed owner instead of dropping raw-reference-sensitive undo.
 
+### Fixed-Class Statistics And Task Events
+
+`Session::mandatory_runtime_stats()` returns one engine-global snapshot with
+fixed `operation` and `transaction_cleanup` classes. Each class publishes
+monotonic `submitted_count`, `started_count`, `completed_count`,
+`error_count`, `panic_count`, `detached_observer_count`,
+`admission_wait_nanos`, `queue_wait_nanos`, and `execution_nanos` fields plus
+the current authoritative `active_count`. Fields are independently sampled;
+concurrent snapshots do not promise a transactionally consistent equation.
+Caller terminal counts, outcomes, and execution time are recorded before
+completion publication wakes the observer, so a snapshot taken immediately
+after an observed result includes that result. `active_count` remains
+independently sampled until the supervisor releases its permit.
+The inspection remains available after poison while engine/session lifecycle
+inspection is admitted and creates no runtime work.
+
+Accepted caller task labels are `create_table`, `drop_table`, `create_index`,
+`drop_index`, `freeze_table`, `checkpoint_table`, `checkpoint_catalog`,
+`truncate_redo_log`, `checkpoint_catalog_and_truncate_redo_log`, and
+`cleanup_secondary_mem_indexes`. Internal cleanup labels are
+`terminal_rollback`, `abandoned_transaction`, and `failed_precommit`. These
+labels and the two class names are diagnostic vocabulary, not scheduling
+policy or a per-label registry.
+
+Every accepted task emits debug records with
+`event=mandatory_task component=mandatory_runtime`: `action=start result=ok`
+includes immutable class, task, optional session-operation/table identities,
+successful admission wait, and executor queue wait; `action=finish` reports
+`result=ok|error|panic`, the same identity, execution time, and
+`observer=attached|detached|none`. An unobserved ordinary error retains its
+error-level `action=discard_unobserved` record, and task panic retains the
+engine-poison error record. The storage crate does not install a logger.
+
+### Cooperative Poll Audit
+
+Accepted execution acquires no logical operation lock or metadata gate after
+the synchronous `PreparedExecution::accept` edge. The bounded-poll audit found:
+
+- CREATE/DROP TABLE and DROP INDEX perform bounded state transitions around
+  awaited storage, transaction, lifecycle, or publication boundaries.
+- CREATE INDEX hot-row collection and construction yield after their named
+  128-row batches; cold input proceeds through awaited storage batches. Its
+  larger bounded-memory/parallel redesign remains backlog 000104.
+- freeze/checkpoint, catalog checkpoint, redo retention/truncation, and
+  secondary `MemIndex` cleanup proceed through operation-specific awaited IO,
+  retry, scan-batch, or transaction boundaries. Synchronous filesystem regions
+  remain the runtime-independent blocking-work scope of backlog 000137.
+- terminal rollback, abandoned cleanup, and failed-precommit cleanup use the
+  same row/index undo paths. Those paths explicitly yield after 128 completed
+  undo entries, after the current entry is unlinked and popped and before the
+  next entry is borrowed.
+- normal finish and panic preservation perform fixed ownership publication or
+  move residual payloads into fatal retention; they do not reacquire operation
+  authority or loop on scheduler state.
+
+These boundaries provide cooperative progress evidence for the fixed runtime;
+they do not establish preemption or a general starvation-free scheduler.
+
 ## Admission, Shutdown, And Drop
 
 The engine lifecycle has three states:
@@ -233,6 +308,12 @@ shutdown can proceed.
 `Engine::try_shutdown()` performs that check once and returns `ShutdownBusy` if
 work remains. The infallible `Engine::shutdown()` waits for the same work to
 drain and returns only after final teardown completes.
+
+Lifecycle records distinguish `mode=try origin=explicit` from blocking
+`mode=wait origin=explicit|owner_drop`. A busy try-shutdown record and its
+returned attachment use the same `strong_refs`, `operation_blocked`,
+`operation_state`, `voluntary_blocked`, `mandatory_session_blocked`,
+`cleanup_queued`, `mandatory_callers`, and `mandatory_internal` fields.
 
 Normal shutdown is:
 
@@ -309,9 +390,11 @@ registry-owned component owners start their final `QuiescentBox<T>` drains.
 An unintended owner drop can therefore block indefinitely while
 caller-retained foreground work, runtime references, or engine-owned
 background work remains live. Callers should finish foreground work and invoke
-explicit shutdown at a controlled point when blocking there is operationally
-important. Drop does not cancel accepted work or tear down components before
-that work reaches terminal state.
+`try_shutdown` or explicit shutdown at a controlled point when blocker
+diagnostics and blocking location are operationally important. Drop does not
+cancel accepted work or tear down components before that work reaches terminal
+state. Future priority or reserved-runner lanes, adaptive sizing, task groups,
+and a separate blocking/CPU pool require workload evidence and separate design.
 
 ## Quiescent Ownership
 

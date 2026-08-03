@@ -1248,9 +1248,12 @@ focused validation.
     finalize engine/session/runtime shutdown diagnostics, task/result
     observability, blocking owner-drop drain, bounded-poll audits,
     configuration documentation, cross-operation stress tests, and paired
-    performance measurements. Synchronize RFC-0025 Phases 3 through 7 as
-    superseded by this RFC and preserve the fixed-runtime implementation
-    evidence that closed backlog 000123. [D3] [D7] [D9] [B1]
+    performance measurements through workloads already implemented in
+    `doradb-bench`. Checkpoint/maintenance and large rollback/mixed-runtime
+    performance shapes require dedicated benchmark design and are not
+    approximated by test-only harnesses in this phase. Synchronize RFC-0025
+    Phases 3 through 7 as superseded by this RFC and preserve the fixed-runtime
+    implementation evidence that closed backlog 000123. [D3] [D7] [D9] [B1]
   - Goals: Demonstrate one execution owner, no dropped accepted payload,
     lossless shutdown wakeups, no transaction/statement hot-path overhead,
     bounded caller-operation backlog, progress for cleanup under
@@ -1261,18 +1264,24 @@ focused validation.
     caller preparation plus atomic prepared-runtime submission; no legacy
     foreground handoff or runtime-side operation-lock acquisition remains.
   - Phase-local Choices: Finalize stable diagnostic labels/counters, select
-    focused stress repetition counts and benchmark thresholds, and determine
-    whether new workload evidence justifies a follow-up scheduling-policy RFC
-    or separate work on backlog 000167.
+    focused stress repetition counts and benchmark thresholds for existing
+    table/index DDL, no-op, insert, lookup, scan, and stream commands, and
+    determine whether deterministic correctness evidence justifies a follow-up
+    scheduling-policy RFC or separate work on backlog 000167. Missing
+    checkpoint/freeze/shutdown-reopen performance coverage remains backlog
+    000147; missing large rollback and heterogeneous mandatory-runtime coverage
+    is recorded in backlog 000176 as separate deferred `doradb-bench` design.
   - Non-goals: Do not implement adaptive resizing, priority lanes, parallel
     recovery/checkpoint/index algorithms, forced shutdown, or explicit
     operation cancellation.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000252-mandatory-runtime-lifecycle-fairness-evolution-readiness.md`
+  - Task Issue: `#931`
+  - Phase Status: done
+  - Implementation Summary: Implemented fixed-class observability, cooperative cleanup progress, coherent shutdown diagnostics, and the final RFC-0026 runtime evidence without changing accepted-operation ownership or adding scheduler policy. [Task Resolve Sync: docs/tasks/000252-mandatory-runtime-lifecycle-fairness-evolution-readiness.md @ 2026-08-03]
   - Related Backlogs:
     - `docs/backlogs/closed/000123-adaptive-background-worker-runtime.md`
+    - `docs/backlogs/000147-doradb-bench-checkpoint-lifecycle-scenarios.md`
+    - `docs/backlogs/000176-quantify-rollback-saturation-alongside-mandatory-ddl.md`
 
 ## Test Strategy
 

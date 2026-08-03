@@ -9,6 +9,7 @@ use crate::id::{SessionOperationKey, TableID};
 use crate::obs;
 use crate::poison::EnginePoisoner;
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
+use crate::stats::{MandatoryRuntimeStats, MandatoryTaskStats};
 use crate::{runtime, thread};
 use error_stack::{Report, ResultExt};
 use event_listener::{Event, listener};
@@ -16,13 +17,15 @@ use futures::FutureExt;
 use futures::future::{Either, select};
 use parking_lot::Mutex;
 use std::any::Any;
+use std::fmt::{self, Display, Formatter};
 use std::future::Future;
 use std::mem::take;
 use std::panic::{AssertUnwindSafe, resume_unwind};
 use std::result::Result as StdResult;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 /// Immutable classification of one mandatory task.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,6 +110,141 @@ impl MandatoryTaskMetadata {
             self.table_id
                 .map_or_else(|| "none".to_owned(), |table_id| table_id.to_string())
         )
+    }
+
+    #[inline]
+    const fn task_class(&self) -> &'static str {
+        self.class.label()
+    }
+
+    #[inline]
+    const fn task_label(&self) -> &'static str {
+        self.label
+    }
+
+    #[inline]
+    const fn session_operation(&self) -> Option<SessionOperationKey> {
+        self.session_operation
+    }
+
+    #[inline]
+    const fn table_id(&self) -> Option<TableID> {
+        self.table_id
+    }
+}
+
+struct OptionalValue<T>(Option<T>);
+
+impl<T> Display for OptionalValue<T>
+where
+    T: Display,
+{
+    #[inline]
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self.0.as_ref() {
+            Some(value) => value.fmt(formatter),
+            None => formatter.write_str("none"),
+        }
+    }
+}
+
+#[derive(Default)]
+struct MandatoryTaskCounters {
+    submitted_count: AtomicUsize,
+    started_count: AtomicUsize,
+    completed_count: AtomicUsize,
+    error_count: AtomicUsize,
+    panic_count: AtomicUsize,
+    detached_observer_count: AtomicUsize,
+    admission_wait_nanos: AtomicUsize,
+    queue_wait_nanos: AtomicUsize,
+    execution_nanos: AtomicUsize,
+}
+
+impl MandatoryTaskCounters {
+    #[inline]
+    fn record_submitted(&self, admission_wait_nanos: usize) {
+        self.submitted_count.fetch_add(1, Ordering::Relaxed);
+        self.admission_wait_nanos
+            .fetch_add(admission_wait_nanos, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn record_started(&self, queue_wait_nanos: usize) {
+        self.started_count.fetch_add(1, Ordering::Relaxed);
+        self.queue_wait_nanos
+            .fetch_add(queue_wait_nanos, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn record_completed(&self, result: MandatoryTaskResult, execution_nanos: usize) {
+        match result {
+            MandatoryTaskResult::Ok => {}
+            MandatoryTaskResult::Error => {
+                self.error_count.fetch_add(1, Ordering::Relaxed);
+            }
+            MandatoryTaskResult::Panic => {
+                self.panic_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.execution_nanos
+            .fetch_add(execution_nanos, Ordering::Relaxed);
+        self.completed_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn record_observer_detached(&self) {
+        self.detached_observer_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn snapshot(&self, active_count: usize) -> MandatoryTaskStats {
+        MandatoryTaskStats {
+            submitted_count: self.submitted_count.load(Ordering::Relaxed),
+            started_count: self.started_count.load(Ordering::Relaxed),
+            completed_count: self.completed_count.load(Ordering::Relaxed),
+            error_count: self.error_count.load(Ordering::Relaxed),
+            panic_count: self.panic_count.load(Ordering::Relaxed),
+            detached_observer_count: self.detached_observer_count.load(Ordering::Relaxed),
+            active_count,
+            admission_wait_nanos: self.admission_wait_nanos.load(Ordering::Relaxed),
+            queue_wait_nanos: self.queue_wait_nanos.load(Ordering::Relaxed),
+            execution_nanos: self.execution_nanos.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MandatoryTaskResult {
+    Ok,
+    Error,
+    Panic,
+}
+
+impl MandatoryTaskResult {
+    #[inline]
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Error => "error",
+            Self::Panic => "panic",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PublishedObserver {
+    Attached,
+    Detached,
+}
+
+impl PublishedObserver {
+    #[inline]
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Attached => "attached",
+            Self::Detached => "detached",
+        }
     }
 }
 
@@ -370,17 +508,20 @@ struct MandatoryCompletion<T> {
     completion: Completion<T>,
     observation: Mutex<ObservationState>,
     metadata: MandatoryTaskMetadata,
+    counters: Arc<MandatoryTaskCounters>,
 }
 
 impl<T> MandatoryCompletion<T> {
     #[inline]
     fn endpoints(
         metadata: MandatoryTaskMetadata,
+        counters: Arc<MandatoryTaskCounters>,
     ) -> (CompletionProducer<T>, CompletionObserver<T>) {
         let inner = Arc::new(Self {
             completion: Completion::new(),
             observation: Mutex::new(ObservationState::Attached),
             metadata,
+            counters,
         });
         (
             CompletionProducer {
@@ -396,8 +537,11 @@ impl<T> MandatoryCompletion<T> {
             Ok(value) => drop(value),
             Err(error) => {
                 obs::error!(
-                    "event=mandatory_completion component=mandatory_runtime action=discard_unobserved result=error {} error={error:?}",
-                    self.metadata.diagnostic()
+                    "event=mandatory_completion component=mandatory_runtime action=discard_unobserved result=error task_class={} task_label={} session_operation={} table_id={} error={error:?}",
+                    self.metadata.task_class(),
+                    self.metadata.task_label(),
+                    OptionalValue(self.metadata.session_operation()),
+                    OptionalValue(self.metadata.table_id()),
                 );
             }
         }
@@ -415,11 +559,17 @@ impl<T> CompletionProducer<T> {
     }
 
     #[inline]
-    fn complete(self, result: CompletionResult<T>) {
+    fn counters(&self) -> &Arc<MandatoryTaskCounters> {
+        &self.inner.counters
+    }
+
+    #[inline]
+    fn complete(self, result: CompletionResult<T>) -> PublishedObserver {
         let observation = self.inner.observation.lock();
         match *observation {
             ObservationState::Attached => {
                 self.inner.completion.complete(result);
+                PublishedObserver::Attached
             }
             ObservationState::Detached => {
                 self.inner.completion.complete(result);
@@ -431,6 +581,7 @@ impl<T> CompletionProducer<T> {
                 };
                 drop(observation);
                 self.inner.handle_unobserved(result);
+                PublishedObserver::Detached
             }
             ObservationState::Consumed => {
                 unreachable!("observer cannot consume before producer completion")
@@ -469,6 +620,7 @@ impl<T> Drop for CompletionObserver<T> {
             return;
         }
         self.armed = false;
+        self.inner.counters.record_observer_detached();
         let mut observation = self.inner.observation.lock();
         assert!(
             matches!(*observation, ObservationState::Attached),
@@ -507,6 +659,10 @@ pub(crate) struct MandatoryRuntime {
     /// while redo can produce final cleanup, then closes and drains before the
     /// executor runners stop.
     internal_admission: MandatoryInternalAdmission,
+    /// Monotonic diagnostics for accepted caller operations.
+    operation_counters: Arc<MandatoryTaskCounters>,
+    /// Monotonic diagnostics for internal transaction cleanup.
+    transaction_cleanup_counters: Arc<MandatoryTaskCounters>,
     /// One-way stop state shared by all executor runners.
     stopping: AtomicBool,
     /// Wakeup used to stop every runner after both admissions drain.
@@ -522,6 +678,8 @@ impl MandatoryRuntime {
             executor: async_executor::Executor::new(),
             admission: MandatoryAdmission::new(config.concurrency_limit),
             internal_admission: MandatoryInternalAdmission::new(),
+            operation_counters: Arc::new(MandatoryTaskCounters::default()),
+            transaction_cleanup_counters: Arc::new(MandatoryTaskCounters::default()),
             stopping: AtomicBool::new(false),
             stop_event: Event::new(),
             poisoner,
@@ -556,6 +714,17 @@ impl MandatoryRuntime {
         let (_, callers) = self.admission.inspect();
         let (_, internal) = self.internal_admission.inspect();
         (callers, internal)
+    }
+
+    /// Return an independently sampled fixed-class statistics snapshot.
+    #[inline]
+    pub(crate) fn stats(&self) -> MandatoryRuntimeStats {
+        let (_, operation_active) = self.admission.inspect();
+        let (_, cleanup_active) = self.internal_admission.inspect();
+        MandatoryRuntimeStats {
+            operation: self.operation_counters.snapshot(operation_active),
+            transaction_cleanup: self.transaction_cleanup_counters.snapshot(cleanup_active),
+        }
     }
 
     async fn run(&self) {
@@ -778,6 +947,7 @@ impl QuiescentGuard<MandatoryRuntime> {
                 .change_context(LifecycleError::RuntimeUnavailable)
                 .attach("phase=mandatory_admission_health_check"));
         }
+        let admission_started_at = Instant::now();
         let acquire = self.admission.acquire(self.clone());
         futures::pin_mut!(acquire);
         futures::pin_mut!(poison_listener);
@@ -795,14 +965,25 @@ impl QuiescentGuard<MandatoryRuntime> {
         };
         // Winning admission is the poison-race linearization point. A later
         // poison does not cancel work that is already admitted and accounted.
+        let admission_wait_nanos = elapsed_nanos(admission_started_at);
         let metadata = prepared.metadata();
-        let (producer, observer) = MandatoryCompletion::endpoints(metadata);
+        let (producer, observer) =
+            MandatoryCompletion::endpoints(metadata, Arc::clone(&self.operation_counters));
 
         // No await or expected rejection exists below this ownership edge.
+        let queued_at = Instant::now();
+        self.operation_counters
+            .record_submitted(admission_wait_nanos);
         let accepted = prepared.accept();
         let task_runtime = self.clone();
         self.executor
-            .spawn(task_runtime.supervise_accepted(accepted, producer, permit))
+            .spawn(task_runtime.supervise_accepted(
+                accepted,
+                producer,
+                permit,
+                queued_at,
+                admission_wait_nanos,
+            ))
             .detach();
         Ok(observer)
     }
@@ -817,9 +998,11 @@ impl QuiescentGuard<MandatoryRuntime> {
             return Err(job);
         };
         let metadata = job.metadata();
+        let queued_at = Instant::now();
         let task_runtime = self.clone();
+        self.transaction_cleanup_counters.record_submitted(0);
         self.executor
-            .spawn(task_runtime.supervise_internal(job, metadata, permit))
+            .spawn(task_runtime.supervise_internal(job, metadata, permit, queued_at))
             .detach();
         Ok(())
     }
@@ -834,23 +1017,59 @@ impl QuiescentGuard<MandatoryRuntime> {
         mut accepted: A,
         producer: CompletionProducer<A::Output>,
         permit: MandatoryPermit,
+        queued_at: Instant,
+        admission_wait_nanos: usize,
     ) where
         A: AcceptedExecution,
     {
+        let started_at = Instant::now();
+        let queue_wait_nanos = duration_nanos(started_at.duration_since(queued_at));
+        let metadata = producer.metadata().clone();
+        let counters = Arc::clone(producer.counters());
+        counters.record_started(queue_wait_nanos);
+        obs::debug!(
+            "event=mandatory_task component=mandatory_runtime action=start result=ok task_class={} task_label={} session_operation={} table_id={} admission_wait_nanos={} queue_wait_nanos={}",
+            metadata.task_class(),
+            metadata.task_label(),
+            OptionalValue(metadata.session_operation()),
+            OptionalValue(metadata.table_id()),
+            admission_wait_nanos,
+            queue_wait_nanos,
+        );
         let outcome = AssertUnwindSafe(async { accepted.execute().await })
             .catch_unwind()
             .await;
-        match outcome {
-            Ok(result) => {
+        let (result, completion_result) = match outcome {
+            Ok(completion_result) => {
+                let task_result = if completion_result.is_ok() {
+                    MandatoryTaskResult::Ok
+                } else {
+                    MandatoryTaskResult::Error
+                };
                 accepted.finish();
-                producer.complete(result);
+                (task_result, completion_result)
             }
             Err(panic) => {
                 let error = accepted.handle_panic(panic).await;
-                self.poison_mandatory_panic(producer.metadata());
-                producer.complete(Err::<A::Output, _>(error));
+                self.poison_mandatory_panic(&metadata);
+                (MandatoryTaskResult::Panic, Err::<A::Output, _>(error))
             }
-        }
+        };
+        let execution_nanos = elapsed_nanos(started_at);
+        counters.record_completed(result, execution_nanos);
+        // Publish terminal metrics before waking the observer so an immediate
+        // statistics snapshot includes the completion that it just consumed.
+        let observer = producer.complete(completion_result);
+        obs::debug!(
+            "event=mandatory_task component=mandatory_runtime action=finish result={} task_class={} task_label={} session_operation={} table_id={} execution_nanos={} observer={}",
+            result.label(),
+            metadata.task_class(),
+            metadata.task_label(),
+            OptionalValue(metadata.session_operation()),
+            OptionalValue(metadata.table_id()),
+            execution_nanos,
+            observer.label(),
+        );
         drop(accepted);
         drop(permit);
     }
@@ -865,10 +1084,23 @@ impl QuiescentGuard<MandatoryRuntime> {
         mut job: J,
         metadata: MandatoryTaskMetadata,
         permit: MandatoryInternalPermit,
+        queued_at: Instant,
     ) where
         J: MandatoryInternalTask,
     {
-        if AssertUnwindSafe(async { job.run().await })
+        let started_at = Instant::now();
+        let queue_wait_nanos = duration_nanos(started_at.duration_since(queued_at));
+        self.transaction_cleanup_counters
+            .record_started(queue_wait_nanos);
+        obs::debug!(
+            "event=mandatory_task component=mandatory_runtime action=start result=ok task_class={} task_label={} session_operation={} table_id={} admission_wait_nanos=0 queue_wait_nanos={}",
+            metadata.task_class(),
+            metadata.task_label(),
+            OptionalValue(metadata.session_operation()),
+            OptionalValue(metadata.table_id()),
+            queue_wait_nanos,
+        );
+        let result = if AssertUnwindSafe(async { job.run().await })
             .catch_unwind()
             .await
             .is_err()
@@ -876,10 +1108,35 @@ impl QuiescentGuard<MandatoryRuntime> {
             job.preserve_after_panic();
             let fatal = self.poison_mandatory_panic(&metadata);
             job.publish_panic(fatal.into_completion_bridge());
-        }
+            MandatoryTaskResult::Panic
+        } else {
+            MandatoryTaskResult::Ok
+        };
+        let execution_nanos = elapsed_nanos(started_at);
+        self.transaction_cleanup_counters
+            .record_completed(result, execution_nanos);
+        obs::debug!(
+            "event=mandatory_task component=mandatory_runtime action=finish result={} task_class={} task_label={} session_operation={} table_id={} execution_nanos={} observer=none",
+            result.label(),
+            metadata.task_class(),
+            metadata.task_label(),
+            OptionalValue(metadata.session_operation()),
+            OptionalValue(metadata.table_id()),
+            execution_nanos,
+        );
         drop(job);
         drop(permit);
     }
+}
+
+#[inline]
+fn elapsed_nanos(started_at: Instant) -> usize {
+    duration_nanos(started_at.elapsed())
+}
+
+#[inline]
+fn duration_nanos(duration: Duration) -> usize {
+    duration.as_nanos() as usize
 }
 
 #[cfg(test)]
@@ -910,8 +1167,11 @@ mod tests {
     fn mandatory_observer_discloses_operation_error() {
         runtime::block_on(async {
             let metadata = MandatoryTaskMetadata::operation("test", None);
-            let (producer, observer) = MandatoryCompletion::<()>::endpoints(metadata);
-            producer.complete(Err::<(), _>(CompletionErrorBridge::capture(
+            let (producer, observer) = MandatoryCompletion::<()>::endpoints(
+                metadata,
+                Arc::new(MandatoryTaskCounters::default()),
+            );
+            let _ = producer.complete(Err::<(), _>(CompletionErrorBridge::capture(
                 Report::new(OperationError::TableNotFound).attach("operation=test"),
             )));
             let error = observer.wait().await.unwrap_err();
@@ -956,24 +1216,42 @@ mod tests {
         }
 
         let drops = Arc::new(AtomicUsize::new(0));
+        let counters = Arc::new(MandatoryTaskCounters::default());
         let (producer, observer) = MandatoryCompletion::<DropCount>::endpoints(
             MandatoryTaskMetadata::operation("test", None),
+            Arc::clone(&counters),
         );
         drop(observer);
-        producer.complete(Ok(DropCount(Arc::clone(&drops))));
+        let _ = producer.complete(Ok(DropCount(Arc::clone(&drops))));
         assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.detached_observer_count.load(Ordering::Relaxed), 1);
+
+        let (producer, observer) = MandatoryCompletion::<DropCount>::endpoints(
+            MandatoryTaskMetadata::operation("test", None),
+            Arc::clone(&counters),
+        );
+        assert!(matches!(
+            producer.complete(Ok(DropCount(Arc::clone(&drops)))),
+            PublishedObserver::Attached
+        ));
+        drop(observer);
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
+        assert_eq!(counters.detached_observer_count.load(Ordering::Relaxed), 2);
     }
 
     struct SyntheticPrepared {
         moves: Arc<AtomicUsize>,
         finishes: Arc<AtomicUsize>,
+        fail: bool,
     }
 
     struct SyntheticAccepted {
         moves: Arc<AtomicUsize>,
         finishes: Arc<AtomicUsize>,
+        fail: bool,
     }
 
+    #[derive(Debug)]
     struct SyntheticOutput(usize);
 
     struct ExecutePanicPrepared {
@@ -1046,6 +1324,153 @@ mod tests {
         completion: Arc<Completion<()>>,
     }
 
+    struct GatedPrepared {
+        started: Arc<Completion<()>>,
+        release: Arc<Completion<()>>,
+    }
+
+    struct GatedAccepted {
+        started: Arc<Completion<()>>,
+        release: Arc<Completion<()>>,
+    }
+
+    impl PreparedExecution for GatedPrepared {
+        type Output = ();
+        type Accepted = GatedAccepted;
+
+        const LABEL: &'static str = "gated_operation";
+
+        #[inline]
+        fn metadata(&self) -> MandatoryTaskMetadata {
+            MandatoryTaskMetadata::operation(Self::LABEL, None)
+        }
+
+        #[inline]
+        fn accept(self) -> Self::Accepted {
+            GatedAccepted {
+                started: self.started,
+                release: self.release,
+            }
+        }
+    }
+
+    impl AcceptedExecution for GatedAccepted {
+        type Output = ();
+
+        #[inline]
+        async fn execute(&mut self) -> CompletionResult<Self::Output> {
+            self.started.complete(Ok(()));
+            self.release.wait_result().await
+        }
+
+        #[inline]
+        fn finish(&mut self) {}
+
+        #[inline]
+        async fn handle_panic(&mut self, _panic: Box<dyn Any + Send>) -> CompletionErrorBridge {
+            CompletionErrorBridge::capture(
+                Report::new(FatalError::MandatoryTaskPanic).attach("gated operation panic"),
+            )
+        }
+    }
+
+    struct SignalInternal {
+        completed: Arc<Completion<()>>,
+    }
+
+    struct OverlapRendezvous {
+        registrations: AtomicUsize,
+        ready: Completion<()>,
+    }
+
+    impl OverlapRendezvous {
+        #[inline]
+        fn new() -> Self {
+            Self {
+                registrations: AtomicUsize::new(0),
+                ready: Completion::new(),
+            }
+        }
+
+        #[inline]
+        async fn arrive(&self) -> CompletionResult<()> {
+            let registrations = self.registrations.fetch_add(1, Ordering::AcqRel) + 1;
+            assert!(registrations <= 2, "overlap task registered more than once");
+            if registrations == 2 {
+                self.ready.complete(Ok(()));
+            }
+            self.ready.wait_result().await
+        }
+    }
+
+    struct OverlapPrepared {
+        rendezvous: Arc<OverlapRendezvous>,
+    }
+
+    struct OverlapAccepted {
+        rendezvous: Arc<OverlapRendezvous>,
+    }
+
+    impl PreparedExecution for OverlapPrepared {
+        type Output = ();
+        type Accepted = OverlapAccepted;
+
+        const LABEL: &'static str = "overlap_operation";
+
+        #[inline]
+        fn metadata(&self) -> MandatoryTaskMetadata {
+            MandatoryTaskMetadata::operation(Self::LABEL, None)
+        }
+
+        #[inline]
+        fn accept(self) -> Self::Accepted {
+            OverlapAccepted {
+                rendezvous: self.rendezvous,
+            }
+        }
+    }
+
+    impl AcceptedExecution for OverlapAccepted {
+        type Output = ();
+
+        #[inline]
+        async fn execute(&mut self) -> CompletionResult<Self::Output> {
+            self.rendezvous.arrive().await
+        }
+
+        #[inline]
+        fn finish(&mut self) {}
+
+        #[inline]
+        async fn handle_panic(&mut self, _panic: Box<dyn Any + Send>) -> CompletionErrorBridge {
+            CompletionErrorBridge::capture(
+                Report::new(FatalError::MandatoryTaskPanic).attach("overlap operation panic"),
+            )
+        }
+    }
+
+    impl MandatoryInternalTask for SignalInternal {
+        const LABEL: &'static str = "signal_internal";
+
+        #[inline]
+        fn metadata(&self) -> MandatoryTaskMetadata {
+            MandatoryTaskMetadata::transaction_cleanup(Self::LABEL, None)
+        }
+
+        #[inline]
+        async fn run(&mut self) {
+            self.completed.complete(Ok(()));
+        }
+
+        #[inline]
+        fn preserve_after_panic(&mut self) {}
+
+        #[inline]
+        fn publish_panic(&mut self, error: CompletionErrorBridge) {
+            self.completed.complete(Err(error));
+        }
+    }
+
     impl Drop for SyntheticPanicInternal {
         #[inline]
         fn drop(&mut self) {
@@ -1095,6 +1520,7 @@ mod tests {
             SyntheticAccepted {
                 moves: self.moves,
                 finishes: self.finishes,
+                fail: self.fail,
             }
         }
     }
@@ -1104,7 +1530,13 @@ mod tests {
 
         #[inline]
         async fn execute(&mut self) -> CompletionResult<Self::Output> {
-            Ok(SyntheticOutput(self.moves.load(Ordering::Relaxed)))
+            if self.fail {
+                Err(CompletionErrorBridge::capture(
+                    Report::new(OperationError::TableNotFound).attach("synthetic error"),
+                ))
+            } else {
+                Ok(SyntheticOutput(self.moves.load(Ordering::Relaxed)))
+            }
         }
 
         #[inline]
@@ -1138,18 +1570,222 @@ mod tests {
             let mandatory = registry.dependency::<MandatoryRuntime>();
             let moves = Arc::new(AtomicUsize::new(0));
             let finishes = Arc::new(AtomicUsize::new(0));
+            assert_eq!(mandatory.stats(), MandatoryRuntimeStats::default());
 
             let observer = mandatory
                 .submit(SyntheticPrepared {
                     moves: Arc::clone(&moves),
                     finishes: Arc::clone(&finishes),
+                    fail: false,
                 })
                 .await
                 .unwrap();
             assert_eq!(observer.wait().await.unwrap().0, 1);
             assert_eq!(moves.load(Ordering::Relaxed), 1);
             assert_eq!(finishes.load(Ordering::Relaxed), 1);
+            let stats = mandatory.stats();
+            assert_eq!(stats.operation.submitted_count, 1);
+            assert_eq!(stats.operation.started_count, 1);
+            assert_eq!(stats.operation.completed_count, 1);
+            assert_eq!(stats.operation.error_count, 0);
+            assert_eq!(stats.operation.panic_count, 0);
+            assert_eq!(stats.operation.detached_observer_count, 0);
+            assert_eq!(stats.transaction_cleanup, MandatoryTaskStats::default());
+            mandatory.drain_callers().await;
+            assert_eq!(mandatory.stats().operation.active_count, 0);
 
+            (registry, mandatory)
+        });
+        mandatory.close_admission();
+        runtime::block_on(mandatory.drain_callers());
+        registry.shutdown_all();
+    }
+
+    #[test]
+    fn ordinary_error_and_observer_detach_are_counted_by_outcome() {
+        let (registry, mandatory) = runtime::block_on(async {
+            let mut builder = RegistryBuilder::new();
+            builder.build::<EnginePoisoner>(()).await.unwrap();
+            builder
+                .build::<MandatoryRuntime>(
+                    MandatoryRuntimeConfig::default()
+                        .worker_threads(1)
+                        .concurrency_limit(1),
+                )
+                .await
+                .unwrap();
+            builder.build::<MandatoryRuntimeWorkers>(()).await.unwrap();
+            let registry = builder.finish();
+            let mandatory = registry.dependency::<MandatoryRuntime>();
+            let moves = Arc::new(AtomicUsize::new(0));
+            let finishes = Arc::new(AtomicUsize::new(0));
+
+            let error = mandatory
+                .submit(SyntheticPrepared {
+                    moves: Arc::clone(&moves),
+                    finishes: Arc::clone(&finishes),
+                    fail: true,
+                })
+                .await
+                .unwrap()
+                .wait()
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Operation);
+            let stats = mandatory.stats().operation;
+            assert_eq!(stats.submitted_count, 1);
+            assert_eq!(stats.started_count, 1);
+            assert_eq!(stats.completed_count, 1);
+            assert_eq!(stats.error_count, 1);
+            assert_eq!(stats.panic_count, 0);
+            mandatory.drain_callers().await;
+
+            let observer = mandatory
+                .submit(SyntheticPrepared {
+                    moves,
+                    finishes,
+                    fail: false,
+                })
+                .await
+                .unwrap();
+            drop(observer);
+            mandatory.drain_callers().await;
+
+            let stats = mandatory.stats().operation;
+            assert_eq!(stats.submitted_count, 2);
+            assert_eq!(stats.started_count, 2);
+            assert_eq!(stats.completed_count, 2);
+            assert_eq!(stats.error_count, 1);
+            assert_eq!(stats.panic_count, 0);
+            assert_eq!(stats.detached_observer_count, 1);
+            assert_eq!(stats.active_count, 0);
+            (registry, mandatory)
+        });
+        mandatory.close_admission();
+        runtime::block_on(mandatory.drain_callers());
+        registry.shutdown_all();
+    }
+
+    #[test]
+    fn internal_work_progresses_with_one_runner_and_saturated_caller_capacity() {
+        let (registry, mandatory) = runtime::block_on(async {
+            let mut builder = RegistryBuilder::new();
+            builder.build::<EnginePoisoner>(()).await.unwrap();
+            builder
+                .build::<MandatoryRuntime>(
+                    MandatoryRuntimeConfig::default()
+                        .worker_threads(1)
+                        .concurrency_limit(1),
+                )
+                .await
+                .unwrap();
+            builder.build::<MandatoryRuntimeWorkers>(()).await.unwrap();
+            let registry = builder.finish();
+            let mandatory = registry.dependency::<MandatoryRuntime>();
+            for _ in 0..32 {
+                let first_started = Arc::new(Completion::new());
+                let first_release = Arc::new(Completion::new());
+                let first = mandatory
+                    .submit(GatedPrepared {
+                        started: Arc::clone(&first_started),
+                        release: Arc::clone(&first_release),
+                    })
+                    .await
+                    .unwrap();
+                first_started.wait_result().await.unwrap();
+
+                let moves = Arc::new(AtomicUsize::new(0));
+                let finishes = Arc::new(AtomicUsize::new(0));
+                let waiting = mandatory.submit(SyntheticPrepared {
+                    moves: Arc::clone(&moves),
+                    finishes: Arc::clone(&finishes),
+                    fail: false,
+                });
+                futures::pin_mut!(waiting);
+                assert!(matches!(
+                    futures::poll!(waiting.as_mut()),
+                    std::task::Poll::Pending
+                ));
+                assert_eq!(moves.load(Ordering::Relaxed), 0);
+
+                let internal_completed = Arc::new(Completion::new());
+                assert!(
+                    mandatory
+                        .submit_internal(SignalInternal {
+                            completed: Arc::clone(&internal_completed),
+                        })
+                        .is_ok()
+                );
+                internal_completed.wait_result().await.unwrap();
+                mandatory.internal_admission.drain().await;
+                assert!(matches!(
+                    futures::poll!(waiting.as_mut()),
+                    std::task::Poll::Pending
+                ));
+                assert_eq!(moves.load(Ordering::Relaxed), 0);
+
+                first_release.complete(Ok(()));
+                first.wait().await.unwrap();
+                let second = waiting.await.unwrap();
+                assert_eq!(second.wait().await.unwrap().0, 1);
+                mandatory.drain_callers().await;
+            }
+
+            let stats = mandatory.stats();
+            assert_eq!(stats.operation.submitted_count, 64);
+            assert_eq!(stats.operation.completed_count, 64);
+            assert_eq!(stats.operation.active_count, 0);
+            assert_eq!(stats.transaction_cleanup.submitted_count, 32);
+            assert_eq!(stats.transaction_cleanup.completed_count, 32);
+            assert_eq!(stats.transaction_cleanup.active_count, 0);
+            (registry, mandatory)
+        });
+        mandatory.close_admission();
+        runtime::block_on(mandatory.drain_callers());
+        registry.shutdown_all();
+    }
+
+    #[test]
+    fn independent_accepted_tasks_overlap_without_blocking_runners() {
+        let (registry, mandatory) = runtime::block_on(async {
+            let mut builder = RegistryBuilder::new();
+            builder.build::<EnginePoisoner>(()).await.unwrap();
+            builder
+                .build::<MandatoryRuntime>(
+                    MandatoryRuntimeConfig::default()
+                        .worker_threads(2)
+                        .concurrency_limit(2),
+                )
+                .await
+                .unwrap();
+            builder.build::<MandatoryRuntimeWorkers>(()).await.unwrap();
+            let registry = builder.finish();
+            let mandatory = registry.dependency::<MandatoryRuntime>();
+            for _ in 0..32 {
+                let rendezvous = Arc::new(OverlapRendezvous::new());
+                let first = mandatory
+                    .submit(OverlapPrepared {
+                        rendezvous: Arc::clone(&rendezvous),
+                    })
+                    .await
+                    .unwrap();
+                let second = mandatory
+                    .submit(OverlapPrepared {
+                        rendezvous: Arc::clone(&rendezvous),
+                    })
+                    .await
+                    .unwrap();
+
+                first.wait().await.unwrap();
+                second.wait().await.unwrap();
+                assert_eq!(rendezvous.registrations.load(Ordering::Acquire), 2);
+                mandatory.drain_callers().await;
+            }
+            let stats = mandatory.stats().operation;
+            assert_eq!(stats.submitted_count, 64);
+            assert_eq!(stats.started_count, 64);
+            assert_eq!(stats.completed_count, 64);
+            assert_eq!(stats.active_count, 0);
             (registry, mandatory)
         });
         mandatory.close_admission();
@@ -1196,6 +1832,16 @@ mod tests {
             );
             assert_eq!(preserved.load(Ordering::Relaxed), 1);
             assert_eq!(published.load(Ordering::Relaxed), 1);
+            mandatory.internal_admission.drain().await;
+            let stats = mandatory.stats();
+            assert_eq!(stats.operation, MandatoryTaskStats::default());
+            assert_eq!(stats.transaction_cleanup.submitted_count, 1);
+            assert_eq!(stats.transaction_cleanup.started_count, 1);
+            assert_eq!(stats.transaction_cleanup.completed_count, 1);
+            assert_eq!(stats.transaction_cleanup.error_count, 0);
+            assert_eq!(stats.transaction_cleanup.panic_count, 1);
+            assert_eq!(stats.transaction_cleanup.detached_observer_count, 0);
+            assert_eq!(stats.transaction_cleanup.active_count, 0);
 
             (registry, mandatory, dropped)
         });
@@ -1241,6 +1887,15 @@ mod tests {
             let poison = format!("{poison:?}");
             assert!(poison.contains("task_class=operation"), "{poison}");
             assert!(poison.contains("task_label=execute_panic"), "{poison}");
+            mandatory.drain_callers().await;
+            let stats = mandatory.stats().operation;
+            assert_eq!(stats.submitted_count, 1);
+            assert_eq!(stats.started_count, 1);
+            assert_eq!(stats.completed_count, 1);
+            assert_eq!(stats.error_count, 0);
+            assert_eq!(stats.panic_count, 1);
+            assert_eq!(stats.detached_observer_count, 0);
+            assert_eq!(stats.active_count, 0);
 
             (registry, mandatory)
         });

@@ -164,7 +164,7 @@ workloads accepts `--seed`.
 | `--batch-size`, `-b` | `prepare`, insert and non-stream read workloads | `prepare`: `1`; `run`: manifest default | Operations per transaction. For inserts this means rows per commit; for reads this means lookup/index-scan requests or table-scan iterations per read transaction. |
 | `--seed` | `run insert-seq`, `insert-rand`, `lookup-rand`, `index-scan`, `index-stream` | `0` | `u64` reproducibility input for payload bytes, randomized insert order, randomized read key selection, or randomized scan bounds. |
 | `--log-sync` | `run ...` | `fsync` | Redo-log durability sync method. `fsync` and `fdatasync` submit the matching native file-sync operation; `none` skips durable sync and is crash-unsafe. |
-| `--include-stats` | `run ...` | `false` | Captures and prints internal transaction-system, storage-IO, and buffer-pool stats. Omit this for prerequisite runs such as data loading before a measured read workload. |
+| `--include-stats` | `run ...` | `false` | Captures and prints internal transaction-system, storage-IO, buffer-pool, and engine-global mandatory-runtime stats. Omit this for prerequisite runs such as data loading before a measured read workload. |
 
 Run defaults resolve as follows:
 
@@ -221,7 +221,13 @@ errors are written to stderr.
   value size, batch size, seed, prepared index mode, loaded key range, threads,
   sessions, log sync mode, and table id.
 - `Internal Stats`, only with `--include-stats`: public transaction-system,
-  storage-IO, and buffer-pool stats deltas when available.
+  storage-IO, buffer-pool, and mandatory-runtime stats when available. The
+  mandatory snapshot is captured once per engine, not summed once per session;
+  its fixed names are `mandatory.operation.*` and
+  `mandatory.transaction_cleanup.*`. Monotonic fields are deltas and active
+  counts are the independently sampled ending values. Caller terminal counters
+  are published before their result waiters wake, so the ending snapshot
+  includes the final observed mandatory operation.
 - `Final Result`: operation count, inserted rows, found count, not-found count,
   returned rows, elapsed time, throughput, average nanoseconds per operation,
   and failures.
@@ -282,7 +288,7 @@ RFC-0025:
   `trx-noop`.
 - Phase 2's no-per-item stream budget uses `index-stream`.
 - RFC-0026 Phase 2's runtime-owned table-DDL path uses `table-ddl`.
-- Phase 5's successful index-DDL path uses `index-ddl`.
+- RFC-0026 Phase 3's runtime-owned index-DDL path uses `index-ddl`.
 - Existing insert, lookup, table-scan, and index-scan workloads remain the
   row/index/page-loop evidence.
 
@@ -316,14 +322,17 @@ baseline/candidate DDL trials should therefore use equivalently fresh prepared
 roots and normally one cycle per invocation:
 
 ```bash
-rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0025-table-ddl prepare --index none
-rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0025-table-ddl run table-ddl --log-sync none
-rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0025-index-ddl prepare --index none
-rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0025-index-ddl run index-ddl --log-sync none
+rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0026-table-ddl prepare --index none
+rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0026-table-ddl run table-ddl --log-sync none --include-stats
+rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0026-index-ddl prepare --index none
+rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0026-index-ddl run index-ddl --log-sync none --include-stats
 ```
 
 The tool supplies workload shapes and fixed result artifacts, not repetition or
 aggregation. Users remain responsible for repeated paired baseline/candidate
 runs on the same host and configuration, then reporting median and dispersion.
-Checkpoint and persisted/cold measurements remain deferred to the backlogs
-linked at the start of this document.
+Checkpoint, freeze, shutdown/reopen, and persisted/cold measurements remain
+deferred to backlog 000147. Large rollback and heterogeneous DDL, maintenance,
+and internal-cleanup measurements require their separately designed
+`doradb-bench` backlog; the current homogeneous session runner and fixed engine
+configuration are not a substitute performance harness for those roles.

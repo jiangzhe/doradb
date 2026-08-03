@@ -2,8 +2,8 @@ use crate::cli::{IndexMode, LogSyncMode, Workload};
 use crate::error::{BenchError, Result};
 use crate::manifest::{internal_stats_csv_path, result_csv_path, result_markdown_path};
 use doradb_storage::{
-    BufferPoolCounters, BufferPoolRuntimeStats, BufferPoolStats, Session, StorageIoStats,
-    TransactionSystemStats,
+    BufferPoolCounters, BufferPoolRuntimeStats, BufferPoolStats, MandatoryRuntimeStats,
+    MandatoryTaskStats, Session, StorageIoStats, TransactionSystemStats,
 };
 use std::fs;
 use std::io::ErrorKind;
@@ -15,6 +15,7 @@ pub(super) struct InternalStatsSnapshot {
     trx: TransactionSystemStats,
     storage: StorageIoStats,
     buffer: BufferPoolStats,
+    mandatory: MandatoryRuntimeStats,
 }
 
 impl InternalStatsSnapshot {
@@ -23,6 +24,7 @@ impl InternalStatsSnapshot {
             trx: session.transaction_system_stats()?,
             storage: session.storage_io_stats()?,
             buffer: session.buffer_pool_stats()?,
+            mandatory: session.mandatory_runtime_stats()?,
         })
     }
 }
@@ -126,6 +128,7 @@ pub(super) fn internal_metrics(
     push_transaction_metrics(&mut metrics, before.trx, after.trx);
     push_storage_metrics(&mut metrics, before.storage, after.storage);
     push_buffer_metrics(&mut metrics, &before.buffer, &after.buffer);
+    push_mandatory_metrics(&mut metrics, before.mandatory, after.mandatory);
     metrics
 }
 
@@ -538,6 +541,86 @@ fn push_buffer_metrics(
     push_one_buffer_pool(metrics, "buffer.disk", before.disk, after.disk);
 }
 
+fn push_mandatory_metrics(
+    metrics: &mut Vec<Metric>,
+    before: MandatoryRuntimeStats,
+    after: MandatoryRuntimeStats,
+) {
+    push_mandatory_task_metrics(
+        metrics,
+        "mandatory.operation",
+        before.operation,
+        after.operation,
+    );
+    push_mandatory_task_metrics(
+        metrics,
+        "mandatory.transaction_cleanup",
+        before.transaction_cleanup,
+        after.transaction_cleanup,
+    );
+}
+
+fn push_mandatory_task_metrics(
+    metrics: &mut Vec<Metric>,
+    prefix: &str,
+    before: MandatoryTaskStats,
+    after: MandatoryTaskStats,
+) {
+    push_metric(
+        metrics,
+        &format!("{prefix}.submitted_count"),
+        delta(after.submitted_count, before.submitted_count),
+    );
+    push_metric(
+        metrics,
+        &format!("{prefix}.started_count"),
+        delta(after.started_count, before.started_count),
+    );
+    push_metric(
+        metrics,
+        &format!("{prefix}.completed_count"),
+        delta(after.completed_count, before.completed_count),
+    );
+    push_metric(
+        metrics,
+        &format!("{prefix}.error_count"),
+        delta(after.error_count, before.error_count),
+    );
+    push_metric(
+        metrics,
+        &format!("{prefix}.panic_count"),
+        delta(after.panic_count, before.panic_count),
+    );
+    push_metric(
+        metrics,
+        &format!("{prefix}.detached_observer_count"),
+        delta(
+            after.detached_observer_count,
+            before.detached_observer_count,
+        ),
+    );
+    push_metric(
+        metrics,
+        &format!("{prefix}.active_count"),
+        after.active_count as u128,
+    );
+    push_metric(
+        metrics,
+        &format!("{prefix}.admission_wait_nanos"),
+        delta(after.admission_wait_nanos, before.admission_wait_nanos),
+    );
+    push_metric(
+        metrics,
+        &format!("{prefix}.queue_wait_nanos"),
+        delta(after.queue_wait_nanos, before.queue_wait_nanos),
+    );
+    push_metric(
+        metrics,
+        &format!("{prefix}.execution_nanos"),
+        delta(after.execution_nanos, before.execution_nanos),
+    );
+}
+
 fn push_one_buffer_pool(
     metrics: &mut Vec<Metric>,
     prefix: &str,
@@ -728,6 +811,15 @@ mod tests {
                 },
                 ..BufferPoolStats::default()
             },
+            mandatory: MandatoryRuntimeStats {
+                operation: MandatoryTaskStats {
+                    submitted_count: 4,
+                    active_count: 1,
+                    queue_wait_nanos: 10,
+                    ..MandatoryTaskStats::default()
+                },
+                ..MandatoryRuntimeStats::default()
+            },
         };
         let after = InternalStatsSnapshot {
             trx: TransactionSystemStats {
@@ -763,10 +855,26 @@ mod tests {
                 },
                 ..BufferPoolStats::default()
             },
+            mandatory: MandatoryRuntimeStats {
+                operation: MandatoryTaskStats {
+                    submitted_count: 7,
+                    completed_count: 2,
+                    active_count: 3,
+                    queue_wait_nanos: 16,
+                    ..MandatoryTaskStats::default()
+                },
+                transaction_cleanup: MandatoryTaskStats {
+                    submitted_count: 2,
+                    started_count: 2,
+                    completed_count: 2,
+                    execution_nanos: 20,
+                    ..MandatoryTaskStats::default()
+                },
+            },
         };
 
         let metrics = internal_metrics(&before, &after);
-        assert_eq!(metrics.len(), 73);
+        assert_eq!(metrics.len(), 93);
         assert_eq!(metric_value(&metrics, "transaction.commit_count"), 5);
         assert_eq!(metric_value(&metrics, "transaction.trx_count"), 0);
         assert_eq!(metric_value(&metrics, "transaction.log_bytes"), 5);
@@ -778,6 +886,30 @@ mod tests {
         assert_eq!(metric_value(&metrics, "buffer.meta.write_errors"), 0);
         assert_eq!(metric_value(&metrics, "buffer.mem.completed_reads"), 3);
         assert_eq!(metric_value(&metrics, "buffer.disk.write_errors"), 0);
+        assert_eq!(
+            metric_value(&metrics, "mandatory.operation.submitted_count"),
+            3
+        );
+        assert_eq!(
+            metric_value(&metrics, "mandatory.operation.completed_count"),
+            2
+        );
+        assert_eq!(
+            metric_value(&metrics, "mandatory.operation.active_count"),
+            3
+        );
+        assert_eq!(
+            metric_value(&metrics, "mandatory.operation.queue_wait_nanos"),
+            6
+        );
+        assert_eq!(
+            metric_value(&metrics, "mandatory.transaction_cleanup.submitted_count"),
+            2
+        );
+        assert_eq!(
+            metric_value(&metrics, "mandatory.transaction_cleanup.execution_nanos"),
+            20
+        );
     }
 
     #[test]

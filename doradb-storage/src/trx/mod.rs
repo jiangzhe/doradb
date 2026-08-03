@@ -1139,7 +1139,7 @@ struct SessionOperationEntryInner {
     /// Public transactions have no separate outer authority and always use
     /// `false`. For private transactions this remains separate from `state`
     /// because dropping the outer authority while the core is checked out
-    /// leaves `ForegroundRunning(Some(Running))` unchanged until that core
+    /// leaves `Voluntary(Some(Running))` unchanged until that core
     /// returns. The flag then determines whether return/completion resumes the
     /// attached outer operation or publishes outer cleanup/terminal state.
     outer_foreground_alive: bool,

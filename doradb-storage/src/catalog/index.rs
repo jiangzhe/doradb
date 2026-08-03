@@ -22,7 +22,7 @@ use crate::obs;
 use crate::quiescent::QuiescentGuard;
 use crate::row::RowRead;
 use crate::runtime::mandatory::{AcceptedExecution, MandatoryTaskMetadata, PreparedExecution};
-use crate::runtime::yield_now;
+use crate::runtime::{POLL_BUDGET, yield_now};
 use crate::session::{AcceptedDdlScope, PreparedDdlScope};
 use crate::table::{DeleteMarker, Table, TableRuntimeLayout, secondary_disk_tree_encoder};
 use crate::trx::{PreparedCatalogWriteAuthority, Transaction, trx_is_committed};
@@ -483,13 +483,20 @@ impl<'a> CreateIndexRuntimeBuilder<'a> {
             index_spec,
             build_ts,
             #[cfg(test)]
-                test: _,
+            test,
         } = self;
         let ty_infer = |col_no| metadata.col.col_type(col_no);
         let mem =
             UniqueMemIndex::new(index_pool, index_guard, index_spec, ty_infer, build_ts).await?;
-        let insert_res =
-            insert_create_index_unique_hot_rows(&mem, index_guard, &hot_rows, build_ts).await;
+        let insert_res = insert_create_index_unique_hot_rows(
+            &mem,
+            index_guard,
+            &hot_rows,
+            build_ts,
+            #[cfg(test)]
+            &test,
+        )
+        .await;
         if let Err(err) = insert_res {
             if let Err(report) = mem.destroy(index_guard).await {
                 let report = report.attach(format!(
@@ -535,8 +542,15 @@ impl<'a> CreateIndexRuntimeBuilder<'a> {
         let forced_population_failure: RuntimeResult<()> = Ok(());
         let insert_res = match forced_population_failure {
             Ok(()) => {
-                insert_create_index_non_unique_hot_rows(&mem, index_guard, &hot_rows, build_ts)
-                    .await
+                insert_create_index_non_unique_hot_rows(
+                    &mem,
+                    index_guard,
+                    &hot_rows,
+                    build_ts,
+                    #[cfg(test)]
+                    &test,
+                )
+                .await
             }
             Err(err) => Err(err),
         };
@@ -1813,6 +1827,7 @@ async fn insert_create_index_unique_hot_rows(
     index_guard: &PoolGuard,
     hot_rows: &[CreateIndexRowEntry],
     build_ts: TrxID,
+    #[cfg(test)] test: &tests::IndexDdlTestController,
 ) -> OperationOrRuntimeResult<()> {
     for (row_no, row) in hot_rows.iter().enumerate() {
         match mem
@@ -1829,7 +1844,10 @@ async fn insert_create_index_unique_hot_rows(
                 .into());
             }
         }
-        if row_no % 64 == 63 {
+        if row_no % POLL_BUDGET == POLL_BUDGET - 1 {
+            #[cfg(test)]
+            test.reach_phase(tests::IndexDdlTestPhase::CreateHotBuildBatchComplete)
+                .await;
             yield_now().await;
         }
     }
@@ -1841,6 +1859,7 @@ async fn insert_create_index_non_unique_hot_rows(
     index_guard: &PoolGuard,
     hot_rows: &[CreateIndexRowEntry],
     build_ts: TrxID,
+    #[cfg(test)] test: &tests::IndexDdlTestController,
 ) -> RuntimeResult<()> {
     for (row_no, row) in hot_rows.iter().enumerate() {
         match mem
@@ -1856,7 +1875,10 @@ async fn insert_create_index_non_unique_hot_rows(
                 );
             }
         }
-        if row_no % 64 == 63 {
+        if row_no % POLL_BUDGET == POLL_BUDGET - 1 {
+            #[cfg(test)]
+            test.reach_phase(tests::IndexDdlTestPhase::CreateHotBuildBatchComplete)
+                .await;
             yield_now().await;
         }
     }
@@ -2107,7 +2129,10 @@ pub(crate) mod tests {
         ActiveIndexSpec, ColumnAttributes, ColumnSpec, CurrentTableState, IndexAttributes,
         IndexKey, IndexSpec, ResolvedVisibleTableMetadata, TableMetadata, tests::table2,
     };
-    use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
+    use crate::conf::{
+        EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, MandatoryRuntimeConfig,
+        TrxSysConfig,
+    };
     use crate::engine::Engine;
     use crate::error::LifecycleError;
     use crate::file::cow_file::tests::old_root_drop_count;
@@ -2122,11 +2147,12 @@ pub(crate) mod tests {
     use crate::table::tests::assert_freeze_created;
     use crate::trx::{MAX_SNAPSHOT_TS, Transaction};
     use crate::value::{Val, ValKind};
-    use smol::Timer;
+    use smol::{Timer, future::race};
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::mpsc::sync_channel;
+    use std::task::Poll;
     use std::thread::spawn;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -2148,6 +2174,7 @@ pub(crate) mod tests {
         CreateColdCollectionComplete,
         CreateDiskTreeBuilt,
         CreateHotCollectionComplete,
+        CreateHotBuildBatchComplete,
         CreateRuntimeStaged,
         CreateCatalogStaged,
         CreateCatalogCommitted,
@@ -2782,6 +2809,130 @@ pub(crate) mod tests {
             assert!(layout.secondary_indexes()[usize::from(index_no)].is_none());
             finish_publication.send_async(()).await.unwrap();
             assert!(engine.inner().poisoner.poison_error().is_none());
+        });
+    }
+
+    #[test]
+    fn test_terminal_cleanup_progresses_during_accepted_index_ddl_on_one_runner() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(
+                lightweight_test_engine_config(
+                    temp_dir.path().to_path_buf(),
+                    "index_ddl_cleanup_progress",
+                )
+                .mandatory_runtime(
+                    MandatoryRuntimeConfig::default()
+                        .worker_threads(1)
+                        .concurrency_limit(1),
+                ),
+            )
+            .await
+            .unwrap();
+            let table_id = table2(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let mut ddl_session = engine.new_session().unwrap();
+            insert_rows(&table, &mut ddl_session, 0, 129, "fairness").await;
+            let before = ddl_session.mandatory_runtime_stats().unwrap();
+
+            for iteration in 0..8 {
+                let expected_cleanup_submitted =
+                    before.transaction_cleanup.submitted_count + iteration + 1;
+                race(
+                    async {
+                        let (entered, release) = engine
+                            .inner()
+                            .index_ddl_test
+                            .install_gate(IndexDdlTestPhase::CreateHotBuildBatchComplete);
+                        let mut create = Box::pin(ddl_session.create_index(
+                            table_id,
+                            IndexSpec::new(
+                                vec![IndexKey::new(1)],
+                                IndexAttributes::empty(),
+                            ),
+                        ));
+                        assert!(matches!(
+                            futures::poll!(create.as_mut()),
+                            Poll::Pending
+                        ));
+                        entered.recv_async().await.unwrap();
+
+                        let mut cleanup_session = engine.new_session().unwrap();
+                        let mut rollback =
+                            Box::pin(cleanup_session.begin_trx().unwrap().rollback());
+                        let mut rollback_result = None;
+                        loop {
+                            if rollback_result.is_none()
+                                && let Poll::Ready(result) = futures::poll!(rollback.as_mut())
+                            {
+                                rollback_result = Some(result);
+                            }
+                            let cleanup_submitted = engine
+                                .inner()
+                                .mandatory_runtime
+                                .stats()
+                                .transaction_cleanup
+                                .submitted_count;
+                            if cleanup_submitted >= expected_cleanup_submitted {
+                                break;
+                            }
+                            assert!(
+                                rollback_result.is_none(),
+                                "rollback completed before mandatory cleanup submission"
+                            );
+                            Timer::after(Duration::from_millis(1)).await;
+                        }
+
+                        release.send_async(()).await.unwrap();
+                        match rollback_result {
+                            Some(result) => result,
+                            None => rollback.await,
+                        }
+                        .unwrap();
+                        cleanup_session.close().await.unwrap();
+
+                        let index_no = create.await.unwrap();
+                        ddl_session.drop_index(table_id, index_no).await.unwrap();
+                    },
+                    async {
+                        Timer::after(Duration::from_secs(5)).await;
+                        panic!(
+                            "one-runner index DDL and cleanup scheduling timed out: iteration={iteration}"
+                        );
+                    },
+                )
+                .await;
+            }
+
+            let after = ddl_session.mandatory_runtime_stats().unwrap();
+            assert_eq!(
+                after
+                    .operation
+                    .submitted_count
+                    .saturating_sub(before.operation.submitted_count),
+                16
+            );
+            assert_eq!(
+                after
+                    .operation
+                    .completed_count
+                    .saturating_sub(before.operation.completed_count),
+                16
+            );
+            assert_eq!(
+                after
+                    .transaction_cleanup
+                    .submitted_count
+                    .saturating_sub(before.transaction_cleanup.submitted_count),
+                8
+            );
+            assert_eq!(
+                after
+                    .transaction_cleanup
+                    .completed_count
+                    .saturating_sub(before.transaction_cleanup.completed_count),
+                8
+            );
         });
     }
 
