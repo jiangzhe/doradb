@@ -2,7 +2,6 @@ use crate::error::{ConfigError, ConfigResult};
 use crate::root::{ResolvedStoragePaths, StoragePathResolveInput};
 use byte_unit::Byte;
 use error_stack::Report;
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use super::consts::{
@@ -26,7 +25,7 @@ use super::{EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
 /// count may increase storage and metadata contention and cannot repair
 /// blocking task code. Sizing is validated once during engine startup; a
 /// running engine cannot be resized.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct MandatoryRuntimeConfig {
     /// Number of fixed operating-system threads driving the shared executor.
     pub worker_threads: usize,
@@ -75,14 +74,13 @@ impl MandatoryRuntimeConfig {
 }
 
 /// Storage-engine configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct EngineConfig {
     /// Root directory for all storage-engine files.
     pub(crate) storage_root: PathBuf,
     /// Transaction-system configuration.
     pub(crate) trx: TrxSysConfig,
     /// Engine-owned mandatory runtime configuration.
-    #[serde(default)]
     pub(crate) mandatory_runtime: MandatoryRuntimeConfig,
     /// Metadata buffer-pool size.
     pub(crate) meta_buffer: Byte,
@@ -197,19 +195,6 @@ impl EngineConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn legacy_engine_config_defaults_mandatory_runtime() {
-        let mut value =
-            toml::Value::try_from(EngineConfig::default()).expect("serialize engine config");
-        value
-            .as_table_mut()
-            .expect("engine config serializes as table")
-            .remove("mandatory_runtime");
-        let decoded: EngineConfig = value.try_into().expect("deserialize legacy engine config");
-        assert_eq!(decoded.mandatory_runtime.worker_threads, 2);
-        assert_eq!(decoded.mandatory_runtime.concurrency_limit, 4);
-    }
 
     #[test]
     fn mandatory_runtime_rejects_zero_sizes() {

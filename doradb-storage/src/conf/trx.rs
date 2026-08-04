@@ -4,7 +4,6 @@ use crate::log::LogSync;
 use crate::log::format::REDO_DEFAULT_DATA_START_OFFSET;
 use byte_unit::Byte;
 use error_stack::{Report, ResultExt};
-use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use super::consts::{
@@ -17,7 +16,7 @@ use super::path::{path_to_utf8, validate_log_file_stem};
 const MAX_REDO_LOG_BLOCK_SIZE: usize = u16::MAX as usize + 1;
 
 /// Configuration for redo logging, recovery, and transaction-system workers.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct TrxSysConfig {
     /// In-flight IO request depth of the live redo writer.
     pub log_write_io_depth: usize,
@@ -54,7 +53,6 @@ pub struct TrxSysConfig {
     /// Supported values are powers of two from 1 through 256. The bucket
     /// count is fixed for the lifetime of one engine instance and does not
     /// affect persistent storage formats.
-    #[serde(default = "default_gc_buckets")]
     pub gc_buckets: usize,
     /// Disable DML payload validation during recovery/no-transaction replay.
     pub recovery_disable_dml_validation: bool,
@@ -261,11 +259,6 @@ fn validate_purge_threads(purge_threads: usize) -> ConfigResult<()> {
 }
 
 #[inline]
-const fn default_gc_buckets() -> usize {
-    DEFAULT_GC_BUCKETS
-}
-
-#[inline]
 fn validate_gc_buckets(gc_buckets: usize) -> ConfigResult<()> {
     const MIN_GC_BUCKETS: usize = 1;
     const MAX_GC_BUCKETS: usize = 256;
@@ -405,20 +398,6 @@ mod tests {
                 .expect_err("unsupported GC bucket count must be rejected");
             assert_invalid_gc_buckets(err, gc_buckets);
         }
-    }
-
-    #[test]
-    fn legacy_serialized_config_defaults_gc_buckets() {
-        let serialized = toml::to_string(&TrxSysConfig::default()).unwrap();
-        assert!(serialized.contains("gc_buckets = 32"));
-        let legacy = serialized
-            .lines()
-            .filter(|line| !line.starts_with("gc_buckets ="))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let config: TrxSysConfig = toml::from_str(&legacy).unwrap();
-        assert_eq!(config.gc_buckets, DEFAULT_GC_BUCKETS);
     }
 
     #[test]

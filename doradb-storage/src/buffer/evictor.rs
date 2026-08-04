@@ -13,7 +13,6 @@ use crate::{DiskPool, IndexPool, MemPool};
 use error_stack::{Report, ResultExt};
 use event_listener::{Event, EventListener, Listener};
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::ops::{Range, RangeFrom, RangeTo};
 use std::panic::resume_unwind;
@@ -151,7 +150,7 @@ impl ClockHand {
 /// - trigger eviction when `free_frames < target_free` OR failure-rate reaches threshold;
 /// - stop when `free_frames >= target_free + hysteresis` AND failure-rate recovers;
 /// - choose dynamic batch size within `[min_batch, max_batch]`.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct EvictionArbiter {
     target_free: usize,
     hysteresis: usize,
@@ -256,7 +255,7 @@ impl EvictionArbiter {
 ///
 /// If `target_free`/`hysteresis` are not explicitly set, they are derived from
 /// ratio fields and the runtime capacity passed to `build(capacity)`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub(crate) struct EvictionArbiterBuilder {
     target_free: Option<usize>,
     target_free_ratio: f64,

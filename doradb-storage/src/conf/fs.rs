@@ -2,7 +2,6 @@ use crate::conf::path::{path_to_utf8, validate_catalog_file_name};
 use crate::error::{ConfigError, ConfigResult, IoResult};
 use crate::file::fs::{FileSystem, StorageIOWorkerBuilder, build_file_system};
 use error_stack::{Report, ResultExt};
-use serde::{Deserialize, Serialize};
 use std::path::{Component as PathComponent, Path, PathBuf};
 
 use super::consts::{
@@ -11,7 +10,7 @@ use super::consts::{
 };
 
 /// Configuration for table and catalog file-system resources.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct FileSystemConfig {
     /// IO depth for reading and writing table files.
     pub io_depth: usize,

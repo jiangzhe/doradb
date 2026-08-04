@@ -9,14 +9,11 @@ use crate::memcmp::{
 use crate::serde::{Deser, DeserResult, MinBytesHint, Ser, Serde, min_bytes_hint};
 use error_stack::Report;
 use ordered_float::OrderedFloat;
-use serde::de::{Error as DeError, Visitor};
-use serde::{Deserialize, Serialize};
 use std::alloc::{Layout as AllocLayout, alloc, dealloc};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::mem::{self, ManuallyDrop, MaybeUninit};
 use std::ptr::copy_nonoverlapping;
-use std::result::Result as StdResult;
 use std::slice::{from_raw_parts, from_raw_parts_mut};
 use std::str::from_utf8_unchecked;
 use std::sync::atomic::*;
@@ -200,7 +197,7 @@ impl TryFrom<u32> for ValKind {
 /// Val is value representation of row-store.
 /// The variable-length data may require new allocation
 /// because we cannot rely on page data.
-#[derive(Clone, Serialize, Default, Deserialize, Eq)]
+#[derive(Clone, Default, Eq)]
 pub enum Val {
     #[default]
     Null,
@@ -1217,26 +1214,6 @@ impl Drop for MemVar {
     }
 }
 
-impl Serialize for MemVar {
-    #[inline]
-    fn serialize<S>(&self, serializer: S) -> StdResult<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_bytes(self.as_bytes())
-    }
-}
-
-impl<'de> Deserialize<'de> for MemVar {
-    #[inline]
-    fn deserialize<D>(deserializer: D) -> StdResult<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        deserializer.deserialize_bytes(MemVarVisitor)
-    }
-}
-
 impl From<&[u8]> for MemVar {
     #[inline]
     fn from(value: &[u8]) -> Self {
@@ -1273,56 +1250,6 @@ impl From<Vec<u8>> for MemVar {
     }
 }
 
-struct MemVarVisitor;
-
-impl Visitor<'_> for MemVarVisitor {
-    type Value = MemVar;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-        formatter.write_str("byte array")
-    }
-
-    fn visit_bytes<E>(self, v: &[u8]) -> StdResult<Self::Value, E>
-    where
-        E: DeError,
-    {
-        if v.len() >= 0xffff {
-            return fail_long_bytes();
-        }
-        Ok(MemVar::from(v))
-    }
-
-    fn visit_byte_buf<E>(self, v: Vec<u8>) -> StdResult<Self::Value, E>
-    where
-        E: DeError,
-    {
-        if v.len() >= 0xffff {
-            return fail_long_bytes();
-        }
-        Ok(MemVar::from(v))
-    }
-
-    fn visit_str<E>(self, v: &str) -> StdResult<Self::Value, E>
-    where
-        E: DeError,
-    {
-        if v.len() >= 0xffff {
-            return fail_long_bytes();
-        }
-        Ok(MemVar::from(v.as_bytes()))
-    }
-
-    fn visit_string<E>(self, v: String) -> StdResult<Self::Value, E>
-    where
-        E: DeError,
-    {
-        if v.len() >= 0xffff {
-            return fail_long_bytes();
-        }
-        Ok(MemVar::from(v.as_bytes()))
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(C, align(8))]
 struct MemVarInline {
@@ -1354,13 +1281,6 @@ impl Clone for MemVarOutline {
             }
         }
     }
-}
-
-#[inline]
-fn fail_long_bytes<T, E: DeError>() -> StdResult<T, E> {
-    Err(DeError::custom(
-        "MemVar does not support bytes longer than u16:MAX",
-    ))
 }
 
 #[cfg(test)]

@@ -84,15 +84,12 @@ impl fmt::Display for IndexMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(super) enum LogSyncMode {
-    #[serde(rename = "fsync")]
     #[value(name = "fsync")]
     Fsync,
-    #[serde(rename = "fdatasync")]
     #[value(name = "fdatasync")]
     Fdatasync,
-    #[serde(rename = "none")]
     #[value(name = "none")]
     None,
 }
