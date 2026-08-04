@@ -3265,35 +3265,27 @@ mod tests {
             )
             .await
             .unwrap();
-            let mut setup = engine.new_session().unwrap();
-            let initial_target = engine.inner().trx_sys.purge_handoff_cts();
-            setup.begin_trx().unwrap().commit().await.unwrap();
-            setup
-                .wait_for_purge_completion_after(initial_target)
-                .await
-                .unwrap();
 
-            let (event_tx, event_rx) = flume::unbounded();
-            engine.inner().trx_sys.set_purge_test_observer(event_tx);
             let mut oldest_session = engine.new_session().unwrap();
             let mut later_session = engine.new_session().unwrap();
             let oldest = oldest_session.begin_trx().unwrap();
             let later = later_session.begin_trx().unwrap();
             assert!(oldest.sts() < later.sts());
+            let (event_tx, event_rx) = flume::unbounded();
+            engine.inner().trx_sys.set_purge_test_observer(event_tx);
 
             later.commit().await.unwrap();
             assert_eq!(
-                recv_purge_plan(&event_rx).await,
-                PurgeTestEvent::Planned {
-                    transaction_gc: false,
-                    advance_completed_horizon: false,
-                }
+                collect_purge_cycle(&event_rx).await,
+                vec![
+                    PurgeTestEvent::PreScan,
+                    PurgeTestEvent::Planned {
+                        transaction_gc: false,
+                        advance_completed_horizon: false,
+                    },
+                    PurgeTestEvent::CycleCompleted,
+                ]
             );
-            assert_eq!(
-                recv_purge_event(&event_rx, |event| *event == PurgeTestEvent::CycleCompleted).await,
-                PurgeTestEvent::CycleCompleted
-            );
-            assert!(event_rx.try_recv().is_err());
 
             oldest.commit().await.unwrap();
             assert_eq!(
