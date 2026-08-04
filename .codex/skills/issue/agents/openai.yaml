@@ -1,4 +1,0 @@
-interface:
-  display_name: "Issue Automation"
-  short_description: "Create and list document-backed issues"
-  default_prompt: "Use $issue to validate a planning document, create its GitHub issue with repository labels, or list existing issues."

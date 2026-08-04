@@ -1,0 +1,4 @@
+interface:
+  display_name: "RFC Issue Automation"
+  short_description: "Create and list RFC-backed issues"
+  default_prompt: "Use $issue-rfc to validate an RFC document, create its GitHub epic with repository labels, or list existing issues."
