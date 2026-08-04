@@ -2055,19 +2055,19 @@ mod tests {
             .unwrap();
             {
                 let metadata = make_test_metadata();
-                let meta_guard = engine.inner().meta_pool.pool_guard();
+                let meta_guard = engine.inner().pools.meta.pool_guard();
                 let blk_idx = RowPageIndex::new(
-                    engine.inner().meta_pool.clone_inner(),
+                    engine.inner().pools.meta.clone(),
                     &meta_guard,
                     RowID::new(0),
                 )
                 .await
                 .expect("test row-page-index construction should succeed");
-                let mem_guard = engine.inner().mem_pool.pool_guard();
+                let mem_guard = engine.inner().pools.mem.pool_guard();
                 let p1 = blk_idx
                     .get_insert_page(
                         &meta_guard,
-                        &*engine.inner().mem_pool,
+                        &*engine.inner().pools.mem,
                         &mem_guard,
                         &metadata.col,
                         100,
@@ -2081,7 +2081,7 @@ mod tests {
                 let p2 = blk_idx
                     .get_insert_page(
                         &meta_guard,
-                        &*engine.inner().mem_pool,
+                        &*engine.inner().pools.mem,
                         &mem_guard,
                         &metadata.col,
                         100,
@@ -2115,19 +2115,19 @@ mod tests {
             .unwrap();
             {
                 let metadata = make_test_metadata();
-                let meta_guard = engine.inner().meta_pool.pool_guard();
+                let meta_guard = engine.inner().pools.meta.pool_guard();
                 let blk_idx = RowPageIndex::new(
-                    engine.inner().meta_pool.clone_inner(),
+                    engine.inner().pools.meta.clone(),
                     &meta_guard,
                     RowID::new(0),
                 )
                 .await
                 .expect("test row-page-index construction should succeed");
-                let mem_guard = engine.inner().mem_pool.pool_guard();
+                let mem_guard = engine.inner().pools.mem.pool_guard();
                 let p1 = blk_idx
                     .get_insert_page_exclusive(
                         &meta_guard,
-                        &*engine.inner().mem_pool,
+                        &*engine.inner().pools.mem,
                         &mem_guard,
                         &metadata.col,
                         100,
@@ -2140,7 +2140,7 @@ mod tests {
                 let p2 = blk_idx
                     .get_insert_page_exclusive(
                         &meta_guard,
-                        &*engine.inner().mem_pool,
+                        &*engine.inner().pools.mem,
                         &mem_guard,
                         &metadata.col,
                         100,
@@ -2497,20 +2497,20 @@ mod tests {
             .unwrap();
             {
                 let metadata = make_test_metadata();
-                let meta_guard = engine.inner().meta_pool.pool_guard();
+                let meta_guard = engine.inner().pools.meta.pool_guard();
                 let blk_idx = RowPageIndex::new(
-                    engine.inner().meta_pool.clone_inner(),
+                    engine.inner().pools.meta.clone(),
                     &meta_guard,
                     RowID::new(0),
                 )
                 .await
                 .expect("test row-page-index construction should succeed");
-                let mem_guard = engine.inner().mem_pool.pool_guard();
+                let mem_guard = engine.inner().pools.mem.pool_guard();
                 for _ in 0..row_pages {
                     let _ = blk_idx
                         .get_insert_page(
                             &meta_guard,
-                            &*engine.inner().mem_pool,
+                            &*engine.inner().pools.mem,
                             &mem_guard,
                             &metadata.col,
                             100,
@@ -2939,21 +2939,21 @@ mod tests {
             .unwrap();
             {
                 let metadata = make_test_metadata();
-                let meta_guard = engine.inner().meta_pool.pool_guard();
+                let meta_guard = engine.inner().pools.meta.pool_guard();
                 let blk_idx = RowPageIndex::new(
-                    engine.inner().meta_pool.clone_inner(),
+                    engine.inner().pools.meta.clone(),
                     &meta_guard,
                     RowID::new(0),
                 )
                 .await
                 .expect("test row-page-index construction should succeed");
-                let mem_guard = engine.inner().mem_pool.pool_guard();
+                let mem_guard = engine.inner().pools.mem.pool_guard();
                 let redo_ctx =
                     RowPageCreateRedoCtx::new(&engine.inner().trx_sys, TableID::new(104));
                 let page_guard = blk_idx
                     .get_insert_page_with_redo(
                         &meta_guard,
-                        &*engine.inner().mem_pool,
+                        &*engine.inner().pools.mem,
                         &mem_guard,
                         &metadata.col,
                         100,
@@ -2971,7 +2971,7 @@ mod tests {
                 let reused_page = blk_idx
                     .get_insert_page_with_redo(
                         &meta_guard,
-                        &*engine.inner().mem_pool,
+                        &*engine.inner().pools.mem,
                         &mem_guard,
                         &metadata.col,
                         100,
@@ -3022,15 +3022,15 @@ mod tests {
             .await
             .unwrap();
             let metadata = make_test_metadata();
-            let meta_guard = engine.inner().meta_pool.pool_guard();
+            let meta_guard = engine.inner().pools.meta.pool_guard();
             let blk_idx = RowPageIndex::new(
-                engine.inner().meta_pool.clone_inner(),
+                engine.inner().pools.meta.clone(),
                 &meta_guard,
                 RowID::new(0),
             )
             .await
             .expect("test row-page-index construction should succeed");
-            let mem_guard = engine.inner().mem_pool.pool_guard();
+            let mem_guard = engine.inner().pools.mem.pool_guard();
             let redo_ctx = RowPageCreateRedoCtx::new(&engine.inner().trx_sys, TableID::new(206));
             let _ = engine
                 .inner()
@@ -3040,7 +3040,7 @@ mod tests {
             let err = match blk_idx
                 .get_insert_page_with_redo(
                     &meta_guard,
-                    &*engine.inner().mem_pool,
+                    &*engine.inner().pools.mem,
                     &mem_guard,
                     &metadata.col,
                     100,
@@ -3068,7 +3068,8 @@ mod tests {
             };
             let page = engine
                 .inner()
-                .mem_pool
+                .pools
+                .mem
                 .get_page::<RowPage>(&mem_guard, page_id, LatchFallbackMode::Shared)
                 .await
                 .expect("published row page should remain allocated")
@@ -3095,12 +3096,11 @@ mod tests {
             .await
             .unwrap();
             {
-                let meta_pool = &engine.inner().meta_pool;
+                let meta_pool = &engine.inner().pools.meta;
                 let meta_guard = meta_pool.pool_guard();
-                let blk_idx =
-                    RowPageIndex::new(meta_pool.clone_inner(), &meta_guard, RowID::new(0))
-                        .await
-                        .expect("test row-page-index construction should succeed");
+                let blk_idx = RowPageIndex::new(meta_pool.clone(), &meta_guard, RowID::new(0))
+                    .await
+                    .expect("test row-page-index construction should succeed");
                 let redo_ctx = RowPageCreateRedoCtx::new(&engine.inner().trx_sys, table_id);
                 let total_pages = NBR_ROW_PAGE_ENTRIES_IN_LEAF + 64;
                 let worker_count = 8usize;

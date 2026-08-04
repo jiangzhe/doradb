@@ -267,7 +267,6 @@ mod tests {
             redo_bin: Some(redo_bin(cts)),
             payload: None,
             attachment: None,
-            lock_manager: None,
             lock_state: None,
             trx_inner: None,
         }
@@ -279,7 +278,6 @@ mod tests {
             redo_bin: Some(redo_bin_large(cts)),
             payload: None,
             attachment: None,
-            lock_manager: None,
             lock_state: None,
             trx_inner: None,
         }
@@ -291,7 +289,6 @@ mod tests {
             redo_bin: None,
             payload: None,
             attachment: None,
-            lock_manager: None,
             lock_state: None,
             trx_inner: None,
         }

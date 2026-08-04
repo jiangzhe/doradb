@@ -1,7 +1,7 @@
 use crate::buffer::page::VersionedPageID;
 use crate::buffer::{BufferPool, PoolGuards};
 use crate::catalog::{
-    CatalogCheckpointOutcome, CatalogCheckpointScope, CreateIndexPlan, DropIndexPlan,
+    Catalog, CatalogCheckpointOutcome, CatalogCheckpointScope, CreateIndexPlan, DropIndexPlan,
     DropTablePlan, IndexDdlGateScope, IndexNo, IndexSpec, PreparedCreateIndex, PreparedCreateTable,
     PreparedDropIndex, PreparedDropTable, TableSpec, ValidatedCreateTable,
     create_index_catalog_write_targets, create_table_catalog_write_targets,
@@ -9,7 +9,7 @@ use crate::catalog::{
     prepare_catalog_checkpoint_operation, reject_non_user_table_id,
     reject_user_table_primary_key_index, validated_index_ddl_target,
 };
-use crate::engine::{EngineInner, EngineRef, WeakEngineRef};
+use crate::engine::{EngineAdmission, EngineCore, EngineLifecycle};
 use crate::error::{
     CompletionErrorBridge, CompletionResult, DiscloseError, DiscloseResultExt, FatalError,
     LifecycleError, LifecycleResult, MultiDomainResultExt, OperationError, OperationResult, Result,
@@ -47,6 +47,7 @@ use std::fmt::Display;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::mem::replace;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -123,7 +124,7 @@ impl PreparedDdlLocks {
     #[inline]
     fn new(operation: &SessionOperationPin) -> Self {
         Self {
-            lock_manager: operation.engine.lock_manager().clone(),
+            lock_manager: operation.runtime.lock_manager().clone(),
             locks: OwnerLockState::new(operation.operation_lock_owner()),
         }
     }
@@ -282,14 +283,8 @@ impl PreparedDdlScope {
 
     /// Return the retained engine while caller preparation still owns the scope.
     #[inline]
-    pub(crate) fn engine(&self) -> &EngineRef {
-        &self.operation.engine
-    }
-
-    /// Return cloned buffer-pool guards while caller preparation owns the scope.
-    #[inline]
-    pub(crate) fn pool_guards(&self) -> PoolGuards {
-        self.operation.pool_guards()
+    pub(crate) fn engine(&self) -> &SessionRuntime {
+        &self.operation.runtime
     }
 
     /// Synchronously consume caller preparation into accepted authority.
@@ -320,14 +315,8 @@ pub(crate) struct AcceptedDdlScope {
 impl AcceptedDdlScope {
     /// Return the retained engine runtime.
     #[inline]
-    pub(crate) fn engine(&self) -> &EngineRef {
-        &self.operation.engine
-    }
-
-    /// Return cloned buffer-pool guards for catalog/table lifecycle work.
-    #[inline]
-    pub(crate) fn pool_guards(&self) -> PoolGuards {
-        self.operation.state.pool_guards().clone()
+    pub(crate) fn engine(&self) -> &SessionRuntime {
+        &self.operation.runtime
     }
 
     /// Start one mandatory-owned nested private transaction.
@@ -367,7 +356,7 @@ impl AcceptedDdlScope {
                 self.operation.fail_retained();
                 let report = Report::new(FatalError::MandatoryTaskPanic)
                     .attach("accepted table DDL finished without terminal-ready state");
-                self.operation.engine.poisoner.poison(report);
+                self.operation.runtime.poisoner.poison(report);
                 drop(self.locks.take());
             }
             DdlFinishState::FailedRetained => {
@@ -394,7 +383,7 @@ impl PreparedMaintenanceLocks {
     #[inline]
     fn new(operation: &SessionOperationPin) -> Self {
         Self {
-            lock_manager: operation.engine.lock_manager().clone(),
+            lock_manager: operation.runtime.lock_manager().clone(),
             locks: OwnerLockState::new(operation.operation_lock_owner()),
         }
     }
@@ -465,8 +454,8 @@ impl PreparedMaintenanceScope {
 
     /// Return the retained engine while caller preparation owns the scope.
     #[inline]
-    pub(crate) fn engine(&self) -> &EngineRef {
-        &self.operation.engine
+    pub(crate) fn engine(&self) -> &SessionRuntime {
+        &self.operation.runtime
     }
 
     /// Resolve and retain the authoritative current-live table under locks.
@@ -476,11 +465,11 @@ impl PreparedMaintenanceScope {
     ) -> OperationResult<Arc<Table>> {
         let table = self
             .operation
-            .engine
+            .runtime
             .catalog()
             .validate_user_table_live(table_id)
             .await?;
-        self.operation.state.cache_user_table(&table);
+        self.operation.runtime.state().cache_user_table(&table);
         Ok(table)
     }
 
@@ -512,14 +501,14 @@ pub(crate) struct AcceptedMaintenanceScope {
 impl AcceptedMaintenanceScope {
     /// Return the retained engine runtime.
     #[inline]
-    pub(crate) fn engine(&self) -> &EngineRef {
-        &self.operation.engine
+    pub(crate) fn engine(&self) -> &SessionRuntime {
+        &self.operation.runtime
     }
 
     /// Return cloned buffer-pool guards for maintenance work.
     #[inline]
-    pub(crate) fn pool_guards(&self) -> PoolGuards {
-        self.operation.state.pool_guards().clone()
+    pub(crate) fn pool_guards(&self) -> &PoolGuards {
+        self.operation.runtime.pool_guards()
     }
 
     /// Start one mandatory-owned nested private transaction.
@@ -551,7 +540,7 @@ impl AcceptedMaintenanceScope {
                 self.operation.fail_retained();
                 let report = Report::new(FatalError::MandatoryTaskPanic)
                     .attach("accepted maintenance finished without terminal-ready state");
-                self.operation.engine.poisoner.poison(report);
+                self.operation.runtime.poisoner.poison(report);
                 drop(self.locks.take());
             }
             MaintenanceFinishState::FailedRetained => {
@@ -570,13 +559,8 @@ impl AcceptedMaintenanceScope {
 
 impl SessionRuntimeAccess for AcceptedMaintenanceScope {
     #[inline]
-    fn engine(&self) -> &EngineRef {
-        &self.operation.engine
-    }
-
-    #[inline]
-    fn state(&self) -> &Arc<SessionState> {
-        &self.operation.state
+    fn runtime(&self) -> &SessionRuntime {
+        &self.operation.runtime
     }
 }
 
@@ -748,17 +732,17 @@ impl MaintenanceBoundary {
     #[inline]
     fn observed(self, session: &SessionObserverPin) -> TrxID {
         match self {
-            MaintenanceBoundary::GcHorizon => session.engine.trx_sys.published_gc_horizon(),
-            MaintenanceBoundary::PurgeCompletion => session.engine.trx_sys.global_visible_sts(),
+            MaintenanceBoundary::GcHorizon => session.runtime.trx_sys.published_gc_horizon(),
+            MaintenanceBoundary::PurgeCompletion => session.runtime.trx_sys.global_visible_sts(),
         }
     }
 
     #[inline]
     fn listener(self, session: &SessionObserverPin) -> event_listener::EventListener {
         match self {
-            MaintenanceBoundary::GcHorizon => session.engine.trx_sys.gc_horizon_listener(),
+            MaintenanceBoundary::GcHorizon => session.runtime.trx_sys.gc_horizon_listener(),
             MaintenanceBoundary::PurgeCompletion => {
-                session.engine.trx_sys.purge_completion_listener()
+                session.runtime.trx_sys.purge_completion_listener()
             }
         }
     }
@@ -804,7 +788,7 @@ impl<'lock> ScopedTableRuntimeAccess<'lock> {
         owner: LockOwner,
     ) -> OperationResult<(Option<FreshLockGuard<'lock>>, Option<FreshLockGuard<'lock>>)> {
         session
-            .engine
+            .runtime
             .lock_manager()
             .acquire_table_locks(table_id, LockMode::IntentShared, owner)
             .await
@@ -830,11 +814,201 @@ impl Drop for ScopedTableRuntimeAccess<'_> {
     }
 }
 
+/// Limited per-session façade over the engine lifecycle admission gate.
+pub(crate) struct SessionAdmission {
+    lifecycle: Arc<EngineLifecycle>,
+}
+
+impl SessionAdmission {
+    /// Create one façade shared by a session state and its public handles.
+    #[inline]
+    pub(crate) fn new(lifecycle: Arc<EngineLifecycle>) -> Self {
+        Self { lifecycle }
+    }
+
+    /// Acquire short-lived operation-start admission.
+    #[inline]
+    fn acquire(&self) -> LifecycleResult<EngineAdmission<'_>> {
+        self.lifecycle
+            .admit()
+            .attach_with(|| "phase=acquire_engine_lifecycle_admission")
+    }
+
+    /// Returns whether owner-side shutdown has started.
+    #[inline]
+    pub(crate) fn shutdown_started(&self) -> bool {
+        self.lifecycle.shutdown_started()
+    }
+
+    /// Register for owner-side shutdown start.
+    #[inline]
+    pub(crate) fn shutdown_listener(&self) -> EventListener {
+        self.lifecycle.shutdown_listener()
+    }
+}
+
+/// Weak reachability to one exact registered session state.
+#[derive(Clone)]
+pub(crate) struct WeakSessionRef {
+    state: Weak<SessionState>,
+    admission: Arc<SessionAdmission>,
+}
+
+impl WeakSessionRef {
+    /// Create a weak session capability without retaining engine components.
+    #[inline]
+    fn new(state: &Arc<SessionState>) -> Self {
+        Self {
+            state: Arc::downgrade(state),
+            admission: Arc::clone(&state.admission),
+        }
+    }
+
+    /// Acquire operation-start admission without cloning the admission façade.
+    #[inline]
+    pub(crate) fn acquire_admission(&self) -> LifecycleResult<AdmittedSessionRef<'_>> {
+        let admission = self.admission.acquire()?;
+        Ok(AdmittedSessionRef {
+            state: &self.state,
+            _admission: admission,
+        })
+    }
+
+    /// Best-effort upgrade for terminal and cleanup ownership.
+    #[inline]
+    pub(crate) fn upgrade_for_terminal(&self) -> Option<SessionRuntime> {
+        self.state.upgrade().map(SessionRuntime)
+    }
+}
+
+/// Weak session reachability paired with its exact operation-start admission.
+///
+/// The wrapper prevents normal weak upgrades from being separated from the
+/// matching engine admission. It remains live until the caller registers a
+/// stable operation or observer proof.
+pub(crate) struct AdmittedSessionRef<'a> {
+    state: &'a Weak<SessionState>,
+    _admission: EngineAdmission<'a>,
+}
+
+impl<'a> AdmittedSessionRef<'a> {
+    /// Consume this admitted weak reference and pin its exact session runtime.
+    #[inline]
+    pub(crate) fn upgrade(self) -> Option<AdmittedSessionRuntime<'a>> {
+        let runtime = self.state.upgrade().map(SessionRuntime)?;
+        Some(AdmittedSessionRuntime {
+            runtime,
+            _admission: self._admission,
+        })
+    }
+}
+
+/// Strong session reachability retaining its operation-start admission.
+///
+/// Callers release admission with [`Self::into_runtime`] only after registering
+/// a stable operation or observer proof.
+pub(crate) struct AdmittedSessionRuntime<'a> {
+    runtime: SessionRuntime,
+    _admission: EngineAdmission<'a>,
+}
+
+impl AdmittedSessionRuntime<'_> {
+    /// Borrow the pinned runtime while admission remains active.
+    #[inline]
+    pub(crate) fn runtime(&self) -> &SessionRuntime {
+        &self.runtime
+    }
+
+    /// Retain the runtime while releasing operation-start admission.
+    #[inline]
+    pub(crate) fn into_runtime(self) -> SessionRuntime {
+        self.runtime
+    }
+}
+
+/// Strong operation-local reachability to one exact session state.
+///
+/// This typed `Arc` wrapper pins the state reached by a public weak handle.
+/// Engine capabilities are reached through the state without a separate core
+/// clone.
+#[derive(Clone)]
+pub(crate) struct SessionRuntime(Arc<SessionState>);
+
+impl SessionRuntime {
+    /// Wrap one registered session state without another allocation.
+    #[inline]
+    pub(crate) fn new(state: Arc<SessionState>) -> Self {
+        Self(state)
+    }
+
+    /// Return the exact pinned session state.
+    #[inline]
+    pub(crate) fn state(&self) -> &Arc<SessionState> {
+        &self.0
+    }
+
+    /// Return the immutable engine capability set reached through the state.
+    #[inline]
+    pub(crate) fn core(&self) -> &EngineCore {
+        &self.0.core
+    }
+
+    /// Create weak reachability for a public transaction facade.
+    #[inline]
+    pub(crate) fn downgrade(&self) -> WeakSessionRef {
+        WeakSessionRef::new(&self.0)
+    }
+
+    /// Borrow the canonical engine pool guard bundle.
+    #[inline]
+    pub(crate) fn pool_guards(&self) -> &PoolGuards {
+        self.core().pool_guards()
+    }
+
+    /// Returns whether owner-side shutdown has closed operation admission.
+    #[inline]
+    pub(crate) fn shutdown_started(&self) -> bool {
+        self.0.admission.shutdown_started()
+    }
+
+    /// Register for owner-side shutdown start through the session admission façade.
+    #[inline]
+    pub(crate) fn shutdown_listener(&self) -> EventListener {
+        self.0.admission.shutdown_listener()
+    }
+
+    /// Clone catalog capability for an accepted ownership handoff.
+    #[inline]
+    pub(crate) fn catalog_guard(&self) -> QuiescentGuard<Catalog> {
+        self.core().catalog.clone()
+    }
+
+    /// Remove this state only when the registry still owns this exact Arc.
+    #[inline]
+    fn remove_if_requested(&self, remove_from_registry: bool) {
+        if !remove_from_registry {
+            return;
+        }
+        if let Some(registry) = self.core().session_registry.upgrade() {
+            registry.remove_exact(self);
+        }
+    }
+}
+
+impl Deref for SessionRuntime {
+    type Target = EngineCore;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.core()
+    }
+}
+
 /// Weak, non-cloneable public session capability bound to one engine instance.
 ///
 /// The engine owns the strong session state in its internal session registry.
-/// Public session operations upgrade weak engine reachability internally, pin
-/// the registry-owned state for one operation, and release registry/admission
+/// Public session operations upgrade weak state reachability internally, pin
+/// that exact state for one operation, and release admission
 /// guards before async work. A session may move between threads but cannot be
 /// shared between them. Lock-free observations use shared access; state
 /// mutation and every logical-lock transition require mutable access. Every
@@ -843,7 +1017,7 @@ impl Drop for ScopedTableRuntimeAccess<'_> {
 /// is active.
 pub struct Session {
     id: SessionID,
-    engine: WeakEngineRef,
+    session: WeakSessionRef,
     /// Local explicit-close marker.
     ///
     /// `Cell` intentionally preserves `Send` while suppressing the `Sync`
@@ -854,10 +1028,10 @@ pub struct Session {
 impl Session {
     /// Creates a weak public session handle.
     #[inline]
-    pub(crate) fn new(engine: WeakEngineRef, id: SessionID) -> Self {
+    pub(crate) fn new(session: WeakSessionRef, id: SessionID) -> Self {
         Session {
             id,
-            engine,
+            session,
             closed: Cell::new(false),
         }
     }
@@ -878,16 +1052,27 @@ impl Session {
             return Err(Report::new(LifecycleError::SessionUnavailable)
                 .attach(format!("session_id={}", self.id)));
         }
-        let engine = self
-            .engine
-            .upgrade()
-            .attach_with(|| format!("session_id={}, phase=upgrade_engine_runtime", self.id))?;
-        let admission = engine
+        let admitted = self
+            .session
             .acquire_admission()
             .attach_with(|| format!("session_id={}", self.id))?;
-        let state = engine.session_registry.pin_observer(self.id)?;
-        drop(admission);
-        Ok(SessionObserverPin { engine, state })
+        let admitted = admitted.upgrade().ok_or_else(|| {
+            Report::new(LifecycleError::SessionUnavailable)
+                .attach(format!("session_id={}, reason=session_missing", self.id))
+        })?;
+        admitted
+            .runtime()
+            .poisoner
+            .ensure_healthy()
+            .change_context(LifecycleError::RuntimeUnavailable)
+            .attach_with(|| format!("session_id={}, phase=check_engine_health", self.id))?;
+        admitted
+            .runtime()
+            .state()
+            .acquire_observer()
+            .attach_with(|| format!("session_id={}", self.id))?;
+        let runtime = admitted.into_runtime();
+        Ok(SessionObserverPin { runtime })
     }
 
     /// Reserves one stable entry for an effectful public session operation.
@@ -897,21 +1082,34 @@ impl Session {
             return Err(Report::new(LifecycleError::SessionUnavailable)
                 .attach(format!("session_id={}", self.id)));
         }
-        let engine = self.engine.upgrade().attach_with(|| {
-            format!(
-                "session_id={}, kind={}, phase=upgrade_engine_runtime",
-                self.id,
-                kind.label()
-            )
-        })?;
-        let admission = engine
+        let admitted = self
+            .session
             .acquire_admission()
             .attach_with(|| format!("session_id={}, kind={}", self.id, kind.label()))?;
-        let (state, entry) = engine.session_registry.reserve_operation(self.id, kind)?;
-        drop(admission);
+        let admitted = admitted.upgrade().ok_or_else(|| {
+            Report::new(LifecycleError::SessionUnavailable)
+                .attach(format!("session_id={}, reason=session_missing", self.id))
+        })?;
+        admitted
+            .runtime()
+            .poisoner
+            .ensure_healthy()
+            .change_context(LifecycleError::RuntimeUnavailable)
+            .attach_with(|| {
+                format!(
+                    "session_id={}, kind={}, phase=check_engine_health",
+                    self.id,
+                    kind.label()
+                )
+            })?;
+        let entry = admitted
+            .runtime()
+            .state()
+            .reserve_operation(kind)
+            .attach_with(|| format!("session_id={}, kind={}", self.id, kind.label()))?;
+        let runtime = admitted.into_runtime();
         Ok(SessionOperationPin {
-            engine,
-            state,
+            runtime,
             entry,
             armed: true,
         })
@@ -929,16 +1127,21 @@ impl Session {
             return Err(Report::new(LifecycleError::SessionUnavailable)
                 .attach(format!("session_id={}", self.id)));
         }
-        let engine = self
-            .engine
-            .upgrade()
-            .attach_with(|| format!("session_id={}, phase=upgrade_engine_runtime", self.id))?;
-        let admission = engine
-            .acquire_inspection_admission()
+        let admitted = self
+            .session
+            .acquire_admission()
             .attach_with(|| format!("session_id={}", self.id))?;
-        let state = engine.session_registry.pin_observer(self.id)?;
-        drop(admission);
-        Ok(SessionObserverPin { engine, state })
+        let admitted = admitted.upgrade().ok_or_else(|| {
+            Report::new(LifecycleError::SessionUnavailable)
+                .attach(format!("session_id={}, reason=session_missing", self.id))
+        })?;
+        admitted
+            .runtime()
+            .state()
+            .acquire_observer()
+            .attach_with(|| format!("session_id={}", self.id))?;
+        let runtime = admitted.into_runtime();
+        Ok(SessionObserverPin { runtime })
     }
 
     /// Return sorted ids for currently loaded user-table runtimes.
@@ -953,7 +1156,7 @@ impl Session {
             .pin_inspection()
             .attach("operation=list_table_ids")
             .disclose()?;
-        Ok(session.engine.catalog().list_user_table_ids_now())
+        Ok(session.runtime.catalog().list_user_table_ids_now())
     }
 
     /// Begin a new transaction if the session is currently idle.
@@ -964,21 +1167,32 @@ impl Session {
                 .attach(format!("session_id={}", self.id))
                 .disclose());
         }
-        let engine = self
-            .engine
-            .upgrade()
-            .attach_with(|| format!("session_id={}, phase=upgrade_engine_runtime", self.id))
-            .disclose()?;
-        let admission = engine
+        let admitted = self
+            .session
             .acquire_admission()
             .attach_with(|| format!("session_id={}", self.id))
             .disclose()?;
-        let trx = engine
-            .session_registry
-            .begin_public_transaction(self.id, &engine)
+        let admitted = admitted
+            .upgrade()
+            .ok_or_else(|| {
+                Report::new(LifecycleError::SessionUnavailable)
+                    .attach(format!("session_id={}, reason=session_missing", self.id))
+            })
+            .disclose()?;
+        admitted
+            .runtime()
+            .poisoner
+            .ensure_healthy()
+            .change_context(LifecycleError::RuntimeUnavailable)
+            .attach_with(|| format!("session_id={}, phase=check_engine_health", self.id))
+            .disclose()?;
+        let trx = admitted
+            .runtime()
+            .state()
+            .begin_public_trx(admitted.runtime())
             .attach("operation=begin_transaction")
             .disclose()?;
-        drop(admission);
+        drop(admitted);
         Ok(trx)
     }
 
@@ -988,27 +1202,44 @@ impl Session {
         if self.closed.get() {
             return Ok(());
         }
-        let engine = self
-            .engine
-            .upgrade()
-            .attach_with(|| {
-                format!(
-                    "operation=close_session, session_id={}, phase=upgrade_engine_runtime",
-                    self.id
-                )
-            })
-            .disclose()?;
-        let admission = engine
-            .acquire_admission()
-            .attach_with(|| format!("operation=close_session, session_id={}", self.id))
-            .disclose()?;
-        drop(admission);
-        engine
-            .session_registry
-            .close(self.id)
-            .await
-            .attach("operation=close_session")
-            .disclose()?;
+        let runtime = {
+            let admitted = self
+                .session
+                .acquire_admission()
+                .attach_with(|| format!("operation=close_session, session_id={}", self.id))
+                .disclose()?;
+            let admitted = admitted
+                .upgrade()
+                .ok_or_else(|| {
+                    Report::new(LifecycleError::SessionUnavailable)
+                        .attach(format!("session_id={}, reason=session_missing", self.id))
+                })
+                .disclose()?;
+            admitted
+                .runtime()
+                .poisoner
+                .ensure_healthy()
+                .change_context(LifecycleError::RuntimeUnavailable)
+                .attach_with(|| {
+                    format!(
+                        "operation=close_session, session_id={}, phase=check_engine_health",
+                        self.id
+                    )
+                })
+                .disclose()?;
+            admitted.into_runtime()
+        };
+        loop {
+            let (decision, remove_from_registry) = runtime.state().request_close();
+            runtime.remove_if_requested(remove_from_registry);
+            match decision {
+                SessionCloseDecision::Closed => break,
+                SessionCloseDecision::Wait(listener) => listener.await,
+                SessionCloseDecision::Rejected(err) => {
+                    return Err(err.attach("operation=close_session").disclose());
+                }
+            }
+        }
         self.closed.set(true);
         Ok(())
     }
@@ -1025,7 +1256,7 @@ impl Session {
             .pin_operation(SessionOperationKind::Ddl)
             .attach("operation=create_table")
             .disclose()?;
-        let mandatory_runtime = operation.engine.mandatory_runtime.clone();
+        let mandatory_runtime = operation.runtime.mandatory_runtime.clone();
         let prepared = operation
             .prepare_create_table(validated)
             .await
@@ -1053,10 +1284,10 @@ impl Session {
             .pin_operation(SessionOperationKind::Ddl)
             .attach("operation=create_index")
             .disclose()?;
-        let mandatory_runtime = operation.engine.mandatory_runtime.clone();
+        let mandatory_runtime = operation.runtime.mandatory_runtime.clone();
         let owner = operation.operation_lock_owner();
         operation
-            .engine
+            .runtime
             .lock_manager()
             .reject_table_ddl_explicit_session_lock(table_id, owner)
             .attach("operation=create_index")
@@ -1069,9 +1300,8 @@ impl Session {
         .await
         .attach_with(|| format!("prepare CREATE INDEX locks: table_id={table_id}"))
         .disclose()?;
-        let engine = scope.engine().clone();
-        let guards = scope.pool_guards();
-        let table = validated_index_ddl_target(&guards, &engine, table_id, "create_index")
+        let engine = scope.engine();
+        let table = validated_index_ddl_target(engine, table_id, "create_index")
             .await
             .disclose()?;
         engine.poisoner.ensure_healthy().disclose()?;
@@ -1097,10 +1327,10 @@ impl Session {
             .pin_operation(SessionOperationKind::Ddl)
             .attach("operation=drop_index")
             .disclose()?;
-        let mandatory_runtime = operation.engine.mandatory_runtime.clone();
+        let mandatory_runtime = operation.runtime.mandatory_runtime.clone();
         let owner = operation.operation_lock_owner();
         operation
-            .engine
+            .runtime
             .lock_manager()
             .reject_table_ddl_explicit_session_lock(table_id, owner)
             .attach("operation=drop_index")
@@ -1110,9 +1340,8 @@ impl Session {
                 .await
                 .attach_with(|| format!("prepare DROP INDEX locks: table_id={table_id}"))
                 .disclose()?;
-        let engine = scope.engine().clone();
-        let guards = scope.pool_guards();
-        let table = validated_index_ddl_target(&guards, &engine, table_id, "drop_index")
+        let engine = scope.engine();
+        let table = validated_index_ddl_target(engine, table_id, "drop_index")
             .await
             .disclose()?;
         engine.poisoner.ensure_healthy().disclose()?;
@@ -1138,7 +1367,7 @@ impl Session {
             .pin_operation(SessionOperationKind::Ddl)
             .attach("operation=drop_table")
             .disclose()?;
-        let mandatory_runtime = operation.engine.mandatory_runtime.clone();
+        let mandatory_runtime = operation.runtime.mandatory_runtime.clone();
         let prepared = operation
             .prepare_drop_table(table_id)
             .await
@@ -1165,13 +1394,13 @@ impl Session {
             .pin_operation(SessionOperationKind::Maintenance)
             .attach("operation=checkpoint_catalog")
             .disclose()?;
-        let mandatory_runtime = operation.engine.mandatory_runtime.clone();
+        let mandatory_runtime = operation.runtime.mandatory_runtime.clone();
         let scope = PreparedMaintenanceScope::global(operation);
-        let engine = scope.engine().clone();
+        let engine = scope.engine();
         let catalog_scope = CatalogCheckpointScope::acquire(engine.catalog_guard()).await;
         let redo_scope = RedoRetentionScope::acquire(engine.trx_sys.clone()).await;
-        let prepared = prepare_catalog_checkpoint_operation(catalog_scope, redo_scope, scope);
         engine.poisoner.ensure_healthy().disclose()?;
+        let prepared = prepare_catalog_checkpoint_operation(catalog_scope, redo_scope, scope);
         let observer = mandatory_runtime
             .submit(prepared)
             .await
@@ -1194,13 +1423,13 @@ impl Session {
             .pin_operation(SessionOperationKind::Maintenance)
             .attach("operation=checkpoint_catalog_and_truncate_redo_log")
             .disclose()?;
-        let mandatory_runtime = operation.engine.mandatory_runtime.clone();
+        let mandatory_runtime = operation.runtime.mandatory_runtime.clone();
         let scope = PreparedMaintenanceScope::global(operation);
-        let engine = scope.engine().clone();
+        let engine = scope.engine();
         let catalog_scope = CatalogCheckpointScope::acquire(engine.catalog_guard()).await;
         let redo_scope = RedoRetentionScope::acquire(engine.trx_sys.clone()).await;
-        let prepared = prepare_catalog_redo_maintenance_operation(catalog_scope, redo_scope, scope);
         engine.poisoner.ensure_healthy().disclose()?;
+        let prepared = prepare_catalog_redo_maintenance_operation(catalog_scope, redo_scope, scope);
         let observer = mandatory_runtime
             .submit(prepared)
             .await
@@ -1222,13 +1451,13 @@ impl Session {
             .pin_operation(SessionOperationKind::Maintenance)
             .attach("operation=truncate_redo_log")
             .disclose()?;
-        let mandatory_runtime = operation.engine.mandatory_runtime.clone();
+        let mandatory_runtime = operation.runtime.mandatory_runtime.clone();
         let scope = PreparedMaintenanceScope::global(operation);
-        let engine = scope.engine().clone();
+        let engine = scope.engine();
         let catalog_scope = CatalogCheckpointScope::acquire(engine.catalog_guard()).await;
         let redo_scope = RedoRetentionScope::acquire(engine.trx_sys.clone()).await;
-        let prepared = prepare_redo_truncation_operation(catalog_scope, redo_scope, scope);
         engine.poisoner.ensure_healthy().disclose()?;
+        let prepared = prepare_redo_truncation_operation(catalog_scope, redo_scope, scope);
         let observer = mandatory_runtime
             .submit(prepared)
             .await
@@ -1250,7 +1479,7 @@ impl Session {
             .pin_inspection()
             .attach("operation=query_transaction_system_stats")
             .disclose()?;
-        let engine = &session.engine;
+        let engine = &session.runtime;
         Ok(transaction_system_stats_snapshot(
             engine.trx_sys.trx_sys_stats(),
         ))
@@ -1268,7 +1497,7 @@ impl Session {
             .pin_inspection()
             .attach("operation=query_storage_io_stats")
             .disclose()?;
-        let engine = &session.engine;
+        let engine = &session.runtime;
         Ok(storage_io_stats_snapshot(
             engine.table_fs.io_backend_stats(),
             engine.table_fs.storage_service_stats(),
@@ -1287,27 +1516,27 @@ impl Session {
             .pin_inspection()
             .attach("operation=query_buffer_pool_stats")
             .disclose()?;
-        let engine = &session.engine;
+        let engine = &session.runtime;
         Ok(BufferPoolStats {
             meta: buffer_pool_runtime_stats_snapshot(
-                engine.meta_pool.capacity(),
-                engine.meta_pool.allocated(),
-                engine.meta_pool.stats(),
+                engine.pools.meta.capacity(),
+                engine.pools.meta.allocated(),
+                engine.pools.meta.stats(),
             ),
             mem: buffer_pool_runtime_stats_snapshot(
-                engine.mem_pool.capacity(),
-                engine.mem_pool.allocated(),
-                engine.mem_pool.stats(),
+                engine.pools.mem.capacity(),
+                engine.pools.mem.allocated(),
+                engine.pools.mem.stats(),
             ),
             index: buffer_pool_runtime_stats_snapshot(
-                engine.index_pool.capacity(),
-                engine.index_pool.allocated(),
-                engine.index_pool.stats(),
+                engine.pools.index.capacity(),
+                engine.pools.index.allocated(),
+                engine.pools.index.stats(),
             ),
             disk: buffer_pool_runtime_stats_snapshot(
-                engine.disk_pool.capacity(),
-                engine.disk_pool.allocated(),
-                engine.disk_pool.stats(),
+                engine.pools.disk.capacity(),
+                engine.pools.disk.allocated(),
+                engine.pools.disk.stats(),
             ),
         })
     }
@@ -1324,7 +1553,7 @@ impl Session {
             .pin_inspection()
             .attach("operation=query_mandatory_runtime_stats")
             .disclose()?;
-        Ok(session.engine.mandatory_runtime.stats())
+        Ok(session.runtime.mandatory_runtime.stats())
     }
 
     /// Freeze a row-page prefix or report the existing table-owned batch.
@@ -1338,7 +1567,7 @@ impl Session {
             .pin_operation(SessionOperationKind::Maintenance)
             .attach("operation=freeze_table")
             .disclose()?;
-        let mandatory_runtime = operation.engine.mandatory_runtime.clone();
+        let mandatory_runtime = operation.runtime.mandatory_runtime.clone();
         let scope = PreparedMaintenanceScope::table(operation, table_id)
             .await
             .attach_with(|| format!("operation=freeze_table, table_id={table_id}"))
@@ -1369,7 +1598,7 @@ impl Session {
             .pin_operation(SessionOperationKind::Maintenance)
             .attach("operation=checkpoint_table")
             .disclose()?;
-        let mandatory_runtime = operation.engine.mandatory_runtime.clone();
+        let mandatory_runtime = operation.runtime.mandatory_runtime.clone();
         let scope = PreparedMaintenanceScope::table(operation, table_id)
             .await
             .attach_with(|| format!("operation=checkpoint_table, table_id={table_id}"))
@@ -1407,13 +1636,13 @@ impl Session {
             | CheckpointDelayReason::FrozenPageCutoff { table_id, .. } => table_id,
         };
         loop {
-            let Some(table) = session.engine.catalog().current_live_user_table(table_id) else {
+            let Some(table) = session.runtime.catalog().current_live_user_table(table_id) else {
                 return Ok(());
             };
             if table.check_foreground_live().is_err() {
                 return Ok(());
             }
-            session.state.cache_user_table(&table);
+            session.runtime.state().cache_user_table(&table);
             let observation = table
                 .checkpoint_retry_observation(&session, reason)
                 .await
@@ -1487,7 +1716,7 @@ impl Session {
         let guards = session.pool_guards();
         access
             .table()
-            .total_row_pages(&guards)
+            .total_row_pages(guards)
             .await
             .attach_with(|| format!("operation=count_table_row_pages, table_id={table_id}"))
             .disclose()
@@ -1508,7 +1737,7 @@ impl Session {
             .pin_operation(SessionOperationKind::Maintenance)
             .attach("operation=cleanup_secondary_mem_indexes")
             .disclose()?;
-        let mandatory_runtime = operation.engine.mandatory_runtime.clone();
+        let mandatory_runtime = operation.runtime.mandatory_runtime.clone();
         let scope = PreparedMaintenanceScope::table(operation, table_id)
             .await
             .attach("operation=cleanup_secondary_mem_indexes")
@@ -1567,21 +1796,24 @@ impl Drop for Session {
         if self.closed.get() {
             return;
         }
-        if let Some(engine) = self.engine.upgrade_for_cleanup() {
-            engine.session_registry.abandon(self.id);
+        if let Some(runtime) = self.session.upgrade_for_terminal() {
+            let remove_from_registry = runtime.state().abandon();
+            runtime.remove_if_requested(remove_from_registry);
         }
     }
 }
 
 /// Shared runtime view implemented by observer and foreground authorities.
 pub(crate) trait SessionRuntimeAccess {
-    /// Returns the retained shared engine access handle.
-    fn engine(&self) -> &EngineRef;
-    /// Returns registry-owned session state.
-    fn state(&self) -> &Arc<SessionState>;
-    /// Returns a cloned pool-guard bundle.
-    fn pool_guards(&self) -> PoolGuards {
-        self.state().pool_guards().clone()
+    /// Returns the retained exact session runtime.
+    fn runtime(&self) -> &SessionRuntime;
+    /// Returns immutable shared engine capabilities.
+    fn engine(&self) -> &EngineCore {
+        self.runtime().core()
+    }
+    /// Borrows the canonical pool-guard bundle.
+    fn pool_guards(&self) -> &PoolGuards {
+        self.runtime().pool_guards()
     }
 }
 
@@ -1590,37 +1822,29 @@ pub(crate) trait SessionRuntimeAccess {
 /// The creating `Session` method establishes whether normal healthy-runtime or
 /// lifecycle-only inspection admission applies.
 pub(crate) struct SessionObserverPin {
-    /// Engine handle retained for the duration of this observation.
-    pub(crate) engine: EngineRef,
-    /// Strong reference to registry-owned session state.
-    pub(crate) state: Arc<SessionState>,
+    /// Exact state and engine capabilities retained for this observation.
+    pub(crate) runtime: SessionRuntime,
 }
 
 impl Drop for SessionObserverPin {
     #[inline]
     fn drop(&mut self) {
-        self.engine.session_registry.finish_observer(&self.state);
+        let remove_from_registry = self.runtime.state().release_observer();
+        self.runtime.remove_if_requested(remove_from_registry);
     }
 }
 
 impl SessionRuntimeAccess for SessionObserverPin {
     #[inline]
-    fn engine(&self) -> &EngineRef {
-        &self.engine
-    }
-
-    #[inline]
-    fn state(&self) -> &Arc<SessionState> {
-        &self.state
+    fn runtime(&self) -> &SessionRuntime {
+        &self.runtime
     }
 }
 
 /// Non-cloneable foreground authority for one stable session operation.
 pub(crate) struct SessionOperationPin {
-    /// Engine access retained while the stable operation blocks shutdown.
-    pub(crate) engine: EngineRef,
-    /// Registry-owned session state containing the active slot.
-    pub(crate) state: Arc<SessionState>,
+    /// Exact state and engine capabilities retained while the operation blocks shutdown.
+    pub(crate) runtime: SessionRuntime,
     /// Stable entry shared with transaction, cleanup, and terminal owners.
     entry: Arc<SessionOperationEntry>,
     /// Whether drop must publish the foreground release edge.
@@ -1663,8 +1887,8 @@ impl SessionOperationPin {
 
     /// Returns a cloned guard bundle for this foreground operation.
     #[inline]
-    pub(crate) fn pool_guards(&self) -> PoolGuards {
-        self.state.pool_guards().clone()
+    pub(crate) fn pool_guards(&self) -> &PoolGuards {
+        self.runtime.pool_guards()
     }
 
     /// Consume voluntary authority at the exact mandatory ownership handoff.
@@ -1674,11 +1898,10 @@ impl SessionOperationPin {
     /// operation can replace that active identity before terminal publication.
     #[inline]
     pub(crate) fn into_mandatory(mut self) -> MandatoryOperationGuard {
-        self.state.accept_mandatory(&self.entry);
+        self.runtime.state().accept_mandatory(&self.entry);
         self.armed = false;
         MandatoryOperationGuard {
-            engine: self.engine.clone(),
-            state: Arc::clone(&self.state),
+            runtime: self.runtime.clone(),
             entry: Arc::clone(&self.entry),
             armed: true,
         }
@@ -1689,7 +1912,7 @@ impl SessionOperationPin {
         self,
         validated: ValidatedCreateTable,
     ) -> OperationResult<PreparedCreateTable> {
-        let table_id = self.engine.catalog().next_table_id();
+        let table_id = self.runtime.catalog().next_table_id();
         let plan = validated.into_plan(table_id);
         let scope = PreparedDdlScope::create(self, table_id, create_table_catalog_write_targets())
             .await
@@ -1700,7 +1923,7 @@ impl SessionOperationPin {
     /// Prepare DROP TABLE while consuming this foreground operation.
     async fn prepare_drop_table(self, table_id: TableID) -> OperationResult<PreparedDropTable> {
         let owner = self.operation_lock_owner();
-        self.engine
+        self.runtime
             .lock_manager()
             .reject_table_ddl_explicit_session_lock(table_id, owner)
             .attach("prepare DROP TABLE explicit-session-lock check")?;
@@ -1730,11 +1953,11 @@ impl SessionOperationPin {
         table_id: TableID,
     ) -> OperationResult<Arc<Table>> {
         let table = self
-            .engine
+            .runtime
             .catalog()
             .validate_user_table_live(table_id)
             .await?;
-        self.state.cache_user_table(&table);
+        self.runtime.state().cache_user_table(&table);
         Ok(table)
     }
 
@@ -1746,7 +1969,7 @@ impl SessionOperationPin {
         mode: LockMode,
     ) -> OperationResult<()> {
         let session_id = self.id();
-        let engine = &self.engine;
+        let engine = &self.runtime;
         let lock_manager = engine.lock_manager();
         let owner = LockOwner::session_explicit(session_id);
         let (mut metadata_guard, mut data_guard) = lock_manager
@@ -1766,7 +1989,7 @@ impl SessionOperationPin {
     #[inline]
     pub(crate) fn unlock_table(&self, table_id: TableID) -> OperationResult<()> {
         let owner = LockOwner::session_explicit(self.id());
-        let lock_manager = self.engine.lock_manager();
+        let lock_manager = self.runtime.lock_manager();
         lock_manager.release(LockResource::TableData(table_id), owner);
         lock_manager.release(LockResource::TableMetadata(table_id), owner);
         Ok(())
@@ -1775,13 +1998,8 @@ impl SessionOperationPin {
 
 impl SessionRuntimeAccess for SessionOperationPin {
     #[inline]
-    fn engine(&self) -> &EngineRef {
-        &self.engine
-    }
-
-    #[inline]
-    fn state(&self) -> &Arc<SessionState> {
-        &self.state
+    fn runtime(&self) -> &SessionRuntime {
+        &self.runtime
     }
 }
 
@@ -1790,9 +2008,16 @@ impl Drop for SessionOperationPin {
     fn drop(&mut self) {
         if self.armed {
             self.armed = false;
-            self.engine
-                .session_registry
-                .finish_foreground(&self.engine, self.key());
+            let (remove_from_registry, cleanup) =
+                self.runtime.state().finish_foreground(self.key());
+            self.runtime.remove_if_requested(remove_from_registry);
+            if let Some(trx_id) = cleanup {
+                self.runtime.trx_sys.request_abandoned_trx_cleanup(
+                    self.runtime.clone(),
+                    self.key(),
+                    trx_id,
+                );
+            }
         }
     }
 }
@@ -1806,8 +2031,7 @@ impl Drop for SessionOperationPin {
 /// Nested private-transaction state can therefore move directly through
 /// `entry` without locking the outer lifecycle.
 pub(crate) struct MandatoryOperationGuard {
-    engine: EngineRef,
-    state: Arc<SessionState>,
+    runtime: SessionRuntime,
     /// Intentionally redundant with the `Arc` retained by `Active(entry)`.
     ///
     /// This direct reference is the guard's exact operation authority. It
@@ -1830,7 +2054,7 @@ impl MandatoryOperationGuard {
     /// installation needs only the entry mutex rather than the lifecycle lock.
     #[inline]
     pub(crate) fn begin_private_trx(&self) -> LifecycleResult<Transaction> {
-        begin_private_transaction(&self.engine, &self.entry)
+        begin_private_transaction(&self.runtime, &self.entry)
     }
 
     /// Verify that accepted execution settled every nested transaction.
@@ -1847,10 +2071,8 @@ impl MandatoryOperationGuard {
         if !self.armed {
             return;
         }
-        let remove_from_registry = self.state.finish_mandatory(&self.entry);
-        self.engine
-            .session_registry
-            .remove_if_requested(self.key().session_id(), remove_from_registry);
+        let remove_from_registry = self.runtime.state().finish_mandatory(&self.entry);
+        self.runtime.remove_if_requested(remove_from_registry);
         self.armed = false;
     }
 
@@ -1861,19 +2083,14 @@ impl MandatoryOperationGuard {
             return;
         }
         self.armed = false;
-        self.state.fail_mandatory_retained(&self.entry);
+        self.runtime.state().fail_mandatory_retained(&self.entry);
     }
 }
 
 impl SessionRuntimeAccess for MandatoryOperationGuard {
     #[inline]
-    fn engine(&self) -> &EngineRef {
-        &self.engine
-    }
-
-    #[inline]
-    fn state(&self) -> &Arc<SessionState> {
-        &self.state
+    fn runtime(&self) -> &SessionRuntime {
+        &self.runtime
     }
 }
 
@@ -1884,12 +2101,12 @@ impl Drop for MandatoryOperationGuard {
             return;
         }
         self.armed = false;
-        self.state.fail_mandatory_retained(&self.entry);
+        self.runtime.state().fail_mandatory_retained(&self.entry);
         let report = Report::new(FatalError::MandatoryTaskPanic).attach(format!(
             "mandatory operation authority dropped unexpectedly: operation_key={}",
             self.key()
         ));
-        self.engine.poisoner.poison(report);
+        self.runtime.poisoner.poison(report);
     }
 }
 
@@ -1904,6 +2121,8 @@ pub(crate) enum SessionShutdownBlocker {
         /// The tuple locates the stable outer operation entry first and
         /// identifies its currently attached transaction second.
         cleanup: Option<(SessionOperationKey, TrxID)>,
+        /// Runtime captured from the registered state during the shutdown scan.
+        runtime: Option<SessionRuntime>,
     },
     /// One or more standalone read-only observers remain active.
     Observer {
@@ -1942,12 +2161,43 @@ impl SessionShutdownBlocker {
 
     /// Returns an exact claimable cleanup hint, when one exists.
     #[inline]
-    pub(crate) const fn cleanup(&self) -> Option<(SessionOperationKey, TrxID)> {
+    pub(crate) fn into_cleanup(self) -> Option<SessionCleanupRequest> {
         match self {
-            Self::Operation { cleanup, .. } => *cleanup,
+            Self::Operation {
+                cleanup: Some((operation_key, trx_id)),
+                runtime: Some(runtime),
+                ..
+            } => Some(SessionCleanupRequest {
+                runtime,
+                operation_key,
+                trx_id,
+            }),
             Self::Observer { .. } => None,
+            Self::Operation { .. } => None,
         }
     }
+
+    #[inline]
+    fn capture_runtime(&mut self, runtime: SessionRuntime) {
+        if let Self::Operation {
+            cleanup: Some(_),
+            runtime: captured,
+            ..
+        } = self
+        {
+            *captured = Some(runtime);
+        }
+    }
+}
+
+/// Exact shutdown-discovered cleanup authority captured during registry scan.
+pub(crate) struct SessionCleanupRequest {
+    /// Exact registered session state and engine capabilities.
+    pub(crate) runtime: SessionRuntime,
+    /// Stable operation identity.
+    pub(crate) operation_key: SessionOperationKey,
+    /// Exact transaction identity.
+    pub(crate) trx_id: TrxID,
 }
 
 /// One session-local blocker observed by blocking shutdown.
@@ -1983,142 +2233,18 @@ impl SessionRegistry {
     #[inline]
     pub(crate) fn create_session(
         &self,
-        engine: &Arc<EngineInner>,
-        engine_ref: EngineRef,
+        core: Arc<EngineCore>,
+        admission: Arc<SessionAdmission>,
         id: SessionID,
     ) -> Session {
-        let state = Arc::new(SessionState::new(engine_ref, id));
+        let state = Arc::new(SessionState::new(core, admission, id));
+        let session = Session::new(WeakSessionRef::new(&state), id);
         self.insert(state);
-        Session::new(WeakEngineRef::new(engine), id)
+        session
     }
 
-    /// Pins one open session for a drop-safe observer operation.
-    #[inline]
-    pub(crate) fn pin_observer(&self, id: SessionID) -> LifecycleResult<Arc<SessionState>> {
-        let state = self.session_or_unavailable(id)?;
-        state
-            .acquire_observer()
-            .attach_with(|| format!("session_id={id}"))?;
-        Ok(state)
-    }
-
-    /// Releases one exact observer and removes its closed session if it drains.
-    #[inline]
-    pub(crate) fn finish_observer(&self, state: &Arc<SessionState>) {
-        let remove_from_registry = state.release_observer();
-        if remove_from_registry {
-            self.entries.remove_if(&state.id(), |_id, registered| {
-                Arc::ptr_eq(registered, state)
-            });
-        }
-    }
-
-    /// Reserves one stable non-transaction operation entry.
-    #[inline]
-    pub(crate) fn reserve_operation(
-        &self,
-        id: SessionID,
-        kind: SessionOperationKind,
-    ) -> LifecycleResult<(Arc<SessionState>, Arc<SessionOperationEntry>)> {
-        let state = self.session_or_unavailable(id)?;
-        let entry = state
-            .reserve_operation(kind)
-            .attach_with(|| format!("session_id={id}, kind={}", kind.label()))?;
-        Ok((state, entry))
-    }
-
-    /// Reserves and starts one public transaction under the lifecycle mutex.
-    #[inline]
-    pub(crate) fn begin_public_transaction(
-        &self,
-        id: SessionID,
-        engine: &EngineRef,
-    ) -> LifecycleResult<Transaction> {
-        let state = self.session_or_unavailable(id)?;
-        state.begin_public_trx(engine)
-    }
-
-    /// Explicitly closes this session, waiting only for authoritative owners.
-    pub(crate) async fn close(&self, id: SessionID) -> LifecycleResult<()> {
-        loop {
-            let Some(state) = self.session_state(id) else {
-                return Ok(());
-            };
-            let (decision, remove_from_registry) = state.request_close();
-            self.remove_if_requested(id, remove_from_registry);
-            match decision {
-                SessionCloseDecision::Closed => return Ok(()),
-                SessionCloseDecision::Wait(listener) => listener.await,
-                SessionCloseDecision::Rejected(err) => return Err(err),
-            }
-        }
-    }
-
-    /// Best-effort nonblocking abandonment from public session `Drop`.
-    #[inline]
-    pub(crate) fn abandon(&self, id: SessionID) {
-        let Some(state) = self.session_state(id) else {
-            return;
-        };
-        let remove_from_registry = state.abandon();
-        self.remove_if_requested(id, remove_from_registry);
-    }
-
-    /// Finalizes or transfers one dropped foreground operation authority.
-    #[inline]
-    pub(crate) fn finish_foreground(&self, engine: &EngineRef, key: SessionOperationKey) {
-        let Some(state) = self.session_state(key.session_id()) else {
-            return;
-        };
-        let (remove_from_registry, cleanup) = state.finish_foreground(key);
-        self.remove_if_requested(key.session_id(), remove_from_registry);
-        if let Some(trx_id) = cleanup {
-            engine
-                .trx_sys
-                .request_abandoned_trx_cleanup(engine.clone(), key, trx_id);
-        }
-    }
-
-    /// Apply session cleanup after a transaction commits.
-    #[inline]
-    fn finish_trx_commit(&self, key: SessionOperationKey, trx_id: TrxID, cts: TrxID) {
-        let Some(state) = self.session_state(key.session_id()) else {
-            return;
-        };
-        let remove_from_registry = state.finish_trx_commit(key, trx_id, cts);
-        self.remove_if_requested(key.session_id(), remove_from_registry);
-    }
-
-    /// Apply session cleanup after a transaction rolls back.
-    #[inline]
-    fn finish_trx_rollback(&self, key: SessionOperationKey, trx_id: TrxID) {
-        let Some(state) = self.session_state(key.session_id()) else {
-            return;
-        };
-        let remove_from_registry = state.finish_trx_rollback(key, trx_id);
-        self.remove_if_requested(key.session_id(), remove_from_registry);
-    }
-
-    /// Resolves one exact operation key before its entry transition validates
-    /// the transaction id under the entry mutex.
-    #[inline]
-    pub(crate) fn resolve_operation(
-        &self,
-        key: SessionOperationKey,
-    ) -> LifecycleResult<(Arc<SessionOperationEntry>, Arc<SessionState>)> {
-        let session = self.session_state(key.session_id()).ok_or_else(|| {
-            Report::new(LifecycleError::TransactionDiscarded)
-                .attach(format!("operation_key={key}, reason=session_missing"))
-        })?;
-        let entry = session.resolve_operation(key).ok_or_else(|| {
-            Report::new(LifecycleError::TransactionDiscarded).attach(format!(
-                "operation_key={key}, reason=operation_entry_missing"
-            ))
-        })?;
-        Ok((entry, session))
-    }
-
-    /// Resolves an active operation without turning staleness into an error.
+    /// Resolve one exact operation through the registry for legacy test setup.
+    #[cfg(test)]
     #[inline]
     pub(crate) fn try_resolve_operation(
         &self,
@@ -2129,13 +2255,23 @@ impl SessionRegistry {
         Some((entry, session))
     }
 
-    /// Mark a public transaction handle abandoned if it still names the active entry.
-    #[inline]
-    pub(crate) fn abandon_trx_handle(&self, key: SessionOperationKey, trx_id: TrxID) -> bool {
-        let Some(session) = self.session_state(key.session_id()) else {
-            return false;
-        };
-        session.abandon_trx_handle(key, trx_id)
+    /// Close one registry-owned session directly for lifecycle tests.
+    #[cfg(test)]
+    pub(crate) async fn close(&self, id: SessionID) -> LifecycleResult<()> {
+        loop {
+            let Some(state) = self.session_state(id) else {
+                return Ok(());
+            };
+            let (decision, remove_from_registry) = state.request_close();
+            if remove_from_registry {
+                self.remove_exact(&SessionRuntime::new(Arc::clone(&state)));
+            }
+            match decision {
+                SessionCloseDecision::Closed => return Ok(()),
+                SessionCloseDecision::Wait(listener) => listener.await,
+                SessionCloseDecision::Rejected(err) => return Err(err),
+            }
+        }
     }
 
     /// Returns the first active session operation without installing a listener.
@@ -2167,32 +2303,29 @@ impl SessionRegistry {
         let sessions = self
             .entries
             .iter()
-            .map(|entry| (*entry.key(), Arc::clone(entry.value())))
+            .map(|entry| Arc::clone(entry.value()))
             .collect::<Vec<_>>();
-        for (id, state) in sessions {
+        for state in sessions {
             let remove_from_registry = state.shutdown_removal();
-            self.remove_if_requested(id, remove_from_registry);
+            if remove_from_registry {
+                self.remove_exact(&SessionRuntime::new(state));
+            }
         }
     }
 
+    #[cfg(test)]
     #[inline]
     fn session_state(&self, id: SessionID) -> Option<Arc<SessionState>> {
         self.entries.get(&id).map(|entry| Arc::clone(entry.value()))
     }
 
+    /// Remove only the pointer-identical registered state.
     #[inline]
-    fn session_or_unavailable(&self, id: SessionID) -> LifecycleResult<Arc<SessionState>> {
-        self.session_state(id).ok_or_else(|| {
-            Report::new(LifecycleError::SessionUnavailable)
-                .attach(format!("session_id={id}, reason=session_missing"))
-        })
-    }
-
-    #[inline]
-    fn remove_if_requested(&self, id: SessionID, remove_from_registry: bool) {
-        if remove_from_registry {
-            drop(self.entries.remove(&id));
-        }
+    pub(crate) fn remove_exact(&self, runtime: &SessionRuntime) {
+        let state = runtime.state();
+        self.entries.remove_if(&state.id(), |_id, registered| {
+            Arc::ptr_eq(registered, state)
+        });
     }
 }
 
@@ -2215,23 +2348,25 @@ impl SessionTableCacheEntry {
 /// Shared mutable state referenced by transactions started from one [`Session`].
 pub(crate) struct SessionState {
     id: SessionID,
-    pool_guards: PoolGuards,
-    lock_manager: QuiescentGuard<LockManager>,
+    core: Arc<EngineCore>,
+    admission: Arc<SessionAdmission>,
     lifecycle: Mutex<SessionLifecycle>,
     last_cts: AtomicU64,
     table_cache: Mutex<FastHashMap<TableID, SessionTableCacheEntry>>,
 }
 
 impl SessionState {
-    /// Create a new session state and populate its default pool guards.
+    /// Create a new session state retaining one engine core and admission façade.
     #[inline]
-    pub(crate) fn new(engine_ref: EngineRef, id: SessionID) -> Self {
-        let pool_guards = engine_ref.pools().pool_guards();
-        let lock_manager = engine_ref.lock_manager().clone();
+    pub(crate) fn new(
+        core: Arc<EngineCore>,
+        admission: Arc<SessionAdmission>,
+        id: SessionID,
+    ) -> Self {
         SessionState {
             id,
-            pool_guards,
-            lock_manager,
+            core,
+            admission,
             lifecycle: Mutex::new(SessionLifecycle {
                 disposition: SessionDisposition::Open,
                 slot: SessionOperationSlot::Idle,
@@ -2249,12 +2384,6 @@ impl SessionState {
     #[inline]
     pub fn id(&self) -> SessionID {
         self.id
-    }
-
-    /// Returns the guard bundle owned by this session state.
-    #[inline]
-    pub fn pool_guards(&self) -> &PoolGuards {
-        &self.pool_guards
     }
 
     #[inline]
@@ -2364,7 +2493,10 @@ impl SessionState {
     }
 
     #[inline]
-    fn begin_public_trx(self: &Arc<Self>, engine: &EngineRef) -> LifecycleResult<Transaction> {
+    fn begin_public_trx(
+        self: &Arc<Self>,
+        runtime: &SessionRuntime,
+    ) -> LifecycleResult<Transaction> {
         let mut lifecycle = self.lifecycle.lock();
         lifecycle
             .admit_idle()
@@ -2376,7 +2508,9 @@ impl SessionState {
                 self.id
             )
         });
-        let (trx, entry) = engine.trx_sys.begin_public_trx(engine, key, inner);
+        let (trx, entry) = runtime
+            .trx_sys
+            .begin_public_trx(runtime.downgrade(), key, inner);
         lifecycle.advance_operation_id();
         lifecycle.slot = SessionOperationSlot::Active(entry);
         Ok(trx)
@@ -2592,14 +2726,19 @@ impl SessionState {
         }
     }
 
+    /// Resolve an exact operation key directly on this pinned session state.
     #[inline]
-    fn resolve_operation(&self, key: SessionOperationKey) -> Option<Arc<SessionOperationEntry>> {
+    pub(crate) fn resolve_operation(
+        &self,
+        key: SessionOperationKey,
+    ) -> Option<Arc<SessionOperationEntry>> {
         let lifecycle = self.lifecycle.lock();
         lifecycle.active_entry(key).cloned()
     }
 
+    /// Abandon the exact public transaction handle when its identity matches.
     #[inline]
-    fn abandon_trx_handle(&self, key: SessionOperationKey, trx_id: TrxID) -> bool {
+    pub(crate) fn abandon_trx_handle(&self, key: SessionOperationKey, trx_id: TrxID) -> bool {
         let lifecycle = self.lifecycle.lock();
         let abandoned = lifecycle
             .active_entry(key)
@@ -2628,19 +2767,22 @@ impl SessionState {
     }
 
     #[inline]
-    fn shutdown_blocker(&self) -> Option<SessionShutdownBlocker> {
+    fn shutdown_blocker(self: &Arc<Self>) -> Option<SessionShutdownBlocker> {
         let lifecycle = self.lifecycle.lock();
-        lifecycle.shutdown_blocker()
+        let mut blocker = lifecycle.shutdown_blocker()?;
+        blocker.capture_runtime(SessionRuntime::new(Arc::clone(self)));
+        Some(blocker)
     }
 
     #[inline]
-    fn shutdown_wait(&self) -> Option<SessionShutdownWait> {
+    fn shutdown_wait(self: &Arc<Self>) -> Option<SessionShutdownWait> {
         let mut lifecycle = self.lifecycle.lock();
         lifecycle.shutdown_blocker()?;
         let listener = lifecycle.change_listener();
-        let blocker = lifecycle
+        let mut blocker = lifecycle
             .shutdown_blocker()
             .expect("session blocker cannot change while lifecycle lock is held");
+        blocker.capture_runtime(SessionRuntime::new(Arc::clone(self)));
         Some(SessionShutdownWait { listener, blocker })
     }
 
@@ -2707,7 +2849,8 @@ impl SessionState {
 
     #[inline]
     fn release_session_locks(&self) {
-        self.lock_manager
+        self.core
+            .lock_manager()
             .release_owner(LockOwner::session_explicit(self.id));
     }
 }
@@ -2793,6 +2936,7 @@ impl SessionLifecycle {
                 cleanup: entry
                     .cleanup_candidate()
                     .map(|trx_id| (entry.key(), trx_id)),
+                runtime: None,
             });
         }
         (self.observer_count != 0).then_some(SessionShutdownBlocker::Observer {
@@ -2895,51 +3039,43 @@ enum SessionCloseDecision {
 
 /// Private transaction runtime attachment retained by checked-out transaction work.
 ///
-/// This handle owns engine access and session-state reachability for one
+/// This handle owns exact session runtime reachability for one
 /// operation, terminal path, prepared commit handoff, or cleanup path. The
 /// stable session operation remains the shutdown proof, and the public
 /// transaction facade never stores this attachment.
 pub(crate) struct TrxAttachment {
-    /// Strong engine access kept until the transaction reaches a terminal path.
-    engine: EngineRef,
-    /// Exact registry lookup key for terminal session-operation cleanup.
+    /// Exact state and engine capabilities retained by this claim.
+    runtime: SessionRuntime,
+    /// Exact session-local operation key for terminal cleanup.
     operation_key: SessionOperationKey,
     /// Active transaction id used to avoid finishing a replaced session state.
     trx_id: TrxID,
-    /// Claim-local reachability for session-local caches.
-    session: Arc<SessionState>,
-    /// Cached guards needed by transaction work even if session state is gone.
-    pool_guards: PoolGuards,
 }
 
 impl TrxAttachment {
     /// Create a transaction runtime attachment without public handle ownership.
     #[inline]
     pub(crate) fn new(
-        engine: EngineRef,
-        session: Arc<SessionState>,
+        runtime: SessionRuntime,
         operation_key: SessionOperationKey,
         trx_id: TrxID,
     ) -> Self {
-        let pool_guards = session.pool_guards().clone();
         assert!(
-            session.id() == operation_key.session_id(),
+            runtime.state().id() == operation_key.session_id(),
             "transaction attachment session/key mismatch: session_id={}, operation_key={operation_key}",
-            session.id()
+            runtime.state().id()
         );
         Self {
-            engine,
+            runtime,
             operation_key,
             trx_id,
-            session,
-            pool_guards,
         }
     }
 
-    /// Returns the crate-private engine runtime handle.
+    /// Returns immutable engine capabilities.
     #[inline]
-    pub(crate) fn engine(&self) -> &EngineRef {
-        &self.engine
+    pub(crate) fn engine(&self) -> &EngineCore {
+        self.runtime.core()
     }
 
     /// Returns the authoritative session identity for transaction lock ownership.
@@ -2955,28 +3091,30 @@ impl TrxAttachment {
         self.trx_id
     }
 
-    /// Returns the cloned session pool guards retained by this transaction.
+    /// Borrows the canonical engine pool guards.
     #[inline]
     pub(crate) fn pool_guards(&self) -> &PoolGuards {
-        &self.pool_guards
+        self.runtime.pool_guards()
     }
 
     /// Store a weak session-local table cache entry after successful resolution.
     #[inline]
     pub(crate) fn cache_user_table(&self, table: &Arc<Table>) {
-        self.session.cache_user_table(table);
+        self.runtime.state().cache_user_table(table);
     }
 
     /// Remove and return the cached insert page for a table, if session state remains.
     #[inline]
     pub(crate) fn load_active_insert_page(&self, table_id: TableID) -> Option<VersionedPageID> {
-        self.session.load_active_insert_page(table_id)
+        self.runtime.state().load_active_insert_page(table_id)
     }
 
     /// Cache the active insert page if session state remains.
     #[inline]
     pub(crate) fn save_active_insert_page(&self, table_id: TableID, page_id: VersionedPageID) {
-        self.session.save_active_insert_page(table_id, page_id);
+        self.runtime
+            .state()
+            .save_active_insert_page(table_id, page_id);
     }
 
     /// Mark the owning session committed.
@@ -2988,23 +3126,27 @@ impl TrxAttachment {
         inner: Box<TrxInner>,
     ) {
         released.assert_validated_for(self.trx_id);
-        self.session
+        self.runtime
+            .state()
             .finish_trx_inner(self.operation_key, self.trx_id, inner);
         #[cfg(test)]
         tests::run_terminal_attachment_test_hook(
             self.trx_id,
             tests::TerminalAttachmentOutcome::Commit,
         );
-        self.engine
-            .session_registry
-            .finish_trx_commit(self.operation_key, self.trx_id, cts);
+        let remove_from_registry =
+            self.runtime
+                .state()
+                .finish_trx_commit(self.operation_key, self.trx_id, cts);
+        self.runtime.remove_if_requested(remove_from_registry);
     }
 
     /// Mark the owning session rolled back.
     #[inline]
     pub(crate) fn rollback(&self, released: ReleasedTransactionLocks, inner: Box<TrxInner>) {
         released.assert_validated_for(self.trx_id);
-        self.session
+        self.runtime
+            .state()
             .finish_trx_inner(self.operation_key, self.trx_id, inner);
         self.finish_rollback();
     }
@@ -3023,16 +3165,18 @@ impl TrxAttachment {
             self.trx_id,
             tests::TerminalAttachmentOutcome::Rollback,
         );
-        self.engine
-            .session_registry
+        let remove_from_registry = self
+            .runtime
+            .state()
             .finish_trx_rollback(self.operation_key, self.trx_id);
+        self.runtime.remove_if_requested(remove_from_registry);
     }
 
     /// Queue rollback cleanup for an abandoned transaction.
     #[inline]
     pub(crate) fn request_abandoned_cleanup(&self) {
-        self.engine.trx_sys.request_abandoned_trx_cleanup(
-            self.engine.clone(),
+        self.runtime.trx_sys.request_abandoned_trx_cleanup(
+            self.runtime.clone(),
             self.operation_key,
             self.trx_id,
         );
@@ -3041,14 +3185,16 @@ impl TrxAttachment {
     /// Notifies close or shutdown only when this exact operation was armed.
     #[inline]
     pub(crate) fn notify_operation_transition(&self) {
-        self.session.notify_operation_transition(self.operation_key);
+        self.runtime
+            .state()
+            .notify_operation_transition(self.operation_key);
     }
 }
 
 /// Starts one private transaction under an existing DDL or maintenance owner.
 #[inline]
 fn begin_private_transaction(
-    engine: &EngineRef,
+    runtime: &SessionRuntime,
     entry: &Arc<SessionOperationEntry>,
 ) -> LifecycleResult<Transaction> {
     let kind = entry.kind();
@@ -3062,7 +3208,9 @@ fn begin_private_transaction(
         kind.label()
     );
     let inner = Box::new(TrxInner::private());
-    Ok(engine.trx_sys.begin_private_trx(engine, entry, inner))
+    Ok(runtime
+        .trx_sys
+        .begin_private_trx(runtime.downgrade(), entry, inner))
 }
 
 async fn wait_for_maintenance_boundary(
@@ -3070,10 +3218,10 @@ async fn wait_for_maintenance_boundary(
     ts: TrxID,
     boundary: MaintenanceBoundary,
 ) -> Result<TrxID> {
-    let trx_sys = &session.engine.trx_sys;
+    let trx_sys = &session.runtime.trx_sys;
     loop {
-        session.engine.poisoner.ensure_healthy().disclose()?;
-        if session.engine.shutdown_started() {
+        session.runtime.poisoner.ensure_healthy().disclose()?;
+        if session.runtime.state().admission.shutdown_started() {
             return Err(Report::new(LifecycleError::Shutdown)
                 .attach(format!(
                     "maintenance progress wait observed engine shutdown: boundary={}, target_ts={ts}",
@@ -3088,11 +3236,11 @@ async fn wait_for_maintenance_boundary(
 
         trx_sys.request_purge_observation();
         let progress_listener = boundary.listener(session);
-        let poison_listener = session.engine.poisoner.listener();
-        let shutdown_listener = session.engine.shutdown_listener();
+        let poison_listener = session.runtime.poisoner.listener();
+        let shutdown_listener = session.runtime.state().admission.shutdown_listener();
 
-        session.engine.poisoner.ensure_healthy().disclose()?;
-        if session.engine.shutdown_started() {
+        session.runtime.poisoner.ensure_healthy().disclose()?;
+        if session.runtime.state().admission.shutdown_started() {
             return Err(Report::new(LifecycleError::Shutdown)
                 .attach(format!(
                     "maintenance progress wait observed engine shutdown: boundary={}, target_ts={ts}",
@@ -3148,9 +3296,10 @@ pub(crate) mod tests {
     use std::path::{Path, PathBuf};
     use std::pin::Pin;
     use std::sync::atomic::AtomicBool;
-    use std::sync::{Arc, Barrier, OnceLock};
+    use std::sync::{Arc, Barrier, OnceLock, mpsc};
     use std::task::{Context, Poll};
     use std::thread;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     const TRUNCATE_TEST_LOG_BLOCK_SIZE: usize = 4096;
@@ -3255,7 +3404,12 @@ pub(crate) mod tests {
                 panic!("test transaction requires active operation slot")
             }
         };
-        registry.finish_trx_commit(key, trx_id, cts);
+        let remove_from_registry = state.finish_trx_commit(key, trx_id, cts);
+        if remove_from_registry {
+            registry.entries.remove_if(&session_id, |_id, registered| {
+                Arc::ptr_eq(registered, &state)
+            });
+        }
     }
 
     type TotalRowPagesAfterAccessHook =
@@ -3312,10 +3466,10 @@ pub(crate) mod tests {
             .pin_observer()
             .attach("operation=wait_for_purge_handoff")
             .disclose()?;
-        let trx_sys = &session.engine.trx_sys;
+        let trx_sys = &session.runtime.trx_sys;
         loop {
-            session.engine.poisoner.ensure_healthy().disclose()?;
-            if session.engine.shutdown_started() {
+            session.runtime.poisoner.ensure_healthy().disclose()?;
+            if session.runtime.shutdown_started() {
                 return Err(Report::new(LifecycleError::Shutdown)
                     .attach("completed-purge wait observed engine shutdown before ordered handoff")
                     .disclose());
@@ -3324,10 +3478,10 @@ pub(crate) mod tests {
                 return Ok(());
             }
             let handoff_listener = trx_sys.purge_handoff_listener();
-            let poison_listener = session.engine.poisoner.listener();
-            let shutdown_listener = session.engine.shutdown_listener();
-            session.engine.poisoner.ensure_healthy().disclose()?;
-            if session.engine.shutdown_started() {
+            let poison_listener = session.runtime.poisoner.listener();
+            let shutdown_listener = session.runtime.shutdown_listener();
+            session.runtime.poisoner.ensure_healthy().disclose()?;
+            if session.runtime.shutdown_started() {
                 return Err(Report::new(LifecycleError::Shutdown)
                     .attach("completed-purge wait observed engine shutdown before ordered handoff")
                     .disclose());
@@ -3586,6 +3740,21 @@ pub(crate) mod tests {
     }
 
     #[inline]
+    fn new_session_state_for_test(engine: &Engine, id: SessionID) -> SessionState {
+        let seed = engine.new_session().unwrap();
+        let state = seed
+            .session
+            .state
+            .upgrade()
+            .expect("new test session must remain registered");
+        let synthetic =
+            SessionState::new(Arc::clone(&state.core), Arc::clone(&state.admission), id);
+        drop(state);
+        drop(seed);
+        synthetic
+    }
+
+    #[inline]
     fn active_operation_entry_for_test(
         registry: &SessionRegistry,
         session_id: SessionID,
@@ -3605,14 +3774,14 @@ pub(crate) mod tests {
     /// Create one registry-owned transaction with test-controlled ids.
     #[inline]
     pub(crate) fn create_test_transaction(
-        registry: &SessionRegistry,
-        engine: EngineRef,
+        engine: &Engine,
         session_id: SessionID,
         trx_id: TrxID,
         sts: TrxID,
         gc_no: usize,
     ) -> (Transaction, Arc<SessionState>) {
-        let state = Arc::new(SessionState::new(engine.clone(), session_id));
+        let registry = &engine.inner().session_registry;
+        let state = Arc::new(new_session_state_for_test(engine, session_id));
         let key = SessionOperationKey::new(session_id, OperationID::new(1));
         let mut inner = state
             .lifecycle
@@ -3627,9 +3796,10 @@ pub(crate) mod tests {
             lifecycle.next_operation_id = 2;
             lifecycle.slot = SessionOperationSlot::Active(entry);
         }
+        let runtime = SessionRuntime::new(Arc::clone(&state));
         registry.insert(Arc::clone(&state));
         (
-            Transaction::new(engine.downgrade(), key, trx_id, sts),
+            Transaction::new(runtime.downgrade(), key, trx_id, sts),
             state,
         )
     }
@@ -3645,16 +3815,17 @@ pub(crate) mod tests {
         ))
     }
 
-    fn test_session_runtime(session: &Session) -> LifecycleResult<(EngineRef, Arc<SessionState>)> {
+    fn test_session_runtime(session: &Session) -> LifecycleResult<SessionRuntime> {
         let pin = session.pin_inspection()?;
-        inspect_session_in_trx(&pin.state).attach_with(|| format!("session_id={}", session.id))?;
-        Ok((pin.engine.clone(), Arc::clone(&pin.state)))
+        inspect_session_in_trx(pin.runtime.state())
+            .attach_with(|| format!("session_id={}", session.id))?;
+        Ok(pin.runtime.clone())
     }
 
     pub(crate) trait SessionTestExt {
         fn in_trx(&self) -> Result<bool>;
         fn pool_guards(&self) -> PoolGuards;
-        fn engine(&self) -> EngineRef;
+        fn engine(&self) -> SessionRuntime;
         fn last_cts(&self) -> TrxID;
         fn load_active_insert_page(&mut self, table_id: TableID) -> Option<VersionedPageID>;
         fn save_active_insert_page(&mut self, table_id: TableID, page_id: VersionedPageID);
@@ -3664,10 +3835,10 @@ pub(crate) mod tests {
         #[inline]
         fn in_trx(&self) -> Result<bool> {
             const OPERATION: &str = "test_inspect_transaction_state";
-            let (_, state) = test_session_runtime(self)
+            let runtime = test_session_runtime(self)
                 .attach_with(|| format!("operation={OPERATION}"))
                 .disclose()?;
-            inspect_session_in_trx(&state)
+            inspect_session_in_trx(runtime.state())
                 .attach_with(|| format!("operation={OPERATION}, session_id={}", self.id))
                 .disclose()
         }
@@ -3676,29 +3847,26 @@ pub(crate) mod tests {
         fn pool_guards(&self) -> PoolGuards {
             test_session_runtime(self)
                 .expect("test session must be running")
-                .1
                 .pool_guards()
                 .clone()
         }
 
         #[inline]
-        fn engine(&self) -> EngineRef {
-            test_session_runtime(self)
-                .expect("test session must be running")
-                .0
+        fn engine(&self) -> SessionRuntime {
+            test_session_runtime(self).expect("test session must be running")
         }
 
         #[inline]
         fn last_cts(&self) -> TrxID {
-            let (_, state) = test_session_runtime(self).expect("test session must be running");
-            TrxID::new(state.last_cts.load(Ordering::SeqCst))
+            let runtime = test_session_runtime(self).expect("test session must be running");
+            TrxID::new(runtime.state().last_cts.load(Ordering::SeqCst))
         }
 
         #[inline]
         fn load_active_insert_page(&mut self, table_id: TableID) -> Option<VersionedPageID> {
             test_session_runtime(self)
                 .expect("test session must be running")
-                .1
+                .state()
                 .load_active_insert_page(table_id)
         }
 
@@ -3706,7 +3874,7 @@ pub(crate) mod tests {
         fn save_active_insert_page(&mut self, table_id: TableID, page_id: VersionedPageID) {
             test_session_runtime(self)
                 .expect("test session must be running")
-                .1
+                .state()
                 .save_active_insert_page(table_id, page_id);
         }
     }
@@ -3740,7 +3908,7 @@ pub(crate) mod tests {
             let session_id = session.id();
             let trx = session.begin_trx().unwrap();
             let trx_id = trx.trx_id();
-            let table_ids_before = engine.catalog().list_user_table_ids_now();
+            let table_ids_before = engine.inner().core.catalog().list_user_table_ids_now();
 
             macro_rules! assert_rejected {
                 ($result:expr) => {
@@ -3829,7 +3997,10 @@ pub(crate) mod tests {
                 lock_entry_count(&engine, LockOwner::session_explicit(session_id)),
                 0
             );
-            assert_eq!(engine.catalog().list_user_table_ids_now(), table_ids_before);
+            assert_eq!(
+                engine.inner().core.catalog().list_user_table_ids_now(),
+                table_ids_before
+            );
 
             trx.rollback().await.unwrap();
             assert_eq!(session.list_table_ids().unwrap(), table_ids_before);
@@ -3926,7 +4097,7 @@ pub(crate) mod tests {
             let mut session = engine.new_session().unwrap();
             let session_id = session.id();
             let observer = session.pin_observer().unwrap();
-            let state = Arc::clone(&observer.state);
+            let state = Arc::clone(observer.runtime.state());
 
             session.close().await.unwrap();
             assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
@@ -3964,7 +4135,7 @@ pub(crate) mod tests {
             let session_id = session.id();
             let trx = session.begin_trx().unwrap();
             let observer = session.pin_observer().unwrap();
-            let state = Arc::clone(&observer.state);
+            let state = Arc::clone(observer.runtime.state());
 
             drop(session);
             {
@@ -4003,7 +4174,7 @@ pub(crate) mod tests {
             let mut session = engine.new_session().unwrap();
             let trx = session.begin_trx().unwrap();
             let observer = session.pin_observer().unwrap();
-            let state = Arc::clone(&observer.state);
+            let state = Arc::clone(observer.runtime.state());
 
             let blocker = state.shutdown_blocker().unwrap();
             assert_eq!(blocker.label(), "operation");
@@ -4124,6 +4295,48 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_admitted_session_ref_holds_admission_until_drop() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let session = engine.new_session().unwrap();
+            let admitted = session
+                .session
+                .acquire_admission()
+                .unwrap()
+                .upgrade()
+                .unwrap();
+            assert_eq!(admitted.runtime().state().id(), session.id());
+            let (started_tx, started_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+
+            thread::scope(|scope| {
+                let shutdown = scope.spawn(|| {
+                    started_tx.send(()).unwrap();
+                    engine.shutdown();
+                    done_tx.send(()).unwrap();
+                });
+
+                started_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("shutdown thread should start");
+                assert!(
+                    done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+                    "shutdown must wait while the admitted session reference is live"
+                );
+
+                drop(admitted);
+                done_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("shutdown should complete after admitted session reference drops");
+                shutdown.join().unwrap();
+            });
+        });
+    }
+
+    #[test]
     fn test_normal_observer_admission_race_registers_or_rejects() {
         run_observer_admission_shutdown_race(false);
     }
@@ -4155,24 +4368,27 @@ pub(crate) mod tests {
 
             let pin = session.pin_observer().unwrap();
             let cached_page = {
-                let cache = pin.state.table_cache.lock();
+                let cache = pin.runtime.state().table_cache.lock();
                 let entry = cache.get(&table_id).unwrap();
                 assert!(entry.table.upgrade().is_some());
                 entry.active_insert_page.unwrap()
             };
             assert_eq!(
-                pin.state.load_active_insert_page(table_id),
+                pin.runtime.state().load_active_insert_page(table_id),
                 Some(cached_page)
             );
             {
-                let cache = pin.state.table_cache.lock();
+                let cache = pin.runtime.state().table_cache.lock();
                 let entry = cache.get(&table_id).unwrap();
                 assert!(entry.table.upgrade().is_some());
                 assert!(entry.active_insert_page.is_none());
             }
-            pin.state.save_active_insert_page(table_id, cached_page);
+            pin.runtime
+                .state()
+                .save_active_insert_page(table_id, cached_page);
             assert_eq!(
-                pin.state
+                pin.runtime
+                    .state()
                     .table_cache
                     .lock()
                     .get(&table_id)
@@ -4190,6 +4406,8 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
             let catalog_tables = engine
+                .inner()
+                .core
                 .catalog()
                 .storage
                 .get_catalog_table(TABLE_ID_TABLES)
@@ -4203,7 +4421,8 @@ pub(crate) mod tests {
             {
                 let pin = session1.pin_observer().unwrap();
                 assert!(
-                    pin.state
+                    pin.runtime
+                        .state()
                         .table_cache
                         .lock()
                         .keys()
@@ -4220,7 +4439,8 @@ pub(crate) mod tests {
             );
             let pin = session2.pin_observer().unwrap();
             assert!(
-                pin.state
+                pin.runtime
+                    .state()
                     .table_cache
                     .lock()
                     .keys()
@@ -4238,7 +4458,7 @@ pub(crate) mod tests {
                 .unwrap();
             let session_id = SessionID::new(1);
             let trx_id = MIN_ACTIVE_TRX_ID;
-            let state = SessionState::new(engine.new_ref().unwrap(), session_id);
+            let state = Arc::new(new_session_state_for_test(&engine, session_id));
             let key = SessionOperationKey::new(session_id, OperationID::new(1));
             let entry = SessionOperationEntry::new_public_transaction(
                 key,
@@ -4254,8 +4474,12 @@ pub(crate) mod tests {
             let blocker = state
                 .shutdown_blocker()
                 .expect("abandoned transaction must block shutdown");
-            assert_eq!(blocker.cleanup(), Some((key, trx_id)));
             assert_eq!(blocker.label(), "operation");
+            let cleanup = blocker
+                .into_cleanup()
+                .expect("abandoned transaction must be claimable");
+            assert_eq!((cleanup.operation_key, cleanup.trx_id), (key, trx_id));
+            assert!(Arc::ptr_eq(cleanup.runtime.state(), &state));
             assert_eq!(entry.inspect().state, SessionOperationState::CleanupReady);
         });
     }
@@ -4269,7 +4493,7 @@ pub(crate) mod tests {
                 .unwrap();
             let session_id = SessionID::new(1);
             let trx_id = MIN_ACTIVE_TRX_ID;
-            let state = SessionState::new(engine.new_ref().unwrap(), session_id);
+            let state = Arc::new(new_session_state_for_test(&engine, session_id));
             let key = SessionOperationKey::new(session_id, OperationID::new(1));
             let entry = SessionOperationEntry::new_public_transaction(
                 key,
@@ -4285,11 +4509,11 @@ pub(crate) mod tests {
             let blocker = state
                 .shutdown_blocker()
                 .expect("failed-retained operation must block shutdown");
-            assert_eq!(blocker.cleanup(), None);
             assert_eq!(
                 blocker.operation_state(),
                 Some(SessionOperationState::FailedRetained)
             );
+            assert!(blocker.into_cleanup().is_none());
             assert_eq!(entry.inspect().state, SessionOperationState::FailedRetained);
         });
     }
@@ -4303,7 +4527,7 @@ pub(crate) mod tests {
                 .unwrap();
             let session_id = SessionID::new(1);
             let trx_id = MIN_ACTIVE_TRX_ID;
-            let state = SessionState::new(engine.new_ref().unwrap(), session_id);
+            let state = Arc::new(new_session_state_for_test(&engine, session_id));
             let key = SessionOperationKey::new(session_id, OperationID::new(1));
             let entry = SessionOperationEntry::new_public_transaction(
                 key,
@@ -4314,11 +4538,12 @@ pub(crate) mod tests {
             let shutdown_wait = state
                 .shutdown_wait()
                 .expect("active transaction must install a shutdown listener");
-            assert_eq!(shutdown_wait.blocker.cleanup(), None);
+            let SessionShutdownWait { blocker, listener } = shutdown_wait;
+            assert!(blocker.into_cleanup().is_none());
             assert!(state.lifecycle.lock().change_ev.is_some());
 
             assert!(state.abandon_trx_handle(key, trx_id));
-            shutdown_wait.listener.await;
+            listener.await;
             assert_eq!(entry.inspect().state, SessionOperationState::CleanupReady);
         });
     }
@@ -4332,7 +4557,7 @@ pub(crate) mod tests {
                 .unwrap();
             let session_id = SessionID::new(1);
             let trx_id = MIN_ACTIVE_TRX_ID;
-            let state = SessionState::new(engine.new_ref().unwrap(), session_id);
+            let state = Arc::new(new_session_state_for_test(&engine, session_id));
             let key = SessionOperationKey::new(session_id, OperationID::new(1));
             let entry = SessionOperationEntry::new_public_transaction(
                 key,
@@ -4365,7 +4590,7 @@ pub(crate) mod tests {
             for raw_id in 1..=2 {
                 let session_id = SessionID::new(raw_id);
                 let trx_id = TrxID::new(MIN_ACTIVE_TRX_ID.as_u64() + raw_id);
-                let state = Arc::new(SessionState::new(engine.new_ref().unwrap(), session_id));
+                let state = Arc::new(new_session_state_for_test(&engine, session_id));
                 let key = SessionOperationKey::new(session_id, OperationID::new(1));
                 let entry = SessionOperationEntry::new_public_transaction(
                     key,
@@ -4385,14 +4610,11 @@ pub(crate) mod tests {
             let shutdown_wait = registry
                 .first_shutdown_wait()
                 .expect("one active session must block shutdown");
-            assert!(
-                expected_cleanup.contains(
-                    &shutdown_wait
-                        .blocker
-                        .cleanup()
-                        .expect("abandoned transaction must be claimable")
-                )
-            );
+            let cleanup = shutdown_wait
+                .blocker
+                .into_cleanup()
+                .expect("abandoned transaction must be claimable");
+            assert!(expected_cleanup.contains(&(cleanup.operation_key, cleanup.trx_id)));
             assert_eq!(
                 states
                     .iter()
@@ -4401,6 +4623,45 @@ pub(crate) mod tests {
                 1,
                 "lazy shutdown scan must stop after arming its first blocker"
             );
+        });
+    }
+
+    #[test]
+    fn test_cold_removal_preserves_pointer_distinct_replacement() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let session = engine.new_session().unwrap();
+            let session_id = session.id();
+            let registry = &engine.inner().session_registry;
+            let stale = registry
+                .session_state(session_id)
+                .expect("new session must be registered");
+            let stale_runtime = SessionRuntime::new(Arc::clone(&stale));
+            let replacement = Arc::new(new_session_state_for_test(&engine, session_id));
+
+            let displaced = registry
+                .entries
+                .insert(session_id, Arc::clone(&replacement))
+                .expect("test replacement must displace the original state");
+            assert!(Arc::ptr_eq(&displaced, &stale));
+
+            stale_runtime.remove_if_requested(true);
+            let registered = registry
+                .session_state(session_id)
+                .expect("pointer-distinct replacement must remain registered");
+            assert!(Arc::ptr_eq(&registered, &replacement));
+
+            remove_session_for_test(registry, session_id);
+            drop(registered);
+            drop(replacement);
+            drop(displaced);
+            drop(stale_runtime);
+            drop(stale);
+            drop(session);
+            engine.shutdown();
         });
     }
 
@@ -4418,7 +4679,7 @@ pub(crate) mod tests {
             for raw_id in 1..=SESSION_COUNT {
                 let session_id = SessionID::new(raw_id);
                 let trx_id = TrxID::new(MIN_ACTIVE_TRX_ID.as_u64() + raw_id);
-                let state = Arc::new(SessionState::new(engine.new_ref().unwrap(), session_id));
+                let state = Arc::new(new_session_state_for_test(&engine, session_id));
                 let key = SessionOperationKey::new(session_id, OperationID::new(1));
                 let entry = SessionOperationEntry::new_public_transaction(
                     key,
@@ -4439,10 +4700,11 @@ pub(crate) mod tests {
                 let shutdown_wait = registry
                     .first_shutdown_wait()
                     .expect("one remaining active session must block shutdown");
-                let (key, _) = shutdown_wait
+                let cleanup = shutdown_wait
                     .blocker
-                    .cleanup()
+                    .into_cleanup()
                     .expect("abandoned transaction must be claimable");
+                let key = cleanup.operation_key;
                 assert!(
                     !drained.contains(&key),
                     "a drained session must not block a later lazy pass"
@@ -4673,7 +4935,7 @@ pub(crate) mod tests {
                 .unwrap();
             let key = operation.key();
             let entry = Arc::clone(&operation.entry);
-            let state = Arc::clone(&operation.state);
+            let state = Arc::clone(operation.runtime.state());
             assert!(state.lifecycle.lock().change_ev.is_none());
             let public_cache_ptr = state
                 .lifecycle
@@ -5065,7 +5327,15 @@ pub(crate) mod tests {
             let engine = Engine::bootstrap(EngineConfig::default().storage_root(&main_dir))
                 .await
                 .unwrap();
-            assert!(engine.catalog().get_table(table_id).await.is_some());
+            assert!(
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .get_table(table_id)
+                    .await
+                    .is_some()
+            );
             assert!(
                 engine
                     .inner()
@@ -5133,7 +5403,7 @@ pub(crate) mod tests {
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             assert_checkpoint_published(&mut session, table_id).await;
 
-            let before = engine.catalog().storage.checkpoint_snapshot();
+            let before = engine.inner().core.catalog().storage.checkpoint_snapshot();
             assert_eq!(before.meta.first_redo_log_seq, 0);
 
             let outcome = session
@@ -5162,7 +5432,7 @@ pub(crate) mod tests {
             );
             assert_eq!(outcome.redo_truncation.failed_unlink_files, 0);
 
-            let after = engine.catalog().storage.checkpoint_snapshot();
+            let after = engine.inner().core.catalog().storage.checkpoint_snapshot();
             assert_eq!(after.catalog_replay_start_ts, catalog_replay_start_ts);
             assert_eq!(
                 after.meta.first_redo_log_seq,
@@ -5204,7 +5474,7 @@ pub(crate) mod tests {
             commit_redo_durability_anchor(&mut session, table_id).await;
             session.checkpoint_catalog().await.unwrap();
 
-            let checkpointed = engine.catalog().storage.checkpoint_snapshot();
+            let checkpointed = engine.inner().core.catalog().storage.checkpoint_snapshot();
             let outcome = session
                 .checkpoint_catalog_and_truncate_redo_log()
                 .await
@@ -5216,7 +5486,7 @@ pub(crate) mod tests {
                 outcome.redo_truncation.new_first_retained_file_seq > 0,
                 "{outcome:?}"
             );
-            let after = engine.catalog().storage.checkpoint_snapshot();
+            let after = engine.inner().core.catalog().storage.checkpoint_snapshot();
             assert_eq!(
                 after.catalog_replay_start_ts,
                 checkpointed.catalog_replay_start_ts
@@ -5238,7 +5508,13 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
             let table_id = create_rotated_redo_table(&engine, &main_dir, log_file_stem, 2).await;
-            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
             let root_floor = table.redo_replay_floor_snapshot();
             drop(table);
             let mut session = engine.new_session().unwrap();
@@ -5253,6 +5529,8 @@ pub(crate) mod tests {
                 "{checkpoint:?}"
             );
             let watermark = engine
+                .inner()
+                .core
                 .catalog()
                 .storage
                 .table_replay_silent_watermarks()
@@ -5264,6 +5542,8 @@ pub(crate) mod tests {
             assert!(watermark.deletion_cutoff_ts > root_floor.deletion_cutoff_ts);
             assert!(
                 engine
+                    .inner()
+                    .core
                     .catalog()
                     .storage
                     .checkpointed_silent_watermarks()
@@ -5313,7 +5593,12 @@ pub(crate) mod tests {
                     )),
                 "{outcome:?}"
             );
-            let checkpointed = engine.catalog().storage.checkpointed_silent_watermarks();
+            let checkpointed = engine
+                .inner()
+                .core
+                .catalog()
+                .storage
+                .checkpointed_silent_watermarks();
             let checkpointed_floor = checkpointed
                 .get(&table_id)
                 .copied()
@@ -5344,7 +5629,7 @@ pub(crate) mod tests {
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             assert_checkpoint_published(&mut session, table_id).await;
 
-            let before = engine.catalog().storage.checkpoint_snapshot();
+            let before = engine.inner().core.catalog().storage.checkpoint_snapshot();
             assert_eq!(before.meta.first_redo_log_seq, 0);
             let plan = engine.inner().trx_sys.plan_redo_truncation().unwrap();
             assert_eq!(plan.first_retained_file_seq, 0);
@@ -5386,7 +5671,7 @@ pub(crate) mod tests {
                 Some(FatalError::CheckpointWrite)
             );
             assert!(publish_hook.call_count() > 0);
-            let after = engine.catalog().storage.checkpoint_snapshot();
+            let after = engine.inner().core.catalog().storage.checkpoint_snapshot();
             assert_eq!(
                 after.catalog_replay_start_ts,
                 before.catalog_replay_start_ts
@@ -5418,7 +5703,7 @@ pub(crate) mod tests {
             commit_redo_durability_anchor(&mut session, table_id).await;
             session.checkpoint_catalog().await.unwrap();
 
-            let before = engine.catalog().storage.checkpoint_snapshot();
+            let before = engine.inner().core.catalog().storage.checkpoint_snapshot();
             assert_eq!(before.meta.first_redo_log_seq, 0);
             let plan = engine.inner().trx_sys.plan_redo_truncation().unwrap();
             assert_eq!(plan.first_retained_file_seq, 0);
@@ -5460,7 +5745,7 @@ pub(crate) mod tests {
                 Some(FatalError::CheckpointWrite)
             );
             assert!(publish_hook.call_count() > 0);
-            let after = engine.catalog().storage.checkpoint_snapshot();
+            let after = engine.inner().core.catalog().storage.checkpoint_snapshot();
             assert_eq!(
                 after.catalog_replay_start_ts,
                 before.catalog_replay_start_ts
@@ -5489,6 +5774,8 @@ pub(crate) mod tests {
             let mut setup_session = engine.new_session().unwrap();
             setup_session.checkpoint_catalog().await.unwrap();
             engine
+                .inner()
+                .core
                 .catalog()
                 .storage
                 .publish_first_redo_log_seq(1)
@@ -5499,7 +5786,7 @@ pub(crate) mod tests {
 
             let hook_called = Arc::new(AtomicBool::new(false));
             let hook_flag = Arc::clone(&hook_called);
-            let hook_engine = engine.new_ref().unwrap();
+            let hook_catalog = engine.inner().core.catalog.clone();
             let hook_guard = install_redo_cleanup_before_unlink_hook(
                 &engine.inner().maintenance_test,
                 Arc::new(move |file_seq, _path| {
@@ -5507,7 +5794,7 @@ pub(crate) mod tests {
                         return;
                     }
                     hook_flag.store(true, Ordering::SeqCst);
-                    let catalog = hook_engine.catalog();
+                    let catalog = &*hook_catalog;
                     let mut metadata_fut = Box::pin(catalog.acquire_index_metadata_change());
                     let waker = noop_waker();
                     let mut cx = Context::from_waker(&waker);
@@ -5552,6 +5839,8 @@ pub(crate) mod tests {
             let mut setup_session = engine.new_session().unwrap();
             setup_session.checkpoint_catalog().await.unwrap();
             engine
+                .inner()
+                .core
                 .catalog()
                 .storage
                 .publish_first_redo_log_seq(1)
@@ -5620,6 +5909,8 @@ pub(crate) mod tests {
             );
             assert_eq!(
                 engine
+                    .inner()
+                    .core
                     .catalog()
                     .storage
                     .checkpoint_snapshot()
@@ -5666,13 +5957,27 @@ pub(crate) mod tests {
             let table_id = create_rotated_redo_table(&engine, &main_dir, log_file_stem, 1).await;
             let mut session = engine.new_session().unwrap();
             session.checkpoint_catalog().await.unwrap();
-            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
             let expected_floor = table.redo_replay_floor_snapshot();
             drop(table);
 
             session.drop_table(table_id).await.unwrap();
 
-            assert!(engine.catalog().get_table(table_id).await.is_none());
+            assert!(
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .get_table(table_id)
+                    .await
+                    .is_none()
+            );
             assert_eq!(session.list_table_ids().unwrap(), Vec::<TableID>::new());
             let plan = engine.inner().trx_sys.plan_redo_truncation().unwrap();
             assert!(
@@ -5699,7 +6004,7 @@ pub(crate) mod tests {
             let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
                 .await
                 .unwrap();
-            let catalog = engine.catalog();
+            let catalog = engine.inner().core.catalog();
             catalog.acquire_index_metadata_change().await;
             let mut session = engine.new_session().unwrap();
             let mut truncate_fut = Box::pin(session.truncate_redo_log());
@@ -5855,6 +6160,8 @@ pub(crate) mod tests {
             assert!(publish_hook.call_count() > 0);
             assert_eq!(
                 engine
+                    .inner()
+                    .core
                     .catalog()
                     .storage
                     .checkpoint_snapshot()
@@ -5883,6 +6190,8 @@ pub(crate) mod tests {
                 .unwrap();
             create_rotated_redo_table(&engine, &main_dir, log_file_stem, 1).await;
             engine
+                .inner()
+                .core
                 .catalog()
                 .storage
                 .publish_first_redo_log_seq(1)
@@ -5893,7 +6202,7 @@ pub(crate) mod tests {
 
             let hook_called = Arc::new(AtomicBool::new(false));
             let hook_flag = Arc::clone(&hook_called);
-            let hook_engine = engine.new_ref().unwrap();
+            let hook_catalog = engine.inner().core.catalog.clone();
             let hook_guard = install_redo_cleanup_before_unlink_hook(
                 &engine.inner().maintenance_test,
                 Arc::new(move |file_seq, _path| {
@@ -5901,7 +6210,7 @@ pub(crate) mod tests {
                         return;
                     }
                     hook_flag.store(true, Ordering::SeqCst);
-                    let catalog = hook_engine.catalog();
+                    let catalog = &*hook_catalog;
                     let mut metadata_fut = Box::pin(catalog.acquire_index_metadata_change());
                     let waker = noop_waker();
                     let mut cx = Context::from_waker(&waker);
@@ -5940,6 +6249,8 @@ pub(crate) mod tests {
                 .unwrap();
             create_rotated_redo_table(&engine, &main_dir, log_file_stem, 1).await;
             engine
+                .inner()
+                .core
                 .catalog()
                 .storage
                 .publish_first_redo_log_seq(1)
@@ -5988,6 +6299,8 @@ pub(crate) mod tests {
                 .unwrap();
             create_rotated_redo_table(&engine, &main_dir, log_file_stem, 1).await;
             engine
+                .inner()
+                .core
                 .catalog()
                 .storage
                 .publish_first_redo_log_seq(1)
@@ -6036,6 +6349,8 @@ pub(crate) mod tests {
                 .unwrap();
             create_rotated_redo_table(&engine, &main_dir, log_file_stem, 1).await;
             engine
+                .inner()
+                .core
                 .catalog()
                 .storage
                 .publish_first_redo_log_seq(1)

@@ -1,9 +1,10 @@
 use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards};
+use crate::catalog::storage::CatalogStorage;
 use crate::catalog::{
     Catalog, IndexColumnObject, IndexNo, IndexObject, IndexSpec, TableMetadata, TableObject,
     catalog_table_id_from_slot,
 };
-use crate::engine::EngineRef;
+use crate::engine::EngineCore;
 use crate::error::{
     CompletionErrorBridge, CompletionResult, DataIntegrityError, DataIntegrityResult,
     DiscloseResultExt, FatalError, OperationError, OperationOrRuntimeResult, OperationResult,
@@ -19,6 +20,7 @@ use crate::index::{
 };
 use crate::log::redo::DDLRedo;
 use crate::obs;
+use crate::poison::EnginePoisoner;
 use crate::quiescent::QuiescentGuard;
 use crate::row::RowRead;
 use crate::runtime::mandatory::{AcceptedExecution, MandatoryTaskMetadata, PreparedExecution};
@@ -454,15 +456,14 @@ struct CreateIndexRuntimeBuilder<'a> {
 impl<'a> CreateIndexRuntimeBuilder<'a> {
     #[inline]
     fn new(
-        engine: &EngineRef,
-        guards: &'a PoolGuards,
+        engine: &'a EngineCore,
         metadata: &'a TableMetadata,
         index_spec: &'a IndexSpec,
         build_ts: TrxID,
     ) -> Self {
         Self {
-            index_pool: engine.index_pool.clone_inner(),
-            index_guard: guards.index_guard(),
+            index_pool: engine.pools.index.clone(),
+            index_guard: engine.pool_guards().index_guard(),
             metadata,
             index_spec,
             build_ts,
@@ -584,10 +585,6 @@ enum CreateIndexBuildPhase {
 }
 
 struct CreateIndexProgress {
-    // Accepted DDL is accounted by its mandatory caller permit and stable
-    // session operation; this handle supplies component access only.
-    engine: EngineRef,
-    guards: PoolGuards,
     table_id: TableID,
     index_no: IndexNo,
     build_ts: TrxID,
@@ -599,17 +596,9 @@ struct CreateIndexProgress {
 
 impl CreateIndexProgress {
     #[inline]
-    fn new(
-        engine: EngineRef,
-        guards: PoolGuards,
-        table_id: TableID,
-        index_no: IndexNo,
-        trx: Transaction,
-    ) -> Self {
+    fn new(table_id: TableID, index_no: IndexNo, trx: Transaction) -> Self {
         let build_ts = trx.sts();
         Self {
-            engine,
-            guards,
             table_id,
             index_no,
             build_ts,
@@ -662,6 +651,7 @@ impl CreateIndexProgress {
 
     async fn execute_catalog_update(
         &mut self,
+        engine: &EngineCore,
         authority: PreparedCatalogWriteAuthority<'_>,
         metadata: &TableMetadata,
         index_spec: &IndexSpec,
@@ -674,7 +664,7 @@ impl CreateIndexProgress {
             )
         });
         let res = execute_create_index_catalog_update(
-            &self.engine,
+            &engine.catalog().storage,
             trx,
             authority,
             self.table_id,
@@ -686,13 +676,14 @@ impl CreateIndexProgress {
         match res {
             Ok(()) => Ok(()),
             Err(err) => {
-                self.rollback_before_catalog_commit().await?;
+                self.rollback_before_catalog_commit(engine.pool_guards())
+                    .await?;
                 Err(RuntimeOrFatalError::from(err))
             }
         }
     }
 
-    async fn commit_catalog(&mut self) -> RuntimeOrFatalResult<TrxID> {
+    async fn commit_catalog(&mut self, guards: &PoolGuards) -> RuntimeOrFatalResult<TrxID> {
         debug_assert_eq!(self.phase, CreateIndexBuildPhase::LayoutStaged);
         let trx = self.trx.take().unwrap_or_else(|| {
             panic!(
@@ -706,7 +697,7 @@ impl CreateIndexProgress {
                 Ok(cts)
             }
             Err(err) => {
-                self.cleanup_staged_runtime().await;
+                self.cleanup_staged_runtime(guards).await;
                 self.phase = CreateIndexBuildPhase::Aborted;
                 Err(err)
             }
@@ -735,8 +726,11 @@ impl CreateIndexProgress {
         self.phase = CreateIndexBuildPhase::Installed;
     }
 
-    async fn rollback_before_catalog_commit(&mut self) -> RuntimeOrFatalResult<()> {
-        self.cleanup_staged_runtime().await;
+    async fn rollback_before_catalog_commit(
+        &mut self,
+        guards: &PoolGuards,
+    ) -> RuntimeOrFatalResult<()> {
+        self.cleanup_staged_runtime(guards).await;
         let rollback_res = rollback_active_ddl_trx(&mut self.trx).await;
         self.phase = CreateIndexBuildPhase::Aborted;
         rollback_res?;
@@ -745,13 +739,14 @@ impl CreateIndexProgress {
 
     async fn cleanup_after_catalog_commit_failure(
         &mut self,
+        engine: &EngineCore,
         operation: &'static str,
         source: RuntimeOrFatalError,
     ) -> RuntimeOrFatalError {
-        self.cleanup_staged_runtime().await;
+        self.cleanup_staged_runtime(engine.pool_guards()).await;
         self.phase = CreateIndexBuildPhase::Aborted;
         poison_index_after_catalog_commit_with_source(
-            &self.engine,
+            &engine.poisoner,
             IndexDdlKind::Create,
             self.table_id,
             self.index_no,
@@ -760,12 +755,12 @@ impl CreateIndexProgress {
         )
     }
 
-    async fn cleanup_staged_runtime(&mut self) {
+    async fn cleanup_staged_runtime(&mut self, guards: &PoolGuards) {
         self.new_layout = None;
         if let Some(index) = self.staged_index.take() {
             // Preserve the existing best-effort cleanup policy. A destroy
             // failure is observed but does not replace the DDL source.
-            if let Err(report) = destroy_uninstalled_staged_index(index, &self.guards).await {
+            if let Err(report) = destroy_uninstalled_staged_index(index, guards).await {
                 let report = report.attach(format!(
                     "operation=cleanup_create_index_staged_runtime, table_id={}, index_no={}",
                     self.table_id, self.index_no
@@ -787,9 +782,6 @@ enum DropIndexBuildPhase {
 }
 
 struct DropIndexProgress {
-    // Accepted DDL is accounted by its mandatory caller permit and stable
-    // session operation; this handle supplies component access only.
-    engine: EngineRef,
     table_id: TableID,
     index_no: IndexNo,
     phase: DropIndexBuildPhase,
@@ -799,9 +791,8 @@ struct DropIndexProgress {
 
 impl DropIndexProgress {
     #[inline]
-    fn new(engine: EngineRef, table_id: TableID, index_no: IndexNo, trx: Transaction) -> Self {
+    fn new(table_id: TableID, index_no: IndexNo, trx: Transaction) -> Self {
         Self {
-            engine,
             table_id,
             index_no,
             phase: DropIndexBuildPhase::LayoutStaged,
@@ -819,6 +810,7 @@ impl DropIndexProgress {
 
     async fn execute_catalog_update(
         &mut self,
+        catalog: &Catalog,
         authority: PreparedCatalogWriteAuthority<'_>,
         old_index_spec: &IndexSpec,
     ) -> RuntimeOrFatalResult<()> {
@@ -830,7 +822,7 @@ impl DropIndexProgress {
             )
         });
         let res = execute_drop_index_catalog_update(
-            &self.engine,
+            &catalog.storage,
             trx,
             authority,
             self.table_id,
@@ -899,13 +891,14 @@ impl DropIndexProgress {
 
     async fn cleanup_after_catalog_commit_failure(
         &mut self,
+        poisoner: &EnginePoisoner,
         operation: &'static str,
         source: RuntimeOrFatalError,
     ) -> RuntimeOrFatalError {
         self.new_layout = None;
         self.phase = DropIndexBuildPhase::Aborted;
         poison_index_after_catalog_commit_with_source(
-            &self.engine,
+            poisoner,
             IndexDdlKind::Drop,
             self.table_id,
             self.index_no,
@@ -1024,8 +1017,8 @@ impl AcceptedCreateIndex {
         let plan = self.plan.take().unwrap_or_else(|| {
             panic!("accepted CREATE INDEX invariant violated: execution plan is missing")
         });
-        let engine = self.scope.engine().clone();
-        let guards = self.scope.pool_guards();
+        let engine = self.scope.engine().core();
+        let guards = engine.pool_guards();
         let table_id = plan.table_id;
         let index_no = plan.index_no;
         let index_no_usize = usize::from(index_no);
@@ -1041,13 +1034,7 @@ impl AcceptedCreateIndex {
                 err.attach("operation=create_index, phase=begin_private_transaction"),
             )
         })?;
-        self.progress = Some(CreateIndexProgress::new(
-            engine.clone(),
-            guards.clone(),
-            table_id,
-            index_no,
-            trx,
-        ));
+        self.progress = Some(CreateIndexProgress::new(table_id, index_no, trx));
         let progress = self
             .progress
             .as_mut()
@@ -1067,7 +1054,7 @@ impl AcceptedCreateIndex {
         let key_validator = CreateIndexKeyValidator::new(&plan.new_index_spec);
         let collector = CreateIndexCollector::new(
             &plan.table,
-            &guards,
+            guards,
             plan.old_layout.as_ref(),
             &plan.new_index_spec,
             &plan.active_root,
@@ -1085,7 +1072,7 @@ impl AcceptedCreateIndex {
         ) {
             Ok(runtime) => runtime,
             Err(err) => {
-                if let Err(cleanup) = progress.rollback_before_catalog_commit().await {
+                if let Err(cleanup) = progress.rollback_before_catalog_commit(guards).await {
                     return Err(CompletionErrorBridge::capture_runtime_or_fatal(cleanup));
                 }
                 return Err(CompletionErrorBridge::capture(err));
@@ -1095,7 +1082,7 @@ impl AcceptedCreateIndex {
         let mut cold_rows = match collector.collect_current_cold().await {
             Ok(cold_rows) => cold_rows,
             Err(err) => {
-                if let Err(cleanup) = progress.rollback_before_catalog_commit().await {
+                if let Err(cleanup) = progress.rollback_before_catalog_commit(guards).await {
                     return Err(CompletionErrorBridge::capture_runtime_or_fatal(cleanup));
                 }
                 return Err(CompletionErrorBridge::capture_operation_or_runtime(err));
@@ -1107,7 +1094,7 @@ impl AcceptedCreateIndex {
             .reach_phase(IndexDdlTestPhase::CreateColdCollectionComplete)
             .await;
         if let Err(err) = key_validator.prepare_cold(&mut cold_rows) {
-            if let Err(cleanup) = progress.rollback_before_catalog_commit().await {
+            if let Err(cleanup) = progress.rollback_before_catalog_commit(guards).await {
                 return Err(CompletionErrorBridge::capture_runtime_or_fatal(cleanup));
             }
             return Err(CompletionErrorBridge::capture(err));
@@ -1116,7 +1103,7 @@ impl AcceptedCreateIndex {
         let cold_root = match build_create_index_disk_tree(
             &mut mutable_file,
             &disk_runtime,
-            &guards,
+            guards,
             &plan.new_index_spec,
             &cold_rows,
             build_ts,
@@ -1125,7 +1112,7 @@ impl AcceptedCreateIndex {
         {
             Ok(root) => root,
             Err(err) => {
-                if let Err(cleanup) = progress.rollback_before_catalog_commit().await {
+                if let Err(cleanup) = progress.rollback_before_catalog_commit(guards).await {
                     return Err(CompletionErrorBridge::capture_runtime_or_fatal(cleanup));
                 }
                 return Err(CompletionErrorBridge::capture_runtime_or_fatal(err));
@@ -1144,8 +1131,7 @@ impl AcceptedCreateIndex {
         );
 
         let runtime_builder = CreateIndexRuntimeBuilder::new(
-            &engine,
-            &guards,
+            engine,
             plan.new_metadata.as_ref(),
             &plan.new_index_spec,
             build_ts,
@@ -1153,7 +1139,7 @@ impl AcceptedCreateIndex {
         let mut hot_rows = match collector.collect_current_hot().await {
             Ok(hot_rows) => hot_rows,
             Err(err) => {
-                if let Err(cleanup) = progress.rollback_before_catalog_commit().await {
+                if let Err(cleanup) = progress.rollback_before_catalog_commit(guards).await {
                     return Err(CompletionErrorBridge::capture_runtime_or_fatal(cleanup));
                 }
                 return Err(CompletionErrorBridge::capture(err));
@@ -1165,7 +1151,7 @@ impl AcceptedCreateIndex {
             .reach_phase(IndexDdlTestPhase::CreateHotCollectionComplete)
             .await;
         if let Err(err) = key_validator.prepare_hot(&mut hot_rows, &cold_rows) {
-            if let Err(cleanup) = progress.rollback_before_catalog_commit().await {
+            if let Err(cleanup) = progress.rollback_before_catalog_commit(guards).await {
                 return Err(CompletionErrorBridge::capture_runtime_or_fatal(cleanup));
             }
             return Err(CompletionErrorBridge::capture(err));
@@ -1180,7 +1166,7 @@ impl AcceptedCreateIndex {
         match runtime_index {
             Ok(index) => progress.stage_runtime_index(index),
             Err(err) => {
-                if let Err(cleanup) = progress.rollback_before_catalog_commit().await {
+                if let Err(cleanup) = progress.rollback_before_catalog_commit(guards).await {
                     return Err(CompletionErrorBridge::capture_runtime_or_fatal(cleanup));
                 }
                 return Err(CompletionErrorBridge::capture_operation_or_runtime(err));
@@ -1197,7 +1183,7 @@ impl AcceptedCreateIndex {
             .index_ddl_test
             .maybe_fail_create(CreateIndexTestFailure::AfterRuntimeStaged)
         {
-            if let Err(cleanup) = progress.rollback_before_catalog_commit().await {
+            if let Err(cleanup) = progress.rollback_before_catalog_commit(guards).await {
                 return Err(CompletionErrorBridge::capture_runtime_or_fatal(cleanup));
             }
             return Err(CompletionErrorBridge::capture(err));
@@ -1213,7 +1199,12 @@ impl AcceptedCreateIndex {
 
         let authority = self.scope.catalog_write_authority();
         if let Err(err) = progress
-            .execute_catalog_update(authority, plan.new_metadata.as_ref(), &plan.new_index_spec)
+            .execute_catalog_update(
+                engine,
+                authority,
+                plan.new_metadata.as_ref(),
+                &plan.new_index_spec,
+            )
             .await
         {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(err));
@@ -1224,7 +1215,7 @@ impl AcceptedCreateIndex {
             .reach_phase(IndexDdlTestPhase::CreateCatalogStaged)
             .await;
         let create_cts = progress
-            .commit_catalog()
+            .commit_catalog(guards)
             .await
             .map_err(CompletionErrorBridge::capture_runtime_or_fatal)?;
         #[cfg(test)]
@@ -1241,6 +1232,7 @@ impl AcceptedCreateIndex {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                 progress
                     .cleanup_after_catalog_commit_failure(
+                        engine,
                         "table_root_publish",
                         RuntimeOrFatalError::from(err),
                     )
@@ -1267,11 +1259,11 @@ impl AcceptedCreateIndex {
             )
             .is_none()
         {
-            progress.cleanup_staged_runtime().await;
+            progress.cleanup_staged_runtime(guards).await;
             progress.phase = CreateIndexBuildPhase::Aborted;
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                 poison_index_publication_invariant(
-                    &engine,
+                    &engine.poisoner,
                     IndexDdlKind::Create,
                     table_id,
                     index_no,
@@ -1398,8 +1390,8 @@ impl AcceptedDropIndex {
         let plan = self.plan.take().unwrap_or_else(|| {
             panic!("accepted DROP INDEX invariant violated: execution plan is missing")
         });
-        let engine = self.scope.engine().clone();
-        let guards = self.scope.pool_guards();
+        let engine = self.scope.engine().core();
+        let guards = engine.pool_guards();
         let table_id = plan.table_id;
         let index_no = plan.index_no;
         let index_no_usize = usize::from(index_no);
@@ -1415,12 +1407,7 @@ impl AcceptedDropIndex {
                 err.attach("operation=drop_index, phase=begin_private_transaction"),
             )
         })?;
-        self.progress = Some(DropIndexProgress::new(
-            engine.clone(),
-            table_id,
-            index_no,
-            trx,
-        ));
+        self.progress = Some(DropIndexProgress::new(table_id, index_no, trx));
         let progress = self
             .progress
             .as_mut()
@@ -1457,7 +1444,7 @@ impl AcceptedDropIndex {
 
         let authority = self.scope.catalog_write_authority();
         if let Err(err) = progress
-            .execute_catalog_update(authority, &plan.old_index_spec)
+            .execute_catalog_update(engine.catalog(), authority, &plan.old_index_spec)
             .await
         {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(err));
@@ -1485,6 +1472,7 @@ impl AcceptedDropIndex {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                 progress
                     .cleanup_after_catalog_commit_failure(
+                        &engine.poisoner,
                         "table_root_publish",
                         RuntimeOrFatalError::from(err),
                     )
@@ -1513,7 +1501,12 @@ impl AcceptedDropIndex {
         {
             progress.phase = DropIndexBuildPhase::Aborted;
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(
-                poison_index_publication_invariant(&engine, IndexDdlKind::Drop, table_id, index_no),
+                poison_index_publication_invariant(
+                    &engine.poisoner,
+                    IndexDdlKind::Drop,
+                    table_id,
+                    index_no,
+                ),
             ));
         }
         progress.mark_installed();
@@ -1525,10 +1518,10 @@ impl AcceptedDropIndex {
         engine.trx_sys.request_metadata_history_purge();
         drop(plan.old_layout);
 
-        if let Err(err) = plan.table.cleanup_retired_secondary_indexes(&guards).await {
+        if let Err(err) = plan.table.cleanup_retired_secondary_indexes(guards).await {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                 poison_index_after_catalog_commit_with_source(
-                    &engine,
+                    &engine.poisoner,
                     IndexDdlKind::Drop,
                     table_id,
                     index_no,
@@ -1955,7 +1948,7 @@ async fn destroy_uninstalled_staged_index(
 
 #[inline]
 async fn execute_drop_index_catalog_update(
-    engine: &EngineRef,
+    storage: &CatalogStorage,
     trx: &mut Transaction,
     authority: PreparedCatalogWriteAuthority<'_>,
     table_id: TableID,
@@ -1963,9 +1956,7 @@ async fn execute_drop_index_catalog_update(
     old_index_spec: &IndexSpec,
 ) -> RuntimeResult<()> {
     trx.stage_prepared_catalog_statement(authority, async |stmt| {
-        let deleted_columns = engine
-            .catalog()
-            .storage
+        let deleted_columns = storage
             .index_columns()
             .delete_by_index(stmt, table_id, index_no)
             .await?;
@@ -1975,9 +1966,7 @@ async fn execute_drop_index_catalog_update(
             "drop-index catalog invariant violated: index-column delete count mismatch, table_id={table_id}, index_no={index_no}"
         );
 
-        let index_deleted = engine
-            .catalog()
-            .storage
+        let index_deleted = storage
             .indexes()
             .delete_by_id(stmt, table_id, index_no)
             .await?;
@@ -2005,7 +1994,7 @@ async fn execute_drop_index_catalog_update(
 /// inserted catalog primary key is therefore unique by construction.
 #[inline]
 async fn execute_create_index_catalog_update(
-    engine: &EngineRef,
+    storage: &CatalogStorage,
     trx: &mut Transaction,
     authority: PreparedCatalogWriteAuthority<'_>,
     table_id: TableID,
@@ -2014,9 +2003,7 @@ async fn execute_create_index_catalog_update(
     index_spec: &IndexSpec,
 ) -> RuntimeResult<()> {
     trx.stage_prepared_catalog_statement(authority, async |stmt| {
-        let table_deleted = engine
-            .catalog()
-            .storage
+        let table_deleted = storage
             .tables()
             .delete_by_id(stmt, table_id)
             .await?;
@@ -2025,9 +2012,7 @@ async fn execute_create_index_catalog_update(
             "create-index catalog invariant violated: validated table row is missing, table_id={table_id}"
         );
 
-        engine
-            .catalog()
-            .storage
+        storage
             .tables()
             .insert(
                 stmt,
@@ -2038,9 +2023,7 @@ async fn execute_create_index_catalog_update(
             )
             .await?;
 
-        engine
-            .catalog()
-            .storage
+        storage
             .indexes()
             .insert(
                 stmt,
@@ -2053,9 +2036,7 @@ async fn execute_create_index_catalog_update(
             .await?;
 
         for (index_column_no, index_key) in index_spec.cols.iter().enumerate() {
-            engine
-                .catalog()
-                .storage
+            storage
                 .index_columns()
                 .insert(
                     stmt,
@@ -2083,7 +2064,7 @@ async fn execute_create_index_catalog_update(
 
 #[inline]
 fn poison_index_after_catalog_commit_with_source(
-    engine: &EngineRef,
+    poisoner: &EnginePoisoner,
     kind: IndexDdlKind,
     table_id: TableID,
     index_no: IndexNo,
@@ -2101,12 +2082,12 @@ fn poison_index_after_catalog_commit_with_source(
         "event=engine_poison component=catalog_index action=poison result=error error={:?}",
         report
     );
-    RuntimeOrFatalError::from(engine.poisoner.poison(report).into_report())
+    RuntimeOrFatalError::from(poisoner.poison(report).into_report())
 }
 
 #[inline]
 fn poison_index_publication_invariant(
-    engine: &EngineRef,
+    poisoner: &EnginePoisoner,
     kind: IndexDdlKind,
     table_id: TableID,
     index_no: IndexNo,
@@ -2122,7 +2103,7 @@ fn poison_index_publication_invariant(
         "event=engine_poison component=catalog_index action=poison result=error error={:?}",
         report
     );
-    RuntimeOrFatalError::from(engine.poisoner.poison(report).into_report())
+    RuntimeOrFatalError::from(poisoner.poison(report).into_report())
 }
 
 #[cfg(test)]
@@ -2340,6 +2321,8 @@ pub(crate) mod tests {
             metadata,
             ..
         } = engine
+            .inner()
+            .core
             .catalog()
             .resolve_user_table_current(table_id)
             .unwrap()
@@ -2350,7 +2333,11 @@ pub(crate) mod tests {
         IndexDdlSnapshot {
             current_effective_cts: effective_cts,
             current_metadata: metadata,
-            history_count: engine.catalog().user_table_history_version_count(table_id),
+            history_count: engine
+                .inner()
+                .core
+                .catalog()
+                .user_table_history_version_count(table_id),
             layout_generation: layout.generation(),
             runtime_slots: layout
                 .secondary_indexes()
@@ -2373,6 +2360,8 @@ pub(crate) mod tests {
             metadata,
             ..
         } = engine
+            .inner()
+            .core
             .catalog()
             .resolve_user_table_current(table_id)
             .unwrap()
@@ -2382,7 +2371,11 @@ pub(crate) mod tests {
         assert_eq!(effective_cts, before.current_effective_cts);
         assert!(Arc::ptr_eq(&metadata, &before.current_metadata));
         assert_eq!(
-            engine.catalog().user_table_history_version_count(table_id),
+            engine
+                .inner()
+                .core
+                .catalog()
+                .user_table_history_version_count(table_id),
             before.history_count
         );
         let layout = table.layout_snapshot();
@@ -2683,6 +2676,8 @@ pub(crate) mod tests {
             assert_eq!(table.layout_snapshot().generation(), old_generation + 1);
             assert_eq!(active_secondary_root(&table, 1), SUPER_BLOCK_ID);
             let table_object = engine
+                .inner()
+                .core
                 .catalog()
                 .storage
                 .tables()
@@ -2754,6 +2749,8 @@ pub(crate) mod tests {
             assert!(layout.metadata().idx.index_spec(1).is_some());
             assert!(layout.secondary_indexes()[1].is_some());
             let CurrentTableState::Live { metadata, .. } = engine
+                .inner()
+                .core
                 .catalog()
                 .resolve_user_table_current(table_id)
                 .unwrap()
@@ -3039,7 +3036,7 @@ pub(crate) mod tests {
                 ));
                 publication_entered.recv_async().await.unwrap();
 
-                let catalog = engine.new_ref().unwrap().catalog_guard();
+                let catalog = engine.inner().core.catalog.clone();
                 let (started_tx, started_rx) = sync_channel(1);
                 let (done_tx, done_rx) = sync_channel(1);
                 let purge = spawn(move || {
@@ -3061,6 +3058,8 @@ pub(crate) mod tests {
 
                 let layout = table.layout_snapshot();
                 let CurrentTableState::Live { metadata, .. } = engine
+                    .inner()
+                    .core
                     .catalog()
                     .resolve_user_table_current(table_id)
                     .unwrap()
@@ -3589,7 +3588,13 @@ pub(crate) mod tests {
             .await
             .unwrap();
             let table_id = table2(&engine).await;
-            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
             let mut session = engine.new_session().unwrap();
             let row_id = insert_one_row(
                 &table,
@@ -3624,7 +3629,13 @@ pub(crate) mod tests {
             ))
             .await
             .unwrap();
-            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
             assert_eq!(table.metadata().idx.next_index_no(), 2);
             assert!(table.metadata().idx.index_spec(1).is_some());
             let session = engine.new_session().unwrap();
@@ -3653,7 +3664,13 @@ pub(crate) mod tests {
                     .await
                     .unwrap();
             let table_id = table2(&engine).await;
-            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
             let mut session = engine.new_session().unwrap();
 
             assert_eq!(
@@ -3676,6 +3693,8 @@ pub(crate) mod tests {
             assert_eq!(root.secondary_index_roots.len(), 2);
             assert_eq!(root.secondary_index_roots[1], SUPER_BLOCK_ID);
             let catalog_indexes = engine
+                .inner()
+                .core
                 .catalog()
                 .storage
                 .indexes()
@@ -3697,7 +3716,13 @@ pub(crate) mod tests {
             let engine = Engine::bootstrap(lightweight_test_engine_config(main_dir, log_stem))
                 .await
                 .unwrap();
-            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
             assert_eq!(table.metadata().idx.next_index_no(), 2);
             assert!(table.metadata().idx.index_spec(1).is_none());
             assert_eq!(
@@ -3817,6 +3842,8 @@ pub(crate) mod tests {
             let mut old_session = engine.new_session().unwrap();
             let old_trx = old_session.begin_trx().unwrap();
             let retained_visible = engine
+                .inner()
+                .core
                 .catalog()
                 .resolve_user_table_visible(table_id, old_trx.sts())
                 .unwrap();
@@ -3866,6 +3893,8 @@ pub(crate) mod tests {
             let mut old_session = engine.new_session().unwrap();
             let old_trx = old_session.begin_trx().unwrap();
             let retained_visible = engine
+                .inner()
+                .core
                 .catalog()
                 .resolve_user_table_visible(table_id, old_trx.sts())
                 .unwrap();
@@ -3930,6 +3959,8 @@ pub(crate) mod tests {
 
     fn table_for_internal_assertion(engine: &Engine, table_id: TableID) -> Arc<Table> {
         engine
+            .inner()
+            .core
             .catalog()
             .get_table_now(table_id)
             .expect("test table should exist")
@@ -4084,7 +4115,7 @@ pub(crate) mod tests {
         let mut session = engine.new_session().unwrap();
         insert_one_row(&table, &mut session, vec![Val::from(1), Val::from("alpha")]).await;
         let before = index_ddl_snapshot(&engine, table_id, &table);
-        let allocated_before = engine.inner().index_pool.allocated();
+        let allocated_before = engine.inner().pools.index.allocated();
 
         engine
             .inner()
@@ -4103,7 +4134,7 @@ pub(crate) mod tests {
             err.report().downcast_ref::<RuntimeError>().copied(),
             Some(RuntimeError::IndexAccess)
         );
-        assert_eq!(engine.inner().index_pool.allocated(), allocated_before);
+        assert_eq!(engine.inner().pools.index.allocated(), allocated_before);
         assert_index_ddl_snapshot_unchanged(&before, &engine, table_id, &table);
         assert_eq!(table.metadata().idx.next_index_no(), 1);
         assert!(table.metadata().idx.index_spec(1).is_none());

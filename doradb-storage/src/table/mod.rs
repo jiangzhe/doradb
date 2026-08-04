@@ -2373,6 +2373,8 @@ pub(crate) mod tests {
     #[inline]
     pub(crate) fn table_for_internal_assertion(engine: &Engine, table_id: TableID) -> Arc<Table> {
         engine
+            .inner()
+            .core
             .catalog()
             .get_table_now(table_id)
             .expect("test table should exist")
@@ -2587,7 +2589,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn lock_entry_count(engine: &Engine, owner: LockOwner) -> usize {
-        debug_snapshot(engine.lock_manager())
+        debug_snapshot(engine.inner().core.lock_manager())
             .entries
             .iter()
             .filter(|entry| entry.owner == owner)
@@ -2601,7 +2603,7 @@ pub(crate) mod tests {
         mode: LockMode,
         state: LockDebugEntryState,
     ) -> bool {
-        debug_snapshot(engine.lock_manager())
+        debug_snapshot(engine.inner().core.lock_manager())
             .entries
             .iter()
             .any(|entry| {
@@ -2617,7 +2619,7 @@ pub(crate) mod tests {
         owner: LockOwner,
         resource: LockResource,
     ) -> bool {
-        debug_snapshot(engine.lock_manager())
+        debug_snapshot(engine.inner().core.lock_manager())
             .entries
             .iter()
             .any(|entry| entry.owner == owner && entry.resource == resource)
@@ -2628,7 +2630,7 @@ pub(crate) mod tests {
         session_id: SessionID,
         resource: LockResource,
     ) -> Option<LockOwner> {
-        debug_snapshot(engine.lock_manager())
+        debug_snapshot(engine.inner().core.lock_manager())
             .entries
             .iter()
             .find(|entry| {
@@ -2654,7 +2656,7 @@ pub(crate) mod tests {
         mode: LockMode,
         state: LockDebugEntryState,
     ) -> Option<LockOwner> {
-        debug_snapshot(engine.lock_manager())
+        debug_snapshot(engine.inner().core.lock_manager())
             .entries
             .iter()
             .find(|entry| {

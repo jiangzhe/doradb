@@ -388,7 +388,7 @@ impl MaintenanceExecutionSpec for CatalogCheckpointExecution {
         _resources: &mut Self::Resources,
         _panic_label: &mut Self::PanicLabel,
     ) -> CompletionResult<Self::Output> {
-        let engine = scope.engine().clone();
+        let engine = scope.engine();
         let result = engine
             .catalog()
             .checkpoint_prepared(&engine.trx_sys)

@@ -183,7 +183,6 @@ impl SysTrx {
                 PreparedTrxPayload::System(SysTrxPayload { retired_row_pages })
             }),
             attachment: None,
-            lock_manager: None,
             lock_state: None,
             trx_inner: None,
         }

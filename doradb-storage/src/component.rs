@@ -494,7 +494,7 @@ pool_access_newtype!(IndexPool, EvictableBufferPool);
 pool_access_newtype!(MemPool, EvictableBufferPool);
 pool_access_newtype!(DiskPool, ReadonlyBufferPool);
 
-/// Inner buffer-pool handles used by engine startup and recovery.
+/// Canonical engine buffer-pool capability shared by session runtime work.
 pub(crate) struct EnginePools {
     /// Metadata pool used for catalog and block-index pages.
     pub(crate) meta: QuiescentGuard<FixedBufferPool>,
@@ -504,6 +504,20 @@ pub(crate) struct EnginePools {
     pub(crate) mem: QuiescentGuard<EvictableBufferPool>,
     /// Readonly persisted-page pool.
     pub(crate) disk: QuiescentGuard<ReadonlyBufferPool>,
+    /// Prebuilt guards for the exact four pool identities above.
+    guards: PoolGuards,
+}
+
+impl Clone for EnginePools {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self::new(
+            self.meta.clone(),
+            self.index.clone(),
+            self.mem.clone(),
+            self.disk.clone(),
+        )
+    }
 }
 
 impl EnginePools {
@@ -515,23 +529,25 @@ impl EnginePools {
         mem: QuiescentGuard<EvictableBufferPool>,
         disk: QuiescentGuard<ReadonlyBufferPool>,
     ) -> Self {
+        let guards = PoolGuards::builder()
+            .push(PoolRole::Meta, meta.pool_guard())
+            .push(PoolRole::Index, index.pool_guard())
+            .push(PoolRole::Mem, mem.pool_guard())
+            .push(PoolRole::Disk, disk.pool_guard())
+            .build();
         Self {
             meta,
             index,
             mem,
             disk,
+            guards,
         }
     }
 
-    /// Build a full guard bundle for all engine buffer pools.
+    /// Borrow the canonical guard bundle for all engine buffer pools.
     #[inline]
-    pub(crate) fn pool_guards(&self) -> PoolGuards {
-        PoolGuards::builder()
-            .push(PoolRole::Meta, self.meta.pool_guard())
-            .push(PoolRole::Index, self.index.pool_guard())
-            .push(PoolRole::Mem, self.mem.pool_guard())
-            .push(PoolRole::Disk, self.disk.pool_guard())
-            .build()
+    pub(crate) fn pool_guards(&self) -> &PoolGuards {
+        &self.guards
     }
 }
 

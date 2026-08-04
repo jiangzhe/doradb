@@ -335,11 +335,15 @@ mod tests {
             );
 
             let current_cts = engine
+                .inner()
+                .core
                 .catalog()
                 .resolve_user_table_current(table_id)
                 .unwrap()
                 .effective_cts();
             let installed = engine
+                .inner()
+                .core
                 .catalog()
                 .install_index_layout_and_publish_history(
                     table_id,
@@ -374,7 +378,7 @@ mod tests {
             );
 
             let guards = PoolGuards::builder()
-                .push(PoolRole::Index, engine.inner().index_pool.pool_guard())
+                .push(PoolRole::Index, engine.inner().pools.index.pool_guard())
                 .build();
             assert_eq!(
                 table_for_internal_assertion(&engine, table_id)

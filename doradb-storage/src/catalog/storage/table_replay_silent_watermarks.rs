@@ -253,7 +253,7 @@ mod tests {
             let mut insert = engine.inner().trx_sys.begin_sys_trx();
             insert
                 .upsert_silent_watermark(
-                    engine.catalog(),
+                    engine.inner().core.catalog(),
                     &guards,
                     SilentWatermarkObject {
                         table_id,
@@ -282,7 +282,7 @@ mod tests {
             let mut update = engine.inner().trx_sys.begin_sys_trx();
             update
                 .upsert_silent_watermark(
-                    engine.catalog(),
+                    engine.inner().core.catalog(),
                     &guards,
                     SilentWatermarkObject {
                         table_id,
@@ -315,7 +315,7 @@ mod tests {
             let mut no_op = engine.inner().trx_sys.begin_sys_trx();
             no_op
                 .upsert_silent_watermark(
-                    engine.catalog(),
+                    engine.inner().core.catalog(),
                     &guards,
                     SilentWatermarkObject {
                         table_id,

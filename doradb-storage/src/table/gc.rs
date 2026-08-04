@@ -277,7 +277,7 @@ async fn execute_mem_index_cleanup_inner(
 ) -> RuntimeOrFatalResult<MemIndexCleanupOutcome> {
     let table = Arc::clone(&resources.table);
     let clean_live_entries = resources.clean_live_entries;
-    let trx_sys = scope.engine().trx_sys.clone();
+    let trx_sys = &scope.engine().trx_sys;
     let pool_guards = scope.pool_guards();
     loop {
         let trx = scope
@@ -328,7 +328,7 @@ async fn execute_mem_index_cleanup_inner(
             } else {
                 let cleanup_res = table
                     .cleanup_secondary_mem_indexes_at_snapshot(
-                        &pool_guards,
+                        pool_guards,
                         &snapshot,
                         clean_live_entries,
                     )
@@ -971,9 +971,8 @@ mod tests {
             let reader_sts = Arc::new(parking_lot::Mutex::new(TrxID::new(0)));
             let hook_reader_holder = Arc::clone(&reader_holder);
             let hook_reader_sts = Arc::clone(&reader_sts);
-            let hook_engine = engine.new_ref().unwrap();
+            let mut reader_session = engine.new_session().unwrap();
             set_test_checkpoint_after_trx_start_hook(&engine, move || async move {
-                let mut reader_session = hook_engine.new_session().unwrap();
                 let reader = reader_session.begin_trx().unwrap();
                 *hook_reader_sts.lock() = reader.sts();
                 *hook_reader_holder.lock() = Some((reader_session, reader));

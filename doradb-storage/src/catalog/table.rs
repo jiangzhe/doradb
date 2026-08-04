@@ -1,27 +1,32 @@
 use crate::buffer::PoolGuards;
 use crate::catalog::spec::{ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexNo, IndexSpec};
+use crate::catalog::storage::CatalogStorage;
 use crate::catalog::{
-    ColumnObject, IndexColumnObject, IndexObject, TableObject, catalog_table_id_from_slot,
+    Catalog, ColumnObject, IndexColumnObject, IndexObject, TableObject, catalog_table_id_from_slot,
     is_user_table,
 };
-use crate::engine::EngineRef;
+use crate::component::EnginePools;
+use crate::engine::EngineCore;
 use crate::error::{
     CompletionErrorBridge, CompletionResult, FatalError, FatalResult, InternalError,
     InternalResult, IoResult, OperationError, OperationOrRuntimeResult, OperationResult,
     RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
 };
+use crate::file::fs::FileSystem;
 use crate::file::table_file::{MutableTableFile, TableFile};
 use crate::id::{TableID, TrxID};
 use crate::index::BlockIndex;
 use crate::log::redo::DDLRedo;
 use crate::map::FastHashSet;
 use crate::obs;
+use crate::poison::EnginePoisoner;
 use crate::row::ops::SelectKey;
 use crate::row::{Row, RowRead};
 use crate::runtime::mandatory::{AcceptedExecution, MandatoryTaskMetadata, PreparedExecution};
 use crate::serde::{Deser, DeserResult, MinBytesHint, Ser, Serde, min_bytes_hint};
 use crate::session::{AcceptedDdlScope, PreparedDdlScope};
 use crate::table::{Table, TableRedoReplayFloor};
+use crate::trx::sys::TransactionSystem;
 use crate::trx::{PreparedCatalogWriteAuthority, Transaction};
 use crate::value::{Val, ValKind, ValType};
 use error_stack::{Report, ResultExt};
@@ -248,7 +253,7 @@ impl CreateTableProgress {
     }
 
     #[inline]
-    async fn publish_file(&mut self, engine: &EngineRef) -> RuntimeResult<()> {
+    async fn publish_file(&mut self, trx_sys: &TransactionSystem) -> RuntimeResult<()> {
         debug_assert_eq!(self.phase, CreateTablePhase::CatalogStaged);
         let root_ts = self
             .trx
@@ -262,8 +267,7 @@ impl CreateTableProgress {
         let CreateTableFile::Mutable(mutable_file) = file else {
             panic!("create-table file is mutable before publish");
         };
-        let table_file = engine
-            .trx_sys
+        let table_file = trx_sys
             .publish_table_file_root(mutable_file, root_ts, true)
             .await
             .change_context(RuntimeError::CatalogAccess)
@@ -279,11 +283,7 @@ impl CreateTableProgress {
     }
 
     #[inline]
-    async fn build_runtime(
-        &mut self,
-        guards: &PoolGuards,
-        engine: &EngineRef,
-    ) -> RuntimeResult<()> {
+    async fn build_runtime(&mut self, pools: &EnginePools) -> RuntimeResult<()> {
         debug_assert_eq!(self.phase, CreateTablePhase::FilePublished);
         let Some(CreateTableFile::Published(table_file)) = self.file.as_ref() else {
             panic!("published table file is present before runtime build");
@@ -291,8 +291,8 @@ impl CreateTableProgress {
         let table_file = Arc::clone(table_file);
         let active_root = table_file.active_root_unchecked();
         let blk_idx = BlockIndex::new(
-            engine.meta_pool.clone_inner(),
-            guards.meta_guard(),
+            pools.meta.clone(),
+            pools.pool_guards().meta_guard(),
             active_root.pivot_row_id,
             active_root.column_block_index_root,
         )
@@ -306,13 +306,13 @@ impl CreateTableProgress {
         })?;
         let table = Arc::new(
             Table::new(
-                engine.mem_pool.clone_inner(),
-                engine.index_pool.clone_inner(),
-                guards.index_guard(),
+                pools.mem.clone(),
+                pools.index.clone(),
+                pools.pool_guards().index_guard(),
                 self.table_id,
                 blk_idx,
                 table_file,
-                engine.disk_pool.clone_inner(),
+                pools.disk.clone(),
             )
             .await
             .change_context(RuntimeError::CatalogAccess)
@@ -341,7 +341,7 @@ impl CreateTableProgress {
     }
 
     #[inline]
-    fn install_runtime(&mut self, engine: &EngineRef, create_cts: TrxID) -> bool {
+    fn install_runtime(&mut self, catalog: &Catalog, create_cts: TrxID) -> bool {
         debug_assert_eq!(self.phase, CreateTablePhase::CatalogCommitted);
         let table = Arc::clone(
             self.staged_table
@@ -350,7 +350,7 @@ impl CreateTableProgress {
         );
         // The table id was atomically allocated and this DDL owns the metadata
         // gate through commit, so no cache entry can exist for this runtime.
-        if !engine.catalog().insert_user_table(create_cts, table) {
+        if !catalog.insert_user_table(create_cts, table) {
             self.phase = CreateTablePhase::Aborted;
             return false;
         }
@@ -360,7 +360,7 @@ impl CreateTableProgress {
     }
 
     #[inline]
-    fn delete_provisional_file(&mut self, engine: &EngineRef) -> IoResult<()> {
+    fn delete_provisional_file(&mut self, table_fs: &FileSystem) -> IoResult<()> {
         match self.file.take() {
             Some(CreateTableFile::Mutable(mutable_file)) => {
                 let _ = mutable_file.try_delete();
@@ -368,7 +368,7 @@ impl CreateTableProgress {
             Some(CreateTableFile::Published(table_file)) => drop(table_file),
             None => {}
         }
-        engine.table_fs.delete_user_table_file(self.table_id)
+        table_fs.delete_user_table_file(self.table_id)
     }
 
     async fn destroy_staged_runtime(&mut self, guards: &PoolGuards) -> RuntimeResult<()> {
@@ -388,16 +388,15 @@ impl CreateTableProgress {
 
     async fn abort_before_catalog_commit(
         &mut self,
-        engine: &EngineRef,
-        guards: &PoolGuards,
+        engine: &EngineCore,
         operation: &'static str,
         source: Report<RuntimeError>,
     ) -> RuntimeOrFatalError {
         let source_debug = format!("{source:?}");
         let mut cleanup_error = None;
-        if let Err(err) = self.destroy_staged_runtime(guards).await {
+        if let Err(err) = self.destroy_staged_runtime(engine.pool_guards()).await {
             cleanup_error = Some(poison_error_source(
-                engine,
+                &engine.poisoner,
                 RuntimeOrFatalError::from(err),
                 FatalError::Poisoned,
                 format!(
@@ -412,7 +411,7 @@ impl CreateTableProgress {
             && cleanup_error.is_none()
         {
             cleanup_error = Some(poison_error_source(
-                engine,
+                &engine.poisoner,
                 err,
                 FatalError::RollbackAccess,
                 format!(
@@ -421,7 +420,7 @@ impl CreateTableProgress {
                 ),
             ));
         }
-        if let Err(err) = self.delete_provisional_file(engine)
+        if let Err(err) = self.delete_provisional_file(&engine.table_fs)
             && cleanup_error.is_none()
         {
             cleanup_error = Some(RuntimeOrFatalError::from(
@@ -438,16 +437,15 @@ impl CreateTableProgress {
 
     async fn abort_after_root_publish_commit_error(
         &mut self,
-        engine: &EngineRef,
-        guards: &PoolGuards,
+        engine: &EngineCore,
         operation: &'static str,
         source: RuntimeOrFatalError,
     ) -> RuntimeOrFatalError {
         let source_debug = format!("{source:?}");
-        if let Err(err) = self.destroy_staged_runtime(guards).await {
+        if let Err(err) = self.destroy_staged_runtime(engine.pool_guards()).await {
             self.phase = CreateTablePhase::Aborted;
             return poison_error_source(
-                engine,
+                &engine.poisoner,
                 RuntimeOrFatalError::from(err),
                 FatalError::Poisoned,
                 format!(
@@ -458,7 +456,7 @@ impl CreateTableProgress {
         }
         self.phase = CreateTablePhase::Aborted;
         poison_error_source(
-            engine,
+            &engine.poisoner,
             source,
             FatalError::Poisoned,
             format!(
@@ -1350,8 +1348,7 @@ impl AcceptedCreateTable {
             .progress
             .as_mut()
             .unwrap_or_else(|| panic!("accepted CREATE progress exists during execution"));
-        let engine = scope.engine().clone();
-        let guards = scope.pool_guards();
+        let engine = scope.engine();
         let table_id = progress.table_id;
 
         #[cfg(test)]
@@ -1377,7 +1374,7 @@ impl AcceptedCreateTable {
             Err(err) => {
                 let source_debug = format!("{err:?}");
                 progress.phase = CreateTablePhase::Aborted;
-                if let Err(cleanup_err) = progress.delete_provisional_file(&engine) {
+                if let Err(cleanup_err) = progress.delete_provisional_file(&engine.table_fs) {
                     return Err(CompletionErrorBridge::capture(cleanup_err.attach(format!(
                     "create table provisional-file cleanup failed after transaction begin: table_id={table_id}, source_error={source_debug}"
                 ))));
@@ -1398,7 +1395,7 @@ impl AcceptedCreateTable {
         let catalog_objects = progress.take_catalog_objects();
         let authority = scope.catalog_write_authority();
         let exec_res = execute_create_table_catalog_staging(
-            &engine,
+            &engine.catalog().storage,
             progress
                 .trx
                 .as_mut()
@@ -1411,7 +1408,7 @@ impl AcceptedCreateTable {
         if let Err(err) = exec_res {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                 progress
-                    .abort_before_catalog_commit(&engine, &guards, "catalog_staging", err)
+                    .abort_before_catalog_commit(engine, "catalog_staging", err)
                     .await,
             ));
         }
@@ -1430,20 +1427,15 @@ impl AcceptedCreateTable {
         {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                 progress
-                    .abort_before_catalog_commit(
-                        &engine,
-                        &guards,
-                        "test_after_catalog_staging",
-                        err,
-                    )
+                    .abort_before_catalog_commit(engine, "test_after_catalog_staging", err)
                     .await,
             ));
         }
 
-        if let Err(err) = progress.publish_file(&engine).await {
+        if let Err(err) = progress.publish_file(&engine.trx_sys).await {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                 progress
-                    .abort_before_catalog_commit(&engine, &guards, "file_publish", err)
+                    .abort_before_catalog_commit(engine, "file_publish", err)
                     .await,
             ));
         }
@@ -1461,15 +1453,15 @@ impl AcceptedCreateTable {
         {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                 progress
-                    .abort_before_catalog_commit(&engine, &guards, "test_after_file_publish", err)
+                    .abort_before_catalog_commit(engine, "test_after_file_publish", err)
                     .await,
             ));
         }
 
-        if let Err(err) = progress.build_runtime(&guards, &engine).await {
+        if let Err(err) = progress.build_runtime(&engine.pools).await {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                 progress
-                    .abort_before_catalog_commit(&engine, &guards, "runtime_build", err)
+                    .abort_before_catalog_commit(engine, "runtime_build", err)
                     .await,
             ));
         }
@@ -1487,7 +1479,7 @@ impl AcceptedCreateTable {
         {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                 progress
-                    .abort_before_catalog_commit(&engine, &guards, "test_after_runtime_build", err)
+                    .abort_before_catalog_commit(engine, "test_after_runtime_build", err)
                     .await,
             ));
         }
@@ -1495,19 +1487,14 @@ impl AcceptedCreateTable {
         #[cfg(test)]
         engine
             .table_ddl_test
-            .maybe_poison_before_create_commit(&engine);
+            .maybe_poison_before_create_commit(&engine.poisoner);
 
         let create_cts = match progress.commit_catalog().await {
             Ok(create_cts) => create_cts,
             Err(err) => {
                 return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                     progress
-                        .abort_after_root_publish_commit_error(
-                            &engine,
-                            &guards,
-                            "catalog_commit",
-                            err,
-                        )
+                        .abort_after_root_publish_commit_error(engine, "catalog_commit", err)
                         .await,
                 ));
             }
@@ -1520,7 +1507,7 @@ impl AcceptedCreateTable {
             .await;
 
         assert!(
-            progress.install_runtime(&engine, create_cts),
+            progress.install_runtime(engine.catalog(), create_cts),
             "allocated CREATE TABLE id duplicated current runtime during accepted execution: table_id={table_id}"
         );
 
@@ -1657,7 +1644,7 @@ impl AcceptedDropTable {
             .progress
             .as_mut()
             .unwrap_or_else(|| panic!("accepted DROP progress exists during execution"));
-        let engine = scope.engine().clone();
+        let engine = scope.engine();
         let table_id = progress.plan.table_id;
         let table = progress.plan.take_table();
 
@@ -1720,7 +1707,7 @@ impl AcceptedDropTable {
         let metadata = table.metadata().clone();
         let authority = scope.catalog_write_authority();
         let exec_res = execute_drop_table_catalog_cascade(
-            &engine,
+            &engine.catalog().storage,
             progress
                 .trx
                 .as_mut()
@@ -1745,7 +1732,7 @@ impl AcceptedDropTable {
             }
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                 poison_error_source(
-                    &engine,
+                    &engine.poisoner,
                     RuntimeOrFatalError::from(err),
                     FatalError::Poisoned,
                     format!(
@@ -1771,7 +1758,7 @@ impl AcceptedDropTable {
             Err(err) => {
                 return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                     poison_error_source(
-                        &engine,
+                        &engine.poisoner,
                         err,
                         FatalError::Poisoned,
                         format!(
@@ -1792,7 +1779,7 @@ impl AcceptedDropTable {
         let replay_floor = engine
             .catalog()
             .effective_user_table_redo_replay_floor(table_id, table.redo_replay_floor_snapshot());
-        finish_drop_table_runtime_retention(&engine, table_id, table, drop_cts, replay_floor)
+        finish_drop_table_runtime_retention(engine, table_id, table, drop_cts, replay_floor)
             .map_err(CompletionErrorBridge::capture)?;
         progress.phase = DropTablePhase::RuntimeRetained;
 
@@ -1837,8 +1824,7 @@ pub(crate) fn reject_non_user_table_id(
 /// Ensure the user-table catalog row exists for a DDL operation.
 #[inline]
 pub(crate) async fn ensure_user_table_catalog_row(
-    guards: &PoolGuards,
-    engine: &EngineRef,
+    engine: &EngineCore,
     table_id: TableID,
     operation: &'static str,
 ) -> OperationOrRuntimeResult<()> {
@@ -1846,7 +1832,7 @@ pub(crate) async fn ensure_user_table_catalog_row(
         .catalog()
         .storage
         .tables()
-        .find_uncommitted_by_id(guards, table_id)
+        .find_uncommitted_by_id(engine.pool_guards(), table_id)
         .await?
         .is_some()
     {
@@ -1859,8 +1845,7 @@ pub(crate) async fn ensure_user_table_catalog_row(
 
 /// Return the validated runtime table for an index-DDL target.
 pub(crate) async fn validated_index_ddl_target(
-    guards: &PoolGuards,
-    engine: &EngineRef,
+    engine: &EngineCore,
     table_id: TableID,
     operation: &'static str,
 ) -> OperationOrRuntimeResult<Arc<Table>> {
@@ -1870,7 +1855,7 @@ pub(crate) async fn validated_index_ddl_target(
         .validate_user_table_live(table_id)
         .await
         .attach_with(|| format!("operation={operation}"))?;
-    ensure_user_table_catalog_row(guards, engine, table_id, operation).await?;
+    ensure_user_table_catalog_row(engine, table_id, operation).await?;
     Ok(table)
 }
 
@@ -1906,7 +1891,7 @@ fn reject_user_table_primary_key_indexes(
 /// namespace, so catalog insert Operation failures are invariant violations.
 #[inline]
 async fn execute_create_table_catalog_staging(
-    engine: &EngineRef,
+    storage: &CatalogStorage,
     trx: &mut Transaction,
     authority: PreparedCatalogWriteAuthority<'_>,
     table_id: TableID,
@@ -1919,33 +1904,16 @@ async fn execute_create_table_catalog_staging(
         index_columns,
     } = catalog_objects;
     trx.stage_prepared_catalog_statement(authority, async |stmt| {
-        engine
-            .catalog()
-            .storage
-            .tables()
-            .insert(stmt, &table)
-            .await?;
+        storage.tables().insert(stmt, &table).await?;
 
         for column_object in columns {
-            engine
-                .catalog()
-                .storage
-                .columns()
-                .insert(stmt, &column_object)
-                .await?;
+            storage.columns().insert(stmt, &column_object).await?;
         }
         for index_object in indexes {
-            engine
-                .catalog()
-                .storage
-                .indexes()
-                .insert(stmt, &index_object)
-                .await?;
+            storage.indexes().insert(stmt, &index_object).await?;
         }
         for index_column_object in index_columns {
-            engine
-                .catalog()
-                .storage
+            storage
                 .index_columns()
                 .insert(stmt, &index_column_object)
                 .await?;
@@ -1967,34 +1935,26 @@ async fn execute_create_table_catalog_staging(
 
 #[inline]
 async fn execute_drop_table_catalog_cascade(
-    engine: &EngineRef,
+    storage: &CatalogStorage,
     trx: &mut Transaction,
     authority: PreparedCatalogWriteAuthority<'_>,
     table_id: TableID,
     metadata: &TableMetadata,
 ) -> RuntimeResult<()> {
     trx.stage_prepared_catalog_statement(authority, async |stmt| {
-        let index_columns_deleted = engine
-            .catalog()
-            .storage
+        let index_columns_deleted = storage
             .index_columns()
             .delete_by_table_id(stmt, table_id)
             .await?;
-        let indexes_deleted = engine
-            .catalog()
-            .storage
+        let indexes_deleted = storage
             .indexes()
             .delete_by_table_id(stmt, table_id)
             .await?;
-        let columns_deleted = engine
-            .catalog()
-            .storage
+        let columns_deleted = storage
             .columns()
             .delete_by_table_id(stmt, table_id)
             .await?;
-        let table_deleted = engine
-            .catalog()
-            .storage
+        let table_deleted = storage
             .tables()
             .delete_by_id(stmt, table_id)
             .await?;
@@ -2002,9 +1962,7 @@ async fn execute_drop_table_catalog_cascade(
             table_deleted,
             "drop-table catalog invariant violated: validated table row is missing, table_id={table_id}"
         );
-        engine
-            .catalog()
-            .storage
+        storage
             .table_replay_silent_watermarks()
             .delete_by_table_id(stmt, table_id)
             .await?;
@@ -2059,7 +2017,7 @@ fn assert_drop_catalog_delete_counts(
 
 #[inline]
 fn finish_drop_table_runtime_retention(
-    engine: &EngineRef,
+    engine: &EngineCore,
     table_id: TableID,
     table: Arc<Table>,
     drop_cts: TrxID,
@@ -2073,7 +2031,7 @@ fn finish_drop_table_runtime_retention(
         return Ok(());
     }
     Err(poison_drop_table_after_gate(
-        engine,
+        &engine.poisoner,
         table_id,
         "runtime_retention",
     ))
@@ -2081,7 +2039,7 @@ fn finish_drop_table_runtime_retention(
 
 #[inline]
 fn poison_drop_table_after_gate(
-    engine: &EngineRef,
+    poisoner: &EnginePoisoner,
     table_id: TableID,
     operation: &'static str,
 ) -> Report<FatalError> {
@@ -2096,13 +2054,13 @@ fn poison_drop_table_after_gate(
         "event=engine_poison component=catalog_table action=poison result=error error={:?}",
         report
     );
-    engine.poisoner.poison(report).into_report()
+    poisoner.poison(report).into_report()
 }
 
 /// Fatalizes a typed catalog source while retaining its physical evidence.
 #[inline]
 fn poison_error_source(
-    engine: &EngineRef,
+    poisoner: &EnginePoisoner,
     source: RuntimeOrFatalError,
     reason: FatalError,
     message: String,
@@ -2112,7 +2070,7 @@ fn poison_error_source(
         "event=engine_poison component=catalog_table action=poison result=error error={:?}",
         report
     );
-    RuntimeOrFatalError::from(engine.poisoner.poison(report).into_report())
+    RuntimeOrFatalError::from(poisoner.poison(report).into_report())
 }
 
 #[inline]
@@ -2256,12 +2214,11 @@ pub(crate) mod tests {
         }
 
         #[inline]
-        pub(super) fn maybe_poison_before_create_commit(&self, engine: &EngineRef) {
+        pub(super) fn maybe_poison_before_create_commit(&self, poisoner: &EnginePoisoner) {
             if *self.create_failure.lock()
                 == Some(CreateTableTestFailure::PoisonBeforeCatalogCommit)
             {
-                let _ = engine
-                    .poisoner
+                let _ = poisoner
                     .poison(Report::new(FatalError::Poisoned).attach("forced create-table poison"));
             }
         }
@@ -2358,24 +2315,39 @@ pub(crate) mod tests {
     }
 
     fn assert_no_user_table_publication(engine: &Engine, table_id: TableID) {
-        assert!(engine.catalog().get_table_now(table_id).is_none());
         assert!(
             engine
+                .inner()
+                .core
+                .catalog()
+                .get_table_now(table_id)
+                .is_none()
+        );
+        assert!(
+            engine
+                .inner()
+                .core
                 .catalog()
                 .resolve_user_table_current(table_id)
                 .is_none()
         );
         assert!(
             engine
+                .inner()
+                .core
                 .catalog()
                 .resolve_user_table_visible(table_id, MAX_SNAPSHOT_TS)
                 .is_none()
         );
         assert_eq!(
-            engine.catalog().user_table_history_version_count(table_id),
+            engine
+                .inner()
+                .core
+                .catalog()
+                .user_table_history_version_count(table_id),
             None
         );
-        assert_no_dropped_table_operational_state(engine.catalog(), table_id);
+        assert_no_dropped_table_operational_state(engine.inner().core.catalog(), table_id);
     }
 
     struct TableDdlSnapshot {
@@ -2395,6 +2367,8 @@ pub(crate) mod tests {
             metadata,
             table: current_table,
         } = engine
+            .inner()
+            .core
             .catalog()
             .resolve_user_table_current(table_id)
             .unwrap()
@@ -2405,8 +2379,14 @@ pub(crate) mod tests {
             effective_cts,
             metadata,
             table: current_table,
-            history_count: engine.catalog().user_table_history_version_count(table_id),
+            history_count: engine
+                .inner()
+                .core
+                .catalog()
+                .user_table_history_version_count(table_id),
             retained_dropped_state: engine
+                .inner()
+                .core
                 .catalog()
                 .retained_dropped_table_ids_now()
                 .contains(&table_id),
@@ -2427,6 +2407,8 @@ pub(crate) mod tests {
             metadata,
             table: current_table,
         } = engine
+            .inner()
+            .core
             .catalog()
             .resolve_user_table_current(table_id)
             .unwrap()
@@ -2437,11 +2419,17 @@ pub(crate) mod tests {
         assert!(Arc::ptr_eq(&metadata, &before.metadata));
         assert!(Arc::ptr_eq(&current_table, &before.table));
         assert_eq!(
-            engine.catalog().user_table_history_version_count(table_id),
+            engine
+                .inner()
+                .core
+                .catalog()
+                .user_table_history_version_count(table_id),
             before.history_count
         );
         assert_eq!(
             engine
+                .inner()
+                .core
                 .catalog()
                 .retained_dropped_table_ids_now()
                 .contains(&table_id),
@@ -3026,9 +3014,19 @@ pub(crate) mod tests {
             let verify_session = engine.new_session().unwrap();
             let guards = verify_session.pool_guards();
             for table_id in [table_id1, table_id2] {
-                assert!(engine.catalog().get_table(table_id).await.is_some());
                 assert!(
                     engine
+                        .inner()
+                        .core
+                        .catalog()
+                        .get_table(table_id)
+                        .await
+                        .is_some()
+                );
+                assert!(
+                    engine
+                        .inner()
+                        .core
                         .catalog()
                         .storage
                         .tables()
@@ -3039,6 +3037,8 @@ pub(crate) mod tests {
                 );
                 assert!(
                     !engine
+                        .inner()
+                        .core
                         .catalog()
                         .storage
                         .columns()
@@ -3049,6 +3049,8 @@ pub(crate) mod tests {
                 );
                 assert!(
                     !engine
+                        .inner()
+                        .core
                         .catalog()
                         .storage
                         .indexes()
@@ -3059,6 +3061,8 @@ pub(crate) mod tests {
                 );
                 assert!(
                     !engine
+                        .inner()
+                        .core
                         .catalog()
                         .storage
                         .index_columns()
@@ -3087,7 +3091,7 @@ pub(crate) mod tests {
             .unwrap();
             let mut session = engine.new_session().unwrap();
             let session_id = session.id();
-            let table_id = engine.catalog().curr_next_table_id();
+            let table_id = engine.inner().core.catalog().curr_next_table_id();
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
 
             let err = session
@@ -3135,7 +3139,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
             let mut session = engine.new_session().unwrap();
-            let table_id = engine.catalog().curr_next_table_id();
+            let table_id = engine.inner().core.catalog().curr_next_table_id();
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
 
             let err = session
@@ -3171,7 +3175,7 @@ pub(crate) mod tests {
             .unwrap();
             let mut session = engine.new_session().unwrap();
             let session_id = session.id();
-            let table_id = engine.catalog().curr_next_table_id();
+            let table_id = engine.inner().core.catalog().curr_next_table_id();
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
             let (table_spec, index_specs) = drop_table_test_spec();
 
@@ -3213,7 +3217,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
             let mut session = engine.new_session().unwrap();
-            let table_id = engine.catalog().curr_next_table_id();
+            let table_id = engine.inner().core.catalog().curr_next_table_id();
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
             let hook = Arc::new(FailingFirstWriteHook::new(table_file_path.clone()));
             let _install = install_storage_backend_test_hook(hook.clone());
@@ -3256,7 +3260,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
             let mut session = engine.new_session().unwrap();
-            let table_id = engine.catalog().curr_next_table_id();
+            let table_id = engine.inner().core.catalog().curr_next_table_id();
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
             let (table_spec, index_specs) = drop_table_test_spec();
 
@@ -3288,7 +3292,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
             let mut session = engine.new_session().unwrap();
-            let table_id = engine.catalog().curr_next_table_id();
+            let table_id = engine.inner().core.catalog().curr_next_table_id();
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
             let (table_spec, index_specs) = drop_table_test_spec();
 
@@ -3320,7 +3324,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
             let mut session = engine.new_session().unwrap();
-            let table_id = engine.catalog().curr_next_table_id();
+            let table_id = engine.inner().core.catalog().curr_next_table_id();
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
             let (table_spec, index_specs) = drop_table_test_spec();
 
@@ -3390,10 +3394,9 @@ pub(crate) mod tests {
                 LockDebugEntryState::Granted,
             ));
 
-            let engine_ref = engine.new_ref().unwrap();
+            let mut writer_session = engine.new_session().unwrap();
             let (owner_tx, owner_rx) = flume::bounded(1);
             let writer = smol::spawn(async move {
-                let mut writer_session = engine_ref.new_session().unwrap();
                 let mut writer_trx = writer_session.begin_trx().unwrap();
                 owner_tx
                     .send_async(trx_tests::lock_owner(&writer_trx).unwrap())
@@ -3568,7 +3571,7 @@ pub(crate) mod tests {
             let blocker = LockOwner::transaction(SessionID::new(91_301), TrxID::new(91_301));
             assert!(
                 try_acquire(
-                    engine.lock_manager(),
+                    engine.inner().core.lock_manager(),
                     LockResource::TableData(table_id),
                     LockMode::Exclusive,
                     blocker,
@@ -3609,6 +3612,8 @@ pub(crate) mod tests {
                 .await;
             assert_eq!(
                 engine
+                    .inner()
+                    .core
                     .lock_manager()
                     .release(LockResource::TableData(table_id), blocker),
                 1
@@ -3672,7 +3677,7 @@ pub(crate) mod tests {
             let blocker = LockOwner::transaction(SessionID::new(91_302), TrxID::new(91_302));
             assert!(
                 try_acquire(
-                    engine.lock_manager(),
+                    engine.inner().core.lock_manager(),
                     LockResource::TableData(table_id),
                     LockMode::Exclusive,
                     blocker,
@@ -3717,6 +3722,8 @@ pub(crate) mod tests {
             );
             assert_eq!(
                 engine
+                    .inner()
+                    .core
                     .lock_manager()
                     .release(LockResource::TableData(table_id), blocker),
                 1
@@ -3738,10 +3745,9 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
 
-            let engine_ref = engine.new_ref().unwrap();
+            let mut writer_session = engine.new_session().unwrap();
             let (owner_tx, owner_rx) = flume::bounded(1);
             let external_writer = smol::spawn(async move {
-                let mut writer_session = engine_ref.new_session().unwrap();
                 let mut writer_trx = writer_session.begin_trx().unwrap();
                 owner_tx
                     .send_async(trx_tests::lock_owner(&writer_trx).unwrap())
@@ -3904,6 +3910,8 @@ pub(crate) mod tests {
             corrupt_trx
                 .exec(async |stmt| {
                     let deleted = engine
+                        .inner()
+                        .core
                         .catalog()
                         .storage
                         .tables()
@@ -3940,7 +3948,15 @@ pub(crate) mod tests {
             );
             assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Dropping);
             assert_checkpoint_workflow_closed(&table);
-            assert!(engine.catalog().get_table(table_id).await.is_some());
+            assert!(
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .get_table(table_id)
+                    .await
+                    .is_some()
+            );
             assert_eq!(active_operation_count(&engine.inner().session_registry), 1);
             let shutdown_err = engine.try_shutdown().unwrap_err();
             assert_eq!(
@@ -3963,7 +3979,7 @@ pub(crate) mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
-            let table_id = engine.catalog().curr_next_table_id();
+            let table_id = engine.inner().core.catalog().curr_next_table_id();
             let mut session = engine.new_session().unwrap();
             let session_id = session.id();
             let (table_spec, index_specs) = drop_table_test_spec();
@@ -4034,7 +4050,15 @@ pub(crate) mod tests {
                 assert!(rendered.contains(&format!("table_id={table_id}")));
 
                 assert_table_ddl_snapshot_unchanged(&before, &engine, table_id, &table);
-                assert!(engine.catalog().get_table(table_id).await.is_some());
+                assert!(
+                    engine
+                        .inner()
+                        .core
+                        .catalog()
+                        .get_table(table_id)
+                        .await
+                        .is_some()
+                );
                 assert!(has_lock_entry(
                     &engine,
                     owner,
@@ -4091,7 +4115,15 @@ pub(crate) mod tests {
 
             let mut other_session = engine.new_session().unwrap();
             other_session.drop_table(other_table_id).await.unwrap();
-            assert!(engine.catalog().get_table(other_table_id).await.is_none());
+            assert!(
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .get_table(other_table_id)
+                    .await
+                    .is_none()
+            );
             assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Dropping);
 
             drop(root_lease);
@@ -4129,7 +4161,15 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
             assert_ne!(created_table_id, table_id);
-            assert!(engine.catalog().get_table(created_table_id).await.is_some());
+            assert!(
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .get_table(created_table_id)
+                    .await
+                    .is_some()
+            );
             assert!(
                 Path::new(
                     &engine
@@ -4223,7 +4263,7 @@ pub(crate) mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
-            let table_id = engine.catalog().curr_next_table_id();
+            let table_id = engine.inner().core.catalog().curr_next_table_id();
             let (entered, release) = engine
                 .inner()
                 .table_ddl_test
@@ -4245,7 +4285,14 @@ pub(crate) mod tests {
                 .lock_table(table_id, TableLockMode::Shared)
                 .await
                 .unwrap();
-            assert!(engine.catalog().get_table_now(table_id).is_some());
+            assert!(
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .get_table_now(table_id)
+                    .is_some()
+            );
             verify_session.unlock_table(table_id).unwrap();
             verify_session.drop_table(table_id).await.unwrap();
             assert!(engine.inner().poisoner.poison_error().is_none());
@@ -4292,7 +4339,7 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
 
-            let create_table_id = engine.catalog().curr_next_table_id();
+            let create_table_id = engine.inner().core.catalog().curr_next_table_id();
             let (create_entered, create_release) = engine
                 .inner()
                 .table_ddl_test
@@ -4563,7 +4610,7 @@ pub(crate) mod tests {
             let horizon = horizon_session.begin_trx().unwrap();
             let mut drop_session = engine.new_session().unwrap();
             drop_session.drop_table(table_id).await.unwrap();
-            assert_dropped_table_runtime(engine.catalog(), table_id);
+            assert_dropped_table_runtime(engine.inner().core.catalog(), table_id);
 
             let mut lock_session = engine.new_session().unwrap();
             let session_owner = LockOwner::session_explicit(lock_session.id());
@@ -4674,9 +4721,19 @@ pub(crate) mod tests {
                 session_id,
                 LockResource::TableData(table_id),
             ));
-            assert!(engine.catalog().get_table(table_id).await.is_none());
             assert!(
                 engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .get_table(table_id)
+                    .await
+                    .is_none()
+            );
+            assert!(
+                engine
+                    .inner()
+                    .core
                     .catalog()
                     .storage
                     .tables()
@@ -4687,6 +4744,8 @@ pub(crate) mod tests {
             );
             assert!(
                 engine
+                    .inner()
+                    .core
                     .catalog()
                     .storage
                     .columns()
@@ -4697,6 +4756,8 @@ pub(crate) mod tests {
             );
             assert!(
                 engine
+                    .inner()
+                    .core
                     .catalog()
                     .storage
                     .indexes()
@@ -4707,6 +4768,8 @@ pub(crate) mod tests {
             );
             assert!(
                 engine
+                    .inner()
+                    .core
                     .catalog()
                     .storage
                     .index_columns()
@@ -4717,6 +4780,8 @@ pub(crate) mod tests {
             );
             assert!(
                 engine
+                    .inner()
+                    .core
                     .catalog()
                     .storage
                     .tables()
@@ -4727,6 +4792,8 @@ pub(crate) mod tests {
             );
             assert!(
                 !engine
+                    .inner()
+                    .core
                     .catalog()
                     .storage
                     .columns()
@@ -4802,23 +4869,40 @@ pub(crate) mod tests {
             session.drop_table(table_id).await.unwrap();
             let drop_cts = session.last_cts();
             assert_eq!(
-                engine.catalog().retained_dropped_table_ids_now(),
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .retained_dropped_table_ids_now(),
                 vec![table_id]
             );
             session.wait_for_gc_horizon_after(drop_cts).await.unwrap();
             request_and_wait_for_purge_cycle(&engine, &event_rx).await;
             assert!(
                 engine
+                    .inner()
+                    .core
                     .catalog()
                     .resolve_user_table_current(table_id)
                     .is_none()
             );
             assert_eq!(
-                engine.catalog().user_table_history_version_count(table_id),
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .user_table_history_version_count(table_id),
                 None
             );
-            assert_dropped_table_floor(engine.catalog(), table_id);
-            assert!(engine.catalog().get_table_now(table_id).is_none());
+            assert_dropped_table_floor(engine.inner().core.catalog(), table_id);
+            assert!(
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .get_table_now(table_id)
+                    .is_none()
+            );
             assert!(Path::new(&table_file_path).exists());
 
             engine
@@ -4829,10 +4913,19 @@ pub(crate) mod tests {
                 .unwrap();
             wait_for_no_dropped_table_operational_state(&engine, table_id).await;
             assert!(!Path::new(&table_file_path).exists());
-            assert!(engine.catalog().retained_dropped_table_ids_now().is_empty());
-            assert_no_dropped_table_operational_state(engine.catalog(), table_id);
             assert!(
                 engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .retained_dropped_table_ids_now()
+                    .is_empty()
+            );
+            assert_no_dropped_table_operational_state(engine.inner().core.catalog(), table_id);
+            assert!(
+                engine
+                    .inner()
+                    .core
                     .catalog()
                     .resolve_user_table_visible(table_id, MAX_SNAPSHOT_TS)
                     .is_none()
@@ -5028,6 +5121,8 @@ pub(crate) mod tests {
             session.drop_table(table_id).await.unwrap();
             let trx_sys = &engine.inner().trx_sys;
             let batch = engine
+                .inner()
+                .core
                 .catalog()
                 .scan_checkpoint_batch(
                     trx_sys.persisted_watermark_cts(),
@@ -5081,6 +5176,8 @@ pub(crate) mod tests {
                 .unwrap();
             assert!(
                 engine
+                    .inner()
+                    .core
                     .catalog()
                     .storage
                     .checkpoint_snapshot()
@@ -5098,7 +5195,15 @@ pub(crate) mod tests {
             ))
             .await
             .unwrap();
-            assert!(engine.catalog().get_table(table_id).await.is_none());
+            assert!(
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .get_table(table_id)
+                    .await
+                    .is_none()
+            );
             assert!(!Path::new(&table_file_path).exists());
         });
     }
