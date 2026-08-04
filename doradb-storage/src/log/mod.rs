@@ -41,7 +41,6 @@ use error_stack::{Report, ResultExt};
 use flume::Sender;
 use glob::{Pattern, glob};
 use parking_lot::{Mutex, MutexGuard};
-use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::io::{ErrorKind as IoErrorKind, Result as StdIoResult};
 use std::mem;
@@ -1015,14 +1014,11 @@ struct ReadyGroupPrefix {
 }
 
 /// Durability mode for syncing redo log writes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LogSync {
     #[default]
-    #[serde(rename = "none")]
     None,
-    #[serde(rename = "fsync")]
     Fsync,
-    #[serde(rename = "fdatasync")]
     Fdatasync,
 }
 

@@ -3,7 +3,6 @@ use crate::id::RowID;
 use crate::row::{Row, RowMut};
 use crate::serde::{Deser, DeserResult, MinBytesHint, Ser, Serde, min_bytes_hint};
 use crate::value::Val;
-use serde::{Deserialize, Serialize};
 use std::iter::Enumerate;
 use std::{mem, slice, vec};
 
@@ -218,7 +217,7 @@ pub(crate) trait UndoVal {
 }
 
 /// Column update value.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateCol {
     /// Column index to update.
     pub idx: usize,

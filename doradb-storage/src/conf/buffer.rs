@@ -1,6 +1,5 @@
 use crate::buffer::{EvictionArbiter, EvictionArbiterBuilder, PoolRole};
 use byte_unit::Byte;
-use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use super::consts::{
@@ -12,10 +11,9 @@ use super::consts::{
 ///
 /// Besides file and memory sizing, this type carries eviction-arbiter tuning
 /// used to build the background evictor policy.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct EvictableBufferPoolConfig {
     /// Logical role assigned to the buffer pool at engine construction.
-    #[serde(default)]
     pub(crate) role: PoolRole,
     /// Swap-file path used when evicting pages from memory.
     pub(crate) data_swap_file: PathBuf,

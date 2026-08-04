@@ -1,9 +1,8 @@
-use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Predefined selector of one logical buffer-pool role.
 #[repr(u8)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum PoolRole {
     #[default]
     Invalid = 0,

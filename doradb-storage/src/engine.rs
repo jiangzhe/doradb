@@ -1362,23 +1362,6 @@ mod tests {
     }
 
     #[test]
-    fn test_engine_config() {
-        let config = EngineConfig::default();
-        let config_str = toml::to_string(&config).unwrap();
-        assert!(config_str.contains("storage_root"));
-        assert!(config_str.contains("index_swap_file"));
-        assert!(config_str.contains("data_swap_file"));
-        assert!(config_str.contains("log_write_io_depth"));
-        assert!(config_str.contains("recovery_io_depth"));
-        assert!(config_str.contains("recovery_disable_dml_validation"));
-        assert!(config_str.contains("catalog_checkpoint_scan_io_depth"));
-        assert!(config_str.contains("gc_buckets"));
-        assert!(config_str.contains("log_dir"));
-        assert!(config_str.contains("log_file_stem"));
-        assert!(!config_str.contains("max_io_depth"));
-    }
-
-    #[test]
     fn test_catalog_checkpoint_scan_io_depth_comes_from_trx_config() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
