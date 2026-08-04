@@ -933,17 +933,11 @@ impl Session {
             .engine
             .upgrade()
             .attach_with(|| format!("session_id={}, phase=upgrade_engine_runtime", self.id))?;
-        // Inspection deliberately bypasses storage-poison validation, but it
-        // must not start after owner-side shutdown closes lifecycle admission.
-        // The EngineRef acquired above keeps components alive if shutdown begins
-        // after this check.
-        if engine.shutdown_started() {
-            return Err(Report::new(LifecycleError::Shutdown).attach(format!(
-                "session_id={}, phase=check_engine_inspection_admission, reason=engine_admission_closed",
-                self.id
-            )));
-        }
+        let admission = engine
+            .acquire_inspection_admission()
+            .attach_with(|| format!("session_id={}", self.id))?;
         let state = engine.session_registry.pin_observer(self.id)?;
+        drop(admission);
         Ok(SessionObserverPin { engine, state })
     }
 
@@ -1581,7 +1575,7 @@ impl Drop for Session {
 
 /// Shared runtime view implemented by observer and foreground authorities.
 pub(crate) trait SessionRuntimeAccess {
-    /// Returns the retained engine runtime pin.
+    /// Returns the retained shared engine access handle.
     fn engine(&self) -> &EngineRef;
     /// Returns registry-owned session state.
     fn state(&self) -> &Arc<SessionState>;
@@ -1602,6 +1596,13 @@ pub(crate) struct SessionObserverPin {
     pub(crate) state: Arc<SessionState>,
 }
 
+impl Drop for SessionObserverPin {
+    #[inline]
+    fn drop(&mut self) {
+        self.engine.session_registry.finish_observer(&self.state);
+    }
+}
+
 impl SessionRuntimeAccess for SessionObserverPin {
     #[inline]
     fn engine(&self) -> &EngineRef {
@@ -1616,7 +1617,7 @@ impl SessionRuntimeAccess for SessionObserverPin {
 
 /// Non-cloneable foreground authority for one stable session operation.
 pub(crate) struct SessionOperationPin {
-    /// Engine runtime pin retained while foreground work owns this operation.
+    /// Engine access retained while the stable operation blocks shutdown.
     pub(crate) engine: EngineRef,
     /// Registry-owned session state containing the active slot.
     pub(crate) state: Arc<SessionState>,
@@ -1892,26 +1893,69 @@ impl Drop for MandatoryOperationGuard {
     }
 }
 
-/// One active operation found by a nonblocking shutdown probe.
-pub(crate) struct SessionShutdownBlocker {
-    /// Current operation ownership class.
-    pub(crate) state: SessionOperationState,
-    /// Exact claimable transaction cleanup hint, when one exists.
-    ///
-    /// The tuple locates the stable outer operation entry first and identifies
-    /// its currently attached transaction second.
-    pub(crate) cleanup: Option<(SessionOperationKey, TrxID)>,
+/// One session-local ownership class found by a shutdown probe.
+pub(crate) enum SessionShutdownBlocker {
+    /// One stable effectful operation remains active.
+    Operation {
+        /// Current operation ownership class.
+        state: SessionOperationState,
+        /// Exact claimable transaction cleanup hint, when one exists.
+        ///
+        /// The tuple locates the stable outer operation entry first and
+        /// identifies its currently attached transaction second.
+        cleanup: Option<(SessionOperationKey, TrxID)>,
+    },
+    /// One or more standalone read-only observers remain active.
+    Observer {
+        /// Current nonzero observer count.
+        count: usize,
+    },
 }
 
-/// One active operation observed by blocking shutdown.
+impl SessionShutdownBlocker {
+    /// Returns the structured shutdown blocker label.
+    #[inline]
+    pub(crate) const fn label(&self) -> &'static str {
+        match self {
+            Self::Operation { .. } => "operation",
+            Self::Observer { .. } => "observer",
+        }
+    }
+
+    /// Returns the active operation state, if this is an operation blocker.
+    #[inline]
+    pub(crate) const fn operation_state(&self) -> Option<SessionOperationState> {
+        match self {
+            Self::Operation { state, .. } => Some(*state),
+            Self::Observer { .. } => None,
+        }
+    }
+
+    /// Returns the active observer count, or zero for an operation blocker.
+    #[inline]
+    pub(crate) const fn observer_count(&self) -> usize {
+        match self {
+            Self::Operation { .. } => 0,
+            Self::Observer { count } => *count,
+        }
+    }
+
+    /// Returns an exact claimable cleanup hint, when one exists.
+    #[inline]
+    pub(crate) const fn cleanup(&self) -> Option<(SessionOperationKey, TrxID)> {
+        match self {
+            Self::Operation { cleanup, .. } => *cleanup,
+            Self::Observer { .. } => None,
+        }
+    }
+}
+
+/// One session-local blocker observed by blocking shutdown.
 pub(crate) struct SessionShutdownWait {
-    /// Listener installed before the active entry was inspected.
+    /// Listener installed before the selected blocker was re-read.
     pub(crate) listener: EventListener,
-    /// Exact claimable transaction cleanup hint, when one exists.
-    ///
-    /// The tuple locates the stable outer operation entry first and identifies
-    /// its currently attached transaction second.
-    pub(crate) cleanup: Option<(SessionOperationKey, TrxID)>,
+    /// Blocker classification captured by the lossless re-read.
+    pub(crate) blocker: SessionShutdownBlocker,
 }
 
 /// Engine-owned registry for strong session state.
@@ -1953,9 +1997,20 @@ impl SessionRegistry {
     pub(crate) fn pin_observer(&self, id: SessionID) -> LifecycleResult<Arc<SessionState>> {
         let state = self.session_or_unavailable(id)?;
         state
-            .ensure_available()
+            .acquire_observer()
             .attach_with(|| format!("session_id={id}"))?;
         Ok(state)
+    }
+
+    /// Releases one exact observer and removes its closed session if it drains.
+    #[inline]
+    pub(crate) fn finish_observer(&self, state: &Arc<SessionState>) {
+        let remove_from_registry = state.release_observer();
+        if remove_from_registry {
+            self.entries.remove_if(&state.id(), |_id, registered| {
+                Arc::ptr_eq(registered, state)
+            });
+        }
     }
 
     /// Reserves one stable non-transaction operation entry.
@@ -2180,6 +2235,7 @@ impl SessionState {
             lifecycle: Mutex::new(SessionLifecycle {
                 disposition: SessionDisposition::Open,
                 slot: SessionOperationSlot::Idle,
+                observer_count: 0,
                 next_operation_id: 1,
                 change_ev: None,
                 public_trx_cache: Some(Box::new(TrxInner::public_cached())),
@@ -2202,15 +2258,38 @@ impl SessionState {
     }
 
     #[inline]
-    fn ensure_available(&self) -> LifecycleResult<()> {
-        let lifecycle = self.lifecycle.lock();
+    fn acquire_observer(&self) -> LifecycleResult<()> {
+        let mut lifecycle = self.lifecycle.lock();
         if lifecycle.disposition == SessionDisposition::Open
             && !matches!(&lifecycle.slot, SessionOperationSlot::Closed)
         {
+            assert!(
+                lifecycle.observer_count < usize::MAX,
+                "session observer count overflow: session_id={}",
+                self.id
+            );
+            lifecycle.observer_count += 1;
             Ok(())
         } else {
             Err(self.unavailable_err(&lifecycle))
         }
+    }
+
+    #[inline]
+    fn release_observer(&self) -> bool {
+        let mut lifecycle = self.lifecycle.lock();
+        assert!(
+            lifecycle.observer_count > 0,
+            "session observer count underflow: session_id={}",
+            self.id
+        );
+        lifecycle.observer_count -= 1;
+        let remove_from_registry =
+            lifecycle.observer_count == 0 && matches!(lifecycle.slot, SessionOperationSlot::Closed);
+        let notify = lifecycle.change_ev.clone();
+        drop(lifecycle);
+        Self::notify_operation_change(notify);
+        remove_from_registry
     }
 
     #[inline]
@@ -2334,7 +2413,9 @@ impl SessionState {
         }
         match &lifecycle.slot {
             SessionOperationSlot::Idle => {}
-            SessionOperationSlot::Closed => return (SessionCloseDecision::Closed, true),
+            SessionOperationSlot::Closed => {
+                return (SessionCloseDecision::Closed, lifecycle.observer_count == 0);
+            }
             SessionOperationSlot::Active(entry) => {
                 let snapshot = entry.inspect();
                 match snapshot.state {
@@ -2365,11 +2446,12 @@ impl SessionState {
         }
         lifecycle.disposition = SessionDisposition::CloseRequested;
         lifecycle.slot = SessionOperationSlot::Closed;
+        let remove_from_registry = lifecycle.observer_count == 0;
         let notify = lifecycle.change_ev.clone();
         drop(lifecycle);
         self.release_session_locks();
         Self::notify_operation_change(notify);
-        (SessionCloseDecision::Closed, true)
+        (SessionCloseDecision::Closed, remove_from_registry)
     }
 
     #[inline]
@@ -2378,17 +2460,19 @@ impl SessionState {
         if lifecycle.disposition == SessionDisposition::Open {
             lifecycle.disposition = SessionDisposition::Abandoned;
         }
-        let remove_from_registry = match lifecycle.slot {
-            SessionOperationSlot::Closed => return true,
+        let release_session_locks = match lifecycle.slot {
+            SessionOperationSlot::Closed => false,
             SessionOperationSlot::Idle => {
                 lifecycle.slot = SessionOperationSlot::Closed;
                 true
             }
             SessionOperationSlot::Active(_) => false,
         };
+        let remove_from_registry =
+            matches!(lifecycle.slot, SessionOperationSlot::Closed) && lifecycle.observer_count == 0;
         let notify = lifecycle.change_ev.clone();
         drop(lifecycle);
-        if remove_from_registry {
+        if release_session_locks {
             self.release_session_locks();
         }
         Self::notify_operation_change(notify);
@@ -2402,18 +2486,18 @@ impl SessionState {
             return (false, None);
         };
         let release = entry.release_foreground();
-        let remove_from_registry = if release.terminal {
+        let terminal = if release.terminal {
             lifecycle.finalize_terminal()
         } else {
-            false
+            SessionTerminalFinish::ACTIVE
         };
         let notify = lifecycle.change_ev.clone();
         drop(lifecycle);
-        if remove_from_registry {
+        if terminal.release_session_locks {
             self.release_session_locks();
         }
         Self::notify_operation_change(notify);
-        (remove_from_registry, release.cleanup)
+        (terminal.remove_from_registry, release.cleanup)
     }
 
     /// Transfer the retained active entry to mandatory ownership.
@@ -2439,14 +2523,14 @@ impl SessionState {
     fn finish_mandatory(&self, entry: &Arc<SessionOperationEntry>) -> bool {
         let mut lifecycle = self.lifecycle.lock();
         entry.publish_mandatory_terminal();
-        let remove_from_registry = lifecycle.finalize_terminal();
+        let terminal = lifecycle.finalize_terminal();
         let notify = lifecycle.change_ev.clone();
         drop(lifecycle);
-        if remove_from_registry {
+        if terminal.release_session_locks {
             self.release_session_locks();
         }
         Self::notify_operation_change(notify);
-        remove_from_registry
+        terminal.remove_from_registry
     }
 
     /// Retain failure on the same stable entry while notifying lifecycle waiters.
@@ -2491,14 +2575,14 @@ impl SessionState {
         if !operation_terminal {
             return false;
         }
-        let remove_from_registry = lifecycle.finalize_terminal();
+        let terminal = lifecycle.finalize_terminal();
         let notify = lifecycle.change_ev.clone();
         drop(lifecycle);
-        if remove_from_registry {
+        if terminal.release_session_locks {
             self.release_session_locks();
         }
         Self::notify_operation_change(notify);
-        remove_from_registry
+        terminal.remove_from_registry
     }
 
     #[inline]
@@ -2546,45 +2630,36 @@ impl SessionState {
     #[inline]
     fn shutdown_blocker(&self) -> Option<SessionShutdownBlocker> {
         let lifecycle = self.lifecycle.lock();
-        let entry = lifecycle.slot.active_entry()?;
-        let state = entry.inspect().state;
-        Some(SessionShutdownBlocker {
-            state,
-            cleanup: entry
-                .cleanup_candidate()
-                .map(|trx_id| (entry.key(), trx_id)),
-        })
+        lifecycle.shutdown_blocker()
     }
 
     #[inline]
     fn shutdown_wait(&self) -> Option<SessionShutdownWait> {
         let mut lifecycle = self.lifecycle.lock();
-        lifecycle.slot.active_entry()?;
+        lifecycle.shutdown_blocker()?;
         let listener = lifecycle.change_listener();
-        let entry = lifecycle
-            .slot
-            .active_entry()
-            .expect("active session slot cannot change while lifecycle lock is held");
-        let cleanup = entry
-            .cleanup_candidate()
-            .map(|trx_id| (entry.key(), trx_id));
-        Some(SessionShutdownWait { listener, cleanup })
+        let blocker = lifecycle
+            .shutdown_blocker()
+            .expect("session blocker cannot change while lifecycle lock is held");
+        Some(SessionShutdownWait { listener, blocker })
     }
 
     #[inline]
     fn shutdown_removal(&self) -> bool {
         let mut lifecycle = self.lifecycle.lock();
-        let remove_from_registry = match lifecycle.slot {
-            SessionOperationSlot::Closed => return true,
+        let release_session_locks = match lifecycle.slot {
+            SessionOperationSlot::Closed => false,
             SessionOperationSlot::Idle => {
                 lifecycle.slot = SessionOperationSlot::Closed;
                 true
             }
             SessionOperationSlot::Active(_) => false,
         };
+        let remove_from_registry =
+            matches!(lifecycle.slot, SessionOperationSlot::Closed) && lifecycle.observer_count == 0;
         let notify = lifecycle.change_ev.clone();
         drop(lifecycle);
-        if remove_from_registry {
+        if release_session_locks {
             self.release_session_locks();
         }
         Self::notify_operation_change(notify);
@@ -2654,6 +2729,7 @@ impl Drop for SessionState {
 struct SessionLifecycle {
     disposition: SessionDisposition,
     slot: SessionOperationSlot,
+    observer_count: usize,
     next_operation_id: u64,
     change_ev: Option<Arc<EventNotifyOnDrop>>,
     /// Reusable public transaction core, checked out only by a public transaction.
@@ -2708,20 +2784,39 @@ impl SessionLifecycle {
         self.slot.active_entry().filter(|entry| entry.key() == key)
     }
 
+    #[inline]
+    fn shutdown_blocker(&self) -> Option<SessionShutdownBlocker> {
+        if let Some(entry) = self.slot.active_entry() {
+            let state = entry.inspect().state;
+            return Some(SessionShutdownBlocker::Operation {
+                state,
+                cleanup: entry
+                    .cleanup_candidate()
+                    .map(|trx_id| (entry.key(), trx_id)),
+            });
+        }
+        (self.observer_count != 0).then_some(SessionShutdownBlocker::Observer {
+            count: self.observer_count,
+        })
+    }
+
     /// Publishes a terminal operation as idle for an open session or closed for
     /// a session whose close or abandonment is already pending.
     ///
-    /// Returns whether the closed session should be removed from the registry.
+    /// Returns the closed-session lock-release and registry-removal decisions.
     #[inline]
-    fn finalize_terminal(&mut self) -> bool {
+    fn finalize_terminal(&mut self) -> SessionTerminalFinish {
         match self.disposition {
             SessionDisposition::Open => {
                 self.slot = SessionOperationSlot::Idle;
-                false
+                SessionTerminalFinish::ACTIVE
             }
             SessionDisposition::CloseRequested | SessionDisposition::Abandoned => {
                 self.slot = SessionOperationSlot::Closed;
-                true
+                SessionTerminalFinish {
+                    remove_from_registry: self.observer_count == 0,
+                    release_session_locks: true,
+                }
             }
         }
     }
@@ -2732,6 +2827,19 @@ impl SessionLifecycle {
             .get_or_insert_with(|| Arc::new(EventNotifyOnDrop::new()))
             .listen()
     }
+}
+
+#[derive(Clone, Copy)]
+struct SessionTerminalFinish {
+    remove_from_registry: bool,
+    release_session_locks: bool,
+}
+
+impl SessionTerminalFinish {
+    const ACTIVE: Self = Self {
+        remove_from_registry: false,
+        release_session_locks: false,
+    };
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2787,11 +2895,12 @@ enum SessionCloseDecision {
 
 /// Private transaction runtime attachment retained by checked-out transaction work.
 ///
-/// This handle owns engine runtime liveness and session-state reachability for
-/// one operation, terminal path, prepared commit handoff, or cleanup path. The
-/// public transaction facade never stores it.
+/// This handle owns engine access and session-state reachability for one
+/// operation, terminal path, prepared commit handoff, or cleanup path. The
+/// stable session operation remains the shutdown proof, and the public
+/// transaction facade never stores this attachment.
 pub(crate) struct TrxAttachment {
-    /// Strong runtime handle kept until the transaction reaches a terminal path.
+    /// Strong engine access kept until the transaction reaches a terminal path.
     engine: EngineRef,
     /// Exact registry lookup key for terminal session-operation cleanup.
     operation_key: SessionOperationKey,
@@ -3038,9 +3147,10 @@ pub(crate) mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::path::{Path, PathBuf};
     use std::pin::Pin;
-    use std::sync::OnceLock;
     use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Barrier, OnceLock};
     use std::task::{Context, Poll};
+    use std::thread;
     use tempfile::TempDir;
 
     const TRUNCATE_TEST_LOG_BLOCK_SIZE: usize = 4096;
@@ -3536,9 +3646,9 @@ pub(crate) mod tests {
     }
 
     fn test_session_runtime(session: &Session) -> LifecycleResult<(EngineRef, Arc<SessionState>)> {
-        let SessionObserverPin { engine, state } = session.pin_inspection()?;
-        inspect_session_in_trx(&state).attach_with(|| format!("session_id={}", session.id))?;
-        Ok((engine, state))
+        let pin = session.pin_inspection()?;
+        inspect_session_in_trx(&pin.state).attach_with(|| format!("session_id={}", session.id))?;
+        Ok((pin.engine.clone(), Arc::clone(&pin.state)))
     }
 
     pub(crate) trait SessionTestExt {
@@ -3727,6 +3837,303 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_observer_registration_counts_without_consuming_operation_slot() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let state = engine
+                .inner()
+                .session_registry
+                .session_state(session.id())
+                .unwrap();
+
+            {
+                let lifecycle = state.lifecycle.lock();
+                assert_eq!(lifecycle.observer_count, 0);
+                assert_eq!(lifecycle.next_operation_id, 1);
+                assert!(matches!(lifecycle.slot, SessionOperationSlot::Idle));
+            }
+
+            let trx = session.begin_trx().unwrap();
+            let operation_key = {
+                let lifecycle = state.lifecycle.lock();
+                assert_eq!(lifecycle.next_operation_id, 2);
+                lifecycle.slot.active_entry().unwrap().key()
+            };
+            let first = session.pin_observer().unwrap();
+            let second = session.pin_inspection().unwrap();
+            {
+                let lifecycle = state.lifecycle.lock();
+                assert_eq!(lifecycle.observer_count, 2);
+                assert_eq!(lifecycle.next_operation_id, 2);
+                assert_eq!(
+                    lifecycle.slot.active_entry().map(|entry| entry.key()),
+                    Some(operation_key)
+                );
+            }
+
+            drop(first);
+            assert_eq!(state.lifecycle.lock().observer_count, 1);
+            drop(second);
+            assert_eq!(state.lifecycle.lock().observer_count, 0);
+            trx.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_observer_counts_are_session_local() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let session1 = engine.new_session().unwrap();
+            let session2 = engine.new_session().unwrap();
+            let state1 = engine
+                .inner()
+                .session_registry
+                .session_state(session1.id())
+                .unwrap();
+            let state2 = engine
+                .inner()
+                .session_registry
+                .session_state(session2.id())
+                .unwrap();
+
+            let observer1 = session1.pin_observer().unwrap();
+            let observer2 = session2.pin_observer().unwrap();
+            assert_eq!(state1.lifecycle.lock().observer_count, 1);
+            assert_eq!(state2.lifecycle.lock().observer_count, 1);
+
+            drop(observer1);
+            assert_eq!(state1.lifecycle.lock().observer_count, 0);
+            assert_eq!(state2.lifecycle.lock().observer_count, 1);
+            drop(observer2);
+            assert_eq!(state2.lifecycle.lock().observer_count, 0);
+        });
+    }
+
+    #[test]
+    fn test_close_retains_observed_session_until_final_observer_drop() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let session_id = session.id();
+            let observer = session.pin_observer().unwrap();
+            let state = Arc::clone(&observer.state);
+
+            session.close().await.unwrap();
+            assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
+            {
+                let lifecycle = state.lifecycle.lock();
+                assert_eq!(lifecycle.disposition, SessionDisposition::CloseRequested);
+                assert!(matches!(lifecycle.slot, SessionOperationSlot::Closed));
+                assert_eq!(lifecycle.observer_count, 1);
+            }
+            let err = match session.pin_observer() {
+                Ok(_) => panic!("closed session must reject new observers"),
+                Err(err) => err,
+            };
+            assert_eq!(err.current_context(), &LifecycleError::SessionUnavailable);
+
+            drop(observer);
+            assert!(
+                engine
+                    .inner()
+                    .session_registry
+                    .session_state(session_id)
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn test_abandonment_and_terminal_operation_retain_observed_session() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let session_id = session.id();
+            let trx = session.begin_trx().unwrap();
+            let observer = session.pin_observer().unwrap();
+            let state = Arc::clone(&observer.state);
+
+            drop(session);
+            {
+                let lifecycle = state.lifecycle.lock();
+                assert_eq!(lifecycle.disposition, SessionDisposition::Abandoned);
+                assert!(matches!(lifecycle.slot, SessionOperationSlot::Active(_)));
+                assert_eq!(lifecycle.observer_count, 1);
+            }
+
+            trx.rollback().await.unwrap();
+            assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
+            {
+                let lifecycle = state.lifecycle.lock();
+                assert!(matches!(lifecycle.slot, SessionOperationSlot::Closed));
+                assert_eq!(lifecycle.observer_count, 1);
+            }
+
+            drop(observer);
+            assert!(
+                engine
+                    .inner()
+                    .session_registry
+                    .session_state(session_id)
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn test_shutdown_reports_operation_before_observers_on_same_session() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let trx = session.begin_trx().unwrap();
+            let observer = session.pin_observer().unwrap();
+            let state = Arc::clone(&observer.state);
+
+            let blocker = state.shutdown_blocker().unwrap();
+            assert_eq!(blocker.label(), "operation");
+            assert_eq!(blocker.observer_count(), 0);
+
+            trx.rollback().await.unwrap();
+            let blocker = state.shutdown_blocker().unwrap();
+            assert_eq!(blocker.label(), "observer");
+            assert_eq!(blocker.operation_state(), None);
+            assert_eq!(blocker.observer_count(), 1);
+
+            drop(observer);
+            assert!(state.shutdown_blocker().is_none());
+        });
+    }
+
+    #[test]
+    fn test_observer_shutdown_wait_is_woken_by_exact_release() {
+        smol::block_on(async {
+            const REPETITIONS: usize = 100;
+
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let session = engine.new_session().unwrap();
+            let state = engine
+                .inner()
+                .session_registry
+                .session_state(session.id())
+                .unwrap();
+
+            for _ in 0..REPETITIONS {
+                let observer = session.pin_observer().unwrap();
+                let shutdown_wait = state
+                    .shutdown_wait()
+                    .expect("observer must install a shutdown listener");
+                assert_eq!(shutdown_wait.blocker.label(), "observer");
+                assert_eq!(shutdown_wait.blocker.observer_count(), 1);
+
+                drop(observer);
+                shutdown_wait.listener.await;
+                assert!(state.shutdown_blocker().is_none());
+            }
+
+            let observer = session.pin_observer().unwrap();
+            drop(observer);
+            assert!(
+                state.shutdown_wait().is_none(),
+                "release before listener installation must be visible to the predicate scan"
+            );
+        });
+    }
+
+    fn run_observer_admission_shutdown_race(inspection: bool) {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let session = engine.new_session().unwrap();
+            if inspection {
+                let _ = engine
+                    .inner()
+                    .poisoner
+                    .poison(Report::new(FatalError::RedoWrite).attach("observer race poison"));
+            }
+            let barrier = Arc::new(Barrier::new(3));
+
+            thread::scope(|scope| {
+                let shutdown_engine = &engine;
+                let shutdown_barrier = Arc::clone(&barrier);
+                let shutdown = scope.spawn(move || {
+                    shutdown_barrier.wait();
+                    shutdown_engine.try_shutdown()
+                });
+                let observer_barrier = Arc::clone(&barrier);
+                let observer = scope.spawn(move || {
+                    observer_barrier.wait();
+                    if inspection {
+                        session.pin_inspection()
+                    } else {
+                        session.pin_observer()
+                    }
+                });
+                barrier.wait();
+
+                match (shutdown.join().unwrap(), observer.join().unwrap()) {
+                    (Ok(()), Err(err)) => {
+                        assert_eq!(err.current_context(), &LifecycleError::Shutdown);
+                    }
+                    (Err(err), Ok(observer)) => {
+                        assert_eq!(
+                            err.report().downcast_ref::<LifecycleError>().copied(),
+                            Some(LifecycleError::ShutdownBusy)
+                        );
+                        assert_eq!(
+                            err.report().downcast_ref::<String>().map(String::as_str),
+                            Some(
+                                "origin=explicit, session_blocker=observer, operation_state=none, observer_count=1, cleanup_queued=false, mandatory_callers=0, mandatory_internal=0"
+                            )
+                        );
+                        drop(observer);
+                        engine.shutdown();
+                    }
+                    (Ok(()), Ok(observer)) => {
+                        drop(observer);
+                        panic!("shutdown completed after admitting an invisible observer");
+                    }
+                    (Err(shutdown_err), Err(observer_err)) => {
+                        panic!(
+                            "observer race produced two rejections: shutdown={shutdown_err:?}, observer={observer_err:?}"
+                        );
+                    }
+                }
+            });
+        });
+    }
+
+    #[test]
+    fn test_normal_observer_admission_race_registers_or_rejects() {
+        run_observer_admission_shutdown_race(false);
+    }
+
+    #[test]
+    fn test_poison_tolerant_inspection_race_registers_or_rejects() {
+        run_observer_admission_shutdown_race(true);
+    }
+
+    #[test]
     fn test_session_table_cache_owns_active_user_insert_page() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
@@ -3847,7 +4254,8 @@ pub(crate) mod tests {
             let blocker = state
                 .shutdown_blocker()
                 .expect("abandoned transaction must block shutdown");
-            assert_eq!(blocker.cleanup, Some((key, trx_id)));
+            assert_eq!(blocker.cleanup(), Some((key, trx_id)));
+            assert_eq!(blocker.label(), "operation");
             assert_eq!(entry.inspect().state, SessionOperationState::CleanupReady);
         });
     }
@@ -3877,7 +4285,11 @@ pub(crate) mod tests {
             let blocker = state
                 .shutdown_blocker()
                 .expect("failed-retained operation must block shutdown");
-            assert_eq!(blocker.cleanup, None);
+            assert_eq!(blocker.cleanup(), None);
+            assert_eq!(
+                blocker.operation_state(),
+                Some(SessionOperationState::FailedRetained)
+            );
             assert_eq!(entry.inspect().state, SessionOperationState::FailedRetained);
         });
     }
@@ -3902,7 +4314,7 @@ pub(crate) mod tests {
             let shutdown_wait = state
                 .shutdown_wait()
                 .expect("active transaction must install a shutdown listener");
-            assert_eq!(shutdown_wait.cleanup, None);
+            assert_eq!(shutdown_wait.blocker.cleanup(), None);
             assert!(state.lifecycle.lock().change_ev.is_some());
 
             assert!(state.abandon_trx_handle(key, trx_id));
@@ -3976,7 +4388,8 @@ pub(crate) mod tests {
             assert!(
                 expected_cleanup.contains(
                     &shutdown_wait
-                        .cleanup
+                        .blocker
+                        .cleanup()
                         .expect("abandoned transaction must be claimable")
                 )
             );
@@ -4027,7 +4440,8 @@ pub(crate) mod tests {
                     .first_shutdown_wait()
                     .expect("one remaining active session must block shutdown");
                 let (key, _) = shutdown_wait
-                    .cleanup
+                    .blocker
+                    .cleanup()
                     .expect("abandoned transaction must be claimable");
                 assert!(
                     !drained.contains(&key),

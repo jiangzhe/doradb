@@ -175,8 +175,10 @@ checkout or terminal claim then validates the handle's independent `TrxID`
 against the entry under the entry mutex.
 
 `SessionState` has orthogonal disposition (`Open`, `CloseRequested`, or
-`Abandoned`) and one operation slot (`Idle`, `Active`, or `Closed`). Its
-existing lifecycle mutex also protects one optional `public_trx_cache`
+`Abandoned`), one effectful operation slot (`Idle`, `Active`, or `Closed`), and
+a standalone observer count. The observer count lets diagnostics and progress
+waits coexist with an active transaction without allocating an operation id.
+Its existing lifecycle mutex also protects one optional `public_trx_cache`
 containing a ready `Box<TrxInner>`. A public transaction takes that box, and
 successful terminal processing resets and returns it before publishing the
 idle lifecycle state. DDL and maintenance leave the public cache parked while
@@ -567,20 +569,24 @@ gone. Attachmentless system transactions neither produce nor consume this
 proof.
 
 During engine shutdown, foreground admission closes first. Blocking shutdown
-lazily traverses sessions and stops at the first active operation. It installs
-or reuses only that session's event, registers a listener under the lifecycle
-mutex, inspects the active entry, then releases all registry and state guards
-before queueing at most one exact cleanup hint and waiting. A relevant exact-key
-transition notifies that session after releasing state and explicit-lock
-ownership; shutdown then rescans for the first current blocker. A full traversal
-is required only to prove that no active operation remains.
+lazily traverses sessions and stops at the first active operation or standalone
+observer. Within one session, an operation is reported before observers. It
+installs or reuses only that session's event, registers a listener under the
+lifecycle mutex, re-reads the selected blocker, then releases all registry and
+state guards before queueing at most one exact cleanup hint and waiting. A
+relevant exact-key transition or observer release notifies that session after
+releasing lifecycle and explicit-lock ownership; shutdown then rescans for the
+first current blocker. A full traversal is required only to prove that no
+operation or observer remains.
 
 The nonblocking `try_shutdown()` uses the same first-blocker probe without
 installing an event. Consequently an ordinary open-session statement does not
 touch notification state, and an unobserved commit or rollback performs no
 notifier atomic update, event allocation, or wake. The listener-before-release
 protocol has no lost-wake interval, and `ShutdownBusy` remains observable while
-any operation or retained runtime pin remains.
+any operation, observer, mandatory caller permit, or mandatory internal permit
+remains. `EngineRef` supplies shared component access but does not independently
+block shutdown.
 
 Recovery only treats checkpoint metadata, table roots, and real redo headers as
 stable timestamp carriers. A no-log ordered commit has a volatile CTS that is

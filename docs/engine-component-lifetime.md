@@ -8,15 +8,18 @@ component-registry migration work.
 
 - `Engine`: public owner of top-level teardown state and session creation.
 - `EngineInner`: crate-private shared runtime state held behind the engine
-  owner and internal runtime pins.
-- `EngineRef`: crate-private cloneable runtime pin used by sessions,
-  transactions, cleanup jobs, and internal subsystems.
+  owner and internal shared handles.
+- `EngineRef`: crate-private cloneable `Arc<EngineInner>` access wrapper. It
+  provides memory reachability and component access but is not itself a
+  shutdown blocker.
 - Public session and transaction handles: weak, non-cloneable capabilities that
-  identify engine-local state and acquire internal runtime pins only for one
-  operation.
+  identify engine-local state and acquire admitted internal access only for one
+  operation or terminal path.
 - `SessionOperationEntry`: one registry-owned stable operation record keyed by
   `(SessionID, OperationID)`; it contains no `EngineRef`,
   `SessionObserverPin`, or whole operation future.
+- `SessionObserverPin`: non-cloneable standalone observer authority accounted
+  by its session lifecycle without consuming the effectful operation slot.
 - `ComponentRegistry`: ordered owner registry for top-level components.
 - `QuiescentBox<T>`: stable owner allocation for a runtime value.
 - `QuiescentGuard<T>`: cloneable keepalive handle into a `QuiescentBox<T>`.
@@ -42,7 +45,7 @@ The runtime uses an explicit owner/runtime split:
 
 `ComponentRegistry` is intentionally not part of `EngineInner`. The registry is
 needed only for explicit reverse-order shutdown and final owner drop. Keeping
-it on `Engine` prevents crate-private cloneable runtime pins from gaining
+it on `Engine` prevents crate-private cloneable runtime handles from gaining
 indirect access to teardown-only owner state.
 
 ## Build Sequence
@@ -302,57 +305,60 @@ The engine lifecycle has three states:
 3. `Shutdown`
 
 Shutdown closes engine and mandatory caller admission for new work and then
-requires active session operations, caller permits, internal cleanup permits,
-and internal `EngineRef` runtime pins to drain before owner-side component
-shutdown can proceed.
+requires active engine admissions, session operations, standalone session
+observers, caller permits, and internal cleanup permits to drain before
+owner-side component shutdown can proceed. Long-lived workers remain owned and
+joined by their registered component owners.
 `Engine::try_shutdown()` performs that check once and returns `ShutdownBusy` if
 work remains. The infallible `Engine::shutdown()` waits for the same work to
 drain and returns only after final teardown completes.
 
 Lifecycle records distinguish `mode=try origin=explicit` from blocking
 `mode=wait origin=explicit|owner_drop`. A busy try-shutdown record and its
-returned attachment use the same `strong_refs`, `operation_blocked`,
-`operation_state`, `voluntary_blocked`, `mandatory_session_blocked`,
-`cleanup_queued`, `mandatory_callers`, and `mandatory_internal` fields.
+returned attachment use the same `session_blocker`, `operation_state`,
+`observer_count`, `cleanup_queued`, `mandatory_callers`, and
+`mandatory_internal` fields.
 
 Normal shutdown is:
 
 1. close engine and mandatory caller admission and flip `Running -> ShuttingDown`
 2. wait for active admission tokens and accepted caller permits to drain
-3. wait for scoped `EngineRef` runtime pins and internal mandatory tasks to drain
-4. acquire the owner-side shutdown lock and lazily traverse registered sessions
-   until the first active operation is found
-5. for blocking shutdown, install or reuse that session's event and register
-   one listener under its lifecycle mutex before inspecting its active entry
-6. release the DashMap, lifecycle, entry, and shutdown guards; queue at most
+3. acquire the owner-side shutdown lock and lazily traverse registered sessions
+   until the first active operation or standalone observer is found
+4. for blocking shutdown, install or reuse that session's event and register
+   one listener under its lifecycle mutex before re-reading the selected blocker
+5. release the DashMap, lifecycle, entry, and shutdown guards; queue at most
    that blocker's exact currently claimable transaction cleanup hint, wait for
    its local event, and repeat from the first current blocker
-7. after one complete traversal finds no active operation, require
-   `Arc::strong_count(inner) == 1`
-8. remove idle registry-owned sessions
-9. call `ComponentRegistry::shutdown_all()` in reverse registration order
-10. mark lifecycle state as `Shutdown`
+6. remove idle registry-owned sessions
+7. call `ComponentRegistry::shutdown_all()` in reverse registration order;
+   redo stops before internal mandatory admission drains, and purge stops last
+8. mark lifecycle state as `Shutdown`
 
 `Engine::try_shutdown()` uses the same first-blocker traversal without
 installing an event or listener. It queues at most that blocker's cleanup hint
-and returns `ShutdownBusy`; its attachment separately labels retained engine
-references, voluntary preparation, accepted mandatory session work, caller
-permits, and internal tasks.
+and returns `ShutdownBusy`; its attachment identifies an operation or observer
+blocker plus caller and internal mandatory permits.
 
 The numbered owner-teardown steps follow the coordinator drain above. Session
 disposition (`Open`, `CloseRequested`, or `Abandoned`) is separate from the
-single operation slot (`Idle`, `Active`, or `Closed`). `Voluntary`,
+single effectful operation slot (`Idle`, `Active`, or `Closed`) and the
+standalone observer count. `Voluntary`,
 `Mandatory`, `CleanupReady`, `Completing`, and `FailedRetained` all block
-shutdown; only `Terminal` does not. Cleanup tasks carry the exact
+shutdown; only `Terminal` does not. A closed session remains registered until
+both its operation slot is closed and its observer count reaches zero. Cleanup
+tasks carry the exact
 `(SessionOperationKey, TrxID)` pair, so stale or duplicate work cannot claim a
 replacement operation.
 
-Operation waiting uses a session-local observation-armed predicate protocol.
+Operation and observer waiting use a session-local observation-armed predicate
+protocol.
 `SessionLifecycle` lazily stores `Option<Arc<EventNotifyOnDrop>>`. Explicit
 close or blocking shutdown installs or reuses the event and creates its
 listener under the lifecycle mutex before releasing the inspected predicate. A
-later relevant exact-key transition clones the event under that mutex, releases
-lifecycle, entry, and explicit-lock state, and then wakes all listeners. The
+later relevant exact-key transition or observer release clones the event under
+that mutex, releases lifecycle, entry, registry, and explicit-lock state as
+applicable, and then wakes all listeners. The
 wrapper also wakes listeners if the final event owner is dropped. If the
 transition wins first, the later scan sees its result; if observation wins
 first, the transition wakes the listener. Normal open-session statement
@@ -367,8 +373,34 @@ dropped before cleanup submission, event waiting, notification, or removal.
 The registry owns `Arc<SessionState>`, and an active slot owns
 `Arc<SessionOperationEntry>`. Neither object owns a strong engine runtime
 handle. `EngineRef` exists only in scoped foreground authorities, transaction
-attachments, claims, and submitted cleanup jobs, preventing a
-registry-to-engine strong reference cycle.
+or observer authorities, transaction attachments, claims, and submitted
+cleanup jobs, preventing a registry-to-engine strong reference cycle. Engine
+admission closes every new operation or observer registration against shutdown;
+session entries and observer counts then become the durable shutdown proof
+after admission drops. Mandatory permits provide the corresponding proof for
+accepted caller and internal cleanup work.
+
+The owned-handle inventory follows those authorities:
+
+- `SessionObserverPin` pairs its `EngineRef` with one counted session observer.
+- `SessionOperationPin`, `TrxAttachment`, transaction checkout and completion
+  claims, and DDL or maintenance progress all remain paired with their exact
+  stable `SessionOperationEntry`.
+- accepted DDL and maintenance also retain a mandatory caller permit through
+  terminal publication.
+- abandoned and terminal-rollback cleanup pair their active session entry with
+  a mandatory internal permit; failed-precommit cleanup is covered by mandatory
+  internal admission.
+- weak upgrades used for admission rejection, handle drop, or exact terminal
+  resolution either register one of those authorities or stay within a bounded
+  section that cannot use components after rejection.
+- redo, mandatory-runtime, purge, file, and eviction workers are owned and
+  joined by their registered component owners rather than by `EngineRef`.
+
+An explicit shutdown may finish while a weak public handle's rejected upgrade
+briefly retains an internal `Arc<EngineInner>`. That handle has no admitted
+authority to access components after rejection, so ordinary `Arc` reachability
+is deliberately not a production shutdown condition.
 
 The final reverse-order shutdown step releases `StorageRootLease`. A later
 engine can therefore acquire the root immediately after explicit shutdown,
@@ -388,8 +420,9 @@ registry-owned component owners start their final `QuiescentBox<T>` drains.
 
 `Engine::drop` invokes the same synchronous drain as `Engine::shutdown()`.
 An unintended owner drop can therefore block indefinitely while
-caller-retained foreground work, runtime references, or engine-owned
-background work remains live. Callers should finish foreground work and invoke
+caller-retained foreground operations, observers, mandatory work, or
+engine-owned background work remains live. Callers should finish foreground
+work and invoke
 `try_shutdown` or explicit shutdown at a controlled point when blocker
 diagnostics and blocking location are operationally important. Drop does not
 cancel accepted work or tear down components before that work reaches terminal
@@ -460,7 +493,7 @@ quiescent waits do not deadlock under normal teardown.
 Use this split when adding or reviewing engine fields:
 
 - put it on `EngineInner` if sessions, transactions, cleanup jobs, or other
-  crate-private runtime pins must retain it after engine construction
+  crate-private runtime handles must retain it after engine construction
 - put it on `Engine` if it is only needed for explicit shutdown, final owner
   drop, or teardown orchestration
 

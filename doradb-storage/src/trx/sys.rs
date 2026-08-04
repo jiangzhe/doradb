@@ -1587,7 +1587,8 @@ impl TransactionSystem {
     /// This is a best-effort signal from public-handle drop or owner shutdown
     /// scanning. During normal operation the receiver is alive; during owner
     /// shutdown, the engine keeps scanning and waiting for active transaction
-    /// state to become terminal before component teardown starts.
+    /// state to become terminal, while mandatory internal admission accounts
+    /// accepted cleanup before component teardown starts.
     #[inline]
     pub(crate) fn request_abandoned_trx_cleanup(
         &self,

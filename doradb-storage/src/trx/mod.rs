@@ -2085,14 +2085,12 @@ impl SessionOperationCompletionClaim {
 
 /// Abandoned transaction cleanup job.
 ///
-/// The job carries an `EngineRef`, so submitted cleanup pins the runtime until
-/// the mandatory-runtime task has either claimed and rolled back the abandoned
-/// transaction or found that the session/transaction is no longer claimable.
-/// Engine shutdown keeps scanning abandoned sessions and waits for active
-/// transaction state to reach a terminal state before component teardown
-/// begins.
+/// The job carries component access through `EngineRef`; its mandatory internal
+/// permit is the background-work shutdown proof. The stable session operation
+/// remains visible until the task has either claimed and rolled back the
+/// abandoned transaction or found that it is no longer claimable.
 pub(crate) struct SessionOperationCleanupJob {
-    /// Engine retained until cleanup resolves this job.
+    /// Shared engine access retained until cleanup resolves this job.
     pub(crate) engine: EngineRef,
     /// Exact stable operation that owns the abandoned transaction.
     pub(crate) operation_key: SessionOperationKey,
@@ -4182,7 +4180,7 @@ pub(crate) mod tests {
                 .session_registry
                 .first_shutdown_wait()
                 .expect("checked-out transaction must block shutdown");
-            assert_eq!(shutdown_wait.cleanup, None);
+            assert_eq!(shutdown_wait.blocker.cleanup(), None);
             let (ready_tx, ready_rx) = mpsc::channel();
             let (done_tx, done_rx) = mpsc::channel();
             let waiter = spawn(move || {
