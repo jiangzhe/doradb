@@ -27,8 +27,6 @@ use crate::recovery::stream::CatalogSafeRedoSegment;
 use crate::runtime::mandatory::{MandatoryInternalTask, MandatoryRuntime, MandatoryTaskMetadata};
 use crate::session::TrxAttachment;
 use crate::thread;
-#[cfg(test)]
-use crate::trx::SessionOperationState;
 use crate::trx::group::{Commit, CommitJoin, GroupCommit};
 #[cfg(test)]
 use crate::trx::purge::PurgeTestHook;
@@ -40,6 +38,8 @@ use crate::trx::{
     PreparedTrxPayload, ReleasedTransactionLocks, SessionOperationCleanupJob,
     SessionOperationCompletionClaim, SessionOperationEntry, Transaction, TrxInner,
 };
+#[cfg(test)]
+use crate::trx::{PrepareListenerResult, SessionOperationState};
 use crossbeam_utils::CachePadded;
 use either::Either::{Left, Right};
 use error_stack::{Report, ResultExt};
@@ -1345,7 +1345,7 @@ impl TransactionSystem {
     ) -> FatalResult<ReleasedTransactionLocks> {
         let sts = inner.sts();
         let gc_no = inner.gc_no();
-        let status = inner.ctx().status();
+        let status = Arc::clone(inner.ctx().status());
         let pool_guards = attachment.pool_guards().clone();
         let mut table_cache = TableCache::new(&self.catalog);
         if let Err(err) = inner
@@ -1998,12 +1998,13 @@ pub(crate) mod tests {
             .expect("test transaction must resolve");
         let status = {
             let inner_slot = entry.inner.lock();
-            inner_slot
+            let status = inner_slot
                 .trx_inner
                 .as_ref()
                 .expect("test transaction must be checked in")
                 .ctx()
-                .status()
+                .status();
+            Arc::clone(status)
         };
         (entry, status)
     }
@@ -2399,7 +2400,10 @@ pub(crate) mod tests {
             assert_eq!(entry.inspect().state, SessionOperationState::Terminal);
             assert!(!session.in_trx().unwrap());
             assert!(!status.preparing());
-            assert!(status.prepare_listener().is_none());
+            assert!(matches!(
+                status.prepare_listener(),
+                PrepareListenerResult::NotPreparing
+            ));
             engine.inner().poisoner.ensure_healthy().unwrap();
         });
     }

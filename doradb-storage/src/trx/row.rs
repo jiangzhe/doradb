@@ -14,7 +14,9 @@ use crate::trx::undo::{
     RowUndoKind, RowUndoRef, UndoStatus,
 };
 use crate::trx::ver_map::{RowPageState, RowVersionMap, RowVersionReadGuard, RowVersionWriteGuard};
-use crate::trx::{SharedTrxStatus, TrxContext, TrxRuntime, trx_is_committed};
+use crate::trx::{
+    PrepareListenerResult, SharedTrxStatus, TrxContext, TrxRuntime, trx_is_committed,
+};
 use crate::value::Val;
 use error_stack::Report;
 use event_listener::EventListener;
@@ -1152,7 +1154,7 @@ impl<'a> RowWriteAccess<'a> {
                 // statement-owned row undo before the actual row-page change is
                 // made.
                 let entry = OwnedRowUndo::new(table_id, Some(page_id), row_id, RowUndoKind::Lock);
-                self.add_undo_head(ctx.status(), entry.leak());
+                self.add_undo_head(Arc::clone(ctx.status()), entry.leak());
                 effects.push_row_undo(entry);
                 LockUndo::Ok
             }
@@ -1165,7 +1167,7 @@ impl<'a> RowWriteAccess<'a> {
                         OwnedRowUndo::new(table_id, Some(page_id), row_id, RowUndoKind::Lock);
                     let new_next = NextRowUndo::new(MainBranch {
                         entry: entry.leak(),
-                        status: UndoStatus::Ref(ctx.status()),
+                        status: UndoStatus::Ref(Arc::clone(ctx.status())),
                     });
                     let old_next = mem::replace(&mut undo_head.next, new_next);
                     entry.next = Some(old_next);
@@ -1233,7 +1235,7 @@ impl<'a> RowWriteAccess<'a> {
                         OwnedRowUndo::new(table_id, Some(page_id), row_id, RowUndoKind::Lock);
                     let new_next = NextRowUndo::new(MainBranch {
                         entry: entry.leak(),
-                        status: UndoStatus::Ref(ctx.status()),
+                        status: UndoStatus::Ref(Arc::clone(ctx.status())),
                     });
                     let old_next = mem::replace(&mut undo_head.next, new_next);
                     entry.next = Some(old_next);
@@ -1243,10 +1245,13 @@ impl<'a> RowWriteAccess<'a> {
                 // Another active transaction owns the hot-row lock. If it is
                 // preparing commit, wait and retry because the status will
                 // shortly become committed; otherwise report a write conflict.
-                if !undo_head.preparing() {
-                    return LockUndo::WriteConflict;
+                match undo_head.prepare_listener() {
+                    PrepareListenerResult::NotPreparing => LockUndo::WriteConflict,
+                    PrepareListenerResult::Registered(listener) => {
+                        LockUndo::Preparing(Some(listener))
+                    }
+                    PrepareListenerResult::Completed => LockUndo::Preparing(None),
                 }
-                LockUndo::Preparing(undo_head.prepare_listener())
             }
         }
     }
@@ -1585,7 +1590,7 @@ pub(crate) mod tests {
         let page = row_page(&metadata);
         let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
         let trx_ctx = test_trx_context(TrxID::new(1));
-        install_test_undo_head(&row_ver, trx_ctx.status());
+        install_test_undo_head(&row_ver, Arc::clone(trx_ctx.status()));
         {
             let access = test_row_read_access(&page, &row_ver, 0);
             assert_eq!(access.read_latest(&trx_ctx), ReadLatestRow::Readable);

@@ -74,7 +74,11 @@ The Heap Table uses a **Tiered Architecture**, combining an in-memory RowStore (
     only when `delete_cts <= reader_sts`; a committed marker newer than the
     reader snapshot preserves the old cold row for that reader. An uncommitted
     marker hides the row from its owning transaction and acts as a write
-    conflict for other writers.
+    conflict for other writers, except that a foreground writer waits when the
+    owner has entered prepare. The waiter releases operation-local row, index,
+    block, page, and deletion-buffer guards, then retries from authoritative
+    index, row-location, and marker state. An ordinary active owner remains an
+    immediate write conflict.
   - **Cold Update Path**: update of an LWC row is modeled as claiming the old
     cold RowID in the deletion buffer, recording cold-delete undo/redo,
     masking old secondary-index entries, and inserting the modified values as a
@@ -205,6 +209,17 @@ attachments need no additional kind field. The old status identity is never
 reused: undo, deletion, transition, or checkpoint owners that cloned it
 continue observing the old terminal result. Fatal retention drops the failed
 core instead of returning it to the session.
+
+Prepare notification is waiter-injected. Entering ordered prepare only
+publishes the shared `preparing` flag; it does not lock or allocate an event.
+The first hot- or cold-row waiter installs one event under the transaction's
+prepare mutex, and later waiters share it. Prepare completion publishes the
+commit or rollback outcome, clears `preparing`, takes the optional event under
+the same mutex, and wakes listeners after releasing the mutex. Successful
+failed-precommit rollback removes transaction-owned cold markers before this
+wake. Fatal cleanup publishes engine poison before releasing waiters, and
+waiters check that poison before retrying retained state. This notification
+protocol does not authorize logical-lock release before redo durability.
 
 During an active transaction, the owning box is checked out for one
 non-terminal operation through `SessionOperationCheckout`; ordinary checkout
@@ -523,6 +538,10 @@ runtime execution.
      backed by shared transaction status. This makes the commit operation
      lightweight: setting the shared status makes all related undo records and
      deletion-buffer markers observe the commit timestamp.
+   - Prepare events are allocated only when a hot- or cold-row waiter actually
+     registers. Completion still serializes the false transition with
+     registration so no commit, rollback, cancellation, or fatal-cleanup race
+     can lose a wakeup.
 4. **Cleanup**: Discard local write buffers.
 
 Transaction-owned logical locks are not redo, undo, durability, or ordered

@@ -34,6 +34,23 @@ recovery replay all use this map. Commit becomes visible atomically through the
 shared transaction status; maintenance may compact the marker later without
 changing its MVCC meaning.
 
+Foreground claiming distinguishes a foreign preparing owner from an ordinary
+active owner. The first waiter lazily installs an event on the owner's shared
+transaction status, releases the deletion-buffer entry guard, waits, checks
+engine poison, and restarts from authoritative row location and marker state.
+Point update/delete therefore never consume a stale cold identity after wake.
+Full-table mutation retains an original-row cursor and owned staged callback
+output: a pre-callback wait may reload the row and invoke the callback at most
+once, while a post-callback wait retries the staged action without invoking the
+callback again.
+
+`put_ref()` remains the non-waiting maintenance boundary. Page transition,
+purge, checkpoint, recovery, and replay callers treat any foreign active marker
+as their existing immediate conflict or invariant outcome and never create an
+unused prepare listener. Successful failed-precommit rollback removes its cold
+marker before prepare completion wakes foreground waiters; fatal cleanup wakes
+them only after engine poison is published.
+
 ### Persistent Delete Metadata
 
 Each `ColumnBlockIndex` leaf describes one LWC RowID range and stores a sorted
@@ -71,7 +88,10 @@ For a committed memory marker:
 
 For an uncommitted marker, the owning transaction sees its own delete while
 other readers preserve snapshot visibility. Competing writers use the marker
-as the cold-row ownership conflict.
+as the cold-row ownership conflict. A foreground writer may wait only when the
+owner is preparing; an ordinary active owner remains an immediate conflict.
+After wake it reclassifies committed, rolled-back, same-owner, replacement, or
+fatal state instead of assuming that prepare succeeded.
 
 When no memory marker exists, membership in the persisted delete set is final
 for all active readers: membership means deleted; absence means no cold delete
