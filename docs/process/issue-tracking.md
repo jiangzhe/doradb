@@ -16,14 +16,14 @@ Backlog files use:
 - **Scope**: Narrow, well-defined changes (e.g., bug fixes, small features, refactoring).
 - **Location**: `docs/tasks/<nnnnnn>-<description>.md`
 - **Template**: Use `docs/tasks/000000-template.md`.
-- **Workflow**: Use `$task-create` -> Link to a `gh` issue -> Implement -> Use `$task-resolve`.
+- **Workflow**: Use `$task-create` -> Use `$issue-task` -> Implement -> Use `$task-resolve`.
 - **Resolve rule**: During `$task-resolve`, always check whether the task belongs to an RFC; if yes, sync the corresponding RFC `Implementation Phases`.
 
 ### 2. RFCs (Large/Complex)
 - **Scope**: Large architectural changes, new subsystems, or complex implementations.
 - **Location**: `docs/rfcs/<nnnn>-<description>.md`
 - **Template**: Use `docs/rfcs/0000-template.md`.
-- **Workflow**: Create draft RFC (`status: draft`) -> Formalize (`proposal`/`accepted`) -> Break into Tasks -> Implement -> Resolve (`implemented`/`superseded`).
+- **Workflow**: Create draft RFC (`status: draft`) -> Formalize (`proposal`/`accepted`) -> Use `$issue-rfc` -> Break into Tasks -> Implement -> Resolve (`implemented`/`superseded`).
 
 ## Quick Start (with `gh` CLI)
 
@@ -150,7 +150,8 @@ gh issue create \
 
 2.  **File Issue**:
     *   File a GitHub issue based on the created Task/RFC document.
-    *   Use `gh issue create` with appropriate labels.
+    *   Use `$issue-task` for a task document or `$issue-rfc` for an RFC document.
+    *   Use the selected skill's `tools/issue.rs create-issue-from-doc` command.
 
 3.  **Branch**:
     *   Create a new branch for the task.

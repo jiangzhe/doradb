@@ -1,0 +1,4 @@
+interface:
+  display_name: "Task Issue Automation"
+  short_description: "Create and list task-backed issues"
+  default_prompt: "Use $issue-task to validate a task document, create its GitHub issue with repository labels and RFC parent linkage when applicable, or list existing issues."
