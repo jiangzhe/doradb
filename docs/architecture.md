@@ -159,6 +159,14 @@ final cleanup, drains the runtime, and stops purge last. See
 [Engine Component Lifetime](./engine-component-lifetime.md) for the exact
 component ordering and observer ownership contract.
 
+Engine lifecycle admission closes session operation and inspection
+registration against shutdown. After admission drops, stable session operation
+entries account effectful foreground work, per-session observer counts account
+standalone diagnostics and progress waits, and mandatory permits account
+accepted caller or internal cleanup work. The crate-private `EngineRef` remains
+an `Arc<EngineInner>` access wrapper for memory reachability; cloning it does
+not create a separate shutdown blocker.
+
 ## Logging, Checkpoint and Recovery
 
 This system adopts logging and recovery strategy of in-memory database system, which uses value logging and redo-only recovery.

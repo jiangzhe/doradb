@@ -584,6 +584,8 @@ enum CreateIndexBuildPhase {
 }
 
 struct CreateIndexProgress {
+    // Accepted DDL is accounted by its mandatory caller permit and stable
+    // session operation; this handle supplies component access only.
     engine: EngineRef,
     guards: PoolGuards,
     table_id: TableID,
@@ -785,6 +787,8 @@ enum DropIndexBuildPhase {
 }
 
 struct DropIndexProgress {
+    // Accepted DDL is accounted by its mandatory caller permit and stable
+    // session operation; this handle supplies component access only.
     engine: EngineRef,
     table_id: TableID,
     index_no: IndexNo,
