@@ -58,7 +58,7 @@ impl WorkloadRunner for TableDdlRunner {
 
     async fn run(&self, session: &mut Session, plan: &SessionPlan) -> Result<SessionSummary> {
         let mut summary = SessionSummary::default();
-        for _ in 0..plan.rows {
+        for _ in 0..plan.number {
             let table_id = session
                 .create_table(benchmark_table_spec(), Vec::new())
                 .await?;
@@ -123,7 +123,7 @@ impl WorkloadRunner for IndexDdlRunner {
 
     async fn run(&self, session: &mut Session, plan: &SessionPlan) -> Result<SessionSummary> {
         let mut summary = SessionSummary::default();
-        for _ in 0..plan.rows {
+        for _ in 0..plan.number {
             let index_no = session
                 .create_index(self.table_id, benchmark_non_unique_index_spec())
                 .await?;
@@ -166,7 +166,6 @@ fn resolve_ddl_common(manifest: &Manifest, args: &WorkerIterationArgs) -> Result
         worker.session_override(),
         None,
         None,
-        worker.log_sync(),
         worker.include_stats(),
     )
 }

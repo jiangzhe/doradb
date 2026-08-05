@@ -208,7 +208,6 @@ fn resolve_insert_config(
         worker.session_override(),
         common_args.value_size_override(),
         common_args.batch_size_override(),
-        worker.log_sync(),
         worker.include_stats(),
     )?;
     let num = args.operation_count();
@@ -303,7 +302,7 @@ mod tests {
         let manifest = Manifest::new_with_defaults(
             1,
             IndexMode::Unique,
-            DefaultsManifest::new(2, 4, 256, 8).unwrap(),
+            DefaultsManifest::new(2, 4, 256, 8, LogSyncMode::Fsync).unwrap(),
         );
         let config = InsertRandConfig::resolve(&manifest, &args).unwrap();
 

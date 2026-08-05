@@ -53,11 +53,11 @@ impl WorkloadRunner for StmtNoopRunner {
     }
 
     async fn run(&self, session: &mut Session, plan: &SessionPlan) -> Result<SessionSummary> {
-        if plan.rows == 0 {
+        if plan.number == 0 {
             return Ok(SessionSummary::default());
         }
         let mut trx = session.begin_trx()?;
-        for _ in 0..plan.rows {
+        for _ in 0..plan.number {
             if let Err(err) = trx.exec(async |_stmt| Ok::<(), StorageError>(())).await {
                 trx.rollback().await?;
                 return Err(err.into());
@@ -65,7 +65,7 @@ impl WorkloadRunner for StmtNoopRunner {
         }
         trx.commit().await?;
         Ok(SessionSummary {
-            operations: plan.rows,
+            operations: plan.number,
             ..SessionSummary::default()
         })
     }
@@ -119,11 +119,11 @@ impl WorkloadRunner for TrxNoopRunner {
     }
 
     async fn run(&self, session: &mut Session, plan: &SessionPlan) -> Result<SessionSummary> {
-        for _ in 0..plan.rows {
+        for _ in 0..plan.number {
             session.begin_trx()?.commit().await?;
         }
         Ok(SessionSummary {
-            operations: plan.rows,
+            operations: plan.number,
             ..SessionSummary::default()
         })
     }
@@ -137,7 +137,6 @@ fn resolve_noop_common(manifest: &Manifest, args: &WorkerCountArgs) -> Result<Co
         worker.session_override(),
         None,
         None,
-        worker.log_sync(),
         worker.include_stats(),
     )
 }
@@ -146,6 +145,7 @@ fn resolve_noop_common(manifest: &Manifest, args: &WorkerCountArgs) -> Result<Co
 mod tests {
     use super::*;
     use crate::cli::{Cli, Command, IndexMode, LogSyncMode, WorkloadArgs};
+    use crate::manifest::DefaultsManifest;
     use clap::Parser;
 
     #[test]
@@ -162,8 +162,6 @@ mod tests {
             "1",
             "--sessions",
             "2",
-            "--log-sync",
-            "none",
             "--include-stats",
         ])
         .unwrap();
@@ -173,7 +171,12 @@ mod tests {
         else {
             panic!("expected stmt-noop workload");
         };
-        let config = StmtNoopConfig::resolve(&Manifest::new(1, IndexMode::None), &args).unwrap();
+        let manifest = Manifest::new_with_defaults(
+            1,
+            IndexMode::None,
+            DefaultsManifest::new(1, 1, 128, 1, LogSyncMode::None).unwrap(),
+        );
+        let config = StmtNoopConfig::resolve(&manifest, &args).unwrap();
         assert_eq!(config.operation_count(), 3);
         assert_eq!(config.common.threads, 1);
         assert_eq!(config.common.sessions, 2);

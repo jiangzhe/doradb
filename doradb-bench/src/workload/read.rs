@@ -201,7 +201,7 @@ impl WorkloadRunner for TableScanRunner {
     }
 
     async fn run(&self, session: &mut Session, plan: &SessionPlan) -> Result<SessionSummary> {
-        table_scan_iterations(session, self.batch_size, self.table_id, plan.rows).await
+        table_scan_iterations(session, self.batch_size, self.table_id, plan.number).await
     }
 }
 
@@ -392,7 +392,6 @@ fn resolve_read_common(manifest: &Manifest, args: &ReadArgs) -> Result<CommonCon
         worker.session_override(),
         None,
         common_args.batch_size_override(),
-        worker.log_sync(),
         worker.include_stats(),
     )
 }
@@ -405,7 +404,6 @@ fn resolve_worker_common(manifest: &Manifest, args: &IndexStreamArgs) -> Result<
         worker.session_override(),
         None,
         None,
-        worker.log_sync(),
         worker.include_stats(),
     )
 }
@@ -546,12 +544,12 @@ async fn index_scan_ranges(
     range_len: u64,
     plan: &SessionPlan,
 ) -> Result<SessionSummary> {
-    if plan.rows == 0 {
+    if plan.number == 0 {
         return Ok(SessionSummary::default());
     }
-    let batch_size = effective_batch_size(batch_size, plan.rows)?;
+    let batch_size = effective_batch_size(batch_size, plan.number)?;
     let mut ranges = RandomScanRangeGenerator::new(seed, loaded_range, range_len, plan)?;
-    let mut remaining = plan.rows;
+    let mut remaining = plan.number;
     let mut summary = SessionSummary::default();
     while remaining > 0 {
         let batch_len = remaining.min(batch_size as u64);
@@ -613,7 +611,7 @@ async fn index_stream_iterations(
 ) -> Result<SessionSummary> {
     let mut ranges = RandomScanRangeGenerator::new(seed, loaded_range, range_len, plan)?;
     let mut summary = SessionSummary::default();
-    for _ in 0..plan.rows {
+    for _ in 0..plan.number {
         let range = ranges.next_range()?;
         let lower = [Val::from(range.start)];
         let upper = [Val::from(range.end()?)];
@@ -647,7 +645,7 @@ async fn index_stream_iterations(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{Cli, Command, IndexMode, WorkloadArgs};
+    use crate::cli::{Cli, Command, IndexMode, LogSyncMode, WorkloadArgs};
     use crate::manifest::DefaultsManifest;
     use clap::Parser;
 
@@ -655,7 +653,7 @@ mod tests {
         let mut manifest = Manifest::new_with_defaults(
             1,
             index,
-            DefaultsManifest::new(2, 4, 128, batch_size).unwrap(),
+            DefaultsManifest::new(2, 4, 128, batch_size, LogSyncMode::Fsync).unwrap(),
         );
         manifest.record_insert_success(3).unwrap();
         manifest

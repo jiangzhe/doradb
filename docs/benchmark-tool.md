@@ -8,7 +8,8 @@ depending on storage internals.
 The tool supports explicit data loading with `run insert-seq` or
 `run insert-rand`, read workloads over rows already loaded by earlier insert
 runs, isolated statement and transaction lifecycle workloads, a public index
-stream, and successful table/index DDL cycles.
+stream, successful table/index DDL cycles, and public shared table-lock
+acquisition under session- or transaction-owned scope.
 
 Deferred benchmark coverage is tracked in:
 
@@ -34,15 +35,26 @@ The tool has three lifecycle commands.
 placed before the lifecycle command, or supplied through `DORADB_BENCH_ROOT`.
 
 `prepare` requires the benchmark storage root to be a non-existing path. It
-creates that root, creates the benchmark table, and writes
+creates that root, creates the configured benchmark table pool, and writes
 `benchmark-manifest.toml` directly under the storage root. `prepare` is
 schema-only: it never inserts benchmark rows.
 
-`prepare --index <none|unique|non-unique>` is required. The selected index mode
-is persisted in the manifest and is the source of truth for later workload
-compatibility checks. `index-ddl` temporarily owns a create/drop lifecycle on a
-table prepared with `index = "none"` but does not change the persisted prepared
-mode. `prepare --threads/-t` and `prepare --sessions/-s` persist default worker
+`prepare --index <none|unique|non-unique>` defaults to `none`. The selected
+index mode is persisted in the manifest and is the source of truth for later
+workload compatibility checks. `prepare --tables N` defaults to one and
+creates exactly `N` ordinary tables with the same two-column schema and index
+shape. The first created table remains the primary table used by insert, read,
+stream, and index-DDL workloads. Later tables are auxiliary lock targets.
+`index-ddl` temporarily owns a create/drop lifecycle on a primary table
+prepared with `index = "none"` but does not change the persisted prepared mode.
+
+`prepare --log-sync <fsync|fdatasync|none>` defaults to `fsync` and persists
+the redo durability mode for every later workload engine bootstrap. Run
+commands do not accept a durability override; selecting another mode requires
+preparing a new root. Legacy manifests without auxiliary table IDs are treated
+as a one-table pool, and legacy manifests without log sync use `fsync`.
+
+`prepare --threads/-t` and `prepare --sessions/-s` persist default worker
 settings for later `run` commands. Both counts must be positive, and `threads`
 must not exceed `sessions`. If `--sessions` is omitted, it defaults to the
 resolved prepare thread count. `prepare --value-size/-v` and
@@ -56,7 +68,7 @@ benchmark table. Repeated insert runs allocate fresh logical key ranges from
 Read workloads run against rows already loaded by previous successful insert
 runs. They fail before measurement if the manifest has no loaded logical key
 range or if the prepared index mode is incompatible. `stmt-noop`, `trx-noop`,
-and `table-ddl` do not require loaded rows.
+`table-ddl`, and `lock-table` do not require loaded rows.
 `index-ddl` permits either an empty or loaded table.
 
 `cleanup` requires `benchmark-manifest.toml` to exist under the storage root,
@@ -139,31 +151,74 @@ runtime-owned index-DDL measurements: both include mandatory admission and
 accepted execution, while the preloaded case additionally measures the
 existing all-row collection, sort, and index-build architecture.
 
+`lock-table --num N [--scope session|transaction] [--unlock] [--rand]
+[--seed SEED]` measures public `TableLockMode::Shared` acquisition across the
+prepared table pool. `--num` is the positive aggregate lock-iteration count
+partitioned across all sessions, and every successful iteration reports one
+operation. Release work is included in the iteration latency and is not a
+second operation. The scope defaults to `session`.
+
+Without `--rand`, session `i` selects the stable table at
+`i % prepared_table_count` for its complete assigned loop. Sessions may
+outnumber tables and intentionally overlap one shared lock resource. Sessions
+assigned zero operations still follow the normal open/close lifecycle but
+acquire no lock.
+
+`--rand` requires `--unlock` and selects one table with replacement for every
+iteration. An explicitly supplied `--seed` requires `--rand`; the resolved
+seed otherwise defaults to zero. Selection is deterministic per session from
+the seed, session index, and aggregate operation offset, so executor scheduling
+does not change the generated sequence. One-table random runs remain valid.
+For paired comparisons, use the same seed, prepared root, session count, and
+aggregate operation count.
+
+The exact ownership and release paths are:
+
+- Session retained: repeatedly acquire the stable table through
+  `Session::lock_table`; normal session close releases the retained claim
+  inside the measured worker boundary.
+- Session paired: acquire and call `Session::unlock_table` in every iteration,
+  using either the stable or newly randomized target.
+- Transaction retained: begin one transaction for each nonempty session,
+  repeatedly acquire its stable table through `Transaction::lock_table`, then
+  commit after the loop.
+- Transaction paired: begin, acquire, and commit one transaction per
+  iteration, using either the stable or newly randomized target.
+
+Transactions have no public early-unlock operation. Transaction `--unlock`
+therefore includes begin and commit cost as the release boundary;
+`trx-noop` is the matching lifecycle baseline.
+
 `--batch-size` sets the number of operations per transaction. For insert
 workloads it means rows per commit. For read workloads it means lookup requests,
 index-scan requests, or full table-scan iterations per read transaction. It is
 applied per session. `--num` remains the aggregate row or request count across
 all sessions. `index-stream`, the no-op workloads, and the DDL workloads do not
-accept `--batch-size` or `--value-size`; only `index-stream` among those
-workloads accepts `--seed`.
+accept `--batch-size` or `--value-size`. `lock-table` likewise accepts neither
+sizing control; only its randomized paired mode accepts `--seed`.
 
 ## Controls
 
 | Flag | Commands | Default | Usage |
 | --- | --- | --- | --- |
 | `--root`, `-r` | Global | `DORADB_BENCH_ROOT` when set | Selects the DoraDB storage root. An explicit CLI value overrides the environment variable. For `prepare`, the path must not exist. `benchmark-manifest.toml` is always stored directly under this root, and `cleanup` requires it before deleting the root. |
-| `--index`, `-i` | `prepare` | Required | Selects the persisted benchmark table index shape. `none` creates no secondary index. `unique` creates one unique secondary index on `logical_key`. `non-unique` creates one non-unique secondary index on `logical_key`. `index-ddl` requires `none` and restores that logical shape after each cycle. |
+| `--index`, `-i` | `prepare` | `none` | Selects the persisted benchmark table index shape. `none` creates no secondary index. `unique` creates one unique secondary index on `logical_key`. `non-unique` creates one non-unique secondary index on `logical_key`. `index-ddl` requires `none` and restores that logical shape after each cycle. |
+| `--tables` | `prepare` | `1` | Positive number of ordinary benchmark tables. The first is the primary data-workload table; later tables are auxiliary lock targets. |
+| `--log-sync` | `prepare` | `fsync` | Persisted redo-log durability mode used by every later run. `fsync` and `fdatasync` submit the matching native file-sync operation; `none` skips durable sync and is crash-unsafe. |
 | `--threads`, `-t` | `prepare`, `run ...` | `prepare`: `1`; `run`: manifest default | Number of operating-system worker threads that drive the benchmark executor. It is not an async task count. |
 | `--sessions`, `-s` | `prepare`, `run ...` | `prepare`: resolved threads; `run`: manifest default or run threads | Number of independent DoraDB public sessions, meaning logical benchmark clients scheduled on the worker threads. Both values must be positive, and `threads > sessions` is rejected. |
 | `--num`, `-n` | `run insert-seq`, `insert-rand`, `lookup-seq`, `lookup-rand`, `index-scan` | Required | Aggregate row, lookup, or scan request count across all sessions. |
 | `--num`, `-n` | `run table-scan` | `1` | Aggregate full table-scan iterations across all sessions. |
 | `--num`, `-n` | `run stmt-noop`, `trx-noop` | Required | Aggregate statement calls or no-effect transaction cycles across all sessions. |
+| `--num`, `-n` | `run lock-table` | Required | Positive aggregate lock iterations across all sessions. Release work is included in each iteration and is not counted separately. |
 | `--num`, `-n` | `run index-stream`, `table-ddl`, `index-ddl` | `1` | Aggregate stream iterations or create/drop cycles across all sessions. |
 | `--range` | `run index-scan`, `index-stream` | Full loaded key range | Positive number of consecutive logical-key values scanned by every iteration. The value must not exceed the loaded key-range length. |
 | `--value-size`, `-v` | `prepare`, `run insert-seq`, `insert-rand` | `prepare`: `128`; `run`: manifest default | Generated payload size in bytes. Run overrides apply only to insert workloads. |
 | `--batch-size`, `-b` | `prepare`, insert and non-stream read workloads | `prepare`: `1`; `run`: manifest default | Operations per transaction. For inserts this means rows per commit; for reads this means lookup/index-scan requests or table-scan iterations per read transaction. |
-| `--seed` | `run insert-seq`, `insert-rand`, `lookup-rand`, `index-scan`, `index-stream` | `0` | `u64` reproducibility input for payload bytes, randomized insert order, randomized read key selection, or randomized scan bounds. |
-| `--log-sync` | `run ...` | `fsync` | Redo-log durability sync method. `fsync` and `fdatasync` submit the matching native file-sync operation; `none` skips durable sync and is crash-unsafe. |
+| `--scope` | `run lock-table` | `session` | Lock ownership scope: `session` or `transaction`. |
+| `--unlock` | `run lock-table` | `false` | Use a paired release boundary per iteration. Session scope calls `unlock_table`; transaction scope commits. |
+| `--rand` | `run lock-table` | `false` | Select a table with replacement for every iteration. Requires `--unlock`. |
+| `--seed` | `run insert-seq`, `insert-rand`, `lookup-rand`, `index-scan`, `index-stream`, randomized `lock-table` | `0` | `u64` reproducibility input for payload bytes, randomized insert order, randomized read key selection, randomized scan bounds, or random table selection. An explicit lock-table seed requires `--rand`. |
 | `--include-stats` | `run ...` | `false` | Captures and prints internal transaction-system, storage-IO, buffer-pool, and engine-global mandatory-runtime stats. Omit this for prerequisite runs such as data loading before a measured read workload. |
 
 Run defaults resolve as follows:
@@ -175,8 +230,10 @@ Run defaults resolve as follows:
 - If a run provides only `--sessions`, threads come from the manifest default.
 - If a run omits `--value-size` or `--batch-size`, it uses the manifest defaults
   from `prepare`.
+- Every run uses the manifest's prepared `log_sync`; run-level durability
+  overrides are rejected.
 
-## Key Ranges
+## Key Ranges and Table Targets
 
 Benchmark rows are generated from logical `u64` key ids. Insert runs allocate
 disjoint key ranges from `[runtime].next_key` in `benchmark-manifest.toml`, so
@@ -205,8 +262,11 @@ session tasks concurrently, so a session waiting on storage I/O does not
 serialize other ready sessions.
 
 No-op and DDL workloads report the manifest's currently allocated range,
-including `[0, 0)` on an empty prepared root. Only successful insert workloads
-advance `[runtime].next_key` or `[runtime].rows_inserted`; successful no-op,
+including `[0, 0)` on an empty prepared root. Lock workloads report that same
+primary-table range plus the complete prepared table count. Existing data
+workloads always target the primary manifest `table_id`; auxiliary tables are
+only lock targets. Only successful insert workloads advance
+`[runtime].next_key` or `[runtime].rows_inserted`; successful no-op, lock,
 stream, and DDL runs leave the serialized manifest unchanged.
 
 ## Output
@@ -219,7 +279,8 @@ errors are written to stderr.
 - `Configuration`: workload, randomized-key-selection mode, storage root,
   internal-stats mode, row/request count, resolved scan range when applicable,
   value size, batch size, seed, prepared index mode, loaded key range, threads,
-  sessions, log sync mode, and table id.
+  sessions, persisted log sync mode, and primary table id. Lock workloads also
+  report scope, paired release, and prepared table count.
 - `Internal Stats`, only with `--include-stats`: public transaction-system,
   storage-IO, buffer-pool, and mandatory-runtime stats when available. The
   mandatory snapshot is captured once per engine, not summed once per session;
@@ -237,8 +298,11 @@ For DDL, the configuration's `num` remains the requested cycle count while
 twice `num`. For `index-scan` and `index-stream`, `num` and `operations` count
 range scans while `range` records their logical-key width and `rows_returned`
 counts actual result rows or stream items. Average latency remains defined per
-scan. Unrelated counters remain zero for all new workloads. Any storage error
-terminates the command instead of producing a partially successful result.
+scan. For `lock-table`, `operations` equals `num` after every successful run;
+scope release and transaction lifecycle work remain inside that iteration's
+latency. Unrelated row and read counters remain zero. Any acquisition, release,
+transaction, cleanup, or other storage error terminates the command instead of
+producing a partially successful result.
 
 `run` also overwrites these files in the storage root:
 
@@ -248,6 +312,8 @@ terminates the command instead of producing a partially successful result.
   `metric-name` and `metric-value`. A later run without `--include-stats`
   removes stale stats output from the previous run.
 - `benchmark-result.csv`: one header row and one latest-result summary row.
+  Lock results populate the stable `scope`, `unlock`, and `tables` columns;
+  unrelated workloads leave those cells empty.
 
 ## Examples
 
@@ -279,6 +345,47 @@ doradb-bench --root target/doradb-bench/index-scan run index-scan --num 10000 --
 doradb-bench --root target/doradb-bench/index-scan cleanup
 ```
 
+Prepare one multi-table, crash-unsafe root for optimized lock measurements:
+
+```bash
+rtk cargo run --release -p doradb-bench -- \
+  --root target/doradb-bench/lock-table \
+  prepare --tables 16 --log-sync none
+```
+
+Measure retained, paired, and randomized paired session ownership:
+
+```bash
+rtk cargo run --release -p doradb-bench -- \
+  --root target/doradb-bench/lock-table \
+  run lock-table --num 1000000 --threads 4 --sessions 16
+rtk cargo run --release -p doradb-bench -- \
+  --root target/doradb-bench/lock-table \
+  run lock-table --num 1000000 --unlock --threads 4 --sessions 16
+rtk cargo run --release -p doradb-bench -- \
+  --root target/doradb-bench/lock-table \
+  run lock-table --num 1000000 --unlock --rand --seed 1 \
+  --threads 4 --sessions 16
+```
+
+Measure the matching retained, paired, and randomized paired transaction
+ownership. Paired results should be compared with `trx-noop` under the same
+worker and session settings:
+
+```bash
+rtk cargo run --release -p doradb-bench -- \
+  --root target/doradb-bench/lock-table \
+  run lock-table --num 100000 --scope transaction --threads 4 --sessions 16
+rtk cargo run --release -p doradb-bench -- \
+  --root target/doradb-bench/lock-table \
+  run lock-table --num 100000 --scope transaction --unlock \
+  --threads 4 --sessions 16
+rtk cargo run --release -p doradb-bench -- \
+  --root target/doradb-bench/lock-table \
+  run lock-table --num 100000 --scope transaction --unlock --rand --seed 1 \
+  --threads 4 --sessions 16
+```
+
 ## RFC-0025 and RFC-0026 Successful-Path Measurements
 
 The new workloads complete the pre-RFC successful-path shapes needed by
@@ -295,26 +402,26 @@ RFC-0025:
 Run measurements in optimized builds. For example:
 
 ```bash
-rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0025-noop prepare --index unique
-rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0025-noop run stmt-noop --num 1000000 --threads 1 --sessions 1 --log-sync none
-rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0025-noop run trx-noop --num 100000 --threads 4 --sessions 16 --log-sync none
+rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0025-noop prepare --index unique --log-sync none
+rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0025-noop run stmt-noop --num 1000000 --threads 1 --sessions 1
+rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0025-noop run trx-noop --num 100000 --threads 4 --sessions 16
 ```
 
 Prepare and load an equivalently sized unique- or non-unique-index root before
 each paired stream trial:
 
 ```bash
-rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0025-stream prepare --index unique
-rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0025-stream run insert-seq --num 100000 --batch-size 1000 --log-sync none
-rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0025-stream run index-stream --num 100 --range 1000 --seed 1 --threads 1 --sessions 1 --log-sync none
+rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0025-stream prepare --index unique --log-sync none
+rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0025-stream run insert-seq --num 100000 --batch-size 1000
+rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0025-stream run index-stream --num 100 --range 1000 --seed 1 --threads 1 --sessions 1
 ```
 
 Existing workloads should cover batch size one and a large batch, plus
 single-session and multi-thread/multi-session settings:
 
 ```bash
-rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0025-stream run lookup-seq --num 1000000 --batch-size 1 --threads 1 --sessions 1 --log-sync none
-rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0025-stream run lookup-seq --num 1000000 --batch-size 1000 --threads 4 --sessions 16 --log-sync none
+rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0025-stream run lookup-seq --num 1000000 --batch-size 1 --threads 1 --sessions 1
+rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0025-stream run lookup-seq --num 1000000 --batch-size 1000 --threads 4 --sessions 16
 ```
 
 Successful DDL leaves catalog history even after logical drop. Paired
@@ -322,10 +429,10 @@ baseline/candidate DDL trials should therefore use equivalently fresh prepared
 roots and normally one cycle per invocation:
 
 ```bash
-rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0026-table-ddl prepare --index none
-rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0026-table-ddl run table-ddl --log-sync none --include-stats
-rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0026-index-ddl prepare --index none
-rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0026-index-ddl run index-ddl --log-sync none --include-stats
+rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0026-table-ddl prepare --index none --log-sync none
+rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0026-table-ddl run table-ddl --include-stats
+rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0026-index-ddl prepare --index none --log-sync none
+rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0026-index-ddl run index-ddl --include-stats
 ```
 
 The tool supplies workload shapes and fixed result artifacts, not repetition or

@@ -84,12 +84,16 @@ impl fmt::Display for IndexMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
 pub(super) enum LogSyncMode {
+    #[default]
+    #[serde(rename = "fsync")]
     #[value(name = "fsync")]
     Fsync,
+    #[serde(rename = "fdatasync")]
     #[value(name = "fdatasync")]
     Fdatasync,
+    #[serde(rename = "none")]
     #[value(name = "none")]
     None,
 }
@@ -128,6 +132,7 @@ pub(super) enum Workload {
     IndexStream,
     TableDdl,
     IndexDdl,
+    LockTable,
 }
 
 impl fmt::Display for Workload {
@@ -144,6 +149,25 @@ impl fmt::Display for Workload {
             Self::IndexStream => f.write_str("index-stream"),
             Self::TableDdl => f.write_str("table-ddl"),
             Self::IndexDdl => f.write_str("index-ddl"),
+            Self::LockTable => f.write_str("lock-table"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub(super) enum TableLockScope {
+    #[default]
+    #[value(name = "session")]
+    Session,
+    #[value(name = "transaction")]
+    Transaction,
+}
+
+impl fmt::Display for TableLockScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Session => f.write_str("session"),
+            Self::Transaction => f.write_str("transaction"),
         }
     }
 }
@@ -152,8 +176,14 @@ impl fmt::Display for Workload {
 #[derive(Clone, Debug, Args)]
 pub struct PrepareArgs {
     /// Benchmark table index shape.
-    #[arg(long, short = 'i', value_enum)]
+    #[arg(long, short = 'i', value_enum, default_value_t = IndexMode::None)]
     pub(super) index: IndexMode,
+    /// Number of ordinary benchmark tables to prepare.
+    #[arg(long, default_value = "1")]
+    pub(super) tables: NonZeroUsize,
+    /// Redo-log durability sync method persisted for later runs.
+    #[arg(long, value_enum, default_value_t = LogSyncMode::Fsync)]
+    pub(super) log_sync: LogSyncMode,
     /// Default operating-system worker threads for later runs.
     #[arg(long, short = 't', default_value = "1")]
     pub(super) threads: NonZeroUsize,
@@ -193,6 +223,8 @@ pub enum WorkloadArgs {
     TableDdl(WorkerIterationArgs),
     /// Create and drop a non-unique logical-key index per iteration.
     IndexDdl(WorkerIterationArgs),
+    /// Acquire public shared table locks under session or transaction scope.
+    LockTable(LockTableArgs),
 }
 
 #[derive(Clone, Debug, Args)]
@@ -203,9 +235,6 @@ pub(super) struct WorkerArgs {
     /// Independent DoraDB public sessions.
     #[arg(long, short = 's')]
     sessions: Option<NonZeroUsize>,
-    /// Redo-log durability sync method.
-    #[arg(long, value_enum, default_value_t = LogSyncMode::Fsync)]
-    log_sync: LogSyncMode,
     /// Capture and print internal storage-engine stats.
     #[arg(long, default_value_t = false)]
     include_stats: bool,
@@ -220,11 +249,6 @@ impl WorkerArgs {
     /// Return an explicitly configured public session count.
     pub(super) fn session_override(&self) -> Option<usize> {
         self.sessions.map(NonZeroUsize::get)
-    }
-
-    /// Return the configured redo-log durability mode.
-    pub(super) fn log_sync(&self) -> LogSyncMode {
-        self.log_sync
     }
 
     /// Return whether internal engine statistics should be captured.
@@ -252,6 +276,62 @@ impl WorkerCountArgs {
     /// Return the required aggregate operation count.
     pub(super) fn operation_count(&self) -> u64 {
         self.num.get()
+    }
+}
+
+/// Arguments for explicit shared table-lock workloads.
+#[derive(Clone, Debug, Args)]
+pub struct LockTableArgs {
+    #[command(flatten)]
+    count: WorkerCountArgs,
+    /// Lock ownership scope.
+    #[arg(long, value_enum, default_value_t = TableLockScope::Session)]
+    scope: TableLockScope,
+    /// Release each acquired claim inside its measured iteration.
+    #[arg(long, default_value_t = false)]
+    unlock: bool,
+    /// Select a prepared table independently for every iteration.
+    #[arg(long, default_value_t = false, requires = "unlock")]
+    rand: bool,
+    /// Reproducibility seed for random table selection.
+    #[arg(long, requires = "rand")]
+    seed: Option<u64>,
+}
+
+impl LockTableArgs {
+    /// Return shared worker arguments.
+    pub(super) fn worker(&self) -> &WorkerArgs {
+        self.count.worker()
+    }
+
+    /// Return the required aggregate lock iteration count.
+    pub(super) fn operation_count(&self) -> u64 {
+        self.count.operation_count()
+    }
+
+    /// Return the configured lock ownership scope.
+    pub(super) fn scope(&self) -> TableLockScope {
+        self.scope
+    }
+
+    /// Return whether every acquired claim is released inside its iteration.
+    pub(super) fn unlock(&self) -> bool {
+        self.unlock
+    }
+
+    /// Return whether table targets are selected randomly.
+    pub(super) fn random(&self) -> bool {
+        self.rand
+    }
+
+    /// Return whether a seed was explicitly supplied.
+    pub(super) fn explicit_seed(&self) -> Option<u64> {
+        self.seed
+    }
+
+    /// Return the resolved table-selection seed.
+    pub(super) fn seed(&self) -> u64 {
+        self.seed.unwrap_or(0)
     }
 }
 
@@ -601,8 +681,6 @@ mod tests {
             "2",
             "-s",
             "4",
-            "--log-sync",
-            "fdatasync",
         ])
         .unwrap();
         let Command::Run {
@@ -616,14 +694,38 @@ mod tests {
         assert_eq!(insert.common().batch_size_override(), Some(4));
         assert_eq!(insert.common().worker().thread_override(), Some(2));
         assert_eq!(insert.common().worker().session_override(), Some(4));
-        assert_eq!(insert.common().worker().log_sync(), LogSyncMode::Fdatasync);
     }
 
     #[test]
-    fn prepare_requires_index_and_parses_worker_defaults() {
-        let err = Cli::try_parse_from(["doradb-bench", "--root", "root", "prepare"]).unwrap_err();
-        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    fn prepare_defaults_index_tables_and_log_sync() {
+        let cli = Cli::try_parse_from(["doradb-bench", "--root", "root", "prepare"]).unwrap();
+        let Command::Prepare(args) = cli.command else {
+            panic!("expected prepare command");
+        };
+        assert_eq!(args.index, IndexMode::None);
+        assert_eq!(args.tables.get(), 1);
+        assert_eq!(args.log_sync, LogSyncMode::Fsync);
+    }
 
+    #[test]
+    fn prepare_rejects_invalid_table_counts() {
+        for tables in ["0", "invalid"] {
+            assert!(
+                Cli::try_parse_from([
+                    "doradb-bench",
+                    "--root",
+                    "root",
+                    "prepare",
+                    "--tables",
+                    tables,
+                ])
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_parses_topology_durability_and_worker_defaults() {
         let cli = Cli::try_parse_from([
             "doradb-bench",
             "--root",
@@ -631,6 +733,10 @@ mod tests {
             "prepare",
             "--index",
             "non-unique",
+            "--tables",
+            "3",
+            "--log-sync",
+            "fdatasync",
             "--threads",
             "2",
             "--sessions",
@@ -645,6 +751,8 @@ mod tests {
             panic!("expected prepare command");
         };
         assert_eq!(args.index, IndexMode::NonUnique);
+        assert_eq!(args.tables.get(), 3);
+        assert_eq!(args.log_sync, LogSyncMode::Fdatasync);
         assert_eq!(args.threads.get(), 2);
         assert_eq!(args.sessions.unwrap().get(), 4);
         assert_eq!(args.value_size.get(), 256);
@@ -753,8 +861,6 @@ mod tests {
                 "1",
                 "--sessions",
                 "2",
-                "--log-sync",
-                "none",
                 "--include-stats",
             ];
             if let Some(num) = num {
@@ -769,14 +875,144 @@ mod tests {
             let worker = parsed_worker(&workload);
             assert_eq!(worker.thread_override(), Some(1));
             assert_eq!(worker.session_override(), Some(2));
-            assert_eq!(worker.log_sync(), LogSyncMode::None);
             assert!(worker.include_stats());
         }
     }
 
     #[test]
+    fn parse_lock_table_controls_and_defaults() {
+        let cli = Cli::try_parse_from([
+            "doradb-bench",
+            "run",
+            "lock-table",
+            "--root",
+            "root",
+            "--num",
+            "7",
+        ])
+        .unwrap();
+        let Command::Run {
+            workload: WorkloadArgs::LockTable(args),
+        } = cli.command
+        else {
+            panic!("expected lock-table command");
+        };
+        assert_eq!(args.operation_count(), 7);
+        assert_eq!(args.scope(), TableLockScope::Session);
+        assert!(!args.unlock());
+        assert!(!args.random());
+        assert_eq!(args.seed(), 0);
+
+        let cli = Cli::try_parse_from([
+            "doradb-bench",
+            "run",
+            "lock-table",
+            "--root",
+            "root",
+            "--num",
+            "7",
+            "--scope",
+            "transaction",
+            "--unlock",
+            "--rand",
+            "--seed",
+            "9",
+        ])
+        .unwrap();
+        let Command::Run {
+            workload: WorkloadArgs::LockTable(args),
+        } = cli.command
+        else {
+            panic!("expected lock-table command");
+        };
+        assert_eq!(args.scope(), TableLockScope::Transaction);
+        assert!(args.unlock());
+        assert!(args.random());
+        assert_eq!(args.seed(), 9);
+    }
+
+    #[test]
+    fn lock_table_enforces_random_dependencies_and_relevant_controls() {
+        for args in [
+            &[
+                "doradb-bench",
+                "run",
+                "lock-table",
+                "--root",
+                "root",
+                "--num",
+                "1",
+                "--rand",
+            ][..],
+            &[
+                "doradb-bench",
+                "run",
+                "lock-table",
+                "--root",
+                "root",
+                "--num",
+                "1",
+                "--seed",
+                "1",
+            ][..],
+        ] {
+            let err = Cli::try_parse_from(args).unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        }
+
+        for option in [
+            "--tables",
+            "--index",
+            "--batch-size",
+            "--value-size",
+            "--range",
+        ] {
+            let err = Cli::try_parse_from([
+                "doradb-bench",
+                "run",
+                "lock-table",
+                "--root",
+                "root",
+                "--num",
+                "1",
+                option,
+                "1",
+            ])
+            .unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+        }
+    }
+
+    #[test]
+    fn run_workloads_reject_prepare_owned_log_sync() {
+        let cases = [
+            ("insert-seq", true),
+            ("insert-rand", true),
+            ("lookup-seq", true),
+            ("lookup-rand", true),
+            ("table-scan", false),
+            ("index-scan", true),
+            ("stmt-noop", true),
+            ("trx-noop", true),
+            ("index-stream", false),
+            ("table-ddl", false),
+            ("index-ddl", false),
+            ("lock-table", true),
+        ];
+        for (workload, needs_num) in cases {
+            let mut args = vec!["doradb-bench", "run", workload, "--root", "root"];
+            if needs_num {
+                args.extend(["--num", "1"]);
+            }
+            args.extend(["--log-sync", "none"]);
+            let err = Cli::try_parse_from(args).unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+        }
+    }
+
+    #[test]
     fn new_workloads_validate_counts_and_reject_irrelevant_controls() {
-        for name in ["stmt-noop", "trx-noop"] {
+        for name in ["stmt-noop", "trx-noop", "lock-table"] {
             let err =
                 Cli::try_parse_from(["doradb-bench", "run", name, "--root", "root"]).unwrap_err();
             assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
@@ -945,6 +1181,16 @@ mod tests {
                 "root",
                 "--include-stats",
             ],
+            vec![
+                "doradb-bench",
+                "run",
+                "lock-table",
+                "--root",
+                "root",
+                "--num",
+                "3",
+                "--include-stats",
+            ],
         ];
 
         for args in cases {
@@ -1067,6 +1313,7 @@ mod tests {
             WorkloadArgs::IndexStream(_) => Workload::IndexStream,
             WorkloadArgs::TableDdl(_) => Workload::TableDdl,
             WorkloadArgs::IndexDdl(_) => Workload::IndexDdl,
+            WorkloadArgs::LockTable(_) => Workload::LockTable,
         }
     }
 
@@ -1081,6 +1328,7 @@ mod tests {
             WorkloadArgs::StmtNoop(args) | WorkloadArgs::TrxNoop(args) => args.worker(),
             WorkloadArgs::IndexStream(args) => args.worker(),
             WorkloadArgs::TableDdl(args) | WorkloadArgs::IndexDdl(args) => args.worker(),
+            WorkloadArgs::LockTable(args) => args.worker(),
         }
     }
 
@@ -1097,6 +1345,7 @@ mod tests {
             }
             WorkloadArgs::IndexStream(args) => Some(args.iterations()),
             WorkloadArgs::TableDdl(args) | WorkloadArgs::IndexDdl(args) => Some(args.iterations()),
+            WorkloadArgs::LockTable(args) => Some(args.operation_count()),
         }
     }
 }
