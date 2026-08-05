@@ -893,7 +893,10 @@ impl Component for Catalog {
     }
 
     #[inline]
-    fn shutdown(_component: &Self::Owned) {}
+    fn shutdown(_component: &Self::Owned) {
+        // Panic safety: foreground catalog users are drained before component
+        // dispatch, and purge workers stop before catalog owner release.
+    }
 }
 
 /// Dropped table runtime detached from the catalog map for purge destruction.

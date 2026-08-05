@@ -305,7 +305,10 @@ impl Component for MetaPool {
     }
 
     #[inline]
-    fn shutdown(_component: &Self::Owned) {}
+    fn shutdown(_component: &Self::Owned) {
+        // Panic safety: this fixed metadata pool owns no worker. Catalog and
+        // transaction guards are drained before passive owner release.
+    }
 }
 
 impl Component for IndexPool {
@@ -344,7 +347,10 @@ impl Component for IndexPool {
     }
 
     #[inline]
-    fn shutdown(_component: &Self::Owned) {}
+    fn shutdown(_component: &Self::Owned) {
+        // Panic safety: shared I/O and evictor worker components own active
+        // index-pool shutdown and run earlier in reverse order.
+    }
 }
 
 impl Component for MemPool {
@@ -379,7 +385,10 @@ impl Component for MemPool {
     }
 
     #[inline]
-    fn shutdown(_component: &Self::Owned) {}
+    fn shutdown(_component: &Self::Owned) {
+        // Panic safety: shared I/O and evictor worker components own active
+        // memory-pool shutdown and run earlier in reverse order.
+    }
 }
 
 impl Component for DiskPool {
@@ -410,7 +419,10 @@ impl Component for DiskPool {
     }
 
     #[inline]
-    fn shutdown(_component: &Self::Owned) {}
+    fn shutdown(_component: &Self::Owned) {
+        // Panic safety: `SharedPoolEvictorWorkers` stops the readonly domain
+        // before this passive pool-owner hook runs.
+    }
 }
 
 #[cfg(test)]

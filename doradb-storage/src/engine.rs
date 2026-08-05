@@ -12,8 +12,8 @@ use crate::catalog::index::tests::IndexDdlTestController;
 use crate::catalog::table::tests::TableDdlTestController;
 use crate::catalog::{Catalog, CatalogConfig};
 use crate::component::{
-    ComponentRegistry, DiskPoolConfig, EnginePools, IndexPoolConfig, MetaPoolConfig,
-    RegistryBuilder,
+    ComponentRegistry, ComponentShutdownOutcome, DiskPoolConfig, EnginePools, IndexPoolConfig,
+    MetaPoolConfig, RegistryBuilder,
 };
 use crate::conf::EngineConfig;
 use crate::error::{
@@ -386,10 +386,18 @@ impl Engine {
                 "origin=explicit, session_blocker={session_blocker}, operation_state={operation_state}, observer_count={observer_count}, cleanup_queued={cleanup_queued}, mandatory_callers={mandatory_callers}, mandatory_internal={mandatory_internal}"
             )));
         }
-        self.finish_shutdown_locked(inner);
-        obs::info!(
-            "event=engine_lifecycle component=engine action=shutdown_finish result=ok mode=try origin=explicit"
-        );
+        let outcome = self.finish_shutdown_locked(inner);
+        drop(_shutdown);
+        if outcome.is_degraded() {
+            obs::error!(
+                "event=engine_lifecycle component=engine action=shutdown_finish result=panic mode=try origin=explicit"
+            );
+        } else {
+            obs::info!(
+                "event=engine_lifecycle component=engine action=shutdown_finish result=ok mode=try origin=explicit"
+            );
+        }
+        outcome.propagate_or_suppress("engine_try_shutdown");
         Ok(())
     }
 
@@ -431,11 +439,20 @@ impl Engine {
 
             let shutdown_wait = inner.session_registry.first_shutdown_wait();
             if shutdown_wait.is_none() {
-                self.finish_shutdown_locked(inner);
-                obs::info!(
-                    "event=engine_lifecycle component=engine action=shutdown_finish result=ok mode=wait origin={}",
-                    origin.label(),
-                );
+                let outcome = self.finish_shutdown_locked(inner);
+                drop(_shutdown);
+                if outcome.is_degraded() {
+                    obs::error!(
+                        "event=engine_lifecycle component=engine action=shutdown_finish result=panic mode=wait origin={}",
+                        origin.label(),
+                    );
+                } else {
+                    obs::info!(
+                        "event=engine_lifecycle component=engine action=shutdown_finish result=ok mode=wait origin={}",
+                        origin.label(),
+                    );
+                }
+                outcome.propagate_or_suppress("engine_shutdown");
                 return;
             }
             drop(_shutdown);
@@ -448,13 +465,14 @@ impl Engine {
     }
 
     #[inline]
-    fn finish_shutdown_locked(&self, inner: &Arc<EngineInner>) {
+    fn finish_shutdown_locked(&self, inner: &Arc<EngineInner>) -> ComponentShutdownOutcome {
         // Once no registered operation or observer remains, idle session state
         // can release its registry-owned guards before component shutdown.
         inner.session_registry.shutdown_idle();
 
-        self.components().shutdown_all();
+        let outcome = self.components().shutdown_all();
         inner.lifecycle.mark_shutdown();
+        outcome
     }
 
     /// Queues rollback for one shutdown-discovered abandoned transaction.
@@ -811,6 +829,7 @@ mod tests {
     use std::future::pending;
     use std::io::Error as StdIoError;
     use std::os::unix::fs::symlink;
+    use std::panic::{self, AssertUnwindSafe};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc;
@@ -1758,6 +1777,151 @@ mod tests {
             };
             assert_runtime_unavailable_after_shutdown(err);
         });
+    }
+
+    #[test]
+    fn test_engine_shutdown_contains_purge_finish_panic_and_releases_root() {
+        let root = TempDir::new().unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let injected = Arc::new(AtomicBool::new(false));
+        let observed_events = Arc::clone(&events);
+        let observed_injected = Arc::clone(&injected);
+        let observer = observe_spawn_named(move |event| {
+            observed_events.lock().push(event.clone());
+            if event == SpawnTestEvent::Finished("Purge-Dispatcher".to_owned())
+                && !observed_injected.swap(true, Ordering::AcqRel)
+            {
+                panic::panic_any("injected purge dispatcher finish panic");
+            }
+        });
+        let engine =
+            smol::block_on(Engine::bootstrap(test_engine_config_for(root.path()))).unwrap();
+
+        let payload = panic::catch_unwind(AssertUnwindSafe(|| engine.shutdown())).unwrap_err();
+        assert_eq!(
+            payload.downcast_ref::<&'static str>().copied(),
+            Some("injected purge dispatcher finish panic")
+        );
+        assert!(injected.load(Ordering::Acquire));
+        assert_eq!(
+            engine.inner().lifecycle.inspect_state(),
+            EngineLifecycleState::Shutdown
+        );
+
+        // A contained payload is consumed once; neither repeated explicit
+        // shutdown nor eventual owner drop may replay it.
+        engine.shutdown();
+        engine.try_shutdown().unwrap();
+
+        let events = events.lock();
+        let finish_position = |worker: &str| {
+            events
+                .iter()
+                .position(|event| event == &SpawnTestEvent::Finished(worker.to_owned()))
+                .unwrap_or_else(|| panic!("worker did not finish after contained panic: {worker}"))
+        };
+        let redo_finished = finish_position("Log-Thread");
+        let mandatory_1_finished = finish_position("Mandatory-Runtime-1");
+        let mandatory_2_finished = finish_position("Mandatory-Runtime-2");
+        let purge_dispatcher_finished = finish_position("Purge-Dispatcher");
+        let purge_executor_finished = finish_position("Purge-Executor-1");
+        let evictor_finished = finish_position("Shared-Pool-Evictor");
+        let io_finished = finish_position("IO-Thread");
+        assert!(redo_finished < mandatory_1_finished);
+        assert!(redo_finished < mandatory_2_finished);
+        assert!(mandatory_1_finished < purge_dispatcher_finished);
+        assert!(mandatory_2_finished < purge_dispatcher_finished);
+        assert!(purge_dispatcher_finished < evictor_finished);
+        assert!(purge_executor_finished < evictor_finished);
+        assert!(evictor_finished < io_finished);
+        drop(events);
+        drop(observer);
+
+        // Root-lease shutdown is an active hook, so a replacement engine can
+        // start while the degraded terminal owner remains allocated.
+        let replacement =
+            smol::block_on(Engine::bootstrap(test_engine_config_for(root.path()))).unwrap();
+        replacement.shutdown();
+        drop(replacement);
+        drop(engine);
+    }
+
+    #[test]
+    fn test_engine_owner_drop_suppresses_shutdown_panic_during_outer_unwind() {
+        let root = TempDir::new().unwrap();
+        let injected = Arc::new(AtomicBool::new(false));
+        let observed_injected = Arc::clone(&injected);
+        let observer = observe_spawn_named(move |event| {
+            if event == SpawnTestEvent::Finished("Purge-Dispatcher".to_owned())
+                && !observed_injected.swap(true, Ordering::AcqRel)
+            {
+                panic::panic_any("injected owner-drop purge finish panic");
+            }
+        });
+        let engine =
+            smol::block_on(Engine::bootstrap(test_engine_config_for(root.path()))).unwrap();
+
+        let payload = panic::catch_unwind(AssertUnwindSafe(move || {
+            let _engine = engine;
+            panic::panic_any("outer engine owner panic");
+        }))
+        .unwrap_err();
+        assert_eq!(
+            payload.downcast_ref::<&'static str>().copied(),
+            Some("outer engine owner panic")
+        );
+        assert!(injected.load(Ordering::Acquire));
+        drop(observer);
+
+        let replacement =
+            smol::block_on(Engine::bootstrap(test_engine_config_for(root.path()))).unwrap();
+        replacement.shutdown();
+    }
+
+    #[test]
+    fn test_engine_contains_evictor_and_io_finish_panics_after_stop_signals() {
+        for target in ["Shared-Pool-Evictor", "IO-Thread"] {
+            let root = TempDir::new().unwrap();
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let observed_events = Arc::clone(&events);
+            let observer = observe_spawn_named(move |event| {
+                observed_events.lock().push(event.clone());
+                if event == SpawnTestEvent::Finished(target.to_owned()) {
+                    panic::panic_any(format!("injected {target} finish panic"));
+                }
+            });
+            let engine =
+                smol::block_on(Engine::bootstrap(test_engine_config_for(root.path()))).unwrap();
+
+            let payload = panic::catch_unwind(AssertUnwindSafe(|| engine.shutdown())).unwrap_err();
+            assert_eq!(
+                payload.downcast_ref::<String>().map(String::as_str),
+                Some(format!("injected {target} finish panic").as_str())
+            );
+            assert_eq!(
+                engine.inner().lifecycle.inspect_state(),
+                EngineLifecycleState::Shutdown
+            );
+            let events = events.lock();
+            assert!(
+                events.contains(&SpawnTestEvent::Finished(target.to_owned())),
+                "target worker did not finish: {target}"
+            );
+            if target == "Shared-Pool-Evictor" {
+                assert!(
+                    events.contains(&SpawnTestEvent::Finished("IO-Thread".to_owned())),
+                    "I/O teardown did not continue after evictor join panic"
+                );
+            }
+            drop(events);
+            drop(observer);
+
+            let replacement =
+                smol::block_on(Engine::bootstrap(test_engine_config_for(root.path()))).unwrap();
+            replacement.shutdown();
+            drop(replacement);
+            drop(engine);
+        }
     }
 
     #[test]

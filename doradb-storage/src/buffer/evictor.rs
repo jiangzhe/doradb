@@ -839,6 +839,8 @@ impl Component for SharedPoolEvictorWorkers {
 
     #[inline]
     fn shutdown(component: &Self::Owned) {
+        // Panic safety: close every pool domain and wake the evictor before the
+        // only deliberate propagation point, its joined worker payload.
         component.shutdown_flag.store(true, Ordering::SeqCst);
         component.disk_pool.signal_shutdown();
         component.index_pool.signal_shutdown();
@@ -854,7 +856,8 @@ impl Component for SharedPoolEvictorWorkers {
                 Err(payload) => {
                     // Eviction errors are handled through pool state machines.
                     // A worker panic is an invariant failure in shared pool
-                    // eviction.
+                    // eviction. Arbitrary eviction-body unwind remains outside
+                    // registry-level shutdown containment.
                     resume_unwind(payload);
                 }
             }
@@ -1323,7 +1326,9 @@ mod tests {
 
     impl Drop for StartedSharedEvictorRuntime {
         fn drop(&mut self) {
-            self.registry.shutdown_all();
+            self.registry
+                .shutdown_all()
+                .propagate_or_suppress("started_shared_evictor_drop");
         }
     }
 

@@ -8,10 +8,13 @@ use std::any::{Any, TypeId};
 use std::fmt::Display;
 use std::future::Future;
 use std::marker::PhantomData;
+use std::mem::forget;
 use std::ops::Deref;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::PathBuf;
 use std::result::Result as StdResult;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::panicking;
 
 /// One lifecycle-managed engine subsystem.
 ///
@@ -33,6 +36,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 ///   drop. Because shutdown does not receive the registry, components that need
 ///   other objects during teardown must retain those dependencies in their own
 ///   owned state.
+///
+/// Panic safety:
+/// - shutdown must close ingress and signal owned workers before a deliberate
+///   catchable panic point;
+/// - multi-worker owners must attempt every join and required infallible
+///   release before propagating the first captured payload;
+/// - registry containment uses [`AssertUnwindSafe`] only because the component
+///   graph becomes terminal and is never exposed for recovery or reuse;
+/// - that containment does not imply that arbitrary component mutation bodies
+///   implement `UnwindSafe` or `RefUnwindSafe`; and
+/// - normal engine shutdown supplies the documented foreground drain, while
+///   bootstrap rollback must establish its own local shutdown preconditions.
 pub(crate) trait Component: Sized + 'static {
     type Config;
     type Owned: Send + Sync + 'static;
@@ -70,10 +85,17 @@ trait ErasedComponentBox: Send + Sync {
     fn name(&self) -> &'static str;
 
     fn shutdown(&self);
+
+    fn mark_shutdown_panicked(&self);
+
+    fn shutdown_panicked(&self) -> bool;
+
+    fn outstanding_guard_count(&self) -> usize;
 }
 
 struct TypedComponentBox<C: Component> {
     owner: QuiescentBox<C::Owned>,
+    shutdown_panicked: AtomicBool,
 }
 
 impl<C: Component> ErasedComponentBox for TypedComponentBox<C> {
@@ -85,6 +107,138 @@ impl<C: Component> ErasedComponentBox for TypedComponentBox<C> {
     #[inline]
     fn shutdown(&self) {
         C::shutdown(&self.owner);
+    }
+
+    #[inline]
+    fn mark_shutdown_panicked(&self) {
+        self.shutdown_panicked.store(true, Ordering::Release);
+    }
+
+    #[inline]
+    fn shutdown_panicked(&self) -> bool {
+        self.shutdown_panicked.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    fn outstanding_guard_count(&self) -> usize {
+        self.owner.outstanding_guard_count()
+    }
+}
+
+/// Original payload produced by a catchable Rust panic.
+pub(crate) type PanicPayload = Box<dyn Any + Send + 'static>;
+
+/// Retains the first panic payload while safely discarding later payloads.
+#[derive(Default)]
+pub(crate) struct FirstPanic {
+    first_payload: Option<PanicPayload>,
+    panic_count: usize,
+}
+
+impl FirstPanic {
+    /// Captures `payload`, retaining the first and forgetting all later ones.
+    ///
+    /// Forgetting secondary payloads avoids running an arbitrary payload
+    /// destructor on an already panic-sensitive teardown path.
+    #[inline]
+    pub(crate) fn capture(&mut self, payload: PanicPayload) {
+        self.panic_count += 1;
+        if self.first_payload.is_none() {
+            self.first_payload = Some(payload);
+        } else {
+            forget(payload);
+        }
+    }
+
+    /// Resumes the first captured panic after local cleanup is complete.
+    #[inline]
+    pub(crate) fn resume(mut self) {
+        if let Some(payload) = self.first_payload.take() {
+            resume_unwind(payload);
+        }
+    }
+
+    #[inline]
+    fn into_shutdown_outcome(mut self) -> ComponentShutdownOutcome {
+        ComponentShutdownOutcome {
+            first_payload: self.first_payload.take(),
+            panic_count: self.panic_count,
+        }
+    }
+}
+
+impl Drop for FirstPanic {
+    #[inline]
+    fn drop(&mut self) {
+        if let Some(payload) = self.first_payload.take() {
+            forget(payload);
+        }
+    }
+}
+
+/// Aggregate result of one once-only component shutdown dispatch.
+#[must_use = "component shutdown panic outcomes must be propagated or suppressed"]
+pub(crate) struct ComponentShutdownOutcome {
+    first_payload: Option<PanicPayload>,
+    panic_count: usize,
+}
+
+impl ComponentShutdownOutcome {
+    #[inline]
+    fn complete() -> Self {
+        Self {
+            first_payload: None,
+            panic_count: 0,
+        }
+    }
+
+    /// Returns whether one or more component hooks panicked.
+    #[inline]
+    pub(crate) fn is_degraded(&self) -> bool {
+        self.panic_count != 0
+    }
+
+    /// Propagates the first payload, or suppresses it during an existing unwind.
+    ///
+    /// All component hooks and required owner-side terminal transitions must be
+    /// complete before this policy is applied.
+    #[inline]
+    pub(crate) fn propagate_or_suppress(mut self, context: &'static str) {
+        let Some(payload) = self.first_payload.take() else {
+            return;
+        };
+        if panicking() {
+            obs::error!(
+                "event=component_shutdown component=engine action=suppress result=panic context={} panic_count={} reason=thread_already_panicking payload={}",
+                context,
+                self.panic_count,
+                panic_payload_description(payload.as_ref())
+            );
+            forget(payload);
+        } else {
+            obs::error!(
+                "event=component_shutdown component=engine action=propagate result=panic context={} panic_count={} payload={}",
+                context,
+                self.panic_count,
+                panic_payload_description(payload.as_ref())
+            );
+            resume_unwind(payload);
+        }
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn panic_count(&self) -> usize {
+        self.panic_count
+    }
+}
+
+impl Drop for ComponentShutdownOutcome {
+    #[inline]
+    fn drop(&mut self) {
+        if let Some(payload) = self.first_payload.take() {
+            forget(payload);
+        }
     }
 }
 
@@ -144,6 +298,7 @@ pub(crate) struct ComponentRegistry {
     access_map: FastHashMap<TypeId, Box<dyn Any + Send + Sync>>,
     boxed_vec: Vec<Box<dyn ErasedComponentBox>>,
     shutdown_started: AtomicBool,
+    shutdown_degraded: AtomicBool,
 }
 
 impl Default for ComponentRegistry {
@@ -161,6 +316,7 @@ impl ComponentRegistry {
             access_map: FastHashMap::default(),
             boxed_vec: Vec::new(),
             shutdown_started: AtomicBool::new(false),
+            shutdown_degraded: AtomicBool::new(false),
         }
     }
 
@@ -190,8 +346,10 @@ impl ComponentRegistry {
         let owner = QuiescentBox::new(owned);
         let access = C::access(&owner);
         self.access_map.insert(tid, Box::new(access));
-        self.boxed_vec
-            .push(Box::new(TypedComponentBox::<C> { owner }));
+        self.boxed_vec.push(Box::new(TypedComponentBox::<C> {
+            owner,
+            shutdown_panicked: AtomicBool::new(false),
+        }));
     }
 
     /// Return the cloned dependency handle for a previously registered
@@ -224,24 +382,44 @@ impl ComponentRegistry {
     /// Run explicit component shutdown in reverse registration order.
     ///
     /// This is idempotent at the registry level and is intended to stop worker
-    /// activity before owner drop starts waiting on quiescent guards.
+    /// activity before owner drop starts waiting on quiescent guards. Catchable
+    /// hook panics are contained independently so every later hook still runs
+    /// once. The returned outcome retains the first original payload.
     #[inline]
-    pub(crate) fn shutdown_all(&self) {
+    pub(crate) fn shutdown_all(&self) -> ComponentShutdownOutcome {
         if self.shutdown_started.swap(true, Ordering::AcqRel) {
-            return;
+            return ComponentShutdownOutcome::complete();
         }
+        let mut panics = FirstPanic::default();
         for component in self.boxed_vec.iter().rev() {
             let component_name = component.name();
             obs::info!(
                 "event=component_lifecycle component=engine storage_component={} action=shutdown_start result=ok",
                 component_name
             );
-            component.shutdown();
-            obs::info!(
-                "event=component_lifecycle component=engine storage_component={} action=shutdown_finish result=ok",
-                component_name
-            );
+            // The graph is terminal after shutdown starts. This assertion is
+            // scoped to hook dispatch and is not a claim that arbitrary
+            // component-domain mutation is unwind-safe.
+            match catch_unwind(AssertUnwindSafe(|| component.shutdown())) {
+                Ok(()) => {
+                    obs::info!(
+                        "event=component_lifecycle component=engine storage_component={} action=shutdown_finish result=ok",
+                        component_name
+                    );
+                }
+                Err(payload) => {
+                    component.mark_shutdown_panicked();
+                    self.shutdown_degraded.store(true, Ordering::Release);
+                    obs::error!(
+                        "event=component_lifecycle component=engine storage_component={} action=shutdown_finish result=panic payload={}",
+                        component_name,
+                        panic_payload_description(payload.as_ref())
+                    );
+                    panics.capture(payload);
+                }
+            }
         }
+        panics.into_shutdown_outcome()
     }
 }
 
@@ -249,8 +427,33 @@ impl Drop for ComponentRegistry {
     #[inline]
     fn drop(&mut self) {
         self.access_map.clear();
+        if !self.shutdown_degraded.load(Ordering::Acquire) {
+            while let Some(owner) = self.boxed_vec.pop() {
+                drop(owner);
+            }
+            return;
+        }
+
         while let Some(owner) = self.boxed_vec.pop() {
-            drop(owner);
+            let guard_count = owner.outstanding_guard_count();
+            let reason = if owner.shutdown_panicked() {
+                Some("shutdown_panic")
+            } else if guard_count != 0 {
+                Some("outstanding_guards")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                obs::error!(
+                    "event=component_owner component=engine storage_component={} action=leak result=degraded reason={} guard_count={}",
+                    owner.name(),
+                    reason,
+                    guard_count
+                );
+                forget(owner);
+            } else {
+                drop(owner);
+            }
         }
     }
 }
@@ -444,12 +647,13 @@ impl RegistryBuilder {
 impl Drop for RegistryBuilder {
     #[inline]
     fn drop(&mut self) {
-        if let Some(registry) = self.registry.as_ref() {
-            registry.shutdown_all();
-        }
+        let outcome = self.registry.as_ref().map(ComponentRegistry::shutdown_all);
         // Provisions can retain quiescent guards into registered owners, so the
         // shelf must be drained before owner drop starts.
         self.shelf.clear();
+        if let Some(outcome) = outcome {
+            outcome.propagate_or_suppress("registry_builder_drop");
+        }
     }
 }
 
@@ -604,6 +808,18 @@ impl DiskPoolConfig {
     }
 }
 
+/// Renders a panic payload without consuming it.
+#[inline]
+pub(crate) fn panic_payload_description(payload: &(dyn Any + Send)) -> &str {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        message.as_str()
+    } else if let Some(message) = payload.downcast_ref::<&'static str>() {
+        message
+    } else {
+        "<opaque>"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -611,7 +827,9 @@ mod tests {
     use error_stack::Report;
     use parking_lot::Mutex;
     use std::convert::Infallible;
+    use std::panic::{self, AssertUnwindSafe};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     struct ValueComponent;
 
@@ -680,6 +898,14 @@ mod tests {
 
     struct ShutdownProbe {
         events: Arc<Mutex<Vec<&'static str>>>,
+        panic_message: Option<&'static str>,
+        drop_event: &'static str,
+    }
+
+    impl Drop for ShutdownProbe {
+        fn drop(&mut self) {
+            self.events.lock().push(self.drop_event);
+        }
     }
 
     struct ShutdownA;
@@ -711,6 +937,9 @@ mod tests {
                 #[inline]
                 fn shutdown(component: &Self::Owned) {
                     component.events.lock().push($name);
+                    if let Some(message) = component.panic_message {
+                        panic::panic_any(message);
+                    }
                 }
             }
         };
@@ -815,18 +1044,125 @@ mod tests {
         let mut registry = ComponentRegistry::new();
         registry.register::<ShutdownA>(ShutdownProbe {
             events: Arc::clone(&events),
+            panic_message: None,
+            drop_event: "drop-a",
         });
         registry.register::<ShutdownB>(ShutdownProbe {
             events: Arc::clone(&events),
+            panic_message: None,
+            drop_event: "drop-b",
         });
         registry.register::<ShutdownC>(ShutdownProbe {
             events: Arc::clone(&events),
+            panic_message: None,
+            drop_event: "drop-c",
         });
 
-        registry.shutdown_all();
-        registry.shutdown_all();
+        let outcome = registry.shutdown_all();
+        assert!(!outcome.is_degraded());
+        outcome.propagate_or_suppress("component_registry_test");
+        let repeated = registry.shutdown_all();
+        assert!(!repeated.is_degraded());
+        repeated.propagate_or_suppress("component_registry_test");
 
         assert_eq!(events.lock().as_slice(), &["c", "b", "a"]);
+        drop(registry);
+        assert_eq!(
+            events.lock().as_slice(),
+            &["c", "b", "a", "drop-c", "drop-b", "drop-a"]
+        );
+    }
+
+    #[test]
+    fn test_component_registry_contains_all_hook_panics_and_resumes_first_payload() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = ComponentRegistry::new();
+        registry.register::<ShutdownA>(ShutdownProbe {
+            events: Arc::clone(&events),
+            panic_message: None,
+            drop_event: "drop-a",
+        });
+        registry.register::<ShutdownB>(ShutdownProbe {
+            events: Arc::clone(&events),
+            panic_message: Some("second panic"),
+            drop_event: "drop-b",
+        });
+        registry.register::<ShutdownC>(ShutdownProbe {
+            events: Arc::clone(&events),
+            panic_message: Some("first panic"),
+            drop_event: "drop-c",
+        });
+
+        let outcome = registry.shutdown_all();
+        assert!(outcome.is_degraded());
+        assert_eq!(outcome.panic_count(), 2);
+        assert_eq!(events.lock().as_slice(), &["c", "b", "a"]);
+
+        let repeated = registry.shutdown_all();
+        assert!(!repeated.is_degraded());
+        repeated.propagate_or_suppress("component_registry_repeated_test");
+
+        let payload = panic::catch_unwind(AssertUnwindSafe(|| {
+            outcome.propagate_or_suppress("component_registry_test");
+        }))
+        .unwrap_err();
+        assert_eq!(
+            payload.downcast_ref::<&'static str>().copied(),
+            Some("first panic")
+        );
+    }
+
+    #[test]
+    fn test_first_panic_forgets_secondary_payload_without_running_destructor() {
+        struct PanicOnDrop;
+
+        impl Drop for PanicOnDrop {
+            fn drop(&mut self) {
+                panic!("secondary panic payload destructor must not run");
+            }
+        }
+
+        let mut panics = FirstPanic::default();
+        panics.capture(Box::new("first panic"));
+        panics.capture(Box::new(PanicOnDrop));
+        let payload = panic::catch_unwind(AssertUnwindSafe(|| panics.resume())).unwrap_err();
+        assert_eq!(
+            payload.downcast_ref::<&'static str>().copied(),
+            Some("first panic")
+        );
+    }
+
+    #[test]
+    fn test_component_shutdown_payload_is_suppressed_during_existing_unwind() {
+        struct ApplyOutcomeOnDrop(Option<ComponentShutdownOutcome>);
+
+        impl Drop for ApplyOutcomeOnDrop {
+            fn drop(&mut self) {
+                self.0
+                    .take()
+                    .expect("test shutdown outcome")
+                    .propagate_or_suppress("existing_unwind_test");
+            }
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = ComponentRegistry::new();
+        registry.register::<ShutdownA>(ShutdownProbe {
+            events,
+            panic_message: Some("shutdown panic"),
+            drop_event: "drop-a",
+        });
+        let outcome = registry.shutdown_all();
+
+        let payload = panic::catch_unwind(AssertUnwindSafe(|| {
+            let _apply = ApplyOutcomeOnDrop(Some(outcome));
+            panic::panic_any("outer panic");
+        }))
+        .unwrap_err();
+        assert_eq!(
+            payload.downcast_ref::<&'static str>().copied(),
+            Some("outer panic")
+        );
     }
 
     #[test]
@@ -840,6 +1176,196 @@ mod tests {
         drop(registry);
 
         assert_eq!(events.lock().as_slice(), &["access", "owner"]);
+    }
+
+    struct CountedOwner {
+        dropped: Arc<AtomicUsize>,
+    }
+
+    impl Drop for CountedOwner {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+    }
+
+    struct DependencyComponent;
+    struct IndependentComponent;
+    struct ShelfGuardConsumer;
+    struct ShelfPanicComponent;
+    struct SuspectComponent;
+
+    struct SuspectOwned {
+        _dependency: QuiescentGuard<CountedOwner>,
+        _owner: CountedOwner,
+    }
+
+    macro_rules! counted_component {
+        ($component:ident, $access:ty, $access_expr:expr, $shutdown:block) => {
+            impl Component for $component {
+                type Config = ();
+                type Owned = CountedOwner;
+                type Access = $access;
+                type Error = Infallible;
+
+                const NAME: &'static str = stringify!($component);
+
+                async fn build(
+                    _config: Self::Config,
+                    _registry: &mut ComponentRegistry,
+                    _shelf: ShelfScope<'_, Self>,
+                ) -> StdResult<(), Self::Error> {
+                    unreachable!("test-only component")
+                }
+
+                fn access(owner: &QuiescentBox<Self::Owned>) -> Self::Access {
+                    ($access_expr)(owner)
+                }
+
+                fn shutdown(_component: &Self::Owned) $shutdown
+            }
+        };
+    }
+
+    counted_component!(
+        DependencyComponent,
+        QuiescentGuard<CountedOwner>,
+        |owner: &QuiescentBox<CountedOwner>| owner.guard(),
+        {}
+    );
+    counted_component!(
+        IndependentComponent,
+        (),
+        |_owner: &QuiescentBox<CountedOwner>| (),
+        {}
+    );
+
+    counted_component!(
+        ShelfPanicComponent,
+        (),
+        |_owner: &QuiescentBox<CountedOwner>| (),
+        {
+            panic!("builder shelf shutdown panic");
+        }
+    );
+
+    impl Component for ShelfGuardConsumer {
+        type Config = ();
+        type Owned = ();
+        type Access = ();
+        type Error = Infallible;
+
+        const NAME: &'static str = "ShelfGuardConsumer";
+
+        async fn build(
+            _config: Self::Config,
+            _registry: &mut ComponentRegistry,
+            _shelf: ShelfScope<'_, Self>,
+        ) -> StdResult<(), Self::Error> {
+            unreachable!("test-only component")
+        }
+
+        fn access(_owner: &QuiescentBox<Self::Owned>) -> Self::Access {}
+
+        fn shutdown(_component: &Self::Owned) {}
+    }
+
+    impl Supplier<ShelfGuardConsumer> for DependencyComponent {
+        type Provision = QuiescentGuard<CountedOwner>;
+    }
+
+    impl Component for SuspectComponent {
+        type Config = ();
+        type Owned = SuspectOwned;
+        type Access = ();
+        type Error = Infallible;
+
+        const NAME: &'static str = "SuspectComponent";
+
+        async fn build(
+            _config: Self::Config,
+            _registry: &mut ComponentRegistry,
+            _shelf: ShelfScope<'_, Self>,
+        ) -> StdResult<(), Self::Error> {
+            unreachable!("test-only component")
+        }
+
+        fn access(_owner: &QuiescentBox<Self::Owned>) -> Self::Access {}
+
+        fn shutdown(_component: &Self::Owned) {
+            panic!("suspect shutdown");
+        }
+    }
+
+    #[test]
+    fn test_degraded_registry_drop_leaks_only_suspect_guard_closure() {
+        let dependency_dropped = Arc::new(AtomicUsize::new(0));
+        let independent_dropped = Arc::new(AtomicUsize::new(0));
+        let suspect_dropped = Arc::new(AtomicUsize::new(0));
+        let mut registry = ComponentRegistry::new();
+        registry.register::<DependencyComponent>(CountedOwner {
+            dropped: Arc::clone(&dependency_dropped),
+        });
+        let external_guard = registry.dependency::<DependencyComponent>();
+        registry.register::<IndependentComponent>(CountedOwner {
+            dropped: Arc::clone(&independent_dropped),
+        });
+        registry.register::<SuspectComponent>(SuspectOwned {
+            _dependency: external_guard.clone(),
+            _owner: CountedOwner {
+                dropped: Arc::clone(&suspect_dropped),
+            },
+        });
+
+        let outcome = registry.shutdown_all();
+        assert!(outcome.is_degraded());
+        drop(outcome);
+        drop(registry);
+
+        assert_eq!(independent_dropped.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(suspect_dropped.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(dependency_dropped.load(AtomicOrdering::Relaxed), 0);
+        // The dependency allocation was intentionally leaked, so a guard
+        // retained past registry destruction can still release safely.
+        drop(external_guard);
+    }
+
+    #[test]
+    fn test_builder_clears_shelf_guards_before_degraded_registry_drop() {
+        let dependency_dropped = Arc::new(AtomicUsize::new(0));
+        let suspect_dropped = Arc::new(AtomicUsize::new(0));
+        let payload = panic::catch_unwind(AssertUnwindSafe(|| {
+            let mut builder = RegistryBuilder::new();
+            let shelf_guard = {
+                let registry = builder
+                    .registry
+                    .as_mut()
+                    .expect("test builder retains registry");
+                registry.register::<DependencyComponent>(CountedOwner {
+                    dropped: Arc::clone(&dependency_dropped),
+                });
+                registry.dependency::<DependencyComponent>()
+            };
+            builder
+                .shelf
+                .scope::<DependencyComponent>()
+                .put::<ShelfGuardConsumer>(shelf_guard);
+            builder
+                .registry
+                .as_mut()
+                .expect("test builder retains registry")
+                .register::<ShelfPanicComponent>(CountedOwner {
+                    dropped: Arc::clone(&suspect_dropped),
+                });
+            drop(builder);
+        }))
+        .unwrap_err();
+
+        assert_eq!(
+            payload.downcast_ref::<&'static str>().copied(),
+            Some("builder shelf shutdown panic")
+        );
+        assert_eq!(dependency_dropped.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(suspect_dropped.load(AtomicOrdering::Relaxed), 0);
     }
 
     struct Upstream;

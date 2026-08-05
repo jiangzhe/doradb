@@ -120,7 +120,10 @@ impl Component for EnginePoisoner {
     }
 
     #[inline]
-    fn shutdown(_component: &Self::Owned) {}
+    fn shutdown(_component: &Self::Owned) {
+        // Panic safety: this passive owner remains available through every
+        // earlier component hook that can report fatal runtime state.
+    }
 }
 
 #[cfg(test)]
