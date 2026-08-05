@@ -1,5 +1,7 @@
 use crate::completion::{Completion, CompletionTake};
-use crate::component::{Component, ComponentRegistry, ShelfScope, Supplier};
+use crate::component::{
+    Component, ComponentRegistry, FirstPanic, ShelfScope, Supplier, panic_payload_description,
+};
 use crate::conf::MandatoryRuntimeConfig;
 use crate::error::{
     CompletionErrorBridge, CompletionResult, ConfigError, ConfigResult, DiscloseError, FatalError,
@@ -20,7 +22,7 @@ use std::any::Any;
 use std::fmt::{self, Display, Formatter};
 use std::future::Future;
 use std::mem::take;
-use std::panic::{AssertUnwindSafe, resume_unwind};
+use std::panic::AssertUnwindSafe;
 use std::result::Result as StdResult;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -780,7 +782,10 @@ impl Component for MandatoryRuntime {
     }
 
     #[inline]
-    fn shutdown(_component: &Self::Owned) {}
+    fn shutdown(_component: &Self::Owned) {
+        // Panic safety: caller/internal admission, stop signalling, and runner
+        // joins belong to the later `MandatoryRuntimeWorkers` component.
+    }
 }
 
 impl Supplier<MandatoryRuntimeWorkers> for MandatoryRuntime {
@@ -856,9 +861,21 @@ impl Drop for PendingMandatoryRuntimeWorkers {
         self.runtime.admission.close();
         self.runtime.internal_admission.close();
         self.runtime.signal_stop();
+        let mut panics = FirstPanic::default();
         for handle in take(&mut self.handles) {
-            let _ = handle.join();
+            let worker = handle.thread().name().unwrap_or("unknown").to_owned();
+            if let Err(payload) = handle.join() {
+                obs::error!(
+                    "event=worker_startup_rollback component=mandatory_runtime worker={} action=join result=panic payload={}",
+                    worker,
+                    panic_payload_description(payload.as_ref())
+                );
+                panics.capture(payload);
+            }
         }
+        // A component-startup error remains the primary diagnostic; dropping
+        // the accumulator forgets captured rollback payloads after all joins.
+        drop(panics);
     }
 }
 
@@ -910,24 +927,52 @@ impl MandatoryRuntimeWorkersOwned {
         // teardown. Bootstrap rollback may reach this owner before the engine
         // lifecycle exists, so close it defensively while still requiring every
         // accepted caller to have drained.
+        let mut panics = FirstPanic::default();
         self.runtime.admission.close();
         let (_, callers) = self.runtime.admission.inspect();
-        assert!(
-            callers == 0,
-            "mandatory runner shutdown requires drained caller admission: callers={callers}"
-        );
+        if callers != 0 {
+            let message = format!(
+                "mandatory runner shutdown requires drained caller admission: callers={callers}"
+            );
+            obs::error!(
+                "event=worker_shutdown component=mandatory_runtime worker=all action=validate_callers result=panic payload={}",
+                message
+            );
+            panics.capture(Box::new(message));
+            // Accepted callers can still depend on the runners and internal
+            // admission remaining live. Report the invariant without starting
+            // worker teardown.
+            panics.resume();
+            return;
+        }
         self.runtime.internal_admission.close();
         runtime::block_on(self.runtime.internal_admission.drain());
         self.runtime.signal_stop();
         for handle in take(&mut *self.handles.lock()) {
-            if let Err(panic) = handle.join() {
-                resume_unwind(panic);
+            let worker = handle.thread().name().unwrap_or("unknown").to_owned();
+            if let Err(payload) = handle.join() {
+                obs::error!(
+                    "event=worker_shutdown component=mandatory_runtime worker={} action=join result=panic payload={}",
+                    worker,
+                    panic_payload_description(payload.as_ref())
+                );
+                panics.capture(payload);
             }
         }
-        assert!(
-            self.runtime.executor.is_empty(),
-            "mandatory executor must be empty after admission drain and runner join"
-        );
+        if !self.runtime.executor.is_empty() {
+            let message =
+                "mandatory executor must be empty after admission drain and runner join".to_owned();
+            obs::error!(
+                "event=worker_shutdown component=mandatory_runtime worker=all action=validate_executor result=panic payload={}",
+                message
+            );
+            panics.capture(Box::new(message));
+        }
+        // Panic safety after caller admission is confirmed drained: both
+        // admissions are closed, internal work is drained, every runner is
+        // signalled and joined, and terminal validation is complete before the
+        // first join or executor-invariant payload is resumed.
+        panics.resume();
     }
 }
 
@@ -1145,7 +1190,9 @@ mod tests {
     use crate::component::RegistryBuilder;
     use crate::conf::MandatoryRuntimeConfig;
     use crate::error::{ErrorKind, OperationError};
-    use crate::thread::fail_spawn_named;
+    use crate::thread::{SpawnTestEvent, fail_spawn_named, observe_spawn_named};
+    use std::panic::{self, AssertUnwindSafe};
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
@@ -1598,7 +1645,116 @@ mod tests {
         });
         mandatory.close_admission();
         runtime::block_on(mandatory.drain_callers());
-        registry.shutdown_all();
+        registry
+            .shutdown_all()
+            .propagate_or_suppress("mandatory_runtime_test");
+    }
+
+    #[test]
+    fn mandatory_shutdown_joins_every_runner_before_resuming_first_panic() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed_events = Arc::clone(&events);
+        let observer = observe_spawn_named(move |event| {
+            observed_events.lock().push(event.clone());
+            match event {
+                SpawnTestEvent::Finished(name) if name == "Mandatory-Runtime-1" => {
+                    panic::panic_any("first mandatory runner panic");
+                }
+                SpawnTestEvent::Finished(name) if name == "Mandatory-Runtime-2" => {
+                    panic::panic_any("second mandatory runner panic");
+                }
+                _ => {}
+            }
+        });
+        let (registry, mandatory) = runtime::block_on(async {
+            let mut builder = RegistryBuilder::new();
+            builder.build::<EnginePoisoner>(()).await.unwrap();
+            builder
+                .build::<MandatoryRuntime>(
+                    MandatoryRuntimeConfig::default()
+                        .worker_threads(2)
+                        .concurrency_limit(1),
+                )
+                .await
+                .unwrap();
+            builder.build::<MandatoryRuntimeWorkers>(()).await.unwrap();
+            let registry = builder.finish();
+            let mandatory = registry.dependency::<MandatoryRuntime>();
+            (registry, mandatory)
+        });
+        mandatory.close_admission();
+        runtime::block_on(mandatory.drain_callers());
+
+        let outcome = registry.shutdown_all();
+        assert!(outcome.is_degraded());
+        let events = events.lock();
+        assert!(events.contains(&SpawnTestEvent::Finished("Mandatory-Runtime-1".to_owned())));
+        assert!(events.contains(&SpawnTestEvent::Finished("Mandatory-Runtime-2".to_owned())));
+        drop(events);
+        drop(observer);
+
+        let payload = panic::catch_unwind(AssertUnwindSafe(|| {
+            outcome.propagate_or_suppress("mandatory_multi_runner_test");
+        }))
+        .unwrap_err();
+        assert_eq!(
+            payload.downcast_ref::<&'static str>().copied(),
+            Some("first mandatory runner panic")
+        );
+    }
+
+    #[test]
+    fn mandatory_shutdown_preserves_runners_until_callers_drain() {
+        let (registry, mandatory) = runtime::block_on(async {
+            let mut builder = RegistryBuilder::new();
+            builder.build::<EnginePoisoner>(()).await.unwrap();
+            builder
+                .build::<MandatoryRuntime>(
+                    MandatoryRuntimeConfig::default()
+                        .worker_threads(1)
+                        .concurrency_limit(1),
+                )
+                .await
+                .unwrap();
+            builder.build::<MandatoryRuntimeWorkers>(()).await.unwrap();
+            let registry = builder.finish();
+            let mandatory = registry.dependency::<MandatoryRuntime>();
+            (registry, mandatory)
+        });
+        let caller = runtime::block_on(mandatory.admission.acquire(mandatory.clone())).unwrap();
+        let workers = MandatoryRuntimeWorkersOwned {
+            runtime: mandatory.clone(),
+            handles: Mutex::new(vec![std::thread::spawn(|| {})]),
+            shutdown_started: AtomicBool::new(false),
+        };
+
+        let payload = panic::catch_unwind(AssertUnwindSafe(|| workers.shutdown())).unwrap_err();
+        let caller_admission = mandatory.admission.inspect();
+        let internal_admission = mandatory.internal_admission.inspect();
+        let stopping = mandatory.stopping.load(Ordering::Acquire);
+        let handle_count = workers.handles.lock().len();
+
+        // Always restore the normal shutdown preconditions before asserting so
+        // a regression cannot leave mandatory-runtime runners detached.
+        drop(caller);
+        for handle in take(&mut *workers.handles.lock()) {
+            handle.join().unwrap();
+        }
+        drop(workers);
+        mandatory.close_admission();
+        runtime::block_on(mandatory.drain_callers());
+        registry
+            .shutdown_all()
+            .propagate_or_suppress("mandatory_active_caller_shutdown_test");
+
+        assert_eq!(
+            payload.downcast_ref::<String>().map(String::as_str),
+            Some("mandatory runner shutdown requires drained caller admission: callers=1")
+        );
+        assert_eq!(caller_admission, (true, 1));
+        assert_eq!(internal_admission, (false, 0));
+        assert!(!stopping);
+        assert_eq!(handle_count, 1);
     }
 
     #[test]
@@ -1663,7 +1819,9 @@ mod tests {
         });
         mandatory.close_admission();
         runtime::block_on(mandatory.drain_callers());
-        registry.shutdown_all();
+        registry
+            .shutdown_all()
+            .propagate_or_suppress("mandatory_runtime_test");
     }
 
     #[test]
@@ -1742,7 +1900,9 @@ mod tests {
         });
         mandatory.close_admission();
         runtime::block_on(mandatory.drain_callers());
-        registry.shutdown_all();
+        registry
+            .shutdown_all()
+            .propagate_or_suppress("mandatory_runtime_test");
     }
 
     #[test]
@@ -1790,7 +1950,9 @@ mod tests {
         });
         mandatory.close_admission();
         runtime::block_on(mandatory.drain_callers());
-        registry.shutdown_all();
+        registry
+            .shutdown_all()
+            .propagate_or_suppress("mandatory_runtime_test");
     }
 
     #[test]
@@ -1847,7 +2009,9 @@ mod tests {
         });
         mandatory.close_admission();
         runtime::block_on(mandatory.drain_callers());
-        registry.shutdown_all();
+        registry
+            .shutdown_all()
+            .propagate_or_suppress("mandatory_runtime_test");
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
     }
 
@@ -1901,7 +2065,9 @@ mod tests {
         });
         mandatory.close_admission();
         runtime::block_on(mandatory.drain_callers());
-        registry.shutdown_all();
+        registry
+            .shutdown_all()
+            .propagate_or_suppress("mandatory_runtime_test");
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
     }
 }

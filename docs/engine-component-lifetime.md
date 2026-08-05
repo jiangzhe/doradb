@@ -347,8 +347,79 @@ Normal shutdown is:
    its local event, and repeat from the first current blocker
 6. remove idle registry-owned sessions
 7. call `ComponentRegistry::shutdown_all()` in reverse registration order;
-   redo stops before internal mandatory admission drains, and purge stops last
-8. mark lifecycle state as `Shutdown`
+   redo stops before internal mandatory admission drains, purge stops last, and
+   each hook is independently panic-contained so later hooks still run
+8. mark lifecycle state as `Shutdown`, release the owner shutdown mutex, report
+   the aggregate outcome, and only then propagate or suppress its first payload
+
+### Panic-contained shutdown
+
+Component shutdown has a narrow terminal panic-containment contract. The
+registry catches each hook with `catch_unwind(AssertUnwindSafe(...))`, reports
+every panic, marks that exact owner suspect, retains the first original payload,
+and continues in exact reverse registration order. Every hook is invoked at
+most once. A repeated registry or engine shutdown returns an empty/already
+complete outcome and never replays a payload.
+
+`AssertUnwindSafe` is justified only because the graph becomes terminal and is
+never exposed for recovery or reuse. It does not state that the storage engine,
+transaction system, or worker mutation bodies implement `UnwindSafe` or
+`RefUnwindSafe`. An active hook must close ingress and signal its workers before
+a deliberate catchable panic point. A multi-worker hook must attempt every
+join and required infallible release before exposing the first payload.
+Bootstrap rollback establishes its own local preconditions because the normal
+engine foreground drain does not yet exist.
+
+After dispatch, the engine publishes `Shutdown` and releases the shutdown mutex
+before applying the aggregate policy. An explicit caller on a non-unwinding
+thread receives the first original payload through `resume_unwind`. If owner
+drop is already running during another unwind, the payload is reported and
+forgotten so teardown does not introduce a second panic. Later payloads are
+reported and forgotten without running arbitrary payload destructors. Either
+case is terminal: callers must not recover or reuse the in-memory component
+graph after any contained hook panic.
+
+The complete reverse-order shutdown audit is:
+
+| Reverse order | Component | Shutdown authority and panic caveat |
+| ---: | --- | --- |
+| 1 | `TransactionRedoWorkers` | Closes group commit, queues the shutdown marker, joins the log thread, releases the active log file, then exposes a captured join payload. Arbitrary redo-body unwind is not repaired. |
+| 2 | `MandatoryRuntimeWorkers` | Closes caller/internal admission, records caller-drain validation, drains internal work, signals stop, joins every runner, validates the executor, then exposes the first invariant or join payload. Accepted task bodies retain their domain supervision. |
+| 3 | `TransactionPurgeWorkers` | Sends `Purge::Stop`, joins the dispatcher and every executor, and retains an explicit transaction-system guard so degraded leakage pins the dependency closure. Arbitrary mid-purge unwind remains unsupported. |
+| 4 | `TransactionSystem` | Passive hook. Redo, mandatory-runtime, and purge worker owners hold active shutdown authority; transaction state is terminal after a worker panic. |
+| 5 | `Catalog` | Passive hook. Purge stops before owner release, and foreground catalog users were drained before component dispatch. |
+| 6 | `LockManager` | Passive hook. The session/operation drain removes its users. |
+| 7 | `SharedPoolEvictorWorkers` | Sets the shutdown flag, signals every pool, wakes the worker, and then joins. Join propagation follows all stop signalling; arbitrary eviction-body unwind is not repaired. |
+| 8 | `FileSystemWorkers` | Closes every I/O ingress lane, drains the worker, and then joins. Arbitrary I/O-body unwind is not repaired. |
+| 9 | `MemPool` | Passive hook. Shared evictor and I/O worker components own active shutdown. |
+| 10 | `IndexPool` | Passive hook with the same split authority as `MemPool`. |
+| 11 | `MetaPool` | Passive owner with no worker; release follows catalog and transaction guard teardown. |
+| 12 | `DiskPool` | Passive hook. The shared evictor stops earlier in reverse order. |
+| 13 | `FileSystem` | Passive hook. `FileSystemWorkers` owns active I/O shutdown and retains this dependency. |
+| 14 | `MandatoryRuntime` | Passive hook. `MandatoryRuntimeWorkers` owns admission drain, stop, and joins. |
+| 15 | `EnginePoisoner` | Passive hook. It remains available through components that may report fatal state. |
+| 16 | `StorageRootLease` | Takes and drops the lock file last, so root ownership brackets subordinate storage activity even after a contained earlier panic. |
+
+Any new production component, dependency edge, or panic-capable shutdown
+operation must update this inventory and its adjacent `Panic safety:` comment.
+
+The purge position also closes the CTS/STS boundary used by containment.
+Foreground sessions and operations are gone before component hooks. Redo joins
+before purge stop, so no later ordered commit producer can hand off a committed
+payload, and mandatory internal work drains before purge. `Purge::Stop` is a
+terminal queue barrier: already observed messages are absorbed, while pending
+committed payloads may remain owned by GC buckets without requiring physical
+reclamation during shutdown. After purge joins, no later hook reads CTS, STS,
+GC buckets, row undo, retained roots, metadata history, or dropped-table state.
+
+`published_gc_horizon` records a fresh active-bucket scan and does not claim
+physical purge. `global_visible_sts` advances only after all selected bucket,
+retirement, retained-root, metadata-history, and dropped-table work for a
+complete cycle succeeds. A failed join proves worker termination, not unwind
+safety for an arbitrary in-progress purge mutation. The deterministic shutdown
+fault occurs at the named-worker `Finished("Purge-Dispatcher")` observer after
+the body returns; it does not exercise a mid-`purge_trx_list_inner` unwind or
+the `CommittedTrx`/raw-`RowUndoRef` ownership limitation.
 
 `Engine::try_shutdown()` uses the same first-blocker traversal without
 installing an event or listener. It queues at most that blocker's cleanup hint
@@ -440,6 +511,25 @@ Dropping `EngineInner` first releases `EngineCore` and its runtime-held
 quiescent guards before registry-owned component owners start their final
 `QuiescentBox<T>` drains.
 
+Panic-free registry drop keeps the strict behavior: it clears published access
+handles and drops owners in reverse order, allowing `QuiescentBox` to wait and
+therefore expose hidden guard-lifetime defects. If any hook panicked, registry
+drop uses a separate degraded policy after owner-side reachability is gone. A
+suspect owner is intentionally leaked. An independent non-suspect owner with a
+zero sampled guard count is dropped normally. A non-suspect owner with
+outstanding guards is also leaked, allowing retained dependency guards to
+produce a bounded closure rather than a hang or use-after-free. Each leak is
+reported with component name, reason (`shutdown_panic` or
+`outstanding_guards`), and the acquire-ordered guard-count sample.
+
+The bounded unit is the suspect component plus owners pinned through its
+quiescent dependency closure for one failed engine. Independent owners,
+including the root lease owner after its active release hook, remain
+reclaimable. Builder rollback clears transient shelf provisions before this
+policy or payload propagation because provisions may retain quiescent guards.
+This protects teardown-owned allocations only; it cannot restore memory that an
+arbitrary worker body already released while unwinding.
+
 `Engine::drop` invokes the same synchronous drain as `Engine::shutdown()`.
 An unintended owner drop can therefore block indefinitely while
 caller-retained foreground operations, observers, mandatory work, or
@@ -459,10 +549,14 @@ for `QuiescentGuard<T>`. The contract is:
 - owner allocation address stays stable for the full guard lifetime
 - guard acquisition is one atomic increment
 - guard release is one atomic decrement
-- owner drop blocks until the outstanding guard count reaches zero
+- normal owner drop blocks until the outstanding guard count reaches zero
+- terminal degraded registry release may sample the count with acquire
+  ordering and intentionally leak an owner instead of entering that wait
 
-The current contract is still purely blocking owner drop. There is no local
-timeout or diagnostic hook in the runtime.
+The sample is valid only after registry access handles, engine-core handles, and
+builder shelf provisions are gone. At that point zero cannot increase because
+no guard remains from which another guard can be cloned. Ordinary runtime code
+does not use the observation and there is no forced timeout or cancellation.
 
 ## Pool Guard Provenance
 

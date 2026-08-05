@@ -21,6 +21,7 @@ use error_stack::Report;
 use flume::{Receiver, Sender};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
+use std::mem::forget;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
@@ -328,6 +329,13 @@ impl TransactionSystem {
     /// secondary-index cleanup fails, purge cannot replay the same in-memory
     /// mutation safely, so it poisons runtime admission before returning the
     /// fatal purge error.
+    ///
+    /// Panic containment does not cover an arbitrary unwind from the mutation
+    /// body below. The owned `Vec<CommittedTrx>` can contain boxed row undo
+    /// backing non-owning `RowUndoRef` links that are still reachable from row
+    /// version chains. A worker join panic proves thread termination only;
+    /// domain-level unwind support would first need explicit retention or
+    /// quarantine for that ownership graph.
     #[inline]
     pub(super) async fn purge_trx_list(
         &self,
@@ -1316,8 +1324,18 @@ fn reclaim_partial_purge_workers(
 ) -> Report<RuntimeError> {
     let mut join_panics = 0usize;
     for handle in handles {
-        if handle.join().is_err() {
+        let worker = handle.thread().name().unwrap_or("unknown").to_owned();
+        if let Err(payload) = handle.join() {
             join_panics += 1;
+            obs::error!(
+                "event=worker_startup_rollback component=trx worker={} action=join result=panic payload={}",
+                worker,
+                crate::component::panic_payload_description(payload.as_ref())
+            );
+            // The spawn report is the primary startup diagnostic. Forget the
+            // secondary payload after observing it rather than invoking an
+            // arbitrary payload destructor during rollback.
+            forget(payload);
         }
     }
     if join_panics != 0 {

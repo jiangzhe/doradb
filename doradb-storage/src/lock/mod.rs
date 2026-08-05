@@ -611,7 +611,10 @@ impl Component for LockManager {
     }
 
     #[inline]
-    fn shutdown(_component: &Self::Owned) {}
+    fn shutdown(_component: &Self::Owned) {
+        // Panic safety: the engine session/operation drain removes every lock
+        // manager user before this passive hook is dispatched.
+    }
 }
 
 #[derive(Default)]

@@ -1698,6 +1698,8 @@ impl Component for FileSystemWorkers {
     /// Stop ingress, then join the worker thread after all queued work drains.
     #[inline]
     fn shutdown(component: &Self::Owned) {
+        // Panic safety: all table/index/memory ingress lanes close before the
+        // only deliberate propagation point, the joined I/O worker payload.
         component.fs.shutdown_io_clients();
         if let Some(handle) = component.handle.lock().take() {
             match handle.join().inspect_err(|_| {
@@ -1709,7 +1711,8 @@ impl Component for FileSystemWorkers {
                 Err(payload) => {
                     // IO request failures are reported through their
                     // completions. A worker panic indicates broken IO-thread
-                    // invariants.
+                    // invariants; arbitrary I/O-body unwind is not repaired by
+                    // registry-level shutdown containment.
                     resume_unwind(payload);
                 }
             }
@@ -2062,7 +2065,10 @@ impl Component for FileSystem {
     }
 
     #[inline]
-    fn shutdown(_component: &Self::Owned) {}
+    fn shutdown(_component: &Self::Owned) {
+        // Panic safety: active I/O shutdown belongs to `FileSystemWorkers`,
+        // which retains this filesystem dependency and runs earlier.
+    }
 }
 
 /// Build the filesystem facade together with the deferred shared worker state.
@@ -2182,7 +2188,9 @@ pub(crate) mod tests {
     impl TestFileSystem {
         #[inline]
         pub(crate) fn shutdown(&self) {
-            self.registry.shutdown_all();
+            self.registry
+                .shutdown_all()
+                .propagate_or_suppress("test_filesystem_shutdown");
         }
 
         #[inline]
@@ -2222,7 +2230,9 @@ pub(crate) mod tests {
         #[inline]
         fn drop(&mut self) {
             self.fs.take();
-            self.registry.shutdown_all();
+            self.registry
+                .shutdown_all()
+                .propagate_or_suppress("test_filesystem_drop");
         }
     }
 

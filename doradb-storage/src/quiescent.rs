@@ -75,6 +75,11 @@ impl QuiescentGuardCount {
         wait_for_guard_count_zero(&self.0);
     }
 
+    #[inline]
+    fn acquire_load(&self) -> usize {
+        self.0.load(Ordering::Acquire)
+    }
+
     #[cfg(test)]
     #[inline]
     fn load(&self, ordering: Ordering) -> usize {
@@ -128,6 +133,16 @@ impl<T> QuiescentBox<T> {
     #[inline]
     pub(crate) fn guard(&self) -> QuiescentGuard<T> {
         QuiescentGuard::new(self.inner_ptr())
+    }
+
+    /// Samples the number of outstanding guards for degraded owner release.
+    ///
+    /// The registry uses this only after clearing every published access handle
+    /// and all other owner-side reachability. At that terminal boundary, a zero
+    /// count cannot increase because no guard remains from which to clone.
+    #[inline]
+    pub(crate) fn outstanding_guard_count(&self) -> usize {
+        self.inner.as_ref().get_ref().guard_count.acquire_load()
     }
 }
 
@@ -315,13 +330,20 @@ mod tests {
     #[test]
     fn test_quiescent_guard_clone_keeps_same_pointer() {
         let owner = QuiescentBox::new(vec![1u64, 2, 3, 4]);
+        assert_eq!(owner.outstanding_guard_count(), 0);
         let guard = owner.guard();
+        assert_eq!(owner.outstanding_guard_count(), 1);
         let guard_clone = guard.clone();
+        assert_eq!(owner.outstanding_guard_count(), 2);
         let owner_ptr = from_ref::<Vec<u64>>(&owner);
         assert_eq!(guard.as_ptr(), owner_ptr);
         assert_eq!(guard_clone.as_ptr(), owner_ptr);
         assert_eq!(guard.iter().sum::<u64>(), 10);
         assert_eq!(guard_clone.iter().sum::<u64>(), 10);
+        drop(guard);
+        assert_eq!(owner.outstanding_guard_count(), 1);
+        drop(guard_clone);
+        assert_eq!(owner.outstanding_guard_count(), 0);
     }
 
     #[test]

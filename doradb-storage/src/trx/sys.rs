@@ -3,7 +3,8 @@ use crate::buffer::PoolGuards;
 use crate::catalog::{Catalog, CatalogCheckpointScanConfig, TableCache};
 use crate::completion::Completion;
 use crate::component::{
-    Component, ComponentRegistry, EnginePools, IndexPool, MemPool, MetaPool, ShelfScope, Supplier,
+    Component, ComponentRegistry, EnginePools, FirstPanic, IndexPool, MemPool, MetaPool,
+    ShelfScope, Supplier, panic_payload_description,
 };
 use crate::conf::TrxSysConfig;
 use crate::error::{
@@ -47,7 +48,6 @@ use flume::{Receiver, Sender};
 use parking_lot::{Mutex, MutexGuard};
 use std::collections::BTreeMap;
 use std::mem::{forget, take};
-use std::panic::resume_unwind;
 use std::result::Result as StdResult;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -200,11 +200,15 @@ impl PendingTransactionPurgeStartup {
         self,
         trx_sys: QuiescentGuard<TransactionSystem>,
     ) -> RuntimeOrFatalResult<TransactionPurgeWorkersOwned> {
-        let purge_threads =
-            TransactionSystem::start_purge_threads(trx_sys, self.pool_guards, self.purge_rx)
-                .attach("phase=start_transaction_purge_workers")
-                .map_err(RuntimeOrFatalError::from)?;
+        let purge_threads = TransactionSystem::start_purge_threads(
+            trx_sys.clone(),
+            self.pool_guards,
+            self.purge_rx,
+        )
+        .attach("phase=start_transaction_purge_workers")
+        .map_err(RuntimeOrFatalError::from)?;
         Ok(TransactionPurgeWorkersOwned {
+            _trx_sys: trx_sys,
             purge_tx: self.purge_tx,
             purge_threads: Mutex::new(purge_threads),
             shutdown_started: AtomicBool::new(false),
@@ -247,6 +251,9 @@ impl PendingTransactionRedoStartup {
 
 /// Owned purge workers retained below the mandatory runtime.
 pub(crate) struct TransactionPurgeWorkersOwned {
+    // This explicit dependency pins the transaction domain if degraded
+    // registry release must leak a suspect purge owner.
+    _trx_sys: QuiescentGuard<TransactionSystem>,
     purge_tx: Sender<Purge>,
     purge_threads: Mutex<Vec<JoinHandle<()>>>,
     shutdown_started: AtomicBool,
@@ -263,19 +270,23 @@ impl TransactionPurgeWorkersOwned {
                 "event=worker_shutdown component=trx worker=purge action=signal_stop result=ignored reason=receiver_closed"
             );
         }
+        let mut panics = FirstPanic::default();
         let purge_threads = { take(&mut *self.purge_threads.lock()) };
         for handle in purge_threads {
-            if let Err(payload) = handle.join().inspect_err(|_| {
+            let worker = handle.thread().name().unwrap_or("unknown").to_owned();
+            if let Err(payload) = handle.join() {
                 obs::error!(
-                    "event=worker_shutdown component=trx worker=purge action=join result=error reason=panic"
+                    "event=worker_shutdown component=trx worker={} action=join result=panic payload={}",
+                    worker,
+                    panic_payload_description(payload.as_ref())
                 );
-            }) {
-                // Purge known failures should be represented before thread
-                // exit. A join panic is an invariant failure that must remain
-                // visible to the owner.
-                resume_unwind(payload);
+                panics.capture(payload);
             }
         }
+        // Panic safety: `Purge::Stop` is sent before all handles are taken, and
+        // every dispatcher/executor join is attempted before the first original
+        // payload is resumed. This does not make mid-purge mutation unwind-safe.
+        panics.resume();
     }
 }
 
@@ -381,12 +392,21 @@ impl TransactionRedoWorkersOwned {
             group_commit.queue.push_back(Commit::Shutdown);
             redo_log.group_commit.notify_one();
         }
+        let mut panics = FirstPanic::default();
         if let Some(handle) = self.log_thread.lock().take()
             && let Err(payload) = handle.join()
         {
-            resume_unwind(payload);
+            obs::error!(
+                "event=worker_shutdown component=trx worker=Log-Thread action=join result=panic payload={}",
+                panic_payload_description(payload.as_ref())
+            );
+            panics.capture(payload);
         }
         drop(redo_log.group_commit.lock().log_file.take());
+        // Panic safety: group-commit admission and the shutdown marker precede
+        // the join, and active log-file release completes before propagation.
+        // Arbitrary redo-body unwind remains outside this containment boundary.
+        panics.resume();
     }
 }
 
@@ -1571,14 +1591,19 @@ impl TransactionSystem {
             group_commit_g.queue.push_back(Commit::Shutdown);
             redo_log.group_commit.notify_one();
         }
-        handle
-            .join()
-            .inspect_err(|_| {
+        match handle.join() {
+            Ok(()) => true,
+            Err(payload) => {
                 obs::error!(
-                    "event=worker_startup_rollback component=trx worker=Log-Thread action=join result=error reason=panic"
+                    "event=worker_startup_rollback component=trx worker=Log-Thread action=join result=panic payload={}",
+                    panic_payload_description(payload.as_ref())
                 );
-            })
-            .is_ok()
+                // Startup already has a primary typed diagnostic. Retain that
+                // result and avoid a payload destructor on the rollback path.
+                forget(payload);
+                false
+            }
+        }
     }
 
     /// Submit abandoned transaction rollback cleanup.
@@ -1718,7 +1743,11 @@ impl Component for TransactionSystem {
     }
 
     #[inline]
-    fn shutdown(_component: &Self::Owned) {}
+    fn shutdown(_component: &Self::Owned) {
+        // Panic safety: active redo, mandatory-runtime, and purge authority is
+        // owned by later worker components. This passive hook runs only after
+        // those hooks attempted terminal shutdown.
+    }
 }
 
 #[inline]
@@ -1842,8 +1871,10 @@ pub(crate) mod tests {
     use crate::log::redo::{RowRedo, RowRedoKind};
     use crate::recovery::stream::RedoSegmentCtsRange;
     use crate::session::tests::SessionTestExt;
+    use crate::thread::{SpawnTestEvent, observe_spawn_named};
     use crate::trx::{PrecommitTrxPayload, RetiredRowPageBatch, SharedTrxStatus};
     use crate::value::Val;
+    use std::panic::{self, AssertUnwindSafe};
     use std::sync::{Arc, Barrier, OnceLock};
     use std::thread::spawn;
     use tempfile::TempDir;
@@ -1973,6 +2004,48 @@ pub(crate) mod tests {
         .await
         .unwrap();
         (temp_dir, engine)
+    }
+
+    #[test]
+    fn redo_shutdown_releases_active_file_before_resuming_join_panic() {
+        let observer = observe_spawn_named(|event| {
+            if event == SpawnTestEvent::Finished("Log-Thread".to_owned()) {
+                panic::panic_any("injected redo finish panic");
+            }
+        });
+        let (_temp_dir, engine) =
+            smol::block_on(build_trx_sys_redo_test_engine_with_log_file_max_size(
+                "redo_shutdown_panic",
+                1024 * 1024,
+            ));
+        assert!(
+            engine
+                .inner()
+                .trx_sys
+                .redo_log
+                .group_commit
+                .lock()
+                .log_file
+                .is_some()
+        );
+
+        let payload = panic::catch_unwind(AssertUnwindSafe(|| engine.shutdown())).unwrap_err();
+        assert_eq!(
+            payload.downcast_ref::<&'static str>().copied(),
+            Some("injected redo finish panic")
+        );
+        assert!(
+            engine
+                .inner()
+                .trx_sys
+                .redo_log
+                .group_commit
+                .lock()
+                .log_file
+                .is_none()
+        );
+        engine.shutdown();
+        drop(observer);
     }
 
     fn add_large_system_redo(sys_trx: &mut SysTrx, value_count: usize) {

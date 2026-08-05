@@ -1071,6 +1071,9 @@ impl Component for StorageRootLease {
 
     #[inline]
     fn shutdown(component: &Self::Owned) {
+        // Panic safety: this component is registered first, so taking and
+        // dropping the lock file happens after every subordinate shutdown hook,
+        // including hooks reached after a contained panic.
         drop(component.file.lock().take());
     }
 }
