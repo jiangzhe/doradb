@@ -13,7 +13,7 @@ mod secondary_index;
 mod unique_index;
 pub(crate) mod util;
 
-use crate::buffer::{BufferPool, PoolGuards};
+use crate::buffer::{BufferPool, PoolGuard, PoolGuards};
 use crate::error::RuntimeResult;
 use crate::id::BlockID;
 use crate::table::TableRootSnapshot;
@@ -136,7 +136,8 @@ impl<'op, 'idx, P: BufferPool + 'static> CurrentIndexReadHandle<'op, 'idx, P> {
 /// Owned executable state retained by one caller-driven index stream.
 pub(crate) struct OwnedCurrentIndexReadHandle<'trx, P: BufferPool + 'static> {
     index: Arc<SecondaryIndex<P>>,
-    guards: PoolGuards,
+    index_pool_guard: PoolGuard,
+    disk_pool_guard: PoolGuard,
     root: BlockID,
     _transaction: PhantomData<&'trx mut Transaction>,
 }
@@ -146,14 +147,16 @@ impl<'trx, P: BufferPool + 'static> OwnedCurrentIndexReadHandle<'trx, P> {
     #[inline]
     pub(crate) fn new(
         index: Arc<SecondaryIndex<P>>,
-        guards: PoolGuards,
+        index_pool_guard: PoolGuard,
+        disk_pool_guard: PoolGuard,
         root: BlockID,
         _proof: &TrxReadProof<'_>,
         _transaction: PhantomData<&'trx mut Transaction>,
     ) -> Self {
         Self {
             index,
-            guards,
+            index_pool_guard,
+            disk_pool_guard,
             root,
             _transaction: PhantomData,
         }

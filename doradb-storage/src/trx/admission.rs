@@ -434,7 +434,7 @@ mod tests {
         resource: LockResource,
         mode: LockMode,
     ) -> bool {
-        debug_snapshot(engine.lock_manager())
+        debug_snapshot(engine.inner().core.lock_manager())
             .entries
             .iter()
             .any(|entry| {
@@ -461,7 +461,7 @@ mod tests {
                 futures::poll!(future.as_mut()),
                 std::task::Poll::Pending
             ));
-            if debug_snapshot(engine.lock_manager())
+            if debug_snapshot(engine.inner().core.lock_manager())
                 .entries
                 .iter()
                 .any(|entry| {
@@ -480,7 +480,7 @@ mod tests {
         let metadata = LockResource::TableMetadata(table_id);
         let data = LockResource::TableData(table_id);
         assert!(
-            debug_snapshot(engine.lock_manager())
+            debug_snapshot(engine.inner().core.lock_manager())
                 .entries
                 .iter()
                 .all(|entry| entry.resource != metadata && entry.resource != data)
@@ -519,7 +519,7 @@ mod tests {
                 LockMode::Shared
             ));
             assert!(
-                debug_snapshot(engine.lock_manager())
+                debug_snapshot(engine.inner().core.lock_manager())
                     .entries
                     .iter()
                     .all(|entry| {
@@ -635,7 +635,7 @@ mod tests {
                         LockMode::IntentExclusive
                     ));
                 }
-                let snapshot = debug_snapshot(engine.lock_manager());
+                let snapshot = debug_snapshot(engine.inner().core.lock_manager());
                 assert!(
                     snapshot
                         .entries
@@ -801,10 +801,17 @@ mod tests {
                 .unwrap();
 
             let mut ddl_session = engine.new_session().unwrap();
-            let table = engine.catalog().get_table_now(table_id).unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table_now(table_id)
+                .unwrap();
             let before_layout = table.layout_snapshot();
             let before_root = table.file().active_root_unchecked().clone();
             let before_current_cts = engine
+                .inner()
+                .core
                 .catalog()
                 .resolve_user_table_current(table_id)
                 .unwrap()
@@ -816,6 +823,8 @@ mod tests {
             observe_metadata_x_waiter(&engine, metadata, create.as_mut()).await;
             assert_eq!(
                 engine
+                    .inner()
+                    .core
                     .catalog()
                     .resolve_user_table_current(table_id)
                     .unwrap()
@@ -855,7 +864,12 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let table = engine.catalog().get_table_now(table_id).unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table_now(table_id)
+                .unwrap();
 
             let mut bound_session = engine.new_session().unwrap();
             let bound_session_id = bound_session.id();
@@ -866,6 +880,8 @@ mod tests {
                 .await
                 .unwrap();
             let before_current_cts = engine
+                .inner()
+                .core
                 .catalog()
                 .resolve_user_table_current(table_id)
                 .unwrap()
@@ -882,6 +898,8 @@ mod tests {
                 LockMode::Shared
             ));
             let waiting_current = engine
+                .inner()
+                .core
                 .catalog()
                 .resolve_user_table_current(table_id)
                 .unwrap();
@@ -906,6 +924,8 @@ mod tests {
             bound_trx.commit().await.unwrap();
             drop_index.await.unwrap();
             let current = engine
+                .inner()
+                .core
                 .catalog()
                 .resolve_user_table_current(table_id)
                 .unwrap();
@@ -928,7 +948,12 @@ mod tests {
             let (_temp_dir, engine) = test_engine("admission_drop_table_waits_for_binding").await;
             let table_id = table2(&engine).await;
             let metadata_resource = LockResource::TableMetadata(table_id);
-            let table = engine.catalog().get_table_now(table_id).unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table_now(table_id)
+                .unwrap();
             let mut bound_session = engine.new_session().unwrap();
             let bound_session_id = bound_session.id();
             let mut bound_trx = bound_session.begin_trx().unwrap();
@@ -938,11 +963,17 @@ mod tests {
                 .await
                 .unwrap();
             let before_current_cts = engine
+                .inner()
+                .core
                 .catalog()
                 .resolve_user_table_current(table_id)
                 .unwrap()
                 .effective_cts();
-            let before_history_count = engine.catalog().user_table_history_version_count(table_id);
+            let before_history_count = engine
+                .inner()
+                .core
+                .catalog()
+                .user_table_history_version_count(table_id);
             let before_generation = table.layout_snapshot().generation();
             let before_root_ts = table.file().active_root_unchecked().root_ts;
 
@@ -956,6 +987,8 @@ mod tests {
                 LockMode::Shared
             ));
             let waiting_current = engine
+                .inner()
+                .core
                 .catalog()
                 .resolve_user_table_current(table_id)
                 .unwrap();
@@ -966,7 +999,11 @@ mod tests {
                     .is_some_and(|current| Arc::ptr_eq(current, &table))
             );
             assert_eq!(
-                engine.catalog().user_table_history_version_count(table_id),
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .user_table_history_version_count(table_id),
                 before_history_count
             );
             assert_eq!(table.layout_snapshot().generation(), before_generation);
@@ -978,10 +1015,21 @@ mod tests {
             bound_trx.rollback().await.unwrap();
             drop_table.await.unwrap();
             assert!(!matches!(
-                engine.catalog().resolve_user_table_current(table_id),
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .resolve_user_table_current(table_id),
                 Some(CurrentTableState::Live { .. })
             ));
-            assert!(engine.catalog().get_table_now(table_id).is_none());
+            assert!(
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .get_table_now(table_id)
+                    .is_none()
+            );
             assert_no_table_locks(&engine, table_id);
 
             drop(ddl_session);
@@ -1004,6 +1052,8 @@ mod tests {
             let mut ddl_session = engine.new_session().unwrap();
             ddl_session.drop_index(table_id, 0).await.unwrap();
             let visible = engine
+                .inner()
+                .core
                 .catalog()
                 .resolve_user_table_visible(table_id, old_sts)
                 .unwrap();
@@ -1012,6 +1062,8 @@ mod tests {
             };
             assert!(visible.metadata().idx.index_spec(0).is_some());
             let CurrentTableState::Live { metadata, .. } = engine
+                .inner()
+                .core
                 .catalog()
                 .resolve_user_table_current(table_id)
                 .unwrap()
@@ -1045,7 +1097,7 @@ mod tests {
                 );
             }
             assert!(
-                debug_snapshot(engine.lock_manager())
+                debug_snapshot(engine.inner().core.lock_manager())
                     .entries
                     .iter()
                     .all(|entry| entry.owner != old_owner
@@ -1075,11 +1127,17 @@ mod tests {
             let mut ddl_session = engine.new_session().unwrap();
             ddl_session.drop_table(table_id).await.unwrap();
             assert!(matches!(
-                engine.catalog().resolve_user_table_current(table_id),
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .resolve_user_table_current(table_id),
                 Some(CurrentTableState::Dropped { .. })
             ));
             assert!(matches!(
                 engine
+                    .inner()
+                    .core
                     .catalog()
                     .resolve_user_table_visible(table_id, old_sts),
                 Some(ResolvedVisibleTableMetadata::Live(_))
@@ -1107,7 +1165,7 @@ mod tests {
                 );
             }
             assert!(
-                debug_snapshot(engine.lock_manager())
+                debug_snapshot(engine.inner().core.lock_manager())
                     .entries
                     .iter()
                     .all(|entry| entry.owner != old_owner

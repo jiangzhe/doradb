@@ -259,6 +259,8 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
                 engine
+                    .inner()
+                    .core
                     .catalog()
                     .storage
                     .columns()
@@ -266,6 +268,8 @@ mod tests {
                     .await
                     .disclose()?;
                 engine
+                    .inner()
+                    .core
                     .catalog()
                     .storage
                     .columns()
@@ -273,6 +277,8 @@ mod tests {
                     .await
                     .disclose()?;
                 engine
+                    .inner()
+                    .core
                     .catalog()
                     .storage
                     .columns()
@@ -290,6 +296,8 @@ mod tests {
             trx.exec(async |stmt| {
                 assert!(
                     engine
+                        .inner()
+                        .core
                         .catalog()
                         .storage
                         .columns()
@@ -299,6 +307,8 @@ mod tests {
                 );
                 assert!(
                     !engine
+                        .inner()
+                        .core
                         .catalog()
                         .storage
                         .columns()
@@ -314,6 +324,8 @@ mod tests {
             trx.commit().await.unwrap();
 
             let cols_42 = engine
+                .inner()
+                .core
                 .catalog()
                 .storage
                 .columns()
@@ -324,6 +336,8 @@ mod tests {
             assert_eq!(cols_42[0].column_no, 0);
 
             let cols_43 = engine
+                .inner()
+                .core
                 .catalog()
                 .storage
                 .columns()
@@ -337,6 +351,8 @@ mod tests {
             trx.exec(async |stmt| {
                 assert!(
                     !engine
+                        .inner()
+                        .core
                         .catalog()
                         .storage
                         .columns()
@@ -346,6 +362,8 @@ mod tests {
                 );
                 assert!(
                     engine
+                        .inner()
+                        .core
                         .catalog()
                         .storage
                         .columns()
@@ -355,6 +373,8 @@ mod tests {
                 );
                 assert!(
                     engine
+                        .inner()
+                        .core
                         .catalog()
                         .storage
                         .columns()
@@ -371,6 +391,8 @@ mod tests {
 
             assert!(
                 engine
+                    .inner()
+                    .core
                     .catalog()
                     .storage
                     .columns()
@@ -381,6 +403,8 @@ mod tests {
             );
             assert!(
                 engine
+                    .inner()
+                    .core
                     .catalog()
                     .storage
                     .columns()
@@ -431,6 +455,8 @@ mod tests {
             trx.exec(async |stmt| {
                 for column in &columns {
                     engine
+                        .inner()
+                        .core
                         .catalog()
                         .storage
                         .columns()
@@ -449,6 +475,8 @@ mod tests {
             trx.exec(async |stmt| {
                 assert_eq!(
                     engine
+                        .inner()
+                        .core
                         .catalog()
                         .storage
                         .columns()
@@ -459,6 +487,8 @@ mod tests {
                 );
                 assert_eq!(
                     engine
+                        .inner()
+                        .core
                         .catalog()
                         .storage
                         .columns()
@@ -476,6 +506,8 @@ mod tests {
 
             assert!(
                 engine
+                    .inner()
+                    .core
                     .catalog()
                     .storage
                     .columns()
@@ -485,6 +517,8 @@ mod tests {
                     .is_empty()
             );
             let remaining = engine
+                .inner()
+                .core
                 .catalog()
                 .storage
                 .columns()

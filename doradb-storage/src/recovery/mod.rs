@@ -1472,7 +1472,13 @@ mod tests {
             "test setup should create retained redo suffix"
         );
 
-        let table = engine.catalog().get_table(table_id).await.unwrap();
+        let table = engine
+            .inner()
+            .core
+            .catalog()
+            .get_table(table_id)
+            .await
+            .unwrap();
         assert_checkpoint_published(&mut session, table.table_id()).await;
         drop(table);
         let mut durability_trx = session.begin_trx().unwrap();
@@ -1491,7 +1497,7 @@ mod tests {
             .checkpoint_catalog()
             .await
             .unwrap();
-        publish_first_redo_log_seq_for_test(&engine.catalog().storage, 1)
+        publish_first_redo_log_seq_for_test(&engine.inner().core.catalog().storage, 1)
             .await
             .unwrap();
         (engine, table_id)
@@ -1512,6 +1518,8 @@ mod tests {
             .await
             .unwrap();
         let replay_floor = engine
+            .inner()
+            .core
             .catalog()
             .storage
             .checkpoint_snapshot()
@@ -1620,9 +1628,9 @@ mod tests {
         catalog_replay_start_ts: TrxID,
     ) -> RecoveryCoordinator<'a> {
         let resources = RecoveryResources::new(
-            engine.inner().pools(),
+            engine.inner().core.pools.clone(),
             engine.inner().table_fs.clone(),
-            engine.catalog(),
+            engine.inner().core.catalog(),
         );
         let config = &engine.inner().trx_sys.config;
         let file_prefix = config.file_prefix().unwrap();
@@ -1795,6 +1803,8 @@ mod tests {
         trx.exec(async |stmt| {
             assert!(
                 engine
+                    .inner()
+                    .core
                     .catalog()
                     .storage
                     .tables()
@@ -1803,6 +1813,8 @@ mod tests {
                     .disclose()?
             );
             engine
+                .inner()
+                .core
                 .catalog()
                 .storage
                 .tables()
@@ -1816,6 +1828,8 @@ mod tests {
                 .await
                 .disclose()?;
             engine
+                .inner()
+                .core
                 .catalog()
                 .storage
                 .indexes()
@@ -1830,6 +1844,8 @@ mod tests {
                 .await
                 .disclose()?;
             engine
+                .inner()
+                .core
                 .catalog()
                 .storage
                 .index_columns()
@@ -1865,6 +1881,8 @@ mod tests {
         trx.exec(async |stmt| {
             assert_eq!(
                 engine
+                    .inner()
+                    .core
                     .catalog()
                     .storage
                     .index_columns()
@@ -1875,6 +1893,8 @@ mod tests {
             );
             assert!(
                 engine
+                    .inner()
+                    .core
                     .catalog()
                     .storage
                     .indexes()
@@ -1902,7 +1922,13 @@ mod tests {
         metadata: Arc<TableMetadata>,
         cts: TrxID,
     ) {
-        let table = engine.catalog().get_table(table_id).await.unwrap();
+        let table = engine
+            .inner()
+            .core
+            .catalog()
+            .get_table(table_id)
+            .await
+            .unwrap();
         let table_file = Arc::clone(table.file());
         let mut roots = table_file
             .active_root_unchecked()
@@ -1935,13 +1961,21 @@ mod tests {
         next_index_no: u16,
         index_one_active: bool,
     ) {
-        let table = engine.catalog().get_table(table_id).await.unwrap();
+        let table = engine
+            .inner()
+            .core
+            .catalog()
+            .get_table(table_id)
+            .await
+            .unwrap();
         let metadata = table.metadata();
         assert_eq!(metadata.idx.next_index_no(), next_index_no);
         assert_eq!(metadata.idx.index_spec(1).is_some(), index_one_active);
 
         let session = engine.new_session().unwrap();
         let table_obj = engine
+            .inner()
+            .core
             .catalog()
             .storage
             .tables()
@@ -1951,6 +1985,8 @@ mod tests {
             .unwrap();
         assert_eq!(table_obj.next_index_no, next_index_no);
         let indexes = engine
+            .inner()
+            .core
             .catalog()
             .storage
             .indexes()
@@ -2384,7 +2420,7 @@ mod tests {
                 .checkpoint_catalog()
                 .await
                 .unwrap();
-            let snapshot = engine.catalog().storage.checkpoint_snapshot();
+            let snapshot = engine.inner().core.catalog().storage.checkpoint_snapshot();
             assert!(snapshot.catalog_replay_start_ts > ddl_cts);
             drop(engine);
 
@@ -2427,7 +2463,7 @@ mod tests {
                 .checkpoint_catalog()
                 .await
                 .unwrap();
-            let snapshot = engine.catalog().storage.checkpoint_snapshot();
+            let snapshot = engine.inner().core.catalog().storage.checkpoint_snapshot();
             assert!(snapshot.catalog_replay_start_ts > ddl_cts);
             drop(engine);
 
@@ -2637,6 +2673,8 @@ mod tests {
             drop(session);
 
             let batch = engine
+                .inner()
+                .core
                 .catalog()
                 .scan_checkpoint_batch(
                     engine.inner().trx_sys.persisted_watermark_cts(),
@@ -2741,8 +2779,22 @@ mod tests {
             .await
             .unwrap();
 
-            assert!(engine.catalog().get_table(table_id).await.is_some());
-            let table = engine.catalog().get_table(table_id).await.unwrap();
+            assert!(
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .get_table(table_id)
+                    .await
+                    .is_some()
+            );
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
             assert_eq!(table.metadata().as_ref(), &expected_metadata);
 
             drop(table);
@@ -2843,7 +2895,13 @@ mod tests {
             .await
             .unwrap();
 
-            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
             let session = engine.new_session().unwrap();
             let mut rows = 0usize;
             {
@@ -2903,7 +2961,7 @@ mod tests {
                 .checkpoint_catalog()
                 .await
                 .unwrap();
-            let snap = engine.catalog().storage.checkpoint_snapshot();
+            let snap = engine.inner().core.catalog().storage.checkpoint_snapshot();
             assert!(snap.catalog_replay_start_ts > MIN_SNAPSHOT_TS);
 
             drop(session);
@@ -2923,7 +2981,15 @@ mod tests {
             .await
             .unwrap();
 
-            assert!(engine.catalog().get_table(table_id).await.is_some());
+            assert!(
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .get_table(table_id)
+                    .await
+                    .is_some()
+            );
             drop(engine);
         })
     }
@@ -2941,11 +3007,19 @@ mod tests {
                     .unwrap();
             let table_id =
                 create_index_ddl_base_table(&engine, vec![base_unique_index_spec()]).await;
-            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
             let root_floor = table.redo_replay_floor_snapshot();
             let mut session = engine.new_session().unwrap();
             assert_checkpoint_published(&mut session, table.table_id()).await;
             let watermark = engine
+                .inner()
+                .core
                 .catalog()
                 .storage
                 .table_replay_silent_watermarks()
@@ -2972,6 +3046,8 @@ mod tests {
                 session.checkpoint_catalog().await.unwrap();
                 assert_eq!(
                     engine
+                        .inner()
+                        .core
                         .catalog()
                         .storage
                         .checkpointed_silent_watermarks()
@@ -3002,14 +3078,23 @@ mod tests {
             ))
             .await
             .unwrap();
-            let snapshot = recovered.catalog().storage.checkpoint_snapshot();
+            let snapshot = recovered
+                .inner()
+                .core
+                .catalog()
+                .storage
+                .checkpoint_snapshot();
             let (live_before_catalog_checkpoint, _) = recovered
+                .inner()
+                .core
                 .catalog()
                 .snapshot_user_table_redo_floors(snapshot.catalog_replay_start_ts);
             assert_eq!(live_before_catalog_checkpoint.len(), 1);
             assert_eq!(live_before_catalog_checkpoint[0].floor, root_floor);
             assert!(
                 recovered
+                    .inner()
+                    .core
                     .catalog()
                     .storage
                     .checkpointed_silent_watermarks()
@@ -3018,6 +3103,8 @@ mod tests {
             );
             let session = recovered.new_session().unwrap();
             let replayed_watermark = recovered
+                .inner()
+                .core
                 .catalog()
                 .storage
                 .table_replay_silent_watermarks()
@@ -3044,8 +3131,15 @@ mod tests {
             ))
             .await
             .unwrap();
-            let snapshot = recovered.catalog().storage.checkpoint_snapshot();
+            let snapshot = recovered
+                .inner()
+                .core
+                .catalog()
+                .storage
+                .checkpoint_snapshot();
             let (live_after_catalog_checkpoint, _) = recovered
+                .inner()
+                .core
                 .catalog()
                 .snapshot_user_table_redo_floors(snapshot.catalog_replay_start_ts);
             assert_eq!(live_after_catalog_checkpoint.len(), 1);
@@ -3092,12 +3186,20 @@ mod tests {
                 .await
                 .unwrap();
             let catalog_replay_start_ts = engine
+                .inner()
+                .core
                 .catalog()
                 .storage
                 .checkpoint_snapshot()
                 .catalog_replay_start_ts;
 
-            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
             let mut trx = session.begin_trx().unwrap();
             let insert = trx_insert_row(
                 &mut trx,
@@ -3141,7 +3243,13 @@ mod tests {
             .await
             .unwrap();
 
-            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
             let mut session = engine.new_session().unwrap();
             assert_eq!(session.total_row_pages(table.table_id()).await.unwrap(), 0);
 
@@ -3222,7 +3330,13 @@ mod tests {
                 .await
                 .unwrap();
 
-            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
             let mut trx = session.begin_trx().unwrap();
             let insert = trx_insert_row(
                 &mut trx,
@@ -3283,7 +3397,13 @@ mod tests {
             .await
             .unwrap();
 
-            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
             let mut session = engine.new_session().unwrap();
             assert!(session.total_row_pages(table.table_id()).await.unwrap() > 0);
 
@@ -3360,7 +3480,13 @@ mod tests {
                 .await
                 .unwrap();
 
-            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
             let mut same_row_ids = Vec::new();
             let mut trx = session.begin_trx().unwrap();
             for id in [1u32, 2, 3] {
@@ -3407,7 +3533,13 @@ mod tests {
                     .await
                     .unwrap();
 
-            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
             let mut session = engine.new_session().unwrap();
             assert_eq!(session.total_row_pages(table.table_id()).await.unwrap(), 0);
 
@@ -3646,13 +3778,21 @@ mod tests {
                 .await
                 .unwrap();
             let catalog_replay_start_ts = engine
+                .inner()
+                .core
                 .catalog()
                 .storage
                 .checkpoint_snapshot()
                 .catalog_replay_start_ts;
             assert!(catalog_replay_start_ts > MIN_SNAPSHOT_TS);
 
-            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
 
             let mut trx = session.begin_trx().unwrap();
             let insert = trx_insert_row(
@@ -3704,7 +3844,13 @@ mod tests {
             .await
             .unwrap();
 
-            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
             let mut session = engine.new_session().unwrap();
             assert!(session.total_row_pages(table.table_id()).await.unwrap() > 0);
 
@@ -3771,7 +3917,13 @@ mod tests {
                 .await
                 .unwrap();
 
-            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
             let mut trx = session.begin_trx().unwrap();
             for i in 0..10u32 {
                 let insert = trx_insert_row(&mut trx, &table, vec![Val::from(i)]).await;
@@ -3838,7 +3990,13 @@ mod tests {
             .await
             .unwrap();
 
-            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
             assert_eq!(
                 table.file().active_root_unchecked().deletion_cutoff_ts,
                 checkpointed_cutoff
@@ -3934,6 +4092,8 @@ mod tests {
                 .await
                 .unwrap();
             let baseline_catalog_replay_start_ts = engine
+                .inner()
+                .core
                 .catalog()
                 .storage
                 .checkpoint_snapshot()
@@ -3941,11 +4101,15 @@ mod tests {
             assert!(baseline_catalog_replay_start_ts > MIN_SNAPSHOT_TS);
 
             let checkpointed_table = engine
+                .inner()
+                .core
                 .catalog()
                 .get_table(checkpointed_table_id)
                 .await
                 .unwrap();
             let replay_only_table = engine
+                .inner()
+                .core
                 .catalog()
                 .get_table(replay_only_table_id)
                 .await
@@ -4010,6 +4174,8 @@ mod tests {
                 .await
                 .unwrap();
             let final_catalog_replay_start_ts = engine
+                .inner()
+                .core
                 .catalog()
                 .storage
                 .checkpoint_snapshot()
@@ -4037,11 +4203,15 @@ mod tests {
             .unwrap();
 
             let checkpointed_table = engine
+                .inner()
+                .core
                 .catalog()
                 .get_table(checkpointed_table_id)
                 .await
                 .unwrap();
             let replay_only_table = engine
+                .inner()
+                .core
                 .catalog()
                 .get_table(replay_only_table_id)
                 .await
@@ -4129,7 +4299,13 @@ mod tests {
                 .await
                 .unwrap();
 
-            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
             let mut trx = session.begin_trx().unwrap();
             let insert = trx_insert_row(
                 &mut trx,
@@ -4192,7 +4368,13 @@ mod tests {
             .await
             .unwrap();
 
-            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
             let key = SelectKey::new(0, vec![Val::from(7u32)]);
@@ -4254,7 +4436,13 @@ mod tests {
                 .await
                 .unwrap();
 
-            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
             let mut trx = session.begin_trx().unwrap();
             for i in 0..80u32 {
                 let insert = trx_insert_row(&mut trx, &table, vec![Val::from(i)]).await;
@@ -4346,7 +4534,13 @@ mod tests {
             .await
             .unwrap();
 
-            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
             let session = engine.new_session().unwrap();
             let active_root = table.file().active_root_unchecked();
             {

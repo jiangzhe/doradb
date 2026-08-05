@@ -2440,7 +2440,7 @@ mod tests {
     use crate::buffer::{PoolRole, test_page_id};
     use crate::catalog::tests::table2;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
-    use crate::engine::{Engine, EngineRef};
+    use crate::engine::Engine;
     use crate::error::{
         DataIntegrityError, ErrorKind, FatalError, IoError, IoResult, LifecycleError, Result,
         RuntimeError, SharedFatalError,
@@ -2856,10 +2856,13 @@ mod tests {
         }
     }
 
-    fn spawn_sys_commit_wait(engine: EngineRef, marker: u64) -> JoinHandle<Result<TrxID>> {
+    fn spawn_sys_commit_wait(
+        trx_sys: QuiescentGuard<TransactionSystem>,
+        marker: u64,
+    ) -> JoinHandle<Result<TrxID>> {
         thread::spawn(move || {
             smol::block_on(async move {
-                let mut sys_trx = engine.trx_sys.begin_sys_trx();
+                let mut sys_trx = trx_sys.begin_sys_trx();
                 sys_trx.create_row_page(
                     TableID::from(marker),
                     PageID::from(marker),
@@ -2867,7 +2870,7 @@ mod tests {
                     RowID::new(1),
                 );
                 let prepared = sys_trx.prepare();
-                engine.trx_sys.commit_prepared(prepared).await
+                trx_sys.commit_prepared(prepared).await
             })
         })
     }
@@ -3419,7 +3422,6 @@ mod tests {
                 redo_bin: None,
                 payload: None,
                 attachment: None,
-                lock_manager: None,
                 lock_state: None,
                 trx_inner: None,
             }],
@@ -3936,7 +3938,6 @@ mod tests {
                         redo_bin: None,
                         payload: None,
                         attachment: None,
-                        lock_manager: None,
                         lock_state: None,
                         trx_inner: None,
                     }],
@@ -4033,7 +4034,6 @@ mod tests {
                         redo_bin: None,
                         payload: None,
                         attachment: None,
-                        lock_manager: None,
                         lock_state: None,
                         trx_inner: None,
                     }],
@@ -5286,10 +5286,10 @@ mod tests {
             let hook = ControlledRedoWriteHook::new(redo_fd, libc::EIO);
             let _install = install_storage_backend_test_hook(Arc::new(hook.clone()));
 
-            let commit1 = spawn_sys_commit_wait(engine.new_ref().unwrap(), 1);
+            let commit1 = spawn_sys_commit_wait(engine.inner().core.trx_sys.clone(), 1);
             hook.wait_started(1).await;
 
-            let commit2 = spawn_sys_commit_wait(engine.new_ref().unwrap(), 2);
+            let commit2 = spawn_sys_commit_wait(engine.inner().core.trx_sys.clone(), 2);
             wait_for(|| {
                 !engine
                     .inner()
@@ -5339,10 +5339,10 @@ mod tests {
         let hook = ControlledRedoSyncHook::new(redo_fd, sync_kind, libc::EIO);
         let _install = install_storage_backend_test_hook(Arc::new(hook.clone()));
 
-        let commit1 = spawn_sys_commit_wait(engine.new_ref().unwrap(), 10);
+        let commit1 = spawn_sys_commit_wait(engine.inner().core.trx_sys.clone(), 10);
         hook.wait_started(1).await;
 
-        let commit2 = spawn_sys_commit_wait(engine.new_ref().unwrap(), 11);
+        let commit2 = spawn_sys_commit_wait(engine.inner().core.trx_sys.clone(), 11);
         wait_for(|| {
             !engine
                 .inner()

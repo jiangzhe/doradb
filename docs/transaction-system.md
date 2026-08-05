@@ -163,16 +163,19 @@ this runtime transaction contract.
 
 Each user statement runs through `Transaction::exec(async |stmt| { ... })`.
 The public `Transaction` is a weak, non-cloneable capability containing weak
-engine reachability plus `SessionOperationKey` and its independent engine-wide
-`TrxID`. `SessionOperationKey` is the exact `(SessionID, OperationID)` identity;
+reachability to its exact `SessionState`, `SessionOperationKey`, and its
+independent engine-wide `TrxID`. `SessionOperationKey` is the exact
+`(SessionID, OperationID)` identity;
 the raw operation id is a session-local `u64` allocated from one sequence shared
 by transactions, DDL, maintenance, and explicit-lock mutation. The facade does
-not own the crate-private `EngineRef`, `SessionState`, or stable operation
-entry. Public transaction operations upgrade weak engine reachability, resolve
-the exact operation key through the session registry, and build an
-operation-local runtime attachment before callbacks or `.await` points. The
-checkout or terminal claim then validates the handle's independent `TrxID`
-against the entry under the entry mutex.
+not own `EngineCore`, `SessionState`, a transaction core, or a stable operation
+entry. A foreground checkout first acquires lifecycle admission through its
+per-session façade, upgrades the exact weak state once, validates engine health,
+and resolves the operation key directly on that state. It then builds a
+`TrxAttachment` containing `SessionRuntime`; checkout validates the handle's
+independent `TrxID` against the entry under the entry mutex. Terminal and
+cleanup paths omit new foreground admission but perform the same exact state,
+operation-key, and transaction-id validation.
 
 `SessionState` has orthogonal disposition (`Open`, `CloseRequested`, or
 `Abandoned`), one effectful operation slot (`Idle`, `Active`, or `Closed`), and
@@ -227,9 +230,10 @@ During an active transaction, the owning box is checked out for one
 non-terminal operation through `SessionOperationCheckout`; ordinary checkout
 drop returns the same box through the entry mutex. This keeps repeated ownership
 transfers pointer-sized without allocating during statement execution. The
-checkout owns the operation-local `TrxAttachment` and exposes a copyable
-`TrxRuntime` value that pairs immutable `TrxContext` with runtime access to the
-engine, pool guards, and session-local user-table cache. `TrxContext` never
+checkout owns a `TrxAttachment` containing the exact `SessionRuntime` and
+exposes a copyable `TrxRuntime` value that pairs immutable `TrxContext` with
+borrowed access to `EngineCore`, its canonical pool guards, and the
+session-local user-table cache. `TrxContext` never
 stores the attachment. Normal statement checkout/check-in does not reacquire
 the session lifecycle mutex, allocate, touch the operation change notifier, or
 send cleanup work.
@@ -554,10 +558,12 @@ without assigning a commit timestamp.
 Terminal user-session completion is structurally gated by
 `ReleasedTransactionLocks`. Transaction code can mint this non-cloneable,
 transaction-id-bound proof only after draining the transaction's owner-local
-lock state; prepared and precommit cleanup also drops its retained lock-manager
-guard first. `TrxAttachment::commit()` and `TrxAttachment::rollback()` consume
-and validate the proof before the session registry may make the session idle or
-closed.
+lock state through the engine lock manager reached from the retained terminal
+attachment. `TrxAttachment::commit()` and `TrxAttachment::rollback()` consume
+and validate the proof before direct state publication may make the session idle
+or closed. If terminal publication leaves a close-requested or abandoned session
+idle, `EngineCore` upgrades its weak registry back-reference and removes only
+the pointer-identical registered state.
 
 For ordered commit, shared committed status is published before transaction
 locks are released, and session completion follows lock release. For rollback
@@ -579,14 +585,17 @@ releasing lifecycle and explicit-lock ownership; shutdown then rescans for the
 first current blocker. A full traversal is required only to prove that no
 operation or observer remains.
 
+Shutdown-discovered abandoned cleanup captures `SessionRuntime` from the
+registered state before submission. The worker resolves the exact operation
+directly on that state and never returns through the registry.
+
 The nonblocking `try_shutdown()` uses the same first-blocker probe without
 installing an event. Consequently an ordinary open-session statement does not
 touch notification state, and an unobserved commit or rollback performs no
 notifier atomic update, event allocation, or wake. The listener-before-release
 protocol has no lost-wake interval, and `ShutdownBusy` remains observable while
 any operation, observer, mandatory caller permit, or mandatory internal permit
-remains. `EngineRef` supplies shared component access but does not independently
-block shutdown.
+remains.
 
 Recovery only treats checkpoint metadata, table roots, and real redo headers as
 stable timestamp carriers. A no-log ordered commit has a volatile CTS that is

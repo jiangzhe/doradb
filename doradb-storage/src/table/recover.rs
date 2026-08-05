@@ -568,6 +568,8 @@ mod tests {
             let (table_spec, index_specs) = drop_table_test_spec();
             let table_id = session.create_table(table_spec, index_specs).await.unwrap();
             let table_for_internal_lifecycle = engine
+                .inner()
+                .core
                 .catalog()
                 .get_table_now(table_id)
                 .expect("created table should still be loaded");
@@ -588,6 +590,8 @@ mod tests {
             .await
             .unwrap();
             let current = engine
+                .inner()
+                .core
                 .catalog()
                 .resolve_user_table_current(table_id)
                 .unwrap();
@@ -598,10 +602,14 @@ mod tests {
                 &table.metadata()
             ));
             assert_eq!(
-                engine.catalog().user_table_history_version_count(table_id),
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .user_table_history_version_count(table_id),
                 Some(0)
             );
-            assert_no_dropped_table_operational_state(engine.catalog(), table_id);
+            assert_no_dropped_table_operational_state(engine.inner().core.catalog(), table_id);
         });
     }
 
@@ -633,29 +641,56 @@ mod tests {
             ))
             .await
             .unwrap();
-            assert!(engine.catalog().get_table(table_id).await.is_none());
-            assert!(engine.catalog().get_table_now(table_id).is_none());
             assert!(
                 engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .get_table(table_id)
+                    .await
+                    .is_none()
+            );
+            assert!(
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .get_table_now(table_id)
+                    .is_none()
+            );
+            assert!(
+                engine
+                    .inner()
+                    .core
                     .catalog()
                     .resolve_user_table_current(table_id)
                     .is_none()
             );
             assert!(
                 engine
+                    .inner()
+                    .core
                     .catalog()
                     .resolve_user_table_visible(table_id, MAX_SNAPSHOT_TS)
                     .is_none()
             );
             assert_eq!(
-                engine.catalog().user_table_history_version_count(table_id),
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .user_table_history_version_count(table_id),
                 None
             );
             assert_eq!(
-                engine.catalog().retained_dropped_table_ids_now(),
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .retained_dropped_table_ids_now(),
                 vec![table_id]
             );
-            assert_dropped_table_floor(engine.catalog(), table_id);
+            assert_dropped_table_floor(engine.inner().core.catalog(), table_id);
             assert!(std::path::Path::new(&table_file_path).exists());
             let mut session = engine.new_session().unwrap();
             let (table_spec, index_specs) = drop_table_test_spec();
@@ -668,10 +703,21 @@ mod tests {
                 .unwrap();
             wait_for_no_dropped_table_operational_state(&engine, table_id).await;
             assert!(!std::path::Path::new(&table_file_path).exists());
-            assert!(engine.catalog().retained_dropped_table_ids_now().is_empty());
-            assert_no_dropped_table_operational_state(engine.catalog(), table_id);
+            assert!(
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .retained_dropped_table_ids_now()
+                    .is_empty()
+            );
+            assert_no_dropped_table_operational_state(engine.inner().core.catalog(), table_id);
             assert_eq!(
-                engine.catalog().user_table_history_version_count(table_id),
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .user_table_history_version_count(table_id),
                 None
             );
         });
@@ -711,7 +757,15 @@ mod tests {
             ))
             .await
             .unwrap();
-            assert!(engine.catalog().get_table(table_id).await.is_none());
+            assert!(
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .get_table(table_id)
+                    .await
+                    .is_none()
+            );
             wait_path_exists(&table_file_path, false).await;
         });
     }

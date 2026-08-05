@@ -6,7 +6,6 @@ use crate::component::{
     Component, ComponentRegistry, EnginePools, IndexPool, MemPool, MetaPool, ShelfScope, Supplier,
 };
 use crate::conf::TrxSysConfig;
-use crate::engine::EngineRef;
 use crate::error::{
     CompletionErrorBridge, DataIntegrityError, DataIntegrityResult, DiscloseError,
     DiscloseResultExt, Error, FatalError, FatalResult, MultiDomainResultExt, Result, RuntimeError,
@@ -25,7 +24,7 @@ use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
 use crate::recovery::RecoveryResources;
 use crate::recovery::stream::CatalogSafeRedoSegment;
 use crate::runtime::mandatory::{MandatoryInternalTask, MandatoryRuntime, MandatoryTaskMetadata};
-use crate::session::TrxAttachment;
+use crate::session::{SessionRuntime, TrxAttachment, WeakSessionRef};
 use crate::thread;
 use crate::trx::group::{Commit, CommitJoin, GroupCommit};
 #[cfg(test)]
@@ -617,7 +616,7 @@ impl TransactionSystem {
         debug_assert!(config.recovery_io_depth != 0);
         debug_assert!(config.catalog_checkpoint_scan_io_depth != 0);
 
-        let pool_guards = pools.pool_guards();
+        let pool_guards = pools.pool_guards().clone();
         let (purge_tx, purge_rx) = flume::unbounded();
         let file_prefix = config.file_prefix().disclose()?;
         let recovery_resources = RecoveryResources::new(pools, table_fs.clone(), &catalog);
@@ -1069,13 +1068,13 @@ impl TransactionSystem {
     #[inline]
     pub(crate) fn begin_public_trx(
         &self,
-        engine: &EngineRef,
+        session: WeakSessionRef,
         operation_key: SessionOperationKey,
         mut inner: Box<TrxInner>,
     ) -> (Transaction, Arc<SessionOperationEntry>) {
         let (trx_id, sts) = self.init_trx(operation_key.session_id(), inner.as_mut());
         let entry = SessionOperationEntry::new_public_transaction(operation_key, inner);
-        let handle = Transaction::new(engine.downgrade(), operation_key, trx_id, sts);
+        let handle = Transaction::new(session, operation_key, trx_id, sts);
         (handle, entry)
     }
 
@@ -1083,14 +1082,14 @@ impl TransactionSystem {
     #[inline]
     pub(crate) fn begin_private_trx(
         &self,
-        engine: &EngineRef,
+        session: WeakSessionRef,
         enclosing_entry: &Arc<SessionOperationEntry>,
         mut inner: Box<TrxInner>,
     ) -> Transaction {
         let operation_key = enclosing_entry.key();
         let (trx_id, sts) = self.init_trx(operation_key.session_id(), inner.as_mut());
         enclosing_entry.install_private_transaction(inner);
-        Transaction::new(engine.downgrade(), operation_key, trx_id, sts)
+        Transaction::new(session, operation_key, trx_id, sts)
     }
 
     /// Allocate a timestamp fence for a runtime state transition.
@@ -1346,11 +1345,11 @@ impl TransactionSystem {
         let sts = inner.sts();
         let gc_no = inner.gc_no();
         let status = Arc::clone(inner.ctx().status());
-        let pool_guards = attachment.pool_guards().clone();
+        let pool_guards = attachment.pool_guards();
         let mut table_cache = TableCache::new(&self.catalog);
         if let Err(err) = inner
             .index_undo_mut()
-            .rollback(&mut table_cache, &pool_guards, sts)
+            .rollback(&mut table_cache, pool_guards, sts)
             .await
         {
             drop(table_cache);
@@ -1372,7 +1371,7 @@ impl TransactionSystem {
         }
         if let Err(err) = inner
             .row_undo_mut()
-            .rollback(&mut table_cache, &pool_guards)
+            .rollback(&mut table_cache, pool_guards)
             .await
         {
             drop(table_cache);
@@ -1592,14 +1591,14 @@ impl TransactionSystem {
     #[inline]
     pub(crate) fn request_abandoned_trx_cleanup(
         &self,
-        engine: EngineRef,
+        runtime: SessionRuntime,
         operation_key: SessionOperationKey,
         trx_id: TrxID,
     ) {
         let _ = self
             .mandatory_runtime
             .submit_internal(SessionOperationCleanupJob {
-                engine,
+                runtime: Some(runtime),
                 operation_key,
                 trx_id,
                 claim: None,
@@ -1736,24 +1735,33 @@ fn recovery_initial_trx_ts(max_recovered_cts: TrxID) -> DataIntegrityResult<TrxI
 
 #[inline]
 async fn run_trx_cleanup_job(job: &mut SessionOperationCleanupJob) {
-    let engine = job.engine.clone();
     let operation_key = job.operation_key;
     let trx_id = job.trx_id;
     if job.claim.is_none() {
+        let runtime = job
+            .runtime
+            .take()
+            .expect("unclaimed abandoned cleanup retains its session runtime");
         // A stale cleanup hint is a neutral outcome: another owner already
         // moved the session/transaction pair beyond the abandoned state.
-        let (entry, session) = match engine.session_registry.try_resolve_operation(operation_key) {
-            Some(parts) => parts,
+        let entry = match runtime.state().resolve_operation(operation_key) {
+            Some(entry) => entry,
             None => return,
         };
-        let attachment = TrxAttachment::new(engine.clone(), session, operation_key, trx_id);
+        let attachment = TrxAttachment::new(runtime, operation_key, trx_id);
         let claim = match SessionOperationCompletionClaim::cleanup(entry, attachment) {
             Ok(claim) => claim,
             Err(_) => return,
         };
         job.claim = Some(claim);
     }
-    let trx_sys = engine.trx_sys.clone();
+    let trx_sys = job
+        .claim
+        .as_ref()
+        .expect("claimed abandoned cleanup retains terminal ownership")
+        .engine()
+        .trx_sys
+        .clone();
     let result = trx_sys
         .cleanup_abandoned_transaction(
             job.claim
@@ -1992,10 +2000,10 @@ pub(crate) mod tests {
     fn capture_transaction_cleanup_state(
         trx: &Transaction,
     ) -> (Arc<SessionOperationEntry>, Arc<SharedTrxStatus>) {
-        let engine = trx.engine().expect("test transaction must have engine");
-        let (entry, _session) = engine
-            .session_registry
-            .try_resolve_operation(trx.operation_key)
+        let runtime = trx.engine().expect("test transaction must have runtime");
+        let entry = runtime
+            .state()
+            .resolve_operation(trx.operation_key)
             .expect("test transaction must resolve");
         let status = {
             let inner_slot = entry.inner.lock();
@@ -2090,9 +2098,8 @@ pub(crate) mod tests {
                 let _ = smol::block_on(trx.commit());
             }
             {
-                let engine = engine.new_ref().unwrap();
+                let mut session = engine.new_session().unwrap();
                 spawn(move || {
-                    let mut session = engine.new_session().unwrap();
                     let trx = session.begin_trx().unwrap();
                     let _ = smol::block_on(trx.commit());
                 })

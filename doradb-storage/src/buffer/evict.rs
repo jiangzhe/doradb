@@ -2183,7 +2183,7 @@ pub(crate) mod tests {
         }
 
         fn owner_guard(&self) -> QuiescentGuard<EvictableBufferPool> {
-            self.engine.inner().mem_pool.clone_inner()
+            self.engine.inner().pools.mem.clone()
         }
 
         fn shutdown(&self) {
@@ -2195,7 +2195,7 @@ pub(crate) mod tests {
         type Target = EvictableBufferPool;
 
         fn deref(&self) -> &Self::Target {
-            &self.engine.inner().mem_pool
+            &self.engine.inner().pools.mem
         }
     }
 

@@ -753,9 +753,11 @@ impl<'op> UserTableAccessor<'op> {
         let root = self
             .storage
             .with_active_root(&proof, |root| root.secondary_index_roots[index_no]);
+        let pool_guards = rt.pool_guards();
         Ok(OwnedCurrentIndexReadHandle::new(
             index,
-            rt.pool_guards().clone(),
+            pool_guards.index_guard().clone(),
+            pool_guards.disk_guard().clone(),
             root,
             &proof,
             transaction,
@@ -5491,7 +5493,7 @@ mod tests {
             .await;
             trx.commit().await.unwrap();
 
-            let allocated_after_route = engine.inner().disk_pool.allocated();
+            let allocated_after_route = engine.inner().pools.disk.allocated();
             assert!(allocated_after_route >= 1);
 
             expect_select_committed(table_id, &mut session, &key, |vals| {
@@ -5499,7 +5501,7 @@ mod tests {
                 assert_eq!(vals[1], Val::from("name"));
             })
             .await;
-            let allocated_after_first = engine.inner().disk_pool.allocated();
+            let allocated_after_first = engine.inner().pools.disk.allocated();
             assert!(allocated_after_first >= allocated_after_route);
 
             expect_select_committed(table_id, &mut session, &key, |vals| {
@@ -5507,7 +5509,7 @@ mod tests {
                 assert_eq!(vals[1], Val::from("name"));
             })
             .await;
-            assert_eq!(engine.inner().disk_pool.allocated(), allocated_after_first);
+            assert_eq!(engine.inner().pools.disk.allocated(), allocated_after_first);
         });
     }
 
@@ -6748,7 +6750,8 @@ mod tests {
             };
             let page_guard = engine
                 .inner()
-                .mem_pool
+                .pools
+                .mem
                 .get_page::<RowPage>(
                     session.pool_guards().mem_guard(),
                     page_id,
@@ -6764,7 +6767,8 @@ mod tests {
 
             let insert_page_guard = engine
                 .inner()
-                .mem_pool
+                .pools
+                .mem
                 .get_page::<RowPage>(
                     session.pool_guards().mem_guard(),
                     page_id,
@@ -6840,7 +6844,8 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let page_guard = engine
                 .inner()
-                .mem_pool
+                .pools
+                .mem
                 .get_page::<RowPage>(
                     session.pool_guards().mem_guard(),
                     page_id,
@@ -8841,6 +8846,8 @@ mod tests {
             let resource = LockResource::TableMetadata(table_id);
             let blocker = LockOwner::session_explicit(SessionID::new(91_225));
             engine
+                .inner()
+                .core
                 .lock_manager()
                 .acquire(resource, LockMode::Exclusive, blocker)
                 .await
@@ -8866,7 +8873,10 @@ mod tests {
                 LockDebugEntryState::Waiting,
             )
             .await;
-            assert_eq!(engine.lock_manager().release_owner(stmt_owner), 1);
+            assert_eq!(
+                engine.inner().core.lock_manager().release_owner(stmt_owner),
+                1
+            );
 
             let err = scan_fut.await.unwrap_err();
             assert_eq!(
@@ -8878,7 +8888,14 @@ mod tests {
             assert_eq!(rendered.matches(&format!("table_id={table_id}")).count(), 1);
             assert!(rendered.contains("resource=table_metadata"), "{rendered}");
             assert!(rendered.contains("mode=shared"), "{rendered}");
-            assert_eq!(engine.lock_manager().release(resource, blocker), 1);
+            assert_eq!(
+                engine
+                    .inner()
+                    .core
+                    .lock_manager()
+                    .release(resource, blocker),
+                1
+            );
             trx.rollback().await.unwrap();
         });
     }
@@ -9179,7 +9196,8 @@ mod tests {
                 .exec(async |stmt| {
                     let page_guard = engine
                         .inner()
-                        .mem_pool
+                        .pools
+                        .mem
                         .get_page::<RowPage>(
                             session.pool_guards().mem_guard(),
                             page_id,
@@ -10031,7 +10049,7 @@ mod tests {
                     inserted.push((row_id, key));
                 }
                 trx.commit().await.unwrap();
-                let stats = engine.inner().index_pool.stats();
+                let stats = engine.inner().pools.index.stats();
                 if stats.completed_writes > 0 && stats.write_errors == 0 {
                     break;
                 }
@@ -10039,14 +10057,14 @@ mod tests {
 
             // Timer audit: index-pool eviction/I/O test coordination.
             for _ in 0..20 {
-                let stats = engine.inner().index_pool.stats();
+                let stats = engine.inner().pools.index.stats();
                 if stats.completed_writes > 0 && stats.write_errors == 0 {
                     break;
                 }
                 Timer::after(Duration::from_millis(50)).await;
             }
 
-            let stats = engine.inner().index_pool.stats();
+            let stats = engine.inner().pools.index.stats();
             assert!(
                 stats.completed_writes > 0 && stats.write_errors == 0,
                 "user secondary-index pool should evict with a small index buffer"

@@ -136,7 +136,7 @@ impl MaintenanceExecutionSpec for RedoTruncationExecution {
         resources: &mut Self::Resources,
         _panic_label: &mut Self::PanicLabel,
     ) -> CompletionResult<Self::Output> {
-        let engine = scope.engine().clone();
+        let engine = scope.engine();
         let result = engine
             .trx_sys
             .truncate_redo_log_prepared(
@@ -170,7 +170,7 @@ impl MaintenanceExecutionSpec for CatalogRedoMaintenanceExecution {
         resources: &mut Self::Resources,
         _panic_label: &mut Self::PanicLabel,
     ) -> CompletionResult<Self::Output> {
-        let engine = scope.engine().clone();
+        let engine = scope.engine();
         let result = engine
             .trx_sys
             .checkpoint_catalog_and_truncate_redo_log_prepared(

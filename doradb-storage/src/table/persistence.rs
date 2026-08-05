@@ -226,8 +226,8 @@ where
         let table_id = table.table_id();
         let table_file = table.file();
         let disk_pool = table.disk_pool();
-        let trx_sys = session.engine().trx_sys.clone();
-        let table_writes = session.engine().table_fs.background_writes().clone();
+        let trx_sys = &session.engine().trx_sys;
+        let table_writes = session.engine().table_fs.background_writes();
         let pool_guards = session.pool_guards();
         if let Some(reason) = table.active_root_checkpoint_delay(session) {
             return Ok(CheckpointOutcome::Delayed { reason });
@@ -238,7 +238,7 @@ where
         // Step 1: claim one mutable root snapshot and initialize checkpoint
         // boundaries. This is checkpoint-internal current-root access after the
         // post-lease liveness check above.
-        let mut mutable_file = MutableTableFile::fork(table_file, &table_writes, disk_pool.clone());
+        let mut mutable_file = MutableTableFile::fork(table_file, table_writes, disk_pool.clone());
         let pivot_row_id = mutable_file.root().pivot_row_id;
         let mut secondary_sidecar = SecondaryCheckpointSidecar::new(metadata);
 
@@ -271,7 +271,7 @@ where
             Some(heap_redo_start_ts) => Some(heap_redo_start_ts),
             None => {
                 let heap_redo_start_ts = table
-                    .heap_redo_start_from(&pool_guards, heap_redo_start_row_id)
+                    .heap_redo_start_from(pool_guards, heap_redo_start_row_id)
                     .await
                     .change_context(RuntimeError::CheckpointExecution)
                     .attach_with(|| {
@@ -287,7 +287,7 @@ where
         };
         if !pages.is_empty() {
             let transition_pages = table
-                .load_frozen_pages_for_transition(&pool_guards, &pages)
+                .load_frozen_pages_for_transition(pool_guards, &pages)
                 .await
                 .change_context(RuntimeError::CheckpointExecution)
                 .attach_with(|| {
@@ -362,7 +362,7 @@ where
         let mut lwc_blocks = table
             .build_lwc_blocks(
                 metadata,
-                &pool_guards,
+                pool_guards,
                 self.attempt
                     .batch()
                     .map(|batch| batch.prepared.as_slice())
@@ -484,7 +484,7 @@ where
                     )
                 })?;
             sys_trx
-                .upsert_silent_watermark(session.engine().catalog(), &pool_guards, watermark)
+                .upsert_silent_watermark(session.engine().catalog(), pool_guards, watermark)
                 .await
                 .change_context(RuntimeError::CheckpointExecution)
                 .attach_with(|| {
@@ -1677,7 +1677,7 @@ impl Table {
     where
         S: SessionRuntimeAccess + ?Sized,
     {
-        let engine = session.engine();
+        let engine = session.runtime();
         let trx_sys = &engine.trx_sys;
         ensure_maintenance_wait_running(session, "observe active-root checkpoint retry")?;
         if self.active_root_retry_ready(effective_ts, trx_sys.published_gc_horizon()) {
@@ -1734,7 +1734,7 @@ impl Table {
         let Some(page_idx) = batch.pages.iter().position(|page| page.page_id == page_id) else {
             return Ok(CheckpointRetryObservation::Ready);
         };
-        let engine = session.engine();
+        let engine = session.runtime();
         let trx_sys = &engine.trx_sys;
 
         loop {
@@ -1857,7 +1857,7 @@ impl Table {
             });
         let guards = session.pool_guards();
         let mut page_guards = self
-            .load_frozen_pages_for_transition(&guards, &[page_info])
+            .load_frozen_pages_for_transition(guards, &[page_info])
             .await?;
         let page_guard = page_guards.pop().unwrap_or_else(|| {
             panic!(
@@ -1900,7 +1900,7 @@ impl Table {
         let mut pages = Vec::new();
         let mut reached_row_budget = false;
         let mut heap_redo_start_ts = None;
-        self.mem_scan(&guards, |page_guard| {
+        self.mem_scan(guards, |page_guard| {
             if reached_row_budget {
                 heap_redo_start_ts = Some(page_guard.unwrap_vmap().create_cts());
                 return false;
@@ -1917,7 +1917,7 @@ impl Table {
         })
         .await?;
         let page_guards = self
-            .load_frozen_pages_for_transition(&guards, &pages)
+            .load_frozen_pages_for_transition(guards, &pages)
             .await?;
         #[cfg(test)]
         test_hooks::run_test_freeze_after_loading_hook(&session.engine().maintenance_test).await;
@@ -2183,7 +2183,7 @@ fn ensure_maintenance_wait_running<S>(
 where
     S: SessionRuntimeAccess + ?Sized,
 {
-    let engine = session.engine();
+    let engine = session.runtime();
     engine.poisoner.ensure_healthy()?;
     if engine.shutdown_started() {
         return Err(RuntimeOrFatalError::from(
@@ -2429,7 +2429,7 @@ mod tests {
 
             thread::scope(|scope| {
                 let shutdown = scope.spawn(|| engine.shutdown());
-                while !pin.engine.shutdown_started() {
+                while !pin.runtime.shutdown_started() {
                     thread::yield_now();
                 }
 
@@ -2622,7 +2622,14 @@ mod tests {
             redo_cts
         };
         assert!(checkpoint_redo_cts < drop_session.last_cts());
-        assert!(engine.catalog().get_table_now(table_id).is_none());
+        assert!(
+            engine
+                .inner()
+                .core
+                .catalog()
+                .get_table_now(table_id)
+                .is_none()
+        );
     }
 
     #[test]
@@ -3530,6 +3537,8 @@ mod tests {
             let root_after = table.file().active_root_unchecked().clone();
             if root_after.deletion_cutoff_ts <= root_before.deletion_cutoff_ts {
                 let watermark = engine
+                    .inner()
+                    .core
                     .catalog()
                     .storage
                     .table_replay_silent_watermarks()
@@ -3541,10 +3550,14 @@ mod tests {
                 insert_rows(table_id, &mut session, 1, 2, "durability-anchor").await;
                 session.checkpoint_catalog().await.unwrap();
             }
-            let effective = engine.catalog().effective_user_table_redo_replay_floor(
-                table_id,
-                table.redo_replay_floor_snapshot(),
-            );
+            let effective = engine
+                .inner()
+                .core
+                .catalog()
+                .effective_user_table_redo_replay_floor(
+                    table_id,
+                    table.redo_replay_floor_snapshot(),
+                );
             assert!(
                 effective.deletion_cutoff_ts > root_before.deletion_cutoff_ts,
                 "{effective:?}"
@@ -3884,6 +3897,8 @@ mod tests {
 
             let checkpoint_ts = assert_checkpoint_published(&mut session, table_id).await;
             let watermark = engine
+                .inner()
+                .core
                 .catalog()
                 .storage
                 .table_replay_silent_watermarks()
@@ -4466,9 +4481,8 @@ mod tests {
             let reader_sts = Arc::new(parking_lot::Mutex::new(TrxID::new(0)));
             let hook_reader_holder = Arc::clone(&reader_holder);
             let hook_reader_sts = Arc::clone(&reader_sts);
-            let hook_engine = engine.new_ref().unwrap();
+            let mut reader_session = engine.new_session().unwrap();
             set_test_checkpoint_after_trx_start_hook(&engine, move || async move {
-                let mut reader_session = hook_engine.new_session().unwrap();
                 let reader = reader_session.begin_trx().unwrap();
                 *hook_reader_sts.lock() = reader.sts();
                 *hook_reader_holder.lock() = Some((reader_session, reader));
@@ -5035,7 +5049,14 @@ mod tests {
             assert_freeze_created(freeze.await.unwrap());
             drop(table);
             drop_table.await.unwrap();
-            assert!(engine.catalog().get_table_now(table_id).is_none());
+            assert!(
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .get_table_now(table_id)
+                    .is_none()
+            );
         });
     }
 
@@ -5278,7 +5299,14 @@ mod tests {
                 redo_cts
             };
             assert!(checkpoint_redo_cts < drop_session.last_cts());
-            assert!(engine.catalog().get_table_now(table_id).is_none());
+            assert!(
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .get_table_now(table_id)
+                    .is_none()
+            );
         });
     }
 
@@ -6025,6 +6053,8 @@ mod tests {
                 evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
             let table_id = create_table2_for_test(&engine).await;
             let table = engine
+                .inner()
+                .core
                 .catalog()
                 .get_table_now(table_id)
                 .expect("test table should exist");
@@ -6046,7 +6076,7 @@ mod tests {
             let table_file = engine
                 .inner()
                 .table_fs
-                .open_table_file(table_id, engine.inner().disk_pool.clone_inner())
+                .open_table_file(table_id, engine.inner().pools.disk.clone())
                 .await
                 .unwrap();
             let root_after = table_file.active_root_unchecked();
@@ -6097,6 +6127,8 @@ mod tests {
         table_id: TableID,
     ) {
         let watermark = engine
+            .inner()
+            .core
             .catalog()
             .storage
             .table_replay_silent_watermarks()
@@ -6139,6 +6171,8 @@ mod tests {
                 "Idle"
             );
             let watermark = engine
+                .inner()
+                .core
                 .catalog()
                 .storage
                 .table_replay_silent_watermarks()
@@ -6278,6 +6312,8 @@ mod tests {
 
             let guards = session.pool_guards();
             let watermark = engine
+                .inner()
+                .core
                 .catalog()
                 .storage
                 .table_replay_silent_watermarks()
@@ -6290,6 +6326,8 @@ mod tests {
             assert!(watermark.deletion_cutoff_ts > root_before.deletion_cutoff_ts);
             assert!(
                 engine
+                    .inner()
+                    .core
                     .catalog()
                     .storage
                     .checkpointed_silent_watermarks()
@@ -6298,8 +6336,10 @@ mod tests {
                 "uncheckpointed watermark rows must not update durable cache"
             );
 
-            let snapshot = engine.catalog().storage.checkpoint_snapshot();
+            let snapshot = engine.inner().core.catalog().storage.checkpoint_snapshot();
             let (live_before_catalog_checkpoint, _) = engine
+                .inner()
+                .core
                 .catalog()
                 .snapshot_user_table_redo_floors(snapshot.catalog_replay_start_ts);
             assert_eq!(live_before_catalog_checkpoint.len(), 1);
@@ -6310,7 +6350,12 @@ mod tests {
 
             insert_rows(table_id, &mut session, 40, 41, &name).await;
             session.checkpoint_catalog().await.unwrap();
-            let checkpointed = engine.catalog().storage.checkpointed_silent_watermarks();
+            let checkpointed = engine
+                .inner()
+                .core
+                .catalog()
+                .storage
+                .checkpointed_silent_watermarks();
             let checkpointed_floor = checkpointed
                 .get(&table_id)
                 .copied()
@@ -6323,8 +6368,10 @@ mod tests {
                 checkpointed_floor.deletion_cutoff_ts,
                 watermark.deletion_cutoff_ts
             );
-            let snapshot = engine.catalog().storage.checkpoint_snapshot();
+            let snapshot = engine.inner().core.catalog().storage.checkpoint_snapshot();
             let (live_after_catalog_checkpoint, _) = engine
+                .inner()
+                .core
                 .catalog()
                 .snapshot_user_table_redo_floors(snapshot.catalog_replay_start_ts);
             assert_eq!(live_after_catalog_checkpoint.len(), 1);
@@ -6448,16 +6495,16 @@ mod tests {
             let name = "g".repeat(1024);
             insert_rows(table_id, &mut session, 0, 200, &name).await;
 
-            let allocated_before = engine.inner().mem_pool.allocated();
+            let allocated_before = engine.inner().pools.mem.allocated();
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             let outcome = session.checkpoint_table_with_wait(table_id).await.unwrap();
             let CheckpointOutcome::Published { redo_cts, .. } = outcome else {
                 panic!("checkpoint should publish, got {outcome:?}");
             };
-            let allocated_after = engine.inner().mem_pool.allocated();
+            let allocated_after = engine.inner().pools.mem.allocated();
             wait_for_checkpoint_purge(&session, redo_cts).await;
             let reclaimed = allocated_after < allocated_before
-                || engine.inner().mem_pool.allocated() < allocated_before;
+                || engine.inner().pools.mem.allocated() < allocated_before;
             assert!(reclaimed, "row pages should be reclaimed after purge");
         });
     }
@@ -6504,7 +6551,7 @@ mod tests {
         );
         let retired_page_ids = table.checkpoint_workflow.frozen_page_ids().unwrap();
         assert!(!retired_page_ids.is_empty());
-        let allocated_before_checkpoint = engine.inner().mem_pool.allocated();
+        let allocated_before_checkpoint = engine.inner().pools.mem.allocated();
         let outcome = checkpoint_session
             .checkpoint_table_with_wait(table_id)
             .await
@@ -6525,7 +6572,7 @@ mod tests {
             drop(page);
         }
         assert_eq!(
-            engine.inner().mem_pool.allocated(),
+            engine.inner().pools.mem.allocated(),
             allocated_before_checkpoint,
             "checkpoint-retired pages must remain allocated while the reader pins system CTS eligibility"
         );
@@ -6536,7 +6583,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            engine.inner().mem_pool.allocated() < allocated_before_checkpoint,
+            engine.inner().pools.mem.allocated() < allocated_before_checkpoint,
             "checkpoint-retired pages must be deallocated after the reader releases the horizon"
         );
     }
@@ -7168,6 +7215,8 @@ mod tests {
             let mut old_session = engine.new_session().unwrap();
             let old_trx = old_session.begin_trx().unwrap();
             let retained_visible = engine
+                .inner()
+                .core
                 .catalog()
                 .resolve_user_table_visible(table_id, old_trx.sts())
                 .unwrap();
@@ -7180,6 +7229,8 @@ mod tests {
             let table = table_for_internal_assertion(&engine, table_id);
             let after_drop_root = table.file().active_root_unchecked().clone();
             let CurrentTableState::Live { metadata, .. } = engine
+                .inner()
+                .core
                 .catalog()
                 .resolve_user_table_current(table_id)
                 .unwrap()
@@ -7195,7 +7246,11 @@ mod tests {
                 "DROP INDEX detaches the root but leaves page reclamation to checkpoint reachability"
             );
             assert_eq!(
-                engine.catalog().user_table_history_version_count(table_id),
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .user_table_history_version_count(table_id),
                 Some(1)
             );
             assert!(retained_live.metadata().idx.index_spec(0).is_some());
@@ -7218,7 +7273,11 @@ mod tests {
                 }
             }
             assert_eq!(
-                engine.catalog().user_table_history_version_count(table_id),
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .user_table_history_version_count(table_id),
                 Some(0)
             );
             assert!(retained_live.metadata().idx.index_spec(0).is_some());

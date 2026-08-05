@@ -177,6 +177,8 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
                 engine
+                    .inner()
+                    .core
                     .catalog()
                     .storage
                     .tables()
@@ -184,6 +186,8 @@ mod tests {
                     .await
                     .disclose()?;
                 engine
+                    .inner()
+                    .core
                     .catalog()
                     .storage
                     .tables()
@@ -201,6 +205,8 @@ mod tests {
             trx.exec(async |stmt| {
                 assert!(
                     engine
+                        .inner()
+                        .core
                         .catalog()
                         .storage
                         .tables()
@@ -210,6 +216,8 @@ mod tests {
                 );
                 assert!(
                     !engine
+                        .inner()
+                        .core
                         .catalog()
                         .storage
                         .tables()
@@ -226,6 +234,8 @@ mod tests {
 
             assert!(
                 engine
+                    .inner()
+                    .core
                     .catalog()
                     .storage
                     .tables()
@@ -236,6 +246,8 @@ mod tests {
             );
             assert!(
                 engine
+                    .inner()
+                    .core
                     .catalog()
                     .storage
                     .tables()
@@ -260,10 +272,12 @@ mod tests {
             let table_id = table1(&engine).await;
             {
                 let guards = PoolGuards::builder()
-                    .push(PoolRole::Meta, engine.inner().meta_pool.pool_guard())
+                    .push(PoolRole::Meta, engine.inner().pools.meta.pool_guard())
                     .build();
                 assert!(
                     engine
+                        .inner()
+                        .core
                         .catalog()
                         .storage
                         .tables()

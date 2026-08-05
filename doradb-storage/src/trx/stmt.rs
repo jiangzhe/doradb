@@ -986,7 +986,7 @@ impl<'stmt> Statement<'stmt> {
     #[inline]
     pub(crate) async fn rollback_effects(&mut self) -> FatalResult<()> {
         let sts = self.inner.sts();
-        let engine = self.attachment.engine().clone();
+        let engine = self.attachment.engine();
         let pool_guards = self.attachment.pool_guards();
         let mut table_cache = TableCache::new(engine.catalog());
         if let Err(err) = self
@@ -1183,11 +1183,9 @@ pub(crate) mod tests {
     }
 
     fn test_trx(engine: &Engine, sts: TrxID) -> (Transaction, Arc<SessionState>) {
-        let engine_ref = engine.new_ref().unwrap();
-        let session_id = engine_ref.next_session_id();
+        let session_id = engine.inner().next_session_id();
         session_tests::create_test_transaction(
-            &engine.inner().session_registry,
-            engine_ref,
+            engine,
             session_id,
             MIN_ACTIVE_TRX_ID + sts.as_u64(),
             sts,
@@ -1196,7 +1194,7 @@ pub(crate) mod tests {
     }
 
     fn lock_entry_count(engine: &Engine, owner: LockOwner) -> usize {
-        debug_snapshot(engine.lock_manager())
+        debug_snapshot(engine.inner().core.lock_manager())
             .entries
             .iter()
             .filter(|entry| entry.owner == owner)
@@ -1266,7 +1264,7 @@ pub(crate) mod tests {
                 .expect("test transaction should be available for checkout");
             let sts = checkout.inner().sts();
             let pool_guards = checkout.attachment().pool_guards().clone();
-            let mut table_cache = TableCache::new(engine.catalog());
+            let mut table_cache = TableCache::new(engine.inner().core.catalog());
             let table_id = TableID::new(99_999_998);
             let row_id = RowID::new(23);
             let mut effects = StmtEffects::empty();
@@ -1330,6 +1328,8 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_catalog_delete_pk_mismatch").await;
             let catalog_table = engine
+                .inner()
+                .core
                 .catalog()
                 .storage
                 .get_catalog_table(TABLE_ID_TABLES)

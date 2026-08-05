@@ -1267,6 +1267,8 @@ pub(crate) mod tests {
         let (event_tx, event_rx) = flume::unbounded();
         engine.inner().trx_sys.set_purge_test_observer(event_tx);
         if engine
+            .inner()
+            .core
             .catalog()
             .snapshot_dropped_table_file_cleanups()
             .iter()
@@ -1282,6 +1284,8 @@ pub(crate) mod tests {
                 PurgeTestEvent::DroppedTableStarted => dropped_table_started = true,
                 PurgeTestEvent::CycleCompleted if dropped_table_started => {
                     if engine
+                        .inner()
+                        .core
                         .catalog()
                         .snapshot_dropped_table_file_cleanups()
                         .iter()
@@ -1295,7 +1299,7 @@ pub(crate) mod tests {
                 _ => {}
             }
         }
-        assert_dropped_table_floor(engine.catalog(), table_id);
+        assert_dropped_table_floor(engine.inner().core.catalog(), table_id);
     }
 
     /// Waits for targeted purge completion after dropped-table file cleanup becomes eligible.
@@ -1306,6 +1310,8 @@ pub(crate) mod tests {
         let (event_tx, event_rx) = flume::unbounded();
         engine.inner().trx_sys.set_purge_test_observer(event_tx);
         while engine
+            .inner()
+            .core
             .catalog()
             .retained_dropped_table_ids_now()
             .contains(&table_id)
@@ -1320,7 +1326,7 @@ pub(crate) mod tests {
                 }
             }
         }
-        assert_no_dropped_table_operational_state(engine.catalog(), table_id);
+        assert_no_dropped_table_operational_state(engine.inner().core.catalog(), table_id);
     }
 
     #[inline]
@@ -1586,10 +1592,12 @@ pub(crate) mod tests {
             )
             .await;
             engine
+                .inner()
+                .core
                 .catalog()
                 .next_table_id
                 .store(USER_TABLE_ID_LIMIT.as_u64(), Ordering::SeqCst);
-            let _ = engine.catalog().next_table_id();
+            let _ = engine.inner().core.catalog().next_table_id();
         });
     }
 
@@ -1697,7 +1705,10 @@ pub(crate) mod tests {
 
             let engine =
                 open_catalog_test_engine(main_dir.clone(), Some("catalog-allocator")).await;
-            assert_eq!(engine.catalog().curr_next_table_id(), USER_TABLE_ID_START);
+            assert_eq!(
+                engine.inner().core.catalog().curr_next_table_id(),
+                USER_TABLE_ID_START
+            );
             let mut session = engine.new_session().unwrap();
             let table_spec = TableSpec::new(vec![
                 ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
@@ -1712,12 +1723,18 @@ pub(crate) mod tests {
                 ),
             ];
             let table_id1 = session.create_table(table_spec, index_specs).await.unwrap();
-            assert_eq!(engine.catalog().curr_next_table_id(), table_id1 + 1);
+            assert_eq!(
+                engine.inner().core.catalog().curr_next_table_id(),
+                table_id1 + 1
+            );
             drop(session);
             drop(engine);
 
             let engine = open_catalog_test_engine(main_dir, Some("catalog-allocator")).await;
-            assert_eq!(engine.catalog().curr_next_table_id(), table_id1 + 1);
+            assert_eq!(
+                engine.inner().core.catalog().curr_next_table_id(),
+                table_id1 + 1
+            );
             let table_id2 = table1(&engine).await;
             assert!(table_id1 >= USER_TABLE_ID_START);
             assert_eq!(table_id2, table_id1 + 1);
@@ -1749,7 +1766,13 @@ pub(crate) mod tests {
                 )
                 .await
                 .unwrap();
-            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
             assert_eq!(table.metadata().idx.next_index_no(), 2);
             assert_eq!(
                 table
@@ -1773,7 +1796,13 @@ pub(crate) mod tests {
             drop(engine);
 
             let engine = open_catalog_test_engine(main_dir.clone(), Some(log_stem)).await;
-            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
             assert_eq!(table.metadata().idx.next_index_no(), 2);
             assert_eq!(
                 table
@@ -1784,12 +1813,14 @@ pub(crate) mod tests {
                 2
             );
             let indexes = engine
+                .inner()
+                .core
                 .catalog()
                 .storage
                 .indexes()
                 .list_uncommitted_by_table_id(
                     &PoolGuards::builder()
-                        .push(PoolRole::Meta, engine.inner().meta_pool.pool_guard())
+                        .push(PoolRole::Meta, engine.inner().pools.meta.pool_guard())
                         .build(),
                     table_id,
                 )
@@ -1812,7 +1843,13 @@ pub(crate) mod tests {
             drop(engine);
 
             let engine = open_catalog_test_engine(main_dir, Some(log_stem)).await;
-            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
             assert_eq!(table.metadata().idx.next_index_no(), 2);
             assert_eq!(table.metadata().idx.active_index_count(), 2);
             assert_eq!(
@@ -1836,10 +1873,17 @@ pub(crate) mod tests {
                 open_catalog_test_engine(temp_dir.path().to_path_buf(), Some("redo-floor-borrow"))
                     .await;
             let table_id = table1(&engine).await;
-            let table = engine.catalog().get_table_now(table_id).unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table_now(table_id)
+                .unwrap();
             let owners_before = Arc::strong_count(&table);
 
             let (live, dropped) = engine
+                .inner()
+                .core
                 .catalog()
                 .snapshot_user_table_redo_floors(MIN_SNAPSHOT_TS);
 
@@ -1861,7 +1905,7 @@ pub(crate) mod tests {
 
             let engine = open_catalog_test_engine(main_dir, Some("catalog-checkpoint-now")).await;
 
-            let snap0 = engine.catalog().storage.checkpoint_snapshot();
+            let snap0 = engine.inner().core.catalog().storage.checkpoint_snapshot();
             assert_eq!(snap0.catalog_replay_start_ts, MIN_SNAPSHOT_TS);
             assert!(
                 snap0
@@ -1878,11 +1922,11 @@ pub(crate) mod tests {
                 .checkpoint_catalog()
                 .await
                 .unwrap();
-            let snap1 = engine.catalog().storage.checkpoint_snapshot();
+            let snap1 = engine.inner().core.catalog().storage.checkpoint_snapshot();
             assert!(snap1.catalog_replay_start_ts > MIN_SNAPSHOT_TS);
             assert_eq!(
                 snap1.meta.next_table_id,
-                engine.catalog().curr_next_table_id()
+                engine.inner().core.catalog().curr_next_table_id()
             );
             assert!(
                 snap1
@@ -1905,7 +1949,7 @@ pub(crate) mod tests {
                 .checkpoint_catalog()
                 .await
                 .unwrap();
-            let snap2 = engine.catalog().storage.checkpoint_snapshot();
+            let snap2 = engine.inner().core.catalog().storage.checkpoint_snapshot();
             assert_eq!(snap2.catalog_replay_start_ts, snap1.catalog_replay_start_ts);
             assert_eq!(snap2.meta.table_roots, snap1.meta.table_roots);
         });
@@ -1931,7 +1975,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
 
-            let snap = engine.catalog().storage.checkpoint_snapshot();
+            let snap = engine.inner().core.catalog().storage.checkpoint_snapshot();
             let root = snap
                 .meta
                 .table_roots
@@ -1941,13 +1985,13 @@ pub(crate) mod tests {
                 .expect("catalog checkpoint should publish at least one root");
             let root_block_id = BlockID::from(root.root_block_id.unwrap().get());
             let block_id = {
-                let disk_pool_guard = engine.catalog().storage.disk_pool.pool_guard();
+                let disk_pool_guard = engine.inner().core.catalog().storage.disk_pool.pool_guard();
                 let index = ColumnBlockIndex::new(
                     root_block_id,
                     root.pivot_row_id,
-                    engine.catalog().storage.mtb.file_kind(),
-                    engine.catalog().storage.mtb.sparse_file(),
-                    &engine.catalog().storage.disk_pool,
+                    engine.inner().core.catalog().storage.mtb.file_kind(),
+                    engine.inner().core.catalog().storage.mtb.sparse_file(),
+                    &engine.inner().core.catalog().storage.disk_pool,
                     &disk_pool_guard,
                 );
                 let entry = index
@@ -1993,7 +2037,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
 
-            let snap = engine.catalog().storage.checkpoint_snapshot();
+            let snap = engine.inner().core.catalog().storage.checkpoint_snapshot();
             let root = snap
                 .meta
                 .table_roots
@@ -2003,13 +2047,13 @@ pub(crate) mod tests {
                 .expect("catalog checkpoint should publish at least one root");
             let root_block_id = BlockID::from(root.root_block_id.unwrap().get());
             let entry = {
-                let disk_pool_guard = engine.catalog().storage.disk_pool.pool_guard();
+                let disk_pool_guard = engine.inner().core.catalog().storage.disk_pool.pool_guard();
                 let index = ColumnBlockIndex::new(
                     root_block_id,
                     root.pivot_row_id,
-                    engine.catalog().storage.mtb.file_kind(),
-                    engine.catalog().storage.mtb.sparse_file(),
-                    &engine.catalog().storage.disk_pool,
+                    engine.inner().core.catalog().storage.mtb.file_kind(),
+                    engine.inner().core.catalog().storage.mtb.sparse_file(),
+                    &engine.inner().core.catalog().storage.disk_pool,
                     &disk_pool_guard,
                 );
                 index
@@ -2054,7 +2098,7 @@ pub(crate) mod tests {
                 .checkpoint_catalog()
                 .await
                 .unwrap();
-            let snap1 = engine.catalog().storage.checkpoint_snapshot();
+            let snap1 = engine.inner().core.catalog().storage.checkpoint_snapshot();
             assert!(snap1.catalog_replay_start_ts > MIN_SNAPSHOT_TS);
             let roots_before = snap1.meta.table_roots;
 
@@ -2074,7 +2118,7 @@ pub(crate) mod tests {
                 .checkpoint_catalog()
                 .await
                 .unwrap();
-            let snap2 = engine.catalog().storage.checkpoint_snapshot();
+            let snap2 = engine.inner().core.catalog().storage.checkpoint_snapshot();
             assert!(snap2.catalog_replay_start_ts > snap1.catalog_replay_start_ts);
             assert_eq!(snap2.meta.table_roots, roots_before);
             assert_eq!(snap2.meta.next_table_id, snap1.meta.next_table_id);
@@ -2096,6 +2140,8 @@ pub(crate) mod tests {
 
             let trx_sys = &engine.inner().trx_sys;
             let batch1 = engine
+                .inner()
+                .core
                 .catalog()
                 .scan_checkpoint_batch(
                     trx_sys.persisted_watermark_cts(),
@@ -2110,14 +2156,18 @@ pub(crate) mod tests {
             );
             let safe_cts_1 = batch1.safe_cts;
             engine
+                .inner()
+                .core
                 .catalog()
                 .apply_checkpoint_batch(batch1)
                 .await
                 .unwrap();
-            let snap1 = engine.catalog().storage.checkpoint_snapshot();
+            let snap1 = engine.inner().core.catalog().storage.checkpoint_snapshot();
             assert_eq!(snap1.catalog_replay_start_ts, safe_cts_1 + 1);
 
             let batch2 = engine
+                .inner()
+                .core
                 .catalog()
                 .scan_checkpoint_batch(
                     trx_sys.persisted_watermark_cts(),
@@ -2128,11 +2178,13 @@ pub(crate) mod tests {
             assert_eq!(batch2.catalog_ddl_txn_count, 0);
             assert_eq!(batch2.safe_cts, safe_cts_1);
             engine
+                .inner()
+                .core
                 .catalog()
                 .apply_checkpoint_batch(batch2)
                 .await
                 .unwrap();
-            let snap2 = engine.catalog().storage.checkpoint_snapshot();
+            let snap2 = engine.inner().core.catalog().storage.checkpoint_snapshot();
             assert_eq!(snap2.catalog_replay_start_ts, snap1.catalog_replay_start_ts);
         });
     }
@@ -2156,7 +2208,7 @@ pub(crate) mod tests {
                 .checkpoint_catalog()
                 .await
                 .unwrap();
-            let snap1 = engine.catalog().storage.checkpoint_snapshot();
+            let snap1 = engine.inner().core.catalog().storage.checkpoint_snapshot();
             assert!(snap1.catalog_replay_start_ts > MIN_SNAPSHOT_TS);
             let roots_before = snap1.meta.table_roots;
 
@@ -2186,11 +2238,15 @@ pub(crate) mod tests {
             trx.commit().await.unwrap();
 
             let checkpointed_table = engine
+                .inner()
+                .core
                 .catalog()
                 .get_table(checkpointed_table_id)
                 .await
                 .unwrap();
             let replay_only_table = engine
+                .inner()
+                .core
                 .catalog()
                 .get_table(replay_only_table_id)
                 .await
@@ -2239,7 +2295,7 @@ pub(crate) mod tests {
                 .checkpoint_catalog()
                 .await
                 .unwrap();
-            let snap2 = engine.catalog().storage.checkpoint_snapshot();
+            let snap2 = engine.inner().core.catalog().storage.checkpoint_snapshot();
             assert!(snap2.catalog_replay_start_ts > snap1.catalog_replay_start_ts);
             assert_eq!(snap2.meta.table_roots, roots_before);
             assert_eq!(snap2.meta.next_table_id, snap1.meta.next_table_id);

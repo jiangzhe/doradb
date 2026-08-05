@@ -163,9 +163,16 @@ Engine lifecycle admission closes session operation and inspection
 registration against shutdown. After admission drops, stable session operation
 entries account effectful foreground work, per-session observer counts account
 standalone diagnostics and progress waits, and mandatory permits account
-accepted caller or internal cleanup work. The crate-private `EngineRef` remains
-an `Arc<EngineInner>` access wrapper for memory reachability; cloning it does
-not create a separate shutdown blocker.
+accepted caller or internal cleanup work. Public session and transaction
+handles retain weak reachability to their exact `SessionState`. Successful
+admission returns a short-lived admitted session wrapper that alone exposes the
+normal weak-state upgrade. Consuming that wrapper produces an admitted
+`SessionRuntime`, retaining the same admission until the stable operation or
+observer proof is registered. Operation and transaction identity then resolve
+directly on the pinned state without a session-registry lookup. The state
+reaches immutable component capabilities through `EngineCore`, whose only
+registry back-reference is weak and used for cold pointer-exact removal after a
+session becomes closed and idle.
 
 ## Logging, Checkpoint and Recovery
 

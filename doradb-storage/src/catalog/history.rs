@@ -670,7 +670,7 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "metadata_history").await;
             let table_id = create_table2_for_test(&engine).await;
-            let catalog = engine.catalog();
+            let catalog = engine.inner().core.catalog();
 
             let initial = catalog.resolve_user_table_current(table_id).unwrap();
             let initial_cts = initial.effective_cts();
@@ -867,6 +867,8 @@ mod tests {
         TableRedoReplayFloor,
     ) {
         let current = engine
+            .inner()
+            .core
             .catalog()
             .resolve_user_table_current(table_id)
             .unwrap();
@@ -958,7 +960,7 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "metadata_history_purge").await;
             let table_id = create_table2_for_test(&engine).await;
-            let catalog = engine.catalog();
+            let catalog = engine.inner().core.catalog();
 
             let mut ddl_session = engine.new_session().unwrap();
             let index_no = ddl_session
@@ -1018,6 +1020,8 @@ mod tests {
                     .unwrap();
                 assert_eq!(usize::from(index_no), 1);
                 let visible = engine
+                    .inner()
+                    .core
                     .catalog()
                     .resolve_user_table_visible(table_id, MAX_SNAPSHOT_TS)
                     .unwrap();
@@ -1025,7 +1029,12 @@ mod tests {
                 assert!(retained_metadata.idx.index_spec(1).is_some());
 
                 session.drop_index(table_id, index_no).await.unwrap();
-                let table = engine.catalog().get_table_now(table_id).unwrap();
+                let table = engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .get_table_now(table_id)
+                    .unwrap();
                 assert!(table.layout_snapshot().secondary_indexes()[1].is_none());
                 assert!(!table.has_retired_secondary_indexes());
                 assert_eq!(
@@ -1037,6 +1046,8 @@ mod tests {
 
             let recovered = lightweight_test_engine(&temp_dir, "metadata_history_recovery").await;
             let current = recovered
+                .inner()
+                .core
                 .catalog()
                 .resolve_user_table_current(table_id)
                 .unwrap();
@@ -1061,6 +1072,8 @@ mod tests {
             assert!(!table.has_retired_secondary_indexes());
             assert_eq!(
                 recovered
+                    .inner()
+                    .core
                     .catalog()
                     .user_table_history_version_count(table_id),
                 Some(0)

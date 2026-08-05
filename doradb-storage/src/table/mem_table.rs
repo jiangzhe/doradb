@@ -3386,11 +3386,11 @@ mod tests {
         mem_table_id: TableID,
         metadata: Arc<TableMetadata>,
     ) -> TestMemTable {
-        let meta_guard = engine.inner().meta_pool.pool_guard();
-        let index_guard = engine.inner().index_pool.pool_guard();
-        let mem_pool = engine.inner().mem_pool.clone_inner();
+        let meta_guard = engine.inner().pools.meta.pool_guard();
+        let index_guard = engine.inner().pools.index.pool_guard();
+        let mem_pool = engine.inner().pools.mem.clone();
         let blk_idx = BlockIndex::new(
-            engine.inner().meta_pool.clone_inner(),
+            engine.inner().pools.meta.clone(),
             &meta_guard,
             RowID::new(0),
             SUPER_BLOCK_ID,
@@ -3400,7 +3400,7 @@ mod tests {
         MemTable::new(
             mem_pool.clone(),
             mem_pool.row_pool_role(),
-            engine.inner().index_pool.clone_inner(),
+            engine.inner().pools.index.clone(),
             PoolRole::Index,
             &index_guard,
             mem_table_id,

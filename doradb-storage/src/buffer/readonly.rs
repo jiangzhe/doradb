@@ -3244,8 +3244,8 @@ pub(crate) mod tests {
                 .unwrap();
             let table_file = commit_table_file(&engine.inner().table_fs, table_file).await;
 
-            let capacity = engine.inner().disk_pool.capacity();
-            let pool = engine.inner().disk_pool.clone_inner();
+            let capacity = engine.inner().pools.disk.capacity();
+            let pool = engine.inner().pools.disk.clone();
             let base_page_id = 7u64;
 
             // Prepare one more block than cache capacity to force drop-only eviction.
@@ -3266,10 +3266,7 @@ pub(crate) mod tests {
             let table_file = engine
                 .inner()
                 .table_fs
-                .open_table_file(
-                    test_user_table_id(103),
-                    engine.inner().disk_pool.clone_inner(),
-                )
+                .open_table_file(test_user_table_id(103), engine.inner().pools.disk.clone())
                 .await
                 .unwrap();
             let pool_guard = pool.pool_guard();
@@ -3297,7 +3294,7 @@ pub(crate) mod tests {
                         test_user_file_id(TableID::new(103)),
                         BlockID::from(base_page_id + *i as u64),
                     );
-                    engine.inner().disk_pool.try_get_frame_id(&key).is_some()
+                    engine.inner().pools.disk.try_get_frame_id(&key).is_some()
                 })
                 .count();
             assert!(mapped_count < loaded_count);

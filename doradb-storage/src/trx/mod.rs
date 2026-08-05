@@ -37,7 +37,7 @@ use crate::buffer::PoolGuards;
 use crate::buffer::page::VersionedPageID;
 use crate::catalog::{TableCache, is_catalog_table};
 use crate::completion::Completion;
-use crate::engine::{EngineRef, WeakEngineRef};
+use crate::engine::EngineCore;
 use crate::error::{
     CompletionErrorBridge, DiscloseError, DiscloseResultExt, Error, FatalError, LifecycleError,
     LifecycleResult, OperationResult, ResourceError, Result, RuntimeError, RuntimeOrFatalError,
@@ -45,16 +45,15 @@ use crate::error::{
 };
 use crate::id::{SessionID, SessionOperationKey, TableID, TrxID};
 use crate::lock::{
-    FreshLockGuard, LockManager, LockMode, LockOwner, LockResource, LockScope, OwnerLockState,
-    StmtNo, TableLockMode,
+    FreshLockGuard, LockMode, LockOwner, LockResource, LockScope, OwnerLockState, StmtNo,
+    TableLockMode,
 };
 use crate::log::block_group::TrxLog;
 use crate::log::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind};
 use crate::map::FastHashMap;
 use crate::notify::EventNotifyOnDrop;
 use crate::obs;
-use crate::quiescent::QuiescentGuard;
-use crate::session::TrxAttachment;
+use crate::session::{SessionRuntime, TrxAttachment, WeakSessionRef};
 use crate::trx::undo::{IndexPurgeEntry, IndexUndoLogs, RowUndoHead, RowUndoLogs, UndoStatus};
 use error_stack::{Report, ResultExt};
 use event_listener::{Event, EventListener};
@@ -86,7 +85,7 @@ pub(crate) const MIN_ACTIVE_TRX_ID: TrxID = TrxID::new((1 << 63) + 1);
 /// Proof that one transaction's owner-local logical lock state was drained.
 ///
 /// The proof is deliberately single-use and is minted only by terminal
-/// transaction cleanup after the retained lock-manager guard is also dropped.
+/// transaction cleanup through the terminal attachment's engine lock manager.
 pub(crate) struct ReleasedTransactionLocks {
     trx_id: TrxID,
 }
@@ -114,7 +113,7 @@ pub struct Transaction {
     trx_id: TrxID,
     sts: TrxID,
     operation_key: SessionOperationKey,
-    engine: WeakEngineRef,
+    session: WeakSessionRef,
     terminal_started: bool,
 }
 
@@ -122,7 +121,7 @@ impl Transaction {
     /// Create a weak public transaction facade for a stable session entry.
     #[inline]
     pub(crate) fn new(
-        engine: WeakEngineRef,
+        session: WeakSessionRef,
         operation_key: SessionOperationKey,
         trx_id: TrxID,
         sts: TrxID,
@@ -131,76 +130,87 @@ impl Transaction {
             trx_id,
             sts,
             operation_key,
-            engine,
+            session,
             terminal_started: false,
         }
     }
 
-    /// Resolve this handle and build an operation-local runtime attachment.
+    /// Check out the mutable core for one crate-internal operation under admission.
     #[inline]
-    fn resolve_active(&self) -> LifecycleResult<(Arc<SessionOperationEntry>, TrxAttachment)> {
-        let engine = self.engine.upgrade().attach_with(|| {
-            format!(
-                "operation_key={}, trx_id={}, phase=upgrade_engine_runtime",
-                self.operation_key, self.trx_id
-            )
-        })?;
-        let admission = engine.acquire_admission().attach_with(|| {
+    pub(crate) fn checkout(&mut self) -> LifecycleResult<SessionOperationCheckout> {
+        let admitted = self.session.acquire_admission().attach_with(|| {
             format!(
                 "operation_key={}, trx_id={}",
                 self.operation_key, self.trx_id
             )
         })?;
-        let (entry, session) = engine
-            .session_registry
-            .resolve_operation(self.operation_key)?;
-        drop(admission);
-        let attachment = TrxAttachment::new(engine, session, self.operation_key, self.trx_id);
-        Ok((entry, attachment))
-    }
-
-    /// Resolve this handle for terminal or cleanup paths.
-    #[inline]
-    fn resolve_terminal(&self) -> LifecycleResult<(Arc<SessionOperationEntry>, TrxAttachment)> {
-        let engine = self.engine.upgrade_for_terminal().attach_with(|| {
-            format!(
-                "operation_key={}, trx_id={}, phase=upgrade_engine_runtime",
+        let admitted = admitted.upgrade().ok_or_else(|| {
+            Report::new(LifecycleError::TransactionDiscarded).attach(format!(
+                "operation_key={}, trx_id={}, reason=session_missing",
                 self.operation_key, self.trx_id
-            )
+            ))
         })?;
-        self.resolve_with_engine(engine)
+        admitted
+            .runtime()
+            .poisoner
+            .ensure_healthy()
+            .change_context(LifecycleError::RuntimeUnavailable)
+            .attach_with(|| {
+                format!(
+                    "operation_key={}, trx_id={}, phase=check_engine_health",
+                    self.operation_key, self.trx_id
+                )
+            })?;
+        let entry = admitted
+            .runtime()
+            .state()
+            .resolve_operation(self.operation_key)
+            .ok_or_else(|| {
+                Report::new(LifecycleError::TransactionDiscarded).attach(format!(
+                    "operation_key={}, trx_id={}, reason=operation_entry_missing",
+                    self.operation_key, self.trx_id
+                ))
+            })?;
+        let runtime = admitted.into_runtime();
+        let attachment = TrxAttachment::new(runtime, self.operation_key, self.trx_id);
+        let checkout = SessionOperationCheckout::new(entry, attachment)?;
+        Ok(checkout)
     }
 
+    /// Check out this handle's exact entry and attachment for terminal paths.
     #[inline]
-    fn resolve_with_engine(
-        &self,
-        engine: EngineRef,
-    ) -> LifecycleResult<(Arc<SessionOperationEntry>, TrxAttachment)> {
-        let (entry, session) = engine
-            .session_registry
-            .resolve_operation(self.operation_key)?;
-        let attachment = TrxAttachment::new(engine, session, self.operation_key, self.trx_id);
+    fn checkout_terminal(&self) -> LifecycleResult<(Arc<SessionOperationEntry>, TrxAttachment)> {
+        let runtime = self.session.upgrade_for_terminal().ok_or_else(|| {
+            Report::new(LifecycleError::TransactionDiscarded).attach(format!(
+                "operation_key={}, trx_id={}, reason=session_missing",
+                self.operation_key, self.trx_id
+            ))
+        })?;
+        let entry = runtime
+            .state()
+            .resolve_operation(self.operation_key)
+            .ok_or_else(|| {
+                Report::new(LifecycleError::TransactionDiscarded).attach(format!(
+                    "operation_key={}, trx_id={}, reason=operation_entry_missing",
+                    self.operation_key, self.trx_id
+                ))
+            })?;
+        let attachment = TrxAttachment::new(runtime, self.operation_key, self.trx_id);
         Ok((entry, attachment))
-    }
-
-    /// Check out the mutable core for one crate-internal operation.
-    #[inline]
-    pub(crate) fn checkout(&mut self) -> LifecycleResult<SessionOperationCheckout> {
-        let (entry, attachment) = self.resolve_active()?;
-        SessionOperationCheckout::new(entry, attachment)
     }
 
     /// Claim this transaction for an explicit terminal operation.
     #[inline]
-    pub(crate) fn claim_terminal(&self) -> LifecycleResult<SessionOperationCompletionClaim> {
-        let (entry, attachment) = self.resolve_terminal()?;
+    fn claim_terminal(mut self) -> LifecycleResult<SessionOperationCompletionClaim> {
+        self.terminal_started = true;
+        let (entry, attachment) = self.checkout_terminal()?;
         SessionOperationCompletionClaim::terminal(entry, attachment)
     }
 
     /// Best-effort check that the transaction can still reach its engine.
     #[inline]
-    pub(crate) fn engine(&self) -> Option<EngineRef> {
-        self.engine.upgrade_for_cleanup()
+    pub(crate) fn engine(&self) -> Option<SessionRuntime> {
+        self.session.upgrade_for_terminal()
     }
 
     /// Returns this transaction's current status timestamp.
@@ -336,139 +346,81 @@ impl Transaction {
     /// Commit the transaction.
     #[inline]
     pub async fn commit(self) -> Result<TrxID> {
-        let mut trx = self;
-        trx.terminal_started = true;
-        let engine = trx
-            .engine
-            .upgrade_for_terminal()
-            .attach_with(|| {
-                format!(
-                    "operation=commit_active_transaction, session_id={}, trx_id={}, phase=upgrade_engine_runtime",
-                    trx.operation_key.session_id(), trx.trx_id
-                )
-            })
-            .disclose()?;
-        let claim = trx
+        let claim = self
             .claim_terminal()
             .attach("operation=commit_active_transaction")
             .disclose()?;
-        engine.trx_sys.commit_transaction(claim).await
+        let trx_sys = claim.engine().trx_sys.clone();
+        trx_sys.commit_transaction(claim).await
     }
 
     /// Rollback the transaction.
     #[inline]
     pub async fn rollback(self) -> Result<()> {
-        let mut trx = self;
-        trx.terminal_started = true;
-        let engine = trx
-            .engine
-            .upgrade_for_terminal()
-            .attach_with(|| {
-                format!(
-                    "operation=rollback_active_transaction, session_id={}, trx_id={}, phase=upgrade_engine_runtime",
-                    trx.operation_key.session_id(), trx.trx_id
-                )
-            })
-            .disclose()?;
-        let claim = trx
+        let claim = self
             .claim_terminal()
             .attach("operation=rollback_active_transaction")
             .disclose()?;
-        engine.trx_sys.rollback_transaction(claim).await.disclose()
+        let trx_sys = claim.engine().trx_sys.clone();
+        trx_sys.rollback_transaction(claim).await.disclose()
     }
 
     /// Commit a catalog DDL transaction without crossing the public error boundary.
     #[inline]
     pub(crate) async fn commit_catalog_ddl(self) -> RuntimeOrFatalResult<TrxID> {
-        let mut trx = self;
-        trx.terminal_started = true;
-        let engine = trx
-            .engine
-            .upgrade_for_terminal()
-            .change_context(RuntimeError::CatalogAccess)
-            .attach_with(|| {
-                format!(
-                    "operation=commit_catalog_ddl, session_id={}, trx_id={}, phase=upgrade_engine_runtime",
-                    trx.operation_key.session_id(), trx.trx_id
-                )
-            })
-            .map_err(RuntimeOrFatalError::from)?;
-        let claim = trx
+        let session_id = self.operation_key.session_id();
+        let trx_id = self.trx_id;
+        let claim = self
             .claim_terminal()
             .change_context(RuntimeError::CatalogAccess)
             .attach_with(|| {
                 format!(
                     "operation=commit_catalog_ddl, session_id={}, trx_id={}",
-                    trx.operation_key.session_id(),
-                    trx.trx_id
+                    session_id, trx_id
                 )
             })
             .map_err(RuntimeOrFatalError::from)?;
-        engine.trx_sys.commit_catalog_transaction(claim).await
+        let trx_sys = claim.engine().trx_sys.clone();
+        trx_sys.commit_catalog_transaction(claim).await
     }
 
     /// Roll back a catalog DDL transaction without crossing the public error boundary.
     #[inline]
     pub(crate) async fn rollback_catalog_ddl(self) -> RuntimeOrFatalResult<()> {
-        let mut trx = self;
-        trx.terminal_started = true;
-        let engine = trx
-            .engine
-            .upgrade_for_terminal()
-            .change_context(RuntimeError::CatalogAccess)
-            .attach_with(|| {
-                format!(
-                    "operation=rollback_catalog_ddl, session_id={}, trx_id={}, phase=upgrade_engine_runtime",
-                    trx.operation_key.session_id(), trx.trx_id
-                )
-            })
-            .map_err(RuntimeOrFatalError::from)?;
-        let claim = trx
+        let session_id = self.operation_key.session_id();
+        let trx_id = self.trx_id;
+        let claim = self
             .claim_terminal()
             .change_context(RuntimeError::CatalogAccess)
             .attach_with(|| {
                 format!(
                     "operation=rollback_catalog_ddl, session_id={}, trx_id={}",
-                    trx.operation_key.session_id(),
-                    trx.trx_id
+                    session_id, trx_id
                 )
             })
             .map_err(RuntimeOrFatalError::from)?;
-        engine.trx_sys.rollback_catalog_transaction(claim).await
+        let trx_sys = claim.engine().trx_sys.clone();
+        trx_sys.rollback_catalog_transaction(claim).await
     }
 
     /// Roll back an engine-owned table-maintenance transaction without crossing
     /// the public error boundary.
     #[inline]
     pub(crate) async fn rollback_table_maintenance(self) -> RuntimeOrFatalResult<()> {
-        let mut trx = self;
-        trx.terminal_started = true;
-        let engine = trx
-            .engine
-            .upgrade_for_terminal()
-            .change_context(RuntimeError::TableAccess)
-            .attach_with(|| {
-                format!(
-                    "operation=rollback_table_maintenance, session_id={}, trx_id={}, phase=upgrade_engine_runtime",
-                    trx.operation_key.session_id(), trx.trx_id
-                )
-            })
-            .map_err(RuntimeOrFatalError::from)?;
-        let claim = trx
+        let session_id = self.operation_key.session_id();
+        let trx_id = self.trx_id;
+        let claim = self
             .claim_terminal()
             .change_context(RuntimeError::TableAccess)
             .attach_with(|| {
                 format!(
                     "operation=rollback_table_maintenance, session_id={}, trx_id={}",
-                    trx.operation_key.session_id(),
-                    trx.trx_id
+                    session_id, trx_id
                 )
             })
             .map_err(RuntimeOrFatalError::from)?;
-        engine
-            .trx_sys
-            .rollback_table_maintenance_transaction(claim)
-            .await
+        let trx_sys = claim.engine().trx_sys.clone();
+        trx_sys.rollback_table_maintenance_transaction(claim).await
     }
 }
 
@@ -478,16 +430,13 @@ impl Drop for Transaction {
         if self.terminal_started {
             return;
         }
-        if let Some(engine) = self.engine.upgrade_for_cleanup() {
-            let abandoned = engine
-                .session_registry
+        if let Some(runtime) = self.session.upgrade_for_terminal() {
+            let abandoned = runtime
+                .state()
                 .abandon_trx_handle(self.operation_key, self.trx_id);
             if abandoned {
-                engine.trx_sys.request_abandoned_trx_cleanup(
-                    engine.clone(),
-                    self.operation_key,
-                    self.trx_id,
-                );
+                let trx_sys = runtime.trx_sys.clone();
+                trx_sys.request_abandoned_trx_cleanup(runtime, self.operation_key, self.trx_id);
             }
         }
     }
@@ -835,7 +784,7 @@ impl<'r> TrxRuntime<'r> {
 
     /// Returns the crate-private engine runtime handle.
     #[inline]
-    pub(crate) fn engine(&self) -> &'r EngineRef {
+    pub(crate) fn engine(&self) -> &'r EngineCore {
         self.attachment.engine()
     }
 
@@ -2065,7 +2014,7 @@ impl SessionOperationCompletionClaim {
 
     /// Returns the engine retained by this terminal or cleanup claim.
     #[inline]
-    pub(crate) fn engine(&self) -> &EngineRef {
+    pub(crate) fn engine(&self) -> &EngineCore {
         self.attachment
             .as_ref()
             .expect("active completion claim retains terminal attachment")
@@ -2085,13 +2034,14 @@ impl SessionOperationCompletionClaim {
 
 /// Abandoned transaction cleanup job.
 ///
-/// The job carries component access through `EngineRef`; its mandatory internal
-/// permit is the background-work shutdown proof. The stable session operation
-/// remains visible until the task has either claimed and rolled back the
-/// abandoned transaction or found that it is no longer claimable.
+/// The job carries exact state and component access through `SessionRuntime`
+/// until that runtime moves into the terminal attachment. Its mandatory
+/// internal permit is the background-work shutdown proof. The stable session
+/// operation remains visible until the task has either claimed and rolled back
+/// the abandoned transaction or found that it is no longer claimable.
 pub(crate) struct SessionOperationCleanupJob {
-    /// Shared engine access retained until cleanup resolves this job.
-    pub(crate) engine: EngineRef,
+    /// Exact session runtime retained until cleanup resolves or claims this job.
+    pub(crate) runtime: Option<SessionRuntime>,
     /// Exact stable operation that owns the abandoned transaction.
     pub(crate) operation_key: SessionOperationKey,
     /// Exact transaction id validated by the entry cleanup claim.
@@ -2460,22 +2410,13 @@ impl TrxInner {
     }
 
     #[inline]
-    fn checked_engine(&self, attachment: &TrxAttachment) -> EngineRef {
+    fn checked_engine<'a>(&self, attachment: &'a TrxAttachment) -> &'a EngineCore {
         assert!(
             self.active,
             "checked-out transaction must retain its active core and engine attachment: trx_id={}",
             self.trx_id()
         );
-        attachment.engine().clone()
-    }
-
-    #[inline]
-    fn clone_lock_manager_guard(
-        &self,
-        attachment: &TrxAttachment,
-    ) -> Option<QuiescentGuard<LockManager>> {
-        self.active
-            .then(|| attachment.engine().lock_manager().clone())
+        attachment.engine()
     }
 
     #[inline]
@@ -2680,7 +2621,6 @@ impl TrxInner {
         self.clear_table_bindings();
         // fast path for readonly transactions
         if !self.require_ordered_commit() {
-            let lock_manager = self.clone_lock_manager_guard(&attachment);
             // there should be no ref count of transaction status.
             debug_assert!(Arc::strong_count(&self.ctx.status) == 1);
             debug_assert!(self.effects.index_undo.is_empty());
@@ -2697,7 +2637,6 @@ impl TrxInner {
                 redo_bin: None,
                 payload: Some(payload),
                 attachment: Some(attachment),
-                lock_manager,
                 lock_state,
                 trx_inner: Some(self),
             };
@@ -2712,7 +2651,6 @@ impl TrxInner {
             None
         };
         let (row_undo, index_undo) = self.effects.take_payload_parts();
-        let lock_manager = self.clone_lock_manager_guard(&attachment);
         let payload = PreparedTrxPayload::User {
             status: Arc::clone(self.ctx.status()),
             sts: self.ctx.sts(),
@@ -2726,7 +2664,6 @@ impl TrxInner {
             redo_bin,
             payload: Some(payload),
             attachment: Some(attachment),
-            lock_manager,
             lock_state,
             trx_inner: Some(self),
         }
@@ -2784,7 +2721,6 @@ pub(crate) struct PreparedTrx {
     payload: Option<PreparedTrxPayload>,
     /// Terminal session attachment carried until ordered commit or rollback cleanup.
     pub(crate) attachment: Option<TrxAttachment>,
-    lock_manager: Option<QuiescentGuard<LockManager>>,
     lock_state: Option<OwnerLockState>,
     /// Emptied session transaction core retained until the terminal outcome.
     trx_inner: Option<Box<TrxInner>>,
@@ -2852,7 +2788,6 @@ impl PreparedTrx {
             redo_bin,
             payload,
             attachment: self.attachment.take(),
-            lock_manager: self.lock_manager.take(),
             lock_state: self.lock_state.take(),
             trx_inner: self.trx_inner.take(),
         }
@@ -2861,7 +2796,7 @@ impl PreparedTrx {
     /// Releases and drops transaction-owned locks for an unordered discard path.
     #[inline]
     pub(self) fn release_transaction_locks(&mut self) -> Option<ReleasedTransactionLocks> {
-        release_carried_transaction_locks(&mut self.lock_state, &mut self.lock_manager)
+        release_carried_transaction_locks(self.attachment.as_ref(), &mut self.lock_state)
     }
 }
 
@@ -2871,10 +2806,6 @@ impl Drop for PreparedTrx {
         assert!(self.redo_bin.is_none(), "redo should be cleared");
         assert!(self.payload.is_none(), "payload should be cleared");
         assert!(self.attachment.is_none(), "attachment should be cleared");
-        assert!(
-            self.lock_manager.is_none(),
-            "lock manager should be cleared"
-        );
         assert!(self.lock_state.is_none(), "lock state should be cleared");
         assert!(
             self.trx_inner.is_none(),
@@ -2925,12 +2856,12 @@ impl PrecommitTrxPayload {
             panic!("rollback requires a user precommit payload")
         };
         let trx_sys = &attachment.engine().trx_sys;
-        let pool_guards = attachment.pool_guards().clone();
+        let pool_guards = attachment.pool_guards();
         let mut table_cache = TableCache::new(&trx_sys.catalog);
         index_undo
-            .rollback(&mut table_cache, &pool_guards, *sts)
+            .rollback(&mut table_cache, pool_guards, *sts)
             .await?;
-        row_undo.rollback(&mut table_cache, &pool_guards).await
+        row_undo.rollback(&mut table_cache, pool_guards).await
     }
 
     #[inline]
@@ -2978,8 +2909,6 @@ pub(crate) struct PrecommitTrx {
     pub(crate) payload: Option<PrecommitTrxPayload>,
     /// Terminal session attachment for user transactions.
     pub(crate) attachment: Option<TrxAttachment>,
-    /// Lock manager retained to release transaction-owned locks.
-    pub(crate) lock_manager: Option<QuiescentGuard<LockManager>>,
     /// Transaction-owned lock state retained until terminal cleanup.
     pub(crate) lock_state: Option<OwnerLockState>,
     /// Emptied session transaction core retained until the terminal outcome.
@@ -3095,10 +3024,6 @@ impl PrecommitTrx {
     #[inline]
     async fn rollback_failed_precommit(&mut self) -> FailedPrecommitRollbackOutcome {
         self.redo_bin.take();
-        let engine = self
-            .attachment
-            .as_ref()
-            .map(|attachment| attachment.engine().clone());
         if let (Some(payload), Some(attachment)) = (self.payload.as_mut(), self.attachment.as_ref())
         {
             if let Err(err) = payload.rollback(attachment).await {
@@ -3110,7 +3035,7 @@ impl PrecommitTrx {
                     report
                 );
                 let _ = attachment.engine().poisoner.poison(report);
-                self.finish_failed_precommit_with_retention(engine);
+                self.finish_failed_precommit_with_retention();
                 return FailedPrecommitRollbackOutcome::FailedRetained;
             }
             payload.record_rollback_for_purge(attachment);
@@ -3127,21 +3052,18 @@ impl PrecommitTrx {
     #[inline]
     fn retain_failed_precommit_without_rollback(&mut self) {
         self.redo_bin.take();
-        let engine = self
-            .attachment
-            .as_ref()
-            .map(|attachment| attachment.engine().clone());
-        self.finish_failed_precommit_with_retention(engine);
+        self.finish_failed_precommit_with_retention();
     }
 
     #[inline]
-    fn finish_failed_precommit_with_retention(&mut self, engine: Option<EngineRef>) {
+    fn finish_failed_precommit_with_retention(&mut self) {
         let released = self.release_transaction_locks();
-        self.finish_carried_session_rollback_without_reuse(released);
+        let attachment = self.finish_carried_session_rollback_without_reuse(released);
         if let Some(payload) = self.payload.take() {
             payload.release_prepare_waiters();
-            if let Some(engine) = engine {
-                engine
+            if let Some(attachment) = attachment {
+                attachment
+                    .engine()
                     .trx_sys
                     .retain_fatal_rollback(FatalRollbackRetention::Precommit(payload));
             } else {
@@ -3184,7 +3106,7 @@ impl PrecommitTrx {
 
     #[inline]
     fn release_transaction_locks(&mut self) -> Option<ReleasedTransactionLocks> {
-        release_carried_transaction_locks(&mut self.lock_state, &mut self.lock_manager)
+        release_carried_transaction_locks(self.attachment.as_ref(), &mut self.lock_state)
     }
 
     #[inline]
@@ -3215,12 +3137,13 @@ impl PrecommitTrx {
     fn finish_carried_session_rollback_without_reuse(
         &mut self,
         released: Option<ReleasedTransactionLocks>,
-    ) {
+    ) -> Option<TrxAttachment> {
         let inner = self.trx_inner.take();
         match (self.attachment.take(), released) {
             (Some(attachment), Some(released)) => {
                 attachment.rollback_without_reuse(released);
                 drop(inner);
+                Some(attachment)
             }
             (None, None) => {
                 assert!(
@@ -3228,6 +3151,7 @@ impl PrecommitTrx {
                     "system precommit cannot carry a session transaction core: cts={}",
                     self.cts
                 );
+                None
             }
             (attachment, released) => {
                 panic!(
@@ -3249,10 +3173,6 @@ impl Drop for PrecommitTrx {
         assert!(self.redo_bin.is_none(), "redo should be cleared");
         assert!(self.payload.is_none(), "payload should be cleared");
         assert!(self.attachment.is_none(), "attachment should be cleared");
-        assert!(
-            self.lock_manager.is_none(),
-            "lock manager should be cleared"
-        );
         assert!(self.lock_state.is_none(), "lock state should be cleared");
         assert!(
             self.trx_inner.is_none(),
@@ -3368,30 +3288,29 @@ fn session_operation_entry_state_err(
 
 #[inline]
 fn release_carried_transaction_locks(
+    attachment: Option<&TrxAttachment>,
     lock_state: &mut Option<OwnerLockState>,
-    lock_manager: &mut Option<QuiescentGuard<LockManager>>,
 ) -> Option<ReleasedTransactionLocks> {
-    match (lock_state.take(), lock_manager.take()) {
-        (Some(mut lock_state), Some(lock_manager)) => {
+    match (lock_state.take(), attachment) {
+        (Some(mut lock_state), Some(attachment)) => {
             let owner = lock_state.owner();
             let LockScope::Transaction(trx_id) = owner.scope() else {
                 panic!("carried terminal lock state requires a transaction owner: owner={owner}")
             };
-            lock_state.release_all(&lock_manager);
+            lock_state.release_all(attachment.engine().lock_manager());
             lock_state.assert_cleared();
             drop(lock_state);
-            drop(lock_manager);
             Some(ReleasedTransactionLocks::new(trx_id))
         }
         (None, None) => None,
         (Some(lock_state), None) => {
             panic!(
-                "carried transaction lock state requires a lock-manager guard: owner={}",
+                "carried transaction lock state requires an attachment: owner={}",
                 lock_state.owner()
             )
         }
         (None, Some(_)) => {
-            panic!("carried transaction lock-manager guard requires owner lock state")
+            panic!("carried transaction attachment requires owner lock state")
         }
     }
 }
@@ -3430,11 +3349,13 @@ pub(crate) mod tests {
         IOKind, StdIoResult, StorageBackendFileIdentity, StorageBackendOp, StorageBackendTestHook,
         install_storage_backend_test_hook,
     };
+    use crate::lock::LockManager;
     use crate::lock::tests::{LockDebugEntryState, debug_snapshot, try_acquire};
     use crate::log::redo::{RowRedo, RowRedoKind};
+    use crate::quiescent::QuiescentGuard;
     use crate::row::ops::SelectKey;
     use crate::session::{
-        Session,
+        Session, SessionRegistry, SessionShutdownWait,
         tests::{
             SessionTestExt, TerminalAttachmentOutcome, TerminalAttachmentTestHookGuard,
             active_operation_count, assert_existing_transaction_error,
@@ -3747,14 +3668,19 @@ pub(crate) mod tests {
     fn resolve_active_parts_for_test(
         trx: &Transaction,
     ) -> Result<(Arc<SessionOperationEntry>, TrxAttachment)> {
-        let engine = trx
-            .engine
+        let runtime = trx
+            .session
             .upgrade_for_terminal()
-            .attach_with(|| format!("operation_key={}, trx_id={}", trx.operation_key, trx.trx_id))
+            .ok_or_else(|| {
+                Report::new(LifecycleError::TransactionDiscarded).attach(format!(
+                    "operation_key={}, trx_id={}, reason=session_missing",
+                    trx.operation_key, trx.trx_id
+                ))
+            })
             .disclose()?;
-        let (entry, session) = engine
-            .session_registry
-            .try_resolve_operation(trx.operation_key)
+        let entry = runtime
+            .state()
+            .resolve_operation(trx.operation_key)
             .ok_or_else(|| {
                 Report::new(LifecycleError::TransactionDiscarded).attach(format!(
                     "operation_key={}, trx_id={}, reason=transaction_not_resolvable",
@@ -3762,7 +3688,7 @@ pub(crate) mod tests {
                 ))
             })
             .disclose()?;
-        let attachment = TrxAttachment::new(engine, session, trx.operation_key, trx.trx_id);
+        let attachment = TrxAttachment::new(runtime, trx.operation_key, trx.trx_id);
         Ok((entry, attachment))
     }
 
@@ -4129,15 +4055,12 @@ pub(crate) mod tests {
                 test_engine("same_operation_key_rejects_wrong_transaction_identity").await;
             let mut session = engine.new_session().unwrap();
             let trx = session.begin_trx().unwrap();
-            let engine_ref = engine.new_ref().unwrap();
             let mut forged = Transaction::new(
-                engine_ref.downgrade(),
+                trx.session.clone(),
                 trx.operation_key,
                 TrxID::new(trx.trx_id().as_u64() + 1),
                 trx.sts(),
             );
-            drop(engine_ref);
-
             let err = match forged.checkout() {
                 Ok(_) => panic!("wrong transaction id must not claim the exact operation entry"),
                 Err(err) => err,
@@ -4180,12 +4103,13 @@ pub(crate) mod tests {
                 .session_registry
                 .first_shutdown_wait()
                 .expect("checked-out transaction must block shutdown");
-            assert_eq!(shutdown_wait.blocker.cleanup(), None);
+            let SessionShutdownWait { blocker, listener } = shutdown_wait;
+            assert!(blocker.into_cleanup().is_none());
             let (ready_tx, ready_rx) = mpsc::channel();
             let (done_tx, done_rx) = mpsc::channel();
             let waiter = spawn(move || {
                 ready_tx.send(()).expect("waiter should report ready");
-                shutdown_wait.listener.wait();
+                listener.wait();
                 done_tx.send(()).expect("waiter should report completion");
             });
 
@@ -4282,8 +4206,7 @@ pub(crate) mod tests {
     }
 
     #[inline]
-    fn prepare_transaction(mut trx: Transaction) -> Result<PreparedTrx> {
-        trx.terminal_started = true;
+    fn prepare_transaction(trx: Transaction) -> Result<PreparedTrx> {
         let claim = trx
             .claim_terminal()
             .attach("operation=prepare_active_transaction")
@@ -4350,7 +4273,9 @@ pub(crate) mod tests {
         let engine = trx.engine().expect("test transaction must have engine");
         discard_transaction_after_fatal_rollback(trx);
         engine.trx_sys.record_rollback_for_purge(gc_no, sts);
-        remove_session_for_test(&engine.session_registry, session_id);
+        if let Some(registry) = engine.session_registry.upgrade() {
+            remove_session_for_test(&registry, session_id);
+        }
     }
 
     /// Add one redo log entry for tests that need a non-readonly transaction.
@@ -4451,7 +4376,7 @@ pub(crate) mod tests {
     }
 
     fn lock_entry_count(engine: &Engine, owner: LockOwner) -> usize {
-        debug_snapshot(engine.lock_manager())
+        debug_snapshot(engine.inner().core.lock_manager())
             .entries
             .iter()
             .filter(|entry| entry.owner == owner)
@@ -4468,7 +4393,8 @@ pub(crate) mod tests {
     }
 
     fn install_terminal_boundary_observer(
-        engine: EngineRef,
+        lock_manager: QuiescentGuard<LockManager>,
+        session_registry: Arc<SessionRegistry>,
         operation_key: SessionOperationKey,
         target_trx_id: TrxID,
         status: Option<Arc<SharedTrxStatus>>,
@@ -4483,7 +4409,7 @@ pub(crate) mod tests {
             if trx_id != target_trx_id {
                 return;
             }
-            let snapshot = debug_snapshot(engine.lock_manager());
+            let snapshot = debug_snapshot(&lock_manager);
             let transaction_lock_entries = snapshot
                 .entries
                 .iter()
@@ -4500,8 +4426,7 @@ pub(crate) mod tests {
                 .send(TerminalBoundaryObservation {
                     outcome,
                     transaction_lock_entries,
-                    session_active: engine
-                        .session_registry
+                    session_active: session_registry
                         .try_resolve_operation(operation_key)
                         .is_some(),
                     status_ts: status.as_ref().map(|status| status.ts()),
@@ -4586,7 +4511,7 @@ pub(crate) mod tests {
         mode: LockMode,
         state: LockDebugEntryState,
     ) -> bool {
-        debug_snapshot(engine.lock_manager())
+        debug_snapshot(engine.inner().core.lock_manager())
             .entries
             .iter()
             .any(|entry| {
@@ -4598,7 +4523,7 @@ pub(crate) mod tests {
     }
 
     fn has_lock_resource(engine: &Engine, owner: LockOwner, resource: LockResource) -> bool {
-        debug_snapshot(engine.lock_manager())
+        debug_snapshot(engine.inner().core.lock_manager())
             .entries
             .iter()
             .any(|entry| entry.owner == owner && entry.resource == resource)
@@ -5209,7 +5134,7 @@ pub(crate) mod tests {
         let blocker = LockOwner::transaction(SessionID::new(id), TrxID::new(id));
         assert!(
             try_acquire(
-                engine.lock_manager(),
+                engine.inner().core.lock_manager(),
                 resource,
                 LockMode::Exclusive,
                 blocker
@@ -5233,7 +5158,14 @@ pub(crate) mod tests {
             LockDebugEntryState::Waiting,
         ));
         if promote_before_drop {
-            assert_eq!(engine.lock_manager().release(resource, blocker), 1);
+            assert_eq!(
+                engine
+                    .inner()
+                    .core
+                    .lock_manager()
+                    .release(resource, blocker),
+                1
+            );
             assert!(has_lock_entry(
                 &engine,
                 stmt_owner,
@@ -5247,7 +5179,14 @@ pub(crate) mod tests {
 
         assert!(!has_lock_resource(&engine, stmt_owner, resource));
         if !promote_before_drop {
-            assert_eq!(engine.lock_manager().release(resource, blocker), 1);
+            assert_eq!(
+                engine
+                    .inner()
+                    .core
+                    .lock_manager()
+                    .release(resource, blocker),
+                1
+            );
         }
         let err = trx.rollback().await.unwrap_err();
         assert_eq!(
@@ -5459,7 +5398,7 @@ pub(crate) mod tests {
             assert!(try_acquire_transaction_lock(&mut trx, metadata, LockMode::Shared).unwrap());
             assert!(
                 try_acquire(
-                    engine.lock_manager(),
+                    engine.inner().core.lock_manager(),
                     metadata,
                     LockMode::Shared,
                     LockOwner::session_explicit(SessionID::new(91_221))
@@ -5473,6 +5412,8 @@ pub(crate) mod tests {
                 Some(OperationError::LockUpgradeWouldBlock)
             );
             engine
+                .inner()
+                .core
                 .lock_manager()
                 .release_owner(LockOwner::session_explicit(SessionID::new(91_221)));
 
@@ -5548,7 +5489,13 @@ pub(crate) mod tests {
             let blocker = LockOwner::transaction(SessionID::new(91_401), TrxID::new(91_401));
             let data = LockResource::TableData(table_id);
             assert!(
-                try_acquire(engine.lock_manager(), data, LockMode::Exclusive, blocker).unwrap()
+                try_acquire(
+                    engine.inner().core.lock_manager(),
+                    data,
+                    LockMode::Exclusive,
+                    blocker
+                )
+                .unwrap()
             );
 
             let mut session = engine.new_session().unwrap();
@@ -5590,7 +5537,7 @@ pub(crate) mod tests {
             assert!(!has_lock_resource(&engine, owner, metadata));
             assert!(!has_lock_resource(&engine, owner, data));
             assert!(!cached_transaction_lock_covers(&trx, metadata, LockMode::Shared).unwrap());
-            assert_eq!(engine.lock_manager().release(data, blocker), 1);
+            assert_eq!(engine.inner().core.lock_manager().release(data, blocker), 1);
 
             trx.rollback().await.unwrap();
         });
@@ -5613,7 +5560,13 @@ pub(crate) mod tests {
 
             let blocker = LockOwner::transaction(SessionID::new(91_402), TrxID::new(91_402));
             assert!(
-                try_acquire(engine.lock_manager(), data, LockMode::Exclusive, blocker).unwrap()
+                try_acquire(
+                    engine.inner().core.lock_manager(),
+                    data,
+                    LockMode::Exclusive,
+                    blocker
+                )
+                .unwrap()
             );
 
             let mut lock_fut = Box::pin(trx.lock_table(table_id, TableLockMode::Shared));
@@ -5656,7 +5609,7 @@ pub(crate) mod tests {
             assert!(!has_lock_resource(&engine, owner, data));
             assert!(cached_transaction_lock_covers(&trx, metadata, LockMode::Shared).unwrap());
             assert!(!cached_transaction_lock_covers(&trx, data, LockMode::Shared).unwrap());
-            assert_eq!(engine.lock_manager().release(data, blocker), 1);
+            assert_eq!(engine.inner().core.lock_manager().release(data, blocker), 1);
 
             trx.rollback().await.unwrap();
             assert_eq!(lock_entry_count(&engine, owner), 0);
@@ -5752,7 +5705,8 @@ pub(crate) mod tests {
             })
             .unwrap();
             let (hook, observed_rx) = install_terminal_boundary_observer(
-                engine.new_ref().unwrap(),
+                engine.inner().core.lock_manager().clone(),
+                Arc::clone(&engine.inner().session_registry),
                 trx.operation_key,
                 trx_id,
                 Some(status),
@@ -5788,7 +5742,8 @@ pub(crate) mod tests {
                 .unwrap()
             );
             let (hook, observed_rx) = install_terminal_boundary_observer(
-                engine.new_ref().unwrap(),
+                engine.inner().core.lock_manager().clone(),
+                Arc::clone(&engine.inner().session_registry),
                 trx.operation_key,
                 trx_id,
                 None,
@@ -5823,7 +5778,8 @@ pub(crate) mod tests {
                 .unwrap()
             );
             let (hook, observed_rx) = install_terminal_boundary_observer(
-                engine.new_ref().unwrap(),
+                engine.inner().core.lock_manager().clone(),
+                Arc::clone(&engine.inner().session_registry),
                 trx.operation_key,
                 trx_id,
                 None,
@@ -5928,7 +5884,8 @@ pub(crate) mod tests {
                 .unwrap()
             );
             let (hook, observed_rx) = install_terminal_boundary_observer(
-                engine.new_ref().unwrap(),
+                engine.inner().core.lock_manager().clone(),
+                Arc::clone(&engine.inner().session_registry),
                 trx.operation_key,
                 trx_id,
                 None,
@@ -5972,7 +5929,8 @@ pub(crate) mod tests {
             let prepared = prepare_transaction(trx).unwrap();
             let mut precommit = prepared.fill_cts(TrxID::new(91_241));
             let (hook, observed_rx) = install_terminal_boundary_observer(
-                engine.new_ref().unwrap(),
+                engine.inner().core.lock_manager().clone(),
+                Arc::clone(&engine.inner().session_registry),
                 operation_key,
                 trx_id,
                 None,
@@ -6135,13 +6093,12 @@ pub(crate) mod tests {
                 .expect("terminal rollback worker should start");
             assert_eq!(entry.inspect().state, SessionOperationState::Completing);
 
-            let engine_ref = engine.new_ref().unwrap();
-            let (duplicate_entry, duplicate_session) = engine_ref
-                .session_registry
-                .try_resolve_operation(operation_key)
-                .expect("rolling-back transaction should remain registry-visible");
-            let duplicate_attachment =
-                TrxAttachment::new(engine_ref, duplicate_session, operation_key, trx_id);
+            let duplicate_runtime = session.engine();
+            let duplicate_entry = duplicate_runtime
+                .state()
+                .resolve_operation(operation_key)
+                .expect("rolling-back transaction should retain its exact entry");
+            let duplicate_attachment = TrxAttachment::new(duplicate_runtime, operation_key, trx_id);
             assert!(
                 SessionOperationCompletionClaim::cleanup(duplicate_entry, duplicate_attachment)
                     .is_err(),
@@ -6229,7 +6186,13 @@ pub(crate) mod tests {
             )
             .await;
             let table_id = catalog_tests::table2(&engine).await;
-            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
             let large = "r".repeat(48 * 1024);
 
             fn precommit_with_cold_row_undo(
@@ -6504,7 +6467,7 @@ pub(crate) mod tests {
             let mutable = MutableTableFile::fork(
                 &table_file,
                 engine.inner().table_fs.background_writes(),
-                engine.inner().disk_pool.clone_inner(),
+                engine.inner().pools.disk.clone(),
             );
             let table_file = engine
                 .inner()

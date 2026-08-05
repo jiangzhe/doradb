@@ -467,8 +467,9 @@ completion.
 Every terminal user-transaction path drains its owner-local `OwnerLockState`
 before finishing the session transaction lifecycle. Transaction code mints one
 non-cloneable, transaction-id-bound `ReleasedTransactionLocks` proof only after
-the local state is empty. Prepared and precommit paths also consume and drop
-their retained lock-manager guard before minting the proof.
+the local state is empty. Prepared and precommit paths reach the engine lock
+manager through their retained terminal attachment, avoiding a second retained
+component guard.
 
 `TrxAttachment::commit()` and `TrxAttachment::rollback()` consume a matching
 proof before they can make a running session idle or close an abandoned

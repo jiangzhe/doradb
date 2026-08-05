@@ -427,7 +427,6 @@ mod tests {
                 redo_bin: None,
                 payload: None,
                 attachment: None,
-                lock_manager: None,
                 lock_state: None,
                 trx_inner: None,
             }],

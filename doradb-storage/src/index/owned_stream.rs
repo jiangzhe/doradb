@@ -266,7 +266,8 @@ impl<'trx, P: BufferPool + 'static> OwnedSecondaryIndexCandidateStream<'trx, P> 
     pub(crate) fn new(handle: OwnedCurrentIndexReadHandle<'trx, P>, range: KeyRange) -> Self {
         let OwnedCurrentIndexReadHandle {
             index,
-            guards: pool_guards,
+            index_pool_guard,
+            disk_pool_guard,
             root,
             _transaction,
         } = handle;
@@ -274,14 +275,11 @@ impl<'trx, P: BufferPool + 'static> OwnedSecondaryIndexCandidateStream<'trx, P> 
         let inner = match index.as_ref() {
             SecondaryIndex::Unique { .. } => {
                 let mem = OwnedUniqueMemIndexCandidateStream::new(
-                    OwnedUniqueMemIndexCursor::new(
-                        Arc::clone(&index),
-                        pool_guards.index_guard().clone(),
-                    ),
+                    OwnedUniqueMemIndexCursor::new(Arc::clone(&index), index_pool_guard),
                     Arc::clone(&range),
                 );
                 let disk = OwnedUniqueDiskTreeCandidateStream::new(
-                    OwnedUniqueDiskTreeCursor::new(index, pool_guards.disk_guard().clone(), root),
+                    OwnedUniqueDiskTreeCursor::new(index, disk_pool_guard, root),
                     range,
                 );
                 OwnedSecondaryIndexCandidateStreamKind::Unique(SecondaryIndexCandidateStream::new(
@@ -290,18 +288,11 @@ impl<'trx, P: BufferPool + 'static> OwnedSecondaryIndexCandidateStream<'trx, P> 
             }
             SecondaryIndex::NonUnique { .. } => {
                 let mem = OwnedNonUniqueMemIndexCandidateStream::new(
-                    OwnedNonUniqueMemIndexCursor::new(
-                        Arc::clone(&index),
-                        pool_guards.index_guard().clone(),
-                    ),
+                    OwnedNonUniqueMemIndexCursor::new(Arc::clone(&index), index_pool_guard),
                     Arc::clone(&range),
                 );
                 let disk = OwnedNonUniqueDiskTreeCandidateStream::new(
-                    OwnedNonUniqueDiskTreeCursor::new(
-                        index,
-                        pool_guards.disk_guard().clone(),
-                        root,
-                    ),
+                    OwnedNonUniqueDiskTreeCursor::new(index, disk_pool_guard, root),
                     range,
                 );
                 OwnedSecondaryIndexCandidateStreamKind::NonUnique(

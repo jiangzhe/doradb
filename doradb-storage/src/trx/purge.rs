@@ -1451,10 +1451,10 @@ mod tests {
     #[inline]
     fn full_pool_guards(engine: &Engine) -> PoolGuards {
         PoolGuards::builder()
-            .push(PoolRole::Meta, engine.inner().meta_pool.pool_guard())
-            .push(PoolRole::Index, engine.inner().index_pool.pool_guard())
-            .push(PoolRole::Mem, engine.inner().mem_pool.pool_guard())
-            .push(PoolRole::Disk, engine.inner().disk_pool.pool_guard())
+            .push(PoolRole::Meta, engine.inner().pools.meta.pool_guard())
+            .push(PoolRole::Index, engine.inner().pools.index.pool_guard())
+            .push(PoolRole::Mem, engine.inner().pools.mem.pool_guard())
+            .push(PoolRole::Disk, engine.inner().pools.disk.pool_guard())
             .build()
     }
 
@@ -1646,7 +1646,12 @@ mod tests {
             let (_temp_dir, engine) =
                 purge_test_engine("drop_runtime_unique_assertion", 1, 1).await;
             let table_id = table1(&engine).await;
-            let table = engine.catalog().get_table_now(table_id).unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table_now(table_id)
+                .unwrap();
             let expected_strong_count = Arc::strong_count(&table) + 1;
 
             let panic = match catch_unwind(AssertUnwindSafe(|| {
@@ -2319,7 +2324,7 @@ mod tests {
                 engine
                     .inner()
                     .trx_sys
-                    .process_retired_row_pages(engine.catalog(), &guards, Vec::new())
+                    .process_retired_row_pages(engine.inner().core.catalog(), &guards, Vec::new())
                     .await
             );
             assert!(engine.inner().poisoner.poison_error().is_none());
@@ -2329,7 +2334,7 @@ mod tests {
                     .inner()
                     .trx_sys
                     .process_retired_row_pages(
-                        engine.catalog(),
+                        engine.inner().core.catalog(),
                         &guards,
                         vec![RetiredRowPageBatch::new(
                             TableID::new(999_999),
@@ -2396,7 +2401,7 @@ mod tests {
             let err = engine
                 .inner()
                 .trx_sys
-                .purge_gc_bucket(engine.catalog(), &guards, 0, MAX_SNAPSHOT_TS)
+                .purge_gc_bucket(engine.inner().core.catalog(), &guards, 0, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -2442,7 +2447,13 @@ mod tests {
             .unwrap();
 
             let table_id = table1(&engine).await;
-            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
@@ -2489,7 +2500,12 @@ mod tests {
                 engine
                     .inner()
                     .trx_sys
-                    .purge_trx_list(engine.catalog(), &pool_guards, vec![trx], MAX_SNAPSHOT_TS)
+                    .purge_trx_list(
+                        engine.inner().core.catalog(),
+                        &pool_guards,
+                        vec![trx],
+                        MAX_SNAPSHOT_TS,
+                    )
                     .await
                     .unwrap();
             }
@@ -2526,7 +2542,13 @@ mod tests {
             .unwrap();
 
             let table_id = table1(&engine).await;
-            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
@@ -2573,7 +2595,12 @@ mod tests {
                 engine
                     .inner()
                     .trx_sys
-                    .purge_trx_list(engine.catalog(), &pool_guards, vec![trx], MAX_SNAPSHOT_TS)
+                    .purge_trx_list(
+                        engine.inner().core.catalog(),
+                        &pool_guards,
+                        vec![trx],
+                        MAX_SNAPSHOT_TS,
+                    )
                     .await
                     .unwrap();
             }
@@ -2614,7 +2641,13 @@ mod tests {
             .unwrap();
 
             let table_id = table1(&engine).await;
-            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
@@ -2684,7 +2717,12 @@ mod tests {
                 engine
                     .inner()
                     .trx_sys
-                    .purge_trx_list(engine.catalog(), &pool_guards, vec![trx], MAX_SNAPSHOT_TS)
+                    .purge_trx_list(
+                        engine.inner().core.catalog(),
+                        &pool_guards,
+                        vec![trx],
+                        MAX_SNAPSHOT_TS,
+                    )
                     .await
                     .unwrap();
             }
@@ -2721,7 +2759,13 @@ mod tests {
             .unwrap();
 
             let table_id = table1(&engine).await;
-            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
@@ -2791,7 +2835,12 @@ mod tests {
                 engine
                     .inner()
                     .trx_sys
-                    .purge_trx_list(engine.catalog(), &pool_guards, vec![trx], MAX_SNAPSHOT_TS)
+                    .purge_trx_list(
+                        engine.inner().core.catalog(),
+                        &pool_guards,
+                        vec![trx],
+                        MAX_SNAPSHOT_TS,
+                    )
                     .await
                     .unwrap();
             }

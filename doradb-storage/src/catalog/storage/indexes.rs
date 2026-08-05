@@ -463,6 +463,8 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
                 engine
+                    .inner()
+                    .core
                     .catalog()
                     .storage
                     .indexes()
@@ -470,6 +472,8 @@ mod tests {
                     .await
                     .disclose()?;
                 engine
+                    .inner()
+                    .core
                     .catalog()
                     .storage
                     .indexes()
@@ -477,6 +481,8 @@ mod tests {
                     .await
                     .disclose()?;
                 engine
+                    .inner()
+                    .core
                     .catalog()
                     .storage
                     .indexes()
@@ -494,6 +500,8 @@ mod tests {
             trx.exec(async |stmt| {
                 assert!(
                     engine
+                        .inner()
+                        .core
                         .catalog()
                         .storage
                         .indexes()
@@ -503,6 +511,8 @@ mod tests {
                 );
                 assert!(
                     !engine
+                        .inner()
+                        .core
                         .catalog()
                         .storage
                         .indexes()
@@ -518,6 +528,8 @@ mod tests {
             trx.commit().await.unwrap();
 
             let idx_42 = engine
+                .inner()
+                .core
                 .catalog()
                 .storage
                 .indexes()
@@ -528,6 +540,8 @@ mod tests {
             assert_eq!(idx_42[0].index_no, 0);
 
             let idx_43 = engine
+                .inner()
+                .core
                 .catalog()
                 .storage
                 .indexes()
@@ -541,6 +555,8 @@ mod tests {
             trx.exec(async |stmt| {
                 assert!(
                     !engine
+                        .inner()
+                        .core
                         .catalog()
                         .storage
                         .indexes()
@@ -550,6 +566,8 @@ mod tests {
                 );
                 assert!(
                     engine
+                        .inner()
+                        .core
                         .catalog()
                         .storage
                         .indexes()
@@ -559,6 +577,8 @@ mod tests {
                 );
                 assert!(
                     engine
+                        .inner()
+                        .core
                         .catalog()
                         .storage
                         .indexes()
@@ -575,6 +595,8 @@ mod tests {
 
             assert!(
                 engine
+                    .inner()
+                    .core
                     .catalog()
                     .storage
                     .indexes()
@@ -585,6 +607,8 @@ mod tests {
             );
             assert!(
                 engine
+                    .inner()
+                    .core
                     .catalog()
                     .storage
                     .indexes()
@@ -629,6 +653,8 @@ mod tests {
             trx.exec(async |stmt| {
                 for index in &indexes {
                     engine
+                        .inner()
+                        .core
                         .catalog()
                         .storage
                         .indexes()
@@ -647,6 +673,8 @@ mod tests {
             trx.exec(async |stmt| {
                 assert_eq!(
                     engine
+                        .inner()
+                        .core
                         .catalog()
                         .storage
                         .indexes()
@@ -657,6 +685,8 @@ mod tests {
                 );
                 assert_eq!(
                     engine
+                        .inner()
+                        .core
                         .catalog()
                         .storage
                         .indexes()
@@ -674,6 +704,8 @@ mod tests {
 
             assert!(
                 engine
+                    .inner()
+                    .core
                     .catalog()
                     .storage
                     .indexes()
@@ -683,6 +715,8 @@ mod tests {
                     .is_empty()
             );
             let remaining = engine
+                .inner()
+                .core
                 .catalog()
                 .storage
                 .indexes()
@@ -740,6 +774,8 @@ mod tests {
             trx.exec(async |stmt| {
                 for index_column in &index_columns {
                     engine
+                        .inner()
+                        .core
                         .catalog()
                         .storage
                         .index_columns()
@@ -758,6 +794,8 @@ mod tests {
             trx.exec(async |stmt| {
                 assert_eq!(
                     engine
+                        .inner()
+                        .core
                         .catalog()
                         .storage
                         .index_columns()
@@ -768,6 +806,8 @@ mod tests {
                 );
                 assert_eq!(
                     engine
+                        .inner()
+                        .core
                         .catalog()
                         .storage
                         .index_columns()
@@ -784,6 +824,8 @@ mod tests {
             trx.commit().await.unwrap();
 
             let remaining_42 = engine
+                .inner()
+                .core
                 .catalog()
                 .storage
                 .index_columns()
@@ -797,6 +839,8 @@ mod tests {
             trx.exec(async |stmt| {
                 assert_eq!(
                     engine
+                        .inner()
+                        .core
                         .catalog()
                         .storage
                         .index_columns()
@@ -807,6 +851,8 @@ mod tests {
                 );
                 assert_eq!(
                     engine
+                        .inner()
+                        .core
                         .catalog()
                         .storage
                         .index_columns()
@@ -824,6 +870,8 @@ mod tests {
 
             assert!(
                 engine
+                    .inner()
+                    .core
                     .catalog()
                     .storage
                     .index_columns()
@@ -833,6 +881,8 @@ mod tests {
                     .is_empty()
             );
             let remaining_43 = engine
+                .inner()
+                .core
                 .catalog()
                 .storage
                 .index_columns()

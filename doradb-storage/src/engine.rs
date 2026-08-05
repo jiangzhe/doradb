@@ -4,8 +4,8 @@
 //! including start, stop, recover, and execute commands. See
 //! `docs/engine-component-lifetime.md` for the runtime-versus-owner lifetime
 //! model that this module enforces with the component registry.
-use crate::buffer::PoolRole;
 use crate::buffer::SharedPoolEvictorWorkers;
+use crate::buffer::{PoolGuards, PoolRole};
 #[cfg(test)]
 use crate::catalog::index::tests::IndexDdlTestController;
 #[cfg(test)]
@@ -20,7 +20,7 @@ use crate::error::{
     ConfigError, DiscloseError, DiscloseResultExt, LifecycleError, LifecycleResult, Result,
 };
 use crate::file::fs::{FileSystem, FileSystemWorkers};
-use crate::id::{SessionID, SessionOperationKey, TrxID};
+use crate::id::SessionID;
 use crate::lock::LockManager;
 use crate::obs;
 use crate::poison::EnginePoisoner;
@@ -28,7 +28,7 @@ use crate::quiescent::QuiescentGuard;
 use crate::root::{StorageRootLease, StorageRootLeaseAttempt};
 use crate::runtime::block_on;
 use crate::runtime::mandatory::{MandatoryRuntime, MandatoryRuntimeWorkers};
-use crate::session::{Session, SessionRegistry};
+use crate::session::{Session, SessionAdmission, SessionCleanupRequest, SessionRegistry};
 #[cfg(test)]
 use crate::table::tests::MaintenanceTestController;
 use crate::trx::SessionOperationState;
@@ -101,7 +101,8 @@ impl ShutdownOrigin {
     }
 }
 
-struct EngineLifecycle {
+/// Packed engine-wide operation admission and shutdown coordination.
+pub(crate) struct EngineLifecycle {
     /// Packed lifecycle state and active admission count.
     ///
     /// Bits `[0, LIFECYCLE_STATE_BITS)` store [`EngineLifecycleState`]. The
@@ -137,8 +138,9 @@ impl EngineLifecycle {
             .unwrap_or_else(|state| panic!("invalid engine lifecycle state: {state}"))
     }
 
+    /// Acquire one operation-start admission while the engine is running.
     #[inline]
-    fn admit(&self) -> LifecycleResult<EngineAdmission<'_>> {
+    pub(crate) fn admit(&self) -> LifecycleResult<EngineAdmission<'_>> {
         loop {
             let word = self.state.load(Ordering::Acquire);
             let state = EngineLifecycleState::try_from(word & LIFECYCLE_STATE_MASK)
@@ -230,8 +232,14 @@ impl EngineLifecycle {
 
     /// Registers for the transition away from the running state.
     #[inline]
-    fn shutdown_listener(&self) -> EventListener {
+    pub(crate) fn shutdown_listener(&self) -> EventListener {
         self.shutdown_started.listen()
+    }
+
+    /// Returns whether owner-side shutdown has started.
+    #[inline]
+    pub(crate) fn shutdown_started(&self) -> bool {
+        self.inspect_state() != EngineLifecycleState::Running
     }
 }
 
@@ -308,33 +316,11 @@ impl Engine {
         let inner = self.inner();
         inner.with_admitted_operation(|| {
             let id = inner.next_session_id();
+            let admission = Arc::new(SessionAdmission::new(Arc::clone(&inner.lifecycle)));
             inner
                 .session_registry
-                .create_session(inner, EngineRef::new(Arc::clone(inner)), id)
+                .create_session(Arc::clone(&inner.core), admission, id)
         })
-    }
-
-    /// Return the shared catalog handle.
-    #[inline]
-    #[cfg_attr(not(test), expect(dead_code, reason = "test-only catalog"))]
-    pub(crate) fn catalog(&self) -> &Catalog {
-        self.inner().catalog()
-    }
-
-    /// Return the shared logical lock manager.
-    #[inline]
-    #[cfg_attr(not(test), expect(dead_code, reason = "test-only lock_manager"))]
-    pub(crate) fn lock_manager(&self) -> &QuiescentGuard<LockManager> {
-        self.inner().lock_manager()
-    }
-
-    /// Try to clone the crate-private shared runtime handle while the engine is
-    /// still running.
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn new_ref(&self) -> LifecycleResult<EngineRef> {
-        let inner = self.inner();
-        inner.with_admitted_operation(|| EngineRef::new(Arc::clone(inner)))
     }
 
     /// Try to complete idempotent engine shutdown without waiting for active work.
@@ -382,12 +368,11 @@ impl Engine {
         let observer_count = blocker
             .as_ref()
             .map_or(0, |blocker| blocker.observer_count());
-        let cleanup_queued = self.queue_shutdown_operation_cleanup(
-            inner,
-            blocker.as_ref().and_then(|blocker| blocker.cleanup()),
-        );
+        let has_session_blocker = blocker.is_some();
+        let cleanup_queued = self
+            .queue_shutdown_operation_cleanup(blocker.and_then(|blocker| blocker.into_cleanup()));
         let (mandatory_callers, mandatory_internal) = inner.mandatory_runtime.blocker_counts();
-        if blocker.is_some() || mandatory_callers != 0 || mandatory_internal != 0 {
+        if has_session_blocker || mandatory_callers != 0 || mandatory_internal != 0 {
             obs::warn!(
                 "event=engine_lifecycle component=engine action=shutdown_finish result=busy mode=try origin=explicit session_blocker={} operation_state={} observer_count={} cleanup_queued={} mandatory_callers={} mandatory_internal={}",
                 session_blocker,
@@ -456,7 +441,7 @@ impl Engine {
             drop(_shutdown);
 
             if let Some(shutdown_wait) = shutdown_wait {
-                self.queue_shutdown_operation_cleanup(inner, shutdown_wait.blocker.cleanup());
+                self.queue_shutdown_operation_cleanup(shutdown_wait.blocker.into_cleanup());
                 shutdown_wait.listener.wait();
             }
         }
@@ -481,18 +466,17 @@ impl Engine {
     /// active operation states only block shutdown; accepted mandatory work
     /// already owns its cleanup authority through the stable operation entry.
     #[inline]
-    fn queue_shutdown_operation_cleanup(
-        &self,
-        inner: &Arc<EngineInner>,
-        cleanup: Option<(SessionOperationKey, TrxID)>,
-    ) -> bool {
-        let Some((operation_key, trx_id)) = cleanup else {
+    fn queue_shutdown_operation_cleanup(&self, cleanup: Option<SessionCleanupRequest>) -> bool {
+        let Some(SessionCleanupRequest {
+            runtime,
+            operation_key,
+            trx_id,
+        }) = cleanup
+        else {
             return false;
         };
-        let engine_ref = EngineRef::new(Arc::clone(inner));
-        inner
-            .trx_sys
-            .request_abandoned_trx_cleanup(engine_ref, operation_key, trx_id);
+        let trx_sys = runtime.trx_sys.clone();
+        trx_sys.request_abandoned_trx_cleanup(runtime, operation_key, trx_id);
         true
     }
 }
@@ -510,118 +494,12 @@ impl Drop for Engine {
     }
 }
 
-/// Crate-private cloneable shared runtime handle for the storage engine.
+/// Immutable component capabilities retained by registered session state.
 ///
-/// `EngineRef` intentionally does not own shutdown orchestration. It exposes
-/// shared memory reachability and component access to admitted session work,
-/// mandatory work, and bounded cleanup sections. Its clone/drop lifecycle is
-/// not itself an authoritative shutdown blocker.
-#[derive(Clone)]
-pub(crate) struct EngineRef(Arc<EngineInner>);
-
-impl EngineRef {
-    #[inline]
-    fn new(inner: Arc<EngineInner>) -> Self {
-        Self(inner)
-    }
-
-    /// Downgrade this private runtime handle into weak engine reachability.
-    #[inline]
-    pub(crate) fn downgrade(&self) -> WeakEngineRef {
-        WeakEngineRef(Arc::downgrade(&self.0))
-    }
-
-    /// Create a new session while the engine is still running.
-    #[inline]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "transitional internal runtime handle")
-    )]
-    pub(crate) fn new_session(&self) -> LifecycleResult<Session> {
-        self.0.with_admitted_operation(|| {
-            let id = self.0.next_session_id();
-            self.0
-                .session_registry
-                .create_session(&self.0, self.clone(), id)
-        })
-    }
-
-    /// Return the shared catalog handle.
-    #[inline]
-    pub(crate) fn catalog(&self) -> &Catalog {
-        &self.0.catalog
-    }
-
-    /// Clone the catalog component guard for transferable runtime authority.
-    #[inline]
-    pub(crate) fn catalog_guard(&self) -> QuiescentGuard<Catalog> {
-        self.0.catalog.clone()
-    }
-
-    /// Return the shared logical lock manager.
-    #[inline]
-    pub(crate) fn lock_manager(&self) -> &QuiescentGuard<LockManager> {
-        self.0.lock_manager()
-    }
-
-    /// Returns the next engine-local session identity.
-    #[inline]
-    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
-    pub(crate) fn next_session_id(&self) -> SessionID {
-        self.0.next_session_id()
-    }
-}
-
-impl Deref for EngineRef {
-    type Target = EngineInner;
-
-    #[inline]
-    fn deref(&self) -> &EngineInner {
-        &self.0
-    }
-}
-
-/// Crate-private weak reachability handle used by public runtime handles.
-#[derive(Clone)]
-pub(crate) struct WeakEngineRef(Weak<EngineInner>);
-
-impl WeakEngineRef {
-    /// Create weak engine reachability from the engine runtime owner.
-    #[inline]
-    pub(crate) fn new(inner: &Arc<EngineInner>) -> Self {
-        Self(Arc::downgrade(inner))
-    }
-
-    /// Upgrade weak engine reachability for one admitted public operation.
-    #[inline]
-    pub(crate) fn upgrade(&self) -> LifecycleResult<EngineRef> {
-        self.0.upgrade().map(EngineRef::new).ok_or_else(|| {
-            Report::new(LifecycleError::Shutdown).attach("engine is no longer reachable")
-        })
-    }
-
-    /// Upgrade weak reachability for explicit terminal cleanup.
-    ///
-    /// This path does not acquire foreground admission: an already-active
-    /// transaction must be able to commit or roll back while owner shutdown is
-    /// waiting for active transactions to finish before component teardown.
-    #[inline]
-    pub(crate) fn upgrade_for_terminal(&self) -> LifecycleResult<EngineRef> {
-        self.upgrade()
-    }
-
-    /// Best-effort upgrade for nonblocking cleanup hints from `Drop`.
-    #[inline]
-    pub(crate) fn upgrade_for_cleanup(&self) -> Option<EngineRef> {
-        self.0.upgrade().map(EngineRef::new)
-    }
-}
-
-/// Shared crate-private runtime state for an [`Engine`].
-///
-/// The fields here are the cloneable handles that sessions and other runtime
-/// objects may retain. Owner-only teardown state lives on [`Engine`] itself.
-pub(crate) struct EngineInner {
+/// The weak registry edge is used only for pointer-exact removal after a
+/// session becomes closed and idle. It must never be used for operation
+/// resolution.
+pub(crate) struct EngineCore {
     /// Engine-level fatal runtime poison state.
     pub(crate) poisoner: QuiescentGuard<EnginePoisoner>,
     /// Engine-owned scheduler for accepted caller and internal obligations.
@@ -630,22 +508,14 @@ pub(crate) struct EngineInner {
     pub(crate) catalog: QuiescentGuard<Catalog>,
     /// Shared transaction-system handle.
     pub(crate) trx_sys: QuiescentGuard<TransactionSystem>,
-    /// Metadata pool used for block-index and catalog tables.
-    pub(crate) meta_pool: MetaPool,
-    /// Secondary-index pool.
-    pub(crate) index_pool: IndexPool,
-    /// In-memory row-page pool for table data.
-    pub(crate) mem_pool: MemPool,
+    /// Canonical typed pool handles and matching guard bundle.
+    pub(crate) pools: EnginePools,
     /// Table-file subsystem that runs persistent page IO.
     pub(crate) table_fs: QuiescentGuard<FileSystem>,
-    /// Global readonly pool for persisted table-file reads.
-    pub(crate) disk_pool: DiskPool,
     /// Shared logical metadata and table-data lock manager.
     lock_manager: QuiescentGuard<LockManager>,
-    /// Engine-owned strong session-state registry.
-    pub(crate) session_registry: SessionRegistry,
-    /// Monotonically increasing engine-local session identity source.
-    next_session_id: AtomicU64,
+    /// Cold weak back-reference for pointer-exact idle-session removal.
+    pub(crate) session_registry: Weak<SessionRegistry>,
     /// Per-engine table-DDL fault and phase controller.
     #[cfg(test)]
     pub(crate) table_ddl_test: TableDdlTestController,
@@ -655,25 +525,19 @@ pub(crate) struct EngineInner {
     /// Per-engine maintenance fault and phase controller.
     #[cfg(test)]
     pub(crate) maintenance_test: MaintenanceTestController,
-    lifecycle: EngineLifecycle,
 }
 
-impl EngineInner {
+impl EngineCore {
     /// Return the shared catalog handle.
     #[inline]
     pub(crate) fn catalog(&self) -> &Catalog {
         &self.catalog
     }
 
-    /// Clone the inner engine buffer-pool handles as one startup/recovery bundle.
+    /// Borrow the canonical pool guard bundle.
     #[inline]
-    pub(crate) fn pools(&self) -> EnginePools {
-        EnginePools::new(
-            self.meta_pool.clone_inner(),
-            self.index_pool.clone_inner(),
-            self.mem_pool.clone_inner(),
-            self.disk_pool.clone_inner(),
-        )
+    pub(crate) fn pool_guards(&self) -> &PoolGuards {
+        self.pools.pool_guards()
     }
 
     /// Return the shared logical lock manager.
@@ -681,7 +545,24 @@ impl EngineInner {
     pub(crate) fn lock_manager(&self) -> &QuiescentGuard<LockManager> {
         &self.lock_manager
     }
+}
 
+/// Owner-facing coordination shell for one [`Engine`].
+///
+/// Registered sessions retain only [`EngineCore`] and the lifecycle admission
+/// gate, so no session-local authority can recover this owner shell.
+pub(crate) struct EngineInner {
+    /// Shared component capabilities.
+    pub(crate) core: Arc<EngineCore>,
+    /// Engine-owned strong session-state registry.
+    pub(crate) session_registry: Arc<SessionRegistry>,
+    /// Shared lifecycle admission and shutdown state.
+    lifecycle: Arc<EngineLifecycle>,
+    /// Monotonically increasing engine-local session identity source.
+    next_session_id: AtomicU64,
+}
+
+impl EngineInner {
     /// Returns the next engine-local session identity.
     #[inline]
     pub(crate) fn next_session_id(&self) -> SessionID {
@@ -706,31 +587,6 @@ impl EngineInner {
         Ok(admission)
     }
 
-    /// Enter one poison-tolerant inspection while lifecycle admission is open.
-    ///
-    /// The returned token closes inspection registration against shutdown but
-    /// deliberately does not validate storage health. Callers must restrict
-    /// the admitted work to read-only diagnostics and register its session
-    /// observer before releasing the token.
-    #[inline]
-    pub(crate) fn acquire_inspection_admission(&self) -> LifecycleResult<EngineAdmission<'_>> {
-        self.lifecycle
-            .admit()
-            .attach_with(|| "phase=acquire_engine_inspection_admission")
-    }
-
-    /// Returns whether owner-side shutdown has started.
-    #[inline]
-    pub(crate) fn shutdown_started(&self) -> bool {
-        self.lifecycle.inspect_state() != EngineLifecycleState::Running
-    }
-
-    /// Registers for owner-side shutdown start.
-    #[inline]
-    pub(crate) fn shutdown_listener(&self) -> EventListener {
-        self.lifecycle.shutdown_listener()
-    }
-
     /// Run immediate synchronous work under engine admission.
     ///
     /// Use this helper for lifecycle validation plus local runtime lookup or
@@ -740,6 +596,15 @@ impl EngineInner {
     pub(crate) fn with_admitted_operation<T>(&self, f: impl FnOnce() -> T) -> LifecycleResult<T> {
         let _admission = self.acquire_admission()?;
         Ok(f())
+    }
+}
+
+impl Deref for EngineInner {
+    type Target = EngineCore;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.core
     }
 }
 
@@ -881,26 +746,34 @@ async fn bootstrap_inner(config: EngineConfig) -> Result<Engine> {
     let table_fs = registry.dependency::<FileSystem>();
     let disk_pool = registry.dependency::<DiskPool>();
     let lock_manager = registry.dependency::<LockManager>();
-    let engine_inner = EngineInner {
+    let session_registry = Arc::new(SessionRegistry::new());
+    let lifecycle = Arc::new(EngineLifecycle::new());
+    let core = Arc::new(EngineCore {
         poisoner,
         mandatory_runtime,
         catalog,
         trx_sys,
-        meta_pool,
-        index_pool,
-        mem_pool,
+        pools: EnginePools::new(
+            meta_pool.clone_inner(),
+            index_pool.clone_inner(),
+            mem_pool.clone_inner(),
+            disk_pool.clone_inner(),
+        ),
         table_fs,
-        disk_pool,
         lock_manager,
-        session_registry: SessionRegistry::new(),
-        next_session_id: AtomicU64::new(FIRST_SESSION_ID.as_u64()),
+        session_registry: Arc::downgrade(&session_registry),
         #[cfg(test)]
         table_ddl_test: TableDdlTestController::default(),
         #[cfg(test)]
         index_ddl_test: IndexDdlTestController::default(),
         #[cfg(test)]
         maintenance_test: MaintenanceTestController::default(),
-        lifecycle: EngineLifecycle::new(),
+    });
+    let engine_inner = EngineInner {
+        core,
+        session_registry,
+        lifecycle,
+        next_session_id: AtomicU64::new(FIRST_SESSION_ID.as_u64()),
     };
     Ok(Engine {
         inner: Arc::new(engine_inner),
@@ -915,8 +788,8 @@ mod tests {
     use crate::catalog::tests::table1;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::error::{
-        ConfigError, DiscloseError, Error, ErrorKind, FatalError, LifecycleError, OperationError,
-        ResourceError, RuntimeError,
+        ConfigError, Error, ErrorKind, FatalError, LifecycleError, OperationError, ResourceError,
+        RuntimeError,
     };
     use crate::file::fs::tests::io_backend_stats_handle_identity as fs_stats_handle_identity;
     use crate::id::{OperationID, SessionOperationKey, TableID, TrxID};
@@ -1271,7 +1144,7 @@ mod tests {
     }
 
     fn lock_entry_count(engine: &Engine, owner: LockOwner) -> usize {
-        debug_snapshot(engine.lock_manager())
+        debug_snapshot(engine.inner().core.lock_manager())
             .entries
             .iter()
             .filter(|entry| entry.owner == owner)
@@ -1312,16 +1185,14 @@ mod tests {
     }
 
     #[test]
-    fn test_session_ids_are_monotonic_across_engine_handles() {
+    fn test_session_ids_are_monotonic_across_engine_sessions() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
             let engine = Engine::bootstrap(test_engine_config_for(root.path()))
                 .await
                 .unwrap();
-            let engine_ref = engine.new_ref().unwrap();
-
             let session1 = engine.new_session().unwrap();
-            let session2 = engine_ref.new_session().unwrap();
+            let session2 = engine.new_session().unwrap();
             let session3 = engine.new_session().unwrap();
 
             assert_eq!(session1.id(), FIRST_SESSION_ID);
@@ -1337,26 +1208,33 @@ mod tests {
             let engine = Engine::bootstrap(test_engine_config_for(root.path()))
                 .await
                 .unwrap();
-            let engine_ref = engine.new_ref().unwrap();
+            let session = engine.new_session().unwrap();
+            let runtime = session.engine();
             let resource = LockResource::TableMetadata(TableID::new(10));
             let owner = LockOwner::session_explicit(SessionID::new(10));
 
             assert!(
-                try_acquire(engine.lock_manager(), resource, LockMode::Exclusive, owner).unwrap()
+                try_acquire(
+                    engine.inner().core.lock_manager(),
+                    resource,
+                    LockMode::Exclusive,
+                    owner
+                )
+                .unwrap()
             );
             assert!(
                 !try_acquire(
-                    engine_ref.lock_manager(),
+                    runtime.lock_manager(),
                     resource,
                     LockMode::Shared,
                     LockOwner::session_explicit(SessionID::new(11))
                 )
                 .unwrap()
             );
-            assert_eq!(engine_ref.lock_manager().release_owner(owner), 1);
+            assert_eq!(runtime.lock_manager().release_owner(owner), 1);
             assert!(
                 try_acquire(
-                    engine.lock_manager(),
+                    engine.inner().core.lock_manager(),
                     resource,
                     LockMode::Shared,
                     LockOwner::session_explicit(SessionID::new(11))
@@ -1378,7 +1256,7 @@ mod tests {
 
             assert!(
                 try_acquire(
-                    engine.lock_manager(),
+                    engine.inner().core.lock_manager(),
                     resource,
                     LockMode::Exclusive,
                     LockOwner::session_explicit(session.id())
@@ -1389,7 +1267,7 @@ mod tests {
 
             assert!(
                 try_acquire(
-                    engine.lock_manager(),
+                    engine.inner().core.lock_manager(),
                     resource,
                     LockMode::Shared,
                     LockOwner::session_explicit(SessionID::new(91_201))
@@ -1417,7 +1295,7 @@ mod tests {
 
             assert!(
                 try_acquire(
-                    engine.lock_manager(),
+                    engine.inner().core.lock_manager(),
                     resource,
                     LockMode::Exclusive,
                     explicit_owner,
@@ -1426,7 +1304,7 @@ mod tests {
             );
             assert!(
                 try_acquire(
-                    engine.lock_manager(),
+                    engine.inner().core.lock_manager(),
                     resource,
                     LockMode::IntentShared,
                     maintenance_owner,
@@ -1436,18 +1314,22 @@ mod tests {
 
             drop(session);
 
-            assert!(!engine.lock_manager().owner_holds(
+            assert!(!engine.inner().core.lock_manager().owner_holds(
                 resource,
                 explicit_owner,
                 LockMode::IntentShared,
             ));
-            assert!(engine.lock_manager().owner_holds(
+            assert!(engine.inner().core.lock_manager().owner_holds(
                 resource,
                 maintenance_owner,
                 LockMode::IntentShared,
             ));
             assert_eq!(
-                engine.lock_manager().release(resource, maintenance_owner),
+                engine
+                    .inner()
+                    .core
+                    .lock_manager()
+                    .release(resource, maintenance_owner),
                 1
             );
         });
@@ -1464,7 +1346,7 @@ mod tests {
             let blocking_owner = LockOwner::session_explicit(SessionID::new(91_203));
             assert!(
                 try_acquire(
-                    engine.lock_manager(),
+                    engine.inner().core.lock_manager(),
                     resource,
                     LockMode::Exclusive,
                     blocking_owner
@@ -1474,7 +1356,7 @@ mod tests {
 
             let session = engine.new_session().unwrap();
             let waiting_owner = LockOwner::session_explicit(session.id());
-            let manager = engine.lock_manager().clone();
+            let manager = engine.inner().core.lock_manager().clone();
             let wait_task = smol::spawn(async move {
                 manager
                     .acquire(resource, LockMode::Shared, waiting_owner)
@@ -1483,7 +1365,7 @@ mod tests {
 
             let mut waiter_seen = false;
             for _ in 0..100 {
-                waiter_seen = debug_snapshot(engine.lock_manager())
+                waiter_seen = debug_snapshot(engine.inner().core.lock_manager())
                     .entries
                     .iter()
                     .any(|entry| entry.owner == waiting_owner);
@@ -1497,7 +1379,14 @@ mod tests {
             drop(session);
             let err = wait_task.await.unwrap_err();
             assert_eq!(*err.current_context(), OperationError::LockWaiterReleased);
-            assert_eq!(engine.lock_manager().release_owner(blocking_owner), 1);
+            assert_eq!(
+                engine
+                    .inner()
+                    .core
+                    .lock_manager()
+                    .release_owner(blocking_owner),
+                1
+            );
         });
     }
 
@@ -1523,8 +1412,8 @@ mod tests {
             .unwrap();
 
             let table_stats = fs_stats_handle_identity(&engine.inner().table_fs);
-            let mem_stats = pool_stats_handle_identity(&engine.inner().mem_pool);
-            let index_stats = pool_stats_handle_identity(&engine.inner().index_pool);
+            let mem_stats = pool_stats_handle_identity(&engine.inner().pools.mem);
+            let index_stats = pool_stats_handle_identity(&engine.inner().pools.index);
 
             assert_eq!(table_stats, mem_stats);
             assert_eq!(table_stats, index_stats);
@@ -1554,11 +1443,11 @@ mod tests {
 
             assert_eq!(engine.inner().table_fs.configured_io_depth(), 7);
             assert_eq!(
-                engine.inner().mem_pool.io_backend_stats(),
+                engine.inner().pools.mem.io_backend_stats(),
                 engine.inner().table_fs.io_backend_stats()
             );
             assert_eq!(
-                engine.inner().index_pool.io_backend_stats(),
+                engine.inner().pools.index.io_backend_stats(),
                 engine.inner().table_fs.io_backend_stats()
             );
         });
@@ -1866,37 +1755,6 @@ mod tests {
             let err = match engine.new_session() {
                 Ok(_) => panic!("expected shutdown error"),
                 Err(err) => err,
-            };
-            assert_runtime_unavailable_after_shutdown(err);
-
-            let err = match engine.new_ref() {
-                Ok(_) => panic!("expected shutdown error"),
-                Err(err) => err.disclose(),
-            };
-            assert_runtime_unavailable_after_shutdown(err);
-        });
-    }
-
-    #[test]
-    fn test_engine_ref_does_not_block_shutdown_or_bypass_closed_admission() {
-        smol::block_on(async {
-            let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
-                .await
-                .unwrap();
-            let engine_ref = engine.new_ref().unwrap();
-
-            engine.try_shutdown().unwrap();
-
-            let err = match engine_ref.new_session() {
-                Ok(_) => panic!("expected shutdown error"),
-                Err(err) => err.disclose(),
-            };
-            assert_runtime_unavailable_after_shutdown(err);
-
-            let err = match engine.new_ref() {
-                Ok(_) => panic!("expected shutdown error"),
-                Err(err) => err.disclose(),
             };
             assert_runtime_unavailable_after_shutdown(err);
         });
@@ -2599,7 +2457,7 @@ mod tests {
             smol::block_on(Engine::bootstrap(test_engine_config_for(root.path()))).unwrap();
         let mut session = engine.new_session().unwrap();
         let trx = session.begin_trx().unwrap();
-        let shutdown_started = engine.inner().shutdown_listener();
+        let shutdown_started = engine.inner().lifecycle.shutdown_listener();
         let (done_tx, done_rx) = mpsc::channel();
 
         thread::scope(|scope| {
@@ -2648,7 +2506,7 @@ mod tests {
                 config,
                 engine.inner().poisoner.clone(),
                 engine.inner().mandatory_runtime.clone(),
-                engine.inner().pools(),
+                engine.inner().core.pools.clone(),
                 engine.inner().table_fs.clone(),
                 engine.inner().catalog.clone(),
             )

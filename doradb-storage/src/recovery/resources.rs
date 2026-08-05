@@ -33,7 +33,7 @@ impl<'a> RecoveryResources<'a> {
         table_fs: QuiescentGuard<FileSystem>,
         catalog: &'a Catalog,
     ) -> Self {
-        let pool_guards = pools.pool_guards();
+        let pool_guards = pools.pool_guards().clone();
         Self {
             pools,
             pool_guards,

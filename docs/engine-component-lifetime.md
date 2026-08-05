@@ -7,16 +7,22 @@ component-registry migration work.
 ## Terminology
 
 - `Engine`: public owner of top-level teardown state and session creation.
-- `EngineInner`: crate-private shared runtime state held behind the engine
-  owner and internal shared handles.
-- `EngineRef`: crate-private cloneable `Arc<EngineInner>` access wrapper. It
-  provides memory reachability and component access but is not itself a
-  shutdown blocker.
+- `EngineInner`: owner-facing coordination shell containing `EngineCore`, the
+  strong session registry, the lifecycle gate, and the session-id source.
+- `EngineCore`: immutable component-capability set retained by registered
+  session state. It has only a weak back-reference to the session registry.
+- `SessionRuntime`: typed strong reference to one exact `SessionState`.
+- `WeakSessionRef`: weak reference to one exact `SessionState` plus that
+  session's limited lifecycle-admission façade.
+- `AdmittedSessionRef`: short-lived pairing of that exact weak state with the
+  admission acquired through its session façade.
+- `AdmittedSessionRuntime`: the result of consuming an admitted weak reference
+  and upgrading it while retaining the same admission.
 - Public session and transaction handles: weak, non-cloneable capabilities that
-  identify engine-local state and acquire admitted internal access only for one
+  identify exact session-local state and acquire admitted internal access for one
   operation or terminal path.
 - `SessionOperationEntry`: one registry-owned stable operation record keyed by
-  `(SessionID, OperationID)`; it contains no `EngineRef`,
+  `(SessionID, OperationID)`; it contains no engine-wide reference,
   `SessionObserverPin`, or whole operation future.
 - `SessionObserverPin`: non-cloneable standalone observer authority accounted
   by its session lifecycle without consuming the effectful operation slot.
@@ -31,8 +37,12 @@ The runtime uses an explicit owner/runtime split:
 - `Engine` owns:
   - `inner: Arc<EngineInner>`
   - `components: ComponentRegistry`
-- `EngineInner` owns only crate-private shared runtime handles and the
-  lifecycle gate:
+- `EngineInner` owns:
+  - `core: Arc<EngineCore>`
+  - `session_registry: Arc<SessionRegistry>`
+  - `lifecycle: Arc<EngineLifecycle>`
+  - the engine-local session-id source
+- `EngineCore` owns the shared runtime capabilities:
   - engine poisoner
   - mandatory runtime
   - catalog
@@ -41,7 +51,12 @@ The runtime uses an explicit owner/runtime split:
   - fixed and evictable buffer pools
   - table-file subsystem
   - readonly buffer pool
-  - shutdown admission state
+  - a weak session-registry back-reference used only for cold exact removal
+
+The registry owns each `Arc<SessionState>`. Each state retains `Arc<EngineCore>`
+and one `Arc<SessionAdmission>` into the lifecycle gate. `EngineCore` does not
+retain `EngineInner`, the lifecycle gate, or a strong registry reference, so
+the graph has no strong cycle.
 
 `ComponentRegistry` is intentionally not part of `EngineInner`. The registry is
 needed only for explicit reverse-order shutdown and final owner drop. Keeping
@@ -105,7 +120,7 @@ dependency.
 
 `MandatoryRuntime` is registered immediately after the poisoner. Catalog,
 transaction, recovery, and future operation adapters can therefore retain its
-direct `QuiescentGuard` without owning `EngineRef` or another runtime `Arc`.
+direct `QuiescentGuard` without owning the engine owner shell.
 Its build shelves only the runtime guard and configured runner count. The later
 `MandatoryRuntimeWorkers` build starts the fixed runners and registers their
 join-handle owner at the required shutdown position.
@@ -370,37 +385,42 @@ The lazy traversal may hold one DashMap shard read guard during the short
 either inner mutex is held, so there is no reverse lock edge. The iterator is
 dropped before cleanup submission, event waiting, notification, or removal.
 
-The registry owns `Arc<SessionState>`, and an active slot owns
-`Arc<SessionOperationEntry>`. Neither object owns a strong engine runtime
-handle. `EngineRef` exists only in scoped foreground authorities, transaction
-or observer authorities, transaction attachments, claims, and submitted
-cleanup jobs, preventing a registry-to-engine strong reference cycle. Engine
-admission closes every new operation or observer registration against shutdown;
-session entries and observer counts then become the durable shutdown proof
-after admission drops. Mandatory permits provide the corresponding proof for
-accepted caller and internal cleanup work.
+The registry owns `Arc<SessionState>`, each state owns `Arc<EngineCore>`, and an
+active slot owns `Arc<SessionOperationEntry>`. Public `Session` and
+`Transaction` handles own only `WeakSessionRef`. Operation authorities,
+transaction attachments, claims, and cleanup jobs retain `SessionRuntime`, so
+they reach components through the already-pinned exact state without recovering
+`EngineInner` or looking up the registry. Engine admission closes every new
+operation or observer registration against shutdown; session entries and
+observer counts then become the durable shutdown proof after admission drops.
+Mandatory permits provide the corresponding proof for accepted caller and
+internal cleanup work.
 
 The owned-handle inventory follows those authorities:
 
-- `SessionObserverPin` pairs its `EngineRef` with one counted session observer.
+- `SessionObserverPin` pairs `SessionRuntime` with one counted session observer.
 - `SessionOperationPin`, `TrxAttachment`, transaction checkout and completion
-  claims, and DDL or maintenance progress all remain paired with their exact
-  stable `SessionOperationEntry`.
+  claims, DDL or maintenance progress, and cleanup jobs carry `SessionRuntime`
+  and remain paired with their exact stable `SessionOperationEntry`.
 - accepted DDL and maintenance also retain a mandatory caller permit through
   terminal publication.
 - abandoned and terminal-rollback cleanup pair their active session entry with
   a mandatory internal permit; failed-precommit cleanup is covered by mandatory
   internal admission.
-- weak upgrades used for admission rejection, handle drop, or exact terminal
-  resolution either register one of those authorities or stay within a bounded
-  section that cannot use components after rejection.
+- foreground acquisition creates `AdmittedSessionRef` through
+  `SessionAdmission`, consumes it to create `AdmittedSessionRuntime`, validates
+  poison when required, and registers its stable operation or observer before
+  releasing admission and retaining plain `SessionRuntime`.
+- terminal and cleanup paths reuse existing authority, upgrade the exact weak
+  state without new foreground admission, and validate both operation key and
+  transaction id directly on that state.
 - redo, mandatory-runtime, purge, file, and eviction workers are owned and
-  joined by their registered component owners rather than by `EngineRef`.
+  joined by their registered component owners.
 
-An explicit shutdown may finish while a weak public handle's rejected upgrade
-briefly retains an internal `Arc<EngineInner>`. That handle has no admitted
-authority to access components after rejection, so ordinary `Arc` reachability
-is deliberately not a production shutdown condition.
+A surviving public handle retains only a weak state reference and its small
+closed admission façade. Once registry ownership is released it cannot retain
+or recover component capabilities, so explicit shutdown and final owner drop
+do not depend on destruction of public handles.
 
 The final reverse-order shutdown step releases `StorageRootLease`. A later
 engine can therefore acquire the root immediately after explicit shutdown,
@@ -412,11 +432,13 @@ persistent `storage.lock` directory entry is never removed.
 After shutdown succeeds, `Engine` field order makes the final owner-drop
 sequence deterministic:
 
-1. drop `Arc<EngineInner>`
+1. drop `Arc<EngineInner>`, releasing the registry-owned session states and
+   their final `EngineCore` references
 2. drop `ComponentRegistry`
 
-Dropping `EngineInner` first releases the runtime-held quiescent guards before
-registry-owned component owners start their final `QuiescentBox<T>` drains.
+Dropping `EngineInner` first releases `EngineCore` and its runtime-held
+quiescent guards before registry-owned component owners start their final
+`QuiescentBox<T>` drains.
 
 `Engine::drop` invokes the same synchronous drain as `Engine::shutdown()`.
 An unintended owner drop can therefore block indefinitely while
@@ -458,8 +480,11 @@ That provenance rule gives three guarantees:
 - stable owner identity survives cloning because guards keep the owner alive
 - page guards and arena state can rely on one exact pool provenance source
 
-`PoolGuards` is only a named bundle of individually branded guards; it does not
-weaken the single-owner provenance rule.
+`EngineCore` owns one canonical `EnginePools` capability containing the four
+typed pool handles and one prebuilt `PoolGuards` bundle. Session-coordinated
+operations borrow that bundle through `SessionRuntime`; transaction attachments
+do not clone it. `PoolGuards` remains only a named bundle of individually
+branded guards and does not weaken the single-owner provenance rule.
 
 ## Arena And Page-Guard Lifetime Rules
 
