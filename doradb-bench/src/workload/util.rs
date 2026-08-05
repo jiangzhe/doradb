@@ -9,6 +9,40 @@ const RANDOM_KEY_SALT: u64 = 0xd1b5_4a32_d192_ed03;
 const UNIQUE_KEY_SALT: u64 = 0x94d0_49bb_1331_11eb;
 const READ_RANDOM_SALT: u64 = 0x3f8a_e42c_6d13_0b57;
 const READ_RANGE_SALT: u64 = 0xa76f_c213_9b48_05de;
+const TABLE_LOCK_SALT: u64 = 0x6b18_d62f_8f73_a945;
+
+/// Deterministic prepared-table indexes for one session's lock iterations.
+pub(super) struct RandomTableIndexGenerator {
+    state: u64,
+    table_count: u64,
+}
+
+impl RandomTableIndexGenerator {
+    /// Build a generator for one session plan and prepared table pool.
+    pub(super) fn new(seed: u64, table_count: usize, plan: &SessionPlan) -> Result<Self> {
+        if table_count == 0 {
+            return Err(BenchError::message(
+                "lock-table workload requires at least one prepared table",
+            ));
+        }
+        let table_count = u64::try_from(table_count)
+            .map_err(|_| BenchError::message("prepared table count exceeds u64"))?;
+        Ok(Self {
+            state: seed_state(
+                seed,
+                plan.key_start,
+                plan.session_index as u64,
+                TABLE_LOCK_SALT,
+            ),
+            table_count,
+        })
+    }
+
+    /// Generate the next in-bounds prepared-table index.
+    pub(super) fn next_index(&mut self) -> usize {
+        (splitmix64(&mut self.state) % self.table_count) as usize
+    }
+}
 
 /// Deterministic random ranges for one session's scan iterations.
 pub(super) struct RandomScanRangeGenerator {
@@ -75,14 +109,14 @@ pub(crate) fn build_session_plans(range: KeyRange, sessions: usize) -> Result<Ve
     let mut session_plans = Vec::with_capacity(sessions);
     let mut key_start = range.start;
     for session_index in 0..sessions {
-        let rows = partition_count(range.len, sessions, session_index);
+        let number = partition_count(range.len, sessions, session_index);
         session_plans.push(SessionPlan {
             session_index,
             key_start,
-            rows,
+            number,
         });
         key_start = key_start
-            .checked_add(rows)
+            .checked_add(number)
             .ok_or_else(|| BenchError::message("session key range overflow"))?;
     }
     Ok(session_plans)
@@ -131,10 +165,10 @@ pub(super) fn generate_sequential_read_keys(
     plan: &SessionPlan,
 ) -> Result<Vec<u64>> {
     validate_loaded_range(loaded_range)?;
-    let requests = usize::try_from(plan.rows)
+    let requests = usize::try_from(plan.number)
         .map_err(|_| BenchError::message("session request count exceeds addressable memory"))?;
     let mut keys = Vec::with_capacity(requests);
-    for offset in 0..plan.rows {
+    for offset in 0..plan.number {
         let request_offset = plan
             .key_start
             .checked_add(offset)
@@ -154,7 +188,7 @@ pub(super) fn generate_random_read_keys(
     plan: &SessionPlan,
 ) -> Result<Vec<u64>> {
     validate_loaded_range(loaded_range)?;
-    let requests = usize::try_from(plan.rows)
+    let requests = usize::try_from(plan.number)
         .map_err(|_| BenchError::message("session request count exceeds addressable memory"))?;
     let mut state = seed_state(
         seed,
@@ -163,7 +197,7 @@ pub(super) fn generate_random_read_keys(
         READ_RANDOM_SALT,
     );
     let mut keys = Vec::with_capacity(requests);
-    for _ in 0..plan.rows {
+    for _ in 0..plan.number {
         keys.push(key_at_loaded_offset(
             loaded_range,
             splitmix64(&mut state) % loaded_range.len,
@@ -198,10 +232,10 @@ fn splitmix64(state: &mut u64) -> u64 {
 }
 
 fn sequential_keys(plan: &SessionPlan) -> Result<Vec<u64>> {
-    let rows = usize::try_from(plan.rows)
+    let rows = usize::try_from(plan.number)
         .map_err(|_| BenchError::message("session row count exceeds addressable memory"))?;
     let mut keys = Vec::with_capacity(rows);
-    for offset in 0..plan.rows {
+    for offset in 0..plan.number {
         keys.push(
             plan.key_start
                 .checked_add(offset)
@@ -212,7 +246,7 @@ fn sequential_keys(plan: &SessionPlan) -> Result<Vec<u64>> {
 }
 
 fn random_keys_with_replacement(seed: u64, plan: &SessionPlan) -> Result<Vec<u64>> {
-    let rows = usize::try_from(plan.rows)
+    let rows = usize::try_from(plan.number)
         .map_err(|_| BenchError::message("session row count exceeds addressable memory"))?;
     if rows == 0 {
         return Ok(Vec::new());
@@ -224,8 +258,8 @@ fn random_keys_with_replacement(seed: u64, plan: &SessionPlan) -> Result<Vec<u64
         RANDOM_KEY_SALT,
     );
     let mut keys = Vec::with_capacity(rows);
-    for _ in 0..plan.rows {
-        let offset = splitmix64(&mut state) % plan.rows;
+    for _ in 0..plan.number {
+        let offset = splitmix64(&mut state) % plan.number;
         keys.push(
             plan.key_start
                 .checked_add(offset)
@@ -280,10 +314,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plans.len(), 4);
-        assert_eq!(plans[0].rows, 3);
-        assert_eq!(plans[1].rows, 3);
-        assert_eq!(plans[2].rows, 2);
-        assert_eq!(plans[3].rows, 2);
+        assert_eq!(plans[0].number, 3);
+        assert_eq!(plans[1].number, 3);
+        assert_eq!(plans[2].number, 2);
+        assert_eq!(plans[3].number, 2);
         assert_eq!(plans[0].key_start, 100);
         assert_eq!(plans[1].key_start, 103);
         assert_eq!(plans[2].key_start, 106);
@@ -315,7 +349,7 @@ mod tests {
         let plan = SessionPlan {
             session_index: 0,
             key_start: 10,
-            rows: 64,
+            number: 64,
         };
         let first = generate_insert_keys(true, IndexMode::None, 42, &plan).unwrap();
         let second = generate_insert_keys(true, IndexMode::None, 42, &plan).unwrap();
@@ -327,7 +361,7 @@ mod tests {
         let plan = SessionPlan {
             session_index: 0,
             key_start: 10,
-            rows: 64,
+            number: 64,
         };
         let keys = generate_insert_keys(true, IndexMode::None, 2, &plan).unwrap();
         let unique: HashSet<_> = keys.iter().copied().collect();
@@ -339,7 +373,7 @@ mod tests {
         let plan = SessionPlan {
             session_index: 0,
             key_start: 10,
-            rows: 64,
+            number: 64,
         };
         let keys = generate_insert_keys(true, IndexMode::NonUnique, 2, &plan).unwrap();
         let unique: HashSet<_> = keys.iter().copied().collect();
@@ -351,7 +385,7 @@ mod tests {
         let plan = SessionPlan {
             session_index: 0,
             key_start: u64::MAX,
-            rows: 2,
+            number: 2,
         };
         assert!(generate_insert_keys(true, IndexMode::None, 0, &plan).is_err());
     }
@@ -361,7 +395,7 @@ mod tests {
         let plan = SessionPlan {
             session_index: 0,
             key_start: 10,
-            rows: 64,
+            number: 64,
         };
         let first = generate_insert_keys(true, IndexMode::Unique, 42, &plan).unwrap();
         let second = generate_insert_keys(true, IndexMode::Unique, 42, &plan).unwrap();
@@ -377,11 +411,44 @@ mod tests {
     }
 
     #[test]
+    fn random_table_indexes_are_seeded_bounded_and_with_replacement() {
+        let plan = SessionPlan {
+            session_index: 2,
+            key_start: 7,
+            number: 64,
+        };
+        let generate = |seed| {
+            let mut generator = RandomTableIndexGenerator::new(seed, 3, &plan).unwrap();
+            (0..plan.number)
+                .map(|_| generator.next_index())
+                .collect::<Vec<_>>()
+        };
+        let first = generate(11);
+        let second = generate(11);
+        let different = generate(12);
+        assert_eq!(first, second);
+        assert_ne!(first, different);
+        assert!(first.iter().all(|index| *index < 3));
+        assert!(first.iter().copied().collect::<HashSet<_>>().len() < first.len());
+    }
+
+    #[test]
+    fn random_table_indexes_support_one_table() {
+        let plan = SessionPlan {
+            session_index: 3,
+            key_start: 9,
+            number: 4,
+        };
+        let mut generator = RandomTableIndexGenerator::new(5, 1, &plan).unwrap();
+        assert!((0..plan.number).all(|_| generator.next_index() == 0));
+    }
+
+    #[test]
     fn sequential_insert_uses_ordered_keys() {
         let plan = SessionPlan {
             session_index: 0,
             key_start: 10,
-            rows: 4,
+            number: 4,
         };
         assert_eq!(
             generate_insert_keys(false, IndexMode::None, 42, &plan).unwrap(),
@@ -407,7 +474,7 @@ mod tests {
         let plan = SessionPlan {
             session_index: 0,
             key_start: 0,
-            rows: 8,
+            number: 8,
         };
         assert_eq!(
             generate_sequential_read_keys(loaded_range(), &plan).unwrap(),
@@ -420,7 +487,7 @@ mod tests {
         let plan = SessionPlan {
             session_index: 1,
             key_start: 4,
-            rows: 4,
+            number: 4,
         };
         assert_eq!(
             generate_sequential_read_keys(loaded_range(), &plan).unwrap(),
@@ -433,7 +500,7 @@ mod tests {
         let plan = SessionPlan {
             session_index: 0,
             key_start: 0,
-            rows: 16,
+            number: 16,
         };
         let first = generate_random_read_keys(11, loaded_range(), &plan).unwrap();
         let second = generate_random_read_keys(11, loaded_range(), &plan).unwrap();
@@ -449,18 +516,18 @@ mod tests {
         let plan = SessionPlan {
             session_index: 1,
             key_start: 4,
-            rows: 16,
+            number: 16,
         };
         let mut first = RandomScanRangeGenerator::new(11, loaded_range, 3, &plan).unwrap();
         let mut second = RandomScanRangeGenerator::new(11, loaded_range, 3, &plan).unwrap();
         let mut different = RandomScanRangeGenerator::new(12, loaded_range, 3, &plan).unwrap();
-        let first_ranges = (0..plan.rows)
+        let first_ranges = (0..plan.number)
             .map(|_| first.next_range().unwrap())
             .collect::<Vec<_>>();
-        let second_ranges = (0..plan.rows)
+        let second_ranges = (0..plan.number)
             .map(|_| second.next_range().unwrap())
             .collect::<Vec<_>>();
-        let different_ranges = (0..plan.rows)
+        let different_ranges = (0..plan.number)
             .map(|_| different.next_range().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(first_ranges, second_ranges);
@@ -483,7 +550,7 @@ mod tests {
         let plan = SessionPlan {
             session_index: 2,
             key_start: 7,
-            rows: 2,
+            number: 2,
         };
         let mut ranges = RandomScanRangeGenerator::new(19, loaded_range, 8, &plan).unwrap();
         assert_eq!(ranges.next_range().unwrap(), loaded_range);
@@ -495,7 +562,7 @@ mod tests {
         let plan = SessionPlan {
             session_index: 0,
             key_start: 0,
-            rows: 1,
+            number: 1,
         };
         assert!(RandomScanRangeGenerator::new(0, loaded_range(), 0, &plan).is_err());
         assert!(RandomScanRangeGenerator::new(0, loaded_range(), 4, &plan).is_err());
@@ -506,7 +573,7 @@ mod tests {
         let plan = SessionPlan {
             session_index: 0,
             key_start: 0,
-            rows: 1,
+            number: 1,
         };
         assert!(generate_sequential_read_keys(KeyRange { start: 0, len: 0 }, &plan).is_err());
         assert!(generate_random_read_keys(0, KeyRange { start: 0, len: 0 }, &plan).is_err());

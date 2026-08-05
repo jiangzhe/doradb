@@ -1,4 +1,4 @@
-use crate::cli::{IndexMode, LogSyncMode, Workload};
+use crate::cli::{IndexMode, LogSyncMode, TableLockScope, Workload};
 use crate::error::{BenchError, Result};
 use crate::manifest::{internal_stats_csv_path, result_csv_path, result_markdown_path};
 use doradb_storage::{
@@ -53,6 +53,9 @@ pub(super) struct OutputConfig {
     pub(super) log_sync: LogSyncMode,
     pub(super) include_stats: bool,
     pub(super) table_id: u64,
+    pub(super) scope: Option<TableLockScope>,
+    pub(super) unlock: Option<bool>,
+    pub(super) tables: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -319,6 +322,9 @@ fn render_result_csv(config: &OutputConfig, result: &BenchmarkResult) -> String 
         "sessions",
         "log_sync",
         "table_id",
+        "scope",
+        "unlock",
+        "tables",
         "operations",
         "inserted_rows",
         "found",
@@ -349,6 +355,18 @@ fn render_result_csv(config: &OutputConfig, result: &BenchmarkResult) -> String 
         config.sessions.to_string(),
         config.log_sync.to_string(),
         config.table_id.to_string(),
+        config
+            .scope
+            .map(|scope| scope.to_string())
+            .unwrap_or_default(),
+        config
+            .unlock
+            .map(|unlock| unlock.to_string())
+            .unwrap_or_default(),
+        config
+            .tables
+            .map(|tables| tables.to_string())
+            .unwrap_or_default(),
         result.operations.to_string(),
         result.inserted_rows.to_string(),
         result.found.to_string(),
@@ -394,6 +412,15 @@ fn configuration_pairs(config: &OutputConfig) -> Vec<(String, String)> {
         ("log_sync".to_owned(), config.log_sync.to_string()),
         ("table_id".to_owned(), config.table_id.to_string()),
     ]);
+    if let Some(scope) = config.scope {
+        pairs.push(("scope".to_owned(), scope.to_string()));
+    }
+    if let Some(unlock) = config.unlock {
+        pairs.push(("unlock".to_owned(), unlock.to_string()));
+    }
+    if let Some(tables) = config.tables {
+        pairs.push(("tables".to_owned(), tables.to_string()));
+    }
     pairs
 }
 
@@ -748,6 +775,9 @@ mod tests {
             log_sync: LogSyncMode::Fsync,
             include_stats: false,
             table_id: 7,
+            scope: None,
+            unlock: None,
+            tables: None,
         }
     }
 
@@ -953,6 +983,7 @@ mod tests {
             (Workload::IndexStream, "index-stream"),
             (Workload::TableDdl, "table-ddl"),
             (Workload::IndexDdl, "index-ddl"),
+            (Workload::LockTable, "lock-table"),
         ];
         for (workload, expected) in names {
             assert_eq!(workload.to_string(), expected);
@@ -971,9 +1002,42 @@ mod tests {
         assert_eq!(row[0], "table-ddl");
         assert_eq!(row[4], "2");
         assert_eq!(row[5], "");
-        assert_eq!(row[16], "4");
-        assert_eq!(&row[17..21], &["0", "0", "0", "0"]);
-        assert_eq!(row[24], "0");
+        assert_eq!(&row[16..19], &["", "", ""]);
+        assert_eq!(row[19], "4");
+        assert_eq!(&row[20..24], &["0", "0", "0", "0"]);
+        assert_eq!(row[27], "0");
+    }
+
+    #[test]
+    fn lock_table_outputs_include_optional_configuration() {
+        let temp = TempDir::new().unwrap();
+        let mut config = sample_config(temp.path());
+        config.workload = Workload::LockTable;
+        config.scope = Some(TableLockScope::Transaction);
+        config.unlock = Some(true);
+        config.tables = Some(3);
+        config.rand = true;
+        config.seed = 9;
+        let csv = render_result_csv(
+            &config,
+            &BenchmarkResult::new(5, 0, 0, 0, 0, Duration::from_nanos(100), 0),
+        );
+        let header = csv.lines().next().unwrap().split(',').collect::<Vec<_>>();
+        let row = csv.lines().nth(1).unwrap().split(',').collect::<Vec<_>>();
+        assert_eq!(&header[16..19], &["scope", "unlock", "tables"]);
+        assert_eq!(&row[16..19], &["transaction", "true", "3"]);
+        let pairs = configuration_pairs(&config);
+        for expected in [
+            ("scope", "transaction"),
+            ("unlock", "true"),
+            ("tables", "3"),
+        ] {
+            assert!(
+                pairs
+                    .iter()
+                    .any(|(name, value)| name == expected.0 && value == expected.1)
+            );
+        }
     }
 
     #[test]

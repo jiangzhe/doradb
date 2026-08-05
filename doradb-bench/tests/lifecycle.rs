@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use doradb_storage::{Engine, EngineConfig};
+    use doradb_storage::{Engine, EngineConfig, TableLockMode};
     use std::fs;
     use std::path::Path;
     use std::process::{Command, Output};
@@ -65,6 +65,24 @@ mod tests {
         })
     }
 
+    fn assert_all_tables_exclusively_lockable(root: &Path) {
+        smol::block_on(async {
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root))
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            for table_id in session.list_table_ids().unwrap() {
+                session
+                    .lock_table(table_id, TableLockMode::Exclusive)
+                    .await
+                    .unwrap();
+                session.unlock_table(table_id).unwrap();
+            }
+            session.close().await.unwrap();
+            engine.shutdown();
+        });
+    }
+
     #[test]
     fn lifecycle_prepare_run_insert_and_cleanup() {
         let temp = TempDir::new().unwrap();
@@ -72,17 +90,12 @@ mod tests {
 
         let prepare_stdout = assert_success(run_bench(
             &root,
-            &[
-                "prepare",
-                "--index",
-                "none",
-                "--value-size",
-                "64",
-                "--batch-size",
-                "5",
-            ],
+            &["prepare", "--value-size", "64", "--batch-size", "5"],
         ));
         assert!(prepare_stdout.contains("prepared storage_root="));
+        assert!(prepare_stdout.contains("index=none"));
+        assert!(prepare_stdout.contains("tables=1"));
+        assert!(prepare_stdout.contains("log_sync=fsync"));
         assert!(prepare_stdout.contains("value_size=64"));
         assert!(prepare_stdout.contains("batch_size=5"));
         assert!(root.join("benchmark-manifest.toml").exists());
@@ -139,9 +152,10 @@ mod tests {
         assert_eq!(columns[9], "none");
         assert_eq!(columns[11], "3");
         assert_eq!(columns[14], "fsync");
-        assert_eq!(columns[16], "3");
-        assert_eq!(columns[17], "3");
-        assert_eq!(columns[24], "0");
+        assert_eq!(&columns[16..19], &["", "", ""]);
+        assert_eq!(columns[19], "3");
+        assert_eq!(columns[20], "3");
+        assert_eq!(columns[27], "0");
 
         let cleanup_stdout = assert_success(run_bench(&root, &["cleanup"]));
         assert!(cleanup_stdout.contains("removed storage_root="));
@@ -164,7 +178,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("bench");
 
-        assert_success(run_bench(&root, &["prepare", "--index", "none"]));
+        assert_success(run_bench(
+            &root,
+            &["prepare", "--index", "none", "--log-sync", "none"],
+        ));
         fs::create_dir(root.join("benchmark-result.csv")).unwrap();
 
         let stderr = assert_failure(run_bench(
@@ -253,7 +270,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("bench");
 
-        assert_success(run_bench(&root, &["prepare", "--index", "none"]));
+        assert_success(run_bench(
+            &root,
+            &["prepare", "--index", "none", "--log-sync", "none"],
+        ));
         assert_success(run_bench(
             &root,
             &["run", "insert-seq", "--num", "4", "--value-size", "16"],
@@ -369,7 +389,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("bench");
 
-        assert_success(run_bench(&root, &["prepare", "--index", "none"]));
+        assert_success(run_bench(
+            &root,
+            &["prepare", "--index", "none", "--log-sync", "none"],
+        ));
         let manifest_before = fs::read_to_string(root.join("benchmark-manifest.toml")).unwrap();
 
         let stmt_stdout = assert_success(run_bench(
@@ -383,8 +406,6 @@ mod tests {
                 "2",
                 "--sessions",
                 "3",
-                "--log-sync",
-                "none",
             ],
         ));
         assert!(stmt_stdout.contains("workload: stmt-noop"));
@@ -392,6 +413,7 @@ mod tests {
         assert!(stmt_stdout.contains("inserted_rows: 0"));
         assert!(stmt_stdout.contains("rows_returned: 0"));
         assert!(stmt_stdout.contains("loaded_key_range: [0, 0)"));
+        assert!(stmt_stdout.contains("log_sync: none"));
         assert_eq!(
             fs::read_to_string(root.join("benchmark-manifest.toml")).unwrap(),
             manifest_before
@@ -408,8 +430,6 @@ mod tests {
                 "2",
                 "--sessions",
                 "3",
-                "--log-sync",
-                "none",
                 "--include-stats",
             ],
         ));
@@ -489,6 +509,180 @@ mod tests {
         let scan_stdout = assert_success(run_bench(&index_root, &["run", "table-scan"]));
         assert!(scan_stdout.contains("rows_returned: 3"));
         assert_success(run_bench(&index_root, &["cleanup"]));
+    }
+
+    #[test]
+    fn lifecycle_lock_table_modes_use_prepared_pool_and_cleanup_claims() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("lock-table");
+
+        let prepare_stdout = assert_success(run_bench(
+            &root,
+            &["prepare", "--tables", "3", "--log-sync", "none"],
+        ));
+        assert!(prepare_stdout.contains("index=none"));
+        assert!(prepare_stdout.contains("tables=3"));
+        assert!(prepare_stdout.contains("log_sync=none"));
+        assert_eq!(loaded_table_count(&root), 3);
+        let manifest_before = fs::read_to_string(root.join("benchmark-manifest.toml")).unwrap();
+
+        let cases = [
+            (
+                &[
+                    "run",
+                    "lock-table",
+                    "--num",
+                    "7",
+                    "--threads",
+                    "2",
+                    "--sessions",
+                    "5",
+                ][..],
+                "session",
+                false,
+                false,
+                0,
+            ),
+            (
+                &[
+                    "run",
+                    "lock-table",
+                    "--num",
+                    "6",
+                    "--unlock",
+                    "--threads",
+                    "2",
+                    "--sessions",
+                    "5",
+                ][..],
+                "session",
+                true,
+                false,
+                0,
+            ),
+            (
+                &[
+                    "run",
+                    "lock-table",
+                    "--num",
+                    "6",
+                    "--unlock",
+                    "--rand",
+                    "--seed",
+                    "9",
+                    "--threads",
+                    "2",
+                    "--sessions",
+                    "5",
+                ][..],
+                "session",
+                true,
+                true,
+                9,
+            ),
+            (
+                &[
+                    "run",
+                    "lock-table",
+                    "--num",
+                    "2",
+                    "--scope",
+                    "transaction",
+                    "--threads",
+                    "2",
+                    "--sessions",
+                    "5",
+                ][..],
+                "transaction",
+                false,
+                false,
+                0,
+            ),
+            (
+                &[
+                    "run",
+                    "lock-table",
+                    "--num",
+                    "6",
+                    "--scope",
+                    "transaction",
+                    "--unlock",
+                    "--threads",
+                    "2",
+                    "--sessions",
+                    "5",
+                ][..],
+                "transaction",
+                true,
+                false,
+                0,
+            ),
+            (
+                &[
+                    "run",
+                    "lock-table",
+                    "--num",
+                    "6",
+                    "--scope",
+                    "transaction",
+                    "--unlock",
+                    "--rand",
+                    "--seed",
+                    "11",
+                    "--threads",
+                    "2",
+                    "--sessions",
+                    "5",
+                ][..],
+                "transaction",
+                true,
+                true,
+                11,
+            ),
+        ];
+
+        for (args, scope, unlock, random, seed) in cases {
+            let stdout = assert_success(run_bench(&root, args));
+            assert!(stdout.contains("workload: lock-table"));
+            assert!(stdout.contains(&format!("scope: {scope}")));
+            assert!(stdout.contains(&format!("unlock: {unlock}")));
+            assert!(stdout.contains(&format!("rand: {random}")));
+            assert!(stdout.contains(&format!("seed: {seed}")));
+            assert!(stdout.contains("tables: 3"));
+            assert!(stdout.contains("log_sync: none"));
+            let num = args
+                .windows(2)
+                .find_map(|pair| (pair[0] == "--num").then_some(pair[1]))
+                .unwrap();
+            assert!(stdout.contains(&format!("operations: {num}")));
+            assert!(stdout.contains("inserted_rows: 0"));
+            assert!(stdout.contains("rows_returned: 0"));
+            assert_eq!(
+                fs::read_to_string(root.join("benchmark-manifest.toml")).unwrap(),
+                manifest_before
+            );
+            assert_all_tables_exclusively_lockable(&root);
+        }
+
+        let result_csv = fs::read_to_string(root.join("benchmark-result.csv")).unwrap();
+        let mut lines = result_csv.lines();
+        let header = lines.next().unwrap().split(',').collect::<Vec<_>>();
+        let row = lines.next().unwrap().split(',').collect::<Vec<_>>();
+        let value = |name: &str| row[header.iter().position(|column| *column == name).unwrap()];
+        assert_eq!(value("scope"), "transaction");
+        assert_eq!(value("unlock"), "true");
+        assert_eq!(value("tables"), "3");
+        assert_eq!(value("rand"), "true");
+        assert_eq!(value("seed"), "11");
+        assert_eq!(value("operations"), "6");
+
+        assert_success(run_bench(
+            &root,
+            &["run", "insert-seq", "--num", "2", "--value-size", "16"],
+        ));
+        let scan_stdout = assert_success(run_bench(&root, &["run", "table-scan"]));
+        assert!(scan_stdout.contains("rows_returned: 2"));
+        assert_success(run_bench(&root, &["cleanup"]));
     }
 
     #[test]

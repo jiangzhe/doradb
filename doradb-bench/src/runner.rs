@@ -1,4 +1,4 @@
-use crate::cli::{LogSyncMode, PrepareArgs, WorkloadArgs};
+use crate::cli::{IndexMode, LogSyncMode, PrepareArgs, WorkloadArgs};
 use crate::error::{BenchError, Result};
 use crate::manifest::{
     DefaultsManifest, Manifest, read_manifest, write_manifest, write_manifest_exclusive,
@@ -8,9 +8,9 @@ use crate::output::{
 };
 use crate::workload::{
     IndexDdlRunner, IndexScanRunner, IndexStreamRunner, InsertRandRunner, InsertSeqRunner,
-    LookupRandRunner, LookupSeqRunner, SessionPlan, SessionSummary, StmtNoopRunner, TableDdlRunner,
-    TableScanRunner, TrxNoopRunner, WorkloadConfig, WorkloadRunner, benchmark_index_specs,
-    benchmark_table_spec, build_session_plans,
+    LockTableRunner, LookupRandRunner, LookupSeqRunner, SessionPlan, SessionSummary,
+    StmtNoopRunner, TableDdlRunner, TableScanRunner, TrxNoopRunner, WorkloadConfig, WorkloadRunner,
+    benchmark_index_specs, benchmark_table_spec, build_session_plans,
 };
 use doradb_storage::id::TableID;
 use doradb_storage::{Engine, EngineConfig, Session, TrxSysConfig};
@@ -29,23 +29,41 @@ pub async fn prepare(storage_root: PathBuf, args: PrepareArgs) -> Result<()> {
         default_sessions,
         args.value_size.get(),
         args.batch_size.get(),
+        args.log_sync,
     )?;
 
-    let engine = open_engine(&storage_root, LogSyncMode::Fsync).await?;
-    let mut session = engine.new_session()?;
-    let table_id = session
-        .create_table(benchmark_table_spec(), benchmark_index_specs(args.index))
-        .await?;
-    session.close().await?;
-    engine.shutdown();
+    let engine = open_engine(&storage_root, args.log_sync).await?;
+    let operation_result = async {
+        let mut session = engine.new_session()?;
+        let create_result =
+            create_prepared_tables(&mut session, args.index, args.tables.get()).await;
+        finish_session(session, create_result).await
+    }
+    .await;
+    let table_ids = finish_engine(&engine, operation_result)?;
+    let Some((table_id, auxiliary_table_ids)) = table_ids.split_first() else {
+        return Err(BenchError::message(
+            "prepare did not create a primary benchmark table",
+        ));
+    };
 
-    let manifest = Manifest::new_with_defaults(table_id.as_u64(), args.index, defaults);
+    let manifest = Manifest::new_with_tables(
+        table_id.as_u64(),
+        auxiliary_table_ids
+            .iter()
+            .map(|table_id| table_id.as_u64())
+            .collect(),
+        args.index,
+        defaults,
+    );
     write_manifest_exclusive(&storage_root, &manifest)?;
     println!(
-        "prepared storage_root={} table_id={} index={} threads={} sessions={} value_size={} batch_size={}",
+        "prepared storage_root={} table_id={} index={} tables={} log_sync={} threads={} sessions={} value_size={} batch_size={}",
         storage_root.display(),
         table_id,
         args.index,
+        manifest.table_count(),
+        manifest.defaults.log_sync,
         manifest.defaults.threads,
         manifest.defaults.sessions,
         manifest.defaults.value_size,
@@ -79,6 +97,7 @@ pub async fn run_workload(
         WorkloadArgs::IndexStream(args) => run!(IndexStreamRunner, args),
         WorkloadArgs::TableDdl(args) => run!(TableDdlRunner, args),
         WorkloadArgs::IndexDdl(args) => run!(IndexDdlRunner, args),
+        WorkloadArgs::LockTable(args) => run!(LockTableRunner, args),
     }
 }
 
@@ -159,6 +178,9 @@ where
         log_sync: common.log_sync,
         include_stats: common.include_stats,
         table_id: manifest.table_id,
+        scope: config.lock_scope(),
+        unlock: config.unlock(),
+        tables: config.prepared_table_count(),
     };
     write_benchmark_outputs(&output_config, &metrics, &result, command_context)?;
 
@@ -191,6 +213,22 @@ async fn open_engine(storage_root: &Path, log_sync: LogSyncMode) -> Result<Engin
             .trx(TrxSysConfig::default().log_sync(log_sync.as_storage())),
     )
     .await?)
+}
+
+async fn create_prepared_tables(
+    session: &mut Session,
+    index: IndexMode,
+    table_count: usize,
+) -> Result<Vec<TableID>> {
+    let mut table_ids = Vec::with_capacity(table_count);
+    for _ in 0..table_count {
+        table_ids.push(
+            session
+                .create_table(benchmark_table_spec(), benchmark_index_specs(index))
+                .await?,
+        );
+    }
+    Ok(table_ids)
 }
 
 fn finish_engine<T>(engine: &Engine, operation_result: Result<T>) -> Result<T> {
@@ -257,10 +295,7 @@ async fn execute_session<R: WorkloadRunner>(
     finish_session(session, run_result).await
 }
 
-async fn finish_session(
-    mut session: Session,
-    run_result: Result<SessionSummary>,
-) -> Result<SessionSummary> {
+async fn finish_session<T>(mut session: Session, run_result: Result<T>) -> Result<T> {
     let close_result = session.close().await;
     match (run_result, close_result) {
         (Ok(summary), Ok(())) => Ok(summary),

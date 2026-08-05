@@ -1,9 +1,10 @@
 use crate::cli::{
-    DEFAULT_BATCH_SIZE, DEFAULT_VALUE_SIZE, IndexMode, Workload, validate_batch_size,
+    DEFAULT_BATCH_SIZE, DEFAULT_VALUE_SIZE, IndexMode, LogSyncMode, Workload, validate_batch_size,
     validate_value_size, validate_workers,
 };
 use crate::error::{BenchError, Result};
 use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -36,6 +37,8 @@ pub(super) struct DefaultsManifest {
     pub(super) value_size: usize,
     #[serde(default = "default_batch_size")]
     pub(super) batch_size: u64,
+    #[serde(default)]
+    pub(super) log_sync: LogSyncMode,
 }
 
 impl DefaultsManifest {
@@ -44,6 +47,7 @@ impl DefaultsManifest {
         sessions: usize,
         value_size: usize,
         batch_size: u64,
+        log_sync: LogSyncMode,
     ) -> Result<Self> {
         validate_workers(threads, sessions)?;
         validate_value_size(value_size)?;
@@ -53,6 +57,7 @@ impl DefaultsManifest {
             sessions,
             value_size,
             batch_size,
+            log_sync,
         })
     }
 
@@ -70,6 +75,7 @@ impl Default for DefaultsManifest {
             sessions: 1,
             value_size: DEFAULT_VALUE_SIZE,
             batch_size: DEFAULT_BATCH_SIZE,
+            log_sync: LogSyncMode::Fsync,
         }
     }
 }
@@ -108,6 +114,8 @@ impl<'de> Deserialize<'de> for RuntimeManifest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct Manifest {
     pub(super) table_id: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) auxiliary_table_ids: Vec<u64>,
     pub(super) index: IndexMode,
     #[serde(default)]
     pub(super) defaults: DefaultsManifest,
@@ -121,13 +129,24 @@ impl Manifest {
         Self::new_with_defaults(table_id, index, DefaultsManifest::default())
     }
 
+    #[cfg(test)]
     pub(super) fn new_with_defaults(
         table_id: u64,
         index: IndexMode,
         defaults: DefaultsManifest,
     ) -> Self {
+        Self::new_with_tables(table_id, Vec::new(), index, defaults)
+    }
+
+    pub(super) fn new_with_tables(
+        table_id: u64,
+        auxiliary_table_ids: Vec<u64>,
+        index: IndexMode,
+        defaults: DefaultsManifest,
+    ) -> Self {
         Self {
             table_id,
+            auxiliary_table_ids,
             index,
             defaults,
             schema: SchemaManifest {
@@ -139,6 +158,19 @@ impl Manifest {
                 rows_inserted: 0,
             },
         }
+    }
+
+    /// Return the primary and auxiliary table IDs in preparation order.
+    pub(super) fn table_ids(&self) -> Vec<u64> {
+        let mut table_ids = Vec::with_capacity(self.table_count());
+        table_ids.push(self.table_id);
+        table_ids.extend_from_slice(&self.auxiliary_table_ids);
+        table_ids
+    }
+
+    /// Return the positive number of prepared benchmark tables.
+    pub(super) fn table_count(&self) -> usize {
+        self.auxiliary_table_ids.len().saturating_add(1)
     }
 
     pub(super) fn key_range(&self, rows: u64) -> Result<KeyRange> {
@@ -183,7 +215,8 @@ impl Manifest {
             | Workload::TableScan
             | Workload::StmtNoop
             | Workload::TrxNoop
-            | Workload::TableDdl => {}
+            | Workload::TableDdl
+            | Workload::LockTable => {}
             Workload::LookupSeq | Workload::LookupRand => {
                 if self.index != IndexMode::Unique {
                     return Err(BenchError::message(format!(
@@ -221,6 +254,20 @@ impl Manifest {
         }
         Ok(())
     }
+
+    fn validate(&self) -> Result<()> {
+        self.defaults.validate()?;
+        let mut unique = HashSet::with_capacity(self.table_count());
+        unique.insert(self.table_id);
+        for table_id in &self.auxiliary_table_ids {
+            if !unique.insert(*table_id) {
+                return Err(BenchError::message(format!(
+                    "benchmark manifest contains duplicate table ID {table_id}"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 pub(super) fn manifest_path(storage_root: &Path) -> PathBuf {
@@ -248,7 +295,7 @@ pub(super) fn read_manifest(storage_root: &Path) -> Result<Manifest> {
         ))
     })?;
     let manifest: Manifest = toml::from_str(&contents)?;
-    manifest.defaults.validate()?;
+    manifest.validate()?;
     Ok(manifest)
 }
 
@@ -337,7 +384,10 @@ mod tests {
         assert_eq!(loaded.defaults, DefaultsManifest::default());
         assert_eq!(loaded.defaults.value_size, DEFAULT_VALUE_SIZE);
         assert_eq!(loaded.defaults.batch_size, DEFAULT_BATCH_SIZE);
+        assert_eq!(loaded.defaults.log_sync, LogSyncMode::Fsync);
         assert_eq!(loaded.runtime.rows_inserted, 0);
+        assert_eq!(loaded.table_ids(), vec![42]);
+        assert_eq!(loaded.table_count(), 1);
     }
 
     #[test]
@@ -346,17 +396,20 @@ mod tests {
         let mut manifest = Manifest::new_with_defaults(
             42,
             IndexMode::NonUnique,
-            DefaultsManifest::new(2, 4, 256, 8).unwrap(),
+            DefaultsManifest::new(2, 4, 256, 8, LogSyncMode::None).unwrap(),
         );
         manifest.record_insert_success(7).unwrap();
 
         write_manifest(temp.path(), &manifest).unwrap();
+        let contents = fs::read_to_string(manifest_path(temp.path())).unwrap();
+        assert!(contents.contains("log_sync = \"none\""));
         let loaded = read_manifest(temp.path()).unwrap();
         assert_eq!(loaded.index, IndexMode::NonUnique);
         assert_eq!(loaded.defaults.threads, 2);
         assert_eq!(loaded.defaults.sessions, 4);
         assert_eq!(loaded.defaults.value_size, 256);
         assert_eq!(loaded.defaults.batch_size, 8);
+        assert_eq!(loaded.defaults.log_sync, LogSyncMode::None);
         assert_eq!(loaded.runtime.next_key, 7);
         assert_eq!(loaded.runtime.rows_inserted, 7);
     }
@@ -370,6 +423,7 @@ mod tests {
         assert!(!contents.contains("schema_version"));
         assert!(!contents.contains("[prepare]"));
         assert!(!contents.contains("workload_set"));
+        assert!(!contents.contains("auxiliary_table_ids"));
     }
 
     #[test]
@@ -446,6 +500,41 @@ rows_inserted = 0
         assert_eq!(loaded.defaults.sessions, 4);
         assert_eq!(loaded.defaults.value_size, DEFAULT_VALUE_SIZE);
         assert_eq!(loaded.defaults.batch_size, DEFAULT_BATCH_SIZE);
+        assert_eq!(loaded.defaults.log_sync, LogSyncMode::Fsync);
+    }
+
+    #[test]
+    fn multi_table_manifest_roundtrips_in_preparation_order() {
+        let temp = TempDir::new().unwrap();
+        let manifest = Manifest::new_with_tables(
+            42,
+            vec![7, 11],
+            IndexMode::None,
+            DefaultsManifest::default(),
+        );
+
+        write_manifest(temp.path(), &manifest).unwrap();
+        let contents = fs::read_to_string(manifest_path(temp.path())).unwrap();
+        assert!(contents.contains("auxiliary_table_ids = ["));
+        let loaded = read_manifest(temp.path()).unwrap();
+
+        assert_eq!(loaded.table_ids(), vec![42, 7, 11]);
+        assert_eq!(loaded.table_count(), 3);
+    }
+
+    #[test]
+    fn manifest_rejects_duplicate_table_ids() {
+        let temp = TempDir::new().unwrap();
+        for auxiliary_table_ids in [vec![42], vec![7, 7]] {
+            let manifest = Manifest::new_with_tables(
+                42,
+                auxiliary_table_ids,
+                IndexMode::None,
+                DefaultsManifest::default(),
+            );
+            write_manifest(temp.path(), &manifest).unwrap();
+            assert!(read_manifest(temp.path()).is_err());
+        }
     }
 
     #[test]
@@ -545,7 +634,12 @@ rows_inserted = 0
     fn no_data_workloads_accept_supported_empty_manifests() {
         for index in [IndexMode::None, IndexMode::Unique, IndexMode::NonUnique] {
             let manifest = Manifest::new(7, index);
-            for workload in [Workload::StmtNoop, Workload::TrxNoop, Workload::TableDdl] {
+            for workload in [
+                Workload::StmtNoop,
+                Workload::TrxNoop,
+                Workload::TableDdl,
+                Workload::LockTable,
+            ] {
                 assert!(
                     manifest.validate_workload_compatible(workload).is_ok(),
                     "workload={workload}, index={index}"
