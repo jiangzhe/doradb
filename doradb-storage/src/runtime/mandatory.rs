@@ -939,6 +939,11 @@ impl MandatoryRuntimeWorkersOwned {
                 message
             );
             panics.capture(Box::new(message));
+            // Accepted callers can still depend on the runners and internal
+            // admission remaining live. Report the invariant without starting
+            // worker teardown.
+            panics.resume();
+            return;
         }
         self.runtime.internal_admission.close();
         runtime::block_on(self.runtime.internal_admission.drain());
@@ -963,9 +968,10 @@ impl MandatoryRuntimeWorkersOwned {
             );
             panics.capture(Box::new(message));
         }
-        // Panic safety: both admissions are closed, internal work is drained,
-        // every runner is signalled and joined, and terminal validation is
-        // complete before the first invariant or join payload is resumed.
+        // Panic safety after caller admission is confirmed drained: both
+        // admissions are closed, internal work is drained, every runner is
+        // signalled and joined, and terminal validation is complete before the
+        // first join or executor-invariant payload is resumed.
         panics.resume();
     }
 }
@@ -1695,6 +1701,60 @@ mod tests {
             payload.downcast_ref::<&'static str>().copied(),
             Some("first mandatory runner panic")
         );
+    }
+
+    #[test]
+    fn mandatory_shutdown_preserves_runners_until_callers_drain() {
+        let (registry, mandatory) = runtime::block_on(async {
+            let mut builder = RegistryBuilder::new();
+            builder.build::<EnginePoisoner>(()).await.unwrap();
+            builder
+                .build::<MandatoryRuntime>(
+                    MandatoryRuntimeConfig::default()
+                        .worker_threads(1)
+                        .concurrency_limit(1),
+                )
+                .await
+                .unwrap();
+            builder.build::<MandatoryRuntimeWorkers>(()).await.unwrap();
+            let registry = builder.finish();
+            let mandatory = registry.dependency::<MandatoryRuntime>();
+            (registry, mandatory)
+        });
+        let caller = runtime::block_on(mandatory.admission.acquire(mandatory.clone())).unwrap();
+        let workers = MandatoryRuntimeWorkersOwned {
+            runtime: mandatory.clone(),
+            handles: Mutex::new(vec![std::thread::spawn(|| {})]),
+            shutdown_started: AtomicBool::new(false),
+        };
+
+        let payload = panic::catch_unwind(AssertUnwindSafe(|| workers.shutdown())).unwrap_err();
+        let caller_admission = mandatory.admission.inspect();
+        let internal_admission = mandatory.internal_admission.inspect();
+        let stopping = mandatory.stopping.load(Ordering::Acquire);
+        let handle_count = workers.handles.lock().len();
+
+        // Always restore the normal shutdown preconditions before asserting so
+        // a regression cannot leave mandatory-runtime runners detached.
+        drop(caller);
+        for handle in take(&mut *workers.handles.lock()) {
+            handle.join().unwrap();
+        }
+        drop(workers);
+        mandatory.close_admission();
+        runtime::block_on(mandatory.drain_callers());
+        registry
+            .shutdown_all()
+            .propagate_or_suppress("mandatory_active_caller_shutdown_test");
+
+        assert_eq!(
+            payload.downcast_ref::<String>().map(String::as_str),
+            Some("mandatory runner shutdown requires drained caller admission: callers=1")
+        );
+        assert_eq!(caller_admission, (true, 1));
+        assert_eq!(internal_admission, (false, 0));
+        assert!(!stopping);
+        assert_eq!(handle_count, 1);
     }
 
     #[test]
