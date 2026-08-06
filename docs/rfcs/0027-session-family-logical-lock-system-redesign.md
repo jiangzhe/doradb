@@ -4,6 +4,7 @@ title: Session-Family Logical Lock System Redesign
 status: proposal
 tags: [storage-engine, logical-locking, session, transaction, concurrency, performance]
 created: 2026-08-06
+github_issue: 947
 ---
 
 # RFC-0027: Session-Family Logical Lock System Redesign
