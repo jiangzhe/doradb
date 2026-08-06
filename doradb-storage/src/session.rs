@@ -16,7 +16,8 @@ use crate::error::{
 };
 use crate::id::{OperationID, SessionID, SessionOperationKey, TableID, TrxID};
 use crate::lock::{
-    FreshLockGuard, LockManager, LockMode, LockOwner, LockResource, OwnerLockState, TableLockMode,
+    FamilyLockAuthority, FamilyLockState, FreshClaimsGuard, LockMode, LockOwner, LockResource,
+    LockScopeState, TableLockMode,
 };
 use crate::map::{FastDashMap, FastHashMap};
 use crate::notify::EventNotifyOnDrop;
@@ -114,115 +115,11 @@ pub struct CatalogRedoMaintenanceOutcome {
     pub redo_truncation: RedoTruncationOutcome,
 }
 
-/// Lifetime-free logical-lock scope prepared for one DDL operation.
-pub(crate) struct PreparedDdlLocks {
-    lock_manager: QuiescentGuard<LockManager>,
-    locks: OwnerLockState,
-}
-
-impl PreparedDdlLocks {
-    #[inline]
-    fn new(operation: &SessionOperationPin) -> Self {
-        Self {
-            lock_manager: operation.runtime.lock_manager().clone(),
-            locks: OwnerLockState::new(operation.operation_lock_owner()),
-        }
-    }
-
-    #[inline]
-    async fn acquire_create(
-        &mut self,
-        table_id: TableID,
-        catalog_targets: &[TableID],
-    ) -> OperationResult<()> {
-        self.locks
-            .acquire(
-                &self.lock_manager,
-                LockResource::TableMetadata(table_id),
-                LockMode::Exclusive,
-            )
-            .await?;
-        for &catalog_table_id in catalog_targets {
-            self.locks
-                .acquire(
-                    &self.lock_manager,
-                    LockResource::TableMetadata(catalog_table_id),
-                    LockMode::Shared,
-                )
-                .await?;
-        }
-        for &catalog_table_id in catalog_targets {
-            self.locks
-                .acquire(
-                    &self.lock_manager,
-                    LockResource::TableData(catalog_table_id),
-                    LockMode::IntentExclusive,
-                )
-                .await?;
-        }
-        Ok(())
-    }
-
-    #[inline]
-    async fn acquire_existing(
-        &mut self,
-        table_id: TableID,
-        catalog_targets: &[TableID],
-    ) -> OperationResult<()> {
-        self.locks
-            .acquire(
-                &self.lock_manager,
-                LockResource::TableMetadata(table_id),
-                LockMode::Exclusive,
-            )
-            .await?;
-        for &catalog_table_id in catalog_targets {
-            self.locks
-                .acquire(
-                    &self.lock_manager,
-                    LockResource::TableMetadata(catalog_table_id),
-                    LockMode::Shared,
-                )
-                .await?;
-        }
-        self.locks
-            .acquire(
-                &self.lock_manager,
-                LockResource::TableData(table_id),
-                LockMode::Exclusive,
-            )
-            .await?;
-        for &catalog_table_id in catalog_targets {
-            self.locks
-                .acquire(
-                    &self.lock_manager,
-                    LockResource::TableData(catalog_table_id),
-                    LockMode::IntentExclusive,
-                )
-                .await?;
-        }
-        Ok(())
-    }
-
-    #[inline]
-    fn catalog_write_authority(&self) -> PreparedCatalogWriteAuthority<'_> {
-        PreparedCatalogWriteAuthority::new(&self.locks)
-    }
-}
-
-impl Drop for PreparedDdlLocks {
-    #[inline]
-    fn drop(&mut self) {
-        self.locks.release_all(&self.lock_manager);
-    }
-}
-
 /// Caller-owned DDL preparation transferred atomically at mandatory acceptance.
 ///
-/// Lock fields precede the foreground pin so ordinary cancellation releases
-/// grants before publishing the outer foreground terminal edge.
+/// The foreground pin owns both the family root and the operation scope, so
+/// ordinary cancellation closes claims before publishing the terminal edge.
 pub(crate) struct PreparedDdlScope {
-    locks: PreparedDdlLocks,
     operation: SessionOperationPin,
 }
 
@@ -230,49 +127,53 @@ impl PreparedDdlScope {
     /// Prepare the fixed CREATE TABLE lock set in canonical resource order.
     #[inline]
     pub(crate) async fn create(
-        operation: SessionOperationPin,
+        mut operation: SessionOperationPin,
         table_id: TableID,
         catalog_targets: &[TableID],
     ) -> OperationResult<Self> {
-        let mut locks = PreparedDdlLocks::new(&operation);
-        locks.acquire_create(table_id, catalog_targets).await?;
-        Ok(Self { locks, operation })
+        operation
+            .acquire_ddl_create(table_id, catalog_targets)
+            .await?;
+        Ok(Self { operation })
     }
 
     /// Prepare the fixed DROP TABLE lock set in canonical resource order.
     #[inline]
     pub(crate) async fn drop_table(
-        operation: SessionOperationPin,
+        mut operation: SessionOperationPin,
         table_id: TableID,
         catalog_targets: &[TableID],
     ) -> OperationResult<Self> {
-        let mut locks = PreparedDdlLocks::new(&operation);
-        locks.acquire_existing(table_id, catalog_targets).await?;
-        Ok(Self { locks, operation })
+        operation
+            .acquire_ddl_existing(table_id, catalog_targets)
+            .await?;
+        Ok(Self { operation })
     }
 
     /// Prepare the fixed CREATE INDEX lock set in canonical resource order.
     #[inline]
     pub(crate) async fn create_index(
-        operation: SessionOperationPin,
+        mut operation: SessionOperationPin,
         table_id: TableID,
         catalog_targets: &[TableID],
     ) -> OperationResult<Self> {
-        let mut locks = PreparedDdlLocks::new(&operation);
-        locks.acquire_existing(table_id, catalog_targets).await?;
-        Ok(Self { locks, operation })
+        operation
+            .acquire_ddl_existing(table_id, catalog_targets)
+            .await?;
+        Ok(Self { operation })
     }
 
     /// Prepare the fixed DROP INDEX lock set in canonical resource order.
     #[inline]
     pub(crate) async fn drop_index(
-        operation: SessionOperationPin,
+        mut operation: SessionOperationPin,
         table_id: TableID,
         catalog_targets: &[TableID],
     ) -> OperationResult<Self> {
-        let mut locks = PreparedDdlLocks::new(&operation);
-        locks.acquire_existing(table_id, catalog_targets).await?;
-        Ok(Self { locks, operation })
+        operation
+            .acquire_ddl_existing(table_id, catalog_targets)
+            .await?;
+        Ok(Self { operation })
     }
 
     /// Return the exact operation key carried into mandatory diagnostics.
@@ -290,10 +191,8 @@ impl PreparedDdlScope {
     /// Synchronously consume caller preparation into accepted authority.
     #[inline]
     pub(crate) fn accept(self) -> AcceptedDdlScope {
-        let Self { locks, operation } = self;
         AcceptedDdlScope {
-            operation: operation.into_mandatory(),
-            locks: Some(locks),
+            operation: self.operation.into_mandatory(),
             finish_state: DdlFinishState::Executing,
         }
     }
@@ -308,7 +207,6 @@ enum DdlFinishState {
 /// Runtime-owned table-DDL operation and its transferred logical locks.
 pub(crate) struct AcceptedDdlScope {
     operation: MandatoryOperationGuard,
-    locks: Option<PreparedDdlLocks>,
     finish_state: DdlFinishState,
 }
 
@@ -321,19 +219,14 @@ impl AcceptedDdlScope {
 
     /// Start one mandatory-owned nested private transaction.
     #[inline]
-    pub(crate) fn begin_private_trx(&self) -> LifecycleResult<Transaction> {
+    pub(crate) fn begin_private_trx(&mut self) -> LifecycleResult<Transaction> {
         self.operation.begin_private_trx()
     }
 
     /// Borrow the prepared proof used by catalog statement mutation.
     #[inline]
     pub(crate) fn catalog_write_authority(&self) -> PreparedCatalogWriteAuthority<'_> {
-        self.locks
-            .as_ref()
-            .map(PreparedDdlLocks::catalog_write_authority)
-            .unwrap_or_else(|| {
-                panic!("accepted table DDL must retain prepared locks during execution")
-            })
+        self.operation.catalog_write_authority()
     }
 
     /// Verify the nested state before returning from accepted execution.
@@ -349,7 +242,6 @@ impl AcceptedDdlScope {
         let state = replace(&mut self.finish_state, DdlFinishState::FailedRetained);
         match state {
             DdlFinishState::TerminalReady => {
-                drop(self.locks.take());
                 self.operation.finish();
             }
             DdlFinishState::Executing => {
@@ -357,11 +249,8 @@ impl AcceptedDdlScope {
                 let report = Report::new(FatalError::MandatoryTaskPanic)
                     .attach("accepted table DDL finished without terminal-ready state");
                 self.operation.runtime.poisoner.poison(report);
-                drop(self.locks.take());
             }
-            DdlFinishState::FailedRetained => {
-                drop(self.locks.take());
-            }
+            DdlFinishState::FailedRetained => {}
         }
     }
 
@@ -373,77 +262,27 @@ impl AcceptedDdlScope {
     }
 }
 
-/// Lifetime-free logical-lock scope prepared for one maintenance operation.
-pub(crate) struct PreparedMaintenanceLocks {
-    lock_manager: QuiescentGuard<LockManager>,
-    locks: OwnerLockState,
-}
-
-impl PreparedMaintenanceLocks {
-    #[inline]
-    fn new(operation: &SessionOperationPin) -> Self {
-        Self {
-            lock_manager: operation.runtime.lock_manager().clone(),
-            locks: OwnerLockState::new(operation.operation_lock_owner()),
-        }
-    }
-
-    /// Acquire table metadata S followed by table data IS.
-    async fn acquire_table(&mut self, table_id: TableID) -> OperationResult<()> {
-        self.locks
-            .acquire(
-                &self.lock_manager,
-                LockResource::TableMetadata(table_id),
-                LockMode::Shared,
-            )
-            .await?;
-        self.locks
-            .acquire(
-                &self.lock_manager,
-                LockResource::TableData(table_id),
-                LockMode::IntentShared,
-            )
-            .await
-    }
-}
-
-impl Drop for PreparedMaintenanceLocks {
-    #[inline]
-    fn drop(&mut self) {
-        self.locks.release_all(&self.lock_manager);
-    }
-}
-
 /// Caller-owned maintenance preparation transferred atomically at acceptance.
 ///
-/// Prepared locks precede the voluntary operation pin so cancellation releases
-/// every logical-lock claim before publishing the foreground terminal edge.
+/// The voluntary operation pin owns its exact lock scope through cancellation.
 pub(crate) struct PreparedMaintenanceScope {
-    locks: Option<PreparedMaintenanceLocks>,
     operation: SessionOperationPin,
 }
 
 impl PreparedMaintenanceScope {
     /// Prepare one table-scoped maintenance lock set.
     pub(crate) async fn table(
-        operation: SessionOperationPin,
+        mut operation: SessionOperationPin,
         table_id: TableID,
     ) -> OperationResult<Self> {
-        let mut locks = PreparedMaintenanceLocks::new(&operation);
-        locks.acquire_table(table_id).await?;
-        Ok(Self {
-            locks: Some(locks),
-            operation,
-        })
+        operation.acquire_maintenance_table(table_id).await?;
+        Ok(Self { operation })
     }
 
     /// Prepare one catalog/redo-wide maintenance operation.
     #[inline]
     pub(crate) fn global(operation: SessionOperationPin) -> Self {
-        Self {
-            locks: None,
-            operation,
-        }
+        Self { operation }
     }
 
     /// Return the exact operation key carried into mandatory diagnostics.
@@ -476,10 +315,8 @@ impl PreparedMaintenanceScope {
     /// Synchronously consume caller preparation into accepted authority.
     #[inline]
     pub(crate) fn accept(self) -> AcceptedMaintenanceScope {
-        let Self { locks, operation } = self;
         AcceptedMaintenanceScope {
-            operation: operation.into_mandatory(),
-            locks,
+            operation: self.operation.into_mandatory(),
             finish_state: MaintenanceFinishState::Executing,
         }
     }
@@ -494,7 +331,6 @@ enum MaintenanceFinishState {
 /// Runtime-owned maintenance operation and its transferred logical locks.
 pub(crate) struct AcceptedMaintenanceScope {
     operation: MandatoryOperationGuard,
-    locks: Option<PreparedMaintenanceLocks>,
     finish_state: MaintenanceFinishState,
 }
 
@@ -505,15 +341,9 @@ impl AcceptedMaintenanceScope {
         &self.operation.runtime
     }
 
-    /// Return cloned buffer-pool guards for maintenance work.
-    #[inline]
-    pub(crate) fn pool_guards(&self) -> &PoolGuards {
-        self.operation.runtime.pool_guards()
-    }
-
     /// Start one mandatory-owned nested private transaction.
     #[inline]
-    pub(crate) fn begin_private_trx(&self) -> LifecycleResult<Transaction> {
+    pub(crate) fn begin_private_trx(&mut self) -> LifecycleResult<Transaction> {
         self.operation.begin_private_trx()
     }
 
@@ -533,7 +363,6 @@ impl AcceptedMaintenanceScope {
         );
         match state {
             MaintenanceFinishState::TerminalReady => {
-                drop(self.locks.take());
                 self.operation.finish();
             }
             MaintenanceFinishState::Executing => {
@@ -541,11 +370,8 @@ impl AcceptedMaintenanceScope {
                 let report = Report::new(FatalError::MandatoryTaskPanic)
                     .attach("accepted maintenance finished without terminal-ready state");
                 self.operation.runtime.poisoner.poison(report);
-                drop(self.locks.take());
             }
-            MaintenanceFinishState::FailedRetained => {
-                drop(self.locks.take());
-            }
+            MaintenanceFinishState::FailedRetained => {}
         }
     }
 
@@ -748,69 +574,31 @@ impl MaintenanceBoundary {
     }
 }
 
-/// Scoped runtime access for one finite session maintenance operation.
-///
-/// The table owner is explicitly released before fresh logical-lock guards so
-/// same-table metadata X cannot detach the catalog-owned runtime while this
-/// scope can still use it.
-struct ScopedTableRuntimeAccess<'lock> {
-    table: Option<Arc<Table>>,
-    metadata_lock: Option<FreshLockGuard<'lock>>,
-    data_lock: Option<FreshLockGuard<'lock>>,
+/// Live table runtime bound to one admitted session maintenance operation.
+struct SessionTable<'s> {
+    table: Arc<Table>,
+    session: &'s SessionOperationPin,
 }
 
-impl<'lock> ScopedTableRuntimeAccess<'lock> {
-    /// Acquires ordered metadata S/data IS admission and resolves a live table.
-    async fn acquire(
-        session: &'lock SessionOperationPin,
-        table_id: TableID,
-    ) -> OperationResult<Self> {
-        assert!(
-            session.kind() == SessionOperationKind::Maintenance,
-            "scoped table runtime access requires maintenance authority: key={}, kind={}",
-            session.key(),
-            session.kind().label()
-        );
-        let owner = session.operation_lock_owner();
-        let (metadata_lock, data_lock) = Self::acquire_locks(session, table_id, owner).await?;
-        let table = session.resolve_user_table(table_id).await?;
-        Ok(Self {
-            table: Some(table),
-            metadata_lock,
-            data_lock,
-        })
-    }
-
-    /// Acquires logical locks in the repository-wide table resource order.
-    async fn acquire_locks(
-        session: &'lock SessionOperationPin,
-        table_id: TableID,
-        owner: LockOwner,
-    ) -> OperationResult<(Option<FreshLockGuard<'lock>>, Option<FreshLockGuard<'lock>>)> {
-        session
-            .runtime
-            .lock_manager()
-            .acquire_table_locks(table_id, LockMode::IntentShared, owner)
-            .await
-    }
-
+impl<'s> SessionTable<'s> {
     /// Borrows the admitted runtime without exposing another strong clone.
     #[inline]
     fn table(&self) -> &Table {
-        self.table.as_deref().unwrap_or_else(|| {
-            panic!("scoped table runtime access invariant violated: table already released")
-        })
+        &self.table
+    }
+
+    /// Borrows the pool guards retained by the admitted session operation.
+    #[inline]
+    fn pool_guards(&self) -> &PoolGuards {
+        self.session.pool_guards()
     }
 }
 
-impl Drop for ScopedTableRuntimeAccess<'_> {
+impl Drop for SessionTable<'_> {
     #[inline]
     fn drop(&mut self) {
-        // Logical DROP can acquire metadata X only after this strong runtime
-        // owner is gone.
-        drop(self.table.take());
-        drop(self.data_lock.take());
-        drop(self.metadata_lock.take());
+        // The Drop impl makes drop checking retain `session` until the owned
+        // table runtime is released.
     }
 }
 
@@ -864,42 +652,24 @@ impl WeakSessionRef {
         }
     }
 
-    /// Acquire operation-start admission without cloning the admission façade.
+    /// Acquires foreground admission and upgrades the exact registered session.
     #[inline]
-    pub(crate) fn acquire_admission(&self) -> LifecycleResult<AdmittedSessionRef<'_>> {
+    pub(crate) fn upgrade(&self) -> LifecycleResult<Option<AdmittedSessionRuntime<'_>>> {
         let admission = self.admission.acquire()?;
-        Ok(AdmittedSessionRef {
-            state: &self.state,
-            _admission: admission,
-        })
+        Ok(self
+            .state
+            .upgrade()
+            .map(SessionRuntime)
+            .map(|runtime| AdmittedSessionRuntime {
+                runtime,
+                _admission: admission,
+            }))
     }
 
     /// Best-effort upgrade for terminal and cleanup ownership.
     #[inline]
     pub(crate) fn upgrade_for_terminal(&self) -> Option<SessionRuntime> {
         self.state.upgrade().map(SessionRuntime)
-    }
-}
-
-/// Weak session reachability paired with its exact operation-start admission.
-///
-/// The wrapper prevents normal weak upgrades from being separated from the
-/// matching engine admission. It remains live until the caller registers a
-/// stable operation or observer proof.
-pub(crate) struct AdmittedSessionRef<'a> {
-    state: &'a Weak<SessionState>,
-    _admission: EngineAdmission<'a>,
-}
-
-impl<'a> AdmittedSessionRef<'a> {
-    /// Consume this admitted weak reference and pin its exact session runtime.
-    #[inline]
-    pub(crate) fn upgrade(self) -> Option<AdmittedSessionRuntime<'a>> {
-        let runtime = self.state.upgrade().map(SessionRuntime)?;
-        Some(AdmittedSessionRuntime {
-            runtime,
-            _admission: self._admission,
-        })
     }
 }
 
@@ -1054,12 +824,12 @@ impl Session {
         }
         let admitted = self
             .session
-            .acquire_admission()
-            .attach_with(|| format!("session_id={}", self.id))?;
-        let admitted = admitted.upgrade().ok_or_else(|| {
-            Report::new(LifecycleError::SessionUnavailable)
-                .attach(format!("session_id={}, reason=session_missing", self.id))
-        })?;
+            .upgrade()
+            .attach_with(|| format!("session_id={}", self.id))?
+            .ok_or_else(|| {
+                Report::new(LifecycleError::SessionUnavailable)
+                    .attach(format!("session_id={}, reason=session_missing", self.id))
+            })?;
         admitted
             .runtime()
             .poisoner
@@ -1084,12 +854,12 @@ impl Session {
         }
         let admitted = self
             .session
-            .acquire_admission()
-            .attach_with(|| format!("session_id={}, kind={}", self.id, kind.label()))?;
-        let admitted = admitted.upgrade().ok_or_else(|| {
-            Report::new(LifecycleError::SessionUnavailable)
-                .attach(format!("session_id={}, reason=session_missing", self.id))
-        })?;
+            .upgrade()
+            .attach_with(|| format!("session_id={}, kind={}", self.id, kind.label()))?
+            .ok_or_else(|| {
+                Report::new(LifecycleError::SessionUnavailable)
+                    .attach(format!("session_id={}, reason=session_missing", self.id))
+            })?;
         admitted
             .runtime()
             .poisoner
@@ -1102,15 +872,22 @@ impl Session {
                     kind.label()
                 )
             })?;
-        let entry = admitted
+        let (entry, authority) = admitted
             .runtime()
             .state()
             .reserve_operation(kind)
             .attach_with(|| format!("session_id={}, kind={}", self.id, kind.label()))?;
         let runtime = admitted.into_runtime();
+        let curr_scope = matches!(
+            kind,
+            SessionOperationKind::Ddl | SessionOperationKind::Maintenance
+        )
+        .then(|| LockScopeState::new(LockOwner::operation(entry.key())));
         Ok(SessionOperationPin {
             runtime,
             entry,
+            authority: Some(authority),
+            curr_scope,
             armed: true,
         })
     }
@@ -1129,12 +906,12 @@ impl Session {
         }
         let admitted = self
             .session
-            .acquire_admission()
-            .attach_with(|| format!("session_id={}", self.id))?;
-        let admitted = admitted.upgrade().ok_or_else(|| {
-            Report::new(LifecycleError::SessionUnavailable)
-                .attach(format!("session_id={}, reason=session_missing", self.id))
-        })?;
+            .upgrade()
+            .attach_with(|| format!("session_id={}", self.id))?
+            .ok_or_else(|| {
+                Report::new(LifecycleError::SessionUnavailable)
+                    .attach(format!("session_id={}, reason=session_missing", self.id))
+            })?;
         admitted
             .runtime()
             .state()
@@ -1169,11 +946,9 @@ impl Session {
         }
         let admitted = self
             .session
-            .acquire_admission()
-            .attach_with(|| format!("session_id={}", self.id))
-            .disclose()?;
-        let admitted = admitted
             .upgrade()
+            .attach_with(|| format!("session_id={}", self.id))
+            .disclose()?
             .ok_or_else(|| {
                 Report::new(LifecycleError::SessionUnavailable)
                     .attach(format!("session_id={}, reason=session_missing", self.id))
@@ -1205,11 +980,9 @@ impl Session {
         let runtime = {
             let admitted = self
                 .session
-                .acquire_admission()
-                .attach_with(|| format!("operation=close_session, session_id={}", self.id))
-                .disclose()?;
-            let admitted = admitted
                 .upgrade()
+                .attach_with(|| format!("operation=close_session, session_id={}", self.id))
+                .disclose()?
                 .ok_or_else(|| {
                     Report::new(LifecycleError::SessionUnavailable)
                         .attach(format!("session_id={}, reason=session_missing", self.id))
@@ -1285,11 +1058,8 @@ impl Session {
             .attach("operation=create_index")
             .disclose()?;
         let mandatory_runtime = operation.runtime.mandatory_runtime.clone();
-        let owner = operation.operation_lock_owner();
         operation
-            .runtime
-            .lock_manager()
-            .reject_table_ddl_explicit_session_lock(table_id, owner)
+            .reject_table_ddl_explicit_session_lock(table_id)
             .attach("operation=create_index")
             .disclose()?;
         let scope = PreparedDdlScope::create_index(
@@ -1328,11 +1098,8 @@ impl Session {
             .attach("operation=drop_index")
             .disclose()?;
         let mandatory_runtime = operation.runtime.mandatory_runtime.clone();
-        let owner = operation.operation_lock_owner();
         operation
-            .runtime
-            .lock_manager()
-            .reject_table_ddl_explicit_session_lock(table_id, owner)
+            .reject_table_ddl_explicit_session_lock(table_id)
             .attach("operation=drop_index")
             .disclose()?;
         let scope =
@@ -1703,20 +1470,20 @@ impl Session {
     /// Returns total number of hot row pages for an existing user table.
     #[inline]
     pub async fn total_row_pages(&mut self, table_id: TableID) -> Result<usize> {
-        let session = self
+        let mut session = self
             .pin_operation(SessionOperationKind::Maintenance)
             .attach("operation=count_table_row_pages")
             .disclose()?;
-        let access = ScopedTableRuntimeAccess::acquire(&session, table_id)
+        let table = session
+            .read_table(table_id)
             .await
             .attach("operation=count_table_row_pages")
             .disclose()?;
         #[cfg(test)]
-        tests::run_test_total_row_pages_after_access_hook().await;
-        let guards = session.pool_guards();
-        access
+        tests::run_test_total_row_pages_after_runtime_resolution_hook().await;
+        table
             .table()
-            .total_row_pages(guards)
+            .total_row_pages(table.pool_guards())
             .await
             .attach_with(|| format!("operation=count_table_row_pages, table_id={table_id}"))
             .disclose()
@@ -1765,7 +1532,7 @@ impl Session {
     #[inline]
     pub async fn lock_table(&mut self, table_id: TableID, mode: TableLockMode) -> Result<()> {
         let mode = LockMode::from(mode);
-        let session = self
+        let mut session = self
             .pin_operation(SessionOperationKind::SessionExplicitLock)
             .attach("operation=lock_explicit_table")
             .disclose()?;
@@ -1779,7 +1546,7 @@ impl Session {
     /// Releases an explicit session-lifetime table lock when no transaction is active.
     #[inline]
     pub fn unlock_table(&mut self, table_id: TableID) -> Result<()> {
-        let session = self
+        let mut session = self
             .pin_operation(SessionOperationKind::SessionExplicitLock)
             .attach("operation=unlock_explicit_table")
             .disclose()?;
@@ -1847,17 +1614,15 @@ pub(crate) struct SessionOperationPin {
     pub(crate) runtime: SessionRuntime,
     /// Stable entry shared with transaction, cleanup, and terminal owners.
     entry: Arc<SessionOperationEntry>,
+    /// The one boxed family authority taken from the idle session.
+    authority: Option<Box<FamilyLockAuthority>>,
+    /// Exact DDL or maintenance scope owned by this operation.
+    curr_scope: Option<LockScopeState>,
     /// Whether drop must publish the foreground release edge.
     armed: bool,
 }
 
 impl SessionOperationPin {
-    /// Returns the engine-local session identity.
-    #[inline]
-    pub(crate) fn id(&self) -> SessionID {
-        self.entry.key().session_id()
-    }
-
     /// Returns this operation's exact stable key.
     #[inline]
     pub(crate) fn key(&self) -> SessionOperationKey {
@@ -1885,6 +1650,136 @@ impl SessionOperationPin {
         LockOwner::operation(self.key())
     }
 
+    #[inline]
+    fn lock_parts(&mut self) -> (&mut FamilyLockState, &mut LockScopeState) {
+        let key = self.key();
+        let expected_owner = self.operation_lock_owner();
+        let authority = self
+            .authority
+            .as_deref_mut()
+            .unwrap_or_else(|| panic!("operation must retain family authority: key={key}"));
+        let curr_scope = self.curr_scope.as_mut().unwrap_or_else(|| {
+            panic!("DDL or maintenance operation must retain curr_scope: key={key}")
+        });
+        assert!(
+            curr_scope.owner() == expected_owner,
+            "operation scope identity mismatch: key={key}, expected_owner={expected_owner}, actual_owner={}",
+            curr_scope.owner()
+        );
+        (authority.family_mut(), curr_scope)
+    }
+
+    #[inline]
+    async fn acquire_ddl_create(
+        &mut self,
+        table_id: TableID,
+        catalog_targets: &[TableID],
+    ) -> OperationResult<()> {
+        let lock_manager = self.runtime.lock_manager().clone();
+        let (family, curr_scope) = self.lock_parts();
+        let mut fresh = FreshClaimsGuard::<16>::new(family, curr_scope, &lock_manager);
+        fresh
+            .acquire(LockResource::TableMetadata(table_id), LockMode::Exclusive)
+            .await?;
+        for &catalog_table_id in catalog_targets {
+            fresh
+                .acquire(
+                    LockResource::TableMetadata(catalog_table_id),
+                    LockMode::Shared,
+                )
+                .await?;
+        }
+        for &catalog_table_id in catalog_targets {
+            fresh
+                .acquire(
+                    LockResource::TableData(catalog_table_id),
+                    LockMode::IntentExclusive,
+                )
+                .await?;
+        }
+        fresh.disarm();
+        Ok(())
+    }
+
+    #[inline]
+    async fn acquire_ddl_existing(
+        &mut self,
+        table_id: TableID,
+        catalog_targets: &[TableID],
+    ) -> OperationResult<()> {
+        let lock_manager = self.runtime.lock_manager().clone();
+        let (family, curr_scope) = self.lock_parts();
+        let mut fresh = FreshClaimsGuard::<16>::new(family, curr_scope, &lock_manager);
+        fresh
+            .acquire(LockResource::TableMetadata(table_id), LockMode::Exclusive)
+            .await?;
+        for &catalog_table_id in catalog_targets {
+            fresh
+                .acquire(
+                    LockResource::TableMetadata(catalog_table_id),
+                    LockMode::Shared,
+                )
+                .await?;
+        }
+        fresh
+            .acquire(LockResource::TableData(table_id), LockMode::Exclusive)
+            .await?;
+        for &catalog_table_id in catalog_targets {
+            fresh
+                .acquire(
+                    LockResource::TableData(catalog_table_id),
+                    LockMode::IntentExclusive,
+                )
+                .await?;
+        }
+        fresh.disarm();
+        Ok(())
+    }
+
+    #[inline]
+    async fn acquire_maintenance_table(&mut self, table_id: TableID) -> OperationResult<()> {
+        let lock_manager = self.runtime.lock_manager().clone();
+        let (family, curr_scope) = self.lock_parts();
+        let mut fresh = FreshClaimsGuard::<2>::new(family, curr_scope, &lock_manager);
+        fresh
+            .acquire(LockResource::TableMetadata(table_id), LockMode::Shared)
+            .await?;
+        fresh
+            .acquire(LockResource::TableData(table_id), LockMode::IntentShared)
+            .await?;
+        fresh.disarm();
+        Ok(())
+    }
+
+    /// Acquires maintenance read admission and returns a lifetime-bound table.
+    async fn read_table(&mut self, table_id: TableID) -> OperationResult<SessionTable<'_>> {
+        assert!(
+            self.kind() == SessionOperationKind::Maintenance,
+            "session table requires maintenance authority: key={}, kind={}",
+            self.key(),
+            self.kind().label()
+        );
+        self.acquire_maintenance_table(table_id).await?;
+        let table = self.resolve_user_table(table_id).await?;
+        Ok(SessionTable {
+            table,
+            session: self,
+        })
+    }
+
+    #[inline]
+    fn reject_table_ddl_explicit_session_lock(&self, table_id: TableID) -> OperationResult<()> {
+        let authority = self.authority.as_deref().unwrap_or_else(|| {
+            panic!(
+                "DDL operation must retain family authority: key={}",
+                self.key()
+            )
+        });
+        authority
+            .family()
+            .reject_table_ddl_explicit_session_lock(table_id, self.operation_lock_owner())
+    }
+
     /// Returns a cloned guard bundle for this foreground operation.
     #[inline]
     pub(crate) fn pool_guards(&self) -> &PoolGuards {
@@ -1903,6 +1798,8 @@ impl SessionOperationPin {
         MandatoryOperationGuard {
             runtime: self.runtime.clone(),
             entry: Arc::clone(&self.entry),
+            authority: self.authority.take(),
+            curr_scope: self.curr_scope.take(),
             armed: true,
         }
     }
@@ -1922,10 +1819,7 @@ impl SessionOperationPin {
 
     /// Prepare DROP TABLE while consuming this foreground operation.
     async fn prepare_drop_table(self, table_id: TableID) -> OperationResult<PreparedDropTable> {
-        let owner = self.operation_lock_owner();
-        self.runtime
-            .lock_manager()
-            .reject_table_ddl_explicit_session_lock(table_id, owner)
+        self.reject_table_ddl_explicit_session_lock(table_id)
             .attach("prepare DROP TABLE explicit-session-lock check")?;
         let scope =
             PreparedDdlScope::drop_table(self, table_id, drop_table_catalog_write_targets())
@@ -1964,34 +1858,48 @@ impl SessionOperationPin {
     /// Acquires an explicit session-lifetime table lock from this operation.
     #[inline]
     pub(crate) async fn lock_table(
-        &self,
+        &mut self,
         table_id: TableID,
         mode: LockMode,
     ) -> OperationResult<()> {
-        let session_id = self.id();
-        let engine = &self.runtime;
-        let lock_manager = engine.lock_manager();
-        let owner = LockOwner::session_explicit(session_id);
-        let (mut metadata_guard, mut data_guard) = lock_manager
-            .acquire_table_locks(table_id, mode, owner)
+        let key = self.key();
+        let lock_manager = self.runtime.lock_manager().clone();
+        let catalog = self.runtime.catalog();
+        let authority = self.authority.as_deref_mut().unwrap_or_else(|| {
+            panic!("explicit lock operation must retain family authority: key={key}")
+        });
+        let (family, session_scope) = authority.parts();
+        let mut fresh = FreshClaimsGuard::<2>::new(family, session_scope, &lock_manager);
+        fresh
+            .acquire(LockResource::TableMetadata(table_id), LockMode::Shared)
             .await?;
-        engine.catalog().validate_user_table_live(table_id).await?;
-        if let Some(guard) = data_guard.as_mut() {
-            guard.disarm();
-        }
-        if let Some(guard) = metadata_guard.as_mut() {
-            guard.disarm();
-        }
+        fresh
+            .acquire(LockResource::TableData(table_id), mode)
+            .await?;
+        catalog.validate_user_table_live(table_id).await?;
+        fresh.disarm();
         Ok(())
     }
 
     /// Releases an explicit session-lifetime table lock from this operation.
     #[inline]
-    pub(crate) fn unlock_table(&self, table_id: TableID) -> OperationResult<()> {
-        let owner = LockOwner::session_explicit(self.id());
-        let lock_manager = self.runtime.lock_manager();
-        lock_manager.release(LockResource::TableData(table_id), owner);
-        lock_manager.release(LockResource::TableMetadata(table_id), owner);
+    pub(crate) fn unlock_table(&mut self, table_id: TableID) -> OperationResult<()> {
+        let key = self.key();
+        let lock_manager = self.runtime.lock_manager().clone();
+        let authority = self.authority.as_deref_mut().unwrap_or_else(|| {
+            panic!("explicit unlock operation must retain family authority: key={key}")
+        });
+        let (family, session_scope) = authority.parts();
+        family.release(
+            session_scope,
+            &lock_manager,
+            LockResource::TableData(table_id),
+        );
+        family.release(
+            session_scope,
+            &lock_manager,
+            LockResource::TableMetadata(table_id),
+        );
         Ok(())
     }
 }
@@ -2008,8 +1916,20 @@ impl Drop for SessionOperationPin {
     fn drop(&mut self) {
         if self.armed {
             self.armed = false;
-            let (remove_from_registry, cleanup) =
-                self.runtime.state().finish_foreground(self.key());
+            if self.authority.is_some()
+                && let Some(mut curr_scope) = self.curr_scope.take()
+            {
+                let lock_manager = self.runtime.lock_manager();
+                let authority = self.authority.as_deref_mut().unwrap();
+                authority
+                    .family_mut()
+                    .close_scope(&mut curr_scope, lock_manager);
+            }
+            let (remove_from_registry, cleanup) = self.runtime.state().finish_foreground(
+                self.key(),
+                self.authority.take(),
+                self.curr_scope.take(),
+            );
             self.runtime.remove_if_requested(remove_from_registry);
             if let Some(trx_id) = cleanup {
                 self.runtime.trx_sys.request_abandoned_trx_cleanup(
@@ -2038,6 +1958,8 @@ pub(crate) struct MandatoryOperationGuard {
     /// avoids lifecycle relookup and lets nested transaction state move through
     /// the stable entry without taking the outer lifecycle lock.
     entry: Arc<SessionOperationEntry>,
+    authority: Option<Box<FamilyLockAuthority>>,
+    curr_scope: Option<LockScopeState>,
     armed: bool,
 }
 
@@ -2053,16 +1975,48 @@ impl MandatoryOperationGuard {
     /// Mandatory ownership keeps the active slot bound to `entry`, so private
     /// installation needs only the entry mutex rather than the lifecycle lock.
     #[inline]
-    pub(crate) fn begin_private_trx(&self) -> LifecycleResult<Transaction> {
-        begin_private_transaction(&self.runtime, &self.entry)
+    pub(crate) fn begin_private_trx(&mut self) -> LifecycleResult<Transaction> {
+        self.reclaim_transaction_authority();
+        let authority = self.authority.take().unwrap_or_else(|| {
+            panic!(
+                "private transaction begin requires family authority: key={}",
+                self.key()
+            )
+        });
+        begin_private_transaction(&self.runtime, &self.entry, authority)
+    }
+
+    #[inline]
+    fn reclaim_transaction_authority(&mut self) {
+        if self.authority.is_none() && self.entry.inspect().trx_id.is_none() {
+            self.authority = Some(self.entry.take_lock_authority_return());
+        }
+    }
+
+    /// Borrows the accepted operation scope as prepared catalog-write proof.
+    #[inline]
+    pub(crate) fn catalog_write_authority(&self) -> PreparedCatalogWriteAuthority<'_> {
+        let curr_scope = self.curr_scope.as_ref().unwrap_or_else(|| {
+            panic!(
+                "accepted DDL must retain operation curr_scope: key={}",
+                self.key()
+            )
+        });
+        PreparedCatalogWriteAuthority::new(curr_scope)
     }
 
     /// Verify that accepted execution settled every nested transaction.
     ///
     /// This assertion-bearing check must run only from `AcceptedExecution::execute`.
     #[inline]
-    pub(crate) fn assert_finish_ready(&self) {
+    pub(crate) fn assert_finish_ready(&mut self) {
+        self.reclaim_transaction_authority();
         self.entry.assert_mandatory_finish_ready();
+        assert!(
+            self.authority.is_some(),
+            "mandatory completion must reclaim family authority: key={}",
+            self.key()
+        );
     }
 
     /// Publish normal terminal state after transferred resources are released.
@@ -2071,7 +2025,24 @@ impl MandatoryOperationGuard {
         if !self.armed {
             return;
         }
-        let remove_from_registry = self.runtime.state().finish_mandatory(&self.entry);
+        self.reclaim_transaction_authority();
+        let mut authority = self.authority.take().unwrap_or_else(|| {
+            panic!(
+                "mandatory completion requires family authority: key={}",
+                self.key()
+            )
+        });
+        if let Some(mut curr_scope) = self.curr_scope.take() {
+            let lock_manager = self.runtime.lock_manager();
+            authority
+                .family_mut()
+                .close_scope(&mut curr_scope, lock_manager);
+        }
+        authority.assert_idle();
+        let remove_from_registry = self
+            .runtime
+            .state()
+            .finish_mandatory(&self.entry, authority);
         self.runtime.remove_if_requested(remove_from_registry);
         self.armed = false;
     }
@@ -2083,6 +2054,8 @@ impl MandatoryOperationGuard {
             return;
         }
         self.armed = false;
+        self.entry
+            .retain_failed_operation_locks(self.authority.take(), self.curr_scope.take());
         self.runtime.state().fail_mandatory_retained(&self.entry);
     }
 }
@@ -2101,6 +2074,8 @@ impl Drop for MandatoryOperationGuard {
             return;
         }
         self.armed = false;
+        self.entry
+            .retain_failed_operation_locks(self.authority.take(), self.curr_scope.take());
         self.runtime.state().fail_mandatory_retained(&self.entry);
         let report = Report::new(FatalError::MandatoryTaskPanic).attach(format!(
             "mandatory operation authority dropped unexpectedly: operation_key={}",
@@ -2370,6 +2345,7 @@ impl SessionState {
             lifecycle: Mutex::new(SessionLifecycle {
                 disposition: SessionDisposition::Open,
                 slot: SessionOperationSlot::Idle,
+                lock_authority: Some(FamilyLockAuthority::new(id)),
                 observer_count: 0,
                 next_operation_id: 1,
                 change_ev: None,
@@ -2476,7 +2452,7 @@ impl SessionState {
     fn reserve_operation(
         &self,
         kind: SessionOperationKind,
-    ) -> LifecycleResult<Arc<SessionOperationEntry>> {
+    ) -> LifecycleResult<(Arc<SessionOperationEntry>, Box<FamilyLockAuthority>)> {
         assert!(
             kind != SessionOperationKind::PublicTransaction,
             "public transaction reservation requires transaction payload installation"
@@ -2487,9 +2463,15 @@ impl SessionState {
             .attach_with(|| format!("session_id={}", self.id))?;
         let key = Self::next_operation_key(&lifecycle, self.id);
         let entry = SessionOperationEntry::new(key, kind);
+        let authority = lifecycle.lock_authority.take().unwrap_or_else(|| {
+            panic!(
+                "idle session must retain family lock authority: session_id={}, operation_key={key}",
+                self.id
+            )
+        });
         lifecycle.advance_operation_id();
         lifecycle.slot = SessionOperationSlot::Active(Arc::clone(&entry));
-        Ok(entry)
+        Ok((entry, authority))
     }
 
     #[inline]
@@ -2508,9 +2490,16 @@ impl SessionState {
                 self.id
             )
         });
-        let (trx, entry) = runtime
-            .trx_sys
-            .begin_public_trx(runtime.downgrade(), key, inner);
+        let authority = lifecycle.lock_authority.take().unwrap_or_else(|| {
+            panic!(
+                "idle session must retain family lock authority: session_id={}, operation_key={key}",
+                self.id
+            )
+        });
+        let (trx, entry) =
+            runtime
+                .trx_sys
+                .begin_public_trx(runtime.downgrade(), key, inner, authority);
         lifecycle.advance_operation_id();
         lifecycle.slot = SessionOperationSlot::Active(entry);
         Ok(trx)
@@ -2582,8 +2571,14 @@ impl SessionState {
         lifecycle.slot = SessionOperationSlot::Closed;
         let remove_from_registry = lifecycle.observer_count == 0;
         let notify = lifecycle.change_ev.clone();
+        let mut authority = lifecycle.lock_authority.take().unwrap_or_else(|| {
+            panic!(
+                "closing idle session must retain family authority: session_id={}",
+                self.id
+            )
+        });
         drop(lifecycle);
-        self.release_session_locks();
+        authority.close_session(self.core.lock_manager());
         Self::notify_operation_change(notify);
         (SessionCloseDecision::Closed, remove_from_registry)
     }
@@ -2594,7 +2589,7 @@ impl SessionState {
         if lifecycle.disposition == SessionDisposition::Open {
             lifecycle.disposition = SessionDisposition::Abandoned;
         }
-        let release_session_locks = match lifecycle.slot {
+        let close_authority = match lifecycle.slot {
             SessionOperationSlot::Closed => false,
             SessionOperationSlot::Idle => {
                 lifecycle.slot = SessionOperationSlot::Closed;
@@ -2605,30 +2600,51 @@ impl SessionState {
         let remove_from_registry =
             matches!(lifecycle.slot, SessionOperationSlot::Closed) && lifecycle.observer_count == 0;
         let notify = lifecycle.change_ev.clone();
+        let authority = close_authority.then(|| {
+            lifecycle.lock_authority.take().unwrap_or_else(|| {
+                panic!(
+                    "abandoning idle session must retain family authority: session_id={}",
+                    self.id
+                )
+            })
+        });
         drop(lifecycle);
-        if release_session_locks {
-            self.release_session_locks();
+        if let Some(mut authority) = authority {
+            authority.close_session(self.core.lock_manager());
         }
         Self::notify_operation_change(notify);
         remove_from_registry
     }
 
     #[inline]
-    fn finish_foreground(&self, key: SessionOperationKey) -> (bool, Option<TrxID>) {
+    fn finish_foreground(
+        &self,
+        key: SessionOperationKey,
+        authority: Option<Box<FamilyLockAuthority>>,
+        curr_scope: Option<LockScopeState>,
+    ) -> (bool, Option<TrxID>) {
         let mut lifecycle = self.lifecycle.lock();
         let Some(entry) = lifecycle.active_entry(key).cloned() else {
             return (false, None);
         };
         let release = entry.release_foreground();
         let terminal = if release.terminal {
-            lifecycle.finalize_terminal()
+            assert!(
+                curr_scope.is_none(),
+                "terminal foreground operation scope must close before publication: key={key}"
+            );
+            let authority = authority.unwrap_or_else(|| {
+                panic!("terminal foreground operation must return family authority: key={key}")
+            });
+            lifecycle.finalize_terminal(authority)
         } else {
+            entry.retain_failed_operation_locks(authority, curr_scope);
             SessionTerminalFinish::ACTIVE
         };
         let notify = lifecycle.change_ev.clone();
         drop(lifecycle);
-        if terminal.release_session_locks {
-            self.release_session_locks();
+        if let Some(mut authority) = terminal.close_authority {
+            authority.close_session(self.core.lock_manager());
         }
         Self::notify_operation_change(notify);
         (terminal.remove_from_registry, release.cleanup)
@@ -2654,14 +2670,18 @@ impl SessionState {
     /// lifecycle lock orders entry publication with concurrent close or
     /// abandonment before changing the slot to `Idle` or `Closed`.
     #[inline]
-    fn finish_mandatory(&self, entry: &Arc<SessionOperationEntry>) -> bool {
+    fn finish_mandatory(
+        &self,
+        entry: &Arc<SessionOperationEntry>,
+        authority: Box<FamilyLockAuthority>,
+    ) -> bool {
         let mut lifecycle = self.lifecycle.lock();
         entry.publish_mandatory_terminal();
-        let terminal = lifecycle.finalize_terminal();
+        let terminal = lifecycle.finalize_terminal(authority);
         let notify = lifecycle.change_ev.clone();
         drop(lifecycle);
-        if terminal.release_session_locks {
-            self.release_session_locks();
+        if let Some(mut authority) = terminal.close_authority {
+            authority.close_session(self.core.lock_manager());
         }
         Self::notify_operation_change(notify);
         terminal.remove_from_registry
@@ -2679,16 +2699,27 @@ impl SessionState {
 
     /// Finish this session's exact transaction lifecycle after commit.
     #[inline]
-    fn finish_trx_commit(&self, key: SessionOperationKey, trx_id: TrxID, cts: TrxID) -> bool {
-        self.finish_trx(key, trx_id, || {
+    fn finish_trx_commit(
+        &self,
+        key: SessionOperationKey,
+        trx_id: TrxID,
+        cts: TrxID,
+        authority: Box<FamilyLockAuthority>,
+    ) -> bool {
+        self.finish_trx(key, trx_id, authority, || {
             self.last_cts.store(cts.as_u64(), Ordering::SeqCst);
         })
     }
 
     /// Finish this session's active-transaction lifecycle after rollback.
     #[inline]
-    fn finish_trx_rollback(&self, key: SessionOperationKey, trx_id: TrxID) -> bool {
-        self.finish_trx(key, trx_id, || {})
+    fn finish_trx_rollback(
+        &self,
+        key: SessionOperationKey,
+        trx_id: TrxID,
+        authority: Box<FamilyLockAuthority>,
+    ) -> bool {
+        self.finish_trx(key, trx_id, authority, || {})
     }
 
     #[inline]
@@ -2696,24 +2727,32 @@ impl SessionState {
         &self,
         key: SessionOperationKey,
         trx_id: TrxID,
+        authority: Box<FamilyLockAuthority>,
         on_finish: impl FnOnce(),
     ) -> bool {
         let mut lifecycle = self.lifecycle.lock();
         let Some(entry) = lifecycle.active_entry(key).cloned() else {
             return false;
         };
-        let Some(operation_terminal) = entry.finish_transaction(trx_id) else {
+        let Some(operation_terminal) = entry.finish_transaction(trx_id, authority) else {
             return false;
         };
         on_finish();
         if !operation_terminal {
             return false;
         }
-        let terminal = lifecycle.finalize_terminal();
+        let authority = entry.take_lock_authority_return();
+        let mut authority = authority;
+        if let Some(mut curr_scope) = entry.take_retained_curr_scope() {
+            authority
+                .family_mut()
+                .close_scope(&mut curr_scope, self.core.lock_manager());
+        }
+        let terminal = lifecycle.finalize_terminal(authority);
         let notify = lifecycle.change_ev.clone();
         drop(lifecycle);
-        if terminal.release_session_locks {
-            self.release_session_locks();
+        if let Some(mut authority) = terminal.close_authority {
+            authority.close_session(self.core.lock_manager());
         }
         Self::notify_operation_change(notify);
         terminal.remove_from_registry
@@ -2789,7 +2828,7 @@ impl SessionState {
     #[inline]
     fn shutdown_removal(&self) -> bool {
         let mut lifecycle = self.lifecycle.lock();
-        let release_session_locks = match lifecycle.slot {
+        let close_authority = match lifecycle.slot {
             SessionOperationSlot::Closed => false,
             SessionOperationSlot::Idle => {
                 lifecycle.slot = SessionOperationSlot::Closed;
@@ -2800,9 +2839,17 @@ impl SessionState {
         let remove_from_registry =
             matches!(lifecycle.slot, SessionOperationSlot::Closed) && lifecycle.observer_count == 0;
         let notify = lifecycle.change_ev.clone();
+        let authority = close_authority.then(|| {
+            lifecycle.lock_authority.take().unwrap_or_else(|| {
+                panic!(
+                    "shutdown of idle session must retain family authority: session_id={}",
+                    self.id
+                )
+            })
+        });
         drop(lifecycle);
-        if release_session_locks {
-            self.release_session_locks();
+        if let Some(mut authority) = authority {
+            authority.close_session(self.core.lock_manager());
         }
         Self::notify_operation_change(notify);
         remove_from_registry
@@ -2846,13 +2893,6 @@ impl SessionState {
             );
         }
     }
-
-    #[inline]
-    fn release_session_locks(&self) {
-        self.core
-            .lock_manager()
-            .release_owner(LockOwner::session_explicit(self.id));
-    }
 }
 
 impl Drop for SessionState {
@@ -2865,13 +2905,17 @@ impl Drop for SessionState {
                 table.mem.cache_insert_page_version(page_id);
             }
         }
-        self.release_session_locks();
+        if let Some(mut authority) = self.lifecycle.get_mut().lock_authority.take() {
+            authority.close_session(self.core.lock_manager());
+        }
     }
 }
 
 struct SessionLifecycle {
     disposition: SessionDisposition,
     slot: SessionOperationSlot,
+    /// Present exactly while this session is idle.
+    lock_authority: Option<Box<FamilyLockAuthority>>,
     observer_count: usize,
     next_operation_id: u64,
     change_ev: Option<Arc<EventNotifyOnDrop>>,
@@ -2949,9 +2993,15 @@ impl SessionLifecycle {
     ///
     /// Returns the closed-session lock-release and registry-removal decisions.
     #[inline]
-    fn finalize_terminal(&mut self) -> SessionTerminalFinish {
+    fn finalize_terminal(&mut self, authority: Box<FamilyLockAuthority>) -> SessionTerminalFinish {
+        authority.assert_idle();
         match self.disposition {
             SessionDisposition::Open => {
+                assert!(
+                    self.lock_authority.is_none(),
+                    "terminal operation cannot replace idle family authority"
+                );
+                self.lock_authority = Some(authority);
                 self.slot = SessionOperationSlot::Idle;
                 SessionTerminalFinish::ACTIVE
             }
@@ -2959,7 +3009,7 @@ impl SessionLifecycle {
                 self.slot = SessionOperationSlot::Closed;
                 SessionTerminalFinish {
                     remove_from_registry: self.observer_count == 0,
-                    release_session_locks: true,
+                    close_authority: Some(authority),
                 }
             }
         }
@@ -2973,16 +3023,15 @@ impl SessionLifecycle {
     }
 }
 
-#[derive(Clone, Copy)]
 struct SessionTerminalFinish {
     remove_from_registry: bool,
-    release_session_locks: bool,
+    close_authority: Option<Box<FamilyLockAuthority>>,
 }
 
 impl SessionTerminalFinish {
     const ACTIVE: Self = Self {
         remove_from_registry: false,
-        release_session_locks: false,
+        close_authority: None,
     };
 }
 
@@ -3125,7 +3174,7 @@ impl TrxAttachment {
         cts: TrxID,
         inner: Box<TrxInner>,
     ) {
-        released.assert_validated_for(self.trx_id);
+        let authority = released.into_authority(self.trx_id);
         self.runtime
             .state()
             .finish_trx_inner(self.operation_key, self.trx_id, inner);
@@ -3137,38 +3186,38 @@ impl TrxAttachment {
         let remove_from_registry =
             self.runtime
                 .state()
-                .finish_trx_commit(self.operation_key, self.trx_id, cts);
+                .finish_trx_commit(self.operation_key, self.trx_id, cts, authority);
         self.runtime.remove_if_requested(remove_from_registry);
     }
 
     /// Mark the owning session rolled back.
     #[inline]
     pub(crate) fn rollback(&self, released: ReleasedTransactionLocks, inner: Box<TrxInner>) {
-        released.assert_validated_for(self.trx_id);
+        let authority = released.into_authority(self.trx_id);
         self.runtime
             .state()
             .finish_trx_inner(self.operation_key, self.trx_id, inner);
-        self.finish_rollback();
+        self.finish_rollback(authority);
     }
 
     /// Mark the owning session rolled back without recycling a failed core.
     #[inline]
     pub(crate) fn rollback_without_reuse(&self, released: ReleasedTransactionLocks) {
-        released.assert_validated_for(self.trx_id);
-        self.finish_rollback();
+        let authority = released.into_authority(self.trx_id);
+        self.finish_rollback(authority);
     }
 
     #[inline]
-    fn finish_rollback(&self) {
+    fn finish_rollback(&self, authority: Box<FamilyLockAuthority>) {
         #[cfg(test)]
         tests::run_terminal_attachment_test_hook(
             self.trx_id,
             tests::TerminalAttachmentOutcome::Rollback,
         );
-        let remove_from_registry = self
-            .runtime
-            .state()
-            .finish_trx_rollback(self.operation_key, self.trx_id);
+        let remove_from_registry =
+            self.runtime
+                .state()
+                .finish_trx_rollback(self.operation_key, self.trx_id, authority);
         self.runtime.remove_if_requested(remove_from_registry);
     }
 
@@ -3196,6 +3245,7 @@ impl TrxAttachment {
 fn begin_private_transaction(
     runtime: &SessionRuntime,
     entry: &Arc<SessionOperationEntry>,
+    authority: Box<FamilyLockAuthority>,
 ) -> LifecycleResult<Transaction> {
     let kind = entry.kind();
     assert!(
@@ -3210,7 +3260,7 @@ fn begin_private_transaction(
     let inner = Box::new(TrxInner::private());
     Ok(runtime
         .trx_sys
-        .begin_private_trx(runtime.downgrade(), entry, inner))
+        .begin_private_trx(runtime.downgrade(), entry, inner, authority))
 }
 
 async fn wait_for_maintenance_boundary(
@@ -3404,7 +3454,8 @@ pub(crate) mod tests {
                 panic!("test transaction requires active operation slot")
             }
         };
-        let remove_from_registry = state.finish_trx_commit(key, trx_id, cts);
+        let remove_from_registry =
+            state.finish_trx_commit(key, trx_id, cts, FamilyLockAuthority::new(session_id));
         if remove_from_registry {
             registry.entries.remove_if(&session_id, |_id, registered| {
                 Arc::ptr_eq(registered, &state)
@@ -3412,32 +3463,33 @@ pub(crate) mod tests {
         }
     }
 
-    type TotalRowPagesAfterAccessHook =
+    type TotalRowPagesAfterRuntimeResolutionHook =
         Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + 'static>> + 'static>;
 
     thread_local! {
-        static TEST_TOTAL_ROW_PAGES_AFTER_ACCESS_HOOK:
-            RefCell<Option<TotalRowPagesAfterAccessHook>> = RefCell::new(None);
+        static TEST_TOTAL_ROW_PAGES_AFTER_RUNTIME_RESOLUTION_HOOK:
+            RefCell<Option<TotalRowPagesAfterRuntimeResolutionHook>> = RefCell::new(None);
     }
 
-    fn set_test_total_row_pages_after_access_hook<F, Fut>(hook: F)
+    fn set_test_total_row_pages_after_runtime_resolution_hook<F, Fut>(hook: F)
     where
         F: FnOnce() -> Fut + 'static,
         Fut: Future<Output = ()> + 'static,
     {
-        TEST_TOTAL_ROW_PAGES_AFTER_ACCESS_HOOK.with(|slot| {
+        TEST_TOTAL_ROW_PAGES_AFTER_RUNTIME_RESOLUTION_HOOK.with(|slot| {
             let old = slot
                 .borrow_mut()
                 .replace(Box::new(move || Box::pin(hook())));
             assert!(
                 old.is_none(),
-                "total-row-pages scoped-access hook already installed"
+                "total-row-pages runtime-resolution hook already installed"
             );
         });
     }
 
-    pub(super) async fn run_test_total_row_pages_after_access_hook() {
-        let hook = TEST_TOTAL_ROW_PAGES_AFTER_ACCESS_HOOK.with(|slot| slot.borrow_mut().take());
+    pub(super) async fn run_test_total_row_pages_after_runtime_resolution_hook() {
+        let hook = TEST_TOTAL_ROW_PAGES_AFTER_RUNTIME_RESOLUTION_HOOK
+            .with(|slot| slot.borrow_mut().take());
         if let Some(hook) = hook {
             hook().await;
         }
@@ -3789,7 +3841,13 @@ pub(crate) mod tests {
             .public_trx_cache
             .take()
             .expect("test session must start with one public transaction cache");
-        inner.init(trx_id, sts, gc_no, session_id);
+        inner.init(
+            trx_id,
+            sts,
+            gc_no,
+            session_id,
+            FamilyLockAuthority::new(session_id),
+        );
         let entry = SessionOperationEntry::new_public_transaction(key, inner);
         {
             let mut lifecycle = state.lifecycle.lock();
@@ -4295,19 +4353,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_admitted_session_ref_holds_admission_until_drop() {
+    fn test_admitted_session_runtime_holds_admission_until_drop() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
             let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
                 .await
                 .unwrap();
             let session = engine.new_session().unwrap();
-            let admitted = session
-                .session
-                .acquire_admission()
-                .unwrap()
-                .upgrade()
-                .unwrap();
+            let admitted = session.session.upgrade().unwrap().unwrap();
             assert_eq!(admitted.runtime().state().id(), session.id());
             let (started_tx, started_rx) = mpsc::channel();
             let (done_tx, done_rx) = mpsc::channel();
@@ -4324,13 +4377,13 @@ pub(crate) mod tests {
                     .expect("shutdown thread should start");
                 assert!(
                     done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
-                    "shutdown must wait while the admitted session reference is live"
+                    "shutdown must wait while the admitted session runtime is live"
                 );
 
                 drop(admitted);
                 done_rx
                     .recv_timeout(Duration::from_secs(5))
-                    .expect("shutdown should complete after admitted session reference drops");
+                    .expect("shutdown should complete after admitted session runtime drops");
                 shutdown.join().unwrap();
             });
         });
@@ -4892,6 +4945,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_lock_parts_reject_wrong_same_family_operation_scope() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let session = engine.new_session().unwrap();
+            let mut operation = session
+                .pin_operation(SessionOperationKind::Maintenance)
+                .unwrap();
+            let key = operation.key();
+            let wrong_key = SessionOperationKey::new(session.id(), OperationID::new(u64::MAX - 1));
+            assert_ne!(wrong_key, key);
+            operation.curr_scope = Some(LockScopeState::new(LockOwner::operation(wrong_key)));
+
+            let panic = catch_unwind(AssertUnwindSafe(|| {
+                let _ = operation.lock_parts();
+            }))
+            .expect_err("operation lock indexes must reject a wrong operation scope");
+            let diagnostic = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&'static str>().copied())
+                .expect("operation scope mismatch panic should retain its diagnostic");
+            assert!(diagnostic.contains("operation scope identity mismatch"));
+            assert!(diagnostic.contains(&format!("key={key}")));
+            assert!(
+                diagnostic.contains(&format!("actual_owner={}", LockOwner::operation(wrong_key)))
+            );
+        });
+    }
+
+    #[test]
     fn test_operation_id_exhaustion_panics_before_reservation() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
@@ -5136,7 +5222,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_total_row_pages_scoped_access_blocks_drop_until_runtime_release() {
+    fn test_total_row_pages_session_table_blocks_drop_until_runtime_release() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
             let engine = Engine::bootstrap(lightweight_test_engine_config(
@@ -5149,7 +5235,7 @@ pub(crate) mod tests {
             let mut count_session = engine.new_session().unwrap();
             let (entered_tx, entered_rx) = flume::bounded(1);
             let (release_tx, release_rx) = flume::bounded(1);
-            set_test_total_row_pages_after_access_hook(move || async move {
+            set_test_total_row_pages_after_runtime_resolution_hook(move || async move {
                 entered_tx.send_async(()).await.unwrap();
                 release_rx.recv_async().await.unwrap();
             });
@@ -5193,7 +5279,7 @@ pub(crate) mod tests {
 
                 let (entered_tx, entered_rx) = flume::bounded(1);
                 let (release_tx, release_rx) = flume::bounded(1);
-                set_test_total_row_pages_after_access_hook(move || async move {
+                set_test_total_row_pages_after_runtime_resolution_hook(move || async move {
                     entered_tx.send_async(()).await.unwrap();
                     release_rx.recv_async().await.unwrap();
                 });

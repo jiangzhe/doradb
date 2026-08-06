@@ -136,19 +136,20 @@ statement acquires Metadata(S)
 ```
 
 Successfully bound reads therefore retain metadata protection until transaction
-commit or rollback. Repeated operations use the transaction binding and lock
-cache.
+commit or rollback. Repeated operations use the transaction binding and exact
+transaction scope.
 
 Table and index DDL acquire their complete fixed lock sequences while the
 public session future is still cancellable. Winning mandatory capacity
-synchronously transfers the same `OwnerLockState` and operation owner to
-accepted execution; there is no release/reacquire window. Catalog statements
+synchronously transfers the same boxed family authority and operation
+`curr_scope` to accepted execution; there is no release/reacquire window.
+Catalog statements
 receive a typed prepared-write authority that proves metadata S plus data IX
 for each catalog table and bypasses ordinary transaction lock acquisition.
 Effectful maintenance likewise prepares an owned lock scope before mandatory
-admission and transfers the exact `OwnerLockState` without a release/reacquire
+admission and transfers the exact authority without a release/reacquire
 window. The read-only `total_row_pages` observation remains caller-owned and
-uses the borrowed scoped lock-manager path.
+uses an operation `curr_scope` that closes before its foreground pin returns.
 
 Recovery, purge, and no-transaction replay do not acquire logical locks. They
 run at lifecycle boundaries where foreground lock owners do not exist. Logical
@@ -306,27 +307,36 @@ from one family may produce multiple granted entries for the same resource even
 though they are one external conflict participant. The resource side does not
 yet physically aggregate those entries.
 
-### Owner-local cache
+### Linear family authority and owner-side indexes
 
-Transactions and statements use:
+Each engine-local session allocates one boxed `FamilyLockAuthority`. The same
+box moves through the idle session, foreground operation, transaction,
+prepared/precommit state, terminal proof, and accepted DDL or maintenance
+carrier. It is never cloned or reconstructed from an owner id. The authority
+contains the family/resource index and the session-explicit
+`LockScopeState`; transaction, statement, DDL, and maintenance carriers own
+their exact `curr_scope`.
 
-```rust
-struct OwnerLockState {
-    owner: LockOwner,
-    held: FastHashMap<LockResource, LockMode>,
-}
+Every accepted logical claim is authoritative in both directions:
+
+```text
+family.resources[resource].typed_scope_slot = (claim_no, mode)
+curr_scope.claims[resource]                 = (claim_no, mode)
 ```
 
-This cache is already useful:
+The common single claim is inline. A second scope expands the resource once
+into fixed session-explicit, operation, transaction, and statement slots; the
+box remains expanded until the entire family/resource entry disappears.
+`ClaimNo` is a session-local `u64` identifier allocated with checked
+arithmetic. Failed, rejected, and cancelled fresh attempts burn their reserved
+number; conversion retains it; release followed by reacquisition receives a
+new number.
 
-- repeated covered requests are local;
-- release iterates resources known to that owner;
-- transaction locks can move through prepare/precommit ownership; and
-- statement-state completion or cancellation releases statement-owned
-  resources deterministically.
-
-Session explicit locks do not yet have the equivalent cache and still use a
-global `release_owner()` scan during session cleanup.
+Repeated covered acquisition by the same exact scope is fully local. A fresh
+claim covered by another scope in the family still creates its own exact
+manager grant in Phase 1. Thus the manager representation below remains an
+exact mirror while owner-side state supplies bounded family lookup and
+targeted cleanup.
 
 Transactions, DDL, maintenance, and explicit-lock mutations reserve ids from
 one plain session-local sequence. One public DDL call retains one
@@ -334,15 +344,18 @@ one plain session-local sequence. One public DDL call retains one
 maintenance call retains one `Operation` owner through its prepared and
 accepted owned scope. A delayed checkpoint completes that operation before its
 observer-only wait and allocates a fresh operation owner for the next attempt.
-The caller-owned `total_row_pages` observation continues to use
-`ScopedTableRuntimeAccess`.
+The caller-owned `total_row_pages` observation uses a lifetime-bound
+`SessionTable` minted by `SessionOperationPin::read_table`, so its strong table
+runtime owner cannot outlive the maintenance operation that retains metadata-S
+and data-IS claims.
 
-Maintenance always records its own exact claims even when a covering
+Maintenance records its own exact claims even when a covering
 `SessionExplicit` claim admits it. Releasing maintenance therefore cannot
 consume the explicit claim. DDL has an additional purpose preflight: a held
 same-family `SessionExplicit` claim on the target table returns
 `LockFamilyConflict`, even if directional coverage would otherwise admit the
-DDL request. This check is not yet atomic with resource acquisition.
+DDL request. The preflight reads the authoritative family slot rather than
+scanning manager grants.
 
 ### Session and transaction admission
 
@@ -367,9 +380,11 @@ The implemented authority transition is:
 
 ```text
 Open + Idle
+    -> take the one boxed family authority
     -> reserve one (SessionID, OperationID) entry
 Open + Active(PublicTransaction)
-    -> commit, rollback, or abandoned cleanup releases transaction locks
+    -> commit, rollback, or abandoned cleanup closes transaction curr_scope
+    -> ReleasedTransactionLocks returns the same box
 Open + Idle
 ```
 
@@ -382,8 +397,10 @@ DDL is an internal nesting exception, not a second public execution owner. A
 DDL call first reserves a typed DDL operation while idle and retains its
 `&mut Session` borrow while the same entry hosts a private catalog
 transaction. The private transaction inherits the operation key and allocates
-only a `TrxID`; terminal completion returns authority to the still-active outer
-operation.
+only a `TrxID`; it temporarily takes the outer carrier's family box while the
+operation `curr_scope` remains owned and immutable. Terminal completion parks
+the returned box in the stable entry, and the still-active outer operation
+reclaims that exact allocation before acquiring again or closing.
 
 ### Wait and cancellation behavior
 
@@ -412,8 +429,7 @@ Let:
 - `G` be granted entries on one resource;
 - `W` be queued waiters on one resource;
 - `K` be waiters promoted by one transition;
-- `H_owner` be resources cached by one transaction or statement owner; and
-- `R` be resource entries in the whole manager.
+- `H_scope` be resources indexed by one exact scope.
 
 Approximate current costs are:
 
@@ -427,16 +443,17 @@ Approximate current costs are:
 | Release one owner/resource | `O(G + W)` plus promotion work |
 | Cancel one waiter | `O(W)` plus promotion work |
 | Promote `K` waiters | up to `O(K * (G + K))` |
-| Transaction/statement cleanup | sum of release costs over `H_owner` |
-| Session cleanup by global scan | `O(R log R)` plus per-resource release work |
+| Exact-scope cleanup | sum of release costs over `H_scope` |
+| Session-explicit cleanup | sum of release costs over its `H_scope` |
 
 These costs are not automatically problematic for small queues. The design
 concern is that they grow with all exact owners on a hot resource and perform
 repeated scans under the resource shard lock.
 
-The `O(R log R)` session-cleanup term comes from snapshotting and sorting all
-resource keys before scanning them. Transaction and statement cleanup already
-use their owner-local caches and do not pay this global scan.
+Normal statement, transaction, operation, and session close never call
+`LockManager::release_owner()` or scan unrelated manager resources.
+`release_owner()` remains only as a manager-level migration and diagnostic
+defense.
 
 ### Behavioral constraints worth preserving
 
@@ -448,7 +465,7 @@ The redesign must preserve:
 4. Blocking conversion is unsupported.
 5. Cancellation after promotion but before observation cannot leak a grant.
 6. DDL rejects explicit same-session table locks in the current behavior.
-7. Cleanup remains proportional to one exact owner's held resources.
+7. Cleanup remains proportional to one exact scope's indexed resources.
 
 The redesign intentionally narrows one current manager behavior. Concurrent
 lock mutations in one session family are unsupported, so duplicate pending
@@ -464,12 +481,14 @@ Implemented [task 000242](./tasks/000242-enforce-terminal-transaction-lock-relea
 made transaction-lock release a structural prerequisite of terminal session
 completion.
 
-Every terminal user-transaction path drains its owner-local `OwnerLockState`
+Every terminal user-transaction path closes its transaction `curr_scope`
 before finishing the session transaction lifecycle. Transaction code mints one
 non-cloneable, transaction-id-bound `ReleasedTransactionLocks` proof only after
-the local state is empty. Prepared and precommit paths reach the engine lock
-manager through their retained terminal attachment, avoiding a second retained
-component guard.
+that scope is empty. The proof owns the returned `Box<FamilyLockAuthority>`,
+so terminal publication cannot lose, duplicate, or reconstruct family
+authority. Prepared and precommit paths reach the engine lock manager through
+their retained terminal attachment, avoiding a second retained component
+guard.
 
 `TrxAttachment::commit()` and `TrxAttachment::rollback()` consume a matching
 proof before they can make a running session idle or close an abandoned
@@ -515,9 +534,9 @@ cleanup-claimable. Statement cancellation does not release transaction-owned
 metadata/data locks or table bindings inline; those remain attached to
 `TrxInner` until whole-transaction rollback reaches the ordering above.
 
-The proof covers the current owner-local cache contract, not the future scope
-representation. A redesign may evolve it into a closed-scope proof, but must
-preserve this terminal ordering.
+The proof covers the implemented closed transaction scope and owns the returned
+family root. Later physical-manager phases must preserve this terminal
+ordering.
 
 ## Working Design Overview
 
@@ -685,10 +704,9 @@ The expected lifecycle owners are:
 | `Ddl` | one DDL operation guard | DDL success or failure |
 | `Maintenance` | one maintenance operation guard | maintenance success or failure |
 
-`LockScopeState` replaces and generalizes the current owner-local
-`OwnerLockState`. In particular, it gives session explicit locks, DDL, and
-maintenance the same targeted cleanup mechanism already used by transactions
-and statements.
+`LockScopeState` is the implemented exact-scope cleanup index. It gives session
+explicit locks, DDL, and maintenance the same targeted cleanup mechanism used
+by transactions and statements.
 
 An acquisition borrows the family execution authority and target scope
 exclusively across `.await`. A pending request is therefore not inserted into
@@ -1723,6 +1741,7 @@ The eventual RFC should accept, reject, or refine each invariant explicitly:
 - [RFC-0016: Logical Lock Manager](./rfcs/0016-logical-lock-manager.md)
 - [Deadlock handling backlog](./backlogs/000167-logical-lock-deadlock-handling.md)
 - `doradb-storage/src/lock/mod.rs`
+- `doradb-storage/src/lock/claim.rs`
 - `doradb-storage/src/lock/state.rs`
 - `doradb-storage/src/session.rs`
 - `doradb-storage/src/trx/admission.rs`

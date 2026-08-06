@@ -16,6 +16,7 @@ use crate::file::fs::FileSystem;
 use crate::file::table_file::{MutableTableFile, OldRoot, TableFile};
 use crate::id::{SessionID, SessionOperationKey, TrxID};
 use crate::latch::ExclusiveGate;
+use crate::lock::FamilyLockAuthority;
 use crate::log::redo::RedoLogs;
 use crate::log::{EnqueuePrecommitError, LogFileSealer, LogWriteDriver, RedoLog, RedoLogWriter};
 use crate::notify::MonotonicU64;
@@ -1057,7 +1058,12 @@ impl TransactionSystem {
 
     /// Initialize one ready transaction core and register its active snapshot.
     #[inline]
-    fn init_trx(&self, session_id: SessionID, inner: &mut TrxInner) -> (TrxID, TrxID) {
+    fn init_trx(
+        &self,
+        session_id: SessionID,
+        inner: &mut TrxInner,
+        authority: Box<FamilyLockAuthority>,
+    ) -> (TrxID, TrxID) {
         let gc_no = self.next_gc_no();
         let gc_bucket = &self.gc_buckets[gc_no];
         // Add to active sts list.
@@ -1080,7 +1086,7 @@ impl TransactionSystem {
                 .store(sts.as_u64(), Ordering::Relaxed);
         }
         drop(g); // release bucket lock.
-        inner.init(trx_id, sts, gc_no, session_id);
+        inner.init(trx_id, sts, gc_no, session_id, authority);
         (trx_id, sts)
     }
 
@@ -1091,8 +1097,9 @@ impl TransactionSystem {
         session: WeakSessionRef,
         operation_key: SessionOperationKey,
         mut inner: Box<TrxInner>,
+        authority: Box<FamilyLockAuthority>,
     ) -> (Transaction, Arc<SessionOperationEntry>) {
-        let (trx_id, sts) = self.init_trx(operation_key.session_id(), inner.as_mut());
+        let (trx_id, sts) = self.init_trx(operation_key.session_id(), inner.as_mut(), authority);
         let entry = SessionOperationEntry::new_public_transaction(operation_key, inner);
         let handle = Transaction::new(session, operation_key, trx_id, sts);
         (handle, entry)
@@ -1105,9 +1112,10 @@ impl TransactionSystem {
         session: WeakSessionRef,
         enclosing_entry: &Arc<SessionOperationEntry>,
         mut inner: Box<TrxInner>,
+        authority: Box<FamilyLockAuthority>,
     ) -> Transaction {
         let operation_key = enclosing_entry.key();
-        let (trx_id, sts) = self.init_trx(operation_key.session_id(), inner.as_mut());
+        let (trx_id, sts) = self.init_trx(operation_key.session_id(), inner.as_mut(), authority);
         enclosing_entry.install_private_transaction(inner);
         Transaction::new(session, operation_key, trx_id, sts)
     }

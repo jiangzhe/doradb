@@ -7,7 +7,7 @@ use crate::error::{
     OperationOrFatalResult, OperationOrRuntimeError, OperationOrRuntimeResult, OperationResult,
     Result, RuntimeError, RuntimeResult,
 };
-use crate::lock::{LockMode, LockResource, OwnerLockState};
+use crate::lock::{LockMode, LockResource, LockScopeState};
 use crate::log::redo::{DDLRedo, RedoLogs, RowRedo};
 use crate::obs;
 use crate::row::ops::{
@@ -266,7 +266,7 @@ enum StmtDropAction {
 /// is dropped.
 pub(crate) struct StmtState {
     effects: StmtEffects,
-    stmt_locks: OwnerLockState,
+    curr_scope: Option<LockScopeState>,
     drop_action: StmtDropAction,
     checkout: Option<SessionOperationCheckout>,
 }
@@ -278,7 +278,7 @@ impl StmtState {
         let owner = checkout.inner_mut().next_statement_owner();
         Self {
             effects: StmtEffects::empty(),
-            stmt_locks: OwnerLockState::new(owner),
+            curr_scope: Some(LockScopeState::new(owner)),
             drop_action: StmtDropAction::CancelPublicTransaction,
             checkout: Some(checkout),
         }
@@ -290,7 +290,7 @@ impl StmtState {
         let owner = checkout.inner_mut().next_statement_owner();
         Self {
             effects: StmtEffects::empty(),
-            stmt_locks: OwnerLockState::new(owner),
+            curr_scope: Some(LockScopeState::new(owner)),
             drop_action: StmtDropAction::PrivateMustComplete,
             checkout: Some(checkout),
         }
@@ -318,7 +318,7 @@ impl StmtState {
     ) -> Statement<'a> {
         let Self {
             effects,
-            stmt_locks,
+            curr_scope,
             checkout,
             ..
         } = self;
@@ -330,7 +330,9 @@ impl StmtState {
             inner,
             attachment,
             effects,
-            stmt_locks,
+            curr_scope: curr_scope
+                .as_mut()
+                .expect("active statement state must retain curr_scope"),
             disable_dml_validation: false,
             prepared_catalog_write,
         }
@@ -373,9 +375,12 @@ impl StmtState {
 
     #[inline]
     fn release_statement_locks(&mut self) {
-        if let Some(checkout) = self.checkout.as_ref() {
-            self.stmt_locks
-                .release_all(checkout.attachment().engine().lock_manager());
+        if let (Some(mut curr_scope), Some(checkout)) =
+            (self.curr_scope.take(), self.checkout.as_mut())
+        {
+            let lock_manager = checkout.attachment().engine().lock_manager().clone();
+            let family = checkout.inner_mut().checked_lock_state_mut().family_mut();
+            family.close_scope(&mut curr_scope, &lock_manager);
         }
     }
 
@@ -389,8 +394,11 @@ impl StmtState {
                 };
                 self.effects
                     .fold_cancelled_into_trx_effects(checkout.inner_mut().effects_mut());
-                self.stmt_locks
-                    .release_all(checkout.attachment().engine().lock_manager());
+                if let Some(mut curr_scope) = self.curr_scope.take() {
+                    let lock_manager = checkout.attachment().engine().lock_manager().clone();
+                    let family = checkout.inner_mut().checked_lock_state_mut().family_mut();
+                    family.close_scope(&mut curr_scope, &lock_manager);
+                }
                 checkout.return_cancelled();
             }
             StmtDropAction::PrivateMustComplete => {
@@ -425,7 +433,7 @@ pub struct Statement<'stmt> {
     inner: &'stmt mut TrxInner,
     attachment: &'stmt TrxAttachment,
     effects: &'stmt mut StmtEffects,
-    stmt_locks: &'stmt mut OwnerLockState,
+    curr_scope: &'stmt mut LockScopeState,
     disable_dml_validation: bool,
     prepared_catalog_write: Option<PreparedCatalogWriteAuthority<'stmt>>,
 }
@@ -488,6 +496,7 @@ impl<'stmt> Statement<'stmt> {
                 LockMode::Shared,
             )
             .await
+            .map(|_| ())
     }
 
     /// Acquires transaction-lifetime table-data intent for a point write.
@@ -505,6 +514,7 @@ impl<'stmt> Statement<'stmt> {
                 LockMode::IntentExclusive,
             )
             .await
+            .map(|_| ())
     }
 
     /// Acquires transaction-lifetime exclusive table-data protection.
@@ -522,6 +532,7 @@ impl<'stmt> Statement<'stmt> {
                 LockMode::Exclusive,
             )
             .await
+            .map(|_| ())
     }
 
     #[inline]
@@ -534,7 +545,7 @@ impl<'stmt> Statement<'stmt> {
         admit_user_table(
             self.inner,
             self.attachment,
-            self.stmt_locks,
+            self.curr_scope,
             table_id,
             request,
             operation,
@@ -1055,8 +1066,8 @@ pub(crate) mod tests {
         OperationError, ResourceError,
     };
     use crate::id::TrxID;
-    use crate::lock::tests::{debug_snapshot, try_acquire};
-    use crate::lock::{LockManager, LockOwner};
+    use crate::lock::LockOwner;
+    use crate::lock::tests::debug_snapshot;
     use crate::session::{SessionState, tests as session_tests};
     use crate::trx::sys::tests as sys_tests;
     use crate::trx::undo::tests::{pause_next_index_rollback, pause_next_row_rollback};
@@ -1088,21 +1099,7 @@ pub(crate) mod tests {
 
     #[inline]
     pub(crate) fn lock_owner(stmt: &Statement<'_>) -> LockOwner {
-        stmt.stmt_locks.owner()
-    }
-
-    #[inline]
-    pub(crate) fn try_acquire_statement_lock(
-        stmt: &mut Statement<'_>,
-        resource: LockResource,
-        mode: LockMode,
-    ) -> Result<bool> {
-        try_acquire_owner_lock_state(
-            stmt.stmt_locks,
-            stmt.attachment.engine().lock_manager(),
-            resource,
-            mode,
-        )
+        stmt.curr_scope.owner()
     }
 
     #[inline]
@@ -1111,9 +1108,12 @@ pub(crate) mod tests {
         resource: LockResource,
         mode: LockMode,
     ) -> Result<()> {
-        stmt.stmt_locks
-            .acquire(stmt.attachment.engine().lock_manager(), resource, mode)
+        let lock_manager = stmt.attachment.engine().lock_manager();
+        let family = stmt.inner.checked_lock_state_mut().family_mut();
+        family
+            .acquire(stmt.curr_scope, lock_manager, resource, mode)
             .await
+            .map(|_| ())
             .disclose()
     }
 
@@ -1131,33 +1131,21 @@ pub(crate) mod tests {
     }
 
     #[inline]
-    fn try_acquire_transaction_lock(
+    fn acquire_transaction_lock_immediate(
         trx: &mut Transaction,
         resource: LockResource,
         mode: LockMode,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         let mut checkout = trx.checkout().disclose()?;
         let (inner, attachment) = checkout.inner_and_attachment_mut();
         let lock_manager = attachment.engine().lock_manager();
-        try_acquire_owner_lock_state(inner.checked_lock_state_mut(), lock_manager, resource, mode)
-    }
-
-    #[inline]
-    fn try_acquire_owner_lock_state(
-        lock_state: &mut OwnerLockState,
-        lock_manager: &LockManager,
-        resource: LockResource,
-        mode: LockMode,
-    ) -> Result<bool> {
-        if lock_state.cached_covers(resource, mode) {
-            return Ok(true);
-        }
-        let owner = lock_state.owner();
-        let acquired = try_acquire(lock_manager, resource, mode, owner).disclose()?;
-        if acquired {
-            lock_state.cache_granted(resource, mode);
-        }
-        Ok(acquired)
+        inner
+            .checked_lock_state_mut()
+            .acquire(lock_manager, resource, mode)
+            .now_or_never()
+            .expect("test transaction lock acquisition unexpectedly waited")
+            .map(|_| ())
+            .disclose()
     }
 
     async fn test_engine(log_file_stem: &str) -> (TempDir, Engine) {
@@ -1404,7 +1392,7 @@ pub(crate) mod tests {
             let (mut trx, _session_state) = test_trx(&engine, TrxID::new(52));
             let session_id = trx.operation_key.session_id();
             let trx_owner = trx_lock_owner(&mut trx).unwrap();
-            try_acquire_transaction_lock(
+            acquire_transaction_lock_immediate(
                 &mut trx,
                 LockResource::TableData(TableID::new(91_250)),
                 LockMode::IntentExclusive,
@@ -1415,11 +1403,12 @@ pub(crate) mod tests {
             let res: Result<()> = trx
                 .exec(async |stmt| {
                     stmt_owner.set(Some(lock_owner(stmt)));
-                    try_acquire_statement_lock(
+                    acquire_statement_lock(
                         stmt,
                         LockResource::TableMetadata(TableID::new(91_250)),
                         LockMode::Shared,
-                    )?;
+                    )
+                    .await?;
                     // This row undo references a table that does not exist. If
                     // statement rollback ever runs row rollback before index
                     // rollback, this test fails before the injected index

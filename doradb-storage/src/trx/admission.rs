@@ -6,7 +6,7 @@ use crate::error::{
     OperationError, OperationOrFatalError, OperationOrFatalResult, OperationResult,
 };
 use crate::id::{TableID, TrxID};
-use crate::lock::{FreshLockGuard, LockGrant, LockMode, LockResource, OwnerLockState};
+use crate::lock::{LockMode, LockResource, LockScopeState};
 use crate::session::TrxAttachment;
 use crate::table::{Table, TableRuntimeLayout};
 use error_stack::{Report, ResultExt};
@@ -102,93 +102,6 @@ impl TransactionTableBinding {
     }
 }
 
-struct AdmissionCommitGuard<'inner, 'lock> {
-    inner: &'inner mut TrxInner,
-    table_id: TableID,
-    metadata_resource: LockResource,
-    fresh_grant: Option<FreshLockGuard<'lock>>,
-    cached_by_admission: bool,
-    binding_inserted: bool,
-    committed: bool,
-}
-
-impl<'inner, 'lock> AdmissionCommitGuard<'inner, 'lock> {
-    #[inline]
-    fn new(
-        inner: &'inner mut TrxInner,
-        table_id: TableID,
-        metadata_resource: LockResource,
-        fresh_grant: Option<FreshLockGuard<'lock>>,
-    ) -> Self {
-        Self {
-            inner,
-            table_id,
-            metadata_resource,
-            fresh_grant,
-            cached_by_admission: false,
-            binding_inserted: false,
-            committed: false,
-        }
-    }
-
-    #[inline]
-    fn commit(
-        &mut self,
-        binding: TransactionTableBinding,
-    ) -> (Arc<Table>, Arc<TableRuntimeLayout>) {
-        let parts = binding.operation_parts();
-        if self.fresh_grant.is_some() {
-            self.inner
-                .checked_lock_state_mut()
-                .cache_granted(self.metadata_resource, LockMode::Shared);
-            self.cached_by_admission = true;
-        } else {
-            assert!(
-                self.inner
-                    .checked_lock_state()
-                    .cached_covers(self.metadata_resource, LockMode::Shared),
-                "existing transaction metadata grant must be owner-cached before binding: table_id={}",
-                self.table_id
-            );
-        }
-        let previous = self.inner.table_bindings.insert(self.table_id, binding);
-        assert!(
-            previous.is_none(),
-            "binding miss commit replaced an existing binding: table_id={}",
-            self.table_id
-        );
-        self.binding_inserted = true;
-        if let Some(guard) = self.fresh_grant.as_mut() {
-            guard.disarm();
-        }
-        self.committed = true;
-        parts
-    }
-}
-
-impl Drop for AdmissionCommitGuard<'_, '_> {
-    #[inline]
-    fn drop(&mut self) {
-        if self.committed {
-            return;
-        }
-        if self.binding_inserted {
-            self.inner.table_bindings.remove(&self.table_id);
-        }
-        if self.cached_by_admission {
-            let removed = self
-                .inner
-                .checked_lock_state_mut()
-                .remove_cached_exact(self.metadata_resource, LockMode::Shared);
-            assert!(
-                removed,
-                "admission rollback lost its owner-cache record: table_id={}",
-                self.table_id
-            );
-        }
-    }
-}
-
 #[inline]
 fn admit_cached_binding(
     inner: &TrxInner,
@@ -203,7 +116,7 @@ fn admit_cached_binding(
     assert!(
         inner
             .checked_lock_state()
-            .cached_covers(metadata_resource, LockMode::Shared),
+            .covers(metadata_resource, LockMode::Shared),
         "transaction table binding requires cached metadata S: table_id={table_id}"
     );
     binding.validate(table_id, request, operation)?;
@@ -279,33 +192,30 @@ fn resolve_table_binding(
 async fn install_table_binding(
     inner: &mut TrxInner,
     attachment: &TrxAttachment,
-    statement_locks: &mut OwnerLockState,
+    statement_locks: &mut LockScopeState,
     table_id: TableID,
     metadata_resource: LockResource,
     binding: TransactionTableBinding,
     operation: &'static str,
 ) -> OperationResult<(Arc<Table>, Arc<TableRuntimeLayout>)> {
     let lock_manager = attachment.engine().lock_manager();
-    let owner = inner.checked_lock_state().owner();
-    let grant = inner
-        .checked_lock_state()
-        .acquire_uncached(lock_manager, metadata_resource, LockMode::Shared)
+    inner
+        .checked_lock_state_mut()
+        .acquire(lock_manager, metadata_resource, LockMode::Shared)
         .await
         .attach_with(|| format!("operation={operation}, table_id={table_id}"))?;
-    let fresh_grant = match grant {
-        LockGrant::Fresh => FreshLockGuard::new(lock_manager, metadata_resource, owner, grant),
-        LockGrant::Existing => None,
-    };
-    let mut admission_guard =
-        AdmissionCommitGuard::new(inner, table_id, metadata_resource, fresh_grant);
-    let (table, layout) = admission_guard.commit(binding);
-
-    let released = statement_locks.release_cached(lock_manager, metadata_resource);
-    assert_eq!(
-        released, 1,
+    let (table, layout) = binding.operation_parts();
+    let previous = inner.table_bindings.insert(table_id, binding);
+    assert!(
+        previous.is_none(),
+        "binding miss commit replaced an existing binding: table_id={table_id}"
+    );
+    let family = inner.checked_lock_state_mut().family_mut();
+    let released = family.release(statement_locks, lock_manager, metadata_resource);
+    assert!(
+        released,
         "successful binding handoff must release statement metadata S: table_id={table_id}"
     );
-    drop(admission_guard);
     attachment.cache_user_table(&table);
     Ok((table, layout))
 }
@@ -318,7 +228,7 @@ async fn install_table_binding(
 pub(super) async fn admit_user_table(
     inner: &mut TrxInner,
     attachment: &TrxAttachment,
-    statement_locks: &mut OwnerLockState,
+    statement_locks: &mut LockScopeState,
     table_id: TableID,
     request: TableAdmissionRequest,
     operation: &'static str,
@@ -345,9 +255,12 @@ pub(super) async fn admit_user_table(
 
     // First touch resolves both snapshot-visible and current metadata while
     // statement metadata S prevents a concurrent DDL publication.
-    statement_locks
+    let lock_manager = attachment.engine().lock_manager();
+    let family = inner.checked_lock_state_mut().family_mut();
+    family
         .acquire(
-            attachment.engine().lock_manager(),
+            statement_locks,
+            lock_manager,
             metadata_resource,
             LockMode::Shared,
         )
@@ -509,7 +422,7 @@ mod tests {
                     checkout
                         .inner()
                         .checked_lock_state()
-                        .cached_covers(metadata, LockMode::Shared)
+                        .covers(metadata, LockMode::Shared)
                 );
             }
             assert!(owner_has_grant(
@@ -628,12 +541,14 @@ mod tests {
                         !checkout
                             .inner()
                             .checked_lock_state()
-                            .cached_covers(metadata, LockMode::Shared)
+                            .covers(metadata, LockMode::Shared)
                     );
-                    assert!(!checkout.inner().checked_lock_state().cached_covers(
-                        LockResource::TableData(table_id),
-                        LockMode::IntentExclusive
-                    ));
+                    assert!(
+                        !checkout
+                            .inner()
+                            .checked_lock_state()
+                            .covers(LockResource::TableData(table_id), LockMode::IntentExclusive)
+                    );
                 }
                 let snapshot = debug_snapshot(engine.inner().core.lock_manager());
                 assert!(
@@ -727,10 +642,12 @@ mod tests {
                 {
                     let checkout = old_trx.checkout().unwrap();
                     assert!(checkout.inner().table_bindings.contains_key(&table_id));
-                    assert!(!checkout.inner().checked_lock_state().cached_covers(
-                        LockResource::TableData(table_id),
-                        LockMode::IntentExclusive
-                    ));
+                    assert!(
+                        !checkout
+                            .inner()
+                            .checked_lock_state()
+                            .covers(LockResource::TableData(table_id), LockMode::IntentExclusive)
+                    );
                 }
                 assert!(owner_has_grant(
                     &engine,
@@ -1087,13 +1004,13 @@ mod tests {
                     !checkout
                         .inner()
                         .checked_lock_state()
-                        .cached_covers(LockResource::TableMetadata(table_id), LockMode::Shared)
+                        .covers(LockResource::TableMetadata(table_id), LockMode::Shared)
                 );
                 assert!(
                     !checkout
                         .inner()
                         .checked_lock_state()
-                        .cached_covers(LockResource::TableData(table_id), LockMode::Shared)
+                        .covers(LockResource::TableData(table_id), LockMode::Shared)
                 );
             }
             assert!(
@@ -1155,13 +1072,13 @@ mod tests {
                     !checkout
                         .inner()
                         .checked_lock_state()
-                        .cached_covers(LockResource::TableMetadata(table_id), LockMode::Shared)
+                        .covers(LockResource::TableMetadata(table_id), LockMode::Shared)
                 );
                 assert!(
                     !checkout
                         .inner()
                         .checked_lock_state()
-                        .cached_covers(LockResource::TableData(table_id), LockMode::Shared)
+                        .covers(LockResource::TableData(table_id), LockMode::Shared)
                 );
             }
             assert!(

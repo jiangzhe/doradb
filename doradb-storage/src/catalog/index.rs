@@ -1017,7 +1017,8 @@ impl AcceptedCreateIndex {
         let plan = self.plan.take().unwrap_or_else(|| {
             panic!("accepted CREATE INDEX invariant violated: execution plan is missing")
         });
-        let engine = self.scope.engine().core();
+        let runtime = self.scope.engine().clone();
+        let engine = runtime.core();
         let guards = engine.pool_guards();
         let table_id = plan.table_id;
         let index_no = plan.index_no;
@@ -1390,7 +1391,8 @@ impl AcceptedDropIndex {
         let plan = self.plan.take().unwrap_or_else(|| {
             panic!("accepted DROP INDEX invariant violated: execution plan is missing")
         });
-        let engine = self.scope.engine().core();
+        let runtime = self.scope.engine().clone();
+        let engine = runtime.core();
         let guards = engine.pool_guards();
         let table_id = plan.table_id;
         let index_no = plan.index_no;

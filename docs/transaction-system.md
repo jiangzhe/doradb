@@ -354,15 +354,23 @@ is poisoned and the operation entry becomes `FailedRetained`. The retained
 entry stays registry-visible, blocks session reuse and shutdown, and makes
 later commit or rollback attempts return an error.
 
-Logical lock ownership is tracked outside `TrxContext`. `Transaction` owns an
-`OwnerLockState` for the transaction owner that caches the strongest granted
-mode per logical resource. `StmtState` owns the statement-owner
-`OwnerLockState` and releases statement-owned locks after success, ordinary
-rollback, fatal cleanup, or public cancellation. The caches do not own the
-lock manager; acquisition and release receive the engine's `LockManager`
-component guard at the lifecycle boundary. Transaction-owned locks are
-released on commit, rollback, no-op discard, or fatal transaction discard.
-Session-owned logical locks are released when the session state is dropped.
+Logical lock ownership is tracked outside `TrxContext`. One boxed
+`FamilyLockAuthority` is allocated per session and moves linearly into
+`TransactionLockState`, which pairs that root with the transaction
+`curr_scope`. `StmtState` and `StreamStmtState` retain their existing effect,
+checkout, cancellation, and Drop policy while owning a statement
+`curr_scope`. Both the family/resource slot and exact-scope cleanup entry carry
+the same session-local claim number and mode.
+
+Statement locks close after success, ordinary rollback, fatal cleanup, stream
+completion, or public cancellation. Transaction locks close on commit,
+rollback, no-op discard, or fatal transaction discard. DDL and maintenance
+private transactions temporarily take the same family box from the accepted
+outer operation and return it through the stable operation entry; the outer
+operation scope remains owned by its carrier. Session-explicit claims stay
+beside the family root across transactions and operations and close only on
+selective unlock or final session teardown. Every normal close iterates the
+exact scope index and does not scan manager resources.
 See [Lock System](./lock-system.md) for the resource and mode model, the
 implemented manager structures, and the pre-RFC redesign study.
 
@@ -557,13 +565,15 @@ without assigning a commit timestamp.
 
 Terminal user-session completion is structurally gated by
 `ReleasedTransactionLocks`. Transaction code can mint this non-cloneable,
-transaction-id-bound proof only after draining the transaction's owner-local
-lock state through the engine lock manager reached from the retained terminal
-attachment. `TrxAttachment::commit()` and `TrxAttachment::rollback()` consume
-and validate the proof before direct state publication may make the session idle
-or closed. If terminal publication leaves a close-requested or abandoned session
-idle, `EngineCore` upgrades its weak registry back-reference and removes only
-the pointer-identical registered state.
+transaction-id-bound proof only after closing the transaction scope through
+the engine lock manager reached from the retained terminal attachment. The
+proof owns the same `Box<FamilyLockAuthority>` that entered the transaction.
+`TrxAttachment::commit()` and `TrxAttachment::rollback()` consume and validate
+the proof before direct state publication may reinstall the box in an open idle
+session or drain session-explicit claims for a closed one. If terminal
+publication closes a requested or abandoned session, `EngineCore` upgrades its
+weak registry back-reference and removes only the pointer-identical registered
+state.
 
 For ordered commit, shared committed status is published before transaction
 locks are released, and session completion follows lock release. For rollback

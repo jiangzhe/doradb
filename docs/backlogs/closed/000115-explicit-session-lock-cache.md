@@ -42,3 +42,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented session-explicit owner-side indexing, local coverage, selective unlock, and targeted cleanup via task 000258.
+- Closed By: backlog close
+- Reference: docs/tasks/000258-linear-lock-family-authority-owner-side-indexes.md
+- Closed At: 2026-08-06

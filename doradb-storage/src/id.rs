@@ -344,6 +344,12 @@ impl_id! {
     methods pub(crate)
 }
 
+impl_id! {
+    /// Session-local identity of one accepted logical lock claim.
+    pub(crate) struct ClaimNo;
+    methods pub(crate)
+}
+
 /// Canonical engine-lifetime identity for one session operation.
 ///
 /// The raw operation value is meaningful only inside its owning session and
@@ -667,6 +673,13 @@ mod tests {
         assert_eq!(format!("{table_id:x}"), "abcd");
         assert_eq!(format!("{table_id:#x}"), "0xabcd");
         assert_eq!(format!("{table_id:08x}"), "0000abcd");
+    }
+
+    #[test]
+    fn test_claim_no_layout_and_zero_value() {
+        assert_eq!(mem::size_of::<ClaimNo>(), mem::size_of::<u64>());
+        assert_eq!(ClaimNo::new(0).as_u64(), 0);
+        assert_eq!(ClaimNo::new(42).as_u64(), 42);
     }
 
     #[test]
