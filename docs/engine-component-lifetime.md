@@ -14,10 +14,8 @@ component-registry migration work.
 - `SessionRuntime`: typed strong reference to one exact `SessionState`.
 - `WeakSessionRef`: weak reference to one exact `SessionState` plus that
   session's limited lifecycle-admission façade.
-- `AdmittedSessionRef`: short-lived pairing of that exact weak state with the
-  admission acquired through its session façade.
-- `AdmittedSessionRuntime`: the result of consuming an admitted weak reference
-  and upgrading it while retaining the same admission.
+- `AdmittedSessionRuntime`: the result of the normal `WeakSessionRef` upgrade,
+  retaining both the exact strong session state and its foreground admission.
 - Public session and transaction handles: weak, non-cloneable capabilities that
   identify exact session-local state and acquire admitted internal access for one
   operation or terminal path.
@@ -478,10 +476,11 @@ The owned-handle inventory follows those authorities:
 - abandoned and terminal-rollback cleanup pair their active session entry with
   a mandatory internal permit; failed-precommit cleanup is covered by mandatory
   internal admission.
-- foreground acquisition creates `AdmittedSessionRef` through
-  `SessionAdmission`, consumes it to create `AdmittedSessionRuntime`, validates
-  poison when required, and registers its stable operation or observer before
-  releasing admission and retaining plain `SessionRuntime`.
+- foreground acquisition calls `WeakSessionRef::upgrade`, which acquires
+  `SessionAdmission` and upgrades the exact weak state together into
+  `AdmittedSessionRuntime`; callers validate poison when required and register
+  a stable operation or observer before releasing admission and retaining plain
+  `SessionRuntime`.
 - terminal and cleanup paths reuse existing authority, upgrade the exact weak
   state without new foreground admission, and validate both operation key and
   transaction id directly on that state.

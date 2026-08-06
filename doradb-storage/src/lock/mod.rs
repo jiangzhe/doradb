@@ -4,6 +4,7 @@
 //! table metadata and table data resources independently from the
 //! engine/session/transaction lifecycle wiring that later phases will add.
 
+mod claim;
 mod state;
 
 use crate::component::{Component, ComponentRegistry, ShelfScope};
@@ -21,7 +22,9 @@ use std::result::Result as StdResult;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
-pub(crate) use state::OwnerLockState;
+pub(crate) use state::{
+    FamilyLockAuthority, FamilyLockState, FreshClaimsGuard, LockScopeState, TransactionLockState,
+};
 
 /// Statement number for statement-owned logical locks.
 pub(crate) type StmtNo = u64;
@@ -178,6 +181,11 @@ pub(crate) struct LockOwner {
 }
 
 impl LockOwner {
+    #[inline]
+    const fn from_parts(family: LockFamily, scope: LockScope) -> Self {
+        Self { family, scope }
+    }
+
     /// Creates the explicit-lock owner for one session.
     #[inline]
     pub(crate) const fn session_explicit(session_id: SessionID) -> Self {
@@ -264,54 +272,6 @@ pub(crate) enum LockGrant {
     Existing,
 }
 
-impl LockGrant {
-    #[inline]
-    fn is_fresh(self) -> bool {
-        self == LockGrant::Fresh
-    }
-}
-
-/// Releases a freshly acquired lock unless the caller completes and disarms it.
-pub(crate) struct FreshLockGuard<'a> {
-    lock_manager: &'a LockManager,
-    resource: LockResource,
-    owner: LockOwner,
-    active: bool,
-}
-
-impl<'a> FreshLockGuard<'a> {
-    /// Creates a guard that releases a fresh grant on drop.
-    #[inline]
-    pub(crate) fn new(
-        lock_manager: &'a LockManager,
-        resource: LockResource,
-        owner: LockOwner,
-        grant: LockGrant,
-    ) -> Option<Self> {
-        grant.is_fresh().then(|| FreshLockGuard {
-            lock_manager,
-            resource,
-            owner,
-            active: true,
-        })
-    }
-
-    /// Marks the guarded fresh lock as externally owned.
-    #[inline]
-    pub(crate) fn disarm(&mut self) {
-        self.active = false;
-    }
-}
-
-impl Drop for FreshLockGuard<'_> {
-    #[inline]
-    fn drop(&mut self) {
-        if self.active {
-            self.lock_manager.release(self.resource, self.owner);
-        }
-    }
-}
-
 /// Standalone logical lock manager.
 pub(crate) struct LockManager {
     resources: Arc<FastDashMap<LockResource, ResourceState>>,
@@ -331,6 +291,13 @@ impl LockManager {
     /// Blocking conversion is not supported. If the same owner already holds an
     /// incomparable or non-immediate weaker mode, this method returns the same
     /// explicit operation error as the non-blocking acquisition path.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "retained as a manager-level migration and diagnostic API"
+        )
+    )]
     #[inline]
     pub(crate) async fn acquire(
         &self,
@@ -350,61 +317,6 @@ impl LockManager {
         owner: LockOwner,
     ) -> OperationResult<LockGrant> {
         self.acquire_inner(resource, mode, owner).await
-    }
-
-    /// Acquires the ordered metadata/data locks for one table operation.
-    #[inline]
-    pub(crate) async fn acquire_table_locks<'a>(
-        &'a self,
-        table_id: TableID,
-        data_mode: LockMode,
-        owner: LockOwner,
-    ) -> OperationResult<(Option<FreshLockGuard<'a>>, Option<FreshLockGuard<'a>>)> {
-        let metadata_resource = LockResource::TableMetadata(table_id);
-        let metadata_grant = self
-            .acquire_with_grant(metadata_resource, LockMode::Shared, owner)
-            .await?;
-        let metadata_guard = FreshLockGuard::new(self, metadata_resource, owner, metadata_grant);
-
-        let data_resource = LockResource::TableData(table_id);
-        let data_grant = self
-            .acquire_with_grant(data_resource, data_mode, owner)
-            .await?;
-        let data_guard = FreshLockGuard::new(self, data_resource, owner, data_grant);
-
-        Ok((metadata_guard, data_guard))
-    }
-
-    /// Rejects table DDL when the session already holds explicit table locks.
-    #[inline]
-    pub(crate) fn reject_table_ddl_explicit_session_lock(
-        &self,
-        table_id: TableID,
-        ddl_owner: LockOwner,
-    ) -> OperationResult<()> {
-        let explicit_owner = LockOwner::session_explicit(ddl_owner.family().session_id());
-        for resource in [
-            LockResource::TableMetadata(table_id),
-            LockResource::TableData(table_id),
-        ] {
-            let held = self
-                .resources
-                .get(&resource)
-                .and_then(|state| state.granted_mode(explicit_owner));
-            if let Some(held) = held {
-                return Err(lock_family_conflict_err(
-                    resource,
-                    held,
-                    LockMode::Exclusive,
-                    ddl_owner,
-                    explicit_owner,
-                )
-                .attach(format!(
-                    "table_id={table_id}, policy=reject_ddl_under_explicit_session_lock"
-                )));
-            }
-        }
-        Ok(())
     }
 
     #[inline]
@@ -503,6 +415,13 @@ impl LockManager {
     ///
     /// This is the authoritative cleanup path for later statement, transaction,
     /// session, rollback, and fatal cleanup integration.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "retained as an explicit migration and diagnostic defense"
+        )
+    )]
     #[inline]
     pub(crate) fn release_owner(&self, owner: LockOwner) -> usize {
         let mut notify = Vec::new();

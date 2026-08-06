@@ -277,8 +277,9 @@ async fn execute_mem_index_cleanup_inner(
 ) -> RuntimeOrFatalResult<MemIndexCleanupOutcome> {
     let table = Arc::clone(&resources.table);
     let clean_live_entries = resources.clean_live_entries;
-    let trx_sys = &scope.engine().trx_sys;
-    let pool_guards = scope.pool_guards();
+    let runtime = scope.engine().clone();
+    let trx_sys = &runtime.trx_sys;
+    let pool_guards = runtime.pool_guards();
     loop {
         let trx = scope
             .begin_private_trx()

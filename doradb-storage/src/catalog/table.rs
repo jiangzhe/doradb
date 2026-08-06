@@ -1348,7 +1348,7 @@ impl AcceptedCreateTable {
             .progress
             .as_mut()
             .unwrap_or_else(|| panic!("accepted CREATE progress exists during execution"));
-        let engine = scope.engine();
+        let engine = scope.engine().clone();
         let table_id = progress.table_id;
 
         #[cfg(test)]
@@ -1408,7 +1408,7 @@ impl AcceptedCreateTable {
         if let Err(err) = exec_res {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                 progress
-                    .abort_before_catalog_commit(engine, "catalog_staging", err)
+                    .abort_before_catalog_commit(&engine, "catalog_staging", err)
                     .await,
             ));
         }
@@ -1427,7 +1427,7 @@ impl AcceptedCreateTable {
         {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                 progress
-                    .abort_before_catalog_commit(engine, "test_after_catalog_staging", err)
+                    .abort_before_catalog_commit(&engine, "test_after_catalog_staging", err)
                     .await,
             ));
         }
@@ -1435,7 +1435,7 @@ impl AcceptedCreateTable {
         if let Err(err) = progress.publish_file(&engine.trx_sys).await {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                 progress
-                    .abort_before_catalog_commit(engine, "file_publish", err)
+                    .abort_before_catalog_commit(&engine, "file_publish", err)
                     .await,
             ));
         }
@@ -1453,7 +1453,7 @@ impl AcceptedCreateTable {
         {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                 progress
-                    .abort_before_catalog_commit(engine, "test_after_file_publish", err)
+                    .abort_before_catalog_commit(&engine, "test_after_file_publish", err)
                     .await,
             ));
         }
@@ -1461,7 +1461,7 @@ impl AcceptedCreateTable {
         if let Err(err) = progress.build_runtime(&engine.pools).await {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                 progress
-                    .abort_before_catalog_commit(engine, "runtime_build", err)
+                    .abort_before_catalog_commit(&engine, "runtime_build", err)
                     .await,
             ));
         }
@@ -1479,7 +1479,7 @@ impl AcceptedCreateTable {
         {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                 progress
-                    .abort_before_catalog_commit(engine, "test_after_runtime_build", err)
+                    .abort_before_catalog_commit(&engine, "test_after_runtime_build", err)
                     .await,
             ));
         }
@@ -1494,7 +1494,7 @@ impl AcceptedCreateTable {
             Err(err) => {
                 return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                     progress
-                        .abort_after_root_publish_commit_error(engine, "catalog_commit", err)
+                        .abort_after_root_publish_commit_error(&engine, "catalog_commit", err)
                         .await,
                 ));
             }
@@ -1644,7 +1644,7 @@ impl AcceptedDropTable {
             .progress
             .as_mut()
             .unwrap_or_else(|| panic!("accepted DROP progress exists during execution"));
-        let engine = scope.engine();
+        let engine = scope.engine().clone();
         let table_id = progress.plan.table_id;
         let table = progress.plan.take_table();
 
@@ -1779,7 +1779,7 @@ impl AcceptedDropTable {
         let replay_floor = engine
             .catalog()
             .effective_user_table_redo_replay_floor(table_id, table.redo_replay_floor_snapshot());
-        finish_drop_table_runtime_retention(engine, table_id, table, drop_cts, replay_floor)
+        finish_drop_table_runtime_retention(&engine, table_id, table, drop_cts, replay_floor)
             .map_err(CompletionErrorBridge::capture)?;
         progress.phase = DropTablePhase::RuntimeRetained;
 
@@ -3650,7 +3650,7 @@ pub(crate) mod tests {
                 LockResource::TableMetadata(table_id),
             ));
             assert!(
-                !trx_tests::cached_transaction_lock_covers(
+                !trx_tests::transaction_lock_covers(
                     &trx,
                     LockResource::TableMetadata(table_id),
                     LockMode::Shared
@@ -3713,7 +3713,7 @@ pub(crate) mod tests {
                 .await;
             wait_for_no_lock_resource(&engine, trx_owner, LockResource::TableData(table_id)).await;
             assert!(
-                !trx_tests::cached_transaction_lock_covers(
+                !trx_tests::transaction_lock_covers(
                     &trx,
                     LockResource::TableMetadata(table_id),
                     LockMode::Shared
