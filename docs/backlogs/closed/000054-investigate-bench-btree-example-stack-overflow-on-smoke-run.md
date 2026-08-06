@@ -38,3 +38,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: stale
+- Detail: The bench_btree target and its third-party comparison dependency were removed by task 000157, so the original smoke command and acceptance target no longer exist.
+- Closed By: backlog close
+- Reference: docs/tasks/000157-narrow-storage-public-api.md
+- Closed At: 2026-08-06
