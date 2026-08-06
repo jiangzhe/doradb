@@ -6,21 +6,21 @@
 
 mod claim;
 mod state;
+mod wait;
 
+use self::claim::{ClaimToken, PendingClaimToken};
+use self::wait::{WaitNodeID, WaitNodePhase, WaitQueue};
+use crate::completion::Completion;
 use crate::component::{Component, ComponentRegistry, ShelfScope};
 use crate::error::{OperationError, OperationResult};
-use crate::id::{OperationID, SessionID, SessionOperationKey, TableID, TrxID};
+use crate::id::{ClaimNo, OperationID, SessionID, SessionOperationKey, TableID, TrxID};
 use crate::map::FastDashMap;
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
 use error_stack::Report;
-use event_listener::Event;
-use parking_lot::Mutex;
-use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::fmt;
 use std::result::Result as StdResult;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 pub(crate) use state::{
     FamilyLockAuthority, FamilyLockState, FreshClaimsGuard, LockScopeState, TransactionLockState,
@@ -286,18 +286,8 @@ impl LockManager {
         }
     }
 
-    /// Acquires a lock, waiting until a fresh conflicting request can be granted.
-    ///
-    /// Blocking conversion is not supported. If the same owner already holds an
-    /// incomparable or non-immediate weaker mode, this method returns the same
-    /// explicit operation error as the non-blocking acquisition path.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "retained as a manager-level migration and diagnostic API"
-        )
-    )]
+    /// Acquires raw manager state for tests without owner-side indexes.
+    #[cfg(test)]
     #[inline]
     pub(crate) async fn acquire(
         &self,
@@ -305,116 +295,30 @@ impl LockManager {
         mode: LockMode,
         owner: LockOwner,
     ) -> OperationResult<()> {
-        self.acquire_inner(resource, mode, owner).await.map(|_| ())
-    }
-
-    /// Acquires a lock and reports whether this call created a grant.
-    #[inline]
-    pub(crate) async fn acquire_with_grant(
-        &self,
-        resource: LockResource,
-        mode: LockMode,
-        owner: LockOwner,
-    ) -> OperationResult<LockGrant> {
-        self.acquire_inner(resource, mode, owner).await
-    }
-
-    #[inline]
-    async fn acquire_inner(
-        &self,
-        resource: LockResource,
-        mode: LockMode,
-        owner: LockOwner,
-    ) -> OperationResult<LockGrant> {
         mode.assert_valid_for(resource);
-        let (waiter, waiter_guard, grant) = {
-            // Reuse the non-blocking path first. If the request must wait,
-            // enqueue the waiter while still holding the resource guard so a
-            // concurrent release cannot miss this request.
-            let mut resource_state = self.resources.entry(resource).or_default();
-            match resource_state.try_acquire_immediate(resource, mode, owner)? {
-                AcquireImmediate::Granted(grant) => return Ok(grant),
-                AcquireImmediate::WouldWait => {
-                    let waiter = Arc::new(Waiter::new(owner, mode));
-                    resource_state.waiters.push_back(Arc::clone(&waiter));
-                    // Keep the queued request cancellation-safe after the resource
-                    // guard is released and before the grant is observed.
-                    let waiter_guard =
-                        WaiterGuard::new(&self.resources, resource, Arc::clone(&waiter));
-                    (waiter, waiter_guard, LockGrant::Fresh)
-                }
-                AcquireImmediate::AlreadyWaiting(waiter) => {
-                    let waiter_guard =
-                        WaiterGuard::new(&self.resources, resource, Arc::clone(&waiter));
-                    (waiter, waiter_guard, LockGrant::Existing)
-                }
-            }
+        let token = PendingClaimToken {
+            resource,
+            owner,
+            claim_no: ClaimNo::new(0),
         };
-        // The resource guard is dropped before awaiting; grant notification
-        // and cleanup paths can keep mutating the same resource while this task
-        // is parked.
-        self.wait_for_grant_with_guard(resource, mode, owner, waiter, waiter_guard, grant)
-            .await
-    }
-
-    #[inline]
-    async fn wait_for_grant_with_guard(
-        &self,
-        resource: LockResource,
-        mode: LockMode,
-        owner: LockOwner,
-        waiter: Arc<Waiter>,
-        mut waiter_guard: WaiterGuard,
-        grant: LockGrant,
-    ) -> OperationResult<LockGrant> {
-        let res = self.wait_for_grant(resource, mode, owner, waiter).await;
-        if res.is_ok() {
-            waiter_guard.disarm_after_grant_observed();
+        if self.raw_existing_acquire(&token, mode)? {
+            return Ok(());
         }
-        res.map(|_| grant)
+        let mut guard = RawPendingGuard::new(self, token, mode);
+        guard.start()?;
+        guard.wait_and_observe().await?;
+        guard.disarm();
+        Ok(())
     }
 
-    /// Releases locks and waiters for one owner/resource pair.
-    ///
-    /// This method is also the cancellation path for lifecycle cleanup: a
-    /// session, transaction, statement, rollback, or admin cleanup task may
-    /// call it while the original task is still blocked in [`Self::acquire`].
-    /// In that case, any queued waiter for `owner` on `resource` is removed and
-    /// the blocked acquisition wakes with `LockWaiterReleased`.
-    ///
-    /// The return value is the number of granted locks and queued requests
-    /// removed. Waiters removed by this call wake with `LockWaiterReleased`.
+    /// Releases raw manager state for one owner/resource pair in tests.
+    #[cfg(test)]
     #[inline]
     pub(crate) fn release(&self, resource: LockResource, owner: LockOwner) -> usize {
-        let mut notify = Vec::new();
-        let mut removed = 0;
-        let remove_resource = {
-            if let Some(mut resource_state) = self.resources.get_mut(&resource) {
-                removed += resource_state.remove_granted(owner);
-                let released_waiters = resource_state.remove_waiters(owner);
-                removed += released_waiters.len();
-                mark_waiters(&released_waiters, WaitOutcome::Released);
-                notify.extend(released_waiters);
-                notify.extend(resource_state.grant_waiters(resource));
-                resource_state.is_empty()
-            } else {
-                false
-            }
-        };
-        if remove_resource {
-            self.resources
-                .remove_if(&resource, |_resource, resource_state| {
-                    resource_state.is_empty()
-                });
-        }
-        notify_waiters(notify);
-        removed
+        self.release_owner_resource(resource, owner)
     }
 
     /// Releases every granted lock and queued request owned by `owner`.
-    ///
-    /// This is the authoritative cleanup path for later statement, transaction,
-    /// session, rollback, and fatal cleanup integration.
     #[cfg_attr(
         not(test),
         expect(
@@ -424,7 +328,6 @@ impl LockManager {
     )]
     #[inline]
     pub(crate) fn release_owner(&self, owner: LockOwner) -> usize {
-        let mut notify = Vec::new();
         let mut removed = 0;
         let mut resources: Vec<_> = self
             .resources
@@ -433,57 +336,12 @@ impl LockManager {
             .collect();
         resources.sort_unstable();
         for resource in resources {
-            let remove_resource = {
-                if let Some(mut resource_state) = self.resources.get_mut(&resource) {
-                    let removed_granted = resource_state.remove_granted(owner);
-                    let released_waiters = resource_state.remove_waiters(owner);
-                    let removed_waiters = released_waiters.len();
-                    mark_waiters(&released_waiters, WaitOutcome::Released);
-                    notify.extend(released_waiters);
-                    notify.extend(resource_state.grant_waiters(resource));
-                    removed += removed_granted + removed_waiters;
-                    resource_state.is_empty()
-                } else {
-                    false
-                }
-            };
-            if remove_resource {
-                self.resources
-                    .remove_if(&resource, |_resource, resource_state| {
-                        resource_state.is_empty()
-                    });
-            }
+            removed += self.release_owner_resource(resource, owner);
         }
-        notify_waiters(notify);
         removed
     }
 
-    #[inline]
-    async fn wait_for_grant(
-        &self,
-        resource: LockResource,
-        mode: LockMode,
-        owner: LockOwner,
-        waiter: Arc<Waiter>,
-    ) -> OperationResult<()> {
-        loop {
-            // Register the listener before reading the outcome to avoid losing
-            // a notification that races with this waiter going back to sleep.
-            let listener = waiter.event.listen();
-            match waiter.outcome() {
-                WaitOutcome::Waiting => listener.await,
-                // Owner cleanup can race with a granted waiter resuming.
-                // Confirm the lock is still held before reporting success.
-                WaitOutcome::Granted if self.owner_holds(resource, owner, mode) => return Ok(()),
-                WaitOutcome::Granted | WaitOutcome::Released => {
-                    return Err(Report::new(OperationError::LockWaiterReleased)
-                        .attach(format!("resource={resource}, owner={owner}, mode={mode}")));
-                }
-            }
-        }
-    }
-
-    /// Returns whether `owner` currently holds a mode covering `requested`.
+    /// Returns whether an exact manager grant covers `requested`.
     #[inline]
     pub(crate) fn owner_holds(
         &self,
@@ -492,10 +350,237 @@ impl LockManager {
         requested: LockMode,
     ) -> bool {
         requested.assert_valid_for(resource);
+        self.resources.get(&resource).is_some_and(|resource_state| {
+            resource_state.granted.iter().any(|granted| {
+                granted.owner == owner
+                    && granted.provisional_node.is_none()
+                    && mode_covers(resource, granted.mode, requested)
+            })
+        })
+    }
+
+    #[inline]
+    fn start_pending(
+        &self,
+        token: &PendingClaimToken,
+        mode: LockMode,
+    ) -> OperationResult<PendingStart> {
+        mode.assert_valid_for(token.resource);
+        let (result, empty_after_error) = {
+            let mut resource_state = self.resources.entry(token.resource).or_default();
+            let result = resource_state.start_pending(token.resource, token, mode);
+            let empty_after_error = result.is_err() && resource_state.is_empty();
+            (result, empty_after_error)
+        };
+        if empty_after_error {
+            self.remove_if_empty(token.resource);
+        }
+        result
+    }
+
+    #[inline]
+    fn observe_pending(
+        &self,
+        token: &PendingClaimToken,
+        mode: LockMode,
+        node_id: WaitNodeID,
+    ) -> PendingObservation {
+        let (observation, empty) = {
+            let mut resource_state = self.resources.get_mut(&token.resource).unwrap_or_else(|| {
+                panic!(
+                    "pending observation requires retained resource state: \
+                         resource={}, owner={}, claim_no={:?}, node_id={node_id:?}",
+                    token.resource, token.owner, token.claim_no
+                )
+            });
+            let observation = resource_state.observe_pending(token, mode, node_id);
+            (observation, resource_state.is_empty())
+        };
+        if empty {
+            self.remove_if_empty(token.resource);
+        }
+        observation
+    }
+
+    #[inline]
+    fn cancel_waiting(&self, token: PendingClaimToken, mode: LockMode, node_id: WaitNodeID) {
+        let (notify, empty) = {
+            let mut resource_state = self.resources.get_mut(&token.resource).unwrap_or_else(|| {
+                panic!(
+                    "pending cancellation requires retained resource state: \
+                         resource={}, owner={}, claim_no={:?}, node_id={node_id:?}",
+                    token.resource, token.owner, token.claim_no
+                )
+            });
+            resource_state
+                .wait_queue
+                .assert_identity(node_id, &token, mode);
+            let mut notify = Vec::new();
+            match resource_state.wait_queue.node(node_id).phase {
+                WaitNodePhase::Queued { .. } => {
+                    resource_state
+                        .wait_queue
+                        .detach_to(node_id, WaitNodePhase::Released);
+                    let _ = resource_state
+                        .wait_queue
+                        .consume(node_id, WaitNodePhase::Released);
+                    notify.extend(resource_state.grant_waiters(token.resource));
+                }
+                WaitNodePhase::Provisional => {
+                    resource_state.remove_provisional(&token, mode, node_id);
+                    let _ = resource_state
+                        .wait_queue
+                        .consume(node_id, WaitNodePhase::Provisional);
+                    notify.extend(resource_state.grant_waiters(token.resource));
+                }
+                WaitNodePhase::Released => {
+                    let _ = resource_state
+                        .wait_queue
+                        .consume(node_id, WaitNodePhase::Released);
+                }
+            }
+            (notify, resource_state.is_empty())
+        };
+        if empty {
+            self.remove_if_empty(token.resource);
+        }
+        notify_completions(notify);
+    }
+
+    #[inline]
+    fn cancel_fresh_grant(&self, token: PendingClaimToken, mode: LockMode) {
+        let (notify, empty) = {
+            let mut resource_state = self.resources.get_mut(&token.resource).unwrap_or_else(|| {
+                panic!(
+                    "fresh pending rollback requires retained resource state: \
+                         resource={}, owner={}, claim_no={:?}",
+                    token.resource, token.owner, token.claim_no
+                )
+            });
+            resource_state.remove_fresh_grant(&token, mode);
+            let notify = resource_state.grant_waiters(token.resource);
+            (notify, resource_state.is_empty())
+        };
+        if empty {
+            self.remove_if_empty(token.resource);
+        }
+        notify_completions(notify);
+    }
+
+    #[inline]
+    fn convert_claim(&self, token: &ClaimToken, mode: LockMode) -> OperationResult<()> {
+        mode.assert_valid_for(token.resource);
+        let mut resource_state = self.resources.get_mut(&token.resource).unwrap_or_else(|| {
+            panic!(
+                "accepted conversion requires a manager mirror: \
+                     resource={}, owner={}, claim_no={:?}",
+                token.resource, token.owner, token.claim_no
+            )
+        });
+        resource_state.convert_claim(token.resource, token, mode)
+    }
+
+    #[inline]
+    fn release_claim(&self, token: &ClaimToken) -> usize {
+        let (notify, empty) = {
+            let mut resource_state = self.resources.get_mut(&token.resource).unwrap_or_else(|| {
+                panic!(
+                    "accepted release requires a manager mirror: \
+                         resource={}, owner={}, claim_no={:?}",
+                    token.resource, token.owner, token.claim_no
+                )
+            });
+            resource_state.remove_accepted(token);
+            let notify = resource_state.grant_waiters(token.resource);
+            (notify, resource_state.is_empty())
+        };
+        if empty {
+            self.remove_if_empty(token.resource);
+        }
+        notify_completions(notify);
+        1
+    }
+
+    #[inline]
+    fn release_owner_resource(&self, resource: LockResource, owner: LockOwner) -> usize {
+        let Some(mut resource_state) = self.resources.get_mut(&resource) else {
+            return 0;
+        };
+        let (removed, notify) = resource_state.release_owner(resource, owner);
+        let empty = resource_state.is_empty();
+        drop(resource_state);
+        if empty {
+            self.remove_if_empty(resource);
+        }
+        notify_completions(notify);
+        removed
+    }
+
+    #[inline]
+    fn remove_if_empty(&self, resource: LockResource) {
         self.resources
-            .get(&resource)
-            .and_then(|resource_state| resource_state.granted_mode(owner))
-            .is_some_and(|held| mode_covers(resource, held, requested))
+            .remove_if(&resource, |_resource, resource_state| {
+                resource_state.is_empty()
+            });
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn raw_existing_acquire(
+        &self,
+        token: &PendingClaimToken,
+        mode: LockMode,
+    ) -> OperationResult<bool> {
+        let Some(mut resource_state) = self.resources.get_mut(&token.resource) else {
+            return Ok(false);
+        };
+        let Some(idx) = resource_state.granted_idx(token.owner) else {
+            assert!(
+                !resource_state.has_waiter_owner(token.owner),
+                "duplicate raw pending acquisition is forbidden: \
+                 resource={}, owner={}",
+                token.resource,
+                token.owner
+            );
+            return Ok(false);
+        };
+        let accepted = ClaimToken {
+            resource: token.resource,
+            owner: token.owner,
+            claim_no: token.claim_no,
+        };
+        resource_state.convert_claim(token.resource, &accepted, mode)?;
+        Ok(idx < resource_state.granted.len())
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn restore_raw_claim(&self, token: &ClaimToken, mode: LockMode) {
+        mode.assert_valid_for(token.resource);
+        let mut resource_state = self.resources.entry(token.resource).or_default();
+        assert!(
+            resource_state.granted_idx(token.owner).is_none()
+                && !resource_state.has_waiter_owner(token.owner),
+            "raw exact-claim restoration requires an owner miss: \
+             resource={}, owner={}, claim_no={:?}",
+            token.resource,
+            token.owner,
+            token.claim_no
+        );
+        assert!(
+            resource_state.compatible_with_granted(token.resource, mode, token.owner),
+            "raw exact-claim restoration must be immediately compatible: \
+             resource={}, owner={}, claim_no={:?}, mode={mode}",
+            token.resource,
+            token.owner,
+            token.claim_no
+        );
+        resource_state.granted.push(GrantedLock {
+            owner: token.owner,
+            claim_no: token.claim_no,
+            mode,
+            provisional_node: None,
+        });
     }
 }
 
@@ -539,61 +624,105 @@ impl Component for LockManager {
 #[derive(Default)]
 struct ResourceState {
     granted: Vec<GrantedLock>,
-    waiters: VecDeque<Arc<Waiter>>,
+    wait_queue: WaitQueue,
 }
 
 impl ResourceState {
     #[inline]
-    fn try_acquire_immediate(
+    fn start_pending(
         &mut self,
         resource: LockResource,
+        token: &PendingClaimToken,
         mode: LockMode,
-        owner: LockOwner,
-    ) -> OperationResult<AcquireImmediate> {
-        if let Some(idx) = self.granted_idx(owner) {
-            // Reentrant requests that are already covered do not create
-            // duplicate granted entries.
-            let held = self.granted[idx].mode;
-            if mode_covers(resource, held, mode) {
-                return Ok(AcquireImmediate::Granted(LockGrant::Existing));
-            }
-            // Conversions are immediate-only in this phase. Incomparable modes
-            // are rejected rather than synthesized into a combined mode such as
-            // SIX, which RFC-0016 deliberately excludes from v1.
-            if !mode_covers(resource, mode, held) {
-                return Err(conversion_not_supported_err(resource, held, mode, owner));
-            }
-            // A stronger same-owner mode may replace the existing grant only
-            // when it does not conflict with current holders and does not jump
-            // ahead of any queued request.
-            self.validate_family_coverage(resource, mode, owner)?;
-            if !self.waiters.is_empty() || !self.compatible_with_granted(resource, mode, owner) {
-                return Err(upgrade_would_block_err(resource, held, mode, owner));
-            }
-            self.granted[idx].mode = mode;
-            return Ok(AcquireImmediate::Granted(LockGrant::Existing));
-        }
-        if let Some(waiter) = self.waiter_by_owner(owner) {
-            let waiting = waiter.mode;
-            if mode_covers(resource, waiting, mode) {
-                return Ok(AcquireImmediate::AlreadyWaiting(waiter));
-            }
-            if !mode_covers(resource, mode, waiting) {
-                return Err(conversion_not_supported_err(resource, waiting, mode, owner));
-            }
-            return Err(upgrade_would_block_err(resource, waiting, mode, owner));
-        }
-        let family_covered = self.validate_family_coverage(resource, mode, owner)?;
+    ) -> OperationResult<PendingStart> {
+        assert!(
+            self.granted_idx(token.owner).is_none(),
+            "fresh pending claim duplicates an exact manager grant: \
+             resource={resource}, owner={}, claim_no={:?}",
+            token.owner,
+            token.claim_no
+        );
+        assert!(
+            !self.has_waiter_owner(token.owner),
+            "fresh pending claim duplicates an exact waiter: \
+             resource={resource}, owner={}, claim_no={:?}",
+            token.owner,
+            token.claim_no
+        );
+        let family_covered = self.validate_family_coverage(resource, mode, token.owner)?;
         // Fresh compatible requests still wait behind an existing queue so
         // readers or intent holders cannot starve an older incompatible waiter,
         // unless an already-granted same-family lock covers this request.
-        if self.compatible_with_granted(resource, mode, owner)
-            && (family_covered || self.waiters.is_empty())
+        if self.compatible_with_granted(resource, mode, token.owner)
+            && (family_covered || self.wait_queue.is_linked_empty())
         {
-            self.granted.push(GrantedLock { owner, mode });
-            return Ok(AcquireImmediate::Granted(LockGrant::Fresh));
+            self.granted.push(GrantedLock {
+                owner: token.owner,
+                claim_no: token.claim_no,
+                mode,
+                provisional_node: None,
+            });
+            return Ok(PendingStart::Immediate);
         }
-        Ok(AcquireImmediate::WouldWait)
+        let completion = Arc::new(Completion::new());
+        let node_id =
+            self.wait_queue
+                .append(token.owner, token.claim_no, mode, Arc::clone(&completion));
+        Ok(PendingStart::Waiting {
+            node_id,
+            completion,
+        })
+    }
+
+    #[inline]
+    fn convert_claim(
+        &mut self,
+        resource: LockResource,
+        token: &ClaimToken,
+        mode: LockMode,
+    ) -> OperationResult<()> {
+        let idx = self.granted_idx(token.owner).unwrap_or_else(|| {
+            panic!(
+                "accepted conversion cannot find its exact manager grant: \
+                 resource={resource}, owner={}, claim_no={:?}",
+                token.owner, token.claim_no
+            )
+        });
+        let granted = self.granted[idx];
+        assert!(
+            granted.claim_no == token.claim_no && granted.provisional_node.is_none(),
+            "accepted conversion token does not identify a held exact grant: \
+             resource={resource}, owner={}, token_claim_no={:?}, \
+             actual_claim_no={:?}, provisional_node={:?}",
+            token.owner,
+            token.claim_no,
+            granted.claim_no,
+            granted.provisional_node
+        );
+        if mode_covers(resource, granted.mode, mode) {
+            return Ok(());
+        }
+        if !mode_covers(resource, mode, granted.mode) {
+            return Err(conversion_not_supported_err(
+                resource,
+                granted.mode,
+                mode,
+                token.owner,
+            ));
+        }
+        self.validate_family_coverage(resource, mode, token.owner)?;
+        if !self.wait_queue.is_linked_empty()
+            || !self.compatible_with_granted(resource, mode, token.owner)
+        {
+            return Err(upgrade_would_block_err(
+                resource,
+                granted.mode,
+                mode,
+                token.owner,
+            ));
+        }
+        self.granted[idx].mode = mode;
+        Ok(())
     }
 
     #[inline]
@@ -604,19 +733,8 @@ impl ResourceState {
     }
 
     #[inline]
-    fn granted_mode(&self, owner: LockOwner) -> Option<LockMode> {
-        self.granted
-            .iter()
-            .find(|granted| granted.owner == owner)
-            .map(|granted| granted.mode)
-    }
-
-    #[inline]
-    fn waiter_by_owner(&self, owner: LockOwner) -> Option<Arc<Waiter>> {
-        self.waiters
-            .iter()
-            .find(|waiter| waiter.owner == owner)
-            .cloned()
+    fn has_waiter_owner(&self, owner: LockOwner) -> bool {
+        self.wait_queue.any_occupied(|node| node.owner == owner)
     }
 
     #[inline]
@@ -660,269 +778,378 @@ impl ResourceState {
             }
             covered = true;
         }
-        for waiter in self.waiters.iter() {
-            if waiter.owner == owner || waiter.owner.family() != owner.family() {
-                continue;
-            }
-            if !mode_covers(resource, waiter.mode, mode) {
-                return Err(lock_family_conflict_err(
-                    resource,
-                    waiter.mode,
-                    mode,
-                    owner,
-                    waiter.owner,
-                ));
-            }
+        if let Some(waiter) = self.wait_queue.find_linked(|waiter| {
+            waiter.owner != owner
+                && waiter.owner.family() == owner.family()
+                && !mode_covers(resource, waiter.target_mode, mode)
+        }) {
+            return Err(lock_family_conflict_err(
+                resource,
+                waiter.target_mode,
+                mode,
+                owner,
+                waiter.owner,
+            ));
         }
         Ok(covered)
     }
 
     #[inline]
-    fn remove_granted(&mut self, owner: LockOwner) -> usize {
-        let before = self.granted.len();
-        self.granted.retain(|granted| granted.owner != owner);
-        before - self.granted.len()
-    }
-
-    #[inline]
-    fn remove_waiters(&mut self, owner: LockOwner) -> Vec<Arc<Waiter>> {
-        let mut retained = VecDeque::with_capacity(self.waiters.len());
-        let mut removed = Vec::new();
-        while let Some(waiter) = self.waiters.pop_front() {
-            if waiter.owner == owner {
-                removed.push(waiter);
-            } else {
-                retained.push_back(waiter);
-            }
-        }
-        self.waiters = retained;
-        removed
-    }
-
-    #[inline]
-    fn remove_waiter(&mut self, target: &Arc<Waiter>) -> Option<Arc<Waiter>> {
-        let mut retained = VecDeque::with_capacity(self.waiters.len());
-        let mut removed = None;
-        while let Some(waiter) = self.waiters.pop_front() {
-            if removed.is_none() && Arc::ptr_eq(&waiter, target) {
-                removed = Some(waiter);
-            } else {
-                retained.push_back(waiter);
-            }
-        }
-        self.waiters = retained;
-        removed
-    }
-
-    #[inline]
-    fn grant_waiters(&mut self, resource: LockResource) -> Vec<Arc<Waiter>> {
-        let mut granted_waiters = Vec::new();
-        while let Some((mode, owner)) = self
-            .waiters
-            .front()
-            .map(|waiter| (waiter.mode, waiter.owner))
-        {
+    fn grant_waiters(&mut self, resource: LockResource) -> Vec<Arc<Completion<()>>> {
+        let mut notifications = Vec::new();
+        while let Some(node_id) = self.wait_queue.head() {
+            let node = self.wait_queue.node(node_id);
+            let owner = node.owner;
+            let claim_no = node.claim_no;
+            let mode = node.target_mode;
             if !self.compatible_with_granted(resource, mode, owner) {
                 break;
             }
-            let Some(waiter) = self.waiters.pop_front() else {
-                break;
-            };
-            if let Some(idx) = self.granted_idx(waiter.owner) {
-                let held = self.granted[idx].mode;
-                if !mode_covers(resource, held, waiter.mode) {
-                    if !mode_covers(resource, waiter.mode, held) {
-                        self.waiters.push_front(waiter);
-                        break;
-                    }
-                    self.granted[idx].mode = waiter.mode;
-                }
-            } else {
-                self.granted.push(GrantedLock {
-                    owner: waiter.owner,
-                    mode: waiter.mode,
-                });
-            }
-            waiter.set_outcome(WaitOutcome::Granted);
-            granted_waiters.push(waiter);
+            assert!(
+                self.granted_idx(owner).is_none(),
+                "FIFO promotion found a duplicate exact manager grant: \
+                 resource={resource}, owner={owner}, claim_no={claim_no:?}"
+            );
+            let completion = Arc::clone(&node.completion);
+            self.wait_queue
+                .detach_to(node_id, WaitNodePhase::Provisional);
+            self.granted.push(GrantedLock {
+                owner,
+                claim_no,
+                mode,
+                provisional_node: Some(node_id),
+            });
+            notifications.push(completion);
         }
-        granted_waiters
+        notifications
+    }
+
+    #[inline]
+    fn observe_pending(
+        &mut self,
+        token: &PendingClaimToken,
+        mode: LockMode,
+        node_id: WaitNodeID,
+    ) -> PendingObservation {
+        self.wait_queue.assert_identity(node_id, token, mode);
+        match self.wait_queue.node(node_id).phase {
+            WaitNodePhase::Queued { .. } => panic!(
+                "completed lock waiter remains queued at observation: \
+                 resource={}, owner={}, claim_no={:?}, node_id={node_id:?}",
+                token.resource, token.owner, token.claim_no
+            ),
+            WaitNodePhase::Provisional => {
+                let idx = self.granted_idx(token.owner).unwrap_or_else(|| {
+                    panic!(
+                        "provisional waiter has no exact manager grant: \
+                         resource={}, owner={}, claim_no={:?}, node_id={node_id:?}",
+                        token.resource, token.owner, token.claim_no
+                    )
+                });
+                let granted = self.granted[idx];
+                assert!(
+                    granted.claim_no == token.claim_no
+                        && granted.mode == mode
+                        && granted.provisional_node == Some(node_id),
+                    "provisional observation grant identity mismatch: \
+                     resource={}, owner={}, claim_no={:?}, mode={}, node_id={node_id:?}, \
+                     actual_grant={granted:?}",
+                    token.resource,
+                    token.owner,
+                    token.claim_no,
+                    mode
+                );
+                self.granted[idx].provisional_node = None;
+                let _ = self.wait_queue.consume(node_id, WaitNodePhase::Provisional);
+                PendingObservation::Adopted
+            }
+            WaitNodePhase::Released => {
+                let _ = self.wait_queue.consume(node_id, WaitNodePhase::Released);
+                PendingObservation::Released
+            }
+        }
+    }
+
+    #[inline]
+    fn remove_provisional(
+        &mut self,
+        token: &PendingClaimToken,
+        mode: LockMode,
+        node_id: WaitNodeID,
+    ) {
+        let idx = self.granted_idx(token.owner).unwrap_or_else(|| {
+            panic!(
+                "provisional cancellation cannot find its exact manager grant: \
+                 resource={}, owner={}, claim_no={:?}, node_id={node_id:?}",
+                token.resource, token.owner, token.claim_no
+            )
+        });
+        let granted = self.granted[idx];
+        assert!(
+            granted.claim_no == token.claim_no
+                && granted.mode == mode
+                && granted.provisional_node == Some(node_id),
+            "provisional cancellation grant identity mismatch: \
+             resource={}, owner={}, claim_no={:?}, mode={}, node_id={node_id:?}, \
+             actual_grant={granted:?}",
+            token.resource,
+            token.owner,
+            token.claim_no,
+            mode
+        );
+        self.granted.remove(idx);
+    }
+
+    #[inline]
+    fn remove_fresh_grant(&mut self, token: &PendingClaimToken, mode: LockMode) {
+        let idx = self.granted_idx(token.owner).unwrap_or_else(|| {
+            panic!(
+                "fresh pending rollback cannot find its exact manager grant: \
+                 resource={}, owner={}, claim_no={:?}",
+                token.resource, token.owner, token.claim_no
+            )
+        });
+        let granted = self.granted[idx];
+        assert!(
+            granted.claim_no == token.claim_no
+                && granted.mode == mode
+                && granted.provisional_node.is_none(),
+            "fresh pending rollback grant identity mismatch: \
+             resource={}, owner={}, claim_no={:?}, mode={}, actual_grant={granted:?}",
+            token.resource,
+            token.owner,
+            token.claim_no,
+            mode
+        );
+        self.granted.remove(idx);
+    }
+
+    #[inline]
+    fn remove_accepted(&mut self, token: &ClaimToken) {
+        let idx = self.granted_idx(token.owner).unwrap_or_else(|| {
+            panic!(
+                "accepted release cannot find its exact manager grant: \
+                 resource={}, owner={}, claim_no={:?}",
+                token.resource, token.owner, token.claim_no
+            )
+        });
+        let granted = self.granted[idx];
+        assert!(
+            granted.claim_no == token.claim_no && granted.provisional_node.is_none(),
+            "accepted release token does not identify a held exact grant: \
+             resource={}, owner={}, token_claim_no={:?}, actual_grant={granted:?}",
+            token.resource,
+            token.owner,
+            token.claim_no
+        );
+        self.granted.remove(idx);
+    }
+
+    #[inline]
+    fn release_owner(
+        &mut self,
+        resource: LockResource,
+        owner: LockOwner,
+    ) -> (usize, Vec<Arc<Completion<()>>>) {
+        let mut removed = 0;
+        let mut notifications = Vec::new();
+        let node_ids = self
+            .wait_queue
+            .occupied_ids()
+            .into_iter()
+            .filter(|&id| self.wait_queue.node(id).owner == owner)
+            .collect::<Vec<_>>();
+
+        for node_id in node_ids {
+            let completion = Arc::clone(&self.wait_queue.node(node_id).completion);
+            match self.wait_queue.node(node_id).phase {
+                WaitNodePhase::Queued { .. } => {
+                    self.wait_queue.detach_to(node_id, WaitNodePhase::Released);
+                    notifications.push(completion);
+                    removed += 1;
+                }
+                WaitNodePhase::Provisional => {
+                    let node = self.wait_queue.node(node_id);
+                    let idx = self.granted_idx(owner).unwrap_or_else(|| {
+                        panic!(
+                            "migration cleanup found a provisional node without its grant: \
+                             resource={resource}, owner={owner}, node_id={node_id:?}"
+                        )
+                    });
+                    assert!(
+                        self.granted[idx].claim_no == node.claim_no
+                            && self.granted[idx].mode == node.target_mode
+                            && self.granted[idx].provisional_node == Some(node_id),
+                        "migration cleanup provisional grant/node mismatch: \
+                         resource={resource}, owner={owner}, node_id={node_id:?}, \
+                         node_claim_no={:?}, node_mode={}, actual_grant={:?}",
+                        node.claim_no,
+                        node.target_mode,
+                        self.granted[idx],
+                    );
+                    self.granted.remove(idx);
+                    self.wait_queue.set_released(node_id);
+                    notifications.push(completion);
+                    removed += 1;
+                }
+                WaitNodePhase::Released => {}
+            }
+        }
+
+        let before = self.granted.len();
+        self.granted.retain(|granted| granted.owner != owner);
+        removed += before - self.granted.len();
+        notifications.extend(self.grant_waiters(resource));
+        (removed, notifications)
     }
 
     #[inline]
     fn is_empty(&self) -> bool {
-        self.granted.is_empty() && self.waiters.is_empty()
+        self.granted.is_empty()
+            && self.wait_queue.is_linked_empty()
+            && self.wait_queue.live_count() == 0
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct GrantedLock {
     owner: LockOwner,
+    claim_no: ClaimNo,
     mode: LockMode,
+    provisional_node: Option<WaitNodeID>,
 }
 
-/// Cancellation guard for a queued acquisition.
-///
-/// If the acquire future is dropped while waiting, the guard removes the exact
-/// queued waiter. If cancellation races with promotion, the guard removes the
-/// unobserved grant before it can leak.
-struct WaiterGuard {
-    resources: Weak<FastDashMap<LockResource, ResourceState>>,
-    resource: LockResource,
-    waiter: Arc<Waiter>,
-    active: bool,
+enum PendingStart {
+    Immediate,
+    Waiting {
+        node_id: WaitNodeID,
+        completion: Arc<Completion<()>>,
+    },
 }
 
-impl WaiterGuard {
-    #[inline]
-    fn new(
-        resources: &Arc<FastDashMap<LockResource, ResourceState>>,
-        resource: LockResource,
-        waiter: Arc<Waiter>,
-    ) -> Self {
-        waiter.add_guard();
-        WaiterGuard {
-            resources: Arc::downgrade(resources),
-            resource,
-            waiter,
-            active: true,
-        }
-    }
-
-    #[inline]
-    fn disarm_after_grant_observed(&mut self) {
-        if !self.active {
-            return;
-        }
-        self.waiter.mark_grant_observed();
-        self.waiter.remove_guard();
-        self.active = false;
-    }
-}
-
-impl Drop for WaiterGuard {
-    #[inline]
-    fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-        self.active = false;
-        if !self.waiter.remove_guard() || self.waiter.grant_observed() {
-            return;
-        }
-        let Some(resources) = self.resources.upgrade() else {
-            return;
-        };
-        let mut notify = Vec::new();
-        let remove_resource = {
-            if let Some(mut resource_state) = resources.get_mut(&self.resource) {
-                if let Some(waiter) = resource_state.remove_waiter(&self.waiter) {
-                    waiter.set_outcome(WaitOutcome::Released);
-                    notify.extend(resource_state.grant_waiters(self.resource));
-                } else if self.waiter.outcome() == WaitOutcome::Granted {
-                    let removed = resource_state.remove_granted(self.waiter.owner);
-                    if removed > 0 {
-                        self.waiter.set_outcome(WaitOutcome::Released);
-                        notify.extend(resource_state.grant_waiters(self.resource));
-                    }
-                }
-                resource_state.is_empty()
-            } else {
-                false
-            }
-        };
-        if remove_resource {
-            resources.remove_if(&self.resource, |_resource, resource_state| {
-                resource_state.is_empty()
-            });
-        }
-        notify_waiters(notify);
-    }
-}
-
-struct Waiter {
-    owner: LockOwner,
-    mode: LockMode,
-    outcome: Mutex<WaitOutcome>,
-    event: Event,
-    active_guards: AtomicUsize,
-    grant_observed: AtomicBool,
-}
-
-impl Waiter {
-    #[inline]
-    fn new(owner: LockOwner, mode: LockMode) -> Self {
-        Waiter {
-            owner,
-            mode,
-            outcome: Mutex::new(WaitOutcome::Waiting),
-            event: Event::new(),
-            active_guards: AtomicUsize::new(0),
-            grant_observed: AtomicBool::new(false),
-        }
-    }
-
-    #[inline]
-    fn outcome(&self) -> WaitOutcome {
-        *self.outcome.lock()
-    }
-
-    #[inline]
-    fn set_outcome(&self, outcome: WaitOutcome) {
-        *self.outcome.lock() = outcome;
-    }
-
-    #[inline]
-    fn add_guard(&self) {
-        self.active_guards.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[inline]
-    fn remove_guard(&self) -> bool {
-        self.active_guards.fetch_sub(1, Ordering::AcqRel) == 1
-    }
-
-    #[inline]
-    fn mark_grant_observed(&self) {
-        self.grant_observed.store(true, Ordering::Release);
-    }
-
-    #[inline]
-    fn grant_observed(&self) -> bool {
-        self.grant_observed.load(Ordering::Acquire)
-    }
-
-    #[inline]
-    #[cfg(test)]
-    fn active_guard_count(&self) -> usize {
-        self.active_guards.load(Ordering::Acquire)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WaitOutcome {
-    Waiting,
-    Granted,
+enum PendingObservation {
+    Adopted,
     Released,
 }
 
-enum AcquireImmediate {
-    Granted(LockGrant),
-    WouldWait,
-    AlreadyWaiting(Arc<Waiter>),
+#[cfg(test)]
+struct RawPendingGuard<'a> {
+    manager: &'a LockManager,
+    token: Option<PendingClaimToken>,
+    mode: LockMode,
+    state: wait::PendingGuardState,
 }
 
-#[inline]
-fn notify_waiters(waiters: Vec<Arc<Waiter>>) {
-    for waiter in waiters {
-        waiter.event.notify(usize::MAX);
+#[cfg(test)]
+impl<'a> RawPendingGuard<'a> {
+    #[inline]
+    fn new(manager: &'a LockManager, token: PendingClaimToken, mode: LockMode) -> Self {
+        Self {
+            manager,
+            token: Some(token),
+            mode,
+            state: wait::PendingGuardState::NotStarted,
+        }
+    }
+
+    #[inline]
+    fn start(&mut self) -> OperationResult<()> {
+        let token = self
+            .token
+            .as_ref()
+            .unwrap_or_else(|| panic!("raw pending guard must retain its token before start"));
+        self.state = match self.manager.start_pending(token, self.mode)? {
+            PendingStart::Immediate => wait::PendingGuardState::FreshGranted,
+            PendingStart::Waiting {
+                node_id,
+                completion,
+            } => wait::PendingGuardState::Waiting {
+                node_id,
+                completion,
+            },
+        };
+        Ok(())
+    }
+
+    #[inline]
+    async fn wait_and_observe(&mut self) -> OperationResult<()> {
+        let wait::PendingGuardState::Waiting {
+            node_id,
+            completion,
+        } = &self.state
+        else {
+            return Ok(());
+        };
+        let node_id = *node_id;
+        let completion = Arc::clone(completion);
+        assert!(
+            completion.wait_take_result().await.is_ok(),
+            "raw lock waiter success-only completion carried an error"
+        );
+        let token = self
+            .token
+            .as_ref()
+            .unwrap_or_else(|| panic!("raw pending guard lost its token before observation"));
+        match self.manager.observe_pending(token, self.mode, node_id) {
+            PendingObservation::Adopted => {
+                self.state = wait::PendingGuardState::FreshGranted;
+                Ok(())
+            }
+            PendingObservation::Released => {
+                self.state = wait::PendingGuardState::Disarmed;
+                let token = self.token.take().unwrap_or_else(|| {
+                    panic!("released raw pending guard must retain its move-only token")
+                });
+                Err(lock_waiter_released_err(token, self.mode))
+            }
+        }
+    }
+
+    #[inline]
+    fn disarm(&mut self) {
+        self.state = wait::PendingGuardState::Disarmed;
+        let _ = self.token.take();
+    }
+}
+
+#[cfg(test)]
+impl Drop for RawPendingGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        let token = self.token.take();
+        match &self.state {
+            wait::PendingGuardState::NotStarted => {
+                assert!(
+                    token.is_some(),
+                    "unstarted raw pending guard must retain its move-only token"
+                );
+            }
+            wait::PendingGuardState::Disarmed => {
+                assert!(
+                    token.is_none(),
+                    "disarmed raw pending guard must not retain a pending token"
+                );
+            }
+            wait::PendingGuardState::Waiting { node_id, .. } => {
+                let token = token.unwrap_or_else(|| {
+                    panic!("waiting raw pending guard must retain its move-only token")
+                });
+                self.manager.cancel_waiting(token, self.mode, *node_id);
+            }
+            wait::PendingGuardState::FreshGranted => {
+                let token = token.unwrap_or_else(|| {
+                    panic!("fresh-granted raw pending guard must retain its move-only token")
+                });
+                self.manager.cancel_fresh_grant(token, self.mode);
+            }
+        }
     }
 }
 
 #[inline]
-fn mark_waiters(waiters: &[Arc<Waiter>], outcome: WaitOutcome) {
-    for waiter in waiters {
-        waiter.set_outcome(outcome);
+fn notify_completions(completions: Vec<Arc<Completion<()>>>) {
+    for completion in completions {
+        completion.complete(Ok(()));
     }
 }
 
@@ -1055,6 +1282,14 @@ fn conversion_not_supported_err(
 }
 
 #[inline]
+fn lock_waiter_released_err(token: PendingClaimToken, mode: LockMode) -> Report<OperationError> {
+    Report::new(OperationError::LockWaiterReleased).attach(format!(
+        "resource={}, owner={}, claim_no={:?}, mode={mode}",
+        token.resource, token.owner, token.claim_no
+    ))
+}
+
+#[inline]
 fn lock_family_conflict_err(
     resource: LockResource,
     held: LockMode,
@@ -1071,8 +1306,10 @@ fn lock_family_conflict_err(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use super::wait::tests::{linked_ids as linked_waiter_ids, queue_snapshot};
     use super::*;
     use smol::Timer;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::time::Duration;
 
     /// Debug snapshot of all granted locks and queued waiters.
@@ -1080,6 +1317,25 @@ pub(crate) mod tests {
     pub(crate) struct LockDebugSnapshot {
         /// Granted and waiting lock entries.
         pub(crate) entries: Vec<LockDebugEntry>,
+        /// Per-resource waiter-slab diagnostics.
+        pub(crate) resources: Vec<LockDebugResource>,
+    }
+
+    /// Waiter storage diagnostics for one manager resource.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct LockDebugResource {
+        /// Resource containing this waiter storage.
+        pub(crate) resource: LockResource,
+        /// Number of allocated slab slots.
+        pub(crate) waiter_slots: usize,
+        /// Retained slab vector capacity.
+        pub(crate) waiter_capacity: usize,
+        /// Number of occupied waiter nodes in any phase.
+        pub(crate) live_waiters: usize,
+        /// Direct-index free-list order.
+        pub(crate) free_slots: Vec<usize>,
+        /// Generation of every allocated slot.
+        pub(crate) generations: Vec<u64>,
     }
 
     /// One granted lock or queued waiter in a debug snapshot.
@@ -1091,10 +1347,16 @@ pub(crate) mod tests {
         pub(crate) mode: LockMode,
         /// Owner for this entry.
         pub(crate) owner: LockOwner,
+        /// Exact manager claim number.
+        pub(crate) claim_no: ClaimNo,
         /// Whether the entry is granted or waiting.
         pub(crate) state: LockDebugEntryState,
         /// FIFO queue order for waiters; `None` for granted locks.
         pub(crate) queue_order: Option<usize>,
+        /// Resource-local waiter slot for queued, provisional, or released state.
+        pub(crate) wait_slot: Option<usize>,
+        /// Generation paired with `wait_slot`.
+        pub(crate) wait_generation: Option<u64>,
     }
 
     /// Granted-or-waiting state for a debug snapshot entry.
@@ -1104,6 +1366,10 @@ pub(crate) mod tests {
         Granted,
         /// Lock is waiting in the resource queue.
         Waiting,
+        /// An exact grant is installed but its waiter has not observed it.
+        Provisional,
+        /// Migration cleanup released the request before its observer resumed.
+        Released,
     }
 
     /// Captures the current lock table for tests.
@@ -1116,12 +1382,25 @@ pub(crate) mod tests {
             .collect();
         resources.sort_unstable();
         let mut entries = Vec::new();
+        let mut resource_diagnostics = Vec::new();
         for resource in resources {
             if let Some(resource_state) = manager.resources.get(&resource) {
                 entries.extend(snapshot_entries(resource_state.value(), resource));
+                let queue = queue_snapshot(&resource_state.wait_queue);
+                resource_diagnostics.push(LockDebugResource {
+                    resource,
+                    waiter_slots: queue.slab.slots_len,
+                    waiter_capacity: queue.slab.capacity,
+                    live_waiters: queue.slab.live_count,
+                    free_slots: queue.slab.free_order,
+                    generations: queue.slab.generations,
+                });
             }
         }
-        LockDebugSnapshot { entries }
+        LockDebugSnapshot {
+            entries,
+            resources: resource_diagnostics,
+        }
     }
 
     /// Attempts to acquire a lock without waiting.
@@ -1133,11 +1412,33 @@ pub(crate) mod tests {
         owner: LockOwner,
     ) -> OperationResult<bool> {
         mode.assert_valid_for(resource);
-        let mut resource_state = manager.resources.entry(resource).or_default();
-        match resource_state.try_acquire_immediate(resource, mode, owner)? {
-            AcquireImmediate::Granted(_) => Ok(true),
-            AcquireImmediate::WouldWait | AcquireImmediate::AlreadyWaiting(_) => Ok(false),
+        let pending = PendingClaimToken {
+            resource,
+            owner,
+            claim_no: ClaimNo::new(0),
+        };
+        if manager.raw_existing_acquire(&pending, mode)? {
+            return Ok(true);
         }
+        let (granted, empty) = {
+            let mut resource_state = manager.resources.entry(resource).or_default();
+            let family_covered = resource_state.validate_family_coverage(resource, mode, owner)?;
+            let granted = resource_state.compatible_with_granted(resource, mode, owner)
+                && (family_covered || resource_state.wait_queue.is_linked_empty());
+            if granted {
+                resource_state.granted.push(GrantedLock {
+                    owner,
+                    claim_no: pending.claim_no,
+                    mode,
+                    provisional_node: None,
+                });
+            }
+            (granted, resource_state.is_empty())
+        };
+        if empty {
+            manager.remove_if_empty(resource);
+        }
+        Ok(granted)
     }
 
     #[inline]
@@ -1145,26 +1446,49 @@ pub(crate) mod tests {
         resource_state: &ResourceState,
         resource: LockResource,
     ) -> Vec<LockDebugEntry> {
-        let mut entries =
-            Vec::with_capacity(resource_state.granted.len() + resource_state.waiters.len());
+        let queue_ids = linked_waiter_ids(&resource_state.wait_queue);
+        let mut entries = Vec::with_capacity(
+            resource_state.granted.len() + resource_state.wait_queue.live_count(),
+        );
         entries.extend(resource_state.granted.iter().map(|granted| LockDebugEntry {
             resource,
             mode: granted.mode,
             owner: granted.owner,
-            state: LockDebugEntryState::Granted,
+            claim_no: granted.claim_no,
+            state: if granted.provisional_node.is_some() {
+                LockDebugEntryState::Provisional
+            } else {
+                LockDebugEntryState::Granted
+            },
             queue_order: None,
+            wait_slot: granted.provisional_node.map(|id| id.slot),
+            wait_generation: granted.provisional_node.map(|id| id.generation),
         }));
         entries.extend(
             resource_state
-                .waiters
-                .iter()
-                .enumerate()
-                .map(|(queue_order, waiter)| LockDebugEntry {
-                    resource,
-                    mode: waiter.mode,
-                    owner: waiter.owner,
-                    state: LockDebugEntryState::Waiting,
-                    queue_order: Some(queue_order),
+                .wait_queue
+                .occupied_ids()
+                .into_iter()
+                .filter_map(|node_id| {
+                    let waiter = resource_state.wait_queue.node(node_id);
+                    let (state, queue_order) = match waiter.phase {
+                        WaitNodePhase::Queued { .. } => (
+                            LockDebugEntryState::Waiting,
+                            queue_ids.iter().position(|&id| id == node_id),
+                        ),
+                        WaitNodePhase::Provisional => return None,
+                        WaitNodePhase::Released => (LockDebugEntryState::Released, None),
+                    };
+                    Some(LockDebugEntry {
+                        resource,
+                        mode: waiter.target_mode,
+                        owner: waiter.owner,
+                        claim_no: waiter.claim_no,
+                        state,
+                        queue_order,
+                        wait_slot: Some(node_id.slot),
+                        wait_generation: Some(node_id.generation),
+                    })
                 }),
         );
         entries
@@ -1265,26 +1589,6 @@ pub(crate) mod tests {
             Timer::after(Duration::from_millis(1)).await;
         }
         panic!("waiter count did not reach {expected}");
-    }
-
-    async fn wait_for_owner_guard_count(
-        manager: &LockManager,
-        resource: LockResource,
-        owner: LockOwner,
-        expected: usize,
-    ) {
-        for _ in 0..100 {
-            let actual = manager
-                .resources
-                .get(&resource)
-                .and_then(|resource_state| resource_state.waiter_by_owner(owner))
-                .map_or(0, |waiter| waiter.active_guard_count());
-            if actual == expected {
-                return;
-            }
-            Timer::after(Duration::from_millis(1)).await;
-        }
-        panic!("waiter guard count did not reach {expected}");
     }
 
     #[test]
@@ -1836,7 +2140,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn duplicate_async_acquire_reuses_existing_waiter() {
+    fn duplicate_pending_owner_is_detected_without_sharing_an_observer() {
         smol::block_on(async {
             let manager = Arc::new(LockManager::new());
             let resource = table_metadata(TableID::new(71));
@@ -1851,59 +2155,16 @@ pub(crate) mod tests {
             };
             wait_for_waiters(&manager, resource, 1).await;
 
-            let second_waiter = {
-                let manager = Arc::clone(&manager);
-                smol::spawn(async move { manager.acquire(resource, LockMode::Shared, owner).await })
-            };
-            wait_for_owner_guard_count(&manager, resource, owner, 2).await;
-
+            let panic = catch_unwind(AssertUnwindSafe(|| {
+                let _ = try_acquire(&manager, resource, LockMode::Shared, owner);
+            }));
+            assert!(panic.is_err());
             let snapshot = debug_snapshot(&manager);
             assert_eq!(
                 count_entries(&snapshot, resource, LockDebugEntryState::Waiting),
                 1
             );
-            assert_eq!(manager.release(resource, trx(TrxID::new(1))), 1);
-            first_waiter.await.unwrap();
-            second_waiter.await.unwrap();
-
-            let snapshot = debug_snapshot(&manager);
-            assert_eq!(
-                snapshot
-                    .entries
-                    .iter()
-                    .filter(|entry| {
-                        entry.owner == owner && entry.state == LockDebugEntryState::Granted
-                    })
-                    .count(),
-                1
-            );
-        });
-    }
-
-    #[test]
-    fn try_acquire_returns_false_for_existing_same_owner_waiter() {
-        smol::block_on(async {
-            let manager = Arc::new(LockManager::new());
-            let resource = table_metadata(TableID::new(50));
-            let owner = trx(TrxID::new(2));
-            assert!(
-                try_acquire(&manager, resource, LockMode::Exclusive, trx(TrxID::new(1))).unwrap()
-            );
-
-            let waiter = {
-                let manager = Arc::clone(&manager);
-                smol::spawn(async move { manager.acquire(resource, LockMode::Shared, owner).await })
-            };
-            wait_for_waiters(&manager, resource, 1).await;
-
-            assert!(!try_acquire(&manager, resource, LockMode::Shared, owner).unwrap());
-            let snapshot = debug_snapshot(&manager);
-            assert_eq!(
-                count_entries(&snapshot, resource, LockDebugEntryState::Waiting),
-                1
-            );
-
-            assert!(waiter.cancel().await.is_none());
+            assert!(first_waiter.cancel().await.is_none());
         });
     }
 
@@ -1936,45 +2197,6 @@ pub(crate) mod tests {
                     .iter()
                     .any(|entry| entry.owner == trx(TrxID::new(2)))
             );
-        });
-    }
-
-    #[test]
-    fn cancelling_duplicate_waiter_keeps_shared_waiter_queued() {
-        smol::block_on(async {
-            let manager = Arc::new(LockManager::new());
-            let resource = table_metadata(TableID::new(53));
-            let owner = trx(TrxID::new(2));
-            assert!(
-                try_acquire(&manager, resource, LockMode::Exclusive, trx(TrxID::new(1))).unwrap()
-            );
-
-            let first_waiter = {
-                let manager = Arc::clone(&manager);
-                smol::spawn(async move { manager.acquire(resource, LockMode::Shared, owner).await })
-            };
-            wait_for_waiters(&manager, resource, 1).await;
-
-            let duplicate_waiter = {
-                let manager = Arc::clone(&manager);
-                smol::spawn(async move { manager.acquire(resource, LockMode::Shared, owner).await })
-            };
-            wait_for_owner_guard_count(&manager, resource, owner, 2).await;
-
-            assert!(duplicate_waiter.cancel().await.is_none());
-            wait_for_owner_guard_count(&manager, resource, owner, 1).await;
-            let snapshot = debug_snapshot(&manager);
-            assert_eq!(
-                count_entries(&snapshot, resource, LockDebugEntryState::Waiting),
-                1
-            );
-
-            assert_eq!(manager.release(resource, trx(TrxID::new(1))), 1);
-            first_waiter.await.unwrap();
-            let snapshot = debug_snapshot(&manager);
-            assert!(snapshot.entries.iter().any(|entry| {
-                entry.owner == owner && entry.state == LockDebugEntryState::Granted
-            }));
         });
     }
 
@@ -2017,21 +2239,29 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn active_waiter_guard_removes_unobserved_grant() {
+    fn pending_guard_removes_a_promoted_but_unobserved_grant() {
         let manager = LockManager::new();
         let resource = table_metadata(TableID::new(52));
-        let waiter = Arc::new(Waiter::new(trx(TrxID::new(2)), LockMode::Shared));
-        {
-            let mut resource_state = manager.resources.entry(resource).or_default();
-            resource_state.waiters.push_back(Arc::clone(&waiter));
-        }
-        let waiter_guard = WaiterGuard::new(&manager.resources, resource, Arc::clone(&waiter));
-        {
-            let mut resource_state = manager.resources.get_mut(&resource).unwrap();
-            assert_eq!(resource_state.grant_waiters(resource).len(), 1);
-        }
+        let blocker = trx(TrxID::new(1));
+        assert!(try_acquire(&manager, resource, LockMode::Exclusive, blocker).unwrap());
+        let token = PendingClaimToken {
+            resource,
+            owner: trx(TrxID::new(2)),
+            claim_no: ClaimNo::new(7),
+        };
+        let mut guard = RawPendingGuard::new(&manager, token, LockMode::Shared);
+        guard.start().unwrap();
+        assert_eq!(manager.release(resource, blocker), 1);
+        assert_eq!(
+            count_entries(
+                &debug_snapshot(&manager),
+                resource,
+                LockDebugEntryState::Provisional
+            ),
+            1
+        );
 
-        drop(waiter_guard);
+        drop(guard);
 
         let snapshot = debug_snapshot(&manager);
         assert!(
@@ -2043,29 +2273,104 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn grant_waiters_deduplicates_existing_owner_grants() {
+    fn grant_waiters_installs_a_provisional_grant_for_each_fifo_node() {
         let resource = table_data(TableID::new(54));
         let mut resource_state = ResourceState::default();
-        resource_state.granted.push(GrantedLock {
-            owner: trx(TrxID::new(2)),
-            mode: LockMode::IntentShared,
+        let first = resource_state.wait_queue.append(
+            trx(TrxID::new(2)),
+            ClaimNo::new(2),
+            LockMode::IntentShared,
+            Arc::new(Completion::new()),
+        );
+        let second = resource_state.wait_queue.append(
+            trx(TrxID::new(3)),
+            ClaimNo::new(3),
+            LockMode::IntentExclusive,
+            Arc::new(Completion::new()),
+        );
+
+        let notifications = resource_state.grant_waiters(resource);
+
+        assert_eq!(notifications.len(), 2);
+        assert_eq!(resource_state.granted.len(), 2);
+        assert_eq!(
+            resource_state.wait_queue.node(first).phase,
+            WaitNodePhase::Provisional
+        );
+        assert_eq!(
+            resource_state.wait_queue.node(second).phase,
+            WaitNodePhase::Provisional
+        );
+        assert_eq!(resource_state.granted[0].provisional_node, Some(first));
+        assert_eq!(resource_state.granted[1].provisional_node, Some(second));
+    }
+
+    #[test]
+    fn immediate_fresh_grant_allocates_no_waiter_storage() {
+        let manager = LockManager::new();
+        let resource = table_metadata(TableID::new(55));
+        let owner = trx(TrxID::new(55));
+
+        assert!(try_acquire(&manager, resource, LockMode::Shared, owner).unwrap());
+
+        let snapshot = debug_snapshot(&manager);
+        let diagnostics = snapshot
+            .resources
+            .iter()
+            .find(|entry| entry.resource == resource)
+            .unwrap();
+        assert_eq!(diagnostics.waiter_slots, 0);
+        assert_eq!(diagnostics.waiter_capacity, 0);
+        assert_eq!(diagnostics.live_waiters, 0);
+        assert!(diagnostics.free_slots.is_empty());
+        let grant = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.owner == owner)
+            .unwrap();
+        assert_eq!(grant.claim_no, ClaimNo::new(0));
+        assert_eq!(grant.state, LockDebugEntryState::Granted);
+    }
+
+    #[test]
+    fn external_provisional_release_retains_node_until_observation() {
+        smol::block_on(async {
+            let manager = LockManager::new();
+            let resource = table_metadata(TableID::new(56));
+            let blocker = trx(TrxID::new(56));
+            let waiting_owner = trx(TrxID::new(57));
+            assert!(try_acquire(&manager, resource, LockMode::Exclusive, blocker).unwrap());
+            let token = PendingClaimToken {
+                resource,
+                owner: waiting_owner,
+                claim_no: ClaimNo::new(9),
+            };
+            let mut guard = RawPendingGuard::new(&manager, token, LockMode::Shared);
+            guard.start().unwrap();
+
+            assert_eq!(manager.release(resource, blocker), 1);
+            assert_eq!(
+                count_entries(
+                    &debug_snapshot(&manager),
+                    resource,
+                    LockDebugEntryState::Provisional
+                ),
+                1
+            );
+            assert_eq!(manager.release_owner(waiting_owner), 1);
+            let released = debug_snapshot(&manager);
+            assert_eq!(
+                count_entries(&released, resource, LockDebugEntryState::Released),
+                1
+            );
+            assert_eq!(released.resources[0].live_waiters, 1);
+            assert!(manager.resources.get(&resource).is_some());
+
+            let err = guard.wait_and_observe().await.unwrap_err();
+            assert_eq!(*err.current_context(), OperationError::LockWaiterReleased);
+            drop(guard);
+            assert!(manager.resources.get(&resource).is_none());
         });
-        let covered_waiter = Arc::new(Waiter::new(trx(TrxID::new(2)), LockMode::IntentShared));
-        let stronger_waiter = Arc::new(Waiter::new(trx(TrxID::new(2)), LockMode::IntentExclusive));
-        resource_state
-            .waiters
-            .push_back(Arc::clone(&covered_waiter));
-        resource_state
-            .waiters
-            .push_back(Arc::clone(&stronger_waiter));
-
-        let granted_waiters = resource_state.grant_waiters(resource);
-
-        assert_eq!(granted_waiters.len(), 2);
-        assert_eq!(covered_waiter.outcome(), WaitOutcome::Granted);
-        assert_eq!(stronger_waiter.outcome(), WaitOutcome::Granted);
-        assert_eq!(resource_state.granted.len(), 1);
-        assert_eq!(resource_state.granted[0].mode, LockMode::IntentExclusive);
     }
 
     #[test]
@@ -2117,6 +2422,12 @@ pub(crate) mod tests {
 
             assert_eq!(manager.release_owner(trx(TrxID::new(2))), 1);
             assert_eq!(manager.release_owner(trx(TrxID::new(3))), 1);
+            let released = debug_snapshot(&manager);
+            assert_eq!(
+                count_entries(&released, resource, LockDebugEntryState::Released),
+                2
+            );
+            assert_eq!(released.resources[0].live_waiters, 2);
             assert_eq!(
                 *first_waiter.await.unwrap_err().current_context(),
                 OperationError::LockWaiterReleased

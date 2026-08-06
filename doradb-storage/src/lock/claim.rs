@@ -7,11 +7,29 @@ pub(super) struct ScopeClaim {
     pub(super) mode: LockMode,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(super) struct ClaimToken {
     pub(super) resource: LockResource,
     pub(super) owner: LockOwner,
     pub(super) claim_no: ClaimNo,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct PendingClaimToken {
+    pub(super) resource: LockResource,
+    pub(super) owner: LockOwner,
+    pub(super) claim_no: ClaimNo,
+}
+
+impl PendingClaimToken {
+    #[inline]
+    pub(super) fn accept(self) -> ClaimToken {
+        ClaimToken {
+            resource: self.resource,
+            owner: self.owner,
+            claim_no: self.claim_no,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

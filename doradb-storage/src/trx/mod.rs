@@ -5229,7 +5229,7 @@ pub(crate) mod tests {
                 stmt_owner,
                 resource,
                 LockMode::Shared,
-                LockDebugEntryState::Granted,
+                LockDebugEntryState::Provisional,
             ));
         }
 

@@ -2,23 +2,22 @@
 
 ## Status and Purpose
 
-This document is a pre-RFC design study for Doradb's logical lock system.
+This document describes Doradb's implemented logical lock system and the
+remaining RFC-0027 redesign direction.
 
 It has three purposes:
 
 1. Describe the behavior and constraints of the implemented lock manager.
-2. Present the current working direction for redesigning its ownership,
-   resource, waiter, and cleanup structures.
-3. Preserve the limitations and unresolved questions that must be answered
-   before the redesign becomes an RFC.
+2. Present the remaining working direction for physical family aggregation.
+3. Preserve the limitations and follow-up work assigned to later RFC phases.
 
-This document is not yet an implementation contract. The implemented baseline
-is the code in `doradb-storage/src/lock/` and its lifecycle call sites.
+The implemented baseline is the code in `doradb-storage/src/lock/` and its
+lifecycle call sites.
 [RFC-0016](./rfcs/0016-logical-lock-manager.md) records the original accepted
 design, but subsequent work has changed parts of it; notably, the implemented
 manager no longer has `CatalogNamespace`. Where this document says **current**,
 it describes the implementation. Where it says **working design**, it describes
-the pre-RFC proposal.
+the remaining RFC-0027 Phase 3 direction.
 
 Deadlock handling is intentionally excluded. It is tracked independently in
 [backlog 000167](./backlogs/000167-logical-lock-deadlock-handling.md) and should
@@ -39,9 +38,9 @@ resources:
 The current manager represents session-explicit, transaction, statement, DDL,
 and maintenance owners as canonical exact owners with one session family and
 one scope. Each exact owner still produces a separate physical grant. Each
-resource stores grants in a `Vec` and waiters in a `VecDeque`. This is
-functionally small and cancellation-aware, but many operations scan all grants
-or rebuild the whole queue.
+resource stores grants in a `Vec` and blocked requests in a resource-local
+generational slab with intrusive FIFO links. Cancellation validates a
+`WaitNodeID { slot, generation }` and unlinks a queued node in `O(1)`.
 
 The working design separates:
 
@@ -288,12 +287,20 @@ The current resource state is:
 ```rust
 struct ResourceState {
     granted: Vec<GrantedLock>,
-    waiters: VecDeque<Arc<Waiter>>,
+    wait_queue: WaitQueue,
 }
 
 struct GrantedLock {
     owner: LockOwner,
+    claim_no: ClaimNo,
     mode: LockMode,
+    provisional_node: Option<WaitNodeID>,
+}
+
+struct WaitQueue {
+    head: Option<WaitNodeID>,
+    tail: Option<WaitNodeID>,
+    nodes: WaitNodeSlab,
 }
 ```
 
@@ -334,9 +341,9 @@ new number.
 
 Repeated covered acquisition by the same exact scope is fully local. A fresh
 claim covered by another scope in the family still creates its own exact
-manager grant in Phase 1. Thus the manager representation below remains an
-exact mirror while owner-side state supplies bounded family lookup and
-targeted cleanup.
+manager grant in Phase 2. Thus the manager representation remains an exact
+mirror while owner-side state supplies bounded family lookup and targeted
+cleanup. Physical family aggregation remains RFC-0027 Phase 3.
 
 Transactions, DDL, maintenance, and explicit-lock mutations reserve ids from
 one plain session-local sequence. One public DDL call retains one
@@ -404,23 +411,31 @@ reclaims that exact allocation before acquiring again or closing.
 
 ### Wait and cancellation behavior
 
-The current waiter is an `Arc` containing:
+A fresh attempt reserves one move-only `PendingClaimToken` before manager
+entry. Immediate compatibility installs an exact grant without allocating a
+completion or waiter slot. A blocked attempt allocates one `Completion<()>`
+and one reusable `WaitNode` containing the same exact owner, `ClaimNo`, and
+target mode.
 
-- exact owner and owner group;
-- target mode;
-- `Waiting`, `Granted`, or `Released` outcome;
-- an `Event`;
-- active cancellation-guard count; and
-- a grant-observed flag.
+Queued nodes carry intrusive `prev` and `next` links. Promotion detaches the
+maximal compatible FIFO prefix, installs exact provisional grants, marks the
+nodes `Provisional`, drops manager synchronization, and then completes their
+one-shot notifications. Provisional grants fully participate in compatibility
+and family coverage.
 
-Duplicate acquisitions by the same exact owner share the waiter. The last
-cancellation guard:
+The unique observer uses `wait_take_result()` and validates the token, node
+generation, fields, node phase, and provisional grant in one manager
+transition. Observation clears the provisional marker and reclaims the node;
+the retained exact grant then pins the resource while `PendingClaimGuard`
+publishes the family/resource and scope/resource records. There is no second
+manager transition after observation.
 
-- removes a queued waiter; or
-- removes a promoted but unobserved grant.
-
-Promotion installs the grant before notifying the async task. This closes the
-wakeup interval in which an incompatible request could otherwise be admitted.
+Dropping `PendingClaimGuard` synchronously removes only its exact queued node,
+provisional grant and node, adopted fresh grant, or matching partial local
+publication. Migration-only external cleanup instead marks queued or
+provisional nodes `Released`, retains the occupied slot and resource, and
+wakes the unique observer to return `LockWaiterReleased`. Duplicate pending
+observer sharing is no longer supported.
 
 ### Current complexity
 
@@ -436,12 +451,12 @@ Approximate current costs are:
 | Operation | Current cost |
 |---|---:|
 | Find same owner grant | `O(G)` |
-| Find same owner waiter | `O(W)` |
+| Detect impossible same-owner pending state | `O(W)` migration defense |
 | Validate same-session owners | `O(G + W)` |
 | Fresh acquisition | `O(G + W)` |
 | Immediate conversion | `O(G + W)` |
 | Release one owner/resource | `O(G + W)` plus promotion work |
-| Cancel one waiter | `O(W)` plus promotion work |
+| Cancel one queued waiter by token | `O(1)` plus promotion work |
 | Promote `K` waiters | up to `O(K * (G + K))` |
 | Exact-scope cleanup | sum of release costs over `H_scope` |
 | Session-explicit cleanup | sum of release costs over its `H_scope` |
@@ -654,7 +669,7 @@ LockManager
     └── family -> exact claims and optional waiter
 
 active acquisition call
-└── PendingAcquireGuard -> waiter or fresh claim
+└── PendingClaimGuard -> waiter or fresh exact grant
 ```
 
 Neither index replaces the other:
@@ -710,11 +725,11 @@ by transactions and statements.
 
 An acquisition borrows the family execution authority and target scope
 exclusively across `.await`. A pending request is therefore not inserted into
-the scope map. Its call-local guard owns the waiter token and completion. When
-promotion is observed, the guard first adopts the provisional claim and then
-transfers the resulting claim token into the scope map. Dropping the guard
-before transfer cancels a queued waiter or releases a promoted but unobserved
-claim.
+the scope map. Its call-local guard owns the pending claim token and, while
+blocked, its waiter-node id and completion. When promotion is observed, the
+guard atomically adopts the provisional exact grant and reclaims the node.
+The exact grant then owns rollback while the guard publishes both owner-side
+records and consumes the pending token into its accepted token.
 
 Scope cleanup begins only after the active family operation has completed or
 been cancelled. It consumes the uniquely owned scope and releases its accepted
@@ -727,9 +742,10 @@ exclusive family operation
     -> inspect the exact scope's claim map
     -> perform one synchronous LockManager resource transition
     -> return a fresh claim, or create a call-local waiter guard
-    -> await WaitCompletion without manager mutexes
-    -> adopt the provisional claim
-    -> transfer the accepted claim into LockScopeState
+    -> await Completion<()> without manager synchronization
+    -> observe and reclaim the provisional waiter node
+    -> publish both owner-side records under exact-grant rollback
+    -> consume PendingClaimToken into ClaimToken
 
 scope close
     -> consume LockScopeState after no family operation remains
@@ -746,7 +762,7 @@ struct LockScopeState {
 }
 
 struct ScopeClaim {
-    claim_token: ClaimToken,
+    claim_no: ClaimNo,
     mode: LockMode,
 }
 ```
@@ -761,8 +777,6 @@ proof that replaces `ReleasedTransactionLocks`.
 
 ```rust
 struct ResourceState {
-    incarnation: ResourceIncarnation,
-
     // Counts physical family holders, not exact claims.
     granted_counts: [u32; MODE_COUNT],
     grant_mask: ModeMask,
@@ -788,18 +802,19 @@ struct FamilyHolder {
 struct FamilyWaiter {
     owner: LockOwner,
     target_mode: LockMode,
-    waiter_token: WaiterToken,
+    claim_no: ClaimNo,
+    node_id: WaitNodeID,
 }
 
 struct ClaimRecord {
     mode: LockMode,
-    claim_id: ClaimID,
+    claim_no: ClaimNo,
     phase: ClaimPhase,
 }
 
 enum ClaimPhase {
     Provisional {
-        waiter_id: WaiterID,
+        node_id: WaitNodeID,
     },
     Held,
 }
@@ -824,36 +839,26 @@ queued_waiter == None
 
 ```rust
 struct WaitQueue {
-    head: Option<WaiterID>,
-    tail: Option<WaiterID>,
-    nodes: GenerationalSlab<WaitNode>,
+    head: Option<WaitNodeID>,
+    tail: Option<WaitNodeID>,
+    nodes: WaitNodeSlab,
 }
 
 struct WaitNode {
     owner: LockOwner,
+    claim_no: ClaimNo,
     target_mode: LockMode,
     phase: WaitNodePhase,
-    completion: Arc<WaitCompletion>,
+    completion: Arc<Completion<()>>,
 }
 
 enum WaitNodePhase {
     Queued {
-        prev: Option<WaiterID>,
-        next: Option<WaiterID>,
+        prev: Option<WaitNodeID>,
+        next: Option<WaitNodeID>,
     },
-    Provisional {
-        claim_id: ClaimID,
-    },
-}
-
-struct WaitCompletion {
-    outcome: Mutex<WaitOutcome>,
-    event: Event,
-}
-
-enum WaitOutcome {
-    Waiting,
-    Promoted,
+    Provisional,
+    Released,
 }
 ```
 
@@ -861,66 +866,68 @@ Promotion detaches a node from the FIFO links but does not reclaim its slab
 slot. The node remains addressable until the provisional claim is observed or
 cancelled.
 
-The completion has independent `Arc` lifetime, so the acquisition guard can
-listen without borrowing the queue node or retaining resource synchronization.
+The existing success-only `Completion<()>` has independent `Arc` lifetime, so
+the acquisition guard can listen without borrowing the queue node or retaining
+resource synchronization. It reports only that manager state changed; the
+observer takes the result once and validates the authoritative node phase.
 
 ### Resource-qualified tokens
 
 ```rust
-struct WaiterToken {
+struct PendingClaimToken {
     resource: LockResource,
-    resource_incarnation: ResourceIncarnation,
-    waiter_id: WaiterID,
     owner: LockOwner,
+    claim_no: ClaimNo,
 }
 
 struct ClaimToken {
     resource: LockResource,
     owner: LockOwner,
-    claim_id: ClaimID,
+    claim_no: ClaimNo,
 }
 ```
 
-`WaiterID` contains slab slot and slot generation. `ResourceIncarnation` is
-allocated from an engine-lifetime monotonic source whenever an empty resource
-entry is recreated. It prevents an old waiter token from matching the same slab
-slot in a new resource-state instance.
-
-`ClaimID` is allocated from an engine-lifetime monotonic source. It must not
-reset when a family or resource entry is removed. A stale claim token therefore
-cannot release a later claim by the same exact owner on the same resource.
-
-All identity and generation counters, including resource incarnations, claim
-ids, and slab-slot generations, must use checked arithmetic and define an
-explicit fatal invariant response on exhaustion.
+`WaitNodeID` contains a resource-local slab slot and slot generation. An
+occupied queued, provisional, or released node pins its `ResourceState`, so no
+waiter id can cross resource destruction and recreation; no resource
+incarnation counter is needed. `ClaimNo` is allocated from the session-family
+authority with checked arithmetic before policy validation or manager entry.
+A stale accepted token therefore cannot release a later reacquisition by the
+same exact owner on the same resource. Slab generations also advance with
+checked arithmetic before reclamation and never wrap.
 
 ### Call-local pending acquisition
 
 One call-local guard owns a waiting acquisition:
 
 ```rust
-struct PendingAcquireGuard<'manager> {
-    manager: &'manager LockManager,
-    state: Option<PendingAcquireState>,
+struct PendingClaimGuard<'a> {
+    manager: &'a LockManager,
+    family: &'a mut FamilyLockState,
+    curr_scope: &'a mut LockScopeState,
+    token: Option<PendingClaimToken>,
+    requested_mode: LockMode,
+    state: PendingGuardState,
+    transfer_started: bool,
 }
 
-enum PendingAcquireState {
+enum PendingGuardState {
+    NotStarted,
     Waiting {
-        waiter_token: WaiterToken,
-        completion: Arc<WaitCompletion>,
+        node_id: WaitNodeID,
+        completion: Arc<Completion<()>>,
     },
-    Granted {
-        claim_token: ClaimToken,
-        mode: LockMode,
-    },
+    FreshGranted,
+    Disarmed,
 }
 ```
 
-Observation changes the guard from `Waiting` to `Granted` before the waiter node
-is reclaimed. The guard is disarmed only after the `ScopeClaim` is inserted.
-Dropping it in `Waiting` cancels the queued or provisional waiter; dropping it
-in `Granted` releases the fresh claim. Immediate fresh grants use the same
-claim-before-transfer discipline.
+Observation reclaims the waiter node and changes the guard from `Waiting` to
+`FreshGranted`. The guard is disarmed only after both local records are
+published and the pending token is consumed. Dropping it in `Waiting` cancels
+the queued or provisional waiter; dropping it in `FreshGranted` removes
+matching partial local records and releases the exact fresh grant. Immediate
+fresh grants use the same transfer discipline without waiter allocation.
 
 ## Core Operations
 
@@ -971,8 +978,8 @@ If a fresh request cannot be granted:
 1. Allocate a slab node.
 2. Link it at the FIFO tail.
 3. Install the family's single `queued_waiter`.
-4. Return `WaiterToken` plus `Arc<WaitCompletion>`.
-5. Construct a `PendingAcquireGuard`.
+4. Return `WaitNodeID` plus `Arc<Completion<()>>`.
+5. Construct a `PendingClaimGuard`.
 6. Release all synchronous locks.
 7. Await the completion event while retaining exclusive family authority.
 
@@ -980,12 +987,13 @@ Enqueue is `O(1)` average.
 
 ### 4. Wait for completion
 
-The async loop registers a listener before inspecting the outcome:
+The observer uses the completion's listener-before-check take:
 
 ```text
-listen
-    -> Waiting: await event
-    -> Promoted: observe promotion through the pending guard
+wait_take_result
+    -> reacquire the resource
+    -> Provisional: adopt the exact grant and reclaim the node
+    -> Released: reclaim the node and return LockWaiterReleased
 ```
 
 Registering first prevents a lost wakeup.
@@ -1018,14 +1026,16 @@ The loop promotes the maximal compatible FIFO prefix.
 
 ### 6. Observe a promoted waiter
 
-The waiting family operation observes `Promoted`:
+The waiting family operation takes its completion and observes manager state:
 
 ```text
-manager validates resource incarnation, node phase, owner, and provisional claim
-    -> provisional claim becomes held
-    -> pending guard changes Waiting -> Granted
+manager validates resource context, slot generation, node fields and phase,
+and the provisional exact grant
+    -> clear the grant's provisional-node marker
     -> reclaim waiter slab node
-    -> insert ScopeClaim into the exact scope
+    -> pending guard changes Waiting -> FreshGranted
+    -> insert the matching family and scope records
+    -> consume PendingClaimToken into ClaimToken
     -> disarm the guard
 ```
 
@@ -1036,7 +1046,7 @@ the fresh claim.
 
 ### 7. Cancel a pending acquisition
 
-Dropping an active `PendingAcquireGuard`:
+Dropping an active `PendingClaimGuard`:
 
 1. In `Waiting`, cancel the queued or provisional waiter, reclaim its node, and
    rerun FIFO-prefix granting.
@@ -1052,7 +1062,7 @@ can move to another operation or scope cleanup.
 Releasing a claim:
 
 1. Remove and take the `ScopeClaim` from the uniquely borrowed scope.
-2. Validate resource, exact owner, and global `ClaimID` in manager state.
+2. Validate resource, exact owner, and session-local `ClaimNo` in manager state.
 3. Remove the exact claim.
 4. Update family claim counts/mask.
 5. Recompute the strongest remaining family claim using the fixed mode set.
@@ -1129,7 +1139,7 @@ Given an exact-owner held mode `H` and requested mode `R`:
    - if valid, update the manager claim, physical holder, and scope mode.
 3. If neither covers the other, return `LockConversionNotSupported`.
 
-The claim keeps its global `ClaimID` across a successful in-place conversion.
+The claim keeps its session-local `ClaimNo` across a successful in-place conversion.
 Release of that claim releases its current mode.
 
 Different exact owners cannot strengthen an earlier owner's claim. They can
@@ -1263,11 +1273,12 @@ Rules:
    call-local guard cancels synchronously.
 4. Never hold a resource-state mutex across `.await`.
 5. Resource transitions never acquire or mutate owner-side scope state.
-6. Queue promotion changes manager state and notifies through
-   `WaitCompletion`; the exclusive async caller later updates its scope.
+6. Queue promotion changes manager state and notifies through `Completion<()>`;
+   the exclusive async caller observes the provisional node and then updates
+   its scope.
 7. Notifications occur after releasing resource synchronization.
-8. Resource state may be removed when empty, so tokens must validate resource
-   incarnation.
+8. Resource state may be removed only after every grant and occupied waiter
+   node is gone; this prevents a waiter id from crossing resource recreation.
 9. Counter/mask updates and their maps are one atomic resource-state
    transition.
 
@@ -1281,7 +1292,7 @@ The implementation should add debug assertions for:
 - queue link and singular `queued_waiter` agreement;
 - at most one queued waiter for a family;
 - provisional node and provisional claim agreement;
-- unique global claim ids among live claims; and
+- unique session-family claim numbers among live claims; and
 - empty family state before removal.
 
 ## Fresh Versus Existing Claims
@@ -1316,13 +1327,13 @@ Diagnostics should expose both indexes without changing their ownership.
 
 ### Physical resource view
 
-The lock manager can report, for each resource:
+The lock manager reports, for each resource:
 
-- resource incarnation;
-- physical family holders and modes;
-- aggregate holder counts/mask;
+- held and provisional exact grants with claim numbers;
 - FIFO queue order;
-- waiter phase and target mode.
+- waiter slot/generation, phase, and target mode; and
+- slab slot length, retained capacity, live count, free-list order, and
+  generations.
 
 ### Exact logical resource view
 
@@ -1415,23 +1426,15 @@ weak-lock migration barrier.
 No deadlock policy is designed here. See
 [backlog 000167](./backlogs/000167-logical-lock-deadlock-handling.md).
 
-## Unresolved Questions
+## Resolved and Remaining Design Choices
 
-These questions remain in scope for pre-RFC design work.
+### Token allocation strategy
 
-### 1. Token allocation strategy
+RFC-0027 uses resource-local generational waiter slots and session-family
+`ClaimNo` allocation. Every occupied waiter node pins the resource state, so
+no resource-incarnation or global waiter/claim counter is required.
 
-The working design uses:
-
-- per-resource generational slab slots;
-- a resource-incarnation id; and
-- global claim ids.
-
-An alternative uses global waiter ids in addition to slab slots. The RFC should
-choose the smallest representation that still proves stale-token safety across
-resource and family removal/recreation.
-
-### 2. Family aggregate representation
+### Family aggregate representation
 
 Per-mode counts and masks make directional checks constant in `MODE_COUNT`.
 The exact maps still carry overhead for the common family with only a
@@ -1553,8 +1556,8 @@ These stages are a planning aid, not yet an accepted RFC plan.
 - Use the session-local operation id shared by DDL and maintenance authorities.
 - Preserve idle-only effectful public Session admission and the existing mutable
   explicit-lock APIs.
-- Preserve the current vector/deque resource representation, guard-owned
-  operation cleanup, duplicate waiters, and exact-owner release.
+- Establish the original vector/deque resource representation and exact-owner
+  release used before the waiter cutover.
 
 ### Stage B: exclusive scope ownership
 
@@ -1566,15 +1569,15 @@ These stages are a planning aid, not yet an accepted RFC plan.
   scope indexes.
 - Preserve proof-bound transaction-lock cleanup before session completion.
 
-### Stage C: tokenized waiter and claim lifecycle
+### Stage C: tokenized waiter and claim lifecycle (implemented)
 
-- Add resource-incarnation and global claim ids.
-- Add generational waiter nodes.
-- Keep nodes alive through provisional state.
-- Add independent `WaitCompletion`.
-- Add the call-local pending acquisition guard.
-- Remove current duplicate-waiter behavior after all family mutations are
-  serialized.
+- Carry session-local `ClaimNo` through move-only pending and accepted tokens.
+- Add resource-local generational waiter nodes and intrusive FIFO links.
+- Keep nodes alive through provisional or externally released state until the
+  unique observer consumes them.
+- Reuse `Completion<()>` as a success-only one-shot notification.
+- Add the call-local `PendingClaimGuard` across manager and owner-side transfer.
+- Remove duplicate-waiter sharing after all family mutations are serialized.
 
 ### Stage D: exact-claim family registry
 
@@ -1649,8 +1652,8 @@ At minimum:
 ### Token and lifecycle race tests
 
 1. Stale waiter slot generation cannot affect a reused slot.
-2. Stale waiter token cannot affect a recreated resource incarnation.
-3. Stale claim id cannot release a later claim.
+2. A resource cannot be recreated until every old waiter node is consumed.
+3. A stale accepted claim number cannot release a later claim.
 4. Acquisition cancellation finishes before family authority moves to another
    operation.
 5. Scope consumption requires no active pending acquisition.
