@@ -1288,7 +1288,7 @@ mod tests {
             assert!(engine.inner().core.lock_manager().owner_holds(
                 resource,
                 explicit_owner,
-                LockMode::Shared,
+                LockMode::Exclusive,
             ));
             assert_eq!(
                 engine
@@ -1341,7 +1341,7 @@ mod tests {
             assert!(engine.inner().core.lock_manager().owner_holds(
                 resource,
                 explicit_owner,
-                LockMode::IntentShared,
+                LockMode::Exclusive,
             ));
             assert!(engine.inner().core.lock_manager().owner_holds(
                 resource,

@@ -10,7 +10,8 @@ The task-000258 review found EnginePoisoner::ensure_healthy() Fatal reports bein
 
 ## Deferred From (Optional)
 
-docs/tasks/000258-linear-lock-family-authority-owner-side-indexes.md
+docs/tasks/000258-linear-lock-family-authority-owner-side-indexes.md;
+docs/rfcs/0027-session-family-logical-lock-system-redesign.md Phase 1
 
 ## Deferral Context (Optional)
 

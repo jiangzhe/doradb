@@ -6,7 +6,7 @@ Turn the working lock-system design into an accepted, phased exact-family owners
 
 ## Reference
 
-Prerequisites docs/backlogs/000169-separate-session-operation-lock-scopes.md and docs/backlogs/000170-session-coordinated-cancellation-cleanup.md; docs/lock-system.md working design, unresolved questions, migration constraints, nested DDL cancellation prerequisite, suggested stages, and validation plan; docs/rfcs/0016-logical-lock-manager.md; docs/tasks/000242-enforce-terminal-transaction-lock-release-ordering.md; related docs/backlogs/000115-explicit-session-lock-cache.md and docs/backlogs/000167-logical-lock-deadlock-handling.md; doradb-storage/src/lock/mod.rs and lock/state.rs; Session, transaction, statement, DDL, and maintenance lock call sites.
+Prerequisites docs/backlogs/closed/000169-separate-session-operation-lock-scopes.md and docs/backlogs/closed/000170-session-coordinated-cancellation-cleanup.md; docs/lock-system.md working design, unresolved questions, migration constraints, nested DDL cancellation prerequisite, suggested stages, and validation plan; docs/rfcs/0016-logical-lock-manager.md; docs/tasks/000242-enforce-terminal-transaction-lock-release-ordering.md; related docs/backlogs/closed/000115-explicit-session-lock-cache.md and docs/backlogs/000167-logical-lock-deadlock-handling.md; doradb-storage/src/lock/mod.rs and lock/state.rs; Session, transaction, statement, DDL, and maintenance lock call sites.
 
 ## Deferred From (Optional)
 

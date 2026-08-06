@@ -206,7 +206,7 @@ notification. [D7] [C7] [U2] [U4] [U5] [U6]
 
 - [B1] `docs/backlogs/000171-exact-family-lock-system-redesign.md` - source
   backlog and RFC acceptance criteria.
-- [B2] `docs/backlogs/000115-explicit-session-lock-cache.md` - session lock
+- [B2] `docs/backlogs/closed/000115-explicit-session-lock-cache.md` - session lock
   cache requirement absorbed by the family state.
 - [B3] `docs/backlogs/000167-logical-lock-deadlock-handling.md` - related but
   explicitly deferred deadlock policy.
@@ -304,9 +304,9 @@ four scope classes, and no heap allocation for the common single-claim case.
 Every fresh logical claim attempt reserves an opaque `ClaimNo`. Its full
 logical identity is `(LockFamily, ClaimNo)`; no comparison or uniqueness
 is required across families. The sequence is a plain session-local integer
-advanced only under exclusive family authority. Zero may be reserved for
-niche optimization. Arithmetic is checked, and exhaustion is an internal
-fatal invariant. [U2] [U4] [U6] [U7]
+advanced only under exclusive family authority. Zero is a valid opaque
+representation, while allocation begins at one. Arithmetic is checked, and
+exhaustion is an internal fatal invariant. [U2] [U4] [U6] [U7]
 
 The number is reserved after an exact-scope cache miss and before a shared
 manager transition or waiter enqueue. Rejected and cancelled acquisitions may
@@ -867,15 +867,15 @@ authorize it. [D16] [U8]
     removal of duplicate-waiter defenses, or catalog authority removal.
   - Prerequisites: Backlogs 000169 and 000170 and their implementation tasks
     are complete.
-  - Phase-local Choices: Select the compact one-inline/fixed-slot byte layout
-    using type-size and workload evidence without introducing per-family claim
-    hashing.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase-local Choices: Selected the safe one-inline/fixed-slot layout without
+    per-family claim hashing. Type-size tests record the Phase 1 layout;
+    expanded workload comparison remains part of the Phase 3 cutover.
+  - Task Doc: `docs/tasks/000258-linear-lock-family-authority-owner-side-indexes.md`
+  - Task Issue: `#948`
+  - Phase Status: done
+  - Implementation Summary: Implemented RFC-0027 Phase 1 with one move-only family authority and targeted scope cleanup while retaining exact manager mirrors. [Task Resolve Sync: docs/tasks/000258-linear-lock-family-authority-owner-side-indexes.md @ 2026-08-06]
   - Related Backlogs:
-    - `docs/backlogs/000115-explicit-session-lock-cache.md`
+    - `docs/backlogs/closed/000115-explicit-session-lock-cache.md`
     - `docs/backlogs/000171-exact-family-lock-system-redesign.md`
 
 - **Phase 2: Tokenized Waiter And Provisional-Grant Lifecycle**
@@ -998,7 +998,7 @@ explain before/after evidence for its affected operation classes.
 - `docs/tasks/000247-statement-public-transaction-cancellation-ownership.md`
 - `docs/tasks/000249-runtime-owned-table-ddl.md`
 - `docs/tasks/000257-doradb-bench-lock-table-workload.md`
-- `docs/backlogs/000115-explicit-session-lock-cache.md`
+- `docs/backlogs/closed/000115-explicit-session-lock-cache.md`
 - `docs/backlogs/000167-logical-lock-deadlock-handling.md`
 - `docs/backlogs/000171-exact-family-lock-system-redesign.md`
 - `docs/backlogs/closed/000169-separate-session-operation-lock-scopes.md`
