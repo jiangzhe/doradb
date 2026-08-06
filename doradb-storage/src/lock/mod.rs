@@ -2376,26 +2376,24 @@ pub(crate) mod tests {
     #[test]
     fn debug_snapshot_reports_granted_waiting_and_queue_order() {
         smol::block_on(async {
-            let manager = Arc::new(LockManager::new());
+            let manager = LockManager::new();
             let resource = table_metadata(TableID::new(42));
             assert!(try_acquire(&manager, resource, LockMode::Shared, trx(TrxID::new(1))).unwrap());
-            let first_waiter = {
-                let manager = Arc::clone(&manager);
-                smol::spawn(async move {
-                    manager
-                        .acquire(resource, LockMode::Exclusive, trx(TrxID::new(2)))
-                        .await
-                })
+            let first_token = PendingClaimToken {
+                resource,
+                owner: trx(TrxID::new(2)),
+                claim_no: ClaimNo::new(0),
             };
-            let second_waiter = {
-                let manager = Arc::clone(&manager);
-                smol::spawn(async move {
-                    manager
-                        .acquire(resource, LockMode::Exclusive, trx(TrxID::new(3)))
-                        .await
-                })
+            let mut first_waiter = RawPendingGuard::new(&manager, first_token, LockMode::Exclusive);
+            first_waiter.start().unwrap();
+            let second_token = PendingClaimToken {
+                resource,
+                owner: trx(TrxID::new(3)),
+                claim_no: ClaimNo::new(0),
             };
-            wait_for_waiters(&manager, resource, 2).await;
+            let mut second_waiter =
+                RawPendingGuard::new(&manager, second_token, LockMode::Exclusive);
+            second_waiter.start().unwrap();
 
             let snapshot = debug_snapshot(&manager);
             assert!(snapshot.entries.iter().any(|entry| {
@@ -2429,11 +2427,19 @@ pub(crate) mod tests {
             );
             assert_eq!(released.resources[0].live_waiters, 2);
             assert_eq!(
-                *first_waiter.await.unwrap_err().current_context(),
+                *first_waiter
+                    .wait_and_observe()
+                    .await
+                    .unwrap_err()
+                    .current_context(),
                 OperationError::LockWaiterReleased
             );
             assert_eq!(
-                *second_waiter.await.unwrap_err().current_context(),
+                *second_waiter
+                    .wait_and_observe()
+                    .await
+                    .unwrap_err()
+                    .current_context(),
                 OperationError::LockWaiterReleased
             );
         });
