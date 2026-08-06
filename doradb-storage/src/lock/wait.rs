@@ -717,6 +717,7 @@ pub(in crate::lock) mod tests {
         Arc::new(Completion::new())
     }
 
+    #[cfg(target_pointer_width = "64")]
     #[test]
     fn waiter_layout_is_recorded() {
         assert_eq!(size_of::<WaitNodeID>(), 16);
