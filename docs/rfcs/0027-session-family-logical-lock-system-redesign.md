@@ -893,14 +893,17 @@ authorize it. [D16] [U8]
     policy, or removal of migration defenses.
   - Prerequisites: Phase 1 authority and scope-close tests pass for every
     lifecycle carrier.
-  - Phase-local Choices: Tune retained slot capacity and compact slot layout
-    using measurements; retain the safe vector/free-list design, checked
-    generation, and resource-pinning invariant without an external slab or
-    resource-incarnation source.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase-local Choices: Implemented the safe vector/free-list design with
+    zero eager capacity, reuse before growth, no shrinking, checked
+    generations, and no resource incarnation. The 64-bit layout is
+    `WaitNodeID` 16 bytes, `WaitNode` 104 bytes, `WaitNodeSlot` 112 bytes, and
+    `WaitNodeSlotEntry` 104 bytes.
+  - Task Doc: `docs/tasks/000259-tokenized-waiter-provisional-grant-lifecycle.md`
+  - Task Issue: `#950`
+  - Phase Status: done
+  - Implementation Summary: Implemented RFC-0027 Phase 2 with token-exact pending ownership, constant-time queued cancellation, provisional-grant rollback, and resource pinning while retaining exact manager grants for Phase 3. [Task Resolve Sync: docs/tasks/000259-tokenized-waiter-provisional-grant-lifecycle.md @ 2026-08-06]
+  - Related Backlogs:
+    - `docs/backlogs/000179-cancel-pending-logical-lock-acquisition-on-engine-poison.md`
 
 - **Phase 3: Physical Family Aggregation And Performance Cutover**
   - Scope: Replace exact physical grants with the physical-only family state,

@@ -5044,10 +5044,12 @@ mod tests {
             ));
             assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Live);
             assert_eq!(table.checkpoint_workflow.state_name(), "Freezing");
+            // Release the test-only strong owner before unblocking freeze so it
+            // cannot overlap with dropped-runtime purge once DROP resumes.
+            drop(table);
 
             release_tx.send_async(()).await.unwrap();
             assert_freeze_created(freeze.await.unwrap());
-            drop(table);
             drop_table.await.unwrap();
             assert!(
                 engine

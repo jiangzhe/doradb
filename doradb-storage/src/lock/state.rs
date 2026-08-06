@@ -1,4 +1,5 @@
-use super::claim::{ClaimToken, LocalFamilyResourceState, ModeMask, ScopeClaim};
+use super::claim::{ClaimToken, LocalFamilyResourceState, ModeMask, PendingClaimToken, ScopeClaim};
+use super::wait::PendingClaimGuard;
 use super::{
     LockFamily, LockGrant, LockManager, LockMode, LockOwner, LockResource, LockScope,
     lock_family_conflict_err,
@@ -6,6 +7,7 @@ use super::{
 use crate::error::OperationResult;
 use crate::id::{ClaimNo, SessionID, TableID, TrxID};
 use crate::map::FastHashMap;
+use std::array::from_fn;
 
 /// Authoritative cleanup index for one exact logical lock scope.
 pub(crate) struct LockScopeState {
@@ -60,9 +62,43 @@ impl LockScopeState {
             claim_no: claim.claim_no,
         })
     }
+
+    #[inline]
+    pub(super) fn publish_pending_scope(&mut self, token: &PendingClaimToken, mode: LockMode) {
+        assert!(
+            token.owner == self.owner,
+            "pending claim exact-scope publication mismatch: \
+             token_owner={}, scope_owner={}",
+            token.owner,
+            self.owner
+        );
+        assert!(
+            !self.claims.contains_key(&token.resource),
+            "pending exact-scope publication requires a resource miss: \
+             resource={}, owner={}, claim_no={:?}",
+            token.resource,
+            token.owner,
+            token.claim_no
+        );
+        let previous = self.claims.insert(
+            token.resource,
+            ScopeClaim {
+                claim_no: token.claim_no,
+                mode,
+            },
+        );
+        assert!(
+            previous.is_none(),
+            "pending exact-scope publication replaced a claim: \
+             resource={}, owner={}, claim_no={:?}",
+            token.resource,
+            token.owner,
+            token.claim_no
+        );
+    }
 }
 
-/// Local Phase 1 family-lock path counters.
+/// Local Phase 2 family-lock path counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct FamilyLockStats {
     /// Acquisitions covered by the same exact logical claim.
@@ -135,24 +171,31 @@ impl FamilyLockState {
             // an error leaves both owner-side indexes unchanged.
             self.validate_family_coverage(resource, mode, curr_scope.owner)?;
             self.stats.manager_acquires += 1;
-            let grant = lock_manager
-                .acquire_with_grant(resource, mode, curr_scope.owner)
-                .await?;
-            assert!(
-                grant == LockGrant::Existing,
-                "indexed exact conversion must match an existing manager grant: \
-                 resource={resource}, owner={}, mode={mode}, grant={grant:?}",
-                curr_scope.owner
-            );
+            let token = ClaimToken {
+                resource,
+                owner: curr_scope.owner,
+                claim_no: existing.claim_no,
+            };
+            lock_manager.convert_claim(&token, mode)?;
 
             // Exclusive family authority preserves the indexed claim across
-            // the await. Update the family aggregate first, then its
-            // exact-scope mirror.
+            // the synchronous manager transition. Update the family aggregate
+            // first, then its exact-scope mirror.
             let family_resource = self.resources.get_mut(&resource).unwrap_or_else(|| {
                 panic!("scope claim requires family/resource state: resource={resource}")
             });
             family_resource.update(resource, curr_scope.owner.scope(), existing.claim_no, mode);
-            curr_scope.claims.get_mut(&resource).unwrap().mode = mode;
+            curr_scope
+                .claims
+                .get_mut(&resource)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "converted scope claim disappeared before local publication: \
+                         resource={resource}, owner={}",
+                        curr_scope.owner
+                    )
+                })
+                .mode = mode;
             self.stats.conversions += 1;
             return Ok(LockGrant::Existing);
         }
@@ -162,28 +205,17 @@ impl FamilyLockState {
         let claim_no = self.reserve_claim_no();
         let family_covered = self.validate_family_coverage(resource, mode, curr_scope.owner)?;
 
-        // 4. Phase 1 still mirrors every fresh logical claim into the manager,
-        // including requests covered by another exact scope in this family.
+        // 4. Phase 2 carries the reserved identity through immediate grant,
+        // waiting, provisional promotion, observation, and both local indexes.
         self.stats.manager_acquires += 1;
-        let grant = lock_manager
-            .acquire_with_grant(resource, mode, curr_scope.owner)
-            .await?;
-        assert!(
-            grant == LockGrant::Fresh,
-            "fresh local claim must create one exact Phase 1 manager grant: \
-             resource={resource}, owner={}, mode={mode}, claim_no={claim_no:?}, grant={grant:?}",
-            curr_scope.owner
-        );
-
-        // 5. Publish the fresh claim synchronously into both authoritative
-        // owner-side indexes. This invariant operation has no suspension point
-        // or recoverable failure after the manager reports a fresh grant.
-        self.insert_claim(curr_scope, resource, claim_no, mode);
-        self.stats.accepted_fresh_claims += 1;
-        if family_covered {
-            self.stats.family_covered_manager_mirrors += 1;
-        }
-        Ok(LockGrant::Fresh)
+        let token = PendingClaimToken {
+            resource,
+            owner: curr_scope.owner,
+            claim_no,
+        };
+        PendingClaimGuard::new(lock_manager, self, curr_scope, token, mode, family_covered)
+            .acquire()
+            .await
     }
 
     /// Releases one accepted claim from this exact scope.
@@ -197,7 +229,7 @@ impl FamilyLockState {
         let Some(token) = curr_scope.claim_token(resource) else {
             return false;
         };
-        self.release_token(curr_scope, lock_manager, token);
+        self.release_token(curr_scope, lock_manager, &token);
         true
     }
 
@@ -214,7 +246,7 @@ impl FamilyLockState {
             let token = curr_scope
                 .claim_token(resource)
                 .expect("scope key must retain its claim");
-            self.release_token(curr_scope, lock_manager, token);
+            self.release_token(curr_scope, lock_manager, &token);
             released += 1;
             self.stats.close_claims_visited += 1;
         }
@@ -347,40 +379,119 @@ impl FamilyLockState {
     }
 
     #[inline]
-    fn insert_claim(
-        &mut self,
-        curr_scope: &mut LockScopeState,
-        resource: LockResource,
-        claim_no: ClaimNo,
-        mode: LockMode,
-    ) {
+    pub(super) fn publish_pending_family(&mut self, token: &PendingClaimToken, mode: LockMode) {
+        self.assert_owner_family(token.owner);
         assert!(
-            !curr_scope.claims.contains_key(&resource),
+            self.resources
+                .get(&token.resource)
+                .and_then(|state| state.get(token.owner.scope()))
+                .is_none(),
             "fresh family claim requires an exact-scope miss: resource={resource}, owner={}",
-            curr_scope.owner
+            token.owner,
+            resource = token.resource
         );
-        match self.resources.get_mut(&resource) {
+        match self.resources.get_mut(&token.resource) {
             Some(state) => {
-                let expanded = state.insert(resource, curr_scope.owner.scope(), claim_no, mode);
+                let expanded =
+                    state.insert(token.resource, token.owner.scope(), token.claim_no, mode);
                 if expanded {
                     self.stats.expansions += 1;
                 }
             }
             None => {
                 self.resources.insert(
-                    resource,
-                    LocalFamilyResourceState::new(curr_scope.owner.scope(), claim_no, mode),
+                    token.resource,
+                    LocalFamilyResourceState::new(token.owner.scope(), token.claim_no, mode),
                 );
             }
         }
-        let previous = curr_scope
-            .claims
-            .insert(resource, ScopeClaim { claim_no, mode });
+    }
+
+    #[inline]
+    pub(super) fn record_pending_accept(&mut self, token: &ClaimToken, family_covered: bool) {
+        let family_claim = self
+            .resources
+            .get(&token.resource)
+            .and_then(|state| state.get(token.owner.scope()))
+            .unwrap_or_else(|| {
+                panic!(
+                    "accepted pending claim requires its family record: \
+                     resource={}, owner={}, claim_no={:?}",
+                    token.resource, token.owner, token.claim_no
+                )
+            });
         assert!(
-            previous.is_none(),
-            "fresh exact-scope insertion replaced a claim: resource={resource}, owner={}",
-            curr_scope.owner
+            family_claim.claim_no == token.claim_no,
+            "accepted pending claim family identity mismatch: \
+             resource={}, owner={}, token_claim_no={:?}, family_claim_no={:?}",
+            token.resource,
+            token.owner,
+            token.claim_no,
+            family_claim.claim_no
         );
+        self.stats.accepted_fresh_claims += 1;
+        if family_covered {
+            self.stats.family_covered_manager_mirrors += 1;
+        }
+    }
+
+    #[inline]
+    pub(super) fn rollback_pending_publication(
+        &mut self,
+        curr_scope: &mut LockScopeState,
+        token: &PendingClaimToken,
+    ) {
+        self.assert_scope_family(curr_scope);
+        assert!(
+            curr_scope.owner == token.owner,
+            "pending rollback exact-scope mismatch: \
+             scope_owner={}, token_owner={}",
+            curr_scope.owner,
+            token.owner
+        );
+
+        if curr_scope
+            .claims
+            .get(&token.resource)
+            .is_some_and(|claim| claim.claim_no == token.claim_no)
+        {
+            curr_scope.claims.remove(&token.resource);
+        }
+
+        let Some(family_resource) = self.resources.get_mut(&token.resource) else {
+            return;
+        };
+        if family_resource
+            .get(token.owner.scope())
+            .map(|claim| claim.claim_no)
+            != Some(token.claim_no)
+        {
+            return;
+        }
+        let mut remaining_mask = ModeMask::default();
+        let mut new_covering_mode = None;
+        family_resource.for_each(|scope, claim| {
+            if scope == token.owner.scope() {
+                return;
+            }
+            remaining_mask.insert(claim.mode);
+            new_covering_mode = merge_covering_mode(token.resource, new_covering_mode, claim.mode);
+        });
+        family_resource.remove(
+            token.owner.scope(),
+            token.claim_no,
+            remaining_mask,
+            new_covering_mode,
+        );
+        if new_covering_mode.is_none() {
+            let removed = self.resources.remove(&token.resource);
+            assert!(
+                removed.is_some(),
+                "empty family/resource state disappeared during pending rollback: \
+                 resource={}",
+                token.resource
+            );
+        }
     }
 
     #[inline]
@@ -388,7 +499,7 @@ impl FamilyLockState {
         &mut self,
         curr_scope: &mut LockScopeState,
         lock_manager: &LockManager,
-        token: ClaimToken,
+        token: &ClaimToken,
     ) {
         self.assert_scope_family(curr_scope);
         assert!(
@@ -439,10 +550,10 @@ impl FamilyLockState {
             };
         });
 
-        let removed_manager = lock_manager.release(token.resource, token.owner);
+        let removed_manager = lock_manager.release_claim(token);
         assert!(
             removed_manager == 1,
-            "accepted logical claim must have one exact Phase 1 manager mirror: \
+            "accepted logical claim must have one exact Phase 2 manager mirror: \
              resource={}, owner={}, claim_no={:?}, removed={removed_manager}",
             token.resource,
             token.owner,
@@ -656,7 +767,7 @@ impl<'a, const N: usize> FreshClaimsGuard<'a, N> {
             family,
             curr_scope,
             lock_manager,
-            fresh: [None; N],
+            fresh: from_fn(|_| None),
             len: 0,
             armed: true,
         }
@@ -683,7 +794,7 @@ impl<'a, const N: usize> FreshClaimsGuard<'a, N> {
             });
             if self.len >= N {
                 self.family
-                    .release_token(self.curr_scope, self.lock_manager, token);
+                    .release_token(self.curr_scope, self.lock_manager, &token);
                 panic!(
                     "fresh-claim rollback guard capacity exceeded: capacity={N}, owner={}",
                     self.curr_scope.owner
@@ -719,8 +830,25 @@ impl<const N: usize> Drop for FreshClaimsGuard<'_, N> {
                 .take()
                 .expect("fresh-claim guard length must identify an occupied token");
             self.family
-                .release_token(self.curr_scope, self.lock_manager, token);
+                .release_token(self.curr_scope, self.lock_manager, &token);
         }
+    }
+}
+
+#[inline]
+fn merge_covering_mode(
+    resource: LockResource,
+    current: Option<LockMode>,
+    mode: LockMode,
+) -> Option<LockMode> {
+    match current {
+        None => Some(mode),
+        Some(current) if current.covers(resource, mode) => Some(current),
+        Some(current) if mode.covers(resource, current) => Some(mode),
+        Some(current) => panic!(
+            "remaining family/resource claims have no occupied covering mode: \
+             resource={resource}, left={current}, right={mode}"
+        ),
     }
 }
 
@@ -801,7 +929,7 @@ mod tests {
     fn assert_manager_agreement(family: &FamilyLockState, lock_manager: &LockManager) {
         let local = family_snapshot(family)
             .into_iter()
-            .map(|entry| (entry.0, entry.1, entry.3))
+            .map(|entry| (entry.0, entry.1, entry.2, entry.3))
             .collect::<Vec<_>>();
         let mut manager = debug_snapshot(lock_manager)
             .entries
@@ -809,7 +937,7 @@ mod tests {
             .filter(|entry| {
                 entry.state == LockDebugEntryState::Granted && entry.owner.family() == family.family
             })
-            .map(|entry| (entry.resource, entry.owner, entry.mode))
+            .map(|entry| (entry.resource, entry.owner, entry.claim_no, entry.mode))
             .collect::<Vec<_>>();
         manager.sort_unstable_by_key(|entry| (entry.0, entry.1));
         assert_eq!(
@@ -1042,9 +1170,18 @@ mod tests {
 
             let mut authority = FamilyLockAuthority::new(SessionID::new(61));
             let (family, session_scope) = authority.parts();
+            let pending_owner = session_scope.owner();
             let mut acquire =
                 Box::pin(family.acquire(session_scope, &manager, resource, LockMode::Shared));
             assert!(matches!(poll!(acquire.as_mut()), Poll::Pending));
+            let waiting = debug_snapshot(&manager)
+                .entries
+                .into_iter()
+                .find(|entry| {
+                    entry.owner == pending_owner && entry.state == LockDebugEntryState::Waiting
+                })
+                .unwrap();
+            assert_eq!(waiting.claim_no, ClaimNo::new(1));
             drop(acquire);
 
             assert_eq!(family.next_claim_no, 2);
@@ -1067,7 +1204,7 @@ mod tests {
                 .await
                 .unwrap();
             let stale = session_scope.claim_token(resource).unwrap();
-            family.release_token(session_scope, &manager, stale);
+            family.release_token(session_scope, &manager, &stale);
             family
                 .acquire(session_scope, &manager, resource, LockMode::Shared)
                 .await
@@ -1075,7 +1212,7 @@ mod tests {
             let current = session_scope.claim_token(resource).unwrap();
 
             let panic = catch_unwind(AssertUnwindSafe(|| {
-                family.release_token(session_scope, &manager, stale);
+                family.release_token(session_scope, &manager, &stale);
             }));
             assert!(panic.is_err());
             assert_eq!(session_scope.claim_token(resource), Some(current));
@@ -1101,17 +1238,14 @@ mod tests {
             assert_eq!(manager.release(resource, session_scope.owner()), 1);
 
             let panic = catch_unwind(AssertUnwindSafe(|| {
-                family.release_token(session_scope, &manager, token);
+                family.release_token(session_scope, &manager, &token);
             }));
             assert!(panic.is_err());
             assert_eq!(family_snapshot(family), before);
-            assert_eq!(session_scope.claim_token(resource), Some(token));
+            assert_eq!(session_scope.claim_token(resource).as_ref(), Some(&token));
 
-            manager
-                .acquire(resource, LockMode::Shared, session_scope.owner())
-                .await
-                .unwrap();
-            family.release_token(session_scope, &manager, token);
+            manager.restore_raw_claim(&token, LockMode::Shared);
+            family.release_token(session_scope, &manager, &token);
             family.assert_empty();
             assert_manager_agreement(family, &manager);
         });
