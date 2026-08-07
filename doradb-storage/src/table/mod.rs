@@ -1159,7 +1159,7 @@ pub(crate) mod tests {
         IOKind, StdIoResult, StorageBackendFileIdentity, StorageBackendOp, StorageBackendTestHook,
     };
     use crate::lock::tests::{LockDebugEntryState, debug_snapshot};
-    use crate::lock::{LockFamily, LockMode, LockOwner, LockResource, LockScope};
+    use crate::lock::{LockFamily, LockMode, LockOwner, LockResource};
     use crate::quiescent::QuiescentGuard;
     use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
     use crate::session::{Session, tests::SessionTestExt};
@@ -2592,7 +2592,7 @@ pub(crate) mod tests {
         debug_snapshot(engine.inner().core.lock_manager())
             .entries
             .iter()
-            .filter(|entry| entry.owner == owner)
+            .filter(|entry| entry.family == owner.family())
             .count()
     }
 
@@ -2607,7 +2607,8 @@ pub(crate) mod tests {
             .entries
             .iter()
             .any(|entry| {
-                entry.owner == owner
+                (entry.pending_owner == Some(owner)
+                    || (entry.pending_owner.is_none() && entry.family == owner.family()))
                     && entry.resource == resource
                     && entry.mode == mode
                     && entry.state == state
@@ -2622,7 +2623,7 @@ pub(crate) mod tests {
         debug_snapshot(engine.inner().core.lock_manager())
             .entries
             .iter()
-            .any(|entry| entry.owner == owner && entry.resource == resource)
+            .any(|entry| entry.family == owner.family() && entry.resource == resource)
     }
 
     pub(crate) fn ddl_lock_owner(
@@ -2633,12 +2634,12 @@ pub(crate) mod tests {
         debug_snapshot(engine.inner().core.lock_manager())
             .entries
             .iter()
-            .find(|entry| {
-                entry.owner.family() == LockFamily::new(session_id)
-                    && matches!(entry.owner.scope(), LockScope::Operation(_))
-                    && entry.resource == resource
+            .find(|entry| entry.family == LockFamily::new(session_id) && entry.resource == resource)
+            .map(|entry| {
+                entry
+                    .pending_owner
+                    .unwrap_or_else(|| LockOwner::session_explicit(session_id))
             })
-            .map(|entry| entry.owner)
     }
 
     pub(crate) fn has_ddl_lock_resource(
@@ -2660,13 +2661,16 @@ pub(crate) mod tests {
             .entries
             .iter()
             .find(|entry| {
-                entry.owner.family() == LockFamily::new(session_id)
-                    && matches!(entry.owner.scope(), LockScope::Operation(_))
+                entry.family == LockFamily::new(session_id)
                     && entry.resource == resource
                     && entry.mode == mode
                     && entry.state == state
             })
-            .map(|entry| entry.owner)
+            .map(|entry| {
+                entry
+                    .pending_owner
+                    .unwrap_or_else(|| LockOwner::session_explicit(session_id))
+            })
     }
 
     pub(crate) async fn wait_for_maintenance_lock_entry(

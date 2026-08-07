@@ -298,35 +298,24 @@ impl Transaction {
         }
     }
 
-    /// Stages catalog DDL under an accepted operation's prepared logical locks.
-    ///
-    /// This is a narrow bridge for the current exact-owner lock manager.
-    /// Reacquiring the same catalog claims for the nested transaction would be
-    /// correctness-safe through same-family coverage, but would add duplicate
-    /// manager grants and owner-cache entries. A future exact-family lock
-    /// design should unify operation and transaction claims and remove this
-    /// special authority path while preserving the panic settlement below.
+    /// Stages one private catalog DDL statement with ordinary exact claims.
     ///
     /// A callback panic is settled while the statement carrier still owns its
     /// partial effects. Incomplete redo is discarded, residual undo returns to
     /// the nested transaction core, and the original unwind resumes for the
     /// mandatory supervisor.
     #[inline]
-    pub(crate) async fn stage_prepared_catalog_statement<T, F>(
-        &mut self,
-        authority: PreparedCatalogWriteAuthority<'_>,
-        f: F,
-    ) -> RuntimeResult<T>
+    pub(crate) async fn stage_catalog_statement<T, F>(&mut self, f: F) -> RuntimeResult<T>
     where
         F: for<'borrow> AsyncFnOnce(&'borrow mut Statement<'_>) -> RuntimeResult<T>,
     {
         let checkout = self
             .checkout()
             .change_context(RuntimeError::CatalogAccess)
-            .attach("operation=stage_prepared_catalog_statement")?;
+            .attach("operation=stage_catalog_statement")?;
         let mut stmt_state = StmtState::private(checkout);
         let outcome = AssertUnwindSafe(async {
-            let mut stmt = stmt_state.prepared_catalog_statement(authority);
+            let mut stmt = stmt_state.statement();
             let result = f(&mut stmt).await;
             stmt.merge_effects();
             result
@@ -692,89 +681,26 @@ impl TrxContext {
     }
 }
 
-/// Borrowed proof that accepted table DDL prepared catalog write locks.
-///
-/// The enclosing operation owns metadata-S and data-IX claims for longer than
-/// its nested catalog transaction. This temporary capability lets that
-/// transaction reuse those covering claims without registering duplicate
-/// exact-owner grants. It is deliberately not a general lock-bypass flag: the
-/// borrow ties its lifetime to the prepared lock scope and every catalog-table
-/// write still asserts exact coverage.
-#[derive(Clone, Copy)]
-pub(crate) struct PreparedCatalogWriteAuthority<'a> {
-    locks: &'a LockScopeState,
-}
-
-impl<'a> PreparedCatalogWriteAuthority<'a> {
-    /// Create a borrowed proof over one accepted operation's prepared locks.
-    #[inline]
-    pub(crate) fn new(locks: &'a LockScopeState) -> Self {
-        Self { locks }
-    }
-
-    /// Assert that the prepared owner covers one catalog-table write.
-    #[inline]
-    pub(crate) fn assert_table_write(self, table_id: TableID) {
-        assert!(
-            self.covers_table_write(table_id),
-            "prepared catalog-write authority is incomplete: table_id={table_id}, owner={}",
-            self.locks.owner()
-        );
-    }
-
-    /// Return whether metadata-S and data-IX are both present.
-    #[inline]
-    pub(crate) fn covers_table_write(self, table_id: TableID) -> bool {
-        self.locks
-            .covers(LockResource::TableMetadata(table_id), LockMode::Shared)
-            && self
-                .locks
-                .covers(LockResource::TableData(table_id), LockMode::IntentExclusive)
-    }
-}
-
 /// Operation-local transaction runtime view.
-///
-/// Prepared catalog authority is present only for accepted table DDL. Ordinary
-/// statements continue proving writes with transaction-owned logical locks.
-/// The optional authority exists only to carry the temporary operation-claim
-/// proof into lower-level write assertions.
 #[derive(Clone, Copy)]
 pub(crate) struct TrxRuntime<'r> {
     ctx: &'r TrxContext,
     attachment: &'r TrxAttachment,
-    #[cfg_attr(
-        not(debug_assertions),
-        expect(
-            dead_code,
-            reason = "prepared authority participates in debug-only lower-level lock assertions"
-        )
-    )]
-    prepared_catalog_write: Option<PreparedCatalogWriteAuthority<'r>>,
+    locks: &'r TransactionLockState,
 }
 
 impl<'r> TrxRuntime<'r> {
     /// Create an operation-local runtime view.
     #[inline]
-    pub(crate) fn new(ctx: &'r TrxContext, attachment: &'r TrxAttachment) -> Self {
-        Self {
-            ctx,
-            attachment,
-            prepared_catalog_write: None,
-        }
-    }
-
-    /// Create a runtime view backed by prepared operation-level catalog locks.
-    #[inline]
-    pub(crate) fn new_prepared_catalog(
+    pub(crate) fn new(
         ctx: &'r TrxContext,
         attachment: &'r TrxAttachment,
-        authority: PreparedCatalogWriteAuthority<'r>,
+        locks: &'r TransactionLockState,
     ) -> Self {
         Self {
             ctx,
             attachment,
-            prepared_catalog_write: Some(authority),
+            locks,
         }
     }
 
@@ -829,19 +755,9 @@ impl<'r> TrxRuntime<'r> {
     pub(crate) fn debug_assert_table_write_lock_held(&self, table_id: TableID) {
         #[cfg(debug_assertions)]
         {
-            if self
-                .prepared_catalog_write
-                .is_some_and(|authority| authority.covers_table_write(table_id))
-            {
-                return;
-            }
-            let resource = LockResource::TableData(table_id);
-            let owner = LockOwner::transaction(self.attachment.session_id(), self.ctx.trx_id());
-            let held = self.engine().lock_manager().owner_holds(
-                resource,
-                owner,
-                LockMode::IntentExclusive,
-            );
+            let held = self
+                .locks
+                .covers(LockResource::TableData(table_id), LockMode::IntentExclusive);
             debug_assert!(
                 held,
                 "transaction owner must hold TableData(IX) or stronger before row/index ownership"
@@ -3392,7 +3308,7 @@ pub(crate) mod tests {
         install_storage_backend_test_hook,
     };
     use crate::lock::LockManager;
-    use crate::lock::tests::{LockDebugEntryState, debug_snapshot, try_acquire};
+    use crate::lock::tests::{LockDebugEntryState, TestLockOwner, debug_snapshot};
     use crate::log::redo::{RowRedo, RowRedoKind};
     use crate::quiescent::QuiescentGuard;
     use crate::row::ops::SelectKey;
@@ -4437,7 +4353,7 @@ pub(crate) mod tests {
         debug_snapshot(engine.inner().core.lock_manager())
             .entries
             .iter()
-            .filter(|entry| entry.owner == owner)
+            .filter(|entry| entry.family == owner.family())
             .count()
     }
 
@@ -4471,13 +4387,13 @@ pub(crate) mod tests {
             let transaction_lock_entries = snapshot
                 .entries
                 .iter()
-                .filter(|entry| entry.owner == LockOwner::transaction(session_id, trx_id))
+                .filter(|entry| entry.family == LockOwner::transaction(session_id, trx_id).family())
                 .count();
             let session_lock_entries = session_owner.map_or(0, |owner| {
                 snapshot
                     .entries
                     .iter()
-                    .filter(|entry| entry.owner == owner)
+                    .filter(|entry| entry.family == owner.family())
                     .count()
             });
             observed_tx
@@ -4573,7 +4489,8 @@ pub(crate) mod tests {
             .entries
             .iter()
             .any(|entry| {
-                entry.owner == owner
+                (entry.pending_owner == Some(owner)
+                    || (entry.pending_owner.is_none() && entry.family == owner.family()))
                     && entry.resource == resource
                     && entry.mode == mode
                     && entry.state == state
@@ -4584,7 +4501,7 @@ pub(crate) mod tests {
         debug_snapshot(engine.inner().core.lock_manager())
             .entries
             .iter()
-            .any(|entry| entry.owner == owner && entry.resource == resource)
+            .any(|entry| entry.family == owner.family() && entry.resource == resource)
     }
 
     async fn publish_initial_test_root(engine: &Engine, table_id_offset: u64) -> Arc<TableFile> {
@@ -5179,7 +5096,7 @@ pub(crate) mod tests {
         );
     }
 
-    async fn assert_dropped_statement_waiter_released(
+    async fn assert_dropped_statement_waiter_cancelled(
         log_file_stem: &str,
         id: u64,
         promote_before_drop: bool,
@@ -5190,15 +5107,16 @@ pub(crate) mod tests {
         let stmt_owner = lock_owner(&trx).unwrap().statement(1);
         let resource = LockResource::TableMetadata(TableID::new(id));
         let blocker = LockOwner::transaction(SessionID::new(id), TrxID::new(id));
-        assert!(
-            try_acquire(
+        let mut blocker = TestLockOwner::new(blocker);
+        blocker
+            .acquire(
                 engine.inner().core.lock_manager(),
                 resource,
                 LockMode::Exclusive,
-                blocker
             )
-            .unwrap()
-        );
+            .await
+            .unwrap();
+        let mut blocker = Some(blocker);
         let mut exec = Box::pin(trx.exec(async |stmt| {
             stmt_tests::acquire_statement_lock(stmt, resource, LockMode::Shared).await?;
             Ok::<(), Error>(())
@@ -5216,14 +5134,10 @@ pub(crate) mod tests {
             LockDebugEntryState::Waiting,
         ));
         if promote_before_drop {
-            assert_eq!(
-                engine
-                    .inner()
-                    .core
-                    .lock_manager()
-                    .release(resource, blocker),
-                1
-            );
+            blocker
+                .take()
+                .unwrap()
+                .close(engine.inner().core.lock_manager());
             assert!(has_lock_entry(
                 &engine,
                 stmt_owner,
@@ -5236,15 +5150,8 @@ pub(crate) mod tests {
         drop(exec);
 
         assert!(!has_lock_resource(&engine, stmt_owner, resource));
-        if !promote_before_drop {
-            assert_eq!(
-                engine
-                    .inner()
-                    .core
-                    .lock_manager()
-                    .release(resource, blocker),
-                1
-            );
+        if let Some(blocker) = blocker {
+            blocker.close(engine.inner().core.lock_manager());
         }
         let err = trx.rollback().await.unwrap_err();
         assert_eq!(
@@ -5257,7 +5164,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_dropped_statement_removes_queued_lock_before_cleanup() {
-        smol::block_on(assert_dropped_statement_waiter_released(
+        smol::block_on(assert_dropped_statement_waiter_cancelled(
             "trx_queued_stmt_lock_cancel",
             91_431,
             false,
@@ -5266,7 +5173,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_dropped_statement_releases_promoted_unobserved_lock_before_cleanup() {
-        smol::block_on(assert_dropped_statement_waiter_released(
+        smol::block_on(assert_dropped_statement_waiter_cancelled(
             "trx_promoted_stmt_lock_cancel",
             91_432,
             true,
@@ -5362,7 +5269,7 @@ pub(crate) mod tests {
                     LockMode::Shared,
                 )
                 .await?;
-                assert_eq!(lock_entry_count(&engine, owner), 1);
+                assert_eq!(lock_entry_count(&engine, owner), 2);
                 Ok(())
             })
             .await
@@ -5384,7 +5291,7 @@ pub(crate) mod tests {
                     LockMode::Shared,
                 )
                 .await?;
-                assert_eq!(lock_entry_count(&engine, owner), 1);
+                assert_eq!(lock_entry_count(&engine, owner), 2);
                 Ok(())
             })
             .await
@@ -5401,7 +5308,7 @@ pub(crate) mod tests {
                         LockMode::Shared,
                     )
                     .await?;
-                    assert_eq!(lock_entry_count(&engine, owner), 1);
+                    assert_eq!(lock_entry_count(&engine, owner), 2);
                     Err(Report::new(OperationError::InvalidDmlInput).disclose())
                 })
                 .await;
@@ -5419,9 +5326,9 @@ pub(crate) mod tests {
             assert_eq!(first_owner, trx_owner.statement(1));
             assert_eq!(second_owner, trx_owner.statement(2));
             assert_eq!(error_owner, trx_owner.statement(3));
-            assert_eq!(lock_entry_count(&engine, first_owner), 0);
-            assert_eq!(lock_entry_count(&engine, second_owner), 0);
-            assert_eq!(lock_entry_count(&engine, error_owner), 0);
+            assert_eq!(lock_entry_count(&engine, first_owner), 1);
+            assert_eq!(lock_entry_count(&engine, second_owner), 1);
+            assert_eq!(lock_entry_count(&engine, error_owner), 1);
             assert_eq!(lock_entry_count(&engine, trx_owner), 1);
 
             trx.rollback().await.unwrap();
@@ -5453,26 +5360,23 @@ pub(crate) mod tests {
 
             let metadata = LockResource::TableMetadata(TableID::new(91_221));
             acquire_transaction_lock_immediate(&mut trx, metadata, LockMode::Shared).unwrap();
-            assert!(
-                try_acquire(
+            let mut blocker =
+                TestLockOwner::new(LockOwner::session_explicit(SessionID::new(91_221)));
+            blocker
+                .acquire(
                     engine.inner().core.lock_manager(),
                     metadata,
                     LockMode::Shared,
-                    LockOwner::session_explicit(SessionID::new(91_221))
                 )
-                .unwrap()
-            );
+                .await
+                .unwrap();
             let err = acquire_transaction_lock_immediate(&mut trx, metadata, LockMode::Exclusive)
                 .unwrap_err();
             assert_eq!(
                 err.report().downcast_ref::<OperationError>().copied(),
                 Some(OperationError::LockUpgradeWouldBlock)
             );
-            engine
-                .inner()
-                .core
-                .lock_manager()
-                .release_owner(LockOwner::session_explicit(SessionID::new(91_221)));
+            blocker.close(engine.inner().core.lock_manager());
 
             trx.rollback().await.unwrap();
             assert_eq!(lock_entry_count(&engine, owner), 0);
@@ -5545,15 +5449,15 @@ pub(crate) mod tests {
             let table_id = catalog_tests::table2(&engine).await;
             let blocker = LockOwner::transaction(SessionID::new(91_401), TrxID::new(91_401));
             let data = LockResource::TableData(table_id);
-            assert!(
-                try_acquire(
+            let mut blocker = TestLockOwner::new(blocker);
+            blocker
+                .acquire(
                     engine.inner().core.lock_manager(),
                     data,
                     LockMode::Exclusive,
-                    blocker
                 )
-                .unwrap()
-            );
+                .await
+                .unwrap();
 
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
@@ -5594,7 +5498,7 @@ pub(crate) mod tests {
             assert!(!has_lock_resource(&engine, owner, metadata));
             assert!(!has_lock_resource(&engine, owner, data));
             assert!(!transaction_lock_covers(&trx, metadata, LockMode::Shared).unwrap());
-            assert_eq!(engine.inner().core.lock_manager().release(data, blocker), 1);
+            blocker.close(engine.inner().core.lock_manager());
 
             trx.rollback().await.unwrap();
         });
@@ -5616,15 +5520,15 @@ pub(crate) mod tests {
             assert!(transaction_lock_covers(&trx, metadata, LockMode::Shared).unwrap());
 
             let blocker = LockOwner::transaction(SessionID::new(91_402), TrxID::new(91_402));
-            assert!(
-                try_acquire(
+            let mut blocker = TestLockOwner::new(blocker);
+            blocker
+                .acquire(
                     engine.inner().core.lock_manager(),
                     data,
                     LockMode::Exclusive,
-                    blocker
                 )
-                .unwrap()
-            );
+                .await
+                .unwrap();
 
             let mut lock_fut = Box::pin(trx.lock_table(table_id, TableLockMode::Shared));
             assert!(matches!(
@@ -5666,7 +5570,7 @@ pub(crate) mod tests {
             assert!(!has_lock_resource(&engine, owner, data));
             assert!(transaction_lock_covers(&trx, metadata, LockMode::Shared).unwrap());
             assert!(!transaction_lock_covers(&trx, data, LockMode::Shared).unwrap());
-            assert_eq!(engine.inner().core.lock_manager().release(data, blocker), 1);
+            blocker.close(engine.inner().core.lock_manager());
 
             trx.rollback().await.unwrap();
             assert_eq!(lock_entry_count(&engine, owner), 0);
@@ -5944,7 +5848,7 @@ pub(crate) mod tests {
 
             let observed = recv_terminal_boundary(&observed_rx);
             assert_eq!(observed.outcome, TerminalAttachmentOutcome::Rollback);
-            assert_eq!(observed.transaction_lock_entries, 0);
+            assert_eq!(observed.transaction_lock_entries, 2);
             assert!(observed.session_active);
             assert!(observed.session_lock_entries > 0);
             assert_eq!(session_registry_len(&engine.inner().session_registry), 0);

@@ -4825,12 +4825,12 @@ mod tests {
         IoError, OperationError, Result, RuntimeError,
     };
     use crate::file::cow_file::SUPER_BLOCK_ID;
-    use crate::id::{PageID, RowID, SessionID, TableID, TrxID};
+    use crate::id::{PageID, RowID, TableID, TrxID};
     use crate::index::RowLocation;
     use crate::io::{StorageBackendFileIdentity, install_storage_backend_test_hook};
     use crate::latch::LatchFallbackMode;
     use crate::lock::tests::LockDebugEntryState;
-    use crate::lock::{LockMode, LockOwner, LockResource};
+    use crate::lock::{LockMode, LockResource};
     use crate::log::redo::RowRedoKind;
     use crate::row::RowPage;
     use crate::row::ops::{
@@ -4863,7 +4863,6 @@ mod tests {
     use error_stack::Report;
     use smol::Timer;
     use smol::future::yield_now;
-    use std::cell::Cell;
     use std::io::Error as StdIoError;
     use std::iter::repeat_n;
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -8833,70 +8832,6 @@ mod tests {
                 .unwrap();
             trx.rollback().await.unwrap();
             table.mark_dropped_lifecycle();
-        });
-    }
-
-    #[test]
-    fn test_table_scan_mvcc_released_waiter_preserves_lock_context() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine =
-                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
-            let table_id = create_table2_for_test(&engine).await;
-            let resource = LockResource::TableMetadata(table_id);
-            let blocker = LockOwner::session_explicit(SessionID::new(91_225));
-            engine
-                .inner()
-                .core
-                .lock_manager()
-                .acquire(resource, LockMode::Exclusive, blocker)
-                .await
-                .unwrap();
-
-            let mut session = engine.new_session().unwrap();
-            let mut trx = session.begin_trx().unwrap();
-            let stmt_owner = Cell::new(None);
-            let mut scan_fut = Box::pin(trx.exec(async |stmt| {
-                stmt_owner.set(Some(stmt_tests::lock_owner(stmt)));
-                stmt.table_scan_mvcc(table_id, &[0], |_| true).await
-            }));
-            assert!(matches!(
-                futures::poll!(scan_fut.as_mut()),
-                std::task::Poll::Pending
-            ));
-            let stmt_owner = stmt_owner.get().unwrap();
-            wait_for_lock_entry(
-                &engine,
-                stmt_owner,
-                resource,
-                LockMode::Shared,
-                LockDebugEntryState::Waiting,
-            )
-            .await;
-            assert_eq!(
-                engine.inner().core.lock_manager().release_owner(stmt_owner),
-                1
-            );
-
-            let err = scan_fut.await.unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<OperationError>().copied(),
-                Some(OperationError::LockWaiterReleased)
-            );
-            let rendered = format!("{err:?}");
-            assert_eq!(rendered.matches("operation=table_scan_mvcc").count(), 1);
-            assert_eq!(rendered.matches(&format!("table_id={table_id}")).count(), 1);
-            assert!(rendered.contains("resource=table_metadata"), "{rendered}");
-            assert!(rendered.contains("mode=shared"), "{rendered}");
-            assert_eq!(
-                engine
-                    .inner()
-                    .core
-                    .lock_manager()
-                    .release(resource, blocker),
-                1
-            );
-            trx.rollback().await.unwrap();
         });
     }
 

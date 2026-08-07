@@ -455,12 +455,14 @@ before releasing the logical locks that authorize those runtime owners.
 `CREATE INDEX` and `DROP INDEX` prepare their full target and catalog lock
 sets, exact live table, table/catalog metadata-gate admissions, layout, active
 root, and metadata/root plan before mandatory admission. Accepted execution
-starts the private catalog transaction and uses prepared catalog-write
-authority, so it does not reacquire logical locks. Catalog commit remains
-followed by table-root publication. The final runtime-layout and catalog
-history transition holds the user-table catalog entry before the table layout
-mutex, exposing only the old/old or new/new metadata pointer pair to history
-purge.
+starts the private catalog transaction and acquires ordinary exact transaction
+and statement metadata/data claims. The enclosing DDL operation already holds
+covering physical modes, so these nested claims publish through the owner-local
+fixed slots without another manager transition. No prepared catalog-write
+bypass exists. Catalog commit remains followed by table-root publication. The
+final runtime-layout and catalog history transition holds the user-table
+catalog entry before the table layout mutex, exposing only the old/old or
+new/new metadata pointer pair to history purge.
 
 CREATE INDEX and DROP INDEX also take same-table `TableMetadata(X)`. That grant
 waits for every transaction that successfully bound the table, but an older

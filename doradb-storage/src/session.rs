@@ -24,8 +24,8 @@ use crate::notify::EventNotifyOnDrop;
 use crate::quiescent::QuiescentGuard;
 use crate::runtime::mandatory::{AcceptedExecution, MandatoryTaskMetadata, PreparedExecution};
 use crate::stats::{
-    BufferPoolStats, MandatoryRuntimeStats, StorageIoStats, TransactionSystemStats,
-    buffer_pool_runtime_stats_snapshot, storage_io_stats_snapshot,
+    BufferPoolStats, LogicalLockStats, MandatoryRuntimeStats, StorageIoStats,
+    TransactionSystemStats, buffer_pool_runtime_stats_snapshot, storage_io_stats_snapshot,
     transaction_system_stats_snapshot,
 };
 use crate::table::{
@@ -34,9 +34,9 @@ use crate::table::{
     prepare_freeze_table_operation, prepare_mem_index_cleanup_operation,
 };
 use crate::trx::{
-    PreparedCatalogWriteAuthority, RedoRetentionScope, ReleasedTransactionLocks,
-    SessionOperationEntry, SessionOperationKind, SessionOperationState, Transaction, TrxInner,
-    prepare_catalog_redo_maintenance_operation, prepare_redo_truncation_operation,
+    RedoRetentionScope, ReleasedTransactionLocks, SessionOperationEntry, SessionOperationKind,
+    SessionOperationState, Transaction, TrxInner, prepare_catalog_redo_maintenance_operation,
+    prepare_redo_truncation_operation,
 };
 use error_stack::{Report, ResultExt};
 use event_listener::EventListener;
@@ -221,12 +221,6 @@ impl AcceptedDdlScope {
     #[inline]
     pub(crate) fn begin_private_trx(&mut self) -> LifecycleResult<Transaction> {
         self.operation.begin_private_trx()
-    }
-
-    /// Borrow the prepared proof used by catalog statement mutation.
-    #[inline]
-    pub(crate) fn catalog_write_authority(&self) -> PreparedCatalogWriteAuthority<'_> {
-        self.operation.catalog_write_authority()
     }
 
     /// Verify the nested state before returning from accepted execution.
@@ -1323,6 +1317,20 @@ impl Session {
         Ok(session.runtime.mandatory_runtime.stats())
     }
 
+    /// Return cumulative logical-lock work and current physical-state statistics.
+    ///
+    /// This read-only diagnostic remains observable after storage poison while
+    /// the engine lifecycle is running. Owner-local counters are aggregated
+    /// when a session's final family authority closes.
+    #[inline]
+    pub fn logical_lock_stats(&self) -> Result<LogicalLockStats> {
+        let session = self
+            .pin_inspection()
+            .attach("operation=query_logical_lock_stats")
+            .disclose()?;
+        Ok(session.runtime.lock_manager().stats())
+    }
+
     /// Freeze a row-page prefix or report the existing table-owned batch.
     #[inline]
     pub async fn freeze_table(
@@ -1991,18 +1999,6 @@ impl MandatoryOperationGuard {
         if self.authority.is_none() && self.entry.inspect().trx_id.is_none() {
             self.authority = Some(self.entry.take_lock_authority_return());
         }
-    }
-
-    /// Borrows the accepted operation scope as prepared catalog-write proof.
-    #[inline]
-    pub(crate) fn catalog_write_authority(&self) -> PreparedCatalogWriteAuthority<'_> {
-        let curr_scope = self.curr_scope.as_ref().unwrap_or_else(|| {
-            panic!(
-                "accepted DDL must retain operation curr_scope: key={}",
-                self.key()
-            )
-        });
-        PreparedCatalogWriteAuthority::new(curr_scope)
     }
 
     /// Verify that accepted execution settled every nested transaction.
@@ -3127,13 +3123,6 @@ impl TrxAttachment {
         self.runtime.core()
     }
 
-    /// Returns the authoritative session identity for transaction lock ownership.
-    #[cfg(debug_assertions)]
-    #[inline]
-    pub(crate) fn session_id(&self) -> SessionID {
-        self.operation_key.session_id()
-    }
-
     /// Returns the exact transaction identity carried by this attachment.
     #[inline]
     pub(crate) const fn trx_id(&self) -> TrxID {
@@ -3993,6 +3982,7 @@ pub(crate) mod tests {
             assert!(session.storage_io_stats().is_ok());
             assert!(session.buffer_pool_stats().is_ok());
             assert!(session.mandatory_runtime_stats().is_ok());
+            assert!(session.logical_lock_stats().is_ok());
             assert!(
                 session
                     .wait_for_checkpoint_retry(CheckpointDelayReason::ActiveRoot {
@@ -5298,11 +5288,7 @@ pub(crate) mod tests {
                     LockDebugEntryState::Granted,
                 )
                 .expect("maintenance owner should retain metadata S");
-                assert_ne!(maintenance_owner, explicit_owner);
-                assert!(matches!(
-                    maintenance_owner.scope(),
-                    crate::lock::LockScope::Operation(_)
-                ));
+                assert_eq!(maintenance_owner.family(), explicit_owner.family());
                 assert!(has_lock_entry(
                     &engine,
                     explicit_owner,
@@ -5321,13 +5307,13 @@ pub(crate) mod tests {
                     &engine,
                     maintenance_owner,
                     data,
-                    LockMode::IntentShared,
+                    explicit_data_mode,
                     LockDebugEntryState::Granted,
                 ));
 
                 release_tx.send_async(()).await.unwrap();
                 assert_eq!(count.await.unwrap(), 0);
-                assert_eq!(lock_entry_count(&engine, maintenance_owner), 0);
+                assert_eq!(lock_entry_count(&engine, maintenance_owner), 2);
                 assert_eq!(lock_entry_count(&engine, explicit_owner), 2);
 
                 session.unlock_table(table_id).unwrap();
@@ -6524,6 +6510,7 @@ pub(crate) mod tests {
             let storage0 = session.storage_io_stats().unwrap();
             let pools0 = session.buffer_pool_stats().unwrap();
             let mandatory0 = session.mandatory_runtime_stats().unwrap();
+            let logical0 = session.logical_lock_stats().unwrap();
             assert_eq!(trx0.commit_count, 0);
             assert_eq!(trx0.trx_count, 0);
             assert_eq!(trx0.log_bytes, 0);
@@ -6539,6 +6526,7 @@ pub(crate) mod tests {
             let pools1 = session.buffer_pool_stats().unwrap();
             engine.inner().mandatory_runtime.drain_callers().await;
             let mandatory1 = session.mandatory_runtime_stats().unwrap();
+            let logical1 = session.logical_lock_stats().unwrap();
             // Commit waiters can complete before the redo thread publishes
             // aggregate stats, so this test verifies monotonic snapshots
             // rather than immediate progress from the preceding operation.
@@ -6558,6 +6546,11 @@ pub(crate) mod tests {
             assert_eq!(
                 mandatory1.transaction_cleanup,
                 MandatoryTaskStats::default()
+            );
+            assert!(logical1.resource_transitions >= logical0.resource_transitions);
+            assert!(
+                logical1.immediate_physical_acquisitions
+                    >= logical0.immediate_physical_acquisitions
             );
         });
     }
@@ -6584,6 +6577,7 @@ pub(crate) mod tests {
                 session.storage_io_stats().unwrap_err(),
                 session.buffer_pool_stats().unwrap_err(),
                 session.mandatory_runtime_stats().unwrap_err(),
+                session.logical_lock_stats().unwrap_err(),
             ] {
                 assert_eq!(err.kind(), ErrorKind::Lifecycle);
                 assert_eq!(
@@ -6614,6 +6608,7 @@ pub(crate) mod tests {
             assert_runtime_unavailable_after_shutdown(
                 session.mandatory_runtime_stats().unwrap_err(),
             );
+            assert_runtime_unavailable_after_shutdown(session.logical_lock_stats().unwrap_err());
         });
     }
 
@@ -6643,6 +6638,7 @@ pub(crate) mod tests {
             assert!(session.storage_io_stats().is_ok());
             assert!(session.buffer_pool_stats().is_ok());
             assert!(session.mandatory_runtime_stats().is_ok());
+            assert!(session.logical_lock_stats().is_ok());
 
             let err = session.truncate_redo_log().await.unwrap_err();
             assert_runtime_unavailable_after_fatal(err, FatalError::RedoWrite);

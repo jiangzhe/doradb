@@ -20,8 +20,8 @@ use crate::trx::undo::{
     IndexUndo, IndexUndoKind, IndexUndoLogs, OwnedRowUndo, RowUndoKind, RowUndoLogs,
 };
 use crate::trx::{
-    FatalRollbackRetention, PreparedCatalogWriteAuthority, SessionOperationCheckout,
-    TableAdmissionRequest, TrxEffects, TrxInner, TrxRuntime,
+    FatalRollbackRetention, SessionOperationCheckout, TableAdmissionRequest, TrxEffects, TrxInner,
+    TrxRuntime,
 };
 use crate::value::Val;
 use error_stack::ResultExt;
@@ -299,23 +299,6 @@ impl StmtState {
     /// Lends one direct callback-facing statement facade.
     #[inline]
     pub(crate) fn statement(&mut self) -> Statement<'_> {
-        self.statement_with_authority(None)
-    }
-
-    /// Lends a callback facade backed by prepared catalog-write authority.
-    #[inline]
-    pub(crate) fn prepared_catalog_statement<'a>(
-        &'a mut self,
-        authority: PreparedCatalogWriteAuthority<'a>,
-    ) -> Statement<'a> {
-        self.statement_with_authority(Some(authority))
-    }
-
-    #[inline]
-    fn statement_with_authority<'a>(
-        &'a mut self,
-        prepared_catalog_write: Option<PreparedCatalogWriteAuthority<'a>>,
-    ) -> Statement<'a> {
         let Self {
             effects,
             curr_scope,
@@ -334,7 +317,6 @@ impl StmtState {
                 .as_mut()
                 .expect("active statement state must retain curr_scope"),
             disable_dml_validation: false,
-            prepared_catalog_write,
         }
     }
 
@@ -435,7 +417,6 @@ pub struct Statement<'stmt> {
     effects: &'stmt mut StmtEffects,
     curr_scope: &'stmt mut LockScopeState,
     disable_dml_validation: bool,
-    prepared_catalog_write: Option<PreparedCatalogWriteAuthority<'stmt>>,
 }
 
 impl<'stmt> Statement<'stmt> {
@@ -456,12 +437,11 @@ impl<'stmt> Statement<'stmt> {
     /// Returns this statement's operation-local transaction runtime.
     #[inline]
     pub(crate) fn runtime(&self) -> TrxRuntime<'_> {
-        match self.prepared_catalog_write {
-            Some(authority) => {
-                TrxRuntime::new_prepared_catalog(self.inner.ctx(), self.attachment, authority)
-            }
-            None => TrxRuntime::new(self.inner.ctx(), self.attachment),
-        }
+        TrxRuntime::new(
+            self.inner.ctx(),
+            self.attachment,
+            self.inner.checked_lock_state(),
+        )
     }
 
     /// Returns mutable access to this statement's effect accumulator.
@@ -472,12 +452,11 @@ impl<'stmt> Statement<'stmt> {
 
     #[inline]
     fn runtime_and_effects_mut(&mut self) -> (TrxRuntime<'_>, &mut StmtEffects) {
-        let runtime = match self.prepared_catalog_write {
-            Some(authority) => {
-                TrxRuntime::new_prepared_catalog(self.inner.ctx(), self.attachment, authority)
-            }
-            None => TrxRuntime::new(self.inner.ctx(), self.attachment),
-        };
+        let runtime = TrxRuntime::new(
+            self.inner.ctx(),
+            self.attachment,
+            self.inner.checked_lock_state(),
+        );
         (runtime, self.effects)
     }
 
@@ -900,24 +879,18 @@ impl<'stmt> Statement<'stmt> {
     ) -> OperationOrRuntimeResult<RowID> {
         const OPERATION: &str = "catalog_insert_mvcc";
         let table_id = table.table_id();
-        if let Some(authority) = self.prepared_catalog_write {
-            authority.assert_table_write(table_id);
-        } else {
-            self.acquire_table_write_metadata_lock(table_id)
-                .await
-                .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
-        }
+        self.acquire_table_write_metadata_lock(table_id)
+            .await
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
         if !self.disable_dml_validation {
             DmlValidator::new(table.metadata())
                 .validate_full_row(&cols)
                 .change_context(OperationError::InvalidDmlInput)
                 .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
         }
-        if self.prepared_catalog_write.is_none() {
-            self.acquire_table_write_data_lock(table_id)
-                .await
-                .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
-        }
+        self.acquire_table_write_data_lock(table_id)
+            .await
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
         let (rt, effects) = self.runtime_and_effects_mut();
         table
             .insert_mvcc(rt, effects, cols)
@@ -954,24 +927,18 @@ impl<'stmt> Statement<'stmt> {
     ) -> OperationOrRuntimeResult<DeleteMvcc> {
         const OPERATION: &str = "catalog_delete_primary_key_mvcc";
         let table_id = table.table_id();
-        if let Some(authority) = self.prepared_catalog_write {
-            authority.assert_table_write(table_id);
-        } else {
-            self.acquire_table_write_metadata_lock(table_id)
-                .await
-                .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
-        }
+        self.acquire_table_write_metadata_lock(table_id)
+            .await
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
         if !self.disable_dml_validation {
             DmlValidator::new(table.metadata())
                 .validate_primary_key(index_no, key_vals)
                 .change_context(OperationError::InvalidDmlInput)
                 .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
         }
-        if self.prepared_catalog_write.is_none() {
-            self.acquire_table_write_data_lock(table_id)
-                .await
-                .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
-        }
+        self.acquire_table_write_data_lock(table_id)
+            .await
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
         let (rt, effects) = self.runtime_and_effects_mut();
         table
             .delete_unique_mvcc(rt, effects, index_no, key_vals, log_by_key)
@@ -1185,7 +1152,7 @@ pub(crate) mod tests {
         debug_snapshot(engine.inner().core.lock_manager())
             .entries
             .iter()
-            .filter(|entry| entry.owner == owner)
+            .filter(|entry| entry.family == owner.family())
             .count()
     }
 

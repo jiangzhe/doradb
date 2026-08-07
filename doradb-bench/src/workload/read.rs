@@ -67,7 +67,12 @@ impl WorkloadRunner for LookupSeqRunner {
         }
     }
 
-    async fn run(&self, session: &mut Session, plan: &SessionPlan) -> Result<SessionSummary> {
+    async fn run(
+        &self,
+        _engine: &doradb_storage::Engine,
+        session: &mut Session,
+        plan: &SessionPlan,
+    ) -> Result<SessionSummary> {
         let keys = generate_sequential_read_keys(self.loaded_range, plan)?;
         lookup_keys(session, self.batch_size, self.table_id, &keys).await
     }
@@ -141,7 +146,12 @@ impl WorkloadRunner for LookupRandRunner {
         }
     }
 
-    async fn run(&self, session: &mut Session, plan: &SessionPlan) -> Result<SessionSummary> {
+    async fn run(
+        &self,
+        _engine: &doradb_storage::Engine,
+        session: &mut Session,
+        plan: &SessionPlan,
+    ) -> Result<SessionSummary> {
         let keys = generate_random_read_keys(self.seed, self.loaded_range, plan)?;
         lookup_keys(session, self.batch_size, self.table_id, &keys).await
     }
@@ -200,7 +210,12 @@ impl WorkloadRunner for TableScanRunner {
         }
     }
 
-    async fn run(&self, session: &mut Session, plan: &SessionPlan) -> Result<SessionSummary> {
+    async fn run(
+        &self,
+        _engine: &doradb_storage::Engine,
+        session: &mut Session,
+        plan: &SessionPlan,
+    ) -> Result<SessionSummary> {
         table_scan_iterations(session, self.batch_size, self.table_id, plan.number).await
     }
 }
@@ -282,7 +297,12 @@ impl WorkloadRunner for IndexScanRunner {
         }
     }
 
-    async fn run(&self, session: &mut Session, plan: &SessionPlan) -> Result<SessionSummary> {
+    async fn run(
+        &self,
+        _engine: &doradb_storage::Engine,
+        session: &mut Session,
+        plan: &SessionPlan,
+    ) -> Result<SessionSummary> {
         index_scan_ranges(
             session,
             self.batch_size,
@@ -370,7 +390,12 @@ impl WorkloadRunner for IndexStreamRunner {
         }
     }
 
-    async fn run(&self, session: &mut Session, plan: &SessionPlan) -> Result<SessionSummary> {
+    async fn run(
+        &self,
+        _engine: &doradb_storage::Engine,
+        session: &mut Session,
+        plan: &SessionPlan,
+    ) -> Result<SessionSummary> {
         index_stream_iterations(
             session,
             self.table_id,

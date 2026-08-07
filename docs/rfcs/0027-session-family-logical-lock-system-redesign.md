@@ -204,7 +204,7 @@ notification. [D7] [C7] [U2] [U4] [U5] [U6]
 
 ### Source Backlogs
 
-- [B1] `docs/backlogs/000171-exact-family-lock-system-redesign.md` - source
+- [B1] `docs/backlogs/closed/000171-exact-family-lock-system-redesign.md` - source
   backlog and RFC acceptance criteria.
 - [B2] `docs/backlogs/closed/000115-explicit-session-lock-cache.md` - session lock
   cache requirement absorbed by the family state.
@@ -390,14 +390,13 @@ scope state. A held state represents all accepted exact claims in the family.
 
 `ResourceState::is_empty()` is true only when there are no physical families,
 no granted counts, no linked queue nodes, and no occupied slab nodes in any
-phase. In particular, detached `Provisional` and `Released` nodes keep the
-resource entry alive until the unique pending observer or guard consumes
-them. Consequently, every live `WaitNodeID` pins the `ResourceState` and its
-slab. The whole slab can be destroyed and a new resource entry created only
-after no waiter-node id can survive, so a separate `ResourceIncarnation` is
-unnecessary. Slot generation handles reuse inside one live slab; the
-resource-removal invariant handles reuse of the entire resource entry. [D7]
-[C1] [U7]
+phase. In particular, a detached `Provisional` node keeps the resource entry
+alive until the unique pending observer or guard consumes it. Consequently,
+every live `WaitNodeID` pins the `ResourceState` and its slab. The whole slab
+can be destroyed and a new resource entry created only after no waiter-node id
+can survive, so a separate `ResourceIncarnation` is unnecessary. Slot
+generation handles reuse inside one live slab; the resource-removal invariant
+handles reuse of the entire resource entry. [D7] [C1] [U7]
 
 Resource state does not duplicate exact-owner claim maps, claim counts, DDL
 purpose records, or accepted `ClaimNo`s. The manager needs only the
@@ -525,7 +524,6 @@ enum WaitNodePhase {
         next: Option<WaitNodeID>,
     },
     Provisional,
-    Released,
 }
 ```
 
@@ -541,21 +539,20 @@ acquisition finds no reusable slot. [D16] [C1] [U6] [U8]
 `WaitNodeID` is the transient identity of one occupied storage slot, not the
 identity of a claim. The call-local pending guard owns the
 `PendingClaimToken` and, while blocked, its `WaitNodeID`. The node repeats the
-token's family, owner, and `ClaimNo`. Every manager-side observation
-first validates slot generation and then asserts those logical fields before
-mutation. A missing slot, generation mismatch, or logical mismatch is an
-internal invariant violation; a matching `Released` phase is the ordinary
-cancelled outcome. [D7] [C1] [U4] [U7]
+token's family, owner, and `ClaimNo`. Every manager-side observation first
+validates slot generation and then asserts those logical fields before
+mutation. A missing slot, generation mismatch, logical mismatch, or
+non-provisional node after notification is an internal invariant violation.
+[D7] [C1] [U4] [U7]
 
 The waiter node and call-local guard share
 `Arc<crate::completion::Completion<()>>`. The completion is only an independent
-one-shot notification that authoritative manager state changed. Promotion or
-release mutates that state, drops resource synchronization, and calls
+one-shot notification that authoritative manager state changed. Promotion
+mutates that state, drops resource synchronization, and calls
 `complete(Ok(()))`. The unique acquisition observer uses
 `wait_take_result()` and then validates its pending token and node id:
 
-- matching `Provisional` adopts the physical grant and accepts the claim;
-- matching `Released` reclaims the node and returns `LockWaiterReleased`; and
+- matching `Provisional` adopts the physical grant and accepts the claim; and
 - `Queued` after completion, a missing node, or any identity mismatch is an
   invariant violation before mutation.
 
@@ -574,12 +571,11 @@ unwinds before that commit, the armed guard removes any inserted local record
 and uses the still-addressable provisional node to release the physical grant.
 No new claim identity is allocated during this transfer. [D7] [C1] [U7]
 
-Cancellation by a separate lifecycle control path unlinks a queued node or
-removes its promoted physical grant, marks the node `Released`, and notifies
-after dropping resource synchronization. The occupied released node pins the
-resource until the unique observer consumes it. If the caller future itself is
-dropped, its pending guard is the final observer and may cancel and reclaim the
-node in the same resource transition. Dropping the guard also synchronously:
+The acquisition future exclusively borrows family mutation authority, so no
+separate lifecycle path can release its pending state while its observer
+remains live. If the caller future is dropped, its pending guard is the final
+observer and cancels and reclaims a queued or provisional node in the same
+resource transition. Dropping the guard also synchronously:
 
 - releases an immediate fresh physical grant not yet transferred; or
 - releases a fresh accepted claim during the narrow guarded local-transfer
@@ -727,7 +723,7 @@ Debug assertions and reference-model tests cover:
 - manager holder mode agreeing with the family aggregate at API boundaries;
 - physical holder counts and masks;
 - queued/provisional/held physical-family-state exclusivity;
-- queued/provisional/released node-phase transitions;
+- queued/provisional node-phase transitions;
 - queue-link, free-list, `live_count`, and slot-generation consistency;
 - pending-token fields matching their occupied waiter nodes;
 - resource removal forbidden while any slab node remains occupied;
@@ -739,8 +735,8 @@ Debug assertions and reference-model tests cover:
 Concurrency tests use deterministic events, barriers, and explicit state hooks
 rather than timing sleeps. Required races include release versus promotion,
 queued cancellation, provisional cancellation, attempted resource removal
-while a queued/provisional/released node remains, removal and recreation after
-node consumption, waiter-slot reuse, caller-future Drop, nested DDL
+while a queued or provisional node remains, removal and recreation after node
+consumption, waiter-slot reuse, caller-future Drop, nested DDL
 cancellation, transaction completion, session teardown, and shutdown drain.
 A simple scan-based reference model validates randomized sequential
 acquisition/release traces against the optimized family model. [D15] [C1]
@@ -833,9 +829,9 @@ this RFC does not introduce a new runner or timeout mechanism. [D15]
   destruction and recreation of a whole resource entry.
 - Why Not Chosen: The required allocator is only a vector, intrusive free
   list, generation check, and live count; the general slab key would still
-  need a generation layer. More importantly, retaining every occupied
-  queued/provisional/released node until its unique observer consumes it
-  proves that no node id survives destruction of the resource slab. A second
+  need a generation layer. More importantly, retaining every occupied queued
+  or provisional node until its unique observer or guard consumes it proves
+  that no node id survives destruction of the resource slab. A second
   incarnation source would protect a lifecycle that the design already
   forbids while adding state and validation to every pending operation.
 - References: [D16] [C1] [U7] [U8]
@@ -876,15 +872,15 @@ authorize it. [D16] [U8]
   - Implementation Summary: Implemented RFC-0027 Phase 1 with one move-only family authority and targeted scope cleanup while retaining exact manager mirrors. [Task Resolve Sync: docs/tasks/000258-linear-lock-family-authority-owner-side-indexes.md @ 2026-08-06]
   - Related Backlogs:
     - `docs/backlogs/closed/000115-explicit-session-lock-cache.md`
-    - `docs/backlogs/000171-exact-family-lock-system-redesign.md`
+    - `docs/backlogs/closed/000171-exact-family-lock-system-redesign.md`
 
 - **Phase 2: Tokenized Waiter And Provisional-Grant Lifecycle**
   - Scope: Replace `Arc<Waiter>`/`VecDeque` cancellation identity with
     resource-local `WaitNodeID`s, the minimal generational `WaitNodeSlab`,
     `PendingClaimToken` to `ClaimToken` transfer, `Completion<()>`,
-    provisional/released node phases, and one call-local pending guard covering
-    queued, promoted, immediate-fresh, and transfer states. Pin resource state
-    until every occupied waiter node is consumed.
+    provisional promotion, a migration-only released phase, and one call-local
+    pending guard covering queued, promoted, immediate-fresh, and transfer
+    states. Pin resource state until every occupied waiter node is consumed.
   - Goals: Provide `O(1)` waiter unlink, no lost wakeup, exact
     promotion/cancellation ownership, no provisional leak, no waiter id across
     whole-slab destruction, and deterministic ABA/race tests while retaining
@@ -910,26 +906,33 @@ authorize it. [D16] [U8]
     fixed holder counts/masks, and family-local covered claim changes; make
     DDL policy local; remove resource-side exact claim mirrors,
     `PreparedCatalogWriteAuthority`, duplicate-waiter repair, production
-    `release_owner()`, and obsolete global scans after proof gates pass.
-    Complete diagnostics, reference-model validation, and expanded
-    lock-table benchmarks.
+    `release_owner()`, raw manager-only test ownership, the migration-only
+    released-waiter phase, and obsolete global scans after proof gates pass.
+    Complete diagnostics, reference-model validation, and expanded lock-table
+    benchmarks.
   - Goals: Deliver the stated complexity bounds, preserve RFC-0016 behavior,
     prove nested DDL/maintenance and shutdown cleanup, and document allocation,
     contention, throughput, and latency changes for every operation class.
   - Non-goals: Deadlock handling, blocking conversion, escalation, weak locks,
     family actors, or parallel same-session mutation.
-  - Prerequisites: Phase 2 pending-token, cancellation, provisional/released
-    node, resource-retention, and post-consumption recreation tests pass under
-    both storage I/O feature sets.
-  - Phase-local Choices: Tune masks, slot packing, notification batches, and
-    retained capacities without weakening structural no-scan/no-global-atomic
-    gates.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Prerequisites: Phase 2 pending-token, cancellation, provisional-node,
+    resource-retention, and post-consumption recreation tests pass under both
+    storage I/O feature sets.
+  - Phase-local Choices: Retained enum lock modes with a purpose-built `u8`
+    presence mask, `[u32; 4]` physical counts, the direct resource map, safe
+    waiter storage, and zero/one/many deferred notifications. Removed the
+    migration-only released-waiter state because the acquisition future is the
+    unique pending cleanup owner.
+  - Task Doc: `docs/tasks/000260-physical-lock-family-aggregation-performance-cutover.md`
+  - Task Issue: `#953`
+  - Phase Status: done
+  - Implementation Summary: Implemented RFC-0027 Phase 3 with one shared physical entry per lock family, owner-local exact authority, bounded compatibility work, and deterministic structural observability. [Task Resolve Sync: docs/tasks/000260-physical-lock-family-aggregation-performance-cutover.md @ 2026-08-07]
   - Related Backlogs:
-    - `docs/backlogs/000171-exact-family-lock-system-redesign.md`
+    - `docs/backlogs/closed/000171-exact-family-lock-system-redesign.md`
+    - `docs/backlogs/000179-cancel-pending-logical-lock-acquisition-on-engine-poison.md`
+    - `docs/backlogs/000180-remove-statement-scope-logical-locks.md`
+    - `docs/backlogs/000181-waitable-comparable-same-scope-lock-upgrades.md`
+    - `docs/backlogs/000182-capture-lock-family-cutover-benchmark-comparison.md`
 
 ## Consequences
 
@@ -975,15 +978,26 @@ authorize it. [D16] [U8]
 
 ## Open Questions
 
-No design-blocking questions remain in this draft. The RFC intentionally
-imposes no hard numeric benchmark budget; each phase must still record and
-explain before/after evidence for its affected operation classes.
+No design-blocking questions remain. Phase 3 recorded final-candidate
+structural counters and timing samples, but equivalent pre-cutover scenario
+instrumentation was not preserved. Backlog 000182 retains the repeated paired
+baseline/candidate comparison rather than treating the candidate-only samples
+as authoritative performance evidence.
 
 ## Future Work
 
 - `docs/backlogs/000167-logical-lock-deadlock-handling.md` - multi-resource
   deadlock policy and diagnostics.
-- Blocking conversion or `SIX`, if justified by future SQL semantics.
+- `docs/backlogs/000179-cancel-pending-logical-lock-acquisition-on-engine-poison.md`
+  - poison-aware waiter cancellation and original-fatal propagation.
+- `docs/backlogs/000180-remove-statement-scope-logical-locks.md` - remove the
+  statement lock scope after the production lifetime audit found no durable
+  statement-only requirement.
+- `docs/backlogs/000181-waitable-comparable-same-scope-lock-upgrades.md` -
+  waitable strengthening after deadlock policy; `SIX` remains a future
+  composition decision.
+- `docs/backlogs/000182-capture-lock-family-cutover-benchmark-comparison.md` -
+  reproducible repeated pre-cutover/final benchmark evidence.
 - Parallel mutation within one session family, which would invalidate the
   local-only claim proof and require a new ownership design.
 - Lock escalation, weak-lock elision, distributed ownership, or family actors.
@@ -1003,7 +1017,7 @@ explain before/after evidence for its affected operation classes.
 - `docs/tasks/000257-doradb-bench-lock-table-workload.md`
 - `docs/backlogs/closed/000115-explicit-session-lock-cache.md`
 - `docs/backlogs/000167-logical-lock-deadlock-handling.md`
-- `docs/backlogs/000171-exact-family-lock-system-redesign.md`
+- `docs/backlogs/closed/000171-exact-family-lock-system-redesign.md`
 - `docs/backlogs/closed/000169-separate-session-operation-lock-scopes.md`
 - `docs/backlogs/closed/000170-session-coordinated-cancellation-cleanup.md`
 - `docs/architecture.md`

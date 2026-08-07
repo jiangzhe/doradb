@@ -1,9 +1,11 @@
-use crate::cli::{IndexMode, LogSyncMode, TableLockScope, Workload};
+use crate::cli::{
+    IndexMode, LockTableMode, LockTableScenario, LogSyncMode, TableLockScope, Workload,
+};
 use crate::error::{BenchError, Result};
 use crate::manifest::{internal_stats_csv_path, result_csv_path, result_markdown_path};
 use doradb_storage::{
-    BufferPoolCounters, BufferPoolRuntimeStats, BufferPoolStats, MandatoryRuntimeStats,
-    MandatoryTaskStats, Session, StorageIoStats, TransactionSystemStats,
+    BufferPoolCounters, BufferPoolRuntimeStats, BufferPoolStats, LogicalLockStats,
+    MandatoryRuntimeStats, MandatoryTaskStats, Session, StorageIoStats, TransactionSystemStats,
 };
 use std::fs;
 use std::io::ErrorKind;
@@ -16,6 +18,7 @@ pub(super) struct InternalStatsSnapshot {
     storage: StorageIoStats,
     buffer: BufferPoolStats,
     mandatory: MandatoryRuntimeStats,
+    logical_lock: LogicalLockStats,
 }
 
 impl InternalStatsSnapshot {
@@ -25,6 +28,7 @@ impl InternalStatsSnapshot {
             storage: session.storage_io_stats()?,
             buffer: session.buffer_pool_stats()?,
             mandatory: session.mandatory_runtime_stats()?,
+            logical_lock: session.logical_lock_stats()?,
         })
     }
 }
@@ -56,6 +60,9 @@ pub(super) struct OutputConfig {
     pub(super) scope: Option<TableLockScope>,
     pub(super) unlock: Option<bool>,
     pub(super) tables: Option<usize>,
+    pub(super) scenario: Option<LockTableScenario>,
+    pub(super) lock_mode: Option<LockTableMode>,
+    pub(super) width: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -132,7 +139,84 @@ pub(super) fn internal_metrics(
     push_storage_metrics(&mut metrics, before.storage, after.storage);
     push_buffer_metrics(&mut metrics, &before.buffer, &after.buffer);
     push_mandatory_metrics(&mut metrics, before.mandatory, after.mandatory);
+    push_logical_lock_metrics(&mut metrics, before.logical_lock, after.logical_lock);
     metrics
+}
+
+fn push_logical_lock_metrics(
+    metrics: &mut Vec<Metric>,
+    before: LogicalLockStats,
+    after: LogicalLockStats,
+) {
+    macro_rules! delta_metric {
+        ($field:ident) => {
+            push_metric(
+                metrics,
+                concat!("logical_lock.", stringify!($field)),
+                delta_u64(after.$field, before.$field),
+            );
+        };
+    }
+    delta_metric!(owner_local_exact_covered_hits);
+    delta_metric!(owner_local_covered_publications);
+    delta_metric!(owner_local_mode_preserving_conversions);
+    delta_metric!(owner_local_mode_preserving_releases);
+    delta_metric!(resource_transitions);
+    delta_metric!(mode_slots_examined);
+    delta_metric!(immediate_physical_acquisitions);
+    delta_metric!(physical_upgrades);
+    delta_metric!(enqueued_waiters);
+    delta_metric!(queue_link_mutations);
+    delta_metric!(cancelled_head_waiters);
+    delta_metric!(cancelled_middle_waiters);
+    delta_metric!(cancelled_tail_waiters);
+    delta_metric!(provisional_observations);
+    delta_metric!(promoted_waiters);
+    delta_metric!(scope_close_claims_visited);
+    delta_metric!(scope_close_physical_changes);
+    delta_metric!(completion_allocations);
+    delta_metric!(waiter_slab_growths);
+    delta_metric!(waiter_slab_reuses);
+    push_metric(
+        metrics,
+        "logical_lock.current_physical_resources",
+        u128::from(after.current_physical_resources),
+    );
+    push_metric(
+        metrics,
+        "logical_lock.peak_physical_resources",
+        u128::from(after.peak_physical_resources),
+    );
+    push_metric(
+        metrics,
+        "logical_lock.current_physical_families",
+        u128::from(after.current_physical_families),
+    );
+    push_metric(
+        metrics,
+        "logical_lock.peak_physical_families",
+        u128::from(after.peak_physical_families),
+    );
+    push_metric(
+        metrics,
+        "logical_lock.current_linked_waiters",
+        u128::from(after.current_linked_waiters),
+    );
+    push_metric(
+        metrics,
+        "logical_lock.peak_linked_waiters",
+        u128::from(after.peak_linked_waiters),
+    );
+    push_metric(
+        metrics,
+        "logical_lock.current_live_waiter_nodes",
+        u128::from(after.current_live_waiter_nodes),
+    );
+    push_metric(
+        metrics,
+        "logical_lock.peak_live_waiter_nodes",
+        u128::from(after.peak_live_waiter_nodes),
+    );
 }
 
 pub(super) fn write_benchmark_outputs(
@@ -420,6 +504,15 @@ fn configuration_pairs(config: &OutputConfig) -> Vec<(String, String)> {
     }
     if let Some(tables) = config.tables {
         pairs.push(("tables".to_owned(), tables.to_string()));
+    }
+    if let Some(scenario) = config.scenario {
+        pairs.push(("scenario".to_owned(), scenario.to_string()));
+    }
+    if let Some(mode) = config.lock_mode {
+        pairs.push(("lock_mode".to_owned(), mode.to_string()));
+    }
+    if let Some(width) = config.width {
+        pairs.push(("width".to_owned(), width.to_string()));
     }
     pairs
 }
@@ -741,6 +834,10 @@ fn delta(after: usize, before: usize) -> u128 {
     after.saturating_sub(before) as u128
 }
 
+fn delta_u64(after: u64, before: u64) -> u128 {
+    u128::from(after.saturating_sub(before))
+}
+
 fn csv_escape(value: &str) -> String {
     if value.contains([',', '"', '\n']) {
         let escaped = value.replace('"', "\"\"");
@@ -778,6 +875,9 @@ mod tests {
             scope: None,
             unlock: None,
             tables: None,
+            scenario: None,
+            lock_mode: None,
+            width: None,
         }
     }
 
@@ -850,6 +950,7 @@ mod tests {
                 },
                 ..MandatoryRuntimeStats::default()
             },
+            logical_lock: LogicalLockStats::default(),
         };
         let after = InternalStatsSnapshot {
             trx: TransactionSystemStats {
@@ -901,10 +1002,11 @@ mod tests {
                     ..MandatoryTaskStats::default()
                 },
             },
+            logical_lock: LogicalLockStats::default(),
         };
 
         let metrics = internal_metrics(&before, &after);
-        assert_eq!(metrics.len(), 93);
+        assert_eq!(metrics.len(), 121);
         assert_eq!(metric_value(&metrics, "transaction.commit_count"), 5);
         assert_eq!(metric_value(&metrics, "transaction.trx_count"), 0);
         assert_eq!(metric_value(&metrics, "transaction.log_bytes"), 5);

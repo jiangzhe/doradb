@@ -57,3 +57,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented through RFC-0027 Phases 1-3, completed by task 000260 physical lock family aggregation and performance cutover.
+- Closed By: backlog close
+- Reference: docs/tasks/000260-physical-lock-family-aggregation-performance-cutover.md; docs/rfcs/0027-session-family-logical-lock-system-redesign.md
+- Closed At: 2026-08-07

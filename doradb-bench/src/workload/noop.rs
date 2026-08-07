@@ -52,7 +52,12 @@ impl WorkloadRunner for StmtNoopRunner {
         Self
     }
 
-    async fn run(&self, session: &mut Session, plan: &SessionPlan) -> Result<SessionSummary> {
+    async fn run(
+        &self,
+        _engine: &doradb_storage::Engine,
+        session: &mut Session,
+        plan: &SessionPlan,
+    ) -> Result<SessionSummary> {
         if plan.number == 0 {
             return Ok(SessionSummary::default());
         }
@@ -118,7 +123,12 @@ impl WorkloadRunner for TrxNoopRunner {
         Self
     }
 
-    async fn run(&self, session: &mut Session, plan: &SessionPlan) -> Result<SessionSummary> {
+    async fn run(
+        &self,
+        _engine: &doradb_storage::Engine,
+        session: &mut Session,
+        plan: &SessionPlan,
+    ) -> Result<SessionSummary> {
         for _ in 0..plan.number {
             session.begin_trx()?.commit().await?;
         }

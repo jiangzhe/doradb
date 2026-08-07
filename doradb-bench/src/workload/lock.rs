@@ -1,17 +1,24 @@
-use crate::cli::{LockTableArgs, TableLockScope, Workload};
+use crate::cli::{LockTableArgs, LockTableMode, LockTableScenario, TableLockScope, Workload};
 use crate::error::{BenchError, Result};
 use crate::manifest::{KeyRange, Manifest};
 use crate::workload::util::RandomTableIndexGenerator;
 use crate::workload::{CommonConfig, SessionPlan, SessionSummary, WorkloadConfig, WorkloadRunner};
 use doradb_storage::id::TableID;
-use doradb_storage::{Session, TableLockMode};
-use std::sync::Arc;
+use doradb_storage::{Engine, Session, TableLockMode};
+use smol::channel;
+use smol::future::or;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
-/// Resolved explicit table-lock workload configuration.
+/// Resolved logical table-lock workload configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LockTableConfig {
     common: CommonConfig,
     num: u64,
+    scenario: LockTableScenario,
+    mode: LockTableMode,
+    width: usize,
     scope: TableLockScope,
     unlock: bool,
     random: bool,
@@ -26,7 +33,15 @@ impl WorkloadConfig for LockTableConfig {
     const WORKLOAD: Workload = Workload::LockTable;
 
     fn resolve(manifest: &Manifest, args: &Self::Args) -> Result<Self> {
-        validate_lock_options(args.unlock(), args.random(), args.explicit_seed())?;
+        validate_lock_options(
+            args.scenario(),
+            args.mode(),
+            args.width(),
+            args.scope(),
+            args.unlock(),
+            args.random(),
+            args.explicit_seed(),
+        )?;
         manifest.validate_workload_compatible(Self::WORKLOAD)?;
         let worker = args.worker();
         let common = CommonConfig::resolve(
@@ -37,6 +52,12 @@ impl WorkloadConfig for LockTableConfig {
             None,
             worker.include_stats(),
         )?;
+        if is_contended(args.scenario()) && common.sessions != 1 {
+            return Err(BenchError::message(format!(
+                "lock-table --scenario {} requires --sessions 1 for deterministic FIFO admission",
+                args.scenario()
+            )));
+        }
         let table_ids = manifest
             .table_ids()
             .into_iter()
@@ -47,9 +68,24 @@ impl WorkloadConfig for LockTableConfig {
                 "lock-table workload requires at least one prepared table",
             ));
         }
+        if matches!(
+            args.scenario(),
+            LockTableScenario::NestedCovered | LockTableScenario::ScopeClose
+        ) && args.width() > table_ids.len()
+        {
+            return Err(BenchError::message(format!(
+                "lock-table --scenario {} --width {} requires at least {} prepared tables",
+                args.scenario(),
+                args.width(),
+                args.width()
+            )));
+        }
         Ok(Self {
             common,
             num: args.operation_count(),
+            scenario: args.scenario(),
+            mode: args.mode(),
+            width: args.width(),
             scope: args.scope(),
             unlock: args.unlock(),
             random: args.random(),
@@ -90,11 +126,26 @@ impl WorkloadConfig for LockTableConfig {
     fn prepared_table_count(&self) -> Option<usize> {
         Some(self.table_ids.len())
     }
+
+    fn lock_scenario(&self) -> Option<LockTableScenario> {
+        Some(self.scenario)
+    }
+
+    fn lock_mode(&self) -> Option<LockTableMode> {
+        Some(self.mode)
+    }
+
+    fn lock_width(&self) -> Option<usize> {
+        Some(self.width)
+    }
 }
 
-/// Executes explicit shared table-lock acquisitions for one public session.
+/// Executes logical table-lock scenarios for one public session.
 #[derive(Clone)]
 pub(crate) struct LockTableRunner {
+    scenario: LockTableScenario,
+    mode: TableLockMode,
+    width: usize,
     scope: TableLockScope,
     unlock: bool,
     random: bool,
@@ -107,6 +158,12 @@ impl WorkloadRunner for LockTableRunner {
 
     fn new(config: &Self::Config, _table_id: TableID) -> Self {
         Self {
+            scenario: config.scenario,
+            mode: match config.mode {
+                LockTableMode::Shared => TableLockMode::Shared,
+                LockTableMode::Exclusive => TableLockMode::Exclusive,
+            },
+            width: config.width,
             scope: config.scope,
             unlock: config.unlock,
             random: config.random,
@@ -115,9 +172,17 @@ impl WorkloadRunner for LockTableRunner {
         }
     }
 
-    async fn run(&self, session: &mut Session, plan: &SessionPlan) -> Result<SessionSummary> {
+    async fn run(
+        &self,
+        engine: &Engine,
+        session: &mut Session,
+        plan: &SessionPlan,
+    ) -> Result<SessionSummary> {
         if plan.number == 0 {
             return Ok(SessionSummary::default());
+        }
+        if self.scenario != LockTableScenario::Basic {
+            return self.run_specialized(engine, session, plan).await;
         }
         match (self.scope, self.unlock) {
             (TableLockScope::Session, false) => self.run_session_retained(session, plan).await,
@@ -131,6 +196,235 @@ impl WorkloadRunner for LockTableRunner {
 }
 
 impl LockTableRunner {
+    async fn run_specialized(
+        &self,
+        engine: &Engine,
+        session: &mut Session,
+        plan: &SessionPlan,
+    ) -> Result<SessionSummary> {
+        match self.scenario {
+            LockTableScenario::Basic => unreachable!("basic scenario uses the legacy path"),
+            LockTableScenario::NestedCovered => {
+                let tables = self.width_tables(plan)?;
+                for _ in 0..plan.number {
+                    for &table_id in tables {
+                        session
+                            .lock_table(table_id, TableLockMode::Exclusive)
+                            .await?;
+                    }
+                    let mut trx = session.begin_trx()?;
+                    for &table_id in tables {
+                        trx.lock_table(table_id, self.mode).await?;
+                    }
+                    trx.commit().await?;
+                    for &table_id in tables.iter().rev() {
+                        session.unlock_table(table_id)?;
+                    }
+                }
+            }
+            LockTableScenario::Convert => {
+                let table_id = self.stable_table(plan)?;
+                for _ in 0..plan.number {
+                    session.lock_table(table_id, TableLockMode::Shared).await?;
+                    session
+                        .lock_table(table_id, TableLockMode::Exclusive)
+                        .await?;
+                    session.unlock_table(table_id)?;
+                }
+            }
+            LockTableScenario::ScopeClose => {
+                let tables = self.width_tables(plan)?;
+                for _ in 0..plan.number {
+                    let mut trx = session.begin_trx()?;
+                    for &table_id in tables {
+                        trx.lock_table(table_id, self.mode).await?;
+                    }
+                    trx.commit().await?;
+                }
+            }
+            LockTableScenario::Handoff => {
+                let table_id = self.stable_table(plan)?;
+                for _ in 0..plan.number {
+                    let mut trx = session.begin_trx()?;
+                    let scan = trx
+                        .exec(async |stmt| stmt.table_scan_mvcc(table_id, &[0], |_| true).await)
+                        .await;
+                    if let Err(err) = scan {
+                        trx.rollback().await?;
+                        return Err(err.into());
+                    }
+                    trx.commit().await?;
+                }
+            }
+            LockTableScenario::Enqueue
+            | LockTableScenario::CancelHead
+            | LockTableScenario::CancelMiddle
+            | LockTableScenario::CancelTail
+            | LockTableScenario::Promote => {
+                let table_id = self.stable_table(plan)?;
+                for _ in 0..plan.number {
+                    self.run_contended_lifecycle(engine, session, table_id)
+                        .await?;
+                }
+            }
+        }
+        Ok(completed_summary(plan.number))
+    }
+
+    async fn run_contended_lifecycle(
+        &self,
+        engine: &Engine,
+        blocker: &mut Session,
+        table_id: TableID,
+    ) -> Result<()> {
+        let blocker_mode = match self.mode {
+            TableLockMode::Shared => TableLockMode::Exclusive,
+            TableLockMode::Exclusive => TableLockMode::Shared,
+        };
+        blocker.lock_table(table_id, blocker_mode).await?;
+        let before = blocker.logical_lock_stats()?;
+        let mut waiters = Vec::with_capacity(self.width);
+        for _ in 0..self.width {
+            waiters.push(engine.new_session()?);
+        }
+        let cancel_index = match self.scenario {
+            LockTableScenario::CancelHead => Some(0),
+            LockTableScenario::CancelMiddle => Some(self.width / 2),
+            LockTableScenario::CancelTail => Some(self.width - 1),
+            _ => None,
+        };
+
+        let lifecycle = thread::scope(|scope| -> Result<()> {
+            let mut workers = Vec::with_capacity(self.width);
+            let mut cancellation = Vec::with_capacity(self.width);
+            let acquisition_order = Arc::new(Mutex::new(Vec::with_capacity(self.width)));
+            for (index, mut waiter) in waiters.into_iter().enumerate() {
+                let (cancel_tx, cancel_rx) = channel::bounded(1);
+                cancellation.push(cancel_tx);
+                let acquisition_order = Arc::clone(&acquisition_order);
+                workers.push(scope.spawn(move || {
+                    smol::block_on(async move {
+                        enum Outcome {
+                            Acquired(doradb_storage::Result<()>),
+                            Cancelled,
+                        }
+
+                        let outcome = or(
+                            async {
+                                Outcome::Acquired(waiter.lock_table(table_id, self.mode).await)
+                            },
+                            async {
+                                let _ = cancel_rx.recv().await;
+                                Outcome::Cancelled
+                            },
+                        )
+                        .await;
+                        match outcome {
+                            Outcome::Acquired(result) => {
+                                result?;
+                                acquisition_order
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .push(index);
+                                waiter.unlock_table(table_id)?;
+                            }
+                            Outcome::Cancelled => {}
+                        }
+                        waiter.close().await?;
+                        Ok::<(), BenchError>(())
+                    })
+                }));
+                if let Err(err) = wait_for_counter(
+                    || {
+                        blocker
+                            .logical_lock_stats()
+                            .map(|stats| stats.enqueued_waiters)
+                    },
+                    before.enqueued_waiters + index as u64 + 1,
+                    "waiter enqueue",
+                ) {
+                    cancel_waiter_workers(&cancellation);
+                    let _ = blocker.unlock_table(table_id);
+                    let _ = join_waiter_workers(workers);
+                    return Err(err);
+                }
+            }
+
+            if self.scenario == LockTableScenario::Enqueue {
+                cancel_waiter_workers(&cancellation);
+                join_waiter_workers(workers)?;
+                blocker.unlock_table(table_id)?;
+                let after = blocker.logical_lock_stats()?;
+                assert_eq!(
+                    after.promoted_waiters, before.promoted_waiters,
+                    "enqueue scenario must not promote a waiter"
+                );
+                return Ok(());
+            }
+
+            if let Some(index) = cancel_index {
+                if let Err(err) = cancellation[index].try_send(()) {
+                    cancel_waiter_workers(&cancellation);
+                    let _ = blocker.unlock_table(table_id);
+                    let _ = join_waiter_workers(workers);
+                    return Err(BenchError::message(format!(
+                        "failed to cancel waiter: {err}"
+                    )));
+                }
+                let (baseline, current) = cancellation_counter(self.scenario, before);
+                if let Err(err) = wait_for_counter(
+                    || blocker.logical_lock_stats().map(current),
+                    baseline + 1,
+                    "waiter cancellation",
+                ) {
+                    cancel_waiter_workers(&cancellation);
+                    let _ = blocker.unlock_table(table_id);
+                    let _ = join_waiter_workers(workers);
+                    return Err(err);
+                }
+            }
+
+            if let Err(err) = blocker.unlock_table(table_id) {
+                cancel_waiter_workers(&cancellation);
+                let _ = join_waiter_workers(workers);
+                return Err(err.into());
+            }
+            join_waiter_workers(workers)?;
+            let expected_promotions = self.width as u64 - u64::from(cancel_index.is_some());
+            let after = blocker.logical_lock_stats()?;
+            assert_eq!(
+                after.promoted_waiters - before.promoted_waiters,
+                expected_promotions,
+                "promotion count must match the admitted non-cancelled waiters"
+            );
+            if self.mode == TableLockMode::Exclusive {
+                let expected = (0..self.width)
+                    .filter(|&index| Some(index) != cancel_index)
+                    .collect::<Vec<_>>();
+                let actual = acquisition_order
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                assert_eq!(
+                    *actual, expected,
+                    "exclusive waiters must observe physical handoff in FIFO order"
+                );
+            }
+            Ok(())
+        });
+        if lifecycle.is_err() {
+            let _ = blocker.unlock_table(table_id);
+        }
+        lifecycle
+    }
+
+    fn width_tables(&self, plan: &SessionPlan) -> Result<&[TableID]> {
+        let start = plan.session_index % self.table_ids.len();
+        if start + self.width <= self.table_ids.len() {
+            return Ok(&self.table_ids[start..start + self.width]);
+        }
+        Ok(&self.table_ids[..self.width])
+    }
+
     async fn run_session_retained(
         &self,
         session: &mut Session,
@@ -138,7 +432,7 @@ impl LockTableRunner {
     ) -> Result<SessionSummary> {
         let table_id = self.stable_table(plan)?;
         for _ in 0..plan.number {
-            session.lock_table(table_id, TableLockMode::Shared).await?;
+            session.lock_table(table_id, self.mode).await?;
         }
         Ok(completed_summary(plan.number))
     }
@@ -153,7 +447,7 @@ impl LockTableRunner {
         let mut operations = 0;
         for _ in 0..plan.number {
             let table_id = self.next_table(stable_table, random.as_mut())?;
-            session.lock_table(table_id, TableLockMode::Shared).await?;
+            session.lock_table(table_id, self.mode).await?;
             session.unlock_table(table_id)?;
             operations += 1;
         }
@@ -168,7 +462,7 @@ impl LockTableRunner {
         let table_id = self.stable_table(plan)?;
         let mut trx = session.begin_trx()?;
         for _ in 0..plan.number {
-            if let Err(err) = trx.lock_table(table_id, TableLockMode::Shared).await {
+            if let Err(err) = trx.lock_table(table_id, self.mode).await {
                 trx.rollback().await?;
                 return Err(err.into());
             }
@@ -188,7 +482,7 @@ impl LockTableRunner {
         for _ in 0..plan.number {
             let table_id = self.next_table(stable_table, random.as_mut())?;
             let mut trx = session.begin_trx()?;
-            if let Err(err) = trx.lock_table(table_id, TableLockMode::Shared).await {
+            if let Err(err) = trx.lock_table(table_id, self.mode).await {
                 trx.rollback().await?;
                 return Err(err.into());
             }
@@ -233,7 +527,30 @@ impl LockTableRunner {
     }
 }
 
-fn validate_lock_options(unlock: bool, random: bool, explicit_seed: Option<u64>) -> Result<()> {
+fn join_waiter_workers(workers: Vec<thread::ScopedJoinHandle<'_, Result<()>>>) -> Result<()> {
+    for worker in workers {
+        worker
+            .join()
+            .map_err(|_| BenchError::message("lock-table waiter worker panicked"))??;
+    }
+    Ok(())
+}
+
+fn cancel_waiter_workers(cancellation: &[channel::Sender<()>]) {
+    for cancel in cancellation {
+        let _ = cancel.try_send(());
+    }
+}
+
+fn validate_lock_options(
+    scenario: LockTableScenario,
+    mode: LockTableMode,
+    width: usize,
+    scope: TableLockScope,
+    unlock: bool,
+    random: bool,
+    explicit_seed: Option<u64>,
+) -> Result<()> {
     if random && !unlock {
         return Err(BenchError::message(
             "lock-table --rand requires paired release with --unlock",
@@ -244,7 +561,95 @@ fn validate_lock_options(unlock: bool, random: bool, explicit_seed: Option<u64>)
             "lock-table --seed requires random selection with --rand",
         ));
     }
+    if scenario == LockTableScenario::Basic {
+        if width != 1 {
+            return Err(BenchError::message(
+                "lock-table --width is only valid for specialized scenarios",
+            ));
+        }
+        return Ok(());
+    }
+    if random || explicit_seed.is_some() || unlock || scope != TableLockScope::Session {
+        return Err(BenchError::message(format!(
+            "lock-table --scenario {scenario} does not accept --scope, --unlock, --rand, or --seed"
+        )));
+    }
+    if scenario == LockTableScenario::Convert && mode != LockTableMode::Exclusive {
+        return Err(BenchError::message(
+            "lock-table --scenario convert requires --mode exclusive",
+        ));
+    }
+    if scenario == LockTableScenario::Handoff && mode != LockTableMode::Shared {
+        return Err(BenchError::message(
+            "lock-table --scenario handoff requires --mode shared",
+        ));
+    }
+    if matches!(
+        scenario,
+        LockTableScenario::Convert | LockTableScenario::Handoff
+    ) && width != 1
+    {
+        return Err(BenchError::message(format!(
+            "lock-table --scenario {scenario} requires --width 1"
+        )));
+    }
+    if scenario == LockTableScenario::CancelMiddle && width < 3 {
+        return Err(BenchError::message(
+            "lock-table --scenario cancel-middle requires --width at least 3",
+        ));
+    }
     Ok(())
+}
+
+fn is_contended(scenario: LockTableScenario) -> bool {
+    matches!(
+        scenario,
+        LockTableScenario::Enqueue
+            | LockTableScenario::CancelHead
+            | LockTableScenario::CancelMiddle
+            | LockTableScenario::CancelTail
+            | LockTableScenario::Promote
+    )
+}
+
+fn wait_for_counter(
+    mut load: impl FnMut() -> doradb_storage::Result<u64>,
+    target: u64,
+    operation: &str,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if load()? >= target {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(BenchError::message(format!(
+                "timed out waiting for deterministic {operation}"
+            )));
+        }
+        thread::yield_now();
+    }
+}
+
+fn cancellation_counter(
+    scenario: LockTableScenario,
+    before: doradb_storage::LogicalLockStats,
+) -> (u64, fn(doradb_storage::LogicalLockStats) -> u64) {
+    match scenario {
+        LockTableScenario::CancelHead => (
+            before.cancelled_head_waiters,
+            |stats: doradb_storage::LogicalLockStats| stats.cancelled_head_waiters,
+        ),
+        LockTableScenario::CancelMiddle => (
+            before.cancelled_middle_waiters,
+            |stats: doradb_storage::LogicalLockStats| stats.cancelled_middle_waiters,
+        ),
+        LockTableScenario::CancelTail => (
+            before.cancelled_tail_waiters,
+            |stats: doradb_storage::LogicalLockStats| stats.cancelled_tail_waiters,
+        ),
+        _ => unreachable!("only cancellation scenarios select a cancellation counter"),
+    }
 }
 
 fn completed_summary(operations: u64) -> SessionSummary {
@@ -259,6 +664,7 @@ mod tests {
     use super::*;
     use crate::cli::{Cli, Command, IndexMode, LogSyncMode, WorkloadArgs};
     use crate::manifest::DefaultsManifest;
+    use crate::workload::{benchmark_index_specs, benchmark_table_spec};
     use clap::Parser;
 
     #[test]
@@ -310,15 +716,106 @@ mod tests {
 
     #[test]
     fn lock_options_repeat_cli_dependency_validation() {
-        assert!(validate_lock_options(false, true, None).is_err());
-        assert!(validate_lock_options(true, false, Some(1)).is_err());
-        assert!(validate_lock_options(true, true, None).is_ok());
-        assert!(validate_lock_options(true, true, Some(1)).is_ok());
+        let validate = |unlock, random, seed| {
+            validate_lock_options(
+                LockTableScenario::Basic,
+                LockTableMode::Shared,
+                1,
+                TableLockScope::Session,
+                unlock,
+                random,
+                seed,
+            )
+        };
+        assert!(validate(false, true, None).is_err());
+        assert!(validate(true, false, Some(1)).is_err());
+        assert!(validate(true, true, None).is_ok());
+        assert!(validate(true, true, Some(1)).is_ok());
+    }
+
+    #[test]
+    fn specialized_lock_options_enforce_scenario_contracts() {
+        let validate = |scenario, mode, width| {
+            validate_lock_options(
+                scenario,
+                mode,
+                width,
+                TableLockScope::Session,
+                false,
+                false,
+                None,
+            )
+        };
+        assert!(validate(LockTableScenario::Convert, LockTableMode::Shared, 1).is_err());
+        assert!(validate(LockTableScenario::Handoff, LockTableMode::Exclusive, 1).is_err());
+        assert!(validate(LockTableScenario::CancelMiddle, LockTableMode::Shared, 2).is_err());
+        assert!(validate(LockTableScenario::Promote, LockTableMode::Exclusive, 3).is_ok());
+    }
+
+    #[test]
+    fn specialized_scenarios_complete_deterministic_lifecycles() {
+        smol::block_on(async {
+            let temp = tempfile::TempDir::new().unwrap();
+            let engine = Engine::bootstrap(
+                doradb_storage::EngineConfig::default().storage_root(temp.path()),
+            )
+            .await
+            .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let mut table_ids = Vec::new();
+            for _ in 0..3 {
+                table_ids.push(
+                    session
+                        .create_table(
+                            benchmark_table_spec(),
+                            benchmark_index_specs(IndexMode::None),
+                        )
+                        .await
+                        .unwrap(),
+                );
+            }
+            let plan = SessionPlan {
+                session_index: 0,
+                key_start: 0,
+                number: 1,
+            };
+            for (scenario, mode, width) in [
+                (LockTableScenario::NestedCovered, TableLockMode::Shared, 3),
+                (LockTableScenario::Convert, TableLockMode::Exclusive, 1),
+                (LockTableScenario::Enqueue, TableLockMode::Exclusive, 3),
+                (LockTableScenario::CancelHead, TableLockMode::Exclusive, 3),
+                (LockTableScenario::CancelMiddle, TableLockMode::Exclusive, 3),
+                (LockTableScenario::CancelTail, TableLockMode::Exclusive, 3),
+                (LockTableScenario::Promote, TableLockMode::Shared, 3),
+                (LockTableScenario::Handoff, TableLockMode::Shared, 1),
+                (LockTableScenario::ScopeClose, TableLockMode::Shared, 3),
+            ] {
+                let runner = LockTableRunner {
+                    scenario,
+                    mode,
+                    width,
+                    scope: TableLockScope::Session,
+                    unlock: false,
+                    random: false,
+                    seed: 0,
+                    table_ids: table_ids.clone().into(),
+                };
+                assert_eq!(
+                    runner.run(&engine, &mut session, &plan).await.unwrap(),
+                    completed_summary(1)
+                );
+            }
+            session.close().await.unwrap();
+            engine.shutdown();
+        });
     }
 
     #[test]
     fn stable_table_selection_uses_session_modulo_pool_size() {
         let runner = LockTableRunner {
+            scenario: LockTableScenario::Basic,
+            mode: TableLockMode::Shared,
+            width: 1,
             scope: TableLockScope::Session,
             unlock: false,
             random: false,

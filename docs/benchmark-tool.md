@@ -151,18 +151,40 @@ runtime-owned index-DDL measurements: both include mandatory admission and
 accepted execution, while the preloaded case additionally measures the
 existing all-row collection, sort, and index-build architecture.
 
-`lock-table --num N [--scope session|transaction] [--unlock] [--rand]
-[--seed SEED]` measures public `TableLockMode::Shared` acquisition across the
-prepared table pool. `--num` is the positive aggregate lock-iteration count
-partitioned across all sessions, and every successful iteration reports one
-operation. Release work is included in the iteration latency and is not a
-second operation. The scope defaults to `session`.
+`lock-table --num N [--scenario SCENARIO] [--mode shared|exclusive]
+[--width N]` measures public logical locking across the prepared table pool.
+`--num` is the positive aggregate lifecycle count and every successful
+lifecycle reports one operation. Release, cancellation, or scope-close work is
+included in that lifecycle's aggregate latency and is not a second operation.
 
-Without `--rand`, session `i` selects the stable table at
-`i % prepared_table_count` for its complete assigned loop. Sessions may
-outnumber tables and intentionally overlap one shared lock resource. Sessions
-assigned zero operations still follow the normal open/close lifecycle but
-acquire no lock.
+`--scenario basic` is the default and retains
+`[--scope session|transaction] [--unlock] [--rand] [--seed SEED]`. It measures
+the selected public mode, defaulting to `shared`. Without `--rand`, session `i`
+selects the stable table at `i % prepared_table_count` for its complete
+assigned loop. Sessions may outnumber tables and intentionally overlap one
+resource. Sessions assigned zero operations still follow normal open/close
+lifecycle but acquire no lock.
+
+Specialized scenarios reject `--scope`, `--unlock`, `--rand`, and `--seed`;
+`width` has the scenario-specific cardinality below:
+
+| Scenario | Lifecycle measured | `width` |
+| --- | --- | ---: |
+| `nested-covered` | Hold session X, publish covered transaction claims, commit, then unlock | prepared tables/covered claims |
+| `convert` | Session S acquisition followed by immediate S-to-X conversion and unlock | must be 1; mode must be `exclusive` |
+| `enqueue` | Install an incompatible blocker, admit FIFO waiters one at a time, confirm each enqueue, cancel all while still blocked, then release | waiters |
+| `cancel-head` | Enqueue a known prefix, cancel its head, release the blocker, and drain/promote the remainder | waiters |
+| `cancel-middle` | Enqueue a known prefix, cancel its middle entry, release, and drain/promote the remainder | waiters; at least 3 |
+| `cancel-tail` | Enqueue a known prefix, cancel its tail, release, and drain/promote the remainder | waiters |
+| `promote` | Enqueue a known prefix, release the blocker, and promote/drain it | promotion prefix |
+| `handoff` | Execute an empty table scan so statement metadata S is installed into the transaction before statement release, then commit | must be 1; mode must be `shared` |
+| `scope-close` | Acquire explicit claims on several tables in one transaction and commit | tables/claims closed |
+
+Contended scenarios require `--sessions 1`. They use explicit incompatible
+blockers, sequential admission confirmed by monotonic logical-lock statistics,
+and cancellation permits; they do not use timing sleeps. Exclusive waiters
+also assert FIFO acquisition order. Shared promotion asserts the exact promoted
+prefix count. `enqueue` asserts zero promotions.
 
 `--rand` requires `--unlock` and selects one table with replacement for every
 iteration. An explicitly supplied `--seed` requires `--rand`; the resolved
@@ -195,7 +217,7 @@ index-scan requests, or full table-scan iterations per read transaction. It is
 applied per session. `--num` remains the aggregate row or request count across
 all sessions. `index-stream`, the no-op workloads, and the DDL workloads do not
 accept `--batch-size` or `--value-size`. `lock-table` likewise accepts neither
-sizing control; only its randomized paired mode accepts `--seed`.
+sizing control; only basic randomized paired mode accepts `--seed`.
 
 ## Controls
 
@@ -218,8 +240,11 @@ sizing control; only its randomized paired mode accepts `--seed`.
 | `--scope` | `run lock-table` | `session` | Lock ownership scope: `session` or `transaction`. |
 | `--unlock` | `run lock-table` | `false` | Use a paired release boundary per iteration. Session scope calls `unlock_table`; transaction scope commits. |
 | `--rand` | `run lock-table` | `false` | Select a table with replacement for every iteration. Requires `--unlock`. |
+| `--scenario` | `run lock-table` | `basic` | Select `basic`, `nested-covered`, `convert`, `enqueue`, `cancel-head`, `cancel-middle`, `cancel-tail`, `promote`, `handoff`, or `scope-close`. |
+| `--mode` | `run lock-table` | `shared` | Requested physical table-data mode. `convert` requires `exclusive`; `handoff` requires `shared`. |
+| `--width` | `run lock-table` | `1` | Specialized scenario resource, waiter, promotion-prefix, or scope-close cardinality. Basic requires 1. |
 | `--seed` | `run insert-seq`, `insert-rand`, `lookup-rand`, `index-scan`, `index-stream`, randomized `lock-table` | `0` | `u64` reproducibility input for payload bytes, randomized insert order, randomized read key selection, randomized scan bounds, or random table selection. An explicit lock-table seed requires `--rand`. |
-| `--include-stats` | `run ...` | `false` | Captures and prints internal transaction-system, storage-IO, buffer-pool, and engine-global mandatory-runtime stats. Omit this for prerequisite runs such as data loading before a measured read workload. |
+| `--include-stats` | `run ...` | `false` | Captures and prints transaction-system, storage-IO, buffer-pool, mandatory-runtime, and logical-lock stats. Omit this for prerequisite runs such as data loading before a measured read workload. |
 
 Run defaults resolve as follows:
 
@@ -280,15 +305,20 @@ errors are written to stderr.
   internal-stats mode, row/request count, resolved scan range when applicable,
   value size, batch size, seed, prepared index mode, loaded key range, threads,
   sessions, persisted log sync mode, and primary table id. Lock workloads also
-  report scope, paired release, and prepared table count.
+  report scope, paired release, prepared table count, scenario, mode, and
+  width.
 - `Internal Stats`, only with `--include-stats`: public transaction-system,
-  storage-IO, buffer-pool, and mandatory-runtime stats when available. The
+  storage-IO, buffer-pool, mandatory-runtime, and logical-lock stats. The
   mandatory snapshot is captured once per engine, not summed once per session;
   its fixed names are `mandatory.operation.*` and
   `mandatory.transaction_cleanup.*`. Monotonic fields are deltas and active
   counts are the independently sampled ending values. Caller terminal counters
   are published before their result waiters wake, so the ending snapshot
-  includes the final observed mandatory operation.
+  includes the final observed mandatory operation. `logical_lock.*` includes
+  owner-local hit/publication/conversion/release work; physical resource
+  transitions and fixed mode slots; queue, cancellation, provisional, and
+  promotion work; scope close; completion/slab allocation classes; and
+  current/peak physical cardinalities.
 - `Final Result`: operation count, inserted rows, found count, not-found count,
   returned rows, elapsed time, throughput, average nanoseconds per operation,
   and failures.
@@ -312,8 +342,8 @@ producing a partially successful result.
   `metric-name` and `metric-value`. A later run without `--include-stats`
   removes stale stats output from the previous run.
 - `benchmark-result.csv`: one header row and one latest-result summary row.
-  Lock results populate the stable `scope`, `unlock`, and `tables` columns;
-  unrelated workloads leave those cells empty.
+  Lock results populate the stable lock configuration columns; unrelated
+  workloads leave those cells empty.
 
 ## Examples
 
@@ -385,6 +415,51 @@ rtk cargo run --release -p doradb-bench -- \
   run lock-table --num 100000 --scope transaction --unlock --rand --seed 1 \
   --threads 4 --sessions 16
 ```
+
+Measure owner-local coverage, conversion, handoff, and indexed scope close:
+
+```bash
+rtk cargo run --release -p doradb-bench -- \
+  --root target/doradb-bench/lock-table \
+  run lock-table --num 100000 --scenario nested-covered --width 8 \
+  --threads 1 --sessions 1 --include-stats
+rtk cargo run --release -p doradb-bench -- \
+  --root target/doradb-bench/lock-table \
+  run lock-table --num 100000 --scenario convert --mode exclusive \
+  --threads 1 --sessions 1 --include-stats
+rtk cargo run --release -p doradb-bench -- \
+  --root target/doradb-bench/lock-table \
+  run lock-table --num 100000 --scenario handoff \
+  --threads 1 --sessions 1 --include-stats
+rtk cargo run --release -p doradb-bench -- \
+  --root target/doradb-bench/lock-table \
+  run lock-table --num 100000 --scenario scope-close --width 8 \
+  --threads 1 --sessions 1 --include-stats
+```
+
+Measure deterministic queue and promotion shapes:
+
+```bash
+rtk cargo run --release -p doradb-bench -- \
+  --root target/doradb-bench/lock-table \
+  run lock-table --num 10000 --scenario cancel-middle --mode exclusive \
+  --width 9 --threads 1 --sessions 1 --include-stats
+rtk cargo run --release -p doradb-bench -- \
+  --root target/doradb-bench/lock-table \
+  run lock-table --num 10000 --scenario promote --mode shared \
+  --width 9 --threads 1 --sessions 1 --include-stats
+```
+
+For paired baseline/candidate evidence, use preserved release binaries and
+separate but identically prepared roots. Keep host, storage backend, durability,
+table count, operation count, threads, sessions, scenario, mode, width, and
+seed identical. Run each matrix cell repeatedly and report throughput and
+average latency with the median, interquartile range, and full range across
+runs. Retain `benchmark-internal-stats.csv` for each run and compare
+`logical_lock.resource_transitions`, `mode_slots_examined`,
+`queue_link_mutations`, `promoted_waiters`, completion/slab allocation
+classes, and physical cardinalities. Explain measured regressions or noise;
+structural counter violations block the cutover even when throughput improves.
 
 ## RFC-0025 and RFC-0026 Successful-Path Measurements
 

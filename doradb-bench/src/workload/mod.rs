@@ -1,11 +1,11 @@
 use crate::cli::{
-    LogSyncMode, TableLockScope, Workload, validate_batch_size, validate_value_size,
-    validate_workers,
+    LockTableMode, LockTableScenario, LogSyncMode, TableLockScope, Workload, validate_batch_size,
+    validate_value_size, validate_workers,
 };
 use crate::error::Result;
 use crate::manifest::{DefaultsManifest, KeyRange, Manifest};
-use doradb_storage::Session;
 use doradb_storage::id::TableID;
+use doradb_storage::{Engine, Session};
 use std::future::Future;
 
 mod ddl;
@@ -35,6 +35,7 @@ pub(super) trait WorkloadRunner: Clone + Send + Sync {
     /// Run the operations assigned by `plan` without opening or closing `session`.
     fn run<'a>(
         &'a self,
+        engine: &'a Engine,
         session: &'a mut Session,
         plan: &'a SessionPlan,
     ) -> impl Future<Output = Result<SessionSummary>> + Send + 'a;
@@ -95,6 +96,21 @@ pub(super) trait WorkloadConfig: Sized {
 
     /// Return the prepared table count reported for lock workloads.
     fn prepared_table_count(&self) -> Option<usize> {
+        None
+    }
+
+    /// Return the specialized lock scenario reported for lock workloads.
+    fn lock_scenario(&self) -> Option<LockTableScenario> {
+        None
+    }
+
+    /// Return the physical lock mode reported for lock workloads.
+    fn lock_mode(&self) -> Option<LockTableMode> {
+        None
+    }
+
+    /// Return the scenario width reported for lock workloads.
+    fn lock_width(&self) -> Option<usize> {
         None
     }
 

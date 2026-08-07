@@ -23,6 +23,7 @@ doradb-storage/src/session.rs,Session::drop_table,4
 doradb-storage/src/session.rs,Session::freeze_table,5
 doradb-storage/src/session.rs,Session::list_table_ids,1
 doradb-storage/src/session.rs,Session::lock_table,2
+doradb-storage/src/session.rs,Session::logical_lock_stats,1
 doradb-storage/src/session.rs,Session::mandatory_runtime_stats,1
 doradb-storage/src/session.rs,Session::storage_io_stats,1
 doradb-storage/src/session.rs,Session::total_row_pages,3

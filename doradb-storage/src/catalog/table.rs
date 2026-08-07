@@ -26,8 +26,8 @@ use crate::runtime::mandatory::{AcceptedExecution, MandatoryTaskMetadata, Prepar
 use crate::serde::{Deser, DeserResult, MinBytesHint, Ser, Serde, min_bytes_hint};
 use crate::session::{AcceptedDdlScope, PreparedDdlScope};
 use crate::table::{Table, TableRedoReplayFloor};
+use crate::trx::Transaction;
 use crate::trx::sys::TransactionSystem;
-use crate::trx::{PreparedCatalogWriteAuthority, Transaction};
 use crate::value::{Val, ValKind, ValType};
 use error_stack::{Report, ResultExt};
 use semistr::SemiStr;
@@ -1393,14 +1393,12 @@ impl AcceptedCreateTable {
             .await;
 
         let catalog_objects = progress.take_catalog_objects();
-        let authority = scope.catalog_write_authority();
         let exec_res = execute_create_table_catalog_staging(
             &engine.catalog().storage,
             progress
                 .trx
                 .as_mut()
                 .unwrap_or_else(|| panic!("CREATE staging requires private transaction")),
-            authority,
             table_id,
             catalog_objects,
         )
@@ -1705,14 +1703,12 @@ impl AcceptedDropTable {
             .await;
 
         let metadata = table.metadata().clone();
-        let authority = scope.catalog_write_authority();
         let exec_res = execute_drop_table_catalog_cascade(
             &engine.catalog().storage,
             progress
                 .trx
                 .as_mut()
                 .unwrap_or_else(|| panic!("DROP cascade requires private transaction")),
-            authority,
             table_id,
             &metadata,
         )
@@ -1893,7 +1889,6 @@ fn reject_user_table_primary_key_indexes(
 async fn execute_create_table_catalog_staging(
     storage: &CatalogStorage,
     trx: &mut Transaction,
-    authority: PreparedCatalogWriteAuthority<'_>,
     table_id: TableID,
     catalog_objects: CreateTableCatalogObjects,
 ) -> RuntimeResult<()> {
@@ -1903,7 +1898,7 @@ async fn execute_create_table_catalog_staging(
         indexes,
         index_columns,
     } = catalog_objects;
-    trx.stage_prepared_catalog_statement(authority, async |stmt| {
+    trx.stage_catalog_statement(async |stmt| {
         storage.tables().insert(stmt, &table).await?;
 
         for column_object in columns {
@@ -1937,11 +1932,10 @@ async fn execute_create_table_catalog_staging(
 async fn execute_drop_table_catalog_cascade(
     storage: &CatalogStorage,
     trx: &mut Transaction,
-    authority: PreparedCatalogWriteAuthority<'_>,
     table_id: TableID,
     metadata: &TableMetadata,
 ) -> RuntimeResult<()> {
-    trx.stage_prepared_catalog_statement(authority, async |stmt| {
+    trx.stage_catalog_statement(async |stmt| {
         let index_columns_deleted = storage
             .index_columns()
             .delete_by_table_id(stmt, table_id)
@@ -2138,8 +2132,8 @@ pub(crate) mod tests {
     };
     use crate::id::{SessionID, TrxID};
     use crate::io::install_storage_backend_test_hook;
-    use crate::lock::tests::{LockDebugEntryState, debug_snapshot, try_acquire};
-    use crate::lock::{LockMode, LockOwner, LockResource, LockScope, TableLockMode};
+    use crate::lock::tests::{LockDebugEntryState, TestLockOwner, debug_snapshot};
+    use crate::lock::{LockMode, LockOwner, LockResource, TableLockMode};
     use crate::log::redo::DDLRedo;
     use crate::session::tests::{SessionTestExt, active_operation_count, remove_session_for_test};
     use crate::table::TableTerminal;
@@ -2917,7 +2911,7 @@ pub(crate) mod tests {
                     .table_lookup_unique_mvcc(table_id, key.index_no, &key.vals, &[0, 1])
                     .await?;
                 assert!(repeated.is_found());
-                assert_eq!(lock_entry_count(&engine, owner), 0);
+                assert_eq!(lock_entry_count(&engine, owner), 1);
                 assert!(!has_lock_resource(
                     &engine,
                     owner,
@@ -2929,7 +2923,7 @@ pub(crate) mod tests {
             .unwrap();
 
             let owner = stmt_owner.get().unwrap();
-            assert_eq!(lock_entry_count(&engine, owner), 0);
+            assert_eq!(lock_entry_count(&engine, owner), 1);
             assert_eq!(lock_entry_count(&engine, trx_owner), 1);
             assert!(has_lock_entry(
                 &engine,
@@ -3528,7 +3522,6 @@ pub(crate) mod tests {
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
-            let session_owner = LockOwner::session_explicit(session.id());
             let mut trx = session.begin_trx().unwrap();
 
             trx_insert_row_by_id(
@@ -3547,17 +3540,6 @@ pub(crate) mod tests {
                 err.report().downcast_ref::<LifecycleError>().copied(),
                 Some(LifecycleError::ExistingTransaction)
             );
-            assert!(!has_lock_resource(
-                &engine,
-                session_owner,
-                LockResource::TableMetadata(table_id),
-            ));
-            assert!(!has_lock_resource(
-                &engine,
-                session_owner,
-                LockResource::TableData(table_id),
-            ));
-
             trx.rollback().await.unwrap();
         });
     }
@@ -3569,15 +3551,15 @@ pub(crate) mod tests {
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
             let table_id = create_table2_for_test(&engine).await;
             let blocker = LockOwner::transaction(SessionID::new(91_301), TrxID::new(91_301));
-            assert!(
-                try_acquire(
+            let mut blocker = TestLockOwner::new(blocker);
+            blocker
+                .acquire(
                     engine.inner().core.lock_manager(),
                     LockResource::TableData(table_id),
                     LockMode::Exclusive,
-                    blocker,
                 )
-                .unwrap()
-            );
+                .await
+                .unwrap();
 
             let mut session = engine.new_session().unwrap();
             let session_owner = LockOwner::session_explicit(session.id());
@@ -3610,14 +3592,7 @@ pub(crate) mod tests {
             .await;
             wait_for_no_lock_resource(&engine, session_owner, LockResource::TableData(table_id))
                 .await;
-            assert_eq!(
-                engine
-                    .inner()
-                    .core
-                    .lock_manager()
-                    .release(LockResource::TableData(table_id), blocker),
-                1
-            );
+            blocker.close(engine.inner().core.lock_manager());
         });
     }
 
@@ -3634,8 +3609,6 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
             let mut trx = session.begin_trx().unwrap();
-            let trx_owner = trx_tests::lock_owner(&trx).unwrap();
-
             let err = trx
                 .lock_table(table_id, TableLockMode::Exclusive)
                 .await
@@ -3644,11 +3617,6 @@ pub(crate) mod tests {
                 err.report().downcast_ref::<OperationError>().copied(),
                 Some(OperationError::LockFamilyConflict)
             );
-            assert!(!has_lock_resource(
-                &engine,
-                trx_owner,
-                LockResource::TableMetadata(table_id),
-            ));
             assert!(
                 !trx_tests::transaction_lock_covers(
                     &trx,
@@ -3675,15 +3643,15 @@ pub(crate) mod tests {
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
             let table_id = create_table2_for_test(&engine).await;
             let blocker = LockOwner::transaction(SessionID::new(91_302), TrxID::new(91_302));
-            assert!(
-                try_acquire(
+            let mut blocker = TestLockOwner::new(blocker);
+            blocker
+                .acquire(
                     engine.inner().core.lock_manager(),
                     LockResource::TableData(table_id),
                     LockMode::Exclusive,
-                    blocker,
                 )
-                .unwrap()
-            );
+                .await
+                .unwrap();
 
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
@@ -3720,14 +3688,7 @@ pub(crate) mod tests {
                 )
                 .unwrap()
             );
-            assert_eq!(
-                engine
-                    .inner()
-                    .core
-                    .lock_manager()
-                    .release(LockResource::TableData(table_id), blocker),
-                1
-            );
+            blocker.close(engine.inner().core.lock_manager());
             trx.rollback().await.unwrap();
         });
     }
@@ -3785,7 +3746,7 @@ pub(crate) mod tests {
                 &engine,
                 same_session_owner,
                 LockResource::TableData(table_id),
-                LockMode::IntentExclusive,
+                LockMode::Exclusive,
                 LockDebugEntryState::Granted,
             ));
 
@@ -4395,9 +4356,11 @@ pub(crate) mod tests {
                 debug_snapshot(engine.inner().lock_manager())
                     .entries
                     .into_iter()
-                    .filter(|entry| entry.owner.family().session_id() == create_session_id)
-                    .all(|entry| matches!(entry.owner.scope(), LockScope::Operation(_))),
-                "accepted CREATE must not acquire transaction/statement catalog locks"
+                    .filter(|entry| entry.family.session_id() == create_session_id)
+                    .all(|entry| {
+                        entry.state == LockDebugEntryState::Granted && entry.pending_owner.is_none()
+                    }),
+                "accepted CREATE must retain only physical held-family diagnostics"
             );
             create_staged_release.send_async(()).await.unwrap();
             assert_eq!(create_fut.await.unwrap(), create_table_id);
@@ -4463,9 +4426,11 @@ pub(crate) mod tests {
                 debug_snapshot(engine.inner().lock_manager())
                     .entries
                     .into_iter()
-                    .filter(|entry| entry.owner.family().session_id() == drop_session_id)
-                    .all(|entry| matches!(entry.owner.scope(), LockScope::Operation(_))),
-                "accepted DROP must not acquire transaction/statement catalog locks"
+                    .filter(|entry| entry.family.session_id() == drop_session_id)
+                    .all(|entry| {
+                        entry.state == LockDebugEntryState::Granted && entry.pending_owner.is_none()
+                    }),
+                "accepted DROP must retain only physical held-family diagnostics"
             );
             drop_staged_release.send_async(()).await.unwrap();
             drop_fut.await.unwrap();

@@ -351,7 +351,7 @@ mod tests {
             .entries
             .iter()
             .any(|entry| {
-                entry.owner == owner
+                entry.family == owner.family()
                     && entry.resource == resource
                     && entry.mode == mode
                     && entry.state == LockDebugEntryState::Granted
@@ -437,7 +437,9 @@ mod tests {
                     .iter()
                     .all(|entry| {
                         entry.resource != metadata
-                            || !matches!(entry.owner.scope(), LockScope::Statement(..))
+                            || !entry.pending_owner.is_some_and(|owner| {
+                                matches!(owner.scope(), LockScope::Statement(..))
+                            })
                     })
             );
 
@@ -459,8 +461,6 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let session_id = session.id();
             let mut trx = session.begin_trx().unwrap();
-            let trx_owner = LockOwner::transaction(session_id, trx.trx_id());
-            let stmt_owner = trx_owner.statement(1);
             let metadata = LockResource::TableMetadata(table_id);
             pause_after_statement_metadata_grant();
             let mut exec = Box::pin(
@@ -471,18 +471,24 @@ mod tests {
                 futures::poll!(exec.as_mut()),
                 std::task::Poll::Pending
             ));
-            assert!(owner_has_grant(
-                &engine,
-                stmt_owner,
-                metadata,
-                LockMode::Shared
-            ));
-            assert!(!owner_has_grant(
-                &engine,
-                trx_owner,
-                metadata,
-                LockMode::Shared
-            ));
+            let physical = debug_snapshot(engine.inner().core.lock_manager())
+                .entries
+                .into_iter()
+                .find(|entry| {
+                    entry.family.session_id() == session_id
+                        && entry.resource == metadata
+                        && entry.mode == LockMode::Shared
+                        && entry.state == LockDebugEntryState::Granted
+                })
+                .expect("paused statement must retain one physical metadata family");
+            assert!(
+                physical.pending_owner.is_none(),
+                "accepted manager state must not expose an exact statement owner"
+            );
+            assert!(
+                physical.claim_no.is_none(),
+                "accepted manager state must not expose an exact claim number"
+            );
 
             drop(exec);
 
@@ -555,11 +561,13 @@ mod tests {
                     snapshot
                         .entries
                         .iter()
-                        .all(|entry| entry.owner != trx_owner)
+                        .all(|entry| entry.family != trx_owner.family())
                 );
                 assert!(snapshot.entries.iter().all(|entry| {
                     entry.resource != metadata
-                        || !matches!(entry.owner.scope(), LockScope::Statement(..))
+                        || !entry
+                            .pending_owner
+                            .is_some_and(|owner| matches!(owner.scope(), LockScope::Statement(..)))
                 }));
 
                 old_trx.rollback().await.unwrap();
@@ -1017,9 +1025,12 @@ mod tests {
                 debug_snapshot(engine.inner().core.lock_manager())
                     .entries
                     .iter()
-                    .all(|entry| entry.owner != old_owner
+                    .all(|entry| entry.family != old_owner.family()
                         && (entry.resource != LockResource::TableMetadata(table_id)
-                            || !matches!(entry.owner.scope(), LockScope::Statement(..))))
+                            || !entry.pending_owner.is_some_and(|owner| matches!(
+                                owner.scope(),
+                                LockScope::Statement(..)
+                            ))))
             );
 
             old_trx.rollback().await.unwrap();
@@ -1085,9 +1096,12 @@ mod tests {
                 debug_snapshot(engine.inner().core.lock_manager())
                     .entries
                     .iter()
-                    .all(|entry| entry.owner != old_owner
+                    .all(|entry| entry.family != old_owner.family()
                         && (entry.resource != LockResource::TableMetadata(table_id)
-                            || !matches!(entry.owner.scope(), LockScope::Statement(..))))
+                            || !entry.pending_owner.is_some_and(|owner| matches!(
+                                owner.scope(),
+                                LockScope::Statement(..)
+                            ))))
             );
 
             old_trx.rollback().await.unwrap();

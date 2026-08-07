@@ -4,6 +4,70 @@ use crate::file::fs::StorageServiceStats as InternalStorageServiceStats;
 use crate::io::BackendStats as InternalIoBackendStats;
 use crate::trx::sys::TrxSysStats as InternalTrxSysStats;
 
+/// Cumulative logical-lock work and current physical representation statistics.
+///
+/// Monotonic counters describe completed structural work. Current values are
+/// point-in-time observations and peak values are monotonic high-water marks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LogicalLockStats {
+    /// Requests satisfied by an existing exact claim without manager access.
+    pub owner_local_exact_covered_hits: u64,
+    /// Fresh exact claims published under an unchanged physical family mode.
+    pub owner_local_covered_publications: u64,
+    /// Exact conversions that preserved the physical family mode.
+    pub owner_local_mode_preserving_conversions: u64,
+    /// Exact releases that preserved the physical family mode.
+    pub owner_local_mode_preserving_releases: u64,
+    /// Shared resource-state transitions.
+    pub resource_transitions: u64,
+    /// Fixed compatibility mode slots examined by shared transitions.
+    pub mode_slots_examined: u64,
+    /// Immediately accepted first-family physical acquisitions.
+    pub immediate_physical_acquisitions: u64,
+    /// Successfully strengthened physical family modes.
+    pub physical_upgrades: u64,
+    /// Requests appended to intrusive FIFO queues.
+    pub enqueued_waiters: u64,
+    /// Intrusive FIFO append, detach, or unlink mutations.
+    pub queue_link_mutations: u64,
+    /// Queued cancellations that removed the FIFO head.
+    pub cancelled_head_waiters: u64,
+    /// Queued cancellations that removed a middle entry.
+    pub cancelled_middle_waiters: u64,
+    /// Queued cancellations that removed the FIFO tail.
+    pub cancelled_tail_waiters: u64,
+    /// Provisional physical holders accepted by their notified observer.
+    pub provisional_observations: u64,
+    /// Waiters promoted into provisional physical holders.
+    pub promoted_waiters: u64,
+    /// Exact claims visited by indexed scope close.
+    pub scope_close_claims_visited: u64,
+    /// Scope-close claims that changed physical family state.
+    pub scope_close_physical_changes: u64,
+    /// Success-only completion objects allocated for blocked requests.
+    pub completion_allocations: u64,
+    /// Waiter slab vector growth events.
+    pub waiter_slab_growths: u64,
+    /// Waiter slab vacant-slot reuse events.
+    pub waiter_slab_reuses: u64,
+    /// Physical resources currently retained by the manager.
+    pub current_physical_resources: u64,
+    /// Maximum simultaneously retained physical resources.
+    pub peak_physical_resources: u64,
+    /// Physical family entries currently retained by the manager.
+    pub current_physical_families: u64,
+    /// Maximum simultaneously retained physical family entries.
+    pub peak_physical_families: u64,
+    /// FIFO-linked waiters currently retained.
+    pub current_linked_waiters: u64,
+    /// Maximum simultaneously FIFO-linked waiters.
+    pub peak_linked_waiters: u64,
+    /// Waiter nodes in queued or provisional state.
+    pub current_live_waiter_nodes: u64,
+    /// Maximum simultaneously live waiter nodes.
+    pub peak_live_waiter_nodes: u64,
+}
+
 /// Snapshot of the engine-owned mandatory runtime's fixed task classes.
 ///
 /// Count and duration fields are monotonic diagnostics. Active counts are

@@ -293,8 +293,6 @@ pub(crate) enum OperationError {
     LockConversionNotSupported,
     #[error("lock family conflict")]
     LockFamilyConflict,
-    #[error("lock waiter released")]
-    LockWaiterReleased,
 }
 
 /// Fieldless fatal-domain errors carried underneath `ErrorKind::Fatal`.

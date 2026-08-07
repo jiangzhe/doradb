@@ -806,16 +806,15 @@ mod tests {
     use crate::catalog::tests::table1;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::error::{
-        ConfigError, Error, ErrorKind, FatalError, LifecycleError, OperationError, ResourceError,
-        RuntimeError,
+        ConfigError, Error, ErrorKind, FatalError, LifecycleError, ResourceError, RuntimeError,
     };
     use crate::file::fs::tests::io_backend_stats_handle_identity as fs_stats_handle_identity;
-    use crate::id::{OperationID, SessionOperationKey, TableID, TrxID};
+    use crate::id::{TableID, TrxID};
     use crate::io::{
         IOKind, StdIoResult, StorageBackendFileIdentity, StorageBackendOp, StorageBackendTestHook,
         install_storage_backend_test_hook,
     };
-    use crate::lock::tests::{debug_snapshot, try_acquire};
+    use crate::lock::tests::{TestLockOwner, debug_snapshot};
     use crate::lock::{LockMode, LockOwner, LockResource, TableLockMode};
     use crate::root::STORAGE_LAYOUT_FILE_NAME;
     use crate::session::tests::{
@@ -824,7 +823,6 @@ mod tests {
     };
     use crate::thread::{SpawnTestEvent, fail_spawn_named_with_observer, observe_spawn_named};
     use crate::trx::tests::add_pseudo_redo_log_entry;
-    use smol::Timer;
     use std::fs;
     use std::future::pending;
     use std::io::Error as StdIoError;
@@ -1166,7 +1164,7 @@ mod tests {
         debug_snapshot(engine.inner().core.lock_manager())
             .entries
             .iter()
-            .filter(|entry| entry.owner == owner)
+            .filter(|entry| entry.family == owner.family())
             .count()
     }
 
@@ -1230,209 +1228,27 @@ mod tests {
             let session = engine.new_session().unwrap();
             let runtime = session.engine();
             let resource = LockResource::TableMetadata(TableID::new(10));
-            let owner = LockOwner::session_explicit(SessionID::new(10));
-
-            assert!(
-                try_acquire(
+            let mut first = TestLockOwner::new(LockOwner::session_explicit(SessionID::new(10)));
+            first
+                .acquire(
                     engine.inner().core.lock_manager(),
                     resource,
                     LockMode::Exclusive,
-                    owner
                 )
-                .unwrap()
-            );
-            assert!(
-                !try_acquire(
-                    runtime.lock_manager(),
-                    resource,
-                    LockMode::Shared,
-                    LockOwner::session_explicit(SessionID::new(11))
-                )
-                .unwrap()
-            );
-            assert_eq!(runtime.lock_manager().release_owner(owner), 1);
-            assert!(
-                try_acquire(
-                    engine.inner().core.lock_manager(),
-                    resource,
-                    LockMode::Shared,
-                    LockOwner::session_explicit(SessionID::new(11))
-                )
-                .unwrap()
-            );
-        });
-    }
-
-    #[test]
-    fn test_session_drop_does_not_scan_unindexed_manager_grants() {
-        smol::block_on(async {
-            let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
                 .await
                 .unwrap();
-            let session = engine.new_session().unwrap();
-            let resource = LockResource::TableData(TableID::new(91_200));
-            let explicit_owner = LockOwner::session_explicit(session.id());
 
-            assert!(
-                try_acquire(
-                    engine.inner().core.lock_manager(),
-                    resource,
-                    LockMode::Exclusive,
-                    explicit_owner
-                )
-                .unwrap()
-            );
-            drop(session);
-
-            assert!(engine.inner().core.lock_manager().owner_holds(
-                resource,
-                explicit_owner,
-                LockMode::Exclusive,
-            ));
-            assert_eq!(
-                engine
-                    .inner()
-                    .core
-                    .lock_manager()
-                    .release_owner(explicit_owner),
-                1
-            );
-        });
-    }
-
-    #[test]
-    fn test_session_drop_does_not_scan_any_unindexed_scope() {
-        smol::block_on(async {
-            let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
-                .await
-                .unwrap();
-            let session = engine.new_session().unwrap();
-            let session_id = session.id();
-            let resource = LockResource::TableData(TableID::new(91_204));
-            let explicit_owner = LockOwner::session_explicit(session_id);
-            let maintenance_owner = LockOwner::operation(SessionOperationKey::new(
-                session_id,
-                OperationID::new(91_204),
+            let mut second = TestLockOwner::new(LockOwner::session_explicit(SessionID::new(11)));
+            let mut acquire =
+                Box::pin(second.acquire(runtime.lock_manager(), resource, LockMode::Shared));
+            assert!(matches!(
+                futures::poll!(acquire.as_mut()),
+                std::task::Poll::Pending
             ));
 
-            assert!(
-                try_acquire(
-                    engine.inner().core.lock_manager(),
-                    resource,
-                    LockMode::Exclusive,
-                    explicit_owner,
-                )
-                .unwrap()
-            );
-            assert!(
-                try_acquire(
-                    engine.inner().core.lock_manager(),
-                    resource,
-                    LockMode::IntentShared,
-                    maintenance_owner,
-                )
-                .unwrap()
-            );
-
-            drop(session);
-
-            assert!(engine.inner().core.lock_manager().owner_holds(
-                resource,
-                explicit_owner,
-                LockMode::Exclusive,
-            ));
-            assert!(engine.inner().core.lock_manager().owner_holds(
-                resource,
-                maintenance_owner,
-                LockMode::IntentShared,
-            ));
-            assert_eq!(
-                engine
-                    .inner()
-                    .core
-                    .lock_manager()
-                    .release(resource, explicit_owner),
-                1
-            );
-            assert_eq!(
-                engine
-                    .inner()
-                    .core
-                    .lock_manager()
-                    .release(resource, maintenance_owner),
-                1
-            );
-        });
-    }
-
-    #[test]
-    fn test_session_drop_does_not_scan_unindexed_waiters() {
-        smol::block_on(async {
-            let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
-                .await
-                .unwrap();
-            let resource = LockResource::TableMetadata(TableID::new(91_202));
-            let blocking_owner = LockOwner::session_explicit(SessionID::new(91_203));
-            assert!(
-                try_acquire(
-                    engine.inner().core.lock_manager(),
-                    resource,
-                    LockMode::Exclusive,
-                    blocking_owner
-                )
-                .unwrap()
-            );
-
-            let session = engine.new_session().unwrap();
-            let waiting_owner = LockOwner::session_explicit(session.id());
-            let manager = engine.inner().core.lock_manager().clone();
-            let wait_task = smol::spawn(async move {
-                manager
-                    .acquire(resource, LockMode::Shared, waiting_owner)
-                    .await
-            });
-
-            let mut waiter_seen = false;
-            for _ in 0..100 {
-                waiter_seen = debug_snapshot(engine.inner().core.lock_manager())
-                    .entries
-                    .iter()
-                    .any(|entry| entry.owner == waiting_owner);
-                if waiter_seen {
-                    break;
-                }
-                Timer::after(Duration::from_millis(1)).await;
-            }
-            assert!(waiter_seen);
-
-            drop(session);
-            assert!(
-                debug_snapshot(engine.inner().core.lock_manager())
-                    .entries
-                    .iter()
-                    .any(|entry| entry.owner == waiting_owner)
-            );
-            assert_eq!(
-                engine
-                    .inner()
-                    .core
-                    .lock_manager()
-                    .release_owner(waiting_owner),
-                1
-            );
-            let err = wait_task.await.unwrap_err();
-            assert_eq!(*err.current_context(), OperationError::LockWaiterReleased);
-            assert_eq!(
-                engine
-                    .inner()
-                    .core
-                    .lock_manager()
-                    .release_owner(blocking_owner),
-                1
-            );
+            first.close(runtime.lock_manager());
+            acquire.await.unwrap();
+            second.close(engine.inner().core.lock_manager());
         });
     }
 

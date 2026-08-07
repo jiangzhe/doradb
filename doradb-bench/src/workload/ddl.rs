@@ -56,7 +56,12 @@ impl WorkloadRunner for TableDdlRunner {
         Self
     }
 
-    async fn run(&self, session: &mut Session, plan: &SessionPlan) -> Result<SessionSummary> {
+    async fn run(
+        &self,
+        _engine: &doradb_storage::Engine,
+        session: &mut Session,
+        plan: &SessionPlan,
+    ) -> Result<SessionSummary> {
         let mut summary = SessionSummary::default();
         for _ in 0..plan.number {
             let table_id = session
@@ -121,7 +126,12 @@ impl WorkloadRunner for IndexDdlRunner {
         Self { table_id }
     }
 
-    async fn run(&self, session: &mut Session, plan: &SessionPlan) -> Result<SessionSummary> {
+    async fn run(
+        &self,
+        _engine: &doradb_storage::Engine,
+        session: &mut Session,
+        plan: &SessionPlan,
+    ) -> Result<SessionSummary> {
         let mut summary = SessionSummary::default();
         for _ in 0..plan.number {
             let index_no = session
