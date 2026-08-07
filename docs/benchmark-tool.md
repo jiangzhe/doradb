@@ -177,7 +177,7 @@ Specialized scenarios reject `--scope`, `--unlock`, `--rand`, and `--seed`;
 | `cancel-middle` | Enqueue a known prefix, cancel its middle entry, release, and drain/promote the remainder | waiters; at least 3 |
 | `cancel-tail` | Enqueue a known prefix, cancel its tail, release, and drain/promote the remainder | waiters |
 | `promote` | Enqueue a known prefix, release the blocker, and promote/drain it | promotion prefix |
-| `handoff` | Execute an empty table scan so statement metadata S is installed into the transaction before statement release, then commit | must be 1; mode must be `shared` |
+| `first-touch` | Execute an empty table scan under direct transaction-owned metadata S, then commit | must be 1; mode must be `shared` |
 | `scope-close` | Acquire explicit claims on several tables in one transaction and commit | tables/claims closed |
 
 Contended scenarios require `--sessions 1`. They use explicit incompatible
@@ -240,8 +240,8 @@ sizing control; only basic randomized paired mode accepts `--seed`.
 | `--scope` | `run lock-table` | `session` | Lock ownership scope: `session` or `transaction`. |
 | `--unlock` | `run lock-table` | `false` | Use a paired release boundary per iteration. Session scope calls `unlock_table`; transaction scope commits. |
 | `--rand` | `run lock-table` | `false` | Select a table with replacement for every iteration. Requires `--unlock`. |
-| `--scenario` | `run lock-table` | `basic` | Select `basic`, `nested-covered`, `convert`, `enqueue`, `cancel-head`, `cancel-middle`, `cancel-tail`, `promote`, `handoff`, or `scope-close`. |
-| `--mode` | `run lock-table` | `shared` | Requested physical table-data mode. `convert` requires `exclusive`; `handoff` requires `shared`. |
+| `--scenario` | `run lock-table` | `basic` | Select `basic`, `nested-covered`, `convert`, `enqueue`, `cancel-head`, `cancel-middle`, `cancel-tail`, `promote`, `first-touch`, or `scope-close`. |
+| `--mode` | `run lock-table` | `shared` | Requested physical table-data mode. `convert` requires `exclusive`; `first-touch` requires `shared`. |
 | `--width` | `run lock-table` | `1` | Specialized scenario resource, waiter, promotion-prefix, or scope-close cardinality. Basic requires 1. |
 | `--seed` | `run insert-seq`, `insert-rand`, `lookup-rand`, `index-scan`, `index-stream`, randomized `lock-table` | `0` | `u64` reproducibility input for payload bytes, randomized insert order, randomized read key selection, randomized scan bounds, or random table selection. An explicit lock-table seed requires `--rand`. |
 | `--include-stats` | `run ...` | `false` | Captures and prints transaction-system, storage-IO, buffer-pool, mandatory-runtime, and logical-lock stats. Omit this for prerequisite runs such as data loading before a measured read workload. |
@@ -416,7 +416,8 @@ rtk cargo run --release -p doradb-bench -- \
   --threads 4 --sessions 16
 ```
 
-Measure owner-local coverage, conversion, handoff, and indexed scope close:
+Measure owner-local coverage, conversion, first-touch admission, and indexed
+scope close:
 
 ```bash
 rtk cargo run --release -p doradb-bench -- \
@@ -429,7 +430,7 @@ rtk cargo run --release -p doradb-bench -- \
   --threads 1 --sessions 1 --include-stats
 rtk cargo run --release -p doradb-bench -- \
   --root target/doradb-bench/lock-table \
-  run lock-table --num 100000 --scenario handoff \
+  run lock-table --num 100000 --scenario first-touch \
   --threads 1 --sessions 1 --include-stats
 rtk cargo run --release -p doradb-bench -- \
   --root target/doradb-bench/lock-table \
@@ -449,6 +450,12 @@ rtk cargo run --release -p doradb-bench -- \
   run lock-table --num 10000 --scenario promote --mode shared \
   --width 9 --threads 1 --sessions 1 --include-stats
 ```
+
+For `first-touch`, each lifecycle creates one direct transaction metadata claim.
+After the session closes and owner-local counters are aggregated, the expected
+per-lifecycle deltas are one immediate physical acquisition, no covered
+cross-scope publication, no mode-preserving child release, one scope-close
+claim visited, and one scope-close physical removal.
 
 For paired baseline/candidate evidence, use preserved release binaries and
 separate but identically prepared roots. Keep host, storage backend, durability,

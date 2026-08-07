@@ -42,7 +42,7 @@ pub struct LogicalLockStats {
     pub promoted_waiters: u64,
     /// Exact claims visited by indexed scope close.
     pub scope_close_claims_visited: u64,
-    /// Scope-close claims that changed physical family state.
+    /// Scope-close claims that removed their family's last physical entry.
     pub scope_close_physical_changes: u64,
     /// Success-only completion objects allocated for blocked requests.
     pub completion_allocations: u64,

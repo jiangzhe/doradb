@@ -199,8 +199,7 @@ zero-capacity effect containers, and one uniquely owned zero-valued
 `SharedTrxStatus`. Public transaction begin calls `TrxInner::init` after
 allocating the new STS/transaction id: `Arc::get_mut` proves the ready status
 was never shared, then initialization stores the active transaction id, STS,
-GC bucket, lock owner, and statement counter without allocating either the core
-or its status.
+GC bucket, and lock owner without allocating either the core or its status.
 
 Successful terminal processing carries the emptied box through
 `PreparedTrx`/`PrecommitTrx` where necessary. After the old status is terminal,
@@ -257,13 +256,12 @@ versioned page tokens through the catalog table's shared insert free list, so
 catalog insert capacity remains available across sessions without requiring a
 user-table runtime cache entry.
 
-`StmtState` owns the per-operation checkout, statement effects, and
-statement-lock state while `Transaction::exec` is active. It lends one
-`Statement` facade with direct disjoint borrows of the checked-out
-`TrxInner`, operation attachment, effects, and locks; DML methods therefore do
-not resolve the entry or unwrap the carrier. Normal statement finish releases
-statement locks and returns the core to the available payload position inside
-outer `Voluntary` ownership. This check-in
+`StmtState` owns the per-operation checkout and statement effects while
+`Transaction::exec` is active. It lends one `Statement` facade with direct
+disjoint borrows of the checked-out `TrxInner`, operation attachment, and
+effects; DML methods therefore do not resolve the entry or unwrap the carrier.
+Normal statement finish returns the core to the available payload position
+inside outer `Voluntary` ownership. This check-in
 ends only the operation-local lease, not the semantic transaction lifetime;
 the weak public `Transaction` remains reusable for its next call.
 
@@ -271,8 +269,8 @@ Dropping an unpolled `Transaction::exec` future performs no checkout. Once
 checkout succeeds, dropping the future is terminal for that public
 transaction. The callback and any pending acquisition guard are destroyed
 first. `StmtState` then discards statement redo, appends residual row and index
-undo after prior transaction undo, releases statement locks, and returns the
-complete core directly as outer `CleanupReady`. It never exposes an intervening
+undo after prior transaction undo, and returns the complete core directly as
+outer `CleanupReady`. It never exposes an intervening
 available payload position. The exact-identity cleanup job claims the
 core and performs whole-transaction rollback; later calls through the stale
 public facade return `TransactionDiscarded`. An ordinary callback error is
@@ -357,13 +355,12 @@ later commit or rollback attempts return an error.
 Logical lock ownership is tracked outside `TrxContext`. One boxed
 `FamilyLockAuthority` is allocated per session and moves linearly into
 `TransactionLockState`, which pairs that root with the transaction
-`curr_scope`. `StmtState` and `StreamStmtState` retain their existing effect,
-checkout, cancellation, and Drop policy while owning a statement
-`curr_scope`. Both the family/resource slot and exact-scope cleanup entry carry
-the same session-local claim number and mode.
+`curr_scope`. `StmtState` retains statement effects, checkout, cancellation,
+and Drop policy without logical-lock state. `StreamStmtState` owns only its
+transaction checkout and remains last in the stream state so cursor/root state
+is destroyed before transaction check-in.
 
-Statement locks close after success, ordinary rollback, fatal cleanup, stream
-completion, or public cancellation. Transaction locks close on commit,
+Transaction locks close on commit,
 rollback, no-op discard, or fatal transaction discard. DDL and maintenance
 private transactions temporarily take the same family box from the accepted
 outer operation and return it through the stable operation entry; the outer
@@ -378,12 +375,13 @@ Foreground table access enters through lock-aware `Statement` APIs and a
 positive transaction-lifetime `TransactionTableBinding`. A binding hit is
 checked before any new metadata-lock request and reuses the STS-visible
 metadata, current `Table`, current `TableRuntimeLayout`, and transaction-owned
-`TableMetadata(S)` already stored for that table. On first touch, the statement
-acquires `TableMetadata(S)`, resolves both STS-visible logical metadata and the
-authoritative current state, and validates the requested table/index shape.
-Admission then acquires transaction-owned `TableMetadata(S)` before releasing
-the statement grant and installing the binding. Failure at any point releases
-the statement grant and installs neither a binding nor a transaction grant.
+`TableMetadata(S)` already stored for that table. On first touch, admission
+acquires transaction-owned `TableMetadata(S)` before resolving STS-visible
+logical metadata or authoritative current state. It then validates the
+requested table/index shape and installs the binding. An ordinary error after
+acquisition installs no binding but retains the accepted metadata claim until
+terminal transaction cleanup; a later attempt reuses that exact claim and
+retries resolution.
 
 Successfully bound reads and writes retain `TableMetadata(S)` until transaction
 commit or rollback. Reads may use the intersection of visible and current
@@ -448,15 +446,15 @@ Mandatory execution begins the nested transaction, closes and drains the
 terminal lifecycle, performs the catalog cascade, commits, and publishes
 dropped-runtime/replay-floor retention. A drop waiting for an already-admitted
 checkpoint publisher therefore does not delay CREATE or DROP for unrelated
-table ids when runner capacity is available. Transaction and statement
-rollback drop their operation-local table caches and transaction bindings
+table ids when runner capacity is available. Transaction rollback drops its
+operation-local table caches and transaction bindings
 before releasing the logical locks that authorize those runtime owners.
 
 `CREATE INDEX` and `DROP INDEX` prepare their full target and catalog lock
 sets, exact live table, table/catalog metadata-gate admissions, layout, active
 root, and metadata/root plan before mandatory admission. Accepted execution
 starts the private catalog transaction and acquires ordinary exact transaction
-and statement metadata/data claims. The enclosing DDL operation already holds
+metadata/data claims. The enclosing DDL operation already holds
 covering physical modes, so these nested claims publish through the owner-local
 fixed slots without another manager transition. No prepared catalog-write
 bypass exists. Catalog commit remains followed by table-root publication. The

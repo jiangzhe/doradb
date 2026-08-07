@@ -785,9 +785,9 @@ pub(in crate::lock) mod tests {
     #[test]
     fn waiter_layout_is_recorded() {
         assert_eq!(size_of::<WaitNodeID>(), 16);
-        assert_eq!(size_of::<WaitNode>(), 104);
-        assert_eq!(size_of::<WaitNodeSlot>(), 112);
-        assert_eq!(size_of::<WaitNodeSlotEntry>(), 104);
+        assert_eq!(size_of::<WaitNode>(), 96);
+        assert_eq!(size_of::<WaitNodeSlot>(), 104);
+        assert_eq!(size_of::<WaitNodeSlotEntry>(), 96);
     }
 
     #[test]

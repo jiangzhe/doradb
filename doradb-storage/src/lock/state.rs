@@ -114,8 +114,8 @@ pub(crate) struct FamilyLockStats {
     pub(crate) physical_mode_preserving_conversions: u64,
     /// Physical manager acquisition or conversion transitions.
     pub(crate) manager_acquires: u64,
-    /// Physical manager downgrade or release transitions.
-    pub(crate) manager_releases: u64,
+    /// Physical family removals from the manager.
+    pub(crate) physical_family_removals: u64,
     /// Fresh accepted logical claim identities.
     pub(crate) accepted_fresh_claims: u64,
     /// Exact logical claims converted to a covering mode.
@@ -133,7 +133,7 @@ pub(crate) struct FamilyLockStats {
 /// Authoritative owner-side family/resource index for one session family.
 ///
 /// For every resource, `resources` aggregates the exact claims retained by
-/// session, operation, transaction, and statement scopes in this family. The
+/// session, operation, and transaction scopes in this family. The
 /// corresponding manager entry contains only one physical family holder in
 /// the aggregate's `covering_mode`:
 ///
@@ -303,9 +303,9 @@ impl FamilyLockState {
             let token = curr_scope
                 .claim_token(resource)
                 .expect("scope key must retain its claim");
-            let physical_changes = self.stats.manager_releases;
+            let physical_changes = self.stats.physical_family_removals;
             self.release_token(curr_scope, lock_manager, &token);
-            if self.stats.manager_releases != physical_changes {
+            if self.stats.physical_family_removals != physical_changes {
                 self.stats.scope_close_physical_changes += 1;
             }
             released += 1;
@@ -523,15 +523,18 @@ impl FamilyLockState {
             token.owner
         );
 
-        if curr_scope
+        let scope_published = curr_scope
             .claims
             .get(&token.resource)
-            .is_some_and(|claim| claim.claim_no == token.claim_no)
-        {
-            curr_scope.claims.remove(&token.resource);
-        }
+            .is_some_and(|claim| claim.claim_no == token.claim_no);
 
         let Some(family_resource) = self.resources.get_mut(&token.resource) else {
+            assert!(
+                !scope_published,
+                "pending exact-scope publication survived without its family record: \
+                 resource={}, owner={}, claim_no={:?}",
+                token.resource, token.owner, token.claim_no
+            );
             return;
         };
         if family_resource
@@ -539,6 +542,12 @@ impl FamilyLockState {
             .map(|claim| claim.claim_no)
             != Some(token.claim_no)
         {
+            assert!(
+                !scope_published,
+                "pending exact-scope publication does not match its family record: \
+                 resource={}, owner={}, claim_no={:?}",
+                token.resource, token.owner, token.claim_no
+            );
             return;
         }
         let remaining = family_resource.aggregates_after_remove(
@@ -546,9 +555,25 @@ impl FamilyLockState {
             token.owner.scope(),
             token.claim_no,
         );
+        let old_covering_mode = family_resource.covering_mode();
+        assert!(
+            remaining
+                .as_ref()
+                .is_none_or(|(_mask, mode)| *mode == old_covering_mode),
+            "pending publication rollback would change a live physical family mode: \
+             resource={}, family={}, owner={}, old_mode={}, candidate_mode={:?}",
+            token.resource,
+            self.family,
+            token.owner,
+            old_covering_mode,
+            remaining.as_ref().map(|(_mask, mode)| mode)
+        );
         let (remaining_mask, new_covering_mode) = remaining
             .map(|(mask, mode)| (mask, Some(mode)))
             .unwrap_or((ModeMask::EMPTY, None));
+        if scope_published {
+            curr_scope.claims.remove(&token.resource);
+        }
         family_resource.remove(
             token.owner.scope(),
             token.claim_no,
@@ -605,9 +630,9 @@ impl FamilyLockState {
         let old_covering_mode = family_resource.covering_mode();
         // Plan the aggregate after removing this exact claim while both
         // owner-side indexes still describe the old state. This yields one of
-        // three physical outcomes:
+        // three candidate outcomes:
         //   * same mode: another claim still provides the old coverage;
-        //   * weaker mode: the strongest remaining claim becomes physical;
+        //   * different mode: the lifecycle topology was violated;
         //   * no mode: this was the family's last claim on the resource.
         let remaining = family_resource.aggregates_after_remove(
             token.resource,
@@ -618,21 +643,26 @@ impl FamilyLockState {
             .map(|(mask, mode)| (mask, Some(mode)))
             .unwrap_or((ModeMask::EMPTY, None));
 
-        if new_covering_mode == Some(old_covering_mode) {
-            // No external compatibility changes, so manager access and waiter
-            // promotion are unnecessary.
-            self.stats.physical_mode_preserving_releases += 1;
-        } else {
-            // Publish the physical transition before deleting the exact
-            // owner-side records. Exclusive family authority prevents another
-            // family operation from observing this short staging interval.
-            lock_manager.replace_or_release_family(
-                token.resource,
-                self.family,
-                old_covering_mode,
-                new_covering_mode,
-            );
-            self.stats.manager_releases += 1;
+        match new_covering_mode {
+            Some(mode) if mode == old_covering_mode => {
+                // No external compatibility changes, so manager access and
+                // waiter promotion are unnecessary.
+                self.stats.physical_mode_preserving_releases += 1;
+            }
+            None => {
+                // Remove the physical family before deleting the exact
+                // owner-side records. Exclusive family authority prevents
+                // another family operation from observing this staging interval.
+                lock_manager.remove_family(token.resource, self.family, old_covering_mode);
+                self.stats.physical_family_removals += 1;
+            }
+            Some(candidate_mode) => {
+                panic!(
+                    "logical lock release would change a live physical family mode: \
+                     resource={}, family={}, owner={}, old_mode={}, candidate_mode={}",
+                    token.resource, self.family, token.owner, old_covering_mode, candidate_mode
+                );
+            }
         }
         let remove_resource = new_covering_mode.is_none();
         // Commit the resource-oriented and scope-oriented mirrors only after
@@ -766,12 +796,6 @@ impl TransactionLockState {
     #[inline]
     pub(crate) fn covers(&self, resource: LockResource, mode: LockMode) -> bool {
         self.curr_scope.covers(resource, mode)
-    }
-
-    /// Returns mutable family/resource index state without borrowing the transaction scope.
-    #[inline]
-    pub(crate) const fn family_mut(&mut self) -> &mut FamilyLockState {
-        &mut self.authority.family
     }
 
     /// Splits family authority from the transaction scope.
@@ -1058,6 +1082,72 @@ mod tests {
     }
 
     #[test]
+    fn operation_claim_preserves_mode_when_private_transaction_closes() {
+        smol::block_on(async {
+            let manager = LockManager::new();
+            let session_id = SessionID::new(11);
+            let resource = table_data(110);
+            let mut family = FamilyLockState::new(LockFamily::new(session_id));
+            let mut operation = LockScopeState::new(LockOwner::operation(
+                SessionOperationKey::new(session_id, OperationID::new(111)),
+            ));
+            let mut transaction =
+                LockScopeState::new(LockOwner::transaction(session_id, TrxID::new(112)));
+            family
+                .acquire(&mut operation, &manager, resource, LockMode::Exclusive)
+                .await
+                .unwrap();
+            family
+                .acquire(&mut transaction, &manager, resource, LockMode::Shared)
+                .await
+                .unwrap();
+
+            family.close_scope(&mut transaction, &manager);
+            assert!(operation.covers(resource, LockMode::Exclusive));
+            assert_eq!(family.stats.physical_mode_preserving_releases, 1);
+            assert_manager_agreement(&family, &manager);
+
+            family.close_scope(&mut operation, &manager);
+            family.assert_empty();
+        });
+    }
+
+    #[test]
+    fn child_only_physical_claim_is_removed_while_parent_remains_on_other_resource() {
+        smol::block_on(async {
+            let manager = LockManager::new();
+            let session_id = SessionID::new(12);
+            let parent_resource = table_data(120);
+            let child_resource = table_data(121);
+            let mut authority = FamilyLockAuthority::new(session_id);
+            let mut transaction =
+                LockScopeState::new(LockOwner::transaction(session_id, TrxID::new(122)));
+            let (family, session_scope) = authority.parts();
+            family
+                .acquire(
+                    session_scope,
+                    &manager,
+                    parent_resource,
+                    LockMode::Exclusive,
+                )
+                .await
+                .unwrap();
+            family
+                .acquire(&mut transaction, &manager, child_resource, LockMode::Shared)
+                .await
+                .unwrap();
+
+            family.close_scope(&mut transaction, &manager);
+            assert!(session_scope.covers(parent_resource, LockMode::Exclusive));
+            assert_eq!(owner_count(&manager, session_scope.owner()), 1);
+            assert_eq!(family.stats.physical_family_removals, 1);
+            assert_manager_agreement(family, &manager);
+
+            family.close_scope(session_scope, &manager);
+        });
+    }
+
+    #[test]
     fn repeated_covered_acquire_is_local_and_reacquire_burns_identity() {
         smol::block_on(async {
             let manager = LockManager::new();
@@ -1168,7 +1258,7 @@ mod tests {
     }
 
     #[test]
-    fn four_scope_acquisitions_update_stats_and_manager_mirrors() {
+    fn three_scope_identities_update_stats_and_manager_mirrors() {
         smol::block_on(async {
             let manager = LockManager::new();
             let session_id = SessionID::new(4);
@@ -1179,8 +1269,6 @@ mod tests {
                 SessionOperationKey::new(session_id, OperationID::new(42)),
             ));
             let mut transaction = LockScopeState::new(LockOwner::transaction(session_id, trx_id));
-            let mut statement =
-                LockScopeState::new(LockOwner::transaction(session_id, trx_id).statement(43));
 
             let (family, session_scope) = authority.parts();
             family
@@ -1195,27 +1283,21 @@ mod tests {
                 .acquire(&mut transaction, &manager, resource, LockMode::IntentShared)
                 .await
                 .unwrap();
-            family
-                .acquire(&mut statement, &manager, resource, LockMode::IntentShared)
-                .await
-                .unwrap();
-
-            assert_eq!(family.stats.family_covered_publications, 3);
+            assert_eq!(family.stats.family_covered_publications, 2);
             assert_eq!(family.stats.manager_acquires, 1);
-            assert_eq!(family.stats.accepted_fresh_claims, 4);
-            assert_eq!(family_snapshot(family).len(), 4);
+            assert_eq!(family.stats.accepted_fresh_claims, 3);
+            assert_eq!(family_snapshot(family).len(), 3);
             assert_manager_agreement(family, &manager);
 
-            family.close_scope(&mut statement, &manager);
             family.close_scope(&mut transaction, &manager);
             family.close_scope(&mut operation, &manager);
             family.close_scope(session_scope, &manager);
             family.assert_empty();
             assert_manager_agreement(family, &manager);
-            assert_eq!(family.stats.manager_releases, 1);
-            assert_eq!(family.stats.scopes_closed, 4);
-            assert_eq!(family.stats.close_claims_visited, 4);
-            assert_eq!(family.stats.physical_mode_preserving_releases, 3);
+            assert_eq!(family.stats.physical_family_removals, 1);
+            assert_eq!(family.stats.scopes_closed, 3);
+            assert_eq!(family.stats.close_claims_visited, 3);
+            assert_eq!(family.stats.physical_mode_preserving_releases, 2);
         });
     }
 
@@ -1340,12 +1422,7 @@ mod tests {
             assert_manager_agreement(family, &manager);
             let before = family_snapshot(family);
             let token = session_scope.claim_token(resource).unwrap();
-            manager.replace_or_release_family(
-                resource,
-                session_scope.owner().family(),
-                LockMode::Shared,
-                None,
-            );
+            manager.remove_family(resource, session_scope.owner().family(), LockMode::Shared);
 
             let panic = catch_unwind(AssertUnwindSafe(|| {
                 family.release_token(session_scope, &manager, &token);
@@ -1389,21 +1466,17 @@ mod tests {
         });
     }
 
-    #[test]
-    fn deterministic_reference_model_matches_dual_indexes_and_manager() {
+    fn run_lifecycle_reference_model(
+        outer_owner: LockOwner,
+        child_owner: LockOwner,
+        mut seed: u64,
+    ) {
         let manager = LockManager::new();
-        let session_id = SessionID::new(90);
-        let family_id = LockFamily::new(session_id);
-        let trx_id = TrxID::new(901);
-        let mut family = FamilyLockState::new(family_id);
+        assert_eq!(outer_owner.family(), child_owner.family());
+        let mut family = FamilyLockState::new(outer_owner.family());
         let mut scopes = [
-            LockScopeState::new(LockOwner::session_explicit(session_id)),
-            LockScopeState::new(LockOwner::operation(SessionOperationKey::new(
-                session_id,
-                OperationID::new(902),
-            ))),
-            LockScopeState::new(LockOwner::transaction(session_id, trx_id)),
-            LockScopeState::new(LockOwner::transaction(session_id, trx_id).statement(903)),
+            LockScopeState::new(outer_owner),
+            LockScopeState::new(child_owner),
         ];
         let resources = [table_data(900), table_data(901), table_data(902)];
         let modes = [
@@ -1413,7 +1486,6 @@ mod tests {
             LockMode::Exclusive,
         ];
         let mut model = BTreeMap::<(usize, LockResource), (ClaimNo, LockMode)>::new();
-        let mut seed = 0x258d_0a27_4c6f_91e3_u64;
         let mut last_claim_no = 0;
 
         for _step in 0..512 {
@@ -1424,6 +1496,9 @@ mod tests {
             let resource = resources[((seed >> 8) as usize) % resources.len()];
             match (seed >> 16) % 8 {
                 0 => {
+                    if scope_index == 0 && model.keys().any(|(index, _resource)| *index == 1) {
+                        continue;
+                    }
                     let expected_resources = model
                         .keys()
                         .filter(|(index, _resource)| *index == scope_index)
@@ -1435,6 +1510,9 @@ mod tests {
                     }
                 }
                 1 | 2 => {
+                    if scope_index == 0 && model.contains_key(&(1, resource)) {
+                        continue;
+                    }
                     let expected = model.remove(&(scope_index, resource));
                     assert_eq!(
                         family.release(&mut scopes[scope_index], &manager, resource),
@@ -1442,6 +1520,9 @@ mod tests {
                     );
                 }
                 _ => {
+                    if scope_index == 0 && model.keys().any(|(index, _resource)| *index == 1) {
+                        continue;
+                    }
                     let requested = modes[((seed >> 24) as usize) % modes.len()];
                     let exact = model.get(&(scope_index, resource)).copied();
                     let family_covers =
@@ -1523,5 +1604,60 @@ mod tests {
         }
         family.assert_empty();
         assert_manager_agreement(&family, &manager);
+    }
+
+    #[test]
+    fn public_transaction_lifecycle_model_matches_indexes_and_manager() {
+        let session_id = SessionID::new(90);
+        run_lifecycle_reference_model(
+            LockOwner::session_explicit(session_id),
+            LockOwner::transaction(session_id, TrxID::new(901)),
+            0x258d_0a27_4c6f_91e3,
+        );
+    }
+
+    #[test]
+    fn private_transaction_lifecycle_model_matches_indexes_and_manager() {
+        let session_id = SessionID::new(91);
+        run_lifecycle_reference_model(
+            LockOwner::operation(SessionOperationKey::new(session_id, OperationID::new(911))),
+            LockOwner::transaction(session_id, TrxID::new(912)),
+            0xa6e1_53d4_88b0_2f79,
+        );
+    }
+
+    #[test]
+    fn closing_strong_outer_claim_before_covered_child_panics_before_mutation() {
+        smol::block_on(async {
+            let manager = LockManager::new();
+            let session_id = SessionID::new(92);
+            let resource = table_data(920);
+            let mut authority = FamilyLockAuthority::new(session_id);
+            let mut child =
+                LockScopeState::new(LockOwner::transaction(session_id, TrxID::new(921)));
+            let (family, outer) = authority.parts();
+            family
+                .acquire(outer, &manager, resource, LockMode::Exclusive)
+                .await
+                .unwrap();
+            family
+                .acquire(&mut child, &manager, resource, LockMode::Shared)
+                .await
+                .unwrap();
+            let family_before = family_snapshot(family);
+            let manager_before = debug_snapshot(&manager);
+
+            let panic = catch_unwind(AssertUnwindSafe(|| {
+                family.release(outer, &manager, resource);
+            }));
+            assert!(panic.is_err());
+            assert_eq!(family_snapshot(family), family_before);
+            assert_eq!(debug_snapshot(&manager), manager_before);
+            assert!(outer.covers(resource, LockMode::Exclusive));
+            assert!(child.covers(resource, LockMode::Shared));
+
+            family.close_scope(&mut child, &manager);
+            family.close_scope(outer, &manager);
+        });
     }
 }

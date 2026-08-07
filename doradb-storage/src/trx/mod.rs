@@ -45,8 +45,8 @@ use crate::error::{
 };
 use crate::id::{SessionID, SessionOperationKey, TableID, TrxID};
 use crate::lock::{
-    FamilyLockAuthority, FreshClaimsGuard, LockMode, LockOwner, LockResource, LockScope,
-    LockScopeState, StmtNo, TableLockMode, TransactionLockState,
+    FamilyLockAuthority, FreshClaimsGuard, LockMode, LockResource, LockScope, LockScopeState,
+    TableLockMode, TransactionLockState,
 };
 use crate::log::block_group::TrxLog;
 use crate::log::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind};
@@ -2226,7 +2226,6 @@ pub(crate) struct TrxInner {
     effects: TrxEffects,
     table_bindings: FastHashMap<TableID, admission::TransactionTableBinding>,
     lock_state: Option<TransactionLockState>,
-    next_stmt_no: StmtNo,
     active: bool,
     /// Whether successful terminal processing returns this core to the session.
     cache_on_terminal: bool,
@@ -2252,7 +2251,6 @@ impl TrxInner {
             effects: TrxEffects::empty(),
             table_bindings: FastHashMap::default(),
             lock_state: None,
-            next_stmt_no: 0,
             active: false,
             cache_on_terminal,
         }
@@ -2287,10 +2285,6 @@ impl TrxInner {
             self.lock_state.is_none(),
             "ready transaction core cannot retain transaction lock state"
         );
-        assert!(
-            self.next_stmt_no == 0,
-            "ready transaction statement number must be zero"
-        );
         self.ctx.init(trx_id, sts, gc_no);
         assert!(
             authority.lock_family().session_id() == session_id,
@@ -2299,7 +2293,6 @@ impl TrxInner {
             authority.lock_family()
         );
         self.lock_state = Some(TransactionLockState::new(authority, trx_id));
-        self.next_stmt_no = 1;
         self.active = true;
     }
 
@@ -2339,7 +2332,6 @@ impl TrxInner {
         self.effects = TrxEffects::empty();
         self.table_bindings = FastHashMap::default();
         self.ctx = TrxContext::ready();
-        self.next_stmt_no = 0;
     }
 
     /// Mark a prepared transaction's emptied core as inactive.
@@ -2430,24 +2422,6 @@ impl TrxInner {
             metadata: LockResource::TableMetadata(table_id),
             data: LockResource::TableData(table_id),
         }
-    }
-
-    #[inline]
-    fn next_stmt_no(&mut self) -> StmtNo {
-        let stmt_no = self.next_stmt_no;
-        self.next_stmt_no = self.next_stmt_no.checked_add(1).unwrap_or_else(|| {
-            panic!(
-                "transaction statement number exhausted u64 space: trx_id={}",
-                self.trx_id()
-            )
-        });
-        stmt_no
-    }
-
-    #[inline]
-    fn next_statement_owner(&mut self) -> LockOwner {
-        let stmt_no = self.next_stmt_no();
-        self.checked_lock_state().owner().statement(stmt_no)
     }
 
     /// Returns this transaction's current status timestamp.
@@ -3307,8 +3281,8 @@ pub(crate) mod tests {
         IOKind, StdIoResult, StorageBackendFileIdentity, StorageBackendOp, StorageBackendTestHook,
         install_storage_backend_test_hook,
     };
-    use crate::lock::LockManager;
     use crate::lock::tests::{LockDebugEntryState, TestLockOwner, debug_snapshot};
+    use crate::lock::{LockManager, LockOwner};
     use crate::log::redo::{RowRedo, RowRedoKind};
     use crate::quiescent::QuiescentGuard;
     use crate::row::ops::SelectKey;
@@ -3336,7 +3310,6 @@ pub(crate) mod tests {
     use event_listener::Listener;
     use smol::Timer;
     use smol::future::yield_now;
-    use std::cell::Cell;
     use std::future::{Future, pending};
     use std::io::Error as IoError;
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -3490,7 +3463,6 @@ pub(crate) mod tests {
         assert_eq!(Arc::strong_count(&inner.ctx.status), 1);
         assert_eq!(inner.table_bindings.capacity(), 0);
         assert!(inner.lock_state.is_none());
-        assert_eq!(inner.next_stmt_no, 0);
         assert!(!inner.active);
         let ready_status_ptr = Arc::as_ptr(&inner.ctx.status);
 
@@ -3507,7 +3479,6 @@ pub(crate) mod tests {
         assert_eq!(inner.trx_id(), second_trx_id);
         assert_eq!(inner.sts(), TrxID::new(72));
         assert_eq!(inner.gc_no(), 4);
-        assert_eq!(inner.next_stmt_no, 1);
         assert!(inner.active);
 
         let second_status = Arc::clone(inner.ctx().status());
@@ -4958,15 +4929,15 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_dropped_effectful_statement_discards_redo_and_releases_locks() {
+    fn test_dropped_effectful_statement_discards_redo_and_terminally_releases_locks() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("trx_effectful_stmt_cancel").await;
             let (session, mut trx) = begin_production_test_transaction(&engine);
             let session_id = session.id();
-            let stmt_owner = lock_owner(&trx).unwrap().statement(1);
+            let trx_owner = lock_owner(&trx).unwrap();
             let resource = LockResource::TableMetadata(TableID::new(91_430));
             let mut exec = Box::pin(trx.exec(async |stmt| {
-                stmt_tests::acquire_statement_lock(stmt, resource, LockMode::Shared).await?;
+                stmt_tests::acquire_transaction_lock(stmt, resource, LockMode::Shared).await?;
                 stmt.effects_mut().insert_row_redo(
                     TableID::new(91_430),
                     RowRedo {
@@ -4984,20 +4955,20 @@ pub(crate) mod tests {
             ));
             assert!(has_lock_entry(
                 &engine,
-                stmt_owner,
+                trx_owner,
                 resource,
                 LockMode::Shared,
                 LockDebugEntryState::Granted,
             ));
             drop(exec);
 
-            assert!(!has_lock_resource(&engine, stmt_owner, resource));
             let err = trx.commit().await.unwrap_err();
             assert_eq!(
                 err.report().downcast_ref::<LifecycleError>().copied(),
                 Some(LifecycleError::TransactionDiscarded)
             );
             wait_for_session_idle(&engine.inner().session_registry, session_id).await;
+            assert!(!has_lock_resource(&engine, trx_owner, resource));
             engine.shutdown();
         });
     }
@@ -5104,7 +5075,7 @@ pub(crate) mod tests {
         let (_temp_dir, engine) = test_engine(log_file_stem).await;
         let (session, mut trx) = begin_production_test_transaction(&engine);
         let session_id = session.id();
-        let stmt_owner = lock_owner(&trx).unwrap().statement(1);
+        let trx_owner = lock_owner(&trx).unwrap();
         let resource = LockResource::TableMetadata(TableID::new(id));
         let blocker = LockOwner::transaction(SessionID::new(id), TrxID::new(id));
         let mut blocker = TestLockOwner::new(blocker);
@@ -5118,7 +5089,7 @@ pub(crate) mod tests {
             .unwrap();
         let mut blocker = Some(blocker);
         let mut exec = Box::pin(trx.exec(async |stmt| {
-            stmt_tests::acquire_statement_lock(stmt, resource, LockMode::Shared).await?;
+            stmt_tests::acquire_transaction_lock(stmt, resource, LockMode::Shared).await?;
             Ok::<(), Error>(())
         }));
 
@@ -5128,7 +5099,7 @@ pub(crate) mod tests {
         ));
         assert!(has_lock_entry(
             &engine,
-            stmt_owner,
+            trx_owner,
             resource,
             LockMode::Shared,
             LockDebugEntryState::Waiting,
@@ -5140,7 +5111,7 @@ pub(crate) mod tests {
                 .close(engine.inner().core.lock_manager());
             assert!(has_lock_entry(
                 &engine,
-                stmt_owner,
+                trx_owner,
                 resource,
                 LockMode::Shared,
                 LockDebugEntryState::Provisional,
@@ -5149,7 +5120,7 @@ pub(crate) mod tests {
 
         drop(exec);
 
-        assert!(!has_lock_resource(&engine, stmt_owner, resource));
+        assert!(!has_lock_resource(&engine, trx_owner, resource));
         if let Some(blocker) = blocker {
             blocker.close(engine.inner().core.lock_manager());
         }
@@ -5243,7 +5214,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_statement_locks_release_without_releasing_transaction_locks() {
+    fn test_statement_completion_retains_transaction_locks_until_terminal_cleanup() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_stmt_lock_release").await;
             let mut session = engine.new_session().unwrap();
@@ -5253,62 +5224,56 @@ pub(crate) mod tests {
             acquire_transaction_lock_immediate(&mut trx, trx_resource, LockMode::IntentExclusive)
                 .unwrap();
 
-            let first_owner = Cell::new(None);
             trx.exec(async |stmt| {
-                let owner = stmt_tests::lock_owner(stmt);
-                first_owner.set(Some(owner));
-                stmt_tests::acquire_statement_lock(
+                assert_eq!(stmt_tests::transaction_lock_owner(stmt), trx_owner);
+                stmt_tests::acquire_transaction_lock(
                     stmt,
                     LockResource::TableMetadata(TableID::new(91_210)),
                     LockMode::Shared,
                 )
                 .await?;
-                stmt_tests::acquire_statement_lock(
+                stmt_tests::acquire_transaction_lock(
                     stmt,
                     LockResource::TableMetadata(TableID::new(91_210)),
                     LockMode::Shared,
                 )
                 .await?;
-                assert_eq!(lock_entry_count(&engine, owner), 2);
+                assert_eq!(lock_entry_count(&engine, trx_owner), 2);
                 Ok(())
             })
             .await
             .unwrap();
 
-            let second_owner = Cell::new(None);
             trx.exec(async |stmt| {
-                let owner = stmt_tests::lock_owner(stmt);
-                second_owner.set(Some(owner));
-                stmt_tests::acquire_statement_lock(
+                assert_eq!(stmt_tests::transaction_lock_owner(stmt), trx_owner);
+                stmt_tests::acquire_transaction_lock(
                     stmt,
                     LockResource::TableMetadata(TableID::new(91_211)),
                     LockMode::Shared,
                 )
                 .await?;
-                stmt_tests::acquire_statement_lock(
+                stmt_tests::acquire_transaction_lock(
                     stmt,
                     LockResource::TableMetadata(TableID::new(91_211)),
                     LockMode::Shared,
                 )
                 .await?;
-                assert_eq!(lock_entry_count(&engine, owner), 2);
+                assert_eq!(lock_entry_count(&engine, trx_owner), 3);
                 Ok(())
             })
             .await
             .unwrap();
 
-            let error_owner = Cell::new(None);
             let res: Result<()> = trx
                 .exec(async |stmt| {
-                    let owner = stmt_tests::lock_owner(stmt);
-                    error_owner.set(Some(owner));
-                    stmt_tests::acquire_statement_lock(
+                    assert_eq!(stmt_tests::transaction_lock_owner(stmt), trx_owner);
+                    stmt_tests::acquire_transaction_lock(
                         stmt,
                         LockResource::TableMetadata(TableID::new(91_212)),
                         LockMode::Shared,
                     )
                     .await?;
-                    assert_eq!(lock_entry_count(&engine, owner), 2);
+                    assert_eq!(lock_entry_count(&engine, trx_owner), 4);
                     Err(Report::new(OperationError::InvalidDmlInput).disclose())
                 })
                 .await;
@@ -5320,16 +5285,7 @@ pub(crate) mod tests {
                 Some(OperationError::InvalidDmlInput)
             );
 
-            let first_owner = first_owner.get().unwrap();
-            let second_owner = second_owner.get().unwrap();
-            let error_owner = error_owner.get().unwrap();
-            assert_eq!(first_owner, trx_owner.statement(1));
-            assert_eq!(second_owner, trx_owner.statement(2));
-            assert_eq!(error_owner, trx_owner.statement(3));
-            assert_eq!(lock_entry_count(&engine, first_owner), 1);
-            assert_eq!(lock_entry_count(&engine, second_owner), 1);
-            assert_eq!(lock_entry_count(&engine, error_owner), 1);
-            assert_eq!(lock_entry_count(&engine, trx_owner), 1);
+            assert_eq!(lock_entry_count(&engine, trx_owner), 4);
 
             trx.rollback().await.unwrap();
             assert_eq!(lock_entry_count(&engine, trx_owner), 0);

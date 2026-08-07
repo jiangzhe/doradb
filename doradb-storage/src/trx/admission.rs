@@ -2,11 +2,9 @@ use super::TrxInner;
 use crate::catalog::{
     CurrentTableState, ResolvedLiveMetadata, ResolvedVisibleTableMetadata, is_catalog_table,
 };
-use crate::error::{
-    OperationError, OperationOrFatalError, OperationOrFatalResult, OperationResult,
-};
+use crate::error::{OperationError, OperationOrFatalResult, OperationResult};
 use crate::id::{TableID, TrxID};
-use crate::lock::{LockMode, LockResource, LockScopeState};
+use crate::lock::{LockMode, LockResource};
 use crate::session::TrxAttachment;
 use crate::table::{Table, TableRuntimeLayout};
 use error_stack::{Report, ResultExt};
@@ -189,35 +187,20 @@ fn resolve_table_binding(
 }
 
 #[inline]
-async fn install_table_binding(
+fn install_table_binding(
     inner: &mut TrxInner,
     attachment: &TrxAttachment,
-    statement_locks: &mut LockScopeState,
     table_id: TableID,
-    metadata_resource: LockResource,
     binding: TransactionTableBinding,
-    operation: &'static str,
-) -> OperationResult<(Arc<Table>, Arc<TableRuntimeLayout>)> {
-    let lock_manager = attachment.engine().lock_manager();
-    inner
-        .checked_lock_state_mut()
-        .acquire(lock_manager, metadata_resource, LockMode::Shared)
-        .await
-        .attach_with(|| format!("operation={operation}, table_id={table_id}"))?;
+) -> (Arc<Table>, Arc<TableRuntimeLayout>) {
     let (table, layout) = binding.operation_parts();
     let previous = inner.table_bindings.insert(table_id, binding);
     assert!(
         previous.is_none(),
-        "binding miss commit replaced an existing binding: table_id={table_id}"
-    );
-    let family = inner.checked_lock_state_mut().family_mut();
-    let released = family.release(statement_locks, lock_manager, metadata_resource);
-    assert!(
-        released,
-        "successful binding handoff must release statement metadata S: table_id={table_id}"
+        "binding miss installation replaced an existing binding: table_id={table_id}"
     );
     attachment.cache_user_table(&table);
-    Ok((table, layout))
+    (table, layout)
 }
 
 /// Admit one foreground user-table operation through a binding hit or locked miss.
@@ -228,7 +211,6 @@ async fn install_table_binding(
 pub(super) async fn admit_user_table(
     inner: &mut TrxInner,
     attachment: &TrxAttachment,
-    statement_locks: &mut LockScopeState,
     table_id: TableID,
     request: TableAdmissionRequest,
     operation: &'static str,
@@ -246,44 +228,29 @@ pub(super) async fn admit_user_table(
 
     let metadata_resource = LockResource::TableMetadata(table_id);
     // The transaction metadata lock already protects a cached binding, so the
-    // operation can validate and reuse it without another lock handoff.
+    // operation can validate and reuse it without another lock acquisition.
     if let Some(parts) =
         admit_cached_binding(inner, table_id, metadata_resource, request, operation)?
     {
         return Ok(parts);
     }
 
-    // First touch resolves both snapshot-visible and current metadata while
-    // statement metadata S prevents a concurrent DDL publication.
+    // First touch retains transaction metadata S before resolving either
+    // snapshot-visible or current metadata. Every accepted claim remains until
+    // terminal transaction cleanup, including after an ordinary resolution or
+    // validation error.
     let lock_manager = attachment.engine().lock_manager();
-    let family = inner.checked_lock_state_mut().family_mut();
-    family
-        .acquire(
-            statement_locks,
-            lock_manager,
-            metadata_resource,
-            LockMode::Shared,
-        )
+    inner
+        .checked_lock_state_mut()
+        .acquire(lock_manager, metadata_resource, LockMode::Shared)
         .await
         .attach_with(|| format!("operation={operation}, table_id={table_id}"))?;
 
     #[cfg(test)]
-    tests::maybe_pause_after_statement_metadata_grant().await;
+    tests::maybe_pause_after_transaction_metadata_grant().await;
 
     let binding = resolve_table_binding(attachment, inner.sts(), table_id, request, operation)?;
-    // Installation acquires transaction metadata S before releasing statement
-    // metadata S, leaving no unprotected gap in the binding's lifetime.
-    install_table_binding(
-        inner,
-        attachment,
-        statement_locks,
-        table_id,
-        metadata_resource,
-        binding,
-        operation,
-    )
-    .await
-    .map_err(OperationOrFatalError::from)
+    Ok(install_table_binding(inner, attachment, table_id, binding))
 }
 
 #[cfg(test)]
@@ -295,8 +262,8 @@ mod tests {
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{Error, LifecycleError, OperationError};
+    use crate::lock::LockOwner;
     use crate::lock::tests::{LockDebugEntryState, debug_snapshot};
-    use crate::lock::{LockOwner, LockScope};
     use crate::session::tests::wait_for_session_idle;
     use crate::table::TableTerminal;
     use crate::value::Val;
@@ -306,15 +273,15 @@ mod tests {
     use tempfile::TempDir;
 
     thread_local! {
-        static PAUSE_AFTER_STATEMENT_METADATA_GRANT: Cell<bool> = const { Cell::new(false) };
+        static PAUSE_AFTER_TRANSACTION_METADATA_GRANT: Cell<bool> = const { Cell::new(false) };
     }
 
-    fn pause_after_statement_metadata_grant() {
-        PAUSE_AFTER_STATEMENT_METADATA_GRANT.set(true);
+    fn pause_after_transaction_metadata_grant() {
+        PAUSE_AFTER_TRANSACTION_METADATA_GRANT.set(true);
     }
 
-    pub(super) async fn maybe_pause_after_statement_metadata_grant() {
-        if PAUSE_AFTER_STATEMENT_METADATA_GRANT.replace(false) {
+    pub(super) async fn maybe_pause_after_transaction_metadata_grant() {
+        if PAUSE_AFTER_TRANSACTION_METADATA_GRANT.replace(false) {
             pending::<()>().await;
         }
     }
@@ -401,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn first_read_commits_binding_and_releases_statement_metadata_lock() {
+    fn first_read_installs_binding_under_transaction_metadata_lock() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("admission_first_read_binding").await;
             let table_id = table2(&engine).await;
@@ -431,18 +398,6 @@ mod tests {
                 metadata,
                 LockMode::Shared
             ));
-            assert!(
-                debug_snapshot(engine.inner().core.lock_manager())
-                    .entries
-                    .iter()
-                    .all(|entry| {
-                        entry.resource != metadata
-                            || !entry.pending_owner.is_some_and(|owner| {
-                                matches!(owner.scope(), LockScope::Statement(..))
-                            })
-                    })
-            );
-
             trx.rollback().await.unwrap();
             assert!(
                 !owner_has_grant(&engine, trx_owner, metadata, LockMode::Shared),
@@ -454,7 +409,96 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_first_touch_releases_statement_grant_before_terminal_cleanup() {
+    fn missing_table_retry_reuses_retained_transaction_metadata_claim() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("admission_missing_table_retry").await;
+            let table_id = TableID::new(91_261);
+            let metadata = LockResource::TableMetadata(table_id);
+            let mut session = engine.new_session().unwrap();
+            let session_id = session.id();
+            let mut trx = session.begin_trx().unwrap();
+            let owner = LockOwner::transaction(session_id, trx.trx_id());
+
+            let before = session.logical_lock_stats().unwrap();
+            let first = trx
+                .exec(async |stmt| stmt.table_scan_mvcc(table_id, &[0], |_| true).await)
+                .await
+                .unwrap_err();
+            assert_eq!(operation_error(&first), Some(OperationError::TableNotFound));
+            let after_first = session.logical_lock_stats().unwrap();
+            assert_eq!(
+                after_first.immediate_physical_acquisitions
+                    - before.immediate_physical_acquisitions,
+                1
+            );
+            {
+                let checkout = trx.checkout().unwrap();
+                assert!(!checkout.inner().table_bindings.contains_key(&table_id));
+                assert!(
+                    checkout
+                        .inner()
+                        .checked_lock_state()
+                        .covers(metadata, LockMode::Shared)
+                );
+            }
+            assert!(owner_has_grant(&engine, owner, metadata, LockMode::Shared));
+
+            let retry = trx
+                .exec(async |stmt| stmt.table_scan_mvcc(table_id, &[0], |_| true).await)
+                .await
+                .unwrap_err();
+            assert_eq!(operation_error(&retry), Some(OperationError::TableNotFound));
+            let after_retry = session.logical_lock_stats().unwrap();
+            assert_eq!(
+                after_retry.immediate_physical_acquisitions,
+                after_first.immediate_physical_acquisitions
+            );
+            assert_eq!(
+                after_retry.resource_transitions,
+                after_first.resource_transitions
+            );
+
+            trx.rollback().await.unwrap();
+            assert_no_table_locks(&engine, table_id);
+            drop(session);
+            engine.shutdown();
+        });
+    }
+
+    #[test]
+    fn missing_index_installs_no_binding_but_retains_transaction_metadata_claim() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("admission_missing_index_claim").await;
+            let table_id = table2(&engine).await;
+            let metadata = LockResource::TableMetadata(table_id);
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+
+            let err = trx
+                .exec(async |stmt| stmt.table_lookup_unique_mvcc(table_id, 99, &[], &[0]).await)
+                .await
+                .unwrap_err();
+            assert_eq!(operation_error(&err), Some(OperationError::IndexNotFound));
+            {
+                let checkout = trx.checkout().unwrap();
+                assert!(!checkout.inner().table_bindings.contains_key(&table_id));
+                assert!(
+                    checkout
+                        .inner()
+                        .checked_lock_state()
+                        .covers(metadata, LockMode::Shared)
+                );
+            }
+
+            trx.rollback().await.unwrap();
+            assert_no_table_locks(&engine, table_id);
+            drop(session);
+            engine.shutdown();
+        });
+    }
+
+    #[test]
+    fn cancelled_first_touch_releases_accepted_claim_through_terminal_cleanup() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("admission_cancel_first_touch").await;
             let table_id = table2(&engine).await;
@@ -462,7 +506,7 @@ mod tests {
             let session_id = session.id();
             let mut trx = session.begin_trx().unwrap();
             let metadata = LockResource::TableMetadata(table_id);
-            pause_after_statement_metadata_grant();
+            pause_after_transaction_metadata_grant();
             let mut exec = Box::pin(
                 trx.exec(async |stmt| stmt.table_scan_mvcc(table_id, &[0], |_| true).await),
             );
@@ -480,10 +524,10 @@ mod tests {
                         && entry.mode == LockMode::Shared
                         && entry.state == LockDebugEntryState::Granted
                 })
-                .expect("paused statement must retain one physical metadata family");
+                .expect("paused first touch must retain one physical metadata family");
             assert!(
                 physical.pending_owner.is_none(),
-                "accepted manager state must not expose an exact statement owner"
+                "accepted manager state must not expose an exact transaction owner"
             );
             assert!(
                 physical.claim_no.is_none(),
@@ -492,19 +536,19 @@ mod tests {
 
             drop(exec);
 
-            assert_no_table_locks(&engine, table_id);
             let err = trx.exec(async |_| Ok::<(), Error>(())).await.unwrap_err();
             assert_eq!(
                 err.report().downcast_ref::<LifecycleError>().copied(),
                 Some(LifecycleError::TransactionDiscarded)
             );
             wait_for_session_idle(&engine.inner().session_registry, session_id).await;
+            assert_no_table_locks(&engine, table_id);
             engine.shutdown();
         });
     }
 
     #[test]
-    fn stale_write_first_rejects_both_index_kinds_before_locks_or_binding() {
+    fn stale_write_first_rejects_binding_but_retains_transaction_metadata_lock() {
         smol::block_on(async {
             for (attributes, log_file_stem) in [
                 (IndexAttributes::UK, "admission_stale_write_first_unique"),
@@ -539,12 +583,34 @@ mod tests {
                     .await
                     .unwrap_err();
                 assert_eq!(operation_error(&err), Some(OperationError::SchemaChanged));
+                let after_first = old_session.logical_lock_stats().unwrap();
+                let retry = old_trx
+                    .exec(async |stmt| {
+                        stmt.table_insert_mvcc(
+                            table_id,
+                            vec![Val::from(2i32), Val::from(&b"retry"[..])],
+                        )
+                        .await
+                        .map(|_| ())
+                    })
+                    .await
+                    .unwrap_err();
+                assert_eq!(operation_error(&retry), Some(OperationError::SchemaChanged));
+                let after_retry = old_session.logical_lock_stats().unwrap();
+                assert_eq!(
+                    after_retry.immediate_physical_acquisitions,
+                    after_first.immediate_physical_acquisitions
+                );
+                assert_eq!(
+                    after_retry.resource_transitions,
+                    after_first.resource_transitions
+                );
 
                 {
                     let checkout = old_trx.checkout().unwrap();
                     assert!(!checkout.inner().table_bindings.contains_key(&table_id));
                     assert!(
-                        !checkout
+                        checkout
                             .inner()
                             .checked_lock_state()
                             .covers(metadata, LockMode::Shared)
@@ -557,20 +623,18 @@ mod tests {
                     );
                 }
                 let snapshot = debug_snapshot(engine.inner().core.lock_manager());
-                assert!(
-                    snapshot
-                        .entries
-                        .iter()
-                        .all(|entry| entry.family != trx_owner.family())
-                );
-                assert!(snapshot.entries.iter().all(|entry| {
-                    entry.resource != metadata
-                        || !entry
-                            .pending_owner
-                            .is_some_and(|owner| matches!(owner.scope(), LockScope::Statement(..)))
+                assert!(snapshot.entries.iter().any(|entry| {
+                    entry.family == trx_owner.family()
+                        && entry.resource == metadata
+                        && entry.mode == LockMode::Shared
+                        && entry.state == LockDebugEntryState::Granted
                 }));
 
+                let mut drop_table = Box::pin(ddl_session.drop_table(table_id));
+                observe_metadata_x_waiter(&engine, metadata, drop_table.as_mut()).await;
                 old_trx.rollback().await.unwrap();
+                drop_table.await.unwrap();
+                assert_no_table_locks(&engine, table_id);
                 drop(ddl_session);
                 drop(old_session);
                 engine.shutdown();
@@ -1009,7 +1073,7 @@ mod tests {
                 let checkout = old_trx.checkout().unwrap();
                 assert!(!checkout.inner().table_bindings.contains_key(&table_id));
                 assert!(
-                    !checkout
+                    checkout
                         .inner()
                         .checked_lock_state()
                         .covers(LockResource::TableMetadata(table_id), LockMode::Shared)
@@ -1025,12 +1089,12 @@ mod tests {
                 debug_snapshot(engine.inner().core.lock_manager())
                     .entries
                     .iter()
-                    .all(|entry| entry.family != old_owner.family()
-                        && (entry.resource != LockResource::TableMetadata(table_id)
-                            || !entry.pending_owner.is_some_and(|owner| matches!(
-                                owner.scope(),
-                                LockScope::Statement(..)
-                            ))))
+                    .any(|entry| {
+                        entry.family == old_owner.family()
+                            && entry.resource == LockResource::TableMetadata(table_id)
+                            && entry.mode == LockMode::Shared
+                            && entry.state == LockDebugEntryState::Granted
+                    })
             );
 
             old_trx.rollback().await.unwrap();
@@ -1080,7 +1144,7 @@ mod tests {
                 let checkout = old_trx.checkout().unwrap();
                 assert!(!checkout.inner().table_bindings.contains_key(&table_id));
                 assert!(
-                    !checkout
+                    checkout
                         .inner()
                         .checked_lock_state()
                         .covers(LockResource::TableMetadata(table_id), LockMode::Shared)
@@ -1096,12 +1160,12 @@ mod tests {
                 debug_snapshot(engine.inner().core.lock_manager())
                     .entries
                     .iter()
-                    .all(|entry| entry.family != old_owner.family()
-                        && (entry.resource != LockResource::TableMetadata(table_id)
-                            || !entry.pending_owner.is_some_and(|owner| matches!(
-                                owner.scope(),
-                                LockScope::Statement(..)
-                            ))))
+                    .any(|entry| {
+                        entry.family == old_owner.family()
+                            && entry.resource == LockResource::TableMetadata(table_id)
+                            && entry.mode == LockMode::Shared
+                            && entry.state == LockDebugEntryState::Granted
+                    })
             );
 
             old_trx.rollback().await.unwrap();
