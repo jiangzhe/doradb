@@ -211,11 +211,11 @@ pub(super) enum LockTableScenario {
     ///
     /// `width` is the number of waiters and expected promotions.
     Promote,
-    /// Run table admission through a statement and retain its locks in the transaction.
+    /// Run first-touch table admission under a transaction-owned metadata claim.
     ///
-    /// The current path measures statement-to-transaction metadata handoff,
-    /// followed by transaction commit. It requires shared mode and `width == 1`.
-    Handoff,
+    /// The current path measures direct transaction metadata admission followed
+    /// by transaction commit. It requires shared mode and `width == 1`.
+    FirstTouch,
     /// Acquire transaction claims on several tables and close them at commit.
     ///
     /// `width` is the number of tables; each table contributes metadata and
@@ -234,7 +234,7 @@ impl fmt::Display for LockTableScenario {
             Self::CancelMiddle => f.write_str("cancel-middle"),
             Self::CancelTail => f.write_str("cancel-tail"),
             Self::Promote => f.write_str("promote"),
-            Self::Handoff => f.write_str("handoff"),
+            Self::FirstTouch => f.write_str("first-touch"),
             Self::ScopeClose => f.write_str("scope-close"),
         }
     }
@@ -1063,6 +1063,41 @@ mod tests {
         assert_eq!(args.scenario(), LockTableScenario::ScopeClose);
         assert_eq!(args.mode(), LockTableMode::Exclusive);
         assert_eq!(args.width(), 4);
+
+        let cli = Cli::try_parse_from([
+            "doradb-bench",
+            "run",
+            "lock-table",
+            "--root",
+            "root",
+            "--num",
+            "7",
+            "--scenario",
+            "first-touch",
+        ])
+        .unwrap();
+        let Command::Run {
+            workload: WorkloadArgs::LockTable(args),
+        } = cli.command
+        else {
+            panic!("expected lock-table command");
+        };
+        assert_eq!(args.scenario(), LockTableScenario::FirstTouch);
+
+        assert!(
+            Cli::try_parse_from([
+                "doradb-bench",
+                "run",
+                "lock-table",
+                "--root",
+                "root",
+                "--num",
+                "7",
+                "--scenario",
+                "handoff",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@ use crate::error::{
     OperationOrFatalResult, OperationOrRuntimeError, OperationOrRuntimeResult, OperationResult,
     Result, RuntimeError, RuntimeResult,
 };
-use crate::lock::{LockMode, LockResource, LockScopeState};
+use crate::lock::{LockMode, LockResource};
 use crate::log::redo::{DDLRedo, RedoLogs, RowRedo};
 use crate::obs;
 use crate::row::ops::{
@@ -260,13 +260,11 @@ enum StmtDropAction {
 
 /// Lifetime-free owner of one checked-out statement operation.
 ///
-/// The carrier keeps the transaction core, statement effects, and statement
-/// locks together across callback await points. It lends direct disjoint
-/// borrows to [`Statement`] and owns the final policy when that callback future
-/// is dropped.
+/// The carrier keeps the transaction core and statement effects together
+/// across callback await points. It lends direct disjoint borrows to
+/// [`Statement`] and owns the final policy when that callback future is dropped.
 pub(crate) struct StmtState {
     effects: StmtEffects,
-    curr_scope: Option<LockScopeState>,
     drop_action: StmtDropAction,
     checkout: Option<SessionOperationCheckout>,
 }
@@ -274,11 +272,9 @@ pub(crate) struct StmtState {
 impl StmtState {
     /// Arms public statement cancellation after a successful checkout.
     #[inline]
-    pub(crate) fn public(mut checkout: SessionOperationCheckout) -> Self {
-        let owner = checkout.inner_mut().next_statement_owner();
+    pub(crate) fn public(checkout: SessionOperationCheckout) -> Self {
         Self {
             effects: StmtEffects::empty(),
-            curr_scope: Some(LockScopeState::new(owner)),
             drop_action: StmtDropAction::CancelPublicTransaction,
             checkout: Some(checkout),
         }
@@ -286,11 +282,9 @@ impl StmtState {
 
     /// Preserves the current must-complete invariant for private catalog work.
     #[inline]
-    pub(crate) fn private(mut checkout: SessionOperationCheckout) -> Self {
-        let owner = checkout.inner_mut().next_statement_owner();
+    pub(crate) fn private(checkout: SessionOperationCheckout) -> Self {
         Self {
             effects: StmtEffects::empty(),
-            curr_scope: Some(LockScopeState::new(owner)),
             drop_action: StmtDropAction::PrivateMustComplete,
             checkout: Some(checkout),
         }
@@ -300,10 +294,7 @@ impl StmtState {
     #[inline]
     pub(crate) fn statement(&mut self) -> Statement<'_> {
         let Self {
-            effects,
-            curr_scope,
-            checkout,
-            ..
+            effects, checkout, ..
         } = self;
         let checkout = checkout
             .as_mut()
@@ -313,18 +304,14 @@ impl StmtState {
             inner,
             attachment,
             effects,
-            curr_scope: curr_scope
-                .as_mut()
-                .expect("active statement state must retain curr_scope"),
             disable_dml_validation: false,
         }
     }
 
-    /// Releases statement locks and ordinarily checks the core back in.
+    /// Ordinarily checks the core back in.
     #[inline]
     pub(crate) fn return_ordinary(mut self) {
         self.drop_action = StmtDropAction::Settled;
-        self.release_statement_locks();
         self.checkout = None;
     }
 
@@ -332,7 +319,6 @@ impl StmtState {
     #[inline]
     pub(crate) fn discard_after_fatal_rollback(mut self) {
         self.drop_action = StmtDropAction::Settled;
-        self.release_statement_locks();
         if let Some(checkout) = self.checkout.as_mut() {
             checkout.discard_after_fatal_rollback();
         }
@@ -351,19 +337,7 @@ impl StmtState {
             self.effects
                 .fold_cancelled_into_trx_effects(checkout.inner_mut().effects_mut());
         }
-        self.release_statement_locks();
         self.checkout = None;
-    }
-
-    #[inline]
-    fn release_statement_locks(&mut self) {
-        if let (Some(mut curr_scope), Some(checkout)) =
-            (self.curr_scope.take(), self.checkout.as_mut())
-        {
-            let lock_manager = checkout.attachment().engine().lock_manager().clone();
-            let family = checkout.inner_mut().checked_lock_state_mut().family_mut();
-            family.close_scope(&mut curr_scope, &lock_manager);
-        }
     }
 
     #[cold]
@@ -376,15 +350,9 @@ impl StmtState {
                 };
                 self.effects
                     .fold_cancelled_into_trx_effects(checkout.inner_mut().effects_mut());
-                if let Some(mut curr_scope) = self.curr_scope.take() {
-                    let lock_manager = checkout.attachment().engine().lock_manager().clone();
-                    let family = checkout.inner_mut().checked_lock_state_mut().family_mut();
-                    family.close_scope(&mut curr_scope, &lock_manager);
-                }
                 checkout.return_cancelled();
             }
             StmtDropAction::PrivateMustComplete => {
-                self.release_statement_locks();
                 assert!(
                     self.effects.is_empty(),
                     "private statement must complete effect settlement before drop"
@@ -407,15 +375,14 @@ impl Drop for StmtState {
 /// Statement-scoped facade for one operation inside an active transaction.
 ///
 /// `Transaction::exec` owns the statement lifecycle. It passes this facade to the
-/// callback with transaction context, statement-local effects, and
-/// statement-owned logical locks. The enclosing statement state retains
-/// ownership and settles those resources on every completion or cancellation
-/// path.
+/// callback with transaction context and statement-local effects. Logical
+/// locks acquired by statement operations belong directly to the transaction.
+/// The enclosing statement state settles effects on every completion or
+/// cancellation path.
 pub struct Statement<'stmt> {
     inner: &'stmt mut TrxInner,
     attachment: &'stmt TrxAttachment,
     effects: &'stmt mut StmtEffects,
-    curr_scope: &'stmt mut LockScopeState,
     disable_dml_validation: bool,
 }
 
@@ -521,15 +488,7 @@ impl<'stmt> Statement<'stmt> {
         request: TableAdmissionRequest,
         operation: &'static str,
     ) -> OperationOrFatalResult<(Arc<Table>, Arc<TableRuntimeLayout>)> {
-        admit_user_table(
-            self.inner,
-            self.attachment,
-            self.curr_scope,
-            table_id,
-            request,
-            operation,
-        )
-        .await
+        admit_user_table(self.inner, self.attachment, table_id, request, operation).await
     }
 
     /// Scans the catalog-owned user table's row store by table id.
@@ -1065,20 +1024,20 @@ pub(crate) mod tests {
     }
 
     #[inline]
-    pub(crate) fn lock_owner(stmt: &Statement<'_>) -> LockOwner {
-        stmt.curr_scope.owner()
+    pub(crate) fn transaction_lock_owner(stmt: &Statement<'_>) -> LockOwner {
+        stmt.inner.checked_lock_state().owner()
     }
 
     #[inline]
-    pub(crate) async fn acquire_statement_lock(
+    pub(crate) async fn acquire_transaction_lock(
         stmt: &mut Statement<'_>,
         resource: LockResource,
         mode: LockMode,
     ) -> Result<()> {
         let lock_manager = stmt.attachment.engine().lock_manager();
-        let family = stmt.inner.checked_lock_state_mut().family_mut();
-        family
-            .acquire(stmt.curr_scope, lock_manager, resource, mode)
+        stmt.inner
+            .checked_lock_state_mut()
+            .acquire(lock_manager, resource, mode)
             .await
             .map(|_| ())
             .disclose()
@@ -1365,12 +1324,10 @@ pub(crate) mod tests {
                 LockMode::IntentExclusive,
             )
             .unwrap();
-            let stmt_owner = Cell::new(None);
-
             let res: Result<()> = trx
                 .exec(async |stmt| {
-                    stmt_owner.set(Some(lock_owner(stmt)));
-                    acquire_statement_lock(
+                    assert_eq!(transaction_lock_owner(stmt), trx_owner);
+                    acquire_transaction_lock(
                         stmt,
                         LockResource::TableMetadata(TableID::new(91_250)),
                         LockMode::Shared,
@@ -1412,7 +1369,6 @@ pub(crate) mod tests {
                 TableID::new(99_999_999),
                 RowID::new(24)
             ));
-            assert_eq!(lock_entry_count(&engine, stmt_owner.get().unwrap()), 0);
             assert_eq!(lock_entry_count(&engine, trx_owner), 0);
             assert!(
                 engine

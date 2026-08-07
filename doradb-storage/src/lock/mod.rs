@@ -38,9 +38,6 @@ const LOCK_MODES: [LockMode; MODE_COUNT] = [
     LockMode::Exclusive,
 ];
 
-/// Statement number for statement-owned logical locks.
-pub(crate) type StmtNo = u64;
-
 /// Logical resource protected by the lock manager.
 ///
 /// Lock acquisition follows the resource order below to avoid deadlocks across
@@ -179,8 +176,6 @@ pub(crate) enum LockScope {
     SessionExplicit,
     /// Locks retained for one transaction.
     Transaction(TrxID),
-    /// Locks retained for one statement inside a transaction.
-    Statement(TrxID, StmtNo),
     /// Locks retained for one enclosing DDL or maintenance operation.
     Operation(OperationID),
 }
@@ -225,20 +220,6 @@ impl LockOwner {
         }
     }
 
-    /// Derives a statement owner from this authoritative transaction owner.
-    #[inline]
-    pub(crate) fn statement(self, stmt_no: StmtNo) -> Self {
-        let LockScope::Transaction(trx_id) = self.scope else {
-            panic!(
-                "statement lock owner requires a transaction source: source_owner={self}, stmt_no={stmt_no}"
-            )
-        };
-        Self {
-            family: self.family,
-            scope: LockScope::Statement(trx_id, stmt_no),
-        }
-    }
-
     /// Returns the canonical family of this exact owner.
     #[inline]
     pub(crate) const fn family(self) -> LockFamily {
@@ -263,10 +244,6 @@ impl fmt::Display for LockOwner {
             LockScope::Transaction(trx_id) => {
                 write!(f, "transaction(session_id={session_id},trx_id={trx_id})")
             }
-            LockScope::Statement(trx_id, stmt_no) => write!(
-                f,
-                "statement(session_id={session_id},trx_id={trx_id},stmt_no={stmt_no})"
-            ),
             LockScope::Operation(operation_id) => write!(
                 f,
                 "operation(session_id={session_id},operation_id={operation_id})"
@@ -290,7 +267,7 @@ pub(crate) enum LockGrant {
 /// `FamilyLockState`. For each `(resource, family)` this manager stores only
 /// one physical state in the family's covering mode. Compatibility therefore
 /// scales with physical session families rather than with the number of
-/// session, operation, transaction, and statement claims they aggregate.
+/// session, operation, and transaction claims they aggregate.
 pub(crate) struct LockManager {
     resources: FastDashMap<LockResource, ResourceState>,
     stats: LockManagerStats,
@@ -520,31 +497,22 @@ impl LockManager {
     }
 
     #[inline]
-    fn replace_or_release_family(
-        &self,
-        resource: LockResource,
-        family: LockFamily,
-        old_mode: LockMode,
-        new_mode: Option<LockMode>,
-    ) {
+    fn remove_family(&self, resource: LockResource, family: LockFamily, old_mode: LockMode) {
         add(&self.stats.resource_transitions, 1);
         let mut notify = DeferredNotifications::default();
         let empty = {
             let mut resource_state = self.resources.get_mut(&resource).unwrap_or_else(|| {
                 panic!(
                     "physical release requires a manager resource: \
-                     resource={resource}, family={family}, old_mode={old_mode}, \
-                     new_mode={new_mode:?}"
+                     resource={resource}, family={family}, old_mode={old_mode}"
                 )
             });
-            resource_state.replace_or_release_family(resource, family, old_mode, new_mode);
+            resource_state.remove_family(resource, family, old_mode);
             resource_state.grant_waiters(resource, &mut notify);
-            if new_mode.is_none() {
-                decrement_current(
-                    &self.stats.current_physical_families,
-                    "current_physical_families",
-                );
-            }
+            decrement_current(
+                &self.stats.current_physical_families,
+                "current_physical_families",
+            );
             self.record_promotions(&notify);
             resource_state.is_empty()
         };
@@ -825,50 +793,26 @@ impl ResourceState {
     }
 
     #[inline]
-    fn replace_or_release_family(
-        &mut self,
-        resource: LockResource,
-        family: LockFamily,
-        old_mode: LockMode,
-        new_mode: Option<LockMode>,
-    ) {
-        // Owner-side aggregation has already selected the post-release mode.
-        // Replace the family's one counted holder, or remove it when no exact
-        // claims remain. The caller reruns FIFO promotion afterward because
-        // either outcome may reduce conflicts for queued families.
+    fn remove_family(&mut self, resource: LockResource, family: LockFamily, old_mode: LockMode) {
+        // Owner-side aggregation has established that no exact claims remain.
+        // Remove the family's one counted holder; the caller reruns FIFO
+        // promotion afterward because this may unblock queued families.
         assert!(
             matches!(
                 self.families.get(&family),
                 Some(PhysicalFamilyState::Held { mode }) if *mode == old_mode
             ),
             "physical release expected a matching held family: \
-             resource={resource}, family={family}, old_mode={old_mode}, \
-             new_mode={new_mode:?}, actual={:?}",
+             resource={resource}, family={family}, old_mode={old_mode}, actual={:?}",
             self.families.get(&family)
         );
         self.decrement_holder(old_mode);
-        match new_mode {
-            Some(mode) => {
-                mode.assert_valid_for(resource);
-                self.increment_holder(mode);
-                let previous = self
-                    .families
-                    .insert(family, PhysicalFamilyState::Held { mode });
-                assert!(
-                    previous.is_some(),
-                    "physical family downgrade unexpectedly inserted a new family: \
-                     resource={resource}, family={family}"
-                );
-            }
-            None => {
-                let removed = self.families.remove(&family);
-                assert!(
-                    removed.is_some(),
-                    "physical family removal lost its family entry: \
-                     resource={resource}, family={family}"
-                );
-            }
-        }
+        let removed = self.families.remove(&family);
+        assert!(
+            removed.is_some(),
+            "physical family removal lost its family entry: \
+             resource={resource}, family={family}"
+        );
     }
 
     #[inline]
@@ -1607,33 +1551,20 @@ pub(crate) mod tests {
         let trx_id = TrxID::new(11);
         let explicit = LockOwner::session_explicit(session_id);
         let trx_owner = LockOwner::transaction(session_id, trx_id);
-        let stmt_owner = trx_owner.statement(3);
         let ddl_owner =
             LockOwner::operation(SessionOperationKey::new(session_id, OperationID::new(5)));
         let maintenance_owner =
             LockOwner::operation(SessionOperationKey::new(session_id, OperationID::new(6)));
 
-        for owner in [
-            explicit,
-            trx_owner,
-            stmt_owner,
-            ddl_owner,
-            maintenance_owner,
-        ] {
+        for owner in [explicit, trx_owner, ddl_owner, maintenance_owner] {
             assert_eq!(owner.family(), LockFamily::new(session_id));
         }
         assert_ne!(explicit, trx_owner);
-        assert_ne!(trx_owner, stmt_owner);
         assert_ne!(ddl_owner, maintenance_owner);
         assert_ne!(trx_owner, LockOwner::transaction(SessionID::new(8), trx_id));
-        assert_eq!(stmt_owner.scope(), LockScope::Statement(trx_id, 3));
 
         assert_eq!(explicit.to_string(), "session_explicit(session_id=7)");
         assert_eq!(trx_owner.to_string(), "transaction(session_id=7,trx_id=11)");
-        assert_eq!(
-            stmt_owner.to_string(),
-            "statement(session_id=7,trx_id=11,stmt_no=3)"
-        );
         assert_eq!(
             ddl_owner.to_string(),
             "operation(session_id=7,operation_id=5)"
@@ -1642,12 +1573,6 @@ pub(crate) mod tests {
             maintenance_owner.to_string(),
             "operation(session_id=7,operation_id=6)"
         );
-    }
-
-    #[test]
-    #[should_panic(expected = "statement lock owner requires a transaction source")]
-    fn statement_owner_requires_transaction_source() {
-        let _ = LockOwner::session_explicit(SessionID::new(7)).statement(1);
     }
 
     fn count_entries(

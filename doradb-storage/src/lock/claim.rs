@@ -1,4 +1,4 @@
-use super::{LockMode, LockOwner, LockResource, LockScope, StmtNo};
+use super::{LockMode, LockOwner, LockResource, LockScope};
 use crate::id::{ClaimNo, OperationID, TrxID};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,7 +50,6 @@ struct FamilyClaimSlots {
     session_explicit: Option<FamilyClaim<()>>,
     operation: Option<FamilyClaim<OperationID>>,
     transaction: Option<FamilyClaim<TrxID>>,
-    statement: Option<FamilyClaim<(TrxID, StmtNo)>>,
 }
 
 impl FamilyClaimSlots {
@@ -67,11 +66,6 @@ impl FamilyClaimSlots {
                 .transaction
                 .as_ref()
                 .filter(|claim| claim.id == id)
-                .map(scope_claim),
-            LockScope::Statement(trx_id, stmt_no) => self
-                .statement
-                .as_ref()
-                .filter(|claim| claim.id == (trx_id, stmt_no))
                 .map(scope_claim),
         }
     }
@@ -104,17 +98,6 @@ impl FamilyClaimSlots {
                 );
                 self.transaction = Some(FamilyClaim { id, claim_no, mode });
             }
-            LockScope::Statement(trx_id, stmt_no) => {
-                assert!(
-                    self.statement.is_none(),
-                    "duplicate statement family claim slot: trx_id={trx_id}, stmt_no={stmt_no}"
-                );
-                self.statement = Some(FamilyClaim {
-                    id: (trx_id, stmt_no),
-                    claim_no,
-                    mode,
-                });
-            }
         }
     }
 
@@ -130,13 +113,6 @@ impl FamilyClaimSlots {
             LockScope::Transaction(id) => {
                 update_claim(self.transaction.as_mut(), id, claim_no, mode, scope)
             }
-            LockScope::Statement(trx_id, stmt_no) => update_claim(
-                self.statement.as_mut(),
-                (trx_id, stmt_no),
-                claim_no,
-                mode,
-                scope,
-            ),
         }
     }
 
@@ -146,9 +122,6 @@ impl FamilyClaimSlots {
             LockScope::SessionExplicit => take_matching(&mut self.session_explicit, ()),
             LockScope::Operation(id) => take_matching(&mut self.operation, id),
             LockScope::Transaction(id) => take_matching(&mut self.transaction, id),
-            LockScope::Statement(trx_id, stmt_no) => {
-                take_matching(&mut self.statement, (trx_id, stmt_no))
-            }
         }
         .unwrap_or_else(|| {
             panic!("missing or wrong-id expanded family claim on removal: scope={scope:?}")
@@ -172,12 +145,6 @@ impl FamilyClaimSlots {
         }
         if let Some(claim) = self.transaction {
             visit(LockScope::Transaction(claim.id), scope_claim(&claim));
-        }
-        if let Some(claim) = self.statement {
-            visit(
-                LockScope::Statement(claim.id.0, claim.id.1),
-                scope_claim(&claim),
-            );
         }
     }
 }
@@ -499,8 +466,7 @@ mod tests {
         assert!(size_of::<FamilyClaim<()>>() <= 16);
         assert!(size_of::<FamilyClaim<OperationID>>() <= 24);
         assert!(size_of::<FamilyClaim<TrxID>>() <= 24);
-        assert!(size_of::<FamilyClaim<(TrxID, StmtNo)>>() <= 32);
-        assert_eq!(size_of::<FamilyClaimSlots>(), 96);
+        assert_eq!(size_of::<FamilyClaimSlots>(), 64);
     }
 
     #[test]
@@ -539,7 +505,6 @@ mod tests {
         let resource = LockResource::TableData(TableID::new(10));
         let operation_id = OperationID::new(11);
         let transaction_id = TrxID::new(12);
-        let statement_no = 13;
         let mut state = LocalFamilyResourceState::new(
             LockScope::SessionExplicit,
             ClaimNo::new(1),
@@ -557,18 +522,10 @@ mod tests {
             ClaimNo::new(3),
             LockMode::IntentShared,
         );
-        state.insert(
-            resource,
-            LockScope::Statement(transaction_id, statement_no),
-            ClaimNo::new(4),
-            LockMode::IntentShared,
-        );
-
         let slots = &state.claims;
         assert!(slots.session_explicit.is_some());
         assert_eq!(slots.operation.unwrap().id, operation_id);
         assert_eq!(slots.transaction.unwrap().id, transaction_id);
-        assert_eq!(slots.statement.unwrap().id, (transaction_id, statement_no));
         assert_eq!(state.claim_mask(), ModeMask(0b1101));
         assert_eq!(state.covering_mode(), LockMode::Exclusive);
         assert_eq!(

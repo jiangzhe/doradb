@@ -2143,7 +2143,6 @@ pub(crate) mod tests {
     use crate::trx::stmt::tests as stmt_tests;
     use crate::trx::tests as trx_tests;
     use crate::value::{Val, ValKind};
-    use std::cell::Cell;
     use std::path::Path;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -2887,7 +2886,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_first_read_hands_metadata_lock_to_transaction_owner() {
+    fn test_first_read_acquires_metadata_lock_for_transaction_owner() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine =
@@ -2896,12 +2895,10 @@ pub(crate) mod tests {
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 1, "name").await;
 
-            let stmt_owner = Cell::new(None);
             let mut trx = session.begin_trx().unwrap();
             let trx_owner = trx_tests::lock_owner(&trx).unwrap();
             trx.exec(async |stmt| {
-                let owner = stmt_tests::lock_owner(stmt);
-                stmt_owner.set(Some(owner));
+                assert_eq!(stmt_tests::transaction_lock_owner(stmt), trx_owner);
                 let key = single_key(0i32);
                 let selected = stmt
                     .table_lookup_unique_mvcc(table_id, key.index_no, &key.vals, &[0, 1])
@@ -2911,10 +2908,10 @@ pub(crate) mod tests {
                     .table_lookup_unique_mvcc(table_id, key.index_no, &key.vals, &[0, 1])
                     .await?;
                 assert!(repeated.is_found());
-                assert_eq!(lock_entry_count(&engine, owner), 1);
+                assert_eq!(lock_entry_count(&engine, trx_owner), 1);
                 assert!(!has_lock_resource(
                     &engine,
-                    owner,
+                    trx_owner,
                     LockResource::TableData(table_id),
                 ));
                 Ok(())
@@ -2922,8 +2919,6 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-            let owner = stmt_owner.get().unwrap();
-            assert_eq!(lock_entry_count(&engine, owner), 1);
             assert_eq!(lock_entry_count(&engine, trx_owner), 1);
             assert!(has_lock_entry(
                 &engine,
@@ -5012,7 +5007,7 @@ pub(crate) mod tests {
             let (held_tx, held_rx) = flume::bounded(1);
             let (release_tx, release_rx) = flume::bounded(1);
             let mut reader_fut = Box::pin(reader_trx.exec(async |stmt| {
-                stmt_tests::acquire_statement_lock(
+                stmt_tests::acquire_transaction_lock(
                     stmt,
                     LockResource::TableMetadata(table_id),
                     LockMode::Shared,
@@ -5042,6 +5037,10 @@ pub(crate) mod tests {
 
             release_tx.send_async(()).await.unwrap();
             reader_fut.await.unwrap();
+            assert!(matches!(
+                futures::poll!(drop_fut.as_mut()),
+                std::task::Poll::Pending
+            ));
             assert_eq!(reader_trx.commit().await.unwrap(), TrxID::new(0));
             drop_fut.await.unwrap();
         });

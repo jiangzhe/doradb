@@ -3,7 +3,8 @@
 ## Status and Purpose
 
 This document describes Doradb's implemented logical lock system after the
-RFC-0027 physical-family aggregation cutover.
+RFC-0027 physical-family aggregation cutover and removal of statement-scope
+logical locks.
 
 It has three purposes:
 
@@ -39,8 +40,8 @@ The implementation separates:
 
 1. **Physical conflict participation**: one holder per session family and
    resource.
-2. **Exact logical ownership**: one claim per session, transaction, statement,
-   DDL operation, or maintenance operation.
+2. **Exact logical ownership**: one claim per session-explicit scope,
+   transaction, or DDL/maintenance operation.
 3. **Serialized family execution**: one lock acquisition, release, conversion,
    or cleanup operation at a time for all scopes in one session family.
 4. **Pending acquisition identity**: one call-local cancellation guard for the
@@ -67,7 +68,7 @@ owner retains exclusive lock-mutation authority across `.await`.
 
 The resulting costs are:
 
-- fixed four-slot compatibility and bounded exact-family lookup;
+- fixed three-slot compatibility and bounded exact-family lookup;
 - `O(1)` enqueue and queue unlink;
 - `O(K)` work to promote `K` actual waiters;
 - cleanup proportional to one scope's indexed resources rather than the whole
@@ -107,7 +108,7 @@ The current implementation uses the following table-level mapping:
 
 | Operation | Metadata lock | Data lock | Logical lifetime |
 |---|---|---|---|
-| First table touch | `S` | none | statement `S`, then transaction `S` binding |
+| First table touch | transaction `S` | none | transaction |
 | Repeated bound read | cached transaction `S` | none | transaction |
 | Insert/update/delete | transaction `S` | transaction `IX` | transaction |
 | Full-table MVCC mutation | transaction `S` | transaction `X` | transaction |
@@ -119,26 +120,25 @@ The current implementation uses the following table-level mapping:
 | CREATE INDEX | target `X`; catalog slots 0,2,3 `S` | target `X`; catalog slots 0,2,3 `IX` | prepared DDL operation, then mandatory owner |
 | DROP INDEX | target `X`; catalog slots 2,3 `S` | target `X`; catalog slots 2,3 `IX` | prepared DDL operation, then mandatory owner |
 
-On first touch, statement metadata protection is handed to the transaction
-without a gap:
+On first touch, metadata protection belongs directly to the transaction:
 
 ```text
-statement acquires Metadata(S)
+transaction acquires Metadata(S)
     -> resolve and validate the binding
-    -> transaction acquires Metadata(S)
-    -> release statement Metadata(S)
+    -> install the binding and update the weak session cache
 ```
 
-Successfully bound reads therefore retain metadata protection until transaction
-commit or rollback. Repeated operations use the transaction binding and exact
-transaction scope.
+Every accepted first-touch claim remains until transaction commit, rollback, or
+fatal cleanup. Resolution or validation failure installs no binding but retains
+the claim, so a retry reuses the same exact transaction claim. Successfully
+bound reads use the transaction binding without another metadata request.
 
 Table and index DDL acquire their complete fixed lock sequences while the
 public session future is still cancellable. Winning mandatory capacity
 synchronously transfers the same boxed family authority and operation
 `curr_scope` to accepted execution; there is no release/reacquire window.
-Nested catalog transactions and statements acquire their ordinary exact
-metadata-S and data-IX claims. The enclosing DDL operation already holds
+Nested catalog transactions acquire their ordinary exact metadata-S and
+data-IX claims. The enclosing DDL operation already holds
 covering physical modes, so these claims publish owner-locally without another
 manager transition.
 Effectful maintenance likewise prepares an owned lock scope before mandatory
@@ -261,7 +261,7 @@ Examples:
 session X -> transaction IX     allowed
 transaction IX -> session X     manager conflict if evaluated
 session S -> transaction IX     conflict
-transaction IX -> statement S   conflict
+operation IX -> private transaction S   conflict
 ```
 
 The rule is evaluated against every accepted owner-local exact claim, not only
@@ -304,9 +304,9 @@ for their mode. `Queued` contributes no holder. Compatibility excludes the
 requesting family and inspects the four counts and compact mask.
 
 `LockOwner` contains a canonical `LockFamily(SessionID)` and exact
-`LockScope`: `SessionExplicit`, `Transaction`, `Statement`, or
-`Operation(OperationID)`. Accepted manager state stores neither this exact
-owner nor its `ClaimNo`. Pending nodes retain both until observation or
+`LockScope`: `SessionExplicit`, `Transaction`, or `Operation(OperationID)`.
+Accepted manager state stores neither this exact owner nor its `ClaimNo`.
+Pending nodes retain both until observation or
 cancellation because they are required for token-exact validation.
 
 ### Linear family authority and owner-side indexes
@@ -316,8 +316,8 @@ box moves through the idle session, foreground operation, transaction,
 prepared/precommit state, terminal proof, and accepted DDL or maintenance
 carrier. It is never cloned or reconstructed from an owner id. The authority
 contains the family/resource index and the session-explicit
-`LockScopeState`; transaction, statement, DDL, and maintenance carriers own
-their exact `curr_scope`.
+`LockScopeState`; transaction, DDL, and maintenance carriers own their exact
+`curr_scope`.
 
 Every accepted logical claim is authoritative in both directions:
 
@@ -326,9 +326,9 @@ family.resources[resource].typed_scope_slot = (claim_no, mode)
 curr_scope.claims[resource]                 = (claim_no, mode)
 ```
 
-Every family/resource entry embeds fixed session-explicit, operation,
-transaction, and statement slots. It does not allocate or expand when another
-scope is inserted.
+Every family/resource entry embeds fixed session-explicit, operation, and
+transaction slots. It does not allocate or expand when another scope is
+inserted.
 `ClaimNo` is a session-local `u64` identifier allocated with checked
 arithmetic. Failed, rejected, and cancelled fresh attempts burn their reserved
 number; conversion retains it; release followed by reacquisition receives a
@@ -337,7 +337,7 @@ new number.
 Repeated covered acquisition by the same exact scope is fully local. A fresh
 claim covered by another scope publishes into both owner-side indexes without
 manager access. Mode-preserving conversion and release likewise inspect at
-most the four fixed slots and remain owner-local.
+most the three fixed slots and remain owner-local.
 
 Transactions, DDL, maintenance, and explicit-lock mutations reserve ids from
 one plain session-local sequence. One public DDL call retains one
@@ -456,7 +456,7 @@ Implemented costs are:
 | Fresh physical acquisition | `O(M)` shared average |
 | Immediate conversion | `O(M)`; shared only if physical mode changes |
 | Mode-preserving release | `O(M)` owner-local |
-| Physical downgrade/removal | `O(M + K * M)` |
+| Last-family physical removal | `O(M + K * M)` |
 | Cancel one queued waiter by token | `O(1)` plus promotion work |
 | Promote `K` waiters | `O(K * M)` |
 | Exact-scope cleanup | `O(H_scope + physical changes + promotion work)` |
@@ -529,7 +529,6 @@ boundary:
 ```text
 drop callback and pending acquisition
     -> fold residual statement undo into transaction undo and discard statement redo
-    -> release statement-owned logical locks
     -> check the complete transaction core in as CleanupReady
     -> worker rolls back transaction effects
     -> release transaction table bindings
@@ -537,11 +536,11 @@ drop callback and pending acquisition
     -> consume ReleasedTransactionLocks at session rollback completion
 ```
 
-The callback future is destroyed before its `StmtState`, so a queued waiter is
-removed, or a promoted-but-unobserved grant is released, before the core becomes
-cleanup-claimable. Statement cancellation does not release transaction-owned
-metadata/data locks or table bindings inline; those remain attached to
-`TrxInner` until whole-transaction rollback reaches the ordering above.
+The callback future is destroyed before its `StmtState`, so a queued waiter or
+promoted-but-unobserved request is cancelled by its call-local pending guard
+before the core becomes cleanup-claimable. An accepted transaction claim is not
+released inline; it remains attached to `TrxInner` until whole-transaction
+rollback reaches the ordering above.
 
 The proof covers the implemented closed transaction scope and owns the returned
 family root. Physical aggregation preserves this terminal ordering.
@@ -563,7 +562,6 @@ struct LockFamily(SessionID);
 enum LockScope {
     SessionExplicit,
     Transaction(TrxID),
-    Statement(TrxID, StmtNo),
     Operation(OperationID),
 }
 ```
@@ -573,25 +571,25 @@ purpose-specific policy. `LockFamily` is used for physical conflict
 aggregation and same-session policy. Purpose-specific policy is selected by
 typed session-operation authority, never recovered from `OperationID`.
 
-Constructors must enforce that transaction and statement ids belong to the
-declared session family. Operation ids are monotonic only within one session;
-equal raw ids in different families remain distinct exact owners.
+Constructors must enforce that transaction ids belong to the declared session
+family. Operation ids are monotonic only within one session; equal raw ids in
+different families remain distinct exact owners.
 
 ### Serialized family ownership
 
 One logical execution owner has lock-mutation authority for a `LockFamily`.
-That authority covers every session, transaction, statement, DDL, and
-maintenance scope in the family. At most one acquisition, release, conversion,
-or scope cleanup may be active in the family, including while an acquisition
-awaits an external blocker.
+That authority covers every session-explicit, transaction, DDL, and maintenance
+scope in the family. At most one acquisition, release, conversion, or scope
+cleanup may be active in the family, including while an acquisition awaits an
+external blocker.
 
 This is not OS-thread affinity. A lock-mutating operation holding mutable
-session access, transaction checkout, statement borrow, or operation guard may
+session access, transaction checkout, or operation guard may
 move between executor threads while retaining exclusive authority. Different
 families continue to execute concurrently.
 
 The outer lifecycle owns and transfers this authority. Session teardown,
-transaction completion, statement drop, and operation-guard cleanup must first
+transaction completion and operation-guard cleanup must first
 obtain it, which proves that an earlier acquisition future completed or was
 cancelled. `LockScopeState` does not add an internal mutex, reference count, or
 close-drain lease to repair a violation of that ownership contract.
@@ -652,7 +650,7 @@ lock mutations through one family coordinator.
 The design maintains both directions:
 
 ```text
-session/transaction/statement/operation runtime
+session/transaction/operation runtime
 └── LockScopeState(owner)
     └── resource -> ScopeClaim
 
@@ -681,7 +679,7 @@ For one `(resource, family)`:
 ```text
 manager PhysicalFamilyState = Held | Queued | Provisional
 owner LocalFamilyResourceState
-└── four fixed exact-scope-class slots
+└── three fixed exact-scope-class slots
 ```
 
 The manager state is exactly one physical entry. Exact claims retain their
@@ -706,13 +704,12 @@ The expected lifecycle owners are:
 |---|---|---|
 | `SessionExplicit` | session runtime state | session teardown; explicit unlock removes selected claims |
 | `Transaction` | transaction state and its completion carrier | after commit publication or rollback effects, before the session becomes idle |
-| `Statement` | statement or streaming-statement state | statement completion or drop |
-| `Ddl` | one DDL operation guard | DDL success or failure |
-| `Maintenance` | one maintenance operation guard | maintenance success or failure |
+| `Operation` (DDL) | one DDL operation guard | DDL success or failure |
+| `Operation` (maintenance) | one maintenance operation guard | maintenance success or failure |
 
 `LockScopeState` is the implemented exact-scope cleanup index. It gives session
 explicit locks, DDL, and maintenance the same targeted cleanup mechanism used
-by transactions and statements.
+by transactions.
 
 An acquisition borrows the family execution authority and target scope
 exclusively across `.await`. A pending request is therefore not inserted into
@@ -786,7 +783,7 @@ Owner-side family state embeds:
 
 ```rust
 struct LocalFamilyResourceState {
-    claims: FamilyClaimSlots, // session, operation, transaction, statement
+    claims: FamilyClaimSlots, // session, operation, transaction
     claim_mask: ModeMask,
     covering_mode: LockMode,
 }
@@ -1021,9 +1018,11 @@ Releasing a claim:
 1. Validate its exact scope and family slots and token-matching `ClaimNo`.
 2. Compute the remaining owner-side mask and actual covering mode.
 3. If the physical mode is unchanged, remove both exact entries locally.
-4. Otherwise perform one checked physical downgrade/removal, update counts and
+4. If no exact claim remains, remove the physical family, update counts and
    mask, and promote the maximal compatible FIFO prefix.
-5. Commit the staged local removal.
+5. If a different live mode remains, assert the lifecycle-order violation
+   before manager or owner-side mutation.
+6. Commit the staged local removal.
 
 An explicit session unlock removes and releases the selected metadata and data
 claims; it does not consume the reusable `SessionExplicit` scope.
@@ -1051,9 +1050,6 @@ outside the serialized family contract.
 Lifecycle ordering is:
 
 ```text
-statement scope cleanup
-    before statement object/effects disappear
-
 transaction scope cleanup
     after commit decision or rollback undo is complete
     before session is marked idle or abandoned-session cleanup runs
@@ -1135,22 +1131,20 @@ released.
 ## Same-Family Physical Mode
 
 The physical family mode is the strongest actual exact claim under `covers()`.
-It is not a lattice join.
-
-Directional admission guarantees that the admitted claim set has one maximum.
-Removing claims preserves comparability among the remaining claims. The
-fixed-size claim counts permit recomputation in `O(MODE_COUNT)`.
-
-Examples:
+It is not a lattice join. Production ownership has two nesting chains:
 
 ```text
-claims: X, IX, IS
-physical mode: X
-
-release X
-remaining claims: IX, IS
-physical mode: IX
+SessionExplicit -> PublicTransaction
+SessionExplicit -> Operation -> PrivateTransaction
 ```
+
+Public transactions and operations are alternatives in the session operation
+slot. Directional admission requires every live outer claim to cover a child
+request. Explicit unlock is idle-only, private transactions return the family
+authority before their operation closes, and transaction cleanup precedes
+session-explicit cleanup. A production release can therefore preserve the
+physical mode or remove the last family claim; it cannot select a different
+live mode.
 
 If `S` and `IX` would coexist, directional admission rejects the later request.
 The manager never manufactures `X` to represent them.
@@ -1176,7 +1170,8 @@ Hash-map costs below are average costs. `M` is constant.
 | Enqueue waiter | `O(1)` average |
 | Unlink queued waiter by token | `O(1)` |
 | Observe provisional grant | `O(1)` average |
-| Release exact claim | `O(M + K * M)` |
+| Mode-preserving exact release | `O(M)` owner-local |
+| Last-family exact release | `O(M + K * M)` |
 | Cancel one pending acquisition | `O(M + K * M)` |
 | Promote `K` waiters | `O(K * M)`, effectively `O(K)` |
 | Consume one scope | `O(H_scope + total promoted work)` |
@@ -1253,14 +1248,11 @@ Existing = the exact owner already had a covering claim
 ```
 
 It must not confuse this with physical family-holder creation. A fresh exact
-statement claim may reuse an existing physical transaction holder.
-
-Statement-to-transaction handoff installs the destination transaction claim
-before releasing the source statement claim.
+private-transaction claim may reuse an existing physical operation holder.
 
 DDL and maintenance use unique operation scopes, so closing a failed operation
-releases only its own claims. Transaction and statement mutations are already
-serialized by their runtime ownership. The redesign extends that serialization
+releases only its own claims. Transaction mutations are already serialized by
+their runtime ownership. The redesign extends that serialization
 to session explicit and cross-scope family mutations. While a multi-resource
 helper is active, no later family operation can depend on one of its fresh
 claims, so failure rollback may release exactly the claims created by that
@@ -1306,7 +1298,7 @@ through the lifecycle owners.
 
 Debug snapshots should clearly separate physical holders from logical claims.
 Counting only the physical family holder is insufficient to prove that a
-transaction or statement owns the required claim.
+transaction or operation owns the required claim.
 
 `Session::logical_lock_stats()` returns the public cumulative
 `LogicalLockStats` snapshot. It separates owner-local covered
@@ -1314,8 +1306,10 @@ hits/publications/conversions/releases from manager transitions, fixed mode
 slots examined, enqueue/link/cancellation/promotion work, scope-close work,
 completion and slab allocation classes, and current/peak physical resource,
 family, and waiter cardinalities. Shared-path counters use relaxed manager
-atomics. Owner-local counters remain plain family data and are aggregated once
-when final session authority closes.
+atomics. `scope_close_physical_changes` counts claims whose indexed scope close
+removed the family's physical entry because no exact claim remained.
+Owner-local counters remain plain family data and are aggregated once when
+final session authority closes.
 
 ## Limitations and Explicit Non-Goals
 
@@ -1360,7 +1354,7 @@ independent parallel lock mutation within one family are outside this design.
 
 ### Serialized family lock mutation
 
-Session, transaction, statement, DDL, and maintenance work in one family may
+Session, transaction, DDL, and maintenance work in one family may
 hold claims at the same time, but their lock-manager transitions are
 serialized. Session explicit lock and unlock already require mutable access,
 and effectful public Session admission is idle-only while a detached transaction exists.
@@ -1390,8 +1384,8 @@ no resource-incarnation or global waiter/claim counter is required.
 ### Family aggregate representation
 
 The selected representation uses manager-side per-mode physical counts and a
-mask plus owner-side fixed session, operation, transaction, and statement
-slots. Accepted exact claims are not stored in manager state. One family's
+mask plus owner-side fixed session, operation, and transaction slots. Accepted
+exact claims are not stored in manager state. One family's
 pending state is represented by its `Queued` or `Provisional` entry and one
 generational waiter node.
 
@@ -1423,19 +1417,13 @@ Family execution serialization is not a purpose policy. It determines when
 requests run; these checks determine whether a new exact claim may coexist with
 claims retained by earlier scopes.
 
-### 5. Downgrade API
+### 5. Removal-only release
 
-Internal release can downgrade a family holder when its strongest claim
-disappears. There is no explicit public or transaction downgrade operation.
-
-Future need should determine whether to add:
-
-- exact-owner mode downgrade;
-- transaction `X -> IX`;
-- session `X -> S`; or
-- no explicit downgrade at all.
-
-A downgrade must rerun FIFO granting and update the exact claim atomically.
+Release either preserves the current physical mode or removes the family's last
+physical claim. A candidate different live mode is an invariant violation
+asserted before manager or owner-side mutation. There is no public or internal
+release-time downgrade API; same-scope immediate strengthening remains
+supported.
 
 ### 6. Observability boundary
 
@@ -1473,9 +1461,9 @@ transaction-scope mutations, but dropping the outer future can abandon the
 transaction and queue asynchronous rollback while DDL guards synchronously
 release their claims.
 
-The implemented ownership handoff guarantees:
+The implemented ownership transfer guarantees:
 
-- statement and pending-acquisition cancellation finishes first;
+- pending-acquisition cancellation finishes first;
 - DDL-scope cleanup and nested transaction cleanup cannot overlap;
 - transaction claims still close before the Session becomes idle; and
 - the Session remains unavailable until all transferred cleanup completes.
@@ -1502,8 +1490,8 @@ These stages record the completed progression.
   declaring family cleanup serialized.
 - Serialize lock mutation across every scope in one family.
 - Add uniquely owned `LockScopeState` claim maps.
-- Route statement, transaction, session, DDL, and maintenance cleanup through
-  scope indexes.
+- Route transaction, session, DDL, and maintenance cleanup through scope
+  indexes.
 - Preserve proof-bound transaction-lock cleanup before session completion.
 
 ### Stage C: tokenized waiter and claim lifecycle (implemented)
@@ -1559,13 +1547,14 @@ At minimum:
 8. DDL rejects held `SessionExplicit` claims; family serialization prevents a
    queued or provisional session-explicit request from coexisting with DDL.
 9. Fresh-versus-existing rollback retains older claims.
-10. Statement-to-transaction handoff has no protection gap.
+10. First touch acquires transaction metadata S before metadata resolution and
+    retains an accepted claim after ordinary admission failure.
 11. Session explicit lock and unlock require mutable access.
 12. Lock-free session observations accept immutable observer admission without
     allocating an operation id, while lock-bearing operations require mutable
     access and an idle coordinator slot.
 13. `Session` remains `Send` and is not `Sync`.
-14. Session, transaction, statement, DDL, and maintenance lock mutations in one
+14. Session, transaction, DDL, and maintenance lock mutations in one
     family never overlap.
 
 ### Queue and cancellation tests
@@ -1579,7 +1568,7 @@ At minimum:
 5. Accepting both exact indexes disarms the guard.
 6. Unwinding before disarm releases the physical family and local claim.
 7. Cancelling the head reconsiders the next waiter.
-8. Physical downgrade promotes newly compatible waiters.
+8. Last-family physical removal promotes newly compatible waiters.
 9. Removing a same-family claim with unchanged physical mode remains local.
 10. A covering same-family claim publishes locally.
 
@@ -1620,7 +1609,7 @@ Useful benchmark shapes include:
 
 1. Many families acquiring `TableMetadata(S)` on one table.
 2. Repeated exact-owner cache hits.
-3. Transaction plus statement claims in one family.
+3. Direct transaction-owned first-touch admission and terminal release.
 4. A queued `X` behind shared holders while new readers arrive.
 5. Cancellation at queue head, middle, and tail.
 6. Promotion of a long compatible FIFO prefix.
@@ -1640,7 +1629,7 @@ Measure:
 
 ## Normative Invariants
 
-1. One exact owner identifies each session, transaction, statement, DDL
+1. One exact owner identifies each session-explicit scope, transaction, DDL
    operation, or maintenance operation.
 2. At most one lock acquisition, release, conversion, or cleanup operation is
    active in a family.
@@ -1661,13 +1650,13 @@ Measure:
     held claim.
 14. Incomparable modes are rejected and never joined.
 15. Only immediate exact-owner conversion may strengthen a family holder.
-16. Every blocker or queue-barrier removal reruns FIFO-prefix granting.
-17. Notifications occur after resource synchronization is released.
-18. DDL preserves explicit same-session rejection unless separately changed.
-19. Scope cleanup never scans unrelated resources.
-20. Transaction scope cleanup precedes session transaction completion.
-21. Destination claims are installed before source claims are released during
-    lifetime handoff.
+16. Release preserves the live physical family mode or removes the last claim;
+    a different candidate mode asserts before mutation.
+17. Every blocker or queue-barrier removal reruns FIFO-prefix granting.
+18. Notifications occur after resource synchronization is released.
+19. DDL preserves explicit same-session rejection unless separately changed.
+20. Scope cleanup never scans unrelated resources.
+21. Transaction scope cleanup precedes session transaction completion.
 
 ## References
 

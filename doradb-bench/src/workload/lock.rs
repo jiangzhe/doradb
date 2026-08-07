@@ -242,7 +242,7 @@ impl LockTableRunner {
                     trx.commit().await?;
                 }
             }
-            LockTableScenario::Handoff => {
+            LockTableScenario::FirstTouch => {
                 let table_id = self.stable_table(plan)?;
                 for _ in 0..plan.number {
                     let mut trx = session.begin_trx()?;
@@ -579,14 +579,14 @@ fn validate_lock_options(
             "lock-table --scenario convert requires --mode exclusive",
         ));
     }
-    if scenario == LockTableScenario::Handoff && mode != LockTableMode::Shared {
+    if scenario == LockTableScenario::FirstTouch && mode != LockTableMode::Shared {
         return Err(BenchError::message(
-            "lock-table --scenario handoff requires --mode shared",
+            "lock-table --scenario first-touch requires --mode shared",
         ));
     }
     if matches!(
         scenario,
-        LockTableScenario::Convert | LockTableScenario::Handoff
+        LockTableScenario::Convert | LockTableScenario::FirstTouch
     ) && width != 1
     {
         return Err(BenchError::message(format!(
@@ -747,7 +747,7 @@ mod tests {
             )
         };
         assert!(validate(LockTableScenario::Convert, LockTableMode::Shared, 1).is_err());
-        assert!(validate(LockTableScenario::Handoff, LockTableMode::Exclusive, 1).is_err());
+        assert!(validate(LockTableScenario::FirstTouch, LockTableMode::Exclusive, 1).is_err());
         assert!(validate(LockTableScenario::CancelMiddle, LockTableMode::Shared, 2).is_err());
         assert!(validate(LockTableScenario::Promote, LockTableMode::Exclusive, 3).is_ok());
     }
@@ -787,7 +787,7 @@ mod tests {
                 (LockTableScenario::CancelMiddle, TableLockMode::Exclusive, 3),
                 (LockTableScenario::CancelTail, TableLockMode::Exclusive, 3),
                 (LockTableScenario::Promote, TableLockMode::Shared, 3),
-                (LockTableScenario::Handoff, TableLockMode::Shared, 1),
+                (LockTableScenario::FirstTouch, TableLockMode::Shared, 1),
                 (LockTableScenario::ScopeClose, TableLockMode::Shared, 3),
             ] {
                 let runner = LockTableRunner {
@@ -833,5 +833,76 @@ mod tests {
                 runner.table_ids[session_index % 2]
             );
         }
+    }
+
+    #[test]
+    fn first_touch_reports_direct_transaction_claim_and_terminal_removal() {
+        smol::block_on(async {
+            let temp = tempfile::TempDir::new().unwrap();
+            let engine = Engine::bootstrap(
+                doradb_storage::EngineConfig::default().storage_root(temp.path()),
+            )
+            .await
+            .unwrap();
+            let mut setup_session = engine.new_session().unwrap();
+            let table_id = setup_session
+                .create_table(
+                    benchmark_table_spec(),
+                    benchmark_index_specs(IndexMode::None),
+                )
+                .await
+                .unwrap();
+            setup_session.close().await.unwrap();
+            let mut session = engine.new_session().unwrap();
+            let before = session.logical_lock_stats().unwrap();
+            let runner = LockTableRunner {
+                scenario: LockTableScenario::FirstTouch,
+                mode: TableLockMode::Shared,
+                width: 1,
+                scope: TableLockScope::Session,
+                unlock: false,
+                random: false,
+                seed: 0,
+                table_ids: vec![table_id].into(),
+            };
+            let plan = SessionPlan {
+                session_index: 0,
+                key_start: 0,
+                number: 1,
+            };
+
+            assert_eq!(
+                runner.run(&engine, &mut session, &plan).await.unwrap(),
+                completed_summary(1)
+            );
+            session.close().await.unwrap();
+            let mut observer = engine.new_session().unwrap();
+            let after = observer.logical_lock_stats().unwrap();
+
+            assert_eq!(
+                after.owner_local_covered_publications - before.owner_local_covered_publications,
+                0
+            );
+            assert_eq!(
+                after.owner_local_mode_preserving_releases
+                    - before.owner_local_mode_preserving_releases,
+                0
+            );
+            assert_eq!(
+                after.scope_close_claims_visited - before.scope_close_claims_visited,
+                1
+            );
+            assert_eq!(
+                after.scope_close_physical_changes - before.scope_close_physical_changes,
+                1
+            );
+            assert_eq!(
+                after.immediate_physical_acquisitions - before.immediate_physical_acquisitions,
+                1
+            );
+
+            observer.close().await.unwrap();
+            engine.shutdown();
+        });
     }
 }

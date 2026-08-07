@@ -6,7 +6,6 @@ use crate::id::TableID;
 use crate::index::{
     BTreeKeyEncoder, IndexBatchStream, IndexLookupCandidate, OwnedSecondaryIndexCandidateStream,
 };
-use crate::lock::LockScopeState;
 use crate::row::ops::SelectMvcc;
 use crate::table::{DmlValidator, Table, TableRuntimeLayout};
 use crate::trx::{SessionOperationCheckout, TableAdmissionRequest, Transaction, TrxRuntime};
@@ -23,16 +22,12 @@ const INDEX_SCAN_STREAM_OPERATION: &str = "table_index_scan_mvcc";
 
 struct StreamStmtState {
     checkout: SessionOperationCheckout,
-    curr_scope: Option<LockScopeState>,
 }
 
 impl StreamStmtState {
     #[inline]
-    fn new(checkout: SessionOperationCheckout, curr_scope: LockScopeState) -> Self {
-        Self {
-            checkout,
-            curr_scope: Some(curr_scope),
-        }
+    fn new(checkout: SessionOperationCheckout) -> Self {
+        Self { checkout }
     }
 
     #[inline]
@@ -50,37 +45,16 @@ impl StreamStmtState {
         table_id: TableID,
         request: TableAdmissionRequest,
     ) -> OperationOrFatalResult<(Arc<Table>, Arc<TableRuntimeLayout>)> {
-        let Self {
-            checkout,
-            curr_scope,
-        } = self;
+        let Self { checkout } = self;
         let (inner, attachment) = checkout.inner_and_attachment_mut();
         admit_user_table(
             inner,
             attachment,
-            curr_scope
-                .as_mut()
-                .expect("active stream statement must retain curr_scope"),
             table_id,
             request,
             INDEX_SCAN_STREAM_OPERATION,
         )
         .await
-    }
-}
-
-impl Drop for StreamStmtState {
-    #[inline]
-    fn drop(&mut self) {
-        if let Some(mut curr_scope) = self.curr_scope.take() {
-            let lock_manager = self.checkout.attachment().engine().lock_manager().clone();
-            let family = self
-                .checkout
-                .inner_mut()
-                .checked_lock_state_mut()
-                .family_mut();
-            family.close_scope(&mut curr_scope, &lock_manager);
-        }
     }
 }
 
@@ -268,14 +242,12 @@ impl<'trx> StreamStmt<'trx> {
     where
         R: RangeBounds<&'r [Val]>,
     {
-        let mut checkout = self
+        let checkout = self
             .trx
             .checkout()
             .attach_with(|| format!("operation={INDEX_SCAN_STREAM_OPERATION}"))
             .disclose()?;
-        let stmt_owner = checkout.inner_mut().next_statement_owner();
-        let curr_scope = LockScopeState::new(stmt_owner);
-        let mut stmt_state = StreamStmtState::new(checkout, curr_scope);
+        let mut stmt_state = StreamStmtState::new(checkout);
         let (table, layout) = stmt_state
             .admit_user_table(table_id, TableAdmissionRequest::IndexRead { index_no })
             .await
