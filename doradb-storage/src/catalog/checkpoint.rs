@@ -15,8 +15,7 @@ use crate::quiescent::QuiescentGuard;
 use crate::recovery::stream::{CatalogSafeRedoSegment, RedoReplayPlanner};
 use crate::runtime::mandatory::PreparedExecution;
 use crate::session::{
-    AcceptedMaintenanceScope, MaintenanceExecutionSpec, PreparedMaintenanceExecution,
-    PreparedMaintenanceScope,
+    MaintenanceExecution, PreparedMaintenanceExecution, PreparedMaintenanceScope, SessionRuntime,
 };
 use crate::trx::RedoRetentionScope;
 use crate::trx::sys::{CatalogRedoRetentionProgress, TransactionSystem};
@@ -362,11 +361,6 @@ impl Drop for CatalogCheckpointScope {
     }
 }
 
-struct CatalogCheckpointResources {
-    _catalog_scope: CatalogCheckpointScope,
-    _redo_scope: RedoRetentionScope,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CatalogCheckpointTxnAction {
     Include,
@@ -374,28 +368,28 @@ enum CatalogCheckpointTxnAction {
     Stop(CatalogCheckpointScanStopReason),
 }
 
-struct CatalogCheckpointExecution;
+struct CatalogCheckpointExecution {
+    _catalog_scope: CatalogCheckpointScope,
+    _redo_scope: RedoRetentionScope,
+}
 
-impl MaintenanceExecutionSpec for CatalogCheckpointExecution {
+impl MaintenanceExecution for CatalogCheckpointExecution {
     type Output = CatalogCheckpointOutcome;
-    type Resources = CatalogCheckpointResources;
-    type PanicLabel = &'static str;
 
     const LABEL: &'static str = "checkpoint_catalog";
 
-    async fn execute(
-        scope: &mut AcceptedMaintenanceScope,
-        _resources: &mut Self::Resources,
-        _panic_label: &mut Self::PanicLabel,
-    ) -> CompletionResult<Self::Output> {
-        let engine = scope.engine();
-        let result = engine
+    async fn execute(&mut self, runtime: &SessionRuntime) -> CompletionResult<Self::Output> {
+        let engine = runtime.core();
+        engine
             .catalog()
             .checkpoint_prepared(&engine.trx_sys)
             .await
-            .map_err(CompletionErrorBridge::capture_runtime_or_fatal);
-        scope.mark_terminal_ready();
-        result
+            .map_err(CompletionErrorBridge::capture_runtime_or_fatal)
+    }
+
+    #[inline]
+    fn panic_diagnostic(&self) -> String {
+        "accepted catalog checkpoint panicked".to_owned()
     }
 }
 
@@ -407,11 +401,10 @@ pub(crate) fn prepare_catalog_checkpoint_operation(
 ) -> impl PreparedExecution<Output = CatalogCheckpointOutcome> {
     PreparedMaintenanceExecution::<CatalogCheckpointExecution>::global(
         scope,
-        CatalogCheckpointResources {
+        CatalogCheckpointExecution {
             _catalog_scope: catalog_scope,
             _redo_scope: redo_scope,
         },
-        "accepted catalog checkpoint panicked",
     )
 }
 

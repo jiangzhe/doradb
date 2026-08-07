@@ -53,7 +53,7 @@ use crate::quiescent::QuiescentGuard;
 use crate::row::ops::{RowUpdateInput, RowUpdateView, SelectKey, UpdateCol};
 use crate::row::{RowPage, RowRead, var_len_for_insert};
 use crate::runtime::yield_now;
-use crate::trx::{TrxContext, TrxReadProof};
+use crate::trx::{PrivateSnapshot, TrxReadProof};
 use crate::value::{PAGE_VAR_LEN_INLINE, Val};
 use error_stack::{Report, ResultExt};
 use parking_lot::Mutex;
@@ -313,6 +313,15 @@ impl Table {
         F: for<'root> FnOnce(&'root ActiveRoot) -> R,
     {
         self.storage.with_active_root(proof, f)
+    }
+
+    /// Bind one active root observation under a private maintenance snapshot.
+    #[inline]
+    pub(crate) fn with_private_snapshot_root<R, F>(&self, snapshot: &PrivateSnapshot, f: F) -> R
+    where
+        F: for<'root> FnOnce(&'root ActiveRoot) -> R,
+    {
+        self.storage.with_private_snapshot_root(snapshot, f)
     }
 
     /// Capture an owned table-root snapshot for this table.
@@ -787,19 +796,19 @@ impl Table {
 /// The snapshot contains only runtime read contract fields copied from a
 /// single active-root observation. Publication and allocation internals remain
 /// behind the table-file boundary.
-pub(crate) struct TableRootSnapshot<'ctx> {
+pub(crate) struct TableRootSnapshot<'read> {
     root_ts: TrxID,
     effective_ts: TrxID,
     pivot_row_id: RowID,
     column_block_index_root: BlockID,
     secondary_index_roots: Vec<BlockID>,
     deletion_cutoff_ts: TrxID,
-    _proof: PhantomData<&'ctx TrxContext>,
+    _read: PhantomData<&'read ()>,
 }
 
-impl<'ctx> TableRootSnapshot<'ctx> {
+impl<'read> TableRootSnapshot<'read> {
     #[inline]
-    fn from_active_root(root: &ActiveRoot, _proof: &TrxReadProof<'ctx>) -> Self {
+    fn from_active_root(root: &ActiveRoot, _proof: &TrxReadProof<'read>) -> Self {
         Self {
             root_ts: root.root_ts,
             effective_ts: root.effective_ts(),
@@ -807,7 +816,20 @@ impl<'ctx> TableRootSnapshot<'ctx> {
             column_block_index_root: root.column_block_index_root,
             secondary_index_roots: root.secondary_index_roots.clone(),
             deletion_cutoff_ts: root.deletion_cutoff_ts,
-            _proof: PhantomData,
+            _read: PhantomData,
+        }
+    }
+
+    #[inline]
+    fn from_private_snapshot(root: &ActiveRoot, _snapshot: &'read PrivateSnapshot) -> Self {
+        Self {
+            root_ts: root.root_ts,
+            effective_ts: root.effective_ts(),
+            pivot_row_id: root.pivot_row_id,
+            column_block_index_root: root.column_block_index_root,
+            secondary_index_roots: root.secondary_index_roots.clone(),
+            deletion_cutoff_ts: root.deletion_cutoff_ts,
+            _read: PhantomData,
         }
     }
 
@@ -1207,7 +1229,7 @@ pub(crate) mod tests {
         checkpoint_retry_after_listener_registration_hook:
             parking_lot::Mutex<Option<MaintenanceAsyncHook>>,
         silent_watermark_mutation_hook: parking_lot::Mutex<Option<MaintenanceFallibleAsyncHook>>,
-        cleanup_after_trx_start_hook: parking_lot::Mutex<Option<MaintenanceAsyncHook>>,
+        cleanup_after_private_snapshot_hook: parking_lot::Mutex<Option<MaintenanceAsyncHook>>,
         redo_cleanup_before_unlink_hook: parking_lot::Mutex<Option<RedoCleanupBeforeUnlinkHook>>,
         force_lwc_build_error: AtomicBool,
         freeze_page_state_locked_hook: parking_lot::Mutex<Option<FreezePageHook>>,
@@ -1349,14 +1371,14 @@ pub(crate) mod tests {
             );
         }
 
-        pub(crate) fn install_cleanup_after_trx_start_hook<F, Fut>(&self, hook: F)
+        pub(crate) fn install_cleanup_after_private_snapshot_hook<F, Fut>(&self, hook: F)
         where
             F: FnOnce() -> Fut + Send + 'static,
             Fut: Future<Output = ()> + Send + 'static,
         {
             let old = self
                 .state
-                .cleanup_after_trx_start_hook
+                .cleanup_after_private_snapshot_hook
                 .lock()
                 .replace(Box::new(move || Box::pin(hook())));
             assert!(
@@ -1409,8 +1431,8 @@ pub(crate) mod tests {
             }
         }
 
-        pub(crate) async fn run_cleanup_after_trx_start_hook(&self) {
-            let hook = self.state.cleanup_after_trx_start_hook.lock().take();
+        pub(crate) async fn run_cleanup_after_private_snapshot_hook(&self) {
+            let hook = self.state.cleanup_after_private_snapshot_hook.lock().take();
             if let Some(hook) = hook {
                 hook().await;
             }

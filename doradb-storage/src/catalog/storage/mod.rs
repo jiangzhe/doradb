@@ -1,4 +1,5 @@
 mod columns;
+mod ddl;
 mod indexes;
 mod merge;
 mod object;
@@ -1283,14 +1284,15 @@ pub(crate) mod tests {
     use crate::index::{ColumnBlockIndex, ColumnDeleteDeltaPatch};
     use crate::log::redo::{DDLRedo, RowRedoKind};
     use crate::row::ops::{SelectKey, UpdateCol};
-    use crate::trx::stmt::Statement;
+    use crate::trx::Transaction;
+    use crate::trx::tests::install_transaction_ddl_redo;
     use crate::value::{Val, ValKind};
     use tempfile::TempDir;
 
-    /// Attach one catalog DDL marker to the current test statement.
-    pub(crate) fn mark_catalog_ddl(stmt: &mut Statement<'_>, ddl: DDLRedo) {
-        let old = stmt.effects_mut().set_ddl_redo(ddl);
-        debug_assert!(old.is_none());
+    /// Attach one catalog DDL marker after test catalog DML has merged.
+    pub(crate) fn mark_catalog_ddl(trx: &mut Transaction, ddl: DDLRedo) {
+        install_transaction_ddl_redo(trx, ddl)
+            .expect("test catalog transaction must remain available");
     }
 
     fn expect_runtime_report(error: RuntimeOrFatalError) -> Report<RuntimeError> {

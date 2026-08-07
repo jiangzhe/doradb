@@ -34,9 +34,9 @@ use crate::table::{
     prepare_freeze_table_operation, prepare_mem_index_cleanup_operation,
 };
 use crate::trx::{
-    RedoRetentionScope, ReleasedTransactionLocks, SessionOperationEntry, SessionOperationKind,
-    SessionOperationState, Transaction, TrxInner, prepare_catalog_redo_maintenance_operation,
-    prepare_redo_truncation_operation,
+    PrivateTransaction, RedoRetentionScope, ReleasedTransactionLocks, SessionOperationEntry,
+    SessionOperationKind, SessionOperationState, Transaction, TrxInner,
+    prepare_catalog_redo_maintenance_operation, prepare_redo_truncation_operation,
 };
 use error_stack::{Report, ResultExt};
 use event_listener::EventListener;
@@ -44,9 +44,7 @@ use futures::future::select_all;
 use parking_lot::Mutex;
 use std::any::Any;
 use std::cell::Cell;
-use std::fmt::Display;
 use std::future::Future;
-use std::marker::PhantomData;
 use std::mem::replace;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -219,7 +217,7 @@ impl AcceptedDdlScope {
 
     /// Start one mandatory-owned nested private transaction.
     #[inline]
-    pub(crate) fn begin_private_trx(&mut self) -> LifecycleResult<Transaction> {
+    pub(crate) fn begin_private_trx(&mut self) -> LifecycleResult<PrivateTransaction> {
         self.operation.begin_private_trx()
     }
 
@@ -306,10 +304,14 @@ impl PreparedMaintenanceScope {
         Ok(table)
     }
 
-    /// Synchronously consume caller preparation into accepted authority.
+    /// Synchronously consume caller preparation and execution state into accepted authority.
     #[inline]
-    pub(crate) fn accept(self) -> AcceptedMaintenanceScope {
+    fn accept<E>(self, execution: E) -> AcceptedMaintenanceScope<E>
+    where
+        E: MaintenanceExecution,
+    {
         AcceptedMaintenanceScope {
+            execution: Some(execution),
             operation: self.operation.into_mandatory(),
             finish_state: MaintenanceFinishState::Executing,
         }
@@ -322,35 +324,38 @@ enum MaintenanceFinishState {
     FailedRetained,
 }
 
-/// Runtime-owned maintenance operation and its transferred logical locks.
-pub(crate) struct AcceptedMaintenanceScope {
+/// Runtime-owned maintenance execution and its transferred logical locks.
+pub(crate) struct AcceptedMaintenanceScope<E>
+where
+    E: MaintenanceExecution,
+{
+    execution: Option<E>,
     operation: MandatoryOperationGuard,
     finish_state: MaintenanceFinishState,
 }
 
-impl AcceptedMaintenanceScope {
-    /// Return the retained engine runtime.
-    #[inline]
-    pub(crate) fn engine(&self) -> &SessionRuntime {
-        &self.operation.runtime
-    }
+impl<E> AcceptedExecution for AcceptedMaintenanceScope<E>
+where
+    E: MaintenanceExecution,
+{
+    type Output = E::Output;
 
-    /// Start one mandatory-owned nested private transaction.
     #[inline]
-    pub(crate) fn begin_private_trx(&mut self) -> LifecycleResult<Transaction> {
-        self.operation.begin_private_trx()
-    }
-
-    /// Verify nested state before returning from accepted execution.
-    #[inline]
-    pub(crate) fn mark_terminal_ready(&mut self) {
+    async fn execute(&mut self) -> CompletionResult<Self::Output> {
+        let result = self
+            .execution
+            .as_mut()
+            .unwrap_or_else(|| panic!("accepted maintenance execution is missing"))
+            .execute(&self.operation.runtime)
+            .await;
         self.operation.assert_finish_ready();
         self.finish_state = MaintenanceFinishState::TerminalReady;
+        result
     }
 
-    /// Publish normal completion or retain an invalid finish state.
     #[inline]
-    pub(crate) fn finish(&mut self) {
+    fn finish(&mut self) {
+        drop(self.execution.take());
         let state = replace(
             &mut self.finish_state,
             MaintenanceFinishState::FailedRetained,
@@ -369,104 +374,85 @@ impl AcceptedMaintenanceScope {
         }
     }
 
-    /// Retain unsafe nested ownership before the supervisor publishes poison.
     #[inline]
-    pub(crate) fn handle_panic(&mut self) {
+    async fn handle_panic(&mut self, _panic: Box<dyn Any + Send>) -> CompletionErrorBridge {
+        let diagnostic = self
+            .execution
+            .as_ref()
+            .unwrap_or_else(|| panic!("accepted maintenance execution is missing"))
+            .panic_diagnostic();
+        drop(self.execution.take());
         self.operation.fail_retained();
         self.finish_state = MaintenanceFinishState::FailedRetained;
+        CompletionErrorBridge::capture(
+            Report::new(FatalError::MandatoryTaskPanic).attach(diagnostic),
+        )
     }
 }
 
-impl SessionRuntimeAccess for AcceptedMaintenanceScope {
-    #[inline]
-    fn runtime(&self) -> &SessionRuntime {
-        &self.operation.runtime
-    }
-}
-
-/// Operation-specific execution specification used by the shared maintenance carrier.
-pub(crate) trait MaintenanceExecutionSpec: Send + 'static {
+/// Operation-specific state and behavior owned by one accepted maintenance scope.
+pub(crate) trait MaintenanceExecution: Send + 'static {
     /// Terminal output delivered to the maintenance observer.
     type Output: Send + 'static;
-    /// Domain resources retained outside the panic-caught execution future.
-    type Resources: Send + 'static;
-    /// Mutable diagnostic data attached after an unexpected execution panic.
-    type PanicLabel: Display + Send + 'static;
 
     /// Stable mandatory-runtime diagnostic label.
     const LABEL: &'static str;
 
-    /// Execute one accepted operation while borrowing its retained resources.
+    /// Execute one accepted operation using its retained session runtime.
     fn execute(
-        scope: &mut AcceptedMaintenanceScope,
-        resources: &mut Self::Resources,
-        panic_label: &mut Self::PanicLabel,
+        &mut self,
+        runtime: &SessionRuntime,
     ) -> impl Future<Output = CompletionResult<Self::Output>> + Send;
+
+    /// Build the diagnostic attached after an unexpected execution panic.
+    fn panic_diagnostic(&self) -> String;
 }
 
 /// Shared caller-prepared carrier for one maintenance execution body.
-///
-/// Resource declaration before the maintenance scope preserves domain-resource
-/// release before logical locks and the voluntary operation terminal edge.
-pub(crate) struct PreparedMaintenanceExecution<S>
+pub(crate) struct PreparedMaintenanceExecution<E>
 where
-    S: MaintenanceExecutionSpec,
+    E: MaintenanceExecution,
 {
-    resources: S::Resources,
+    execution: E,
     scope: PreparedMaintenanceScope,
-    panic_label: S::PanicLabel,
     metadata: MandatoryTaskMetadata,
-    spec: PhantomData<S>,
 }
 
-impl<S> PreparedMaintenanceExecution<S>
+impl<E> PreparedMaintenanceExecution<E>
 where
-    S: MaintenanceExecutionSpec,
+    E: MaintenanceExecution,
 {
     /// Build one global catalog/redo maintenance operation.
     #[inline]
-    pub(crate) fn global(
-        scope: PreparedMaintenanceScope,
-        resources: S::Resources,
-        panic_label: S::PanicLabel,
-    ) -> Self {
-        let metadata = MandatoryTaskMetadata::operation(S::LABEL, Some(scope.key()));
+    pub(crate) fn global(scope: PreparedMaintenanceScope, execution: E) -> Self {
+        let metadata = MandatoryTaskMetadata::operation(E::LABEL, Some(scope.key()));
         Self {
-            resources,
+            execution,
             scope,
-            panic_label,
             metadata,
-            spec: PhantomData,
         }
     }
 
     /// Build one table-scoped maintenance operation.
     #[inline]
-    pub(crate) fn table(
-        scope: PreparedMaintenanceScope,
-        resources: S::Resources,
-        panic_label: S::PanicLabel,
-        table_id: TableID,
-    ) -> Self {
-        let metadata = MandatoryTaskMetadata::table_operation(S::LABEL, scope.key(), table_id);
+    pub(crate) fn table(scope: PreparedMaintenanceScope, execution: E, table_id: TableID) -> Self {
+        let metadata = MandatoryTaskMetadata::table_operation(E::LABEL, scope.key(), table_id);
         Self {
-            resources,
+            execution,
             scope,
-            panic_label,
             metadata,
-            spec: PhantomData,
         }
     }
 }
 
-impl<S> PreparedExecution for PreparedMaintenanceExecution<S>
+impl<E> PreparedExecution for PreparedMaintenanceExecution<E>
 where
-    S: MaintenanceExecutionSpec,
+    E: MaintenanceExecution,
 {
-    type Output = S::Output;
-    type Accepted = AcceptedMaintenanceExecution<S>;
+    type Output = E::Output;
+    type Accepted = AcceptedMaintenanceScope<E>;
 
-    const LABEL: &'static str = S::LABEL;
+    const LABEL: &'static str = E::LABEL;
 
     #[inline]
     fn metadata(&self) -> MandatoryTaskMetadata {
@@ -476,61 +462,11 @@ where
     #[inline]
     fn accept(self) -> Self::Accepted {
         let Self {
-            resources,
+            execution,
             scope,
-            panic_label,
             metadata: _,
-            spec: _,
         } = self;
-        AcceptedMaintenanceExecution {
-            resources: Some(resources),
-            scope: scope.accept(),
-            panic_label,
-            spec: PhantomData,
-        }
-    }
-}
-
-/// Shared mandatory-runtime owner for one accepted maintenance execution.
-pub(crate) struct AcceptedMaintenanceExecution<S>
-where
-    S: MaintenanceExecutionSpec,
-{
-    resources: Option<S::Resources>,
-    scope: AcceptedMaintenanceScope,
-    panic_label: S::PanicLabel,
-    spec: PhantomData<S>,
-}
-
-impl<S> AcceptedExecution for AcceptedMaintenanceExecution<S>
-where
-    S: MaintenanceExecutionSpec,
-{
-    type Output = S::Output;
-
-    #[inline]
-    fn execute(&mut self) -> impl Future<Output = CompletionResult<Self::Output>> + Send {
-        S::execute(
-            &mut self.scope,
-            self.resources
-                .as_mut()
-                .unwrap_or_else(|| panic!("accepted maintenance resources are missing")),
-            &mut self.panic_label,
-        )
-    }
-
-    #[inline]
-    fn finish(&mut self) {
-        drop(self.resources.take());
-        self.scope.finish();
-    }
-
-    #[inline]
-    async fn handle_panic(&mut self, _panic: Box<dyn Any + Send>) -> CompletionErrorBridge {
-        self.scope.handle_panic();
-        CompletionErrorBridge::capture(
-            Report::new(FatalError::MandatoryTaskPanic).attach(self.panic_label.to_string()),
-        )
+        scope.accept(execution)
     }
 }
 
@@ -690,6 +626,20 @@ impl AdmittedSessionRuntime<'_> {
     }
 }
 
+/// Shared runtime view implemented by observer and foreground authorities.
+pub(crate) trait SessionRuntimeAccess {
+    /// Returns the retained exact session runtime.
+    fn runtime(&self) -> &SessionRuntime;
+    /// Returns immutable shared engine capabilities.
+    fn engine(&self) -> &EngineCore {
+        self.runtime().core()
+    }
+    /// Borrows the canonical pool-guard bundle.
+    fn pool_guards(&self) -> &PoolGuards {
+        self.runtime().pool_guards()
+    }
+}
+
 /// Strong operation-local reachability to one exact session state.
 ///
 /// This typed `Arc` wrapper pins the state reached by a public weak handle.
@@ -765,6 +715,13 @@ impl Deref for SessionRuntime {
     #[inline]
     fn deref(&self) -> &Self::Target {
         self.core()
+    }
+}
+
+impl SessionRuntimeAccess for SessionRuntime {
+    #[inline]
+    fn runtime(&self) -> &SessionRuntime {
+        self
     }
 }
 
@@ -1578,20 +1535,6 @@ impl Drop for Session {
     }
 }
 
-/// Shared runtime view implemented by observer and foreground authorities.
-pub(crate) trait SessionRuntimeAccess {
-    /// Returns the retained exact session runtime.
-    fn runtime(&self) -> &SessionRuntime;
-    /// Returns immutable shared engine capabilities.
-    fn engine(&self) -> &EngineCore {
-        self.runtime().core()
-    }
-    /// Borrows the canonical pool-guard bundle.
-    fn pool_guards(&self) -> &PoolGuards {
-        self.runtime().pool_guards()
-    }
-}
-
 /// One strong runtime/session pin for observer or inspection work.
 ///
 /// The creating `Session` method establishes whether normal healthy-runtime or
@@ -1983,8 +1926,9 @@ impl MandatoryOperationGuard {
     /// Mandatory ownership keeps the active slot bound to `entry`, so private
     /// installation needs only the entry mutex rather than the lifecycle lock.
     #[inline]
-    pub(crate) fn begin_private_trx(&mut self) -> LifecycleResult<Transaction> {
+    pub(crate) fn begin_private_trx(&mut self) -> LifecycleResult<PrivateTransaction> {
         self.reclaim_transaction_authority();
+        self.entry.validate_private_transaction_begin()?;
         let authority = self.authority.take().unwrap_or_else(|| {
             panic!(
                 "private transaction begin requires family authority: key={}",
@@ -3229,27 +3173,24 @@ impl TrxAttachment {
     }
 }
 
-/// Starts one private transaction under an existing DDL or maintenance owner.
+/// Starts one private transaction under an existing DDL owner.
 #[inline]
 fn begin_private_transaction(
     runtime: &SessionRuntime,
     entry: &Arc<SessionOperationEntry>,
     authority: Box<FamilyLockAuthority>,
-) -> LifecycleResult<Transaction> {
+) -> LifecycleResult<PrivateTransaction> {
     let kind = entry.kind();
     assert!(
-        matches!(
-            kind,
-            SessionOperationKind::Ddl | SessionOperationKind::Maintenance
-        ),
-        "private transaction requires DDL or maintenance authority: key={}, kind={}",
+        kind == SessionOperationKind::Ddl,
+        "private transaction requires DDL authority: key={}, kind={}",
         entry.key(),
         kind.label()
     );
     let inner = Box::new(TrxInner::private());
-    Ok(runtime
+    runtime
         .trx_sys
-        .begin_private_trx(runtime.downgrade(), entry, inner, authority))
+        .begin_private_trx(runtime.clone(), entry, inner, authority)
 }
 
 async fn wait_for_maintenance_boundary(
@@ -3324,8 +3265,8 @@ pub(crate) mod tests {
     use crate::trx::retention::{
         RedoTruncationBlocker, tests::install_redo_cleanup_before_unlink_hook,
     };
-    use crate::trx::tests::trx_inner;
-    use crate::trx::{MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, TrxInner};
+    use crate::trx::tests::{private_transaction_inner_ptr, trx_inner};
+    use crate::trx::{MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, SessionOperationSnapshot, TrxInner};
     use crate::value::{Val, ValKind};
     use futures::task::noop_waker;
     use std::cell::RefCell;
@@ -3761,6 +3702,15 @@ pub(crate) mod tests {
                 )
             })
             .count()
+    }
+
+    /// Return the coherent snapshot of one test session's active operation.
+    #[inline]
+    pub(crate) fn active_operation_snapshot(
+        registry: &SessionRegistry,
+        session_id: SessionID,
+    ) -> SessionOperationSnapshot {
+        active_operation_entry_for_test(registry, session_id).inspect()
     }
 
     /// Returns whether a registered session currently owns its public transaction cache.
@@ -5006,9 +4956,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
             let session = engine.new_session().unwrap();
-            let operation = session
-                .pin_operation(SessionOperationKind::Maintenance)
-                .unwrap();
+            let operation = session.pin_operation(SessionOperationKind::Ddl).unwrap();
             let key = operation.key();
             let entry = Arc::clone(&operation.entry);
             let state = Arc::clone(operation.runtime.state());
@@ -5025,13 +4973,37 @@ pub(crate) mod tests {
                 entry.inspect().state,
                 SessionOperationState::Mandatory(None)
             );
-            let trx = operation.begin_private_trx().unwrap();
-            let first_inner = entry
-                .inner_ptr_for_test()
-                .expect("private transaction entry must retain its checked-in core");
+            let mut trx = operation.begin_private_trx().unwrap();
+            let first_inner = private_transaction_inner_ptr(&trx);
             assert_ne!(
                 first_inner, public_cache_ptr,
                 "private transaction must use a core distinct from the parked public cache"
+            );
+            assert_eq!(
+                entry.inner_ptr_for_test(),
+                None,
+                "running private transaction must hold its core outside the entry"
+            );
+            assert_eq!(
+                entry.inspect().state,
+                SessionOperationState::Mandatory(Some(crate::trx::InternalTrxState::Running))
+            );
+            let nested_begin_err = match operation.begin_private_trx() {
+                Ok(_) => panic!("mandatory operation cannot start a second private transaction"),
+                Err(err) => err,
+            };
+            assert_eq!(
+                *nested_begin_err.current_context(),
+                LifecycleError::ExistingTransaction
+            );
+            trx.stage_statement(async |_stmt| Ok(())).await.unwrap();
+            assert_eq!(private_transaction_inner_ptr(&trx), first_inner);
+            assert_eq!(entry.inner_ptr_for_test(), None);
+            trx.stage_statement(async |_stmt| Ok(())).await.unwrap();
+            assert_eq!(private_transaction_inner_ptr(&trx), first_inner);
+            assert_eq!(
+                entry.inspect().state,
+                SessionOperationState::Mandatory(Some(crate::trx::InternalTrxState::Running))
             );
             assert_eq!(
                 state
@@ -5052,7 +5024,7 @@ pub(crate) mod tests {
             assert!(Arc::ptr_eq(&resolved, &entry));
             assert_eq!(state.lifecycle.lock().next_operation_id, 2);
 
-            trx.rollback().await.unwrap();
+            trx.rollback_catalog_ddl().await.unwrap();
             let snapshot = entry.inspect();
             assert_eq!(snapshot.state, SessionOperationState::Mandatory(None));
             assert_eq!(snapshot.trx_id, None);
@@ -5075,13 +5047,12 @@ pub(crate) mod tests {
             assert!(state.lifecycle.lock().change_ev.is_none());
 
             let replacement = operation.begin_private_trx().unwrap();
-            let second_inner = entry
-                .inner_ptr_for_test()
-                .expect("replacement private transaction must retain its checked-in core");
+            let second_inner = private_transaction_inner_ptr(&replacement);
             assert_ne!(
                 second_inner, public_cache_ptr,
                 "each private transaction must remain separate from the public cache"
             );
+            assert_eq!(entry.inner_ptr_for_test(), None);
             assert_eq!(
                 state
                     .lifecycle
@@ -5092,7 +5063,7 @@ pub(crate) mod tests {
                 Some(public_cache_ptr),
                 "sequential private transactions must leave the public cache parked"
             );
-            replacement.rollback().await.unwrap();
+            replacement.rollback_catalog_ddl().await.unwrap();
 
             operation.assert_finish_ready();
             operation.finish();

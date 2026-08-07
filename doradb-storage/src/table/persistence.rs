@@ -26,8 +26,8 @@ use crate::obs;
 use crate::row::RowPage;
 use crate::runtime::mandatory::PreparedExecution;
 use crate::session::{
-    AcceptedMaintenanceScope, MaintenanceExecutionSpec, PreparedMaintenanceExecution,
-    PreparedMaintenanceScope, SessionRuntimeAccess,
+    MaintenanceExecution, PreparedMaintenanceExecution, PreparedMaintenanceScope, SessionRuntime,
+    SessionRuntimeAccess,
 };
 #[cfg(test)]
 use crate::table::tests::MaintenanceTestController;
@@ -126,72 +126,60 @@ impl DetachedCheckpointRetryWait {
     }
 }
 
-struct FreezeTableResources {
+struct FreezeTableExecution {
     attempt: Option<PreparedFreezeAttempt>,
     _root_mutation: TableCheckpointRootMutationScope,
     table: Arc<Table>,
     max_rows: usize,
 }
 
-struct FreezeTableExecution;
-
-impl MaintenanceExecutionSpec for FreezeTableExecution {
+impl MaintenanceExecution for FreezeTableExecution {
     type Output = FreezeOutcome;
-    type Resources = FreezeTableResources;
-    type PanicLabel = &'static str;
 
     const LABEL: &'static str = "freeze_table";
 
-    async fn execute(
-        scope: &mut AcceptedMaintenanceScope,
-        resources: &mut Self::Resources,
-        _panic_label: &mut Self::PanicLabel,
-    ) -> CompletionResult<Self::Output> {
-        let attempt = resources
+    async fn execute(&mut self, runtime: &SessionRuntime) -> CompletionResult<Self::Output> {
+        let attempt = self
             .attempt
             .take()
             .unwrap_or_else(|| panic!("accepted freeze attempt is missing"));
-        let result = resources
-            .table
-            .freeze_prepared(scope, resources.max_rows, attempt)
+        self.table
+            .freeze_prepared(runtime, self.max_rows, attempt)
             .await
-            .map_err(CompletionErrorBridge::capture);
-        scope.mark_terminal_ready();
-        result
+            .map_err(CompletionErrorBridge::capture)
+    }
+
+    #[inline]
+    fn panic_diagnostic(&self) -> String {
+        "accepted table freeze panicked".to_owned()
     }
 }
 
-struct CheckpointTableResources {
+struct CheckpointTableExecution {
     attempt: Option<PreparedCheckpointAttempt>,
     _root_mutation: TableCheckpointRootMutationScope,
     table: Arc<Table>,
 }
 
-struct CheckpointTableExecution;
-
-impl MaintenanceExecutionSpec for CheckpointTableExecution {
+impl MaintenanceExecution for CheckpointTableExecution {
     type Output = CheckpointOutcome;
-    type Resources = CheckpointTableResources;
-    type PanicLabel = &'static str;
 
     const LABEL: &'static str = "checkpoint_table";
 
-    async fn execute(
-        scope: &mut AcceptedMaintenanceScope,
-        resources: &mut Self::Resources,
-        _panic_label: &mut Self::PanicLabel,
-    ) -> CompletionResult<Self::Output> {
-        let attempt = resources
+    async fn execute(&mut self, runtime: &SessionRuntime) -> CompletionResult<Self::Output> {
+        let attempt = self
             .attempt
             .take()
             .unwrap_or_else(|| panic!("accepted checkpoint attempt is missing"));
-        let result = resources
-            .table
-            .checkpoint_prepared(scope, attempt)
+        self.table
+            .checkpoint_prepared(runtime, attempt)
             .await
-            .map_err(CompletionErrorBridge::capture_runtime_or_fatal);
-        scope.mark_terminal_ready();
-        result
+            .map_err(CompletionErrorBridge::capture_runtime_or_fatal)
+    }
+
+    #[inline]
+    fn panic_diagnostic(&self) -> String {
+        "accepted table checkpoint panicked".to_owned()
     }
 }
 
@@ -919,13 +907,12 @@ pub(crate) fn prepare_freeze_table_operation(
     let table_id = table.table_id();
     Ok(PreparedMaintenanceExecution::<FreezeTableExecution>::table(
         scope,
-        FreezeTableResources {
+        FreezeTableExecution {
             attempt: Some(attempt),
             _root_mutation: root_mutation,
             table,
             max_rows,
         },
-        "accepted table freeze panicked",
         table_id,
     ))
 }
@@ -947,12 +934,11 @@ pub(crate) fn prepare_checkpoint_table_operation(
     Ok(
         PreparedMaintenanceExecution::<CheckpointTableExecution>::table(
             scope,
-            CheckpointTableResources {
+            CheckpointTableExecution {
                 attempt: Some(attempt),
                 _root_mutation: root_mutation,
                 table,
             },
-            "accepted table checkpoint panicked",
             table_id,
         ),
     )

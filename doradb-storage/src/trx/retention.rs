@@ -13,9 +13,8 @@ use crate::recovery::stream::{
 };
 use crate::runtime::mandatory::PreparedExecution;
 use crate::session::{
-    AcceptedMaintenanceScope, CatalogRedoMaintenanceOutcome, MaintenanceExecutionSpec,
-    PreparedMaintenanceExecution, PreparedMaintenanceScope, RedoTruncationBlockerInfo,
-    RedoTruncationOutcome,
+    CatalogRedoMaintenanceOutcome, MaintenanceExecution, PreparedMaintenanceExecution,
+    PreparedMaintenanceScope, RedoTruncationBlockerInfo, RedoTruncationOutcome, SessionRuntime,
 };
 #[cfg(test)]
 use crate::table::tests::MaintenanceTestController;
@@ -117,71 +116,61 @@ impl PendingDroppedTableRedoFloor {
     }
 }
 
-struct RedoTruncationResources {
+struct RedoTruncationExecution {
     catalog_scope: CatalogCheckpointScope,
     _redo_scope: RedoRetentionScope,
 }
 
-struct RedoTruncationExecution;
-
-impl MaintenanceExecutionSpec for RedoTruncationExecution {
+impl MaintenanceExecution for RedoTruncationExecution {
     type Output = RedoTruncationOutcome;
-    type Resources = RedoTruncationResources;
-    type PanicLabel = &'static str;
 
     const LABEL: &'static str = "truncate_redo_log";
 
-    async fn execute(
-        scope: &mut AcceptedMaintenanceScope,
-        resources: &mut Self::Resources,
-        _panic_label: &mut Self::PanicLabel,
-    ) -> CompletionResult<Self::Output> {
-        let engine = scope.engine();
-        let result = engine
+    async fn execute(&mut self, runtime: &SessionRuntime) -> CompletionResult<Self::Output> {
+        let engine = runtime.core();
+        engine
             .trx_sys
             .truncate_redo_log_prepared(
-                || resources.catalog_scope.release(),
+                || self.catalog_scope.release(),
                 #[cfg(test)]
                 &engine.maintenance_test,
             )
             .await
-            .map_err(CompletionErrorBridge::capture_runtime_or_fatal);
-        scope.mark_terminal_ready();
-        result
+            .map_err(CompletionErrorBridge::capture_runtime_or_fatal)
+    }
+
+    #[inline]
+    fn panic_diagnostic(&self) -> String {
+        "accepted redo truncation panicked".to_owned()
     }
 }
 
-struct CatalogRedoMaintenanceResources {
+struct CatalogRedoMaintenanceExecution {
     catalog_scope: CatalogCheckpointScope,
     _redo_scope: RedoRetentionScope,
 }
 
-struct CatalogRedoMaintenanceExecution;
-
-impl MaintenanceExecutionSpec for CatalogRedoMaintenanceExecution {
+impl MaintenanceExecution for CatalogRedoMaintenanceExecution {
     type Output = CatalogRedoMaintenanceOutcome;
-    type Resources = CatalogRedoMaintenanceResources;
-    type PanicLabel = &'static str;
 
     const LABEL: &'static str = "checkpoint_catalog_and_truncate_redo_log";
 
-    async fn execute(
-        scope: &mut AcceptedMaintenanceScope,
-        resources: &mut Self::Resources,
-        _panic_label: &mut Self::PanicLabel,
-    ) -> CompletionResult<Self::Output> {
-        let engine = scope.engine();
-        let result = engine
+    async fn execute(&mut self, runtime: &SessionRuntime) -> CompletionResult<Self::Output> {
+        let engine = runtime.core();
+        engine
             .trx_sys
             .checkpoint_catalog_and_truncate_redo_log_prepared(
-                || resources.catalog_scope.release(),
+                || self.catalog_scope.release(),
                 #[cfg(test)]
                 &engine.maintenance_test,
             )
             .await
-            .map_err(CompletionErrorBridge::capture_runtime_or_fatal);
-        scope.mark_terminal_ready();
-        result
+            .map_err(CompletionErrorBridge::capture_runtime_or_fatal)
+    }
+
+    #[inline]
+    fn panic_diagnostic(&self) -> String {
+        "accepted combined catalog/redo maintenance panicked".to_owned()
     }
 }
 
@@ -200,11 +189,10 @@ pub(crate) fn prepare_redo_truncation_operation(
 ) -> impl PreparedExecution<Output = RedoTruncationOutcome> {
     PreparedMaintenanceExecution::<RedoTruncationExecution>::global(
         scope,
-        RedoTruncationResources {
+        RedoTruncationExecution {
             catalog_scope,
             _redo_scope: redo_scope,
         },
-        "accepted redo truncation panicked",
     )
 }
 
@@ -216,11 +204,10 @@ pub(crate) fn prepare_catalog_redo_maintenance_operation(
 ) -> impl PreparedExecution<Output = CatalogRedoMaintenanceOutcome> {
     PreparedMaintenanceExecution::<CatalogRedoMaintenanceExecution>::global(
         scope,
-        CatalogRedoMaintenanceResources {
+        CatalogRedoMaintenanceExecution {
             catalog_scope,
             _redo_scope: redo_scope,
         },
-        "accepted combined catalog/redo maintenance panicked",
     )
 }
 

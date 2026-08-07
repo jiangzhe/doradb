@@ -399,9 +399,12 @@ DDL call first reserves a typed DDL operation while idle and retains its
 `&mut Session` borrow while the same entry hosts a private catalog
 transaction. The private transaction inherits the operation key and allocates
 only a `TrxID`; it temporarily takes the outer carrier's family box while the
-operation `curr_scope` remains owned and immutable. Terminal completion parks
-the returned box in the stable entry, and the still-active outer operation
-reclaims that exact allocation before acquiring again or closing.
+operation `curr_scope` remains owned and immutable. It owns one checked-out
+core and strong runtime attachment for its complete lifetime, so catalog
+statement boundaries do not move the family authority or core through the
+entry. Terminal completion returns the family box through the stable entry,
+and the still-active outer operation reclaims that exact allocation before
+acquiring again or closing.
 
 ### Wait and cancellation behavior
 
@@ -630,11 +633,11 @@ Open + Idle: effectful Session admission resumes
 ```
 
 An already-admitted typed DDL operation may create a private catalog
-transaction in its stable entry while the outer `&mut Session` call remains borrowed. The normal
-path is sequential, but cancellation of the whole DDL future can queue
-transaction cleanup while DDL scope guards unwind. The DDL carrier and private
-transaction transfer the same boxed family authority, serializing cleanup with
-outer-scope unwind.
+transaction in its stable entry while the outer `&mut Session` call remains
+borrowed. Mandatory execution owns that transaction through normal terminal
+completion; there is no caller-abandonment cleanup boundary between its
+statements. On a supervised panic, the private checkout is synchronously
+parked before the operation and its family authority are retained as failed.
 
 The public `Session` handle remains movable between threads but is not
 shareable: its local closed flag uses `Cell<bool>`, making the type `Send` and

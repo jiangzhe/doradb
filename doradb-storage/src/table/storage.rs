@@ -6,7 +6,7 @@ use crate::id::BlockID;
 use crate::index::SecondaryDiskTreeRuntime;
 use crate::lwc::PersistedLwcBlock;
 use crate::quiescent::QuiescentGuard;
-use crate::trx::TrxReadProof;
+use crate::trx::{PrivateSnapshot, TrxReadProof};
 use error_stack::Report;
 use std::sync::Arc;
 
@@ -73,6 +73,16 @@ impl ColumnStorage {
     /// Bind one active root observation under a transaction read proof.
     #[inline]
     pub(crate) fn with_active_root<'ctx, R, F>(&self, _proof: &TrxReadProof<'ctx>, f: F) -> R
+    where
+        F: for<'root> FnOnce(&'root ActiveRoot) -> R,
+    {
+        let root = self.file().active_root_unchecked();
+        f(root)
+    }
+
+    /// Bind one active root observation under a private maintenance snapshot.
+    #[inline]
+    pub(crate) fn with_private_snapshot_root<R, F>(&self, _snapshot: &PrivateSnapshot, f: F) -> R
     where
         F: for<'root> FnOnce(&'root ActiveRoot) -> R,
     {

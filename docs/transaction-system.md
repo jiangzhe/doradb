@@ -148,6 +148,10 @@ For the detailed index design, see [`secondary-index.md`](./secondary-index.md).
 - **STS (Start Timestamp)**: Acquired at transaction start from a global atomic sequence.
 - **CTS (Commit Timestamp)**: Acquired at transaction commit.
 
+Mandatory maintenance may register a `PrivateSnapshot` from the same STS
+sequence. It participates in the active GC watermark but is not a transaction
+and receives no transaction id or status.
+
 ### Transaction Lifecycle
 
 #### Execution Phase
@@ -160,6 +164,11 @@ then copy a single secondary `DiskTree` root id or build an owned
 `TableRootSnapshot` for broader MVCC and GC work. Checkpoint, recovery, catalog
 load, and file-internal root reads remain explicit unchecked exceptions outside
 this runtime transaction contract.
+
+MemIndex cleanup is the separate registered-reader case. Its
+`PrivateSnapshot` directly brands the captured `TableRootSnapshot` lifetime;
+it cannot mint `TrxReadProof`, and the captured root cannot outlive the active
+STS registration.
 
 Each user statement runs through `Transaction::exec(async |stmt| { ... })`.
 The public `Transaction` is a weak, non-cloneable capability containing weak
@@ -225,11 +234,12 @@ wake. Fatal cleanup publishes engine poison before releasing waiters, and
 waiters check that poison before retrying retained state. This notification
 protocol does not authorize logical-lock release before redo durability.
 
-During an active transaction, the owning box is checked out for one
+During an active public transaction, the owning box is checked out for one
 non-terminal operation through `SessionOperationCheckout`; ordinary checkout
-drop returns the same box through the entry mutex. This keeps repeated ownership
-transfers pointer-sized without allocating during statement execution. The
-checkout owns a `TrxAttachment` containing the exact `SessionRuntime` and
+drop returns the same box through the entry mutex. A private transaction
+instead owns one checkout continuously from direct construction through
+terminal conversion or synchronous panic parking. The checkout owns a
+`TrxAttachment` containing the exact `SessionRuntime` and
 exposes a copyable `TrxRuntime` value that pairs immutable `TrxContext` with
 borrowed access to `EngineCore`, its canonical pool guards, and the
 session-local user-table cache. `TrxContext` never
@@ -256,14 +266,17 @@ versioned page tokens through the catalog table's shared insert free list, so
 catalog insert capacity remains available across sessions without requiring a
 user-table runtime cache entry.
 
-`StmtState` owns the per-operation checkout and statement effects while
+`StmtState` owns the per-operation checkout and statement effects while public
 `Transaction::exec` is active. It lends one `Statement` facade with direct
 disjoint borrows of the checked-out `TrxInner`, operation attachment, and
 effects; DML methods therefore do not resolve the entry or unwrap the carrier.
-Normal statement finish returns the core to the available payload position
-inside outer `Voluntary` ownership. This check-in
-ends only the operation-local lease, not the semantic transaction lifetime;
-the weak public `Transaction` remains reusable for its next call.
+Normal public statement finish returns the core to its checked-in payload
+position inside outer `Voluntary` ownership. This ends only the
+operation-local checkout, not the semantic transaction lifetime; the weak
+public `Transaction` remains reusable for its next call. Private catalog
+statements borrow the core and attachment directly from `PrivateTransaction`,
+settle their statement effects into the held `TrxInner`, and never check the
+core through the entry between logical catalog-table boundaries.
 
 Dropping an unpolled `Transaction::exec` future performs no checkout. Once
 checkout succeeds, dropping the future is terminal for that public
@@ -283,36 +296,45 @@ abandonment, and claim the same entry and core through
 rolls back inline; it records cleanup intent on the exact entry and queues
 transaction-system cleanup when the engine is still reachable.
 
-DDL and effectful maintenance start private transactions through their
-already-reserved operation authority. A private transaction allocates a new
-`TrxID` and boxed core but inherits the outer operation key, installs that box
-in the same entry mutex, and does not replace the active slot. During caller
-preparation the entry remains `Voluntary(None)`; accepted DDL and maintenance
-transfer it to `Mandatory(None)` before starting a child. While mandatory
-execution owns that child, `Mandatory(Some(InternalTrxState))` records its
-available, checked-out, cleanup, or completion position. Public transactions
-use the outer operation states directly and therefore use `Voluntary(None)`
-only while checked out.
+DDL starts private transactions through its already-reserved operation
+authority. `PrivateTransaction` allocates a new `TrxID` and boxed core,
+inherits the outer operation key, and constructs a strong `TrxAttachment` from
+the accepted operation's `SessionRuntime`. During caller preparation the entry
+remains `Voluntary(None)`; accepted DDL transfers it to `Mandatory(None)`
+before starting a child. Private begin validates that exact DDL state and publishes
+`Mandatory(Some(Running))` directly while the core remains owned by the
+private checkout and the entry payload slot remains empty. Public transactions
+continue to use weak session reachability and per-operation checkout.
 
 Accepted table and index DDL transfer the same entry to `Mandatory(None)`
 before the runtime task is detached. Their nested catalog transaction follows
-`Mandatory(None) -> Mandatory(Some(Available)) ->
-Mandatory(Some(Running)) -> Mandatory(Some(Available))`; commit or rollback
-claims `Mandatory(Some(Completing))` and clears the child back to
-`Mandatory(None)`. That child terminal edge never publishes the outer
-operation terminal. Successful accepted execution first proves the exact empty
-mandatory state, releases its complete prepared lock scope, and consumes that
-proof to publish `Terminal`. A supervised unwind moves any still-owned nested
-state to `FailedRetained`; this remains registry-visible and blocks shutdown
-instead of exposing an idle session or scheduling competing abandoned cleanup.
+`Mandatory(None) -> Mandatory(Some(Running))`; consuming commit or rollback
+converts the held checkout directly to `Mandatory(Some(Completing))` and then
+clears the child back to `Mandatory(None)`. The core remains continuously held
+across catalog statements, file/root awaits, runtime construction, and index
+build work. That child terminal edge never publishes the outer operation
+terminal. Successful accepted execution first proves the exact empty mandatory
+state, releases its complete prepared lock scope, and consumes that proof to
+publish `Terminal`. Before a supervised unwind publishes `FailedRetained`, the
+DDL progress owner synchronously parks any active private checkout as
+`Mandatory(Some(Available))`; the retained core and entry remain
+registry-visible and block shutdown without exposing an idle session or
+scheduling abandoned cleanup.
 
-Accepted maintenance uses the same mandatory child transitions as accepted
-DDL. Secondary `MemIndex` cleanup installs its private transaction into the
-stable entry before any hook, scan, or await. A root-capture race settles that
-child completely back to `Mandatory(None)` before a retry installs a fresh
-`TrxID`. Normal completion releases the prepared maintenance resources before
-publishing the outer terminal state; supervised unwind retains unsafe child
-state in `FailedRetained`.
+Accepted maintenance has no nested transaction state. One stateful
+`MaintenanceExecution` owns its operation-specific resources inside
+`AcceptedMaintenanceScope<E>`, which implements the mandatory
+`AcceptedExecution` contract directly. Normal completion drops the execution
+state before publishing the outer terminal state; a supervised unwind drops it
+before the outer scope publishes `FailedRetained`.
+
+Secondary `MemIndex` cleanup registers a `PrivateSnapshot` before observing
+the GC horizon. The snapshot owns only an active STS registration and directly
+brands the captured table-root lifetime. A root-capture race drops both the
+root and registration before yielding and retrying with a fresh STS. Normal,
+error, and panic paths synchronously deregister the snapshot; the stable
+maintenance entry remains `Mandatory(None)` throughout and carries no nested
+transaction id.
 
 After explicit rollback claims terminal ownership and publishes `Completing`,
 the claimed transaction core, undo buffers, locks, and session cleanup
@@ -332,7 +354,9 @@ optionally contain the nested private-transaction positions `Available`,
 `Running`, `CleanupReady`, and `Completing`; public transaction checkout is
 represented by payload ownership within `Voluntary(None)`. Handle-drop intent
 is orthogonal while a transaction core is checked out, so checkout return
-publishes outer `CleanupReady` exactly once.
+publishes outer `CleanupReady` exactly once. Normal mandatory private execution
+uses `Running` continuously; its `Available` position is reserved for
+defensive Drop and mandatory panic parking.
 Cleanup messages carry `(SessionOperationKey, TrxID)` and stale, replaced, or
 duplicate hints are neutral. Registry resolution uses only the operation key;
 the cleanup claim atomically validates the message's `TrxID`, claimable state,
@@ -340,7 +364,11 @@ and physical payload ownership under the entry mutex.
 
 `Statement` is a borrowed facade over operation-local runtime access and
 carrier-owned statement-local `StmtEffects`; callers cannot construct or
-finish it directly.
+finish it directly. Public statements settle through `StmtState`; private
+catalog statements use a fresh effect accumulator borrowed alongside the
+continuously held checkout. Private ordinary errors merge complete and partial
+undo for whole-transaction rollback, while panic settlement discards
+incomplete statement redo and folds residual undo before resuming the unwind.
 Foreground table APIs receive `TrxRuntime` by value when they need pool guards,
 insert-page cache access, or runtime lock assertions, while pure row MVCC
 helpers continue to receive `&TrxContext`. When the callback succeeds,
@@ -355,10 +383,18 @@ later commit or rollback attempts return an error.
 Logical lock ownership is tracked outside `TrxContext`. One boxed
 `FamilyLockAuthority` is allocated per session and moves linearly into
 `TransactionLockState`, which pairs that root with the transaction
-`curr_scope`. `StmtState` retains statement effects, checkout, cancellation,
-and Drop policy without logical-lock state. `StreamStmtState` owns only its
-transaction checkout and remains last in the stream state so cursor/root state
-is destroyed before transaction check-in.
+`curr_scope`. Public `StmtState` retains statement effects, checkout,
+cancellation, and Drop policy without logical-lock state. `StreamStmtState`
+owns only its transaction checkout and remains last in the stream state so
+cursor/root state is destroyed before transaction check-in.
+
+Catalog DDL mutations are owned by `CatalogStorage` and use one private
+statement per logical catalog table, retaining same-table row batches in one
+effect boundary. `StmtEffects` carries only DML redo. After every catalog-table
+statement and invariant check succeeds, `PrivateTransaction` installs exactly
+one `DDLRedo` marker directly in `TrxEffects`; an ordinary staging error leaves
+all accumulated undo available for whole-transaction rollback and leaves the
+transaction-level DDL slot empty.
 
 Transaction locks close on commit,
 rollback, no-op discard, or fatal transaction discard. DDL and maintenance
@@ -410,8 +446,9 @@ Finite effectful session maintenance reserves one outer `Maintenance`
 operation, acquires owned `TableMetadata(S)` followed by `TableData(IS)`, and
 resolves the exact live runtime before mandatory admission. Freeze, checkpoint,
 and secondary `MemIndex` cleanup transfer that complete scope into accepted
-execution and retain it through their last table/layout/index use. Hot-row-page
-counting remains a caller-owned, cancellable scoped observation. These calls
+execution. The stateful execution and lock scope are one accepted owner and
+remain retained through their last table/layout/index use. Hot-row-page counting
+remains a caller-owned, cancellable scoped observation. These calls
 preserve ordinary `IX` DML and explicit `S` table-reader concurrency while
 excluding same-table DROP and serializing page freeze/transition against
 full-table mutation `X`. Grants admitted by a covering explicit session lock

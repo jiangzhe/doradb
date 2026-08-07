@@ -194,11 +194,11 @@ mod tests {
                     .insert(stmt, &table101)
                     .await
                     .disclose()?;
-                mark_catalog_ddl(stmt, DDLRedo::CreateTable(table100.table_id));
                 Ok(())
             })
             .await
             .unwrap();
+            mark_catalog_ddl(&mut trx, DDLRedo::CreateTable(table100.table_id));
             trx.commit().await.unwrap();
 
             let mut trx = session.begin_trx().unwrap();
@@ -225,11 +225,11 @@ mod tests {
                         .await
                         .disclose()?
                 );
-                mark_catalog_ddl(stmt, DDLRedo::DropTable(table100.table_id));
                 Ok(())
             })
             .await
             .unwrap();
+            mark_catalog_ddl(&mut trx, DDLRedo::DropTable(table100.table_id));
             trx.commit().await.unwrap();
 
             assert!(

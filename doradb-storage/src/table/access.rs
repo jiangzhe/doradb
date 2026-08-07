@@ -7872,9 +7872,7 @@ mod tests {
                     );
                 }
 
-                let rows = &stmt
-                    .effects_mut()
-                    .redo_for_test()
+                let rows = &stmt_tests::statement_redo(stmt)
                     .dml
                     .get(&table_id)
                     .unwrap()
@@ -7937,9 +7935,7 @@ mod tests {
                             })
                         })
                         .await?;
-                    let rows = &stmt
-                        .effects_mut()
-                        .redo_for_test()
+                    let rows = &stmt_tests::statement_redo(stmt)
                         .dml
                         .get(&table_id)
                         .unwrap()

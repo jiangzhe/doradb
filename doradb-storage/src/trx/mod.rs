@@ -18,6 +18,7 @@
 mod admission;
 pub(crate) mod group;
 pub(crate) mod purge;
+mod readonly;
 pub(crate) mod retention;
 pub(crate) mod row;
 pub(crate) mod stmt;
@@ -27,6 +28,7 @@ mod sys_trx;
 pub(crate) mod undo;
 pub(crate) mod ver_map;
 
+pub(crate) use readonly::PrivateSnapshot;
 pub(crate) use retention::{
     prepare_catalog_redo_maintenance_operation, prepare_redo_truncation_operation,
 };
@@ -39,9 +41,9 @@ use crate::catalog::{TableCache, is_catalog_table};
 use crate::completion::Completion;
 use crate::engine::EngineCore;
 use crate::error::{
-    CompletionErrorBridge, DiscloseError, DiscloseResultExt, Error, FatalError, LifecycleError,
-    LifecycleResult, OperationResult, ResourceError, Result, RuntimeError, RuntimeOrFatalError,
-    RuntimeOrFatalResult, RuntimeResult, SharedFatalError,
+    CompletionErrorBridge, DiscloseError, DiscloseResultExt, Error, FatalError, FatalResult,
+    LifecycleError, LifecycleResult, OperationResult, ResourceError, Result, RuntimeError,
+    RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult, SharedFatalError,
 };
 use crate::id::{SessionID, SessionOperationKey, TableID, TrxID};
 use crate::lock::{
@@ -69,7 +71,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub(crate) use admission::TableAdmissionRequest;
 pub use stmt::Statement;
-use stmt::StmtState;
+use stmt::{StmtEffects, StmtState};
 pub use stream_stmt::{IndexScanMvccStream, StreamStmt};
 /// Minimum snapshot timestamp assigned by the transaction system.
 pub(crate) const MIN_SNAPSHOT_TS: TrxID = TrxID::new(1);
@@ -209,12 +211,6 @@ impl Transaction {
         SessionOperationCompletionClaim::terminal(entry, attachment)
     }
 
-    /// Best-effort check that the transaction can still reach its engine.
-    #[inline]
-    pub(crate) fn engine(&self) -> Option<SessionRuntime> {
-        self.session.upgrade_for_terminal()
-    }
-
     /// Returns this transaction's current status timestamp.
     #[inline]
     pub fn trx_id(&self) -> TrxID {
@@ -298,42 +294,6 @@ impl Transaction {
         }
     }
 
-    /// Stages one private catalog DDL statement with ordinary exact claims.
-    ///
-    /// A callback panic is settled while the statement carrier still owns its
-    /// partial effects. Incomplete redo is discarded, residual undo returns to
-    /// the nested transaction core, and the original unwind resumes for the
-    /// mandatory supervisor.
-    #[inline]
-    pub(crate) async fn stage_catalog_statement<T, F>(&mut self, f: F) -> RuntimeResult<T>
-    where
-        F: for<'borrow> AsyncFnOnce(&'borrow mut Statement<'_>) -> RuntimeResult<T>,
-    {
-        let checkout = self
-            .checkout()
-            .change_context(RuntimeError::CatalogAccess)
-            .attach("operation=stage_catalog_statement")?;
-        let mut stmt_state = StmtState::private(checkout);
-        let outcome = AssertUnwindSafe(async {
-            let mut stmt = stmt_state.statement();
-            let result = f(&mut stmt).await;
-            stmt.merge_effects();
-            result
-        })
-        .catch_unwind()
-        .await;
-        match outcome {
-            Ok(result) => {
-                stmt_state.return_ordinary();
-                result
-            }
-            Err(panic) => {
-                stmt_state.return_after_mandatory_panic();
-                resume_unwind(panic);
-            }
-        }
-    }
-
     /// Commit the transaction.
     #[inline]
     pub async fn commit(self) -> Result<TrxID> {
@@ -355,64 +315,6 @@ impl Transaction {
         let trx_sys = claim.engine().trx_sys.clone();
         trx_sys.rollback_transaction(claim).await.disclose()
     }
-
-    /// Commit a catalog DDL transaction without crossing the public error boundary.
-    #[inline]
-    pub(crate) async fn commit_catalog_ddl(self) -> RuntimeOrFatalResult<TrxID> {
-        let session_id = self.operation_key.session_id();
-        let trx_id = self.trx_id;
-        let claim = self
-            .claim_terminal()
-            .change_context(RuntimeError::CatalogAccess)
-            .attach_with(|| {
-                format!(
-                    "operation=commit_catalog_ddl, session_id={}, trx_id={}",
-                    session_id, trx_id
-                )
-            })
-            .map_err(RuntimeOrFatalError::from)?;
-        let trx_sys = claim.engine().trx_sys.clone();
-        trx_sys.commit_catalog_transaction(claim).await
-    }
-
-    /// Roll back a catalog DDL transaction without crossing the public error boundary.
-    #[inline]
-    pub(crate) async fn rollback_catalog_ddl(self) -> RuntimeOrFatalResult<()> {
-        let session_id = self.operation_key.session_id();
-        let trx_id = self.trx_id;
-        let claim = self
-            .claim_terminal()
-            .change_context(RuntimeError::CatalogAccess)
-            .attach_with(|| {
-                format!(
-                    "operation=rollback_catalog_ddl, session_id={}, trx_id={}",
-                    session_id, trx_id
-                )
-            })
-            .map_err(RuntimeOrFatalError::from)?;
-        let trx_sys = claim.engine().trx_sys.clone();
-        trx_sys.rollback_catalog_transaction(claim).await
-    }
-
-    /// Roll back an engine-owned table-maintenance transaction without crossing
-    /// the public error boundary.
-    #[inline]
-    pub(crate) async fn rollback_table_maintenance(self) -> RuntimeOrFatalResult<()> {
-        let session_id = self.operation_key.session_id();
-        let trx_id = self.trx_id;
-        let claim = self
-            .claim_terminal()
-            .change_context(RuntimeError::TableAccess)
-            .attach_with(|| {
-                format!(
-                    "operation=rollback_table_maintenance, session_id={}, trx_id={}",
-                    session_id, trx_id
-                )
-            })
-            .map_err(RuntimeOrFatalError::from)?;
-        let trx_sys = claim.engine().trx_sys.clone();
-        trx_sys.rollback_table_maintenance_transaction(claim).await
-    }
 }
 
 impl Drop for Transaction {
@@ -430,6 +332,153 @@ impl Drop for Transaction {
                 trx_sys.request_abandoned_trx_cleanup(runtime, self.operation_key, self.trx_id);
             }
         }
+    }
+}
+
+/// Strongly attached transaction used by mandatory DDL work.
+///
+/// Unlike the weak public facade, this owner retains one checked-out core and
+/// its exact session runtime attachment from construction through terminal
+/// completion or synchronous panic parking.
+pub(crate) struct PrivateTransaction {
+    checkout: Option<SessionOperationCheckout>,
+}
+
+impl PrivateTransaction {
+    /// Create a private facade over one directly initialized checkout.
+    #[inline]
+    fn new(checkout: SessionOperationCheckout) -> Self {
+        Self {
+            checkout: Some(checkout),
+        }
+    }
+
+    #[inline]
+    fn checkout(&self) -> &SessionOperationCheckout {
+        self.checkout
+            .as_ref()
+            .expect("active private transaction retains its checkout")
+    }
+
+    #[inline]
+    fn checkout_mut(&mut self) -> &mut SessionOperationCheckout {
+        self.checkout
+            .as_mut()
+            .expect("active private transaction retains its checkout")
+    }
+
+    /// Returns the exact active transaction identity.
+    #[inline]
+    pub(crate) fn trx_id(&self) -> TrxID {
+        self.checkout().inner().trx_id()
+    }
+
+    /// Returns this transaction's snapshot timestamp.
+    #[inline]
+    pub(crate) fn sts(&self) -> TrxID {
+        self.checkout().inner().sts()
+    }
+
+    /// Validate the retained engine immediately before private transaction work.
+    #[inline]
+    pub(crate) fn ensure_engine_healthy(&self) -> FatalResult<()> {
+        self.checkout()
+            .attachment()
+            .engine()
+            .poisoner
+            .ensure_healthy()
+    }
+
+    /// Execute one private statement without returning the core to its entry.
+    ///
+    /// Ordinary errors retain all complete and partial undo in transaction
+    /// effects for whole-transaction rollback. A callback panic discards
+    /// incomplete redo, folds residual undo into the transaction, and resumes
+    /// the original unwind while this facade still owns the checkout.
+    #[inline]
+    pub(crate) async fn stage_statement<T, F>(&mut self, f: F) -> RuntimeResult<T>
+    where
+        F: for<'borrow> AsyncFnOnce(&'borrow mut Statement<'_>) -> RuntimeResult<T>,
+    {
+        let checkout = self.checkout_mut();
+        let mut effects = StmtEffects::empty();
+        let outcome = AssertUnwindSafe(async {
+            let (inner, attachment) = checkout.inner_and_attachment_mut();
+            let mut stmt = Statement::new(inner, attachment, &mut effects);
+            let result = f(&mut stmt).await;
+            stmt.merge_effects();
+            result
+        })
+        .catch_unwind()
+        .await;
+        match outcome {
+            Ok(result) => result,
+            Err(panic) => {
+                effects.fold_cancelled_into_trx_effects(checkout.inner_mut().effects_mut());
+                resume_unwind(panic);
+            }
+        }
+    }
+
+    /// Install the exact catalog DDL marker after every catalog statement succeeds.
+    #[inline]
+    pub(crate) fn install_ddl_redo(&mut self, ddl: DDLRedo) {
+        self.checkout_mut()
+            .inner_mut()
+            .effects_mut()
+            .install_ddl_redo(ddl);
+    }
+
+    #[inline]
+    fn claim_terminal(mut self) -> LifecycleResult<SessionOperationCompletionClaim> {
+        self.checkout
+            .take()
+            .expect("active private transaction retains its checkout")
+            .claim_private_terminal()
+    }
+
+    /// Commit a catalog DDL transaction without crossing the public error boundary.
+    #[inline]
+    pub(crate) async fn commit_catalog_ddl(self) -> RuntimeOrFatalResult<TrxID> {
+        let session_id = self.checkout().entry.key().session_id();
+        let trx_id = self.trx_id();
+        let claim = self
+            .claim_terminal()
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=commit_catalog_ddl, session_id={}, trx_id={}",
+                    session_id, trx_id
+                )
+            })
+            .map_err(RuntimeOrFatalError::from)?;
+        let trx_sys = claim.engine().trx_sys.clone();
+        trx_sys.commit_catalog_transaction(claim).await
+    }
+
+    /// Roll back a catalog DDL transaction without crossing the public error boundary.
+    #[inline]
+    pub(crate) async fn rollback_catalog_ddl(self) -> RuntimeOrFatalResult<()> {
+        let session_id = self.checkout().entry.key().session_id();
+        let trx_id = self.trx_id();
+        let claim = self
+            .claim_terminal()
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=rollback_catalog_ddl, session_id={}, trx_id={}",
+                    session_id, trx_id
+                )
+            })
+            .map_err(RuntimeOrFatalError::from)?;
+        let trx_sys = claim.engine().trx_sys.clone();
+        trx_sys.rollback_catalog_transaction(claim).await
+    }
+
+    /// Synchronously return an active core before mandatory panic publication.
+    #[inline]
+    pub(crate) fn park(mut self) {
+        drop(self.checkout.take());
     }
 }
 
@@ -834,6 +883,17 @@ impl TrxEffects {
         &mut self.index_undo
     }
 
+    /// Install exactly one catalog DDL marker for this transaction.
+    #[inline]
+    pub(crate) fn install_ddl_redo(&mut self, ddl: DDLRedo) {
+        assert!(
+            self.redo.ddl.is_none(),
+            "transaction DDL redo installed more than once: existing_ddl={:?}, attempted_ddl={ddl:?}",
+            self.redo.ddl
+        );
+        self.redo.ddl = Some(Box::new(ddl));
+    }
+
     /// Merges one successful statement's effects into this transaction.
     #[inline]
     pub(crate) fn merge_statement_effects(
@@ -1008,9 +1068,9 @@ struct SessionOperationEntryInner {
     state: SessionOperationState,
     /// Identity of the currently attached transaction, if any.
     ///
-    /// One DDL or maintenance operation may run sequential private
-    /// transactions, so this changes with payload installation and completion
-    /// under the same mutex rather than being immutable entry identity.
+    /// One DDL operation may run sequential private transactions, so this
+    /// changes with payload installation and completion under the same mutex
+    /// rather than being immutable entry identity.
     trx_id: Option<TrxID>,
     /// Heap-stable transaction core allocated once at installation.
     ///
@@ -1141,46 +1201,65 @@ impl SessionOperationEntry {
             .map(|inner| inner as *const TrxInner as usize)
     }
 
-    /// Installs one private transaction inside a DDL or maintenance entry.
+    /// Validate that accepted mandatory execution may start a private transaction.
     #[inline]
-    pub(crate) fn install_private_transaction(&self, trx_inner: Box<TrxInner>) {
+    pub(crate) fn validate_private_transaction_begin(&self) -> LifecycleResult<()> {
         assert!(
-            matches!(
-                self.kind,
-                SessionOperationKind::Ddl | SessionOperationKind::Maintenance
-            ),
-            "private transaction requires DDL or maintenance operation: key={}, kind={}",
+            self.kind == SessionOperationKind::Ddl,
+            "private transaction requires DDL operation: key={}, kind={}",
             self.key,
             self.kind.label()
         );
-        let trx_id = trx_inner.trx_id();
+        let inner = self.inner.lock();
+        if inner.state != SessionOperationState::Mandatory(None)
+            || inner.outer_foreground_alive
+            || inner.trx_id.is_some()
+            || inner.trx_inner.is_some()
+            || inner.lock_authority_return.is_some()
+        {
+            return Err(session_operation_entry_state_err(
+                self.key, self.kind, &inner,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Publish a directly checked-out private transaction as running.
+    #[inline]
+    fn install_running_private_transaction(&self, trx_id: TrxID) {
         let mut inner = self.inner.lock();
-        let next_state = match inner.state {
-            SessionOperationState::Voluntary(None) if inner.outer_foreground_alive => {
-                SessionOperationState::Voluntary(Some(InternalTrxState::Available))
-            }
-            SessionOperationState::Mandatory(None) if !inner.outer_foreground_alive => {
-                SessionOperationState::Mandatory(Some(InternalTrxState::Available))
-            }
-            _ => panic!(
-                "private transaction installation requires empty voluntary or mandatory authority: key={}, state={}, trx_id={:?}",
-                self.key,
-                inner.state.label(),
-                inner.trx_id
-            ),
-        };
         assert!(
-            inner.trx_id.is_none()
+            self.kind == SessionOperationKind::Ddl
+                && inner.state == SessionOperationState::Mandatory(None)
+                && !inner.outer_foreground_alive
+                && inner.trx_id.is_none()
                 && inner.trx_inner.is_none()
                 && inner.lock_authority_return.is_none(),
-            "private transaction installation requires an empty payload slot: key={}, state={}, trx_id={:?}",
+            "private transaction direct installation requires empty mandatory authority: key={}, kind={}, state={}, trx_id={:?}",
             self.key,
+            self.kind.label(),
             inner.state.label(),
             inner.trx_id
         );
-        inner.state = next_state;
+        inner.state = SessionOperationState::Mandatory(Some(InternalTrxState::Running));
         inner.trx_id = Some(trx_id);
-        inner.trx_inner = Some(trx_inner);
+    }
+
+    /// Convert one exact held private checkout into terminal ownership.
+    #[inline]
+    fn claim_running_private_terminal(&self, trx_id: TrxID) -> LifecycleResult<()> {
+        let mut inner = self.inner.lock();
+        if inner.trx_id != Some(trx_id)
+            || self.kind != SessionOperationKind::Ddl
+            || inner.state != SessionOperationState::Mandatory(Some(InternalTrxState::Running))
+            || inner.trx_inner.is_some()
+        {
+            return Err(session_operation_entry_state_err(
+                self.key, self.kind, &inner,
+            ));
+        }
+        inner.state = SessionOperationState::Mandatory(Some(InternalTrxState::Completing));
+        Ok(())
     }
 
     #[inline]
@@ -1204,7 +1283,7 @@ impl SessionOperationEntry {
             {
                 None
             }
-            SessionOperationKind::Ddl | SessionOperationKind::Maintenance
+            SessionOperationKind::Ddl
                 if inner.state
                     == SessionOperationState::Voluntary(Some(InternalTrxState::Available)) =>
             {
@@ -1212,7 +1291,7 @@ impl SessionOperationEntry {
                     InternalTrxState::Running,
                 )))
             }
-            SessionOperationKind::Ddl | SessionOperationKind::Maintenance
+            SessionOperationKind::Ddl
                 if inner.state
                     == SessionOperationState::Mandatory(Some(InternalTrxState::Available)) =>
             {
@@ -1262,13 +1341,13 @@ impl SessionOperationEntry {
             {
                 SessionOperationState::Completing
             }
-            SessionOperationKind::Ddl | SessionOperationKind::Maintenance
+            SessionOperationKind::Ddl
                 if inner.state
                     == SessionOperationState::Voluntary(Some(InternalTrxState::Available)) =>
             {
                 SessionOperationState::Voluntary(Some(InternalTrxState::Completing))
             }
-            SessionOperationKind::Ddl | SessionOperationKind::Maintenance
+            SessionOperationKind::Ddl
                 if inner.state
                     == SessionOperationState::Mandatory(Some(InternalTrxState::Available)) =>
             {
@@ -1313,7 +1392,7 @@ impl SessionOperationEntry {
             {
                 SessionOperationState::Completing
             }
-            SessionOperationKind::Ddl | SessionOperationKind::Maintenance
+            SessionOperationKind::Ddl
                 if inner.outer_foreground_alive
                     && inner.state
                         == SessionOperationState::Voluntary(Some(
@@ -1322,7 +1401,7 @@ impl SessionOperationEntry {
             {
                 SessionOperationState::Voluntary(Some(InternalTrxState::Completing))
             }
-            SessionOperationKind::Ddl | SessionOperationKind::Maintenance
+            SessionOperationKind::Ddl
                 if !inner.outer_foreground_alive
                     && inner.state == SessionOperationState::CleanupReady =>
             {
@@ -1360,14 +1439,14 @@ impl SessionOperationEntry {
             SessionOperationKind::PublicTransaction => {
                 inner.state == SessionOperationState::Voluntary(None)
             }
-            SessionOperationKind::Ddl | SessionOperationKind::Maintenance => {
+            SessionOperationKind::Ddl => {
                 matches!(
                     inner.state,
                     SessionOperationState::Voluntary(Some(InternalTrxState::Running))
                         | SessionOperationState::Mandatory(Some(InternalTrxState::Running))
                 )
             }
-            SessionOperationKind::SessionExplicitLock => false,
+            SessionOperationKind::Maintenance | SessionOperationKind::SessionExplicitLock => false,
         };
         assert!(
             running && inner.trx_inner.is_none(),
@@ -1386,18 +1465,15 @@ impl SessionOperationEntry {
         if inner.cleanup_requested {
             inner.state = match self.kind {
                 SessionOperationKind::PublicTransaction => SessionOperationState::CleanupReady,
-                SessionOperationKind::Ddl | SessionOperationKind::Maintenance
-                    if inner.outer_foreground_alive =>
-                {
+                SessionOperationKind::Ddl if inner.outer_foreground_alive => {
                     SessionOperationState::Voluntary(Some(InternalTrxState::CleanupReady))
                 }
-                SessionOperationKind::Ddl | SessionOperationKind::Maintenance => {
-                    SessionOperationState::CleanupReady
-                }
-                SessionOperationKind::SessionExplicitLock => {
+                SessionOperationKind::Ddl => SessionOperationState::CleanupReady,
+                SessionOperationKind::Maintenance | SessionOperationKind::SessionExplicitLock => {
                     panic!(
-                        "explicit-lock operation cannot return a transaction core: key={}",
-                        self.key
+                        "non-transaction operation cannot return a transaction core: key={}, kind={}",
+                        self.key,
+                        self.kind.label()
                     )
                 }
             };
@@ -1405,29 +1481,28 @@ impl SessionOperationEntry {
         }
         if self.kind != SessionOperationKind::PublicTransaction {
             inner.state = match self.kind {
-                SessionOperationKind::Ddl | SessionOperationKind::Maintenance => {
-                    match inner.state {
-                        SessionOperationState::Voluntary(Some(InternalTrxState::Running))
-                            if inner.outer_foreground_alive =>
-                        {
-                            SessionOperationState::Voluntary(Some(InternalTrxState::Available))
-                        }
-                        SessionOperationState::Mandatory(Some(InternalTrxState::Running))
-                            if !inner.outer_foreground_alive =>
-                        {
-                            SessionOperationState::Mandatory(Some(InternalTrxState::Available))
-                        }
-                        _ => panic!(
-                            "private transaction return requires matching outer authority: key={}, state={}",
-                            self.key,
-                            inner.state.label()
-                        ),
+                SessionOperationKind::Ddl => match inner.state {
+                    SessionOperationState::Voluntary(Some(InternalTrxState::Running))
+                        if inner.outer_foreground_alive =>
+                    {
+                        SessionOperationState::Voluntary(Some(InternalTrxState::Available))
                     }
-                }
-                SessionOperationKind::SessionExplicitLock => {
+                    SessionOperationState::Mandatory(Some(InternalTrxState::Running))
+                        if !inner.outer_foreground_alive =>
+                    {
+                        SessionOperationState::Mandatory(Some(InternalTrxState::Available))
+                    }
+                    _ => panic!(
+                        "private transaction return requires matching outer authority: key={}, state={}",
+                        self.key,
+                        inner.state.label()
+                    ),
+                },
+                SessionOperationKind::Maintenance | SessionOperationKind::SessionExplicitLock => {
                     panic!(
-                        "explicit-lock operation cannot return a transaction core: key={}",
-                        self.key
+                        "non-transaction operation cannot return a transaction core: key={}, kind={}",
+                        self.key,
+                        self.kind.label()
                     )
                 }
                 SessionOperationKind::PublicTransaction => unreachable!(),
@@ -1481,14 +1556,14 @@ impl SessionOperationEntry {
             }
             (SessionOperationKind::PublicTransaction, SessionOperationState::Voluntary(None))
             | (
-                SessionOperationKind::Ddl | SessionOperationKind::Maintenance,
+                SessionOperationKind::Ddl,
                 SessionOperationState::Voluntary(Some(InternalTrxState::Running)),
             ) => {
                 inner.cleanup_requested = true;
                 true
             }
             (
-                SessionOperationKind::Ddl | SessionOperationKind::Maintenance,
+                SessionOperationKind::Ddl,
                 SessionOperationState::Voluntary(Some(InternalTrxState::Available)),
             ) => {
                 inner.cleanup_requested = true;
@@ -1497,13 +1572,11 @@ impl SessionOperationEntry {
                 true
             }
             (
-                SessionOperationKind::Ddl | SessionOperationKind::Maintenance,
+                SessionOperationKind::Ddl,
                 SessionOperationState::Voluntary(Some(InternalTrxState::CleanupReady)),
             )
             | (
-                SessionOperationKind::PublicTransaction
-                | SessionOperationKind::Ddl
-                | SessionOperationKind::Maintenance,
+                SessionOperationKind::PublicTransaction | SessionOperationKind::Ddl,
                 SessionOperationState::CleanupReady,
             ) => {
                 assert!(
@@ -1624,24 +1697,20 @@ impl SessionOperationEntry {
             SessionOperationKind::PublicTransaction => {
                 inner.state == SessionOperationState::Completing
             }
-            SessionOperationKind::Ddl | SessionOperationKind::Maintenance
-                if inner.outer_foreground_alive =>
-            {
+            SessionOperationKind::Ddl if inner.outer_foreground_alive => {
                 matches!(
                     inner.state,
                     SessionOperationState::Voluntary(Some(InternalTrxState::Completing))
                 )
             }
-            SessionOperationKind::Ddl | SessionOperationKind::Maintenance
+            SessionOperationKind::Ddl
                 if inner.state
                     == SessionOperationState::Mandatory(Some(InternalTrxState::Completing)) =>
             {
                 true
             }
-            SessionOperationKind::Ddl | SessionOperationKind::Maintenance => {
-                inner.state == SessionOperationState::Completing
-            }
-            SessionOperationKind::SessionExplicitLock => false,
+            SessionOperationKind::Ddl => inner.state == SessionOperationState::Completing,
+            SessionOperationKind::Maintenance | SessionOperationKind::SessionExplicitLock => false,
         };
         if inner.trx_id != Some(trx_id) || !completion_owned {
             return None;
@@ -1792,11 +1861,12 @@ impl SessionOperationEntry {
 /// runtime attachment, and restores the same box on ordinary drop. Statement
 /// ownership policy lives in
 /// [`StmtState`], its callback facade is [`Statement`], and terminal commit and
-/// rollback use private completion claims.
+/// rollback use private completion claims. Public statements construct a fresh
+/// checkout per operation; [`PrivateTransaction`] owns one continuously.
 pub(crate) struct SessionOperationCheckout {
     entry: Arc<SessionOperationEntry>,
     inner: Option<Box<TrxInner>>,
-    attachment: TrxAttachment,
+    attachment: Option<TrxAttachment>,
 }
 
 impl SessionOperationCheckout {
@@ -1806,8 +1876,23 @@ impl SessionOperationCheckout {
         Ok(Self {
             entry,
             inner: Some(inner),
-            attachment,
+            attachment: Some(attachment),
         })
+    }
+
+    /// Own a newly initialized private core without checking it through the entry.
+    #[inline]
+    fn private(
+        entry: Arc<SessionOperationEntry>,
+        inner: Box<TrxInner>,
+        attachment: TrxAttachment,
+    ) -> Self {
+        entry.install_running_private_transaction(attachment.trx_id());
+        Self {
+            entry,
+            inner: Some(inner),
+            attachment: Some(attachment),
+        }
     }
 
     /// Returns this checkout's immutable transaction core.
@@ -1833,13 +1918,20 @@ impl SessionOperationCheckout {
             .inner
             .as_mut()
             .expect("SessionOperationCheckout always owns an inner until fatal discard");
-        (inner, &self.attachment)
+        (
+            inner,
+            self.attachment
+                .as_ref()
+                .expect("active checkout retains its transaction attachment"),
+        )
     }
 
     /// Returns this checkout's operation-local attachment.
     #[inline]
     pub(crate) fn attachment(&self) -> &TrxAttachment {
-        &self.attachment
+        self.attachment
+            .as_ref()
+            .expect("active checkout retains its transaction attachment")
     }
 
     /// Acquires an explicit transaction-lifetime table lock.
@@ -1855,6 +1947,9 @@ impl SessionOperationCheckout {
         let inner = inner
             .as_mut()
             .expect("SessionOperationCheckout always owns an inner until fatal discard");
+        let attachment = attachment
+            .as_ref()
+            .expect("active checkout retains its transaction attachment");
         inner.lock_table(attachment, table_id, mode).await
     }
 
@@ -1862,14 +1957,15 @@ impl SessionOperationCheckout {
     #[inline]
     pub(crate) fn discard_after_fatal_rollback(&mut self) {
         if let Some(mut inner) = self.inner.take() {
-            let retention = inner.retain_and_discard_after_fatal_rollback(&self.attachment);
-            self.attachment
-                .engine()
-                .trx_sys
-                .retain_fatal_rollback(retention);
+            let attachment = self
+                .attachment
+                .as_ref()
+                .expect("active checkout retains its transaction attachment");
+            let retention = inner.retain_and_discard_after_fatal_rollback(attachment);
+            attachment.engine().trx_sys.retain_fatal_rollback(retention);
         }
         self.entry.fail_retained();
-        self.attachment.notify_operation_transition();
+        self.attachment().notify_operation_transition();
     }
 
     /// Returns a cancelled public statement directly to cleanup ownership.
@@ -1880,8 +1976,28 @@ impl SessionOperationCheckout {
             .take()
             .expect("cancelled statement checkout must retain its transaction core");
         self.entry.return_cancelled(inner);
-        self.attachment.notify_operation_transition();
-        self.attachment.request_abandoned_cleanup();
+        self.attachment().notify_operation_transition();
+        self.attachment().request_abandoned_cleanup();
+    }
+
+    /// Convert a continuously held private checkout into a terminal claim.
+    #[inline]
+    fn claim_private_terminal(mut self) -> LifecycleResult<SessionOperationCompletionClaim> {
+        let trx_id = self.attachment().trx_id();
+        self.entry.claim_running_private_terminal(trx_id)?;
+        let inner = self
+            .inner
+            .take()
+            .expect("private terminal claim retains its transaction core");
+        let attachment = self
+            .attachment
+            .take()
+            .expect("private terminal claim retains its transaction attachment");
+        Ok(SessionOperationCompletionClaim {
+            entry: Arc::clone(&self.entry),
+            inner: Some(inner),
+            attachment: Some(attachment),
+        })
     }
 }
 
@@ -1892,8 +2008,8 @@ impl Drop for SessionOperationCheckout {
             return;
         };
         if self.entry.return_inner(inner) {
-            self.attachment.notify_operation_transition();
-            self.attachment.request_abandoned_cleanup();
+            self.attachment().notify_operation_transition();
+            self.attachment().request_abandoned_cleanup();
         }
     }
 }
@@ -3417,7 +3533,72 @@ pub(crate) mod tests {
         inner
     }
 
-    async fn test_engine(log_file_stem: &str) -> (TempDir, Engine) {
+    /// Install one transaction-level DDL marker for catalog and recovery tests.
+    pub(crate) fn install_transaction_ddl_redo(
+        trx: &mut Transaction,
+        ddl: DDLRedo,
+    ) -> LifecycleResult<()> {
+        let mut checkout = trx.checkout()?;
+        checkout.inner_mut().effects_mut().install_ddl_redo(ddl);
+        Ok(())
+    }
+
+    /// Return the core allocation held by one running private transaction.
+    pub(crate) fn private_transaction_inner_ptr(trx: &PrivateTransaction) -> usize {
+        trx.checkout().inner() as *const TrxInner as usize
+    }
+
+    /// Return the exact number of snapshot timestamps registered for GC.
+    pub(crate) fn active_sts_count(trx_sys: &sys::TransactionSystem) -> usize {
+        trx_sys
+            .gc_buckets
+            .iter()
+            .map(|bucket| {
+                let active_sts = bucket.active_sts_list.lock();
+                active_sts.active.len() - active_sts.deleted.len()
+            })
+            .sum()
+    }
+
+    /// Install a checked-in private core for entry state-machine tests.
+    fn install_private_transaction(entry: &SessionOperationEntry, trx_inner: Box<TrxInner>) {
+        let trx_id = trx_inner.trx_id();
+        let mut inner = entry.inner.lock();
+        assert!(
+            entry.kind == SessionOperationKind::Ddl,
+            "test private transaction installation requires DDL operation: key={}, kind={}",
+            entry.key,
+            entry.kind.label()
+        );
+        let next_state = match inner.state {
+            SessionOperationState::Voluntary(None) if inner.outer_foreground_alive => {
+                SessionOperationState::Voluntary(Some(InternalTrxState::Available))
+            }
+            SessionOperationState::Mandatory(None) if !inner.outer_foreground_alive => {
+                SessionOperationState::Mandatory(Some(InternalTrxState::Available))
+            }
+            _ => panic!(
+                "test private transaction installation requires empty authority: key={}, state={}, trx_id={:?}",
+                entry.key,
+                inner.state.label(),
+                inner.trx_id
+            ),
+        };
+        assert!(
+            inner.trx_id.is_none()
+                && inner.trx_inner.is_none()
+                && inner.lock_authority_return.is_none(),
+            "test private transaction installation requires an empty payload slot: key={}, state={}, trx_id={:?}",
+            entry.key,
+            inner.state.label(),
+            inner.trx_id
+        );
+        inner.state = next_state;
+        inner.trx_id = Some(trx_id);
+        inner.trx_inner = Some(trx_inner);
+    }
+
+    pub(super) async fn test_engine(log_file_stem: &str) -> (TempDir, Engine) {
         test_engine_with_mem_size(log_file_stem, 64usize * 1024 * 1024).await
     }
 
@@ -3702,19 +3883,17 @@ pub(crate) mod tests {
         let trx_id = MIN_ACTIVE_TRX_ID + 101;
         let entry = SessionOperationEntry::new(
             SessionOperationKey::new(session_id, OperationID::new(1)),
-            SessionOperationKind::Maintenance,
+            SessionOperationKind::Ddl,
         );
 
         assert_eq!(
             entry.inspect().state,
             SessionOperationState::Voluntary(None)
         );
-        entry.install_private_transaction(Box::new(trx_inner(
-            trx_id,
-            TrxID::new(101),
-            0,
-            session_id,
-        )));
+        install_private_transaction(
+            &entry,
+            Box::new(trx_inner(trx_id, TrxID::new(101), 0, session_id)),
+        );
         assert_eq!(
             entry.inspect().state,
             SessionOperationState::Voluntary(Some(InternalTrxState::Available))
@@ -3774,12 +3953,10 @@ pub(crate) mod tests {
             entry.inspect().state,
             SessionOperationState::Mandatory(None)
         );
-        entry.install_private_transaction(Box::new(trx_inner(
-            trx_id,
-            TrxID::new(102),
-            0,
-            session_id,
-        )));
+        install_private_transaction(
+            &entry,
+            Box::new(trx_inner(trx_id, TrxID::new(102), 0, session_id)),
+        );
         assert_eq!(
             entry.inspect().state,
             SessionOperationState::Mandatory(Some(InternalTrxState::Available))
@@ -3828,15 +4005,13 @@ pub(crate) mod tests {
         let second_trx_id = MIN_ACTIVE_TRX_ID + 201;
         let entry = SessionOperationEntry::new(
             SessionOperationKey::new(session_id, OperationID::new(1)),
-            SessionOperationKind::Maintenance,
+            SessionOperationKind::Ddl,
         );
 
-        entry.install_private_transaction(Box::new(trx_inner(
-            first_trx_id,
-            TrxID::new(200),
-            0,
-            session_id,
-        )));
+        install_private_transaction(
+            &entry,
+            Box::new(trx_inner(first_trx_id, TrxID::new(200), 0, session_id)),
+        );
         let first_inner = entry
             .take_for_terminal(first_trx_id)
             .expect("first private transaction can be completed");
@@ -3850,12 +4025,10 @@ pub(crate) mod tests {
         drop(entry.take_lock_authority_return());
         drop(first_inner);
 
-        entry.install_private_transaction(Box::new(trx_inner(
-            second_trx_id,
-            TrxID::new(201),
-            0,
-            session_id,
-        )));
+        install_private_transaction(
+            &entry,
+            Box::new(trx_inner(second_trx_id, TrxID::new(201), 0, session_id)),
+        );
         assert!(
             !entry.abandon_transaction(first_trx_id),
             "a stale handle must not abandon the replacement transaction"
@@ -3881,14 +4054,12 @@ pub(crate) mod tests {
         let available_trx_id = MIN_ACTIVE_TRX_ID + 102;
         let available_entry = SessionOperationEntry::new(
             SessionOperationKey::new(session_id, OperationID::new(1)),
-            SessionOperationKind::Maintenance,
+            SessionOperationKind::Ddl,
         );
-        available_entry.install_private_transaction(Box::new(trx_inner(
-            available_trx_id,
-            TrxID::new(102),
-            0,
-            session_id,
-        )));
+        install_private_transaction(
+            &available_entry,
+            Box::new(trx_inner(available_trx_id, TrxID::new(102), 0, session_id)),
+        );
         let release = available_entry.release_foreground();
         assert!(!release.terminal);
         assert_eq!(release.cleanup, Some(available_trx_id));
@@ -3903,12 +4074,10 @@ pub(crate) mod tests {
             SessionOperationKey::new(session_id, OperationID::new(2)),
             SessionOperationKind::Ddl,
         );
-        terminal_entry.install_private_transaction(Box::new(trx_inner(
-            terminal_trx_id,
-            TrxID::new(103),
-            0,
-            session_id,
-        )));
+        install_private_transaction(
+            &terminal_entry,
+            Box::new(trx_inner(terminal_trx_id, TrxID::new(103), 0, session_id)),
+        );
         let _inner = terminal_entry
             .take_for_terminal(terminal_trx_id)
             .expect("private transaction terminal ownership can be claimed");
@@ -3938,14 +4107,12 @@ pub(crate) mod tests {
         let running_trx_id = MIN_ACTIVE_TRX_ID + 104;
         let running_entry = SessionOperationEntry::new(
             SessionOperationKey::new(session_id, OperationID::new(3)),
-            SessionOperationKind::Maintenance,
+            SessionOperationKind::Ddl,
         );
-        running_entry.install_private_transaction(Box::new(trx_inner(
-            running_trx_id,
-            TrxID::new(104),
-            0,
-            session_id,
-        )));
+        install_private_transaction(
+            &running_entry,
+            Box::new(trx_inner(running_trx_id, TrxID::new(104), 0, session_id)),
+        );
         let inner = running_entry
             .take_for_checkout(running_trx_id)
             .expect("private transaction can be checked out");
@@ -4225,16 +4392,13 @@ pub(crate) mod tests {
     }
 
     #[inline]
-    fn discard_production_transaction_after_fatal_rollback(trx: &mut Transaction) {
+    fn discard_production_transaction_after_fatal_rollback(engine: &Engine, trx: &mut Transaction) {
         let sts = trx.sts();
         let gc_no = transaction_gc_no(trx);
         let session_id = trx.operation_key.session_id();
-        let engine = trx.engine().expect("test transaction must have engine");
         discard_transaction_after_fatal_rollback(trx);
-        engine.trx_sys.record_rollback_for_purge(gc_no, sts);
-        if let Some(registry) = engine.session_registry.upgrade() {
-            remove_session_for_test(&registry, session_id);
-        }
+        engine.inner().trx_sys.record_rollback_for_purge(gc_no, sts);
+        remove_session_for_test(&engine.inner().session_registry, session_id);
     }
 
     /// Add one redo log entry for tests that need a non-readonly transaction.
@@ -4248,7 +4412,7 @@ pub(crate) mod tests {
         trx.exec(async |stmt| {
             // Simulate one sysbench record:
             // uint64 + int32 + int32 + char(60) + char(120)
-            stmt.effects_mut().insert_row_redo(
+            stmt_tests::statement_effects_mut(stmt).insert_row_redo(
                 USER_TABLE_ID_START,
                 RowRedo {
                     row_id: RowID::new(0),
@@ -4837,7 +5001,7 @@ pub(crate) mod tests {
             let (_temp_dir, engine) = test_engine("redo_stmt_effect_merge").await;
             let (_session, mut trx) = begin_production_test_transaction(&engine);
             trx.exec(async |stmt| {
-                let effects = stmt.effects_mut();
+                let effects = stmt_tests::statement_effects_mut(stmt);
                 effects.push_row_undo(OwnedRowUndo::new(
                     TableID::new(12),
                     None,
@@ -4870,7 +5034,7 @@ pub(crate) mod tests {
             })
             .unwrap();
 
-            discard_production_transaction_after_fatal_rollback(&mut trx);
+            discard_production_transaction_after_fatal_rollback(&engine, &mut trx);
         });
     }
 
@@ -4938,7 +5102,7 @@ pub(crate) mod tests {
             let resource = LockResource::TableMetadata(TableID::new(91_430));
             let mut exec = Box::pin(trx.exec(async |stmt| {
                 stmt_tests::acquire_transaction_lock(stmt, resource, LockMode::Shared).await?;
-                stmt.effects_mut().insert_row_redo(
+                stmt_tests::statement_effects_mut(stmt).insert_row_redo(
                     TableID::new(91_430),
                     RowRedo {
                         row_id: RowID::new(1),
@@ -5166,13 +5330,32 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_transaction_effects_install_first_ddl_redo() {
+        let mut effects = TrxEffects::empty();
+        effects.install_ddl_redo(DDLRedo::CreateTable(TableID::new(42)));
+        assert!(matches!(
+            effects.redo.ddl.as_deref(),
+            Some(DDLRedo::CreateTable(table_id)) if *table_id == TableID::new(42)
+        ));
+        effects.clear_for_rollback();
+    }
+
+    #[test]
+    #[should_panic(expected = "transaction DDL redo installed more than once")]
+    fn test_transaction_effects_reject_duplicate_ddl_redo() {
+        let mut effects = TrxEffects::empty();
+        effects.install_ddl_redo(DDLRedo::CreateTable(TableID::new(42)));
+        effects.install_ddl_redo(DDLRedo::DropTable(TableID::new(42)));
+    }
+
+    #[test]
     fn test_statement_error_rolls_back_only_statement_effects() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_stmt_error_rollback").await;
             let (_session, mut trx) = begin_production_test_transaction(&engine);
 
             trx.exec(async |stmt| {
-                stmt.effects_mut().insert_row_redo(
+                stmt_tests::statement_effects_mut(stmt).insert_row_redo(
                     TableID::new(12),
                     RowRedo {
                         row_id: RowID::new(23),
@@ -5186,7 +5369,7 @@ pub(crate) mod tests {
 
             let res: Result<()> = trx
                 .exec(async |stmt| {
-                    stmt.effects_mut().insert_row_redo(
+                    stmt_tests::statement_effects_mut(stmt).insert_row_redo(
                         TableID::new(12),
                         RowRedo {
                             row_id: RowID::new(24),
@@ -5209,7 +5392,7 @@ pub(crate) mod tests {
             })
             .unwrap();
 
-            discard_production_transaction_after_fatal_rollback(&mut trx);
+            discard_production_transaction_after_fatal_rollback(&engine, &mut trx);
         });
     }
 
