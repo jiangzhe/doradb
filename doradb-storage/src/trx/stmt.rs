@@ -481,6 +481,13 @@ impl<'stmt> Statement<'stmt> {
             .map(|_| ())
     }
 
+    /// Admits one user-table operation under transaction-owned metadata protection.
+    ///
+    /// Once a first-touch metadata claim is accepted, a later resolution or
+    /// validation error does not release it. The transaction remains reusable,
+    /// but the retained claim can delay metadata-exclusive DDL and subsequent
+    /// FIFO waiters until terminal cleanup. A caller that does not deliberately
+    /// continue after such an error should roll back the transaction promptly.
     #[inline]
     async fn admit_user_table(
         &mut self,

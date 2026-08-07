@@ -34,16 +34,10 @@ MySQL InnoDB normally retains in-memory row locks across rollback to a savepoint
 
 Doradb has no identified engine requirement corresponding to either a successful statement-only lock lifetime or a phase-based physical downgrade. Under the intended topology, SessionExplicit outlives a public transaction, Operation outlives its private transaction, parent scopes never close while a child is alive, and every inner same-resource claim must be covered by all live outer claims. Closing an inner scope should therefore leave the physical family mode unchanged or remove its final claim, never downgrade it to another live mode.
 
-## Close Reason (Added When Closed)
-
-When a backlog item is moved to `docs/backlogs/closed/`, append:
-
-```md
 ## Close Reason
 
-- Type: <implemented|stale|replaced|duplicate|wontfix|already-implemented|other>
-- Detail: <reason detail>
-- Closed By: <backlog close>
-- Reference: <task/issue/pr reference>
-- Closed At: <YYYY-MM-DD>
-```
+- Type: implemented
+- Detail: Implemented via docs/tasks/000261-remove-statement-scope-logical-locks.md
+- Closed By: backlog close
+- Reference: User decision
+- Closed At: 2026-08-07
