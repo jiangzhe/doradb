@@ -204,7 +204,7 @@ notification. [D7] [C7] [U2] [U4] [U5] [U6]
 
 ### Source Backlogs
 
-- [B1] `docs/backlogs/000171-exact-family-lock-system-redesign.md` - source
+- [B1] `docs/backlogs/closed/000171-exact-family-lock-system-redesign.md` - source
   backlog and RFC acceptance criteria.
 - [B2] `docs/backlogs/closed/000115-explicit-session-lock-cache.md` - session lock
   cache requirement absorbed by the family state.
@@ -872,7 +872,7 @@ authorize it. [D16] [U8]
   - Implementation Summary: Implemented RFC-0027 Phase 1 with one move-only family authority and targeted scope cleanup while retaining exact manager mirrors. [Task Resolve Sync: docs/tasks/000258-linear-lock-family-authority-owner-side-indexes.md @ 2026-08-06]
   - Related Backlogs:
     - `docs/backlogs/closed/000115-explicit-session-lock-cache.md`
-    - `docs/backlogs/000171-exact-family-lock-system-redesign.md`
+    - `docs/backlogs/closed/000171-exact-family-lock-system-redesign.md`
 
 - **Phase 2: Tokenized Waiter And Provisional-Grant Lifecycle**
   - Scope: Replace `Arc<Waiter>`/`VecDeque` cancellation identity with
@@ -918,15 +918,21 @@ authorize it. [D16] [U8]
   - Prerequisites: Phase 2 pending-token, cancellation, provisional-node,
     resource-retention, and post-consumption recreation tests pass under both
     storage I/O feature sets.
-  - Phase-local Choices: Tune masks, slot packing, notification batches, and
-    retained capacities without weakening structural no-scan/no-global-atomic
-    gates.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase-local Choices: Retained enum lock modes with a purpose-built `u8`
+    presence mask, `[u32; 4]` physical counts, the direct resource map, safe
+    waiter storage, and zero/one/many deferred notifications. Removed the
+    migration-only released-waiter state because the acquisition future is the
+    unique pending cleanup owner.
+  - Task Doc: `docs/tasks/000260-physical-lock-family-aggregation-performance-cutover.md`
+  - Task Issue: `#953`
+  - Phase Status: done
+  - Implementation Summary: Implemented RFC-0027 Phase 3 with one shared physical entry per lock family, owner-local exact authority, bounded compatibility work, and deterministic structural observability. [Task Resolve Sync: docs/tasks/000260-physical-lock-family-aggregation-performance-cutover.md @ 2026-08-07]
   - Related Backlogs:
-    - `docs/backlogs/000171-exact-family-lock-system-redesign.md`
+    - `docs/backlogs/closed/000171-exact-family-lock-system-redesign.md`
+    - `docs/backlogs/000179-cancel-pending-logical-lock-acquisition-on-engine-poison.md`
+    - `docs/backlogs/000180-remove-statement-scope-logical-locks.md`
+    - `docs/backlogs/000181-waitable-comparable-same-scope-lock-upgrades.md`
+    - `docs/backlogs/000182-capture-lock-family-cutover-benchmark-comparison.md`
 
 ## Consequences
 
@@ -972,15 +978,26 @@ authorize it. [D16] [U8]
 
 ## Open Questions
 
-No design-blocking questions remain in this draft. The RFC intentionally
-imposes no hard numeric benchmark budget; each phase must still record and
-explain before/after evidence for its affected operation classes.
+No design-blocking questions remain. Phase 3 recorded final-candidate
+structural counters and timing samples, but equivalent pre-cutover scenario
+instrumentation was not preserved. Backlog 000182 retains the repeated paired
+baseline/candidate comparison rather than treating the candidate-only samples
+as authoritative performance evidence.
 
 ## Future Work
 
 - `docs/backlogs/000167-logical-lock-deadlock-handling.md` - multi-resource
   deadlock policy and diagnostics.
-- Blocking conversion or `SIX`, if justified by future SQL semantics.
+- `docs/backlogs/000179-cancel-pending-logical-lock-acquisition-on-engine-poison.md`
+  - poison-aware waiter cancellation and original-fatal propagation.
+- `docs/backlogs/000180-remove-statement-scope-logical-locks.md` - remove the
+  statement lock scope after the production lifetime audit found no durable
+  statement-only requirement.
+- `docs/backlogs/000181-waitable-comparable-same-scope-lock-upgrades.md` -
+  waitable strengthening after deadlock policy; `SIX` remains a future
+  composition decision.
+- `docs/backlogs/000182-capture-lock-family-cutover-benchmark-comparison.md` -
+  reproducible repeated pre-cutover/final benchmark evidence.
 - Parallel mutation within one session family, which would invalidate the
   local-only claim proof and require a new ownership design.
 - Lock escalation, weak-lock elision, distributed ownership, or family actors.
@@ -1000,7 +1017,7 @@ explain before/after evidence for its affected operation classes.
 - `docs/tasks/000257-doradb-bench-lock-table-workload.md`
 - `docs/backlogs/closed/000115-explicit-session-lock-cache.md`
 - `docs/backlogs/000167-logical-lock-deadlock-handling.md`
-- `docs/backlogs/000171-exact-family-lock-system-redesign.md`
+- `docs/backlogs/closed/000171-exact-family-lock-system-redesign.md`
 - `docs/backlogs/closed/000169-separate-session-operation-lock-scopes.md`
 - `docs/backlogs/closed/000170-session-coordinated-cancellation-cleanup.md`
 - `docs/architecture.md`

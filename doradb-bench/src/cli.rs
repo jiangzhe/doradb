@@ -174,16 +174,52 @@ impl fmt::Display for TableLockScope {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 pub(super) enum LockTableScenario {
+    /// Exercise configurable session- or transaction-scope acquisition.
+    ///
+    /// `--unlock` selects retained versus paired release, while `--rand` may
+    /// select a different prepared table for each paired iteration.
     #[default]
     Basic,
+    /// Hold session `X`, publish covered transaction claims, commit, and unlock.
+    ///
+    /// `width` is the number of prepared tables and covered transaction claims
+    /// included in one measured lifecycle.
     NestedCovered,
+    /// Acquire session `S`, immediately convert the same claim to `X`, and unlock.
+    ///
+    /// This measures nonblocking same-scope conversion and requires exclusive
+    /// mode with `width == 1`.
     Convert,
+    /// Queue a known waiter prefix behind a blocker, then cancel every waiter.
+    ///
+    /// `width` is the number of waiters. The blocker remains held through
+    /// cancellation, so this scenario must not promote any waiter.
     Enqueue,
+    /// Cancel the FIFO head before releasing the blocker and draining the rest.
+    ///
+    /// `width` is the number of waiters initially enqueued.
     CancelHead,
+    /// Cancel the middle FIFO node before releasing and draining the queue.
+    ///
+    /// `width` is the number of waiters and must be at least three.
     CancelMiddle,
+    /// Cancel the FIFO tail before releasing the blocker and draining the rest.
+    ///
+    /// `width` is the number of waiters initially enqueued.
     CancelTail,
+    /// Release the blocker and promote every waiter in the known FIFO prefix.
+    ///
+    /// `width` is the number of waiters and expected promotions.
     Promote,
+    /// Run table admission through a statement and retain its locks in the transaction.
+    ///
+    /// The current path measures statement-to-transaction metadata handoff,
+    /// followed by transaction commit. It requires shared mode and `width == 1`.
     Handoff,
+    /// Acquire transaction claims on several tables and close them at commit.
+    ///
+    /// `width` is the number of tables; each table contributes metadata and
+    /// data claims to exact-scope cleanup.
     ScopeClose,
 }
 

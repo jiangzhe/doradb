@@ -62,7 +62,7 @@ pub struct LogicalLockStats {
     pub current_linked_waiters: u64,
     /// Maximum simultaneously FIFO-linked waiters.
     pub peak_linked_waiters: u64,
-    /// Waiter nodes in queued, provisional, or released state.
+    /// Waiter nodes in queued or provisional state.
     pub current_live_waiter_nodes: u64,
     /// Maximum simultaneously live waiter nodes.
     pub peak_live_waiter_nodes: u64,

@@ -3124,7 +3124,6 @@ impl TrxAttachment {
     }
 
     /// Returns the exact transaction identity carried by this attachment.
-    #[cfg(debug_assertions)]
     #[inline]
     pub(crate) const fn trx_id(&self) -> TrxID {
         self.trx_id
