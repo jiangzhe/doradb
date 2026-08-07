@@ -172,6 +172,54 @@ impl fmt::Display for TableLockScope {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub(super) enum LockTableScenario {
+    #[default]
+    Basic,
+    NestedCovered,
+    Convert,
+    Enqueue,
+    CancelHead,
+    CancelMiddle,
+    CancelTail,
+    Promote,
+    Handoff,
+    ScopeClose,
+}
+
+impl fmt::Display for LockTableScenario {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Basic => f.write_str("basic"),
+            Self::NestedCovered => f.write_str("nested-covered"),
+            Self::Convert => f.write_str("convert"),
+            Self::Enqueue => f.write_str("enqueue"),
+            Self::CancelHead => f.write_str("cancel-head"),
+            Self::CancelMiddle => f.write_str("cancel-middle"),
+            Self::CancelTail => f.write_str("cancel-tail"),
+            Self::Promote => f.write_str("promote"),
+            Self::Handoff => f.write_str("handoff"),
+            Self::ScopeClose => f.write_str("scope-close"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub(super) enum LockTableMode {
+    #[default]
+    Shared,
+    Exclusive,
+}
+
+impl fmt::Display for LockTableMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Shared => f.write_str("shared"),
+            Self::Exclusive => f.write_str("exclusive"),
+        }
+    }
+}
+
 /// Arguments for preparing a benchmark storage root.
 #[derive(Clone, Debug, Args)]
 pub struct PrepareArgs {
@@ -223,7 +271,7 @@ pub enum WorkloadArgs {
     TableDdl(WorkerIterationArgs),
     /// Create and drop a non-unique logical-key index per iteration.
     IndexDdl(WorkerIterationArgs),
-    /// Acquire public shared table locks under session or transaction scope.
+    /// Measure public logical table-lock scenarios.
     LockTable(LockTableArgs),
 }
 
@@ -284,6 +332,15 @@ impl WorkerCountArgs {
 pub struct LockTableArgs {
     #[command(flatten)]
     count: WorkerCountArgs,
+    /// Lock operation scenario.
+    #[arg(long, value_enum, default_value_t = LockTableScenario::Basic)]
+    scenario: LockTableScenario,
+    /// Physical lock mode used by the scenario.
+    #[arg(long, value_enum, default_value_t = LockTableMode::Shared)]
+    mode: LockTableMode,
+    /// Scenario resource, waiter, promotion, or close cardinality.
+    #[arg(long, default_value = "1")]
+    width: NonZeroUsize,
     /// Lock ownership scope.
     #[arg(long, value_enum, default_value_t = TableLockScope::Session)]
     scope: TableLockScope,
@@ -307,6 +364,18 @@ impl LockTableArgs {
     /// Return the required aggregate lock iteration count.
     pub(super) fn operation_count(&self) -> u64 {
         self.count.operation_count()
+    }
+
+    pub(super) fn scenario(&self) -> LockTableScenario {
+        self.scenario
+    }
+
+    pub(super) fn mode(&self) -> LockTableMode {
+        self.mode
+    }
+
+    pub(super) fn width(&self) -> usize {
+        self.width.get()
     }
 
     /// Return the configured lock ownership scope.
@@ -899,6 +968,9 @@ mod tests {
         };
         assert_eq!(args.operation_count(), 7);
         assert_eq!(args.scope(), TableLockScope::Session);
+        assert_eq!(args.scenario(), LockTableScenario::Basic);
+        assert_eq!(args.mode(), LockTableMode::Shared);
+        assert_eq!(args.width(), 1);
         assert!(!args.unlock());
         assert!(!args.random());
         assert_eq!(args.seed(), 0);
@@ -929,6 +1001,32 @@ mod tests {
         assert!(args.unlock());
         assert!(args.random());
         assert_eq!(args.seed(), 9);
+
+        let cli = Cli::try_parse_from([
+            "doradb-bench",
+            "run",
+            "lock-table",
+            "--root",
+            "root",
+            "--num",
+            "7",
+            "--scenario",
+            "scope-close",
+            "--mode",
+            "exclusive",
+            "--width",
+            "4",
+        ])
+        .unwrap();
+        let Command::Run {
+            workload: WorkloadArgs::LockTable(args),
+        } = cli.command
+        else {
+            panic!("expected lock-table command");
+        };
+        assert_eq!(args.scenario(), LockTableScenario::ScopeClose);
+        assert_eq!(args.mode(), LockTableMode::Exclusive);
+        assert_eq!(args.width(), 4);
     }
 
     #[test]

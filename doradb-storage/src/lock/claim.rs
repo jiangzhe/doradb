@@ -33,122 +33,18 @@ impl PendingClaimToken {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct InlineFamilyClaim {
-    scope: LockScope,
-    claim_no: ClaimNo,
-    mode: LockMode,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FamilyClaim<I> {
     id: I,
     claim_no: ClaimNo,
     mode: LockMode,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum FamilyClaims {
-    Inline(InlineFamilyClaim),
-    Expanded(Box<FamilyClaimSlots>),
-}
-
-impl FamilyClaims {
-    #[inline]
-    fn new(scope: LockScope, claim_no: ClaimNo, mode: LockMode) -> Self {
-        Self::Inline(InlineFamilyClaim {
-            scope,
-            claim_no,
-            mode,
-        })
-    }
-
-    #[inline]
-    fn get(&self, scope: LockScope) -> Option<ScopeClaim> {
-        match self {
-            Self::Inline(claim) if claim.scope == scope => Some(ScopeClaim {
-                claim_no: claim.claim_no,
-                mode: claim.mode,
-            }),
-            Self::Inline(_) => None,
-            Self::Expanded(slots) => slots.get(scope),
-        }
-    }
-
-    /// Inserts a distinct exact scope and returns whether inline storage expanded.
-    #[inline]
-    fn insert(&mut self, scope: LockScope, claim_no: ClaimNo, mode: LockMode) -> bool {
-        assert!(
-            self.get(scope).is_none(),
-            "duplicate family lock scope slot: scope={scope:?}, claim_no={claim_no:?}"
-        );
-        match self {
-            Self::Inline(inline) => {
-                assert!(
-                    scope_class(inline.scope) != scope_class(scope),
-                    "family lock topology permits at most one live scope per class: \
-                     existing_scope={:?}, new_scope={scope:?}",
-                    inline.scope
-                );
-                let previous = *inline;
-                let mut slots = Box::<FamilyClaimSlots>::default();
-                slots.insert(previous.scope, previous.claim_no, previous.mode);
-                slots.insert(scope, claim_no, mode);
-                *self = Self::Expanded(slots);
-                true
-            }
-            Self::Expanded(slots) => {
-                slots.insert(scope, claim_no, mode);
-                false
-            }
-        }
-    }
-
-    #[inline]
-    fn update(&mut self, scope: LockScope, claim_no: ClaimNo, mode: LockMode) {
-        match self {
-            Self::Inline(claim) if claim.scope == scope && claim.claim_no == claim_no => {
-                claim.mode = mode;
-            }
-            Self::Inline(claim) => panic!(
-                "family inline claim update mismatch: expected_scope={scope:?}, \
-                 expected_claim_no={claim_no:?}, actual_claim={claim:?}"
-            ),
-            Self::Expanded(slots) => slots.update(scope, claim_no, mode),
-        }
-    }
-
-    #[inline]
-    fn remove(&mut self, scope: LockScope, claim_no: ClaimNo) -> ScopeClaim {
-        match self {
-            Self::Inline(claim) if claim.scope == scope && claim.claim_no == claim_no => {
-                ScopeClaim {
-                    claim_no: claim.claim_no,
-                    mode: claim.mode,
-                }
-            }
-            Self::Inline(claim) => panic!(
-                "family inline claim removal mismatch: expected_scope={scope:?}, \
-                 expected_claim_no={claim_no:?}, actual_claim={claim:?}"
-            ),
-            Self::Expanded(slots) => slots.remove(scope, claim_no),
-        }
-    }
-
-    #[inline]
-    fn for_each(&self, mut visit: impl FnMut(LockScope, ScopeClaim)) {
-        match self {
-            Self::Inline(claim) => visit(
-                claim.scope,
-                ScopeClaim {
-                    claim_no: claim.claim_no,
-                    mode: claim.mode,
-                },
-            ),
-            Self::Expanded(slots) => slots.for_each(visit),
-        }
-    }
-}
-
+/// Fixed exact-scope claims for one `(family, resource)` pair.
+///
+/// This is the resource-oriented half of the owner-side dual index. Each
+/// occupied slot has a matching `LockScopeState` entry with the same
+/// `ClaimNo` and mode. The fixed layout also makes aggregate recomputation
+/// bounded by the number of scope classes rather than by session history.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct FamilyClaimSlots {
     session_explicit: Option<FamilyClaim<()>>,
@@ -286,23 +182,51 @@ impl FamilyClaimSlots {
     }
 }
 
+/// Compact set of distinct modes represented by a family or resource.
+///
+/// This mask records presence, not multiplicity, and it is not itself a lock
+/// mode. `ResourceState` pairs its mask with per-mode counts. The owner-side
+/// family aggregate instead recomputes this mask from its bounded claim slots,
+/// which is necessary when two scopes hold the same mode and one is removed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) struct ModeMask(u8);
+pub(crate) struct ModeMask(u8);
 
 impl ModeMask {
+    pub(super) const EMPTY: Self = Self(0);
+
     #[inline]
     pub(super) fn insert(&mut self, mode: LockMode) {
-        self.0 |= match mode {
-            LockMode::IntentShared => 1,
-            LockMode::IntentExclusive => 1 << 1,
-            LockMode::Shared => 1 << 2,
-            LockMode::Exclusive => 1 << 3,
-        };
+        self.0 |= mode_bit(mode);
+    }
+
+    #[inline]
+    pub(super) fn remove(&mut self, mode: LockMode) {
+        self.0 &= !mode_bit(mode);
+    }
+
+    #[inline]
+    pub(super) const fn is_empty(self) -> bool {
+        self.0 == 0
     }
 }
 
+/// Owner-side aggregate for one `(LockFamily, LockResource)` pair.
+///
+/// `claims` preserves the exact logical owners and lifetimes. `covering_mode`
+/// is the single mode published for this family in the physical
+/// `LockManager`; it must be one of the occupied claim modes and must cover
+/// every other occupied mode. `claim_mask` records all distinct logical modes
+/// for diagnostics and invariant checks.
+///
+/// Directional same-family admission keeps the occupied modes comparable, so
+/// aggregation only selects an existing strongest claim. It never synthesizes
+/// a join such as `SIX` and never silently promotes `S + IX` to `X`.
+///
+/// Mutations first calculate a candidate aggregate from the fixed slots.
+/// Callers can then perform any required physical transition before committing
+/// the matching claim-slot and exact-scope changes.
 pub(super) struct LocalFamilyResourceState {
-    claims: FamilyClaims,
+    claims: FamilyClaimSlots,
     claim_mask: ModeMask,
     covering_mode: LockMode,
 }
@@ -312,8 +236,10 @@ impl LocalFamilyResourceState {
     pub(super) fn new(scope: LockScope, claim_no: ClaimNo, mode: LockMode) -> Self {
         let mut claim_mask = ModeMask::default();
         claim_mask.insert(mode);
+        let mut claims = FamilyClaimSlots::default();
+        claims.insert(scope, claim_no, mode);
         Self {
-            claims: FamilyClaims::new(scope, claim_no, mode),
+            claims,
             claim_mask,
             covering_mode: mode,
         }
@@ -324,7 +250,6 @@ impl LocalFamilyResourceState {
         self.claims.get(scope)
     }
 
-    /// Inserts a distinct exact claim and returns whether inline storage expanded.
     #[inline]
     pub(super) fn insert(
         &mut self,
@@ -332,10 +257,9 @@ impl LocalFamilyResourceState {
         scope: LockScope,
         claim_no: ClaimNo,
         mode: LockMode,
-    ) -> bool {
-        let expanded = self.claims.insert(scope, claim_no, mode);
+    ) {
+        self.claims.insert(scope, claim_no, mode);
         self.recompute(resource);
-        expanded
     }
 
     #[inline]
@@ -371,6 +295,63 @@ impl LocalFamilyResourceState {
         self.claims.for_each(visit);
     }
 
+    #[inline]
+    pub(super) fn aggregates_after_update(
+        &self,
+        resource: LockResource,
+        scope: LockScope,
+        claim_no: ClaimNo,
+        mode: LockMode,
+    ) -> (ModeMask, LockMode) {
+        let current = self.claims.get(scope).unwrap_or_else(|| {
+            panic!(
+                "family claim update plan requires an occupied slot: \
+                 resource={resource}, scope={scope:?}, claim_no={claim_no:?}"
+            )
+        });
+        assert!(
+            current.claim_no == claim_no,
+            "family claim update plan has a stale claim number: \
+             resource={resource}, scope={scope:?}, expected={claim_no:?}, actual={:?}",
+            current.claim_no
+        );
+        // Plan the replacement without changing either owner-side index. A
+        // physical conversion may still fail, in which case the old aggregate
+        // and exact claim must remain authoritative.
+        self.aggregates_excluding(resource, scope, Some(mode))
+            .unwrap_or_else(|| {
+                panic!(
+                    "family claim update plan unexpectedly produced no claims: \
+                     resource={resource}, scope={scope:?}"
+                )
+            })
+    }
+
+    #[inline]
+    pub(super) fn aggregates_after_remove(
+        &self,
+        resource: LockResource,
+        scope: LockScope,
+        claim_no: ClaimNo,
+    ) -> Option<(ModeMask, LockMode)> {
+        let current = self.claims.get(scope).unwrap_or_else(|| {
+            panic!(
+                "family claim removal plan requires an occupied slot: \
+                 resource={resource}, scope={scope:?}, claim_no={claim_no:?}"
+            )
+        });
+        assert!(
+            current.claim_no == claim_no,
+            "family claim removal plan has a stale claim number: \
+             resource={resource}, scope={scope:?}, expected={claim_no:?}, actual={:?}",
+            current.claim_no
+        );
+        // As with conversion, compute the post-removal physical mode before
+        // deleting the logical claim. The caller publishes the physical
+        // transition first and commits both owner-side removals afterward.
+        self.aggregates_excluding(resource, scope, None)
+    }
+
     #[cfg(test)]
     #[inline]
     pub(super) const fn claim_mask(&self) -> ModeMask {
@@ -388,6 +369,10 @@ impl LocalFamilyResourceState {
         let mut covering = None;
         self.claims.for_each(|_scope, claim| {
             mask.insert(claim.mode);
+            // Same-family policy admits only a directional chain. Therefore
+            // one occupied claim must cover the other at each merge; reaching
+            // an incomparable pair means admission violated the aggregate
+            // representation rather than that a synthetic mode is needed.
             covering = match covering {
                 None => Some(claim.mode),
                 Some(current) if current.covers(resource, claim.mode) => Some(current),
@@ -404,15 +389,59 @@ impl LocalFamilyResourceState {
             panic!("live family/resource state must retain at least one claim: resource={resource}")
         });
     }
+
+    #[inline]
+    fn aggregates_excluding(
+        &self,
+        resource: LockResource,
+        excluded_scope: LockScope,
+        replacement: Option<LockMode>,
+    ) -> Option<(ModeMask, LockMode)> {
+        // Rebuild instead of clearing one bit from `claim_mask`: multiple
+        // scopes may hold the same mode, so removing one claim does not imply
+        // that the mode disappears from the aggregate.
+        let mut mask = ModeMask::default();
+        let mut covering = None;
+        self.claims.for_each(|scope, claim| {
+            let mode = if scope == excluded_scope {
+                let Some(mode) = replacement else {
+                    return;
+                };
+                mode
+            } else {
+                claim.mode
+            };
+            mask.insert(mode);
+            covering = merge_covering(resource, covering, mode);
+        });
+        covering.map(|mode| (mask, mode))
+    }
 }
 
 #[inline]
-const fn scope_class(scope: LockScope) -> u8 {
-    match scope {
-        LockScope::SessionExplicit => 0,
-        LockScope::Operation(_) => 1,
-        LockScope::Transaction(_) => 2,
-        LockScope::Statement(_, _) => 3,
+const fn mode_bit(mode: LockMode) -> u8 {
+    match mode {
+        LockMode::IntentShared => 1,
+        LockMode::IntentExclusive => 1 << 1,
+        LockMode::Shared => 1 << 2,
+        LockMode::Exclusive => 1 << 3,
+    }
+}
+
+#[inline]
+fn merge_covering(
+    resource: LockResource,
+    current: Option<LockMode>,
+    mode: LockMode,
+) -> Option<LockMode> {
+    match current {
+        None => Some(mode),
+        Some(current) if current.covers(resource, mode) => Some(current),
+        Some(current) if mode.covers(resource, current) => Some(mode),
+        Some(current) => panic!(
+            "family/resource claims have no occupied covering mode: \
+             resource={resource}, left={current}, right={mode}"
+        ),
     }
 }
 
@@ -475,29 +504,27 @@ mod tests {
     }
 
     #[test]
-    fn inline_claims_expand_once_reuse_slots_and_never_shrink() {
+    fn fixed_claim_slots_reuse_scope_classes() {
         let operation_id = OperationID::new(2);
         let transaction_id = TrxID::new(3);
-        let mut claims = FamilyClaims::new(
+        let mut claims = FamilyClaimSlots::default();
+        claims.insert(
             LockScope::SessionExplicit,
             ClaimNo::new(1),
             LockMode::Exclusive,
         );
-        assert!(matches!(claims, FamilyClaims::Inline(_)));
-        assert!(claims.insert(
+        claims.insert(
             LockScope::Operation(operation_id),
             ClaimNo::new(2),
-            LockMode::Shared
-        ));
-        assert!(matches!(claims, FamilyClaims::Expanded(_)));
+            LockMode::Shared,
+        );
 
         claims.remove(LockScope::Operation(operation_id), ClaimNo::new(2));
-        assert!(matches!(claims, FamilyClaims::Expanded(_)));
-        assert!(!claims.insert(
+        claims.insert(
             LockScope::Transaction(transaction_id),
             ClaimNo::new(3),
-            LockMode::IntentShared
-        ));
+            LockMode::IntentShared,
+        );
         assert_eq!(
             claims.get(LockScope::Transaction(transaction_id)),
             Some(ScopeClaim {
@@ -518,28 +545,26 @@ mod tests {
             ClaimNo::new(1),
             LockMode::Exclusive,
         );
-        assert!(state.insert(
+        state.insert(
             resource,
             LockScope::Operation(operation_id),
             ClaimNo::new(2),
             LockMode::Shared,
-        ));
-        assert!(!state.insert(
+        );
+        state.insert(
             resource,
             LockScope::Transaction(transaction_id),
             ClaimNo::new(3),
             LockMode::IntentShared,
-        ));
-        assert!(!state.insert(
+        );
+        state.insert(
             resource,
             LockScope::Statement(transaction_id, statement_no),
             ClaimNo::new(4),
             LockMode::IntentShared,
-        ));
+        );
 
-        let FamilyClaims::Expanded(slots) = &state.claims else {
-            panic!("four claims must use expanded typed slots")
-        };
+        let slots = &state.claims;
         assert!(slots.session_explicit.is_some());
         assert_eq!(slots.operation.unwrap().id, operation_id);
         assert_eq!(slots.transaction.unwrap().id, transaction_id);

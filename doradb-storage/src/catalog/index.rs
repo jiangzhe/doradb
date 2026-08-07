@@ -27,7 +27,7 @@ use crate::runtime::mandatory::{AcceptedExecution, MandatoryTaskMetadata, Prepar
 use crate::runtime::{POLL_BUDGET, yield_now};
 use crate::session::{AcceptedDdlScope, PreparedDdlScope};
 use crate::table::{DeleteMarker, Table, TableRuntimeLayout, secondary_disk_tree_encoder};
-use crate::trx::{PreparedCatalogWriteAuthority, Transaction, trx_is_committed};
+use crate::trx::{Transaction, trx_is_committed};
 use crate::value::Val;
 use error_stack::{Report, ResultExt};
 use std::any::Any;
@@ -652,7 +652,6 @@ impl CreateIndexProgress {
     async fn execute_catalog_update(
         &mut self,
         engine: &EngineCore,
-        authority: PreparedCatalogWriteAuthority<'_>,
         metadata: &TableMetadata,
         index_spec: &IndexSpec,
     ) -> RuntimeOrFatalResult<()> {
@@ -666,7 +665,6 @@ impl CreateIndexProgress {
         let res = execute_create_index_catalog_update(
             &engine.catalog().storage,
             trx,
-            authority,
             self.table_id,
             self.index_no,
             metadata,
@@ -811,7 +809,6 @@ impl DropIndexProgress {
     async fn execute_catalog_update(
         &mut self,
         catalog: &Catalog,
-        authority: PreparedCatalogWriteAuthority<'_>,
         old_index_spec: &IndexSpec,
     ) -> RuntimeOrFatalResult<()> {
         debug_assert_eq!(self.phase, DropIndexBuildPhase::LayoutStaged);
@@ -824,7 +821,6 @@ impl DropIndexProgress {
         let res = execute_drop_index_catalog_update(
             &catalog.storage,
             trx,
-            authority,
             self.table_id,
             self.index_no,
             old_index_spec,
@@ -1198,14 +1194,8 @@ impl AcceptedCreateIndex {
         );
         progress.stage_layout(new_layout);
 
-        let authority = self.scope.catalog_write_authority();
         if let Err(err) = progress
-            .execute_catalog_update(
-                engine,
-                authority,
-                plan.new_metadata.as_ref(),
-                &plan.new_index_spec,
-            )
+            .execute_catalog_update(engine, plan.new_metadata.as_ref(), &plan.new_index_spec)
             .await
         {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(err));
@@ -1444,9 +1434,8 @@ impl AcceptedDropIndex {
             .reach_phase(IndexDdlTestPhase::DropRuntimeStaged)
             .await;
 
-        let authority = self.scope.catalog_write_authority();
         if let Err(err) = progress
-            .execute_catalog_update(engine.catalog(), authority, &plan.old_index_spec)
+            .execute_catalog_update(engine.catalog(), &plan.old_index_spec)
             .await
         {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(err));
@@ -1952,12 +1941,11 @@ async fn destroy_uninstalled_staged_index(
 async fn execute_drop_index_catalog_update(
     storage: &CatalogStorage,
     trx: &mut Transaction,
-    authority: PreparedCatalogWriteAuthority<'_>,
     table_id: TableID,
     index_no: IndexNo,
     old_index_spec: &IndexSpec,
 ) -> RuntimeResult<()> {
-    trx.stage_prepared_catalog_statement(authority, async |stmt| {
+    trx.stage_catalog_statement(async |stmt| {
         let deleted_columns = storage
             .index_columns()
             .delete_by_index(stmt, table_id, index_no)
@@ -1998,13 +1986,12 @@ async fn execute_drop_index_catalog_update(
 async fn execute_create_index_catalog_update(
     storage: &CatalogStorage,
     trx: &mut Transaction,
-    authority: PreparedCatalogWriteAuthority<'_>,
     table_id: TableID,
     index_no: IndexNo,
     metadata: &TableMetadata,
     index_spec: &IndexSpec,
 ) -> RuntimeResult<()> {
-    trx.stage_prepared_catalog_statement(authority, async |stmt| {
+    trx.stage_catalog_statement(async |stmt| {
         let table_deleted = storage
             .tables()
             .delete_by_id(stmt, table_id)

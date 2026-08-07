@@ -37,7 +37,11 @@ impl StreamStmtState {
 
     #[inline]
     fn runtime(&self) -> TrxRuntime<'_> {
-        TrxRuntime::new(self.checkout.inner().ctx(), self.checkout.attachment())
+        TrxRuntime::new(
+            self.checkout.inner().ctx(),
+            self.checkout.attachment(),
+            self.checkout.inner().checked_lock_state(),
+        )
     }
 
     #[inline]

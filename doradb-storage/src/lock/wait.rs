@@ -1,9 +1,6 @@
 use super::claim::PendingClaimToken;
 use super::state::{FamilyLockState, LockScopeState};
-use super::{
-    LockGrant, LockManager, LockMode, LockOwner, PendingObservation, PendingStart,
-    lock_waiter_released_err,
-};
+use super::{LockGrant, LockManager, LockMode, LockOwner, PendingStart};
 use crate::completion::Completion;
 use crate::error::OperationResult;
 use crate::id::ClaimNo;
@@ -41,7 +38,6 @@ pub(super) enum WaitNodePhase {
         next: Option<WaitNodeID>,
     },
     Provisional,
-    Released,
 }
 
 pub(super) struct WaitNodeSlab {
@@ -180,10 +176,33 @@ impl WaitNodeSlab {
     }
 
     #[inline]
+    fn assert_reclaimable(&self, id: WaitNodeID) {
+        let slot = self.slots.get(id.slot).unwrap_or_else(|| {
+            panic!(
+                "waiter reclaim slot is out of bounds: id={id:?}, slots_len={}",
+                self.slots.len()
+            )
+        });
+        assert!(
+            slot.generation == id.generation,
+            "stale waiter reclaim generation: id={id:?}, actual_generation={}",
+            slot.generation
+        );
+        assert!(
+            matches!(slot.entry, WaitNodeSlotEntry::Occupied(_)),
+            "waiter reclaim requires an occupied slot: id={id:?}"
+        );
+        let _ = slot.generation.checked_add(1).unwrap_or_else(|| {
+            panic!("waiter node generation exhausted before reclamation: id={id:?}")
+        });
+    }
+
+    #[inline]
     pub(super) const fn live_count(&self) -> usize {
         self.live_count
     }
 
+    #[cfg(test)]
     #[inline]
     pub(super) fn occupied_ids(&self) -> Vec<WaitNodeID> {
         self.slots
@@ -196,14 +215,6 @@ impl WaitNodeSlab {
                 })
             })
             .collect()
-    }
-
-    #[inline]
-    fn any_occupied(&self, mut predicate: impl FnMut(&WaitNode) -> bool) -> bool {
-        self.slots.iter().any(|slot| match &slot.entry {
-            WaitNodeSlotEntry::Occupied(node) => predicate(node),
-            WaitNodeSlotEntry::Vacant { .. } => false,
-        })
     }
 }
 
@@ -309,11 +320,7 @@ impl WaitQueue {
     }
 
     #[inline]
-    pub(super) fn detach_to(&mut self, id: WaitNodeID, phase: WaitNodePhase) {
-        assert!(
-            matches!(phase, WaitNodePhase::Provisional | WaitNodePhase::Released),
-            "waiter detach requires a detached phase: id={id:?}, phase={phase:?}"
-        );
+    pub(super) fn detach_to_provisional(&mut self, id: WaitNodeID) {
         let (prev, next) = match self.nodes.get(id).phase {
             WaitNodePhase::Queued { prev, next } => (prev, next),
             actual => {
@@ -387,76 +394,46 @@ impl WaitQueue {
         } else {
             self.tail = prev;
         }
-        self.nodes.get_mut(id).phase = phase;
+        self.nodes.get_mut(id).phase = WaitNodePhase::Provisional;
     }
 
     #[inline]
-    pub(super) fn set_released(&mut self, id: WaitNodeID) {
-        let node = self.nodes.get_mut(id);
-        assert!(
-            node.phase == WaitNodePhase::Provisional,
-            "waiter release requires a provisional node: id={id:?}, phase={:?}",
-            node.phase
-        );
-        node.phase = WaitNodePhase::Released;
+    pub(super) fn remove_queued(&mut self, id: WaitNodeID) -> WaitNode {
+        self.nodes.assert_reclaimable(id);
+        self.detach_to_provisional(id);
+        self.consume_provisional(id)
     }
 
     #[inline]
-    pub(super) fn consume(&mut self, id: WaitNodeID, expected: WaitNodePhase) -> WaitNode {
+    pub(super) fn consume_provisional(&mut self, id: WaitNodeID) -> WaitNode {
         assert!(
-            matches!(
-                expected,
-                WaitNodePhase::Provisional | WaitNodePhase::Released
-            ),
-            "waiter consume requires a detached phase: id={id:?}, expected={expected:?}"
-        );
-        assert!(
-            self.nodes.get(id).phase == expected,
-            "waiter consume phase mismatch: id={id:?}, expected={expected:?}, actual={:?}",
+            self.nodes.get(id).phase == WaitNodePhase::Provisional,
+            "waiter consume requires a provisional node: id={id:?}, actual={:?}",
             self.nodes.get(id).phase
         );
         self.nodes.reclaim(id)
     }
 
+    #[cfg(test)]
     #[inline]
     pub(super) fn occupied_ids(&self) -> Vec<WaitNodeID> {
         self.nodes.occupied_ids()
     }
 
     #[inline]
-    pub(super) fn any_occupied(&self, predicate: impl FnMut(&WaitNode) -> bool) -> bool {
-        self.nodes.any_occupied(predicate)
-    }
-
-    #[inline]
-    pub(super) fn find_linked(
-        &self,
-        mut predicate: impl FnMut(&WaitNode) -> bool,
-    ) -> Option<&WaitNode> {
-        let mut next = self.head;
-        while let Some(id) = next {
-            let node = self.nodes.get(id);
-            if predicate(node) {
-                return Some(node);
-            }
-            next = match node.phase {
-                WaitNodePhase::Queued { next, .. } => next,
-                phase => {
-                    panic!("linked waiter has a detached phase: id={id:?}, phase={phase:?}")
-                }
-            };
-        }
-        None
-    }
-
-    #[inline]
     pub(super) const fn live_count(&self) -> usize {
         self.nodes.live_count()
+    }
+
+    #[inline]
+    pub(super) fn allocated_slots(&self) -> usize {
+        self.nodes.slots.len()
     }
 }
 
 pub(super) enum PendingGuardState {
     NotStarted,
+    LocalCovered,
     Waiting {
         node_id: WaitNodeID,
         completion: Arc<Completion<()>>,
@@ -465,6 +442,24 @@ pub(super) enum PendingGuardState {
     Disarmed,
 }
 
+/// Rollback owner for a fresh logical claim until all representations agree.
+///
+/// A fresh claim follows one of two paths:
+///
+/// ```text
+/// family-covered:
+///     publish family/resource slot -> publish exact-scope entry -> accept
+///
+/// first physical claim:
+///     grant or queue manager family -> publish both owner-side entries
+///     -> adopt any provisional grant -> accept
+/// ```
+///
+/// `token` is the unique identity connecting the manager request and both
+/// owner-side indexes. The guard retains it until acceptance. Dropping at any
+/// intermediate state removes staged owner-side entries and cancels or
+/// releases the physical family state, so a partially transferred claim never
+/// becomes an accepted aggregate.
 pub(super) struct PendingClaimGuard<'a> {
     manager: &'a LockManager,
     family: &'a mut FamilyLockState,
@@ -498,8 +493,31 @@ impl<'a> PendingClaimGuard<'a> {
         }
     }
 
+    /// Publishes a fresh exact claim covered by the family's existing physical mode.
+    #[inline]
+    pub(super) fn acquire_covered(mut self) -> OperationResult<LockGrant> {
+        assert!(
+            self.family_covered,
+            "owner-local pending acquisition requires existing family coverage"
+        );
+        self.state = PendingGuardState::LocalCovered;
+        self.publish_local();
+        self.accept()
+    }
+
+    /// Acquires the family's first physical holder.
+    ///
+    /// After first poll, the caller must eventually continue polling this
+    /// future or drop it. Retaining it indefinitely without polling retains
+    /// its queued request or provisional physical reservation and may block
+    /// other acquisitions. No timeout, lease, watchdog, or background
+    /// reclamation is provided.
     #[inline]
     pub(super) async fn acquire(mut self) -> OperationResult<LockGrant> {
+        assert!(
+            !self.family_covered,
+            "first-physical pending acquisition cannot already be family-covered"
+        );
         let token = self.token.as_ref().unwrap_or_else(|| {
             panic!("pending claim guard must retain its token before manager entry")
         });
@@ -526,26 +544,32 @@ impl<'a> PendingClaimGuard<'a> {
                 completion_result.is_ok(),
                 "lock waiter success-only completion carried an error"
             );
+            // Promotion has already counted this family as physically
+            // granted. Stage both logical indexes before changing
+            // Provisional to Held; guard drop can still remove all three
+            // representations if observation or transfer cannot finish.
+            self.publish_local();
             let token = self.token.as_ref().unwrap_or_else(|| {
                 panic!("waiting pending claim guard lost its token before observation")
             });
-            match self
-                .manager
-                .observe_pending(token, self.requested_mode, node_id)
-            {
-                PendingObservation::Adopted => {
-                    self.state = PendingGuardState::FreshGranted;
-                }
-                PendingObservation::Released => {
-                    self.state = PendingGuardState::Disarmed;
-                    let token = self.token.take().unwrap_or_else(|| {
-                        panic!("released pending claim guard must retain its move-only token")
-                    });
-                    return Err(lock_waiter_released_err(token, self.requested_mode));
-                }
-            }
+            self.manager
+                .observe_pending(token, self.requested_mode, node_id);
+            self.state = PendingGuardState::FreshGranted;
         }
 
+        if !self.transfer_started {
+            // Immediate physical grants reach this point without owner-side
+            // records. Covered claims published them in `acquire_covered`.
+            self.publish_local();
+        }
+        self.accept()
+    }
+
+    #[inline]
+    fn publish_local(&mut self) {
+        // Mark transfer first so unwinding between the two publications runs
+        // token-exact rollback. Family authority prevents concurrent scope
+        // cleanup from observing the temporary one-sided publication.
         self.transfer_started = true;
         let token = self.token.as_ref().unwrap_or_else(|| {
             panic!("fresh-granted pending claim guard lost its token before publication")
@@ -554,14 +578,30 @@ impl<'a> PendingClaimGuard<'a> {
             .publish_pending_family(token, self.requested_mode);
         self.curr_scope
             .publish_pending_scope(token, self.requested_mode);
+    }
 
-        let accepted = self
+    #[inline]
+    fn accept(mut self) -> OperationResult<LockGrant> {
+        let token = self.token.as_ref().unwrap_or_else(|| {
+            panic!("accepted pending claim must retain its token before validation")
+        });
+        assert!(
+            self.family_covered || matches!(self.state, PendingGuardState::FreshGranted),
+            "pending claim acceptance requires local coverage or a held physical family: \
+             resource={}, owner={}, state={}",
+            token.resource,
+            token.owner,
+            pending_guard_state_label(&self.state)
+        );
+        self.family
+            .record_pending_accept(token, self.family_covered);
+        // Consuming the pending token is the commit point: the manager and
+        // both owner-side indexes now agree, so Drop must perform no rollback.
+        let _accepted = self
             .token
             .take()
             .unwrap_or_else(|| panic!("accepted pending claim must retain its move-only token"))
             .accept();
-        self.family
-            .record_pending_accept(&accepted, self.family_covered);
         self.transfer_started = false;
         self.state = PendingGuardState::Disarmed;
         Ok(LockGrant::Fresh)
@@ -579,6 +619,15 @@ impl Drop for PendingClaimGuard<'_> {
                     "unstarted pending claim guard must retain its move-only token"
                 );
             }
+            PendingGuardState::LocalCovered => {
+                let token = token.unwrap_or_else(|| {
+                    panic!("local pending claim guard must retain its move-only token")
+                });
+                if self.transfer_started {
+                    self.family
+                        .rollback_pending_publication(self.curr_scope, &token);
+                }
+            }
             PendingGuardState::Disarmed => {
                 assert!(
                     token.is_none(),
@@ -589,6 +638,10 @@ impl Drop for PendingClaimGuard<'_> {
                 let token = token.unwrap_or_else(|| {
                     panic!("waiting pending claim guard must retain its move-only token")
                 });
+                if self.transfer_started {
+                    self.family
+                        .rollback_pending_publication(self.curr_scope, &token);
+                }
                 self.manager
                     .cancel_waiting(token, self.requested_mode, *node_id);
             }
@@ -603,6 +656,17 @@ impl Drop for PendingClaimGuard<'_> {
                 self.manager.cancel_fresh_grant(token, self.requested_mode);
             }
         }
+    }
+}
+
+#[inline]
+fn pending_guard_state_label(state: &PendingGuardState) -> &'static str {
+    match state {
+        PendingGuardState::NotStarted => "not_started",
+        PendingGuardState::LocalCovered => "local_covered",
+        PendingGuardState::Waiting { .. } => "waiting",
+        PendingGuardState::FreshGranted => "fresh_granted",
+        PendingGuardState::Disarmed => "disarmed",
     }
 }
 
@@ -736,8 +800,7 @@ pub(in crate::lock) mod tests {
         assert!(empty.slab.free_order.is_empty());
 
         let first = queue.append(owner(1), ClaimNo::new(1), LockMode::Shared, completion());
-        queue.detach_to(first, WaitNodePhase::Released);
-        let _ = queue.consume(first, WaitNodePhase::Released);
+        let _ = queue.remove_queued(first);
         let reclaimed = queue_snapshot(&queue);
         assert_eq!(reclaimed.slab.slots_len, 1);
         assert_eq!(reclaimed.slab.free_order, vec![0]);
@@ -770,18 +833,15 @@ pub(in crate::lock) mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        queue.detach_to(ids[1], WaitNodePhase::Released);
+        let _ = queue.remove_queued(ids[1]);
         assert_eq!(linked_ids(&queue), vec![ids[0], ids[2], ids[3]]);
-        queue.detach_to(ids[0], WaitNodePhase::Released);
+        let _ = queue.remove_queued(ids[0]);
         assert_eq!(linked_ids(&queue), vec![ids[2], ids[3]]);
-        queue.detach_to(ids[3], WaitNodePhase::Released);
+        let _ = queue.remove_queued(ids[3]);
         assert_eq!(linked_ids(&queue), vec![ids[2]]);
-        queue.detach_to(ids[2], WaitNodePhase::Released);
+        let _ = queue.remove_queued(ids[2]);
         assert!(linked_ids(&queue).is_empty());
         assert!(queue.head().is_none());
-        for id in ids {
-            let _ = queue.consume(id, WaitNodePhase::Released);
-        }
         assert_eq!(queue.live_count(), 0);
     }
 
@@ -789,12 +849,11 @@ pub(in crate::lock) mod tests {
     fn stale_id_panics_before_reused_node_mutation() {
         let mut queue = WaitQueue::default();
         let first = queue.append(owner(1), ClaimNo::new(1), LockMode::Shared, completion());
-        queue.detach_to(first, WaitNodePhase::Released);
-        let _ = queue.consume(first, WaitNodePhase::Released);
+        let _ = queue.remove_queued(first);
         let reused = queue.append(owner(2), ClaimNo::new(2), LockMode::Shared, completion());
         let before = queue_snapshot(&queue);
         let panic = catch_unwind(AssertUnwindSafe(|| {
-            queue.detach_to(first, WaitNodePhase::Released);
+            let _ = queue.remove_queued(first);
         }));
         assert!(panic.is_err());
         assert_eq!(queue_snapshot(&queue), before);
@@ -813,7 +872,7 @@ pub(in crate::lock) mod tests {
         *prev = Some(ids[0]);
 
         let panic = catch_unwind(AssertUnwindSafe(|| {
-            queue.detach_to(ids[1], WaitNodePhase::Released);
+            let _ = queue.remove_queued(ids[1]);
         }));
 
         assert!(panic.is_err());
@@ -837,11 +896,10 @@ pub(in crate::lock) mod tests {
         queue.nodes.slots[initial.slot].generation = u64::MAX;
         queue.head = Some(exhausted);
         queue.tail = Some(exhausted);
-        queue.detach_to(exhausted, WaitNodePhase::Released);
         let before = queue_snapshot(&queue);
 
         let panic = catch_unwind(AssertUnwindSafe(|| {
-            let _ = queue.consume(exhausted, WaitNodePhase::Released);
+            let _ = queue.remove_queued(exhausted);
         }));
 
         assert!(panic.is_err());
@@ -849,7 +907,10 @@ pub(in crate::lock) mod tests {
         assert_eq!(queue.live_count(), 1);
         assert_eq!(
             queue.node(exhausted).phase,
-            WaitNodePhase::Released,
+            WaitNodePhase::Queued {
+                prev: None,
+                next: None,
+            },
             "generation exhaustion must not expose the slot for reuse"
         );
     }
@@ -861,8 +922,7 @@ pub(in crate::lock) mod tests {
             .map(|id| queue.append(owner(id), ClaimNo::new(id), LockMode::Shared, completion()))
             .collect::<Vec<_>>();
         for id in [ids[1], ids[0], ids[2]] {
-            queue.detach_to(id, WaitNodePhase::Released);
-            let _ = queue.consume(id, WaitNodePhase::Released);
+            let _ = queue.remove_queued(id);
         }
         assert_eq!(queue_snapshot(&queue).slab.free_order, vec![2, 0, 1]);
 
@@ -910,8 +970,7 @@ pub(in crate::lock) mod tests {
             } else {
                 let index = usize::try_from(random).unwrap() % queue_model.len();
                 let id = queue_model.remove(index);
-                queue.detach_to(id, WaitNodePhase::Released);
-                let _ = queue.consume(id, WaitNodePhase::Released);
+                let _ = queue.remove_queued(id);
                 generations[id.slot] += 1;
                 free_model.insert(0, id.slot);
             }
@@ -985,7 +1044,6 @@ pub(in crate::lock) mod tests {
 
             family.assert_empty();
             curr_scope.assert_cleared();
-            assert!(!manager.owner_holds(resource, owner, LockMode::Shared));
             assert!(manager.resources.get(&resource).is_none());
         }
     }
@@ -1019,14 +1077,12 @@ pub(in crate::lock) mod tests {
         else {
             panic!("conflicting fresh request must wait")
         };
-        assert_eq!(manager.release_owner(blocker), 1);
-        assert!(matches!(
-            manager.observe_pending(&pending, LockMode::Shared, node_id),
-            PendingObservation::Adopted
-        ));
+        manager.cancel_fresh_grant(blocker_token, LockMode::Exclusive);
+        manager.observe_pending(&pending, LockMode::Shared, node_id);
         let resource_state = manager.resources.get(&resource).unwrap();
         assert_eq!(resource_state.wait_queue.live_count(), 0);
-        assert_eq!(resource_state.granted.len(), 1);
+        assert_eq!(resource_state.families.len(), 1);
+        assert_eq!(resource_state.granted_counts, [0, 0, 1, 0]);
         drop(resource_state);
 
         let mut guard = PendingClaimGuard::new(

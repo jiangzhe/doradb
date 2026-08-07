@@ -85,7 +85,12 @@ impl WorkloadRunner for InsertSeqRunner {
         }
     }
 
-    async fn run(&self, session: &mut Session, plan: &SessionPlan) -> Result<SessionSummary> {
+    async fn run(
+        &self,
+        _engine: &doradb_storage::Engine,
+        session: &mut Session,
+        plan: &SessionPlan,
+    ) -> Result<SessionSummary> {
         let keys = generate_insert_keys(false, self.index, self.seed, plan)?;
         insert_keys(
             session,
@@ -182,7 +187,12 @@ impl WorkloadRunner for InsertRandRunner {
         }
     }
 
-    async fn run(&self, session: &mut Session, plan: &SessionPlan) -> Result<SessionSummary> {
+    async fn run(
+        &self,
+        _engine: &doradb_storage::Engine,
+        session: &mut Session,
+        plan: &SessionPlan,
+    ) -> Result<SessionSummary> {
         let keys = generate_insert_keys(true, self.index, self.seed, plan)?;
         insert_keys(
             session,

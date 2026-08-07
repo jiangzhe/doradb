@@ -58,7 +58,7 @@ pub use session::{
     CatalogRedoMaintenanceOutcome, RedoTruncationBlockerInfo, RedoTruncationOutcome, Session,
 };
 pub use stats::{
-    BufferPoolCounters, BufferPoolRuntimeStats, BufferPoolStats, IoBackendStats,
+    BufferPoolCounters, BufferPoolRuntimeStats, BufferPoolStats, IoBackendStats, LogicalLockStats,
     MandatoryRuntimeStats, MandatoryTaskStats, StorageIoStats, TransactionSystemStats,
 };
 pub use table::{

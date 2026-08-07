@@ -181,6 +181,9 @@ where
         scope: config.lock_scope(),
         unlock: config.unlock(),
         tables: config.prepared_table_count(),
+        scenario: config.lock_scenario(),
+        lock_mode: config.lock_mode(),
+        width: config.lock_width(),
     };
     write_benchmark_outputs(&output_config, &metrics, &result, command_context)?;
 
@@ -291,7 +294,7 @@ async fn execute_session<R: WorkloadRunner>(
     plan: SessionPlan,
 ) -> Result<SessionSummary> {
     let mut session = engine.new_session()?;
-    let run_result = runner.run(&mut session, &plan).await;
+    let run_result = runner.run(engine, &mut session, &plan).await;
     finish_session(session, run_result).await
 }
 
