@@ -1,9 +1,5 @@
 use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards};
-use crate::catalog::storage::CatalogStorage;
-use crate::catalog::{
-    Catalog, IndexColumnObject, IndexNo, IndexObject, IndexSpec, TableMetadata, TableObject,
-    catalog_table_id_from_slot,
-};
+use crate::catalog::{Catalog, IndexNo, IndexSpec, TableMetadata, catalog_table_id_from_slot};
 use crate::engine::EngineCore;
 use crate::error::{
     CompletionErrorBridge, CompletionResult, DataIntegrityError, DataIntegrityResult,
@@ -18,7 +14,6 @@ use crate::index::{
     BTreeKey, BTreeKeyEncoder, ColumnBlockIndex, IndexInsert, NonUniqueMemIndex,
     SecondaryDiskTreeRuntime, SecondaryIndex, UniqueMemIndex,
 };
-use crate::log::redo::DDLRedo;
 use crate::obs;
 use crate::poison::EnginePoisoner;
 use crate::quiescent::QuiescentGuard;
@@ -27,7 +22,7 @@ use crate::runtime::mandatory::{AcceptedExecution, MandatoryTaskMetadata, Prepar
 use crate::runtime::{POLL_BUDGET, yield_now};
 use crate::session::{AcceptedDdlScope, PreparedDdlScope};
 use crate::table::{DeleteMarker, Table, TableRuntimeLayout, secondary_disk_tree_encoder};
-use crate::trx::{Transaction, trx_is_committed};
+use crate::trx::{PrivateTransaction, trx_is_committed};
 use crate::value::Val;
 use error_stack::{Report, ResultExt};
 use std::any::Any;
@@ -158,7 +153,6 @@ pub(crate) struct DropIndexPlan {
     table: Arc<Table>,
     old_layout: Arc<TableRuntimeLayout>,
     index_no: IndexNo,
-    old_index_spec: IndexSpec,
     new_metadata: Arc<TableMetadata>,
     secondary_index_roots: Vec<BlockID>,
 }
@@ -169,7 +163,7 @@ impl DropIndexPlan {
         let old_layout = table.layout_snapshot();
         let old_metadata = old_layout.metadata();
         let index_no_usize = usize::from(index_no);
-        let old_index_spec = old_metadata
+        old_metadata
             .idx
             .index_spec(index_no_usize)
             .ok_or_else(|| {
@@ -177,8 +171,7 @@ impl DropIndexPlan {
                     "drop index target not found: table_id={table_id}, index_no={index_no}, reason=inactive_metadata_slot"
                 ))
             })
-            .disclose()?
-            .clone();
+            .disclose()?;
         old_layout
             .secondary_index(index_no_usize)
             .expect("active index metadata must have a matching runtime index");
@@ -193,7 +186,6 @@ impl DropIndexPlan {
             table,
             old_layout,
             index_no,
-            old_index_spec,
             new_metadata,
             secondary_index_roots,
         })
@@ -589,14 +581,14 @@ struct CreateIndexProgress {
     index_no: IndexNo,
     build_ts: TrxID,
     phase: CreateIndexBuildPhase,
-    trx: Option<Transaction>,
+    trx: Option<PrivateTransaction>,
     staged_index: Option<Arc<SecondaryIndex<EvictableBufferPool>>>,
     new_layout: Option<TableRuntimeLayout>,
 }
 
 impl CreateIndexProgress {
     #[inline]
-    fn new(table_id: TableID, index_no: IndexNo, trx: Transaction) -> Self {
+    fn new(table_id: TableID, index_no: IndexNo, trx: PrivateTransaction) -> Self {
         let build_ts = trx.sts();
         Self {
             table_id,
@@ -606,6 +598,13 @@ impl CreateIndexProgress {
             trx: Some(trx),
             staged_index: None,
             new_layout: None,
+        }
+    }
+
+    #[inline]
+    fn park_active_transaction(&mut self) {
+        if let Some(trx) = self.trx.take() {
+            trx.park();
         }
     }
 
@@ -652,8 +651,7 @@ impl CreateIndexProgress {
     async fn execute_catalog_update(
         &mut self,
         engine: &EngineCore,
-        metadata: &TableMetadata,
-        index_spec: &IndexSpec,
+        new_metadata: &TableMetadata,
     ) -> RuntimeOrFatalResult<()> {
         debug_assert_eq!(self.phase, CreateIndexBuildPhase::LayoutStaged);
         let trx = self.trx.as_mut().unwrap_or_else(|| {
@@ -662,15 +660,11 @@ impl CreateIndexProgress {
                 self.table_id, self.index_no
             )
         });
-        let res = execute_create_index_catalog_update(
-            &engine.catalog().storage,
-            trx,
-            self.table_id,
-            self.index_no,
-            metadata,
-            index_spec,
-        )
-        .await;
+        let res = engine
+            .catalog()
+            .storage
+            .stage_create_index(trx, self.table_id, self.index_no, new_metadata)
+            .await;
         match res {
             Ok(()) => Ok(()),
             Err(err) => {
@@ -783,19 +777,26 @@ struct DropIndexProgress {
     table_id: TableID,
     index_no: IndexNo,
     phase: DropIndexBuildPhase,
-    trx: Option<Transaction>,
+    trx: Option<PrivateTransaction>,
     new_layout: Option<TableRuntimeLayout>,
 }
 
 impl DropIndexProgress {
     #[inline]
-    fn new(table_id: TableID, index_no: IndexNo, trx: Transaction) -> Self {
+    fn new(table_id: TableID, index_no: IndexNo, trx: PrivateTransaction) -> Self {
         Self {
             table_id,
             index_no,
             phase: DropIndexBuildPhase::LayoutStaged,
             trx: Some(trx),
             new_layout: None,
+        }
+    }
+
+    #[inline]
+    fn park_active_transaction(&mut self) {
+        if let Some(trx) = self.trx.take() {
+            trx.park();
         }
     }
 
@@ -809,7 +810,7 @@ impl DropIndexProgress {
     async fn execute_catalog_update(
         &mut self,
         catalog: &Catalog,
-        old_index_spec: &IndexSpec,
+        old_metadata: &TableMetadata,
     ) -> RuntimeOrFatalResult<()> {
         debug_assert_eq!(self.phase, DropIndexBuildPhase::LayoutStaged);
         let trx = self.trx.as_mut().unwrap_or_else(|| {
@@ -818,14 +819,10 @@ impl DropIndexProgress {
                 self.table_id, self.index_no
             )
         });
-        let res = execute_drop_index_catalog_update(
-            &catalog.storage,
-            trx,
-            self.table_id,
-            self.index_no,
-            old_index_spec,
-        )
-        .await;
+        let res = catalog
+            .storage
+            .stage_drop_index(trx, self.table_id, self.index_no, old_metadata)
+            .await;
         match res {
             Ok(()) => Ok(()),
             Err(err) => {
@@ -996,6 +993,9 @@ impl AcceptedExecution for AcceptedCreateIndex {
 
     #[inline]
     async fn handle_panic(&mut self, _panic: Box<dyn Any + Send>) -> CompletionErrorBridge {
+        if let Some(progress) = self.progress.as_mut() {
+            progress.park_active_transaction();
+        }
         self.scope.handle_panic();
         let phase = self
             .progress
@@ -1195,7 +1195,7 @@ impl AcceptedCreateIndex {
         progress.stage_layout(new_layout);
 
         if let Err(err) = progress
-            .execute_catalog_update(engine, plan.new_metadata.as_ref(), &plan.new_index_spec)
+            .execute_catalog_update(engine, plan.new_metadata.as_ref())
             .await
         {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(err));
@@ -1364,6 +1364,9 @@ impl AcceptedExecution for AcceptedDropIndex {
 
     #[inline]
     async fn handle_panic(&mut self, _panic: Box<dyn Any + Send>) -> CompletionErrorBridge {
+        if let Some(progress) = self.progress.as_mut() {
+            progress.park_active_transaction();
+        }
         self.scope.handle_panic();
         let phase = self
             .progress
@@ -1435,7 +1438,7 @@ impl AcceptedDropIndex {
             .await;
 
         if let Err(err) = progress
-            .execute_catalog_update(engine.catalog(), &plan.old_index_spec)
+            .execute_catalog_update(engine.catalog(), plan.old_layout.metadata())
             .await
         {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(err));
@@ -1633,13 +1636,11 @@ pub(crate) fn classify_index_ddl_root(
     }
 }
 
-async fn rollback_active_ddl_trx(trx: &mut Option<Transaction>) -> RuntimeOrFatalResult<()> {
+async fn rollback_active_ddl_trx(trx: &mut Option<PrivateTransaction>) -> RuntimeOrFatalResult<()> {
     let Some(trx) = trx.take() else {
         return Ok(());
     };
-    if trx.engine().is_some() {
-        trx.rollback_catalog_ddl().await?;
-    }
+    trx.rollback_catalog_ddl().await?;
     Ok(())
 }
 
@@ -1935,120 +1936,6 @@ async fn destroy_uninstalled_staged_index(
         .await
         .change_context(RuntimeError::CatalogAccess)
         .attach("operation=destroy_uninstalled_create_index_runtime")
-}
-
-#[inline]
-async fn execute_drop_index_catalog_update(
-    storage: &CatalogStorage,
-    trx: &mut Transaction,
-    table_id: TableID,
-    index_no: IndexNo,
-    old_index_spec: &IndexSpec,
-) -> RuntimeResult<()> {
-    trx.stage_catalog_statement(async |stmt| {
-        let deleted_columns = storage
-            .index_columns()
-            .delete_by_index(stmt, table_id, index_no)
-            .await?;
-        assert_eq!(
-            deleted_columns,
-            old_index_spec.cols.len(),
-            "drop-index catalog invariant violated: index-column delete count mismatch, table_id={table_id}, index_no={index_no}"
-        );
-
-        let index_deleted = storage
-            .indexes()
-            .delete_by_id(stmt, table_id, index_no)
-            .await?;
-        assert!(
-            index_deleted,
-            "drop-index catalog invariant violated: validated index row is missing, table_id={table_id}, index_no={index_no}"
-        );
-
-        assert!(
-            stmt.effects_mut()
-                .set_ddl_redo(DDLRedo::DropIndex { table_id, index_no })
-                .is_none(),
-            "drop-index catalog invariant violated: statement already has DDL redo, table_id={table_id}, index_no={index_no}"
-        );
-        Ok(())
-    })
-    .await
-}
-
-/// Stage catalog metadata for a newly allocated table-local index number.
-///
-/// The metadata-change gate serializes index DDL. The table row is deleted and
-/// reinserted by this transaction, `index_no` is allocated from `next_index_no`,
-/// and index-column numbers are enumerated from the validated index spec. Every
-/// inserted catalog primary key is therefore unique by construction.
-#[inline]
-async fn execute_create_index_catalog_update(
-    storage: &CatalogStorage,
-    trx: &mut Transaction,
-    table_id: TableID,
-    index_no: IndexNo,
-    metadata: &TableMetadata,
-    index_spec: &IndexSpec,
-) -> RuntimeResult<()> {
-    trx.stage_catalog_statement(async |stmt| {
-        let table_deleted = storage
-            .tables()
-            .delete_by_id(stmt, table_id)
-            .await?;
-        assert!(
-            table_deleted,
-            "create-index catalog invariant violated: validated table row is missing, table_id={table_id}"
-        );
-
-        storage
-            .tables()
-            .insert(
-                stmt,
-                &TableObject {
-                    table_id,
-                    next_index_no: metadata.idx.next_index_no(),
-                },
-            )
-            .await?;
-
-        storage
-            .indexes()
-            .insert(
-                stmt,
-                &IndexObject {
-                    table_id,
-                    index_no,
-                    index_attributes: index_spec.attributes,
-                },
-            )
-            .await?;
-
-        for (index_column_no, index_key) in index_spec.cols.iter().enumerate() {
-            storage
-                .index_columns()
-                .insert(
-                    stmt,
-                    &IndexColumnObject {
-                        table_id,
-                        index_no,
-                        index_column_no: index_column_no as u16,
-                        column_no: index_key.col_no,
-                        index_order: index_key.order,
-                    },
-                )
-                .await?;
-        }
-
-        assert!(
-            stmt.effects_mut()
-                .set_ddl_redo(DDLRedo::CreateIndex { table_id, index_no })
-                .is_none(),
-            "create-index catalog invariant violated: statement already has DDL redo, table_id={table_id}, index_no={index_no}"
-        );
-        Ok(())
-    })
-    .await
 }
 
 #[inline]

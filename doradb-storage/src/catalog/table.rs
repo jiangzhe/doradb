@@ -1,10 +1,6 @@
 use crate::buffer::PoolGuards;
 use crate::catalog::spec::{ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexNo, IndexSpec};
-use crate::catalog::storage::CatalogStorage;
-use crate::catalog::{
-    Catalog, ColumnObject, IndexColumnObject, IndexObject, TableObject, catalog_table_id_from_slot,
-    is_user_table,
-};
+use crate::catalog::{Catalog, catalog_table_id_from_slot, is_user_table};
 use crate::component::EnginePools;
 use crate::engine::EngineCore;
 use crate::error::{
@@ -16,7 +12,6 @@ use crate::file::fs::FileSystem;
 use crate::file::table_file::{MutableTableFile, TableFile};
 use crate::id::{TableID, TrxID};
 use crate::index::BlockIndex;
-use crate::log::redo::DDLRedo;
 use crate::map::FastHashSet;
 use crate::obs;
 use crate::poison::EnginePoisoner;
@@ -26,7 +21,7 @@ use crate::runtime::mandatory::{AcceptedExecution, MandatoryTaskMetadata, Prepar
 use crate::serde::{Deser, DeserResult, MinBytesHint, Ser, Serde, min_bytes_hint};
 use crate::session::{AcceptedDdlScope, PreparedDdlScope};
 use crate::table::{Table, TableRedoReplayFloor};
-use crate::trx::Transaction;
+use crate::trx::PrivateTransaction;
 use crate::trx::sys::TransactionSystem;
 use crate::value::{Val, ValKind, ValType};
 use error_stack::{Report, ResultExt};
@@ -55,7 +50,6 @@ const DROP_TABLE_CATALOG_WRITE_TARGETS: [TableID; 5] = [
 
 /// Purely validated public CREATE TABLE input.
 pub(crate) struct ValidatedCreateTable {
-    table_spec: super::TableSpec,
     metadata: Arc<TableMetadata>,
 }
 
@@ -71,57 +65,15 @@ impl ValidatedCreateTable {
             table_spec.columns.clone(),
             index_specs,
         )?);
-        Ok(Self {
-            table_spec,
-            metadata,
-        })
+        Ok(Self { metadata })
     }
 
     /// Bind validated metadata to one gap-tolerant allocated table id.
     #[inline]
     pub(crate) fn into_plan(self, table_id: TableID) -> CreateTablePlan {
-        let table_object = TableObject {
-            table_id,
-            next_index_no: self.metadata.idx.next_index_no(),
-        };
-        let column_objects = self
-            .table_spec
-            .columns
-            .into_iter()
-            .enumerate()
-            .map(|(col_no, col_spec)| ColumnObject {
-                table_id,
-                column_no: col_no as u16,
-                column_name: col_spec.column_name,
-                column_type: col_spec.column_type,
-                column_attributes: col_spec.column_attributes,
-            })
-            .collect();
-        let mut index_objects = Vec::new();
-        let mut index_column_objects = Vec::new();
-        for (index_no, index_spec) in self.metadata.idx.active_indexes() {
-            index_objects.push(IndexObject {
-                table_id,
-                index_no: index_no as u16,
-                index_attributes: index_spec.attributes,
-            });
-            for (index_column_no, key) in index_spec.cols.iter().enumerate() {
-                index_column_objects.push(IndexColumnObject {
-                    table_id,
-                    index_no: index_no as u16,
-                    index_column_no: index_column_no as u16,
-                    column_no: key.col_no,
-                    index_order: key.order,
-                });
-            }
-        }
         CreateTablePlan {
             table_id,
             metadata: self.metadata,
-            table_object: Some(table_object),
-            column_objects,
-            index_objects,
-            index_column_objects,
         }
     }
 }
@@ -130,10 +82,6 @@ impl ValidatedCreateTable {
 pub(crate) struct CreateTablePlan {
     table_id: TableID,
     metadata: Arc<TableMetadata>,
-    table_object: Option<TableObject>,
-    column_objects: Vec<ColumnObject>,
-    index_objects: Vec<IndexObject>,
-    index_column_objects: Vec<IndexColumnObject>,
 }
 
 /// Owned DROP TABLE target selected under complete target exclusion.
@@ -176,13 +124,6 @@ enum CreateTablePhase {
     Aborted,
 }
 
-struct CreateTableCatalogObjects {
-    table: TableObject,
-    columns: Vec<ColumnObject>,
-    indexes: Vec<IndexObject>,
-    index_columns: Vec<IndexColumnObject>,
-}
-
 enum CreateTableFile {
     Mutable(MutableTableFile),
     Published(Arc<TableFile>),
@@ -193,7 +134,7 @@ struct CreateTableProgress {
     table_id: TableID,
     phase: CreateTablePhase,
     file: Option<CreateTableFile>,
-    trx: Option<Transaction>,
+    trx: Option<PrivateTransaction>,
     staged_table: Option<Arc<Table>>,
 }
 
@@ -224,7 +165,7 @@ impl CreateTableProgress {
     }
 
     #[inline]
-    fn set_catalog_transaction(&mut self, trx: Transaction) {
+    fn set_catalog_transaction(&mut self, trx: PrivateTransaction) {
         assert_eq!(self.phase, CreateTablePhase::FileCreated);
         assert!(self.trx.is_none());
         self.trx = Some(trx);
@@ -232,24 +173,16 @@ impl CreateTableProgress {
     }
 
     #[inline]
-    fn mark_catalog_staged(&mut self) {
-        assert_eq!(self.phase, CreateTablePhase::PrivateTransactionActive);
-        self.phase = CreateTablePhase::CatalogStaged;
+    fn park_active_transaction(&mut self) {
+        if let Some(trx) = self.trx.take() {
+            trx.park();
+        }
     }
 
     #[inline]
-    fn take_catalog_objects(&mut self) -> CreateTableCatalogObjects {
-        CreateTableCatalogObjects {
-            table: self.plan.table_object.take().unwrap_or_else(|| {
-                panic!(
-                    "create-table plan object moves exactly once: table_id={}",
-                    self.table_id
-                )
-            }),
-            columns: mem::take(&mut self.plan.column_objects),
-            indexes: mem::take(&mut self.plan.index_objects),
-            index_columns: mem::take(&mut self.plan.index_column_objects),
-        }
+    fn mark_catalog_staged(&mut self) {
+        assert_eq!(self.phase, CreateTablePhase::PrivateTransactionActive);
+        self.phase = CreateTablePhase::CatalogStaged;
     }
 
     #[inline]
@@ -406,7 +339,6 @@ impl CreateTableProgress {
             ));
         }
         if let Some(trx) = self.trx.take()
-            && trx.engine().is_some()
             && let Err(err) = trx.rollback_catalog_ddl().await
             && cleanup_error.is_none()
         {
@@ -1329,6 +1261,9 @@ impl AcceptedExecution for AcceptedCreateTable {
 
     #[inline]
     async fn handle_panic(&mut self, _panic: Box<dyn Any + Send>) -> CompletionErrorBridge {
+        if let Some(progress) = self.progress.as_mut() {
+            progress.park_active_transaction();
+        }
         self.scope.handle_panic();
         let phase = match self.progress.as_ref() {
             Some(progress) => progress.phase,
@@ -1392,17 +1327,19 @@ impl AcceptedCreateTable {
             .reach_phase(TableDdlTestPhase::CreatePrivateTransactionBegun)
             .await;
 
-        let catalog_objects = progress.take_catalog_objects();
-        let exec_res = execute_create_table_catalog_staging(
-            &engine.catalog().storage,
-            progress
-                .trx
-                .as_mut()
-                .unwrap_or_else(|| panic!("CREATE staging requires private transaction")),
-            table_id,
-            catalog_objects,
-        )
-        .await;
+        let metadata = Arc::clone(progress.metadata());
+        let exec_res = engine
+            .catalog()
+            .storage
+            .stage_create_table(
+                progress
+                    .trx
+                    .as_mut()
+                    .unwrap_or_else(|| panic!("CREATE staging requires private transaction")),
+                table_id,
+                &metadata,
+            )
+            .await;
         if let Err(err) = exec_res {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                 progress
@@ -1533,7 +1470,7 @@ enum DropTablePhase {
 struct DropTableProgress {
     plan: DropTablePlan,
     phase: DropTablePhase,
-    trx: Option<Transaction>,
+    trx: Option<PrivateTransaction>,
 }
 
 impl DropTableProgress {
@@ -1543,6 +1480,13 @@ impl DropTableProgress {
             plan,
             phase: DropTablePhase::Prepared,
             trx: None,
+        }
+    }
+
+    #[inline]
+    fn park_active_transaction(&mut self) {
+        if let Some(trx) = self.trx.take() {
+            trx.park();
         }
     }
 }
@@ -1623,6 +1567,9 @@ impl AcceptedExecution for AcceptedDropTable {
 
     #[inline]
     async fn handle_panic(&mut self, _panic: Box<dyn Any + Send>) -> CompletionErrorBridge {
+        if let Some(progress) = self.progress.as_mut() {
+            progress.park_active_transaction();
+        }
         self.scope.handle_panic();
         let phase = match self.progress.as_ref() {
             Some(progress) => progress.phase,
@@ -1703,16 +1650,18 @@ impl AcceptedDropTable {
             .await;
 
         let metadata = table.metadata().clone();
-        let exec_res = execute_drop_table_catalog_cascade(
-            &engine.catalog().storage,
-            progress
-                .trx
-                .as_mut()
-                .unwrap_or_else(|| panic!("DROP cascade requires private transaction")),
-            table_id,
-            &metadata,
-        )
-        .await;
+        let exec_res = engine
+            .catalog()
+            .storage
+            .stage_drop_table(
+                progress
+                    .trx
+                    .as_mut()
+                    .unwrap_or_else(|| panic!("DROP cascade requires private transaction")),
+                table_id,
+                &metadata,
+            )
+            .await;
         if let Err(err) = exec_res {
             if let Some(trx) = progress.trx.take()
                 && let Err(rollback_err) = trx.rollback_catalog_ddl().await
@@ -1880,135 +1829,6 @@ fn reject_user_table_primary_key_indexes(
     Ok(())
 }
 
-/// Stage the catalog rows for a newly allocated table.
-///
-/// `table_id` is allocated atomically before this call. Every child key is
-/// derived by enumerating validated metadata inside that fresh table-id
-/// namespace, so catalog insert Operation failures are invariant violations.
-#[inline]
-async fn execute_create_table_catalog_staging(
-    storage: &CatalogStorage,
-    trx: &mut Transaction,
-    table_id: TableID,
-    catalog_objects: CreateTableCatalogObjects,
-) -> RuntimeResult<()> {
-    let CreateTableCatalogObjects {
-        table,
-        columns,
-        indexes,
-        index_columns,
-    } = catalog_objects;
-    trx.stage_catalog_statement(async |stmt| {
-        storage.tables().insert(stmt, &table).await?;
-
-        for column_object in columns {
-            storage.columns().insert(stmt, &column_object).await?;
-        }
-        for index_object in indexes {
-            storage.indexes().insert(stmt, &index_object).await?;
-        }
-        for index_column_object in index_columns {
-            storage
-                .index_columns()
-                .insert(stmt, &index_column_object)
-                .await?;
-        }
-
-        let existing = stmt
-            .effects_mut()
-            .set_ddl_redo(DDLRedo::CreateTable(table_id));
-        // A catalog DDL statement stages exactly one logical DDL effect; the
-        // create-table path owns the empty redo slot until this point.
-        assert!(
-            existing.is_none(),
-            "create-table catalog staging found existing DDL redo: table_id={table_id}, existing_ddl={existing:?}"
-        );
-        Ok(())
-    })
-    .await
-}
-
-#[inline]
-async fn execute_drop_table_catalog_cascade(
-    storage: &CatalogStorage,
-    trx: &mut Transaction,
-    table_id: TableID,
-    metadata: &TableMetadata,
-) -> RuntimeResult<()> {
-    trx.stage_catalog_statement(async |stmt| {
-        let index_columns_deleted = storage
-            .index_columns()
-            .delete_by_table_id(stmt, table_id)
-            .await?;
-        let indexes_deleted = storage
-            .indexes()
-            .delete_by_table_id(stmt, table_id)
-            .await?;
-        let columns_deleted = storage
-            .columns()
-            .delete_by_table_id(stmt, table_id)
-            .await?;
-        let table_deleted = storage
-            .tables()
-            .delete_by_id(stmt, table_id)
-            .await?;
-        assert!(
-            table_deleted,
-            "drop-table catalog invariant violated: validated table row is missing, table_id={table_id}"
-        );
-        storage
-            .table_replay_silent_watermarks()
-            .delete_by_table_id(stmt, table_id)
-            .await?;
-
-        assert_drop_catalog_delete_counts(
-            table_id,
-            metadata,
-            columns_deleted,
-            indexes_deleted,
-            index_columns_deleted,
-        );
-
-        assert!(
-            stmt.effects_mut()
-                .set_ddl_redo(DDLRedo::DropTable(table_id))
-                .is_none(),
-            "drop-table catalog invariant violated: statement already has DDL redo, table_id={table_id}"
-        );
-        Ok(())
-    })
-    .await
-}
-
-#[inline]
-fn assert_drop_catalog_delete_counts(
-    table_id: TableID,
-    metadata: &TableMetadata,
-    columns_deleted: usize,
-    indexes_deleted: usize,
-    index_columns_deleted: usize,
-) {
-    let expected_index_columns = metadata
-        .idx
-        .active_indexes()
-        .map(|(_, spec)| spec.cols.len())
-        .sum::<usize>();
-    assert_eq!(
-        columns_deleted,
-        metadata.col.col_count(),
-        "drop-table catalog invariant violated: column delete count mismatch, table_id={table_id}"
-    );
-    assert_eq!(
-        indexes_deleted,
-        metadata.idx.active_index_count(),
-        "drop-table catalog invariant violated: index delete count mismatch, table_id={table_id}"
-    );
-    assert_eq!(
-        index_columns_deleted, expected_index_columns,
-        "drop-table catalog invariant violated: index-column delete count mismatch, table_id={table_id}"
-    );
-}
-
 #[inline]
 fn finish_drop_table_runtime_retention(
     engine: &EngineCore,
@@ -2116,6 +1936,7 @@ fn validate_primary_key_contract(
 pub(crate) mod tests {
     use super::*;
     use crate::catalog::storage::tables::TABLE_ID_TABLES;
+    use crate::catalog::storage::tests::mark_catalog_ddl;
     use crate::catalog::tests::{
         assert_dropped_table_floor, assert_dropped_table_runtime,
         assert_no_dropped_table_operational_state, wait_for_dropped_table_floor,
@@ -2135,7 +1956,9 @@ pub(crate) mod tests {
     use crate::lock::tests::{LockDebugEntryState, TestLockOwner, debug_snapshot};
     use crate::lock::{LockMode, LockOwner, LockResource, TableLockMode};
     use crate::log::redo::DDLRedo;
-    use crate::session::tests::{SessionTestExt, active_operation_count, remove_session_for_test};
+    use crate::session::tests::{
+        SessionTestExt, active_operation_count, active_operation_snapshot, remove_session_for_test,
+    };
     use crate::table::TableTerminal;
     use crate::table::tests::*;
     use crate::trx::MAX_SNAPSHOT_TS;
@@ -3875,14 +3698,11 @@ pub(crate) mod tests {
                         .await
                         .disclose()?;
                     assert!(deleted);
-                    let old = stmt
-                        .effects_mut()
-                        .set_ddl_redo(DDLRedo::DropTable(table_id));
-                    debug_assert!(old.is_none());
                     Ok(())
                 })
                 .await
                 .unwrap();
+            mark_catalog_ddl(&mut corrupt_trx, DDLRedo::DropTable(table_id));
             corrupt_trx.commit().await.unwrap();
 
             let mut drop_session = engine.new_session().unwrap();
@@ -3973,6 +3793,42 @@ pub(crate) mod tests {
                     .copied(),
                 Some(LifecycleError::ShutdownBusy)
             );
+
+            remove_session_for_test(&engine.inner().session_registry, session_id);
+            drop(session);
+            engine.shutdown();
+        });
+    }
+
+    #[test]
+    fn test_create_table_execution_panic_parks_active_private_transaction() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "create_table_private_panic").await;
+            let mut session = engine.new_session().unwrap();
+            let session_id = session.id();
+            let (table_spec, index_specs) = drop_table_test_spec();
+            engine
+                .inner()
+                .table_ddl_test
+                .set_panic_phase(Some(TableDdlTestPhase::CreatePrivateTransactionBegun));
+
+            let err = session
+                .create_table(table_spec, index_specs)
+                .await
+                .unwrap_err();
+
+            assert_eq!(
+                err.report().downcast_ref::<FatalError>().copied(),
+                Some(FatalError::MandatoryTaskPanic)
+            );
+            assert_eq!(active_operation_count(&engine.inner().session_registry), 1);
+            let snapshot = active_operation_snapshot(&engine.inner().session_registry, session_id);
+            assert_eq!(
+                snapshot.state,
+                crate::trx::SessionOperationState::FailedRetained
+            );
+            assert!(snapshot.trx_id.is_some());
 
             remove_session_for_test(&engine.inner().session_registry, session_id);
             drop(session);

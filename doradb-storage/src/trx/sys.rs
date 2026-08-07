@@ -9,8 +9,8 @@ use crate::component::{
 use crate::conf::TrxSysConfig;
 use crate::error::{
     CompletionErrorBridge, DataIntegrityError, DataIntegrityResult, DiscloseError,
-    DiscloseResultExt, Error, FatalError, FatalResult, MultiDomainResultExt, Result, RuntimeError,
-    RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
+    DiscloseResultExt, Error, FatalError, FatalResult, LifecycleResult, MultiDomainResultExt,
+    Result, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
 };
 use crate::file::fs::FileSystem;
 use crate::file::table_file::{MutableTableFile, OldRoot, TableFile};
@@ -36,8 +36,9 @@ use crate::trx::sys_trx::SysTrx;
 use crate::trx::{
     FailedPrecommitCleanupJob, FailedPrecommitReason, FatalRollbackRetention, MAX_COMMIT_TS,
     MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, PrecommitTrx, PreparedTrx,
-    PreparedTrxPayload, ReleasedTransactionLocks, SessionOperationCleanupJob,
-    SessionOperationCompletionClaim, SessionOperationEntry, Transaction, TrxInner,
+    PreparedTrxPayload, PrivateTransaction, ReleasedTransactionLocks, SessionOperationCheckout,
+    SessionOperationCleanupJob, SessionOperationCompletionClaim, SessionOperationEntry,
+    Transaction, TrxInner,
 };
 #[cfg(test)]
 use crate::trx::{PrepareListenerResult, SessionOperationState};
@@ -1056,6 +1057,28 @@ impl TransactionSystem {
         Ok(table_file)
     }
 
+    /// Register one snapshot timestamp in an active GC bucket.
+    #[inline]
+    pub(super) fn register_active_sts(&self) -> (usize, TrxID) {
+        let gc_no = self.next_gc_no();
+        let gc_bucket = &self.gc_buckets[gc_no];
+        let mut g = gc_bucket.active_sts_list.lock();
+        // Holding the bucket lock preserves STS order within this active list.
+        let sts = TrxID::new(self.ts.fetch_add(1, Ordering::SeqCst));
+        debug_assert!(sts < MAX_SNAPSHOT_TS);
+        g.insert(sts);
+        if g.len() == 1 {
+            debug_assert!(
+                TrxID::new(gc_bucket.min_active_sts.load(Ordering::Relaxed)) == MAX_SNAPSHOT_TS
+            );
+            gc_bucket
+                .min_active_sts
+                .store(sts.as_u64(), Ordering::Relaxed);
+        }
+        drop(g);
+        (gc_no, sts)
+    }
+
     /// Initialize one ready transaction core and register its active snapshot.
     #[inline]
     fn init_trx(
@@ -1064,28 +1087,9 @@ impl TransactionSystem {
         inner: &mut TrxInner,
         authority: Box<FamilyLockAuthority>,
     ) -> (TrxID, TrxID) {
-        let gc_no = self.next_gc_no();
-        let gc_bucket = &self.gc_buckets[gc_no];
-        // Add to active sts list.
-        let mut g = gc_bucket.active_sts_list.lock();
-        // With bucket lock, we can make sure all transactions are ordered by STS.
-        let sts = TrxID::new(self.ts.fetch_add(1, Ordering::SeqCst));
+        let (gc_no, sts) = self.register_active_sts();
         let trx_id = TrxID::new(sts.as_u64() | (1 << 63));
-        debug_assert!(sts < MAX_SNAPSHOT_TS);
         debug_assert!(trx_id >= MIN_ACTIVE_TRX_ID);
-        g.insert(sts);
-        if g.len() == 1 {
-            // Only when the previous list is empty, we should update min_active_sts
-            // as STS of current transaction.
-            // In this case, current value of min_active_sts should be MAX.
-            debug_assert!(
-                TrxID::new(gc_bucket.min_active_sts.load(Ordering::Relaxed)) == MAX_SNAPSHOT_TS
-            );
-            gc_bucket
-                .min_active_sts
-                .store(sts.as_u64(), Ordering::Relaxed);
-        }
-        drop(g); // release bucket lock.
         inner.init(trx_id, sts, gc_no, session_id, authority);
         (trx_id, sts)
     }
@@ -1105,19 +1109,22 @@ impl TransactionSystem {
         (handle, entry)
     }
 
-    /// Create a private transaction inside an existing stable operation entry.
+    /// Create a private transaction inside an existing stable DDL entry.
     #[inline]
     pub(crate) fn begin_private_trx(
         &self,
-        session: WeakSessionRef,
+        runtime: SessionRuntime,
         enclosing_entry: &Arc<SessionOperationEntry>,
         mut inner: Box<TrxInner>,
         authority: Box<FamilyLockAuthority>,
-    ) -> Transaction {
+    ) -> LifecycleResult<PrivateTransaction> {
+        enclosing_entry.validate_private_transaction_begin()?;
         let operation_key = enclosing_entry.key();
-        let (trx_id, sts) = self.init_trx(operation_key.session_id(), inner.as_mut(), authority);
-        enclosing_entry.install_private_transaction(inner);
-        Transaction::new(session, operation_key, trx_id, sts)
+        let (trx_id, _sts) = self.init_trx(operation_key.session_id(), inner.as_mut(), authority);
+        let attachment = TrxAttachment::new(runtime, operation_key, trx_id);
+        let checkout =
+            SessionOperationCheckout::private(Arc::clone(enclosing_entry), inner, attachment);
+        Ok(PrivateTransaction::new(checkout))
     }
 
     /// Allocate a timestamp fence for a runtime state transition.
@@ -1265,22 +1272,6 @@ impl TransactionSystem {
             completion,
             RuntimeError::CatalogAccess,
             "wait for catalog DDL terminal rollback cleanup",
-        )
-        .await
-    }
-
-    /// Roll back an engine-owned table-maintenance transaction with typed domains.
-    #[inline]
-    pub(crate) async fn rollback_table_maintenance_transaction(
-        &self,
-        claim: SessionOperationCompletionClaim,
-    ) -> RuntimeOrFatalResult<()> {
-        let completion =
-            self.enqueue_terminal_rollback(claim, "rollback table maintenance transaction");
-        Self::wait_terminal_rollback_runtime_or_fatal(
-            completion,
-            RuntimeError::TableAccess,
-            "wait for table maintenance terminal rollback cleanup",
         )
         .await
     }
@@ -2079,12 +2070,13 @@ pub(crate) mod tests {
     }
 
     fn capture_transaction_cleanup_state(
+        engine: &Engine,
         trx: &Transaction,
     ) -> (Arc<SessionOperationEntry>, Arc<SharedTrxStatus>) {
-        let runtime = trx.engine().expect("test transaction must have runtime");
-        let entry = runtime
-            .state()
-            .resolve_operation(trx.operation_key)
+        let (entry, _) = engine
+            .inner()
+            .session_registry
+            .try_resolve_operation(trx.operation_key)
             .expect("test transaction must resolve");
         let status = {
             let inner_slot = entry.inner.lock();
@@ -2477,7 +2469,7 @@ pub(crate) mod tests {
             })
             .await
             .unwrap();
-            let (entry, status) = capture_transaction_cleanup_state(&trx);
+            let (entry, status) = capture_transaction_cleanup_state(&engine, &trx);
 
             let err = trx.commit().await.unwrap_err();
 

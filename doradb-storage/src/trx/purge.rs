@@ -271,6 +271,16 @@ impl TransactionSystem {
         progress
     }
 
+    /// Deregister one active STS and report its causal horizon transition.
+    #[inline]
+    pub(super) fn deregister_active_sts(&self, gc_no: usize, sts: TrxID) -> bool {
+        let progress = self.gc_buckets[gc_no].record_rollback_for_purge(sts);
+        if let Some(progress) = progress {
+            let _ = self.purge_tx.send(Purge::ActiveSts(progress));
+        }
+        progress.is_some()
+    }
+
     /// Record rollback progress and report the causal active-STS transition.
     ///
     /// Commit handoffs are non-lossy through `Purge::Committed` because purge
@@ -279,11 +289,7 @@ impl TransactionSystem {
     /// a coalescible scheduling observation.
     #[inline]
     pub(crate) fn record_rollback_for_purge(&self, gc_no: usize, sts: TrxID) -> bool {
-        let progress = self.gc_buckets[gc_no].record_rollback_for_purge(sts);
-        if let Some(progress) = progress {
-            let _ = self.purge_tx.send(Purge::ActiveSts(progress));
-        }
-        progress.is_some()
+        self.deregister_active_sts(gc_no, sts)
     }
 
     #[inline]

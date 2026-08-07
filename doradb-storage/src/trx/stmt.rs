@@ -8,7 +8,7 @@ use crate::error::{
     Result, RuntimeError, RuntimeResult,
 };
 use crate::lock::{LockMode, LockResource};
-use crate::log::redo::{DDLRedo, RedoLogs, RowRedo};
+use crate::log::redo::{RedoLogs, RowRedo};
 use crate::obs;
 use crate::row::ops::{
     DeleteMvcc, RowMutation, ScanMvcc, SelectKey, SelectMvcc, TableMutationOutcome, UpdateCol,
@@ -75,12 +75,6 @@ impl StmtEffects {
             index_undo: IndexUndoLogs::empty(),
             redo: RedoLogs::default(),
         }
-    }
-
-    /// Returns whether this accumulator has no statement-local effects.
-    #[inline]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.row_undo.is_empty() && self.index_undo.is_empty() && self.redo.is_empty()
     }
 
     /// Push one row undo entry into this statement.
@@ -169,19 +163,6 @@ impl StmtEffects {
         self.redo.insert_dml(table_id, entry);
     }
 
-    /// Borrow statement-local redo for producer assertions.
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn redo_for_test(&self) -> &RedoLogs {
-        &self.redo
-    }
-
-    /// Replace the statement's deferred DDL redo payload.
-    #[inline]
-    pub(crate) fn set_ddl_redo(&mut self, ddl: DDLRedo) -> Option<Box<DDLRedo>> {
-        self.redo.ddl.replace(Box::new(ddl))
-    }
-
     #[inline]
     fn push_index_undo(&mut self, index_undo: IndexUndo) {
         self.index_undo.push(index_undo);
@@ -197,13 +178,14 @@ impl StmtEffects {
         );
     }
 
-    /// Folds residual cancelled-statement undo into whole-transaction rollback.
+    /// Folds residual incomplete-statement undo into whole-transaction rollback.
     ///
     /// Redo from a statement that did not complete is never commit-visible.
     /// Undo remains ordered after prior successful statements so whole-
-    /// transaction rollback unwinds this statement first.
+    /// transaction rollback unwinds this statement first. Public cancellation
+    /// and private mandatory panic settlement share this mechanical operation.
     #[inline]
-    fn fold_cancelled_into_trx_effects(&mut self, trx_effects: &mut TrxEffects) {
+    pub(crate) fn fold_cancelled_into_trx_effects(&mut self, trx_effects: &mut TrxEffects) {
         self.redo.clear();
         trx_effects.row_undo_mut().merge(&mut self.row_undo);
         trx_effects.index_undo_mut().merge(&mut self.index_undo);
@@ -254,7 +236,6 @@ impl StmtEffects {
 #[derive(Clone, Copy)]
 enum StmtDropAction {
     CancelPublicTransaction,
-    PrivateMustComplete,
     Settled,
 }
 
@@ -276,16 +257,6 @@ impl StmtState {
         Self {
             effects: StmtEffects::empty(),
             drop_action: StmtDropAction::CancelPublicTransaction,
-            checkout: Some(checkout),
-        }
-    }
-
-    /// Preserves the current must-complete invariant for private catalog work.
-    #[inline]
-    pub(crate) fn private(checkout: SessionOperationCheckout) -> Self {
-        Self {
-            effects: StmtEffects::empty(),
-            drop_action: StmtDropAction::PrivateMustComplete,
             checkout: Some(checkout),
         }
     }
@@ -325,21 +296,6 @@ impl StmtState {
         self.checkout = None;
     }
 
-    /// Preserve partial statement undo in the mandatory nested transaction.
-    ///
-    /// This path runs before resuming a prepared catalog callback panic. Redo
-    /// from the incomplete statement is discarded, while row/index undo is
-    /// checked back into the stable transaction core for outer fatal retention.
-    #[inline]
-    pub(crate) fn return_after_mandatory_panic(mut self) {
-        self.drop_action = StmtDropAction::Settled;
-        if let Some(checkout) = self.checkout.as_mut() {
-            self.effects
-                .fold_cancelled_into_trx_effects(checkout.inner_mut().effects_mut());
-        }
-        self.checkout = None;
-    }
-
     #[cold]
     #[inline(never)]
     fn settle_armed_drop(&mut self) {
@@ -351,12 +307,6 @@ impl StmtState {
                 self.effects
                     .fold_cancelled_into_trx_effects(checkout.inner_mut().effects_mut());
                 checkout.return_cancelled();
-            }
-            StmtDropAction::PrivateMustComplete => {
-                assert!(
-                    self.effects.is_empty(),
-                    "private statement must complete effect settlement before drop"
-                );
             }
             StmtDropAction::Settled => {}
         }
@@ -387,6 +337,21 @@ pub struct Statement<'stmt> {
 }
 
 impl<'stmt> Statement<'stmt> {
+    /// Create a callback-facing statement over borrowed transaction ownership.
+    #[inline]
+    pub(crate) fn new(
+        inner: &'stmt mut TrxInner,
+        attachment: &'stmt TrxAttachment,
+        effects: &'stmt mut StmtEffects,
+    ) -> Self {
+        Self {
+            inner,
+            attachment,
+            effects,
+            disable_dml_validation: false,
+        }
+    }
+
     /// Disable default DML shape, type, nullability, sparse-update, key, and
     /// index-scan validation for this statement.
     ///
@@ -409,12 +374,6 @@ impl<'stmt> Statement<'stmt> {
             self.attachment,
             self.inner.checked_lock_state(),
         )
-    }
-
-    /// Returns mutable access to this statement's effect accumulator.
-    #[inline]
-    pub(crate) fn effects_mut(&mut self) -> &mut StmtEffects {
-        self.effects
     }
 
     #[inline]
@@ -1001,6 +960,7 @@ pub(crate) mod tests {
     use crate::id::TrxID;
     use crate::lock::LockOwner;
     use crate::lock::tests::debug_snapshot;
+    use crate::log::redo::RowRedoKind;
     use crate::session::{SessionState, tests as session_tests};
     use crate::trx::sys::tests as sys_tests;
     use crate::trx::undo::tests::{pause_next_index_rollback, pause_next_row_rollback};
@@ -1055,6 +1015,18 @@ pub(crate) mod tests {
         stmt: &'borrow mut Statement<'_>,
     ) -> (TrxRuntime<'borrow>, &'borrow mut StmtEffects) {
         stmt.runtime_and_effects_mut()
+    }
+
+    #[inline]
+    pub(crate) fn statement_effects_mut<'borrow>(
+        stmt: &'borrow mut Statement<'_>,
+    ) -> &'borrow mut StmtEffects {
+        stmt.effects
+    }
+
+    #[inline]
+    pub(crate) fn statement_redo<'borrow>(stmt: &'borrow Statement<'_>) -> &'borrow RedoLogs {
+        &stmt.effects.redo
     }
 
     #[inline]
@@ -1122,13 +1094,16 @@ pub(crate) mod tests {
             .count()
     }
 
-    #[test]
-    fn test_stmt_effects_empty() {
-        let effects = StmtEffects::empty();
-        assert!(effects.is_empty());
+    fn assert_stmt_effects_empty(effects: &StmtEffects) {
         assert!(effects.row_undo.is_empty());
         assert!(effects.index_undo.is_empty());
         assert!(effects.redo.is_empty());
+    }
+
+    #[test]
+    fn test_stmt_effects_empty() {
+        let effects = StmtEffects::empty();
+        assert_stmt_effects_empty(&effects);
     }
 
     #[test]
@@ -1159,12 +1134,18 @@ pub(crate) mod tests {
             SelectKey::new(0, vec![]),
             true,
         );
-        effects.set_ddl_redo(DDLRedo::CreateTable(TableID::new(42)));
+        effects.insert_row_redo(
+            TableID::new(42),
+            RowRedo {
+                row_id: RowID::new(2),
+                kind: RowRedoKind::Delete(None),
+            },
+        );
         let cancelled_row_undo = from_ref(&*effects.row_undo[0]);
 
         effects.fold_cancelled_into_trx_effects(&mut trx_effects);
 
-        assert!(effects.is_empty());
+        assert_stmt_effects_empty(&effects);
         assert_eq!(trx_effects.row_undo.len(), 2);
         assert_eq!(trx_effects.row_undo[0].table_id, TableID::new(41));
         assert_eq!(trx_effects.row_undo[1].table_id, TableID::new(42));
@@ -1344,13 +1325,13 @@ pub(crate) mod tests {
                     // statement rollback ever runs row rollback before index
                     // rollback, this test fails before the injected index
                     // rollback error can discard the statement safely.
-                    stmt.effects_mut().push_row_undo(OwnedRowUndo::new(
+                    statement_effects_mut(stmt).push_row_undo(OwnedRowUndo::new(
                         TableID::new(99_999_999),
                         None,
                         RowID::new(24),
                         RowUndoKind::Delete,
                     ));
-                    stmt.effects_mut().push_delete_index_undo(
+                    statement_effects_mut(stmt).push_delete_index_undo(
                         TableID::new(12),
                         RowID::new(23),
                         SelectKey::new(0, vec![]),

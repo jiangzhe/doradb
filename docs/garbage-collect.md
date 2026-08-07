@@ -119,8 +119,10 @@ checkpointed cold entries into `MemIndex`.
 
 The cleanup pass captures:
 
-- a `TrxReadProof<'ctx>` from the cleanup transaction context
-- one proof-gated `TableRootSnapshot<'ctx>` containing:
+- a mandatory-only `PrivateSnapshot` whose STS is registered in the active GC
+  watermark
+- one `TableRootSnapshot<'snapshot>` directly lifetime-bound to that private
+  snapshot and containing:
   - table checkpoint timestamp
   - `pivot_row_id`
   - `ColumnBlockIndex` root
@@ -158,11 +160,16 @@ the root fence failed, delete-overlay cleanup still runs and
 and active horizon alongside the completed `MemIndexCleanupStats`. A
 caller-disabled live pass has no delay.
 
-The complete table pass uses one maintenance transaction and one
-`TableRootSnapshot` for all secondary indexes. If publication races with root
-capture and the root is not visible to the cleanup transaction, cleanup rolls
-back and retries immediately; this transient capture race does not wait for or
-report a horizon event.
+The complete table pass uses one private snapshot and one `TableRootSnapshot`
+for all secondary indexes. The private snapshot has no transaction id, status,
+session child state, scan API, locks, undo, commit, or rollback capability. Its
+only job is to keep its STS registered until every root-bound read has
+finished.
+
+If publication races with root capture and the root is not visible to the
+private snapshot STS, cleanup drops the captured root, deregisters the STS,
+yields once, and retries with a fresh registration. This transient capture
+race does not wait for or report a horizon event.
 
 Delete overlays require overlay-obsolescence proof, not `DiskTree` absence. A
 unique delete-shadow or non-unique delete-marked exact entry below the captured

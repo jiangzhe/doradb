@@ -1238,6 +1238,7 @@ mod tests {
     };
     use crate::buffer::PoolRole;
     use crate::catalog::storage::publish_first_redo_log_seq_for_test;
+    use crate::catalog::storage::tests::mark_catalog_ddl;
     use crate::catalog::{
         ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexAttributes, IndexColumnObject,
         IndexKey, IndexObject, IndexOrder, IndexSpec, TableMetadata, TableObject, TableSpec,
@@ -1861,15 +1862,17 @@ mod tests {
                 )
                 .await
                 .disclose()?;
-            let old = stmt.effects_mut().set_ddl_redo(DDLRedo::CreateIndex {
-                table_id,
-                index_no: 1,
-            });
-            debug_assert!(old.is_none());
             Ok(())
         })
         .await
         .unwrap();
+        mark_catalog_ddl(
+            &mut trx,
+            DDLRedo::CreateIndex {
+                table_id,
+                index_no: 1,
+            },
+        );
         let cts = trx.commit().await.unwrap();
         drop(session);
         cts
@@ -1902,15 +1905,17 @@ mod tests {
                     .await
                     .disclose()?
             );
-            let old = stmt.effects_mut().set_ddl_redo(DDLRedo::DropIndex {
-                table_id,
-                index_no: 1,
-            });
-            debug_assert!(old.is_none());
             Ok(())
         })
         .await
         .unwrap();
+        mark_catalog_ddl(
+            &mut trx,
+            DDLRedo::DropIndex {
+                table_id,
+                index_no: 1,
+            },
+        );
         let cts = trx.commit().await.unwrap();
         drop(session);
         cts
