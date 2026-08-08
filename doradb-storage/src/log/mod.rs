@@ -2442,8 +2442,8 @@ mod tests {
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{
-        DataIntegrityError, ErrorKind, FatalError, IoError, IoResult, LifecycleError, Result,
-        RuntimeError, SharedFatalError,
+        DataIntegrityError, DiscloseResultExt, ErrorKind, FatalError, IoError, IoResult,
+        LifecycleError, Result, RuntimeError, SharedFatalError,
     };
     use crate::id::{PageID, RowID, TableID};
     use crate::io::{
@@ -2870,7 +2870,7 @@ mod tests {
                     RowID::new(1),
                 );
                 let prepared = sys_trx.prepare();
-                trx_sys.commit_prepared(prepared).await
+                trx_sys.commit_prepared(prepared).await.disclose()
             })
         })
     }

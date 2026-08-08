@@ -3000,6 +3000,11 @@ pub(crate) mod tests {
                 err.report().downcast_ref::<RuntimeError>().copied(),
                 Some(RuntimeError::CatalogAccess)
             );
+            let report = format!("{err:?}");
+            assert!(
+                report.contains("operation=create_table, phase=wait_mandatory_completion"),
+                "{report}"
+            );
             assert_no_user_table_publication(&engine, table_id);
             assert!(engine.inner().poisoner.poison_error().is_none());
             assert!(!has_ddl_lock_resource(

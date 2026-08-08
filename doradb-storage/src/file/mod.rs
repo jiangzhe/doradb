@@ -837,7 +837,7 @@ mod tests {
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, USER_TABLE_ID_START,
     };
     use crate::compression::BitPackable;
-    use crate::error::{DiscloseError, RuntimeError};
+    use crate::error::{DiscloseResultExt, MultiDomainResultExt, RuntimeError};
     use crate::file::fs::tests::{TestFileSystem, build_test_fs};
     use crate::file::table_file::TableFile;
     use crate::id::TrxID;
@@ -1187,11 +1187,12 @@ mod tests {
                 .on_complete(TableFsSubmission::Write(submission), Ok(expected_len - 1));
 
             assert_eq!(kind, IOKind::Write);
-            let wait_result = waiter.wait_result().await.map_err(|report| {
-                report
-                    .disclose()
-                    .attach_with(|| "wait for table file background write".to_owned())
-            });
+            let wait_result = waiter
+                .wait_result()
+                .await
+                .map_err(|report| report.into_quad(RuntimeError::FileRootAccess))
+                .attach("wait for table file background write")
+                .disclose();
             assert!(wait_result.as_ref().is_err_and(|err| {
                 err.report()
                     .downcast_ref::<IoError>()
@@ -1262,11 +1263,12 @@ mod tests {
             let kind = state_machine.on_complete(TableFsSubmission::Sync(submission), Ok(1));
 
             assert_eq!(kind, IOKind::Fsync);
-            let wait_result = waiter.wait_result().await.map_err(|report| {
-                report
-                    .disclose()
-                    .attach_with(|| "wait for table file background fsync".to_owned())
-            });
+            let wait_result = waiter
+                .wait_result()
+                .await
+                .map_err(|report| report.into_quad(RuntimeError::FileRootAccess))
+                .attach("wait for table file background fsync")
+                .disclose();
             let err = wait_result.expect_err("nonzero fsync completion should fail");
             assert_eq!(
                 err.report()
@@ -1306,11 +1308,12 @@ mod tests {
             );
 
             assert_eq!(kind, IOKind::Fsync);
-            let wait_result = waiter.wait_result().await.map_err(|report| {
-                report
-                    .disclose()
-                    .attach_with(|| "wait for table file background fsync".to_owned())
-            });
+            let wait_result = waiter
+                .wait_result()
+                .await
+                .map_err(|report| report.into_quad(RuntimeError::FileRootAccess))
+                .attach("wait for table file background fsync")
+                .disclose();
             let err = wait_result.expect_err("backend fsync completion should fail");
             assert!(
                 err.report().downcast_ref::<IoError>().is_some(),

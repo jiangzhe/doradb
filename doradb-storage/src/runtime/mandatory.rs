@@ -4,8 +4,9 @@ use crate::component::{
 };
 use crate::conf::MandatoryRuntimeConfig;
 use crate::error::{
-    CompletionErrorBridge, CompletionResult, ConfigError, ConfigResult, DiscloseError, FatalError,
-    LifecycleError, LifecycleResult, Result, RuntimeError, RuntimeResult, SharedFatalError,
+    CompletionErrorBridge, CompletionResult, ConfigError, ConfigResult, FatalError, LifecycleError,
+    LifecycleOrFatalError, LifecycleOrFatalResult, LifecycleResult, RuntimeError, RuntimeResult,
+    SharedFatalError,
 };
 use crate::id::{SessionOperationKey, TableID};
 use crate::obs;
@@ -599,9 +600,9 @@ pub(crate) struct CompletionObserver<T> {
 }
 
 impl<T> CompletionObserver<T> {
-    /// Wait for the mandatory task and disclose its terminal result.
+    /// Wait for the mandatory task and return its typed completion transport.
     #[inline]
-    pub(crate) async fn wait(mut self) -> Result<T> {
+    pub(crate) async fn wait(mut self) -> CompletionResult<T> {
         let result = self.inner.completion.wait_take_result().await;
         let mut observation = self.inner.observation.lock();
         assert!(
@@ -611,7 +612,7 @@ impl<T> CompletionObserver<T> {
         *observation = ObservationState::Consumed;
         self.armed = false;
         drop(observation);
-        result.map_err(DiscloseError::disclose)
+        result
     }
 }
 
@@ -981,16 +982,16 @@ impl QuiescentGuard<MandatoryRuntime> {
     pub(crate) async fn submit<E>(
         &self,
         prepared: E,
-    ) -> LifecycleResult<CompletionObserver<E::Output>>
+    ) -> LifecycleOrFatalResult<CompletionObserver<E::Output>>
     where
         E: PreparedExecution,
     {
         let poison_listener = self.poisoner.listener();
         if let Err(error) = self.poisoner.ensure_healthy() {
             self.admission.close();
-            return Err(error
-                .change_context(LifecycleError::RuntimeUnavailable)
-                .attach("phase=mandatory_admission_health_check"));
+            return Err(LifecycleOrFatalError::from(
+                error.attach("phase=mandatory_admission_health_check"),
+            ));
         }
         let admission_started_at = Instant::now();
         let acquire = self.admission.acquire(self.clone());
@@ -1000,12 +1001,12 @@ impl QuiescentGuard<MandatoryRuntime> {
             Either::Left((result, _)) => result?,
             Either::Right((_, _)) => {
                 self.admission.close();
-                return Err(self
-                    .poisoner
-                    .ensure_healthy()
-                    .expect_err("poison event requires a published fatal reason")
-                    .change_context(LifecycleError::RuntimeUnavailable)
-                    .attach("phase=mandatory_admission_poison_wake"));
+                return Err(LifecycleOrFatalError::from(
+                    self.poisoner
+                        .ensure_healthy()
+                        .expect_err("poison event requires a published fatal reason")
+                        .attach("phase=mandatory_admission_poison_wake"),
+                ));
             }
         };
         // Winning admission is the poison-race linearization point. A later
@@ -1189,7 +1190,7 @@ mod tests {
     use super::*;
     use crate::component::RegistryBuilder;
     use crate::conf::MandatoryRuntimeConfig;
-    use crate::error::{ErrorKind, OperationError};
+    use crate::error::{FatalError, OperationError};
     use crate::thread::{SpawnTestEvent, fail_spawn_named, observe_spawn_named};
     use std::panic::{self, AssertUnwindSafe};
     use std::sync::Arc;
@@ -1211,7 +1212,7 @@ mod tests {
     }
 
     #[test]
-    fn mandatory_observer_discloses_operation_error() {
+    fn mandatory_observer_retains_operation_error() {
         runtime::block_on(async {
             let metadata = MandatoryTaskMetadata::operation("test", None);
             let (producer, observer) = MandatoryCompletion::<()>::endpoints(
@@ -1222,7 +1223,10 @@ mod tests {
                 Report::new(OperationError::TableNotFound).attach("operation=test"),
             )));
             let error = observer.wait().await.unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::Operation);
+            assert_eq!(
+                error.downcast_ref::<OperationError>().copied(),
+                Some(OperationError::TableNotFound)
+            );
         });
     }
 
@@ -1787,7 +1791,10 @@ mod tests {
                 .wait()
                 .await
                 .unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::Operation);
+            assert_eq!(
+                error.downcast_ref::<OperationError>().copied(),
+                Some(OperationError::TableNotFound)
+            );
             let stats = mandatory.stats().operation;
             assert_eq!(stats.submitted_count, 1);
             assert_eq!(stats.started_count, 1);
@@ -2044,13 +2051,35 @@ mod tests {
                 .await
                 .unwrap();
             let error = observer.wait().await.unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::Fatal);
+            assert_eq!(
+                error.downcast_ref::<FatalError>().copied(),
+                Some(FatalError::MandatoryTaskPanic)
+            );
             assert_eq!(finishes.load(Ordering::Relaxed), 0);
             assert_eq!(handled.load(Ordering::Relaxed), 1);
             let poison = mandatory.poisoner.poison_error().unwrap();
             let poison = format!("{poison:?}");
             assert!(poison.contains("task_class=operation"), "{poison}");
             assert!(poison.contains("task_label=execute_panic"), "{poison}");
+            let rejected = mandatory
+                .submit(SyntheticPrepared {
+                    moves: Arc::new(AtomicUsize::new(0)),
+                    finishes: Arc::new(AtomicUsize::new(0)),
+                    fail: false,
+                })
+                .await;
+            let error = match rejected {
+                Ok(_) => panic!("poisoned mandatory runtime must reject new work"),
+                Err(error) => error,
+            };
+            let LifecycleOrFatalError::Fatal(error) = error else {
+                panic!("poisoned mandatory admission must remain Fatal")
+            };
+            assert_eq!(
+                error.downcast_ref::<FatalError>().copied(),
+                Some(FatalError::MandatoryTaskPanic)
+            );
+            assert!(error.downcast_ref::<LifecycleError>().is_none());
             mandatory.drain_callers().await;
             let stats = mandatory.stats().operation;
             assert_eq!(stats.submitted_count, 1);

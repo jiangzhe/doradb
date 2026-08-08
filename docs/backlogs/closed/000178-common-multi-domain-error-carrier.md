@@ -29,17 +29,10 @@ A future task selects and implements a consistent carrier strategy; poison remai
 
 ## Notes (Optional)
 
-
-## Close Reason (Added When Closed)
-
-When a backlog item is moved to `docs/backlogs/closed/`, append:
-
-```md
 ## Close Reason
 
-- Type: <implemented|stale|replaced|duplicate|wontfix|already-implemented|other>
-- Detail: <reason detail>
-- Closed By: <backlog close>
-- Reference: <task/issue/pr reference>
-- Closed At: <YYYY-MM-DD>
-```
+- Type: implemented
+- Detail: Implemented via docs/tasks/000263-introduce-quad-error-and-narrow-audited-error-convergence.md
+- Closed By: backlog close
+- Reference: User decision
+- Closed At: 2026-08-08

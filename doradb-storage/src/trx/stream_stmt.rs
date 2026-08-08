@@ -1,6 +1,7 @@
 use crate::buffer::EvictableBufferPool;
 use crate::error::{
-    DiscloseResultExt, OperationError, OperationOrFatalResult, Result, RuntimeResult,
+    DiscloseResultExt, MultiDomainResultExt, OperationError, OperationOrFatalResult, Result,
+    RuntimeResult,
 };
 use crate::id::TableID;
 use crate::index::{

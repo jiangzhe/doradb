@@ -12,7 +12,8 @@ use crate::catalog::{
 use crate::engine::{EngineAdmission, EngineCore, EngineLifecycle};
 use crate::error::{
     CompletionErrorBridge, CompletionResult, DiscloseError, DiscloseResultExt, FatalError,
-    LifecycleError, LifecycleResult, MultiDomainResultExt, OperationError, OperationResult, Result,
+    LifecycleError, LifecycleOrFatalError, LifecycleOrFatalResult, LifecycleResult,
+    MultiDomainResultExt, OperationError, OperationResult, Result, RuntimeError,
 };
 use crate::id::{OperationID, SessionID, SessionOperationKey, TableID, TrxID};
 use crate::lock::{
@@ -768,10 +769,11 @@ impl Session {
     /// This path rejects storage poison. Poison-observable read-only diagnostics
     /// use [`Self::pin_inspection`] instead.
     #[inline]
-    pub(crate) fn pin_observer(&self) -> LifecycleResult<SessionObserverPin> {
+    pub(crate) fn pin_observer(&self) -> LifecycleOrFatalResult<SessionObserverPin> {
         if self.closed.get() {
             return Err(Report::new(LifecycleError::SessionUnavailable)
-                .attach(format!("session_id={}", self.id)));
+                .attach(format!("session_id={}", self.id))
+                .into());
         }
         let admitted = self
             .session
@@ -785,8 +787,11 @@ impl Session {
             .runtime()
             .poisoner
             .ensure_healthy()
-            .change_context(LifecycleError::RuntimeUnavailable)
-            .attach_with(|| format!("session_id={}, phase=check_engine_health", self.id))?;
+            .map_err(|error| {
+                LifecycleOrFatalError::from(
+                    error.attach(format!("session_id={}, phase=check_engine_health", self.id)),
+                )
+            })?;
         admitted
             .runtime()
             .state()
@@ -798,10 +803,14 @@ impl Session {
 
     /// Reserves one stable entry for an effectful public session operation.
     #[inline]
-    fn pin_operation(&self, kind: SessionOperationKind) -> LifecycleResult<SessionOperationPin> {
+    fn pin_operation(
+        &self,
+        kind: SessionOperationKind,
+    ) -> LifecycleOrFatalResult<SessionOperationPin> {
         if self.closed.get() {
             return Err(Report::new(LifecycleError::SessionUnavailable)
-                .attach(format!("session_id={}", self.id)));
+                .attach(format!("session_id={}", self.id))
+                .into());
         }
         let admitted = self
             .session
@@ -815,13 +824,12 @@ impl Session {
             .runtime()
             .poisoner
             .ensure_healthy()
-            .change_context(LifecycleError::RuntimeUnavailable)
-            .attach_with(|| {
-                format!(
+            .map_err(|error| {
+                LifecycleOrFatalError::from(error.attach(format!(
                     "session_id={}, kind={}, phase=check_engine_health",
                     self.id,
                     kind.label()
-                )
+                )))
             })?;
         let (entry, authority) = admitted
             .runtime()
@@ -909,7 +917,6 @@ impl Session {
             .runtime()
             .poisoner
             .ensure_healthy()
-            .change_context(LifecycleError::RuntimeUnavailable)
             .attach_with(|| format!("session_id={}, phase=check_engine_health", self.id))
             .disclose()?;
         let trx = admitted
@@ -943,7 +950,6 @@ impl Session {
                 .runtime()
                 .poisoner
                 .ensure_healthy()
-                .change_context(LifecycleError::RuntimeUnavailable)
                 .attach_with(|| {
                     format!(
                         "operation=close_session, session_id={}, phase=check_engine_health",
@@ -992,7 +998,12 @@ impl Session {
             .attach("operation=create_table")
             .disclose()?;
         drop(mandatory_runtime);
-        observer.wait().await
+        observer
+            .wait()
+            .await
+            .map_err(|error| error.into_quad(RuntimeError::CatalogAccess))
+            .attach("operation=create_table, phase=wait_mandatory_completion")
+            .disclose()
     }
 
     /// Build and publish a new secondary index for an existing user table.
@@ -1030,14 +1041,23 @@ impl Session {
             .await
             .attach("operation=create_index")
             .disclose()?;
-        let plan = CreateIndexPlan::new(table_id, table, index_spec)?;
+        let plan = CreateIndexPlan::new(table_id, table, index_spec).disclose()?;
         let observer = mandatory_runtime
             .submit(PreparedCreateIndex::new(gates, scope, plan))
             .await
             .attach("operation=create_index")
             .disclose()?;
         drop(mandatory_runtime);
-        observer.wait().await
+        observer
+            .wait()
+            .await
+            .map_err(|error| error.into_quad(RuntimeError::IndexAccess))
+            .attach_with(|| {
+                format!(
+                    "operation=create_index, phase=wait_mandatory_completion, table_id={table_id}"
+                )
+            })
+            .disclose()
     }
 
     /// Logically drop an active secondary index from an existing user table.
@@ -1067,14 +1087,23 @@ impl Session {
             .await
             .attach("operation=drop_index")
             .disclose()?;
-        let plan = DropIndexPlan::new(table_id, table, index_no)?;
+        let plan = DropIndexPlan::new(table_id, table, index_no).disclose()?;
         let observer = mandatory_runtime
             .submit(PreparedDropIndex::new(gates, scope, plan))
             .await
             .attach("operation=drop_index")
             .disclose()?;
         drop(mandatory_runtime);
-        observer.wait().await
+        observer
+            .wait()
+            .await
+            .map_err(|error| error.into_quad(RuntimeError::IndexAccess))
+            .attach_with(|| {
+                format!(
+                    "operation=drop_index, phase=wait_mandatory_completion, table_id={table_id}, index_no={index_no}"
+                )
+            })
+            .disclose()
     }
 
     /// Logically drop an existing user table.
@@ -1097,7 +1126,16 @@ impl Session {
             .attach("operation=drop_table")
             .disclose()?;
         drop(mandatory_runtime);
-        observer.wait().await
+        observer
+            .wait()
+            .await
+            .map_err(|error| error.into_quad(RuntimeError::CatalogAccess))
+            .attach_with(|| {
+                format!(
+                    "operation=drop_table, phase=wait_mandatory_completion, table_id={table_id}"
+                )
+            })
+            .disclose()
     }
 
     /// Run one online catalog checkpoint.
@@ -1125,7 +1163,13 @@ impl Session {
             .attach("operation=checkpoint_catalog")
             .disclose()?;
         drop(mandatory_runtime);
-        observer.wait().await.map(|_| ())
+        observer
+            .wait()
+            .await
+            .map_err(|error| error.into_quad(RuntimeError::CatalogAccess))
+            .attach("operation=checkpoint_catalog, phase=wait_mandatory_completion")
+            .map(|_| ())
+            .disclose()
     }
 
     /// Run catalog checkpoint and redo-log truncation as one maintenance operation.
@@ -1154,7 +1198,14 @@ impl Session {
             .attach("operation=checkpoint_catalog_and_truncate_redo_log")
             .disclose()?;
         drop(mandatory_runtime);
-        observer.wait().await
+        observer
+            .wait()
+            .await
+            .map_err(|error| error.into_quad(RuntimeError::CatalogAccess))
+            .attach(
+                "operation=checkpoint_catalog_and_truncate_redo_log, phase=wait_mandatory_completion",
+            )
+            .disclose()
     }
 
     /// Physically remove recovery-obsolete sealed redo prefix files.
@@ -1182,7 +1233,12 @@ impl Session {
             .attach("operation=truncate_redo_log")
             .disclose()?;
         drop(mandatory_runtime);
-        observer.wait().await
+        observer
+            .wait()
+            .await
+            .map_err(|error| error.into_quad(RuntimeError::RedoLogAccess))
+            .attach("operation=truncate_redo_log, phase=wait_mandatory_completion")
+            .disclose()
     }
 
     /// Return a monotonic transaction-system statistics snapshot.
@@ -1320,7 +1376,16 @@ impl Session {
             .attach_with(|| format!("operation=freeze_table, table_id={table_id}"))
             .disclose()?;
         drop(mandatory_runtime);
-        observer.wait().await
+        observer
+            .wait()
+            .await
+            .map_err(|error| error.into_quad(RuntimeError::TableAccess))
+            .attach_with(|| {
+                format!(
+                    "operation=freeze_table, phase=wait_mandatory_completion, table_id={table_id}, max_rows={max_rows}"
+                )
+            })
+            .disclose()
     }
 
     /// Persist eligible state using the table-owned canonical frozen batch.
@@ -1351,7 +1416,16 @@ impl Session {
             .attach_with(|| format!("operation=checkpoint_table, table_id={table_id}"))
             .disclose()?;
         drop(mandatory_runtime);
-        observer.wait().await
+        observer
+            .wait()
+            .await
+            .map_err(|error| error.into_quad(RuntimeError::CheckpointExecution))
+            .attach_with(|| {
+                format!(
+                    "operation=checkpoint_table, phase=wait_mandatory_completion, table_id={table_id}"
+                )
+            })
+            .disclose()
     }
 
     /// Wait until retry may be useful for one self-identifying checkpoint delay.
@@ -1417,7 +1491,9 @@ impl Session {
             .pin_observer()
             .attach("operation=wait_for_gc_horizon")
             .disclose()?;
-        wait_for_maintenance_boundary(&session, ts, MaintenanceBoundary::GcHorizon).await
+        wait_for_maintenance_boundary(&session, ts, MaintenanceBoundary::GcHorizon)
+            .await
+            .disclose()
     }
 
     /// Wait for completed purge-horizon-cycle progress to become strictly newer.
@@ -1429,7 +1505,9 @@ impl Session {
             .pin_observer()
             .attach("operation=wait_for_purge_completion")
             .disclose()?;
-        wait_for_maintenance_boundary(&session, ts, MaintenanceBoundary::PurgeCompletion).await
+        wait_for_maintenance_boundary(&session, ts, MaintenanceBoundary::PurgeCompletion)
+            .await
+            .disclose()
     }
 
     /// Returns total number of hot row pages for an existing user table.
@@ -1490,7 +1568,16 @@ impl Session {
             .attach_with(|| format!("operation=cleanup_secondary_mem_indexes, table_id={table_id}"))
             .disclose()?;
         drop(mandatory_runtime);
-        observer.wait().await
+        observer
+            .wait()
+            .await
+            .map_err(|error| error.into_quad(RuntimeError::IndexAccess))
+            .attach_with(|| {
+                format!(
+                    "operation=cleanup_secondary_mem_indexes, phase=wait_mandatory_completion, table_id={table_id}, clean_live_entries={clean_live_entries}"
+                )
+            })
+            .disclose()
     }
 
     /// Acquires an explicit session-lifetime table lock.
@@ -3197,17 +3284,27 @@ async fn wait_for_maintenance_boundary(
     session: &SessionObserverPin,
     ts: TrxID,
     boundary: MaintenanceBoundary,
-) -> Result<TrxID> {
+) -> LifecycleOrFatalResult<TrxID> {
     let trx_sys = &session.runtime.trx_sys;
     loop {
-        session.runtime.poisoner.ensure_healthy().disclose()?;
+        session
+            .runtime
+            .poisoner
+            .ensure_healthy()
+            .map_err(LifecycleOrFatalError::from)
+            .attach_with(|| {
+                format!(
+                    "maintenance progress wait observed engine poison: boundary={}, target_ts={ts}",
+                    boundary.name()
+                )
+            })?;
         if session.runtime.state().admission.shutdown_started() {
             return Err(Report::new(LifecycleError::Shutdown)
                 .attach(format!(
                     "maintenance progress wait observed engine shutdown: boundary={}, target_ts={ts}",
                     boundary.name()
                 ))
-                .disclose());
+                .into());
         }
         let observed = boundary.observed(session);
         if observed > ts {
@@ -3219,14 +3316,24 @@ async fn wait_for_maintenance_boundary(
         let poison_listener = session.runtime.poisoner.listener();
         let shutdown_listener = session.runtime.state().admission.shutdown_listener();
 
-        session.runtime.poisoner.ensure_healthy().disclose()?;
+        session
+            .runtime
+            .poisoner
+            .ensure_healthy()
+            .map_err(LifecycleOrFatalError::from)
+            .attach_with(|| {
+                format!(
+                    "maintenance progress wait observed engine poison: boundary={}, target_ts={ts}",
+                    boundary.name()
+                )
+            })?;
         if session.runtime.state().admission.shutdown_started() {
             return Err(Report::new(LifecycleError::Shutdown)
                 .attach(format!(
                     "maintenance progress wait observed engine shutdown: boundary={}, target_ts={ts}",
                     boundary.name()
                 ))
-                .disclose());
+                .into());
         }
         let observed = boundary.observed(session);
         if observed > ts {
@@ -3485,12 +3592,9 @@ pub(crate) mod tests {
     }
 
     #[inline]
-    fn assert_runtime_unavailable_after_fatal(err: Error, fatal: FatalError) {
-        assert_eq!(err.kind(), ErrorKind::Lifecycle);
-        assert_eq!(
-            err.report().downcast_ref::<LifecycleError>().copied(),
-            Some(LifecycleError::RuntimeUnavailable)
-        );
+    fn assert_fatal_admission_error(err: Error, fatal: FatalError) {
+        assert_eq!(err.kind(), ErrorKind::Fatal);
+        assert!(err.report().downcast_ref::<LifecycleError>().is_none());
         assert_eq!(
             err.report().downcast_ref::<FatalError>().copied(),
             Some(fatal)
@@ -4109,6 +4213,9 @@ pub(crate) mod tests {
                 Ok(_) => panic!("closed session must reject new observers"),
                 Err(err) => err,
             };
+            let LifecycleOrFatalError::Lifecycle(err) = err else {
+                panic!("closed session must remain a Lifecycle rejection")
+            };
             assert_eq!(err.current_context(), &LifecycleError::SessionUnavailable);
 
             drop(observer);
@@ -4253,7 +4360,9 @@ pub(crate) mod tests {
                 let observer = scope.spawn(move || {
                     observer_barrier.wait();
                     if inspection {
-                        session.pin_inspection()
+                        session
+                            .pin_inspection()
+                            .map_err(LifecycleOrFatalError::from)
                     } else {
                         session.pin_observer()
                     }
@@ -4262,6 +4371,9 @@ pub(crate) mod tests {
 
                 match (shutdown.join().unwrap(), observer.join().unwrap()) {
                     (Ok(()), Err(err)) => {
+                        let LifecycleOrFatalError::Lifecycle(err) = err else {
+                            panic!("shutdown admission must remain Lifecycle")
+                        };
                         assert_eq!(err.current_context(), &LifecycleError::Shutdown);
                     }
                     (Err(err), Ok(observer)) => {
@@ -5340,6 +5452,46 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_maintenance_progress_wait_poison_reports_boundary_context() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let session = engine.new_session().unwrap();
+            let observer = session.pin_observer().unwrap();
+            let target = engine.inner().trx_sys.purge_handoff_cts();
+            let _ = engine
+                .inner()
+                .poisoner
+                .poison(Report::new(FatalError::RedoWrite).attach("maintenance wait poison"));
+
+            for boundary in [
+                MaintenanceBoundary::GcHorizon,
+                MaintenanceBoundary::PurgeCompletion,
+            ] {
+                let error = wait_for_maintenance_boundary(&observer, target, boundary)
+                    .await
+                    .unwrap_err();
+                let LifecycleOrFatalError::Fatal(error) = error else {
+                    panic!("poisoned maintenance wait must remain Fatal")
+                };
+                assert_eq!(
+                    error.downcast_ref::<FatalError>().copied(),
+                    Some(FatalError::RedoWrite)
+                );
+                assert!(error.downcast_ref::<LifecycleError>().is_none());
+                let report = format!("{error:?}");
+                let expected = format!(
+                    "maintenance progress wait observed engine poison: boundary={}, target_ts={target}",
+                    boundary.name()
+                );
+                assert!(report.contains(&expected), "{report}");
+            }
+        });
+    }
+
+    #[test]
     fn test_session_checkpoint_catalog_persists_catalog_state() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
@@ -5712,6 +5864,13 @@ pub(crate) mod tests {
             assert_eq!(
                 err.report().downcast_ref::<FatalError>().copied(),
                 Some(FatalError::CheckpointWrite)
+            );
+            let report = format!("{err:?}");
+            assert!(
+                report.contains(
+                    "operation=checkpoint_catalog_and_truncate_redo_log, phase=wait_mandatory_completion"
+                ),
+                "{report}"
             );
             assert!(publish_hook.call_count() > 0);
             let after = engine.inner().core.catalog().storage.checkpoint_snapshot();
@@ -6602,7 +6761,7 @@ pub(crate) mod tests {
                 Ok(_) => panic!("normal observer admission must reject storage poison"),
                 Err(err) => err,
             };
-            assert_runtime_unavailable_after_fatal(err, FatalError::RedoWrite);
+            assert_fatal_admission_error(err, FatalError::RedoWrite);
 
             assert_eq!(session.list_table_ids().unwrap(), vec![table_id]);
             assert!(session.transaction_system_stats().is_ok());
@@ -6612,10 +6771,10 @@ pub(crate) mod tests {
             assert!(session.logical_lock_stats().is_ok());
 
             let err = session.truncate_redo_log().await.unwrap_err();
-            assert_runtime_unavailable_after_fatal(err, FatalError::RedoWrite);
+            assert_fatal_admission_error(err, FatalError::RedoWrite);
 
             let err = session.checkpoint_catalog().await.unwrap_err();
-            assert_runtime_unavailable_after_fatal(err, FatalError::RedoWrite);
+            assert_fatal_admission_error(err, FatalError::RedoWrite);
         });
     }
 }

@@ -654,6 +654,8 @@ impl<'stmt> Statement<'stmt> {
             .accessor_with_layout(&layout)
             .insert_mvcc(rt, effects, cols)
             .await
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+            .disclose()
     }
 
     /// Inserts or replaces one catalog-owned user-table row by table id and unique key.
@@ -699,6 +701,8 @@ impl<'stmt> Statement<'stmt> {
             .accessor_with_layout(&layout)
             .upsert_unique_mvcc(rt, effects, unique_index_no, cols, false)
             .await
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+            .disclose()
     }
 
     /// Updates one catalog-owned user-table row by table id and unique key.
@@ -743,6 +747,8 @@ impl<'stmt> Statement<'stmt> {
             .accessor_with_layout(&layout)
             .update_unique_mvcc(rt, effects, index_no, key_vals, update, false)
             .await
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+            .disclose()
     }
 
     /// Deletes one catalog-owned user-table row by table id and unique key.
@@ -780,6 +786,8 @@ impl<'stmt> Statement<'stmt> {
             .accessor_with_layout(&layout)
             .delete_unique_mvcc(rt, effects, index_no, key_vals)
             .await
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+            .disclose()
     }
 
     /// Inserts one catalog-table row through the foreground lock-aware path.
