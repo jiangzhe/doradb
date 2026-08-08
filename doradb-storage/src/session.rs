@@ -3291,7 +3291,13 @@ async fn wait_for_maintenance_boundary(
             .runtime
             .poisoner
             .ensure_healthy()
-            .map_err(LifecycleOrFatalError::from)?;
+            .map_err(LifecycleOrFatalError::from)
+            .attach_with(|| {
+                format!(
+                    "maintenance progress wait observed engine poison: boundary={}, target_ts={ts}",
+                    boundary.name()
+                )
+            })?;
         if session.runtime.state().admission.shutdown_started() {
             return Err(Report::new(LifecycleError::Shutdown)
                 .attach(format!(
@@ -3314,7 +3320,13 @@ async fn wait_for_maintenance_boundary(
             .runtime
             .poisoner
             .ensure_healthy()
-            .map_err(LifecycleOrFatalError::from)?;
+            .map_err(LifecycleOrFatalError::from)
+            .attach_with(|| {
+                format!(
+                    "maintenance progress wait observed engine poison: boundary={}, target_ts={ts}",
+                    boundary.name()
+                )
+            })?;
         if session.runtime.state().admission.shutdown_started() {
             return Err(Report::new(LifecycleError::Shutdown)
                 .attach(format!(
@@ -5436,6 +5448,46 @@ pub(crate) mod tests {
                 .unwrap();
             assert!(active_session.in_trx().unwrap());
             trx.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_maintenance_progress_wait_poison_reports_boundary_context() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let session = engine.new_session().unwrap();
+            let observer = session.pin_observer().unwrap();
+            let target = engine.inner().trx_sys.purge_handoff_cts();
+            let _ = engine
+                .inner()
+                .poisoner
+                .poison(Report::new(FatalError::RedoWrite).attach("maintenance wait poison"));
+
+            for boundary in [
+                MaintenanceBoundary::GcHorizon,
+                MaintenanceBoundary::PurgeCompletion,
+            ] {
+                let error = wait_for_maintenance_boundary(&observer, target, boundary)
+                    .await
+                    .unwrap_err();
+                let LifecycleOrFatalError::Fatal(error) = error else {
+                    panic!("poisoned maintenance wait must remain Fatal")
+                };
+                assert_eq!(
+                    error.downcast_ref::<FatalError>().copied(),
+                    Some(FatalError::RedoWrite)
+                );
+                assert!(error.downcast_ref::<LifecycleError>().is_none());
+                let report = format!("{error:?}");
+                let expected = format!(
+                    "maintenance progress wait observed engine poison: boundary={}, target_ts={target}",
+                    boundary.name()
+                );
+                assert!(report.contains(&expected), "{report}");
+            }
         });
     }
 

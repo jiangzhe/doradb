@@ -41,16 +41,7 @@ Briefly describe what outcome would indicate this item is done.
 
 Extra context that helps future task creation.
 
-## Close Reason (Added When Closed)
-
-When a backlog item is moved to `docs/backlogs/closed/`, append:
-
-```md
-## Close Reason
-
-- Type: <implemented|stale|replaced|duplicate|wontfix|already-implemented|other>
-- Detail: <reason detail>
-- Closed By: <backlog close>
-- Reference: <task/issue/pr reference>
-- Closed At: <YYYY-MM-DD>
-```
+Closure metadata is added only by `tools/backlog.rs close-doc`. It records the
+resolution type, explanatory detail, closing actor, task/issue/PR reference,
+and closure date. Do not add a Close Reason section to an open backlog; the
+close command appends the populated section when archiving it.
