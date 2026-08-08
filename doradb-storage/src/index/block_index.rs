@@ -367,8 +367,8 @@ mod tests {
         }
 
         #[inline]
-        fn pool_guard(&self) -> PoolGuard {
-            self.inner.pool_guard()
+        fn create_base_guard(&self) -> PoolGuard {
+            self.inner.create_base_guard()
         }
 
         #[inline]
@@ -456,7 +456,7 @@ mod tests {
     fn test_block_index_root_accessors_and_update() {
         smol::block_on(async {
             let meta_pool = owned_index_pool(64 * 1024 * 1024);
-            let meta_guard = (*meta_pool).pool_guard();
+            let meta_guard = (*meta_pool).create_base_guard();
             let blk_idx = BlockIndex::new(
                 meta_pool.guard(),
                 &meta_guard,
@@ -501,7 +501,7 @@ mod tests {
         let pool = QuiescentBox::new(
             FixedBufferPool::with_capacity(PoolRole::Index, 64 * 1024 * 1024).unwrap(),
         );
-        let meta_guard = (*pool).pool_guard();
+        let meta_guard = (*pool).create_base_guard();
         let blk_idx = smol::block_on(BlockIndex::new(
             pool.guard(),
             &meta_guard,
@@ -520,8 +520,8 @@ mod tests {
         smol::block_on(async {
             let meta_pool = owned_index_pool(64 * 1024 * 1024);
             let mem_pool = owned_mem_pool(64 * 1024 * 1024);
-            let meta_guard = (*meta_pool).pool_guard();
-            let mem_guard = (*mem_pool).pool_guard();
+            let meta_guard = (*meta_pool).create_base_guard();
+            let mem_guard = (*mem_pool).create_base_guard();
             let metadata = make_test_metadata();
             let blk_idx = BlockIndex::new(
                 meta_pool.guard(),

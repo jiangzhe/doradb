@@ -698,7 +698,7 @@ pool_access_newtype!(IndexPool, EvictableBufferPool);
 pool_access_newtype!(MemPool, EvictableBufferPool);
 pool_access_newtype!(DiskPool, ReadonlyBufferPool);
 
-/// Canonical engine buffer-pool capability shared by session runtime work.
+/// Engine buffer-pool capabilities and owner-scoped canonical guards.
 pub(crate) struct EnginePools {
     /// Metadata pool used for catalog and block-index pages.
     pub(crate) meta: QuiescentGuard<FixedBufferPool>,
@@ -708,20 +708,12 @@ pub(crate) struct EnginePools {
     pub(crate) mem: QuiescentGuard<EvictableBufferPool>,
     /// Readonly persisted-page pool.
     pub(crate) disk: QuiescentGuard<ReadonlyBufferPool>,
-    /// Prebuilt guards for the exact four pool identities above.
+    /// Prebuilt guards for engine-owned work outside session hot paths.
+    ///
+    /// Session state must use [`Self::create_session_pool_guards`] instead. Page latch
+    /// guards clone these roots on every access, so sharing this bundle across
+    /// sessions would make each pool's outer `Arc` counter engine-global.
     guards: PoolGuards,
-}
-
-impl Clone for EnginePools {
-    #[inline]
-    fn clone(&self) -> Self {
-        Self::new(
-            self.meta.clone(),
-            self.index.clone(),
-            self.mem.clone(),
-            self.disk.clone(),
-        )
-    }
 }
 
 impl EnginePools {
@@ -734,10 +726,10 @@ impl EnginePools {
         disk: QuiescentGuard<ReadonlyBufferPool>,
     ) -> Self {
         let guards = PoolGuards::builder()
-            .push(PoolRole::Meta, meta.pool_guard())
-            .push(PoolRole::Index, index.pool_guard())
-            .push(PoolRole::Mem, mem.pool_guard())
-            .push(PoolRole::Disk, disk.pool_guard())
+            .push(PoolRole::Meta, meta.create_base_guard())
+            .push(PoolRole::Index, index.create_base_guard())
+            .push(PoolRole::Mem, mem.create_base_guard())
+            .push(PoolRole::Disk, disk.create_base_guard())
             .build();
         Self {
             meta,
@@ -752,6 +744,23 @@ impl EnginePools {
     #[inline]
     pub(crate) fn pool_guards(&self) -> &PoolGuards {
         &self.guards
+    }
+
+    /// Build an independent guard-root bundle for one session lifetime.
+    ///
+    /// Each `create_base_guard` call acquires one long-lived arena keepalive
+    /// and wraps it in a fresh `Arc`. Page guards cloned by that session then
+    /// update only its root instead of contending on the canonical engine
+    /// roots. Keep this construction at session creation rather than moving it
+    /// into per-page or per-statement work.
+    #[inline]
+    pub(crate) fn create_session_pool_guards(&self) -> PoolGuards {
+        PoolGuards::builder()
+            .push(PoolRole::Meta, self.meta.create_base_guard())
+            .push(PoolRole::Index, self.index.create_base_guard())
+            .push(PoolRole::Mem, self.mem.create_base_guard())
+            .push(PoolRole::Disk, self.disk.create_base_guard())
+            .build()
     }
 }
 

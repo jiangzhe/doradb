@@ -1705,9 +1705,11 @@ mod tests {
 
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
             corrupt_lwc_row_shape_fingerprint(table_file_path, block_id);
-            let _ = table
-                .disk_pool()
-                .invalidate_block(table.file().sparse_file().file_id(), block_id);
+            let _ = table.disk_pool().invalidate_block(
+                session.pool_guards().disk_guard(),
+                table.file().sparse_file().file_id(),
+                block_id,
+            );
 
             let err = session
                 .cleanup_secondary_mem_indexes(table_id, true)

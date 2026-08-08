@@ -722,12 +722,13 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
-            let disk_pool_guard = disk_pool.pool_guard();
+            let disk_pool_guard = disk_pool.create_base_guard();
 
             let mut mutable = MutableTableFile::fork(
                 &table,
                 fs.background_writes(),
                 disk_pool.global_pool().clone(),
+                disk_pool_guard.clone(),
             );
             let blob = vec![9u8; 513];
             let blob_ref = {
@@ -761,12 +762,13 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
-            let disk_pool_guard = disk_pool.pool_guard();
+            let disk_pool_guard = disk_pool.create_base_guard();
 
             let mut mutable = MutableTableFile::fork(
                 &table,
                 fs.background_writes(),
                 disk_pool.global_pool().clone(),
+                disk_pool_guard.clone(),
             );
             let blob = vec![9u8; 513];
             let blob_ref = {
@@ -809,12 +811,13 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
-            let disk_pool_guard = disk_pool.pool_guard();
+            let disk_pool_guard = disk_pool.create_base_guard();
 
             let mut mutable = MutableTableFile::fork(
                 &table,
                 fs.background_writes(),
                 disk_pool.global_pool().clone(),
+                disk_pool_guard.clone(),
             );
             let blob = vec![7u8; COLUMN_DELETION_BLOB_PAGE_BODY_SIZE * 2 + 113];
             let blob_ref = {
@@ -848,12 +851,13 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
-            let disk_pool_guard = disk_pool.pool_guard();
+            let disk_pool_guard = disk_pool.create_base_guard();
 
             let mut mutable = MutableTableFile::fork(
                 &table,
                 fs.background_writes(),
                 disk_pool.global_pool().clone(),
+                disk_pool_guard.clone(),
             );
             let blob = vec![7u8; COLUMN_DELETION_BLOB_PAGE_BODY_SIZE * 2 + 113];
             let blob_ref = {
@@ -893,12 +897,13 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
-            let disk_pool_guard = disk_pool.pool_guard();
+            let disk_pool_guard = disk_pool.create_base_guard();
 
             let mut mutable = MutableTableFile::fork(
                 &table,
                 fs.background_writes(),
                 disk_pool.global_pool().clone(),
+                disk_pool_guard.clone(),
             );
             let first_blob =
                 vec![3u8; COLUMN_DELETION_BLOB_PAGE_BODY_SIZE - COLUMN_AUX_BLOB_HEADER_SIZE];

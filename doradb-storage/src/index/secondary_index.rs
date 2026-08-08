@@ -187,15 +187,6 @@ impl SecondaryDiskTreeRuntime {
         self.index_no
     }
 
-    /// Borrow a guard for opening one or more DiskTree readers on this runtime.
-    #[inline]
-    pub(crate) fn disk_pool_guard(&self) -> PoolGuard {
-        match &self.kind {
-            SecondaryDiskTreeRuntimeKind::Unique(runtime) => runtime.disk_pool_guard(),
-            SecondaryDiskTreeRuntimeKind::NonUnique(runtime) => runtime.disk_pool_guard(),
-        }
-    }
-
     /// Returns the shared key encoder for this secondary index.
     #[inline]
     pub(crate) fn key_encoder(&self) -> Arc<BTreeKeyEncoder> {
@@ -1179,11 +1170,12 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(611), &table);
-            let disk_guard = disk_pool.pool_guard();
+            let disk_guard = disk_pool.create_base_guard();
             let mut mutable = MutableTableFile::fork(
                 &table,
                 fs.background_writes(),
                 disk_pool.global_pool().clone(),
+                disk_guard.clone(),
             );
             let disk_runtime = unique_runtime!(metadata, disk_pool);
             let disk = disk_runtime.open(SUPER_BLOCK_ID, &disk_guard);
@@ -1219,7 +1211,7 @@ mod tests {
             let index_pool = QuiescentBox::new(
                 FixedBufferPool::with_capacity(PoolRole::Index, 64 * 1024 * 1024).unwrap(),
             );
-            let index_guard = (*index_pool).pool_guard();
+            let index_guard = (*index_pool).create_base_guard();
             let mem = unique_mem_index(&index_pool, &index_guard).await;
             assert!(
                 mem.bind(&index_guard)
@@ -1237,8 +1229,8 @@ mod tests {
             .unwrap();
             let index = SecondaryIndex::Unique { mem, disk: runtime };
             let pool_guards = PoolGuards::builder()
-                .push(PoolRole::Index, (*index_pool).pool_guard())
-                .push(PoolRole::Disk, disk_pool.pool_guard())
+                .push(PoolRole::Index, (*index_pool).create_base_guard())
+                .push(PoolRole::Disk, disk_pool.create_base_guard())
                 .build();
             let bound = index.bind_unique_unchecked(&pool_guards, root).unwrap();
 
@@ -1509,7 +1501,7 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(614), &table);
-            let disk_guard = disk_pool.pool_guard();
+            let disk_guard = disk_pool.create_base_guard();
             let key1 = [Val::from(1u32)];
             let key2 = [Val::from(2u32)];
 
@@ -1517,6 +1509,7 @@ mod tests {
                 &table,
                 fs.background_writes(),
                 disk_pool.global_pool().clone(),
+                disk_guard.clone(),
             );
             let disk_runtime = unique_runtime!(metadata, disk_pool);
             let disk = disk_runtime.open(SUPER_BLOCK_ID, &disk_guard);
@@ -1538,7 +1531,7 @@ mod tests {
                 disk_pool.global_pool().clone(),
             )
             .unwrap();
-            let opened_a_guard = runtime.disk_pool_guard();
+            let opened_a_guard = disk_pool.create_base_guard();
             let opened_a = runtime.open_unique_at(root_a, &opened_a_guard).unwrap();
             assert_eq!(opened_a.lookup(&key1).await.unwrap(), Some(RowID::new(10)));
             assert_eq!(opened_a.lookup(&key2).await.unwrap(), None);
@@ -1547,6 +1540,7 @@ mod tests {
                 &table,
                 fs.background_writes(),
                 disk_pool.global_pool().clone(),
+                disk_guard.clone(),
             );
             let disk = disk_runtime.open(root_a, &disk_guard);
             let root_b = {
@@ -1569,7 +1563,7 @@ mod tests {
             assert_eq!(opened_a.lookup(&key1).await.unwrap(), Some(RowID::new(10)));
             assert_eq!(opened_a.lookup(&key2).await.unwrap(), None);
 
-            let opened_b_guard = runtime.disk_pool_guard();
+            let opened_b_guard = disk_pool.create_base_guard();
             let opened_b = runtime.open_unique_at(root_b, &opened_b_guard).unwrap();
             assert_eq!(opened_b.lookup(&key1).await.unwrap(), Some(RowID::new(10)));
             assert_eq!(opened_b.lookup(&key2).await.unwrap(), Some(RowID::new(20)));
@@ -1588,11 +1582,12 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(612), &table);
-            let disk_guard = disk_pool.pool_guard();
+            let disk_guard = disk_pool.create_base_guard();
             let mut mutable = MutableTableFile::fork(
                 &table,
                 fs.background_writes(),
                 disk_pool.global_pool().clone(),
+                disk_guard.clone(),
             );
             let disk_runtime = non_unique_runtime!(metadata, disk_pool);
             let disk = disk_runtime.open(SUPER_BLOCK_ID, &disk_guard);
@@ -1628,7 +1623,7 @@ mod tests {
             let index_pool = QuiescentBox::new(
                 FixedBufferPool::with_capacity(PoolRole::Index, 64 * 1024 * 1024).unwrap(),
             );
-            let index_guard = (*index_pool).pool_guard();
+            let index_guard = (*index_pool).create_base_guard();
             let mem = non_unique_mem_index(&index_pool, &index_guard).await;
             assert!(
                 mem.bind(&index_guard)
@@ -1646,8 +1641,8 @@ mod tests {
             .unwrap();
             let index = SecondaryIndex::NonUnique { mem, disk: runtime };
             let pool_guards = PoolGuards::builder()
-                .push(PoolRole::Index, (*index_pool).pool_guard())
-                .push(PoolRole::Disk, disk_pool.pool_guard())
+                .push(PoolRole::Index, (*index_pool).create_base_guard())
+                .push(PoolRole::Disk, disk_pool.create_base_guard())
                 .build();
             let bound = index.bind_non_unique_unchecked(&pool_guards, root).unwrap();
 
@@ -1817,11 +1812,12 @@ mod tests {
                 drop(old_root);
                 let global = global_readonly_pool_scope(64 * 1024 * 1024);
                 let disk_pool = table_readonly_pool(&global, test_user_table_id(615), &table);
-                let disk_guard = disk_pool.pool_guard();
+                let disk_guard = disk_pool.create_base_guard();
                 let mut mutable = MutableTableFile::fork(
                     &table,
                     fs.background_writes(),
                     disk_pool.global_pool().clone(),
+                    disk_guard.clone(),
                 );
                 let disk_runtime = unique_runtime!(metadata, disk_pool);
                 let disk = disk_runtime.open(SUPER_BLOCK_ID, &disk_guard);
@@ -1857,7 +1853,7 @@ mod tests {
                 let index_pool = QuiescentBox::new(
                     FixedBufferPool::with_capacity(PoolRole::Index, 64 * 1024 * 1024).unwrap(),
                 );
-                let index_guard = (*index_pool).pool_guard();
+                let index_guard = (*index_pool).create_base_guard();
                 let mem = unique_mem_index(&index_pool, &index_guard).await;
                 assert!(
                     mem.bind(&index_guard)
@@ -1875,8 +1871,8 @@ mod tests {
                 .unwrap();
                 let index = SecondaryIndex::Unique { mem, disk: runtime };
                 let pool_guards = PoolGuards::builder()
-                    .push(PoolRole::Index, (*index_pool).pool_guard())
-                    .push(PoolRole::Disk, disk_pool.pool_guard())
+                    .push(PoolRole::Index, (*index_pool).create_base_guard())
+                    .push(PoolRole::Disk, disk_pool.create_base_guard())
                     .build();
                 let bound = index.bind_unique_unchecked(&pool_guards, root).unwrap();
 
@@ -1924,11 +1920,12 @@ mod tests {
                 drop(old_root);
                 let global = global_readonly_pool_scope(64 * 1024 * 1024);
                 let disk_pool = table_readonly_pool(&global, test_user_table_id(616), &table);
-                let disk_guard = disk_pool.pool_guard();
+                let disk_guard = disk_pool.create_base_guard();
                 let mut mutable = MutableTableFile::fork(
                     &table,
                     fs.background_writes(),
                     disk_pool.global_pool().clone(),
+                    disk_guard.clone(),
                 );
                 let disk_runtime = non_unique_runtime!(metadata, disk_pool);
                 let disk = disk_runtime.open(SUPER_BLOCK_ID, &disk_guard);
@@ -1959,7 +1956,7 @@ mod tests {
                 let index_pool = QuiescentBox::new(
                     FixedBufferPool::with_capacity(PoolRole::Index, 64 * 1024 * 1024).unwrap(),
                 );
-                let index_guard = (*index_pool).pool_guard();
+                let index_guard = (*index_pool).create_base_guard();
                 let mem = non_unique_mem_index(&index_pool, &index_guard).await;
                 assert!(
                     mem.bind(&index_guard)
@@ -1977,8 +1974,8 @@ mod tests {
                 .unwrap();
                 let index = SecondaryIndex::NonUnique { mem, disk: runtime };
                 let pool_guards = PoolGuards::builder()
-                    .push(PoolRole::Index, (*index_pool).pool_guard())
-                    .push(PoolRole::Disk, disk_pool.pool_guard())
+                    .push(PoolRole::Index, (*index_pool).create_base_guard())
+                    .push(PoolRole::Disk, disk_pool.create_base_guard())
                     .build();
                 let bound = index.bind_non_unique_unchecked(&pool_guards, root).unwrap();
 
@@ -2029,7 +2026,7 @@ mod tests {
             let index_pool = QuiescentBox::new(
                 FixedBufferPool::with_capacity(PoolRole::Index, 64 * 1024 * 1024).unwrap(),
             );
-            let index_guard = (*index_pool).pool_guard();
+            let index_guard = (*index_pool).create_base_guard();
             let mem = unique_mem_index(&index_pool, &index_guard).await;
             let shadow_key = [Val::from(9u32)];
             let guarded = mem.bind(&index_guard);

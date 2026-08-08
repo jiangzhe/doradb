@@ -1235,8 +1235,12 @@ mod tests {
     ) {
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         buf.as_bytes_mut()[..payload.len()].copy_from_slice(payload);
-        let mutable =
-            MutableTableFile::fork(table_file, fs.background_writes(), readonly_pool.clone());
+        let mutable = MutableTableFile::fork(
+            table_file,
+            fs.background_writes(),
+            readonly_pool.clone(),
+            readonly_pool.create_base_guard(),
+        );
         mutable.write_block(block_id, buf).await.unwrap();
         drop(mutable);
     }
@@ -1333,7 +1337,7 @@ mod tests {
     }
 
     async fn allocate_with_pressure(pool: &EvictableBufferPool, total_pages: usize) {
-        let pool_guard = pool.pool_guard();
+        let pool_guard = pool.create_base_guard();
         for _ in 0..total_pages {
             let page = pool
                 .allocate_page::<Page>(&pool_guard)
@@ -1363,7 +1367,11 @@ mod tests {
             write_payload(fs, &table_file, &pool, block_id, payload.as_bytes()).await;
         }
 
-        let file = fs.open_table_file(table_id, pool.clone()).await.unwrap();
+        let disk_guard = pool.create_base_guard();
+        let file = fs
+            .open_table_file(table_id, pool.clone(), &disk_guard)
+            .await
+            .unwrap();
         ReadonlyPressureFixture {
             file,
             pool,
@@ -1374,7 +1382,7 @@ mod tests {
 
     async fn drive_read_pressure(fixture: &ReadonlyPressureFixture) {
         let pool = &fixture.pool;
-        let pool_guard = pool.pool_guard();
+        let pool_guard = pool.create_base_guard();
         for i in 0..fixture.block_count {
             let block_id = fixture.base_block_id + i as u64;
             let g = pool

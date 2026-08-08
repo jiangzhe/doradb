@@ -1,3 +1,4 @@
+use crate::buffer::PoolGuard;
 use crate::catalog::storage::tables::TABLE_ID_TABLES;
 use crate::catalog::{
     Catalog, IndexDdlKind, IndexDdlRootProof, classify_index_ddl_root, is_catalog_table,
@@ -382,7 +383,7 @@ impl MaintenanceExecution for CatalogCheckpointExecution {
         let engine = runtime.core();
         engine
             .catalog()
-            .checkpoint_prepared(&engine.trx_sys)
+            .checkpoint_prepared(&engine.trx_sys, runtime.pool_guards().disk_guard())
             .await
             .map_err(CompletionErrorBridge::capture_runtime_or_fatal)
     }
@@ -417,9 +418,10 @@ impl Catalog {
     async fn checkpoint_prepared(
         &self,
         trx_sys: &TransactionSystem,
+        disk_guard: &PoolGuard,
     ) -> RuntimeOrFatalResult<CatalogCheckpointOutcome> {
         obs::info!("event=checkpoint_publish component=catalog action=start result=ok");
-        self.checkpoint_prepared_inner(trx_sys)
+        self.checkpoint_prepared_inner(trx_sys, disk_guard)
             .await
         .inspect(|outcome| match outcome {
             CatalogCheckpointOutcome::Published {
@@ -447,13 +449,14 @@ impl Catalog {
     async fn checkpoint_prepared_inner(
         &self,
         trx_sys: &TransactionSystem,
+        disk_guard: &PoolGuard,
     ) -> RuntimeOrFatalResult<CatalogCheckpointOutcome> {
         let scan_cfg = trx_sys.catalog_checkpoint_scan_config()?;
         let batch = self
             .scan_checkpoint_batch(trx_sys.persisted_watermark_cts(), scan_cfg)
             .await?;
         let publishable_progress = batch.redo_retention_progress();
-        match self.apply_checkpoint_batch(batch).await {
+        match self.apply_checkpoint_batch(batch, disk_guard).await {
             Ok(CatalogCheckpointOutcome::Published {
                 catalog_replay_start_ts,
             }) => {

@@ -2,7 +2,7 @@ use crate::buffer::guard::PageExclusiveGuard;
 use crate::buffer::page::Page;
 use crate::buffer::{
     EvictReadSubmission, EvictSubmission, EvictableBufferPool, EvictablePoolStateMachine,
-    PoolRequest, PoolRole, ReadSubmission, ReadonlyBufferPool,
+    PoolGuard, PoolRequest, PoolRole, ReadSubmission, ReadonlyBufferPool,
 };
 use crate::catalog::is_user_table;
 use crate::catalog::table::TableMetadata;
@@ -1854,6 +1854,7 @@ impl FileSystem {
         &self,
         table_id: TableID,
         disk_pool: QuiescentGuard<ReadonlyBufferPool>,
+        disk_guard: &PoolGuard,
     ) -> RuntimeResult<Arc<TableFile>> {
         let file_path = self.user_table_file_path(table_id);
         let table_file = Arc::new(
@@ -1863,7 +1864,9 @@ impl FileSystem {
                     format!("operation=open_table_file, table_id={table_id}, file_path={file_path}")
                 })?,
         );
-        let active_root = table_file.load_active_root_from_pool(&disk_pool).await?;
+        let active_root = table_file
+            .load_active_root_from_pool(&disk_pool, disk_guard)
+            .await?;
         let old_root = table_file.install_loaded_root(active_root);
         debug_assert!(old_root.is_none());
         Ok(table_file)
@@ -1991,6 +1994,7 @@ impl FileSystem {
     pub(crate) async fn open_or_create_multi_table_file(
         &self,
         disk_pool: QuiescentGuard<ReadonlyBufferPool>,
+        disk_guard: &PoolGuard,
     ) -> RuntimeResult<Arc<MultiTableFile>> {
         let file_path = self.catalog_mtb_file_path();
         match MultiTableFile::open_or_create(&file_path)
@@ -2000,7 +2004,9 @@ impl FileSystem {
                 format!("operation=open_or_create_catalog_file, file_path={file_path}")
             })? {
             MultiTableFileOpenOutcome::Opened(mtb) => {
-                let active_root = mtb.load_active_root_from_pool(&disk_pool).await?;
+                let active_root = mtb
+                    .load_active_root_from_pool(&disk_pool, disk_guard)
+                    .await?;
                 let old_root = mtb.install_loaded_root(active_root);
                 debug_assert!(old_root.is_none());
                 Ok(mtb)
@@ -2371,6 +2377,7 @@ pub(crate) mod tests {
             table_file,
             fs.background_writes(),
             disk_pool.global_pool().clone(),
+            disk_pool.create_base_guard(),
         );
         mutable.write_block(block_id, buf).await.unwrap();
         drop(mutable);
@@ -2968,7 +2975,10 @@ pub(crate) mod tests {
                 let _hook = install_storage_backend_test_hook(Arc::new(
                     FailingFirstWriteHook::new(path.clone()),
                 ));
-                let err = match fs.open_or_create_multi_table_file(global.guard()).await {
+                let err = match fs
+                    .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
+                    .await
+                {
                     Ok(_) => panic!("expected initial catalog.mtb publish failure"),
                     Err(err) => err,
                 };
@@ -2993,7 +3003,7 @@ pub(crate) mod tests {
             );
 
             let mtb = fs
-                .open_or_create_multi_table_file(global.guard())
+                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
                 .await
                 .unwrap();
             let snapshot = mtb.load_snapshot();
@@ -3055,6 +3065,7 @@ pub(crate) mod tests {
                 &table_file,
                 fs.background_writes(),
                 disk_pool.global_pool().clone(),
+                disk_pool.create_base_guard(),
             );
             let err = match mutable.commit(TrxID::new(2), false).await {
                 Ok(_) => panic!("expected table commit fsync failure"),
@@ -3131,11 +3142,15 @@ pub(crate) mod tests {
             write_payload(&fs, &table_file, BlockID::from(7usize), b"table-read").await;
 
             let reopened = fs
-                .open_table_file(table_id, fs.disk_pool().clone_inner())
+                .open_table_file(
+                    table_id,
+                    fs.disk_pool().clone_inner(),
+                    &fs.disk_pool().create_base_guard(),
+                )
                 .await
                 .unwrap();
             let readonly_pool = fs.disk_pool().clone_inner();
-            let readonly_guard = readonly_pool.pool_guard();
+            let readonly_guard = readonly_pool.create_base_guard();
             let index_pool = fs.index_pool();
             let background_file =
                 StorageBackendFileIdentity::from_path(temp_dir.path().join("index.swp")).unwrap();
@@ -3227,7 +3242,7 @@ pub(crate) mod tests {
 
             let read_stats_start = mem_pool.stats();
             let mem_pool_probe = mem_pool.clone();
-            let pool_guard = mem_pool.pool_guard();
+            let pool_guard = mem_pool.create_base_guard();
             let reload_task = smol::spawn(async move {
                 let g = mem_pool
                     .get_page::<Page>(&pool_guard, reload_page_id, LatchFallbackMode::Shared)

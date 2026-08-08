@@ -12,11 +12,15 @@ mod readonly;
 mod util;
 
 #[cfg(test)]
+pub(crate) use self::arena::outstanding_base_guard_count as test_outstanding_base_guard_count;
+#[cfg(test)]
 pub(crate) use self::evict::tests::{
     dispatch_dirty_pages_for_test as test_dispatch_dirty_pages, frame_kind as test_frame_kind,
     io_backend_stats_handle_identity as test_io_backend_stats_handle_identity,
     persist_and_evict_page_for_test as test_persist_and_evict_page,
 };
+#[cfg(test)]
+pub(crate) use self::pool_guard::shares_keepalive_root as test_pool_guards_share_keepalive_root;
 #[cfg(test)]
 pub(crate) use self::readonly::tests::{global_readonly_pool_scope, table_readonly_pool};
 #[cfg(test)]
@@ -198,8 +202,14 @@ pub(crate) trait BufferPool: Send + Sync {
     /// Returns the number of allocated pages.
     fn allocated(&self) -> usize;
 
-    /// Returns a cloneable keepalive guard for this pool.
-    fn pool_guard(&self) -> PoolGuard;
+    /// Creates a new clone root for keeping this pool alive.
+    ///
+    /// This is a lifecycle-boundary operation, not a cheap accessor. Every
+    /// call acquires one pool-global quiescent keepalive and allocates a fresh
+    /// outer `Arc` root. Ordinary storage work should receive an existing
+    /// owner- or session-scoped guard and clone that root instead of calling
+    /// this method per request, retry, or page access.
+    fn create_base_guard(&self) -> PoolGuard;
 
     /// Allocate a new page.
     ///

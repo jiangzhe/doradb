@@ -1475,10 +1475,19 @@ mod tests {
     #[inline]
     fn full_pool_guards(engine: &Engine) -> PoolGuards {
         PoolGuards::builder()
-            .push(PoolRole::Meta, engine.inner().pools.meta.pool_guard())
-            .push(PoolRole::Index, engine.inner().pools.index.pool_guard())
-            .push(PoolRole::Mem, engine.inner().pools.mem.pool_guard())
-            .push(PoolRole::Disk, engine.inner().pools.disk.pool_guard())
+            .push(
+                PoolRole::Meta,
+                engine.inner().pools.meta.create_base_guard(),
+            )
+            .push(
+                PoolRole::Index,
+                engine.inner().pools.index.create_base_guard(),
+            )
+            .push(PoolRole::Mem, engine.inner().pools.mem.create_base_guard())
+            .push(
+                PoolRole::Disk,
+                engine.inner().pools.disk.create_base_guard(),
+            )
             .build()
     }
 
@@ -2703,7 +2712,7 @@ mod tests {
                 .mem
                 .mem_pool()
                 .get_page::<RowPage>(
-                    &table.mem.mem_pool().pool_guard(),
+                    &table.mem.mem_pool().create_base_guard(),
                     page_id,
                     LatchFallbackMode::Shared,
                 )
@@ -2821,7 +2830,7 @@ mod tests {
                 .mem
                 .mem_pool()
                 .get_page::<RowPage>(
-                    &table.mem.mem_pool().pool_guard(),
+                    &table.mem.mem_pool().create_base_guard(),
                     page_id,
                     LatchFallbackMode::Shared,
                 )

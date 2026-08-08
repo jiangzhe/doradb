@@ -6,7 +6,7 @@ mod object;
 mod table_replay_silent_watermarks;
 pub(crate) mod tables;
 
-use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard, PoolGuards, ReadonlyBufferPool};
+use crate::buffer::{FixedBufferPool, PoolGuard, PoolGuards, ReadonlyBufferPool};
 use crate::catalog::storage::columns::*;
 use crate::catalog::storage::indexes::*;
 use crate::catalog::storage::merge::{CatalogFoldedRows, CatalogMergeKeyBuilder};
@@ -74,10 +74,10 @@ impl CatalogStorage {
         meta_pool: QuiescentGuard<FixedBufferPool>,
         table_fs: QuiescentGuard<FileSystem>,
         disk_pool: QuiescentGuard<ReadonlyBufferPool>,
+        bootstrap_guards: &PoolGuards,
     ) -> RuntimeResult<Self> {
-        let meta_pool_guard = meta_pool.pool_guard();
         let mtb = table_fs
-            .open_or_create_multi_table_file(disk_pool.clone())
+            .open_or_create_multi_table_file(disk_pool.clone(), bootstrap_guards.disk_guard())
             .await
             .change_context(RuntimeError::CatalogAccess)
             .attach("operation=open_catalog_storage")?;
@@ -94,7 +94,7 @@ impl CatalogStorage {
             // Make sure catalog table ids match their dense root slots.
             assert_eq!(cat.len(), must_catalog_table_slot(*table_id));
             let metadata = Arc::new(metadata.clone());
-            let blk_idx = BlockIndex::new_catalog(meta_pool.clone(), &meta_pool_guard)
+            let blk_idx = BlockIndex::new_catalog(meta_pool.clone(), bootstrap_guards.meta_guard())
                 .await
                 .change_context(RuntimeError::CatalogAccess)
                 .attach_with(|| {
@@ -103,7 +103,7 @@ impl CatalogStorage {
             let table = Arc::new(
                 CatalogTable::new(
                     meta_pool.clone(),
-                    &meta_pool_guard,
+                    bootstrap_guards.meta_guard(),
                     *table_id,
                     blk_idx,
                     metadata,
@@ -309,6 +309,7 @@ impl CatalogStorage {
         &self,
         batch: CatalogCheckpointBatch,
         next_table_id: TableID,
+        disk_guard: &PoolGuard,
     ) -> RuntimeOrFatalResult<PreparedCatalogCheckpoint> {
         let CatalogCheckpointBatch {
             replay_start_ts,
@@ -385,6 +386,7 @@ impl CatalogStorage {
                         current_root,
                         &ops_by_table[idx],
                         safe_cts,
+                        disk_guard,
                     )
                     .await?;
                 new_roots[idx] = new_root;
@@ -400,7 +402,8 @@ impl CatalogStorage {
             // Rewriting catalog table roots can make arbitrary old catalog
             // blocks unreachable, so rebuild the allocation map from the new
             // root graph before publishing.
-            self.rebuild_catalog_alloc_map(&mut mutable).await?;
+            self.rebuild_catalog_alloc_map(&mut mutable, disk_guard)
+                .await?;
         } else {
             // Metadata-only checkpoints do not change catalog table root
             // reachability. Reclaim the displaced metadata block directly and
@@ -410,7 +413,6 @@ impl CatalogStorage {
                 .change_context(RuntimeError::CatalogAccess)
                 .attach("operation=prepare_catalog_checkpoint, phase=reserve_meta_block")?;
         }
-        let disk_pool_guard = self.disk_pool.pool_guard();
         // Load the silent replay watermark overlay from `new_roots`, not from
         // the currently durable cache. The prepared checkpoint has already
         // materialized catalog-table changes into blocks, but its metadata root
@@ -420,7 +422,7 @@ impl CatalogStorage {
         // root is committed.
         let checkpointed_silent_watermarks = self
             .load_checkpointed_table_replay_silent_watermark_map(
-                &disk_pool_guard,
+                disk_guard,
                 new_roots[must_catalog_table_slot(TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS)],
             )
             .await?;
@@ -438,8 +440,11 @@ impl CatalogStorage {
         &self,
         batch: CatalogCheckpointBatch,
         next_table_id: TableID,
+        disk_guard: &PoolGuard,
     ) -> RuntimeOrFatalResult<CatalogCheckpointOutcome> {
-        let prepared = self.prepare_checkpoint_batch(batch, next_table_id).await?;
+        let prepared = self
+            .prepare_checkpoint_batch(batch, next_table_id, disk_guard)
+            .await?;
         Ok(prepared.commit(self).await?)
     }
 
@@ -483,13 +488,14 @@ impl CatalogStorage {
     async fn rebuild_catalog_alloc_map(
         &self,
         mutable: &mut MutableMultiTableFile,
+        disk_guard: &PoolGuard,
     ) -> RuntimeResult<usize> {
         mutable
             .reserve_publish_meta_block()
             .change_context(RuntimeError::CatalogAccess)
             .attach("operation=rebuild_catalog_alloc_map, phase=reserve_meta_block")?;
         let reachable = self
-            .collect_catalog_reachable_blocks(mutable.root())
+            .collect_catalog_reachable_blocks(mutable.root(), disk_guard)
             .await?;
         Ok(mutable.rebuild_alloc_map_from_reachable(&reachable))
     }
@@ -497,12 +503,12 @@ impl CatalogStorage {
     async fn collect_catalog_reachable_blocks(
         &self,
         root: &MultiTableActiveRoot,
+        disk_guard: &PoolGuard,
     ) -> RuntimeResult<BTreeSet<BlockID>> {
         let mut reachable = BTreeSet::new();
         reachable.insert(SUPER_BLOCK_ID);
         reachable.insert(root.meta_block_id);
 
-        let disk_pool_guard = self.disk_pool.pool_guard();
         for (idx, table_root) in root.table_roots.iter().enumerate() {
             if catalog_table_slot(table_root.table_id) != Some(idx) {
                 return Err(
@@ -547,7 +553,7 @@ impl CatalogStorage {
                 self.mtb.file_kind(),
                 self.mtb.sparse_file(),
                 &self.disk_pool,
-                &disk_pool_guard,
+                disk_guard,
             );
             column_index
                 .collect_reachable_blocks(&mut reachable)
@@ -573,6 +579,10 @@ impl CatalogStorage {
         Ok(reachable)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "catalog checkpoint folding keeps the root, mutation batch, and caller guard explicit"
+    )]
     async fn apply_table_ops(
         &self,
         mutable: &mut MutableMultiTableFile,
@@ -581,11 +591,9 @@ impl CatalogStorage {
         root: CatalogTableRootDesc,
         table_ops: &[RowRedoKind],
         checkpoint_cts: TrxID,
+        disk_guard: &PoolGuard,
     ) -> RuntimeOrFatalResult<(CatalogTableRootDesc, bool)> {
-        let disk_pool_guard = self.disk_pool.pool_guard();
-        let base_rows = self
-            .load_rows_from_root(metadata, &disk_pool_guard, root)
-            .await?;
+        let base_rows = self.load_rows_from_root(metadata, disk_guard, root).await?;
         let mut folded = CatalogFoldedRows::from_base_rows(metadata, base_rows)
             .change_context(RuntimeError::CatalogAccess)
             .attach_with(|| format!("operation=apply_catalog_table_ops, table_id={table_id}"))?;
@@ -691,7 +699,7 @@ impl CatalogStorage {
             self.mtb.file_kind(),
             self.mtb.sparse_file(),
             &self.disk_pool,
-            &disk_pool_guard,
+            disk_guard,
         );
         let root_block_id = column_index
             .batch_insert(mutable, &new_entries, pivot_row_id, checkpoint_cts)
@@ -1268,7 +1276,7 @@ fn validate_catalog_row(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::buffer::{PoolGuards, PoolRole};
+    use crate::buffer::{BufferPool, PoolGuards, PoolRole};
     use crate::catalog::USER_TABLE_ID_START;
     use crate::catalog::tests::{open_catalog_test_engine, table1, table2};
     use crate::catalog::{
@@ -1386,8 +1394,13 @@ pub(crate) mod tests {
         next_table_id: TableID,
     ) -> Result<()> {
         let replay_start_ts = storage.checkpoint_snapshot().catalog_replay_start_ts;
+        let disk_guard = storage.disk_pool.create_base_guard();
         storage
-            .apply_checkpoint_batch(metadata_only_batch(replay_start_ts), next_table_id)
+            .apply_checkpoint_batch(
+                metadata_only_batch(replay_start_ts),
+                next_table_id,
+                &disk_guard,
+            )
             .await
             .map(|_| ())
             .disclose()
@@ -1461,7 +1474,7 @@ pub(crate) mod tests {
         let root =
             storage.checkpoint_snapshot().meta.table_roots[must_catalog_table_slot(table_id)];
         let table = storage.get_catalog_table(table_id).unwrap();
-        let disk_pool_guard = storage.disk_pool.pool_guard();
+        let disk_pool_guard = storage.disk_pool.create_base_guard();
         storage
             .load_rows_from_root(table.metadata(), &disk_pool_guard, root)
             .await
@@ -1485,7 +1498,7 @@ pub(crate) mod tests {
         }
         assert_eq!(root.pivot_row_id, RowID::new(rows.len() as u64));
         let root_block_id = BlockID::from(root.root_block_id.unwrap().get());
-        let disk_pool_guard = storage.disk_pool.pool_guard();
+        let disk_pool_guard = storage.disk_pool.create_base_guard();
         let entries = storage
             .collect_index_entries(&disk_pool_guard, root_block_id)
             .await
@@ -1526,7 +1539,7 @@ pub(crate) mod tests {
             mutable.write_block(block_id, page.buf).await.unwrap();
             entries.push(page.shape.with_block_id(block_id));
         }
-        let disk_pool_guard = storage.disk_pool.pool_guard();
+        let disk_pool_guard = storage.disk_pool.create_base_guard();
         let pivot_row_id = RowID::new(rows.len() as u64);
         let column_index = ColumnBlockIndex::new(
             SUPER_BLOCK_ID,
@@ -1594,7 +1607,11 @@ pub(crate) mod tests {
 
         let err = expect_runtime_report(
             storage
-                .apply_checkpoint_batch(batch, engine.inner().core.catalog().curr_next_table_id())
+                .apply_checkpoint_batch(
+                    batch,
+                    engine.inner().core.catalog().curr_next_table_id(),
+                    engine.inner().core.pools.pool_guards().disk_guard(),
+                )
                 .await
                 .unwrap_err(),
         );
@@ -1626,8 +1643,8 @@ pub(crate) mod tests {
             root.table_id = TABLE_ID_COLUMNS;
 
             let guards = PoolGuards::builder()
-                .push(PoolRole::Meta, storage.meta_pool.pool_guard())
-                .push(PoolRole::Disk, storage.disk_pool.pool_guard())
+                .push(PoolRole::Meta, storage.meta_pool.create_base_guard())
+                .push(PoolRole::Disk, storage.disk_pool.create_base_guard())
                 .build();
             let err = storage
                 .bootstrap_from_checkpoint(&snapshot, &guards, false)
@@ -1684,6 +1701,7 @@ pub(crate) mod tests {
                     .apply_checkpoint_batch(
                         batch,
                         engine.inner().core.catalog().curr_next_table_id(),
+                        engine.inner().core.pools.pool_guards().disk_guard(),
                     )
                     .await
                     .unwrap_err(),
@@ -1857,7 +1875,7 @@ pub(crate) mod tests {
             )
             .await;
 
-            let disk_pool_guard = storage.disk_pool.pool_guard();
+            let disk_pool_guard = storage.disk_pool.create_base_guard();
             storage
                 .load_rows_from_root(table.metadata(), &disk_pool_guard, root)
                 .await
@@ -1895,7 +1913,7 @@ pub(crate) mod tests {
             )
             .await;
 
-            let disk_pool_guard = storage.disk_pool.pool_guard();
+            let disk_pool_guard = storage.disk_pool.create_base_guard();
             let err = storage
                 .load_rows_from_root(table.metadata(), &disk_pool_guard, root)
                 .await
@@ -2015,7 +2033,7 @@ pub(crate) mod tests {
 
             let storage = &engine.inner().core.catalog().storage;
             let snap = storage.checkpoint_snapshot();
-            let disk_pool_guard = storage.disk_pool.pool_guard();
+            let disk_pool_guard = storage.disk_pool.create_base_guard();
             let mut catalog_index_blocks = BTreeSet::new();
             for root in snap.meta.table_roots {
                 let Some(root_block_id) = root.checkpoint_root_block_id() else {
@@ -2032,11 +2050,11 @@ pub(crate) mod tests {
             }
             assert!(!catalog_index_blocks.is_empty());
             for block_id in &catalog_index_blocks {
-                let _ = engine
-                    .inner()
-                    .pools
-                    .disk
-                    .invalidate_block(CATALOG_MTB_FILE_ID, *block_id);
+                let _ = engine.inner().pools.disk.invalidate_block(
+                    &disk_pool_guard,
+                    CATALOG_MTB_FILE_ID,
+                    *block_id,
+                );
                 let key = BlockKey::new(CATALOG_MTB_FILE_ID, *block_id);
                 assert!(engine.inner().pools.disk.try_get_frame_id(&key).is_none());
             }
@@ -2097,7 +2115,11 @@ pub(crate) mod tests {
             };
 
             storage
-                .apply_checkpoint_batch(batch, engine.inner().core.catalog().curr_next_table_id())
+                .apply_checkpoint_batch(
+                    batch,
+                    engine.inner().core.catalog().curr_next_table_id(),
+                    engine.inner().core.pools.pool_guards().disk_guard(),
+                )
                 .await
                 .unwrap();
 
@@ -2149,7 +2171,11 @@ pub(crate) mod tests {
             );
 
             storage
-                .apply_checkpoint_batch(batch, engine.inner().core.catalog().curr_next_table_id())
+                .apply_checkpoint_batch(
+                    batch,
+                    engine.inner().core.catalog().curr_next_table_id(),
+                    engine.inner().core.pools.pool_guards().disk_guard(),
+                )
                 .await
                 .unwrap();
 
@@ -2201,6 +2227,7 @@ pub(crate) mod tests {
                     .apply_checkpoint_batch(
                         batch,
                         engine.inner().core.catalog().curr_next_table_id(),
+                        engine.inner().core.pools.pool_guards().disk_guard(),
                     )
                     .await
                     .unwrap_err(),
@@ -2251,7 +2278,11 @@ pub(crate) mod tests {
             );
 
             storage
-                .apply_checkpoint_batch(batch, engine.inner().core.catalog().curr_next_table_id())
+                .apply_checkpoint_batch(
+                    batch,
+                    engine.inner().core.catalog().curr_next_table_id(),
+                    engine.inner().core.pools.pool_guards().disk_guard(),
+                )
                 .await
                 .unwrap();
 
@@ -2296,7 +2327,10 @@ pub(crate) mod tests {
                 roots,
             );
             let err = storage
-                .rebuild_catalog_alloc_map(&mut mutable)
+                .rebuild_catalog_alloc_map(
+                    &mut mutable,
+                    engine.inner().core.pools.pool_guards().disk_guard(),
+                )
                 .await
                 .unwrap_err();
 
@@ -2343,6 +2377,7 @@ pub(crate) mod tests {
                     root,
                     &table_ops,
                     TrxID::new(7),
+                    engine.inner().core.pools.pool_guards().disk_guard(),
                 )
                 .await
                 .unwrap();
@@ -2393,6 +2428,7 @@ pub(crate) mod tests {
                     root,
                     &table_ops,
                     TrxID::new(8),
+                    engine.inner().core.pools.pool_guards().disk_guard(),
                 )
                 .await
                 .unwrap();
@@ -2422,7 +2458,13 @@ pub(crate) mod tests {
             let snap = engine.inner().core.catalog().storage.checkpoint_snapshot();
             let tables_root = snap.meta.table_roots[0];
             let root_block_id = BlockID::from(tables_root.root_block_id.unwrap().get());
-            let disk_pool_guard = engine.inner().core.catalog().storage.disk_pool.pool_guard();
+            let disk_pool_guard = engine
+                .inner()
+                .core
+                .catalog()
+                .storage
+                .disk_pool
+                .create_base_guard();
 
             let cached_before_first = engine.inner().pools.disk.allocated();
 
@@ -2563,11 +2605,12 @@ pub(crate) mod tests {
                         vec![catalog_column_insert(table_id, 0, 30_000)],
                     ),
                     engine.inner().core.catalog().curr_next_table_id(),
+                    engine.inner().core.pools.pool_guards().disk_guard(),
                 )
                 .await
                 .unwrap();
 
-            let disk_pool_guard = storage.disk_pool.pool_guard();
+            let disk_pool_guard = storage.disk_pool.create_base_guard();
             let snap1 = storage.checkpoint_snapshot();
             let columns_root1 = snap1.meta.table_roots[1];
             assert_eq!(columns_root1.pivot_row_id, RowID::new(1));
@@ -2587,6 +2630,7 @@ pub(crate) mod tests {
                 .apply_checkpoint_batch(
                     checkpoint_batch_with_ops(storage, second_batch),
                     engine.inner().core.catalog().curr_next_table_id(),
+                    engine.inner().core.pools.pool_guards().disk_guard(),
                 )
                 .await
                 .unwrap();

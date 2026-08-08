@@ -1,5 +1,5 @@
 use crate::bitmap::AllocMap;
-use crate::buffer::ReadonlyBufferPool;
+use crate::buffer::{PoolGuard, ReadonlyBufferPool};
 use crate::catalog::table::TableMetadata;
 use crate::error::{
     CompletionErrorBridge, CompletionResult, DataIntegrityResult, IoResult, MultiDomainResultExt,
@@ -166,9 +166,10 @@ impl TableFile {
     pub(crate) async fn load_active_root_from_pool(
         &self,
         disk_pool: &QuiescentGuard<ReadonlyBufferPool>,
+        disk_guard: &PoolGuard,
     ) -> RuntimeResult<ActiveRoot> {
         self.file
-            .load_active_root_from_pool(FileKind::TableFile, disk_pool)
+            .load_active_root_from_pool(FileKind::TableFile, disk_pool, disk_guard)
             .await
     }
 
@@ -262,18 +263,27 @@ impl MutableTableFile {
     }
 
     /// Fork the whole table file with readonly-cache write barriers enabled.
+    ///
+    /// `disk_guard` must come from the operation/session that owns this fork.
+    /// The mutable file retains that same root for every block invalidation;
+    /// creating a base guard here would turn a routine fork into a hidden
+    /// pool-global lifecycle acquisition.
     #[inline]
     pub(crate) fn fork(
         table_file: &Arc<TableFile>,
         background_writes: &IOClient<BackgroundWriteRequest>,
         disk_pool: QuiescentGuard<ReadonlyBufferPool>,
+        disk_guard: PoolGuard,
     ) -> Self {
         let writer_claim = MutableWriterClaim::new(table_file);
         MutableTableFile {
             file: Arc::clone(table_file),
             new_root: MutableCowRoot::fork(table_file.active_root_unchecked()),
             background_writes: background_writes.clone(),
-            write_barrier: MutableTableWriteBarrier::ReadonlyPool(disk_pool),
+            write_barrier: MutableTableWriteBarrier::ReadonlyPool {
+                pool: disk_pool,
+                guard: disk_guard,
+            },
             writer_claim,
         }
     }
@@ -427,10 +437,10 @@ impl MutableTableFile {
         heap_redo_start_ts: TrxID,
         ts: TrxID,
         disk_pool: &QuiescentGuard<ReadonlyBufferPool>,
+        disk_guard: &PoolGuard,
     ) -> RuntimeOrFatalResult<()> {
         let table_file = Arc::clone(&self.file);
         let background_writes = self.background_writes.clone();
-        let disk_pool_guard = disk_pool.pool_guard();
         let mut max_row_id = self.root().pivot_row_id;
         let mut writes = Vec::with_capacity(lwc_blocks.len());
         let mut new_entries = Vec::with_capacity(lwc_blocks.len());
@@ -490,7 +500,7 @@ impl MutableTableFile {
             table_file.file_kind(),
             table_file.sparse_file(),
             disk_pool,
-            &disk_pool_guard,
+            disk_guard,
         );
         let new_root = column_index
             .batch_insert(self, &new_entries, max_row_id, ts)
@@ -561,7 +571,10 @@ impl MutableCowFile for MutableTableFile {
 }
 
 enum MutableTableWriteBarrier {
-    ReadonlyPool(QuiescentGuard<ReadonlyBufferPool>),
+    ReadonlyPool {
+        pool: QuiescentGuard<ReadonlyBufferPool>,
+        guard: PoolGuard,
+    },
     Disabled,
 }
 
@@ -569,7 +582,9 @@ impl MutableTableWriteBarrier {
     #[inline]
     fn as_cow_write_barrier(&self) -> CowWriteBarrier<'_> {
         match self {
-            MutableTableWriteBarrier::ReadonlyPool(pool) => CowWriteBarrier::readonly_pool(pool),
+            MutableTableWriteBarrier::ReadonlyPool { pool, guard } => {
+                CowWriteBarrier::readonly_pool(pool, guard)
+            }
             MutableTableWriteBarrier::Disabled => CowWriteBarrier::Disabled,
         }
     }
@@ -737,7 +752,7 @@ mod tests {
     ) -> Result<DirectBuf> {
         let global = global_readonly_pool_scope(64 * 1024 * 1024);
         let disk_pool = table_readonly_pool(&global, test_user_table_id(0), table_file);
-        let disk_pool_guard = disk_pool.pool_guard();
+        let disk_pool_guard = disk_pool.create_base_guard();
         let page = disk_pool
             .read_validated_block(&disk_pool_guard, page_id, accept_any_page)
             .await
@@ -754,8 +769,9 @@ mod tests {
         ts: TrxID,
         disk_pool: &QuiescentGuard<ReadonlyBufferPool>,
     ) -> Result<(Arc<TableFile>, Option<OldRoot>)> {
+        let disk_guard = disk_pool.create_base_guard();
         mutable_file
-            .apply_lwc_blocks(lwc_blocks, heap_redo_start_ts, ts, disk_pool)
+            .apply_lwc_blocks(lwc_blocks, heap_redo_start_ts, ts, disk_pool, &disk_guard)
             .await
             .disclose()?;
         mutable_file.commit(ts, false).await.disclose()
@@ -799,6 +815,7 @@ mod tests {
                 &table_file,
                 background_writes,
                 test_disk_pool.global_pool().clone(),
+                test_disk_pool.create_base_guard(),
             );
             let res = mutable.write_block(test_block_id(3), buf).await;
             assert!(res.is_ok());
@@ -811,12 +828,20 @@ mod tests {
 
             drop(table_file);
 
-            let table_file2 = fs.open_table_file(table_id, global.guard()).await.unwrap();
+            let disk_guard = global.create_base_guard();
+            let table_file2 = fs
+                .open_table_file(table_id, global.guard(), &disk_guard)
+                .await
+                .unwrap();
             let disk_pool = global.guard();
             assert_eq!(table_file2.active_root_unchecked().root_ts, TrxID::new(1));
 
-            let mut mutable =
-                MutableTableFile::fork(&table_file2, background_writes, disk_pool.clone());
+            let mut mutable = MutableTableFile::fork(
+                &table_file2,
+                background_writes,
+                disk_pool.clone(),
+                disk_guard.clone(),
+            );
             let secondary_root = mutable.allocate_block().unwrap();
             mutable.set_secondary_index_root(0, secondary_root);
             assert_eq!(mutable.secondary_index_root(0), secondary_root);
@@ -831,7 +856,7 @@ mod tests {
             let (table_file3, old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
             drop(old_root);
             let active_root = table_file3
-                .load_active_root_from_pool(&disk_pool)
+                .load_active_root_from_pool(&disk_pool, &disk_guard)
                 .await
                 .unwrap();
             assert_eq!(active_root.slot_no, 1);
@@ -857,10 +882,12 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, table_id, &table_file);
 
+            let disk_guard = disk_pool.create_base_guard();
             let mut mutable = MutableTableFile::fork(
                 &table_file,
                 background_writes,
                 disk_pool.global_pool().clone(),
+                disk_guard.clone(),
             );
             let inherited_root = mutable.allocate_block().unwrap();
             mutable.set_secondary_index_root(0, inherited_root);
@@ -872,6 +899,7 @@ mod tests {
                 &table_file,
                 background_writes,
                 disk_pool.global_pool().clone(),
+                disk_pool.create_base_guard(),
             );
             let allocated_before = mutable.root().alloc_map.allocated();
             let panic = catch_unwind(AssertUnwindSafe(|| {
@@ -921,7 +949,7 @@ mod tests {
 
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, table_id, &table_file);
-            let disk_pool_guard = disk_pool.pool_guard();
+            let disk_pool_guard = disk_pool.create_base_guard();
             let block_id = first_unallocated_blocks(table_file.active_root_unchecked(), 1)
                 .pop()
                 .unwrap();
@@ -937,6 +965,7 @@ mod tests {
                 &table_file,
                 background_writes,
                 disk_pool.global_pool().clone(),
+                disk_pool.create_base_guard(),
             );
             let allocated = mutable.allocate_block().unwrap();
             assert_eq!(allocated, block_id);
@@ -966,7 +995,7 @@ mod tests {
 
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, table_id, &table_file);
-            let disk_pool_guard = disk_pool.pool_guard();
+            let disk_pool_guard = disk_pool.create_base_guard();
             let meta_block_id = first_unallocated_blocks(table_file.active_root_unchecked(), 1)
                 .pop()
                 .unwrap();
@@ -982,6 +1011,7 @@ mod tests {
                 &table_file,
                 background_writes,
                 disk_pool.global_pool().clone(),
+                disk_pool.create_base_guard(),
             );
             let (table_file, old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
             drop(old_root);
@@ -1009,7 +1039,7 @@ mod tests {
 
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, table_id, &table_file);
-            let disk_pool_guard = disk_pool.pool_guard();
+            let disk_pool_guard = disk_pool.create_base_guard();
             let before_root = table_file.active_root_unchecked().clone();
             let cached_blocks = first_unallocated_blocks(&before_root, 8);
             for block_id in &cached_blocks {
@@ -1049,6 +1079,7 @@ mod tests {
                 &table_file,
                 background_writes,
                 disk_pool.global_pool().clone(),
+                disk_pool.create_base_guard(),
             );
             mutable
                 .apply_lwc_blocks(
@@ -1056,6 +1087,7 @@ mod tests {
                     TrxID::new(7),
                     TrxID::new(2),
                     disk_pool.global_pool(),
+                    &disk_pool_guard,
                 )
                 .await
                 .unwrap();
@@ -1095,7 +1127,7 @@ mod tests {
 
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, table_id, &table_file);
-            let disk_pool_guard = disk_pool.pool_guard();
+            let disk_pool_guard = disk_pool.create_base_guard();
             let out_of_range_page_id = test_block_id(1_000_000);
             let res = disk_pool
                 .read_validated_block(&disk_pool_guard, out_of_range_page_id, accept_any_page)
@@ -1133,7 +1165,7 @@ mod tests {
                     .unwrap(),
             );
             let disk_pool = global.guard();
-            let disk_pool_guard = disk_pool.pool_guard();
+            let disk_pool_guard = disk_pool.create_base_guard();
 
             // We first shut down the file system, then send the IO request,
             // it should fail.
@@ -1233,7 +1265,10 @@ mod tests {
 
             let fs = build_test_fs_in(temp_dir.path());
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let err = match fs.open_table_file(table_id, global.guard()).await {
+            let err = match fs
+                .open_table_file(table_id, global.guard(), &global.create_base_guard())
+                .await
+            {
                 Ok(_) => panic!("expected table meta checksum corruption"),
                 Err(err) => err,
             };
@@ -1270,7 +1305,10 @@ mod tests {
 
             let fs = build_test_fs_in(temp_dir.path());
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let err = match fs.open_table_file(table_id, global.guard()).await {
+            let err = match fs
+                .open_table_file(table_id, global.guard(), &global.create_base_guard())
+                .await
+            {
                 Ok(_) => panic!("expected table meta version corruption"),
                 Err(err) => err,
             };
@@ -1321,6 +1359,7 @@ mod tests {
                     &table_file,
                     background_writes,
                     disk_pool.global_pool().clone(),
+                    disk_pool.create_base_guard(),
                 ),
                 lwc_blocks,
                 TrxID::new(7),
@@ -1338,7 +1377,7 @@ mod tests {
             assert_eq!(active_root.deletion_cutoff_ts, TrxID::new(1));
             assert_ne!(active_root.column_block_index_root, SUPER_BLOCK_ID);
             let disk_pool = table_readonly_pool(&global, table_id, &table_file);
-            let disk_pool_guard = disk_pool.pool_guard();
+            let disk_pool_guard = disk_pool.create_base_guard();
 
             let column_index = ColumnBlockIndex::new(
                 active_root.column_block_index_root,
@@ -1414,6 +1453,7 @@ mod tests {
                     &table_file,
                     background_writes,
                     disk_pool.global_pool().clone(),
+                    disk_pool.create_base_guard(),
                 ),
                 lwc_blocks,
                 TrxID::new(7),
@@ -1443,11 +1483,13 @@ mod tests {
                 &table_file,
                 background_writes,
                 disk_pool.global_pool().clone(),
+                disk_pool.create_base_guard(),
             );
             let _second = MutableTableFile::fork(
                 &table_file,
                 background_writes,
                 disk_pool.global_pool().clone(),
+                disk_pool.create_base_guard(),
             );
         });
     }
@@ -1469,6 +1511,7 @@ mod tests {
                 &table_file,
                 background_writes,
                 disk_pool.global_pool().clone(),
+                disk_pool.create_base_guard(),
             );
             drop(first);
 
@@ -1476,6 +1519,7 @@ mod tests {
                 &table_file,
                 background_writes,
                 disk_pool.global_pool().clone(),
+                disk_pool.create_base_guard(),
             );
         });
     }

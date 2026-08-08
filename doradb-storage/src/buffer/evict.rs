@@ -379,8 +379,11 @@ impl EvictableBufferPool {
     ) -> (EvictableRuntime, PressureDeltaClockPolicy) {
         let policy =
             PressureDeltaClockPolicy::new(pool.in_mem.eviction_arbiter, MIN_IN_MEM_PAGES / 2);
+        // The evictor is detached engine-owned work with no session root to
+        // borrow. Create exactly one base root for the worker runtime and let
+        // every eviction page guard clone that root.
         let runtime = EvictableRuntime {
-            arena: pool.arena.arena_guard(pool.pool_guard()),
+            arena: pool.arena.arena_guard(pool.create_base_guard()),
             pool,
         };
         (runtime, policy)
@@ -459,8 +462,8 @@ impl BufferPool for EvictableBufferPool {
     }
 
     #[inline]
-    fn pool_guard(&self) -> PoolGuard {
-        self.arena.guard()
+    fn create_base_guard(&self) -> PoolGuard {
+        self.arena.create_base_guard()
     }
 
     #[inline]
@@ -1921,7 +1924,7 @@ pub(crate) mod tests {
         pool: QuiescentGuard<EvictableBufferPool>,
         page_count: usize,
     ) -> event_listener::EventListener {
-        let pool_guard = pool.pool_guard();
+        let pool_guard = pool.create_base_guard();
         let mut page_guards = Vec::with_capacity(page_count);
         for idx in 0..page_count {
             let mut page_guard = pool
@@ -1934,7 +1937,7 @@ pub(crate) mod tests {
             page_guards.push(page_guard);
         }
         let runtime = EvictableRuntime {
-            arena: pool.arena.arena_guard(pool.pool_guard()),
+            arena: pool.arena.arena_guard(pool.create_base_guard()),
             pool: pool.into_sync(),
         };
         runtime.dispatch_io_writes(page_guards)
@@ -1944,7 +1947,7 @@ pub(crate) mod tests {
         pool: QuiescentGuard<EvictableBufferPool>,
         payload: &[u8],
     ) -> PageID {
-        let pool_guard = pool.pool_guard();
+        let pool_guard = pool.create_base_guard();
         let mut page_guard = pool
             .allocate_page::<Page>(&pool_guard)
             .await
@@ -1954,7 +1957,7 @@ pub(crate) mod tests {
         page_guard.bf_mut().set_dirty(true);
         page_guard.bf_mut().set_kind(FrameKind::Evicting);
         let runtime = EvictableRuntime {
-            arena: pool.arena.arena_guard(pool.pool_guard()),
+            arena: pool.arena.arena_guard(pool.create_base_guard()),
             pool: pool.clone().into_sync(),
         };
         runtime.dispatch_io_writes(vec![page_guard]).await;
@@ -2259,7 +2262,7 @@ pub(crate) mod tests {
                     .max_file_size(128u64 * 1024 * 1024),
             )
             .unwrap();
-            let pool_guard = pool.pool_guard();
+            let pool_guard = pool.create_base_guard();
 
             pool.signal_shutdown();
             let err = match pool.allocate_page::<Page>(&pool_guard).await {
@@ -2313,7 +2316,7 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let (_fs_owner, owner, mut state_machine) =
                 build_state_machine_for_test(temp_dir.path().join("data.swp"));
-            let pool_guard = owner.pool_guard();
+            let pool_guard = owner.create_base_guard();
             let err = backend_failure_for_test();
 
             let read_page_id = make_evicted_reload_target_for_test(&owner, &pool_guard).await;
@@ -2342,7 +2345,7 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let (_fs_owner, owner, mut state_machine) =
                 build_state_machine_for_test(temp_dir.path().join("data.swp"));
-            let pool_guard = owner.pool_guard();
+            let pool_guard = owner.create_base_guard();
             let err = backend_failure_for_test();
 
             let read_page_id = make_evicted_reload_target_for_test(&owner, &pool_guard).await;
@@ -2373,7 +2376,7 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let (_fs_owner, owner, mut state_machine) =
                 build_state_machine_for_test(temp_dir.path().join("data.swp"));
-            let pool_guard = owner.pool_guard();
+            let pool_guard = owner.create_base_guard();
             let err = backend_failure_for_test();
 
             let read_page_id = make_evicted_reload_target_for_test(&owner, &pool_guard).await;
@@ -2418,7 +2421,7 @@ pub(crate) mod tests {
                     .max_mem_size(1024u64 * 1024 * 128)
                     .max_file_size(1024u64 * 1024 * 256),
             );
-            let pool_guard = pool.pool_guard();
+            let pool_guard = pool.create_base_guard();
             {
                 let g = pool
                     .allocate_page::<RowPage>(&pool_guard)
@@ -2562,7 +2565,7 @@ pub(crate) mod tests {
                     .max_mem_size(1024u64 * 1024 * 128)
                     .max_file_size(1024u64 * 1024 * 256),
             );
-            let pool_guard = pool.pool_guard();
+            let pool_guard = pool.create_base_guard();
             let page_guard = pool
                 .allocate_page::<RowPage>(&pool_guard)
                 .await
@@ -2592,7 +2595,7 @@ pub(crate) mod tests {
                     .max_mem_size(1024u64 * 1024 * 128)
                     .max_file_size(1024u64 * 1024 * 256),
             );
-            let pool_guard = pool.pool_guard();
+            let pool_guard = pool.create_base_guard();
             let g = pool
                 .allocate_page::<RowPage>(&pool_guard)
                 .await
@@ -2669,7 +2672,7 @@ pub(crate) mod tests {
                     .max_file_size(128u64 * 1024 * 1024),
             )
             .unwrap();
-            let pool_guard = pool.pool_guard();
+            let pool_guard = pool.create_base_guard();
 
             let mut page_guard = pool
                 .allocate_page::<Page>(&pool_guard)
@@ -2711,7 +2714,7 @@ pub(crate) mod tests {
             )
             .unwrap();
             let owner = QuiescentBox::new(pool);
-            let pool_guard = owner.pool_guard();
+            let pool_guard = owner.create_base_guard();
             let mut state_machine = EvictablePoolStateMachine {
                 pool: owner.guard().into_sync(),
                 file: storage,
@@ -2766,7 +2769,7 @@ pub(crate) mod tests {
             )
             .unwrap();
             let owner = QuiescentBox::new(pool);
-            let pool_guard = owner.pool_guard();
+            let pool_guard = owner.create_base_guard();
             let mut page_guard = owner
                 .allocate_page::<Page>(&pool_guard)
                 .await
@@ -2825,7 +2828,7 @@ pub(crate) mod tests {
             )
             .unwrap();
             let owner = QuiescentBox::new(pool);
-            let pool_guard = owner.pool_guard();
+            let pool_guard = owner.create_base_guard();
             let mut page_guard = owner
                 .allocate_page::<Page>(&pool_guard)
                 .await
@@ -2836,7 +2839,7 @@ pub(crate) mod tests {
             page_guard.bf_mut().set_kind(FrameKind::Evicting);
             let baseline = owner.stats();
             let runtime = EvictableRuntime {
-                arena: owner.arena.arena_guard(owner.pool_guard()),
+                arena: owner.arena.arena_guard(owner.create_base_guard()),
                 pool: owner.guard().into_sync(),
             };
 
@@ -2861,7 +2864,7 @@ pub(crate) mod tests {
             )
             .unwrap();
             let owner = QuiescentBox::new(pool);
-            let pool_guard = owner.pool_guard();
+            let pool_guard = owner.create_base_guard();
             let sync_pool = owner.guard().into_sync();
             let mut state_machine = EvictablePoolStateMachine {
                 pool: sync_pool,
@@ -2943,7 +2946,7 @@ pub(crate) mod tests {
             )
             .unwrap();
             let owner = QuiescentBox::new(pool);
-            let pool_guard = owner.pool_guard();
+            let pool_guard = owner.create_base_guard();
             let mut state_machine = EvictablePoolStateMachine {
                 pool: owner.guard().into_sync(),
                 file: storage,
@@ -2993,7 +2996,7 @@ pub(crate) mod tests {
             )
             .unwrap();
             let owner = QuiescentBox::new(pool);
-            let pool_guard = owner.pool_guard();
+            let pool_guard = owner.create_base_guard();
             let mut state_machine = EvictablePoolStateMachine {
                 pool: owner.guard().into_sync(),
                 file: storage,
@@ -3052,7 +3055,7 @@ pub(crate) mod tests {
             )
             .unwrap();
             let owner = QuiescentBox::new(pool);
-            let pool_guard = owner.pool_guard();
+            let pool_guard = owner.create_base_guard();
 
             let mut page_guard = owner
                 .allocate_page::<Page>(&pool_guard)
@@ -3063,7 +3066,7 @@ pub(crate) mod tests {
             page_guard.bf_mut().set_kind(FrameKind::Evicting);
 
             let runtime = EvictableRuntime {
-                arena: owner.arena.arena_guard(owner.pool_guard()),
+                arena: owner.arena.arena_guard(owner.create_base_guard()),
                 pool: owner.guard().into_sync(),
             };
 
@@ -3106,7 +3109,7 @@ pub(crate) mod tests {
             )
             .unwrap();
             let owner = QuiescentBox::new(pool);
-            let pool_guard = owner.pool_guard();
+            let pool_guard = owner.create_base_guard();
             let mut page_guard = owner
                 .allocate_page::<Page>(&pool_guard)
                 .await
@@ -3193,7 +3196,7 @@ pub(crate) mod tests {
                     .max_file_size(128u64 * 1024 * 1024),
             )
             .unwrap();
-            let pool_guard = pool.pool_guard();
+            let pool_guard = pool.create_base_guard();
             let mut page_guard = pool
                 .allocate_page::<Page>(&pool_guard)
                 .await
@@ -3238,7 +3241,7 @@ pub(crate) mod tests {
                 .max_file_size(128u64 * 1024 * 130),
         );
         let pool_ref = pool.owner_guard();
-        let pool_guard = pool.pool_guard();
+        let pool_guard = pool.create_base_guard();
 
         let (tx, rx) = flume::unbounded();
         let handle1 = {
@@ -3290,7 +3293,7 @@ pub(crate) mod tests {
                 .max_mem_size(1024u64 * 1024 * 64)
                 .max_file_size(1024u64 * 1024 * 128),
         );
-        let pool_guard = pool.pool_guard();
+        let pool_guard = pool.create_base_guard();
 
         println!(
             "max_nbr={}, max_nbr_in_mem={}",
@@ -3321,7 +3324,7 @@ pub(crate) mod tests {
                     .max_mem_size(64u64 * 1024 * 130)
                     .max_file_size(128u64 * 1024 * 130),
             );
-            let pool_guard = EvictableBufferPool::pool_guard(&pool);
+            let pool_guard = EvictableBufferPool::create_base_guard(&pool);
             let total_pages = pool.in_mem.max_count + 64;
 
             for i in 0..total_pages {
@@ -3364,7 +3367,7 @@ pub(crate) mod tests {
             .unwrap();
             let pool = QuiescentBox::new(pool);
             let guard = {
-                let pool_guard = EvictableBufferPool::pool_guard(&pool);
+                let pool_guard = EvictableBufferPool::create_base_guard(&pool);
                 pool.allocate_page::<RowPage>(&pool_guard)
                     .await
                     .expect("test page allocation should succeed")
@@ -3399,7 +3402,7 @@ pub(crate) mod tests {
                 .max_mem_size(64u64 * 1024 * 1024)
                 .max_file_size(64u64 * 1024 * 2048),
         );
-        let pool_guard = pool.pool_guard();
+        let pool_guard = pool.create_base_guard();
 
         println!(
             "max_nbr={}, max_nbr_in_mem={}",
@@ -3487,7 +3490,7 @@ pub(crate) mod tests {
                         .dynamic_batch_bounds(3, 3),
                 ),
         );
-        let _pool_guard = pool.pool_guard();
+        let _pool_guard = pool.create_base_guard();
         let arbiter = pool.in_mem.eviction_arbiter;
 
         assert_eq!(arbiter.target_free(), 2);
@@ -3531,8 +3534,8 @@ pub(crate) mod tests {
                     .max_mem_size(1024u64 * 1024 * 32)
                     .max_file_size(1024u64 * 1024 * 64),
             );
-            let pool1_guard = pool1.pool_guard();
-            let pool2_guard = pool2.pool_guard();
+            let pool1_guard = pool1.create_base_guard();
+            let pool2_guard = pool2.create_base_guard();
 
             let page = pool1
                 .allocate_page::<RowPage>(&pool1_guard)

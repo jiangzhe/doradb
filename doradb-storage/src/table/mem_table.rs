@@ -3388,8 +3388,8 @@ mod tests {
         mem_table_id: TableID,
         metadata: Arc<TableMetadata>,
     ) -> TestMemTable {
-        let meta_guard = engine.inner().pools.meta.pool_guard();
-        let index_guard = engine.inner().pools.index.pool_guard();
+        let meta_guard = engine.inner().pools.meta.create_base_guard();
+        let index_guard = engine.inner().pools.index.create_base_guard();
         let mem_pool = engine.inner().pools.mem.clone();
         let blk_idx = BlockIndex::new(
             engine.inner().pools.meta.clone(),
@@ -4926,7 +4926,7 @@ mod tests {
                 FixedBufferPool::with_capacity(PoolRole::Index, pool_bytes)
                     .expect("one-page fixed index pool should be constructible"),
             );
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = (*pool).create_base_guard();
             let metadata = TableMetadata::try_new(
                 vec![ColumnSpec::new(
                     "id",

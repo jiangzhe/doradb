@@ -348,6 +348,7 @@ impl<'a> RecoveryCoordinator<'a> {
                     self.resources.pools.index.clone(),
                     &self.resources.table_fs,
                     self.resources.pools.disk.clone(),
+                    &self.resources.pool_guards,
                     table.table_id,
                 )
                 .await?;
@@ -705,6 +706,7 @@ impl<'a> RecoveryCoordinator<'a> {
                 self.resources.pools.index.clone(),
                 &self.resources.table_fs,
                 self.resources.pools.disk.clone(),
+                &self.resources.pool_guards,
                 table_id,
             )
             .await?;
@@ -1244,6 +1246,7 @@ mod tests {
         IndexKey, IndexObject, IndexOrder, IndexSpec, TableMetadata, TableObject, TableSpec,
         USER_TABLE_ID_START,
     };
+    use crate::component::EnginePools;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{
@@ -1629,7 +1632,12 @@ mod tests {
         catalog_replay_start_ts: TrxID,
     ) -> RecoveryCoordinator<'a> {
         let resources = RecoveryResources::new(
-            engine.inner().core.pools.clone(),
+            EnginePools::new(
+                engine.inner().core.pools.meta.clone(),
+                engine.inner().core.pools.index.clone(),
+                engine.inner().core.pools.mem.clone(),
+                engine.inner().core.pools.disk.clone(),
+            ),
             engine.inner().table_fs.clone(),
             engine.inner().core.catalog(),
         );
@@ -1949,6 +1957,7 @@ mod tests {
             &table_file,
             engine.inner().table_fs.background_writes(),
             table.disk_pool().clone(),
+            engine.inner().core.pools.pool_guards().disk_guard().clone(),
         );
         mutable.replace_metadata_and_secondary_index_roots(metadata, roots);
         engine
@@ -4332,7 +4341,7 @@ mod tests {
 
             let active_root = table.file().active_root_unchecked();
             let block_id = {
-                let disk_pool_guard = table.disk_pool().pool_guard();
+                let disk_pool_guard = table.disk_pool().create_base_guard();
                 let index = ColumnBlockIndex::new(
                     active_root.column_block_index_root,
                     active_root.pivot_row_id,
@@ -4494,7 +4503,7 @@ mod tests {
 
             let active_root = table.file().active_root_unchecked();
             let blob_ref = {
-                let disk_pool_guard = table.disk_pool().pool_guard();
+                let disk_pool_guard = table.disk_pool().create_base_guard();
                 let index = ColumnBlockIndex::new(
                     active_root.column_block_index_root,
                     active_root.pivot_row_id,

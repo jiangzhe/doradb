@@ -136,6 +136,9 @@ pub(crate) struct PageLatchGuard {
     // also bind `keepalive` before `raw` so reverse local-drop order preserves
     // the same guarantee across async suspension or future refactors.
     raw: RawHybridGuard,
+    // Callers clone one long-lived `PoolGuard` root into this field. That clone
+    // updates the root's outer `Arc`, so high-frequency session paths must use
+    // the session-local roots rather than `EnginePools`' canonical bundle.
     keepalive: PoolGuard,
 }
 

@@ -1,5 +1,5 @@
 use crate::bitmap::AllocMap;
-use crate::buffer::ReadonlyBufferPool;
+use crate::buffer::{PoolGuard, ReadonlyBufferPool};
 use crate::catalog::{
     USER_TABLE_ID_LIMIT, USER_TABLE_ID_START, catalog_table_id_from_slot, catalog_table_slot,
 };
@@ -209,9 +209,10 @@ impl MultiTableFile {
     pub(crate) async fn load_active_root_from_pool(
         &self,
         disk_pool: &QuiescentGuard<ReadonlyBufferPool>,
+        disk_guard: &PoolGuard,
     ) -> RuntimeResult<MultiTableActiveRoot> {
         self.file
-            .load_active_root_from_pool(FileKind::CatalogMultiTableFile, disk_pool)
+            .load_active_root_from_pool(FileKind::CatalogMultiTableFile, disk_pool, disk_guard)
             .await
     }
 
@@ -710,7 +711,7 @@ mod tests {
             let (_dir, fs) = build_test_fs();
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let mtb = fs
-                .open_or_create_multi_table_file(global.guard())
+                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
                 .await
                 .unwrap();
             let displaced_meta_block_id = (1..mtb.active_root_unchecked().alloc_map.len())
@@ -760,7 +761,7 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
 
             let mtb = fs
-                .open_or_create_multi_table_file(global.guard())
+                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
                 .await
                 .unwrap();
             let s0 = mtb.load_snapshot();
@@ -789,7 +790,7 @@ mod tests {
             drop(mtb);
 
             let mtb2 = fs
-                .open_or_create_multi_table_file(global.guard())
+                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
                 .await
                 .unwrap();
             let s1 = mtb2.load_snapshot();
@@ -811,7 +812,7 @@ mod tests {
             let background_writes = fs.background_writes();
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let mtb = fs
-                .open_or_create_multi_table_file(global.guard())
+                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
                 .await
                 .unwrap();
 
@@ -841,7 +842,7 @@ mod tests {
 
             let fs = build_test_fs_in(dir.path());
             let mtb = fs
-                .open_or_create_multi_table_file(global.guard())
+                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
                 .await
                 .unwrap();
             let reloaded = mtb.load_snapshot();
@@ -857,7 +858,7 @@ mod tests {
             let background_writes = fs.background_writes();
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let mtb = fs
-                .open_or_create_multi_table_file(global.guard())
+                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
                 .await
                 .unwrap();
 
@@ -898,7 +899,7 @@ mod tests {
             let path = fs.catalog_mtb_file_path();
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let mtb = fs
-                .open_or_create_multi_table_file(global.guard())
+                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
                 .await
                 .unwrap();
             drop(mtb);
@@ -921,7 +922,9 @@ mod tests {
             file.sync_all().unwrap();
 
             let fs = build_test_fs_in(dir.path());
-            let res = fs.open_or_create_multi_table_file(global.guard()).await;
+            let res = fs
+                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
+                .await;
             assert!(res.is_err());
         });
     }
@@ -933,7 +936,7 @@ mod tests {
             let path = fs.catalog_mtb_file_path();
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let mtb = fs
-                .open_or_create_multi_table_file(global.guard())
+                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
                 .await
                 .unwrap();
             let active_meta_block_id = mtb.active_root_unchecked().meta_block_id;
@@ -956,7 +959,10 @@ mod tests {
             file.sync_all().unwrap();
 
             let fs = build_test_fs_in(dir.path());
-            let err = match fs.open_or_create_multi_table_file(global.guard()).await {
+            let err = match fs
+                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
+                .await
+            {
                 Ok(_) => panic!("expected multi-table meta version corruption"),
                 Err(err) => err,
             };
@@ -975,7 +981,7 @@ mod tests {
             let path = fs.catalog_mtb_file_path();
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let mtb = fs
-                .open_or_create_multi_table_file(global.guard())
+                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
                 .await
                 .unwrap();
             let active_meta_block_id = mtb.active_root_unchecked().meta_block_id;
@@ -987,7 +993,10 @@ mod tests {
             overwrite_file_bytes(&path, checksum_offset, &[0xff]);
 
             let fs = build_test_fs_in(dir.path());
-            let err = match fs.open_or_create_multi_table_file(global.guard()).await {
+            let err = match fs
+                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
+                .await
+            {
                 Ok(_) => panic!("expected multi-table meta checksum corruption"),
                 Err(err) => err,
             };
@@ -1007,7 +1016,7 @@ mod tests {
             let path = fs.catalog_mtb_file_path();
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let mtb = fs
-                .open_or_create_multi_table_file(global.guard())
+                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
                 .await
                 .unwrap();
 
@@ -1048,7 +1057,7 @@ mod tests {
 
             let fs = build_test_fs_in(dir.path());
             let mtb = fs
-                .open_or_create_multi_table_file(global.guard())
+                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
                 .await
                 .unwrap();
             let snapshot = mtb.load_snapshot();
@@ -1068,7 +1077,7 @@ mod tests {
             let path = fs.catalog_mtb_file_path();
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let mtb = fs
-                .open_or_create_multi_table_file(global.guard())
+                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
                 .await
                 .unwrap();
 
@@ -1130,7 +1139,10 @@ mod tests {
             );
 
             let fs = build_test_fs_in(dir.path());
-            let err = match fs.open_or_create_multi_table_file(global.guard()).await {
+            let err = match fs
+                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
+                .await
+            {
                 Ok(_) => panic!("expected newest multi-table root invariant failure"),
                 Err(err) => err,
             };
@@ -1149,7 +1161,7 @@ mod tests {
             let (_dir, fs) = build_test_fs();
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let mtb = fs
-                .open_or_create_multi_table_file(global.guard())
+                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
                 .await
                 .unwrap();
 
@@ -1164,7 +1176,7 @@ mod tests {
             let (_dir, fs) = build_test_fs();
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let mtb = fs
-                .open_or_create_multi_table_file(global.guard())
+                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
                 .await
                 .unwrap();
 

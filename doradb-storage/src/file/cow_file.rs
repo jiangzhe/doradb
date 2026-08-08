@@ -1,6 +1,6 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::page::PAGE_SIZE;
-use crate::buffer::{ReadonlyBufferPool, ReadonlyWriteLease, begin_write_barrier};
+use crate::buffer::{PoolGuard, ReadonlyBufferPool, ReadonlyWriteLease, begin_write_barrier};
 use crate::error::{
     CompletionResult, DataIntegrityError, DataIntegrityResult, InternalResult, IoError, IoResult,
     ResourceError, ResourceResult, RuntimeError, RuntimeResult,
@@ -66,7 +66,10 @@ pub(crate) trait MutableWriterFile {
 #[derive(Clone, Copy)]
 pub(crate) enum CowWriteBarrier<'a> {
     /// Block same-key readonly misses while the physical block is written.
-    ReadonlyPool(&'a QuiescentGuard<ReadonlyBufferPool>),
+    ReadonlyPool {
+        pool: &'a QuiescentGuard<ReadonlyBufferPool>,
+        guard: &'a PoolGuard,
+    },
     /// Bypass readonly-cache write blocking when the caller has no relevant readonly path.
     Disabled,
 }
@@ -74,8 +77,11 @@ pub(crate) enum CowWriteBarrier<'a> {
 impl<'a> CowWriteBarrier<'a> {
     /// Builds a user-table write barrier backed by the shared readonly pool.
     #[inline]
-    pub(crate) fn readonly_pool(pool: &'a QuiescentGuard<ReadonlyBufferPool>) -> Self {
-        Self::ReadonlyPool(pool)
+    pub(crate) fn readonly_pool(
+        pool: &'a QuiescentGuard<ReadonlyBufferPool>,
+        guard: &'a PoolGuard,
+    ) -> Self {
+        Self::ReadonlyPool { pool, guard }
     }
 
     /// Start the readonly-cache write barrier for one physical block.
@@ -86,8 +92,8 @@ impl<'a> CowWriteBarrier<'a> {
         block_id: BlockID,
     ) -> InternalResult<Option<ReadonlyWriteLease>> {
         match self {
-            CowWriteBarrier::ReadonlyPool(pool) => {
-                begin_write_barrier(pool.clone(), file_id, block_id).map(Some)
+            CowWriteBarrier::ReadonlyPool { pool, guard } => {
+                begin_write_barrier(pool.clone(), guard, file_id, block_id).map(Some)
             }
             CowWriteBarrier::Disabled => Ok(None),
         }
@@ -600,12 +606,12 @@ impl<M> CowFile<M> {
         &self,
         file_kind: FileKind,
         disk_pool: &QuiescentGuard<ReadonlyBufferPool>,
+        disk_guard: &PoolGuard,
     ) -> RuntimeResult<ActiveRoot<M>> {
         let file_id = self.file.file_id();
-        let _ = disk_pool.invalidate_block(file_id, SUPER_BLOCK_ID);
-        let pool_guard = disk_pool.pool_guard();
+        let _ = disk_pool.invalidate_block(disk_guard, file_id, SUPER_BLOCK_ID);
         let super_block_guard = disk_pool
-            .read_block(file_kind, &self.file, &pool_guard, SUPER_BLOCK_ID)
+            .read_block(file_kind, &self.file, disk_guard, SUPER_BLOCK_ID)
             .await
             .change_context(RuntimeError::FileRootAccess)
             .attach_with(|| {
@@ -626,9 +632,9 @@ impl<M> CowFile<M> {
         drop(super_block_guard);
 
         let meta_block_id = super_block.body.meta_block_id;
-        let _ = disk_pool.invalidate_block(file_id, meta_block_id);
+        let _ = disk_pool.invalidate_block(disk_guard, file_id, meta_block_id);
         let meta_block_guard = disk_pool
-            .read_block(file_kind, &self.file, &pool_guard, meta_block_id)
+            .read_block(file_kind, &self.file, disk_guard, meta_block_id)
             .await
             .change_context(RuntimeError::FileRootAccess)
             .attach_with(|| {

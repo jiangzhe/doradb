@@ -302,7 +302,7 @@ mod tests {
     fn test_btree_cursor_resumes_with_raw_upper_fence_before_strict_successor() {
         smol::block_on(async {
             let pool = owned_index_pool(64 * 1024 * 1024);
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = (*pool).create_base_guard();
             {
                 let fixture = build_exact_boundary_resume_fixture(pool.guard(), &pool_guard).await;
 
@@ -366,7 +366,7 @@ mod tests {
     fn test_btree_compactor_parent_done_buffers_raw_upper_fence() {
         smol::block_on(async {
             let pool = owned_index_pool(64 * 1024 * 1024);
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = (*pool).create_base_guard();
             {
                 let fixture = build_exact_boundary_resume_fixture(pool.guard(), &pool_guard).await;
                 let mut compactor =

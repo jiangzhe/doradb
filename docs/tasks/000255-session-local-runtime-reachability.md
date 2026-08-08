@@ -19,10 +19,12 @@ operation directly on the pinned state.
 Introduced one engine-owned `EngineCore` for shared runtime capabilities and a
 strong `SessionRuntime` wrapper around the upgraded state. Operation pins,
 observers, transaction attachments, mandatory work, and cleanup handoffs carry
-that runtime instead of `EngineRef`. The final implementation removes
-`EngineRef` and `WeakEngineRef` from storage source, removes normal
-session-registry lookup from statement checkout, and borrows one canonical
-pool-guard bundle.
+that runtime instead of `EngineRef`. The task implementation removed
+`EngineRef` and `WeakEngineRef` from storage source, removed normal
+session-registry lookup from statement checkout, and at that revision borrowed
+one canonical pool-guard bundle. The later backlog 000175 follow-up replaced
+that bundle with one independent root bundle per session after proving the
+canonical roots caused cross-session refcount contention.
 
 Lifecycle admission, shutdown authority, exact identity validation, public
 APIs, persisted formats, and component teardown order remain unchanged.
@@ -35,7 +37,7 @@ APIs, persisted formats, and component teardown order remain unchanged.
 `- codex`
 
 `Source Backlogs:`
-`- docs/backlogs/000175-scalable-shared-resource-lifetime-management.md`
+`- docs/backlogs/closed/000175-scalable-shared-resource-lifetime-management.md`
 
 `Related Tasks:`
 `- docs/tasks/000247-statement-public-transaction-cancellation-ownership.md`
@@ -57,9 +59,9 @@ redundant once the strong session runtime could reach immutable engine
 capabilities through the state.
 
 This was a bounded ownership-path refactor with no parent RFC. Backlog 000175
-remains open because it covers broader lifecycle admission, component guard,
-buffer-page ownership, and shared-counter questions that this task did not
-resolve.
+remained open at task resolution because it covered broader lifecycle
+admission, component guard, buffer-page ownership, and shared-counter questions
+that this task did not resolve.
 
 ## Goals
 
@@ -91,8 +93,8 @@ resolve.
    redo, undo, and persisted formats were not changed.
 5. Public APIs, storage semantics, benchmark workloads, and CI timing policy
    were not changed.
-6. The contended `index-stream` regression was investigated but not fixed;
-   backlog 000175 remains open for that and wider lifetime work.
+6. The contended `index-stream` regression was investigated but not fixed in
+   this task; backlog 000175 remained open for that and wider lifetime work.
 
 ## Plan
 
@@ -238,9 +240,9 @@ backlog 000175 rather than broadening this task without a root cause.
   95.84% (9,757/10,180): 97.21%, 95.96%, and 95.14% respectively.
 - `rtk git diff --check`: passed.
 
-No parent RFC synchronization is required. Source backlog 000175 remains open
-intentionally because only its session-coordinated reachability slice was
-implemented.
+No parent RFC synchronization was required. Source backlog 000175 remained open
+intentionally at task resolution because only its session-coordinated
+reachability slice was implemented.
 
 ## Impacts
 
@@ -250,14 +252,15 @@ implemented.
   retains owner orchestration.
 - Session-coordinated runtime owners carry `SessionRuntime`, while
   single-capability helpers use narrow guards.
-- Pool guards are built once per engine and borrowed by session-coordinated
-  work.
+- At this task revision, pool guards were built once per engine and borrowed by
+  session-coordinated work. The backlog follow-up later moved base roots back to
+  one bundle per session while retaining the same pool identities.
 - Shutdown, terminal cleanup, poison handling, and exact identity error
   classifications remain compatible.
 - Public APIs, dependencies, configuration, persisted formats, recovery
   protocols, benchmark CLI, and CI policy are unchanged.
-- The contended index-stream finding is a documented performance risk owned by
-  backlog 000175.
+- At task resolution, the contended index-stream finding remained a documented
+  performance risk owned by backlog 000175.
 
 ## Test Cases
 
@@ -291,10 +294,9 @@ implemented.
 
 No task-scoped design question remains.
 
-Backlog
-[000175](../backlogs/000175-scalable-shared-resource-lifetime-management.md)
-retains the unresolved engine-global admission cache line, broader
-quiescent/component guard ownership, buffer-page reference-count contention,
-and the measured choice between centralized, sharded, or retained counting.
-Its future work should first reproduce the index-stream profile independently
-and establish causality before changing index or buffer ownership.
+At task resolution, backlog
+[000175](../backlogs/closed/000175-scalable-shared-resource-lifetime-management.md)
+retained the unresolved broader guard-ownership and buffer-page refcount work.
+The follow-up reproduced the profile, isolated canonical `PoolGuard` roots as
+the cause, restored per-session roots, audited base-root construction, and
+closed with measured 1/1 neutrality and recovered 4/16 stream performance.

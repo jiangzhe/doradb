@@ -762,7 +762,8 @@ statement-boundary and stream-operation regressions. The amendment does not
 claim that the original successful-path budget passed: it records the fixed
 boundary cost as performance debt and defers eliminating unnecessary hot-path
 lifetime traffic, plus the broader shared-resource lifetime design, to
-`docs/backlogs/000175-scalable-shared-resource-lifetime-management.md`.
+`docs/backlogs/closed/000175-scalable-shared-resource-lifetime-management.md`,
+which subsequently implemented and measured that correction.
 Phase 3's cancellation ownership prerequisite is unchanged.
 
 ### Validation
@@ -961,13 +962,12 @@ There are no unresolved implementation choices for this task.
 
 The following are explicit follow-ups rather than Phase 2 decisions:
 
-1. Resolution measurements show contended statement-boundary and stream
+1. Resolution measurements showed contended statement-boundary and stream
    operation regressions after local boxed-core work removed allocation and
-   copy costs. `docs/backlogs/000175-scalable-shared-resource-lifetime-management.md`
-   owns both the narrow removal of unnecessary session-coordinated hot-path
-   lifetime-counter traffic and the broader engine/buffer-pool/transaction-
-   system lifetime design. Do not move the transaction core into the public
-   handle as an incidental Phase 2 optimization.
+   copy costs. `docs/backlogs/closed/000175-scalable-shared-resource-lifetime-management.md`
+   subsequently resolved the narrow hot-path lifetime traffic and documented
+   the broader engine/buffer-pool/transaction-system lifetime policy. The
+   transaction core remains outside the public handle.
 2. Phase 3 replaces the private must-complete fallback with reliable
    whole-DDL/maintenance future ownership and background continuation.
 3. A later task may add `DiscardOnly` cleanup only after proving absence of

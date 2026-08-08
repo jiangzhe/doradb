@@ -119,7 +119,7 @@ RFC-0026. [D5] [D6] [D7]
 
 - [B1] `docs/backlogs/closed/000170-session-coordinated-cancellation-cleanup.md`
 - [B2] `docs/backlogs/closed/000124-statement-execution-cancellation-safety.md`
-- [B3] `docs/backlogs/000175-scalable-shared-resource-lifetime-management.md`
+- [B3] `docs/backlogs/closed/000175-scalable-shared-resource-lifetime-management.md`
 - [B4] `docs/backlogs/000171-exact-family-lock-system-redesign.md`
 
 ## Decision
@@ -223,7 +223,8 @@ work. Lifecycle events are created only for an actual close or shutdown waiter.
 Phase 2 improved uncontended statement and transaction boundaries but exposed
 repeatable contended statement-boundary and stream regressions. The
 cancellation result was accepted with that fixed overhead recorded as explicit
-debt in backlog 000175; detailed samples and flamegraphs remain in task 000247.
+debt in backlog 000175; the debt was subsequently resolved, while detailed
+original samples and flamegraphs remain in task 000247.
 [D6] [B3] [U4]
 
 ### 5. RFC-0026 owns all post-Phase-2 execution design
@@ -319,7 +320,8 @@ numbered phase. [D8]
   - Implementation Summary: Implemented cancellation-safe public statement
     ownership, synchronous residual-effect settlement, whole-transaction
     cleanup, boxed transaction cores, and a reusable public-session core cache;
-    accepted measured contention debt is tracked by backlog 000175.
+    accepted measured contention debt was later resolved through backlog
+    000175.
 
 ### Superseded Remainder
 
@@ -348,8 +350,8 @@ RFC-0026 defines the replacement five-phase runtime-first program. [D7] [U5]
   000246 and 000247 or the current code.
 - Existing transitional state names may remain in the implementation until
   RFC-0026 migrates them.
-- The measured shared-resource lifetime contention remains open in backlog
-  000175.
+- The measured shared-resource lifetime contention remained open when this RFC
+  was superseded and was subsequently resolved through backlog 000175.
 
 ## Open Questions
 
@@ -362,8 +364,9 @@ deadlock and mutation policy remains separate follow-up work under backlog
 
 - Implement the RFC-0026 mandatory runtime and migrate DDL, maintenance, and
   transaction cleanup through its phases. [D7]
-- Remove unnecessary hot-path shared-resource lifetime traffic and reassess
-  long-lived resource ownership under backlog 000175. [B3]
+- Completed after this RFC closed: remove unnecessary hot-path shared-resource
+  lifetime traffic and document long-lived resource ownership under backlog
+  000175. [B3]
 - Revisit exact-family lock-system policy independently under backlog 000171.
   [B4]
 
@@ -376,5 +379,5 @@ deadlock and mutation policy remains separate follow-up work under backlog
 - `docs/tasks/000247-statement-public-transaction-cancellation-ownership.md`
 - `docs/backlogs/closed/000170-session-coordinated-cancellation-cleanup.md`
 - `docs/backlogs/closed/000124-statement-execution-cancellation-safety.md`
-- `docs/backlogs/000175-scalable-shared-resource-lifetime-management.md`
+- `docs/backlogs/closed/000175-scalable-shared-resource-lifetime-management.md`
 - `docs/backlogs/000171-exact-family-lock-system-redesign.md`

@@ -135,16 +135,13 @@ impl Catalog {
         storage: CatalogStorage,
         poisoner: QuiescentGuard<EnginePoisoner>,
         config: CatalogConfig,
+        bootstrap_guards: &PoolGuards,
     ) -> RuntimeResult<Self> {
-        let pool_guards = PoolGuards::builder()
-            .push(PoolRole::Meta, storage.meta_pool.pool_guard())
-            .push(PoolRole::Disk, storage.disk_pool.pool_guard())
-            .build();
         let snapshot = storage.checkpoint_snapshot();
         storage
             .bootstrap_from_checkpoint(
                 &snapshot,
-                &pool_guards,
+                bootstrap_guards,
                 config.recovery_disable_dml_validation,
             )
             .await?;
@@ -194,9 +191,10 @@ impl Catalog {
     pub(crate) async fn apply_checkpoint_batch(
         &self,
         batch: CatalogCheckpointBatch,
+        disk_guard: &PoolGuard,
     ) -> RuntimeOrFatalResult<CatalogCheckpointOutcome> {
         self.storage
-            .apply_checkpoint_batch(batch, self.curr_next_table_id())
+            .apply_checkpoint_batch(batch, self.curr_next_table_id(), disk_guard)
             .await
     }
 
@@ -205,9 +203,10 @@ impl Catalog {
     pub(crate) async fn prepare_checkpoint_batch(
         &self,
         batch: CatalogCheckpointBatch,
+        disk_guard: &PoolGuard,
     ) -> RuntimeOrFatalResult<PreparedCatalogCheckpoint> {
         self.storage
-            .prepare_checkpoint_batch(batch, self.curr_next_table_id())
+            .prepare_checkpoint_batch(batch, self.curr_next_table_id(), disk_guard)
             .await
     }
 
@@ -229,26 +228,22 @@ impl Catalog {
         index_pool: QuiescentGuard<EvictableBufferPool>,
         table_fs: &FileSystem,
         disk_pool: QuiescentGuard<ReadonlyBufferPool>,
+        guards: &PoolGuards,
         table_id: TableID,
     ) -> RuntimeResult<bool> {
         assert!(
             !self.user_tables.contains_key(&table_id),
             "catalog reload invariant violated: table runtime already exists, table_id={table_id}"
         );
-        let guards = PoolGuards::builder()
-            .push(PoolRole::Meta, self.storage.meta_pool.pool_guard())
-            .push(PoolRole::Index, index_pool.pool_guard())
-            .push(PoolRole::Disk, disk_pool.pool_guard())
-            .build();
         let (table, metadata_in_catalog) = self
-            .user_table_metadata_from_catalog(&guards, table_id)
+            .user_table_metadata_from_catalog(guards, table_id)
             .await?;
 
         // Phase 2 allocator semantics: only table ids consume the global allocator.
         self.try_update_next_table_id(table.table_id.saturating_add(1));
 
         let table_file = table_fs
-            .open_table_file(table.table_id, disk_pool.clone())
+            .open_table_file(table.table_id, disk_pool.clone(), guards.disk_guard())
             .await
             .change_context(RuntimeError::CatalogAccess)
             .attach_with(|| {
@@ -877,13 +872,22 @@ impl Component for Catalog {
         let table_fs = registry.dependency::<FileSystem>();
         let disk_pool = registry.dependency::<DiskPool>();
         let poisoner = registry.dependency::<EnginePoisoner>();
+        // Catalog bootstrap runs before sessions exist. Create one explicit
+        // component-build root per required pool and thread that bundle through
+        // file loading and catalog-table initialization.
+        let bootstrap_guards = PoolGuards::builder()
+            .push(PoolRole::Meta, meta_pool.create_base_guard())
+            .push(PoolRole::Disk, disk_pool.create_base_guard())
+            .build();
         let storage = CatalogStorage::new(
             meta_pool.clone_inner(),
             table_fs.clone(),
             disk_pool.clone_inner(),
+            &bootstrap_guards,
         )
         .await?;
-        registry.register::<Self>(Catalog::new(storage, poisoner, config).await?);
+        registry
+            .register::<Self>(Catalog::new(storage, poisoner, config, &bootstrap_guards).await?);
         Ok(())
     }
 
@@ -1823,7 +1827,10 @@ pub(crate) mod tests {
                 .indexes()
                 .list_uncommitted_by_table_id(
                     &PoolGuards::builder()
-                        .push(PoolRole::Meta, engine.inner().pools.meta.pool_guard())
+                        .push(
+                            PoolRole::Meta,
+                            engine.inner().pools.meta.create_base_guard(),
+                        )
                         .build(),
                     table_id,
                 )
@@ -1988,7 +1995,13 @@ pub(crate) mod tests {
                 .expect("catalog checkpoint should publish at least one root");
             let root_block_id = BlockID::from(root.root_block_id.unwrap().get());
             let block_id = {
-                let disk_pool_guard = engine.inner().core.catalog().storage.disk_pool.pool_guard();
+                let disk_pool_guard = engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .storage
+                    .disk_pool
+                    .create_base_guard();
                 let index = ColumnBlockIndex::new(
                     root_block_id,
                     root.pivot_row_id,
@@ -2050,7 +2063,13 @@ pub(crate) mod tests {
                 .expect("catalog checkpoint should publish at least one root");
             let root_block_id = BlockID::from(root.root_block_id.unwrap().get());
             let entry = {
-                let disk_pool_guard = engine.inner().core.catalog().storage.disk_pool.pool_guard();
+                let disk_pool_guard = engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .storage
+                    .disk_pool
+                    .create_base_guard();
                 let index = ColumnBlockIndex::new(
                     root_block_id,
                     root.pivot_row_id,
@@ -2162,7 +2181,10 @@ pub(crate) mod tests {
                 .inner()
                 .core
                 .catalog()
-                .apply_checkpoint_batch(batch1)
+                .apply_checkpoint_batch(
+                    batch1,
+                    engine.inner().core.pools.pool_guards().disk_guard(),
+                )
                 .await
                 .unwrap();
             let snap1 = engine.inner().core.catalog().storage.checkpoint_snapshot();
@@ -2184,7 +2206,10 @@ pub(crate) mod tests {
                 .inner()
                 .core
                 .catalog()
-                .apply_checkpoint_batch(batch2)
+                .apply_checkpoint_batch(
+                    batch2,
+                    engine.inner().core.pools.pool_guards().disk_guard(),
+                )
                 .await
                 .unwrap();
             let snap2 = engine.inner().core.catalog().storage.checkpoint_snapshot();

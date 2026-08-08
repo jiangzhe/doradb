@@ -31,7 +31,7 @@ teardown.
 `- codex`
 
 `Source Backlogs:`
-`- docs/backlogs/000175-scalable-shared-resource-lifetime-management.md`
+`- docs/backlogs/closed/000175-scalable-shared-resource-lifetime-management.md`
 
 `Benchmark Base:`
 `- 7151941aa9d9b5468adb864a3fdeb068ebcb020a`
@@ -49,10 +49,11 @@ joined long-lived workers. Standalone observers were the remaining uncovered
 class because they intentionally coexist with an active effectful operation and
 therefore do not consume its slot.
 
-Backlog 000175 recorded the contention evidence and still owns the wider
-resource-lifetime investigation. This task delivered only the engine-accounting
-slice; it did not redesign ordinary `Arc`, quiescent guards, pools, catalog or
-file ownership, or transaction-system shared-resource guards.
+Backlog 000175 recorded the contention evidence and, at this task's resolution,
+still owned the wider resource-lifetime investigation. This task delivered only
+the engine-accounting slice; it did not redesign ordinary `Arc`, quiescent
+guards, pools, catalog or file ownership, or transaction-system shared-resource
+guards.
 
 ## Goals
 
@@ -82,7 +83,8 @@ file ownership, or transaction-system shared-resource guards.
    order remain unchanged.
 6. Persisted formats, `doradb-bench` source, and CI timing policy remain
    unchanged.
-7. Source backlog 000175 remains open for broader lifetime-management work.
+7. Source backlog 000175 remained open at task resolution for broader
+   lifetime-management work.
 
 ## Plan
 
@@ -242,9 +244,9 @@ No required row showed a repeatable regression outside baseline dispersion.
 - Focused line coverage: `engine.rs` 96.74%, `session.rs` 95.61%, combined
   95.94%
 
-No parent RFC is linked. Source backlog 000175 remains open intentionally
-because its wider shared-resource lifetime investigation is not completed by
-this task.
+No parent RFC is linked. Source backlog 000175 remained open intentionally at
+task resolution because its wider shared-resource lifetime investigation was
+not completed by this task.
 
 ## Impacts
 
@@ -291,10 +293,10 @@ this task.
 
 ## Open Questions
 
-Backlog
-[000175](../backlogs/000175-scalable-shared-resource-lifetime-management.md)
-remains open for wider resource-lifetime work: ordinary `Arc` upgrades,
+At task resolution, backlog
+[000175](../backlogs/closed/000175-scalable-shared-resource-lifetime-management.md)
+retained wider resource-lifetime work: ordinary `Arc` upgrades,
 engine-admission traffic, quiescent and component counters, and frequently
-cloned pool, catalog, file, and transaction-system guards. Any architecture
-change across those subsystems requires separate measured planning and may
-require an RFC.
+cloned pool, catalog, file, and transaction-system guards. Task 000255 and the
+later pool-root audit subsequently completed that measured follow-up and closed
+the backlog with a hybrid centralized, sharded, and retained-counting policy.

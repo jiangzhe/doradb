@@ -982,8 +982,9 @@ because the first pair was noisy; the repeat still showed a slower candidate
 median, but the baseline was bimodal and its 19.020 ns IQR overlaps the
 candidate distribution. No mandatory-runtime access occurs on the public
 statement/transaction hot path, so this does not establish a deterministic
-Phase 1 regression. Existing backlog 000175 continues to own the broader
-contended shared-resource lifetime performance work.
+Phase 1 regression. Existing backlog 000175 continued to own the broader
+contended shared-resource lifetime performance work and subsequently resolved
+it through session-local pool roots.
 
 ### Validation
 
@@ -1174,8 +1175,8 @@ None within Phase 1.
 
 The noisy contended `stmt-noop` comparison does not establish a
 mandatory-runtime regression, but it also does not close the broader
-shared-lifetime contention question. That work remains linked to
-`docs/backlogs/000175-scalable-shared-resource-lifetime-management.md`.
+shared-lifetime contention question. That work was subsequently resolved in
+`docs/backlogs/closed/000175-scalable-shared-resource-lifetime-management.md`.
 
 Future DDL and maintenance tasks must implement `PreparedExecution` with their
 own operation-specific preparation guards and accepted compensation/panic

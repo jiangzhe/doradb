@@ -195,6 +195,10 @@ impl<T> QuiescentGuard<T> {
     ///
     /// The wrapped direct guard still holds exactly one quiescent keepalive.
     /// Further clones only clone the outer `Arc` and do not touch guard_count.
+    /// The caller therefore chooses the contention domain: every call creates
+    /// a distinct `Arc` root, while every clone of its result updates that
+    /// root's strong count. High-frequency users should create roots at their
+    /// natural ownership boundary instead of sharing one process-wide root.
     #[inline]
     pub(crate) fn into_sync(self) -> SyncQuiescentGuard<T> {
         SyncQuiescentGuard {
@@ -297,6 +301,9 @@ fn guard_count_underflow() -> ! {
 }
 
 #[cfg(test)]
+pub(crate) use self::tests::shares_root as test_sync_guards_share_root;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::ptr::from_ref;
@@ -309,6 +316,15 @@ mod tests {
 
     struct DropSpy {
         dropped: Arc<AtomicBool>,
+    }
+
+    /// Returns whether two wrappers update the same outer `Arc` strong count.
+    #[inline]
+    pub(crate) fn shares_root<T>(
+        first: &SyncQuiescentGuard<T>,
+        second: &SyncQuiescentGuard<T>,
+    ) -> bool {
+        Arc::ptr_eq(&first.guard, &second.guard)
     }
 
     impl Drop for DropSpy {
@@ -501,5 +517,25 @@ mod tests {
 
         drop(guard);
         drop(owner);
+    }
+
+    #[test]
+    fn test_sync_quiescent_guard_fresh_roots_shard_outer_arc() {
+        let owner = QuiescentBox::new(());
+        let first = owner.guard().into_sync();
+        let second = owner.guard().into_sync();
+        assert_eq!(owner.outstanding_guard_count(), 2);
+        assert!(!shares_root(&first, &second));
+
+        let first_clone = first.clone();
+        assert!(shares_root(&first, &first_clone));
+        assert_eq!(owner.outstanding_guard_count(), 2);
+
+        drop(first);
+        assert_eq!(owner.outstanding_guard_count(), 2);
+        drop(first_clone);
+        assert_eq!(owner.outstanding_guard_count(), 1);
+        drop(second);
+        assert_eq!(owner.outstanding_guard_count(), 0);
     }
 }

@@ -184,9 +184,14 @@ impl QuiescentArena {
         self.keepalive.guard()
     }
 
-    /// Returns a cloneable pool guard for accesses into this arena.
+    /// Creates one independent clone root for accesses into this arena.
+    ///
+    /// Each call acquires the arena's pool-global quiescent counter once and
+    /// wraps that direct guard in a new `Arc`. Callers must keep the resulting
+    /// base guard at a natural ownership boundary and clone it for individual
+    /// page or task lifetimes.
     #[inline]
-    pub(crate) fn guard(&self) -> PoolGuard {
+    pub(crate) fn create_base_guard(&self) -> PoolGuard {
         PoolGuard::new(self.identity, self.quiescent_guard().into_sync())
     }
 
@@ -257,15 +262,47 @@ impl QuiescentArena {
 }
 
 #[cfg(test)]
+pub(crate) use self::tests::outstanding_base_guard_count;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::test_pool_guards_share_keepalive_root;
+
+    /// Returns the number of independently created base guards.
+    #[inline]
+    pub(crate) fn outstanding_base_guard_count(arena: &QuiescentArena) -> usize {
+        arena.keepalive.outstanding_guard_count()
+    }
 
     #[test]
     #[should_panic(expected = "pool guard identity mismatch")]
     fn test_arena_guard_panics_on_foreign_guard() {
         let arena1 = Box::leak(Box::new(QuiescentArena::new(1).unwrap()));
         let arena2 = Box::leak(Box::new(QuiescentArena::new(1).unwrap()));
-        let foreign_guard = arena2.guard();
+        let foreign_guard = arena2.create_base_guard();
         let _ = arena1.arena_guard(foreign_guard);
+    }
+
+    #[test]
+    fn test_base_guard_creation_and_clone_lifecycle() {
+        let arena = QuiescentArena::new(1).unwrap();
+        assert_eq!(outstanding_base_guard_count(&arena), 0);
+
+        let first = arena.create_base_guard();
+        let first_clone = first.clone();
+        assert_eq!(outstanding_base_guard_count(&arena), 1);
+        assert!(test_pool_guards_share_keepalive_root(&first, &first_clone));
+
+        let second = arena.create_base_guard();
+        assert_eq!(outstanding_base_guard_count(&arena), 2);
+        assert!(!test_pool_guards_share_keepalive_root(&first, &second));
+        assert_eq!(first.identity(), second.identity());
+
+        drop(first);
+        drop(first_clone);
+        assert_eq!(outstanding_base_guard_count(&arena), 1);
+        drop(second);
+        assert_eq!(outstanding_base_guard_count(&arena), 0);
     }
 }

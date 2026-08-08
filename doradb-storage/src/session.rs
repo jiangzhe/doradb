@@ -636,7 +636,7 @@ pub(crate) trait SessionRuntimeAccess {
     fn engine(&self) -> &EngineCore {
         self.runtime().core()
     }
-    /// Borrows the canonical pool-guard bundle.
+    /// Borrows the exact session's pool-guard roots.
     fn pool_guards(&self) -> &PoolGuards {
         self.runtime().pool_guards()
     }
@@ -675,10 +675,10 @@ impl SessionRuntime {
         WeakSessionRef::new(&self.0)
     }
 
-    /// Borrow the canonical engine pool guard bundle.
+    /// Borrow the exact session's pool-guard roots.
     #[inline]
     pub(crate) fn pool_guards(&self) -> &PoolGuards {
-        self.core().pool_guards()
+        &self.0.pool_guards
     }
 
     /// Returns whether owner-side shutdown has closed operation admission.
@@ -1034,9 +1034,10 @@ impl Session {
         .attach_with(|| format!("prepare CREATE INDEX locks: table_id={table_id}"))
         .disclose()?;
         let engine = scope.engine();
-        let table = validated_index_ddl_target(engine, table_id, "create_index")
-            .await
-            .disclose()?;
+        let table =
+            validated_index_ddl_target(engine, engine.pool_guards(), table_id, "create_index")
+                .await
+                .disclose()?;
         engine.poisoner.ensure_healthy().disclose()?;
         let gates = IndexDdlGateScope::acquire(Arc::clone(&table), engine.catalog_guard())
             .await
@@ -1080,9 +1081,10 @@ impl Session {
                 .attach_with(|| format!("prepare DROP INDEX locks: table_id={table_id}"))
                 .disclose()?;
         let engine = scope.engine();
-        let table = validated_index_ddl_target(engine, table_id, "drop_index")
-            .await
-            .disclose()?;
+        let table =
+            validated_index_ddl_target(engine, engine.pool_guards(), table_id, "drop_index")
+                .await
+                .disclose()?;
         engine.poisoner.ensure_healthy().disclose()?;
         let gates = IndexDdlGateScope::acquire(Arc::clone(&table), engine.catalog_guard())
             .await
@@ -1839,7 +1841,7 @@ impl SessionOperationPin {
             .reject_table_ddl_explicit_session_lock(table_id, self.operation_lock_owner())
     }
 
-    /// Returns a cloned guard bundle for this foreground operation.
+    /// Borrows the exact session's pool-guard roots.
     #[inline]
     pub(crate) fn pool_guards(&self) -> &PoolGuards {
         self.runtime.pool_guards()
@@ -2368,6 +2370,13 @@ impl SessionTableCacheEntry {
 /// Shared mutable state referenced by transactions started from one [`Session`].
 pub(crate) struct SessionState {
     id: SessionID,
+    /// Per-session roots for page-guard `Arc` clone/drop traffic.
+    ///
+    /// Keep this field before `core`: Rust drops fields in declaration order,
+    /// so the session roots release their arena keepalives before the shared
+    /// engine capabilities. Do not replace them with `EngineCore`'s canonical
+    /// bundle; page lookup clones would again contend across all sessions.
+    pool_guards: PoolGuards,
     core: Arc<EngineCore>,
     admission: Arc<SessionAdmission>,
     lifecycle: Mutex<SessionLifecycle>,
@@ -2383,8 +2392,12 @@ impl SessionState {
         admission: Arc<SessionAdmission>,
         id: SessionID,
     ) -> Self {
+        // Four allocations and arena acquisitions are intentionally paid once
+        // at session creation to shard millions of page-guard Arc operations.
+        let pool_guards = core.pools.create_session_pool_guards();
         SessionState {
             id,
+            pool_guards,
             core,
             admission,
             lifecycle: Mutex::new(SessionLifecycle {
@@ -3178,7 +3191,7 @@ impl TrxAttachment {
         self.trx_id
     }
 
-    /// Borrows the canonical engine pool guards.
+    /// Borrows the exact session's pool-guard roots.
     #[inline]
     pub(crate) fn pool_guards(&self) -> &PoolGuards {
         self.runtime.pool_guards()
@@ -3365,6 +3378,7 @@ async fn wait_for_maintenance_boundary(
 pub(crate) mod tests {
     use super::*;
     use crate::buffer::guard::PageGuard;
+    use crate::buffer::{PoolRole, test_pool_guards_share_keepalive_root};
     use crate::catalog::storage::tables::TABLE_ID_TABLES;
     use crate::catalog::tests::{table1, table2, wait_for_dropped_table_floor};
     use crate::catalog::{
@@ -4569,6 +4583,54 @@ pub(crate) mod tests {
                     .keys()
                     .all(|table_id| !is_catalog_table(*table_id))
             );
+        });
+    }
+
+    #[test]
+    fn test_sessions_use_independent_pool_guard_arc_roots() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let session1 = engine.new_session().unwrap();
+            let session2 = engine.new_session().unwrap();
+            let runtime1 = test_session_runtime(&session1).unwrap();
+            let runtime2 = test_session_runtime(&session2).unwrap();
+            let guards1 = runtime1.pool_guards().clone();
+            let guards1_clone = runtime1.pool_guards().clone();
+            let guards2 = runtime2.pool_guards().clone();
+            let canonical = engine.inner().core.pools.pool_guards().clone();
+
+            for role in [
+                PoolRole::Meta,
+                PoolRole::Index,
+                PoolRole::Mem,
+                PoolRole::Disk,
+            ] {
+                let guard1 = guards1.guard(role);
+                let guard1_clone = guards1_clone.guard(role);
+                let guard2 = guards2.guard(role);
+                let canonical_guard = canonical.guard(role);
+                assert_eq!(guard1.identity(), guard2.identity(), "role={role:?}");
+                assert_eq!(
+                    guard1.identity(),
+                    canonical_guard.identity(),
+                    "role={role:?}"
+                );
+                assert!(
+                    test_pool_guards_share_keepalive_root(guard1, guard1_clone),
+                    "same-session clones must share one root: role={role:?}"
+                );
+                assert!(
+                    !test_pool_guards_share_keepalive_root(guard1, guard2),
+                    "different sessions must shard roots: role={role:?}"
+                );
+                assert!(
+                    !test_pool_guards_share_keepalive_root(guard1, canonical_guard),
+                    "session and canonical engine work must shard roots: role={role:?}"
+                );
+            }
         });
     }
 
