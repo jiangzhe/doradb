@@ -13,8 +13,9 @@ use crate::buffer::{
 use crate::catalog::{IndexSpec, PrimaryKeyMatchError, TableColumnLayout, TableMetadata};
 use crate::error::{
     DataIntegrityError, InternalError, InternalResult, MultiDomainResultExt, OperationError,
-    OperationOrRuntimeError, OperationOrRuntimeResult, RecoveryDuplicateKey, RuntimeError,
-    RuntimeOrFatalResult, RuntimeOrFatalResultExt, RuntimeResult, SecondaryIndexBinding,
+    OperationOrRuntimeError, OperationOrRuntimeResult, QuadResult, RecoveryDuplicateKey,
+    RuntimeError, RuntimeOrFatalResult, RuntimeOrFatalResultExt, RuntimeResult,
+    SecondaryIndexBinding,
 };
 use crate::id::{PageID, RowID, TableID, TrxID};
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
@@ -2155,7 +2156,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         unique_index_no: usize,
         cols: Vec<Val>,
         log_by_key: bool,
-    ) -> OperationOrRuntimeResult<UpsertMvcc> {
+    ) -> QuadResult<UpsertMvcc> {
         let key = unique_key_from_full_row(
             self.metadata(),
             unique_index_no,
@@ -2175,6 +2176,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                 self.insert_mvcc(rt, effects, cols)
                     .await
                     .map(UpsertMvcc::Inserted)
+                    .map_err(Into::into)
             }
         }
     }
@@ -2192,7 +2194,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         key_vals: &[Val],
         update: Vec<UpdateCol>,
         log_by_key: bool,
-    ) -> OperationOrRuntimeResult<UpdateMvcc> {
+    ) -> QuadResult<UpdateMvcc> {
         let input = RowUpdateInput::Sparse(update);
         match self
             .update_unique_mvcc_input(rt, effects, index_no, key_vals, input, log_by_key)
@@ -2212,7 +2214,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         key_vals: &[Val],
         input: RowUpdateInput,
         log_by_key: bool,
-    ) -> OperationOrRuntimeResult<UpdateUniqueMvcc> {
+    ) -> QuadResult<UpdateUniqueMvcc> {
         debug_assert!(index_no < self.sec_idx_len());
         debug_assert!(
             self.metadata()
@@ -2915,7 +2917,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         index_no: usize,
         key_vals: &[Val],
         log_by_key: bool,
-    ) -> OperationOrRuntimeResult<DeleteMvcc> {
+    ) -> QuadResult<DeleteMvcc> {
         debug_assert!(index_no < self.sec_idx_len());
         debug_assert!(
             self.metadata()

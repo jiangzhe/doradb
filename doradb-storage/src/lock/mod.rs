@@ -1329,7 +1329,9 @@ fn lock_family_conflict_err(
 pub(crate) mod tests {
     use super::wait::tests::{linked_ids as linked_waiter_ids, queue_snapshot};
     use super::*;
+    use crate::error::{OperationOrFatalError, OperationOrFatalResult};
     use crate::id::ClaimNo;
+    use crate::poison::healthy_test_poisoner;
 
     /// Debug snapshot of all physical families and queued waiters.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1419,8 +1421,20 @@ pub(crate) mod tests {
         ) -> OperationResult<LockGrant> {
             self.authority
                 .family_mut()
-                .acquire(&mut self.scope, manager, resource, mode)
+                .acquire(
+                    &mut self.scope,
+                    manager,
+                    healthy_test_poisoner(),
+                    resource,
+                    mode,
+                )
                 .await
+                .map_err(|error| match error {
+                    OperationOrFatalError::Operation(report) => report,
+                    OperationOrFatalError::Fatal(report) => {
+                        panic!("shared healthy test poisoner returned Fatal: {report:?}")
+                    }
+                })
         }
 
         #[inline]
@@ -1543,6 +1557,15 @@ pub(crate) mod tests {
     fn assert_operation_err<T>(res: OperationResult<T>, expected: OperationError) {
         let err = res.err().unwrap();
         assert_eq!(*err.current_context(), expected);
+    }
+
+    fn operation_result<T>(result: OperationOrFatalResult<T>) -> OperationResult<T> {
+        result.map_err(|error| match error {
+            OperationOrFatalError::Operation(report) => report,
+            OperationOrFatalError::Fatal(report) => {
+                panic!("shared healthy test poisoner returned Fatal: {report:?}")
+            }
+        })
     }
 
     #[test]
@@ -1824,7 +1847,13 @@ pub(crate) mod tests {
             let mut transaction_scope = LockScopeState::new(family_owner);
             let (family, session_scope) = authority.parts();
             family
-                .acquire(session_scope, &manager, resource, LockMode::Exclusive)
+                .acquire(
+                    session_scope,
+                    &manager,
+                    healthy_test_poisoner(),
+                    resource,
+                    LockMode::Exclusive,
+                )
                 .await
                 .unwrap();
 
@@ -1840,6 +1869,7 @@ pub(crate) mod tests {
                 .acquire(
                     &mut transaction_scope,
                     &manager,
+                    healthy_test_poisoner(),
                     resource,
                     LockMode::IntentExclusive,
                 )
@@ -1874,18 +1904,27 @@ pub(crate) mod tests {
             let mut transaction_scope = LockScopeState::new(family_owner);
             let (family, session_scope) = authority.parts();
             family
-                .acquire(session_scope, &manager, resource, LockMode::Shared)
+                .acquire(
+                    session_scope,
+                    &manager,
+                    healthy_test_poisoner(),
+                    resource,
+                    LockMode::Shared,
+                )
                 .await
                 .unwrap();
             assert_operation_err(
-                family
-                    .acquire(
-                        &mut transaction_scope,
-                        &manager,
-                        resource,
-                        LockMode::IntentExclusive,
-                    )
-                    .await,
+                operation_result(
+                    family
+                        .acquire(
+                            &mut transaction_scope,
+                            &manager,
+                            healthy_test_poisoner(),
+                            resource,
+                            LockMode::IntentExclusive,
+                        )
+                        .await,
+                ),
                 OperationError::LockFamilyConflict,
             );
             let snapshot = debug_snapshot(&manager);

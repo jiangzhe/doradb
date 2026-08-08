@@ -1,6 +1,6 @@
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::catalog::TableMetadata;
-use crate::error::{OperationError, OperationResult};
+use crate::error::{FatalResult, OperationError, OperationOrFatalResult};
 use crate::id::{RowID, TableID};
 use crate::log::redo::{RowRedo, RowRedoKind};
 use crate::map::FastHashMap;
@@ -193,7 +193,7 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
         &self,
         effects: &mut StmtEffects,
         key: Option<(usize, &[Val])>,
-    ) -> LockRowForWrite<'g> {
+    ) -> FatalResult<LockRowForWrite<'g>> {
         let page_guard = self.page_guard;
         let row_id = self.row_id;
         let page = page_guard.page();
@@ -206,7 +206,7 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
             }
             let state_guard = ver_map.read_state();
             if *state_guard == RowPageState::Transition {
-                return LockRowForWrite::RetryInTransition;
+                return Ok(LockRowForWrite::RetryInTransition);
             }
             let mut access =
                 page_guard.write_row_with_state_guard(page.row_idx(row_id), state_guard);
@@ -220,25 +220,16 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
                 key,
             );
             match lock_undo {
-                LockUndo::Ok => return LockRowForWrite::Ok(Some(access)),
-                LockUndo::InvalidIndex => return LockRowForWrite::InvalidIndex,
-                LockUndo::WriteConflict => return LockRowForWrite::WriteConflict,
+                LockUndo::Ok => return Ok(LockRowForWrite::Ok(Some(access))),
+                LockUndo::InvalidIndex => return Ok(LockRowForWrite::InvalidIndex),
+                LockUndo::WriteConflict => return Ok(LockRowForWrite::WriteConflict),
                 LockUndo::Preparing(listener) => {
-                    if let Some(listener) = listener {
-                        drop(access);
+                    drop(access);
 
-                        // Here we do not unlock the page, because the preparation time of commit is supposed
-                        // to be short.
-                        // And as active transaction is using this page, we don't want page evictor swap it onto
-                        // disk.
-                        // Other transactions can still access this page and modify other rows.
-
-                        listener.await; // wait for that transaction to be committed.
-
-                        // now we get back on current page.
-                        // maybe another thread modify our row before the lock acquisition,
-                        // so we need to recheck.
-                    }
+                    // Keep the page pin while releasing row access. Either
+                    // prepare completion or poison causes an authoritative
+                    // retry or ordinary guard unwind.
+                    self.rt.wait_prepare_or_poison(listener).await?;
                 }
             }
         }
@@ -252,7 +243,7 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
         index_no: usize,
         key_vals: &[Val],
         log_by_key: bool,
-    ) -> OperationResult<DeleteInternal> {
+    ) -> OperationOrFatalResult<DeleteInternal> {
         let redo_kind = if log_by_key {
             RowRedoKind::DeleteByPrimaryKey(SelectKey::new(index_no, key_vals.to_vec()))
         } else {
@@ -267,7 +258,7 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
     pub(super) async fn delete_known_row(
         &self,
         effects: &mut StmtEffects,
-    ) -> OperationResult<DeleteInternal> {
+    ) -> OperationOrFatalResult<DeleteInternal> {
         self.delete_inner(
             effects,
             None,
@@ -282,7 +273,7 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
         effects: &mut StmtEffects,
         lookup_key: Option<(usize, &[Val])>,
         redo_kind: RowRedoKind,
-    ) -> OperationResult<DeleteInternal> {
+    ) -> OperationOrFatalResult<DeleteInternal> {
         let page_guard = self.page_guard;
         let row_id = self.row_id;
         let page = page_guard.page();
@@ -292,11 +283,12 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
         // The undo-head lock is the conflict check for hot delete. Once the
         // lock is owned, the row-page delete bit becomes the latest image and
         // the same undo entry is rewritten to `Delete`.
-        let mut lock_row = self.lock_for_write(effects, lookup_key).await;
+        let mut lock_row = self.lock_for_write(effects, lookup_key).await?;
         match &mut lock_row {
             LockRowForWrite::InvalidIndex => Ok(DeleteInternal::NotFound),
             LockRowForWrite::WriteConflict => Err(Report::new(OperationError::WriteConflict)
-                .attach("delete MVCC row-page write lock")),
+                .attach("delete MVCC row-page write lock")
+                .into()),
             LockRowForWrite::RetryInTransition => Ok(DeleteInternal::RetryInTransition),
             LockRowForWrite::Ok(access) => {
                 let mut access = access
@@ -333,7 +325,7 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
         key_vals: &[Val],
         update: RowUpdateInput,
         log_by_key: bool,
-    ) -> OperationResult<UpdateRowInplace> {
+    ) -> OperationOrFatalResult<UpdateRowInplace> {
         let redo_key = log_by_key.then(|| SelectKey::new(index_no, key_vals.to_vec()));
         self.update_known_row_inner(effects, update, Some((index_no, key_vals)), redo_key)
             .await
@@ -345,7 +337,7 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
         &self,
         effects: &mut StmtEffects,
         update: RowUpdateInput,
-    ) -> OperationResult<UpdateRowInplace> {
+    ) -> OperationOrFatalResult<UpdateRowInplace> {
         self.update_known_row_inner(effects, update, None, None)
             .await
     }
@@ -357,7 +349,7 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
         update: RowUpdateInput,
         lookup_key: Option<(usize, &[Val])>,
         redo_key: Option<SelectKey>,
-    ) -> OperationResult<UpdateRowInplace> {
+    ) -> OperationOrFatalResult<UpdateRowInplace> {
         let page_guard = self.page_guard;
         let row_id = self.row_id;
         let page_id = page_guard.page_id();
@@ -375,11 +367,12 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
         // image, never an older version reconstructed from MVCC undo. The image
         // must remain stable until the undo-head lock is installed. The lock
         // path also rejects stale index candidates whose latest key differs.
-        let mut lock_row = self.lock_for_write(effects, lookup_key).await;
+        let mut lock_row = self.lock_for_write(effects, lookup_key).await?;
         match &mut lock_row {
             LockRowForWrite::InvalidIndex => Ok(UpdateRowInplace::RowNotFound(update)),
             LockRowForWrite::WriteConflict => Err(Report::new(OperationError::WriteConflict)
-                .attach("update MVCC row-page write lock")),
+                .attach("update MVCC row-page write lock")
+                .into()),
             LockRowForWrite::RetryInTransition => Ok(UpdateRowInplace::RetryInTransition(update)),
             LockRowForWrite::Ok(access) => {
                 let mut access = access

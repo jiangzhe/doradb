@@ -6,7 +6,10 @@ use crate::catalog::table::{TableColumnLayout, TableMetadata};
 use crate::catalog::{
     ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, catalog_table_id_from_slot,
 };
-use crate::error::{DataIntegrityError, DataIntegrityResult, RuntimeError, RuntimeResult};
+use crate::error::{
+    DataIntegrityError, DataIntegrityResult, MultiDomainResultExt, RuntimeError,
+    RuntimeOrFatalResult, RuntimeResult,
+};
 use crate::id::{TableID, TrxID};
 use crate::row::ops::DeleteMvcc;
 use crate::row::{Row, RowRead};
@@ -105,7 +108,7 @@ impl TableReplaySilentWatermarks<'_> {
         &self,
         stmt: &mut Statement<'_>,
         table_id: TableID,
-    ) -> RuntimeResult<bool> {
+    ) -> RuntimeOrFatalResult<bool> {
         let key_vals = [Val::from(table_id)];
         let res = stmt
             .catalog_delete_primary_key_mvcc(

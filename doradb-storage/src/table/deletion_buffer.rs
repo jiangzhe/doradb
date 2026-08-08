@@ -13,9 +13,9 @@
 
 use crate::id::{RowID, TrxID};
 use crate::map::FastDashMap;
+use crate::poison::PoisonAwareListener;
 use crate::trx::{PrepareListenerResult, SharedTrxStatus, trx_is_committed};
 use dashmap::mapref::entry::Entry;
-use event_listener::EventListener;
 use std::sync::Arc;
 
 /// Result of attempting to claim or seed a cold-row delete marker.
@@ -32,9 +32,9 @@ pub(crate) enum DeletionError {
 pub(crate) enum DeletionClaim {
     /// The caller installed or already owns the delete marker.
     Acquired,
-    /// A foreign owner is preparing; wait when a listener was registered, then
-    /// retry from authoritative row and marker state.
-    Preparing(Option<EventListener>),
+    /// A foreign owner is preparing; consume the poison-aware token, then retry
+    /// from authoritative row and marker state.
+    Preparing(PoisonAwareListener),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,8 +119,8 @@ impl ColumnDeletionBuffer {
     /// Claims a cold row for a foreground update or delete.
     ///
     /// Unlike [`ColumnDeletionBuffer::put_ref`], a foreign preparing owner
-    /// returns its shared prepare listener. The returned listener is owned and
-    /// the deletion-buffer entry guard has already been released.
+    /// returns opaque poison-aware retry authority. The returned token is owned
+    /// and the deletion-buffer entry guard has already been released.
     #[inline]
     pub(crate) fn claim_ref(
         &self,
@@ -144,15 +144,15 @@ impl ColumnDeletionBuffer {
                                         .unwrap_or(Err(DeletionError::WriteConflict))
                                 }
                                 PrepareListenerResult::Registered(listener) => {
-                                    Ok(DeletionClaim::Preparing(Some(listener)))
+                                    Ok(DeletionClaim::Preparing(listener))
                                 }
-                                PrepareListenerResult::Completed => {
+                                PrepareListenerResult::Completed(listener) => {
                                     // Completion won registration. Reclassify a
                                     // committed owner under the CDB entry guard; an
                                     // active timestamp requires an immediate retry so
                                     // rollback removal or fatal poison can be observed.
                                     Self::foreground_committed_result(existing.ts(), snapshot_sts)
-                                        .unwrap_or(Ok(DeletionClaim::Preparing(None)))
+                                        .unwrap_or(Ok(DeletionClaim::Preparing(listener)))
                                 }
                             }
                         }
@@ -398,7 +398,6 @@ mod tests {
         rollback_preparing_shared_trx_status, shared_trx_status,
     };
     use crate::trx::{MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID};
-    use event_listener::Listener;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
@@ -496,7 +495,7 @@ mod tests {
             .claim_ref(RowID::new(1), first_waiter, MAX_SNAPSHOT_TS)
             .unwrap()
         {
-            DeletionClaim::Preparing(Some(listener)) => listener,
+            DeletionClaim::Preparing(listener) => listener,
             _ => panic!("preparing owner should return an installed listener"),
         };
         assert!(prepare_event_is_installed(&owner));
@@ -504,14 +503,14 @@ mod tests {
             .claim_ref(RowID::new(1), second_waiter, MAX_SNAPSHOT_TS)
             .unwrap()
         {
-            DeletionClaim::Preparing(Some(listener)) => listener,
+            DeletionClaim::Preparing(listener) => listener,
             _ => panic!("later waiter should reuse the installed listener"),
         };
 
         let cts = TrxID::new(40);
         commit_preparing_shared_trx_status(&owner, cts);
-        first.wait();
-        second.wait();
+        first.wait_primary_for_test();
+        second.wait_primary_for_test();
         assert!(!prepare_event_is_installed(&owner));
         let requester = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 13));
         assert!(matches!(
@@ -572,10 +571,10 @@ mod tests {
             let claim = claimant_buffer
                 .claim_ref(row_id, requester, MAX_SNAPSHOT_TS)
                 .expect("preparing owner should produce a foreground wait");
-            let DeletionClaim::Preparing(Some(listener)) = claim else {
+            let DeletionClaim::Preparing(listener) = claim else {
                 panic!("claimant should install the shared prepare listener")
             };
-            listener.wait();
+            listener.wait_primary_for_test();
         });
 
         loaded_rx

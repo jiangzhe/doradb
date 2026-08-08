@@ -25,6 +25,7 @@ use crate::index::{
 use crate::log::redo::{RowRedo, RowRedoKind};
 use crate::lwc::LwcBlock;
 use crate::map::{FastHashMap, FastHashSet};
+use crate::poison::PoisonAwareListener;
 use crate::row::ops::{
     DeleteMvcc, LinkForUniqueIndex, ReadRow, RowMutation, RowUpdateInput, ScanMvcc, SelectKey,
     SelectMvcc, TableMutationOutcome, UpdateCol, UpdateMvcc, UpsertMvcc,
@@ -45,7 +46,6 @@ use crate::trx::{
 };
 use crate::value::Val;
 use error_stack::{Report, ResultExt};
-use event_listener::EventListener;
 use futures::FutureExt;
 use std::marker::PhantomData;
 use std::mem;
@@ -527,14 +527,14 @@ pub(super) enum ColdRowUpdateRead {
     Ok(Vec<Val>),
     NotFound,
     WriteConflict,
-    Preparing(Option<EventListener>),
+    Preparing(PoisonAwareListener),
 }
 
 enum ColdLatestRow {
     Readable,
     NotFound,
     WriteConflict,
-    Preparing(Option<EventListener>),
+    Preparing(PoisonAwareListener),
 }
 
 enum PointMutationAttempt<'ctx> {
@@ -543,7 +543,7 @@ enum PointMutationAttempt<'ctx> {
         page_guard: PageSharedGuard<RowPage>,
         row_id: RowID,
     },
-    Preparing(Option<EventListener>),
+    Preparing(PoisonAwareListener),
 }
 
 /// Operation accessor for user tables.
@@ -641,20 +641,6 @@ impl<'op> UserTableAccessor<'op> {
             }
             engine.poisoner.ensure_healthy()?;
         }
-    }
-
-    #[inline]
-    async fn wait_prepare_retry(
-        &self,
-        rt: TrxRuntime<'_>,
-        listener: Option<EventListener>,
-    ) -> FatalResult<()> {
-        if let Some(listener) = listener {
-            listener.await;
-        }
-        // Fatal failed-precommit cleanup wakes prepare waiters while retaining
-        // unsafe undo/marker state. Poison must win before any retry touches it.
-        rt.engine().poisoner.ensure_healthy()
     }
 
     #[inline]
@@ -1566,9 +1552,9 @@ impl<'op> UserTableAccessor<'op> {
                     } else {
                         match status.prepare_listener() {
                             PrepareListenerResult::Registered(listener) => {
-                                return Ok(ColdRowUpdateRead::Preparing(Some(listener)));
+                                return Ok(ColdRowUpdateRead::Preparing(listener));
                             }
-                            PrepareListenerResult::Completed => {
+                            PrepareListenerResult::Completed(listener) => {
                                 // Completion won registration. Reclassify commit now;
                                 // rollback marker removal or fatal poison is observed by
                                 // the caller's immediate authoritative retry.
@@ -1578,7 +1564,7 @@ impl<'op> UserTableAccessor<'op> {
                                         return Ok(ColdRowUpdateRead::NotFound);
                                     }
                                 } else {
-                                    return Ok(ColdRowUpdateRead::Preparing(None));
+                                    return Ok(ColdRowUpdateRead::Preparing(listener));
                                 }
                             }
                             PrepareListenerResult::NotPreparing => {
@@ -3465,7 +3451,7 @@ impl<'op> UserTableAccessor<'op> {
                     .disclose()?;
                 let block = persisted.block();
                 validate_cold_scan_entry(file_kind, &entry, block, &row_ids).disclose()?;
-                let mut prepare_wait: Option<Option<EventListener>> = None;
+                let mut prepare_wait: Option<PoisonAwareListener> = None;
                 while row_idx < row_ids.len() {
                     let row_id = row_ids[row_idx];
                     match read_latest_cold_row(
@@ -3571,11 +3557,12 @@ impl<'op> UserTableAccessor<'op> {
                         }
                     }
                 }
-                // The outer `None` means the scan completed without interruption.
-                // `Some(None)` means completion won listener registration, while
-                // `Some(Some(listener))` waits before checking fatal engine poison.
+                // `None` means the scan completed without interruption. `Some`
+                // carries opaque retry authority whose internal state records
+                // whether primary completion still needs a wait or only a
+                // sticky poison recheck.
                 if let Some(listener) = prepare_wait {
-                    self.wait_prepare_retry(rt, listener).await.disclose()?;
+                    rt.wait_prepare_or_poison(listener).await.disclose()?;
                 }
             }
         }
@@ -3764,7 +3751,7 @@ impl<'op> UserTableAccessor<'op> {
             match deletion_buffer.claim_ref(row_id, Arc::clone(rt.status()), rt.sts()) {
                 Ok(DeletionClaim::Acquired) => return Ok(()),
                 Ok(DeletionClaim::Preparing(listener)) => {
-                    self.wait_prepare_retry(rt, listener).await?;
+                    rt.wait_prepare_or_poison(listener).await?;
                 }
                 Err(DeletionError::WriteConflict) => {
                     return Err(Report::new(OperationError::WriteConflict).into());
@@ -4361,7 +4348,7 @@ impl<'op> UserTableAccessor<'op> {
                     row_id,
                 } => (root_snapshot, page_guard, row_id),
                 PointMutationAttempt::Preparing(listener) => {
-                    self.wait_prepare_retry(rt, listener).await?;
+                    rt.wait_prepare_or_poison(listener).await?;
                     continue;
                 }
             };
@@ -4570,7 +4557,7 @@ impl<'op> UserTableAccessor<'op> {
                     row_id,
                 } => (root_snapshot, page_guard, row_id),
                 PointMutationAttempt::Preparing(listener) => {
-                    self.wait_prepare_retry(rt, listener).await?;
+                    rt.wait_prepare_or_poison(listener).await?;
                     continue;
                 }
             };
@@ -4769,13 +4756,13 @@ fn read_latest_cold_row(
             }
             match status.prepare_listener() {
                 PrepareListenerResult::Registered(listener) => {
-                    return ColdLatestRow::Preparing(Some(listener));
+                    return ColdLatestRow::Preparing(listener);
                 }
-                PrepareListenerResult::Completed => {
+                PrepareListenerResult::Completed(listener) => {
                     if trx_is_committed(status.ts()) {
                         return ColdLatestRow::NotFound;
                     }
-                    return ColdLatestRow::Preparing(None);
+                    return ColdLatestRow::Preparing(listener);
                 }
                 PrepareListenerResult::NotPreparing => (),
             }
@@ -4801,8 +4788,8 @@ mod tests {
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{
-        DataIntegrityError, DiscloseError, DiscloseResultExt, ErrorKind, FatalError, InternalError,
-        IoError, OperationError, Result, RuntimeError,
+        DataIntegrityError, DiscloseError, DiscloseResultExt, Error, ErrorKind, FatalError,
+        InternalError, IoError, OperationError, Result, RuntimeError,
     };
     use crate::file::cow_file::SUPER_BLOCK_ID;
     use crate::id::{PageID, RowID, TableID, TrxID};
@@ -4812,6 +4799,7 @@ mod tests {
     use crate::lock::tests::LockDebugEntryState;
     use crate::lock::{LockMode, LockResource};
     use crate::log::redo::RowRedoKind;
+    use crate::poison::PoisonAwareListener;
     use crate::row::RowPage;
     use crate::row::ops::{
         DeleteMvcc, RowMutation, RowUpdateInput, ScanMvcc, SelectKey, SelectMvcc,
@@ -4833,8 +4821,9 @@ mod tests {
     use crate::trx::stmt::tests as stmt_tests;
     use crate::trx::sys::tests::fatal_rollback_retention_count;
     use crate::trx::tests::{
-        commit_preparing_shared_trx_status, prepare_event_is_installed, prepare_shared_trx_status,
-        rollback_preparing_shared_trx_status, shared_trx_status,
+        commit_preparing_shared_trx_status, discard_production_prepared_for_test,
+        prepare_event_is_installed, prepare_shared_trx_status, prepare_transaction,
+        rollback_preparing_shared_trx_status, shared_trx_status, transaction_status_for_test,
     };
     use crate::trx::undo::RowUndoKind;
     use crate::trx::ver_map::RowPageState;
@@ -7499,7 +7488,7 @@ mod tests {
                 RowID::new(6),
                 false,
             ),
-            ColdLatestRow::Preparing(Some(_))
+            ColdLatestRow::Preparing(_)
         ));
         rollback_preparing_shared_trx_status(&preparing);
     }
@@ -7528,6 +7517,185 @@ mod tests {
         let row_id = assert_row_in_lwc(&table, &session.pool_guards(), &key, reader.sts()).await;
         reader.commit().await.unwrap();
         (temp_dir, engine, table_id, session, table, key, row_id)
+    }
+
+    fn assert_unrelated_poison_fatal(error: &Error) {
+        assert_eq!(error.kind(), ErrorKind::Fatal);
+        assert_eq!(
+            error.report().downcast_ref::<FatalError>().copied(),
+            Some(FatalError::StorageIo)
+        );
+        let report = format!("{error:?}");
+        assert!(
+            report.contains("unrelated foreground wait poison"),
+            "fatal propagation lost the first poison report: {report}"
+        );
+    }
+
+    #[test]
+    fn test_hot_point_update_fast_path_skips_prepare_wait_helper() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "hot_update_prepare_fast_path").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 1, 1, "hot").await;
+            let key = single_key(1);
+            let before = engine.inner().poisoner.test_observation_counts().2;
+
+            let mut writer = session.begin_trx().unwrap();
+            assert!(matches!(
+                trx_update_row_by_id(
+                    &mut writer,
+                    table_id,
+                    &key,
+                    vec![UpdateCol {
+                        idx: 1,
+                        val: Val::from("updated"),
+                    }],
+                )
+                .await
+                .unwrap(),
+                UpdateMvcc::Updated(_)
+            ));
+            assert_eq!(
+                engine.inner().poisoner.test_observation_counts().2,
+                before,
+                "ordinary hot update must not enter the prepare slow path"
+            );
+            writer.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_prepare_completion_won_registration_rechecks_poison() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "prepare_completion_won_poison").await;
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let result: Result<()> = trx
+                .exec(async |stmt| {
+                    stmt.runtime().engine().poisoner.poison(
+                        Report::new(FatalError::StorageIo)
+                            .attach("unrelated foreground wait poison: completion won"),
+                    );
+                    stmt.runtime()
+                        .wait_prepare_or_poison(PoisonAwareListener::recheck_only())
+                        .await
+                        .disclose()
+                })
+                .await;
+
+            assert_unrelated_poison_fatal(&result.unwrap_err());
+            trx.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_cold_point_update_returns_fatal_on_unrelated_poison() {
+        smol::block_on(async {
+            let (_temp_dir, engine, table_id, _setup_session, table, key, row_id) =
+                setup_single_cold_row("cold_update_unrelated_poison").await;
+
+            let owner = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 104));
+            table
+                .deletion_buffer()
+                .put_ref(row_id, Arc::clone(&owner), MAX_SNAPSHOT_TS)
+                .unwrap();
+            prepare_shared_trx_status(&owner);
+
+            let mut writer_session = engine.new_session().unwrap();
+            let mut writer = writer_session.begin_trx().unwrap();
+            let update = async {
+                let result = trx_update_row_by_id(
+                    &mut writer,
+                    table_id,
+                    &key,
+                    vec![UpdateCol {
+                        idx: 1,
+                        val: Val::from("updated"),
+                    }],
+                )
+                .await;
+                writer.rollback().await.unwrap();
+                result
+            };
+            let poison = async {
+                while !prepare_event_is_installed(&owner) {
+                    yield_now().await;
+                }
+                engine.inner().poisoner.poison(
+                    Report::new(FatalError::StorageIo)
+                        .attach("unrelated foreground wait poison: cold row"),
+                );
+            };
+            let (result, ()) = futures::join!(update, poison);
+            assert_unrelated_poison_fatal(&result.unwrap_err());
+
+            table.deletion_buffer().remove(row_id);
+            rollback_preparing_shared_trx_status(&owner);
+        });
+    }
+
+    #[test]
+    fn test_hot_point_update_returns_fatal_on_unrelated_poison() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "hot_update_unrelated_poison").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut setup_session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut setup_session, 1, 1, "hot").await;
+            let key = single_key(1);
+
+            let mut owner_session = engine.new_session().unwrap();
+            let mut owner = owner_session.begin_trx().unwrap();
+            assert!(matches!(
+                trx_update_row_by_id(
+                    &mut owner,
+                    table_id,
+                    &key,
+                    vec![UpdateCol {
+                        idx: 1,
+                        val: Val::from("owner"),
+                    }],
+                )
+                .await
+                .unwrap(),
+                UpdateMvcc::Updated(_)
+            ));
+            let owner_status = transaction_status_for_test(&owner);
+            let prepared = prepare_transaction(owner).unwrap();
+
+            let mut writer_session = engine.new_session().unwrap();
+            let mut writer = writer_session.begin_trx().unwrap();
+            let update = async {
+                let result = trx_update_row_by_id(
+                    &mut writer,
+                    table_id,
+                    &key,
+                    vec![UpdateCol {
+                        idx: 1,
+                        val: Val::from("writer"),
+                    }],
+                )
+                .await;
+                writer.rollback().await.unwrap();
+                result
+            };
+            let poison = async {
+                while !prepare_event_is_installed(&owner_status) {
+                    yield_now().await;
+                }
+                engine.inner().poisoner.poison(
+                    Report::new(FatalError::StorageIo)
+                        .attach("unrelated foreground wait poison: hot row"),
+                );
+            };
+            let (result, ()) = futures::join!(update, poison);
+            assert_unrelated_poison_fatal(&result.unwrap_err());
+            discard_production_prepared_for_test(prepared);
+        });
     }
 
     #[test]
@@ -9141,7 +9309,8 @@ mod tests {
                         row_id,
                     )
                     .lock_for_write(effects, Some((key.index_no, &key.vals)))
-                    .await;
+                    .await
+                    .unwrap();
                     match &mut lock_row {
                         LockRowForWrite::Ok(access) => {
                             drop(access.take());

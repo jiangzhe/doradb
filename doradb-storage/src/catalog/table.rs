@@ -323,8 +323,9 @@ impl CreateTableProgress {
         &mut self,
         engine: &EngineCore,
         operation: &'static str,
-        source: Report<RuntimeError>,
+        source: impl Into<RuntimeOrFatalError>,
     ) -> RuntimeOrFatalError {
+        let source = source.into();
         let source_debug = format!("{source:?}");
         let mut cleanup_error = None;
         if let Err(err) = self.destroy_staged_runtime(engine.pool_guards()).await {
@@ -364,7 +365,7 @@ impl CreateTableProgress {
             ));
         }
         self.phase = CreateTablePhase::Aborted;
-        cleanup_error.unwrap_or_else(|| RuntimeOrFatalError::from(source))
+        cleanup_error.unwrap_or(source)
     }
 
     async fn abort_after_root_publish_commit_error(
@@ -1678,7 +1679,7 @@ impl AcceptedDropTable {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                 poison_error_source(
                     &engine.poisoner,
-                    RuntimeOrFatalError::from(err),
+                    err,
                     FatalError::Poisoned,
                     format!(
                         "drop table failed after lifecycle gate: table_id={table_id}, operation=catalog_cascade"

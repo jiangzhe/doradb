@@ -5,6 +5,7 @@ use crate::error::{OperationError, OperationResult};
 use crate::id::{RowID, TableID, TrxID};
 use crate::index::{BTreeKeyEncoder, IndexLookupCandidate};
 use crate::map::FastHashMap;
+use crate::poison::PoisonAwareListener;
 use crate::recovery::RowRecoveryMap;
 use crate::row::ops::{ReadRow, RowUpdateView, SelectKey, UndoCol, UndoVal, UpdateCol, UpdateRow};
 use crate::row::{Row, RowMut, RowPage, RowRead};
@@ -19,7 +20,6 @@ use crate::trx::{
 };
 use crate::value::Val;
 use error_stack::Report;
-use event_listener::EventListener;
 use parking_lot::RwLockReadGuard;
 use std::collections::{BTreeMap, BTreeSet};
 use std::mem;
@@ -1247,10 +1247,8 @@ impl<'a> RowWriteAccess<'a> {
                 // shortly become committed; otherwise report a write conflict.
                 match undo_head.prepare_listener() {
                     PrepareListenerResult::NotPreparing => LockUndo::WriteConflict,
-                    PrepareListenerResult::Registered(listener) => {
-                        LockUndo::Preparing(Some(listener))
-                    }
-                    PrepareListenerResult::Completed => LockUndo::Preparing(None),
+                    PrepareListenerResult::Registered(listener)
+                    | PrepareListenerResult::Completed(listener) => LockUndo::Preparing(listener),
                 }
             }
         }
@@ -1444,7 +1442,7 @@ pub(crate) enum LockUndo {
     /// The index entry does not identify this row version.
     InvalidIndex,
     /// The row is locked by a preparing transaction.
-    Preparing(Option<EventListener>),
+    Preparing(PoisonAwareListener),
 }
 
 impl LockUndo {

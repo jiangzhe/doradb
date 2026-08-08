@@ -79,6 +79,11 @@ The Heap Table uses a **Tiered Architecture**, combining an in-memory RowStore (
     block, page, and deletion-buffer guards, then retries from authoritative
     index, row-location, and marker state. An ordinary active owner remains an
     immediate write conflict.
+    A foreign owner in ordered prepare is the sole row-prepare wait case. Hot
+    and cold mutation use the shared prepare-or-poison retry contract described
+    in [Shutdown and Engine Poison](shutdown-and-poison.md#hot--and-cold-row-prepare-waiting);
+    ordinary active-owner conflicts and uncontended mutations stay on their
+    immediate paths.
   - **Cold Update Path**: update of an LWC row is modeled as claiming the old
     cold RowID in the deletion buffer, recording cold-delete undo/redo,
     masking old secondary-index entries, and inserting the modified values as a

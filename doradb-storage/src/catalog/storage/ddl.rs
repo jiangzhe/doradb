@@ -1,10 +1,9 @@
 use super::{CatalogStorage, ColumnObject, IndexColumnObject, IndexObject, TableObject};
 use crate::catalog::{IndexNo, TableMetadata};
-use crate::error::{RuntimeError, RuntimeResult};
+use crate::error::{MultiDomainResultExt, RuntimeOrFatalError, RuntimeOrFatalResult};
 use crate::id::TableID;
 use crate::log::redo::DDLRedo;
 use crate::trx::PrivateTransaction;
-use error_stack::ResultExt;
 
 impl CatalogStorage {
     /// Stage all persisted catalog rows for a newly allocated table.
@@ -13,7 +12,7 @@ impl CatalogStorage {
         trx: &mut PrivateTransaction,
         table_id: TableID,
         metadata: &TableMetadata,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         validate_catalog_engine_health(trx, "stage_create_table")?;
 
         let table = TableObject {
@@ -101,7 +100,7 @@ impl CatalogStorage {
         trx: &mut PrivateTransaction,
         table_id: TableID,
         metadata: &TableMetadata,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         validate_catalog_engine_health(trx, "stage_drop_table")?;
 
         let index_columns_deleted = trx
@@ -165,7 +164,7 @@ impl CatalogStorage {
         table_id: TableID,
         index_no: IndexNo,
         new_metadata: &TableMetadata,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         validate_catalog_engine_health(trx, "stage_create_index")?;
 
         let expected_next_index_no = index_no.checked_add(1).unwrap_or_else(|| {
@@ -249,7 +248,7 @@ impl CatalogStorage {
         table_id: TableID,
         index_no: IndexNo,
         old_metadata: &TableMetadata,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         validate_catalog_engine_health(trx, "stage_drop_index")?;
 
         assert!(
@@ -298,8 +297,8 @@ impl CatalogStorage {
 fn validate_catalog_engine_health(
     trx: &PrivateTransaction,
     operation: &'static str,
-) -> RuntimeResult<()> {
+) -> RuntimeOrFatalResult<()> {
     trx.ensure_engine_healthy()
-        .change_context(RuntimeError::CatalogAccess)
+        .map_err(RuntimeOrFatalError::from)
         .attach_with(|| format!("operation={operation}, phase=check_engine_health"))
 }

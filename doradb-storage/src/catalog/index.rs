@@ -679,7 +679,7 @@ impl CreateIndexProgress {
             Err(err) => {
                 self.rollback_before_catalog_commit(engine.pool_guards())
                     .await?;
-                Err(RuntimeOrFatalError::from(err))
+                Err(err)
             }
         }
     }
@@ -836,7 +836,7 @@ impl DropIndexProgress {
             Ok(()) => Ok(()),
             Err(err) => {
                 self.rollback_before_catalog_commit().await?;
-                Err(RuntimeOrFatalError::from(err))
+                Err(err)
             }
         }
     }
