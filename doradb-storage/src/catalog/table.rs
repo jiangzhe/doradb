@@ -327,9 +327,9 @@ impl CreateTableProgress {
     ) -> RuntimeOrFatalError {
         let source = source.into();
         let source_debug = format!("{source:?}");
-        let mut cleanup_error = None;
+        let mut error = source;
         if let Err(err) = self.destroy_staged_runtime(engine.pool_guards()).await {
-            cleanup_error = Some(poison_error_source(
+            let cleanup = poison_error_source(
                 &engine.poisoner,
                 RuntimeOrFatalError::from(err),
                 FatalError::Poisoned,
@@ -337,13 +337,13 @@ impl CreateTableProgress {
                     "create table cleanup failed: table_id={}, operation={operation}, cleanup_operation=runtime_destroy, source_error={source_debug}",
                     self.table_id
                 ),
-            ));
+            );
+            error = error.merge_cleanup(cleanup);
         }
         if let Some(trx) = self.trx.take()
             && let Err(err) = trx.rollback_catalog_ddl().await
-            && cleanup_error.is_none()
         {
-            cleanup_error = Some(poison_error_source(
+            let cleanup = poison_error_source(
                 &engine.poisoner,
                 err,
                 FatalError::RollbackAccess,
@@ -351,21 +351,21 @@ impl CreateTableProgress {
                     "create table rollback cleanup failed: table_id={}, operation={operation}, source_error={source_debug}",
                     self.table_id
                 ),
-            ));
+            );
+            error = error.merge_cleanup(cleanup);
         }
-        if let Err(err) = self.delete_provisional_file(&engine.table_fs)
-            && cleanup_error.is_none()
-        {
-            cleanup_error = Some(RuntimeOrFatalError::from(
+        if let Err(err) = self.delete_provisional_file(&engine.table_fs) {
+            let cleanup = RuntimeOrFatalError::from(
                 err.change_context(RuntimeError::CatalogAccess)
                     .attach(format!(
                         "operation=create_table, phase=delete_provisional_file, table_id={}",
                         self.table_id
                     )),
-            ));
+            );
+            error = error.merge_cleanup(cleanup);
         }
         self.phase = CreateTablePhase::Aborted;
-        cleanup_error.unwrap_or(source)
+        error
     }
 
     async fn abort_after_root_publish_commit_error(

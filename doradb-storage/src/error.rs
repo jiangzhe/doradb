@@ -1044,6 +1044,25 @@ impl<T> MultiDomainResultExt for OperationOrFatalResult<T> {
     }
 }
 
+struct RuntimeOrFatalAttachment {
+    relationship: &'static str,
+    error: RuntimeOrFatalError,
+}
+
+impl Debug for RuntimeOrFatalAttachment {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Display::fmt(self, f)
+    }
+}
+
+impl Display for RuntimeOrFatalAttachment {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {:?}", self.relationship, self.error)
+    }
+}
+
 /// Constrained carrier for integration operations with Runtime and Fatal exits.
 ///
 /// This enum owns the two report types directly and is deliberately not an
@@ -1119,6 +1138,35 @@ impl RuntimeOrFatalError {
         match self {
             Self::Runtime(report) => report.change_context(fallback_reason),
             Self::Fatal(report) => report,
+        }
+    }
+
+    /// Merges a cleanup failure without losing the most important typed source.
+    ///
+    /// Fatal outranks Runtime, while the original operation source wins when
+    /// both errors have the same domain. The non-selected carrier remains
+    /// attached to the selected report as diagnostic evidence.
+    #[inline]
+    pub(crate) fn merge_cleanup(self, cleanup: Self) -> Self {
+        match (self, cleanup) {
+            (Self::Fatal(source), cleanup) => {
+                Self::Fatal(source.attach(RuntimeOrFatalAttachment {
+                    relationship: "secondary cleanup failure",
+                    error: cleanup,
+                }))
+            }
+            (source, Self::Fatal(cleanup)) => {
+                Self::Fatal(cleanup.attach(RuntimeOrFatalAttachment {
+                    relationship: "primary operation failure before fatal cleanup",
+                    error: source,
+                }))
+            }
+            (Self::Runtime(source), cleanup) => {
+                Self::Runtime(source.attach(RuntimeOrFatalAttachment {
+                    relationship: "secondary cleanup failure",
+                    error: cleanup,
+                }))
+            }
         }
     }
 }
@@ -2221,6 +2269,64 @@ mod tests {
             Some(IoErrorKind::BrokenPipe)
         );
         assert!(format!("{report:?}").contains("checkpoint write failed"));
+    }
+
+    #[test]
+    fn test_runtime_or_fatal_cleanup_precedence_preserves_typed_sources() {
+        let source_fatal = RuntimeOrFatalError::Fatal(
+            Report::new(FatalError::RedoWrite).attach("fatal operation source"),
+        );
+        let cleanup_runtime = RuntimeOrFatalError::Runtime(
+            Report::new(RuntimeError::CatalogAccess).attach("runtime cleanup source"),
+        );
+        let RuntimeOrFatalError::Fatal(report) = source_fatal.merge_cleanup(cleanup_runtime) else {
+            panic!("fatal operation source must outrank runtime cleanup")
+        };
+        assert_eq!(*report.current_context(), FatalError::RedoWrite);
+        let output = format!("{report:?}");
+        assert!(output.contains("fatal operation source"));
+        assert!(output.contains("runtime cleanup source"));
+        assert!(output.contains("secondary cleanup failure"));
+
+        let source_runtime = RuntimeOrFatalError::Runtime(
+            Report::new(RuntimeError::IndexAccess).attach("runtime operation source"),
+        );
+        let cleanup_fatal = RuntimeOrFatalError::Fatal(
+            Report::new(FatalError::RollbackAccess).attach("fatal cleanup source"),
+        );
+        let RuntimeOrFatalError::Fatal(report) = source_runtime.merge_cleanup(cleanup_fatal) else {
+            panic!("fatal cleanup must outrank runtime operation source")
+        };
+        assert_eq!(*report.current_context(), FatalError::RollbackAccess);
+        let output = format!("{report:?}");
+        assert!(output.contains("runtime operation source"));
+        assert!(output.contains("fatal cleanup source"));
+        assert!(output.contains("primary operation failure before fatal cleanup"));
+
+        let source_fatal = RuntimeOrFatalError::Fatal(
+            Report::new(FatalError::RedoWrite).attach("first fatal source"),
+        );
+        let cleanup_fatal = RuntimeOrFatalError::Fatal(
+            Report::new(FatalError::RollbackAccess).attach("later fatal cleanup"),
+        );
+        let RuntimeOrFatalError::Fatal(report) = source_fatal.merge_cleanup(cleanup_fatal) else {
+            panic!("first fatal source must retain equal-domain precedence")
+        };
+        assert_eq!(*report.current_context(), FatalError::RedoWrite);
+        assert!(format!("{report:?}").contains("later fatal cleanup"));
+
+        let source_runtime = RuntimeOrFatalError::Runtime(
+            Report::new(RuntimeError::IndexAccess).attach("first runtime source"),
+        );
+        let cleanup_runtime = RuntimeOrFatalError::Runtime(
+            Report::new(RuntimeError::CatalogAccess).attach("later runtime cleanup"),
+        );
+        let RuntimeOrFatalError::Runtime(report) = source_runtime.merge_cleanup(cleanup_runtime)
+        else {
+            panic!("runtime operation source must retain equal-domain precedence")
+        };
+        assert_eq!(*report.current_context(), RuntimeError::IndexAccess);
+        assert!(format!("{report:?}").contains("later runtime cleanup"));
     }
 
     #[test]

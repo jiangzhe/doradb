@@ -677,8 +677,17 @@ impl CreateIndexProgress {
         match res {
             Ok(()) => Ok(()),
             Err(err) => {
-                self.rollback_before_catalog_commit(engine.pool_guards())
-                    .await?;
+                if let Err(cleanup) = self
+                    .rollback_before_catalog_commit(engine.pool_guards())
+                    .await
+                {
+                    return Err(err.merge_cleanup(cleanup.attach_with(|| {
+                        format!(
+                            "operation=create_index, phase=rollback_before_catalog_commit, table_id={}, index_no={}",
+                            self.table_id, self.index_no
+                        )
+                    })));
+                }
                 Err(err)
             }
         }
@@ -835,7 +844,14 @@ impl DropIndexProgress {
         match res {
             Ok(()) => Ok(()),
             Err(err) => {
-                self.rollback_before_catalog_commit().await?;
+                if let Err(cleanup) = self.rollback_before_catalog_commit().await {
+                    return Err(err.merge_cleanup(cleanup.attach_with(|| {
+                        format!(
+                            "operation=drop_index, phase=rollback_before_catalog_commit, table_id={}, index_no={}",
+                            self.table_id, self.index_no
+                        )
+                    })));
+                }
                 Err(err)
             }
         }

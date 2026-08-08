@@ -28,17 +28,10 @@ Registered-listener and completion-wins-registration hot-row paths check engine 
 
 ## Notes (Optional)
 
-
-## Close Reason (Added When Closed)
-
-When a backlog item is moved to `docs/backlogs/closed/`, append:
-
-```md
 ## Close Reason
 
-- Type: <implemented|stale|replaced|duplicate|wontfix|already-implemented|other>
-- Detail: <reason detail>
-- Closed By: <backlog close>
-- Reference: <task/issue/pr reference>
-- Closed At: <YYYY-MM-DD>
-```
+- Type: implemented
+- Detail: Implemented via docs/tasks/000264-engine-poison-foreground-waiters.md
+- Closed By: backlog close
+- Reference: User decision
+- Closed At: 2026-08-08
