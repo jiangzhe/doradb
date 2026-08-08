@@ -15,4 +15,5 @@ pub use self::engine::{EngineConfig, MandatoryRuntimeConfig};
 pub use self::fs::FileSystemConfig;
 pub(crate) use self::fs::ValidatedFileSystemConfig;
 pub use self::trx::TrxSysConfig;
+pub(crate) use self::trx::ValidatedTrxSysConfig;
 pub use crate::log::LogSync;

@@ -218,6 +218,35 @@ impl TrxSysConfig {
     }
 }
 
+/// Validated transaction configuration and its resolved redo-file prefix.
+///
+/// Public engine bootstrap constructs this wrapper while Config disclosure is
+/// still owned at the public boundary. Transaction-system components consume
+/// it without reopening configuration-domain failure paths.
+pub(crate) struct ValidatedTrxSysConfig {
+    config: TrxSysConfig,
+    file_prefix: String,
+}
+
+impl ValidatedTrxSysConfig {
+    /// Validate, normalize, and resolve one transaction-system configuration.
+    #[inline]
+    pub(crate) fn try_new(mut config: TrxSysConfig) -> ConfigResult<Self> {
+        config.validate()?;
+        let file_prefix = config.file_prefix()?;
+        Ok(Self {
+            config,
+            file_prefix,
+        })
+    }
+
+    /// Consume the wrapper into normalized configuration and resolved prefix.
+    #[inline]
+    pub(crate) fn into_parts(self) -> (TrxSysConfig, String) {
+        (self.config, self.file_prefix)
+    }
+}
+
 #[inline]
 fn normalize_redo_file_max_size(
     requested_file_max_size: usize,

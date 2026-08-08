@@ -198,8 +198,6 @@ pub(crate) enum DataIntegrityError {
 pub(crate) enum LifecycleError {
     #[error("storage root is already in use")]
     StorageRootInUse,
-    #[error("runtime is unavailable")]
-    RuntimeUnavailable,
     #[error("storage engine is shut down")]
     Shutdown,
     #[error("storage engine shutdown is busy")]
@@ -250,9 +248,9 @@ pub(crate) enum RuntimeError {
     /// Reversible checkpoint orchestration failed.
     #[error("checkpoint execution failed")]
     CheckpointExecution,
-    /// System-transaction preparation or commit admission failed.
-    #[error("system transaction commit failed")]
-    SystemTransactionCommit,
+    /// User- or system-transaction preparation or commit integration failed.
+    #[error("transaction commit failed")]
+    TransactionCommit,
 }
 
 /// Fieldless resource-domain errors carried underneath `ErrorKind::Resource`.
@@ -588,6 +586,60 @@ impl CompletionErrorBridge {
         }
     }
 
+    /// Replays a completion into the common four-domain integration carrier.
+    ///
+    /// Operation, Runtime, Lifecycle, and Fatal roots retain their native
+    /// outer domain. Lower physical roots are stacked beneath the
+    /// caller-supplied Runtime context.
+    #[inline]
+    pub(crate) fn into_quad(self, runtime_context: RuntimeError) -> QuadError {
+        enum RootDomain {
+            Operation,
+            Runtime,
+            Lifecycle,
+            Fatal,
+            Physical,
+        }
+
+        let root_domain = match &self.0.canonical {
+            CompletionSourceReport::Operation(_) => RootDomain::Operation,
+            CompletionSourceReport::Runtime(_) => RootDomain::Runtime,
+            CompletionSourceReport::Lifecycle(_) => RootDomain::Lifecycle,
+            CompletionSourceReport::Fatal(_) => RootDomain::Fatal,
+            CompletionSourceReport::Io(_)
+            | CompletionSourceReport::Resource(_)
+            | CompletionSourceReport::DataIntegrity(_) => RootDomain::Physical,
+        };
+
+        #[cfg(test)]
+        self.0.reconstructions.fetch_add(1, Ordering::Relaxed);
+
+        let builder = self.replay_builder();
+        match root_domain {
+            RootDomain::Operation => QuadError::Operation(
+                builder
+                    .into_operation()
+                    .expect("Operation completion source must reconstruct as Operation"),
+            ),
+            RootDomain::Runtime => QuadError::Runtime(
+                builder
+                    .into_runtime()
+                    .expect("Runtime completion source must reconstruct as Runtime"),
+            ),
+            RootDomain::Lifecycle => QuadError::Lifecycle(
+                builder
+                    .into_lifecycle()
+                    .expect("Lifecycle completion source must reconstruct as Lifecycle"),
+            ),
+            RootDomain::Fatal => QuadError::Fatal(
+                builder
+                    .into_fatal()
+                    .expect("Fatal completion source must reconstruct as Fatal"),
+            ),
+            RootDomain::Physical => QuadError::Runtime(builder.finish(runtime_context)),
+        }
+    }
+
     /// Reconstructs a completion whose producer contract guarantees Fatal.
     ///
     /// # Panics
@@ -624,18 +676,6 @@ impl CompletionErrorBridge {
             };
         }
         builder
-    }
-
-    fn public_error_kind(&self) -> ErrorKind {
-        self.0
-            .replay
-            .iter()
-            .rev()
-            .find_map(|frame| match frame {
-                ReplayFrame::Context(context) => context.error_kind(),
-                ReplayFrame::Attachment(_) => None,
-            })
-            .expect("validated completion bridge must contain a real context")
     }
 
     #[inline]
@@ -762,14 +802,6 @@ impl Debug for CompletionErrorBridge {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         Debug::fmt(&self.0.canonical, f)
-    }
-}
-
-impl DiscloseError for CompletionErrorBridge {
-    #[inline]
-    fn disclose(self) -> Error {
-        let kind = self.public_error_kind();
-        Error(self.replace_context(kind))
     }
 }
 
@@ -1147,6 +1179,277 @@ impl<T> RuntimeOrFatalResultExt for RuntimeOrFatalResult<T> {
     }
 }
 
+/// Constrained carrier for lifecycle rejection and fatal engine health exits.
+///
+/// The reports remain in their native domains until an outward public
+/// boundary. This carrier is deliberately not an `error-stack` context.
+pub(crate) enum LifecycleOrFatalError {
+    /// A request rejected by ordinary lifecycle state.
+    Lifecycle(Report<LifecycleError>),
+    /// A request rejected by the engine's one-way fatal state.
+    Fatal(Report<FatalError>),
+}
+
+impl Debug for LifecycleOrFatalError {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Lifecycle(report) => Debug::fmt(report, f),
+            Self::Fatal(report) => Debug::fmt(report, f),
+        }
+    }
+}
+
+impl Display for LifecycleOrFatalError {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Lifecycle(report) => Display::fmt(report, f),
+            Self::Fatal(report) => Display::fmt(report, f),
+        }
+    }
+}
+
+impl LifecycleOrFatalError {
+    #[inline]
+    fn attach(self, attachment: &'static str) -> Self {
+        match self {
+            Self::Lifecycle(report) => Self::Lifecycle(report.attach(attachment)),
+            Self::Fatal(report) => Self::Fatal(report.attach(attachment)),
+        }
+    }
+
+    #[inline]
+    fn attach_with<F>(self, attachment: F) -> Self
+    where
+        F: FnOnce() -> String,
+    {
+        match self {
+            Self::Lifecycle(report) => Self::Lifecycle(report.attach(attachment())),
+            Self::Fatal(report) => Self::Fatal(report.attach(attachment())),
+        }
+    }
+}
+
+impl From<Report<LifecycleError>> for LifecycleOrFatalError {
+    #[inline]
+    fn from(report: Report<LifecycleError>) -> Self {
+        Self::Lifecycle(report)
+    }
+}
+
+impl From<Report<FatalError>> for LifecycleOrFatalError {
+    #[inline]
+    fn from(report: Report<FatalError>) -> Self {
+        Self::Fatal(report)
+    }
+}
+
+impl From<SharedFatalError> for LifecycleOrFatalError {
+    #[inline]
+    fn from(error: SharedFatalError) -> Self {
+        Self::Fatal(error.into_report())
+    }
+}
+
+impl DiscloseError for LifecycleOrFatalError {
+    #[inline]
+    fn disclose(self) -> Error {
+        match self {
+            Self::Lifecycle(report) => report.disclose(),
+            Self::Fatal(report) => report.disclose(),
+        }
+    }
+}
+
+/// Result carrying either ordinary lifecycle rejection or a Fatal report.
+pub(crate) type LifecycleOrFatalResult<T> = result::Result<T, LifecycleOrFatalError>;
+
+impl<T> MultiDomainResultExt for LifecycleOrFatalResult<T> {
+    #[inline]
+    fn attach(self, attachment: &'static str) -> Self {
+        self.map_err(|error| error.attach(attachment))
+    }
+
+    #[inline]
+    fn attach_with<F>(self, attachment: F) -> Self
+    where
+        F: FnOnce() -> String,
+    {
+        self.map_err(|error| error.attach_with(attachment))
+    }
+}
+
+/// Closed four-domain carrier for final internal integration owners.
+///
+/// The fixed membership is Operation, Runtime, Lifecycle, and Fatal. Lower
+/// physical domains require an explicit Runtime owner before entering this
+/// carrier. This carrier is deliberately not an `error-stack` context.
+pub(crate) enum QuadError {
+    /// A terminal semantic operation failure.
+    Operation(Report<OperationError>),
+    /// A recoverable runtime-integration failure.
+    Runtime(Report<RuntimeError>),
+    /// An ordinary lifecycle rejection.
+    Lifecycle(Report<LifecycleError>),
+    /// A failure that already crossed a Fatal policy boundary.
+    Fatal(Report<FatalError>),
+}
+
+impl Debug for QuadError {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Operation(report) => Debug::fmt(report, f),
+            Self::Runtime(report) => Debug::fmt(report, f),
+            Self::Lifecycle(report) => Debug::fmt(report, f),
+            Self::Fatal(report) => Debug::fmt(report, f),
+        }
+    }
+}
+
+impl Display for QuadError {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Operation(report) => Display::fmt(report, f),
+            Self::Runtime(report) => Display::fmt(report, f),
+            Self::Lifecycle(report) => Display::fmt(report, f),
+            Self::Fatal(report) => Display::fmt(report, f),
+        }
+    }
+}
+
+impl QuadError {
+    #[inline]
+    fn attach(self, attachment: &'static str) -> Self {
+        match self {
+            Self::Operation(report) => Self::Operation(report.attach(attachment)),
+            Self::Runtime(report) => Self::Runtime(report.attach(attachment)),
+            Self::Lifecycle(report) => Self::Lifecycle(report.attach(attachment)),
+            Self::Fatal(report) => Self::Fatal(report.attach(attachment)),
+        }
+    }
+
+    #[inline]
+    fn attach_with<F>(self, attachment: F) -> Self
+    where
+        F: FnOnce() -> String,
+    {
+        match self {
+            Self::Operation(report) => Self::Operation(report.attach(attachment())),
+            Self::Runtime(report) => Self::Runtime(report.attach(attachment())),
+            Self::Lifecycle(report) => Self::Lifecycle(report.attach(attachment())),
+            Self::Fatal(report) => Self::Fatal(report.attach(attachment())),
+        }
+    }
+}
+
+impl From<Report<OperationError>> for QuadError {
+    #[inline]
+    fn from(report: Report<OperationError>) -> Self {
+        Self::Operation(report)
+    }
+}
+
+impl From<Report<RuntimeError>> for QuadError {
+    #[inline]
+    fn from(report: Report<RuntimeError>) -> Self {
+        Self::Runtime(report)
+    }
+}
+
+impl From<Report<LifecycleError>> for QuadError {
+    #[inline]
+    fn from(report: Report<LifecycleError>) -> Self {
+        Self::Lifecycle(report)
+    }
+}
+
+impl From<Report<FatalError>> for QuadError {
+    #[inline]
+    fn from(report: Report<FatalError>) -> Self {
+        Self::Fatal(report)
+    }
+}
+
+impl From<SharedFatalError> for QuadError {
+    #[inline]
+    fn from(error: SharedFatalError) -> Self {
+        Self::Fatal(error.into_report())
+    }
+}
+
+impl From<OperationOrRuntimeError> for QuadError {
+    #[inline]
+    fn from(error: OperationOrRuntimeError) -> Self {
+        match error {
+            OperationOrRuntimeError::Operation(report) => Self::Operation(report),
+            OperationOrRuntimeError::Runtime(report) => Self::Runtime(report),
+        }
+    }
+}
+
+impl From<OperationOrFatalError> for QuadError {
+    #[inline]
+    fn from(error: OperationOrFatalError) -> Self {
+        match error {
+            OperationOrFatalError::Operation(report) => Self::Operation(report),
+            OperationOrFatalError::Fatal(report) => Self::Fatal(report),
+        }
+    }
+}
+
+impl From<RuntimeOrFatalError> for QuadError {
+    #[inline]
+    fn from(error: RuntimeOrFatalError) -> Self {
+        match error {
+            RuntimeOrFatalError::Runtime(report) => Self::Runtime(report),
+            RuntimeOrFatalError::Fatal(report) => Self::Fatal(report),
+        }
+    }
+}
+
+impl From<LifecycleOrFatalError> for QuadError {
+    #[inline]
+    fn from(error: LifecycleOrFatalError) -> Self {
+        match error {
+            LifecycleOrFatalError::Lifecycle(report) => Self::Lifecycle(report),
+            LifecycleOrFatalError::Fatal(report) => Self::Fatal(report),
+        }
+    }
+}
+
+impl DiscloseError for QuadError {
+    #[inline]
+    fn disclose(self) -> Error {
+        match self {
+            Self::Operation(report) => report.disclose(),
+            Self::Runtime(report) => report.disclose(),
+            Self::Lifecycle(report) => report.disclose(),
+            Self::Fatal(report) => report.disclose(),
+        }
+    }
+}
+
+/// Result carrying the fixed Operation/Runtime/Lifecycle/Fatal integration set.
+pub(crate) type QuadResult<T> = result::Result<T, QuadError>;
+
+impl<T> MultiDomainResultExt for QuadResult<T> {
+    #[inline]
+    fn attach(self, attachment: &'static str) -> Self {
+        self.map_err(|error| error.attach(attachment))
+    }
+
+    #[inline]
+    fn attach_with<F>(self, attachment: F) -> Self
+    where
+        F: FnOnce() -> String,
+    {
+        self.map_err(|error| error.attach_with(attachment))
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ReplayContext {
     Config(ConfigError),
@@ -1232,21 +1535,6 @@ impl ReplayContext {
             Self::Internal(context) => {
                 ReplayReportBuilder::Internal(report.change_context(context))
             }
-        }
-    }
-
-    #[inline]
-    const fn error_kind(self) -> Option<ErrorKind> {
-        match self {
-            ReplayContext::Config(_) => Some(ErrorKind::Config),
-            ReplayContext::Operation(_) => Some(ErrorKind::Operation),
-            ReplayContext::Resource(_) => Some(ErrorKind::Resource),
-            ReplayContext::Io(_) => Some(ErrorKind::Io),
-            ReplayContext::DataIntegrity(_) => Some(ErrorKind::DataIntegrity),
-            ReplayContext::Lifecycle(_) => Some(ErrorKind::Lifecycle),
-            ReplayContext::Runtime(_) => Some(ErrorKind::Runtime),
-            ReplayContext::Fatal(_) => Some(ErrorKind::Fatal),
-            ReplayContext::Internal(_) => None,
         }
     }
 }
@@ -1359,6 +1647,51 @@ impl ReplayReportBuilder {
             | Self::Internal(_) => None,
         }
     }
+
+    #[inline]
+    fn into_operation(self) -> Option<Report<OperationError>> {
+        match self {
+            Self::Operation(report) => Some(report),
+            Self::Config(_)
+            | Self::Resource(_)
+            | Self::Io(_)
+            | Self::DataIntegrity(_)
+            | Self::Lifecycle(_)
+            | Self::Runtime(_)
+            | Self::Fatal(_)
+            | Self::Internal(_) => None,
+        }
+    }
+
+    #[inline]
+    fn into_runtime(self) -> Option<Report<RuntimeError>> {
+        match self {
+            Self::Runtime(report) => Some(report),
+            Self::Config(_)
+            | Self::Operation(_)
+            | Self::Resource(_)
+            | Self::Io(_)
+            | Self::DataIntegrity(_)
+            | Self::Lifecycle(_)
+            | Self::Fatal(_)
+            | Self::Internal(_) => None,
+        }
+    }
+
+    #[inline]
+    fn into_lifecycle(self) -> Option<Report<LifecycleError>> {
+        match self {
+            Self::Lifecycle(report) => Some(report),
+            Self::Config(_)
+            | Self::Operation(_)
+            | Self::Resource(_)
+            | Self::Io(_)
+            | Self::DataIntegrity(_)
+            | Self::Runtime(_)
+            | Self::Fatal(_)
+            | Self::Internal(_) => None,
+        }
+    }
 }
 
 /// Printable secondary-index binding mismatch context.
@@ -1425,15 +1758,6 @@ impl Error {
     #[inline]
     pub fn into_report(self) -> Report<ErrorKind> {
         self.0
-    }
-
-    /// Lazily adds boundary context without changing the existing error classification.
-    #[inline]
-    pub(crate) fn attach_with<F>(self, attachment: F) -> Self
-    where
-        F: FnOnce() -> String,
-    {
-        Error(self.0.attach(attachment()))
     }
 
     #[inline]
@@ -1963,6 +2287,95 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_or_fatal_preserves_domain_and_attachments() {
+        let lifecycle: LifecycleOrFatalResult<()> =
+            Err(Report::new(LifecycleError::Shutdown).into());
+        let error = lifecycle
+            .attach("operation=admit")
+            .expect_err("shutdown must reject admission")
+            .disclose();
+        assert_eq!(error.kind(), ErrorKind::Lifecycle);
+        assert_eq!(
+            error.report().downcast_ref::<LifecycleError>().copied(),
+            Some(LifecycleError::Shutdown)
+        );
+        assert!(format!("{error:?}").contains("operation=admit"));
+
+        let fatal: LifecycleOrFatalResult<()> = Err(Report::new(FatalError::Poisoned).into());
+        let error = fatal
+            .attach_with(|| "phase=health_check".to_owned())
+            .expect_err("poison must reject admission")
+            .disclose();
+        assert_eq!(error.kind(), ErrorKind::Fatal);
+        assert_eq!(
+            error.report().downcast_ref::<FatalError>().copied(),
+            Some(FatalError::Poisoned)
+        );
+        assert!(error.report().downcast_ref::<LifecycleError>().is_none());
+        assert!(format!("{error:?}").contains("phase=health_check"));
+    }
+
+    #[test]
+    fn quad_native_arms_disclose_without_carrier_context() {
+        let cases = [
+            (
+                QuadError::from(Report::new(OperationError::DuplicateKey)),
+                ErrorKind::Operation,
+            ),
+            (
+                QuadError::from(Report::new(RuntimeError::TableAccess)),
+                ErrorKind::Runtime,
+            ),
+            (
+                QuadError::from(Report::new(LifecycleError::Shutdown)),
+                ErrorKind::Lifecycle,
+            ),
+            (
+                QuadError::from(Report::new(FatalError::Poisoned)),
+                ErrorKind::Fatal,
+            ),
+        ];
+
+        for (carrier, expected_kind) in cases {
+            let error = carrier.attach("operation=quad_test").disclose();
+            assert_eq!(error.kind(), expected_kind);
+            assert!(error.report().downcast_ref::<QuadError>().is_none());
+            assert!(format!("{error:?}").contains("operation=quad_test"));
+        }
+    }
+
+    #[test]
+    fn quad_flattens_pairwise_carriers_without_losing_reports() {
+        let operation = QuadError::from(OperationOrRuntimeError::Operation(
+            Report::new(OperationError::IndexNotFound).attach("pair=operation_runtime"),
+        ));
+        let runtime = QuadError::from(RuntimeOrFatalError::Runtime(
+            Report::new(RuntimeError::IndexAccess).attach("pair=runtime_fatal"),
+        ));
+        let fatal = QuadError::from(OperationOrFatalError::Fatal(
+            Report::new(FatalError::RedoWrite).attach("pair=operation_fatal"),
+        ));
+        let lifecycle = QuadError::from(LifecycleOrFatalError::Lifecycle(
+            Report::new(LifecycleError::Shutdown).attach("pair=lifecycle_fatal"),
+        ));
+
+        assert!(matches!(&operation, QuadError::Operation(_)));
+        assert!(matches!(&runtime, QuadError::Runtime(_)));
+        assert!(matches!(&fatal, QuadError::Fatal(_)));
+        assert!(matches!(&lifecycle, QuadError::Lifecycle(_)));
+        for (carrier, attachment) in [
+            (operation, "pair=operation_runtime"),
+            (runtime, "pair=runtime_fatal"),
+            (fatal, "pair=operation_fatal"),
+            (lifecycle, "pair=lifecycle_fatal"),
+        ] {
+            let error = carrier.disclose();
+            assert!(format!("{error:?}").contains(attachment));
+            assert!(error.report().downcast_ref::<QuadError>().is_none());
+        }
+    }
+
+    #[test]
     fn test_buffer_pool_init_report_converts_losslessly_to_public_runtime() {
         let report = Report::new(ResourceError::BufferPoolSizeTooSmall)
             .attach("configured pool cannot hold the minimum resident pages")
@@ -2234,9 +2647,10 @@ mod tests {
         assert!(second_output.contains("complete test backend read"));
 
         let err = bridge
-            .disclose()
-            .attach_with(|| "public completion boundary".to_owned());
-        assert_eq!(err.kind(), ErrorKind::Io);
+            .into_quad(RuntimeError::FileRootAccess)
+            .attach("public completion boundary")
+            .disclose();
+        assert_eq!(err.kind(), ErrorKind::Runtime);
         assert!(err.report().downcast_ref::<BackendError>().is_some());
         assert!(
             err.report()
@@ -2368,6 +2782,141 @@ mod tests {
     }
 
     #[test]
+    fn completion_bridge_into_quad_preserves_common_outer_domains() {
+        let operation = CompletionErrorBridge::capture(
+            Report::new(OperationError::IndexNotFound).attach("operation source"),
+        )
+        .into_quad(RuntimeError::CatalogAccess)
+        .attach("operation=create_index, phase=wait_mandatory_completion");
+        let QuadError::Operation(operation) = operation else {
+            panic!("Operation completion must remain Operation")
+        };
+        assert_eq!(
+            operation.downcast_ref::<OperationError>().copied(),
+            Some(OperationError::IndexNotFound)
+        );
+        assert!(format!("{operation:?}").contains("operation source"));
+        assert!(
+            format!("{operation:?}")
+                .contains("operation=create_index, phase=wait_mandatory_completion")
+        );
+        assert!(operation.downcast_ref::<QuadError>().is_none());
+        assert!(operation.downcast_ref::<CompletionErrorBridge>().is_none());
+
+        let runtime = CompletionErrorBridge::capture(
+            Report::new(RuntimeError::IndexAccess).attach("runtime source"),
+        )
+        .into_quad(RuntimeError::CatalogAccess)
+        .attach("operation=create_index, phase=wait_mandatory_completion");
+        let QuadError::Runtime(runtime) = runtime else {
+            panic!("Runtime completion must remain Runtime")
+        };
+        assert_eq!(runtime.current_context(), &RuntimeError::IndexAccess);
+        assert!(format!("{runtime:?}").contains("runtime source"));
+        assert!(
+            format!("{runtime:?}")
+                .contains("operation=create_index, phase=wait_mandatory_completion")
+        );
+        assert!(runtime.downcast_ref::<QuadError>().is_none());
+        assert!(runtime.downcast_ref::<CompletionErrorBridge>().is_none());
+
+        let lifecycle = CompletionErrorBridge::capture(
+            Report::new(LifecycleError::Shutdown).attach("lifecycle source"),
+        )
+        .into_quad(RuntimeError::CatalogAccess)
+        .attach("operation=create_index, phase=wait_mandatory_completion");
+        let QuadError::Lifecycle(lifecycle) = lifecycle else {
+            panic!("Lifecycle completion must remain Lifecycle")
+        };
+        assert!(
+            format!("{lifecycle:?}")
+                .contains("operation=create_index, phase=wait_mandatory_completion")
+        );
+        assert!(lifecycle.downcast_ref::<QuadError>().is_none());
+        assert!(lifecycle.downcast_ref::<CompletionErrorBridge>().is_none());
+
+        let fatal = CompletionErrorBridge::capture(
+            Report::new(FatalError::RedoWrite).attach("fatal source"),
+        )
+        .into_quad(RuntimeError::CatalogAccess)
+        .attach("operation=create_index, phase=wait_mandatory_completion");
+        let QuadError::Fatal(fatal) = fatal else {
+            panic!("Fatal completion must remain Fatal")
+        };
+        assert!(fatal.downcast_ref::<RuntimeError>().is_none());
+        assert!(format!("{fatal:?}").contains("fatal source"));
+        assert!(
+            format!("{fatal:?}")
+                .contains("operation=create_index, phase=wait_mandatory_completion")
+        );
+        assert!(fatal.downcast_ref::<QuadError>().is_none());
+        assert!(fatal.downcast_ref::<CompletionErrorBridge>().is_none());
+    }
+
+    #[test]
+    fn completion_bridge_into_quad_stacks_physical_roots_under_runtime() {
+        let resource = CompletionErrorBridge::capture(
+            Report::new(ResourceError::BufferPoolFull).attach("resource source"),
+        )
+        .into_quad(RuntimeError::TransactionCommit)
+        .attach("operation=commit_transaction, phase=wait_redo_group_commit");
+        let QuadError::Runtime(resource) = resource else {
+            panic!("Resource completion must enter Quad through Runtime")
+        };
+        assert_eq!(resource.current_context(), &RuntimeError::TransactionCommit);
+        assert_eq!(
+            resource.downcast_ref::<ResourceError>().copied(),
+            Some(ResourceError::BufferPoolFull)
+        );
+        assert!(
+            format!("{resource:?}")
+                .contains("operation=commit_transaction, phase=wait_redo_group_commit")
+        );
+        assert!(resource.downcast_ref::<QuadError>().is_none());
+        assert!(resource.downcast_ref::<CompletionErrorBridge>().is_none());
+
+        let io = CompletionErrorBridge::capture(
+            Report::new(IoError::from(IoErrorKind::BrokenPipe)).attach("io source"),
+        )
+        .into_quad(RuntimeError::RedoLogAccess)
+        .attach("operation=truncate_redo_log, phase=wait_mandatory_completion");
+        let QuadError::Runtime(io) = io else {
+            panic!("IO completion must enter Quad through Runtime")
+        };
+        assert_eq!(io.current_context(), &RuntimeError::RedoLogAccess);
+        assert_eq!(
+            io.downcast_ref::<IoError>().copied().map(IoError::kind),
+            Some(IoErrorKind::BrokenPipe)
+        );
+        assert!(
+            format!("{io:?}")
+                .contains("operation=truncate_redo_log, phase=wait_mandatory_completion")
+        );
+        assert!(io.downcast_ref::<QuadError>().is_none());
+        assert!(io.downcast_ref::<CompletionErrorBridge>().is_none());
+
+        let integrity = CompletionErrorBridge::capture(
+            Report::new(DataIntegrityError::ChecksumMismatch).attach("integrity source"),
+        )
+        .into_quad(RuntimeError::Recovery)
+        .attach("operation=recover_transaction_system, phase=wait_completion");
+        let QuadError::Runtime(integrity) = integrity else {
+            panic!("Data-integrity completion must enter Quad through Runtime")
+        };
+        assert_eq!(integrity.current_context(), &RuntimeError::Recovery);
+        assert_eq!(
+            integrity.downcast_ref::<DataIntegrityError>().copied(),
+            Some(DataIntegrityError::ChecksumMismatch)
+        );
+        assert!(
+            format!("{integrity:?}")
+                .contains("operation=recover_transaction_system, phase=wait_completion")
+        );
+        assert!(integrity.downcast_ref::<QuadError>().is_none());
+        assert!(integrity.downcast_ref::<CompletionErrorBridge>().is_none());
+    }
+
+    #[test]
     fn test_completion_bridge_runtime_conversion_composes_static_attachment() {
         let bridge = CompletionErrorBridge::capture(
             Report::new(InternalError::SecondaryIndexOutOfBounds)
@@ -2375,7 +2924,7 @@ mod tests {
                 .change_context(RuntimeError::IndexAccess),
         );
         let result: RuntimeOrFatalResult<()> =
-            Err(bridge.into_runtime_or_fatal(RuntimeError::SystemTransactionCommit));
+            Err(bridge.into_runtime_or_fatal(RuntimeError::TransactionCommit));
 
         let error = result
             .attach("operation=commit_system_transaction")
@@ -2384,10 +2933,7 @@ mod tests {
             panic!("non-Fatal completion must reconstruct as Runtime")
         };
 
-        assert_eq!(
-            report.current_context(),
-            &RuntimeError::SystemTransactionCommit
-        );
+        assert_eq!(report.current_context(), &RuntimeError::TransactionCommit);
         assert_eq!(
             report.downcast_ref::<InternalError>().copied(),
             Some(InternalError::SecondaryIndexOutOfBounds)
@@ -2408,7 +2954,7 @@ mod tests {
                 .change_context(FatalError::RedoWrite),
         );
         let result: RuntimeOrFatalResult<()> =
-            Err(bridge.into_runtime_or_fatal(RuntimeError::SystemTransactionCommit));
+            Err(bridge.into_runtime_or_fatal(RuntimeError::TransactionCommit));
 
         let error = result
             .attach("operation=commit_system_transaction")
@@ -2483,7 +3029,7 @@ mod tests {
         );
         assert!(reconstructed.downcast_ref::<ErrorKind>().is_none());
 
-        let public = bridge.disclose();
+        let public = bridge.into_quad(RuntimeError::TableAccess).disclose();
         assert_eq!(public.kind(), ErrorKind::Fatal);
         assert_eq!(
             public
@@ -2549,9 +3095,9 @@ mod tests {
         assert!(output.contains("redo write policy"), "{output}");
 
         let public = shared
-            .into_completion_bridge()
-            .disclose()
-            .attach_with(|| "wait for shared fatal completion".to_owned());
+            .into_report()
+            .attach("wait for shared fatal completion")
+            .disclose();
         assert_eq!(public.kind(), ErrorKind::Fatal);
         assert_eq!(
             public.report().downcast_ref::<FatalError>().copied(),

@@ -144,31 +144,59 @@ Disclosure is approved only at one of these boundaries:
 
 - a public Doradb method returning the public `Result` alias;
 - an external trait whose signature is fixed to the public result;
-- a genuine orchestration owner whose producer set spans multiple independent
-  domains and cannot be represented by an existing constrained carrier.
+- a constrained carrier's disclosure implementation; or
+- the three callback-mutation helpers that must forward an arbitrary public
+  `Error` returned by `Statement::table_mutate_mvcc`'s caller.
 
 Reusable private helpers do not return public `Result` merely to make `?`
 compile. Test helpers follow the same rule: test a typed producer as typed, and
 use a public adapter only when asserting public classification.
 
+Configuration convergence is owned by public `Engine::bootstrap`. Startup
+validates and normalizes transaction configuration there, including resolving
+the redo-file prefix, before passing a `ValidatedTrxSysConfig` into the
+Runtime-typed transaction-system component.
+
 ## Constrained carriers
 
-Three carriers encode closed multi-domain contracts without adding a synthetic
-error-stack frame:
+Select the narrowest stable contract in this order:
+
+1. one native typed domain;
+2. an exact two-domain carrier; then
+3. `QuadResult` when three or four common integration domains are reachable.
+
+Four pairwise carriers encode exact two-domain contracts without adding a
+synthetic error-stack frame:
 
 - `OperationOrRuntimeError` contains either an Operation report or a Runtime
   report;
 - `OperationOrFatalError` contains either an Operation report or a Fatal
   report;
-- `RuntimeOrFatalError` contains either a Runtime report or a Fatal report.
+- `RuntimeOrFatalError` contains either a Runtime report or a Fatal report; and
+- `LifecycleOrFatalError` contains either a Lifecycle report or a Fatal report.
 
 Structural `From` implementations into these carriers are allowed because the
 native report is preserved and the destination explicitly represents that
 domain. These are not public convergence conversions.
 
+`QuadError` is the closed final-integration carrier for exactly Operation,
+Runtime, Lifecycle, and Fatal. It flattens the pairwise carriers by moving their
+native report directly into the matching arm. It deliberately has no Config,
+Resource, IO, DataIntegrity, Internal, public `Error`, or completion-bridge
+arm. A fifth arm changes the integration design and requires a new design
+review rather than a routine extension.
+
+Resource, IO, and DataIntegrity can enter `QuadError` only after a semantic
+owner stacks a specific Runtime context such as `TableAccess`, `IndexAccess`,
+`CatalogAccess`, `Recovery`, `RedoLogAccess`, or `TransactionCommit`. There is
+no generic physical-domain conversion into Quad. Config remains owned by
+public bootstrap.
+
 Carrier extensions add attachments to either arm and can replace only the
 non-Fatal Runtime context where that operation is owned. Fatal always bypasses
-ordinary reinterpretation.
+Runtime and Lifecycle reinterpretation. Poison-aware admission therefore
+returns Fatal without a Lifecycle frame, while shutdown, closed-session, and
+discarded-transaction rejection remain Lifecycle.
 
 Do not introduce a general sum-error framework. Add a carrier only when a
 small, stable producer set is repeatedly shared and no existing carrier fits.
@@ -176,15 +204,28 @@ small, stable producer set is repeatedly shared and no existing carrier fits.
 ## Completion and Fatal transport
 
 `CompletionErrorBridge` transports one canonical typed report across an async
-completion or multiple waiters. Its accepted roots are closed and audited: IO,
-Resource, DataIntegrity, Lifecycle, Runtime, and Fatal. The bridge itself must
-never appear as a frame in the reconstructed or public report.
+completion or multiple waiters. Its accepted roots are closed and audited:
+Operation, IO, Resource, DataIntegrity, Lifecycle, Runtime, and Fatal. The
+bridge itself must never appear as a frame in the reconstructed or public
+report.
 
 Cloning a bridge shares its immutable canonical state. Each consumer rebuilds
 an independent physical report, retains the registered source frames and
 attachments, and installs the consumer-owned outer context. A Runtime report
 may contain a private Internal frame beneath it; that frame is diagnostic only
 and does not become a completion root or public kind.
+
+Mandatory completion observers return the typed bridge. Their semantic owner
+uses a named replay policy: `into_runtime_or_fatal` for an exact pairwise
+contract or `into_quad` for the common integration set. `into_quad` preserves
+Operation, Runtime, Lifecycle, and Fatal roots; it stacks raw Resource, IO, or
+DataIntegrity roots beneath the caller-supplied Runtime context.
+
+Immediately after replay, the semantic owner attaches one combined diagnostic
+with the public operation, completion-wait phase, and available request
+identifiers. The attachment is added to whichever native carrier arm was
+reconstructed, including Operation, Lifecycle, and Fatal arms that do not use
+the fallback Runtime context. `QuadError` remains a frame-less carrier.
 
 `SharedFatalError` provides equivalent fan-out for a canonical Fatal report.
 Poison publication and every waiter retain the initiating source and Fatal
@@ -250,13 +291,13 @@ The principal convergence owners are:
 | Area | Boundary |
 | --- | --- |
 | value and rows | public decode/access adapters and fixed external traits |
-| engine | build orchestration, new-session admission, and shutdown facades |
+| engine | public bootstrap, new-session admission, and shutdown facades |
 | session | public table, checkpoint, retention, and transaction operations |
 | transaction | public lock, statement execution, commit, and rollback |
 | statement/stream | public DML and stream iteration methods |
 | log configuration | fixed `FromStr` adapter over typed validation |
-| catalog/table | public semantic facades and genuine Runtime-or-Fatal policy owners |
-| recovery/startup | transaction-system bootstrap over typed recovery helpers |
+| catalog/table | public semantic facades plus callback mutation error transport |
+| recovery/startup | typed recovery helpers beneath public Engine bootstrap |
 
 Lower buffer, file, log internals, index, table, purge, retention, recovery, and
 component suppliers stay typed or use one of the constrained carriers. A new

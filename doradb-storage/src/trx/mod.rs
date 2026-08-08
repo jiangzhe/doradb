@@ -42,7 +42,8 @@ use crate::completion::Completion;
 use crate::engine::EngineCore;
 use crate::error::{
     CompletionErrorBridge, DiscloseError, DiscloseResultExt, Error, FatalError, FatalResult,
-    LifecycleError, LifecycleResult, OperationResult, ResourceError, Result, RuntimeError,
+    LifecycleError, LifecycleOrFatalError, LifecycleOrFatalResult, LifecycleResult,
+    MultiDomainResultExt, OperationResult, ResourceError, Result, RuntimeError,
     RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult, SharedFatalError,
 };
 use crate::id::{SessionID, SessionOperationKey, TableID, TrxID};
@@ -141,7 +142,7 @@ impl Transaction {
 
     /// Check out the mutable core for one crate-internal operation under admission.
     #[inline]
-    pub(crate) fn checkout(&mut self) -> LifecycleResult<SessionOperationCheckout> {
+    pub(crate) fn checkout(&mut self) -> LifecycleOrFatalResult<SessionOperationCheckout> {
         let admitted = self.session.upgrade().attach_with(|| {
             format!(
                 "operation_key={}, trx_id={}",
@@ -158,12 +159,11 @@ impl Transaction {
             .runtime()
             .poisoner
             .ensure_healthy()
-            .change_context(LifecycleError::RuntimeUnavailable)
-            .attach_with(|| {
-                format!(
+            .map_err(|error| {
+                LifecycleOrFatalError::from(error.attach(format!(
                     "operation_key={}, trx_id={}, phase=check_engine_health",
                     self.operation_key, self.trx_id
-                )
+                )))
             })?;
         let entry = admitted
             .runtime()
@@ -302,7 +302,7 @@ impl Transaction {
             .attach("operation=commit_active_transaction")
             .disclose()?;
         let trx_sys = claim.engine().trx_sys.clone();
-        trx_sys.commit_transaction(claim).await
+        trx_sys.commit_transaction(claim).await.disclose()
     }
 
     /// Rollback the transaction.
@@ -2173,11 +2173,11 @@ impl FailedPrecommitReason {
         match self {
             FailedPrecommitReason::Fatal(error) => RuntimeOrFatalError::from(error),
             FailedPrecommitReason::Resource(reason) => RuntimeOrFatalError::from(
-                Report::new(reason).change_context(RuntimeError::SystemTransactionCommit),
+                Report::new(reason).change_context(RuntimeError::TransactionCommit),
             ),
             FailedPrecommitReason::Shutdown => RuntimeOrFatalError::from(
                 Report::new(LifecycleError::Shutdown)
-                    .change_context(RuntimeError::SystemTransactionCommit),
+                    .change_context(RuntimeError::TransactionCommit),
             ),
         }
     }
@@ -3537,7 +3537,7 @@ pub(crate) mod tests {
     pub(crate) fn install_transaction_ddl_redo(
         trx: &mut Transaction,
         ddl: DDLRedo,
-    ) -> LifecycleResult<()> {
+    ) -> LifecycleOrFatalResult<()> {
         let mut checkout = trx.checkout()?;
         checkout.inner_mut().effects_mut().install_ddl_redo(ddl);
         Ok(())
@@ -4190,6 +4190,9 @@ pub(crate) mod tests {
             let err = match forged.checkout() {
                 Ok(_) => panic!("wrong transaction id must not claim the exact operation entry"),
                 Err(err) => err,
+            };
+            let LifecycleOrFatalError::Lifecycle(err) = err else {
+                panic!("discarded transaction must remain a Lifecycle rejection")
             };
             assert_eq!(
                 err.downcast_ref::<LifecycleError>().copied(),
@@ -6503,6 +6506,34 @@ pub(crate) mod tests {
             );
             assert!(err.report().downcast_ref::<InternalError>().is_none());
             remove_session_for_test(&engine.inner().session_registry, session_id);
+        });
+    }
+
+    #[test]
+    fn test_transaction_checkout_preserves_fatal_poison() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("transaction_checkout_fatal_poison").await;
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let _ = engine
+                .inner()
+                .poisoner
+                .poison(Report::new(FatalError::RedoWrite).attach("test checkout poison"));
+
+            let error = match trx.checkout() {
+                Ok(_) => panic!("poisoned transaction checkout must be rejected"),
+                Err(error) => error,
+            };
+            let LifecycleOrFatalError::Fatal(error) = error else {
+                panic!("poisoned transaction checkout must remain Fatal")
+            };
+            assert_eq!(
+                error.downcast_ref::<FatalError>().copied(),
+                Some(FatalError::RedoWrite)
+            );
+            assert!(error.downcast_ref::<LifecycleError>().is_none());
+
+            trx.rollback().await.unwrap();
         });
     }
 

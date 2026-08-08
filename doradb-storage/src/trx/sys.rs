@@ -6,11 +6,11 @@ use crate::component::{
     Component, ComponentRegistry, EnginePools, FirstPanic, IndexPool, MemPool, MetaPool,
     ShelfScope, Supplier, panic_payload_description,
 };
-use crate::conf::TrxSysConfig;
+use crate::conf::{TrxSysConfig, ValidatedTrxSysConfig};
 use crate::error::{
-    CompletionErrorBridge, DataIntegrityError, DataIntegrityResult, DiscloseError,
-    DiscloseResultExt, Error, FatalError, FatalResult, LifecycleResult, MultiDomainResultExt,
-    Result, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
+    CompletionErrorBridge, DataIntegrityError, DataIntegrityResult, FatalError, FatalResult,
+    LifecycleResult, MultiDomainResultExt, QuadError, QuadResult, RuntimeError,
+    RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
 };
 use crate::file::fs::FileSystem;
 use crate::file::table_file::{MutableTableFile, OldRoot, TableFile};
@@ -580,6 +580,8 @@ pub(crate) struct TransactionSystem {
     pub(crate) redo_log: CachePadded<RedoLog>,
     /// Transaction system configuration.
     pub(crate) config: CachePadded<TrxSysConfig>,
+    /// Bootstrap-validated redo file prefix reused by runtime maintenance.
+    file_prefix: CachePadded<String>,
     /// Catalog of the database.
     pub(crate) catalog: QuiescentGuard<Catalog>,
     /// Table file facade used by background dropped-table cleanup.
@@ -618,18 +620,15 @@ pub(crate) struct TransactionSystem {
 
 impl TransactionSystem {
     /// Recover durable state and bootstrap transaction-system startup resources.
-    ///
-    /// This is a genuine mixed startup owner: configuration, recovery IO,
-    /// persisted-data validation, runtime setup, and resource failures meet
-    /// here before engine construction exposes the public result.
     pub(crate) async fn bootstrap(
-        config: TrxSysConfig,
+        validated: ValidatedTrxSysConfig,
         poisoner: QuiescentGuard<EnginePoisoner>,
         mandatory_runtime: QuiescentGuard<MandatoryRuntime>,
         pools: EnginePools,
         table_fs: QuiescentGuard<FileSystem>,
         catalog: QuiescentGuard<Catalog>,
-    ) -> Result<(Self, PendingTransactionWorkerStartups)> {
+    ) -> RuntimeResult<(Self, PendingTransactionWorkerStartups)> {
+        let (config, file_prefix) = validated.into_parts();
         debug_assert!(config.purge_threads != 0);
         debug_assert!(
             (1..=256).contains(&config.gc_buckets) && config.gc_buckets.is_power_of_two()
@@ -640,20 +639,17 @@ impl TransactionSystem {
 
         let pool_guards = pools.pool_guards().clone();
         let (purge_tx, purge_rx) = flume::unbounded();
-        let file_prefix = config.file_prefix().disclose()?;
         let recovery_resources = RecoveryResources::new(pools, table_fs.clone(), &catalog);
-        let coordinator = recovery_resources
-            .prepare(&config, file_prefix)
-            .disclose()?;
-        let (max_recovered_cts, finalizer) = coordinator.recover_all().await.disclose()?;
-        let initial_trx_ts = recovery_initial_trx_ts(max_recovered_cts)
-            .change_context(RuntimeError::Recovery)
-            .disclose()?;
-        let (redo_log, initial_redo_header) = finalizer.finalize(purge_tx.clone()).disclose()?;
+        let coordinator = recovery_resources.prepare(&config, file_prefix.clone())?;
+        let (max_recovered_cts, finalizer) = coordinator.recover_all().await?;
+        let initial_trx_ts =
+            recovery_initial_trx_ts(max_recovered_cts).change_context(RuntimeError::Recovery)?;
+        let (redo_log, initial_redo_header) = finalizer.finalize(purge_tx.clone())?;
         let redo_log = CachePadded::new(redo_log);
 
         let trx_sys = Self::new(
             config,
+            file_prefix,
             poisoner,
             mandatory_runtime,
             catalog,
@@ -687,6 +683,7 @@ impl TransactionSystem {
     #[inline]
     fn new(
         config: TrxSysConfig,
+        file_prefix: String,
         poisoner: QuiescentGuard<EnginePoisoner>,
         mandatory_runtime: QuiescentGuard<MandatoryRuntime>,
         catalog: QuiescentGuard<Catalog>,
@@ -713,6 +710,7 @@ impl TransactionSystem {
             gc_buckets: gc_buckets.into_boxed_slice(),
             redo_log,
             config: CachePadded::new(config),
+            file_prefix: CachePadded::new(file_prefix),
             catalog,
             table_fs,
             poisoner,
@@ -961,20 +959,15 @@ impl TransactionSystem {
         }
     }
 
-    /// Enqueue a prepared transaction and wait for ordered commit completion.
-    ///
-    /// The shared user-commit completion has a closed but genuinely mixed
-    /// producer set: intrinsic Resource rejection, Lifecycle shutdown, or
-    /// Fatal redo/rollback failure. This helper intentionally retains the
-    /// public result rather than introducing a one-use sum carrier.
+    /// Enqueue a prepared user transaction and wait for ordered commit completion.
     #[inline]
-    pub(crate) async fn commit_prepared(&self, trx: PreparedTrx) -> Result<TrxID> {
+    pub(crate) async fn commit_prepared(&self, trx: PreparedTrx) -> QuadResult<TrxID> {
         let (cts, waiter) = self.enqueue_prepared_waiter(trx);
-        waiter.wait_result().await.map_err(|report| {
-            report
-                .disclose()
-                .attach_with(|| format!("wait for redo group commit: commit_ts={cts}"))
-        })?;
+        waiter
+            .wait_result()
+            .await
+            .map_err(|bridge| bridge.into_quad(RuntimeError::TransactionCommit))
+            .attach_with(|| format!("wait for redo group commit: commit_ts={cts}"))?;
         assert!(TrxID::new(self.redo_log.persisted_cts.load(Ordering::Relaxed)) >= cts);
         Ok(cts)
     }
@@ -1161,10 +1154,7 @@ impl TransactionSystem {
 
     /// Commit an active transaction.
     ///
-    /// This is the internal owner of the public user-commit boundary. Its
-    /// failures are limited to Resource, Lifecycle, and Fatal reports from
-    /// ordered completion or mandatory rollback, but remain on `Result` so the
-    /// completion source and commit-timestamp attachment are disclosed once.
+    /// This is the typed internal owner of the public user-commit boundary.
     /// The commit process is implemented as group commit.
     /// If multiple transactions are being committed at the same time, one of them
     /// will become leader of the commit group. Others become followers waiting for
@@ -1174,13 +1164,13 @@ impl TransactionSystem {
     pub(crate) async fn commit_transaction(
         &self,
         claim: SessionOperationCompletionClaim,
-    ) -> Result<TrxID> {
+    ) -> QuadResult<TrxID> {
         if let Err(err) = self.poisoner.ensure_healthy() {
             let completion = self.enqueue_terminal_rollback(claim, "rollback poisoned commit");
             Self::wait_terminal_rollback(completion, "wait for poisoned commit rollback cleanup")
                 .await
-                .disclose()?;
-            return Err(err.disclose());
+                .map_err(QuadError::from)?;
+            return Err(err.into());
         }
         // Prepare redo log first, this may take some time,
         // so keep it out of lock scope, and we can fill cts after the lock is held.
@@ -1671,11 +1661,7 @@ impl TransactionSystem {
         &self,
     ) -> RuntimeResult<CatalogCheckpointScanConfig> {
         Ok(CatalogCheckpointScanConfig {
-            file_prefix: self
-                .config
-                .file_prefix()
-                .change_context(RuntimeError::CatalogAccess)
-                .attach("operation=build_catalog_checkpoint_scan_config")?,
+            file_prefix: self.file_prefix.as_str().to_owned(),
             read_ahead_depth: self.config.catalog_checkpoint_scan_io_depth,
         })
     }
@@ -1690,22 +1676,19 @@ impl Supplier<TransactionRedoWorkers> for TransactionSystem {
 }
 
 impl Component for TransactionSystem {
-    type Config = TrxSysConfig;
+    type Config = ValidatedTrxSysConfig;
     type Owned = Self;
     type Access = QuiescentGuard<Self>;
-    // Component construction combines config validation with genuinely mixed
-    // recovery/bootstrap sources, so this is the remaining startup-wide owner.
-    type Error = Error;
+    type Error = Report<RuntimeError>;
 
     const NAME: &'static str = "trx_sys";
 
     #[inline]
     async fn build(
-        mut config: Self::Config,
+        config: Self::Config,
         registry: &mut ComponentRegistry,
         mut shelf: ShelfScope<'_, Self>,
-    ) -> Result<()> {
-        config.validate().disclose()?;
+    ) -> RuntimeResult<()> {
         let meta_pool = registry.dependency::<MetaPool>();
         let index_pool = registry.dependency::<IndexPool>();
         let mem_pool = registry.dependency::<MemPool>();
@@ -1885,8 +1868,10 @@ pub(crate) mod tests {
         redo_log: RedoLog,
     ) -> (TransactionSystem, Receiver<Purge>) {
         let (purge_tx, purge_rx) = flume::unbounded();
+        let file_prefix = config.file_prefix().unwrap();
         let trx_sys = TransactionSystem::new(
             config,
+            file_prefix,
             engine.inner().poisoner.clone(),
             engine.inner().mandatory_runtime.clone(),
             engine.inner().catalog.clone(),
@@ -2473,6 +2458,12 @@ pub(crate) mod tests {
 
             let err = trx.commit().await.unwrap_err();
 
+            assert_eq!(err.kind(), crate::error::ErrorKind::Runtime);
+            assert_eq!(
+                err.report().downcast_ref::<RuntimeError>().copied(),
+                Some(RuntimeError::TransactionCommit),
+                "{err:?}"
+            );
             assert_eq!(
                 err.report().downcast_ref::<ResourceError>().copied(),
                 Some(ResourceError::StorageFileCapacityExceeded),

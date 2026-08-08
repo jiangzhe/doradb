@@ -2,9 +2,9 @@ use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards};
 use crate::catalog::{Catalog, IndexNo, IndexSpec, TableMetadata, catalog_table_id_from_slot};
 use crate::engine::EngineCore;
 use crate::error::{
-    CompletionErrorBridge, CompletionResult, DataIntegrityError, DataIntegrityResult,
-    DiscloseResultExt, FatalError, OperationError, OperationOrRuntimeResult, OperationResult,
-    Result, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
+    CompletionErrorBridge, CompletionResult, DataIntegrityError, DataIntegrityResult, FatalError,
+    OperationError, OperationOrRuntimeResult, OperationResult, RuntimeError, RuntimeOrFatalError,
+    RuntimeOrFatalResult, RuntimeResult,
 };
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::file::table_file::{ActiveRoot, MutableTableFile};
@@ -118,13 +118,18 @@ pub(crate) struct CreateIndexPlan {
 
 impl CreateIndexPlan {
     /// Captures the stable layout, root, and allocated metadata shape.
-    pub(crate) fn new(table_id: TableID, table: Arc<Table>, index_spec: IndexSpec) -> Result<Self> {
+    pub(crate) fn new(
+        table_id: TableID,
+        table: Arc<Table>,
+        index_spec: IndexSpec,
+    ) -> OperationOrRuntimeResult<Self> {
         let old_layout = table.layout_snapshot();
         let old_metadata = old_layout.metadata();
         let active_root = table.file().active_root_unchecked().clone();
-        validate_create_index_root_shape(table_id, &active_root, old_metadata).disclose()?;
-        let (index_no, new_metadata_value) =
-            old_metadata.try_with_created_index(index_spec).disclose()?;
+        validate_create_index_root_shape(table_id, &active_root, old_metadata)
+            .change_context(RuntimeError::CatalogAccess)
+            .attach("operation=create_index, phase=validate_root_shape")?;
+        let (index_no, new_metadata_value) = old_metadata.try_with_created_index(index_spec)?;
         let new_metadata = Arc::new(new_metadata_value);
         let index_no_usize = usize::from(index_no);
         let new_index_spec = new_metadata
@@ -159,7 +164,11 @@ pub(crate) struct DropIndexPlan {
 
 impl DropIndexPlan {
     /// Captures the stable active slot, layout, and replacement root shape.
-    pub(crate) fn new(table_id: TableID, table: Arc<Table>, index_no: IndexNo) -> Result<Self> {
+    pub(crate) fn new(
+        table_id: TableID,
+        table: Arc<Table>,
+        index_no: IndexNo,
+    ) -> OperationOrRuntimeResult<Self> {
         let old_layout = table.layout_snapshot();
         let old_metadata = old_layout.metadata();
         let index_no_usize = usize::from(index_no);
@@ -170,14 +179,14 @@ impl DropIndexPlan {
                 Report::new(OperationError::IndexNotFound).attach(format!(
                     "drop index target not found: table_id={table_id}, index_no={index_no}, reason=inactive_metadata_slot"
                 ))
-            })
-            .disclose()?;
+            })?;
         old_layout
             .secondary_index(index_no_usize)
             .expect("active index metadata must have a matching runtime index");
         let active_root = table.file().active_root_unchecked().clone();
         validate_drop_index_root_shape(table_id, index_no_usize, &active_root, old_metadata)
-            .disclose()?;
+            .change_context(RuntimeError::CatalogAccess)
+            .attach("operation=drop_index, phase=validate_root_shape")?;
         let new_metadata = Arc::new(old_metadata.without_index(index_no));
         let mut secondary_index_roots = active_root.secondary_index_roots.clone();
         secondary_index_roots[index_no_usize] = SUPER_BLOCK_ID;
@@ -1995,7 +2004,7 @@ pub(crate) mod tests {
         TrxSysConfig,
     };
     use crate::engine::Engine;
-    use crate::error::LifecycleError;
+    use crate::error::{LifecycleError, Result};
     use crate::file::cow_file::tests::old_root_drop_count;
     use crate::file::table_file::ActiveRoot;
     use crate::index::IndexBatchStream;
