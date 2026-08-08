@@ -4,8 +4,8 @@ use crate::id::{RowID, TableID, TrxID};
 use crate::catalog::{CatalogTable, TableCache};
 use crate::error::{
     DiscloseResultExt, FatalError, FatalResult, MultiDomainResultExt, OperationError,
-    OperationOrFatalResult, OperationOrRuntimeError, OperationOrRuntimeResult, OperationResult,
-    Result, RuntimeError, RuntimeResult,
+    OperationOrFatalResult, QuadError, QuadResult, Result, RuntimeError, RuntimeOrFatalError,
+    RuntimeOrFatalResult, RuntimeResult,
 };
 use crate::lock::{LockMode, LockResource};
 use crate::log::redo::{RedoLogs, RowRedo};
@@ -37,20 +37,18 @@ use super::admission::admit_user_table;
 /// `change_runtime_context` is a domain-preserving carrier primitive and owns
 /// no operation identity. Its semantic callers chain `attach_with` immediately
 /// after reclassification.
-trait OperationOrRuntimeResultExt<T>: MultiDomainResultExt {
+trait QuadResultExt<T>: MultiDomainResultExt {
     fn change_runtime_context(self, context: RuntimeError) -> Self;
 }
 
-impl<T> OperationOrRuntimeResultExt<T> for OperationOrRuntimeResult<T> {
+impl<T> QuadResultExt<T> for QuadResult<T> {
     #[inline]
     fn change_runtime_context(self, context: RuntimeError) -> Self {
         self.map_err(|error| match error {
-            OperationOrRuntimeError::Operation(report) => {
-                OperationOrRuntimeError::Operation(report)
-            }
-            OperationOrRuntimeError::Runtime(report) => {
-                OperationOrRuntimeError::Runtime(report.change_context(context))
-            }
+            QuadError::Operation(report) => QuadError::Operation(report),
+            QuadError::Runtime(report) => QuadError::Runtime(report.change_context(context)),
+            QuadError::Lifecycle(report) => QuadError::Lifecycle(report),
+            QuadError::Fatal(report) => QuadError::Fatal(report),
         })
     }
 }
@@ -391,12 +389,14 @@ impl<'stmt> Statement<'stmt> {
     pub(crate) async fn acquire_table_write_metadata_lock(
         &mut self,
         table_id: TableID,
-    ) -> OperationResult<()> {
-        let lock_manager = self.attachment.engine().lock_manager();
+    ) -> OperationOrFatalResult<()> {
+        let engine = self.attachment.engine();
+        let lock_manager = engine.lock_manager();
         self.inner
             .checked_lock_state_mut()
             .acquire(
                 lock_manager,
+                &engine.poisoner,
                 LockResource::TableMetadata(table_id),
                 LockMode::Shared,
             )
@@ -409,12 +409,14 @@ impl<'stmt> Statement<'stmt> {
     pub(crate) async fn acquire_table_write_data_lock(
         &mut self,
         table_id: TableID,
-    ) -> OperationResult<()> {
-        let lock_manager = self.attachment.engine().lock_manager();
+    ) -> OperationOrFatalResult<()> {
+        let engine = self.attachment.engine();
+        let lock_manager = engine.lock_manager();
         self.inner
             .checked_lock_state_mut()
             .acquire(
                 lock_manager,
+                &engine.poisoner,
                 LockResource::TableData(table_id),
                 LockMode::IntentExclusive,
             )
@@ -427,12 +429,14 @@ impl<'stmt> Statement<'stmt> {
     async fn acquire_table_exclusive_data_lock(
         &mut self,
         table_id: TableID,
-    ) -> OperationResult<()> {
-        let lock_manager = self.attachment.engine().lock_manager();
+    ) -> OperationOrFatalResult<()> {
+        let engine = self.attachment.engine();
+        let lock_manager = engine.lock_manager();
         self.inner
             .checked_lock_state_mut()
             .acquire(
                 lock_manager,
+                &engine.poisoner,
                 LockResource::TableData(table_id),
                 LockMode::Exclusive,
             )
@@ -796,7 +800,7 @@ impl<'stmt> Statement<'stmt> {
         &mut self,
         table: &CatalogTable,
         cols: Vec<Val>,
-    ) -> RuntimeResult<RowID> {
+    ) -> RuntimeOrFatalResult<RowID> {
         let table_id = table.table_id();
         let result = self.catalog_insert_mvcc_inner(table, cols).await;
         assert_catalog_mutation_invariant(table_id, result)
@@ -809,7 +813,7 @@ impl<'stmt> Statement<'stmt> {
         &mut self,
         table: &CatalogTable,
         cols: Vec<Val>,
-    ) -> OperationOrRuntimeResult<RowID> {
+    ) -> QuadResult<RowID> {
         const OPERATION: &str = "catalog_insert_mvcc";
         let table_id = table.table_id();
         self.acquire_table_write_metadata_lock(table_id)
@@ -828,6 +832,7 @@ impl<'stmt> Statement<'stmt> {
         table
             .insert_mvcc(rt, effects, cols)
             .await
+            .map_err(QuadError::from)
             .change_runtime_context(RuntimeError::CatalogAccess)
             .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
     }
@@ -840,7 +845,7 @@ impl<'stmt> Statement<'stmt> {
         index_no: usize,
         key_vals: &[Val],
         log_by_key: bool,
-    ) -> RuntimeResult<DeleteMvcc> {
+    ) -> RuntimeOrFatalResult<DeleteMvcc> {
         let table_id = table.table_id();
         let result = self
             .catalog_delete_primary_key_mvcc_inner(table, index_no, key_vals, log_by_key)
@@ -857,7 +862,7 @@ impl<'stmt> Statement<'stmt> {
         index_no: usize,
         key_vals: &[Val],
         log_by_key: bool,
-    ) -> OperationOrRuntimeResult<DeleteMvcc> {
+    ) -> QuadResult<DeleteMvcc> {
         const OPERATION: &str = "catalog_delete_primary_key_mvcc";
         let table_id = table.table_id();
         self.acquire_table_write_metadata_lock(table_id)
@@ -939,18 +944,25 @@ impl<'stmt> Statement<'stmt> {
 
 /// Catalog mutations use internally derived keys and validated row shapes.
 /// An Operation failure therefore means a catalog key, row shape, transaction,
-/// or lock invariant was violated; only Runtime failures may leave this boundary.
+/// or lock invariant was violated; only Runtime and Fatal failures may leave
+/// this boundary.
 #[inline]
 fn assert_catalog_mutation_invariant<T>(
     table_id: TableID,
-    result: OperationOrRuntimeResult<T>,
-) -> RuntimeResult<T> {
+    result: QuadResult<T>,
+) -> RuntimeOrFatalResult<T> {
     match result {
         Ok(value) => Ok(value),
-        Err(OperationOrRuntimeError::Operation(report)) => {
+        Err(QuadError::Operation(report)) => {
             panic!("catalog mutation invariant violated: table_id={table_id}, error={report:?}")
         }
-        Err(OperationOrRuntimeError::Runtime(report)) => Err(report),
+        Err(QuadError::Runtime(report)) => Err(RuntimeOrFatalError::Runtime(report)),
+        Err(QuadError::Lifecycle(report)) => {
+            panic!(
+                "catalog mutation lifecycle invariant violated: table_id={table_id}, error={report:?}"
+            )
+        }
+        Err(QuadError::Fatal(report)) => Err(RuntimeOrFatalError::Fatal(report)),
     }
 }
 
@@ -1009,10 +1021,11 @@ pub(crate) mod tests {
         resource: LockResource,
         mode: LockMode,
     ) -> Result<()> {
-        let lock_manager = stmt.attachment.engine().lock_manager();
+        let engine = stmt.attachment.engine();
+        let lock_manager = engine.lock_manager();
         stmt.inner
             .checked_lock_state_mut()
-            .acquire(lock_manager, resource, mode)
+            .acquire(lock_manager, &engine.poisoner, resource, mode)
             .await
             .map(|_| ())
             .disclose()
@@ -1051,10 +1064,11 @@ pub(crate) mod tests {
     ) -> Result<()> {
         let mut checkout = trx.checkout().disclose()?;
         let (inner, attachment) = checkout.inner_and_attachment_mut();
-        let lock_manager = attachment.engine().lock_manager();
+        let engine = attachment.engine();
+        let lock_manager = engine.lock_manager();
         inner
             .checked_lock_state_mut()
-            .acquire(lock_manager, resource, mode)
+            .acquire(lock_manager, &engine.poisoner, resource, mode)
             .now_or_never()
             .expect("test transaction lock acquisition unexpectedly waited")
             .map(|_| ())
@@ -1209,7 +1223,7 @@ pub(crate) mod tests {
     fn test_catalog_mutation_operation_errors_violate_invariant() {
         for error in [OperationError::DuplicateKey, OperationError::WriteConflict] {
             let panic = catch_unwind(|| {
-                let result: OperationOrRuntimeResult<()> = Err(Report::new(error).into());
+                let result: QuadResult<()> = Err(Report::new(error).into());
                 let _ = assert_catalog_mutation_invariant(TableID::new(42), result);
             });
             assert!(panic.is_err(), "operation error did not assert: {error:?}");
@@ -1218,12 +1232,15 @@ pub(crate) mod tests {
 
     #[test]
     fn test_catalog_mutation_runtime_error_preserves_stack() {
-        let result: OperationOrRuntimeResult<()> = Err(Report::new(ResourceError::BufferPoolFull)
+        let result: QuadResult<()> = Err(Report::new(ResourceError::BufferPoolFull)
             .attach("pool_role=Meta")
             .change_context(RuntimeError::CatalogAccess)
             .into());
 
         let err = assert_catalog_mutation_invariant(TableID::new(42), result).unwrap_err();
+        let RuntimeOrFatalError::Runtime(err) = err else {
+            panic!("runtime catalog failure changed domain")
+        };
 
         assert_eq!(*err.current_context(), RuntimeError::CatalogAccess);
         assert_eq!(
@@ -1231,6 +1248,21 @@ pub(crate) mod tests {
             Some(ResourceError::BufferPoolFull)
         );
         assert!(format!("{err:?}").contains("pool_role=Meta"));
+    }
+
+    #[test]
+    fn test_catalog_mutation_fatal_error_preserves_first_source() {
+        let result: QuadResult<()> = Err(Report::new(FatalError::StorageIo)
+            .attach("first catalog mutation poison source")
+            .into());
+
+        let err = assert_catalog_mutation_invariant(TableID::new(42), result).unwrap_err();
+        let RuntimeOrFatalError::Fatal(err) = err else {
+            panic!("fatal catalog failure changed domain")
+        };
+
+        assert_eq!(*err.current_context(), FatalError::StorageIo);
+        assert!(format!("{err:?}").contains("first catalog mutation poison source"));
     }
 
     #[test]

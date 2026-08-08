@@ -7,7 +7,7 @@ use crate::catalog::{
     ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexOrder, IndexSpec,
     catalog_table_id_from_slot,
 };
-use crate::error::{RuntimeError, RuntimeResult};
+use crate::error::{MultiDomainResultExt, RuntimeError, RuntimeOrFatalResult, RuntimeResult};
 use crate::id::TableID;
 use crate::row::ops::DeleteMvcc;
 use crate::row::{Row, RowRead};
@@ -59,7 +59,7 @@ impl Indexes<'_> {
         &self,
         stmt: &mut Statement<'_>,
         obj: &IndexObject,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         let cols = vec![
             Val::from(obj.table_id),
             Val::from(obj.index_no),
@@ -82,7 +82,7 @@ impl Indexes<'_> {
         stmt: &mut Statement<'_>,
         table_id: TableID,
         index_no: u16,
-    ) -> RuntimeResult<bool> {
+    ) -> RuntimeOrFatalResult<bool> {
         let key_vals = [Val::from(table_id), Val::from(index_no)];
         let res = stmt
             .catalog_delete_primary_key_mvcc(self.table, PK_NO_INDEXES, &key_vals, true)
@@ -100,7 +100,7 @@ impl Indexes<'_> {
         &self,
         stmt: &mut Statement<'_>,
         table_id: TableID,
-    ) -> RuntimeResult<usize> {
+    ) -> RuntimeOrFatalResult<usize> {
         let indexes = self
             .list_uncommitted_by_table_id(stmt.runtime().pool_guards(), table_id)
             .await?;
@@ -157,7 +157,7 @@ impl IndexColumns<'_> {
         &self,
         stmt: &mut Statement<'_>,
         obj: &IndexColumnObject,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         let cols = vec![
             Val::from(obj.table_id),
             Val::from(obj.index_no),
@@ -182,7 +182,7 @@ impl IndexColumns<'_> {
         table_id: TableID,
         index_no: u16,
         index_column_no: u16,
-    ) -> RuntimeResult<bool> {
+    ) -> RuntimeOrFatalResult<bool> {
         let key_vals = [
             Val::from(table_id),
             Val::from(index_no),
@@ -205,7 +205,7 @@ impl IndexColumns<'_> {
         stmt: &mut Statement<'_>,
         table_id: TableID,
         index_no: u16,
-    ) -> RuntimeResult<usize> {
+    ) -> RuntimeOrFatalResult<usize> {
         let index_columns = self
             .list_uncommitted_by_table_id(stmt.runtime().pool_guards(), table_id)
             .await?;
@@ -229,7 +229,7 @@ impl IndexColumns<'_> {
         &self,
         stmt: &mut Statement<'_>,
         table_id: TableID,
-    ) -> RuntimeResult<usize> {
+    ) -> RuntimeOrFatalResult<usize> {
         let index_columns = self
             .list_uncommitted_by_table_id(stmt.runtime().pool_guards(), table_id)
             .await?;

@@ -2,7 +2,7 @@ use super::TrxInner;
 use crate::catalog::{
     CurrentTableState, ResolvedLiveMetadata, ResolvedVisibleTableMetadata, is_catalog_table,
 };
-use crate::error::{OperationError, OperationOrFatalResult, OperationResult};
+use crate::error::{MultiDomainResultExt, OperationError, OperationOrFatalResult, OperationResult};
 use crate::id::{TableID, TrxID};
 use crate::lock::{LockMode, LockResource};
 use crate::session::TrxAttachment;
@@ -239,10 +239,16 @@ pub(super) async fn admit_user_table(
     // snapshot-visible or current metadata. Every accepted claim remains until
     // terminal transaction cleanup, including after an ordinary resolution or
     // validation error.
-    let lock_manager = attachment.engine().lock_manager();
+    let engine = attachment.engine();
+    let lock_manager = engine.lock_manager();
     inner
         .checked_lock_state_mut()
-        .acquire(lock_manager, metadata_resource, LockMode::Shared)
+        .acquire(
+            lock_manager,
+            &engine.poisoner,
+            metadata_resource,
+            LockMode::Shared,
+        )
         .await
         .attach_with(|| format!("operation={operation}, table_id={table_id}"))?;
 

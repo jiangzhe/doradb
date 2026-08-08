@@ -43,7 +43,7 @@ use crate::engine::EngineCore;
 use crate::error::{
     CompletionErrorBridge, DiscloseError, DiscloseResultExt, Error, FatalError, FatalResult,
     LifecycleError, LifecycleOrFatalError, LifecycleOrFatalResult, LifecycleResult,
-    MultiDomainResultExt, OperationResult, ResourceError, Result, RuntimeError,
+    MultiDomainResultExt, OperationOrFatalResult, ResourceError, Result, RuntimeError,
     RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult, SharedFatalError,
 };
 use crate::id::{SessionID, SessionOperationKey, TableID, TrxID};
@@ -56,6 +56,7 @@ use crate::log::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind};
 use crate::map::FastHashMap;
 use crate::notify::EventNotifyOnDrop;
 use crate::obs;
+use crate::poison::PoisonAwareListener;
 use crate::session::{SessionRuntime, TrxAttachment, WeakSessionRef};
 use crate::trx::undo::{IndexPurgeEntry, IndexUndoLogs, RowUndoHead, RowUndoLogs, UndoStatus};
 use error_stack::{Report, ResultExt};
@@ -396,9 +397,9 @@ impl PrivateTransaction {
     /// incomplete redo, folds residual undo into the transaction, and resumes
     /// the original unwind while this facade still owns the checkout.
     #[inline]
-    pub(crate) async fn stage_statement<T, F>(&mut self, f: F) -> RuntimeResult<T>
+    pub(crate) async fn stage_statement<T, F>(&mut self, f: F) -> RuntimeOrFatalResult<T>
     where
-        F: for<'borrow> AsyncFnOnce(&'borrow mut Statement<'_>) -> RuntimeResult<T>,
+        F: for<'borrow> AsyncFnOnce(&'borrow mut Statement<'_>) -> RuntimeOrFatalResult<T>,
     {
         let checkout = self.checkout_mut();
         let mut effects = StmtEffects::empty();
@@ -486,10 +487,10 @@ impl PrivateTransaction {
 pub(crate) enum PrepareListenerResult {
     /// The transaction was not preparing when registration started.
     NotPreparing,
-    /// Registration succeeded and the listener must be awaited.
-    Registered(EventListener),
-    /// Prepare completion won the race with first-listener registration.
-    Completed,
+    /// Registration succeeded; consume the token before retrying.
+    Registered(PoisonAwareListener),
+    /// Completion won registration; consume the token to recheck poison.
+    Completed(PoisonAwareListener),
 }
 
 /// Shared transaction timestamp state referenced by row undo heads.
@@ -588,16 +589,18 @@ impl SharedTrxStatus {
         if let Some(event) = g.as_ref() {
             // Completion must take an installed event while holding this same
             // mutex, so finding one here proves notification is still owed.
-            return PrepareListenerResult::Registered(event.listen());
+            return PrepareListenerResult::Registered(PoisonAwareListener::registered(
+                event.listen(),
+            ));
         }
         if !self.preparing.load(Ordering::Acquire) {
             // Completion won between the optimistic load and mutex acquisition.
-            return PrepareListenerResult::Completed;
+            return PrepareListenerResult::Completed(PoisonAwareListener::recheck_only());
         }
         let event = EventNotifyOnDrop::new();
         let listener = event.listen();
         *g = Some(event);
-        PrepareListenerResult::Registered(listener)
+        PrepareListenerResult::Registered(PoisonAwareListener::registered(listener))
     }
 
     /// Marks the transaction as preparing without allocating a notifier.
@@ -763,6 +766,21 @@ impl<'r> TrxRuntime<'r> {
     #[inline]
     pub(crate) fn engine(&self) -> &'r EngineCore {
         self.attachment.engine()
+    }
+
+    /// Waits for foreign prepare completion without losing engine poison.
+    #[inline]
+    pub(crate) async fn wait_prepare_or_poison(
+        &self,
+        prepare_listener: PoisonAwareListener,
+    ) -> FatalResult<()> {
+        #[cfg(test)]
+        self.engine().poisoner.record_prepare_wait_entry();
+
+        self.engine()
+            .poisoner
+            .wait_or_poison(prepare_listener)
+            .await
     }
 
     /// Returns the cloned session pool guards retained by this operation.
@@ -1940,7 +1958,7 @@ impl SessionOperationCheckout {
         &mut self,
         table_id: TableID,
         mode: LockMode,
-    ) -> OperationResult<()> {
+    ) -> OperationOrFatalResult<()> {
         let Self {
             inner, attachment, ..
         } = self;
@@ -2577,13 +2595,14 @@ impl TrxInner {
         attachment: &TrxAttachment,
         table_id: TableID,
         mode: LockMode,
-    ) -> OperationResult<()> {
+    ) -> OperationOrFatalResult<()> {
         let operation = "lock_explicit_table";
         let engine = self.checked_engine(attachment);
         let lock_manager = engine.lock_manager();
         let resources = Self::table_lock_resources(table_id);
         let (family, curr_scope) = self.checked_lock_state_mut().parts();
-        let mut fresh = FreshClaimsGuard::<2>::new(family, curr_scope, lock_manager);
+        let mut fresh =
+            FreshClaimsGuard::<2>::new(family, curr_scope, lock_manager, &engine.poisoner);
         fresh
             .acquire(resources.metadata, LockMode::Shared)
             .await
@@ -4335,13 +4354,21 @@ pub(crate) mod tests {
     }
 
     #[inline]
-    fn prepare_transaction(trx: Transaction) -> Result<PreparedTrx> {
+    pub(crate) fn prepare_transaction(trx: Transaction) -> Result<PreparedTrx> {
         let claim = trx
             .claim_terminal()
             .attach("operation=prepare_active_transaction")
             .disclose()?;
         let (_entry, inner, attachment) = claim.into_parts();
         Ok(inner.prepare(attachment))
+    }
+
+    #[inline]
+    pub(crate) fn transaction_status_for_test(trx: &Transaction) -> Arc<SharedTrxStatus> {
+        with_transaction_inner(trx, "query_test_transaction_status", |inner| {
+            Arc::clone(inner.ctx().status())
+        })
+        .expect("test transaction must be active")
     }
 
     #[inline]
@@ -4352,7 +4379,7 @@ pub(crate) mod tests {
     }
 
     #[inline]
-    fn discard_production_prepared_for_test(mut prepared: PreparedTrx) {
+    pub(crate) fn discard_production_prepared_for_test(mut prepared: PreparedTrx) {
         if let Some(payload) = prepared.payload.take() {
             let attachment = prepared
                 .attachment
@@ -4477,10 +4504,11 @@ pub(crate) mod tests {
             .attach("operation=acquire_transaction_lock_immediate")
             .disclose()?;
         let (inner, attachment) = checkout.inner_and_attachment_mut();
-        let lock_manager = attachment.engine().lock_manager();
+        let engine = attachment.engine();
+        let lock_manager = engine.lock_manager();
         inner
             .checked_lock_state_mut()
-            .acquire(lock_manager, resource, mode)
+            .acquire(lock_manager, &engine.poisoner, resource, mode)
             .now_or_never()
             .expect("test transaction lock acquisition unexpectedly waited")
             .map(|_| ())
@@ -4802,7 +4830,7 @@ pub(crate) mod tests {
             let (done_tx, done_rx) = mpsc::channel();
             let waiter = spawn(move || {
                 ready_tx.send(()).expect("waiter should report ready");
-                listener.wait();
+                listener.wait_primary_for_test();
                 done_tx
                     .send(waiter_status.ts())
                     .expect("waiter should report observed status");
@@ -4863,8 +4891,8 @@ pub(crate) mod tests {
         assert_eq!(event_addr, shared_event_addr);
 
         status.finish_preparing();
-        first.wait();
-        second.wait();
+        first.wait_primary_for_test();
+        second.wait_primary_for_test();
         assert!(!status.preparing());
         assert!(status.prepare_ev.lock().is_none());
     }
@@ -4902,7 +4930,7 @@ pub(crate) mod tests {
             result_tx
                 .send(matches!(
                     waiter_status.prepare_listener(),
-                    PrepareListenerResult::Completed
+                    PrepareListenerResult::Completed(_)
                 ))
                 .expect("waiter should report registration outcome");
         });
@@ -4961,7 +4989,7 @@ pub(crate) mod tests {
             let (done_tx, done_rx) = mpsc::channel();
             let waiter = spawn(move || {
                 ready_tx.send(()).expect("waiter should report ready");
-                listener.wait();
+                listener.wait_primary_for_test();
                 done_tx
                     .send(matches!(
                         waiter_status.prepare_listener(),

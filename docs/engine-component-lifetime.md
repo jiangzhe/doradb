@@ -4,6 +4,11 @@ This document describes the ownership and shutdown model for the
 storage-engine runtime after the static-lifetime removal and
 component-registry migration work.
 
+The engine-wide distinction between shutdown, fatal runtime poison, accepted
+work, terminal cleanup, and semantic wait cancellation is specified in
+[Shutdown and Engine Poison](shutdown-and-poison.md). This document retains the
+component graph and teardown details only.
+
 ## Terminology
 
 - `Engine`: public owner of top-level teardown state and session creation.

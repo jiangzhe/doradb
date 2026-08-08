@@ -2,11 +2,80 @@ use crate::component::{Component, ComponentRegistry, ShelfScope};
 use crate::error::{FatalError, FatalResult, SharedFatalError};
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
 use error_stack::Report;
+#[cfg(test)]
+use event_listener::Listener;
 use event_listener::{Event, EventListener};
+use futures::FutureExt;
 use parking_lot::Mutex;
 use std::convert::Infallible;
 use std::result::Result as StdResult;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+enum PoisonAwareListenerState {
+    Registered(EventListener),
+    RecheckOnly,
+}
+
+/// Move-only authority to retry work after a poison-aware wait boundary.
+///
+/// This token exists to make the safety protocol structural. A caller that
+/// observes a transient primary condition, such as a foreign transaction in
+/// prepare, must not wait only for that condition: engine poison can make the
+/// expected primary notification impossible. The caller therefore receives
+/// this opaque token instead of a raw [`EventListener`]. Its only production
+/// consumer is [`EnginePoisoner::wait_or_poison`], which couples primary
+/// progress with sticky engine-health validation.
+///
+/// The token has two internal states with the same retry contract:
+///
+/// - registered: primary completion still owes a notification, so consumption
+///   races that notification with engine poison and then rechecks health;
+/// - recheck-only: primary completion won listener registration, so no primary
+///   wait remains, but consumption must still check poison before retrying.
+///
+/// The raw listener and state are deliberately private. This type implements
+/// neither `Future` nor `Clone`, so it cannot be awaited directly or reused to
+/// authorize multiple retries. Dropping it is valid cancellation, but a caller
+/// that wants to retry normal work must first consume it through the poisoner.
+#[must_use = "poison-aware listeners must be consumed before retrying normal work"]
+pub(crate) struct PoisonAwareListener {
+    state: PoisonAwareListenerState,
+}
+
+impl PoisonAwareListener {
+    /// Wraps an owed primary notification without exposing a direct wait path.
+    #[inline]
+    pub(crate) fn registered(listener: EventListener) -> Self {
+        Self {
+            state: PoisonAwareListenerState::Registered(listener),
+        }
+    }
+
+    /// Requires a poison recheck when primary completion won registration.
+    #[inline]
+    pub(crate) fn recheck_only() -> Self {
+        Self {
+            state: PoisonAwareListenerState::RecheckOnly,
+        }
+    }
+
+    /// Waits only for the primary notifier in low-level registration tests.
+    ///
+    /// Production code must use [`EnginePoisoner::wait_or_poison`]. This escape
+    /// hatch exists only for tests of the primary registration protocol itself.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn wait_primary_for_test(self) {
+        match self.state {
+            PoisonAwareListenerState::Registered(listener) => listener.wait(),
+            PoisonAwareListenerState::RecheckOnly => {
+                panic!("recheck-only poison-aware listener has no primary event")
+            }
+        }
+    }
+}
 
 /// Engine-level owner of fatal runtime poison state.
 ///
@@ -21,22 +90,39 @@ pub(crate) struct EnginePoisoner {
     poison_reason: Mutex<Option<SharedFatalError>>,
     /// One-shot wake for event waits that must notice engine poison.
     poison_event: Event,
+    /// Test-only count of sticky health observations.
+    #[cfg(test)]
+    health_checks: AtomicUsize,
+    /// Test-only count of poison-listener registrations.
+    #[cfg(test)]
+    listener_registrations: AtomicUsize,
+    /// Test-only count of prepare-or-poison helper entries.
+    #[cfg(test)]
+    prepare_wait_entries: AtomicUsize,
 }
 
 impl EnginePoisoner {
     /// Create a healthy engine poison component.
     #[inline]
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             poisoned: AtomicBool::new(false),
             poison_reason: Mutex::new(None),
             poison_event: Event::new(),
+            #[cfg(test)]
+            health_checks: AtomicUsize::new(0),
+            #[cfg(test)]
+            listener_registrations: AtomicUsize::new(0),
+            #[cfg(test)]
+            prepare_wait_entries: AtomicUsize::new(0),
         }
     }
 
     /// Returns the first fatal engine poison error, if runtime admission has been poisoned.
     #[inline]
     pub(crate) fn poison_error(&self) -> Option<Report<FatalError>> {
+        #[cfg(test)]
+        self.health_checks.fetch_add(1, Ordering::Relaxed);
         if !self.poisoned.load(Ordering::Acquire) {
             return None;
         }
@@ -61,7 +147,51 @@ impl EnginePoisoner {
     /// Registers for the one-shot engine poison event.
     #[inline]
     pub(crate) fn listener(&self) -> EventListener {
+        #[cfg(test)]
+        self.listener_registrations.fetch_add(1, Ordering::Relaxed);
         self.poison_event.listen()
+    }
+
+    /// Waits for primary progress without permitting engine poison to be lost.
+    ///
+    /// A registered primary listener is raced with the one-shot poison event
+    /// using sticky health checks before and after the race. A recheck-only
+    /// token performs only the sticky health check required before retry.
+    #[inline]
+    pub(crate) async fn wait_or_poison(&self, listener: PoisonAwareListener) -> FatalResult<()> {
+        let PoisonAwareListenerState::Registered(primary_listener) = listener.state else {
+            return self.ensure_healthy();
+        };
+
+        let poison_listener = self.listener();
+        self.ensure_healthy()?;
+        let primary_wait = primary_listener.fuse();
+        let poison_wait = poison_listener.fuse();
+        futures::pin_mut!(primary_wait);
+        futures::pin_mut!(poison_wait);
+        futures::select! {
+            () = primary_wait => (),
+            () = poison_wait => (),
+        }
+        self.ensure_healthy()
+    }
+
+    /// Records entry into the row prepare-or-poison slow path.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn record_prepare_wait_entry(&self) {
+        self.prepare_wait_entries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Returns health, listener, and prepare-slow-path observation counts.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn test_observation_counts(&self) -> (usize, usize, usize) {
+        (
+            self.health_checks.load(Ordering::Relaxed),
+            self.listener_registrations.load(Ordering::Relaxed),
+            self.prepare_wait_entries.load(Ordering::Relaxed),
+        )
     }
 
     /// Records one complete fatal report and returns this caller's shared error.
@@ -124,6 +254,16 @@ impl Component for EnginePoisoner {
         // Panic safety: this passive owner remains available through every
         // earlier component hook that can report fatal runtime state.
     }
+}
+
+/// Returns a shared healthy poisoner for tests that never publish poison.
+#[cfg(test)]
+#[inline]
+pub(crate) fn healthy_test_poisoner() -> &'static EnginePoisoner {
+    use std::sync::OnceLock;
+
+    static POISONER: OnceLock<EnginePoisoner> = OnceLock::new();
+    POISONER.get_or_init(EnginePoisoner::new)
 }
 
 #[cfg(test)]
@@ -298,6 +438,51 @@ mod tests {
                     .ensure_healthy()
                     .as_ref()
                     .is_err_and(|err| *err.current_context() == FatalError::CheckpointWrite)
+            );
+        });
+    }
+
+    #[test]
+    fn test_recheck_only_token_checks_health_without_registering_listener() {
+        smol::block_on(async {
+            let poisoner = EnginePoisoner::new();
+            let before = poisoner.test_observation_counts();
+
+            poisoner
+                .wait_or_poison(PoisonAwareListener::recheck_only())
+                .await
+                .unwrap();
+
+            let after = poisoner.test_observation_counts();
+            assert_eq!(after.0, before.0 + 1, "recheck-only must inspect health");
+            assert_eq!(
+                after.1, before.1,
+                "recheck-only must not register a poison listener"
+            );
+        });
+    }
+
+    #[test]
+    fn test_registered_token_races_primary_with_poison_protocol() {
+        smol::block_on(async {
+            let poisoner = EnginePoisoner::new();
+            let primary = Event::new();
+            let token = PoisonAwareListener::registered(primary.listen());
+            primary.notify(1);
+            let before = poisoner.test_observation_counts();
+
+            poisoner.wait_or_poison(token).await.unwrap();
+
+            let after = poisoner.test_observation_counts();
+            assert_eq!(
+                after.0,
+                before.0 + 2,
+                "registered wait must check health before and after selection"
+            );
+            assert_eq!(
+                after.1,
+                before.1 + 1,
+                "registered wait must install the poison side of the race"
             );
         });
     }

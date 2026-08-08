@@ -2,8 +2,10 @@ use super::claim::PendingClaimToken;
 use super::state::{FamilyLockState, LockScopeState};
 use super::{LockGrant, LockManager, LockMode, LockOwner, PendingStart};
 use crate::completion::Completion;
-use crate::error::OperationResult;
+use crate::error::{OperationOrFatalResult, OperationResult};
 use crate::id::ClaimNo;
+use crate::poison::EnginePoisoner;
+use futures::FutureExt;
 use std::mem::replace;
 use std::sync::Arc;
 
@@ -462,6 +464,7 @@ pub(super) enum PendingGuardState {
 /// becomes an accepted aggregate.
 pub(super) struct PendingClaimGuard<'a> {
     manager: &'a LockManager,
+    poisoner: &'a EnginePoisoner,
     family: &'a mut FamilyLockState,
     curr_scope: &'a mut LockScopeState,
     token: Option<PendingClaimToken>,
@@ -475,6 +478,7 @@ impl<'a> PendingClaimGuard<'a> {
     #[inline]
     pub(super) fn new(
         manager: &'a LockManager,
+        poisoner: &'a EnginePoisoner,
         family: &'a mut FamilyLockState,
         curr_scope: &'a mut LockScopeState,
         token: PendingClaimToken,
@@ -483,6 +487,7 @@ impl<'a> PendingClaimGuard<'a> {
     ) -> Self {
         Self {
             manager,
+            poisoner,
             family,
             curr_scope,
             token: Some(token),
@@ -513,7 +518,7 @@ impl<'a> PendingClaimGuard<'a> {
     /// other acquisitions. No timeout, lease, watchdog, or background
     /// reclamation is provided.
     #[inline]
-    pub(super) async fn acquire(mut self) -> OperationResult<LockGrant> {
+    pub(super) async fn acquire(mut self) -> OperationOrFatalResult<LockGrant> {
         assert!(
             !self.family_covered,
             "first-physical pending acquisition cannot already be family-covered"
@@ -539,7 +544,31 @@ impl<'a> PendingClaimGuard<'a> {
         {
             let node_id = *node_id;
             let completion = Arc::clone(completion);
-            let completion_result = completion.wait_take_result().await;
+            let poisoner = self.poisoner;
+            let poison_listener = poisoner.listener();
+            #[cfg(test)]
+            tests::run_pending_claim_test_hook(
+                tests::PendingClaimTestPhase::ListenerRegistered,
+                poisoner,
+            );
+            poisoner.ensure_healthy()?;
+            let completion_wait = completion.wait_take_result().fuse();
+            let poison_wait = poison_listener.fuse();
+            futures::pin_mut!(completion_wait);
+            futures::pin_mut!(poison_wait);
+            let completion_result = futures::select! {
+                result = completion_wait => Some(result),
+                () = poison_wait => None,
+            };
+            #[cfg(test)]
+            tests::run_pending_claim_test_hook(
+                tests::PendingClaimTestPhase::CompletionSelected,
+                poisoner,
+            );
+            poisoner.ensure_healthy()?;
+            let completion_result = completion_result.unwrap_or_else(|| {
+                panic!("engine poison listener fired while sticky health remained healthy")
+            });
             assert!(
                 completion_result.is_ok(),
                 "lock waiter success-only completion carried an error"
@@ -552,9 +581,21 @@ impl<'a> PendingClaimGuard<'a> {
             let token = self.token.as_ref().unwrap_or_else(|| {
                 panic!("waiting pending claim guard lost its token before observation")
             });
+            #[cfg(test)]
+            tests::run_pending_claim_test_hook(
+                tests::PendingClaimTestPhase::BeforeProvisionalObservation,
+                poisoner,
+            );
             self.manager
                 .observe_pending(token, self.requested_mode, node_id);
             self.state = PendingGuardState::FreshGranted;
+            poisoner.ensure_healthy()?;
+            #[cfg(test)]
+            tests::run_pending_claim_test_hook(
+                tests::PendingClaimTestPhase::AfterAcceptHealthCheck,
+                poisoner,
+            );
+            return Ok(self.accept()?);
         }
 
         if !self.transfer_started {
@@ -562,7 +603,7 @@ impl<'a> PendingClaimGuard<'a> {
             // records. Covered claims published them in `acquire_covered`.
             self.publish_local();
         }
-        self.accept()
+        Ok(self.accept()?)
     }
 
     #[inline]
@@ -673,10 +714,68 @@ fn pending_guard_state_label(state: &PendingGuardState) -> &'static str {
 #[cfg(test)]
 pub(in crate::lock) mod tests {
     use super::*;
+    use crate::error::FatalError;
     use crate::id::{SessionID, TableID, TrxID};
     use crate::lock::{FamilyLockAuthority, LockResource};
+    use crate::poison::healthy_test_poisoner;
+    use error_stack::Report;
+    use std::cell::Cell;
     use std::mem::size_of;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(in crate::lock) enum PendingClaimTestPhase {
+        ListenerRegistered,
+        CompletionSelected,
+        BeforeProvisionalObservation,
+        AfterAcceptHealthCheck,
+    }
+
+    thread_local! {
+        static POISON_PHASE: Cell<Option<PendingClaimTestPhase>> = const { Cell::new(None) };
+    }
+
+    pub(in crate::lock) struct PendingClaimTestHookGuard;
+
+    impl Drop for PendingClaimTestHookGuard {
+        fn drop(&mut self) {
+            POISON_PHASE.set(None);
+        }
+    }
+
+    #[inline]
+    pub(in crate::lock) fn poison_pending_claim_at(
+        phase: PendingClaimTestPhase,
+    ) -> PendingClaimTestHookGuard {
+        POISON_PHASE.with(|slot| {
+            assert!(
+                slot.replace(Some(phase)).is_none(),
+                "pending-claim test hook must not be nested"
+            );
+        });
+        PendingClaimTestHookGuard
+    }
+
+    #[inline]
+    pub(super) fn run_pending_claim_test_hook(
+        phase: PendingClaimTestPhase,
+        poisoner: &EnginePoisoner,
+    ) {
+        let should_poison = POISON_PHASE.with(|slot| {
+            if slot.get() == Some(phase) {
+                slot.set(None);
+                true
+            } else {
+                false
+            }
+        });
+        if should_poison {
+            poisoner.poison(
+                Report::new(FatalError::StorageIo)
+                    .attach(format!("pending-claim test poison at phase={phase:?}")),
+            );
+        }
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(in crate::lock) struct WaitSlabSnapshot {
@@ -1023,6 +1122,7 @@ pub(in crate::lock) mod tests {
             };
             let mut guard = PendingClaimGuard::new(
                 &manager,
+                healthy_test_poisoner(),
                 family,
                 curr_scope,
                 guard_token,
@@ -1087,6 +1187,7 @@ pub(in crate::lock) mod tests {
 
         let mut guard = PendingClaimGuard::new(
             &manager,
+            healthy_test_poisoner(),
             family,
             curr_scope,
             pending,

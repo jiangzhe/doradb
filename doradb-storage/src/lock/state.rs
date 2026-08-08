@@ -4,9 +4,10 @@ use super::{
     LockFamily, LockGrant, LockManager, LockMode, LockOwner, LockResource, LockScope,
     lock_family_conflict_err,
 };
-use crate::error::OperationResult;
+use crate::error::{OperationOrFatalResult, OperationResult};
 use crate::id::{ClaimNo, SessionID, TableID, TrxID};
 use crate::map::FastHashMap;
+use crate::poison::EnginePoisoner;
 use std::array::from_fn;
 
 /// Authoritative cleanup index for one exact logical lock scope.
@@ -173,9 +174,10 @@ impl FamilyLockState {
         &mut self,
         curr_scope: &mut LockScopeState,
         lock_manager: &LockManager,
+        poisoner: &EnginePoisoner,
         resource: LockResource,
         mode: LockMode,
-    ) -> OperationResult<LockGrant> {
+    ) -> OperationOrFatalResult<LockGrant> {
         // 1. Validate the request before consulting either owner-side index.
         self.assert_scope_family(curr_scope);
         mode.assert_valid_for(resource);
@@ -196,7 +198,8 @@ impl FamilyLockState {
                     existing.mode,
                     mode,
                     curr_scope.owner,
-                ));
+                )
+                .into());
             }
 
             // Other scopes remain independent logical owners. Requiring each
@@ -266,10 +269,17 @@ impl FamilyLockState {
         if !family_covered {
             self.stats.manager_acquires += 1;
         }
-        let guard =
-            PendingClaimGuard::new(lock_manager, self, curr_scope, token, mode, family_covered);
+        let guard = PendingClaimGuard::new(
+            lock_manager,
+            poisoner,
+            self,
+            curr_scope,
+            token,
+            mode,
+            family_covered,
+        );
         if family_covered {
-            guard.acquire_covered()
+            Ok(guard.acquire_covered()?)
         } else {
             guard.acquire().await
         }
@@ -809,12 +819,13 @@ impl TransactionLockState {
     pub(crate) async fn acquire(
         &mut self,
         lock_manager: &LockManager,
+        poisoner: &EnginePoisoner,
         resource: LockResource,
         mode: LockMode,
-    ) -> OperationResult<LockGrant> {
+    ) -> OperationOrFatalResult<LockGrant> {
         self.authority
             .family
-            .acquire(&mut self.curr_scope, lock_manager, resource, mode)
+            .acquire(&mut self.curr_scope, lock_manager, poisoner, resource, mode)
             .await
     }
 
@@ -844,44 +855,72 @@ impl TransactionLockState {
     }
 }
 
-/// Fixed-capacity rollback guard for newly accepted owner-side claims.
+/// Fixed-capacity rollback guard for one multi-resource lock preparation.
+///
+/// While armed, the guard records only claims accepted as [`LockGrant::Fresh`].
+/// If a later acquisition, validation step, poison observation, or caller
+/// cancellation ends the attempt, `Drop` releases that fresh prefix in reverse
+/// order. Claims that existed before the attempt return [`LockGrant::Existing`]
+/// and are deliberately not recorded or released.
+///
+/// A successful caller invokes [`Self::disarm`] to transfer the accepted claims
+/// to the enclosing scope's normal lifecycle cleanup. The fixed capacity avoids
+/// allocation and declares the maximum fresh prefix expected by the caller.
 pub(crate) struct FreshClaimsGuard<'a, const N: usize> {
     family: &'a mut FamilyLockState,
     curr_scope: &'a mut LockScopeState,
     lock_manager: &'a LockManager,
+    poisoner: &'a EnginePoisoner,
     fresh: [Option<ClaimToken>; N],
     len: usize,
     armed: bool,
 }
 
 impl<'a, const N: usize> FreshClaimsGuard<'a, N> {
-    /// Creates an armed group around one exact scope.
+    /// Creates an armed preparation group around one exact scope.
+    ///
+    /// The stored poisoner is forwarded to every acquisition. The guard adds
+    /// no poison-specific rollback state; Fatal propagation uses the same
+    /// ordinary armed-drop cleanup as every other unsuccessful attempt.
     #[inline]
     pub(crate) fn new(
         family: &'a mut FamilyLockState,
         curr_scope: &'a mut LockScopeState,
         lock_manager: &'a LockManager,
+        poisoner: &'a EnginePoisoner,
     ) -> Self {
         Self {
             family,
             curr_scope,
             lock_manager,
+            poisoner,
             fresh: from_fn(|_| None),
             len: 0,
             armed: true,
         }
     }
 
-    /// Acquires one claim and records only a fresh accepted identity.
+    /// Acquires one claim and records it only when a new exact claim is accepted.
+    ///
+    /// A family-covered publication still returns [`LockGrant::Fresh`] and is
+    /// therefore rolled back with this attempt. Reuse or conversion of an
+    /// existing exact claim returns [`LockGrant::Existing`] and remains owned
+    /// by its pre-existing scope lifecycle.
     #[inline]
     pub(crate) async fn acquire(
         &mut self,
         resource: LockResource,
         mode: LockMode,
-    ) -> OperationResult<LockGrant> {
+    ) -> OperationOrFatalResult<LockGrant> {
         let grant = self
             .family
-            .acquire(self.curr_scope, self.lock_manager, resource, mode)
+            .acquire(
+                self.curr_scope,
+                self.lock_manager,
+                self.poisoner,
+                resource,
+                mode,
+            )
             .await?;
         if grant == LockGrant::Fresh {
             let token = self.curr_scope.claim_token(resource).unwrap_or_else(|| {
@@ -910,7 +949,7 @@ impl<'a, const N: usize> FreshClaimsGuard<'a, N> {
         Ok(grant)
     }
 
-    /// Leaves every accepted claim owned by its enclosing lifecycle carrier.
+    /// Commits the preparation by leaving its claims to enclosing scope cleanup.
     #[inline]
     pub(crate) fn disarm(&mut self) {
         self.armed = false;
@@ -937,9 +976,12 @@ impl<const N: usize> Drop for FreshClaimsGuard<'_, N> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::OperationError;
+    use crate::error::{FatalError, OperationError, OperationOrFatalError};
     use crate::id::{OperationID, SessionOperationKey};
     use crate::lock::tests::{LockDebugEntryState, TestLockOwner, debug_snapshot};
+    use crate::lock::wait::tests::{PendingClaimTestPhase, poison_pending_claim_at};
+    use crate::poison::EnginePoisoner;
+    use crate::poison::healthy_test_poisoner;
     use futures::{FutureExt, poll};
     use std::collections::BTreeMap;
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -948,6 +990,15 @@ mod tests {
 
     fn table_data(id: u64) -> LockResource {
         LockResource::TableData(TableID::new(id))
+    }
+
+    fn operation_report(error: OperationOrFatalError) -> error_stack::Report<OperationError> {
+        match error {
+            OperationOrFatalError::Operation(report) => report,
+            OperationOrFatalError::Fatal(report) => {
+                panic!("shared healthy test poisoner returned Fatal: {report:?}")
+            }
+        }
     }
 
     fn owner_count(manager: &LockManager, owner: LockOwner) -> usize {
@@ -1060,7 +1111,13 @@ mod tests {
             {
                 let (family, session_scope) = authority.parts();
                 family
-                    .acquire(session_scope, &manager, resource, LockMode::Exclusive)
+                    .acquire(
+                        session_scope,
+                        &manager,
+                        healthy_test_poisoner(),
+                        resource,
+                        LockMode::Exclusive,
+                    )
                     .await
                     .unwrap();
             }
@@ -1068,7 +1125,13 @@ mod tests {
             let mut trx = LockScopeState::new(LockOwner::transaction(session_id, trx_id));
             authority
                 .family
-                .acquire(&mut trx, &manager, resource, LockMode::Shared)
+                .acquire(
+                    &mut trx,
+                    &manager,
+                    healthy_test_poisoner(),
+                    resource,
+                    LockMode::Shared,
+                )
                 .await
                 .unwrap();
             assert_eq!(authority.family.stats.family_covered_publications, 1);
@@ -1094,11 +1157,23 @@ mod tests {
             let mut transaction =
                 LockScopeState::new(LockOwner::transaction(session_id, TrxID::new(112)));
             family
-                .acquire(&mut operation, &manager, resource, LockMode::Exclusive)
+                .acquire(
+                    &mut operation,
+                    &manager,
+                    healthy_test_poisoner(),
+                    resource,
+                    LockMode::Exclusive,
+                )
                 .await
                 .unwrap();
             family
-                .acquire(&mut transaction, &manager, resource, LockMode::Shared)
+                .acquire(
+                    &mut transaction,
+                    &manager,
+                    healthy_test_poisoner(),
+                    resource,
+                    LockMode::Shared,
+                )
                 .await
                 .unwrap();
 
@@ -1127,13 +1202,20 @@ mod tests {
                 .acquire(
                     session_scope,
                     &manager,
+                    healthy_test_poisoner(),
                     parent_resource,
                     LockMode::Exclusive,
                 )
                 .await
                 .unwrap();
             family
-                .acquire(&mut transaction, &manager, child_resource, LockMode::Shared)
+                .acquire(
+                    &mut transaction,
+                    &manager,
+                    healthy_test_poisoner(),
+                    child_resource,
+                    LockMode::Shared,
+                )
                 .await
                 .unwrap();
 
@@ -1155,13 +1237,25 @@ mod tests {
             let resource = table_data(20);
             let (family, session_scope) = authority.parts();
             family
-                .acquire(session_scope, &manager, resource, LockMode::Exclusive)
+                .acquire(
+                    session_scope,
+                    &manager,
+                    healthy_test_poisoner(),
+                    resource,
+                    LockMode::Exclusive,
+                )
                 .await
                 .unwrap();
             let first = session_scope.claim_token(resource).unwrap();
             assert_eq!(
                 family
-                    .acquire(session_scope, &manager, resource, LockMode::Shared)
+                    .acquire(
+                        session_scope,
+                        &manager,
+                        healthy_test_poisoner(),
+                        resource,
+                        LockMode::Shared,
+                    )
                     .await
                     .unwrap(),
                 LockGrant::Existing
@@ -1169,7 +1263,13 @@ mod tests {
             assert_eq!(owner_count(&manager, session_scope.owner()), 1);
             assert!(family.release(session_scope, &manager, resource));
             family
-                .acquire(session_scope, &manager, resource, LockMode::Shared)
+                .acquire(
+                    session_scope,
+                    &manager,
+                    healthy_test_poisoner(),
+                    resource,
+                    LockMode::Shared,
+                )
                 .await
                 .unwrap();
             assert_ne!(
@@ -1191,11 +1291,23 @@ mod tests {
             {
                 let (family, session_scope) = authority.parts();
                 family
-                    .acquire(session_scope, &manager, resource, LockMode::Exclusive)
+                    .acquire(
+                        session_scope,
+                        &manager,
+                        healthy_test_poisoner(),
+                        resource,
+                        LockMode::Exclusive,
+                    )
                     .await
                     .unwrap();
                 family
-                    .acquire(session_scope, &manager, resource, LockMode::Shared)
+                    .acquire(
+                        session_scope,
+                        &manager,
+                        healthy_test_poisoner(),
+                        resource,
+                        LockMode::Shared,
+                    )
                     .await
                     .unwrap();
             }
@@ -1203,7 +1315,13 @@ mod tests {
                 LockScopeState::new(LockOwner::transaction(session_id, TrxID::new(221)));
             authority
                 .family
-                .acquire(&mut trx_scope, &manager, resource, LockMode::Shared)
+                .acquire(
+                    &mut trx_scope,
+                    &manager,
+                    healthy_test_poisoner(),
+                    resource,
+                    LockMode::Shared,
+                )
                 .await
                 .unwrap();
             authority.family.close_scope(&mut trx_scope, &manager);
@@ -1243,15 +1361,30 @@ mod tests {
             let resource = table_data(30);
             let (family, session_scope) = authority.parts();
             family
-                .acquire(session_scope, &manager, resource, LockMode::IntentExclusive)
+                .acquire(
+                    session_scope,
+                    &manager,
+                    healthy_test_poisoner(),
+                    resource,
+                    LockMode::IntentExclusive,
+                )
                 .await
                 .unwrap();
             let mut trx = LockScopeState::new(LockOwner::transaction(session_id, TrxID::new(31)));
             let err = family
-                .acquire(&mut trx, &manager, resource, LockMode::Shared)
+                .acquire(
+                    &mut trx,
+                    &manager,
+                    healthy_test_poisoner(),
+                    resource,
+                    LockMode::Shared,
+                )
                 .await
                 .unwrap_err();
-            assert_eq!(*err.current_context(), OperationError::LockFamilyConflict);
+            assert_eq!(
+                *operation_report(err).current_context(),
+                OperationError::LockFamilyConflict
+            );
             assert_eq!(owner_count(&manager, trx.owner()), 1);
             family.close_scope(session_scope, &manager);
         });
@@ -1272,15 +1405,33 @@ mod tests {
 
             let (family, session_scope) = authority.parts();
             family
-                .acquire(session_scope, &manager, resource, LockMode::Exclusive)
+                .acquire(
+                    session_scope,
+                    &manager,
+                    healthy_test_poisoner(),
+                    resource,
+                    LockMode::Exclusive,
+                )
                 .await
                 .unwrap();
             family
-                .acquire(&mut operation, &manager, resource, LockMode::Shared)
+                .acquire(
+                    &mut operation,
+                    &manager,
+                    healthy_test_poisoner(),
+                    resource,
+                    LockMode::Shared,
+                )
                 .await
                 .unwrap();
             family
-                .acquire(&mut transaction, &manager, resource, LockMode::IntentShared)
+                .acquire(
+                    &mut transaction,
+                    &manager,
+                    healthy_test_poisoner(),
+                    resource,
+                    LockMode::IntentShared,
+                )
                 .await
                 .unwrap();
             assert_eq!(family.stats.family_covered_publications, 2);
@@ -1309,12 +1460,24 @@ mod tests {
             let resource = table_data(50);
             let (family, session_scope) = authority.parts();
             family
-                .acquire(session_scope, &manager, resource, LockMode::IntentShared)
+                .acquire(
+                    session_scope,
+                    &manager,
+                    healthy_test_poisoner(),
+                    resource,
+                    LockMode::IntentShared,
+                )
                 .await
                 .unwrap();
             let claim_no = session_scope.claim_token(resource).unwrap().claim_no;
             family
-                .acquire(session_scope, &manager, resource, LockMode::IntentExclusive)
+                .acquire(
+                    session_scope,
+                    &manager,
+                    healthy_test_poisoner(),
+                    resource,
+                    LockMode::IntentExclusive,
+                )
                 .await
                 .unwrap();
             assert_eq!(
@@ -1324,11 +1487,17 @@ mod tests {
             assert!(session_scope.covers(resource, LockMode::IntentExclusive));
 
             let err = family
-                .acquire(session_scope, &manager, resource, LockMode::Shared)
+                .acquire(
+                    session_scope,
+                    &manager,
+                    healthy_test_poisoner(),
+                    resource,
+                    LockMode::Shared,
+                )
                 .await
                 .unwrap_err();
             assert_eq!(
-                *err.current_context(),
+                *operation_report(err).current_context(),
                 OperationError::LockConversionNotSupported
             );
             assert_eq!(
@@ -1357,8 +1526,13 @@ mod tests {
             let mut authority = FamilyLockAuthority::new(SessionID::new(61));
             let (family, session_scope) = authority.parts();
             let pending_owner = session_scope.owner();
-            let mut acquire =
-                Box::pin(family.acquire(session_scope, &manager, resource, LockMode::Shared));
+            let mut acquire = Box::pin(family.acquire(
+                session_scope,
+                &manager,
+                healthy_test_poisoner(),
+                resource,
+                LockMode::Shared,
+            ));
             assert!(matches!(poll!(acquire.as_mut()), Poll::Pending));
             let waiting = debug_snapshot(&manager)
                 .entries
@@ -1387,13 +1561,25 @@ mod tests {
             let resource = table_data(70);
             let (family, session_scope) = authority.parts();
             family
-                .acquire(session_scope, &manager, resource, LockMode::Shared)
+                .acquire(
+                    session_scope,
+                    &manager,
+                    healthy_test_poisoner(),
+                    resource,
+                    LockMode::Shared,
+                )
                 .await
                 .unwrap();
             let stale = session_scope.claim_token(resource).unwrap();
             family.release_token(session_scope, &manager, &stale);
             family
-                .acquire(session_scope, &manager, resource, LockMode::Shared)
+                .acquire(
+                    session_scope,
+                    &manager,
+                    healthy_test_poisoner(),
+                    resource,
+                    LockMode::Shared,
+                )
                 .await
                 .unwrap();
             let current = session_scope.claim_token(resource).unwrap();
@@ -1416,7 +1602,13 @@ mod tests {
             let resource = table_data(710);
             let (family, session_scope) = authority.parts();
             family
-                .acquire(session_scope, &manager, resource, LockMode::Shared)
+                .acquire(
+                    session_scope,
+                    &manager,
+                    healthy_test_poisoner(),
+                    resource,
+                    LockMode::Shared,
+                )
                 .await
                 .unwrap();
             assert_manager_agreement(family, &manager);
@@ -1442,11 +1634,22 @@ mod tests {
             let fresh_resource = table_data(81);
             let (family, session_scope) = authority.parts();
             family
-                .acquire(session_scope, &manager, existing, LockMode::Exclusive)
+                .acquire(
+                    session_scope,
+                    &manager,
+                    healthy_test_poisoner(),
+                    existing,
+                    LockMode::Exclusive,
+                )
                 .await
                 .unwrap();
             {
-                let mut fresh = FreshClaimsGuard::<2>::new(family, session_scope, &manager);
+                let mut fresh = FreshClaimsGuard::<2>::new(
+                    family,
+                    session_scope,
+                    &manager,
+                    healthy_test_poisoner(),
+                );
                 assert_eq!(
                     fresh.acquire(existing, LockMode::Shared).await.unwrap(),
                     LockGrant::Existing
@@ -1463,6 +1666,187 @@ mod tests {
             assert!(!session_scope.covers(fresh_resource, LockMode::Shared));
             assert_eq!(owner_count(&manager, session_scope.owner()), 1);
             family.close_scope(session_scope, &manager);
+        });
+    }
+
+    fn assert_fatal_storage_io(error: OperationOrFatalError) {
+        match error {
+            OperationOrFatalError::Fatal(report) => {
+                assert_eq!(*report.current_context(), FatalError::StorageIo);
+                assert!(
+                    format!("{report:?}").contains("pending-claim test poison"),
+                    "fatal report lost its source-bearing test attachment: {report:?}"
+                );
+            }
+            OperationOrFatalError::Operation(report) => {
+                panic!("poisoned lock wait returned Operation: {report:?}")
+            }
+        }
+    }
+
+    fn run_pending_claim_poison_phase(phase: PendingClaimTestPhase) {
+        smol::block_on(async {
+            let manager = LockManager::new();
+            let resource = table_data(850 + phase as u64);
+            let mut blocker = TestLockOwner::new(LockOwner::session_explicit(SessionID::new(850)));
+            blocker
+                .acquire(&manager, resource, LockMode::Exclusive)
+                .await
+                .unwrap();
+
+            let poisoner = EnginePoisoner::new();
+            let mut authority = FamilyLockAuthority::new(SessionID::new(851));
+            let (family, scope) = authority.parts();
+            let _hook = poison_pending_claim_at(phase);
+            let mut acquire =
+                Box::pin(family.acquire(scope, &manager, &poisoner, resource, LockMode::Shared));
+            let first_poll = poll!(acquire.as_mut());
+            let error = if phase == PendingClaimTestPhase::ListenerRegistered {
+                match first_poll {
+                    Poll::Ready(result) => result,
+                    Poll::Pending => panic!("listener-phase poison must complete the first poll"),
+                }
+            } else {
+                assert!(first_poll.is_pending());
+                assert!(blocker.release(&manager, resource));
+                acquire.as_mut().await
+            }
+            .unwrap_err();
+            assert_fatal_storage_io(error);
+            drop(acquire);
+
+            if phase == PendingClaimTestPhase::ListenerRegistered {
+                assert!(blocker.release(&manager, resource));
+            }
+            blocker.close(&manager);
+            family.assert_empty();
+            scope.assert_cleared();
+            assert!(debug_snapshot(&manager).entries.is_empty());
+        });
+    }
+
+    #[test]
+    fn pending_claim_poison_cancels_every_wait_to_accept_race() {
+        for phase in [
+            PendingClaimTestPhase::ListenerRegistered,
+            PendingClaimTestPhase::CompletionSelected,
+            PendingClaimTestPhase::BeforeProvisionalObservation,
+        ] {
+            run_pending_claim_poison_phase(phase);
+        }
+    }
+
+    #[test]
+    fn poison_after_final_health_check_does_not_revoke_accepted_claim() {
+        smol::block_on(async {
+            let manager = LockManager::new();
+            let resource = table_data(855);
+            let mut blocker = TestLockOwner::new(LockOwner::session_explicit(SessionID::new(855)));
+            blocker
+                .acquire(&manager, resource, LockMode::Exclusive)
+                .await
+                .unwrap();
+
+            let poisoner = EnginePoisoner::new();
+            let mut authority = FamilyLockAuthority::new(SessionID::new(856));
+            let (family, scope) = authority.parts();
+            let _hook = poison_pending_claim_at(PendingClaimTestPhase::AfterAcceptHealthCheck);
+            let mut acquire =
+                Box::pin(family.acquire(scope, &manager, &poisoner, resource, LockMode::Shared));
+            assert!(poll!(acquire.as_mut()).is_pending());
+            assert!(blocker.release(&manager, resource));
+            assert_eq!(acquire.as_mut().await.unwrap(), LockGrant::Fresh);
+            drop(acquire);
+
+            assert!(poisoner.ensure_healthy().is_err());
+            assert!(scope.covers(resource, LockMode::Shared));
+            assert_eq!(owner_count(&manager, scope.owner()), 1);
+            blocker.close(&manager);
+            family.close_scope(scope, &manager);
+            assert!(debug_snapshot(&manager).entries.is_empty());
+        });
+    }
+
+    #[test]
+    fn fresh_group_poison_rolls_back_only_its_fresh_prefix() {
+        smol::block_on(async {
+            let manager = LockManager::new();
+            let existing = table_data(860);
+            let fresh_resource = table_data(861);
+            let blocked_resource = table_data(862);
+            let poisoner = EnginePoisoner::new();
+            let mut authority = FamilyLockAuthority::new(SessionID::new(860));
+            let (family, scope) = authority.parts();
+            family
+                .acquire(scope, &manager, &poisoner, existing, LockMode::Shared)
+                .await
+                .unwrap();
+
+            let mut blocker = TestLockOwner::new(LockOwner::session_explicit(SessionID::new(861)));
+            blocker
+                .acquire(&manager, blocked_resource, LockMode::Exclusive)
+                .await
+                .unwrap();
+            {
+                let mut fresh = FreshClaimsGuard::<2>::new(family, scope, &manager, &poisoner);
+                assert_eq!(
+                    fresh
+                        .acquire(fresh_resource, LockMode::Shared)
+                        .await
+                        .unwrap(),
+                    LockGrant::Fresh
+                );
+                let _hook = poison_pending_claim_at(PendingClaimTestPhase::ListenerRegistered);
+                let error = fresh
+                    .acquire(blocked_resource, LockMode::Shared)
+                    .await
+                    .unwrap_err();
+                assert_fatal_storage_io(error);
+            }
+
+            assert!(scope.covers(existing, LockMode::Shared));
+            assert!(!scope.covers(fresh_resource, LockMode::Shared));
+            assert!(!scope.covers(blocked_resource, LockMode::Shared));
+            assert_eq!(owner_count(&manager, scope.owner()), 1);
+            assert!(blocker.release(&manager, blocked_resource));
+            blocker.close(&manager);
+            family.close_scope(scope, &manager);
+            assert!(debug_snapshot(&manager).entries.is_empty());
+        });
+    }
+
+    #[test]
+    fn immediate_and_family_covered_acquires_skip_poison_observation() {
+        smol::block_on(async {
+            let manager = LockManager::new();
+            let poisoner = EnginePoisoner::new();
+            let session_id = SessionID::new(870);
+            let resource = table_data(870);
+            let mut family = FamilyLockState::new(LockFamily::new(session_id));
+            let mut first = LockScopeState::new(LockOwner::session_explicit(session_id));
+            let mut second =
+                LockScopeState::new(LockOwner::transaction(session_id, TrxID::new(870)));
+
+            let before = poisoner.test_observation_counts();
+            assert_eq!(
+                family
+                    .acquire(&mut first, &manager, &poisoner, resource, LockMode::Shared,)
+                    .await
+                    .unwrap(),
+                LockGrant::Fresh
+            );
+            assert_eq!(
+                family
+                    .acquire(&mut second, &manager, &poisoner, resource, LockMode::Shared,)
+                    .await
+                    .unwrap(),
+                LockGrant::Fresh
+            );
+            assert_eq!(poisoner.test_observation_counts(), before);
+
+            family.close_scope(&mut second, &manager);
+            family.close_scope(&mut first, &manager);
+            assert!(debug_snapshot(&manager).entries.is_empty());
         });
     }
 
@@ -1540,7 +1924,13 @@ mod tests {
                     };
                     let next_claim_no = family.next_claim_no;
                     let result = family
-                        .acquire(&mut scopes[scope_index], &manager, resource, requested)
+                        .acquire(
+                            &mut scopes[scope_index],
+                            &manager,
+                            healthy_test_poisoner(),
+                            resource,
+                            requested,
+                        )
                         .now_or_never()
                         .expect("reference-model acquisition unexpectedly waited");
                     if expected_success {
@@ -1637,11 +2027,23 @@ mod tests {
                 LockScopeState::new(LockOwner::transaction(session_id, TrxID::new(921)));
             let (family, outer) = authority.parts();
             family
-                .acquire(outer, &manager, resource, LockMode::Exclusive)
+                .acquire(
+                    outer,
+                    &manager,
+                    healthy_test_poisoner(),
+                    resource,
+                    LockMode::Exclusive,
+                )
                 .await
                 .unwrap();
             family
-                .acquire(&mut child, &manager, resource, LockMode::Shared)
+                .acquire(
+                    &mut child,
+                    &manager,
+                    healthy_test_poisoner(),
+                    resource,
+                    LockMode::Shared,
+                )
                 .await
                 .unwrap();
             let family_before = family_snapshot(family);

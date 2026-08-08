@@ -6,7 +6,7 @@ use crate::catalog::table::{TableColumnLayout, TableMetadata};
 use crate::catalog::{
     ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, catalog_table_id_from_slot,
 };
-use crate::error::{RuntimeError, RuntimeResult};
+use crate::error::{MultiDomainResultExt, RuntimeError, RuntimeOrFatalResult, RuntimeResult};
 use crate::id::TableID;
 use crate::row::ops::DeleteMvcc;
 use crate::row::{Row, RowRead};
@@ -76,7 +76,7 @@ impl Tables<'_> {
         &self,
         stmt: &mut Statement<'_>,
         obj: &TableObject,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         let cols = vec![Val::from(obj.table_id), Val::from(obj.next_index_no)];
         stmt.catalog_insert_mvcc(self.table, cols)
             .await
@@ -89,7 +89,7 @@ impl Tables<'_> {
         &self,
         stmt: &mut Statement<'_>,
         id: TableID,
-    ) -> RuntimeResult<bool> {
+    ) -> RuntimeOrFatalResult<bool> {
         let key_vals = [Val::from(id)];
         let res = stmt
             .catalog_delete_primary_key_mvcc(self.table, PK_NO_TABLES, &key_vals, true)

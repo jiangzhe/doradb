@@ -445,6 +445,11 @@ retains its queued request or provisional physical reservation and may block
 other acquisitions. No timeout, lease, watchdog, or background reclamation is
 provided.
 
+Only an acquisition that actually enters `Waiting` races engine poison. The
+canonical register/recheck sequence, acceptance boundary, exact cancellation
+policy, clean-shutdown behavior, and fast-path exclusions are defined in
+[Shutdown and Engine Poison](shutdown-and-poison.md#logical-lock-acquisition).
+
 ### Current complexity
 
 Let `M = 4` be the fixed mode count, `K` the number of waiters promoted by one

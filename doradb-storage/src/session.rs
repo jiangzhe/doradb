@@ -13,7 +13,8 @@ use crate::engine::{EngineAdmission, EngineCore, EngineLifecycle};
 use crate::error::{
     CompletionErrorBridge, CompletionResult, DiscloseError, DiscloseResultExt, FatalError,
     LifecycleError, LifecycleOrFatalError, LifecycleOrFatalResult, LifecycleResult,
-    MultiDomainResultExt, OperationError, OperationResult, Result, RuntimeError,
+    MultiDomainResultExt, OperationError, OperationOrFatalResult, OperationResult, Result,
+    RuntimeError,
 };
 use crate::id::{OperationID, SessionID, SessionOperationKey, TableID, TrxID};
 use crate::lock::{
@@ -129,7 +130,7 @@ impl PreparedDdlScope {
         mut operation: SessionOperationPin,
         table_id: TableID,
         catalog_targets: &[TableID],
-    ) -> OperationResult<Self> {
+    ) -> OperationOrFatalResult<Self> {
         operation
             .acquire_ddl_create(table_id, catalog_targets)
             .await?;
@@ -142,7 +143,7 @@ impl PreparedDdlScope {
         mut operation: SessionOperationPin,
         table_id: TableID,
         catalog_targets: &[TableID],
-    ) -> OperationResult<Self> {
+    ) -> OperationOrFatalResult<Self> {
         operation
             .acquire_ddl_existing(table_id, catalog_targets)
             .await?;
@@ -155,7 +156,7 @@ impl PreparedDdlScope {
         mut operation: SessionOperationPin,
         table_id: TableID,
         catalog_targets: &[TableID],
-    ) -> OperationResult<Self> {
+    ) -> OperationOrFatalResult<Self> {
         operation
             .acquire_ddl_existing(table_id, catalog_targets)
             .await?;
@@ -168,7 +169,7 @@ impl PreparedDdlScope {
         mut operation: SessionOperationPin,
         table_id: TableID,
         catalog_targets: &[TableID],
-    ) -> OperationResult<Self> {
+    ) -> OperationOrFatalResult<Self> {
         operation
             .acquire_ddl_existing(table_id, catalog_targets)
             .await?;
@@ -267,7 +268,7 @@ impl PreparedMaintenanceScope {
     pub(crate) async fn table(
         mut operation: SessionOperationPin,
         table_id: TableID,
-    ) -> OperationResult<Self> {
+    ) -> OperationOrFatalResult<Self> {
         operation.acquire_maintenance_table(table_id).await?;
         Ok(Self { operation })
     }
@@ -1689,9 +1690,10 @@ impl SessionOperationPin {
     }
 
     #[inline]
-    fn lock_parts(&mut self) -> (&mut FamilyLockState, &mut LockScopeState) {
+    fn operation_lock_parts(&mut self) -> (&EngineCore, &mut FamilyLockState, &mut LockScopeState) {
         let key = self.key();
         let expected_owner = self.operation_lock_owner();
+        let engine = self.runtime.core();
         let authority = self
             .authority
             .as_deref_mut()
@@ -1704,7 +1706,18 @@ impl SessionOperationPin {
             "operation scope identity mismatch: key={key}, expected_owner={expected_owner}, actual_owner={}",
             curr_scope.owner()
         );
-        (authority.family_mut(), curr_scope)
+        (engine, authority.family_mut(), curr_scope)
+    }
+
+    #[inline]
+    fn session_lock_parts(&mut self) -> (&EngineCore, &mut FamilyLockState, &mut LockScopeState) {
+        let key = self.key();
+        let engine = self.runtime.core();
+        let authority = self.authority.as_deref_mut().unwrap_or_else(|| {
+            panic!("explicit lock operation must retain family authority: key={key}")
+        });
+        let (family, session_scope) = authority.parts();
+        (engine, family, session_scope)
     }
 
     #[inline]
@@ -1712,10 +1725,14 @@ impl SessionOperationPin {
         &mut self,
         table_id: TableID,
         catalog_targets: &[TableID],
-    ) -> OperationResult<()> {
-        let lock_manager = self.runtime.lock_manager().clone();
-        let (family, curr_scope) = self.lock_parts();
-        let mut fresh = FreshClaimsGuard::<16>::new(family, curr_scope, &lock_manager);
+    ) -> OperationOrFatalResult<()> {
+        let (engine, family, curr_scope) = self.operation_lock_parts();
+        let mut fresh = FreshClaimsGuard::<16>::new(
+            family,
+            curr_scope,
+            engine.lock_manager(),
+            &engine.poisoner,
+        );
         fresh
             .acquire(LockResource::TableMetadata(table_id), LockMode::Exclusive)
             .await?;
@@ -1744,10 +1761,14 @@ impl SessionOperationPin {
         &mut self,
         table_id: TableID,
         catalog_targets: &[TableID],
-    ) -> OperationResult<()> {
-        let lock_manager = self.runtime.lock_manager().clone();
-        let (family, curr_scope) = self.lock_parts();
-        let mut fresh = FreshClaimsGuard::<16>::new(family, curr_scope, &lock_manager);
+    ) -> OperationOrFatalResult<()> {
+        let (engine, family, curr_scope) = self.operation_lock_parts();
+        let mut fresh = FreshClaimsGuard::<16>::new(
+            family,
+            curr_scope,
+            engine.lock_manager(),
+            &engine.poisoner,
+        );
         fresh
             .acquire(LockResource::TableMetadata(table_id), LockMode::Exclusive)
             .await?;
@@ -1775,10 +1796,10 @@ impl SessionOperationPin {
     }
 
     #[inline]
-    async fn acquire_maintenance_table(&mut self, table_id: TableID) -> OperationResult<()> {
-        let lock_manager = self.runtime.lock_manager().clone();
-        let (family, curr_scope) = self.lock_parts();
-        let mut fresh = FreshClaimsGuard::<2>::new(family, curr_scope, &lock_manager);
+    async fn acquire_maintenance_table(&mut self, table_id: TableID) -> OperationOrFatalResult<()> {
+        let (engine, family, curr_scope) = self.operation_lock_parts();
+        let mut fresh =
+            FreshClaimsGuard::<2>::new(family, curr_scope, engine.lock_manager(), &engine.poisoner);
         fresh
             .acquire(LockResource::TableMetadata(table_id), LockMode::Shared)
             .await?;
@@ -1790,7 +1811,7 @@ impl SessionOperationPin {
     }
 
     /// Acquires maintenance read admission and returns a lifetime-bound table.
-    async fn read_table(&mut self, table_id: TableID) -> OperationResult<SessionTable<'_>> {
+    async fn read_table(&mut self, table_id: TableID) -> OperationOrFatalResult<SessionTable<'_>> {
         assert!(
             self.kind() == SessionOperationKind::Maintenance,
             "session table requires maintenance authority: key={}, kind={}",
@@ -1846,7 +1867,7 @@ impl SessionOperationPin {
     async fn prepare_create_table(
         self,
         validated: ValidatedCreateTable,
-    ) -> OperationResult<PreparedCreateTable> {
+    ) -> OperationOrFatalResult<PreparedCreateTable> {
         let table_id = self.runtime.catalog().next_table_id();
         let plan = validated.into_plan(table_id);
         let scope = PreparedDdlScope::create(self, table_id, create_table_catalog_write_targets())
@@ -1856,7 +1877,10 @@ impl SessionOperationPin {
     }
 
     /// Prepare DROP TABLE while consuming this foreground operation.
-    async fn prepare_drop_table(self, table_id: TableID) -> OperationResult<PreparedDropTable> {
+    async fn prepare_drop_table(
+        self,
+        table_id: TableID,
+    ) -> OperationOrFatalResult<PreparedDropTable> {
         self.reject_table_ddl_explicit_session_lock(table_id)
             .attach("prepare DROP TABLE explicit-session-lock check")?;
         let scope =
@@ -1899,22 +1923,21 @@ impl SessionOperationPin {
         &mut self,
         table_id: TableID,
         mode: LockMode,
-    ) -> OperationResult<()> {
-        let key = self.key();
-        let lock_manager = self.runtime.lock_manager().clone();
-        let catalog = self.runtime.catalog();
-        let authority = self.authority.as_deref_mut().unwrap_or_else(|| {
-            panic!("explicit lock operation must retain family authority: key={key}")
-        });
-        let (family, session_scope) = authority.parts();
-        let mut fresh = FreshClaimsGuard::<2>::new(family, session_scope, &lock_manager);
+    ) -> OperationOrFatalResult<()> {
+        let (engine, family, session_scope) = self.session_lock_parts();
+        let mut fresh = FreshClaimsGuard::<2>::new(
+            family,
+            session_scope,
+            engine.lock_manager(),
+            &engine.poisoner,
+        );
         fresh
             .acquire(LockResource::TableMetadata(table_id), LockMode::Shared)
             .await?;
         fresh
             .acquire(LockResource::TableData(table_id), mode)
             .await?;
-        catalog.validate_user_table_live(table_id).await?;
+        engine.catalog().validate_user_table_live(table_id).await?;
         fresh.disarm();
         Ok(())
     }
@@ -1922,20 +1945,15 @@ impl SessionOperationPin {
     /// Releases an explicit session-lifetime table lock from this operation.
     #[inline]
     pub(crate) fn unlock_table(&mut self, table_id: TableID) -> OperationResult<()> {
-        let key = self.key();
-        let lock_manager = self.runtime.lock_manager().clone();
-        let authority = self.authority.as_deref_mut().unwrap_or_else(|| {
-            panic!("explicit unlock operation must retain family authority: key={key}")
-        });
-        let (family, session_scope) = authority.parts();
+        let (engine, family, session_scope) = self.session_lock_parts();
         family.release(
             session_scope,
-            &lock_manager,
+            engine.lock_manager(),
             LockResource::TableData(table_id),
         );
         family.release(
             session_scope,
-            &lock_manager,
+            engine.lock_manager(),
             LockResource::TableMetadata(table_id),
         );
         Ok(())
@@ -5013,7 +5031,7 @@ pub(crate) mod tests {
             operation.curr_scope = Some(LockScopeState::new(LockOwner::operation(wrong_key)));
 
             let panic = catch_unwind(AssertUnwindSafe(|| {
-                let _ = operation.lock_parts();
+                let _ = operation.operation_lock_parts();
             }))
             .expect_err("operation lock indexes must reject a wrong operation scope");
             let diagnostic = panic
@@ -5402,6 +5420,44 @@ pub(crate) mod tests {
                 session.unlock_table(table_id).unwrap();
                 engine.shutdown();
             }
+        });
+    }
+
+    #[test]
+    fn test_queued_explicit_lock_poison_returns_fatal_and_rolls_back_prefix() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(lightweight_test_engine_config(
+                root.path().to_path_buf(),
+                "explicit-lock-poison",
+            ))
+            .await
+            .unwrap();
+            let table_id = table2(&engine).await;
+            let mut blocker = engine.new_session().unwrap();
+            blocker
+                .lock_table(table_id, TableLockMode::Exclusive)
+                .await
+                .unwrap();
+
+            let mut waiter = engine.new_session().unwrap();
+            let waiter_owner = LockOwner::session_explicit(waiter.id());
+            let blocker_owner = LockOwner::session_explicit(blocker.id());
+            let mut acquire = Box::pin(waiter.lock_table(table_id, TableLockMode::Shared));
+            assert!(futures::poll!(acquire.as_mut()).is_pending());
+            engine.inner().poisoner.poison(
+                Report::new(FatalError::StorageIo).attach("queued explicit-lock unrelated poison"),
+            );
+
+            let error = acquire.as_mut().await.unwrap_err();
+            assert_fatal_admission_error(error, FatalError::StorageIo);
+            drop(acquire);
+            assert_eq!(lock_entry_count(&engine, waiter_owner), 0);
+            assert_eq!(lock_entry_count(&engine, blocker_owner), 2);
+
+            drop(waiter);
+            drop(blocker);
+            engine.shutdown();
         });
     }
 

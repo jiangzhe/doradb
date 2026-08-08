@@ -6,7 +6,7 @@ use crate::catalog::table::{TableColumnLayout, TableMetadata};
 use crate::catalog::{
     ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, catalog_table_id_from_slot,
 };
-use crate::error::{RuntimeError, RuntimeResult};
+use crate::error::{MultiDomainResultExt, RuntimeError, RuntimeOrFatalResult, RuntimeResult};
 use crate::id::TableID;
 use crate::row::ops::DeleteMvcc;
 use crate::row::{Row, RowRead};
@@ -44,7 +44,7 @@ impl Columns<'_> {
         &self,
         stmt: &mut Statement<'_>,
         obj: &ColumnObject,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         let cols = vec![
             Val::from(obj.table_id),
             Val::from(obj.column_no),
@@ -98,7 +98,7 @@ impl Columns<'_> {
         stmt: &mut Statement<'_>,
         table_id: TableID,
         column_no: u16,
-    ) -> RuntimeResult<bool> {
+    ) -> RuntimeOrFatalResult<bool> {
         let key_vals = [Val::from(table_id), Val::from(column_no)];
         let res = stmt
             .catalog_delete_primary_key_mvcc(self.table, PK_NO_COLUMNS, &key_vals, true)
@@ -116,7 +116,7 @@ impl Columns<'_> {
         &self,
         stmt: &mut Statement<'_>,
         table_id: TableID,
-    ) -> RuntimeResult<usize> {
+    ) -> RuntimeOrFatalResult<usize> {
         let columns = self
             .list_uncommitted_by_table_id(stmt.runtime().pool_guards(), table_id)
             .await?;
