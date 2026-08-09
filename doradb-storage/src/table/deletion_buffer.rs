@@ -387,6 +387,28 @@ impl ColumnDeletionBuffer {
     pub(crate) fn remove(&self, row_id: RowID) {
         self.entries.remove(&row_id);
     }
+
+    /// Removes an active marker only when it still belongs to `status`.
+    ///
+    /// This is the inverse of a provisional foreground claim that has not yet
+    /// been converted into a delete/update effect. Ownership is checked under
+    /// the map entry guard so cancellation cannot remove a replacement marker.
+    #[inline]
+    pub(crate) fn remove_ref_if_owned(&self, row_id: RowID, status: &Arc<SharedTrxStatus>) -> bool {
+        match self.entries.entry(row_id) {
+            Entry::Occupied(entry) => {
+                let owned = matches!(
+                    entry.get(),
+                    DeleteMarker::Ref(existing) if Arc::ptr_eq(existing, status)
+                );
+                if owned {
+                    entry.remove();
+                }
+                owned
+            }
+            Entry::Vacant(_) => false,
+        }
+    }
 }
 
 #[cfg(test)]

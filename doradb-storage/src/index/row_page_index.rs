@@ -1545,17 +1545,21 @@ impl RowPageIndex {
     }
 }
 
+/// Persisted row location returned by the column block-index route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LwcRowLocation {
+    /// Persisted LWC block id.
+    pub(crate) block_id: BlockID,
+    /// Resolved row ordinal within the persisted LWC block.
+    pub(crate) row_idx: usize,
+    /// Canonical authoritative row-shape fingerprint bound to the block.
+    pub(crate) row_shape_fingerprint: u128,
+}
+
 /// Physical lookup target returned by row/column block-index search.
 pub(crate) enum RowLocation {
-    /// Persisted lightweight columnar page plus the resolved row ordinal.
-    LwcBlock {
-        /// Persisted LWC block id.
-        block_id: BlockID,
-        /// Resolved row ordinal within the persisted LWC block.
-        row_idx: usize,
-        /// Canonical authoritative row-shape fingerprint bound to the block.
-        row_shape_fingerprint: u128,
-    },
+    /// Persisted lightweight columnar row.
+    LwcBlock(LwcRowLocation),
     /// Row page.
     RowPage(PageID),
     /// Row id was not found in either route.
@@ -3062,7 +3066,7 @@ mod tests {
                 .expect("published row-page index entry should remain readable")
             {
                 RowLocation::RowPage(page_id) => page_id,
-                RowLocation::LwcBlock { .. } | RowLocation::NotFound => {
+                RowLocation::LwcBlock(..) | RowLocation::NotFound => {
                     panic!("expected published row page")
                 }
             };

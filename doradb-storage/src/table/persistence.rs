@@ -2518,7 +2518,7 @@ mod tests {
         match table.find_row(&guards, row_id).await.unwrap() {
             RowLocation::RowPage(page_id) => page_id,
             RowLocation::NotFound => panic!("test row should exist"),
-            RowLocation::LwcBlock { .. } => panic!("test row should still be hot"),
+            RowLocation::LwcBlock(..) => panic!("test row should still be hot"),
         }
     }
 
@@ -3075,7 +3075,7 @@ mod tests {
                         .find_row(&session.pool_guards(), row_id)
                         .await
                         .unwrap(),
-                    RowLocation::LwcBlock { .. }
+                    RowLocation::LwcBlock(..)
                 ));
             }
             assert!(matches!(
@@ -5745,7 +5745,13 @@ mod tests {
                 let page_guard = hook_first_page.lock().take().unwrap();
                 let page = page_guard.page();
                 let map = page_guard.unwrap_vmap();
-                let undo = OwnedRowUndo::new(table_id, None, page.row_id(0), RowUndoKind::Lock);
+                let undo = OwnedRowUndo::new(
+                    crate::trx::NON_FOREGROUND_STMT_NO,
+                    table_id,
+                    None,
+                    page.row_id(0),
+                    RowUndoKind::Lock,
+                );
                 map.begin_frozen_mutation();
                 *map.write_latch(0) = Some(Box::new(RowUndoHead::new(
                     hook_ownership_status,
@@ -5809,7 +5815,13 @@ mod tests {
                 let page_guard = hook_first_page.lock().take().unwrap();
                 let page = page_guard.page();
                 let map = page_guard.unwrap_vmap();
-                let undo = OwnedRowUndo::new(table_id, None, page.row_id(0), RowUndoKind::Lock);
+                let undo = OwnedRowUndo::new(
+                    crate::trx::NON_FOREGROUND_STMT_NO,
+                    table_id,
+                    None,
+                    page.row_id(0),
+                    RowUndoKind::Lock,
+                );
                 map.begin_frozen_mutation();
                 *map.write_latch(0) = Some(Box::new(RowUndoHead::new(
                     hook_ownership_status,

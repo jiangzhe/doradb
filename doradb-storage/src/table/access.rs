@@ -1,3 +1,6 @@
+#[path = "index_mutate.rs"]
+mod index_mutate;
+
 use super::hot::{
     DeleteInternal, HotRowMutator, InsertRowIntoPage, RowInserter, UpdateRowInplace,
     read_hot_row_mvcc,
@@ -17,10 +20,10 @@ use crate::file::table_file::ActiveRoot;
 use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{
-    BTreeKeyEncoder, ColumnBlockIndex, ColumnLeafEntry, CurrentIndexReadHandle, IndexBatchStream,
-    IndexCompareExchange, IndexInsert, IndexLookupCandidate, IndexMask, KeyRange,
-    NonUniqueSecondaryIndex, OwnedCurrentIndexReadHandle, OwnedSecondaryIndexCandidateStream,
-    RowLocation, SecondaryIndex, UniqueInsertAttempt, UniqueSecondaryIndex,
+    BorrowedIndexMutationStream, ColumnBlockIndex, ColumnLeafEntry, CurrentIndexReadHandle,
+    IndexBatchStream, IndexCompareExchange, IndexInsert, IndexMask, KeyRange, LwcRowLocation,
+    NonUniqueSecondaryIndex, OwnedCurrentIndexReadHandle, OwnedIndexCandidateStream, RowLocation,
+    SecondaryIndex, UniqueInsertAttempt, UniqueSecondaryIndex,
 };
 use crate::log::redo::{RowRedo, RowRedoKind};
 use crate::lwc::LwcBlock;
@@ -37,16 +40,19 @@ use crate::table::{
     index_key_is_changed, index_key_replace, read_latest_index_key,
     read_physical_index_keys_for_delete, row_len, unique_key_from_full_row,
 };
-use crate::trx::row::{FindOldVersion, IndexCandidateRecheck, ReadLatestRow, RowReadAccess};
+use crate::trx::row::{
+    BoundIndexCandidate, FindOldVersion, ReadLatestRow, RowReadAccess, RowWriteAccess,
+};
 use crate::trx::stmt::StmtEffects;
 use crate::trx::undo::{IndexBranch, OwnedRowUndo, RowUndoKind};
 use crate::trx::{
-    MIN_SNAPSHOT_TS, PrepareListenerResult, SharedTrxStatus, Transaction, TrxContext, TrxRuntime,
+    MIN_SNAPSHOT_TS, PrepareListenerResult, SharedTrxStatus, TrxContext, TrxRuntime,
     trx_is_committed,
 };
 use crate::value::Val;
 use error_stack::{Report, ResultExt};
 use futures::FutureExt;
+use index_mutate::IndexMutator;
 use std::marker::PhantomData;
 use std::mem;
 use std::ops::RangeBounds;
@@ -63,6 +69,10 @@ enum LazyRowSource<'row> {
     },
     Hot {
         access: RowReadAccess<'row>,
+        column_layout: &'row TableColumnLayout,
+    },
+    HotWrite {
+        access: RowWriteAccess<'row>,
         column_layout: &'row TableColumnLayout,
     },
 }
@@ -86,19 +96,26 @@ impl LazyRowSource<'_> {
                 access,
                 column_layout,
             } => Ok(access.read_latest_value(column_layout, column_no)),
+            LazyRowSource::HotWrite {
+                access,
+                column_layout,
+            } => Ok(access.row().val(column_layout, column_no)),
         }
     }
 }
 
-/// Lazy accessor for one latest modifiable row in a full-table mutation callback.
+/// Lazy accessor for one latest modifiable row in a table mutation callback.
 ///
 /// The accessor hides whether the row is stored in a persisted column block or
 /// an in-memory row page. Requested values are cached for the callback
 /// invocation. Cold values are decoded only after the persisted image is
 /// confirmed to remain the current logical row. Hot values come from the latest
 /// physical page image after row ownership validation; they are not
-/// reconstructed from MVCC undo for an older snapshot. References returned by
-/// [`LazyRow::val`] remain tied to the mutable accessor borrow.
+/// reconstructed from MVCC undo for an older snapshot. Index-driven mutation
+/// retains definitive row ownership for the callback, while full-table
+/// mutation retains its existing table-exclusive traversal protocol.
+/// References returned by [`LazyRow::val`] remain tied to the mutable accessor
+/// borrow.
 pub struct LazyRow<'row> {
     source: LazyRowSource<'row>,
     values: Vec<Val>,
@@ -163,6 +180,31 @@ impl<'row> LazyRow<'row> {
             self.values[column_no] = Val::default();
         }
         self.values
+    }
+
+    #[inline]
+    fn into_hot_write_reusable_buffer(mut self) -> (RowWriteAccess<'row>, Vec<Val>) {
+        for column_no in self.ready_columns {
+            self.values[column_no] = Val::default();
+        }
+        let LazyRowSource::HotWrite { access, .. } = self.source else {
+            unreachable!("hot mutation callback must retain row write access")
+        };
+        (access, self.values)
+    }
+
+    #[inline]
+    fn into_hot_write_index_keys<'op>(
+        mut self,
+        accessor: &UserTableAccessor<'op>,
+    ) -> DataIntegrityResult<(RowWriteAccess<'row>, WriteIndexKeySet<'op>, Vec<Val>)> {
+        let metadata = accessor.metadata();
+        for &column_no in metadata.idx.index_columns() {
+            let _ = self.val_inner(column_no)?;
+        }
+        let keys = WriteIndexKeySet::from_full_row(accessor, &self.values);
+        let (access, values) = self.into_hot_write_reusable_buffer();
+        Ok((access, keys, values))
     }
 
     #[inline]
@@ -728,12 +770,11 @@ impl<'op> UserTableAccessor<'op> {
     }
 
     #[inline]
-    fn owned_current_index_read_handle<'trx>(
+    fn owned_current_index_read_handle(
         &self,
         rt: TrxRuntime<'_>,
         index_no: usize,
-        transaction: PhantomData<&'trx mut Transaction>,
-    ) -> RuntimeResult<OwnedCurrentIndexReadHandle<'trx, EvictableBufferPool>> {
+    ) -> RuntimeResult<OwnedCurrentIndexReadHandle<EvictableBufferPool>> {
         let index = self.require_sec_idx_arc(index_no)?;
         let proof = rt.read_proof();
         let root = self
@@ -746,7 +787,6 @@ impl<'op> UserTableAccessor<'op> {
             pool_guards.disk_guard().clone(),
             root,
             &proof,
-            transaction,
         ))
     }
 
@@ -1101,11 +1141,11 @@ impl<'op> UserTableAccessor<'op> {
             let location = self.find_row_location(rt.pool_guards(), row_id).await?;
             match location {
                 RowLocation::NotFound => return Ok(SelectMvcc::NotFound),
-                RowLocation::LwcBlock {
+                RowLocation::LwcBlock(LwcRowLocation {
                     block_id,
                     row_idx,
                     row_shape_fingerprint,
-                } => {
+                }) => {
                     let deletion_buffer = self.lwc_deletion_buffer();
                     if let Some(marker) = deletion_buffer.get(row_id) {
                         match marker {
@@ -1163,23 +1203,21 @@ impl<'op> UserTableAccessor<'op> {
     pub(crate) async fn index_lookup_candidate_row_mvcc(
         &self,
         rt: TrxRuntime<'_>,
-        index_no: usize,
-        unique: bool,
-        encoder: &BTreeKeyEncoder,
-        candidate: &IndexLookupCandidate,
+        candidate: BoundIndexCandidate<'_>,
         read_set: &[usize],
     ) -> RuntimeResult<SelectMvcc> {
+        let index_no = candidate.index_no;
         loop {
             let location = self
                 .find_row_location(rt.pool_guards(), candidate.row_id)
                 .await?;
             match location {
                 RowLocation::NotFound => return Ok(SelectMvcc::NotFound),
-                RowLocation::LwcBlock {
+                RowLocation::LwcBlock(LwcRowLocation {
                     block_id,
                     row_idx,
                     row_shape_fingerprint,
-                } => {
+                }) => {
                     let deletion_buffer = self.lwc_deletion_buffer();
                     if let Some(marker) = deletion_buffer.get(candidate.row_id) {
                         match marker {
@@ -1221,7 +1259,7 @@ impl<'op> UserTableAccessor<'op> {
                     let index_spec = self
                         .metadata()
                         .idx
-                        .require_index_spec(index_no)
+                        .require_index_spec(candidate.index_no)
                         .change_context(RuntimeError::TableAccess)
                         .attach_with(|| {
                             format!(
@@ -1243,12 +1281,7 @@ impl<'op> UserTableAccessor<'op> {
                                 candidate.row_id
                             )
                         })?;
-                    let encoded = if index_spec.unique() {
-                        encoder.encode(&key_vals)
-                    } else {
-                        encoder.encode_pair(&key_vals, Val::from(candidate.row_id))
-                    };
-                    if encoded.as_bytes() != candidate.encoded_key.as_bytes() {
+                    if !candidate.matches_key(&key_vals) {
                         return Ok(SelectMvcc::NotFound);
                     }
                     let vals = block
@@ -1279,18 +1312,12 @@ impl<'op> UserTableAccessor<'op> {
                         continue;
                     };
                     let access = page_guard.read_row_by_id(candidate.row_id);
-                    let recheck = IndexCandidateRecheck {
-                        index_no,
-                        unique,
-                        candidate,
-                        encoder,
-                    };
                     return Ok(
                         match access.read_row_mvcc_index_candidate(
                             rt.ctx(),
                             self.metadata(),
                             read_set,
-                            &recheck,
+                            &candidate,
                         ) {
                             ReadRow::Ok(vals) => SelectMvcc::Found(vals),
                             ReadRow::InvalidIndex | ReadRow::NotFound => SelectMvcc::NotFound,
@@ -1302,16 +1329,15 @@ impl<'op> UserTableAccessor<'op> {
     }
 
     /// Create an index-derived candidate stream for a public scan range.
-    pub(crate) fn index_scan_candidates<'trx>(
+    pub(crate) fn index_scan_candidates(
         &self,
         rt: TrxRuntime<'_>,
         index_no: usize,
         range: KeyRange,
-        transaction: PhantomData<&'trx mut Transaction>,
-    ) -> RuntimeResult<OwnedSecondaryIndexCandidateStream<'trx, EvictableBufferPool>> {
+    ) -> RuntimeResult<OwnedIndexCandidateStream<EvictableBufferPool>> {
         debug_assert!(index_no < self.sec_idx_len());
-        let handle = self.owned_current_index_read_handle(rt, index_no, transaction)?;
-        Ok(OwnedSecondaryIndexCandidateStream::new(handle, range))
+        let handle = self.owned_current_index_read_handle(rt, index_no)?;
+        Ok(OwnedIndexCandidateStream::new(handle, range))
     }
 
     #[inline]
@@ -1644,11 +1670,11 @@ impl<'op> UserTableAccessor<'op> {
 
         match self.find_row_location(guards, row_id).await? {
             RowLocation::NotFound => Ok(IndexPurgeDecision::Delete),
-            RowLocation::LwcBlock {
+            RowLocation::LwcBlock(LwcRowLocation {
                 block_id,
                 row_idx,
                 row_shape_fingerprint,
-            } => {
+            }) => {
                 // LWC rows are immutable persisted images. If no globally
                 // purgeable marker proves the whole row invisible, decode only
                 // the indexed columns and delete the purge key only when it no
@@ -2114,7 +2140,7 @@ impl<'op> UserTableAccessor<'op> {
         // duplicate path through link_for_unique_index_lwc(), where snapshot
         // visibility decides between duplicate, link, and write conflict.
         match self.find_row_location(rt.pool_guards(), row_id).await? {
-            RowLocation::LwcBlock { .. } => {
+            RowLocation::LwcBlock(..) => {
                 let deletion_buffer = self.lwc_deletion_buffer();
                 Ok(deletion_buffer.get(row_id).is_some())
             }
@@ -2222,11 +2248,11 @@ impl<'op> UserTableAccessor<'op> {
         let (old_guard, old_id) = loop {
             match self.find_row_location(rt.pool_guards(), old_id).await {
                 Ok(RowLocation::NotFound) => return Ok(LinkForUniqueIndex::NotNeeded),
-                Ok(RowLocation::LwcBlock {
+                Ok(RowLocation::LwcBlock(LwcRowLocation {
                     block_id,
                     row_idx,
                     row_shape_fingerprint,
-                }) => {
+                })) => {
                     return self
                         .link_for_unique_index_lwc(
                             rt,
@@ -3330,6 +3356,57 @@ impl<'op> UserTableAccessor<'op> {
         .await
     }
 
+    /// Mutate latest rows selected by one secondary-index logical-key range.
+    pub(crate) async fn table_index_mutate_mvcc<'r, R, F>(
+        &self,
+        rt: TrxRuntime<'_>,
+        effects: &mut StmtEffects,
+        index_no: usize,
+        range: R,
+        validate_updates: bool,
+        mut mutate_row: F,
+    ) -> Result<TableMutationOutcome>
+    where
+        R: RangeBounds<&'r [Val]>,
+        F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<RowMutation>,
+    {
+        let root_snapshot = self.root_snapshot(rt.ctx());
+        let index = self.require_sec_idx(index_no).disclose()?;
+        let unique = index.is_unique();
+        let encoder = index.key_encoder();
+        let encoded_range = if unique {
+            encoder.encode_range(range)
+        } else {
+            encoder.encode_non_unique_range(range)
+        };
+        let mut stream = BorrowedIndexMutationStream::new(
+            index,
+            rt.pool_guards(),
+            &root_snapshot,
+            &encoded_range,
+        )
+        .disclose()?;
+        let column_count = self.metadata().col.col_count();
+        let mut value_buffer = vec![Val::default(); column_count];
+        let mut outcome = TableMutationOutcome::default();
+        let mut mutator = IndexMutator::new(self, rt, effects, &root_snapshot, validate_updates);
+
+        while let Some(batch) = stream.next_batch().await.disclose()? {
+            for candidate in batch {
+                let candidate = BoundIndexCandidate::new(index_no, unique, encoder, candidate);
+                mutator
+                    .mutate_index_candidate(
+                        candidate,
+                        &mut value_buffer,
+                        &mut outcome,
+                        &mut mutate_row,
+                    )
+                    .await?;
+            }
+        }
+        Ok(outcome)
+    }
+
     /// Mutate callback-selected rows from one original latest-read worklist.
     ///
     /// This public-result contract is retained solely to transport an arbitrary
@@ -3720,6 +3797,7 @@ impl<'op> UserTableAccessor<'op> {
         root_snapshot: &TableRootSnapshot<'_>,
     ) -> RuntimeResult<()> {
         effects.push_row_undo(OwnedRowUndo::new(
+            effects.stmt_no(),
             self.table_id(),
             None,
             row_id,
@@ -3737,6 +3815,63 @@ impl<'op> UserTableAccessor<'op> {
             .await?;
         self.defer_delete_owned_row_index_set(rt, effects, proof)
             .await
+    }
+
+    /// Convert a provisional cold-row lock into definitive delete effects.
+    #[inline]
+    async fn finish_owned_cold_delete_effects(
+        &self,
+        rt: TrxRuntime<'_>,
+        effects: &mut StmtEffects,
+        row_id: RowID,
+        index_keys: WriteIndexKeySet<'op>,
+        root_snapshot: &TableRootSnapshot<'_>,
+    ) -> RuntimeResult<()> {
+        effects.update_last_row_undo(RowUndoKind::Delete);
+        effects.insert_row_redo(
+            self.table_id(),
+            RowRedo {
+                row_id,
+                kind: RowRedoKind::Delete(None),
+            },
+        );
+        let proof = self
+            .owned_cdb_index_set_proof(rt.pool_guards(), row_id, index_keys, root_snapshot)
+            .await?;
+        self.defer_delete_owned_row_index_set(rt, effects, proof)
+            .await
+    }
+
+    #[inline]
+    async fn update_owned_cold_row(
+        &self,
+        rt: TrxRuntime<'_>,
+        effects: &mut StmtEffects,
+        row_id: RowID,
+        old_row: Vec<Val>,
+        update: Vec<UpdateCol>,
+        root_snapshot: &TableRootSnapshot<'_>,
+    ) -> QuadResult<InsertedRow> {
+        let old_index_keys = WriteIndexKeySet::from_full_row(self, &old_row);
+        self.finish_owned_cold_delete_effects(rt, effects, row_id, old_index_keys, root_snapshot)
+            .await
+            .attach("index-driven mutation cold update delete effects")?;
+        let new_row = self.build_cold_update_row(old_row, RowUpdateInput::Sparse(update));
+        let new_index_keys = WriteIndexKeySet::from_full_row(self, &new_row);
+        let (new_row_id, new_guard) = self
+            .insert_row_internal(rt, effects, new_row, RowUndoKind::Insert, Vec::new())
+            .await?;
+        self.insert_index_set(
+            rt,
+            effects,
+            new_index_keys,
+            new_row_id,
+            &new_guard,
+            root_snapshot,
+        )
+        .await
+        .attach("index-driven mutation cold replacement index claim")?;
+        Ok(InsertedRow::new(new_guard.page_id(), new_row_id))
     }
 
     #[inline]
@@ -4010,10 +4145,9 @@ impl<'op> UserTableAccessor<'op> {
         let mut stream = index.equal_scan_candidates(&range, rt.sts())?;
         while let Some(batch) = stream.next_batch().await? {
             for candidate in batch {
+                let candidate = BoundIndexCandidate::new(index_no, false, encoder, candidate);
                 match self
-                    .index_lookup_candidate_row_mvcc(
-                        rt, index_no, false, &encoder, &candidate, read_set,
-                    )
+                    .index_lookup_candidate_row_mvcc(rt, candidate, read_set)
                     .await?
                 {
                     SelectMvcc::NotFound => (),
@@ -4059,10 +4193,9 @@ impl<'op> UserTableAccessor<'op> {
             let mut stream = index.index_scan_candidates(&range, rt.sts())?;
             while let Some(batch) = stream.next_batch().await? {
                 for candidate in batch {
+                    let candidate = BoundIndexCandidate::new(index_no, true, encoder, candidate);
                     match self
-                        .index_lookup_candidate_row_mvcc(
-                            rt, index_no, true, &encoder, &candidate, read_set,
-                        )
+                        .index_lookup_candidate_row_mvcc(rt, candidate, read_set)
                         .await?
                     {
                         SelectMvcc::NotFound => (),
@@ -4077,10 +4210,9 @@ impl<'op> UserTableAccessor<'op> {
             let mut stream = index.index_scan_candidates(&range, rt.sts())?;
             while let Some(batch) = stream.next_batch().await? {
                 for candidate in batch {
+                    let candidate = BoundIndexCandidate::new(index_no, false, encoder, candidate);
                     match self
-                        .index_lookup_candidate_row_mvcc(
-                            rt, index_no, false, &encoder, &candidate, read_set,
-                        )
+                        .index_lookup_candidate_row_mvcc(rt, candidate, read_set)
                         .await?
                     {
                         SelectMvcc::NotFound => (),
@@ -4222,11 +4354,11 @@ impl<'op> UserTableAccessor<'op> {
                         Ok(RowLocation::NotFound) => {
                             return Ok(UpdateUniqueMvcc::NotFound(input));
                         }
-                        Ok(RowLocation::LwcBlock {
+                        Ok(RowLocation::LwcBlock(LwcRowLocation {
                             block_id,
                             row_idx,
                             row_shape_fingerprint,
-                        }) => {
+                        })) => {
                             // LWC rows are immutable. A cold update is represented
                             // as an owned CDB delete marker for the old row plus a
                             // new hot RowStore row containing the updated values.
@@ -4466,11 +4598,11 @@ impl<'op> UserTableAccessor<'op> {
                     Some((row_id, _)) => {
                         match self.find_row_location(rt.pool_guards(), row_id).await {
                             Ok(RowLocation::NotFound) => return Ok(DeleteMvcc::NotFound),
-                            Ok(RowLocation::LwcBlock {
+                            Ok(RowLocation::LwcBlock(LwcRowLocation {
                                 block_id,
                                 row_idx,
                                 row_shape_fingerprint,
-                            }) => {
+                            })) => {
                                 // Delete only needs old secondary-index keys, so read
                                 // indexed columns instead of decoding the whole row.
                                 // The key recheck prevents acting on stale DiskTree or
@@ -4793,7 +4925,7 @@ mod tests {
     };
     use crate::file::cow_file::SUPER_BLOCK_ID;
     use crate::id::{PageID, RowID, TableID, TrxID};
-    use crate::index::RowLocation;
+    use crate::index::{LwcRowLocation, RowLocation};
     use crate::io::{StorageBackendFileIdentity, install_storage_backend_test_hook};
     use crate::latch::LatchFallbackMode;
     use crate::lock::tests::LockDebugEntryState;
@@ -5513,11 +5645,11 @@ mod tests {
                 .await
                 .unwrap()
             {
-                RowLocation::LwcBlock {
+                RowLocation::LwcBlock(LwcRowLocation {
                     block_id,
                     row_idx,
                     row_shape_fingerprint,
-                } => {
+                }) => {
                     assert_eq!(block_id, resolved.block_id());
                     assert_eq!(row_idx, resolved.row_idx());
                     assert_eq!(row_shape_fingerprint, resolved.row_shape_fingerprint());
@@ -6533,7 +6665,7 @@ mod tests {
                             .find_row(&session.pool_guards(), claimed_row_id)
                             .await
                             .unwrap(),
-                        RowLocation::LwcBlock { .. }
+                        RowLocation::LwcBlock(..)
                     ));
                     Ok(())
                 })
@@ -6653,7 +6785,7 @@ mod tests {
                             .find_row(&session.pool_guards(), claimed_row_id)
                             .await
                             .unwrap(),
-                        RowLocation::LwcBlock { .. }
+                        RowLocation::LwcBlock(..)
                     ));
                     Ok(())
                 })
@@ -6722,7 +6854,7 @@ mod tests {
             {
                 RowLocation::RowPage(page_id) => page_id,
                 RowLocation::NotFound => panic!("row should exist"),
-                RowLocation::LwcBlock { .. } => unreachable!("lwc block"),
+                RowLocation::LwcBlock(..) => unreachable!("lwc block"),
             };
             let page_guard = engine
                 .inner()
@@ -7973,6 +8105,62 @@ mod tests {
                 Some(OperationError::InvalidDmlInput)
             );
             assert_eq!(scan_table_pairs(&mut trx, table_id).await, before_error);
+            trx.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_hot_point_mutation_rejects_stale_key_from_same_transaction() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "hot_point_same_trx_stale_key").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 1, 1, "original").await;
+
+            let old_key = single_key(1i32);
+            let new_key = single_key(2i32);
+            let mut trx = session.begin_trx().unwrap();
+            assert!(matches!(
+                trx_update_row_by_id(
+                    &mut trx,
+                    table_id,
+                    &old_key,
+                    vec![UpdateCol {
+                        idx: 0,
+                        val: Val::from(2i32),
+                    }],
+                )
+                .await
+                .unwrap(),
+                UpdateMvcc::Updated(_)
+            ));
+            assert_eq!(
+                trx_update_row_by_id(
+                    &mut trx,
+                    table_id,
+                    &old_key,
+                    vec![UpdateCol {
+                        idx: 1,
+                        val: Val::from("stale-update"),
+                    }],
+                )
+                .await
+                .unwrap(),
+                UpdateMvcc::NotFound
+            );
+            assert_eq!(
+                trx_delete_row_by_id(&mut trx, table_id, &old_key)
+                    .await
+                    .unwrap(),
+                DeleteMvcc::NotFound
+            );
+            assert_eq!(
+                trx_select_row_mvcc_by_id(&mut trx, table_id, &new_key, &[0, 1])
+                    .await
+                    .unwrap(),
+                SelectMvcc::Found(vec![Val::from(2i32), Val::from("original")])
+            );
             trx.commit().await.unwrap();
         });
     }
@@ -9276,7 +9464,7 @@ mod tests {
             {
                 RowLocation::RowPage(page_id) => page_id,
                 RowLocation::NotFound => panic!("row should exist"),
-                RowLocation::LwcBlock { .. } => unreachable!("row page expected"),
+                RowLocation::LwcBlock(..) => unreachable!("row page expected"),
             };
 
             let res: Result<()> = trx
@@ -9435,7 +9623,7 @@ mod tests {
                 .unwrap()
             {
                 RowLocation::RowPage(page_id) => page_id,
-                RowLocation::LwcBlock { .. } | RowLocation::NotFound => {
+                RowLocation::LwcBlock(..) | RowLocation::NotFound => {
                     panic!("row should still be in the in-memory row store")
                 }
             };
@@ -9478,7 +9666,7 @@ mod tests {
             .unwrap()
         {
             RowLocation::RowPage(page_id) => page_id,
-            RowLocation::LwcBlock { .. } | RowLocation::NotFound => {
+            RowLocation::LwcBlock(..) | RowLocation::NotFound => {
                 panic!("inserted row should remain in the row store")
             }
         };
@@ -9505,7 +9693,7 @@ mod tests {
             .unwrap()
         {
             RowLocation::RowPage(page_id) => page_id,
-            RowLocation::LwcBlock { .. } | RowLocation::NotFound => {
+            RowLocation::LwcBlock(..) | RowLocation::NotFound => {
                 panic!("inserted row should remain in the row store")
             }
         };
@@ -9658,7 +9846,7 @@ mod tests {
                         break;
                     }
                     RowLocation::RowPage(..) => (),
-                    RowLocation::LwcBlock { .. } | RowLocation::NotFound => {
+                    RowLocation::LwcBlock(..) | RowLocation::NotFound => {
                         panic!("newly inserted row should stay in a row page")
                     }
                 }

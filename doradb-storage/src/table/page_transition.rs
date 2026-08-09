@@ -883,7 +883,13 @@ mod tests {
             .into_iter()
             .map(|(kind, status)| {
                 (
-                    OwnedRowUndo::new(TableID::new(1), None, RowID::new(100), kind),
+                    OwnedRowUndo::new(
+                        crate::trx::NON_FOREGROUND_STMT_NO,
+                        TableID::new(1),
+                        None,
+                        RowID::new(100),
+                        kind,
+                    ),
                     Some(status),
                 )
             })

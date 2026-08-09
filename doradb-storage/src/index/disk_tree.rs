@@ -556,6 +556,12 @@ impl<F: DiskTreeSpec> DiskTreeRuntime<F> {
     pub(crate) fn encoder(&self) -> Arc<BTreeKeyEncoder> {
         Arc::clone(&self.encoder)
     }
+
+    /// Returns a borrowed key encoder for operation-local use.
+    #[inline]
+    pub(crate) fn encoder_ref(&self) -> &BTreeKeyEncoder {
+        self.encoder.as_ref()
+    }
 }
 
 /// Fixed runtime shape for persisted unique secondary DiskTrees.

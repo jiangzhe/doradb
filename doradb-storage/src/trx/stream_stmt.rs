@@ -5,11 +5,14 @@ use crate::error::{
 };
 use crate::id::TableID;
 use crate::index::{
-    BTreeKeyEncoder, IndexBatchStream, IndexLookupCandidate, OwnedSecondaryIndexCandidateStream,
+    BTreeKeyEncoder, IndexBatchStream, IndexLookupCandidate, OwnedIndexCandidateStream,
 };
 use crate::row::ops::SelectMvcc;
 use crate::table::{DmlValidator, Table, TableRuntimeLayout};
-use crate::trx::{SessionOperationCheckout, TableAdmissionRequest, Transaction, TrxRuntime};
+use crate::trx::row::BoundIndexCandidate;
+use crate::trx::{
+    SessionOperationCheckout, StmtNo, TableAdmissionRequest, Transaction, TrxRuntime,
+};
 use crate::value::Val;
 use error_stack::ResultExt;
 use std::collections::VecDeque;
@@ -23,12 +26,17 @@ const INDEX_SCAN_STREAM_OPERATION: &str = "table_index_scan_mvcc";
 
 struct StreamStmtState {
     checkout: SessionOperationCheckout,
+    _stmt_no: StmtNo,
 }
 
 impl StreamStmtState {
     #[inline]
-    fn new(checkout: SessionOperationCheckout) -> Self {
-        Self { checkout }
+    fn new(mut checkout: SessionOperationCheckout) -> Self {
+        let stmt_no = checkout.inner_mut().next_stmt_no();
+        Self {
+            checkout,
+            _stmt_no: stmt_no,
+        }
     }
 
     #[inline]
@@ -46,7 +54,7 @@ impl StreamStmtState {
         table_id: TableID,
         request: TableAdmissionRequest,
     ) -> OperationOrFatalResult<(Arc<Table>, Arc<TableRuntimeLayout>)> {
-        let Self { checkout } = self;
+        let Self { checkout, .. } = self;
         let (inner, attachment) = checkout.inner_and_attachment_mut();
         admit_user_table(
             inner,
@@ -59,8 +67,8 @@ impl StreamStmtState {
     }
 }
 
-struct IndexScanMvccStreamState<'trx> {
-    candidate_stream: OwnedSecondaryIndexCandidateStream<'trx, EvictableBufferPool>,
+struct IndexScanMvccStreamState {
+    candidate_stream: OwnedIndexCandidateStream<EvictableBufferPool>,
     table: Arc<Table>,
     layout: Arc<TableRuntimeLayout>,
     index_no: usize,
@@ -73,7 +81,7 @@ struct IndexScanMvccStreamState<'trx> {
 
 /// Public caller-driven MVCC secondary-index scan stream.
 pub struct IndexScanMvccStream<'trx> {
-    state: Option<IndexScanMvccStreamState<'trx>>,
+    state: Option<IndexScanMvccStreamState>,
     candidates: VecDeque<IndexLookupCandidate>,
     exhausted: bool,
     _trx: PhantomData<&'trx mut Transaction>,
@@ -81,7 +89,7 @@ pub struct IndexScanMvccStream<'trx> {
 
 impl<'trx> IndexScanMvccStream<'trx> {
     #[inline]
-    fn new(state: IndexScanMvccStreamState<'trx>) -> Self {
+    fn new(state: IndexScanMvccStreamState) -> Self {
         Self {
             state: Some(state),
             candidates: VecDeque::new(),
@@ -109,7 +117,7 @@ impl<'trx> IndexScanMvccStream<'trx> {
                     return Err(err);
                 }
             };
-            match self.lookup_candidate(&candidate).await.disclose() {
+            match self.lookup_candidate(candidate).await.disclose() {
                 Ok(SelectMvcc::Found(vals)) => return Ok(Some(vals)),
                 Ok(SelectMvcc::NotFound) => (),
                 Err(err) => {
@@ -153,7 +161,7 @@ impl<'trx> IndexScanMvccStream<'trx> {
     #[inline]
     async fn lookup_candidate(
         &mut self,
-        candidate: &IndexLookupCandidate,
+        candidate: IndexLookupCandidate,
     ) -> RuntimeResult<SelectMvcc> {
         let state = self
             .state
@@ -161,22 +169,22 @@ impl<'trx> IndexScanMvccStream<'trx> {
             .expect("stream state is present until exhaustion or error");
         let rt = state.stmt_state.runtime();
         let accessor = state.table.accessor_with_layout(&state.layout);
+        let row_id = candidate.row_id;
+        let candidate = BoundIndexCandidate::new(
+            state.index_no,
+            state.unique,
+            state.encoder.as_ref(),
+            candidate,
+        );
         accessor
-            .index_lookup_candidate_row_mvcc(
-                rt,
-                state.index_no,
-                state.unique,
-                &state.encoder,
-                candidate,
-                &state.read_set,
-            )
+            .index_lookup_candidate_row_mvcc(rt, candidate, &state.read_set)
             .await
             .attach_with(|| {
                 format!(
                     "operation={INDEX_SCAN_STREAM_OPERATION}, table_id={}, index_no={}, row_id={}",
                     state.table.table_id(),
                     state.index_no,
-                    candidate.row_id
+                    row_id
                 )
             })
     }
@@ -264,7 +272,7 @@ impl<'trx> StreamStmt<'trx> {
         }
         let index = layout.secondary_index(index_no).disclose()?;
         let unique = index.is_unique();
-        let encoder = index.key_encoder();
+        let encoder = index.key_encoder_arc();
         let range = if unique {
             encoder.encode_range(range)
         } else {
@@ -273,7 +281,7 @@ impl<'trx> StreamStmt<'trx> {
         let rt = stmt_state.runtime();
         let accessor = table.accessor_with_layout(&layout);
         let candidate_stream = accessor
-            .index_scan_candidates(rt, index_no, range, PhantomData)
+            .index_scan_candidates(rt, index_no, range)
             .disclose()?;
         let state = IndexScanMvccStreamState {
             candidate_stream,

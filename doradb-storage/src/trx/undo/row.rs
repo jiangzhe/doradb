@@ -5,7 +5,9 @@ use crate::error::RuntimeResult as Result;
 use crate::id::{RowID, TableID, TrxID};
 use crate::row::ops::{SelectKey, UndoCol, UpdateCol};
 use crate::runtime::{POLL_BUDGET, yield_now};
-use crate::trx::{MIN_SNAPSHOT_TS, PrepareListenerResult, SharedTrxStatus, trx_is_committed};
+use crate::trx::{
+    MIN_SNAPSHOT_TS, PrepareListenerResult, SharedTrxStatus, StmtNo, trx_is_committed,
+};
 use crate::value::Val;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
@@ -115,6 +117,12 @@ impl RowUndoLogs {
         self.0.push(value)
     }
 
+    /// Remove the newest entry after its row-version reference was unlinked.
+    #[inline]
+    pub(crate) fn pop(&mut self) -> Option<OwnedRowUndo> {
+        self.0.pop()
+    }
+
     /// Move all row undo entries from another buffer into this one.
     #[inline]
     pub(crate) fn merge(&mut self, other: &mut Self) {
@@ -211,12 +219,14 @@ impl OwnedRowUndo {
     /// Create an owned row undo entry for a single row-page change.
     #[inline]
     pub(crate) fn new(
+        stmt_no: StmtNo,
         table_id: TableID,
         page_id: Option<VersionedPageID>,
         row_id: RowID,
         kind: RowUndoKind,
     ) -> Self {
         let entry = RowUndo {
+            stmt_no,
             table_id,
             page_id,
             row_id,
@@ -287,6 +297,8 @@ impl Clone for RowUndoRef {
 
 /// Undo entry for one hot-row or cold-delete-buffer row version.
 pub(crate) struct RowUndo {
+    /// Transaction-local statement that installed this foreground version.
+    pub(crate) stmt_no: StmtNo,
     /// Table containing the hot row or cold deletion marker.
     pub(crate) table_id: TableID,
     /// Row page for hot-row undo. `None` is reserved for cold-row deletion
@@ -547,6 +559,12 @@ impl RowUndoHead {
     #[inline]
     pub(crate) fn ts(&self) -> TrxID {
         self.next.main.status.ts()
+    }
+
+    /// Returns the transaction-local statement tag on the current main entry.
+    #[inline]
+    pub(crate) fn stmt_no(&self) -> StmtNo {
+        self.next.main.entry.as_ref().stmt_no
     }
 
     /// Register a listener for the owning transaction's prepare completion.

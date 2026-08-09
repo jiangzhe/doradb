@@ -1,5 +1,6 @@
 mod block_index;
 mod block_index_root;
+mod borrowed_stream;
 mod btree;
 mod column_block_index;
 mod column_deletion_blob;
@@ -17,11 +18,12 @@ use crate::buffer::{BufferPool, PoolGuard, PoolGuards};
 use crate::error::RuntimeResult;
 use crate::id::BlockID;
 use crate::table::TableRootSnapshot;
-use crate::trx::{Transaction, TrxReadProof};
+use crate::trx::TrxReadProof;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
 pub(crate) use block_index::BlockIndex;
+pub(crate) use borrowed_stream::BorrowedIndexMutationStream;
 pub(crate) use btree::{BTreeKey, BTreeKeyEncoder, KeyRange};
 #[cfg(test)]
 pub(crate) use column_block_index::{
@@ -39,10 +41,10 @@ pub(crate) use column_deletion_blob::{
 pub(crate) use index_stream::{IndexBatchStream, IndexLookupCandidate};
 pub(crate) use mem_index::MemIndexEntry;
 pub(crate) use non_unique_index::{GuardedNonUniqueMemIndex, IndexMask, NonUniqueMemIndex};
-pub(crate) use owned_stream::OwnedSecondaryIndexCandidateStream;
-pub(crate) use row_page_index::RowLocation;
+pub(crate) use owned_stream::OwnedIndexCandidateStream;
 #[cfg(test)]
 pub(crate) use row_page_index::RowPageIndexNode;
+pub(crate) use row_page_index::{LwcRowLocation, RowLocation};
 pub(crate) use secondary_index::{
     InMemorySecondaryIndex, IndexCompareExchange, IndexInsert, NonUniqueSecondaryIndex,
     SecondaryDiskTreeRuntime, SecondaryIndex, UniqueInsertAttempt, UniqueSecondaryIndex,
@@ -112,9 +114,9 @@ impl<'op, 'idx, P: BufferPool + 'static> CurrentIndexReadHandle<'op, 'idx, P> {
         self.index.is_unique()
     }
 
-    /// Returns the admitted current index's key encoder.
+    /// Returns the admitted current index's borrowed key encoder.
     #[inline]
-    pub(crate) fn key_encoder(&self) -> Arc<BTreeKeyEncoder> {
+    pub(crate) fn key_encoder(&self) -> &BTreeKeyEncoder {
         self.index.key_encoder()
     }
 
@@ -134,15 +136,14 @@ impl<'op, 'idx, P: BufferPool + 'static> CurrentIndexReadHandle<'op, 'idx, P> {
 }
 
 /// Owned executable state retained by one caller-driven index stream.
-pub(crate) struct OwnedCurrentIndexReadHandle<'trx, P: BufferPool + 'static> {
+pub(crate) struct OwnedCurrentIndexReadHandle<P: BufferPool + 'static> {
     index: Arc<SecondaryIndex<P>>,
     index_pool_guard: PoolGuard,
     disk_pool_guard: PoolGuard,
     root: BlockID,
-    _transaction: PhantomData<&'trx mut Transaction>,
 }
 
-impl<'trx, P: BufferPool + 'static> OwnedCurrentIndexReadHandle<'trx, P> {
+impl<P: BufferPool + 'static> OwnedCurrentIndexReadHandle<P> {
     /// Creates an owned handle from one proof-gated current index root.
     #[inline]
     pub(crate) fn new(
@@ -151,14 +152,12 @@ impl<'trx, P: BufferPool + 'static> OwnedCurrentIndexReadHandle<'trx, P> {
         disk_pool_guard: PoolGuard,
         root: BlockID,
         _proof: &TrxReadProof<'_>,
-        _transaction: PhantomData<&'trx mut Transaction>,
     ) -> Self {
         Self {
             index,
             index_pool_guard,
             disk_pool_guard,
             root,
-            _transaction: PhantomData,
         }
     }
 }

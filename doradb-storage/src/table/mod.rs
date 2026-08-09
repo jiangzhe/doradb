@@ -2939,7 +2939,7 @@ pub(crate) mod tests {
             panic!("row should exist");
         };
         match table.find_row(guards, row_id).await.unwrap() {
-            RowLocation::LwcBlock { .. } => row_id,
+            RowLocation::LwcBlock(..) => row_id,
             RowLocation::RowPage(..) => panic!("row should be in lwc"),
             RowLocation::NotFound => panic!("row should exist"),
         }

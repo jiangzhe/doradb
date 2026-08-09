@@ -2514,6 +2514,7 @@ mod tests {
 
             let mut row_undo = RowUndoLogs::empty();
             row_undo.push(OwnedRowUndo::new(
+                crate::trx::NON_FOREGROUND_STMT_NO,
                 table.table_id(),
                 None,
                 row_id,
@@ -2609,6 +2610,7 @@ mod tests {
 
             let mut row_undo = RowUndoLogs::empty();
             row_undo.push(OwnedRowUndo::new(
+                crate::trx::NON_FOREGROUND_STMT_NO,
                 table.table_id(),
                 None,
                 row_id,
@@ -2706,7 +2708,7 @@ mod tests {
                 .expect("test row lookup should succeed")
             {
                 RowLocation::RowPage(page_id) => page_id,
-                RowLocation::LwcBlock { .. } | RowLocation::NotFound => unreachable!(),
+                RowLocation::LwcBlock(..) | RowLocation::NotFound => unreachable!(),
             };
             let page_guard = table
                 .mem
@@ -2731,6 +2733,7 @@ mod tests {
 
             let mut row_undo = RowUndoLogs::empty();
             row_undo.push(OwnedRowUndo::new(
+                crate::trx::NON_FOREGROUND_STMT_NO,
                 table.table_id(),
                 Some(stale_page_id),
                 row_id,
@@ -2824,7 +2827,7 @@ mod tests {
                 .expect("test row lookup should succeed")
             {
                 RowLocation::RowPage(page_id) => page_id,
-                RowLocation::LwcBlock { .. } | RowLocation::NotFound => unreachable!(),
+                RowLocation::LwcBlock(..) | RowLocation::NotFound => unreachable!(),
             };
             let page_guard = table
                 .mem
@@ -2849,6 +2852,7 @@ mod tests {
 
             let mut row_undo = RowUndoLogs::empty();
             row_undo.push(OwnedRowUndo::new(
+                crate::trx::NON_FOREGROUND_STMT_NO,
                 table.table_id(),
                 Some(stale_page_id),
                 row_id,

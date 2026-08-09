@@ -3,7 +3,7 @@ use crate::buffer::page::VersionedPageID;
 use crate::catalog::{TableColumnLayout, TableMetadata};
 use crate::error::{OperationError, OperationResult};
 use crate::id::{RowID, TableID, TrxID};
-use crate::index::{BTreeKeyEncoder, IndexLookupCandidate};
+use crate::index::{BTreeKey, BTreeKeyEncoder, IndexLookupCandidate};
 use crate::map::FastHashMap;
 use crate::poison::PoisonAwareListener;
 use crate::recovery::RowRecoveryMap;
@@ -16,7 +16,7 @@ use crate::trx::undo::{
 };
 use crate::trx::ver_map::{RowPageState, RowVersionMap, RowVersionReadGuard, RowVersionWriteGuard};
 use crate::trx::{
-    PrepareListenerResult, SharedTrxStatus, TrxContext, TrxRuntime, trx_is_committed,
+    PrepareListenerResult, SharedTrxStatus, StmtNo, TrxContext, TrxRuntime, trx_is_committed,
 };
 use crate::value::Val;
 use error_stack::Report;
@@ -158,13 +158,13 @@ impl<'a> RowReadAccess<'a> {
         &self,
         metadata: &TableMetadata,
         read_set: &[usize],
-        recheck: &IndexCandidateRecheck<'_>,
+        candidate: &BoundIndexCandidate<'_>,
     ) -> ReadRow {
         let row = self.row();
         if row.is_deleted() {
             return ReadRow::NotFound;
         }
-        let Some(index_spec) = metadata.idx.index_spec(recheck.index_no) else {
+        let Some(index_spec) = metadata.idx.index_spec(candidate.index_no) else {
             return ReadRow::InvalidIndex;
         };
         let key_vals = index_spec
@@ -172,7 +172,7 @@ impl<'a> RowReadAccess<'a> {
             .iter()
             .map(|key| row.val(metadata.col.as_ref(), key.col_no as usize))
             .collect::<Vec<_>>();
-        if !recheck.matches_key(&key_vals) {
+        if !candidate.matches_key(&key_vals) {
             return ReadRow::InvalidIndex;
         }
         let vals = row.vals_for_read_set(metadata.col.as_ref(), read_set);
@@ -373,23 +373,23 @@ impl<'a> RowReadAccess<'a> {
         ctx: &TrxContext,
         metadata: &TableMetadata,
         read_set: &[usize],
-        recheck: &IndexCandidateRecheck<'_>,
+        candidate: &BoundIndexCandidate<'_>,
     ) -> ReadRow {
         match &self.state {
             RowReadState::RowVer(undo) => match &**undo {
-                None => self.read_row_latest_index_candidate(metadata, read_set, recheck),
+                None => self.read_row_latest_index_candidate(metadata, read_set, candidate),
                 Some(undo_head) => {
                     let ts = undo_head.ts();
                     if trx_is_committed(ts) {
                         if ctx.sts() > ts {
                             return self
-                                .read_row_latest_index_candidate(metadata, read_set, recheck);
+                                .read_row_latest_index_candidate(metadata, read_set, candidate);
                         }
                     } else if ctx.trx_id() == ts {
-                        return self.read_row_latest_index_candidate(metadata, read_set, recheck);
+                        return self.read_row_latest_index_candidate(metadata, read_set, candidate);
                     }
 
-                    let Some(index_spec) = metadata.idx.index_spec(recheck.index_no) else {
+                    let Some(index_spec) = metadata.idx.index_spec(candidate.index_no) else {
                         return ReadRow::InvalidIndex;
                     };
                     let mut next = &undo_head.next;
@@ -401,7 +401,7 @@ impl<'a> RowReadAccess<'a> {
                         .map(|(key_pos, key)| (key.col_no as usize, key_pos))
                         .collect();
                     let undo_key = SelectKey {
-                        index_no: recheck.index_no,
+                        index_no: candidate.index_no,
                         vals: index_spec
                             .cols
                             .iter()
@@ -419,7 +419,8 @@ impl<'a> RowReadAccess<'a> {
                     };
                     loop {
                         let entry;
-                        if let Some(ib) = next.indexes.iter().find(|ib| recheck.matches_branch(ib))
+                        if let Some(ib) =
+                            next.indexes.iter().find(|ib| candidate.matches_branch(ib))
                         {
                             ver.undo_update(&ib.undo_vals);
                             debug_assert!(!ver.deleted);
@@ -432,7 +433,7 @@ impl<'a> RowReadAccess<'a> {
                                         return ver.get_visible_vals_for_index_candidate(
                                             metadata,
                                             self.row(),
-                                            recheck,
+                                            candidate,
                                         );
                                     }
                                     entry = hot_entry.as_ref();
@@ -446,7 +447,7 @@ impl<'a> RowReadAccess<'a> {
                                     return ver.get_visible_vals_for_index_candidate(
                                         metadata,
                                         self.row(),
-                                        recheck,
+                                        candidate,
                                     );
                                 }
                             }
@@ -475,7 +476,7 @@ impl<'a> RowReadAccess<'a> {
                                 return ver.get_visible_vals_for_index_candidate(
                                     metadata,
                                     self.row(),
-                                    recheck,
+                                    candidate,
                                 );
                             }
                             Some(nx) => {
@@ -487,7 +488,7 @@ impl<'a> RowReadAccess<'a> {
                                     return ver.get_visible_vals_for_index_candidate(
                                         metadata,
                                         self.row(),
-                                        recheck,
+                                        candidate,
                                     );
                                 }
                                 next = nx;
@@ -739,28 +740,47 @@ impl<'a> RowReadState<'a> {
     }
 }
 
-/// Exact secondary-index candidate identity used during hot-row MVCC recheck.
-pub(crate) struct IndexCandidateRecheck<'a> {
-    /// Target secondary-index slot.
+/// Exact secondary-index candidate identity bound to one admitted index.
+///
+/// The lookup candidate is consumed from its scanner, while the key encoder
+/// remains borrowed from the operation-owned index handle.
+pub(crate) struct BoundIndexCandidate<'a> {
     pub(crate) index_no: usize,
-    /// Whether the target index is unique.
     pub(crate) unique: bool,
-    /// Candidate emitted by the secondary-index stream.
-    pub(crate) candidate: &'a IndexLookupCandidate,
-    /// Encoder for the target index identity.
+    pub(crate) encoded_key: BTreeKey,
+    pub(crate) row_id: RowID,
     pub(crate) encoder: &'a BTreeKeyEncoder,
 }
 
-impl IndexCandidateRecheck<'_> {
+impl<'a> BoundIndexCandidate<'a> {
     #[inline]
-    fn matches_key(&self, key_vals: &[Val]) -> bool {
+    pub(crate) fn new(
+        index_no: usize,
+        unique: bool,
+        encoder: &'a BTreeKeyEncoder,
+        candidate: IndexLookupCandidate,
+    ) -> Self {
+        let IndexLookupCandidate {
+            encoded_key,
+            row_id,
+        } = candidate;
+        Self {
+            index_no,
+            unique,
+            encoded_key,
+            row_id,
+            encoder,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn matches_key(&self, key_vals: &[Val]) -> bool {
         let encoded = if self.unique {
             self.encoder.encode(key_vals)
         } else {
-            self.encoder
-                .encode_pair(key_vals, Val::from(self.candidate.row_id))
+            self.encoder.encode_pair(key_vals, Val::from(self.row_id))
         };
-        encoded.as_bytes() == self.candidate.encoded_key.as_bytes()
+        encoded.as_bytes() == self.encoded_key.as_bytes()
     }
 
     #[inline]
@@ -923,9 +943,9 @@ impl RowVersion {
         mut self,
         metadata: &TableMetadata,
         row: Row<'_>,
-        recheck: &IndexCandidateRecheck<'_>,
+        candidate: &BoundIndexCandidate<'_>,
     ) -> ReadRow {
-        let Some(index_spec) = metadata.idx.index_spec(recheck.index_no) else {
+        let Some(index_spec) = metadata.idx.index_spec(candidate.index_no) else {
             return ReadRow::InvalidIndex;
         };
         let matches_candidate = if let Some(undo_key) = self
@@ -933,7 +953,7 @@ impl RowVersion {
             .as_ref()
             .and_then(|tracker| tracker.undo_key.as_ref())
         {
-            recheck.matches_key(&undo_key.vals)
+            candidate.matches_key(&undo_key.vals)
         } else {
             let key_vals = index_spec
                 .cols
@@ -946,7 +966,7 @@ impl RowVersion {
                         .unwrap_or_else(|| row.val(metadata.col.as_ref(), col_no))
                 })
                 .collect::<Vec<_>>();
-            recheck.matches_key(&key_vals)
+            candidate.matches_key(&key_vals)
         };
         if !matches_candidate {
             return ReadRow::InvalidIndex;
@@ -1075,6 +1095,14 @@ impl<'a> RowWriteAccess<'a> {
         *self._state_guard
     }
 
+    /// Returns whether the latest hot-row image was produced by this statement.
+    #[inline]
+    pub(crate) fn owned_by_stmt(&self, ctx: &TrxContext, stmt_no: StmtNo) -> bool {
+        self.guard
+            .as_ref()
+            .is_some_and(|head| ctx.is_same_trx(head.as_ref()) && head.stmt_no() == stmt_no)
+    }
+
     /// Marks the row as deleted in the page image.
     #[inline]
     pub(crate) fn delete_row(&mut self) {
@@ -1127,129 +1155,83 @@ impl<'a> RowWriteAccess<'a> {
         self.guard.take();
     }
 
-    /// Acquires modification ownership for the latest physical row image.
+    /// Acquires modification ownership for a valid latest physical row image.
     ///
     /// Row writes never target an older image reconstructed from MVCC undo.
     /// The current transaction may extend its own active chain; another active
-    /// owner conflicts or, while preparing, is awaited by the caller.
-    #[expect(clippy::too_many_arguments, reason = "code style")]
+    /// owner conflicts or, while preparing, is awaited by the caller. The
+    /// caller-supplied validation runs only after that ownership admission and
+    /// before a provisional undo lock is installed.
     #[inline]
     pub(crate) fn lock_undo(
         &mut self,
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
-        metadata: &TableMetadata,
         table_id: TableID,
         page_id: VersionedPageID,
         row_id: RowID,
-        key: Option<(usize, &[Val])>,
+        validate_latest: impl FnOnce(Row<'a>) -> bool,
     ) -> LockUndo {
         rt.debug_assert_table_write_lock_held(table_id);
         let ctx = rt.ctx();
-        let row = self.page.row(self.row_idx);
+        match &*self.guard {
+            None => (),
+            Some(undo_head) if ctx.is_same_trx(undo_head) || trx_is_committed(undo_head.ts()) => {}
+            Some(undo_head) => {
+                // Another active transaction owns the hot-row lock. If it is
+                // preparing commit, wait and retry because the status will
+                // shortly become committed; otherwise report a write conflict.
+                return match undo_head.prepare_listener() {
+                    PrepareListenerResult::NotPreparing => LockUndo::WriteConflict,
+                    PrepareListenerResult::Registered(listener)
+                    | PrepareListenerResult::Completed(listener) => LockUndo::Preparing(listener),
+                };
+            }
+        }
+
+        // Interpret the physical image only after excluding a foreign owner.
+        // The row write latch keeps that image stable through undo installation.
+        if !validate_latest(self.page.row(self.row_idx)) {
+            return LockUndo::InvalidIndex;
+        }
+
         match &mut *self.guard {
             None => {
                 // No undo head exists yet, so this transaction becomes the
                 // first writer for the hot row. The `Lock` entry is pushed to
                 // statement-owned row undo before the actual row-page change is
                 // made.
-                let entry = OwnedRowUndo::new(table_id, Some(page_id), row_id, RowUndoKind::Lock);
+                let entry = OwnedRowUndo::new(
+                    effects.stmt_no(),
+                    table_id,
+                    Some(page_id),
+                    row_id,
+                    RowUndoKind::Lock,
+                );
                 self.add_undo_head(Arc::clone(ctx.status()), entry.leak());
                 effects.push_row_undo(entry);
                 LockUndo::Ok
             }
             Some(undo_head) => {
-                if ctx.is_same_trx(undo_head) {
-                    // Re-entrant write by the same transaction. Chain another
-                    // provisional lock entry so each statement-level operation
-                    // can roll back independently in reverse order.
-                    let mut entry =
-                        OwnedRowUndo::new(table_id, Some(page_id), row_id, RowUndoKind::Lock);
-                    let new_next = NextRowUndo::new(MainBranch {
-                        entry: entry.leak(),
-                        status: UndoStatus::Ref(Arc::clone(ctx.status())),
-                    });
-                    let old_next = mem::replace(&mut undo_head.next, new_next);
-                    entry.next = Some(old_next);
-                    effects.push_row_undo(entry);
-                    return LockUndo::Ok;
-                }
-                let old_cts = undo_head.ts();
-                if trx_is_committed(old_cts) {
-                    // The previous writer has committed, so this transaction
-                    // can own a new undo head. Key validation filters stale
-                    // index candidates before the row is locked.
-                    //
-                    // Check whether the row is valid through index lookup.
-                    // There might be case an out-of-date index entry pointing to the
-                    // latest version of the row which has different key other than index.
-                    //
-                    // For example, assume:
-                    //
-                    // 1. one row with row_id=100, k=200 is inserted.
-                    //    Then index has entry k(200) -> row_id(100).
-                    //
-                    // 2. update row set k=300.
-                    //    If in-place update is available, we will reuse row_id=100, and
-                    //    just update its key to 300.
-                    //    So in index, we have two entries: k(200) -> row_id(100),
-                    //    k(300) -> row_id(100).
-                    //    The first entry is supposed to be linked to the old version, and
-                    //    second entry to new version.
-                    //    But in our design, both of them point to latest version and
-                    //    we need to traverse the version chain to find correct(visible)
-                    //    version.
-                    //
-                    // 3. insert one row with row_id=101, k=200.
-                    //    Now we need to identify k=200 is actually out-of-date index entry,
-                    //    and just skip it.
-                    //
-                    // argument validate_key indicates whether we should perform the validation.
-                    // When we chain deleted row and new row with same key, we may need to
-                    // skip the validation.
-                    //
-                    // For example:
-                    //
-                    // 1. One row[row_id=100, k=1] inserted.
-                    //
-                    // 2. Update k to 2. so row becomes [row_id=100, k=2].
-                    //
-                    // 3. Delete it. [row_id=100, k=2, deleted].
-                    //
-                    // 4. Insert k=1 again. We will find index entry k=1 already
-                    //    pointed to deleted row [row_id=100, k=2].
-                    //    Now we should not validate the key.
-                    //
-                    // todo: A further optimization for this scenario is to traverse through
-                    // undo chain and check whether the same key exists in any old versions.
-                    // If not exists, we do not need to build the version chain.
-                    if let Some((index_no, key_vals)) = key {
-                        let Some(index_spec) = metadata.idx.index_spec(index_no) else {
-                            return LockUndo::InvalidIndex;
-                        };
-                        if row.is_key_different(metadata.col.as_ref(), index_spec, key_vals) {
-                            return LockUndo::InvalidIndex;
-                        }
-                    }
-                    let mut entry =
-                        OwnedRowUndo::new(table_id, Some(page_id), row_id, RowUndoKind::Lock);
-                    let new_next = NextRowUndo::new(MainBranch {
-                        entry: entry.leak(),
-                        status: UndoStatus::Ref(Arc::clone(ctx.status())),
-                    });
-                    let old_next = mem::replace(&mut undo_head.next, new_next);
-                    entry.next = Some(old_next);
-                    effects.push_row_undo(entry);
-                    return LockUndo::Ok;
-                }
-                // Another active transaction owns the hot-row lock. If it is
-                // preparing commit, wait and retry because the status will
-                // shortly become committed; otherwise report a write conflict.
-                match undo_head.prepare_listener() {
-                    PrepareListenerResult::NotPreparing => LockUndo::WriteConflict,
-                    PrepareListenerResult::Registered(listener)
-                    | PrepareListenerResult::Completed(listener) => LockUndo::Preparing(listener),
-                }
+                // Re-entrant writes and writes after a committed head both
+                // chain a provisional lock so statement rollback remains
+                // independent and the previous version stays reachable.
+                debug_assert!(ctx.is_same_trx(undo_head) || trx_is_committed(undo_head.ts()));
+                let mut entry = OwnedRowUndo::new(
+                    effects.stmt_no(),
+                    table_id,
+                    Some(page_id),
+                    row_id,
+                    RowUndoKind::Lock,
+                );
+                let new_next = NextRowUndo::new(MainBranch {
+                    entry: entry.leak(),
+                    status: UndoStatus::Ref(Arc::clone(ctx.status())),
+                });
+                let old_next = mem::replace(&mut undo_head.next, new_next);
+                entry.next = Some(old_next);
+                effects.push_row_undo(entry);
+                LockUndo::Ok
             }
         }
     }
@@ -1530,7 +1512,13 @@ pub(crate) mod tests {
     }
 
     fn install_test_undo_head(row_ver: &RowVersionMap, status: Arc<SharedTrxStatus>) {
-        let undo = OwnedRowUndo::new(TableID::new(1), None, RowID::new(100), RowUndoKind::Lock);
+        let undo = OwnedRowUndo::new(
+            crate::trx::NON_FOREGROUND_STMT_NO,
+            TableID::new(1),
+            None,
+            RowID::new(100),
+            RowUndoKind::Lock,
+        );
         *row_ver.write_latch(0) = Some(Box::new(RowUndoHead::new(status, undo.leak())));
     }
 
@@ -1729,8 +1717,13 @@ pub(crate) mod tests {
         }
 
         let rollback_status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 10));
-        let mut rollback_undo =
-            OwnedRowUndo::new(TableID::new(1), None, RowID::new(100), RowUndoKind::Lock);
+        let mut rollback_undo = OwnedRowUndo::new(
+            crate::trx::NON_FOREGROUND_STMT_NO,
+            TableID::new(1),
+            None,
+            RowID::new(100),
+            RowUndoKind::Lock,
+        );
         *row_ver.write_latch(0) = Some(Box::new(RowUndoHead::new(
             rollback_status,
             rollback_undo.leak(),
@@ -1739,8 +1732,13 @@ pub(crate) mod tests {
         // restoration boundary, so exercise two independent rollback passes.
         test_row_write_access(&page, &row_ver, &dirty, 0)
             .rollback_first_undo(&metadata, &mut rollback_undo);
-        let mut trx_rollback_undo =
-            OwnedRowUndo::new(TableID::new(1), None, RowID::new(100), RowUndoKind::Lock);
+        let mut trx_rollback_undo = OwnedRowUndo::new(
+            crate::trx::NON_FOREGROUND_STMT_NO,
+            TableID::new(1),
+            None,
+            RowID::new(100),
+            RowUndoKind::Lock,
+        );
         *row_ver.write_latch(0) = Some(Box::new(RowUndoHead::new(
             Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 11)),
             trx_rollback_undo.leak(),
@@ -1748,8 +1746,13 @@ pub(crate) mod tests {
         test_row_write_access(&page, &row_ver, &dirty, 0)
             .rollback_first_undo(&metadata, &mut trx_rollback_undo);
 
-        let purge_undo =
-            OwnedRowUndo::new(TableID::new(1), None, RowID::new(101), RowUndoKind::Lock);
+        let purge_undo = OwnedRowUndo::new(
+            crate::trx::NON_FOREGROUND_STMT_NO,
+            TableID::new(1),
+            None,
+            RowID::new(101),
+            RowUndoKind::Lock,
+        );
         *row_ver.write_latch(1) = Some(Box::new(RowUndoHead::new(
             Arc::new(shared_trx_status(TrxID::new(20))),
             purge_undo.leak(),
@@ -1767,10 +1770,20 @@ pub(crate) mod tests {
         *row_ver.write_state() = RowPageState::Frozen;
         let dirty = AtomicBool::new(false);
         let repeated_status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 9));
-        let repeated_first_undo =
-            OwnedRowUndo::new(TableID::new(1), None, RowID::new(100), RowUndoKind::Lock);
-        let repeated_second_undo =
-            OwnedRowUndo::new(TableID::new(1), None, RowID::new(101), RowUndoKind::Lock);
+        let repeated_first_undo = OwnedRowUndo::new(
+            crate::trx::NON_FOREGROUND_STMT_NO,
+            TableID::new(1),
+            None,
+            RowID::new(100),
+            RowUndoKind::Lock,
+        );
+        let repeated_second_undo = OwnedRowUndo::new(
+            crate::trx::NON_FOREGROUND_STMT_NO,
+            TableID::new(1),
+            None,
+            RowID::new(101),
+            RowUndoKind::Lock,
+        );
         *row_ver.write_latch(0) = Some(Box::new(RowUndoHead::new(
             Arc::clone(&repeated_status),
             repeated_first_undo.leak(),
@@ -1794,8 +1807,13 @@ pub(crate) mod tests {
         assert_eq!(row_ver.frozen_mutation_version(), 4);
 
         let rollback_status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 10));
-        let mut rollback_undo =
-            OwnedRowUndo::new(TableID::new(1), None, RowID::new(100), RowUndoKind::Lock);
+        let mut rollback_undo = OwnedRowUndo::new(
+            crate::trx::NON_FOREGROUND_STMT_NO,
+            TableID::new(1),
+            None,
+            RowID::new(100),
+            RowUndoKind::Lock,
+        );
         *row_ver.write_latch(0) = Some(Box::new(RowUndoHead::new(
             rollback_status,
             rollback_undo.leak(),
@@ -1809,8 +1827,13 @@ pub(crate) mod tests {
         }
         assert_eq!(row_ver.frozen_mutation_version(), prepared_version + 2);
 
-        let mut trx_rollback_undo =
-            OwnedRowUndo::new(TableID::new(1), None, RowID::new(100), RowUndoKind::Lock);
+        let mut trx_rollback_undo = OwnedRowUndo::new(
+            crate::trx::NON_FOREGROUND_STMT_NO,
+            TableID::new(1),
+            None,
+            RowID::new(100),
+            RowUndoKind::Lock,
+        );
         *row_ver.write_latch(0) = Some(Box::new(RowUndoHead::new(
             Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 11)),
             trx_rollback_undo.leak(),
@@ -1821,8 +1844,13 @@ pub(crate) mod tests {
             .rollback_first_undo(&metadata, &mut trx_rollback_undo);
         assert_eq!(row_ver.frozen_mutation_version(), prepared_version + 2);
 
-        let purge_undo =
-            OwnedRowUndo::new(TableID::new(1), None, RowID::new(101), RowUndoKind::Lock);
+        let purge_undo = OwnedRowUndo::new(
+            crate::trx::NON_FOREGROUND_STMT_NO,
+            TableID::new(1),
+            None,
+            RowID::new(101),
+            RowUndoKind::Lock,
+        );
         *row_ver.write_latch(1) = Some(Box::new(RowUndoHead::new(
             Arc::new(shared_trx_status(TrxID::new(20))),
             purge_undo.leak(),
@@ -1855,6 +1883,7 @@ pub(crate) mod tests {
         let page = row_page(&metadata);
         let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
         let undo = OwnedRowUndo::new(
+            crate::trx::NON_FOREGROUND_STMT_NO,
             TableID::new(1),
             None,
             RowID::new(100),
