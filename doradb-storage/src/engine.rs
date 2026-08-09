@@ -4,8 +4,8 @@
 //! including start, stop, recover, and execute commands. See
 //! `docs/engine-component-lifetime.md` for the runtime-versus-owner lifetime
 //! model that this module enforces with the component registry.
+use crate::buffer::PoolRole;
 use crate::buffer::SharedPoolEvictorWorkers;
-use crate::buffer::{PoolGuards, PoolRole};
 #[cfg(test)]
 use crate::catalog::index::tests::IndexDdlTestController;
 #[cfg(test)]
@@ -702,7 +702,7 @@ pub(crate) struct EngineCore {
     pub(crate) catalog: QuiescentGuard<Catalog>,
     /// Shared transaction-system handle.
     pub(crate) trx_sys: QuiescentGuard<TransactionSystem>,
-    /// Canonical typed pool handles and matching guard bundle.
+    /// Typed pool handles, owner-scoped guards, and session-root factory.
     pub(crate) pools: EnginePools,
     /// Table-file subsystem that runs persistent page IO.
     pub(crate) table_fs: QuiescentGuard<FileSystem>,
@@ -726,12 +726,6 @@ impl EngineCore {
     #[inline]
     pub(crate) fn catalog(&self) -> &Catalog {
         &self.catalog
-    }
-
-    /// Borrow the canonical pool guard bundle.
-    #[inline]
-    pub(crate) fn pool_guards(&self) -> &PoolGuards {
-        self.pools.pool_guards()
     }
 
     /// Return the shared logical lock manager.
@@ -2543,7 +2537,12 @@ mod tests {
                 config,
                 engine.inner().poisoner.clone(),
                 engine.inner().mandatory_runtime.clone(),
-                engine.inner().core.pools.clone(),
+                EnginePools::new(
+                    engine.inner().core.pools.meta.clone(),
+                    engine.inner().core.pools.index.clone(),
+                    engine.inner().core.pools.mem.clone(),
+                    engine.inner().core.pools.disk.clone(),
+                ),
                 engine.inner().table_fs.clone(),
                 engine.inner().catalog.clone(),
             )

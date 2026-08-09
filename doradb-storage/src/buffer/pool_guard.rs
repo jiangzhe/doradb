@@ -2,6 +2,11 @@ use crate::buffer::identity::{PoolIdentity, PoolRole, RowPoolRole};
 use crate::quiescent::SyncQuiescentGuard;
 
 /// Cloneable keepalive guard branded with one exact buffer-pool identity.
+///
+/// Page latch guards clone this value for every retained page access. Clones
+/// from one root update the same outer `Arc` strong count, while separately
+/// constructed guards retain the same pool through independent roots. Root
+/// construction scope is therefore part of the buffer hot-path design.
 #[derive(Clone)]
 pub struct PoolGuard {
     identity: PoolIdentity,
@@ -191,10 +196,19 @@ fn pool_guard_identity_mismatch(
 }
 
 #[cfg(test)]
+pub(crate) use self::tests::shares_keepalive_root;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::quiescent::QuiescentBox;
     use std::panic::catch_unwind;
+
+    /// Returns whether two guards update the same keepalive `Arc` root.
+    #[inline]
+    pub(crate) fn shares_keepalive_root(first: &PoolGuard, second: &PoolGuard) -> bool {
+        crate::quiescent::test_sync_guards_share_root(&first._keepalive, &second._keepalive)
+    }
 
     fn test_guard() -> PoolGuard {
         let owner = Box::leak(Box::new(QuiescentBox::new(())));

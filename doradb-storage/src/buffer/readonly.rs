@@ -188,11 +188,15 @@ impl ReadonlyBufferPool {
         self.stats.snapshot()
     }
 
-    /// Returns a cloneable pool guard for this readonly pool.
+    /// Creates a new clone root for keeping this readonly pool alive.
+    ///
+    /// This has the same lifecycle-boundary semantics as
+    /// [`BufferPool::create_base_guard`]: every call acquires a pool-global
+    /// quiescent keepalive and allocates a fresh outer `Arc` root.
     #[inline]
-    pub(crate) fn pool_guard(&self) -> PoolGuard {
+    pub(crate) fn create_base_guard(&self) -> PoolGuard {
         debug_assert!(!matches!(self.role, PoolRole::Invalid));
-        self.arena.guard()
+        self.arena.create_base_guard()
     }
 
     /// Returns the runtime identity of this pool instance.
@@ -295,19 +299,25 @@ impl ReadonlyBufferPool {
 
     /// Invalidates a specific cache key and returns its old frame id.
     #[inline]
-    fn invalidate_key(&self, key: &BlockKey) -> Option<PageID> {
+    fn invalidate_key(&self, guard: &PoolGuard, key: &BlockKey) -> Option<PageID> {
+        self.validate_guard(guard);
         let frame_id = match self.mappings.remove(key) {
             Some((_, frame_id)) => frame_id,
             None => return None,
         };
-        self.invalidate_frame_retry(frame_id, Some(*key));
+        self.invalidate_frame_retry(guard, frame_id, Some(*key));
         Some(frame_id)
     }
 
     /// Invalidates one physical block from one file.
     #[inline]
-    pub(crate) fn invalidate_block(&self, file_id: FileID, block_id: BlockID) -> Option<PageID> {
-        self.invalidate_key(&BlockKey::new(file_id, block_id))
+    pub(crate) fn invalidate_block(
+        &self,
+        guard: &PoolGuard,
+        file_id: FileID,
+        block_id: BlockID,
+    ) -> Option<PageID> {
+        self.invalidate_key(guard, &BlockKey::new(file_id, block_id))
     }
 
     #[inline]
@@ -315,8 +325,11 @@ impl ReadonlyBufferPool {
         pool: SyncQuiescentGuard<Self>,
     ) -> (ReadonlyRuntime, PressureDeltaClockPolicy) {
         let policy = PressureDeltaClockPolicy::new(pool.eviction_arbiter, 1);
+        // The evictor is detached engine-owned work with no session root to
+        // borrow. Create exactly one base root for the worker runtime and let
+        // every eviction page guard clone that root.
         let runtime = ReadonlyRuntime {
-            arena: pool.arena.arena_guard(pool.pool_guard()),
+            arena: pool.arena.arena_guard(pool.create_base_guard()),
             pool,
         };
         (runtime, policy)
@@ -381,10 +394,15 @@ impl ReadonlyBufferPool {
     }
 
     #[inline]
-    fn invalidate_frame_retry(&self, frame_id: PageID, expected_key: Option<BlockKey>) {
+    fn invalidate_frame_retry(
+        &self,
+        guard: &PoolGuard,
+        frame_id: PageID,
+        expected_key: Option<BlockKey>,
+    ) {
+        self.validate_guard(guard);
         loop {
-            let guard = self.pool_guard();
-            if let Some(page_guard) = self.try_lock_page_exclusive(&guard, frame_id) {
+            if let Some(page_guard) = self.try_lock_page_exclusive(guard, frame_id) {
                 self.invalidate_frame_with_guard(page_guard, expected_key);
                 let _ = self.residency.move_resident_to_free(frame_id);
                 return;
@@ -514,6 +532,7 @@ impl QuiescentGuard<ReadonlyBufferPool> {
     async fn join_or_start_inflight_load(
         &self,
         file: &Arc<SparseFile>,
+        guard: &PoolGuard,
         key: BlockKey,
         validation: Option<InflightLoadValidation>,
     ) -> InternalResult<Arc<PageIOCompletion>> {
@@ -543,7 +562,11 @@ impl QuiescentGuard<ReadonlyBufferPool> {
         };
         // The entry guard above is dropped before we reserve a frame or inspect
         // resident mappings, avoiding nested locks across the two DashMaps.
-        let task_arena = self.arena.arena_guard(self.pool_guard());
+        // The reservation and submitted IO may outlive this caller, so clone
+        // the caller's root into the task-owned arena guard. Creating a new
+        // base root here would touch the pool-global quiescent counter on every
+        // cache miss and would discard the caller's session sharding domain.
+        let task_arena = self.arena.arena_guard(guard.clone());
         match ReadonlyPageReservation::reserve_page(self, task_arena).await {
             Ok((frame_id, page_guard)) => {
                 let reservation = ReadonlyPageReservation::from_reserved_page(
@@ -592,13 +615,14 @@ impl QuiescentGuard<ReadonlyBufferPool> {
     async fn get_or_load_frame_id(
         &self,
         file: &Arc<SparseFile>,
+        guard: &PoolGuard,
         key: BlockKey,
     ) -> RuntimeResult<(PageID, bool)> {
         if let Some(frame_id) = self.try_get_frame_id(&key) {
             return Ok((frame_id, true));
         }
         let inflight = self
-            .join_or_start_inflight_load(file, key, None)
+            .join_or_start_inflight_load(file, guard, key, None)
             .await
             .change_context(RuntimeError::BufferPageAccess)?;
         if let Some(frame_id) = self.try_get_frame_id(&key) {
@@ -620,6 +644,7 @@ impl QuiescentGuard<ReadonlyBufferPool> {
         &self,
         file_kind: FileKind,
         file: &Arc<SparseFile>,
+        guard: &PoolGuard,
         key: BlockKey,
         validator: ReadonlyBlockValidator,
     ) -> RuntimeResult<(PageID, bool)> {
@@ -629,6 +654,7 @@ impl QuiescentGuard<ReadonlyBufferPool> {
         let inflight = self
             .join_or_start_inflight_load(
                 file,
+                guard,
                 key,
                 Some(InflightLoadValidation {
                     file_kind,
@@ -667,19 +693,19 @@ impl QuiescentGuard<ReadonlyBufferPool> {
         loop {
             let (frame_id, resident_hit) = match validation {
                 Some(validator) => {
-                    self.get_or_load_frame_id_validated(file_kind, file, key, validator)
+                    self.get_or_load_frame_id_validated(file_kind, file, guard, key, validator)
                         .await?
                 }
-                None => self.get_or_load_frame_id(file, key).await?,
+                None => self.get_or_load_frame_id(file, guard, key).await?,
             };
-            let guard = self
+            let page_guard = self
                 .get_page_internal::<Page>(guard, frame_id, LatchFallbackMode::Shared)
                 .await;
-            if !self.validate_guarded_frame_key(&guard, key) {
+            if !self.validate_guarded_frame_key(&page_guard, key) {
                 self.invalidate_stale_mapping_if_same_frame(key, frame_id);
                 continue;
             }
-            if let Some(shared) = guard.lock_shared_async().await {
+            if let Some(shared) = page_guard.lock_shared_async().await {
                 let block = ReadonlyBlockGuard::new(block_id, shared);
                 if let Some(validator) = validation
                     && let Err(err) = validator(block.page(), file_kind, block_id)
@@ -693,7 +719,7 @@ impl QuiescentGuard<ReadonlyBufferPool> {
                     // shared guard before invalidation so the retry loop does
                     // not contend with our own latch; revisit this synchronous
                     // path if raw readonly usage expands in the future.
-                    let _ = self.invalidate_block(file.file_id(), block_id);
+                    let _ = self.invalidate_block(guard, file.file_id(), block_id);
                     return Err(err.change_context(RuntimeError::BufferPageAccess));
                 }
                 if resident_hit {
@@ -1256,12 +1282,17 @@ impl ReadonlyBlockGuard {
 /// It installs a per-key write-blocked state before invalidating resident
 /// mappings, so new misses cannot load old disk bytes while the physical block
 /// write is queued or in flight.
+///
+/// The caller supplies its existing guard root. This path can run once per CoW
+/// block write and must not create an independent base root for invalidation.
 #[inline]
 pub(crate) fn begin_write_barrier(
     pool: QuiescentGuard<ReadonlyBufferPool>,
+    guard: &PoolGuard,
     file_id: FileID,
     block_id: BlockID,
 ) -> InternalResult<ReadonlyWriteLease> {
+    pool.validate_guard(guard);
     let key = BlockKey::new(file_id, block_id);
     {
         // Keep the inflight entry guard scoped to this block; invalidation below
@@ -1285,7 +1316,7 @@ pub(crate) fn begin_write_barrier(
             },
         }
     }
-    let _ = pool.invalidate_key(&key);
+    let _ = pool.invalidate_key(guard, &key);
     Ok(ReadonlyWriteLease::new(pool, key))
 }
 
@@ -1293,7 +1324,7 @@ pub(crate) fn begin_write_barrier(
 pub(crate) mod tests {
     use super::*;
     use crate::buffer::page::Page;
-    use crate::buffer::test_page_id;
+    use crate::buffer::{test_outstanding_base_guard_count, test_page_id};
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata, USER_TABLE_ID_START};
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
@@ -1449,7 +1480,7 @@ pub(crate) mod tests {
 
     async fn publish_test_frame(global: &GlobalReadOnlyPoolScope, key: BlockKey) -> PageID {
         let pool = global.guard();
-        let task_arena = pool.arena.arena_guard(pool.pool_guard());
+        let task_arena = pool.arena.arena_guard(pool.create_base_guard());
         let (frame_id, page_guard) = ReadonlyPageReservation::reserve_page(&pool, task_arena)
             .await
             .unwrap();
@@ -1485,8 +1516,8 @@ pub(crate) mod tests {
         }
 
         #[inline]
-        pub(crate) fn pool_guard(&self) -> PoolGuard {
-            self.global.pool_guard()
+        pub(crate) fn create_base_guard(&self) -> PoolGuard {
+            self.global.create_base_guard()
         }
 
         #[inline]
@@ -1588,8 +1619,12 @@ pub(crate) mod tests {
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         let bytes = buf.as_bytes_mut();
         bytes[..payload.len()].copy_from_slice(payload);
-        let mutable =
-            MutableTableFile::fork(table_file, fs.background_writes(), readonly_pool.clone());
+        let mutable = MutableTableFile::fork(
+            table_file,
+            fs.background_writes(),
+            readonly_pool.clone(),
+            readonly_pool.create_base_guard(),
+        );
         mutable.write_block(page_id, buf).await.unwrap();
         drop(mutable);
     }
@@ -1608,6 +1643,7 @@ pub(crate) mod tests {
             table_file,
             fs.background_writes(),
             disk_pool.global_pool().clone(),
+            disk_pool.create_base_guard(),
         );
         mutable.write_block(page_id, buf).await.unwrap();
         drop(mutable);
@@ -1625,7 +1661,7 @@ pub(crate) mod tests {
 
             let scope = global_readonly_pool_scope(frame_page_bytes(4));
             let pool = table_readonly_pool(&scope, test_user_table_id(120), &table_file);
-            let pool_guard = pool.pool_guard();
+            let pool_guard = pool.create_base_guard();
 
             let cold_start = pool.global_stats();
             let cold_guard = pool
@@ -1680,7 +1716,7 @@ pub(crate) mod tests {
             let scope = global_readonly_pool_scope(frame_page_bytes(4));
             let pool_a = table_readonly_pool(&scope, test_user_table_id(121), &table_file_a);
             let pool_b = table_readonly_pool(&scope, test_user_table_id(122), &table_file_b);
-            let pool_a_guard = pool_a.pool_guard();
+            let pool_a_guard = pool_a.create_base_guard();
 
             let start_a = pool_a.global_stats();
             let start_b = pool_b.global_stats();
@@ -1942,6 +1978,7 @@ pub(crate) mod tests {
     fn test_global_readonly_mapping_and_invalidation() {
         smol::block_on(async {
             let global = owned_global_pool(64 * 1024 * 1024);
+            let pool_guard = global.create_base_guard();
             let key = BlockKey::new(test_file_id(7), test_block_id(11));
 
             assert_eq!(global.allocated(), 0);
@@ -1951,10 +1988,46 @@ pub(crate) mod tests {
             assert_eq!(global.try_get_block_key(frame_id), Some(key));
 
             assert_eq!(
-                global.invalidate_block(key.file_id, key.block_id),
+                global.invalidate_block(&pool_guard, key.file_id, key.block_id),
                 Some(frame_id)
             );
             assert_eq!(global.allocated(), 0);
+        });
+    }
+
+    #[test]
+    fn test_readonly_miss_and_invalidation_reuse_caller_base_guard() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let table_id = test_user_table_id(121);
+            let table_file = fs
+                .create_table_file(table_id, make_metadata(), false)
+                .unwrap();
+            let table_file = commit_table_file(&fs, table_file).await;
+            let block_id = test_block_id(19);
+            write_payload(&fs, &table_file, block_id, b"guard-root").await;
+
+            let global = owned_global_pool(frame_page_bytes(2));
+            let pool = owned_readonly_pool(
+                FileID::from(table_id),
+                FileKind::TableFile,
+                Arc::clone(table_file.sparse_file()),
+                &global,
+            );
+            let guard = pool.create_base_guard();
+            assert_eq!(test_outstanding_base_guard_count(&global.arena), 1);
+
+            let block = pool.read_block(&guard, block_id).await.unwrap();
+            assert_eq!(&block.page()[..10], b"guard-root");
+            assert_eq!(test_outstanding_base_guard_count(&global.arena), 1);
+            drop(block);
+
+            assert!(
+                global
+                    .invalidate_block(&guard, FileID::from(table_id), block_id)
+                    .is_some()
+            );
+            assert_eq!(test_outstanding_base_guard_count(&global.arena), 1);
         });
     }
 
@@ -1970,14 +2043,14 @@ pub(crate) mod tests {
                 .lock()
                 .last()
                 .expect("readonly test pool must contain one free frame");
-            let pool_guard = global.pool_guard();
+            let pool_guard = global.create_base_guard();
             let shared = global
                 .get_page_internal::<Page>(&pool_guard, frame_id, LatchFallbackMode::Shared)
                 .await
                 .lock_shared_async()
                 .await
                 .unwrap();
-            let task_arena = global.arena.arena_guard(global.pool_guard());
+            let task_arena = global.arena.arena_guard(global.create_base_guard());
             let mut reserve = Box::pin(ReadonlyPageReservation::reserve_page(&global, task_arena));
 
             assert!(futures::poll!(reserve.as_mut()).is_pending());
@@ -2008,7 +2081,7 @@ pub(crate) mod tests {
             let existing_frame_id = publish_test_frame(&global, key).await;
 
             let free_before = global.residency.free.lock().len();
-            let task_arena = global.arena.arena_guard(global.pool_guard());
+            let task_arena = global.arena.arena_guard(global.create_base_guard());
             let (reserved_frame_id, page_guard) =
                 ReadonlyPageReservation::reserve_page(&global, task_arena)
                     .await
@@ -2051,11 +2124,13 @@ pub(crate) mod tests {
     fn test_readonly_write_barrier_invalidates_resident_mapping() {
         smol::block_on(async {
             let global = owned_global_pool(64 * 1024 * 1024);
+            let pool_guard = global.create_base_guard();
             let key = BlockKey::new(test_file_id(70), test_block_id(11));
             let frame_id = publish_test_frame(&global, key).await;
             assert_eq!(global.try_get_frame_id(&key), Some(frame_id));
 
-            let lease = begin_write_barrier(global.guard(), key.file_id, key.block_id).unwrap();
+            let lease = begin_write_barrier(global.guard(), &pool_guard, key.file_id, key.block_id)
+                .unwrap();
             assert_eq!(global.try_get_frame_id(&key), None);
             assert_eq!(global.try_get_block_key(frame_id), None);
             assert_eq!(global.allocated(), 0);
@@ -2063,7 +2138,8 @@ pub(crate) mod tests {
             drop(lease);
             assert!(!global.inflights.contains_key(&key));
 
-            let miss = begin_write_barrier(global.guard(), key.file_id, key.block_id).unwrap();
+            let miss = begin_write_barrier(global.guard(), &pool_guard, key.file_id, key.block_id)
+                .unwrap();
             assert!(key_state_is_write_blocked(&global, &key));
             drop(miss);
         });
@@ -2072,13 +2148,15 @@ pub(crate) mod tests {
     #[test]
     fn test_readonly_write_barrier_rejects_same_key_inflight_load() {
         let global = owned_global_pool(64 * 1024 * 1024);
+        let pool_guard = global.create_base_guard();
         let key = BlockKey::new(test_file_id(71), test_block_id(12));
         global.inflights.insert(
             key,
             InflightBlockState::Loading(Arc::new(PageIOCompletion::new())),
         );
 
-        let err = begin_write_barrier(global.guard(), key.file_id, key.block_id).unwrap_err();
+        let err = begin_write_barrier(global.guard(), &pool_guard, key.file_id, key.block_id)
+            .unwrap_err();
         assert_eq!(
             err.downcast_ref::<InternalError>().copied(),
             Some(InternalError::ReadonlyWriteInflight)
@@ -2090,6 +2168,7 @@ pub(crate) mod tests {
     #[test]
     fn test_readonly_write_barrier_replaces_completed_same_key_load() {
         let global = owned_global_pool(64 * 1024 * 1024);
+        let pool_guard = global.create_base_guard();
         let key = BlockKey::new(test_file_id(72), test_block_id(12));
         let inflight = Arc::new(PageIOCompletion::new());
         inflight.complete(Ok(test_page_id(2)));
@@ -2097,7 +2176,8 @@ pub(crate) mod tests {
             .inflights
             .insert(key, InflightBlockState::Loading(inflight));
 
-        let lease = begin_write_barrier(global.guard(), key.file_id, key.block_id).unwrap();
+        let lease =
+            begin_write_barrier(global.guard(), &pool_guard, key.file_id, key.block_id).unwrap();
         assert!(key_state_is_write_blocked(&global, &key));
         drop(lease);
         assert!(!global.inflights.contains_key(&key));
@@ -2121,7 +2201,7 @@ pub(crate) mod tests {
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
-            let pool_guard = pool.pool_guard();
+            let pool_guard = pool.create_base_guard();
             let key = BlockKey::new(test_user_file_id(TableID::new(119)), block_id);
 
             let old = pool.read_block(&pool_guard, block_id).await.unwrap();
@@ -2129,7 +2209,8 @@ pub(crate) mod tests {
             drop(old);
             assert!(global.try_get_frame_id(&key).is_some());
 
-            let lease = begin_write_barrier(global.guard(), key.file_id, key.block_id).unwrap();
+            let lease = begin_write_barrier(global.guard(), &pool_guard, key.file_id, key.block_id)
+                .unwrap();
             assert_eq!(global.try_get_frame_id(&key), None);
             assert!(key_state_is_write_blocked(&global, &key));
             write_payload(&fs, &table_file, block_id, b"new-reuse-bytes").await;
@@ -2160,9 +2241,10 @@ pub(crate) mod tests {
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
-            let pool_guard = pool.pool_guard();
+            let pool_guard = pool.create_base_guard();
             let key = BlockKey::new(test_user_file_id(TableID::new(120)), block_id);
-            let lease = begin_write_barrier(global.guard(), key.file_id, key.block_id).unwrap();
+            let lease = begin_write_barrier(global.guard(), &pool_guard, key.file_id, key.block_id)
+                .unwrap();
             assert!(key_state_is_write_blocked(&global, &key));
 
             let err = match pool.read_block(&pool_guard, block_id).await {
@@ -2197,7 +2279,7 @@ pub(crate) mod tests {
 
             let global = global_readonly_pool_scope(frame_page_bytes(2));
             let disk_pool = table_readonly_pool(&global, test_user_table_id(121), &table_file);
-            let pool_guard = disk_pool.pool_guard();
+            let pool_guard = disk_pool.create_base_guard();
             let key = BlockKey::new(test_user_file_id(TableID::new(121)), block_id);
             let write_hook = Arc::new(ControlledWriteHook::for_page(
                 table_file.sparse_file().as_raw_fd(),
@@ -2211,6 +2293,7 @@ pub(crate) mod tests {
                 &table_file,
                 fs.background_writes(),
                 disk_pool.global_pool().clone(),
+                disk_pool.create_base_guard(),
             );
             let writer = smol::spawn(async move { mutable.write_block(block_id, buf).await });
             write_hook.wait_started(1).await;
@@ -2257,7 +2340,7 @@ pub(crate) mod tests {
             );
             let key = BlockKey::new(test_user_file_id(TableID::new(118)), test_block_id(14));
             let inflight = Arc::new(PageIOCompletion::new());
-            let task_arena = global.arena.arena_guard(global.pool_guard());
+            let task_arena = global.arena.arena_guard(global.create_base_guard());
             let (frame_id, page_guard) = ReadonlyPageReservation::reserve_page(&global, task_arena)
                 .await
                 .unwrap();
@@ -2342,14 +2425,14 @@ pub(crate) mod tests {
             } else {
                 test_page_id(0)
             };
-            let global_guard = global.pool_guard();
+            let global_guard = global.create_base_guard();
             let mut page_guard = global
                 .try_lock_page_exclusive(&global_guard, frame_id)
                 .unwrap();
             global.mappings.insert(key, mapped_frame_id);
             page_guard.bf_mut().set_kind(FrameKind::Evicting);
             let runtime = ReadonlyRuntime {
-                arena: global.arena.arena_guard(global.pool_guard()),
+                arena: global.arena.arena_guard(global.create_base_guard()),
                 pool: global.guard().into_sync(),
             };
 
@@ -2364,14 +2447,14 @@ pub(crate) mod tests {
             let global = owned_global_pool(64 * 1024 * 1024);
             let key = BlockKey::new(test_file_id(302), test_block_id(12));
             let frame_id = publish_test_frame(&global, key).await;
-            let global_guard = global.pool_guard();
+            let global_guard = global.create_base_guard();
             let mut page_guard = global
                 .try_lock_page_exclusive(&global_guard, frame_id)
                 .unwrap();
             assert!(global.residency.move_resident_to_free(frame_id));
             page_guard.bf_mut().set_kind(FrameKind::Evicting);
             let runtime = ReadonlyRuntime {
-                arena: global.arena.arena_guard(global.pool_guard()),
+                arena: global.arena.arena_guard(global.create_base_guard()),
                 pool: global.guard().into_sync(),
             };
 
@@ -2385,7 +2468,7 @@ pub(crate) mod tests {
         smol::block_on(async {
             let global1 = owned_global_pool(64 * 1024 * 1024);
             let global2 = owned_global_pool(64 * 1024 * 1024);
-            let foreign_guard = (*global2).pool_guard();
+            let foreign_guard = (*global2).create_base_guard();
             let _ = global1
                 .get_page_internal::<Page>(
                     &foreign_guard,
@@ -2407,7 +2490,7 @@ pub(crate) mod tests {
             write_payload(&fs, &table_file, test_block_id(9), b"reload").await;
 
             let global = owned_global_pool(frame_page_bytes(2));
-            let global_guard = (*global).pool_guard();
+            let global_guard = (*global).create_base_guard();
             let key = BlockKey::new(test_user_file_id(TableID::new(111)), test_block_id(9));
             let stale_frame_id = publish_test_frame(&global, key).await;
             let mut stale_frame = global
@@ -2426,7 +2509,7 @@ pub(crate) mod tests {
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
-            let pool_guard = pool.pool_guard();
+            let pool_guard = pool.create_base_guard();
             let reload_start = pool.global_stats();
             let page = pool
                 .read_block(&pool_guard, test_block_id(9))
@@ -2464,7 +2547,7 @@ pub(crate) mod tests {
             write_page_bytes(&fs, &table_file, test_block_id(12), &persisted_page).await;
 
             let global = owned_global_pool(frame_page_bytes(2));
-            let global_guard = (*global).pool_guard();
+            let global_guard = (*global).create_base_guard();
             let key = BlockKey::new(test_user_file_id(TableID::new(123)), test_block_id(12));
             let stale_frame_id = publish_test_frame(&global, key).await;
             let mut stale_frame = global
@@ -2483,7 +2566,7 @@ pub(crate) mod tests {
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
-            let pool_guard = pool.pool_guard();
+            let pool_guard = pool.create_base_guard();
 
             let reload_start = pool.global_stats();
             let page = pool
@@ -2536,7 +2619,7 @@ pub(crate) mod tests {
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
-            let pool_guard = pool.pool_guard();
+            let pool_guard = pool.create_base_guard();
             let page = pool
                 .read_block(&pool_guard, test_block_id(3))
                 .await
@@ -2574,7 +2657,7 @@ pub(crate) mod tests {
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
-            let pool_guard = pool.pool_guard();
+            let pool_guard = pool.create_base_guard();
             let key = BlockKey::new(table_file.sparse_file().file_id(), block_id);
 
             let page = pool
@@ -2592,7 +2675,7 @@ pub(crate) mod tests {
 
             let global_guard = global.guard();
             let inflight = global_guard
-                .join_or_start_inflight_load(table_file.sparse_file(), key, None)
+                .join_or_start_inflight_load(table_file.sparse_file(), &pool_guard, key, None)
                 .await
                 .expect("duplicate load abort should not fail");
 
@@ -2636,7 +2719,7 @@ pub(crate) mod tests {
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
-            let pool_guard = pool.pool_guard();
+            let pool_guard = pool.create_base_guard();
 
             let mut tasks = vec![];
             for _ in 0..16 {
@@ -2681,7 +2764,7 @@ pub(crate) mod tests {
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
-            let pool_guard = pool.pool_guard();
+            let pool_guard = pool.create_base_guard();
             let key = BlockKey::new(test_user_file_id(TableID::new(112)), test_block_id(5));
 
             let pool_for_loader = (*pool).clone();
@@ -2742,7 +2825,7 @@ pub(crate) mod tests {
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
-            let pool_guard = pool.pool_guard();
+            let pool_guard = pool.create_base_guard();
             let key = BlockKey::new(test_user_file_id(TableID::new(113)), test_block_id(9));
 
             let pool_for_loader = (*pool).clone();
@@ -2799,7 +2882,7 @@ pub(crate) mod tests {
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
-            let pool_guard = pool.pool_guard();
+            let pool_guard = pool.create_base_guard();
             let observe = global.guard();
 
             let pool_for_loader = (*pool).clone();
@@ -2857,7 +2940,9 @@ pub(crate) mod tests {
                 .inflights
                 .insert(key, InflightBlockState::Loading(Arc::clone(&inflight)));
             let global_guard = global.guard();
-            let task_arena = global_guard.arena.arena_guard(global_guard.pool_guard());
+            let task_arena = global_guard
+                .arena
+                .arena_guard(global_guard.create_base_guard());
             let inflight_for_waiter = Arc::clone(&inflight);
             let reserve_waiter = {
                 listener!(global.residency.evict_ev => evict_listener);
@@ -2929,7 +3014,7 @@ pub(crate) mod tests {
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
-            let pool_guard = pool.pool_guard();
+            let pool_guard = pool.create_base_guard();
             let key = BlockKey::new(test_user_file_id(TableID::new(114)), test_block_id(7));
 
             let pool_1 = (*pool).clone();
@@ -3001,7 +3086,7 @@ pub(crate) mod tests {
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
-            let pool_guard = pool.pool_guard();
+            let pool_guard = pool.create_base_guard();
             let key = BlockKey::new(test_user_file_id(TableID::new(115)), test_block_id(8));
             let stats_start = pool.global_stats();
 
@@ -3075,7 +3160,7 @@ pub(crate) mod tests {
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
-            let pool_guard = pool.pool_guard();
+            let pool_guard = pool.create_base_guard();
             let key = BlockKey::new(test_user_file_id(TableID::new(107)), test_block_id(9));
 
             let err = match pool
@@ -3119,7 +3204,7 @@ pub(crate) mod tests {
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
-            let pool_guard = pool.pool_guard();
+            let pool_guard = pool.create_base_guard();
             let key = BlockKey::new(test_user_file_id(TableID::new(116)), test_block_id(10));
 
             let err = match pool
@@ -3156,7 +3241,7 @@ pub(crate) mod tests {
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
-            let pool_guard = pool.pool_guard();
+            let pool_guard = pool.create_base_guard();
             let key = BlockKey::new(test_user_file_id(TableID::new(108)), test_block_id(10));
 
             let err = match pool
@@ -3197,7 +3282,7 @@ pub(crate) mod tests {
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
-            let pool_guard = pool.pool_guard();
+            let pool_guard = pool.create_base_guard();
             let key = BlockKey::new(test_user_file_id(TableID::new(109)), test_block_id(11));
 
             let err = match pool
@@ -3266,10 +3351,14 @@ pub(crate) mod tests {
             let table_file = engine
                 .inner()
                 .table_fs
-                .open_table_file(test_user_table_id(103), engine.inner().pools.disk.clone())
+                .open_table_file(
+                    test_user_table_id(103),
+                    engine.inner().pools.disk.clone(),
+                    engine.inner().core.pools.pool_guards().disk_guard(),
+                )
                 .await
                 .unwrap();
-            let pool_guard = pool.pool_guard();
+            let pool_guard = pool.create_base_guard();
 
             for i in 0..=capacity {
                 let block_id = BlockID::from(base_page_id + i as u64);
@@ -3335,7 +3424,7 @@ pub(crate) mod tests {
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
-            let pool_guard = pool.pool_guard();
+            let pool_guard = pool.create_base_guard();
 
             let g = pool
                 .read_block(&pool_guard, test_block_id(9))
@@ -3364,7 +3453,7 @@ pub(crate) mod tests {
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
-            let pool_guard = pool.pool_guard();
+            let pool_guard = pool.create_base_guard();
             let guard: ReadonlyBlockGuard = pool
                 .read_block(&pool_guard, test_block_id(4))
                 .await

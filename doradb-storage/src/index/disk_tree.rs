@@ -551,12 +551,6 @@ impl<F: DiskTreeSpec> DiskTreeRuntime<F> {
         DiskTree::from_root_snapshot(root_block_id, self, disk_pool_guard)
     }
 
-    /// Returns a readonly buffer-pool guard for opening DiskTree snapshots.
-    #[inline]
-    pub(crate) fn disk_pool_guard(&self) -> PoolGuard {
-        self.disk_pool.pool_guard()
-    }
-
     /// Returns the shared key encoder for this DiskTree shape.
     #[inline]
     pub(crate) fn encoder(&self) -> Arc<BTreeKeyEncoder> {
@@ -2721,7 +2715,7 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(301), &table);
-            let guard = disk_pool.pool_guard();
+            let guard = disk_pool.create_base_guard();
             let runtime = unique_runtime!(metadata, disk_pool);
             let tree = runtime.open(SUPER_BLOCK_ID, &guard);
             assert_eq!(tree.lookup(&[Val::from(1u32)]).await.unwrap(), None);
@@ -2743,7 +2737,7 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(302), &table);
-            let guard = disk_pool.pool_guard();
+            let guard = disk_pool.create_base_guard();
             let runtime = non_unique_runtime!(metadata, disk_pool);
             let tree = runtime.open(SUPER_BLOCK_ID, &guard);
             assert!(
@@ -2775,11 +2769,12 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(303), &table);
-            let guard = disk_pool.pool_guard();
+            let guard = disk_pool.create_base_guard();
             let mut mutable = MutableTableFile::fork(
                 &table,
                 fs.background_writes(),
                 disk_pool.global_pool().clone(),
+                guard.clone(),
             );
             let runtime = unique_runtime!(metadata, disk_pool);
             let tree = runtime.open(SUPER_BLOCK_ID, &guard);
@@ -2848,11 +2843,12 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(310), &table);
-            let guard = disk_pool.pool_guard();
+            let guard = disk_pool.create_base_guard();
             let mut mutable = MutableTableFile::fork(
                 &table,
                 fs.background_writes(),
                 disk_pool.global_pool().clone(),
+                guard.clone(),
             );
             let runtime = unique_runtime!(metadata, disk_pool);
             let tree = runtime.open(SUPER_BLOCK_ID, &guard);
@@ -2932,11 +2928,12 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(311), &table);
-            let guard = disk_pool.pool_guard();
+            let guard = disk_pool.create_base_guard();
             let mut mutable = MutableTableFile::fork(
                 &table,
                 fs.background_writes(),
                 disk_pool.global_pool().clone(),
+                guard.clone(),
             );
             let runtime = non_unique_runtime!(metadata, disk_pool);
             let tree = runtime.open(SUPER_BLOCK_ID, &guard);
@@ -2978,11 +2975,12 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(312), &table);
-            let guard = disk_pool.pool_guard();
+            let guard = disk_pool.create_base_guard();
             let mut mutable = MutableTableFile::fork(
                 &table,
                 fs.background_writes(),
                 disk_pool.global_pool().clone(),
+                guard.clone(),
             );
             let runtime = unique_runtime!(metadata, disk_pool);
             let tree = runtime.open(SUPER_BLOCK_ID, &guard);
@@ -3044,11 +3042,12 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(304), &table);
-            let guard = disk_pool.pool_guard();
+            let guard = disk_pool.create_base_guard();
             let mut mutable = MutableTableFile::fork(
                 &table,
                 fs.background_writes(),
                 disk_pool.global_pool().clone(),
+                guard.clone(),
             );
             let runtime = non_unique_runtime!(metadata, disk_pool);
             let tree = runtime.open(SUPER_BLOCK_ID, &guard);
@@ -3129,11 +3128,12 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(309), &table);
-            let guard = disk_pool.pool_guard();
+            let guard = disk_pool.create_base_guard();
             let mut mutable = MutableTableFile::fork(
                 &table,
                 fs.background_writes(),
                 disk_pool.global_pool().clone(),
+                guard.clone(),
             );
             let runtime = non_unique_runtime!(metadata, disk_pool);
             let tree = runtime.open(SUPER_BLOCK_ID, &guard);
@@ -3187,11 +3187,12 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(310), &table);
-            let guard = disk_pool.pool_guard();
+            let guard = disk_pool.create_base_guard();
             let inner = MutableTableFile::fork(
                 &table,
                 fs.background_writes(),
                 disk_pool.global_pool().clone(),
+                guard.clone(),
             );
             let allocated_before = inner.root().alloc_map.allocated();
             let mut mutable = FailingDiskTreeWriteFile::new(inner, Some(1), None);
@@ -3232,11 +3233,12 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(311), &table);
-            let guard = disk_pool.pool_guard();
+            let guard = disk_pool.create_base_guard();
             let inner = MutableTableFile::fork(
                 &table,
                 fs.background_writes(),
                 disk_pool.global_pool().clone(),
+                guard.clone(),
             );
             let allocated_before = inner.root().alloc_map.allocated();
             let mut mutable = FailingDiskTreeWriteFile::new(inner, None, Some(0));
@@ -3280,11 +3282,12 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(305), &table);
-            let guard = disk_pool.pool_guard();
+            let guard = disk_pool.create_base_guard();
             let mut mutable = MutableTableFile::fork(
                 &table,
                 fs.background_writes(),
                 disk_pool.global_pool().clone(),
+                guard.clone(),
             );
 
             let unique_runtime = unique_runtime!(metadata, disk_pool);
@@ -3443,11 +3446,12 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(306), &table);
-            let guard = disk_pool.pool_guard();
+            let guard = disk_pool.create_base_guard();
             let mut mutable = MutableTableFile::fork(
                 &table,
                 fs.background_writes(),
                 disk_pool.global_pool().clone(),
+                guard.clone(),
             );
             let runtime = unique_runtime!(metadata, disk_pool);
             let tree = runtime.open(SUPER_BLOCK_ID, &guard);
@@ -3529,11 +3533,12 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(307), &table);
-            let guard = disk_pool.pool_guard();
+            let guard = disk_pool.create_base_guard();
             let mut mutable = MutableTableFile::fork(
                 &table,
                 fs.background_writes(),
                 disk_pool.global_pool().clone(),
+                guard.clone(),
             );
             let runtime = non_unique_runtime!(metadata, disk_pool);
             let tree = runtime.open(SUPER_BLOCK_ID, &guard);
@@ -3643,11 +3648,12 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(308), &table);
-            let guard = disk_pool.pool_guard();
+            let guard = disk_pool.create_base_guard();
             let mut mutable = MutableTableFile::fork(
                 &table,
                 fs.background_writes(),
                 disk_pool.global_pool().clone(),
+                guard.clone(),
             );
             let runtime = unique_runtime!(metadata, disk_pool);
             let tree = runtime.open(SUPER_BLOCK_ID, &guard);
@@ -3730,11 +3736,12 @@ mod tests {
             let write_global = global_readonly_pool_scope(64 * 1024 * 1024);
             let write_disk_pool =
                 table_readonly_pool(&write_global, test_user_table_id(309), &table);
-            let write_guard = write_disk_pool.pool_guard();
+            let write_guard = write_disk_pool.create_base_guard();
             let mut mutable = MutableTableFile::fork(
                 &table,
                 fs.background_writes(),
                 write_disk_pool.global_pool().clone(),
+                write_guard.clone(),
             );
             let write_runtime = unique_runtime!(metadata, write_disk_pool);
             let tree = write_runtime.open(SUPER_BLOCK_ID, &write_guard);
@@ -3758,7 +3765,7 @@ mod tests {
             let inspect_global = global_readonly_pool_scope(64 * 1024 * 1024);
             let inspect_disk_pool =
                 table_readonly_pool(&inspect_global, test_user_table_id(309), &table);
-            let inspect_guard = inspect_disk_pool.pool_guard();
+            let inspect_guard = inspect_disk_pool.create_base_guard();
             let inspect_runtime = unique_runtime!(metadata, inspect_disk_pool);
             let inspect_tree = inspect_runtime.open(root, &inspect_guard);
             let root_guard = inspect_tree.read_node(root).await.unwrap();
@@ -3772,7 +3779,7 @@ mod tests {
             let collect_global = global_readonly_pool_scope(64 * 1024 * 1024);
             let collect_disk_pool =
                 table_readonly_pool(&collect_global, test_user_table_id(309), &table);
-            let collect_guard = collect_disk_pool.pool_guard();
+            let collect_guard = collect_disk_pool.create_base_guard();
             let collect_runtime = unique_runtime!(metadata, collect_disk_pool);
             let collect_tree = collect_runtime.open(root, &collect_guard);
             let start_stats = collect_disk_pool.global_stats();
@@ -3806,11 +3813,12 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(313), &table);
-            let guard = disk_pool.pool_guard();
+            let guard = disk_pool.create_base_guard();
             let mut mutable = MutableTableFile::fork(
                 &table,
                 fs.background_writes(),
                 disk_pool.global_pool().clone(),
+                guard.clone(),
             );
             let runtime = unique_runtime!(metadata, disk_pool);
             let tree = runtime.open(SUPER_BLOCK_ID, &guard);
@@ -3920,11 +3928,12 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(314), &table);
-            let guard = disk_pool.pool_guard();
+            let guard = disk_pool.create_base_guard();
             let mut mutable = MutableTableFile::fork(
                 &table,
                 fs.background_writes(),
                 disk_pool.global_pool().clone(),
+                guard.clone(),
             );
             let runtime = unique_runtime!(metadata, disk_pool);
             let tree = runtime.open(SUPER_BLOCK_ID, &guard);
@@ -4014,11 +4023,12 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(305), &table);
-            let guard = disk_pool.pool_guard();
+            let guard = disk_pool.create_base_guard();
             let mut mutable = MutableTableFile::fork(
                 &table,
                 fs.background_writes(),
                 disk_pool.global_pool().clone(),
+                guard.clone(),
             );
             let runtime = unique_runtime!(metadata, disk_pool);
             let tree = runtime.open(SUPER_BLOCK_ID, &guard);

@@ -246,11 +246,12 @@ instead owns one checkout continuously from direct construction through
 terminal conversion or synchronous panic parking. The checkout owns a
 `TrxAttachment` containing the exact `SessionRuntime` and
 exposes a copyable `TrxRuntime` value that pairs immutable `TrxContext` with
-borrowed access to `EngineCore`, its canonical pool guards, and the
-session-local user-table cache. `TrxContext` never
-stores the attachment. Normal statement checkout/check-in does not reacquire
-the session lifecycle mutex, allocate, touch the operation change notifier, or
-send cleanup work.
+borrowed access to `EngineCore`, the exact session's pool-guard roots, and the
+session-local user-table cache. Those roots are created once with
+`SessionState`; checkout and attachment accessors only borrow them.
+`TrxContext` never stores the attachment. Normal statement checkout/check-in
+does not reacquire the session lifecycle mutex, allocate, touch the operation
+change notifier, or send cleanup work.
 
 Each session user-table cache entry contains one weak `Table` runtime hint and
 an optional `VersionedPageID`. The weak runtime is never authoritative for

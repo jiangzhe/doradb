@@ -3,8 +3,8 @@ use super::checkpoint_workflow::{
     PreparedFreezeAttempt, PreparedTransitionPage,
 };
 use super::lifecycle::{CheckpointPublishLease, TableCheckpointRootMutationScope, TableTerminal};
-use crate::buffer::PoolGuards;
 use crate::buffer::guard::PageGuard;
+use crate::buffer::{PoolGuard, PoolGuards};
 use crate::catalog::{IndexSpec, SilentWatermarkObject, TableColumnLayout, TableMetadata};
 use crate::error::{
     CompletionErrorBridge, CompletionResult, DataIntegrityError, DataIntegrityResult, FatalError,
@@ -226,7 +226,13 @@ where
         // Step 1: claim one mutable root snapshot and initialize checkpoint
         // boundaries. This is checkpoint-internal current-root access after the
         // post-lease liveness check above.
-        let mut mutable_file = MutableTableFile::fork(table_file, table_writes, disk_pool.clone());
+        let disk_guard = pool_guards.disk_guard();
+        let mut mutable_file = MutableTableFile::fork(
+            table_file,
+            table_writes,
+            disk_pool.clone(),
+            disk_guard.clone(),
+        );
         let pivot_row_id = mutable_file.root().pivot_row_id;
         let mut secondary_sidecar = SecondaryCheckpointSidecar::new(metadata);
 
@@ -377,7 +383,13 @@ where
         // Step 5: apply checkpoint changes to the already-checked mutable root.
         if !lwc_blocks.is_empty() {
             mutable_file
-                .apply_lwc_blocks(lwc_blocks, heap_redo_start_ts, checkpoint_ts, disk_pool)
+                .apply_lwc_blocks(
+                    lwc_blocks,
+                    heap_redo_start_ts,
+                    checkpoint_ts,
+                    disk_pool,
+                    disk_guard,
+                )
                 .await
                 .change_runtime_context(RuntimeError::CheckpointExecution)
                 .attach_with(|| {
@@ -399,6 +411,7 @@ where
                 &mut secondary_sidecar,
                 cutoff_ts,
                 checkpoint_ts,
+                disk_guard,
             )
             .await
             .change_runtime_context(RuntimeError::CheckpointExecution)
@@ -417,6 +430,7 @@ where
                 &layout,
                 &mut secondary_sidecar,
                 checkpoint_ts,
+                disk_guard,
                 #[cfg(test)]
                 &session.engine().maintenance_test,
             )
@@ -432,7 +446,7 @@ where
         // mutable root, rebuild its allocation map from the current active root
         // and the mutable root that will be published.
         table
-            .rebuild_reachable_alloc_map(&mut mutable_file, &layout)
+            .rebuild_reachable_alloc_map(&mut mutable_file, &layout, disk_guard)
             .await
             .change_context(RuntimeError::CheckpointExecution)
             .attach_with(|| {
@@ -1034,6 +1048,7 @@ impl Table {
         root: &ActiveRoot,
         layout: &TableRuntimeLayout,
         reachable: &mut BTreeSet<BlockID>,
+        disk_guard: &PoolGuard,
     ) -> RuntimeResult<()> {
         if root.secondary_index_roots.len() != layout.index_slot_count() {
             return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
@@ -1056,14 +1071,13 @@ impl Table {
 
         if root.column_block_index_root != SUPER_BLOCK_ID {
             let disk_pool = self.disk_pool();
-            let disk_pool_guard = disk_pool.pool_guard();
             let column_index = ColumnBlockIndex::new(
                 root.column_block_index_root,
                 root.pivot_row_id,
                 self.file().file_kind(),
                 self.file().sparse_file(),
                 disk_pool,
-                &disk_pool_guard,
+                disk_guard,
             );
             column_index
                 .collect_reachable_blocks(&mut root_reachable)
@@ -1097,9 +1111,8 @@ impl Table {
                 continue;
             }
             let runtime = index.disk_runtime();
-            let disk_pool_guard = runtime.disk_pool_guard();
             runtime
-                .collect_reachable_blocks(root_block_id, &disk_pool_guard, &mut root_reachable)
+                .collect_reachable_blocks(root_block_id, disk_guard, &mut root_reachable)
                 .await
                 .change_context(RuntimeError::CheckpointExecution)
                 .attach_with(|| {
@@ -1128,15 +1141,17 @@ impl Table {
         &self,
         mutable_file: &mut MutableTableFile,
         layout: &TableRuntimeLayout,
+        disk_guard: &PoolGuard,
     ) -> RuntimeResult<usize> {
         let mut reachable = BTreeSet::new();
         self.collect_root_reachable_blocks(
             self.file().active_root_unchecked(),
             layout,
             &mut reachable,
+            disk_guard,
         )
         .await?;
-        self.collect_root_reachable_blocks(mutable_file.root(), layout, &mut reachable)
+        self.collect_root_reachable_blocks(mutable_file.root(), layout, &mut reachable, disk_guard)
             .await?;
         Ok(mutable_file.rebuild_alloc_map_from_reachable(&reachable))
     }
@@ -1148,9 +1163,9 @@ impl Table {
         secondary_sidecar: &mut SecondaryCheckpointSidecar,
         cutoff_ts: TrxID,
         checkpoint_ts: TrxID,
+        disk_guard: &PoolGuard,
     ) -> RuntimeOrFatalResult<()> {
         let disk_pool = self.disk_pool();
-        let disk_pool_guard = disk_pool.pool_guard();
         let (column_block_index_root, pivot_row_id, deletion_cutoff_ts) = {
             let root = mutable_file.root();
             (
@@ -1217,7 +1232,7 @@ impl Table {
             self.file().file_kind(),
             self.file().sparse_file(),
             disk_pool,
-            &disk_pool_guard,
+            disk_guard,
         );
 
         let mut groups: Vec<BlockPatchGroup> = Vec::new();
@@ -1326,6 +1341,7 @@ impl Table {
                 &new_deltas,
                 metadata,
                 secondary_sidecar,
+                disk_guard,
             )
             .await?;
 
@@ -1362,6 +1378,7 @@ impl Table {
         layout: &TableRuntimeLayout,
         sidecar: &mut SecondaryCheckpointSidecar,
         checkpoint_ts: TrxID,
+        disk_guard: &PoolGuard,
         #[cfg(test)] maintenance_test: &MaintenanceTestController,
     ) -> RuntimeOrFatalResult<()> {
         let metadata = layout.metadata();
@@ -1390,8 +1407,6 @@ impl Table {
                 .into());
         }
 
-        let disk_pool = self.disk_pool();
-        let disk_pool_guard = disk_pool.pool_guard();
         for active in &mut sidecar.indexes {
             let index_no = active.index_no;
             // The sidecar is built directly from this immutable metadata
@@ -1412,7 +1427,7 @@ impl Table {
                 SecondaryIndexSidecar::Unique { puts, deletes, .. } => {
                     // Use one writer per affected index so same-run puts and
                     // conditional deletes produce a single new DiskTree root.
-                    let tree = runtime.open_unique_at(old_root, &disk_pool_guard)?;
+                    let tree = runtime.open_unique_at(old_root, disk_guard)?;
                     let mut writer = tree.batch_writer(mutable_file, checkpoint_ts);
                     let put_entries = puts
                         .iter()
@@ -1440,7 +1455,7 @@ impl Table {
                 } => {
                     // Non-unique roots are exact-entry sets. Inserts and
                     // deletes are independent facts keyed by (key, row_id).
-                    let tree = runtime.open_non_unique_at(old_root, &disk_pool_guard)?;
+                    let tree = runtime.open_non_unique_at(old_root, disk_guard)?;
                     let mut writer = tree.batch_writer(mutable_file, checkpoint_ts);
                     let insert_entries = inserts
                         .iter()
@@ -1471,6 +1486,7 @@ impl Table {
         delete_deltas: &[u32],
         metadata: &TableMetadata,
         secondary_sidecar: &mut SecondaryCheckpointSidecar,
+        disk_guard: &PoolGuard,
     ) -> RuntimeResult<()> {
         if secondary_sidecar.indexes.is_empty() || delete_deltas.is_empty() {
             return Ok(());
@@ -1501,16 +1517,11 @@ impl Table {
                 .enumerate()
                 .all(|(idx, row_id)| *row_id == entry.start_row_id + idx as u64);
 
-        let disk_pool = self.disk_pool();
-        let disk_pool_guard = disk_pool.pool_guard();
         // Decode the persisted LWC block once for this block group, then derive
         // all secondary delete keys from the selected row indexes.
         let file_kind = self.file().file_kind();
         let block_id = entry.block_id();
-        let persisted = self
-            .storage
-            .load_lwc_block(&disk_pool_guard, block_id)
-            .await?;
+        let persisted = self.storage.load_lwc_block(disk_guard, block_id).await?;
         let block = persisted.block();
         if block.row_count() != row_ids.len()
             || block.row_shape_fingerprint() != entry.row_shape_fingerprint()
@@ -3664,9 +3675,11 @@ mod tests {
 
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
             corrupt_leaf_delete_codec(table_file_path, entry.leaf_block_id, 0);
-            let _ = table
-                .disk_pool()
-                .invalidate_block(table.file().sparse_file().file_id(), entry.leaf_block_id);
+            let _ = table.disk_pool().invalidate_block(
+                session.pool_guards().disk_guard(),
+                table.file().sparse_file().file_id(),
+                entry.leaf_block_id,
+            );
 
             let err = session.checkpoint_table(table_id).await.unwrap_err();
             assert_table_data_integrity(
@@ -3734,9 +3747,11 @@ mod tests {
 
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
             corrupt_leaf_short_delete_section_header(table_file_path, entry.leaf_block_id, 0);
-            let _ = table
-                .disk_pool()
-                .invalidate_block(table.file().sparse_file().file_id(), entry.leaf_block_id);
+            let _ = table.disk_pool().invalidate_block(
+                session.pool_guards().disk_guard(),
+                table.file().sparse_file().file_id(),
+                entry.leaf_block_id,
+            );
 
             let err = session.checkpoint_table(table_id).await.unwrap_err();
             assert_table_data_integrity(
@@ -6064,7 +6079,11 @@ mod tests {
             let table_file = engine
                 .inner()
                 .table_fs
-                .open_table_file(table_id, engine.inner().pools.disk.clone())
+                .open_table_file(
+                    table_id,
+                    engine.inner().pools.disk.clone(),
+                    session.pool_guards().disk_guard(),
+                )
                 .await
                 .unwrap();
             let root_after = table_file.active_root_unchecked();

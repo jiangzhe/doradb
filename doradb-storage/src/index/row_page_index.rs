@@ -1958,8 +1958,8 @@ mod tests {
         }
 
         #[inline]
-        fn pool_guard(&self) -> PoolGuard {
-            self.inner.pool_guard()
+        fn create_base_guard(&self) -> PoolGuard {
+            self.inner.create_base_guard()
         }
 
         #[inline]
@@ -2055,7 +2055,7 @@ mod tests {
             .unwrap();
             {
                 let metadata = make_test_metadata();
-                let meta_guard = engine.inner().pools.meta.pool_guard();
+                let meta_guard = engine.inner().pools.meta.create_base_guard();
                 let blk_idx = RowPageIndex::new(
                     engine.inner().pools.meta.clone(),
                     &meta_guard,
@@ -2063,7 +2063,7 @@ mod tests {
                 )
                 .await
                 .expect("test row-page-index construction should succeed");
-                let mem_guard = engine.inner().pools.mem.pool_guard();
+                let mem_guard = engine.inner().pools.mem.create_base_guard();
                 let p1 = blk_idx
                     .get_insert_page(
                         &meta_guard,
@@ -2115,7 +2115,7 @@ mod tests {
             .unwrap();
             {
                 let metadata = make_test_metadata();
-                let meta_guard = engine.inner().pools.meta.pool_guard();
+                let meta_guard = engine.inner().pools.meta.create_base_guard();
                 let blk_idx = RowPageIndex::new(
                     engine.inner().pools.meta.clone(),
                     &meta_guard,
@@ -2123,7 +2123,7 @@ mod tests {
                 )
                 .await
                 .expect("test row-page-index construction should succeed");
-                let mem_guard = engine.inner().pools.mem.pool_guard();
+                let mem_guard = engine.inner().pools.mem.create_base_guard();
                 let p1 = blk_idx
                     .get_insert_page_exclusive(
                         &meta_guard,
@@ -2159,8 +2159,8 @@ mod tests {
         smol::block_on(async {
             let meta_pool = owned_index_pool(fixed_pool_bytes(1));
             let mem_pool = owned_mem_pool(fixed_pool_bytes(1));
-            let meta_guard = (*meta_pool).pool_guard();
-            let mem_guard = (*mem_pool).pool_guard();
+            let meta_guard = (*meta_pool).create_base_guard();
+            let mem_guard = (*mem_pool).create_base_guard();
             let blk_idx = RowPageIndex::new(meta_pool.guard(), &meta_guard, RowID::new(0))
                 .await
                 .expect("test row-page-index construction should succeed");
@@ -2231,8 +2231,8 @@ mod tests {
         smol::block_on(async {
             let meta_pool = owned_index_pool(64 * 1024 * 1024);
             let mem_pool = owned_mem_pool(64 * 1024 * 1024);
-            let meta_guard = (*meta_pool).pool_guard();
-            let mem_guard = (*mem_pool).pool_guard();
+            let meta_guard = (*meta_pool).create_base_guard();
+            let mem_guard = (*mem_pool).create_base_guard();
             let metadata = make_test_metadata();
             let blk_idx = RowPageIndex::new(meta_pool.guard(), &meta_guard, RowID::new(0))
                 .await
@@ -2268,8 +2268,8 @@ mod tests {
         smol::block_on(async {
             let meta_pool = owned_index_pool(64 * 1024 * 1024);
             let mem_pool = owned_mem_pool(64 * 1024 * 1024);
-            let meta_guard = (*meta_pool).pool_guard();
-            let mem_guard = (*mem_pool).pool_guard();
+            let meta_guard = (*meta_pool).create_base_guard();
+            let mem_guard = (*mem_pool).create_base_guard();
             let metadata = make_test_metadata();
             let index = RowPageIndex::new(meta_pool.guard(), &meta_guard, RowID::new(0))
                 .await
@@ -2308,8 +2308,8 @@ mod tests {
         smol::block_on(async {
             let meta_pool = owned_index_pool(64 * 1024 * 1024);
             let mem_pool = owned_mem_pool(64 * 1024 * 1024);
-            let meta_guard = (*meta_pool).pool_guard();
-            let mem_guard = (*mem_pool).pool_guard();
+            let meta_guard = (*meta_pool).create_base_guard();
+            let mem_guard = (*mem_pool).create_base_guard();
             let metadata = make_test_metadata();
             let blk_idx = RowPageIndex::new(meta_pool.guard(), &meta_guard, RowID::new(0))
                 .await
@@ -2340,8 +2340,8 @@ mod tests {
         smol::block_on(async {
             let meta_pool = owned_index_pool(64 * 1024 * 1024);
             let mem_pool = owned_mem_pool(64 * 1024 * 1024);
-            let meta_guard = (*meta_pool).pool_guard();
-            let mem_guard = (*mem_pool).pool_guard();
+            let meta_guard = (*meta_pool).create_base_guard();
+            let mem_guard = (*mem_pool).create_base_guard();
             let metadata = make_test_metadata();
             let blk_idx = RowPageIndex::new(meta_pool.guard(), &meta_guard, RowID::new(0))
                 .await
@@ -2379,8 +2379,8 @@ mod tests {
         smol::block_on(async {
             let meta_pool = owned_index_pool(fixed_pool_bytes(1));
             let mem_pool = owned_mem_pool(fixed_pool_bytes(1));
-            let meta_guard = (*meta_pool).pool_guard();
-            let mem_guard = (*mem_pool).pool_guard();
+            let meta_guard = (*meta_pool).create_base_guard();
+            let mem_guard = (*mem_pool).create_base_guard();
             let metadata = make_test_metadata();
             let blk_idx = RowPageIndex::new(meta_pool.guard(), &meta_guard, RowID::new(0))
                 .await
@@ -2408,8 +2408,8 @@ mod tests {
         smol::block_on(async {
             let meta_pool = owned_index_pool(fixed_pool_bytes(1));
             let mem_pool = owned_mem_pool(fixed_pool_bytes(1));
-            let meta_guard = (*meta_pool).pool_guard();
-            let mem_guard = (*mem_pool).pool_guard();
+            let meta_guard = (*meta_pool).create_base_guard();
+            let mem_guard = (*mem_pool).create_base_guard();
             let metadata = make_test_metadata();
             let blk_idx = RowPageIndex::new(meta_pool.guard(), &meta_guard, RowID::new(0))
                 .await
@@ -2437,8 +2437,8 @@ mod tests {
         smol::block_on(async {
             let meta_pool = owned_index_pool(fixed_pool_bytes(1));
             let mem_pool = owned_mem_pool(fixed_pool_bytes(1));
-            let meta_guard = (*meta_pool).pool_guard();
-            let mem_guard = (*mem_pool).pool_guard();
+            let meta_guard = (*meta_pool).create_base_guard();
+            let mem_guard = (*mem_pool).create_base_guard();
             let metadata = make_test_metadata();
             let blk_idx = RowPageIndex::new(meta_pool.guard(), &meta_guard, RowID::new(0))
                 .await
@@ -2497,7 +2497,7 @@ mod tests {
             .unwrap();
             {
                 let metadata = make_test_metadata();
-                let meta_guard = engine.inner().pools.meta.pool_guard();
+                let meta_guard = engine.inner().pools.meta.create_base_guard();
                 let blk_idx = RowPageIndex::new(
                     engine.inner().pools.meta.clone(),
                     &meta_guard,
@@ -2505,7 +2505,7 @@ mod tests {
                 )
                 .await
                 .expect("test row-page-index construction should succeed");
-                let mem_guard = engine.inner().pools.mem.pool_guard();
+                let mem_guard = engine.inner().pools.mem.create_base_guard();
                 for _ in 0..row_pages {
                     let _ = blk_idx
                         .get_insert_page(
@@ -2537,7 +2537,7 @@ mod tests {
     fn test_row_page_index_cursor_two_level_tree() {
         smol::block_on(async {
             let pool = owned_index_pool(1024usize * 1024 * 1024);
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = (*pool).create_base_guard();
             let blk_idx = RowPageIndex::new(pool.guard(), &pool_guard, RowID::new(0))
                 .await
                 .expect("test row-page-index construction should succeed");
@@ -2607,7 +2607,7 @@ mod tests {
     fn test_prune_checkpoint_prefix_in_root_leaf_and_reset_empty_root() {
         smol::block_on(async {
             let pool = owned_index_pool(64 * 1024 * 1024);
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = (*pool).create_base_guard();
             let index = RowPageIndex::new(pool.guard(), &pool_guard, RowID::new(0))
                 .await
                 .unwrap();
@@ -2672,7 +2672,7 @@ mod tests {
     fn test_prune_checkpoint_prefix_reclaims_leaf_and_collapses_root() {
         smol::block_on(async {
             let pool = owned_index_pool(128 * 1024 * 1024);
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = (*pool).create_base_guard();
             let index = RowPageIndex::new(pool.guard(), &pool_guard, RowID::new(0))
                 .await
                 .unwrap();
@@ -2714,7 +2714,7 @@ mod tests {
     fn test_prune_checkpoint_prefix_across_multiple_branch_levels() {
         smol::block_on(async {
             let pool = owned_index_pool(64 * 1024 * 1024);
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = (*pool).create_base_guard();
             let index = RowPageIndex::new(pool.guard(), &pool_guard, RowID::new(0))
                 .await
                 .unwrap();
@@ -2817,7 +2817,7 @@ mod tests {
     fn test_row_page_index_search() {
         smol::block_on(async {
             let pool = owned_index_pool(512usize * 1024 * 1024);
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = (*pool).create_base_guard();
             let blk_idx = RowPageIndex::new(pool.guard(), &pool_guard, RowID::new(0))
                 .await
                 .expect("test row-page-index construction should succeed");
@@ -2859,7 +2859,7 @@ mod tests {
     fn test_row_page_index_split() {
         smol::block_on(async {
             let pool = owned_index_pool(1024usize * 1024 * 1024);
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = (*pool).create_base_guard();
             let blk_idx = RowPageIndex::new(pool.guard(), &pool_guard, RowID::new(0))
                 .await
                 .expect("test row-page-index construction should succeed");
@@ -2939,7 +2939,7 @@ mod tests {
             .unwrap();
             {
                 let metadata = make_test_metadata();
-                let meta_guard = engine.inner().pools.meta.pool_guard();
+                let meta_guard = engine.inner().pools.meta.create_base_guard();
                 let blk_idx = RowPageIndex::new(
                     engine.inner().pools.meta.clone(),
                     &meta_guard,
@@ -2947,7 +2947,7 @@ mod tests {
                 )
                 .await
                 .expect("test row-page-index construction should succeed");
-                let mem_guard = engine.inner().pools.mem.pool_guard();
+                let mem_guard = engine.inner().pools.mem.create_base_guard();
                 let redo_ctx =
                     RowPageCreateRedoCtx::new(&engine.inner().trx_sys, TableID::new(104));
                 let page_guard = blk_idx
@@ -3022,7 +3022,7 @@ mod tests {
             .await
             .unwrap();
             let metadata = make_test_metadata();
-            let meta_guard = engine.inner().pools.meta.pool_guard();
+            let meta_guard = engine.inner().pools.meta.create_base_guard();
             let blk_idx = RowPageIndex::new(
                 engine.inner().pools.meta.clone(),
                 &meta_guard,
@@ -3030,7 +3030,7 @@ mod tests {
             )
             .await
             .expect("test row-page-index construction should succeed");
-            let mem_guard = engine.inner().pools.mem.pool_guard();
+            let mem_guard = engine.inner().pools.mem.create_base_guard();
             let redo_ctx = RowPageCreateRedoCtx::new(&engine.inner().trx_sys, TableID::new(206));
             let _ = engine
                 .inner()
@@ -3097,7 +3097,7 @@ mod tests {
             .unwrap();
             {
                 let meta_pool = &engine.inner().pools.meta;
-                let meta_guard = meta_pool.pool_guard();
+                let meta_guard = meta_pool.create_base_guard();
                 let blk_idx = RowPageIndex::new(meta_pool.clone(), &meta_guard, RowID::new(0))
                     .await
                     .expect("test row-page-index construction should succeed");
@@ -3109,7 +3109,7 @@ mod tests {
                     let blk_idx = &blk_idx;
                     let meta_pool_ref = meta_pool;
                     async move {
-                        let pool_guard = meta_pool_ref.pool_guard();
+                        let pool_guard = meta_pool_ref.create_base_guard();
                         let start = worker * pages_per_worker;
                         let end = (start + pages_per_worker).min(total_pages);
                         for page_no in start..end {

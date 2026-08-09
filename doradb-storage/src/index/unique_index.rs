@@ -383,7 +383,7 @@ mod tests {
                 FixedBufferPool::with_capacity(PoolRole::Index, 1024usize * 1024 * 1024).unwrap(),
             );
             {
-                let pool_guard = (*pool).pool_guard();
+                let pool_guard = (*pool).create_base_guard();
                 let index = test_unique_mem_index(
                     &pool,
                     &pool_guard,
@@ -405,7 +405,7 @@ mod tests {
                 FixedBufferPool::with_capacity(PoolRole::Index, 1024usize * 1024 * 1024).unwrap(),
             );
             {
-                let pool_guard = (*pool).pool_guard();
+                let pool_guard = (*pool).create_base_guard();
                 let index = test_unique_mem_index(
                     &pool,
                     &pool_guard,
@@ -432,7 +432,7 @@ mod tests {
             let pool = QuiescentBox::new(
                 FixedBufferPool::with_capacity(PoolRole::Index, 1024usize * 1024 * 1024).unwrap(),
             );
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = (*pool).create_base_guard();
             let index = test_unique_mem_index(
                 &pool,
                 &pool_guard,
@@ -474,7 +474,7 @@ mod tests {
             let pool = QuiescentBox::new(
                 FixedBufferPool::with_capacity(PoolRole::Index, 1024usize * 1024 * 1024).unwrap(),
             );
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = (*pool).create_base_guard();
             let index = test_unique_mem_index(
                 &pool,
                 &pool_guard,
@@ -533,7 +533,7 @@ mod tests {
             let pool = QuiescentBox::new(
                 FixedBufferPool::with_capacity(PoolRole::Index, 1024usize * 1024 * 1024).unwrap(),
             );
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = (*pool).create_base_guard();
             let index = test_unique_mem_index(
                 &pool,
                 &pool_guard,
@@ -619,7 +619,7 @@ mod tests {
             let pool = QuiescentBox::new(
                 FixedBufferPool::with_capacity(PoolRole::Index, 1024usize * 1024 * 1024).unwrap(),
             );
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = (*pool).create_base_guard();
             let index = test_unique_mem_index(
                 &pool,
                 &pool_guard,

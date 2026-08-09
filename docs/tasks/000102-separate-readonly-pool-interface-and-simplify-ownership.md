@@ -147,7 +147,7 @@ Reference:
      - `read_validated_block(&self, guard: &PoolGuard, block_id: PageID, validator: ReadonlyPageValidator) -> Result<ReadonlyBlockGuard>`
    - Keep `persisted_file_kind()`, `invalidate_block_id()`, and
      `invalidate_block_id_strict()` as readonly-specific metadata/invalidation
-     operations, and keep `pool_guard()` available for outer callers that need
+     operations, and keep `create_base_guard()` available for outer callers that need
      an explicit readonly guard source.
    - Implement the new methods on top of the existing internal
      load/dedup/validation machinery so task scope stays narrow.
@@ -164,7 +164,7 @@ Reference:
      - readonly page tests in `doradb-storage/src/file/table_file.rs`
      to use `read_validated_block()` and the returned immutable guard rather
      than `PageSharedGuard<Page>`.
-   - Thread `PoolGuards::disk_guard()` or `ReadonlyBufferPool::pool_guard()`
+   - Thread `PoolGuards::disk_guard()` or `ReadonlyBufferPool::create_base_guard()`
      from outer call sites instead of reacquiring readonly guards inside the
      read helpers.
    - Remove readonly-only `BufferPool` imports from modules that no longer need
@@ -224,7 +224,7 @@ Reference:
    - removed `impl BufferPool for ReadonlyBufferPool`;
    - added `ReadonlyBlockGuard` and readonly-specific `read_block(...)` /
      `read_validated_block(...)` entrypoints;
-   - kept `ReadonlyBufferPool::pool_guard()` public, and the final shipped API
+   - kept `ReadonlyBufferPool::create_base_guard()` public, and the final shipped API
      requires callers to pass `&PoolGuard` explicitly for readonly reads.
 2. Simplified readonly ownership and runtime structure:
    - `GlobalReadonlyBufferPool` now owns `mappings`, `inflight_loads`, and
@@ -241,7 +241,7 @@ Reference:
      explicit disk-pool guard threading.
 4. Implementation review adjusted the final public shape:
    - readonly reads keep caller-owned guard provenance instead of reacquiring
-     `global.pool_guard()` internally;
+     `global.create_base_guard()` internally;
    - raw `read_block()` is now documented as a narrow COW root/meta-page helper
      and future expansion is explicitly cautioned;
    - the resident-hit validation-failure invalidation path keeps synchronous

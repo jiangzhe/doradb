@@ -578,11 +578,28 @@ That provenance rule gives three guarantees:
 - stable owner identity survives cloning because guards keep the owner alive
 - page guards and arena state can rely on one exact pool provenance source
 
-`EngineCore` owns one canonical `EnginePools` capability containing the four
-typed pool handles and one prebuilt `PoolGuards` bundle. Session-coordinated
-operations borrow that bundle through `SessionRuntime`; transaction attachments
-do not clone it. `PoolGuards` remains only a named bundle of individually
-branded guards and does not weaken the single-owner provenance rule.
+`EngineCore` owns one `EnginePools` capability containing the four typed pool
+handles and a prebuilt `PoolGuards` bundle for engine-owned work. Each
+`SessionState` constructs one fresh bundle from those same handles and
+session-coordinated operations borrow it through `SessionRuntime`; transaction
+attachments do not clone it. The engine and session bundles carry identical
+`PoolIdentity` values but distinct outer `Arc` roots.
+
+This distinction is intentional. The arena's `QuiescentGuardCount` remains
+pool-global and is acquired once for each long-lived root. Page guards clone
+the outer `SyncQuiescentGuard` on every retained page access, so allocating one
+root per session keeps that high-frequency `Arc` traffic on session-local cache
+lines. Moving session paths back to the canonical engine bundle would preserve
+provenance and memory safety but reintroduce cross-session refcount contention.
+`PoolGuards` remains only a named bundle of individually branded guards and
+does not weaken the single-owner provenance rule.
+
+`BufferPool::create_base_guard()` names the exceptional root-construction
+operation explicitly. It is appropriate at engine, session, component
+bootstrap, detached-worker, and isolated test-fixture ownership boundaries.
+Page access, cache-miss retries, invalidation, CoW mutation, DDL, recovery, and
+checkpoint helpers must instead accept an owner-scoped guard and clone it only
+when an owned sub-operation can outlive the borrow.
 
 ## Arena And Page-Guard Lifetime Rules
 

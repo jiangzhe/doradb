@@ -5603,9 +5603,11 @@ mod tests {
             let block_id = entry.block_id();
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
             corrupt_page_checksum(table_file_path, block_id);
-            let _ = table
-                .disk_pool()
-                .invalidate_block(table.file().sparse_file().file_id(), block_id);
+            let _ = table.disk_pool().invalidate_block(
+                session.pool_guards().disk_guard(),
+                table.file().sparse_file().file_id(),
+                block_id,
+            );
 
             let mut trx = session.begin_trx().unwrap();
             let err = trx
@@ -5651,9 +5653,11 @@ mod tests {
 
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
             corrupt_leaf_row_codec(table_file_path, entry.leaf_block_id, 0);
-            let _ = table
-                .disk_pool()
-                .invalidate_block(table.file().sparse_file().file_id(), entry.leaf_block_id);
+            let _ = table.disk_pool().invalidate_block(
+                session.pool_guards().disk_guard(),
+                table.file().sparse_file().file_id(),
+                entry.leaf_block_id,
+            );
 
             let mut trx = session.begin_trx().unwrap();
             let res = trx_select_row_mvcc_by_id(&mut trx, table_id, &key, &[0, 1]).await;
@@ -5696,9 +5700,11 @@ mod tests {
 
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
             corrupt_leaf_block_id(table_file_path, entry.leaf_block_id, 0);
-            let _ = table
-                .disk_pool()
-                .invalidate_block(table.file().sparse_file().file_id(), entry.leaf_block_id);
+            let _ = table.disk_pool().invalidate_block(
+                session.pool_guards().disk_guard(),
+                table.file().sparse_file().file_id(),
+                entry.leaf_block_id,
+            );
 
             let mut trx = session.begin_trx().unwrap();
             let res = trx_select_row_mvcc_by_id(&mut trx, table_id, &key, &[0, 1]).await;
@@ -5741,9 +5747,11 @@ mod tests {
 
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
             corrupt_lwc_row_shape_fingerprint(table_file_path, entry.block_id());
-            let _ = table
-                .disk_pool()
-                .invalidate_block(table.file().sparse_file().file_id(), entry.block_id());
+            let _ = table.disk_pool().invalidate_block(
+                session.pool_guards().disk_guard(),
+                table.file().sparse_file().file_id(),
+                entry.block_id(),
+            );
 
             let mut trx = session.begin_trx().unwrap();
             let res = trx_select_row_mvcc_by_id(&mut trx, table_id, &key, &[0, 1]).await;

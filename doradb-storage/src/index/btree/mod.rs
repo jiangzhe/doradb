@@ -1994,7 +1994,7 @@ mod tests {
 
     async fn run_lookup_against_map(hints_enabled: bool) {
         let pool = owned_index_pool(64 * 1024 * 1024);
-        let pool_guard = (*pool).pool_guard();
+        let pool_guard = (*pool).create_base_guard();
         let tree = BTree::new(pool.guard(), &pool_guard, hints_enabled, TrxID::new(200))
             .await
             .expect("test btree construction should succeed");
@@ -2033,7 +2033,7 @@ mod tests {
     fn test_btree_merge_partial_branch_suffix_drops_lower_fence_child() {
         smol::block_on(async {
             let pool = owned_index_pool(64 * 1024 * 1024);
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = (*pool).create_base_guard();
             let tree = BTree::new(pool.guard(), &pool_guard, false, TrxID::new(200))
                 .await
                 .expect("test btree construction should succeed");
@@ -2101,7 +2101,7 @@ mod tests {
     fn test_btree_merge_full_deletes_parent_separator_with_branch_value_width() {
         smol::block_on(async {
             let pool = owned_index_pool(64 * 1024 * 1024);
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = (*pool).create_base_guard();
             let tree = BTree::new(pool.guard(), &pool_guard, false, TrxID::new(200))
                 .await
                 .expect("test btree construction should succeed");
@@ -2168,7 +2168,7 @@ mod tests {
     fn test_btree_delete_exact_checks_value_and_delete_state() {
         smol::block_on(async {
             let pool = owned_index_pool(64 * 1024 * 1024);
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = (*pool).create_base_guard();
             let tree = BTree::new(pool.guard(), &pool_guard, false, TrxID::new(100))
                 .await
                 .expect("test btree construction should succeed");
@@ -2235,7 +2235,7 @@ mod tests {
                 )
                 .unwrap(),
             );
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = (*pool).create_base_guard();
             let tree = BTree::new(pool.guard(), &pool_guard, false, TrxID::new(200))
                 .await
                 .expect("test btree construction should succeed");
@@ -2294,7 +2294,7 @@ mod tests {
     fn test_btree_replace_or_insert_semantics() {
         smol::block_on(async {
             let pool = owned_index_pool(64 * 1024 * 1024);
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = (*pool).create_base_guard();
             let tree = BTree::new(pool.guard(), &pool_guard, false, TrxID::new(200))
                 .await
                 .expect("test btree construction should succeed");
@@ -2371,7 +2371,7 @@ mod tests {
     fn test_btree_replace_or_insert_splits_for_absent_keys() {
         smol::block_on(async {
             let pool = owned_index_pool(64 * 1024 * 1024);
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = (*pool).create_base_guard();
             let tree = BTree::new(pool.guard(), &pool_guard, false, TrxID::new(200))
                 .await
                 .expect("test btree construction should succeed");
@@ -2409,7 +2409,7 @@ mod tests {
     fn test_btree_single_node() {
         smol::block_on(async {
             let pool = owned_index_pool(64 * 1024 * 1024);
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = (*pool).create_base_guard();
             {
                 let tree = BTree::new(pool.guard(), &pool_guard, false, TrxID::new(200))
                     .await
@@ -2564,7 +2564,7 @@ mod tests {
     fn test_btree_scale() {
         smol::block_on(async {
             let pool = owned_index_pool(128 * 1024 * 1024);
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = (*pool).create_base_guard();
             {
                 let tree = BTree::new(pool.guard(), &pool_guard, false, TrxID::new(200))
                     .await
@@ -2583,7 +2583,7 @@ mod tests {
     fn test_btree_delete() {
         smol::block_on(async {
             let pool = owned_index_pool(128 * 1024 * 1024);
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = (*pool).create_base_guard();
             {
                 let tree = BTree::new(pool.guard(), &pool_guard, false, TrxID::new(200))
                     .await
@@ -2604,7 +2604,7 @@ mod tests {
     fn test_btree_compact() {
         smol::block_on(async {
             let pool = owned_index_pool(128 * 1024 * 1024);
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = (*pool).create_base_guard();
             {
                 let tree = BTree::new(pool.guard(), &pool_guard, false, TrxID::new(200))
                     .await
@@ -2651,7 +2651,7 @@ mod tests {
             const ROWS: u64 = 10_000;
             const MAX_VALUE: u64 = 100_000;
             let pool = owned_index_pool(20 * 1024 * 1024);
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = (*pool).create_base_guard();
             {
                 let tree = BTree::new(pool.guard(), &pool_guard, false, TrxID::new(1))
                     .await
@@ -2726,7 +2726,7 @@ mod tests {
     fn test_btree_split() {
         smol::block_on(async {
             let pool = owned_index_pool(128 * 1024 * 1024);
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = (*pool).create_base_guard();
             {
                 let tree = Arc::new(
                     BTree::new(pool.guard(), &pool_guard, false, TrxID::new(200))
@@ -2805,7 +2805,7 @@ mod tests {
     fn test_btree_concurrent_split() {
         smol::block_on(async {
             let pool = owned_index_pool(128 * 1024 * 1024);
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = (*pool).create_base_guard();
             {
                 let tree = Arc::new(
                     BTree::new(pool.guard(), &pool_guard, false, TrxID::new(200))
@@ -2861,7 +2861,7 @@ mod tests {
     fn test_btree_low_count_delete_insert_churn_reclaims_without_split() {
         smol::block_on(async {
             let pool = owned_index_pool(16 * 1024 * 1024);
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = (*pool).create_base_guard();
             let tree = BTree::new(pool.guard(), &pool_guard, true, TrxID::new(300))
                 .await
                 .expect("test btree construction should succeed");
@@ -2934,7 +2934,7 @@ mod tests {
     fn test_btree_merge_partial() {
         smol::block_on(async {
             let pool = owned_index_pool(128 * 1024 * 1024);
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = (*pool).create_base_guard();
             {
                 let tree = BTree::new(pool.guard(), &pool_guard, false, TrxID::new(200))
                     .await
@@ -2967,7 +2967,7 @@ mod tests {
         const H2_ROWS: u64 = WIDE_HEIGHT2_ROWS;
         smol::block_on(async {
             let pool = owned_index_pool(128 * 1024 * 1024);
-            let pool_guard = (*pool).pool_guard();
+            let pool_guard = (*pool).create_base_guard();
             assert!(pool.allocated() == 0);
             // height=0
             {

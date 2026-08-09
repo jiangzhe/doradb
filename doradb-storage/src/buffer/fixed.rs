@@ -155,8 +155,8 @@ impl BufferPool for FixedBufferPool {
     }
 
     #[inline]
-    fn pool_guard(&self) -> PoolGuard {
-        self.arena.guard()
+    fn create_base_guard(&self) -> PoolGuard {
+        self.arena.create_base_guard()
     }
 
     // allocate a new page with exclusive lock.
@@ -314,7 +314,7 @@ mod tests {
             let pool = QuiescentBox::new(
                 FixedBufferPool::with_capacity(PoolRole::Meta, pool_bytes).unwrap(),
             );
-            let pool_guard = pool.pool_guard();
+            let pool_guard = pool.create_base_guard();
             let page = pool
                 .allocate_page::<Page>(&pool_guard)
                 .await
@@ -344,7 +344,7 @@ mod tests {
             let pool = QuiescentBox::new(
                 FixedBufferPool::with_capacity(PoolRole::Meta, pool_bytes).unwrap(),
             );
-            let pool_guard = pool.pool_guard();
+            let pool_guard = pool.create_base_guard();
             let page_id = test_page_id(0);
             let page = pool
                 .allocate_page_at::<Page>(&pool_guard, page_id)
@@ -415,7 +415,7 @@ mod tests {
     fn test_fixed_buffer_pool() {
         smol::block_on(async {
             let pool = test_pool();
-            let pool_guard = FixedBufferPool::pool_guard(&pool);
+            let pool_guard = FixedBufferPool::create_base_guard(&pool);
             {
                 let g = pool
                     .allocate_page::<RowPageIndexNode>(&pool_guard)
@@ -564,7 +564,7 @@ mod tests {
     fn test_fixed_buffer_pool_stats_track_resident_hits_only() {
         smol::block_on(async {
             let pool = test_pool();
-            let pool_guard = FixedBufferPool::pool_guard(&pool);
+            let pool_guard = FixedBufferPool::create_base_guard(&pool);
             let page = pool
                 .allocate_page::<RowPageIndexNode>(&pool_guard)
                 .await
@@ -592,7 +592,7 @@ mod tests {
     fn test_facade_page_guard_lock_shared_and_try_into_shared() {
         smol::block_on(async {
             let pool = test_pool();
-            let pool_guard = FixedBufferPool::pool_guard(&pool);
+            let pool_guard = FixedBufferPool::create_base_guard(&pool);
             let g = pool
                 .allocate_page::<RowPageIndexNode>(&pool_guard)
                 .await
@@ -665,7 +665,7 @@ mod tests {
     fn test_facade_page_guard_lock_exclusive_and_try_into_exclusive() {
         smol::block_on(async {
             let pool = test_pool();
-            let pool_guard = FixedBufferPool::pool_guard(&pool);
+            let pool_guard = FixedBufferPool::create_base_guard(&pool);
             let g = pool
                 .allocate_page::<RowPageIndexNode>(&pool_guard)
                 .await
@@ -742,7 +742,7 @@ mod tests {
     fn test_facade_page_guard_try_upgrades_reject_generation_mismatch() {
         smol::block_on(async {
             let pool = test_pool();
-            let pool_guard = FixedBufferPool::pool_guard(&pool);
+            let pool_guard = FixedBufferPool::create_base_guard(&pool);
 
             let (mut g, _, _) = stale_facade_guard(&pool, &pool_guard).await;
             assert!(g.try_shared().is_invalid());
@@ -762,7 +762,7 @@ mod tests {
     fn test_facade_page_guard_verify_upgrades_reject_generation_mismatch() {
         smol::block_on(async {
             let pool = test_pool();
-            let pool_guard = FixedBufferPool::pool_guard(&pool);
+            let pool_guard = FixedBufferPool::create_base_guard(&pool);
 
             let (g, _, _) = stale_facade_guard(&pool, &pool_guard).await;
             assert!(g.verify_shared_async::<false>().await.is_invalid());
@@ -777,7 +777,7 @@ mod tests {
     fn test_page_optimistic_guard_checked_upgrades_reject_generation_mismatch() {
         smol::block_on(async {
             let pool = test_pool();
-            let pool_guard = FixedBufferPool::pool_guard(&pool);
+            let pool_guard = FixedBufferPool::create_base_guard(&pool);
             let page_id = allocate_test_row_page(&pool, &pool_guard).await;
 
             let g = pool
@@ -817,7 +817,7 @@ mod tests {
     fn test_facade_page_guard_lock_exclusive_async_panics_on_shared_state() {
         smol::block_on(async {
             let pool = test_pool();
-            let pool_guard = FixedBufferPool::pool_guard(&pool);
+            let pool_guard = FixedBufferPool::create_base_guard(&pool);
             let g = pool
                 .allocate_page::<RowPageIndexNode>(&pool_guard)
                 .await
@@ -843,7 +843,7 @@ mod tests {
     fn test_facade_page_guard_lock_shared_async_panics_on_exclusive_state() {
         smol::block_on(async {
             let pool = test_pool();
-            let pool_guard = FixedBufferPool::pool_guard(&pool);
+            let pool_guard = FixedBufferPool::create_base_guard(&pool);
             let g = pool
                 .allocate_page::<RowPageIndexNode>(&pool_guard)
                 .await
@@ -871,7 +871,7 @@ mod tests {
                 FixedBufferPool::with_capacity(PoolRole::Meta, 8 * 1024 * 1024).unwrap(),
             );
             let guard = {
-                let pool_guard = FixedBufferPool::pool_guard(&pool);
+                let pool_guard = FixedBufferPool::create_base_guard(&pool);
                 pool.allocate_page::<RowPageIndexNode>(&pool_guard)
                     .await
                     .expect("test page allocation should succeed")
@@ -900,8 +900,8 @@ mod tests {
         smol::block_on(async {
             let pool1 = test_pool();
             let pool2 = test_pool();
-            let pool1_guard = FixedBufferPool::pool_guard(&pool1);
-            let pool2_guard = FixedBufferPool::pool_guard(&pool2);
+            let pool1_guard = FixedBufferPool::create_base_guard(&pool1);
+            let pool2_guard = FixedBufferPool::create_base_guard(&pool2);
 
             let page = pool1
                 .allocate_page::<RowPageIndexNode>(&pool1_guard)

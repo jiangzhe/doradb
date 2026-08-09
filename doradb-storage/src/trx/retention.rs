@@ -1,3 +1,4 @@
+use crate::buffer::PoolGuard;
 use crate::catalog::{CatalogCheckpointOutcome, CatalogCheckpointScope};
 use crate::error::{
     CompletionErrorBridge, CompletionResult, DataIntegrityError, DataIntegrityResult, FatalError,
@@ -161,6 +162,7 @@ impl MaintenanceExecution for CatalogRedoMaintenanceExecution {
             .trx_sys
             .checkpoint_catalog_and_truncate_redo_log_prepared(
                 || self.catalog_scope.release(),
+                runtime.pool_guards().disk_guard(),
                 #[cfg(test)]
                 &engine.maintenance_test,
             )
@@ -359,6 +361,7 @@ impl TransactionSystem {
     async fn checkpoint_catalog_and_truncate_redo_log_prepared<F>(
         &self,
         release_catalog: F,
+        disk_guard: &PoolGuard,
         #[cfg(test)] maintenance_test: &MaintenanceTestController,
     ) -> RuntimeOrFatalResult<CatalogRedoMaintenanceOutcome>
     where
@@ -383,7 +386,10 @@ impl TransactionSystem {
             .await
             .map_err(RuntimeOrFatalError::from)?;
         let checkpoint_progress = batch.redo_retention_progress();
-        let mut prepared = self.catalog.prepare_checkpoint_batch(batch).await?;
+        let mut prepared = self
+            .catalog
+            .prepare_checkpoint_batch(batch, disk_guard)
+            .await?;
         let checkpoint_will_publish = prepared.will_publish();
 
         // 3. Build truncation inputs from the projected post-checkpoint state.

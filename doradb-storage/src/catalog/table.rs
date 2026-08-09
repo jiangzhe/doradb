@@ -125,7 +125,7 @@ enum CreateTablePhase {
 }
 
 enum CreateTableFile {
-    Mutable(MutableTableFile),
+    Mutable(Box<MutableTableFile>),
     Published(Arc<TableFile>),
 }
 
@@ -160,7 +160,7 @@ impl CreateTableProgress {
     #[inline]
     fn set_provisional_file(&mut self, mutable_file: MutableTableFile) {
         assert_eq!(self.phase, CreateTablePhase::Prepared);
-        self.file = Some(CreateTableFile::Mutable(mutable_file));
+        self.file = Some(CreateTableFile::Mutable(Box::new(mutable_file)));
         self.phase = CreateTablePhase::FileCreated;
     }
 
@@ -201,7 +201,7 @@ impl CreateTableProgress {
             panic!("create-table file is mutable before publish");
         };
         let table_file = trx_sys
-            .publish_table_file_root(mutable_file, root_ts, true)
+            .publish_table_file_root(*mutable_file, root_ts, true)
             .await
             .change_context(RuntimeError::CatalogAccess)
             .attach_with(|| {
@@ -216,7 +216,11 @@ impl CreateTableProgress {
     }
 
     #[inline]
-    async fn build_runtime(&mut self, pools: &EnginePools) -> RuntimeResult<()> {
+    async fn build_runtime(
+        &mut self,
+        pools: &EnginePools,
+        guards: &PoolGuards,
+    ) -> RuntimeResult<()> {
         debug_assert_eq!(self.phase, CreateTablePhase::FilePublished);
         let Some(CreateTableFile::Published(table_file)) = self.file.as_ref() else {
             panic!("published table file is present before runtime build");
@@ -225,7 +229,7 @@ impl CreateTableProgress {
         let active_root = table_file.active_root_unchecked();
         let blk_idx = BlockIndex::new(
             pools.meta.clone(),
-            pools.pool_guards().meta_guard(),
+            guards.meta_guard(),
             active_root.pivot_row_id,
             active_root.column_block_index_root,
         )
@@ -241,7 +245,7 @@ impl CreateTableProgress {
             Table::new(
                 pools.mem.clone(),
                 pools.index.clone(),
-                pools.pool_guards().index_guard(),
+                guards.index_guard(),
                 self.table_id,
                 blk_idx,
                 table_file,
@@ -296,7 +300,7 @@ impl CreateTableProgress {
     fn delete_provisional_file(&mut self, table_fs: &FileSystem) -> IoResult<()> {
         match self.file.take() {
             Some(CreateTableFile::Mutable(mutable_file)) => {
-                let _ = mutable_file.try_delete();
+                let _ = (*mutable_file).try_delete();
             }
             Some(CreateTableFile::Published(table_file)) => drop(table_file),
             None => {}
@@ -322,13 +326,14 @@ impl CreateTableProgress {
     async fn abort_before_catalog_commit(
         &mut self,
         engine: &EngineCore,
+        guards: &PoolGuards,
         operation: &'static str,
         source: impl Into<RuntimeOrFatalError>,
     ) -> RuntimeOrFatalError {
         let source = source.into();
         let source_debug = format!("{source:?}");
         let mut error = source;
-        if let Err(err) = self.destroy_staged_runtime(engine.pool_guards()).await {
+        if let Err(err) = self.destroy_staged_runtime(guards).await {
             let cleanup = poison_error_source(
                 &engine.poisoner,
                 RuntimeOrFatalError::from(err),
@@ -371,11 +376,12 @@ impl CreateTableProgress {
     async fn abort_after_root_publish_commit_error(
         &mut self,
         engine: &EngineCore,
+        guards: &PoolGuards,
         operation: &'static str,
         source: RuntimeOrFatalError,
     ) -> RuntimeOrFatalError {
         let source_debug = format!("{source:?}");
-        if let Err(err) = self.destroy_staged_runtime(engine.pool_guards()).await {
+        if let Err(err) = self.destroy_staged_runtime(guards).await {
             self.phase = CreateTablePhase::Aborted;
             return poison_error_source(
                 &engine.poisoner,
@@ -1285,6 +1291,7 @@ impl AcceptedCreateTable {
             .as_mut()
             .unwrap_or_else(|| panic!("accepted CREATE progress exists during execution"));
         let engine = scope.engine().clone();
+        let guards = engine.pool_guards();
         let table_id = progress.table_id;
 
         #[cfg(test)]
@@ -1344,7 +1351,7 @@ impl AcceptedCreateTable {
         if let Err(err) = exec_res {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                 progress
-                    .abort_before_catalog_commit(&engine, "catalog_staging", err)
+                    .abort_before_catalog_commit(&engine, guards, "catalog_staging", err)
                     .await,
             ));
         }
@@ -1363,7 +1370,7 @@ impl AcceptedCreateTable {
         {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                 progress
-                    .abort_before_catalog_commit(&engine, "test_after_catalog_staging", err)
+                    .abort_before_catalog_commit(&engine, guards, "test_after_catalog_staging", err)
                     .await,
             ));
         }
@@ -1371,7 +1378,7 @@ impl AcceptedCreateTable {
         if let Err(err) = progress.publish_file(&engine.trx_sys).await {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                 progress
-                    .abort_before_catalog_commit(&engine, "file_publish", err)
+                    .abort_before_catalog_commit(&engine, guards, "file_publish", err)
                     .await,
             ));
         }
@@ -1389,15 +1396,15 @@ impl AcceptedCreateTable {
         {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                 progress
-                    .abort_before_catalog_commit(&engine, "test_after_file_publish", err)
+                    .abort_before_catalog_commit(&engine, guards, "test_after_file_publish", err)
                     .await,
             ));
         }
 
-        if let Err(err) = progress.build_runtime(&engine.pools).await {
+        if let Err(err) = progress.build_runtime(&engine.pools, guards).await {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                 progress
-                    .abort_before_catalog_commit(&engine, "runtime_build", err)
+                    .abort_before_catalog_commit(&engine, guards, "runtime_build", err)
                     .await,
             ));
         }
@@ -1415,7 +1422,7 @@ impl AcceptedCreateTable {
         {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                 progress
-                    .abort_before_catalog_commit(&engine, "test_after_runtime_build", err)
+                    .abort_before_catalog_commit(&engine, guards, "test_after_runtime_build", err)
                     .await,
             ));
         }
@@ -1430,7 +1437,12 @@ impl AcceptedCreateTable {
             Err(err) => {
                 return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                     progress
-                        .abort_after_root_publish_commit_error(&engine, "catalog_commit", err)
+                        .abort_after_root_publish_commit_error(
+                            &engine,
+                            guards,
+                            "catalog_commit",
+                            err,
+                        )
                         .await,
                 ));
             }
@@ -1771,6 +1783,7 @@ pub(crate) fn reject_non_user_table_id(
 #[inline]
 pub(crate) async fn ensure_user_table_catalog_row(
     engine: &EngineCore,
+    guards: &PoolGuards,
     table_id: TableID,
     operation: &'static str,
 ) -> OperationOrRuntimeResult<()> {
@@ -1778,7 +1791,7 @@ pub(crate) async fn ensure_user_table_catalog_row(
         .catalog()
         .storage
         .tables()
-        .find_uncommitted_by_id(engine.pool_guards(), table_id)
+        .find_uncommitted_by_id(guards, table_id)
         .await?
         .is_some()
     {
@@ -1792,6 +1805,7 @@ pub(crate) async fn ensure_user_table_catalog_row(
 /// Return the validated runtime table for an index-DDL target.
 pub(crate) async fn validated_index_ddl_target(
     engine: &EngineCore,
+    guards: &PoolGuards,
     table_id: TableID,
     operation: &'static str,
 ) -> OperationOrRuntimeResult<Arc<Table>> {
@@ -1801,7 +1815,7 @@ pub(crate) async fn validated_index_ddl_target(
         .validate_user_table_live(table_id)
         .await
         .attach_with(|| format!("operation={operation}"))?;
-    ensure_user_table_catalog_row(engine, table_id, operation).await?;
+    ensure_user_table_catalog_row(engine, guards, table_id, operation).await?;
     Ok(table)
 }
 

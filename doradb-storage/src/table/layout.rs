@@ -378,7 +378,10 @@ mod tests {
             );
 
             let guards = PoolGuards::builder()
-                .push(PoolRole::Index, engine.inner().pools.index.pool_guard())
+                .push(
+                    PoolRole::Index,
+                    engine.inner().pools.index.create_base_guard(),
+                )
                 .build();
             assert_eq!(
                 table_for_internal_assertion(&engine, table_id)

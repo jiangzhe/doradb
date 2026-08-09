@@ -458,13 +458,14 @@ impl<'a> CreateIndexRuntimeBuilder<'a> {
     #[inline]
     fn new(
         engine: &'a EngineCore,
+        guards: &'a PoolGuards,
         metadata: &'a TableMetadata,
         index_spec: &'a IndexSpec,
         build_ts: TrxID,
     ) -> Self {
         Self {
             index_pool: engine.pools.index.clone(),
-            index_guard: engine.pool_guards().index_guard(),
+            index_guard: guards.index_guard(),
             metadata,
             index_spec,
             build_ts,
@@ -660,6 +661,7 @@ impl CreateIndexProgress {
     async fn execute_catalog_update(
         &mut self,
         engine: &EngineCore,
+        guards: &PoolGuards,
         new_metadata: &TableMetadata,
     ) -> RuntimeOrFatalResult<()> {
         debug_assert_eq!(self.phase, CreateIndexBuildPhase::LayoutStaged);
@@ -677,10 +679,7 @@ impl CreateIndexProgress {
         match res {
             Ok(()) => Ok(()),
             Err(err) => {
-                if let Err(cleanup) = self
-                    .rollback_before_catalog_commit(engine.pool_guards())
-                    .await
-                {
+                if let Err(cleanup) = self.rollback_before_catalog_commit(guards).await {
                     return Err(err.merge_cleanup(cleanup.attach_with(|| {
                         format!(
                             "operation=create_index, phase=rollback_before_catalog_commit, table_id={}, index_no={}",
@@ -750,10 +749,11 @@ impl CreateIndexProgress {
     async fn cleanup_after_catalog_commit_failure(
         &mut self,
         engine: &EngineCore,
+        guards: &PoolGuards,
         operation: &'static str,
         source: RuntimeOrFatalError,
     ) -> RuntimeOrFatalError {
-        self.cleanup_staged_runtime(engine.pool_guards()).await;
+        self.cleanup_staged_runtime(guards).await;
         self.phase = CreateIndexBuildPhase::Aborted;
         poison_index_after_catalog_commit_with_source(
             &engine.poisoner,
@@ -1040,7 +1040,7 @@ impl AcceptedCreateIndex {
         });
         let runtime = self.scope.engine().clone();
         let engine = runtime.core();
-        let guards = engine.pool_guards();
+        let guards = runtime.pool_guards();
         let table_id = plan.table_id;
         let index_no = plan.index_no;
         let index_no_usize = usize::from(index_no);
@@ -1085,6 +1085,7 @@ impl AcceptedCreateIndex {
             plan.table.file(),
             engine.table_fs.background_writes(),
             plan.table.disk_pool().clone(),
+            guards.disk_guard().clone(),
         );
         let disk_runtime = match SecondaryDiskTreeRuntime::new(
             index_no_usize,
@@ -1154,6 +1155,7 @@ impl AcceptedCreateIndex {
 
         let runtime_builder = CreateIndexRuntimeBuilder::new(
             engine,
+            guards,
             plan.new_metadata.as_ref(),
             &plan.new_index_spec,
             build_ts,
@@ -1220,7 +1222,7 @@ impl AcceptedCreateIndex {
         progress.stage_layout(new_layout);
 
         if let Err(err) = progress
-            .execute_catalog_update(engine, plan.new_metadata.as_ref())
+            .execute_catalog_update(engine, guards, plan.new_metadata.as_ref())
             .await
         {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(err));
@@ -1249,6 +1251,7 @@ impl AcceptedCreateIndex {
                 progress
                     .cleanup_after_catalog_commit_failure(
                         engine,
+                        guards,
                         "table_root_publish",
                         RuntimeOrFatalError::from(err),
                     )
@@ -1411,7 +1414,7 @@ impl AcceptedDropIndex {
         });
         let runtime = self.scope.engine().clone();
         let engine = runtime.core();
-        let guards = engine.pool_guards();
+        let guards = runtime.pool_guards();
         let table_id = plan.table_id;
         let index_no = plan.index_no;
         let index_no_usize = usize::from(index_no);
@@ -1446,6 +1449,7 @@ impl AcceptedDropIndex {
             plan.table.file(),
             engine.table_fs.background_writes(),
             plan.table.disk_pool().clone(),
+            guards.disk_guard().clone(),
         );
         mutable_file.replace_metadata_and_secondary_index_roots(
             Arc::clone(&plan.new_metadata),

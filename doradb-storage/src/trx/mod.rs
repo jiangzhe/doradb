@@ -6614,6 +6614,7 @@ pub(crate) mod tests {
                 &table_file,
                 engine.inner().table_fs.background_writes(),
                 engine.inner().pools.disk.clone(),
+                session.pool_guards().disk_guard().clone(),
             );
             let table_file = engine
                 .inner()

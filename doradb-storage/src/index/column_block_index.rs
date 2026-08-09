@@ -3702,9 +3702,13 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
-            let disk_pool_guard = disk_pool.pool_guard();
-            let mut mutable =
-                MutableTableFile::fork(&table, background_writes, disk_pool.global_pool().clone());
+            let disk_pool_guard = disk_pool.create_base_guard();
+            let mut mutable = MutableTableFile::fork(
+                &table,
+                background_writes,
+                disk_pool.global_pool().clone(),
+                disk_pool_guard.clone(),
+            );
             let index = ColumnBlockIndex::new(
                 SUPER_BLOCK_ID,
                 RowID::new(0),
@@ -3776,9 +3780,13 @@ mod tests {
         drop(old_root);
         let global = global_readonly_pool_scope(64 * 1024 * 1024);
         let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
-        let disk_pool_guard = disk_pool.pool_guard();
-        let mut mutable =
-            MutableTableFile::fork(&table, background_writes, disk_pool.global_pool().clone());
+        let disk_pool_guard = disk_pool.create_base_guard();
+        let mut mutable = MutableTableFile::fork(
+            &table,
+            background_writes,
+            disk_pool.global_pool().clone(),
+            disk_pool_guard.clone(),
+        );
         let root_block_id = ColumnBlockIndex::new(
             SUPER_BLOCK_ID,
             RowID::new(0),
@@ -3883,9 +3891,13 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
-            let disk_pool_guard = disk_pool.pool_guard();
-            let mut mutable =
-                MutableTableFile::fork(&table, background_writes, disk_pool.global_pool().clone());
+            let disk_pool_guard = disk_pool.create_base_guard();
+            let mut mutable = MutableTableFile::fork(
+                &table,
+                background_writes,
+                disk_pool.global_pool().clone(),
+                disk_pool_guard.clone(),
+            );
             let root_block_id = ColumnBlockIndex::new(
                 SUPER_BLOCK_ID,
                 RowID::new(0),
@@ -3963,9 +3975,13 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
-            let disk_pool_guard = disk_pool.pool_guard();
-            let mut mutable =
-                MutableTableFile::fork(&table, background_writes, disk_pool.global_pool().clone());
+            let disk_pool_guard = disk_pool.create_base_guard();
+            let mut mutable = MutableTableFile::fork(
+                &table,
+                background_writes,
+                disk_pool.global_pool().clone(),
+                disk_pool_guard.clone(),
+            );
             let entries = vec![
                 dense_entry(RowID::new(0), RowID::new(4), test_block_id(1001)),
                 sparse_entry(
@@ -4058,9 +4074,13 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
-            let disk_pool_guard = disk_pool.pool_guard();
-            let mut mutable =
-                MutableTableFile::fork(&table, background_writes, disk_pool.global_pool().clone());
+            let disk_pool_guard = disk_pool.create_base_guard();
+            let mut mutable = MutableTableFile::fork(
+                &table,
+                background_writes,
+                disk_pool.global_pool().clone(),
+                disk_pool_guard.clone(),
+            );
             let root_v1 = ColumnBlockIndex::new(
                 SUPER_BLOCK_ID,
                 RowID::new(0),
@@ -4083,8 +4103,12 @@ mod tests {
             .unwrap();
             let (_table, _old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
 
-            let mut mutable =
-                MutableTableFile::fork(&table, background_writes, disk_pool.global_pool().clone());
+            let mut mutable = MutableTableFile::fork(
+                &table,
+                background_writes,
+                disk_pool.global_pool().clone(),
+                disk_pool_guard.clone(),
+            );
             let root_v2 = ColumnBlockIndex::new(
                 root_v1,
                 RowID::new(8),
@@ -4141,15 +4165,19 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
-            let disk_pool_guard = disk_pool.pool_guard();
+            let disk_pool_guard = disk_pool.create_base_guard();
 
             let row_ids = test_row_id_range(0, 96);
             let delete_deltas: Vec<u32> = (0..96).collect();
             let entry =
                 ColumnBlockEntryShape::new(RowID::new(0), RowID::new(96), row_ids, delete_deltas)
                     .with_block_id(test_block_id(1001));
-            let mut mutable =
-                MutableTableFile::fork(&table, background_writes, disk_pool.global_pool().clone());
+            let mut mutable = MutableTableFile::fork(
+                &table,
+                background_writes,
+                disk_pool.global_pool().clone(),
+                disk_pool_guard.clone(),
+            );
             let root = ColumnBlockIndex::new(
                 SUPER_BLOCK_ID,
                 RowID::new(0),
@@ -4199,7 +4227,7 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
-            let disk_pool_guard = disk_pool.pool_guard();
+            let disk_pool_guard = disk_pool.create_base_guard();
 
             let seed = dense_entry_with_delete_domain(
                 RowID::new(0),
@@ -4208,8 +4236,12 @@ mod tests {
                 ColumnDeleteDomain::Ordinal,
                 test_block_id(1001),
             );
-            let mut mutable =
-                MutableTableFile::fork(&table, background_writes, disk_pool.global_pool().clone());
+            let mut mutable = MutableTableFile::fork(
+                &table,
+                background_writes,
+                disk_pool.global_pool().clone(),
+                disk_pool_guard.clone(),
+            );
             let root_v1 = ColumnBlockIndex::new(
                 SUPER_BLOCK_ID,
                 RowID::new(0),
@@ -4223,8 +4255,12 @@ mod tests {
             .unwrap();
             let (_table, _old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
 
-            let mut mutable =
-                MutableTableFile::fork(&table, background_writes, disk_pool.global_pool().clone());
+            let mut mutable = MutableTableFile::fork(
+                &table,
+                background_writes,
+                disk_pool.global_pool().clone(),
+                disk_pool_guard.clone(),
+            );
             let root_v2 = ColumnBlockIndex::new(
                 root_v1,
                 RowID::new(8),
@@ -4280,9 +4316,13 @@ mod tests {
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
-            let disk_pool_guard = disk_pool.pool_guard();
-            let mut mutable =
-                MutableTableFile::fork(&table, background_writes, disk_pool.global_pool().clone());
+            let disk_pool_guard = disk_pool.create_base_guard();
+            let mut mutable = MutableTableFile::fork(
+                &table,
+                background_writes,
+                disk_pool.global_pool().clone(),
+                disk_pool_guard.clone(),
+            );
             let mut entries = Vec::new();
             for idx in 0..(COLUMN_BLOCK_MAX_ENTRIES + 32) as u64 {
                 entries.push(dense_entry(
