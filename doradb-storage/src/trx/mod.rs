@@ -85,12 +85,12 @@ pub(crate) const MAX_COMMIT_TS: TrxID = TrxID::new(1 << 63);
 // visibility check can be simplified to "STS is larger".
 /// Minimum active transaction id derived from a snapshot timestamp.
 pub(crate) const MIN_ACTIVE_TRX_ID: TrxID = TrxID::new((1 << 63) + 1);
-
-/// Transaction-local statement identity used only by foreground MVCC state.
-pub(crate) type StmtNo = u64;
 /// Statement tag reserved for recovery, purge, and synthetic non-foreground undo.
 pub(crate) const NON_FOREGROUND_STMT_NO: StmtNo = 0;
 const FIRST_FOREGROUND_STMT_NO: StmtNo = 1;
+
+/// Transaction-local statement identity used only by foreground MVCC state.
+pub(crate) type StmtNo = u64;
 
 /// Proof that one transaction's exact logical lock scope was drained.
 ///

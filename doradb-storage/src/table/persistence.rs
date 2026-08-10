@@ -2402,12 +2402,12 @@ mod tests {
     };
     use crate::table::tests::*;
     use crate::table::{DeleteMarker, TableTerminal};
-    use crate::trx::MIN_ACTIVE_TRX_ID;
     use crate::trx::purge::PurgeTestEvent;
     use crate::trx::stmt::tests as stmt_tests;
     use crate::trx::tests::{discard_transaction_after_fatal_rollback, shared_trx_status};
     use crate::trx::undo::{OwnedRowUndo, RowUndoHead, RowUndoKind};
     use crate::trx::ver_map::RowPageState;
+    use crate::trx::{MIN_ACTIVE_TRX_ID, NON_FOREGROUND_STMT_NO};
     use futures::FutureExt;
     use std::cmp::Ordering;
     use std::sync::Arc;
@@ -5746,7 +5746,7 @@ mod tests {
                 let page = page_guard.page();
                 let map = page_guard.unwrap_vmap();
                 let undo = OwnedRowUndo::new(
-                    crate::trx::NON_FOREGROUND_STMT_NO,
+                    NON_FOREGROUND_STMT_NO,
                     table_id,
                     None,
                     page.row_id(0),
@@ -5816,7 +5816,7 @@ mod tests {
                 let page = page_guard.page();
                 let map = page_guard.unwrap_vmap();
                 let undo = OwnedRowUndo::new(
-                    crate::trx::NON_FOREGROUND_STMT_NO,
+                    NON_FOREGROUND_STMT_NO,
                     table_id,
                     None,
                     page.row_id(0),

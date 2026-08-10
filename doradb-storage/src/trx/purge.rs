@@ -1464,7 +1464,9 @@ mod tests {
     use crate::trx::stmt::Statement;
     use crate::trx::tests::shared_trx_status;
     use crate::trx::undo::{OwnedRowUndo, RowUndoKind, RowUndoLogs};
-    use crate::trx::{CommittedTrxPayload, MIN_ACTIVE_TRX_ID, SysTrxPayload};
+    use crate::trx::{
+        CommittedTrxPayload, MIN_ACTIVE_TRX_ID, NON_FOREGROUND_STMT_NO, SysTrxPayload,
+    };
     use crate::value::Val;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::path::Path;
@@ -2514,7 +2516,7 @@ mod tests {
 
             let mut row_undo = RowUndoLogs::empty();
             row_undo.push(OwnedRowUndo::new(
-                crate::trx::NON_FOREGROUND_STMT_NO,
+                NON_FOREGROUND_STMT_NO,
                 table.table_id(),
                 None,
                 row_id,
@@ -2610,7 +2612,7 @@ mod tests {
 
             let mut row_undo = RowUndoLogs::empty();
             row_undo.push(OwnedRowUndo::new(
-                crate::trx::NON_FOREGROUND_STMT_NO,
+                NON_FOREGROUND_STMT_NO,
                 table.table_id(),
                 None,
                 row_id,
@@ -2733,7 +2735,7 @@ mod tests {
 
             let mut row_undo = RowUndoLogs::empty();
             row_undo.push(OwnedRowUndo::new(
-                crate::trx::NON_FOREGROUND_STMT_NO,
+                NON_FOREGROUND_STMT_NO,
                 table.table_id(),
                 Some(stale_page_id),
                 row_id,
@@ -2852,7 +2854,7 @@ mod tests {
 
             let mut row_undo = RowUndoLogs::empty();
             row_undo.push(OwnedRowUndo::new(
-                crate::trx::NON_FOREGROUND_STMT_NO,
+                NON_FOREGROUND_STMT_NO,
                 table.table_id(),
                 Some(stale_page_id),
                 row_id,

@@ -745,14 +745,20 @@ impl<'a> RowReadState<'a> {
 /// The lookup candidate is consumed from its scanner, while the key encoder
 /// remains borrowed from the operation-owned index handle.
 pub(crate) struct BoundIndexCandidate<'a> {
+    /// Admitted secondary-index slot.
     pub(crate) index_no: usize,
+    /// Whether the admitted index is unique.
     pub(crate) unique: bool,
+    /// Encoded candidate identity emitted by the index scan.
     pub(crate) encoded_key: BTreeKey,
+    /// Candidate row identifier decoded from the index entry.
     pub(crate) row_id: RowID,
+    /// Encoder borrowed from the operation-owned index handle.
     pub(crate) encoder: &'a BTreeKeyEncoder,
 }
 
 impl<'a> BoundIndexCandidate<'a> {
+    /// Consumes one lookup candidate and binds it to admitted index metadata.
     #[inline]
     pub(crate) fn new(
         index_no: usize,
@@ -773,6 +779,7 @@ impl<'a> BoundIndexCandidate<'a> {
         }
     }
 
+    /// Returns whether logical key values encode to this exact candidate identity.
     #[inline]
     pub(crate) fn matches_key(&self, key_vals: &[Val]) -> bool {
         let encoded = if self.unique {
@@ -1463,7 +1470,7 @@ pub(crate) mod tests {
     };
     use crate::trx::tests::{commit_shared_trx_status, shared_trx_status};
     use crate::trx::undo::RowUndoHead;
-    use crate::trx::{MIN_ACTIVE_TRX_ID, ver_map::RowVersionMap};
+    use crate::trx::{MIN_ACTIVE_TRX_ID, NON_FOREGROUND_STMT_NO, ver_map::RowVersionMap};
     use crate::value::ValKind;
     use std::collections::BTreeMap;
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -1513,7 +1520,7 @@ pub(crate) mod tests {
 
     fn install_test_undo_head(row_ver: &RowVersionMap, status: Arc<SharedTrxStatus>) {
         let undo = OwnedRowUndo::new(
-            crate::trx::NON_FOREGROUND_STMT_NO,
+            NON_FOREGROUND_STMT_NO,
             TableID::new(1),
             None,
             RowID::new(100),
@@ -1718,7 +1725,7 @@ pub(crate) mod tests {
 
         let rollback_status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 10));
         let mut rollback_undo = OwnedRowUndo::new(
-            crate::trx::NON_FOREGROUND_STMT_NO,
+            NON_FOREGROUND_STMT_NO,
             TableID::new(1),
             None,
             RowID::new(100),
@@ -1733,7 +1740,7 @@ pub(crate) mod tests {
         test_row_write_access(&page, &row_ver, &dirty, 0)
             .rollback_first_undo(&metadata, &mut rollback_undo);
         let mut trx_rollback_undo = OwnedRowUndo::new(
-            crate::trx::NON_FOREGROUND_STMT_NO,
+            NON_FOREGROUND_STMT_NO,
             TableID::new(1),
             None,
             RowID::new(100),
@@ -1747,7 +1754,7 @@ pub(crate) mod tests {
             .rollback_first_undo(&metadata, &mut trx_rollback_undo);
 
         let purge_undo = OwnedRowUndo::new(
-            crate::trx::NON_FOREGROUND_STMT_NO,
+            NON_FOREGROUND_STMT_NO,
             TableID::new(1),
             None,
             RowID::new(101),
@@ -1771,14 +1778,14 @@ pub(crate) mod tests {
         let dirty = AtomicBool::new(false);
         let repeated_status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 9));
         let repeated_first_undo = OwnedRowUndo::new(
-            crate::trx::NON_FOREGROUND_STMT_NO,
+            NON_FOREGROUND_STMT_NO,
             TableID::new(1),
             None,
             RowID::new(100),
             RowUndoKind::Lock,
         );
         let repeated_second_undo = OwnedRowUndo::new(
-            crate::trx::NON_FOREGROUND_STMT_NO,
+            NON_FOREGROUND_STMT_NO,
             TableID::new(1),
             None,
             RowID::new(101),
@@ -1808,7 +1815,7 @@ pub(crate) mod tests {
 
         let rollback_status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 10));
         let mut rollback_undo = OwnedRowUndo::new(
-            crate::trx::NON_FOREGROUND_STMT_NO,
+            NON_FOREGROUND_STMT_NO,
             TableID::new(1),
             None,
             RowID::new(100),
@@ -1828,7 +1835,7 @@ pub(crate) mod tests {
         assert_eq!(row_ver.frozen_mutation_version(), prepared_version + 2);
 
         let mut trx_rollback_undo = OwnedRowUndo::new(
-            crate::trx::NON_FOREGROUND_STMT_NO,
+            NON_FOREGROUND_STMT_NO,
             TableID::new(1),
             None,
             RowID::new(100),
@@ -1845,7 +1852,7 @@ pub(crate) mod tests {
         assert_eq!(row_ver.frozen_mutation_version(), prepared_version + 2);
 
         let purge_undo = OwnedRowUndo::new(
-            crate::trx::NON_FOREGROUND_STMT_NO,
+            NON_FOREGROUND_STMT_NO,
             TableID::new(1),
             None,
             RowID::new(101),
@@ -1883,7 +1890,7 @@ pub(crate) mod tests {
         let page = row_page(&metadata);
         let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
         let undo = OwnedRowUndo::new(
-            crate::trx::NON_FOREGROUND_STMT_NO,
+            NON_FOREGROUND_STMT_NO,
             TableID::new(1),
             None,
             RowID::new(100),
