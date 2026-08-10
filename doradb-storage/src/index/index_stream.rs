@@ -341,8 +341,8 @@ where
             return Ok(None);
         }
         if !self.started {
-            let lower_seek_key = self.range.borrow().lower_seek_key().to_vec();
-            self.cursor.seek(&lower_seek_key).await?;
+            let lower_seek_key = self.range.borrow().lower_seek_key();
+            self.cursor.seek(lower_seek_key).await?;
             self.started = true;
         }
         while let Some(leaf) = self.cursor.next_leaf().await? {

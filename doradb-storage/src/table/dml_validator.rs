@@ -147,6 +147,21 @@ impl<'m> DmlValidator<'m> {
     where
         R: RangeBounds<&'r [Val]> + ?Sized,
     {
+        self.validate_index_range(index_no, range)?;
+        self.validate_read_set(read_set)?;
+        Ok(())
+    }
+
+    /// Validates an index range without requiring a projection read set.
+    #[inline]
+    pub(crate) fn validate_index_range<'r, R>(
+        &self,
+        index_no: usize,
+        range: &R,
+    ) -> DmlValidationResult<()>
+    where
+        R: RangeBounds<&'r [Val]> + ?Sized,
+    {
         let Some(index_spec) = self.metadata.idx.index_spec(index_no) else {
             return Err(Report::new(DmlValidationError::IndexKey).attach(format!(
                 "index not found: index_no={}, index_slot_count={}",
@@ -156,7 +171,6 @@ impl<'m> DmlValidator<'m> {
         };
         self.validate_index_bound(index_no, index_spec, range.start_bound())?;
         self.validate_index_bound(index_no, index_spec, range.end_bound())?;
-        self.validate_read_set(read_set)?;
         Ok(())
     }
 

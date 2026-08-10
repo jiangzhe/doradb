@@ -18,7 +18,6 @@ use crate::error::RuntimeResult;
 use crate::id::BlockID;
 use crate::index::btree::{BTreeNode, BTreeNodeCursorState};
 use crate::index::{IndexBatchStream, IndexLookupCandidate, KeyRange, OwnedCurrentIndexReadHandle};
-use crate::trx::Transaction;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -239,7 +238,7 @@ type OwnedUniqueDiskTreeCandidateStream<P> =
 type OwnedNonUniqueDiskTreeCandidateStream<P> =
     IndexScanStream<OwnedNonUniqueDiskTreeCandidateScanSpec<P>, Arc<KeyRange>>;
 
-enum OwnedSecondaryIndexCandidateStreamKind<P: BufferPool + 'static> {
+enum OwnedIndexCandidateStreamKind<P: BufferPool + 'static> {
     Unique(
         SecondaryIndexCandidateStream<
             OwnedUniqueMemIndexCandidateStream<P>,
@@ -254,22 +253,28 @@ enum OwnedSecondaryIndexCandidateStreamKind<P: BufferPool + 'static> {
     ),
 }
 
-/// Owned persistent lookup-candidate stream for user-table secondary scans.
-pub(crate) struct OwnedSecondaryIndexCandidateStream<'trx, P: BufferPool + 'static> {
-    inner: OwnedSecondaryIndexCandidateStreamKind<P>,
-    _transaction: PhantomData<&'trx mut Transaction>,
+/// Resource-owning persistent lookup-candidate stream for user-table scans.
+///
+/// This cursor owns its index runtime, pool guards, encoded range, and
+/// traversal state, but it is not standalone authority for the captured
+/// DiskTree root. It must remain nested in the public index-scan operation,
+/// whose checkout keeps the transaction and root-reachability proof active and
+/// is dropped only after this cursor. Transaction exclusivity belongs to the
+/// public `IndexScanMvccStream<'trx>` lifetime; do not retain or poll this
+/// crate-private cursor after releasing that enclosing operation state.
+pub(crate) struct OwnedIndexCandidateStream<P: BufferPool + 'static> {
+    inner: OwnedIndexCandidateStreamKind<P>,
 }
 
-impl<'trx, P: BufferPool + 'static> OwnedSecondaryIndexCandidateStream<'trx, P> {
+impl<P: BufferPool + 'static> OwnedIndexCandidateStream<P> {
     /// Create a persistent candidate stream over one proof-gated root.
     #[inline]
-    pub(crate) fn new(handle: OwnedCurrentIndexReadHandle<'trx, P>, range: KeyRange) -> Self {
+    pub(crate) fn new(handle: OwnedCurrentIndexReadHandle<P>, range: KeyRange) -> Self {
         let OwnedCurrentIndexReadHandle {
             index,
             index_pool_guard,
             disk_pool_guard,
             root,
-            _transaction,
         } = handle;
         let range = Arc::new(range);
         let inner = match index.as_ref() {
@@ -282,9 +287,7 @@ impl<'trx, P: BufferPool + 'static> OwnedSecondaryIndexCandidateStream<'trx, P> 
                     OwnedUniqueDiskTreeCursor::new(index, disk_pool_guard, root),
                     range,
                 );
-                OwnedSecondaryIndexCandidateStreamKind::Unique(SecondaryIndexCandidateStream::new(
-                    mem, disk,
-                ))
+                OwnedIndexCandidateStreamKind::Unique(SecondaryIndexCandidateStream::new(mem, disk))
             }
             SecondaryIndex::NonUnique { .. } => {
                 let mem = OwnedNonUniqueMemIndexCandidateStream::new(
@@ -295,26 +298,23 @@ impl<'trx, P: BufferPool + 'static> OwnedSecondaryIndexCandidateStream<'trx, P> 
                     OwnedNonUniqueDiskTreeCursor::new(index, disk_pool_guard, root),
                     range,
                 );
-                OwnedSecondaryIndexCandidateStreamKind::NonUnique(
-                    SecondaryIndexCandidateStream::new(mem, disk),
-                )
+                OwnedIndexCandidateStreamKind::NonUnique(SecondaryIndexCandidateStream::new(
+                    mem, disk,
+                ))
             }
         };
-        Self {
-            inner,
-            _transaction,
-        }
+        Self { inner }
     }
 }
 
 impl<P: BufferPool + 'static> IndexBatchStream<IndexLookupCandidate>
-    for OwnedSecondaryIndexCandidateStream<'_, P>
+    for OwnedIndexCandidateStream<P>
 {
     #[inline]
     async fn next_batch(&mut self) -> RuntimeResult<Option<Vec<IndexLookupCandidate>>> {
         match &mut self.inner {
-            OwnedSecondaryIndexCandidateStreamKind::Unique(stream) => stream.next_batch().await,
-            OwnedSecondaryIndexCandidateStreamKind::NonUnique(stream) => stream.next_batch().await,
+            OwnedIndexCandidateStreamKind::Unique(stream) => stream.next_batch().await,
+            OwnedIndexCandidateStreamKind::NonUnique(stream) => stream.next_batch().await,
         }
     }
 }

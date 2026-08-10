@@ -270,7 +270,7 @@ impl UndoVal for UpdateCol {
     }
 }
 
-/// Callback decision for one latest modifiable row in a full-table mutation.
+/// Callback decision for one latest modifiable row in a table mutation.
 ///
 /// The callback is invoked at most once for each eligible original row. Update
 /// replacements created by the operation are not offered to the callback again.
@@ -286,7 +286,7 @@ pub enum RowMutation {
     Update(Vec<UpdateCol>),
 }
 
-/// Counts of successful delete and update decisions from a full-table mutation.
+/// Counts of successful delete and update decisions from a table mutation.
 ///
 /// Skipped rows increment neither field. A failed operation returns no outcome
 /// and rolls back its statement-local row and index effects.

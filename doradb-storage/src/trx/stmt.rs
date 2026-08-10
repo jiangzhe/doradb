@@ -20,8 +20,8 @@ use crate::trx::undo::{
     IndexUndo, IndexUndoKind, IndexUndoLogs, OwnedRowUndo, RowUndoKind, RowUndoLogs,
 };
 use crate::trx::{
-    FatalRollbackRetention, SessionOperationCheckout, TableAdmissionRequest, TrxEffects, TrxInner,
-    TrxRuntime,
+    FatalRollbackRetention, NON_FOREGROUND_STMT_NO, SessionOperationCheckout, StmtNo,
+    TableAdmissionRequest, TrxEffects, TrxInner, TrxRuntime,
 };
 use crate::value::Val;
 use error_stack::ResultExt;
@@ -59,25 +59,55 @@ impl<T> QuadResultExt<T> for QuadResult<T> {
 /// succeeds. If the statement fails, index effects roll back before row effects
 /// and redo is discarded.
 pub(crate) struct StmtEffects {
+    stmt_no: StmtNo,
     row_undo: RowUndoLogs,
     index_undo: IndexUndoLogs,
     redo: RedoLogs,
 }
 
 impl StmtEffects {
-    /// Create an empty statement effect accumulator.
+    /// Create an empty effect accumulator for one checked-out statement.
     #[inline]
-    pub(crate) fn empty() -> Self {
+    pub(crate) fn new(stmt_no: StmtNo) -> Self {
+        assert!(
+            stmt_no != NON_FOREGROUND_STMT_NO,
+            "foreground statement effects require a non-sentinel statement number"
+        );
         StmtEffects {
+            stmt_no,
             row_undo: RowUndoLogs::empty(),
             index_undo: IndexUndoLogs::empty(),
             redo: RedoLogs::default(),
         }
     }
 
+    /// Create an empty synthetic accumulator for unit tests.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn empty() -> Self {
+        StmtEffects {
+            stmt_no: NON_FOREGROUND_STMT_NO,
+            row_undo: RowUndoLogs::empty(),
+            index_undo: IndexUndoLogs::empty(),
+            redo: RedoLogs::default(),
+        }
+    }
+
+    /// Returns this transaction-local statement identity.
+    #[inline]
+    pub(crate) fn stmt_no(&self) -> StmtNo {
+        self.stmt_no
+    }
+
     /// Push one row undo entry into this statement.
     #[inline]
     pub(crate) fn push_row_undo(&mut self, undo: OwnedRowUndo) {
+        debug_assert!(
+            self.stmt_no == NON_FOREGROUND_STMT_NO || undo.stmt_no == self.stmt_no,
+            "foreground row undo statement tag mismatch: effects_stmt_no={}, undo_stmt_no={}",
+            self.stmt_no,
+            undo.stmt_no
+        );
         self.row_undo.push(undo);
     }
 
@@ -88,6 +118,31 @@ impl StmtEffects {
         // Currently the update can only be applied on LOCK entry.
         debug_assert!(matches!(last_undo.kind, RowUndoKind::Lock));
         last_undo.kind = kind;
+    }
+
+    /// Unlink and discard the newest provisional row lock without retaining an effect.
+    #[inline]
+    pub(crate) fn cancel_last_row_undo_lock(&mut self, unlink: impl FnOnce(&mut OwnedRowUndo)) {
+        let last_undo = self
+            .row_undo
+            .last_mut()
+            .expect("provisional row lock cancellation requires a row undo entry");
+        assert!(
+            matches!(last_undo.kind, RowUndoKind::Lock),
+            "provisional row lock cancellation requires the newest undo to be Lock"
+        );
+        assert!(
+            last_undo.stmt_no == self.stmt_no,
+            "provisional row lock cancellation statement mismatch: effects_stmt_no={}, undo_stmt_no={}",
+            self.stmt_no,
+            last_undo.stmt_no
+        );
+        unlink(last_undo);
+        let removed = self
+            .row_undo
+            .pop()
+            .expect("unlinked provisional row lock must remain statement-owned");
+        debug_assert!(matches!(removed.kind, RowUndoKind::Lock));
     }
 
     /// Push an inserted unique-index claim into statement rollback state.
@@ -251,9 +306,10 @@ pub(crate) struct StmtState {
 impl StmtState {
     /// Arms public statement cancellation after a successful checkout.
     #[inline]
-    pub(crate) fn public(checkout: SessionOperationCheckout) -> Self {
+    pub(crate) fn public(mut checkout: SessionOperationCheckout) -> Self {
+        let stmt_no = checkout.inner_mut().next_stmt_no();
         Self {
-            effects: StmtEffects::empty(),
+            effects: StmtEffects::new(stmt_no),
             drop_action: StmtDropAction::CancelPublicTransaction,
             checkout: Some(checkout),
         }
@@ -526,6 +582,53 @@ impl<'stmt> Statement<'stmt> {
         table
             .accessor_with_layout(&layout)
             .table_mutate_mvcc(rt, effects, validate_updates, mutate_row)
+            .await
+    }
+
+    /// Sequentially mutates latest rows selected by a secondary-index range.
+    ///
+    /// The traversal is a weak monotonic current read: mutable index state is
+    /// resumed strictly after its last consumed exact key, while the captured
+    /// DiskTree cursor advances incrementally. Each callback runs only after
+    /// exact candidate revalidation and row ownership acquisition. Updates
+    /// driven by a unique index must preserve that index's encoded logical key.
+    #[inline]
+    pub async fn table_index_mutate_mvcc<'r, R, F>(
+        &mut self,
+        table_id: TableID,
+        index_no: usize,
+        range: R,
+        mutate_row: F,
+    ) -> Result<TableMutationOutcome>
+    where
+        R: RangeBounds<&'r [Val]>,
+        F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<RowMutation>,
+    {
+        const OPERATION: &str = "table_index_mutate_mvcc";
+        let (table, layout) = self
+            .admit_user_table(
+                table_id,
+                TableAdmissionRequest::IndexWrite { index_no },
+                OPERATION,
+            )
+            .await
+            .disclose()?;
+        if !self.disable_dml_validation {
+            DmlValidator::new(layout.metadata())
+                .validate_index_range(index_no, &range)
+                .change_context(OperationError::InvalidDmlInput)
+                .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+                .disclose()?;
+        }
+        self.acquire_table_write_data_lock(table_id)
+            .await
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+            .disclose()?;
+        let validate_updates = !self.disable_dml_validation;
+        let (rt, effects) = self.runtime_and_effects_mut();
+        table
+            .accessor_with_layout(&layout)
+            .table_index_mutate_mvcc(rt, effects, index_no, range, validate_updates, mutate_row)
             .await
     }
 
@@ -1129,9 +1232,51 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_public_statements_consume_monotonic_statement_numbers() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("stmt_number_sequence").await;
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let mut observed = Vec::new();
+
+            trx.exec(async |stmt| {
+                observed.push(statement_effects_mut(stmt).stmt_no());
+                Ok(())
+            })
+            .await
+            .unwrap();
+            let failed: Result<()> = trx
+                .exec(async |stmt| {
+                    observed.push(statement_effects_mut(stmt).stmt_no());
+                    Err(Report::new(OperationError::InvalidDmlInput).disclose())
+                })
+                .await;
+            assert!(failed.is_err());
+            trx.exec(async |stmt| {
+                observed.push(statement_effects_mut(stmt).stmt_no());
+                Ok(())
+            })
+            .await
+            .unwrap();
+            assert_eq!(observed, vec![1, 2, 3]);
+            trx.commit().await.unwrap();
+
+            let mut next = session.begin_trx().unwrap();
+            next.exec(async |stmt| {
+                assert_eq!(statement_effects_mut(stmt).stmt_no(), 1);
+                Ok(())
+            })
+            .await
+            .unwrap();
+            next.commit().await.unwrap();
+        });
+    }
+
+    #[test]
     fn test_cancelled_stmt_effects_fold_undo_and_discard_redo() {
         let mut trx_effects = TrxEffects::empty();
         trx_effects.row_undo_mut().push(OwnedRowUndo::new(
+            NON_FOREGROUND_STMT_NO,
             TableID::new(41),
             None,
             RowID::new(1),
@@ -1145,6 +1290,7 @@ pub(crate) mod tests {
 
         let mut effects = StmtEffects::empty();
         effects.push_row_undo(OwnedRowUndo::new(
+            NON_FOREGROUND_STMT_NO,
             TableID::new(42),
             None,
             RowID::new(2),
@@ -1194,6 +1340,7 @@ pub(crate) mod tests {
             let mut effects = StmtEffects::empty();
             effects.push_delete_index_undo(table_id, row_id, SelectKey::new(0, vec![]), true);
             effects.push_row_undo(OwnedRowUndo::new(
+                NON_FOREGROUND_STMT_NO,
                 table_id,
                 None,
                 row_id,
@@ -1365,13 +1512,15 @@ pub(crate) mod tests {
                     // statement rollback ever runs row rollback before index
                     // rollback, this test fails before the injected index
                     // rollback error can discard the statement safely.
-                    statement_effects_mut(stmt).push_row_undo(OwnedRowUndo::new(
+                    let effects = statement_effects_mut(stmt);
+                    effects.push_row_undo(OwnedRowUndo::new(
+                        effects.stmt_no(),
                         TableID::new(99_999_999),
                         None,
                         RowID::new(24),
                         RowUndoKind::Delete,
                     ));
-                    statement_effects_mut(stmt).push_delete_index_undo(
+                    effects.push_delete_index_undo(
                         TableID::new(12),
                         RowID::new(23),
                         SelectKey::new(0, vec![]),

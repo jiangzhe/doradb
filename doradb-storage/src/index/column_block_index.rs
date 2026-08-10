@@ -620,6 +620,7 @@ pub(crate) struct ResolvedColumnRow {
     block_id: BlockID,
     row_idx: usize,
     row_shape_fingerprint: u128,
+    durable_deleted: bool,
 }
 
 impl ResolvedColumnRow {
@@ -647,6 +648,16 @@ impl ResolvedColumnRow {
     #[inline]
     pub(crate) fn row_shape_fingerprint(&self) -> u128 {
         self.row_shape_fingerprint
+    }
+
+    /// Returns whether the row belongs to the resolved entry's durable delete set.
+    ///
+    /// This is committed base state, not unconditional MVCC invisibility. A
+    /// surviving `ColumnDeletionBuffer` marker is newer authority and must be
+    /// interpreted first; this bit is final only when that marker is absent.
+    #[inline]
+    pub(crate) fn durable_deleted(&self) -> bool {
+        self.durable_deleted
     }
 }
 
@@ -792,6 +803,18 @@ impl LogicalDeleteSet {
             }
             LogicalDeleteSet::External { del_count, .. } => *del_count,
         }
+    }
+
+    #[inline]
+    fn contains_delta(&self, delta: u32) -> bool {
+        let row_id_deltas = match self {
+            LogicalDeleteSet::None { .. } => return false,
+            LogicalDeleteSet::Inline { row_id_deltas, .. } => row_id_deltas,
+            LogicalDeleteSet::External { row_id_deltas, .. } => row_id_deltas
+                .as_ref()
+                .expect("resolved external delete set must contain decoded row-id deltas"),
+        };
+        row_id_deltas.binary_search(&delta).is_ok()
     }
 }
 
@@ -1523,14 +1546,33 @@ impl<'a> ColumnBlockIndex<'a> {
                     .node_result(block_id, node.leaf_entry_view(idx))
                     .change_context(RuntimeError::IndexAccess)
                     .attach_with(|| format!("operation=resolve_column_row, row_id={row_id}"))?;
-                let Some(row_idx) = self
-                    .node_result(block_id, resolve_row_idx_in_view(&view, row_id))
+                let row_set = self
+                    .node_result(block_id, decode_logical_row_set(&view))
                     .change_context(RuntimeError::IndexAccess)
-                    .attach_with(|| format!("operation=resolve_column_row, row_id={row_id}"))?
+                    .attach_with(|| format!("operation=resolve_column_row, row_id={row_id}"))?;
+                let delta = match row_id.checked_sub(view.start_row_id) {
+                    Some(delta) if delta < u64::from(view.entry_header.row_id_span()) => {
+                        delta as u32
+                    }
+                    Some(_) | None => return Ok(None),
+                };
+                let Some(row_idx) = row_set
+                    .ordinal_for_delta(delta)
+                    .map(|ordinal| ordinal as usize)
                 else {
                     return Ok(None);
                 };
-                return Ok(Some(build_resolved_row(block_id, &view, row_idx)));
+                // todo: query deletion flag without full decoding.
+                let delete_set = self
+                    .decode_logical_delete_set(&view, &row_set, block_id)
+                    .await?;
+                let durable_deleted = delete_set.contains_delta(delta);
+                return Ok(Some(build_resolved_row(
+                    block_id,
+                    &view,
+                    row_idx,
+                    durable_deleted,
+                )));
             }
             let entries = node.branch_entries();
             let idx = match search_branch_entry(entries, row_id) {
@@ -2804,12 +2846,14 @@ fn build_resolved_row(
     leaf_block_id: BlockID,
     view: &LeafEntryView<'_>,
     row_idx: usize,
+    durable_deleted: bool,
 ) -> ResolvedColumnRow {
     ResolvedColumnRow {
         leaf_block_id,
         block_id: view.entry_header.block_id(),
         row_idx,
         row_shape_fingerprint: view.entry_header.row_shape_fingerprint(),
+        durable_deleted,
     }
 }
 
@@ -4021,6 +4065,7 @@ mod tests {
             assert_eq!(dense_resolved.block_id(), 1001);
             assert_eq!(dense_resolved.row_idx(), 2);
             assert_eq!(dense_resolved.leaf_block_id(), dense_entry.leaf_block_id);
+            assert!(!dense_resolved.durable_deleted());
             assert_eq!(
                 dense_resolved.row_shape_fingerprint(),
                 dense_entry.row_shape_fingerprint()
@@ -4035,6 +4080,7 @@ mod tests {
             assert_eq!(sparse_resolved.block_id(), 1002);
             assert_eq!(sparse_resolved.row_idx(), 1);
             assert_eq!(sparse_resolved.leaf_block_id(), sparse_entry.leaf_block_id);
+            assert!(!sparse_resolved.durable_deleted());
             assert_eq!(
                 sparse_resolved.row_shape_fingerprint(),
                 sparse_entry.row_shape_fingerprint()
@@ -4149,6 +4195,22 @@ mod tests {
                 .into_iter()
                 .collect();
             assert_eq!(loaded, BTreeSet::from([1u32, 3, 6]));
+            assert!(
+                index
+                    .locate_and_resolve_row(RowID::new(1))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .durable_deleted()
+            );
+            assert!(
+                !index
+                    .locate_and_resolve_row(RowID::new(2))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .durable_deleted()
+            );
         });
     }
 
@@ -4168,7 +4230,7 @@ mod tests {
             let disk_pool_guard = disk_pool.create_base_guard();
 
             let row_ids = test_row_id_range(0, 96);
-            let delete_deltas: Vec<u32> = (0..96).collect();
+            let delete_deltas: Vec<u32> = (0..80).collect();
             let entry =
                 ColumnBlockEntryShape::new(RowID::new(0), RowID::new(96), row_ids, delete_deltas)
                     .with_block_id(test_block_id(1001));
@@ -4203,6 +4265,22 @@ mod tests {
             let blob_ref = entry
                 .deletion_blob_ref()
                 .expect("large delete set should be stored in external blob blocks");
+            assert!(
+                index
+                    .locate_and_resolve_row(RowID::new(40))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .durable_deleted()
+            );
+            assert!(
+                !index
+                    .locate_and_resolve_row(RowID::new(90))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .durable_deleted()
+            );
             let mut reachable = BTreeSet::new();
             index
                 .collect_reachable_blocks(&mut reachable)

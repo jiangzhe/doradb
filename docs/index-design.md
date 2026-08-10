@@ -78,7 +78,40 @@ Use the following documents as the living source of truth:
    - `MemIndex` cleanup proofs
    - `DiskTree` and table-file CoW root reclamation
 
-## 4. Summary
+## 4. Operation-local borrowed mutation traversal
+
+Index-driven MVCC mutation merges the selected secondary index's mutable
+`MemIndex` with one captured immutable `DiskTree` root. The mutation stream is
+created and fully consumed inside the statement operation, so it borrows the
+selected index runtime, pool guards, proof-bearing `TableRootSnapshot`, and
+encoded original range. It owns only traversal state, copied candidate
+batches, and the exact MemTree restart key. This makes the snapshot reference,
+rather than a cloned runtime plus a lifetime marker, the authority that keeps
+the captured DiskTree root valid.
+
+The stream does not retain a mutable B-tree cursor or leaf/parent latch across
+a row callback. Instead it copies at most one accepted leaf batch from each
+source. The immutable `DiskTree` cursor advances incrementally; an empty
+mutable-source buffer is refilled with a fresh root seek whose lower bound
+excludes the last consumed exact MemIndex key. Unconsumed entries from the
+other source remain buffered.
+
+The merger emits ascending exact encoded keys and lets MemIndex win equality,
+but stops whenever a non-exhausted source buffer empties so the next leaf can
+be compared before a larger retained key is emitted. Memory is therefore
+bounded by one accepted leaf from each source, and mutation cannot self-block
+on cursor coupling state.
+
+This traversal is intentionally weak and monotonic rather than a fixed
+statement-start candidate snapshot. A mutable source resumes strictly after
+its last consumed exact key and is not reopened after exhaustion. Entries
+inserted behind that point may be missed, entries ahead may be observed, and
+buffered stale entries are discarded by latest row/key revalidation. Unique
+driver updates must preserve their encoded logical key; non-unique exact keys
+include `RowID`, and current-statement undo tags exclude self-produced rows.
+There are no predicate, next-key, or gap locks.
+
+## 5. Summary
 
 `RowID` is the common identity across the storage engine. Block index resolves
 that identity to current physical location, while secondary index resolves

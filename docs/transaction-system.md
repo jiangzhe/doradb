@@ -176,6 +176,13 @@ it cannot mint `TrxReadProof`, and the captured root cannot outlive the active
 STS registration.
 
 Each user statement runs through `Transaction::exec(async |stmt| { ... })`.
+Every successfully checked-out public, private, or public stream statement
+receives one monotonically increasing transaction-local `StmtNo`. Read-only and
+failed statements consume numbers, and terminal transaction reset restarts the
+counter. `StmtNo` is runtime-only: each foreground row undo entry carries it so
+an index-driven mutation can recognize a latest image produced by its own
+statement without changing redo, recovery, or persisted formats. Undo rollback
+naturally reveals the older entry and its older statement number.
 The public `Transaction` is a weak, non-cloneable capability containing weak
 reachability to its exact `SessionState`, `SessionOperationKey`, and its
 independent engine-wide `TrxID`. `SessionOperationKey` is the exact
@@ -447,6 +454,40 @@ freeze and checkpoint page-state movement while ordinary metadata-only MVCC
 readers remain admitted. A transaction that already holds `TableData(IX)` can
 convert to `X` only when conversion is immediately compatible; otherwise the
 operation returns `LockUpgradeWouldBlock` before invoking the callback.
+
+Index-driven MVCC mutation instead uses index-targeted write admission and
+transaction-lifetime `TableData(IX)`. `IndexWrite` validates that the named
+driver index is active in the bound runtime; it is not exclusive permission to
+maintain indexes, because ordinary table writes also maintain every affected
+secondary index. Each candidate is re-resolved as a latest current read and
+its exact encoded driver key is checked before callback execution.
+
+The callback runs while definitive row ownership is held. A hot row retains
+its row-version write latch and page-state read guard after installing a
+statement-tagged provisional `Lock`; a cold row retains its deletion-buffer
+claim plus a provisional cold `Lock` undo. A foreign active owner conflicts,
+while a preparing owner is awaited only before the callback and then resolved
+again. The callback is never retried. `Skip` and an empty update synchronously
+unlink the provisional undo and release ownership; delete or non-empty update
+converts the same entry into its final operation. A callback or later storage
+error leaves the provisional effect for ordinary statement rollback.
+
+Under the hot-row latch, current-statement exclusion and foreign-owner
+admission precede latest-image deletion and key validation. This order is
+required because a foreign uncommitted delete or key change is a write conflict
+or prepare wait, not evidence that the index candidate is stale. The shared
+hot-row write helper validates every otherwise admissible head, including one
+owned by the same transaction, and installs the provisional undo only after
+validation succeeds. Keyed point update/delete therefore also reject an old
+index key after an in-place key change by the same transaction.
+
+The selected index range is a weak monotonic current-read traversal, without
+predicate or gap locks. Concurrent movement may cause omissions or later
+entries to appear. A latest hot image tagged with the current transaction and
+`StmtNo` is skipped before callback execution, preventing self-produced
+replacement rows from being processed again. A unique driver update must keep
+its encoded logical key unchanged; other indexes retain normal immediate
+maintenance and constraint checks.
 
 Finite effectful session maintenance reserves one outer `Maintenance`
 operation, acquires owned `TableMetadata(S)` followed by `TableData(IS)`, and

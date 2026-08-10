@@ -85,6 +85,12 @@ pub(crate) const MAX_COMMIT_TS: TrxID = TrxID::new(1 << 63);
 // visibility check can be simplified to "STS is larger".
 /// Minimum active transaction id derived from a snapshot timestamp.
 pub(crate) const MIN_ACTIVE_TRX_ID: TrxID = TrxID::new((1 << 63) + 1);
+/// Statement tag reserved for recovery, purge, and synthetic non-foreground undo.
+pub(crate) const NON_FOREGROUND_STMT_NO: StmtNo = 0;
+const FIRST_FOREGROUND_STMT_NO: StmtNo = 1;
+
+/// Transaction-local statement identity used only by foreground MVCC state.
+pub(crate) type StmtNo = u64;
 
 /// Proof that one transaction's exact logical lock scope was drained.
 ///
@@ -402,7 +408,8 @@ impl PrivateTransaction {
         F: for<'borrow> AsyncFnOnce(&'borrow mut Statement<'_>) -> RuntimeOrFatalResult<T>,
     {
         let checkout = self.checkout_mut();
-        let mut effects = StmtEffects::empty();
+        let stmt_no = checkout.inner_mut().next_stmt_no();
+        let mut effects = StmtEffects::new(stmt_no);
         let outcome = AssertUnwindSafe(async {
             let (inner, attachment) = checkout.inner_and_attachment_mut();
             let mut stmt = Statement::new(inner, attachment, &mut effects);
@@ -2360,6 +2367,7 @@ pub(crate) struct TrxInner {
     effects: TrxEffects,
     table_bindings: FastHashMap<TableID, admission::TransactionTableBinding>,
     lock_state: Option<TransactionLockState>,
+    next_stmt_no: StmtNo,
     active: bool,
     /// Whether successful terminal processing returns this core to the session.
     cache_on_terminal: bool,
@@ -2385,6 +2393,7 @@ impl TrxInner {
             effects: TrxEffects::empty(),
             table_bindings: FastHashMap::default(),
             lock_state: None,
+            next_stmt_no: NON_FOREGROUND_STMT_NO,
             active: false,
             cache_on_terminal,
         }
@@ -2419,6 +2428,10 @@ impl TrxInner {
             self.lock_state.is_none(),
             "ready transaction core cannot retain transaction lock state"
         );
+        assert!(
+            self.next_stmt_no == NON_FOREGROUND_STMT_NO,
+            "ready transaction core cannot retain a statement counter"
+        );
         self.ctx.init(trx_id, sts, gc_no);
         assert!(
             authority.lock_family().session_id() == session_id,
@@ -2427,6 +2440,7 @@ impl TrxInner {
             authority.lock_family()
         );
         self.lock_state = Some(TransactionLockState::new(authority, trx_id));
+        self.next_stmt_no = FIRST_FOREGROUND_STMT_NO;
         self.active = true;
     }
 
@@ -2466,6 +2480,7 @@ impl TrxInner {
         self.effects = TrxEffects::empty();
         self.table_bindings = FastHashMap::default();
         self.ctx = TrxContext::ready();
+        self.next_stmt_no = NON_FOREGROUND_STMT_NO;
     }
 
     /// Mark a prepared transaction's emptied core as inactive.
@@ -2506,6 +2521,24 @@ impl TrxInner {
     #[inline]
     pub(crate) fn effects_mut(&mut self) -> &mut TrxEffects {
         &mut self.effects
+    }
+
+    /// Allocate one monotonically increasing transaction-local statement number.
+    #[inline]
+    pub(crate) fn next_stmt_no(&mut self) -> StmtNo {
+        let stmt_no = self.next_stmt_no;
+        assert!(
+            stmt_no != NON_FOREGROUND_STMT_NO,
+            "active transaction statement number cannot use the non-foreground sentinel: trx_id={}",
+            self.trx_id()
+        );
+        self.next_stmt_no = stmt_no.checked_add(1).unwrap_or_else(|| {
+            panic!(
+                "transaction statement number exhausted u64 space: trx_id={}",
+                self.trx_id()
+            )
+        });
+        stmt_no
     }
 
     #[inline]
@@ -4736,6 +4769,7 @@ pub(crate) mod tests {
             add_pseudo_redo_log_entry(&mut trx).await;
             with_transaction_inner_mut(&mut trx, "test_prepare_payload", |inner| {
                 inner.row_undo_mut().push(OwnedRowUndo::new(
+                    NON_FOREGROUND_STMT_NO,
                     TableID::new(11),
                     None,
                     RowID::new(22),
@@ -5034,6 +5068,7 @@ pub(crate) mod tests {
             trx.exec(async |stmt| {
                 let effects = stmt_tests::statement_effects_mut(stmt);
                 effects.push_row_undo(OwnedRowUndo::new(
+                    effects.stmt_no(),
                     TableID::new(12),
                     None,
                     RowID::new(23),
@@ -6324,6 +6359,7 @@ pub(crate) mod tests {
                     "test_failed_precommit_retained_cold_row_undo",
                     |inner| {
                         inner.row_undo_mut().push(OwnedRowUndo::new(
+                            NON_FOREGROUND_STMT_NO,
                             table_id,
                             None,
                             RowID::new(cts.as_u64()),

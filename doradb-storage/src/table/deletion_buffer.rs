@@ -121,12 +121,18 @@ impl ColumnDeletionBuffer {
     /// Unlike [`ColumnDeletionBuffer::put_ref`], a foreign preparing owner
     /// returns opaque poison-aware retry authority. The returned token is owned
     /// and the deletion-buffer entry guard has already been released.
+    ///
+    /// `durable_deleted` is durable committed base state. An occupied CDB
+    /// entry is always classified first because it carries newer MVCC and
+    /// ownership information; the durable bit is consulted only for a vacant
+    /// entry.
     #[inline]
     pub(crate) fn claim_ref(
         &self,
         row_id: RowID,
         status: Arc<SharedTrxStatus>,
         snapshot_sts: TrxID,
+        durable_deleted: bool,
     ) -> Result<DeletionClaim, DeletionError> {
         match self.entries.entry(row_id) {
             Entry::Occupied(entry) => match entry.get() {
@@ -163,6 +169,12 @@ impl ColumnDeletionBuffer {
                 }
             },
             Entry::Vacant(entry) => {
+                // A present in-memory marker is always the newest authority.
+                // Only after proving the entry is vacant may durable delete
+                // membership be treated as final for this writer.
+                if durable_deleted {
+                    return Err(DeletionError::AlreadyDeleted);
+                }
                 entry.insert(DeleteMarker::Ref(status));
                 Ok(DeletionClaim::Acquired)
             }
@@ -301,37 +313,41 @@ impl ColumnDeletionBuffer {
         self.entries.get(&row_id).map(|entry| entry.value().clone())
     }
 
-    /// Returns whether a cold-row delete marker is safe for global physical
-    /// purge at the supplied oldest active snapshot.
+    /// Returns `None` when no marker exists, otherwise whether the marker is
+    /// globally purgeable at the supplied oldest active snapshot.
     ///
     /// A marker is purgeable only after its delete is committed and strictly
     /// older than `min_active_sts`. This proves every active or future
     /// transaction sees the cold row as deleted.
     #[inline]
-    pub(crate) fn delete_marker_is_globally_purgeable(
+    pub(crate) fn delete_marker_purgeability(
         &self,
         row_id: RowID,
         min_active_sts: TrxID,
-    ) -> bool {
-        self.delete_marker_is_globally_purgeable_with(row_id, || min_active_sts)
+    ) -> Option<bool> {
+        self.delete_marker_purgeability_with(row_id, || min_active_sts)
     }
 
-    /// Lazy variant of [`ColumnDeletionBuffer::delete_marker_is_globally_purgeable`].
+    /// Lazy test variant of [`ColumnDeletionBuffer::delete_marker_purgeability`].
     ///
     /// The `min_active_sts` closure is called only after the marker exists and
     /// has a committed delete timestamp.
+    #[cfg(test)]
     #[inline]
-    pub(crate) fn delete_marker_is_globally_purgeable_with<F>(
-        &self,
-        row_id: RowID,
-        min_active_sts: F,
-    ) -> bool
+    fn delete_marker_is_globally_purgeable_with<F>(&self, row_id: RowID, min_active_sts: F) -> bool
     where
         F: FnOnce() -> TrxID,
     {
-        let Some(marker) = self.get(row_id) else {
-            return false;
-        };
+        self.delete_marker_purgeability_with(row_id, min_active_sts)
+            .unwrap_or(false)
+    }
+
+    #[inline]
+    fn delete_marker_purgeability_with<F>(&self, row_id: RowID, min_active_sts: F) -> Option<bool>
+    where
+        F: FnOnce() -> TrxID,
+    {
+        let marker = self.get(row_id)?;
         let delete_cts = match marker {
             DeleteMarker::Committed(ts) => ts,
             DeleteMarker::Ref(status) => {
@@ -339,12 +355,12 @@ impl ColumnDeletionBuffer {
                 if !trx_is_committed(ts) {
                     // Active owners must keep both the write lock and the MVCC
                     // undo state in memory.
-                    return false;
+                    return Some(false);
                 }
                 ts
             }
         };
-        delete_cts < min_active_sts()
+        Some(delete_cts < min_active_sts())
     }
 
     /// Collects row ids whose delete marker is committed and
@@ -386,6 +402,28 @@ impl ColumnDeletionBuffer {
     #[inline]
     pub(crate) fn remove(&self, row_id: RowID) {
         self.entries.remove(&row_id);
+    }
+
+    /// Removes an active marker only when it still belongs to `status`.
+    ///
+    /// This is the inverse of a provisional foreground claim that has not yet
+    /// been converted into a delete/update effect. Ownership is checked under
+    /// the map entry guard so cancellation cannot remove a replacement marker.
+    #[inline]
+    pub(crate) fn remove_ref_if_owned(&self, row_id: RowID, status: &Arc<SharedTrxStatus>) -> bool {
+        match self.entries.entry(row_id) {
+            Entry::Occupied(entry) => {
+                let owned = matches!(
+                    entry.get(),
+                    DeleteMarker::Ref(existing) if Arc::ptr_eq(existing, status)
+                );
+                if owned {
+                    entry.remove();
+                }
+                owned
+            }
+            Entry::Vacant(_) => false,
+        }
     }
 }
 
@@ -492,7 +530,7 @@ mod tests {
         assert!(!prepare_event_is_installed(&owner));
 
         let first = match buffer
-            .claim_ref(RowID::new(1), first_waiter, MAX_SNAPSHOT_TS)
+            .claim_ref(RowID::new(1), first_waiter, MAX_SNAPSHOT_TS, false)
             .unwrap()
         {
             DeletionClaim::Preparing(listener) => listener,
@@ -500,7 +538,7 @@ mod tests {
         };
         assert!(prepare_event_is_installed(&owner));
         let second = match buffer
-            .claim_ref(RowID::new(1), second_waiter, MAX_SNAPSHOT_TS)
+            .claim_ref(RowID::new(1), second_waiter, MAX_SNAPSHOT_TS, false)
             .unwrap()
         {
             DeletionClaim::Preparing(listener) => listener,
@@ -514,8 +552,34 @@ mod tests {
         assert!(!prepare_event_is_installed(&owner));
         let requester = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 13));
         assert!(matches!(
-            buffer.claim_ref(RowID::new(1), requester, cts),
+            buffer.claim_ref(RowID::new(1), requester, cts, false),
             Err(DeletionError::AlreadyDeleted)
+        ));
+    }
+
+    #[test]
+    fn test_foreground_claim_prefers_cdb_marker_to_durable_delete() {
+        let buffer = ColumnDeletionBuffer::new();
+        let requester = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 1));
+
+        assert!(matches!(
+            buffer.claim_ref(RowID::new(1), Arc::clone(&requester), MAX_SNAPSHOT_TS, true,),
+            Err(DeletionError::AlreadyDeleted)
+        ));
+        assert!(buffer.get(RowID::new(1)).is_none());
+
+        buffer
+            .put_ref(RowID::new(2), Arc::clone(&requester), MAX_SNAPSHOT_TS)
+            .unwrap();
+        assert!(matches!(
+            buffer.claim_ref(RowID::new(2), Arc::clone(&requester), MAX_SNAPSHOT_TS, true,),
+            Ok(DeletionClaim::Acquired)
+        ));
+
+        buffer.put_committed(RowID::new(3), TrxID::new(30)).unwrap();
+        assert!(matches!(
+            buffer.claim_ref(RowID::new(3), requester, TrxID::new(29), true),
+            Err(DeletionError::WriteConflict)
         ));
     }
 
@@ -528,7 +592,12 @@ mod tests {
             .put_ref(RowID::new(1), Arc::clone(&owner), MAX_SNAPSHOT_TS)
             .unwrap();
         assert!(matches!(
-            buffer.claim_ref(RowID::new(1), Arc::clone(&requester), MAX_SNAPSHOT_TS),
+            buffer.claim_ref(
+                RowID::new(1),
+                Arc::clone(&requester),
+                MAX_SNAPSHOT_TS,
+                false,
+            ),
             Err(DeletionError::WriteConflict)
         ));
         assert!(
@@ -569,7 +638,7 @@ mod tests {
             });
             let requester = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 31));
             let claim = claimant_buffer
-                .claim_ref(row_id, requester, MAX_SNAPSHOT_TS)
+                .claim_ref(row_id, requester, MAX_SNAPSHOT_TS, false)
                 .expect("preparing owner should produce a foreground wait");
             let DeletionClaim::Preparing(listener) = claim else {
                 panic!("claimant should install the shared prepare listener")

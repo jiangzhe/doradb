@@ -11,7 +11,7 @@ use std::ops::{Bound, RangeBounds};
 pub(crate) type BTreeKey = MemCmpKey;
 
 /// Owned encoded key range used by B-tree scan streams.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct KeyRange {
     lower: Bound<BTreeKey>,
     upper: Bound<BTreeKey>,
@@ -50,6 +50,19 @@ impl KeyRange {
             Bound::Unbounded => true,
             Bound::Included(bound) => key <= bound.as_bytes(),
             Bound::Excluded(bound) => key < bound.as_bytes(),
+        }
+    }
+
+    /// Clone this range with an exact consumed key excluded from its lower side.
+    #[inline]
+    pub(crate) fn resume_after(&self, key: BTreeKey) -> Self {
+        debug_assert!(
+            self.lower_accepts(key.as_bytes()),
+            "index scan resume key must belong to the original lower range"
+        );
+        Self {
+            lower: Bound::Excluded(key),
+            upper: self.upper.clone(),
         }
     }
 }

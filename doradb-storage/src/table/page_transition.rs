@@ -842,7 +842,7 @@ mod tests {
         MainBranch, NextRowUndo, OwnedRowUndo, RowUndoHead, RowUndoKind, UndoStatus,
     };
     use crate::trx::ver_map::{RowPageState, RowVersionMap};
-    use crate::trx::{MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS};
+    use crate::trx::{MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, NON_FOREGROUND_STMT_NO};
     use crate::value::{Val, ValKind};
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
@@ -883,7 +883,13 @@ mod tests {
             .into_iter()
             .map(|(kind, status)| {
                 (
-                    OwnedRowUndo::new(TableID::new(1), None, RowID::new(100), kind),
+                    OwnedRowUndo::new(
+                        NON_FOREGROUND_STMT_NO,
+                        TableID::new(1),
+                        None,
+                        RowID::new(100),
+                        kind,
+                    ),
                     Some(status),
                 )
             })

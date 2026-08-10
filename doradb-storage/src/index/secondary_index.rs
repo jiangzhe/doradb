@@ -187,9 +187,18 @@ impl SecondaryDiskTreeRuntime {
         self.index_no
     }
 
-    /// Returns the shared key encoder for this secondary index.
+    /// Returns a borrowed key encoder for operation-local use.
     #[inline]
-    pub(crate) fn key_encoder(&self) -> Arc<BTreeKeyEncoder> {
+    pub(crate) fn key_encoder(&self) -> &BTreeKeyEncoder {
+        match &self.kind {
+            SecondaryDiskTreeRuntimeKind::Unique(runtime) => runtime.encoder_ref(),
+            SecondaryDiskTreeRuntimeKind::NonUnique(runtime) => runtime.encoder_ref(),
+        }
+    }
+
+    /// Returns a shared key encoder for caller-owned state.
+    #[inline]
+    pub(crate) fn key_encoder_arc(&self) -> Arc<BTreeKeyEncoder> {
         match &self.kind {
             SecondaryDiskTreeRuntimeKind::Unique(runtime) => runtime.encoder(),
             SecondaryDiskTreeRuntimeKind::NonUnique(runtime) => runtime.encoder(),
@@ -336,10 +345,16 @@ impl<P: BufferPool> SecondaryIndex<P> {
         }
     }
 
-    /// Returns the shared key encoder for this index.
+    /// Returns a borrowed key encoder for operation-local use.
     #[inline]
-    pub(crate) fn key_encoder(&self) -> Arc<BTreeKeyEncoder> {
+    pub(crate) fn key_encoder(&self) -> &BTreeKeyEncoder {
         self.disk_runtime().key_encoder()
+    }
+
+    /// Returns a shared key encoder for caller-owned state.
+    #[inline]
+    pub(crate) fn key_encoder_arc(&self) -> Arc<BTreeKeyEncoder> {
+        self.disk_runtime().key_encoder_arc()
     }
 
     /// Return the unique MemIndex when this slot is unique.
@@ -838,14 +853,21 @@ impl<P: BufferPool> NonUniqueSecondaryIndex<'_, '_, P> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DualTreeStreamState {
+    Both,
+    MemOnly,
+    DiskOnly,
+    Done,
+}
+
 /// Incremental lookup-candidate stream over a MemIndex/DiskTree pair.
 pub(crate) struct SecondaryIndexCandidateStream<M, D> {
     mem: M,
     disk: D,
     mem_buf: VecDeque<IndexLookupCandidate>,
-    mem_done: bool,
     disk_buf: VecDeque<IndexLookupCandidate>,
-    disk_done: bool,
+    state: DualTreeStreamState,
 }
 
 impl<M, D> SecondaryIndexCandidateStream<M, D>
@@ -859,9 +881,8 @@ where
             mem,
             disk,
             mem_buf: VecDeque::new(),
-            mem_done: false,
             disk_buf: VecDeque::new(),
-            disk_done: false,
+            state: DualTreeStreamState::Both,
         }
     }
 
@@ -869,9 +890,6 @@ where
         loop {
             if !self.mem_buf.is_empty() {
                 return Ok(true);
-            }
-            if self.mem_done {
-                return Ok(false);
             }
             match self.mem.next_batch().await? {
                 Some(entries) => {
@@ -881,10 +899,7 @@ where
                     self.mem_buf = VecDeque::from(entries);
                     return Ok(true);
                 }
-                None => {
-                    self.mem_done = true;
-                    return Ok(false);
-                }
+                None => return Ok(false),
             }
         }
     }
@@ -894,9 +909,6 @@ where
             if !self.disk_buf.is_empty() {
                 return Ok(true);
             }
-            if self.disk_done {
-                return Ok(false);
-            }
             match self.disk.next_batch().await? {
                 Some(entries) => {
                     if entries.is_empty() {
@@ -905,10 +917,7 @@ where
                     self.disk_buf = VecDeque::from(entries);
                     return Ok(true);
                 }
-                None => {
-                    self.disk_done = true;
-                    return Ok(false);
-                }
+                None => return Ok(false),
             }
         }
     }
@@ -932,6 +941,73 @@ where
         self.push_mem(out);
         let _ = self.disk_buf.pop_front();
     }
+
+    #[inline]
+    fn drain_mem(&mut self, out: &mut Vec<IndexLookupCandidate>) {
+        while !self.mem_buf.is_empty() {
+            self.push_mem(out);
+        }
+    }
+
+    #[inline]
+    fn drain_disk(&mut self, out: &mut Vec<IndexLookupCandidate>) {
+        while !self.disk_buf.is_empty() {
+            self.push_disk(out);
+        }
+    }
+
+    async fn next_mem_batch(&mut self) -> RuntimeResult<Option<Vec<IndexLookupCandidate>>> {
+        if !self.ensure_mem().await? {
+            self.state = DualTreeStreamState::Done;
+            return Ok(None);
+        }
+        let mut out = Vec::with_capacity(self.mem_buf.len());
+        self.drain_mem(&mut out);
+        Ok(Some(out))
+    }
+
+    async fn next_disk_batch(&mut self) -> RuntimeResult<Option<Vec<IndexLookupCandidate>>> {
+        if !self.ensure_disk().await? {
+            self.state = DualTreeStreamState::Done;
+            return Ok(None);
+        }
+        let mut out = Vec::with_capacity(self.disk_buf.len());
+        self.drain_disk(&mut out);
+        Ok(Some(out))
+    }
+
+    async fn next_merged_batch(&mut self) -> RuntimeResult<Option<Vec<IndexLookupCandidate>>> {
+        let mut out = Vec::new();
+        loop {
+            if !self.ensure_mem().await? {
+                debug_assert!(out.is_empty());
+                self.state = DualTreeStreamState::DiskOnly;
+                return self.next_disk_batch().await;
+            }
+            if !self.ensure_disk().await? {
+                self.state = DualTreeStreamState::MemOnly;
+                self.drain_mem(&mut out);
+                return Ok(Some(out));
+            }
+
+            let mem = self
+                .mem_buf
+                .front()
+                .expect("ensured MemTree buffer must have a front entry");
+            let disk = self
+                .disk_buf
+                .front()
+                .expect("ensured DiskTree buffer must have a front entry");
+            match mem.encoded_key.as_bytes().cmp(disk.encoded_key.as_bytes()) {
+                Ordering::Less => self.push_mem(&mut out),
+                Ordering::Equal => self.push_equal(&mut out),
+                Ordering::Greater => self.push_disk(&mut out),
+            }
+            if self.mem_buf.is_empty() || self.disk_buf.is_empty() {
+                return Ok(Some(out));
+            }
+        }
+    }
 }
 
 impl<M, D> IndexBatchStream<IndexLookupCandidate> for SecondaryIndexCandidateStream<M, D>
@@ -940,44 +1016,11 @@ where
     D: IndexBatchStream<IndexLookupCandidate>,
 {
     async fn next_batch(&mut self) -> RuntimeResult<Option<Vec<IndexLookupCandidate>>> {
-        let mut out = Vec::new();
-        loop {
-            let mem_has = self.ensure_mem().await?;
-            let disk_has = self.ensure_disk().await?;
-            match (mem_has, disk_has) {
-                (false, false) => {
-                    return Ok((!out.is_empty()).then_some(out));
-                }
-                (true, false) => {
-                    self.push_mem(&mut out);
-                }
-                (false, true) => {
-                    self.push_disk(&mut out);
-                }
-                (true, true) => {
-                    let (Some(mem), Some(disk)) = (self.mem_buf.front(), self.disk_buf.front())
-                    else {
-                        continue;
-                    };
-                    match mem.encoded_key.as_bytes().cmp(disk.encoded_key.as_bytes()) {
-                        Ordering::Less => {
-                            self.push_mem(&mut out);
-                        }
-                        Ordering::Equal => {
-                            self.push_equal(&mut out);
-                        }
-                        Ordering::Greater => {
-                            self.push_disk(&mut out);
-                        }
-                    }
-                }
-            }
-            if !out.is_empty()
-                && ((self.mem_buf.is_empty() && !self.mem_done)
-                    || (self.disk_buf.is_empty() && !self.disk_done))
-            {
-                return Ok(Some(out));
-            }
+        match self.state {
+            DualTreeStreamState::Both => self.next_merged_batch().await,
+            DualTreeStreamState::MemOnly => self.next_mem_batch().await,
+            DualTreeStreamState::DiskOnly => self.next_disk_batch().await,
+            DualTreeStreamState::Done => Ok(None),
         }
     }
 }

@@ -640,12 +640,13 @@ impl Table {
         // A globally purgeable row tombstone proves the delete overlay is no
         // longer protecting any transaction-visible row, independent of where
         // the row currently falls relative to the cold/hot pivot.
-        if self
-            .deletion_buffer()
-            .delete_marker_is_globally_purgeable(row_id, snapshot.min_active_sts)
-        {
-            return Ok(DeleteOverlayProof::Obsolete);
-        }
+        let deletion_buffer = self.deletion_buffer();
+        let marker_present =
+            match deletion_buffer.delete_marker_purgeability(row_id, snapshot.min_active_sts) {
+                Some(true) => return Ok(DeleteOverlayProof::Obsolete),
+                Some(false) => true,
+                None => false,
+            };
         // Full-scan cleanup only proves key obsolescence for persisted LWC
         // rows. Hot row pages require undo-chain checks, which transaction
         // index GC already performs while holding the row-page context.
@@ -665,6 +666,11 @@ impl Table {
         let Some(row) = column_index.locate_and_resolve_row(row_id).await? else {
             return Ok(DeleteOverlayProof::Obsolete);
         };
+        // A surviving CDB marker is the newer MVCC authority. Durable delete
+        // membership proves obsolescence only after that marker is absent.
+        if !marker_present && row.durable_deleted() {
+            return Ok(DeleteOverlayProof::Obsolete);
+        }
         let values = self
             .cleanup_read_cold_index_values(cleanup_context, index_no, row)
             .await?;
@@ -2216,6 +2222,88 @@ mod tests {
                     .unwrap(),
                 Some((actual_row_id, true)) if actual_row_id == row_id
             ));
+        });
+    }
+
+    #[test]
+    fn test_lwc_unique_index_purge_prefers_marker_over_durable_delete() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = evictable_test_engine(
+                &temp_dir,
+                64u64 * 1024 * 1024,
+                "durable_delete_marker_priority",
+            )
+            .await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 1, "name").await;
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+            assert_checkpoint_published(&mut session, table_id).await;
+
+            let key = single_key(0i32);
+            let table = table_for_internal_assertion(&engine, table_id);
+            let reader = session.begin_trx().unwrap();
+            let row_id =
+                assert_row_in_lwc(&table, &session.pool_guards(), &key, reader.sts()).await;
+            reader.commit().await.unwrap();
+
+            expect_delete_committed(table_id, &mut session, &key).await;
+            let marker_ts = delete_marker_ts(table.deletion_buffer().get(row_id).unwrap());
+            session.wait_for_gc_horizon_after(marker_ts).await.unwrap();
+            assert_checkpoint_published(&mut session, table_id).await;
+
+            let pool_guards = session.pool_guards();
+            let index = bound_unique_index(&table, &pool_guards, key.index_no);
+            assert!(
+                index
+                    .inject_mem_entry_if_absent(&key.vals, row_id, true, MAX_SNAPSHOT_TS)
+                    .await
+                    .unwrap()
+                    .is_ok()
+            );
+            assert!(
+                index
+                    .inject_mem_delete_mask(&key.vals, row_id, MAX_SNAPSHOT_TS)
+                    .await
+                    .unwrap()
+            );
+
+            let layout = table.layout_snapshot();
+            let deleted = table
+                .accessor_with_layout(&layout)
+                .delete_index(
+                    &pool_guards,
+                    key.index_no,
+                    &key.vals,
+                    row_id,
+                    true,
+                    marker_ts,
+                )
+                .await
+                .unwrap();
+            assert!(
+                !deleted,
+                "non-purgeable CDB marker must override durable deletion"
+            );
+
+            table.deletion_buffer().remove(row_id);
+            let deleted = table
+                .accessor_with_layout(&layout)
+                .delete_index(
+                    &pool_guards,
+                    key.index_no,
+                    &key.vals,
+                    row_id,
+                    true,
+                    marker_ts,
+                )
+                .await
+                .unwrap();
+            assert!(
+                deleted,
+                "durable deletion is final once the CDB marker is absent"
+            );
         });
     }
 

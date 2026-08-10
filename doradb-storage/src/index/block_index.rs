@@ -8,7 +8,7 @@ use crate::id::{BlockID, PageID, RowID};
 use crate::index::block_index_root::{BlockIndexRoot, BlockIndexRoute};
 use crate::index::column_block_index::ColumnBlockIndex;
 use crate::index::row_page_index::{
-    RowLocation, RowPageIndex, RowPageIndexMemCursor, RowPagePrefixPrune,
+    LwcRowLocation, RowLocation, RowPageIndex, RowPageIndexMemCursor, RowPagePrefixPrune,
 };
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::quiescent::QuiescentGuard;
@@ -309,11 +309,12 @@ impl BlockIndex {
             disk_pool_guard,
         );
         match index.locate_and_resolve_row(row_id).await? {
-            Some(resolved) => Ok(RowLocation::LwcBlock {
+            Some(resolved) => Ok(RowLocation::LwcBlock(LwcRowLocation {
                 block_id: resolved.block_id(),
                 row_idx: resolved.row_idx(),
                 row_shape_fingerprint: resolved.row_shape_fingerprint(),
-            }),
+                durable_deleted: resolved.durable_deleted(),
+            })),
             None => Ok(RowLocation::NotFound),
         }
     }

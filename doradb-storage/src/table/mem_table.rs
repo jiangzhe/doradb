@@ -1143,7 +1143,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         let (old_guard, old_id) = loop {
             match self.find_row(guards, old_id).await {
                 Ok(RowLocation::NotFound) => return Ok(LinkForUniqueIndex::NotNeeded),
-                Ok(RowLocation::LwcBlock { .. }) => {
+                Ok(RowLocation::LwcBlock(..)) => {
                     self.catalog_lwc_invariant("link_unique_index", old_id);
                 }
                 Ok(RowLocation::RowPage(page_id)) => {
@@ -1439,7 +1439,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     ) -> RuntimeResult<Option<PageID>> {
         match self.find_row(guards, row_id).await? {
             RowLocation::NotFound => Ok(None),
-            RowLocation::LwcBlock { .. } => self.catalog_lwc_invariant("index_purge", row_id),
+            RowLocation::LwcBlock(..) => self.catalog_lwc_invariant("index_purge", row_id),
             RowLocation::RowPage(page_id) => Ok(Some(page_id)),
         }
     }
@@ -1808,7 +1808,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                         .change_context(RuntimeError::TableAccess)
                         .attach("operation=validate_catalog_primary_key_payload"));
                 }
-                RowLocation::LwcBlock { .. } => {
+                RowLocation::LwcBlock(..) => {
                     self.catalog_lwc_invariant("delete_primary_key_no_trx", row_id);
                 }
                 RowLocation::RowPage(page_id) => {
@@ -1939,7 +1939,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                         .change_context(RuntimeError::TableAccess)
                         .attach("operation=validate_catalog_primary_key_payload"));
                 }
-                RowLocation::LwcBlock { .. } => {
+                RowLocation::LwcBlock(..) => {
                     self.catalog_lwc_invariant("update_primary_key_no_trx", row_id);
                 }
                 RowLocation::RowPage(page_id) => {
@@ -2085,7 +2085,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             None => return Ok(None),
             Some((row_id, _)) => match self.find_row(guards, row_id).await? {
                 RowLocation::NotFound => return Ok(None),
-                RowLocation::LwcBlock { .. } => {
+                RowLocation::LwcBlock(..) => {
                     self.catalog_lwc_invariant("unique_uncommitted_lookup", row_id);
                 }
                 RowLocation::RowPage(page_id) => {
@@ -2242,7 +2242,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                     Ok(RowLocation::NotFound) => {
                         return Ok(UpdateUniqueMvcc::NotFound(input));
                     }
-                    Ok(RowLocation::LwcBlock { .. }) => {
+                    Ok(RowLocation::LwcBlock(..)) => {
                         self.catalog_lwc_invariant("update_unique_mvcc", row_id);
                     }
                     Ok(RowLocation::RowPage(page_id)) => {
@@ -2939,7 +2939,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                 None => return Ok(DeleteMvcc::NotFound),
                 Some((row_id, _)) => match self.find_row(guards, row_id).await {
                     Ok(RowLocation::NotFound) => return Ok(DeleteMvcc::NotFound),
-                    Ok(RowLocation::LwcBlock { .. }) => {
+                    Ok(RowLocation::LwcBlock(..)) => {
                         self.catalog_lwc_invariant("delete_unique_mvcc", row_id);
                     }
                     Ok(RowLocation::RowPage(page_id)) => {
@@ -4485,7 +4485,7 @@ mod tests {
                 {
                     RowLocation::RowPage(page_id) => page_id,
                     RowLocation::NotFound => panic!("updated row should exist"),
-                    RowLocation::LwcBlock { .. } => {
+                    RowLocation::LwcBlock(..) => {
                         panic!("standalone MemTable should not use LWC")
                     }
                 };
@@ -4713,7 +4713,7 @@ mod tests {
             {
                 RowLocation::RowPage(page_id) => page_id,
                 RowLocation::NotFound => panic!("inserted row should be found"),
-                RowLocation::LwcBlock { .. } => panic!("standalone MemTable should not use LWC"),
+                RowLocation::LwcBlock(..) => panic!("standalone MemTable should not use LWC"),
             };
             let page_guard = mem_table
                 .try_get_validated_row_page_shared_result(&session.pool_guards(), page_id, row_id)
