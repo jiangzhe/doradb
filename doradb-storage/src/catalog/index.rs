@@ -367,7 +367,7 @@ impl<'a> CreateIndexCollector<'a> {
                 .into());
             }
 
-            let mut persisted_deleted = BTreeSet::new();
+            let mut durable_deleted = BTreeSet::new();
             for delta in delete_deltas {
                 let row_id = entry
                     .start_row_id
@@ -381,11 +381,11 @@ impl<'a> CreateIndexCollector<'a> {
                             .change_context(RuntimeError::CatalogAccess)
                             .attach("operation=create_index, phase=validate_index_build_input")
                     })?;
-                persisted_deleted.insert(row_id);
+                durable_deleted.insert(row_id);
             }
 
             for (row_idx, row_id) in row_ids.into_iter().enumerate() {
-                if persisted_deleted.contains(&row_id) {
+                if durable_deleted.contains(&row_id) {
                     continue;
                 }
                 if create_index_current_cold_row_is_deleted(table, row_id)? {

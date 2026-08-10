@@ -39,9 +39,9 @@ doradb-storage/src/table/access.rs,UserTableAccessor::mutate_hot_rows_mvcc,7
 doradb-storage/src/table/access.rs,UserTableAccessor::table_index_mutate_mvcc,3
 doradb-storage/src/table/access.rs,UserTableAccessor::table_mutate_mvcc,1
 doradb-storage/src/table/index_mutate.rs,IndexMutator::mutate_cold_index_candidate,12
-doradb-storage/src/table/index_mutate.rs,IndexMutator::mutate_hot_index_candidate,4
+doradb-storage/src/table/index_mutate.rs,IndexMutator::mutate_hot_index_candidate,5
 doradb-storage/src/table/index_mutate.rs,IndexMutator::mutate_index_candidate,1
-doradb-storage/src/table/index_mutate.rs,IndexMutator::mutate_owned_hot_index_candidate,8
+doradb-storage/src/table/index_mutate.rs,IndexMutator::mutate_owned_hot_index_candidate,7
 doradb-storage/src/table/index_mutate.rs,IndexMutator::validate_unique_driver_update,2
 doradb-storage/src/trx/mod.rs,Transaction::commit,2
 doradb-storage/src/trx/mod.rs,Transaction::exec,2

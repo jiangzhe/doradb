@@ -78,7 +78,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
         loop {
             let location = self
                 .accessor
-                .find_row_location(self.rt.pool_guards(), candidate.row_id)
+                .resolve_row_location(self.rt.pool_guards(), candidate.row_id)
                 .await
                 .disclose()?;
             let progress = match location {
@@ -170,15 +170,31 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                 .expect("candidate ownership must retain hot-row write access"),
         };
         drop(locked);
-        self.mutate_owned_hot_index_candidate(
-            candidate,
-            &page_guard,
-            access,
-            value_buffer,
-            outcome,
-            mutate_row,
-        )
-        .await?;
+        let deleted_index_keys = self
+            .mutate_owned_hot_index_candidate(
+                candidate,
+                &page_guard,
+                access,
+                value_buffer,
+                outcome,
+                mutate_row,
+            )
+            .await?;
+        if let Some(index_keys) = deleted_index_keys {
+            let proof = accessor.owned_row_page_index_set_proof(
+                candidate.row_id,
+                index_keys,
+                self.root_snapshot,
+            );
+            // Row undo ownership keeps the reconstructed key set stable;
+            // release the page latch before awaiting MemIndex mutations.
+            drop(page_guard);
+            accessor
+                .defer_delete_owned_row_index_set(self.rt, self.effects, proof)
+                .await
+                .attach("index-driven mutation hot delete index masking")
+                .disclose()?;
+        }
         Ok(CandidateProgress::Done)
     }
 
@@ -199,6 +215,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
             block_id,
             row_idx,
             row_shape_fingerprint,
+            durable_deleted,
         } = location;
         let storage = accessor.column_storage();
         let file_kind = storage.file().file_kind();
@@ -230,7 +247,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
             accessor.lwc_deletion_buffer(),
             self.rt.status().as_ref(),
             candidate.row_id,
-            false,
+            durable_deleted,
         ) {
             ColdLatestRow::Readable => (),
             ColdLatestRow::NotFound => return Ok(CandidateProgress::Done),
@@ -253,6 +270,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
             candidate.row_id,
             Arc::clone(self.rt.status()),
             self.rt.sts(),
+            durable_deleted,
         ) {
             Ok(DeletionClaim::Acquired) => (),
             Ok(DeletionClaim::Preparing(listener)) => {
@@ -355,7 +373,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
         value_buffer: &mut Vec<Val>,
         outcome: &mut TableMutationOutcome,
         mutate_row: &mut F,
-    ) -> Result<()>
+    ) -> Result<Option<WriteIndexKeySet<'op>>>
     where
         F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<RowMutation>,
     {
@@ -374,7 +392,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                 let (access, reusable) = lazy_row.into_hot_write_reusable_buffer();
                 *value_buffer = reusable;
                 self.cancel_owned_hot_row(access);
-                Ok(())
+                Ok(None)
             }
             RowMutation::Delete => {
                 outcome.delete_count += 1;
@@ -393,16 +411,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                     matches!(result, DeleteInternal::Ok),
                     "owned hot candidate changed while its write latch was retained"
                 );
-                let proof = accessor.owned_row_page_index_set_proof(
-                    candidate.row_id,
-                    index_keys,
-                    self.root_snapshot,
-                );
-                accessor
-                    .defer_delete_owned_row_index_set(self.rt, self.effects, proof)
-                    .await
-                    .attach("index-driven mutation hot delete index masking")
-                    .disclose()
+                Ok(Some(index_keys))
             }
             RowMutation::Update(update) => {
                 outcome.update_count += 1;
@@ -416,7 +425,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                 *value_buffer = reusable;
                 if update.is_empty() {
                     self.cancel_owned_hot_row(access);
-                    return Ok(());
+                    return Ok(None);
                 }
                 let result = HotRowMutator::new(
                     accessor.table_id(),
@@ -447,7 +456,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                                 .attach("index-driven mutation hot key change")
                                 .disclose()?;
                         }
-                        Ok(())
+                        Ok(None)
                     }
                     UpdateRowInplace::NoFreeSpaceOrFrozen(old_row_id, old_row, update) => {
                         let old_index_keys = WriteIndexKeySet::from_full_row(accessor, &old_row);
@@ -498,7 +507,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                                 .attach("index-driven mutation hot move index update")
                                 .disclose()?;
                         }
-                        Ok(())
+                        Ok(None)
                     }
                     UpdateRowInplace::RowDeleted(_)
                     | UpdateRowInplace::RowNotFound(_)
@@ -575,9 +584,13 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
 mod tests {
     use crate::catalog::tests::table4;
     use crate::error::{DiscloseResultExt, OperationError};
-    use crate::row::ops::{DeleteMvcc, RowMutation, TableMutationOutcome, UpdateCol, UpdateMvcc};
-    use crate::session::tests::assert_checkpoint_published;
+    use crate::index::IndexInsert;
+    use crate::row::ops::{
+        DeleteMvcc, RowMutation, SelectMvcc, TableMutationOutcome, UpdateCol, UpdateMvcc,
+    };
+    use crate::session::tests::{SessionTestExt, assert_checkpoint_published};
     use crate::table::tests::*;
+    use crate::trx::MAX_SNAPSHOT_TS;
     use crate::trx::tests::{
         prepare_event_is_installed, prepare_transaction, transaction_status_for_test,
     };
@@ -644,7 +657,84 @@ mod tests {
                     (11, "hot".to_owned()),
                 ]
             );
+            let deleted_hot_key = [Val::from(12i32)];
+            let deleted_hot_row = reader
+                .exec(async |stmt| {
+                    stmt.table_lookup_unique_mvcc(table_id, 0, &deleted_hot_key, &[0])
+                        .await
+                })
+                .await
+                .unwrap();
+            assert!(matches!(deleted_hot_row, SelectMvcc::NotFound));
             reader.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_table_index_mutate_mvcc_skips_persisted_cold_delete() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = evictable_test_engine(
+                &temp_dir,
+                64u64 * 1024 * 1024,
+                "index_mutate_persisted_cold_delete",
+            )
+            .await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 3, "cold").await;
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+            assert_checkpoint_published(&mut session, table_id).await;
+
+            let key = single_key(1i32);
+            let table = table_for_internal_assertion(&engine, table_id);
+            let reader = session.begin_trx().unwrap();
+            let row_id =
+                assert_row_in_lwc(&table, &session.pool_guards(), &key, reader.sts()).await;
+            reader.commit().await.unwrap();
+
+            expect_delete_committed(table_id, &mut session, &key).await;
+            let marker_ts = delete_marker_ts(table.deletion_buffer().get(row_id).unwrap());
+            session.wait_for_gc_horizon_after(marker_ts).await.unwrap();
+            assert_checkpoint_published(&mut session, table_id).await;
+
+            let pool_guards = session.pool_guards();
+            let snapshot = column_block_index_snapshot(&engine, table_id);
+            let column_index = snapshot.index(pool_guards.disk_guard());
+            let entry = column_index.locate_block(row_id).await.unwrap().unwrap();
+            let delete_deltas = column_index.load_delete_deltas(&entry).await.unwrap();
+            assert!(delete_deltas.contains(&((row_id - entry.start_row_id) as u32)));
+
+            table.deletion_buffer().remove(row_id);
+            let inserted = bound_unique_index(&table, &pool_guards, key.index_no)
+                .inject_mem_entry_if_absent(&key.vals, row_id, true, MAX_SNAPSHOT_TS)
+                .await
+                .unwrap();
+            assert!(matches!(inserted, IndexInsert::Ok(_)));
+            drop(pool_guards);
+
+            let range_key = [Val::from(1i32)];
+            let mut callbacks = 0usize;
+            let mut writer = session.begin_trx().unwrap();
+            let outcome = writer
+                .exec(async |stmt| {
+                    stmt.table_index_mutate_mvcc(
+                        table_id,
+                        0,
+                        &range_key[..]..=&range_key[..],
+                        |_| {
+                            callbacks += 1;
+                            Ok(RowMutation::Skip)
+                        },
+                    )
+                    .await
+                })
+                .await
+                .unwrap();
+            assert_eq!(callbacks, 0);
+            assert_eq!(outcome, TableMutationOutcome::default());
+            assert!(table.deletion_buffer().get(row_id).is_none());
+            writer.commit().await.unwrap();
         });
     }
 

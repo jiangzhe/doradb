@@ -1554,6 +1554,11 @@ pub(crate) struct LwcRowLocation {
     pub(crate) row_idx: usize,
     /// Canonical authoritative row-shape fingerprint bound to the block.
     pub(crate) row_shape_fingerprint: u128,
+    /// Whether the row belongs to the resolved entry's durable delete set.
+    ///
+    /// This committed base fact applies only when no newer in-memory column
+    /// deletion marker exists; callers must always consult that marker first.
+    pub(crate) durable_deleted: bool,
 }
 
 /// Physical lookup target returned by row/column block-index search.

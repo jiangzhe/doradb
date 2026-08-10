@@ -313,6 +313,7 @@ impl BlockIndex {
                 block_id: resolved.block_id(),
                 row_idx: resolved.row_idx(),
                 row_shape_fingerprint: resolved.row_shape_fingerprint(),
+                durable_deleted: resolved.durable_deleted(),
             })),
             None => Ok(RowLocation::NotFound),
         }
