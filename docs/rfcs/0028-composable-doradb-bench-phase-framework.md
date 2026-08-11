@@ -231,14 +231,15 @@ Engine resolution is a typed, field-wise merge in this order:
 EngineConfig defaults < included engine defaults < plan [engine] overrides
 ```
 
-Other than the CLI-owned storage root, the benchmark model mirrors every public
-`EngineConfig` builder input, and every leaf can be overridden in the plan.
-This includes mandatory-runtime sizing, transaction/redo/purge settings,
-metadata/index/data buffer sizing, and filesystem I/O settings. The merge is
-typed rather than textual: nested optional fields resolve into one
-configuration, are validated once, and are recorded in full with the results.
-Phase 1 may add read-only storage configuration getters or a resolved snapshot
-to avoid copying private defaults into the benchmark crate. [C6] [U2] [U10]
+Other than the CLI-owned storage root, the benchmark model mirrors stable,
+benchmark-relevant `EngineConfig` inputs. This includes mandatory-runtime
+sizing, transaction/redo/purge settings, metadata/index/data buffer sizing, and
+filesystem I/O settings; internal eviction-arbiter policy is deliberately
+omitted. The merge is typed rather than textual: nested optional fields resolve
+into one configuration, are validated once, and are recorded in full with the
+results. Phase 1 exposes the reusable storage configuration fields directly so
+the benchmark does not copy private defaults or require parallel snapshot
+types. [C6] [U2] [U10]
 
 ### Rust entity model and phase roles
 
@@ -397,8 +398,9 @@ public-session boundaries remain unchanged unless the new latency contract
 requires an explicit and documented sample unit. CLI and artifact shape need
 not remain compatible. [D2] [C8] [U3] [U6]
 
-Migration is deliberately staged. The simple stage covers `stmt-noop`,
-`trx-noop`, `insert-seq`, `insert-rand`, and `table-ddl`. These workloads need
+Migration is deliberately staged. Phase 1 uses `trx-noop` as the executable
+foundation slice. The remaining simple stage covers `stmt-noop`, `insert-seq`,
+`insert-rand`, and `table-ddl`. These workloads need
 no loaded-data dependency, secondary-index prerequisite, table-pool selection,
 or specialized cross-session coordination; insert needs only the primary table
 created by an earlier prepare workload. This stage implements the basic primary
@@ -417,10 +419,11 @@ advanced workload dependencies. [D2] [C7] [C8] [U15]
 ### Complete workload plan templates
 
 Phase 2 introduces `doradb-bench/templates/`, the shared engine-defaults file,
-and complete plans for the five simple workloads. Phase 3 adds complete plans
-for the seven dependent/coordinated workloads, completing one static TOML file
-for each current workload. A template is an ordinary complete plan accepted by
-`--plan`; the executor has no template-only path. [D2] [C5] [U3] [U9] [U15]
+and complete plans for the four remaining simple workloads. Phase 3 adds
+complete plans for the seven dependent/coordinated workloads, completing one
+static TOML file for each current workload. A template is an ordinary complete
+plan accepted by `--plan`; the executor has no template-only path. [D2] [C5]
+[U3] [U9] [U15]
 
 Each template selects the target workload as its final benchmark phase and
 contains every required preceding phase. Lookup and scan templates therefore
@@ -595,32 +598,37 @@ requires separate justification and review outside this RFC.
     strict TOML parsing, explicit engine-defaults loading, field-wise plan
     overrides, workload defaults, prepare-by-default phase decoding, the
     `--plan` engine lifecycle, a sequential workload-dispatch interface, the
-    structural phase fence, final-benchmark/replay-safety rules, histogram
-    aggregation, and resolved configuration/result models. Define fixture
-    requirement/effect extension points without implementing advanced loaded
-    range, index, table-pool, fence, or cross-session coordination.
+    structural phase fence, final-benchmark/replay-safety rules, quanta raw
+    transaction timing, histogram aggregation, and resolved
+    configuration/result models. Define fixture requirement/effect extension
+    points without implementing advanced loaded range, index, table-pool,
+    fence, or cross-session coordination. Migrate `trx-noop` as the executable
+    public-session vertical slice proving prepare, warm-up, repetition,
+    measurement, diagnostics, artifacts, and failure handling.
   - Goals: Establish the small common parsing, configuration, execution, and
     measurement foundation used by both migration stages.
-  - Non-goals: Migrating production workloads, implementing advanced fixture
-    dependencies or semantic waits, changing storage behavior, implementing
-    checkpoint, adding delete/mixed workloads, or adding concurrent actors and
-    fixture reset.
+  - Non-goals: Migrating workloads other than `trx-noop`, implementing advanced
+    fixture dependencies or semantic waits, changing storage behavior beyond
+    pure configuration validation/inspection, implementing checkpoint, adding
+    delete/mixed workloads, or adding concurrent actors and fixture reset.
   - Phase-local Choices: Result filenames may be refined while preserving the
     entity, merge, fixture, phase-role, and measurement contracts in this RFC.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000266-doradb-bench-plan-measurement-foundation.md`
+  - Task Issue: `#969`
+  - Phase Status: `in-progress`
+  - Implementation Summary: Task 000266 implements the foundation and moves
+    `trx-noop` forward from Phase 2 as its real end-to-end proof workload.
 
 - **Phase 2: Migrate simple workloads and basic fixture state**
-  - Prerequisites: Phase 1 plan, engine, dispatch, and measurement contracts are
-    implemented and tested.
-  - Scope: Add create-table, `stmt-noop`, `trx-noop`, `insert-seq`,
-    `insert-rand`, and `table-ddl` `WorkloadSpec` variants; implement the
+  - Prerequisites: Phase 1 plan, engine, fixture-extension, `trx-noop` dispatch,
+    and quanta/histogram measurement contracts are implemented and tested.
+  - Scope: Add create-table, `stmt-noop`, `insert-seq`, `insert-rand`, and
+    `table-ddl` `WorkloadSpec` variants; implement the
     implicit primary-table shape, generated-key cursor, loaded range, and commit
     fence effects; instrument their latency units; introduce
     `doradb-bench/templates/engine-defaults.toml` and complete templates for the
-    five migrated current workloads; add smoke coverage and documentation.
+    four newly migrated current workloads; add smoke coverage and
+    documentation.
   - Goals: Prove plan execution and basic prepare-to-benchmark composition with
     real workloads before adding dependent workload chains.
   - Non-goals: Loaded read/index workloads, `index-ddl`, `lock-table`, advanced

@@ -15,6 +15,14 @@ mod tests {
             .unwrap()
     }
 
+    fn run_bench_with_env(root: &Path, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_doradb-bench"))
+            .env("DORADB_BENCH_ROOT", root)
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
     fn assert_success(output: Output) -> String {
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         if !output.status.success() {
@@ -81,6 +89,42 @@ mod tests {
             session.close().await.unwrap();
             engine.shutdown();
         });
+    }
+
+    #[test]
+    fn root_can_come_from_environment_and_cli_overrides_it() {
+        let temp = TempDir::new().unwrap();
+        let env_root = temp.path().join("env-root");
+        let cli_root = temp.path().join("cli-root");
+
+        assert_success(run_bench_with_env(&env_root, &["prepare"]));
+        assert!(env_root.exists());
+        assert_success(run_bench_with_env(&env_root, &["cleanup"]));
+
+        assert_success(run_bench_with_env(
+            &env_root,
+            &["--root", cli_root.to_str().unwrap(), "prepare"],
+        ));
+        assert!(cli_root.exists());
+        assert!(!env_root.exists());
+        assert_success(run_bench(&cli_root, &["cleanup"]));
+    }
+
+    #[test]
+    fn exactly_one_execution_mode_is_required() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("bench");
+        let plan = temp.path().join("missing-plan.toml");
+
+        let stderr = assert_failure(run_bench(&root, &[]));
+        assert!(stderr.contains("exactly one of --plan or a lifecycle command is required"));
+
+        let stderr = assert_failure(run_bench(
+            &root,
+            &["--plan", plan.to_str().unwrap(), "prepare"],
+        ));
+        assert!(stderr.contains("exactly one of --plan or a lifecycle command is required"));
+        assert!(!root.exists());
     }
 
     #[test]
@@ -732,5 +776,84 @@ mod tests {
         assert!(stderr.contains("index-ddl workload requires prepared index mode none"));
 
         assert_success(run_bench(&root, &["cleanup"]));
+    }
+
+    #[test]
+    fn plan_trx_noop_writes_canonical_results_and_plan_marker() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("bench-plan");
+        let plan_path = temp.path().join("plan.toml");
+        fs::write(
+            &plan_path,
+            r#"
+name = "trx-noop-smoke"
+meta = "not accepted here"
+"#,
+        )
+        .unwrap();
+        let stderr = assert_failure(run_bench(&root, &["-p", plan_path.to_str().unwrap()]));
+        assert!(stderr.contains("unknown field"));
+        assert!(!root.exists());
+
+        fs::write(
+            &plan_path,
+            r#"
+name = "trx-noop-smoke"
+
+[engine]
+meta_buffer_bytes = 16777216
+
+[engine.transaction]
+log_sync = "none"
+
+[engine.index_buffer]
+max_file_size_bytes = 67108864
+max_mem_size_bytes = 16777216
+
+[engine.data_buffer]
+max_file_size_bytes = 67108864
+max_mem_size_bytes = 16777216
+
+[engine.file]
+readonly_buffer_size_bytes = 33554432
+
+[workload_defaults]
+threads = 2
+sessions = 2
+include_stats = true
+
+[[phase]]
+workload = { type = "trx-noop", num = 1 }
+
+[[phase]]
+kind = "benchmark"
+warmup_runs = 1
+measured_runs = 2
+workload = { type = "trx-noop", num = 4 }
+"#,
+        )
+        .unwrap();
+
+        let stdout = assert_success(run_bench(&root, &["-p", plan_path.to_str().unwrap()]));
+        assert!(stdout.contains("completed benchmark plan="));
+        let marker = fs::read_to_string(root.join("benchmark-manifest.toml")).unwrap();
+        assert!(marker.contains("mode = \"plan\""));
+        assert!(marker.contains("plan_source"));
+
+        let result = fs::read_to_string(root.join("benchmark-result.toml")).unwrap();
+        assert!(result.contains("status = \"success\""));
+        assert!(result.contains("measured_runs = 2"));
+        assert!(result.contains("unit = \"transaction-lifecycle\""));
+        assert!(result.contains("kind = \"counter-delta\""));
+        assert!(result.contains("elapsed_nanos = \""));
+        assert_eq!(result.matches("run_index = ").count(), 2);
+
+        let markdown = fs::read_to_string(root.join("benchmark-result.md")).unwrap();
+        assert!(markdown.contains("# DoraDB Benchmark Plan Result"));
+        assert!(markdown.contains(&result));
+
+        let cleanup_stdout = assert_success(run_bench(&root, &["cleanup"]));
+        assert!(cleanup_stdout.contains("removed storage_root="));
+        assert!(!root.exists());
     }
 }

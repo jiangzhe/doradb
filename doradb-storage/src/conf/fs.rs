@@ -1,3 +1,4 @@
+use crate::buffer::minimum_readonly_pool_bytes;
 use crate::conf::path::{path_to_utf8, validate_catalog_file_name};
 use crate::error::{ConfigError, ConfigResult, IoResult};
 use crate::file::fs::{FileSystem, StorageIOWorkerBuilder, build_file_system};
@@ -54,6 +55,18 @@ impl FileSystemConfig {
     /// Validate and normalize construction inputs for the file system.
     #[inline]
     pub(crate) fn validate(self) -> ConfigResult<ValidatedFileSystemConfig> {
+        if self.io_depth == 0 {
+            return Err(Report::new(ConfigError::InvalidIoDepth).attach("file.io_depth=0"));
+        }
+        let min_readonly_buffer_size = minimum_readonly_pool_bytes();
+        if self.readonly_buffer_size < min_readonly_buffer_size {
+            return Err(
+                Report::new(ConfigError::InvalidFixedBufferPoolSize).attach(format!(
+                    "file.readonly_buffer_size={}, min_supported={min_readonly_buffer_size}",
+                    self.readonly_buffer_size
+                )),
+            );
+        }
         if !validate_catalog_file_name(&self.catalog_file_name) {
             return Err(
                 Report::new(ConfigError::InvalidCatalogFileName).attach(format!(

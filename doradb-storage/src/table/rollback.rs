@@ -430,7 +430,6 @@ impl IndexRollback for CatalogTable {
 
 #[cfg(test)]
 mod tests {
-    use crate::buffer::PoolRole;
     use crate::catalog::tests::table4;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
@@ -846,7 +845,7 @@ mod tests {
             let engine = Engine::bootstrap(
                 EngineConfig::default()
                     .storage_root(main_dir)
-                    .data_buffer(EvictableBufferPoolConfig::default().role(PoolRole::Mem))
+                    .data_buffer(EvictableBufferPoolConfig::default())
                     .trx(TrxSysConfig::default().log_file_stem("redo_secidx2")),
             )
             .await

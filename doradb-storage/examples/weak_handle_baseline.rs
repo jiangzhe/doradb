@@ -323,8 +323,12 @@ fn baseline_engine_config(root: &Path) -> EngineConfig {
     EngineConfig::default()
         .storage_root(root)
         .meta_buffer(DEFAULT_POOL_BYTES)
-        .index_buffer(DEFAULT_POOL_BYTES)
-        .index_max_file_size(128usize * 1024 * 1024)
+        .index_buffer(
+            EvictableBufferPoolConfig::default()
+                .swap_file("index.swp")
+                .max_mem_size(DEFAULT_POOL_BYTES)
+                .max_file_size(128usize * 1024 * 1024),
+        )
         .data_buffer(
             EvictableBufferPoolConfig::default()
                 .max_mem_size(DEFAULT_POOL_BYTES)

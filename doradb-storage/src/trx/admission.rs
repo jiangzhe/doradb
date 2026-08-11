@@ -262,7 +262,6 @@ pub(super) async fn admit_user_table(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::PoolRole;
     use crate::catalog::tests::table2;
     use crate::catalog::{IndexAttributes, IndexKey, IndexSpec};
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
@@ -299,7 +298,6 @@ mod tests {
                 .storage_root(temp_dir.path().to_path_buf())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )

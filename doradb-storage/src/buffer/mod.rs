@@ -43,8 +43,8 @@ use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageSharedGuard}
 use crate::buffer::page::{BufferPage, VersionedPageID};
 use crate::completion::Completion;
 use crate::component::{
-    Component, ComponentRegistry, DiskPoolConfig, IndexPool, IndexPoolConfig, MemPool, MetaPool,
-    MetaPoolConfig, ShelfScope,
+    Component, ComponentRegistry, DiskPoolConfig, IndexPool, MemPool, MetaPool, MetaPoolConfig,
+    ShelfScope,
 };
 use crate::conf::EvictableBufferPoolConfig;
 use crate::error::Validation;
@@ -57,6 +57,7 @@ use crate::quiescent::QuiescentBox;
 use crate::stats::BufferPoolCounters;
 use error_stack::{Report, ResultExt};
 use std::future::Future;
+use std::mem::size_of;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -260,6 +261,30 @@ pub(crate) trait BufferPool: Send + Sync {
     ) -> impl Future<Output = RuntimeResult<Validation<FacadePageGuard<T>>>> + Send;
 }
 
+/// Return the resident page count for a valid evictable-pool sizing request.
+#[inline]
+pub(crate) fn evictable_resident_pages(max_file_size: usize, max_mem_size: usize) -> Option<usize> {
+    let capacity = max_file_size / size_of::<page::Page>();
+    let frame_bytes = util::frame_total_bytes(capacity);
+    let resident_pages = max_mem_size
+        .checked_sub(frame_bytes)?
+        .checked_div(size_of::<page::Page>())?;
+    (max_mem_size <= max_file_size && capacity != 0 && resident_pages >= evict::MIN_IN_MEM_PAGES)
+        .then_some(resident_pages)
+}
+
+/// Minimum byte capacity that yields one fixed-pool frame and page.
+#[inline]
+pub(crate) const fn minimum_fixed_pool_bytes() -> usize {
+    size_of::<frame::BufferFrame>() + size_of::<page::Page>()
+}
+
+/// Minimum byte capacity accepted by the readonly disk buffer pool.
+#[inline]
+pub(crate) const fn minimum_readonly_pool_bytes() -> usize {
+    minimum_fixed_pool_bytes() * readonly::MIN_READONLY_POOL_PAGES
+}
+
 /// Returns the stable lowercase name used in buffer-pool diagnostics.
 #[inline]
 pub(crate) const fn pool_role_name(role: PoolRole) -> &'static str {
@@ -322,7 +347,7 @@ impl Component for MetaPool {
 }
 
 impl Component for IndexPool {
-    type Config = IndexPoolConfig;
+    type Config = EvictableBufferPoolConfig;
     type Owned = EvictableBufferPool;
     type Access = Self;
     type Error = Report<RuntimeError>;
@@ -336,16 +361,12 @@ impl Component for IndexPool {
         mut shelf: ShelfScope<'_, Self>,
     ) -> RuntimeResult<()> {
         let fs = registry.dependency::<FileSystem>();
-        let config = EvictableBufferPoolConfig::default()
-            .role(PoolRole::Index)
-            .max_mem_size(config.bytes)
-            .max_file_size(config.max_file_size)
-            .data_swap_file(config.swap_file);
         let build_diagnostic = format!(
             "config_field=index_swap_file, path={}",
-            config.data_swap_file_ref().display()
+            config.swap_file_ref().display()
         );
-        let (pool, storage) = EvictableBufferPool::create(config, fs).attach(build_diagnostic)?;
+        let (pool, storage) =
+            EvictableBufferPool::create(PoolRole::Index, config, fs).attach(build_diagnostic)?;
         registry.register::<Self>(pool);
         shelf.put::<FileSystemWorkers>(storage);
         Ok(())
@@ -378,12 +399,12 @@ impl Component for MemPool {
         mut shelf: ShelfScope<'_, Self>,
     ) -> RuntimeResult<()> {
         let fs = registry.dependency::<FileSystem>();
-        let config = config.role(PoolRole::Mem);
         let build_diagnostic = format!(
             "config_field=data_swap_file, path={}",
-            config.data_swap_file_ref().display()
+            config.swap_file_ref().display()
         );
-        let (pool, storage) = EvictableBufferPool::create(config, fs).attach(build_diagnostic)?;
+        let (pool, storage) =
+            EvictableBufferPool::create(PoolRole::Mem, config, fs).attach(build_diagnostic)?;
         registry.register::<Self>(pool);
         shelf.put::<FileSystemWorkers>(storage);
         Ok(())

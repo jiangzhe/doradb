@@ -2139,15 +2139,14 @@ pub(crate) mod tests {
     use crate::buffer::guard::PageGuard;
     use crate::buffer::page::Page;
     use crate::buffer::{
-        BufferPool, EvictableBufferPool, PoolRole, SharedPoolEvictorWorkers,
-        global_readonly_pool_scope, table_readonly_pool, test_dispatch_dirty_pages,
-        test_persist_and_evict_page,
+        BufferPool, EvictableBufferPool, SharedPoolEvictorWorkers, global_readonly_pool_scope,
+        table_readonly_pool, test_dispatch_dirty_pages, test_persist_and_evict_page,
     };
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, USER_TABLE_ID_START,
     };
     use crate::completion::Completion;
-    use crate::component::{DiskPoolConfig, IndexPoolConfig, MetaPoolConfig, RegistryBuilder};
+    use crate::component::{DiskPoolConfig, MetaPoolConfig, RegistryBuilder};
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{ConfigError, DiscloseResultExt, ErrorKind, IoError, IoResult, Result};
@@ -2265,11 +2264,14 @@ pub(crate) mod tests {
                 EngineConfig::default()
                     .storage_root(storage_root)
                     .meta_buffer(TEST_META_POOL_BYTES)
-                    .index_buffer(TEST_INDEX_POOL_BYTES)
-                    .index_max_file_size(TEST_INDEX_MAX_FILE_BYTES)
+                    .index_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .swap_file("index.swp")
+                            .max_mem_size(TEST_INDEX_POOL_BYTES)
+                            .max_file_size(TEST_INDEX_MAX_FILE_BYTES),
+                    )
                     .data_buffer(
                         EvictableBufferPoolConfig::default()
-                            .role(PoolRole::Mem)
                             .max_mem_size(TEST_DATA_POOL_BYTES)
                             .max_file_size(TEST_DATA_MAX_FILE_BYTES),
                     )
@@ -2302,20 +2304,20 @@ pub(crate) mod tests {
                 .await
                 .disclose()?;
             builder
-                .build::<IndexPool>(IndexPoolConfig::new(
-                    TEST_INDEX_POOL_BYTES,
-                    data_dir.join("index.swp"),
-                    TEST_INDEX_MAX_FILE_BYTES,
-                ))
+                .build::<IndexPool>(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(TEST_INDEX_POOL_BYTES)
+                        .max_file_size(TEST_INDEX_MAX_FILE_BYTES)
+                        .swap_file(data_dir.join("index.swp")),
+                )
                 .await
                 .disclose()?;
             builder
                 .build::<MemPool>(
                     EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
                         .max_mem_size(TEST_DATA_POOL_BYTES)
                         .max_file_size(TEST_DATA_MAX_FILE_BYTES)
-                        .data_swap_file(data_dir.join("data.swp")),
+                        .swap_file(data_dir.join("data.swp")),
                 )
                 .await
                 .disclose()?;

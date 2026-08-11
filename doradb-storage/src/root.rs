@@ -1517,6 +1517,10 @@ mod tests {
         }
     }
 
+    fn index_buffer_with_swap_file(swap_file: impl Into<PathBuf>) -> EvictableBufferPoolConfig {
+        EngineConfig::default().index_buffer.swap_file(swap_file)
+    }
+
     #[test]
     fn test_resolve_storage_paths_default_layout() {
         let root = TempDir::new().unwrap();
@@ -1583,7 +1587,9 @@ mod tests {
                 .resolve_storage_paths()
                 .unwrap_err(),
             EngineConfig::default()
-                .index_swap_file(format!("{STORAGE_LAYOUT_TEMP_PREFIX}12.34/index.swp"))
+                .index_buffer(index_buffer_with_swap_file(format!(
+                    "{STORAGE_LAYOUT_TEMP_PREFIX}12.34/index.swp"
+                )))
                 .resolve_storage_paths()
                 .unwrap_err(),
         ] {
@@ -1844,7 +1850,7 @@ mod tests {
         );
 
         let err = EngineConfig::default()
-            .data_buffer(EvictableBufferPoolConfig::default().data_swap_file("data.bin"))
+            .data_buffer(EvictableBufferPoolConfig::default().swap_file("data.bin"))
             .resolve_storage_paths()
             .unwrap_err();
         assert_config_report(
@@ -1854,7 +1860,7 @@ mod tests {
         );
 
         let err = EngineConfig::default()
-            .data_buffer(EvictableBufferPoolConfig::default().data_swap_file("../data.swp"))
+            .data_buffer(EvictableBufferPoolConfig::default().swap_file("../data.swp"))
             .resolve_storage_paths()
             .unwrap_err();
         assert_config_report(
@@ -1864,7 +1870,7 @@ mod tests {
         );
 
         let err = EngineConfig::default()
-            .index_swap_file("index.bin")
+            .index_buffer(index_buffer_with_swap_file("index.bin"))
             .resolve_storage_paths()
             .unwrap_err();
         assert_config_report(
@@ -1959,13 +1965,14 @@ mod tests {
             ),
             (
                 EngineConfig::default().data_buffer(
-                    EvictableBufferPoolConfig::default().data_swap_file("data-swap/data.swp"),
+                    EvictableBufferPoolConfig::default().swap_file("data-swap/data.swp"),
                 ),
                 "data-swap",
                 "create data swap-file parent directory",
             ),
             (
-                EngineConfig::default().index_swap_file("index-swap/index.swp"),
+                EngineConfig::default()
+                    .index_buffer(index_buffer_with_swap_file("index-swap/index.swp")),
                 "index-swap",
                 "create index swap-file parent directory",
             ),
@@ -2163,8 +2170,8 @@ log_partitions = 1
     #[test]
     fn test_swap_files_reject_overlap() {
         let err = EngineConfig::default()
-            .data_buffer(EvictableBufferPoolConfig::default().data_swap_file("shared.swp"))
-            .index_swap_file("shared.swp")
+            .data_buffer(EvictableBufferPoolConfig::default().swap_file("shared.swp"))
+            .index_buffer(index_buffer_with_swap_file("shared.swp"))
             .resolve_storage_paths()
             .unwrap_err();
         assert_config_report(err, ConfigError::PathsMustNotOverlap, &["shared.swp"]);
@@ -2174,7 +2181,7 @@ log_partitions = 1
     fn test_swap_files_reject_data_dir_aliases() {
         let err = EngineConfig::default()
             .file(FileSystemConfig::default().data_dir("data.swp"))
-            .data_buffer(EvictableBufferPoolConfig::default().data_swap_file("data.swp"))
+            .data_buffer(EvictableBufferPoolConfig::default().swap_file("data.swp"))
             .resolve_storage_paths()
             .unwrap_err();
         assert_config_report(
@@ -2185,7 +2192,7 @@ log_partitions = 1
 
         let err = EngineConfig::default()
             .file(FileSystemConfig::default().data_dir("data.swp"))
-            .data_buffer(EvictableBufferPoolConfig::default().data_swap_file("data.swp/heap.swp"))
+            .data_buffer(EvictableBufferPoolConfig::default().swap_file("data.swp/heap.swp"))
             .resolve_storage_paths()
             .unwrap_err();
         assert_config_report(
@@ -2199,7 +2206,7 @@ log_partitions = 1
     fn test_swap_files_reject_log_dir_aliases() {
         let err = EngineConfig::default()
             .trx(TrxSysConfig::default().log_dir("log.swp"))
-            .index_swap_file("log.swp")
+            .index_buffer(index_buffer_with_swap_file("log.swp"))
             .resolve_storage_paths()
             .unwrap_err();
         assert_config_report(
@@ -2210,7 +2217,7 @@ log_partitions = 1
 
         let err = EngineConfig::default()
             .trx(TrxSysConfig::default().log_dir("log.swp"))
-            .index_swap_file("log.swp/index.swp")
+            .index_buffer(index_buffer_with_swap_file("log.swp/index.swp"))
             .resolve_storage_paths()
             .unwrap_err();
         assert_config_report(
@@ -2223,9 +2230,7 @@ log_partitions = 1
     #[test]
     fn test_swap_files_reject_reserved_file_descendants() {
         let err = EngineConfig::default()
-            .data_buffer(
-                EvictableBufferPoolConfig::default().data_swap_file("catalog.mtb/data.swp"),
-            )
+            .data_buffer(EvictableBufferPoolConfig::default().swap_file("catalog.mtb/data.swp"))
             .resolve_storage_paths()
             .unwrap_err();
         assert_config_report(
@@ -2235,7 +2240,9 @@ log_partitions = 1
         );
 
         let err = EngineConfig::default()
-            .index_swap_file(format!("{STORAGE_LAYOUT_FILE_NAME}/index.swp"))
+            .index_buffer(index_buffer_with_swap_file(format!(
+                "{STORAGE_LAYOUT_FILE_NAME}/index.swp"
+            )))
             .resolve_storage_paths()
             .unwrap_err();
         assert_config_report(
@@ -2245,7 +2252,7 @@ log_partitions = 1
         );
 
         let err = EngineConfig::default()
-            .index_swap_file("redo.log/index.swp")
+            .index_buffer(index_buffer_with_swap_file("redo.log/index.swp"))
             .resolve_storage_paths()
             .unwrap_err();
         assert_config_report(

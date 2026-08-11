@@ -4,7 +4,6 @@
 //! including start, stop, recover, and execute commands. See
 //! `docs/engine-component-lifetime.md` for the runtime-versus-owner lifetime
 //! model that this module enforces with the component registry.
-use crate::buffer::PoolRole;
 use crate::buffer::SharedPoolEvictorWorkers;
 #[cfg(test)]
 use crate::catalog::index::tests::IndexDdlTestController;
@@ -12,8 +11,8 @@ use crate::catalog::index::tests::IndexDdlTestController;
 use crate::catalog::table::tests::TableDdlTestController;
 use crate::catalog::{Catalog, CatalogConfig};
 use crate::component::{
-    ComponentRegistry, ComponentShutdownOutcome, DiskPoolConfig, EnginePools, IndexPoolConfig,
-    MetaPoolConfig, RegistryBuilder,
+    ComponentRegistry, ComponentShutdownOutcome, DiskPoolConfig, EnginePools, MetaPoolConfig,
+    RegistryBuilder,
 };
 use crate::conf::{EngineConfig, ValidatedTrxSysConfig};
 use crate::error::{
@@ -281,6 +280,7 @@ impl Engine {
     pub async fn bootstrap(config: EngineConfig) -> Result<Self> {
         obs::info!("event=engine_lifecycle component=engine action=build_start result=ok");
         let result = async {
+            let config = config.validate_inner().disclose()?;
             let resolved = config
                 .resolve_storage_paths()
                 .disclose()?
@@ -351,19 +351,18 @@ impl Engine {
                 .await
                 .disclose()?;
             builder
-                .build::<IndexPool>(IndexPoolConfig::new(
-                    config.index_buffer.as_u64() as usize,
-                    resolved.index_swap_file_path(),
-                    config.index_max_file_size.as_u64() as usize,
-                ))
+                .build::<IndexPool>(
+                    config
+                        .index_buffer
+                        .swap_file(resolved.index_swap_file_path()),
+                )
                 .await
                 .disclose()?;
             builder
                 .build::<MemPool>(
                     config
                         .data_buffer
-                        .role(PoolRole::Mem)
-                        .data_swap_file(resolved.data_swap_file_path()),
+                        .swap_file(resolved.data_swap_file_path()),
                 )
                 .await
                 .disclose()?;
@@ -804,9 +803,7 @@ mod tests {
     use crate::buffer::test_io_backend_stats_handle_identity as pool_stats_handle_identity;
     use crate::catalog::tests::table1;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
-    use crate::error::{
-        ConfigError, Error, ErrorKind, FatalError, LifecycleError, ResourceError, RuntimeError,
-    };
+    use crate::error::{ConfigError, Error, ErrorKind, FatalError, LifecycleError, RuntimeError};
     use crate::file::fs::tests::io_backend_stats_handle_identity as fs_stats_handle_identity;
     use crate::id::{TableID, TrxID};
     use crate::io::{
@@ -878,11 +875,14 @@ mod tests {
         EngineConfig::default()
             .storage_root(root)
             .meta_buffer(TEST_POOL_BYTES)
-            .index_buffer(TEST_POOL_BYTES)
-            .index_max_file_size(128usize * 1024 * 1024)
+            .index_buffer(
+                EvictableBufferPoolConfig::default()
+                    .swap_file("index.swp")
+                    .max_mem_size(TEST_POOL_BYTES)
+                    .max_file_size(128usize * 1024 * 1024),
+            )
             .data_buffer(
                 EvictableBufferPoolConfig::default()
-                    .role(PoolRole::Mem)
                     .max_mem_size(TEST_POOL_BYTES)
                     .max_file_size(128usize * 1024 * 1024),
             )
@@ -1289,7 +1289,6 @@ mod tests {
                     )
                     .data_buffer(
                         EvictableBufferPoolConfig::default()
-                            .role(PoolRole::Mem)
                             .max_mem_size(TEST_POOL_BYTES)
                             .max_file_size(128usize * 1024 * 1024),
                     ),
@@ -1319,7 +1318,6 @@ mod tests {
                     )
                     .data_buffer(
                         EvictableBufferPoolConfig::default()
-                            .role(PoolRole::Mem)
                             .max_mem_size(TEST_POOL_BYTES)
                             .max_file_size(128usize * 1024 * 1024),
                     ),
@@ -1351,10 +1349,9 @@ mod tests {
             let engine = Engine::bootstrap(
                 test_engine_config_for(root.path()).data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024)
-                        .data_swap_file("alt-data.swp"),
+                        .swap_file("alt-data.swp"),
                 ),
             )
             .await
@@ -1373,7 +1370,12 @@ mod tests {
             drop(engine);
 
             let engine = Engine::bootstrap(
-                test_engine_config_for(root.path()).index_swap_file("alt-index.swp"),
+                test_engine_config_for(root.path()).index_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(TEST_POOL_BYTES)
+                        .max_file_size(128usize * 1024 * 1024)
+                        .swap_file("alt-index.swp"),
+                ),
             )
             .await
             .unwrap();
@@ -1524,11 +1526,15 @@ mod tests {
                 EngineConfig::default()
                     .storage_root(root.path())
                     .meta_buffer(TEST_POOL_BYTES)
-                    .index_buffer(TEST_POOL_BYTES)
+                    .index_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .swap_file("index.swp")
+                            .max_mem_size(TEST_POOL_BYTES)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
                     .file(FileSystemConfig::default().readonly_buffer_size(TEST_POOL_BYTES))
                     .data_buffer(
                         EvictableBufferPoolConfig::default()
-                            .role(PoolRole::Mem)
                             .max_mem_size(1024usize * 1024)
                             .max_file_size(2usize * 1024 * 1024),
                     )
@@ -1539,18 +1545,12 @@ mod tests {
                 Ok(_) => panic!("expected startup failure"),
                 Err(err) => err,
             };
-            assert_eq!(err.kind(), ErrorKind::Runtime);
+            assert_eq!(err.kind(), ErrorKind::Config);
             assert_eq!(
-                err.report().downcast_ref::<RuntimeError>().copied(),
-                Some(RuntimeError::BufferPoolInit)
+                err.report().downcast_ref::<ConfigError>().copied(),
+                Some(ConfigError::InvalidBufferPoolConfig)
             );
-            assert_eq!(
-                err.report().downcast_ref::<ResourceError>().copied(),
-                Some(ResourceError::BufferPoolSizeTooSmall)
-            );
-            assert!(
-                format!("{err:?}").contains("buffer_pool_type=evictable, buffer_pool_role=mem")
-            );
+            assert!(format!("{err:?}").contains("data_buffer"));
             assert!(!marker_path.exists());
 
             let engine = Engine::bootstrap(
@@ -1568,7 +1568,7 @@ mod tests {
     }
 
     #[test]
-    fn test_readonly_buffer_pool_init_retains_resource_error_and_diagnostic() {
+    fn test_readonly_buffer_pool_preflight_reports_config_error() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
             let marker_path = root.path().join(STORAGE_LAYOUT_FILE_NAME);
@@ -1582,18 +1582,12 @@ mod tests {
                 Err(err) => err,
             };
 
-            assert_eq!(err.kind(), ErrorKind::Runtime);
+            assert_eq!(err.kind(), ErrorKind::Config);
             assert_eq!(
-                err.report().downcast_ref::<RuntimeError>().copied(),
-                Some(RuntimeError::BufferPoolInit)
+                err.report().downcast_ref::<ConfigError>().copied(),
+                Some(ConfigError::InvalidFixedBufferPoolSize)
             );
-            assert_eq!(
-                err.report().downcast_ref::<ResourceError>().copied(),
-                Some(ResourceError::BufferPoolSizeTooSmall)
-            );
-            assert!(
-                format!("{err:?}").contains("buffer_pool_type=readonly, buffer_pool_role=disk")
-            );
+            assert!(format!("{err:?}").contains("file.readonly_buffer_size=1"));
             assert!(!marker_path.exists());
         });
     }
@@ -1607,10 +1601,9 @@ mod tests {
             let err = match Engine::bootstrap(
                 test_engine_config_for(root.path()).data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
                         .max_mem_size(TEST_POOL_BYTES)
                         .max_file_size(128usize * 1024 * 1024)
-                        .data_swap_file("catalog.mtb/data.swp"),
+                        .swap_file("catalog.mtb/data.swp"),
                 ),
             )
             .await

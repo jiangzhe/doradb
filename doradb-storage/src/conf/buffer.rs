@@ -1,10 +1,13 @@
-use crate::buffer::{EvictionArbiter, EvictionArbiterBuilder, PoolRole};
+use crate::buffer::{EvictionArbiter, EvictionArbiterBuilder, evictable_resident_pages};
+use crate::conf::path::validate_swap_file_path_candidate;
+use crate::error::{ConfigError, ConfigResult};
 use byte_unit::Byte;
+use error_stack::Report;
 use std::path::{Path, PathBuf};
 
 use super::consts::{
-    DEFAULT_EVICTABLE_BUFFER_POOL_DATA_SWAP_FILE, DEFAULT_EVICTABLE_BUFFER_POOL_MAX_FILE_SIZE,
-    DEFAULT_EVICTABLE_BUFFER_POOL_MAX_MEM_SIZE,
+    DEFAULT_EVICTABLE_BUFFER_POOL_MAX_FILE_SIZE, DEFAULT_EVICTABLE_BUFFER_POOL_MAX_MEM_SIZE,
+    DEFAULT_EVICTABLE_BUFFER_POOL_SWAP_FILE,
 };
 
 /// Builder-style configuration for an evictable buffer pool.
@@ -13,14 +16,12 @@ use super::consts::{
 /// used to build the background evictor policy.
 #[derive(Debug, Clone)]
 pub struct EvictableBufferPoolConfig {
-    /// Logical role assigned to the buffer pool at engine construction.
-    pub(crate) role: PoolRole,
     /// Swap-file path used when evicting pages from memory.
-    pub(crate) data_swap_file: PathBuf,
+    pub swap_file: PathBuf,
     /// Maximum size allowed for the swap file.
-    pub(crate) max_file_size: Byte,
+    pub max_file_size: Byte,
     /// Maximum memory budget for resident pages.
-    pub(crate) max_mem_size: Byte,
+    pub max_mem_size: Byte,
     /// Builder used to tune the eviction arbiter.
     pub(crate) eviction_arbiter_builder: EvictionArbiterBuilder,
 }
@@ -29,8 +30,7 @@ impl Default for EvictableBufferPoolConfig {
     #[inline]
     fn default() -> Self {
         EvictableBufferPoolConfig {
-            role: PoolRole::Invalid,
-            data_swap_file: PathBuf::from(DEFAULT_EVICTABLE_BUFFER_POOL_DATA_SWAP_FILE),
+            swap_file: PathBuf::from(DEFAULT_EVICTABLE_BUFFER_POOL_SWAP_FILE),
             max_file_size: DEFAULT_EVICTABLE_BUFFER_POOL_MAX_FILE_SIZE,
             max_mem_size: DEFAULT_EVICTABLE_BUFFER_POOL_MAX_MEM_SIZE,
             eviction_arbiter_builder: EvictionArbiter::builder(),
@@ -39,24 +39,30 @@ impl Default for EvictableBufferPoolConfig {
 }
 
 impl EvictableBufferPoolConfig {
-    /// Set the logical role assigned to the buffer pool.
+    /// Validate and normalize buffer-pool construction inputs without touching
+    /// the filesystem.
     #[inline]
-    pub fn role(mut self, role: PoolRole) -> Self {
-        self.role = role;
-        self
+    pub(crate) fn validate(mut self) -> ConfigResult<Self> {
+        validate_swap_file_path_candidate(&self.swap_file)?;
+        let resident_pages =
+            validate_evictable_sizing(self.max_file_size.as_u64(), self.max_mem_size.as_u64())?;
+        self.eviction_arbiter_builder = self
+            .eviction_arbiter_builder
+            .normalize_for_capacity(resident_pages);
+        Ok(self)
     }
 
     /// Set the swap-file path used by the buffer pool.
     #[inline]
-    pub fn data_swap_file(mut self, data_swap_file: impl Into<PathBuf>) -> Self {
-        self.data_swap_file = data_swap_file.into();
+    pub fn swap_file(mut self, swap_file: impl Into<PathBuf>) -> Self {
+        self.swap_file = swap_file.into();
         self
     }
 
     /// Borrow the configured swap-file path.
     #[inline]
-    pub(crate) fn data_swap_file_ref(&self) -> &Path {
-        &self.data_swap_file
+    pub(crate) fn swap_file_ref(&self) -> &Path {
+        &self.swap_file
     }
 
     /// Set the maximum size allowed for the swap file.
@@ -131,4 +137,27 @@ impl EvictableBufferPoolConfig {
             .dynamic_batch_bounds(min_batch, max_batch);
         self
     }
+}
+
+/// Validate the sizing shared by the index and data evictable pools.
+#[inline]
+pub(crate) fn validate_evictable_sizing(
+    max_file_size: u64,
+    max_mem_size: u64,
+) -> ConfigResult<usize> {
+    let max_file_size_usize = usize::try_from(max_file_size).map_err(|_| {
+        Report::new(ConfigError::InvalidBufferPoolConfig).attach("max_file_size exceeds usize")
+    })?;
+    let max_mem_size_usize = usize::try_from(max_mem_size).map_err(|_| {
+        Report::new(ConfigError::InvalidBufferPoolConfig).attach("max_mem_size exceeds usize")
+    })?;
+    let Some(resident_pages) = evictable_resident_pages(max_file_size_usize, max_mem_size_usize)
+    else {
+        return Err(
+            Report::new(ConfigError::InvalidBufferPoolConfig).attach(format!(
+                "max_file_size={max_file_size}, max_mem_size={max_mem_size}"
+            )),
+        );
+    };
+    Ok(resident_pages)
 }

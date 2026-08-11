@@ -1,7 +1,8 @@
 use crate::cli::{IndexMode, LogSyncMode, PrepareArgs, WorkloadArgs};
 use crate::error::{BenchError, Result};
 use crate::manifest::{
-    DefaultsManifest, Manifest, read_manifest, write_manifest, write_manifest_exclusive,
+    DefaultsManifest, Manifest, read_manifest, validate_cleanup_manifest, write_manifest,
+    write_manifest_exclusive,
 };
 use crate::output::{
     BenchmarkResult, InternalStatsSnapshot, OutputConfig, internal_metrics, write_benchmark_outputs,
@@ -103,7 +104,7 @@ pub async fn run_workload(
 
 /// Clean benchmark artifacts from a prepared storage root.
 pub async fn cleanup(storage_root: PathBuf) -> Result<()> {
-    let _manifest = read_manifest(&storage_root)?;
+    validate_cleanup_manifest(&storage_root)?;
     fs::remove_dir_all(&storage_root).map_err(|err| {
         BenchError::message(format!(
             "failed to remove storage root {}: {err}",

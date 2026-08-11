@@ -1,5 +1,6 @@
 file,function_or_method,disclose_calls
-doradb-storage/src/engine.rs,Engine::bootstrap,25
+doradb-storage/src/conf/engine.rs,EngineConfig::validate,1
+doradb-storage/src/engine.rs,Engine::bootstrap,26
 doradb-storage/src/engine.rs,Engine::new_session,1
 doradb-storage/src/engine.rs,Engine::try_shutdown,1
 doradb-storage/src/error.rs,LifecycleOrFatalError::disclose,2

@@ -213,7 +213,7 @@ mod tests {
             Cli::try_parse_from(["doradb-bench", "--root", "root", "run", "table-ddl"]).unwrap();
         let Command::Run {
             workload: WorkloadArgs::TableDdl(args),
-        } = cli.command
+        } = cli.command.unwrap()
         else {
             panic!("expected table-ddl workload");
         };
@@ -235,7 +235,7 @@ mod tests {
                 &u64::MAX.to_string(),
             ])
             .unwrap();
-            let Command::Run { workload } = cli.command else {
+            let Command::Run { workload } = cli.command.unwrap() else {
                 panic!("expected DDL workload");
             };
             let manifest = Manifest::new(1, IndexMode::None);
@@ -258,7 +258,7 @@ mod tests {
             Cli::try_parse_from(["doradb-bench", "--root", "root", "run", "index-ddl"]).unwrap();
         let Command::Run {
             workload: WorkloadArgs::IndexDdl(args),
-        } = cli.command
+        } = cli.command.unwrap()
         else {
             panic!("expected index-ddl workload");
         };

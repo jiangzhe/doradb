@@ -284,6 +284,50 @@ impl Default for EvictionArbiterBuilder {
 }
 
 impl EvictionArbiterBuilder {
+    /// Normalize capacity-independent builder inputs used by configuration
+    /// validation and runtime construction.
+    #[inline]
+    pub(crate) fn normalize_inputs(mut self) -> Self {
+        self.failure_rate_threshold = if self.failure_rate_threshold.is_finite() {
+            self.failure_rate_threshold.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        self.failure_window = self.failure_window.max(1);
+        self.min_batch = self.min_batch.max(1);
+        self.max_batch = self.max_batch.max(self.min_batch);
+        self
+    }
+
+    /// Resolve capacity-dependent target and hysteresis values while retaining
+    /// a builder that can be snapshotted and consumed by runtime construction.
+    #[inline]
+    pub(crate) fn normalize_for_capacity(mut self, capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        let target_free_ratio = if self.target_free_ratio.is_finite() {
+            self.target_free_ratio.clamp(0.0, 1.0)
+        } else {
+            DEFAULT_TARGET_FREE_RATIO
+        };
+        let target_free = self
+            .target_free
+            .unwrap_or(((capacity as f64) * target_free_ratio) as usize)
+            .max(1)
+            .min(capacity);
+        let hysteresis_ratio = if self.hysteresis_ratio.is_finite() {
+            self.hysteresis_ratio.clamp(0.0, 1.0)
+        } else {
+            DEFAULT_HYSTERESIS_RATIO
+        };
+        let hysteresis = self
+            .hysteresis
+            .unwrap_or(((target_free as f64) * hysteresis_ratio) as usize)
+            .max(1);
+        self.target_free = Some(target_free);
+        self.hysteresis = Some(hysteresis);
+        self.normalize_inputs()
+    }
+
     /// Creates a builder with default eviction settings.
     #[inline]
     #[cfg_attr(
@@ -367,39 +411,17 @@ impl EvictionArbiterBuilder {
     /// This method clamps invalid values and fills unset fields from ratio-based defaults.
     #[inline]
     pub(crate) fn build(self, capacity: usize) -> EvictionArbiter {
-        let capacity = capacity.max(1);
-        let target_free_ratio = if self.target_free_ratio.is_finite() {
-            self.target_free_ratio.clamp(0.0, 1.0)
-        } else {
-            DEFAULT_TARGET_FREE_RATIO
-        };
-        let mut target_free = self
+        let normalized = self.normalize_for_capacity(capacity);
+        let target_free = normalized
             .target_free
-            .unwrap_or(((capacity as f64) * target_free_ratio) as usize);
-        target_free = target_free.max(1).min(capacity);
-
-        let hysteresis_ratio = if self.hysteresis_ratio.is_finite() {
-            self.hysteresis_ratio.clamp(0.0, 1.0)
-        } else {
-            DEFAULT_HYSTERESIS_RATIO
-        };
-        let mut hysteresis = self
+            .expect("normalized eviction target must be resolved");
+        let hysteresis = normalized
             .hysteresis
-            .unwrap_or(((target_free as f64) * hysteresis_ratio) as usize);
-        hysteresis = hysteresis.max(1);
-
-        let failure_window = self.failure_window.max(1);
-        let failure_rate_threshold = if self.failure_rate_threshold.is_finite() {
-            self.failure_rate_threshold.clamp(0.0, 1.0)
-        } else {
-            1.0
-        };
-
-        let min_batch = self.min_batch.max(1);
-        let mut max_batch = self.max_batch.max(1);
-        if max_batch < min_batch {
-            max_batch = min_batch;
-        }
+            .expect("normalized eviction hysteresis must be resolved");
+        let failure_window = normalized.failure_window;
+        let failure_rate_threshold = normalized.failure_rate_threshold;
+        let min_batch = normalized.min_batch;
+        let max_batch = normalized.max_batch;
 
         EvictionArbiter {
             target_free,
@@ -1004,11 +1026,11 @@ mod tests {
     use crate::buffer::BufferPool;
     use crate::buffer::frame::BufferFrame;
     use crate::buffer::page::Page;
-    use crate::buffer::{EvictableBufferPool, PoolRole, ReadonlyBufferPool};
+    use crate::buffer::{EvictableBufferPool, ReadonlyBufferPool};
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
     };
-    use crate::component::{ComponentRegistry, DiskPoolConfig, IndexPoolConfig, RegistryBuilder};
+    use crate::component::{ComponentRegistry, DiskPoolConfig, RegistryBuilder};
     use crate::conf::{EvictableBufferPoolConfig, FileSystemConfig};
     use crate::file::FileKind;
     use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile};
@@ -1278,20 +1300,20 @@ mod tests {
                     .await
                     .unwrap();
                 builder
-                    .build::<IndexPool>(IndexPoolConfig::new(
-                        TEST_POOL_BYTES,
-                        root.join("index.swp"),
-                        TEST_POOL_MAX_FILE_BYTES,
-                    ))
+                    .build::<IndexPool>(
+                        EvictableBufferPoolConfig::default()
+                            .max_mem_size(TEST_POOL_BYTES)
+                            .max_file_size(TEST_POOL_MAX_FILE_BYTES)
+                            .swap_file(root.join("index.swp")),
+                    )
                     .await
                     .unwrap();
                 builder
                     .build::<MemPool>(
                         EvictableBufferPoolConfig::default()
-                            .role(PoolRole::Mem)
                             .max_mem_size(TEST_POOL_BYTES)
                             .max_file_size(TEST_POOL_MAX_FILE_BYTES)
-                            .data_swap_file(root.join("data.swp")),
+                            .swap_file(root.join("data.swp")),
                     )
                     .await
                     .unwrap();

@@ -14,6 +14,28 @@ pub(super) const MANIFEST_FILE_NAME: &str = "benchmark-manifest.toml";
 pub(super) const RESULT_MARKDOWN_FILE_NAME: &str = "benchmark-result.md";
 pub(super) const INTERNAL_STATS_CSV_FILE_NAME: &str = "benchmark-internal-stats.csv";
 pub(super) const RESULT_CSV_FILE_NAME: &str = "benchmark-result.csv";
+pub(super) const RESULT_TOML_FILE_NAME: &str = "benchmark-result.toml";
+
+/// Cleanup-safe marker for one plan-owned benchmark root.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PlanManifest {
+    /// Explicit marker shape discriminator.
+    pub(super) mode: PlanManifestMode,
+    /// Plan source used by the invocation.
+    pub(super) plan_source: PathBuf,
+    /// Optional validated plan name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) plan_name: Option<String>,
+}
+
+/// Only accepted plan marker discriminator.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(super) enum PlanManifestMode {
+    /// Root belongs to direct plan execution.
+    Plan,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct KeyRange {
@@ -286,6 +308,80 @@ pub(super) fn result_csv_path(storage_root: &Path) -> PathBuf {
     storage_root.join(RESULT_CSV_FILE_NAME)
 }
 
+pub(super) fn result_toml_path(storage_root: &Path) -> PathBuf {
+    storage_root.join(RESULT_TOML_FILE_NAME)
+}
+
+/// Validate either supported guarded-root marker shape.
+pub(super) fn validate_cleanup_manifest(storage_root: &Path) -> Result<()> {
+    let path = manifest_path(storage_root);
+    let contents = fs::read_to_string(&path).map_err(|err| {
+        BenchError::message(format!(
+            "failed to read benchmark manifest {}: {err}",
+            path.display()
+        ))
+    })?;
+    let shape: toml::Value = toml::from_str(&contents).map_err(|err| {
+        BenchError::message(format!(
+            "failed to decode benchmark manifest {}: {err}",
+            path.display()
+        ))
+    })?;
+    if shape.get("mode").is_some() {
+        let marker: PlanManifest = toml::from_str(&contents).map_err(|err| {
+            BenchError::message(format!(
+                "failed to decode plan benchmark manifest {}: {err}",
+                path.display()
+            ))
+        })?;
+        if marker.plan_source.as_os_str().is_empty() {
+            return Err(BenchError::message(
+                "plan benchmark manifest has an empty plan_source",
+            ));
+        }
+        Ok(())
+    } else {
+        let manifest: Manifest = toml::from_str(&contents).map_err(|err| {
+            BenchError::message(format!(
+                "failed to decode legacy benchmark manifest {}: {err}",
+                path.display()
+            ))
+        })?;
+        manifest.validate()
+    }
+}
+
+/// Exclusively install the cleanup marker for one validated plan invocation.
+pub(super) fn write_plan_manifest_exclusive(
+    storage_root: &Path,
+    plan_source: &Path,
+    plan_name: Option<&str>,
+) -> Result<()> {
+    let marker = PlanManifest {
+        mode: PlanManifestMode::Plan,
+        plan_source: plan_source.to_path_buf(),
+        plan_name: plan_name.map(str::to_owned),
+    };
+    let path = manifest_path(storage_root);
+    let contents = toml::to_string_pretty(&marker)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|err| {
+            BenchError::message(format!(
+                "failed to create benchmark manifest {}: {err}",
+                path.display()
+            ))
+        })?;
+    file.write_all(contents.as_bytes()).map_err(|err| {
+        BenchError::message(format!(
+            "failed to write benchmark manifest {}: {err}",
+            path.display()
+        ))
+    })
+}
+
 pub(super) fn read_manifest(storage_root: &Path) -> Result<Manifest> {
     let path = manifest_path(storage_root);
     let contents = fs::read_to_string(&path).map_err(|err| {
@@ -438,6 +534,16 @@ mod tests {
         let loaded = read_manifest(temp.path()).unwrap();
         assert_eq!(loaded.table_id, 42);
         assert_eq!(loaded.index, IndexMode::Unique);
+    }
+
+    #[test]
+    fn cleanup_marker_accepts_plan_shape_and_rejects_malformed_plan_shape() {
+        let temp = TempDir::new().unwrap();
+        write_plan_manifest_exclusive(temp.path(), Path::new("plan.toml"), Some("test")).unwrap();
+        validate_cleanup_manifest(temp.path()).unwrap();
+
+        fs::write(manifest_path(temp.path()), "mode = \"plan\"\n").unwrap();
+        assert!(validate_cleanup_manifest(temp.path()).is_err());
     }
 
     #[test]

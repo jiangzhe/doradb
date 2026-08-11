@@ -3432,7 +3432,6 @@ fn is_catalog_metadata_ddl(ddl: Option<&DDLRedo>) -> bool {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::buffer::PoolRole;
     use crate::buffer::frame::FrameKind;
     use crate::buffer::page::PAGE_SIZE;
     use crate::buffer::test_frame_kind;
@@ -3778,7 +3777,6 @@ pub(crate) mod tests {
                 .storage_root(temp_dir.path().to_path_buf())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
                         .max_mem_size(max_mem_size)
                         .max_file_size(128usize * 1024 * 1024),
                 )

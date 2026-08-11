@@ -2,12 +2,10 @@ use crate::error::{BenchError, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use doradb_storage::LogSync;
 use serde::{Deserialize, Serialize};
-use std::env::var_os;
 use std::fmt;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 
-const ROOT_ENV_VAR: &str = "DORADB_BENCH_ROOT";
 pub(super) const DEFAULT_VALUE_SIZE: usize = 128;
 pub(super) const DEFAULT_BATCH_SIZE: u64 = 1;
 pub(super) const MAX_VALUE_SIZE: usize = u16::MAX as usize;
@@ -20,31 +18,20 @@ pub(super) const MAX_VALUE_SIZE: usize = u16::MAX as usize;
     disable_help_subcommand = true
 )]
 pub struct Cli {
-    /// DoraDB storage root; falls back to DORADB_BENCH_ROOT.
-    #[arg(long = "root", short = 'r', global = true, value_name = "STORAGE_ROOT")]
-    root: Option<PathBuf>,
+    /// DoraDB storage root; may be supplied by DORADB_BENCH_ROOT.
+    #[arg(
+        long = "root",
+        short = 'r',
+        env = "DORADB_BENCH_ROOT",
+        value_name = "STORAGE_ROOT"
+    )]
+    pub root: PathBuf,
+    /// Execute a strict TOML benchmark plan directly.
+    #[arg(long, short = 'p', value_name = "PLAN_FILE")]
+    pub plan: Option<PathBuf>,
     /// Lifecycle command to execute.
     #[command(subcommand)]
-    pub command: Command,
-}
-
-impl Cli {
-    /// Resolve the benchmark storage root from CLI arguments or the environment.
-    pub fn resolve_root_from_env(&self) -> Result<PathBuf> {
-        self.resolve_root_with_env(var_os(ROOT_ENV_VAR).map(PathBuf::from))
-    }
-
-    fn resolve_root_with_env(&self, env_root: Option<PathBuf>) -> Result<PathBuf> {
-        if let Some(root) = &self.root {
-            return Ok(root.clone());
-        }
-        if let Some(root) = env_root.filter(|root| !root.as_os_str().is_empty()) {
-            return Ok(root);
-        }
-        Err(BenchError::message(format!(
-            "--root is required when {ROOT_ENV_VAR} is not set"
-        )))
-    }
+    pub command: Option<Command>,
 }
 
 /// Supported top-level benchmark commands.
@@ -689,7 +676,8 @@ pub(super) fn validate_batch_size(batch_size: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
+    use std::ffi::OsStr;
 
     #[test]
     fn parse_insert_seq_workload_subcommand() {
@@ -703,16 +691,13 @@ mod tests {
             "1",
         ])
         .unwrap();
-        assert!(matches!(cli.command, Command::Run { .. }));
-        assert_eq!(
-            cli.resolve_root_with_env(None).unwrap(),
-            PathBuf::from("root")
-        );
+        assert!(matches!(cli.command, Some(Command::Run { .. })));
+        assert_eq!(cli.root, PathBuf::from("root"));
     }
 
     #[test]
-    fn parse_global_root_after_nested_command() {
-        let cli = Cli::try_parse_from([
+    fn reject_root_after_nested_command() {
+        let err = Cli::try_parse_from([
             "doradb-bench",
             "run",
             "insert-seq",
@@ -721,22 +706,26 @@ mod tests {
             "--num",
             "1",
         ])
-        .unwrap();
-        assert!(matches!(cli.command, Command::Run { .. }));
-        assert_eq!(
-            cli.resolve_root_with_env(None).unwrap(),
-            PathBuf::from("root")
-        );
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn parse_direct_plan_mode() {
+        let cli = Cli::try_parse_from(["doradb-bench", "-r", "root", "-p", "plan.toml"]).unwrap();
+        assert_eq!(cli.plan, Some(PathBuf::from("plan.toml")));
+        assert!(cli.command.is_none());
+        assert_eq!(cli.root, PathBuf::from("root"));
     }
 
     #[test]
     fn reject_removed_warmup_command() {
         let err = Cli::try_parse_from([
             "doradb-bench",
-            "warmup",
-            "insert-seq",
             "--root",
             "root",
+            "warmup",
+            "insert-seq",
             "--num",
             "1",
         ])
@@ -748,9 +737,9 @@ mod tests {
     fn reject_removed_workload_option() {
         let err = Cli::try_parse_from([
             "doradb-bench",
-            "run",
             "--root",
             "root",
+            "run",
             "--workload",
             "fillseq",
             "--num",
@@ -763,7 +752,8 @@ mod tests {
     #[test]
     fn reject_removed_file_options() {
         for removed in ["--state-file", "--output", "--storage-root"] {
-            let err = Cli::try_parse_from(["doradb-bench", "run", removed, "x"]).unwrap_err();
+            let err = Cli::try_parse_from(["doradb-bench", "--root", "root", "run", removed, "x"])
+                .unwrap_err();
             assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
         }
     }
@@ -772,10 +762,10 @@ mod tests {
     fn parse_insert_short_flags() {
         let cli = Cli::try_parse_from([
             "doradb-bench",
-            "run",
-            "insert-rand",
             "-r",
             "root",
+            "run",
+            "insert-rand",
             "-n",
             "10",
             "-v",
@@ -790,7 +780,7 @@ mod tests {
         .unwrap();
         let Command::Run {
             workload: WorkloadArgs::InsertRand(insert),
-        } = cli.command
+        } = cli.command.unwrap()
         else {
             panic!("expected run command");
         };
@@ -804,7 +794,7 @@ mod tests {
     #[test]
     fn prepare_defaults_index_tables_and_log_sync() {
         let cli = Cli::try_parse_from(["doradb-bench", "--root", "root", "prepare"]).unwrap();
-        let Command::Prepare(args) = cli.command else {
+        let Command::Prepare(args) = cli.command.unwrap() else {
             panic!("expected prepare command");
         };
         assert_eq!(args.index, IndexMode::None);
@@ -852,7 +842,7 @@ mod tests {
             "8",
         ])
         .unwrap();
-        let Command::Prepare(args) = cli.command else {
+        let Command::Prepare(args) = cli.command.unwrap() else {
             panic!("expected prepare command");
         };
         assert_eq!(args.index, IndexMode::NonUnique);
@@ -870,10 +860,10 @@ mod tests {
             (
                 vec![
                     "doradb-bench",
-                    "run",
-                    "lookup-seq",
                     "--root",
                     "root",
+                    "run",
+                    "lookup-seq",
                     "--num",
                     "3",
                     "--batch-size",
@@ -884,10 +874,10 @@ mod tests {
             (
                 vec![
                     "doradb-bench",
-                    "run",
-                    "lookup-rand",
                     "--root",
                     "root",
+                    "run",
+                    "lookup-rand",
                     "--num",
                     "3",
                     "--batch-size",
@@ -900,10 +890,10 @@ mod tests {
             (
                 vec![
                     "doradb-bench",
-                    "run",
-                    "table-scan",
                     "--root",
                     "root",
+                    "run",
+                    "table-scan",
                     "--batch-size",
                     "2",
                 ],
@@ -912,10 +902,10 @@ mod tests {
             (
                 vec![
                     "doradb-bench",
-                    "run",
-                    "index-scan",
                     "--root",
                     "root",
+                    "run",
+                    "index-scan",
                     "--num",
                     "3",
                     "--batch-size",
@@ -929,7 +919,7 @@ mod tests {
 
         for (args, workload) in cases {
             let cli = Cli::try_parse_from(args).unwrap();
-            let Command::Run { workload: load } = cli.command else {
+            let Command::Run { workload: load } = cli.command.unwrap() else {
                 panic!("expected run command");
             };
             assert_eq!(parsed_workload(&load), workload);
@@ -958,10 +948,10 @@ mod tests {
         for (name, num, expected, expected_num) in cases {
             let mut args = vec![
                 "doradb-bench",
-                "run",
-                name,
                 "--root",
                 "root",
+                "run",
+                name,
                 "--threads",
                 "1",
                 "--sessions",
@@ -972,7 +962,7 @@ mod tests {
                 args.extend(["--num", num]);
             }
             let cli = Cli::try_parse_from(args).unwrap();
-            let Command::Run { workload } = cli.command else {
+            let Command::Run { workload } = cli.command.unwrap() else {
                 panic!("expected run command");
             };
             assert_eq!(parsed_workload(&workload), expected);
@@ -988,17 +978,17 @@ mod tests {
     fn parse_lock_table_controls_and_defaults() {
         let cli = Cli::try_parse_from([
             "doradb-bench",
-            "run",
-            "lock-table",
             "--root",
             "root",
+            "run",
+            "lock-table",
             "--num",
             "7",
         ])
         .unwrap();
         let Command::Run {
             workload: WorkloadArgs::LockTable(args),
-        } = cli.command
+        } = cli.command.unwrap()
         else {
             panic!("expected lock-table command");
         };
@@ -1013,10 +1003,10 @@ mod tests {
 
         let cli = Cli::try_parse_from([
             "doradb-bench",
-            "run",
-            "lock-table",
             "--root",
             "root",
+            "run",
+            "lock-table",
             "--num",
             "7",
             "--scope",
@@ -1029,7 +1019,7 @@ mod tests {
         .unwrap();
         let Command::Run {
             workload: WorkloadArgs::LockTable(args),
-        } = cli.command
+        } = cli.command.unwrap()
         else {
             panic!("expected lock-table command");
         };
@@ -1040,10 +1030,10 @@ mod tests {
 
         let cli = Cli::try_parse_from([
             "doradb-bench",
-            "run",
-            "lock-table",
             "--root",
             "root",
+            "run",
+            "lock-table",
             "--num",
             "7",
             "--scenario",
@@ -1056,7 +1046,7 @@ mod tests {
         .unwrap();
         let Command::Run {
             workload: WorkloadArgs::LockTable(args),
-        } = cli.command
+        } = cli.command.unwrap()
         else {
             panic!("expected lock-table command");
         };
@@ -1066,10 +1056,10 @@ mod tests {
 
         let cli = Cli::try_parse_from([
             "doradb-bench",
-            "run",
-            "lock-table",
             "--root",
             "root",
+            "run",
+            "lock-table",
             "--num",
             "7",
             "--scenario",
@@ -1078,7 +1068,7 @@ mod tests {
         .unwrap();
         let Command::Run {
             workload: WorkloadArgs::LockTable(args),
-        } = cli.command
+        } = cli.command.unwrap()
         else {
             panic!("expected lock-table command");
         };
@@ -1087,10 +1077,10 @@ mod tests {
         assert!(
             Cli::try_parse_from([
                 "doradb-bench",
-                "run",
-                "lock-table",
                 "--root",
                 "root",
+                "run",
+                "lock-table",
                 "--num",
                 "7",
                 "--scenario",
@@ -1105,20 +1095,20 @@ mod tests {
         for args in [
             &[
                 "doradb-bench",
-                "run",
-                "lock-table",
                 "--root",
                 "root",
+                "run",
+                "lock-table",
                 "--num",
                 "1",
                 "--rand",
             ][..],
             &[
                 "doradb-bench",
-                "run",
-                "lock-table",
                 "--root",
                 "root",
+                "run",
+                "lock-table",
                 "--num",
                 "1",
                 "--seed",
@@ -1138,10 +1128,10 @@ mod tests {
         ] {
             let err = Cli::try_parse_from([
                 "doradb-bench",
-                "run",
-                "lock-table",
                 "--root",
                 "root",
+                "run",
+                "lock-table",
                 "--num",
                 "1",
                 option,
@@ -1169,7 +1159,7 @@ mod tests {
             ("lock-table", true),
         ];
         for (workload, needs_num) in cases {
-            let mut args = vec!["doradb-bench", "run", workload, "--root", "root"];
+            let mut args = vec!["doradb-bench", "--root", "root", "run", workload];
             if needs_num {
                 args.extend(["--num", "1"]);
             }
@@ -1183,7 +1173,7 @@ mod tests {
     fn new_workloads_validate_counts_and_reject_irrelevant_controls() {
         for name in ["stmt-noop", "trx-noop", "lock-table"] {
             let err =
-                Cli::try_parse_from(["doradb-bench", "run", name, "--root", "root"]).unwrap_err();
+                Cli::try_parse_from(["doradb-bench", "--root", "root", "run", name]).unwrap_err();
             assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
         }
         for name in [
@@ -1194,7 +1184,7 @@ mod tests {
             "index-ddl",
         ] {
             let err =
-                Cli::try_parse_from(["doradb-bench", "run", name, "--root", "root", "--num", "0"])
+                Cli::try_parse_from(["doradb-bench", "--root", "root", "run", name, "--num", "0"])
                     .unwrap_err();
             assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
 
@@ -1212,10 +1202,10 @@ mod tests {
             for &option in irrelevant {
                 let mut args = vec![
                     "doradb-bench",
-                    "run",
-                    name,
                     "--root",
                     "root",
+                    "run",
+                    name,
                     "--num",
                     "1",
                     option,
@@ -1231,10 +1221,10 @@ mod tests {
         for name in ["index-scan", "index-stream"] {
             let err = Cli::try_parse_from([
                 "doradb-bench",
-                "run",
-                name,
                 "--root",
                 "root",
+                "run",
+                name,
                 "--num",
                 "1",
                 "--range",
@@ -1250,112 +1240,112 @@ mod tests {
         let cases = vec![
             vec![
                 "doradb-bench",
+                "--root",
+                "root",
                 "run",
                 "insert-seq",
-                "--root",
-                "root",
                 "--num",
                 "3",
                 "--include-stats",
             ],
             vec![
                 "doradb-bench",
+                "--root",
+                "root",
                 "run",
                 "insert-rand",
-                "--root",
-                "root",
                 "--num",
                 "3",
                 "--include-stats",
             ],
             vec![
                 "doradb-bench",
+                "--root",
+                "root",
                 "run",
                 "lookup-seq",
-                "--root",
-                "root",
                 "--num",
                 "3",
                 "--include-stats",
             ],
             vec![
                 "doradb-bench",
+                "--root",
+                "root",
                 "run",
                 "lookup-rand",
-                "--root",
-                "root",
                 "--num",
                 "3",
                 "--include-stats",
             ],
             vec![
                 "doradb-bench",
+                "--root",
+                "root",
                 "run",
                 "table-scan",
-                "--root",
-                "root",
                 "--include-stats",
             ],
             vec![
                 "doradb-bench",
+                "--root",
+                "root",
                 "run",
                 "index-scan",
-                "--root",
-                "root",
                 "--num",
                 "3",
                 "--include-stats",
             ],
             vec![
                 "doradb-bench",
+                "--root",
+                "root",
                 "run",
                 "stmt-noop",
-                "--root",
-                "root",
                 "--num",
                 "3",
                 "--include-stats",
             ],
             vec![
                 "doradb-bench",
+                "--root",
+                "root",
                 "run",
                 "trx-noop",
-                "--root",
-                "root",
                 "--num",
                 "3",
                 "--include-stats",
             ],
             vec![
                 "doradb-bench",
+                "--root",
+                "root",
                 "run",
                 "index-stream",
-                "--root",
-                "root",
                 "--include-stats",
             ],
             vec![
                 "doradb-bench",
+                "--root",
+                "root",
                 "run",
                 "table-ddl",
-                "--root",
-                "root",
                 "--include-stats",
             ],
             vec![
                 "doradb-bench",
+                "--root",
+                "root",
                 "run",
                 "index-ddl",
-                "--root",
-                "root",
                 "--include-stats",
             ],
             vec![
                 "doradb-bench",
-                "run",
-                "lock-table",
                 "--root",
                 "root",
+                "run",
+                "lock-table",
                 "--num",
                 "3",
                 "--include-stats",
@@ -1364,7 +1354,7 @@ mod tests {
 
         for args in cases {
             let cli = Cli::try_parse_from(args).unwrap();
-            let Command::Run { workload } = cli.command else {
+            let Command::Run { workload } = cli.command.unwrap() else {
                 panic!("expected run command");
             };
             assert!(parsed_worker(&workload).include_stats());
@@ -1375,10 +1365,10 @@ mod tests {
     fn read_workloads_reject_value_size() {
         let err = Cli::try_parse_from([
             "doradb-bench",
-            "run",
-            "lookup-seq",
             "--root",
             "root",
+            "run",
+            "lookup-seq",
             "--num",
             "3",
             "--value-size",
@@ -1392,10 +1382,10 @@ mod tests {
     fn reject_run_level_index_option() {
         let err = Cli::try_parse_from([
             "doradb-bench",
-            "run",
-            "insert-seq",
             "--root",
             "root",
+            "run",
+            "insert-seq",
             "--num",
             "1",
             "--index",
@@ -1409,10 +1399,10 @@ mod tests {
     fn reject_removed_insert_workload_and_rand_flag() {
         let err = Cli::try_parse_from([
             "doradb-bench",
-            "run",
-            "insert",
             "--root",
             "root",
+            "run",
+            "insert",
             "--num",
             "1",
         ])
@@ -1421,10 +1411,10 @@ mod tests {
 
         let err = Cli::try_parse_from([
             "doradb-bench",
-            "run",
-            "insert-seq",
             "--root",
             "root",
+            "run",
+            "insert-seq",
             "--num",
             "1",
             "--rand",
@@ -1434,39 +1424,23 @@ mod tests {
     }
 
     #[test]
-    fn resolve_root_uses_env_fallback() {
-        let cli = Cli::try_parse_from(["doradb-bench", "run", "insert-seq", "--num", "1"]).unwrap();
-        assert_eq!(
-            cli.resolve_root_with_env(Some(PathBuf::from("env-root")))
-                .unwrap(),
-            PathBuf::from("env-root")
-        );
+    fn root_is_required_and_bound_to_environment() {
+        let command = Cli::command();
+        let root = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "root")
+            .unwrap();
+        assert!(root.is_required_set());
+        assert_eq!(root.get_env(), Some(OsStr::new("DORADB_BENCH_ROOT")));
     }
 
     #[test]
-    fn resolve_root_prefers_cli_over_env() {
-        let cli = Cli::try_parse_from([
-            "doradb-bench",
-            "--root",
-            "cli-root",
-            "run",
-            "insert-seq",
-            "--num",
-            "1",
-        ])
-        .unwrap();
-        assert_eq!(
-            cli.resolve_root_with_env(Some(PathBuf::from("env-root")))
-                .unwrap(),
-            PathBuf::from("cli-root")
-        );
-    }
-
-    #[test]
-    fn resolve_root_rejects_missing_root_and_empty_env() {
-        let cli = Cli::try_parse_from(["doradb-bench", "run", "insert-seq", "--num", "1"]).unwrap();
-        assert!(cli.resolve_root_with_env(None).is_err());
-        assert!(cli.resolve_root_with_env(Some(PathBuf::new())).is_err());
+    fn reject_missing_root_without_environment() {
+        let err = Cli::command()
+            .mut_arg("root", |arg| arg.env(None::<&str>))
+            .try_get_matches_from(["doradb-bench", "prepare"])
+            .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     }
 
     fn parsed_workload(args: &WorkloadArgs) -> Workload {

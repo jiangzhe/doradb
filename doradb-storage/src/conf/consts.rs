@@ -22,7 +22,7 @@ pub(crate) const DEFAULT_CATALOG_FILE_NAME: &str = "catalog.mtb";
 /// Required suffix for ephemeral swap files managed by evictable buffer pools.
 pub(crate) const SWAP_FILE_SUFFIX: &str = ".swp";
 /// Default ephemeral swap file name for a generic evictable buffer pool.
-pub(crate) const DEFAULT_EVICTABLE_BUFFER_POOL_DATA_SWAP_FILE: &str = "data.swp";
+pub(crate) const DEFAULT_EVICTABLE_BUFFER_POOL_SWAP_FILE: &str = "data.swp";
 /// Default sparse-file size cap for a generic evictable buffer pool.
 pub(crate) const DEFAULT_EVICTABLE_BUFFER_POOL_MAX_FILE_SIZE: Byte =
     Byte::from_u64(2 * 1024 * 1024 * 1024);

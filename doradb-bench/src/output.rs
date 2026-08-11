@@ -3,6 +3,7 @@ use crate::cli::{
 };
 use crate::error::{BenchError, Result};
 use crate::manifest::{internal_stats_csv_path, result_csv_path, result_markdown_path};
+use crate::measurement::{InternalMetric, InternalMetricKind, InternalMetricUnit};
 use doradb_storage::{
     BufferPoolCounters, BufferPoolRuntimeStats, BufferPoolStats, LogicalLockStats,
     MandatoryRuntimeStats, MandatoryTaskStats, Session, StorageIoStats, TransactionSystemStats,
@@ -130,6 +131,49 @@ impl OutputArtifact {
     }
 }
 
+/// Capture the public engine diagnostics used by plan mode.
+pub(crate) fn capture_internal_stats(session: &Session) -> Result<InternalStatsSnapshot> {
+    InternalStatsSnapshot::capture(session)
+}
+
+/// Build typed plan-mode diagnostics while preserving legacy metric ordering.
+pub(crate) fn plan_internal_metrics(
+    before: &InternalStatsSnapshot,
+    after: &InternalStatsSnapshot,
+) -> Vec<InternalMetric> {
+    internal_metrics(before, after)
+        .into_iter()
+        .map(|metric| {
+            let kind = if metric.name.ends_with(".capacity")
+                || metric.name.ends_with(".allocated")
+                || metric.name.ends_with(".active_count")
+                || metric.name.starts_with("logical_lock.current_")
+            {
+                InternalMetricKind::EndGauge
+            } else if metric.name.starts_with("logical_lock.peak_") {
+                InternalMetricKind::LifetimePeak
+            } else {
+                InternalMetricKind::CounterDelta
+            };
+            let unit = if metric.name == "transaction.log_bytes" {
+                InternalMetricUnit::Bytes
+            } else if metric.name.ends_with("_nanos") {
+                InternalMetricUnit::Nanoseconds
+            } else if metric.name.ends_with(".capacity") || metric.name.ends_with(".allocated") {
+                InternalMetricUnit::Frames
+            } else {
+                InternalMetricUnit::Count
+            };
+            InternalMetric {
+                name: metric.name,
+                value: metric.value,
+                kind,
+                unit,
+            }
+        })
+        .collect()
+}
+
 pub(super) fn internal_metrics(
     before: &InternalStatsSnapshot,
     after: &InternalStatsSnapshot,
@@ -141,6 +185,42 @@ pub(super) fn internal_metrics(
     push_mandatory_metrics(&mut metrics, before.mandatory, after.mandatory);
     push_logical_lock_metrics(&mut metrics, before.logical_lock, after.logical_lock);
     metrics
+}
+
+pub(super) fn write_benchmark_outputs(
+    config: &OutputConfig,
+    metrics: &[Metric],
+    result: &BenchmarkResult,
+    command_context: &str,
+) -> Result<()> {
+    print_stdout(config, metrics, result);
+    let stats_path = internal_stats_csv_path(&config.storage_root);
+    let staged_stats_path = staged_output_path(&stats_path);
+    if !config.include_stats {
+        remove_file_if_exists(&staged_stats_path)?;
+    }
+
+    let mut artifacts = vec![OutputArtifact::new(
+        result_markdown_path(&config.storage_root),
+        render_markdown(config, metrics, result, command_context),
+    )];
+    if config.include_stats {
+        artifacts.push(OutputArtifact::new(
+            stats_path.clone(),
+            render_internal_stats_csv(metrics),
+        ));
+    }
+    artifacts.push(OutputArtifact::new(
+        result_csv_path(&config.storage_root),
+        render_result_csv(config, result),
+    ));
+
+    write_staged_outputs(&artifacts)?;
+    if !config.include_stats {
+        remove_file_if_exists(&stats_path)?;
+        remove_file_if_exists(&staged_stats_path)?;
+    }
+    Ok(())
 }
 
 fn push_logical_lock_metrics(
@@ -217,42 +297,6 @@ fn push_logical_lock_metrics(
         "logical_lock.peak_live_waiter_nodes",
         u128::from(after.peak_live_waiter_nodes),
     );
-}
-
-pub(super) fn write_benchmark_outputs(
-    config: &OutputConfig,
-    metrics: &[Metric],
-    result: &BenchmarkResult,
-    command_context: &str,
-) -> Result<()> {
-    print_stdout(config, metrics, result);
-    let stats_path = internal_stats_csv_path(&config.storage_root);
-    let staged_stats_path = staged_output_path(&stats_path);
-    if !config.include_stats {
-        remove_file_if_exists(&staged_stats_path)?;
-    }
-
-    let mut artifacts = vec![OutputArtifact::new(
-        result_markdown_path(&config.storage_root),
-        render_markdown(config, metrics, result, command_context),
-    )];
-    if config.include_stats {
-        artifacts.push(OutputArtifact::new(
-            stats_path.clone(),
-            render_internal_stats_csv(metrics),
-        ));
-    }
-    artifacts.push(OutputArtifact::new(
-        result_csv_path(&config.storage_root),
-        render_result_csv(config, result),
-    ));
-
-    write_staged_outputs(&artifacts)?;
-    if !config.include_stats {
-        remove_file_if_exists(&stats_path)?;
-        remove_file_if_exists(&staged_stats_path)?;
-    }
-    Ok(())
 }
 
 fn write_staged_outputs(artifacts: &[OutputArtifact]) -> Result<()> {

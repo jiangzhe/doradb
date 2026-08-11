@@ -2014,7 +2014,7 @@ fn poison_index_publication_invariant(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::buffer::{BufferPool, PoolRole};
+    use crate::buffer::BufferPool;
     use crate::catalog::{
         ActiveIndexSpec, ColumnAttributes, ColumnSpec, CurrentTableState, IndexAttributes,
         IndexKey, IndexSpec, ResolvedVisibleTableMetadata, TableMetadata, tests::table2,
@@ -3878,11 +3878,14 @@ pub(crate) mod tests {
         EngineConfig::default()
             .storage_root(main_dir)
             .meta_buffer(LIGHTWEIGHT_TEST_BUFFER_BYTES)
-            .index_buffer(LIGHTWEIGHT_TEST_BUFFER_BYTES)
-            .index_max_file_size(LIGHTWEIGHT_TEST_MAX_FILE_BYTES)
+            .index_buffer(
+                EvictableBufferPoolConfig::default()
+                    .swap_file("index.swp")
+                    .max_mem_size(LIGHTWEIGHT_TEST_BUFFER_BYTES)
+                    .max_file_size(LIGHTWEIGHT_TEST_MAX_FILE_BYTES),
+            )
             .data_buffer(
                 EvictableBufferPoolConfig::default()
-                    .role(PoolRole::Mem)
                     .max_mem_size(LIGHTWEIGHT_TEST_BUFFER_BYTES)
                     .max_file_size(LIGHTWEIGHT_TEST_MAX_FILE_BYTES),
             )

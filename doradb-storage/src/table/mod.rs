@@ -1156,7 +1156,7 @@ fn unique_key_from_full_row(
 pub(crate) mod tests {
     use super::lifecycle::{CheckpointPublishLease, TableCheckpointRootMutationScope};
     use crate::buffer::page::PAGE_SIZE;
-    use crate::buffer::{PoolGuard, PoolGuards, PoolRole, ReadonlyBufferPool};
+    use crate::buffer::{PoolGuard, PoolGuards, ReadonlyBufferPool};
     use crate::catalog::tests::table2;
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableSpec,
@@ -2088,7 +2088,6 @@ pub(crate) mod tests {
                 .storage_root(temp_dir.path().to_path_buf())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
                         .max_mem_size(max_mem_size)
                         .max_file_size(128u64 * 1024 * 1024),
                 )
@@ -2368,11 +2367,14 @@ pub(crate) mod tests {
         EngineConfig::default()
             .storage_root(main_dir)
             .meta_buffer(LIGHTWEIGHT_TEST_BUFFER_BYTES)
-            .index_buffer(LIGHTWEIGHT_TEST_BUFFER_BYTES)
-            .index_max_file_size(LIGHTWEIGHT_TEST_MAX_FILE_BYTES)
+            .index_buffer(
+                EvictableBufferPoolConfig::default()
+                    .swap_file("index.swp")
+                    .max_mem_size(LIGHTWEIGHT_TEST_BUFFER_BYTES)
+                    .max_file_size(LIGHTWEIGHT_TEST_MAX_FILE_BYTES),
+            )
             .data_buffer(
                 EvictableBufferPoolConfig::default()
-                    .role(PoolRole::Mem)
                     .max_mem_size(LIGHTWEIGHT_TEST_BUFFER_BYTES)
                     .max_file_size(LIGHTWEIGHT_TEST_MAX_FILE_BYTES),
             )
