@@ -1,7 +1,7 @@
 ---
 id: 000266
 title: Add doradb-bench Plan and Measurement Foundation
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-08-11
 github_issue: 969
 ---
@@ -10,61 +10,39 @@ github_issue: 969
 
 ## Summary
 
-Implement Phase 1 of RFC 0028 as an executable vertical slice. Add the strict
-raw and validated TOML plan models, benchmark-owned engine overlays, public
-storage configuration validation and inspection, sequential phase execution,
-replay validation, quanta-based low-overhead timing, session-local HDR
-histograms, typed result metrics, and canonical TOML and Markdown artifacts.
+Implemented RFC 0028 Phase 1 as an executable `doradb-bench` vertical slice.
+The benchmark now accepts a strict TOML plan, resolves benchmark-owned engine
+overlays over authoritative storage defaults, validates the complete plan
+before root creation, executes ordered phases in one engine lifetime, and
+writes canonical TOML plus Markdown results.
 
-Move `trx-noop` from RFC Phase 2 into this task so the foundation is exercised
-end to end by a real public-session workload. A plan can run `trx-noop` as an
-unmeasured prepare phase or as the required final benchmark phase, including
-warm-up and repeated measured runs. Legacy commands remain available during
-the staged migration, but plan execution owns its configuration, fixture,
-measurement, and result models rather than adapting command-line argument
-vectors.
-
-Use one calibrated `quanta::Clock` and raw timestamps on the per-transaction
-hot path. Each session owns its histogram and exact duration sum; worker and
-run aggregation merge distributions instead of averaging percentiles. Public
-engine statistics remain optional diagnostics and gain explicit delta, gauge,
-or lifetime-peak semantics so they cannot be mistaken for benchmark scores.
+`trx-noop` moved forward from RFC Phase 2 to prove the framework through public
+sessions, warm-up, repeated measured runs, optional engine diagnostics, and
+failure reporting. Measurement uses one calibrated quanta clock and
+session-local HDR histograms; aggregation merges exact samples and duration
+sums rather than averaging percentiles. Legacy lifecycle commands remain
+available during the staged RFC migration.
 
 ## Context
 
-RFC 0028 replaces independently prepared benchmark roots and one-workload
-commands with a strict, sequential plan that owns one engine lifetime. Its
-first phase must establish the common parser, configuration, dispatch,
-fixture-extension, measurement, and result contracts used by later workload
-migrations.
+The previous benchmark lifecycle prepared a persistent root and then ran one
+CLI-selected workload per invocation. Configuration was coupled to Clap types
+and a legacy manifest, engine settings were only partially exposed, latency was
+derived from total wall time, and the flat result model could not represent
+ordered setup, warm-up, repetition, percentiles, or structured failure
+context.
 
-The current benchmark is organized around `Cli` subcommands, a persistent
-`Manifest`, CLI-associated `WorkloadConfig::Args`, one invocation of
-`run_typed_workload`, `std::time::Instant` wall timing, additive
-`SessionSummary` counters, and flat CSV/Markdown output. `TrxNoopRunner` is the
-smallest real workload: it needs no table, loaded range, index, semantic fence,
-or specialized coordination, but it exercises public session creation,
-transaction begin/commit, worker partitioning, phase fences, latency sampling,
-warm-up, repetition, failure handling, and engine diagnostics.
+RFC 0028 requires a sequential plan that owns one engine lifetime, validates
+implicit fixture transitions, and eventually composes all existing workloads
+before adding checkpoint scenarios. `trx-noop` was the smallest real proof
+workload because it exercises session creation, transaction begin/commit,
+worker partitioning, timing, phase fences, and diagnostics without requiring a
+table or advanced fixture state.
 
-`EngineConfig` owns defaults that are private to `doradb-storage`. Repeating
-those values in `doradb-bench` would create a second source of truth, while the
-plan must be able to override every effective public engine builder input and
-record the fully resolved configuration. Storage startup also performs some
-validation after filesystem preparation. Plan mode needs the same validation
-and normalization without creating the requested root.
-
-The current `Metric { name, value }` output mixes interval deltas, endpoint
-gauges, and engine-lifetime peaks. Those values require different
-interpretations and are not valid inputs to throughput or latency aggregation.
-The current `failures` workload counter is likewise misleading because an
-errored run is not a successful result with an additive failure count.
-
-This task deliberately advances one RFC staging choice: `trx-noop` moves from
-Phase 2 to Phase 1 as the proof workload. RFC Phase 1 and Phase 2 descriptions,
-template counts, non-goals, and prerequisites must be updated with the
-implementation. Phase 2 otherwise retains the simple-fixture migration, and
-Phase 3's dependent/coordinated assumptions do not change.
+Storage configuration remained the source of truth. The implementation reused
+public storage configuration types and added pure validation instead of
+copying defaults into the benchmark. Buffer-pool identity and eviction policy
+remain storage component concerns rather than plan schema.
 
 Parent RFC:
 
@@ -78,587 +56,221 @@ Issue Labels:
 
 ## Goals
 
-1. Parse one unversioned, strict TOML plan into separate raw and validated Rust
-   models before creating the storage root.
-2. Resolve an optional engine-defaults file and local engine overrides over the
-   authoritative storage defaults, validate them without filesystem mutation,
-   and record the normalized effective configuration.
-3. Execute all plan phases sequentially against one newly bootstrapped engine,
-   with exactly one final benchmark phase and an explicit structural fence
-   between phases and runs.
-4. Define fixture requirement/effect and runtime-state extension points without
-   implementing table, loaded-range, index, table-pool, commit-fence, or
-   semantic-wait state.
-5. Migrate `trx-noop` onto a serde-owned specification and shared resolved
-   runner so a real plan can exercise prepare, warm-up, repeated measurement,
-   and replay-safety behavior.
-6. Use `quanta` raw timestamps for transaction latency and a calibrated clock
-   wall source for run duration, excluding calibration and framework setup from
-   measured intervals.
-7. Build exact session-local latency distributions with HDR histograms, merge
-   them correctly across sessions and equivalent measured runs, and fail
-   explicitly on timestamp or histogram-range errors.
-8. Separate run envelope metrics, latency metrics, workload counters, and
-   optional typed engine diagnostics, with no additive `failures` counter.
-9. Write a canonical machine-readable result and a human-readable rendering
-   for both successful and failed plan invocations while retaining a guarded
-   cleanup path.
-10. Preserve the existing workload commands during staged migration and leave
-    later RFC phases with stable plan, configuration, dispatch, fixture, and
-    measurement contracts.
+- Provide an unversioned, strict raw and validated TOML plan model.
+- Resolve an optional plan-relative engine-defaults file and local leaf
+  overrides over `EngineConfig::default()`.
+- Validate plan shape, replay safety, fixture transitions, and normalized
+  engine configuration before creating the invocation root.
+- Execute prepare, warm-up, and measured runs sequentially against one engine.
+- Migrate `trx-noop` to serde-owned configuration and shared legacy/plan core
+  execution.
+- Record transaction-lifecycle latency with quanta and merge session-local HDR
+  histograms across workers and measured runs.
+- Separate workload counters, wall throughput, latency summaries, and typed
+  engine diagnostics.
+- Emit cleanup-safe success or ordinary failure artifacts without changing
+  persistent DoraDB formats.
+- Preserve legacy prepare, run, and cleanup commands for later RFC phases.
 
 ## Non-Goals
 
-- Migrating `stmt-noop`, create-table, insert, DDL, read, index, scan, or lock
-  workloads; only `trx-noop` moves in this phase.
-- Removing the legacy `prepare` or nested `run` commands before RFC Phase 3, or
-  translating their Clap argument vectors into plans.
-- Adding repository plan templates; shared engine defaults and workload
-  templates remain Phase 2 deliverables.
-- Implementing primary-table state, generated-key allocation, loaded ranges,
-  indexes, table pools, typed transaction fences, semantic waits, or
-  cross-session workload coordination.
-- Adding checkpoint/freeze, update/delete/mixed workloads, concurrent phases,
-  actor graphs, fixture reset, independent-root repetition, or generic sleep,
-  signal, and barrier primitives.
-- Preserving plan schema or plan-result compatibility while the repository-local
-  framework evolves; the schema remains deliberately unversioned.
-- Correcting coordinated omission, subtracting timer overhead, sharing one
-  concurrent histogram recorder, or adding CI performance thresholds.
-- Changing transaction, storage, checkpoint, recovery, or public-session
-  behavior beyond exposing pure configuration validation and config values.
-- Treating engine diagnostics as workload operation counts or aggregating
-  endpoint/lifetime gauges across measured runs.
+- Migrating workloads other than `trx-noop` or removing legacy commands.
+- Adding repository plan templates; shared defaults and the remaining simple
+  workload templates belong to RFC Phase 2.
+- Implementing table, loaded-range, index, table-pool, typed-fence, semantic
+  wait, or cross-session coordination state.
+- Adding checkpoint, update/delete/mixed, concurrent-phase, actor, reset,
+  restart, or cold-cache workloads.
+- Versioning the plan or result schema during repository-local development.
+- Correcting coordinated omission, subtracting timer overhead, or adding
+  performance thresholds.
+- Exposing storage-internal eviction-arbiter policy in benchmark input.
+- Preserving result artifacts when storage shutdown itself panics.
 
 ## Plan
 
-### Dependencies and command surface
-
-Add workspace dependencies and `doradb-bench` crate dependencies for
-`quanta = 0.12.6` and `hdrhistogram = 7.5.4`, both with default features
-disabled. Retain `std::time::Duration` as a value type, but remove
-`std::time::Instant` from plan measurement paths.
-
-Extend `Cli` with direct plan execution:
-
-```text
-doradb-bench -r <storage-root> -p <plan.toml>
-```
-
-`-r` and `-p` are the short forms of `--root` and `--plan`. The root remains
-invocation-owned and never appears in plan input. Clap requires the top-level
-root unless `DORADB_BENCH_ROOT` supplies it; an explicit root takes precedence
-over the environment. The root option must precede lifecycle subcommands. Plan
-mode conflicts with lifecycle subcommands; the existing `prepare`, `run`, and
-`cleanup` forms remain transitional commands. `cleanup` accepts either a valid
-legacy manifest or the new plan-run marker and never gains a force mode.
-
-Plan execution requires a non-existing root. Parse, include, merge, fixture
-validation, replay validation, and pure engine validation all complete first.
-Only then create the root and install the plan-run marker exclusively. Create
-one measurement clock, bootstrap one engine, run every phase, shut down the
-engine on success or failure, and leave the root and artifacts for inspection.
-
-### Raw plan, validated plan, and workload entities
-
-Add a dedicated `plan` module. TOML types use `deny_unknown_fields` at every
-struct boundary and contain no version field:
-
-```rust
-struct RawPlan {
-    name: Option<String>,
-    engine_defaults: Option<PathBuf>,
-    engine: EngineConfigOverlay,
-    workload_defaults: WorkloadDefaults,
-    phases: Vec<RawPhase>, // serde name: phase
-}
-
-struct EngineDefaultsFile {
-    engine: EngineConfigOverlay,
-}
-
-struct RawPhase {
-    kind: PhaseKind, // serde default: prepare
-    warmup_runs: Option<u32>,
-    measured_runs: Option<NonZeroU32>,
-    workload: WorkloadSpec,
-}
-
-enum PhaseKind {
-    Prepare,
-    Benchmark,
-}
-
-enum WorkloadSpec {
-    TrxNoop(TrxNoopSpec), // internally tagged by type = "trx-noop"
-}
-
-struct TrxNoopSpec {
-    num: NonZeroU64,
-    threads: Option<NonZeroUsize>,
-    sessions: Option<NonZeroUsize>,
-    include_stats: Option<bool>,
-}
-```
-
-`WorkloadDefaults` contains `threads`, `sessions`, `value_size`, `batch_size`,
-and `include_stats`. Resolution defaults to one thread, sessions equal to the
-resolved thread count, value size 128, batch size 1, and internal statistics
-disabled. A phase-local workload value overrides the corresponding workload
-default; `TrxNoopSpec` only exposes values relevant to that workload.
-Validation rejects zero counts, `threads > sessions`, arithmetic overflow, an
-empty phase list, no benchmark phase, multiple benchmark phases, or a
-benchmark phase that is not last.
-
-Convert raw entities into execution-owned entities:
-
-```rust
-struct Plan {
-    name: Option<String>,
-    source: PathBuf,
-    engine: ResolvedEngineConfig,
-    workload_defaults: WorkloadDefaults,
-    phases: Vec<Phase>,
-}
-
-enum Phase {
-    Prepare { workload: ResolvedWorkload },
-    Benchmark {
-        measurement: MeasurementSpec,
-        workload: ResolvedWorkload,
-    },
-}
-
-struct MeasurementSpec {
-    warmup_runs: u32,
-    measured_runs: NonZeroU32,
-}
-
-enum ResolvedWorkload {
-    TrxNoop(TrxNoopConfig),
-}
-```
-
-Prepare phases reject either measurement field. Benchmark defaults are zero
-warm-up runs and one measured run. Each resolved workload declares a stable
-identity, latency unit, replay policy, fixture requirements/effects, and
-execution entry point. `trx-noop` is replay-safe and has no fixture requirement
-or effect, so it permits warm-up and multiple measured runs.
-
-### Engine overlays and authoritative storage configuration
-
-Keep serde-facing `EngineConfigOverlay` and its nested overlays in
-`doradb-bench`; every leaf is optional and field-wise mergeable. An
-`engine_defaults` path is resolved relative to the plan file's parent. The
-included document accepts only one `[engine]` tree, cannot include another
-file, and rejects unknown top-level and nested fields. Merge precedence is:
-
-```text
-EngineConfig::default() < included [engine] < plan-local [engine]
-```
-
-The overlay covers every effective public engine builder input except
-`storage_root` and storage-internal eviction-arbiter policy:
-
-- mandatory runtime worker threads and concurrency limit;
-- transaction log write, recovery, and catalog-scan I/O depths; log block
-  size, directory, file stem, maximum file size, sync mode, purge threads, GC
-  buckets, and recovery DML-validation switch;
-- metadata-buffer bytes;
-- index- and data-buffer swap paths, maximum file bytes, and maximum memory
-  bytes through one shared evictable-buffer overlay shape;
-- table/catalog filesystem I/O depth, data directory, readonly-buffer bytes,
-  and catalog filename.
-
-Byte-sized TOML leaves and resolved output use integer byte counts. Path values
-inside `[engine]` retain storage's existing root-relative meaning; only the
-`engine_defaults` include path is plan-relative.
-
-Reuse the public storage configuration types instead of introducing parallel
-snapshot types. Use `EvictableBufferPoolConfig` for both the index and data
-buffers, make its basic path and size fields public, and retain the
-eviction-arbiter builder as a private storage detail. Add a consuming,
-side-effect-free `EngineConfig::validate()`
-that returns the normalized configuration or the existing public configuration
-error, backed by a crate-private `validate_inner()` that preserves
-`ConfigResult`. `Engine::bootstrap` uses the typed inner path before filesystem
-preparation, preventing benchmark preflight and engine startup from drifting.
-
-Pool identity is component-owned rather than configuration-owned. Remove
-`PoolRole` from `EvictableBufferPoolConfig`; the metadata, index, memory, and
-disk pool components select their fixed roles when constructing their pools.
-The index and memory components consume `EvictableBufferPoolConfig` directly;
-benchmark input and resolved output reuse one role-free buffer shape for both.
-
-The benchmark applies overlays over `EngineConfig::default()`, validates the
-result, then converts the validated config directly into serde-owned
-`ResolvedEngineConfig`. Eviction-arbiter tuning remains a storage concern and
-is not exposed in the benchmark plan or result model.
-The root is recorded separately as invocation context. Result output therefore
-contains actual normalized defaults and overrides rather than a reconstruction
-of storage-private constants.
-
-### Fixture and workload-dispatch extension contracts
-
-Introduce explicit `FixturePlanState` and `FixtureRuntimeState` contexts even
-though both carry no advanced state in Phase 1. Validation folds each resolved
-workload's requirements and effects over `FixturePlanState` in phase order.
-Execution applies runtime effects only after a workload succeeds.
-
-Central enum dispatch exposes the following operations without CLI-associated
-argument types or trait objects:
-
-- validate requirements and return/apply typed fixture effects;
-- report replay safety and the documented latency unit;
-- resolve session plans from workload defaults and overrides;
-- execute through a `RunContext` containing the engine, runtime fixture, clock,
-  and measurement mode;
-- return one `SessionRunResult` per joined session.
-
-Refactor `TrxNoopConfig` so its core configuration no longer depends on
-`WorkerCountArgs` or `Manifest`. The plan resolver constructs it directly;
-the legacy command keeps a narrow adapter from existing args/defaults. Reuse
-the same operation loop and session-worker machinery. Other workloads retain
-their current `WorkloadConfig` coupling until their RFC migration phases.
-
-### Sequential execution and failure boundaries
-
-Add a plan executor that owns the resolved plan, engine, runtime fixture, and
-one shared measurement clock. Execute phases strictly in declaration order.
-For every individual prepare, warm-up, or measured run, all workload workers
-must join and all workload sessions must reach their close result before the
-next run begins. This join/close boundary is the Phase 1 structural fence; no
-sleep or private engine synchronization is introduced.
-
-A prepare workload executes once and may emit diagnostic elapsed time,
-workload counters, and requested engine statistics, but never contributes
-latency samples to the final benchmark distribution. Warm-ups execute the same
-resolved benchmark workload and timing path, must succeed, and discard all
-samples, counters, and stat deltas. Measured runs remain individually visible.
-Only after all configured measured runs succeed is an aggregate emitted.
-
-Drain every spawned session task and retain the first error, matching the
-current cleanup behavior. A failed prepare, warm-up, or measured run aborts
-later work. Close workload sessions, shut down the engine, preserve all
-previously completed diagnostics/runs, set the invocation status to failed,
-record phase/run context and the error message, and omit the aggregate and any
-latency summary for the incomplete run. Do not manufacture partial-success
-counters.
-
-### Quanta clock and latency hot path
-
-Construct one `quanta::Clock` after complete plan validation and before root
-creation or engine bootstrap. This keeps initial calibration outside all
-reported durations. Store it behind a small `MeasurementClock` wrapper and
-share that calibrated source with session tasks.
-
-Use `Clock::now()` for measured-run wall boundaries. Start the wall interval
-immediately before workload-session task construction/execution and stop it
-after every workload session has closed and every worker has joined. This
-includes workload worker/session lifecycle overhead but excludes plan parsing,
-clock calibration, root creation, engine bootstrap, dedicated stats-session
-creation/snapshots/closure, artifact rendering, and engine shutdown.
-
-Use the lower-overhead raw API for every `trx-noop` latency sample:
-
-```text
-start = clock.raw()
-session.begin_trx()?.commit().await?
-end = clock.raw()
-nanos = clock.delta_as_nanos(start, end)
-```
-
-Capture `start` immediately before `Session::begin_trx` and `end` immediately
-after commit succeeds. Session creation and closure are wall-time costs, not
-transaction-latency samples. Explicitly reject `end < start` as a measurement
-error before calling/concluding from `delta_as_nanos`; accept `end == start` as
-a zero-nanosecond sample. Do not use `Clock::recent()`, subtract estimated
-clock overhead, or substitute an unscaled raw delta.
-
-Tests inject a mock clock or supplied timestamp/duration seam rather than
-depending on host timing. The production wrapper remains the only location
-that interprets raw quanta timestamps.
-
-### Histogram and aggregation structures
-
-Use a session-local `Histogram<u64>` with lowest discernible value 1 ns,
-highest trackable value 3,600,000,000,000 ns (one hour), three significant
-digits, and auto-resize disabled. Recording a value outside that range is an
-explicit run error. `trx-noop` is closed-loop, so do not apply coordinated
-omission correction.
-
-Use these ownership boundaries:
-
-```rust
-struct LatencyDistribution {
-    histogram: Histogram<u64>,
-    sample_count: u64,
-    sum_nanos: u128,
-}
-
-struct SessionRunResult {
-    counters: WorkloadCounters,
-    latency: LatencyDistribution,
-}
-
-struct LatencySummary {
-    unit: LatencyUnit,
-    sample_count: u64,
-    sum_nanos: u128,
-    average_nanos: f64,
-    p95_nanos: u64,
-    p99_nanos: u64,
-}
-
-struct MeasuredRunResult {
-    run_index: u32,
-    elapsed_nanos: u128,
-    counters: WorkloadCounters,
-    operations_per_second: f64,
-    latency: LatencySummary,
-    internal_metrics: Vec<InternalMetric>,
-}
-
-struct BenchmarkAggregate {
-    measured_runs: u32,
-    elapsed_nanos: u128,
-    counters: WorkloadCounters,
-    operations_per_second: f64,
-    latency: LatencySummary,
-}
-```
-
-Session and run merges use checked addition for counts and exact `u128`
-duration sums, and `Histogram::add` for distributions. Average is exact merged
-sum divided by merged sample count. p95 and p99 are queried from the merged
-histogram. Aggregate throughput is total operations divided by the sum of run
-wall durations; never average run throughput or percentiles. For `trx-noop`,
-`latency_unit` is `transaction-lifecycle` and successful runs require
-`sample_count == operations`.
-
-### Benchmark metrics and engine diagnostics
-
-Replace `SessionSummary` on the plan path with additive `WorkloadCounters`:
-
-```rust
-struct WorkloadCounters {
-    operations: u64,
-    inserted_rows: u64,
-    found: u64,
-    not_found: u64,
-    rows_returned: u64,
-}
-```
-
-Phase 1 `trx-noop` increments only `operations`. Remove `failures` from the new
-model; terminal status and error context represent failure. Keep any legacy
-field only inside the transitional legacy output path.
-
-Represent optional public storage diagnostics as:
-
-```rust
-enum InternalMetricKind {
-    CounterDelta,
-    EndGauge,
-    LifetimePeak,
-}
-
-enum InternalMetricUnit {
-    Count,
-    Bytes,
-    Nanoseconds,
-    Frames,
-}
-
-struct InternalMetric {
-    name: String,
-    value: u128,
-    kind: InternalMetricKind,
-    unit: InternalMetricUnit,
-}
-```
-
-Preserve the existing deterministic metric-name order and classify it as
-follows:
-
-- transaction, storage-I/O, ordinary buffer activity, ordinary mandatory-task,
-  and ordinary logical-lock fields are `CounterDelta` values computed from the
-  public before/after snapshots;
-- `transaction.log_bytes` uses `Bytes`, names ending in `_nanos` use
-  `Nanoseconds`, and other deltas use `Count`;
-- buffer `capacity` and `allocated` values are `EndGauge` values in `Frames`;
-- mandatory `active_count` and logical-lock `current_*` values are
-  `EndGauge` values in `Count`;
-- logical-lock `peak_*` values are `LifetimePeak` values in `Count`, explicitly
-  not phase-local peaks.
-
-Capture diagnostics through one dedicated public session immediately before
-and after the target run, outside its wall and latency timers. Prepare-phase
-diagnostics may be rendered when requested. Warm-up diagnostics are discarded.
-Measured diagnostics remain per run and are not included in
-`BenchmarkAggregate`, because counter deltas, endpoint gauges, and lifetime
-peaks do not share one valid cross-run aggregation rule.
-
-Logical benchmark operations remain authoritative. In particular, no-effect
-commits may leave `transaction.commit_count` and `transaction.trx_count` at
-zero even when `trx-noop.operations` is nonzero.
-
-### Result artifacts and cleanup marker
-
-Add a serializable invocation report containing:
-
-- success/failed status and optional structured phase/run error context;
-- invocation root and plan source;
-- the complete resolved plan, workload defaults, and normalized engine
-  configuration;
-- prepare-phase diagnostics;
-- every completed measured run;
-- the aggregate only when all measured runs succeed.
-
-Write `benchmark-result.toml` as the canonical machine-readable artifact and
-`benchmark-result.md` as a rendering of the same entity. Serialize every
-`u128` field, including exact latency sums and internal metric values, as a
-decimal string because TOML integers are signed 64-bit. Preserve stable phase,
-run, and metric order. Continue staged writes and rename installation so a
-render/write failure does not install a partial pair.
-
-Use `benchmark-manifest.toml` as the guarded root marker in both modes. Add an
-explicit plan-mode shape while retaining decode support for the current legacy
-manifest, and teach `cleanup` to validate either shape before deleting the
-root. The plan marker is diagnostic/cleanup metadata only; it is not fixture
-state, an included plan, or an execution authority.
-
-Attempt to write the result pair after engine/bootstrap or execution failure
-whenever the root and marker exist. If artifact creation itself fails, report
-that error while retaining the original execution error as diagnostic context
-and leave the guarded root recoverable by `cleanup`.
-
-### RFC and benchmark documentation
-
-Update `docs/benchmark-tool.md` with the plan-mode syntax, strict schema,
-`trx-noop` example, engine-default merge, phase/replay rules, exact latency
-unit, metric taxonomy, artifact names, and transitional legacy-command status.
-
-Update RFC 0028's phase plan atomically with implementation:
-
-- Phase 1 adds the executable `trx-noop` vertical slice and quanta timing and
-  changes its workload-migration non-goal accordingly;
-- Phase 2 removes `trx-noop`, retains create-table, `stmt-noop`, both inserts,
-  and `table-ddl`, and changes its complete simple-template count from five to
-  four;
-- Phase 2 prerequisites explicitly consume the already-proven `trx-noop`
-  dispatch and measurement contracts;
-- Phase 3 and Phase 4 dependency/coordination assumptions otherwise remain
-  unchanged.
-
-During `$task-resolve`, synchronize Phase 1's task path, issue, status, and
-implementation summary through the repository RFC resolution tooling.
+### Command and plan model
+
+Plan mode uses `doradb-bench -r <root> -p <plan.toml>`. The root is required by
+Clap unless `DORADB_BENCH_ROOT` supplies it, and an explicit CLI value wins.
+Exactly one plan or lifecycle command is required. The top-level root remains
+outside plan input and must precede lifecycle subcommands.
+
+Every serde struct rejects unknown fields. Raw plans contain optional engine
+defaults, local engine overlays, workload defaults, and ordered phases.
+Resolution produces a complete `Plan` with normalized engine configuration,
+resolved workload defaults, and typed prepare or benchmark phases. Exactly one
+benchmark phase is required and it must be final. Prepare rejects measurement
+controls; benchmark defaults to zero warm-ups and one measured run.
+
+`ResolvedWorkload` centralizes identity, replay policy, fixture validation,
+worker counts, and diagnostic selection. Phase 1 fixture plan/runtime states
+are explicit extension points with no advanced state. `trx-noop` is replay-safe
+and has no fixture requirement or effect.
+
+### Engine configuration
+
+Benchmark overlays merge in this order:
+
+`EngineConfig::default()` < included `[engine]` < plan-local `[engine]`
+
+The included defaults path is relative to the plan. Its document accepts only
+one strict engine tree and cannot include another file. Engine paths retain
+their existing storage-root-relative semantics.
+
+The overlay covers mandatory runtime sizing, transaction/log/recovery/purge
+settings, metadata bytes, index/data evictable buffer settings, and filesystem
+settings. The invocation root and eviction-arbiter policy are excluded.
+Index and data buffers share one role-free `EvictableBufferPoolConfig` shape;
+their components hardcode `PoolRole::Index` and `PoolRole::Mem` when building
+the pools.
+
+`EngineConfig::validate()` consumes and returns the normalized public config
+through the public storage `Result`. Its crate-private `validate_inner()`
+preserves `ConfigResult` diagnostics for engine bootstrap. Bootstrap invokes
+the same inner path before filesystem preparation, and buffer validation owns
+its field-local checks without a caller-supplied field label.
+
+### Execution and measurement
+
+Plan parsing, include resolution, overlay merge, fixture/replay validation, and
+pure engine validation finish before the root is created. Plan mode then writes
+an exclusive plan marker, bootstraps one engine, and executes phases in order.
+Every session task is drained, sessions are closed, and workers are joined
+before advancing. The first operation error wins.
+
+One `MeasurementClock` is calibrated before root creation. Scaled quanta
+instants measure each run's session/worker wall envelope. Raw timestamps sample
+from immediately before public transaction begin until immediately after a
+successful commit. Reversed timestamps fail; equal timestamps are accepted as
+zero-nanosecond samples.
+
+Each session owns an HDR histogram covering one nanosecond through one hour at
+three significant digits with auto-resize disabled. Checked counters and exact
+`u128` sums accompany the histogram. Session and run aggregation use
+`Histogram::add`; p95 and p99 come from the merged distribution. Aggregate
+throughput is total operations divided by total measured wall duration.
+Warm-ups execute the same path but discard all results.
+
+### Results, diagnostics, and cleanup
+
+`InvocationReport` records terminal status, optional structured boundary and
+phase/run failure context, root and plan source, the complete resolved plan,
+prepare diagnostics, completed measured runs, and an aggregate only after all
+measured runs succeed. Measurement-side failures record the exact phase and
+run before the outer defensive fallback can supply approximate context.
+
+Workload results use additive logical counters without a `failures` field.
+Optional public engine metrics are typed as counter deltas, endpoint gauges,
+or lifetime peaks with explicit count, byte, nanosecond, or frame units.
+Diagnostics remain attached to individual runs and never enter the benchmark
+aggregate.
+
+`benchmark-result.toml` is canonical; every `u128` is a decimal string.
+`benchmark-result.md` renders the same entity and chooses a backtick fence
+longer than any run inside the canonical TOML. The pair is staged and installed
+atomically. Ordinary bootstrap or execution errors retain completed results and
+write structured failure output when the guarded root exists. Storage shutdown
+panics intentionally keep fail-fast propagation and do not promise artifacts.
+
+`benchmark-manifest.toml` accepts either the legacy manifest or an explicit
+plan marker. Cleanup validates the selected root's marker before removing it
+and has no force mode.
 
 ## Implementation Notes
 
+Task 000266 shipped RFC 0028 Phase 1 with `trx-noop` as its proof workload.
+It adds strict plan execution, reusable storage configuration validation,
+quanta/HDR measurement, and typed artifacts. The RFC was adjusted so Phase 2
+now migrates four remaining simple workloads and owns the shared engine
+defaults plus repository templates.
+
+Implementation refinement replaced proposed benchmark snapshots with direct
+reuse of storage configuration. `EvictableBufferPoolConfig` became the shared
+index/data shape, `PoolRole` moved to component construction, and the
+eviction-arbiter builder stayed crate-private. Public `EngineConfig::validate`
+returns normalized configuration through the normal storage error type, while
+`validate_inner` preserves typed configuration reports internally.
+
+CLI refinement added `-p`, made root required, and enabled Clap environment
+support for `DORADB_BENCH_ROOT`. An explicit root overrides the environment.
+Repository templates were intentionally not added because they remain a Phase
+2 deliverable.
+
+Review established these durable failure/output decisions:
+
+- component shutdown panics remain unrecoverable engine defects and may skip
+  benchmark artifacts;
+- `InvocationStatus` remains an artifact classification alongside structured
+  `InvocationFailure`, while runtime errors still propagate through `Result`;
+- measurement construction, summary, merge, and finalization errors route
+  through exact phase/run failure attribution;
+- the current TOML serializer already orders root values before child tables,
+  so no `InvocationReport` field reorder was required; a failed-report
+  round-trip test records that behavior;
+- canonical TOML Markdown blocks use adaptive fences so embedded backticks
+  cannot terminate the block.
+
+Release-mode `trx-noop` verification used one prepare run of 1,000 operations,
+one warm-up, five measured runs of 100,000 operations, and `log_sync = "none"`:
+
+- 1 thread / 1 session: 3,610,719.727 aggregate operations/second, 270.836 ns
+  average, 500 ns p95, and 833 ns p99;
+- 2 threads / 2 sessions: 3,217,198.660 operations/second, 613.961 ns average,
+  1,041 ns p95, and 3,333 ns p99;
+- 4 threads / 16 sessions: 4,353,307.772 operations/second, 883.212 ns average,
+  1,583 ns p95, and 5,503 ns p99.
+
+These runs were behavioral verification only; no performance threshold was
+introduced. The engine's mandatory runtime retained its default two workers
+and concurrency limit of four.
+
+Final verification passed the branch-diff style gate for 44 Rust files,
+131 `doradb-bench` tests, 1,762 workspace tests, and 1,632 storage tests with
+the alternate `libaio` backend. CLI help displayed required root selection,
+`-r`/`--root`, `-p`/`--plan`, the environment source, and transitional
+lifecycle commands.
+
 ## Impacts
 
-- `Cargo.toml`, `Cargo.lock`, and `doradb-bench/Cargo.toml`: add quanta and HDR
-  histogram dependencies.
-- `doradb-storage/src/conf/`: expose reusable configuration fields, remove pool
-  role from evictable configuration, and add one shared, pure
-  validation/normalization path.
-- `doradb-storage/src/engine.rs`: invoke pure validation before storage-root
-  preparation and preserve existing bootstrap behavior.
-- `doradb-storage/src/lib.rs`: retain the public reusable configuration surface.
-- `doradb-bench/src/cli.rs` and `src/bin/doradb_bench.rs`: add mutually
-  exclusive direct plan execution while retaining transitional commands.
-- New or split benchmark modules such as `plan`, `engine_config`, `executor`,
-  and `measurement`: own strict serde entities, merge/validation, phase
-  dispatch, fixture contexts, timing, histograms, and aggregation.
-- `doradb-bench/src/workload/mod.rs`, `workload/noop.rs`, and `runner.rs`:
-  decouple `trx-noop` core execution from CLI/manifest resolution and integrate
-  per-session latency results without migrating other workloads.
-- `doradb-bench/src/output.rs` and `manifest.rs`: add typed result/diagnostic
-  entities, canonical TOML/Markdown rendering, plan failure output, and a
-  cleanup-safe plan marker while preserving legacy mode.
-- `docs/benchmark-tool.md`: document the executable Phase 1 contract.
-- `docs/rfcs/0028-composable-doradb-bench-phase-framework.md`: record the
-  approved `trx-noop` phase-boundary change and eventual task outcome.
-- No persisted DoraDB catalog, row, index, transaction log, checkpoint, or
-  recovery format changes.
-- No unsafe code is expected; any unsafe addition requires separate design and
-  review outside this task.
+- `doradb-bench` gains strict plan parsing, engine overlay resolution,
+  sequential execution, quanta/HDR measurement, typed diagnostics, canonical
+  result artifacts, and plan-marker cleanup.
+- `trx-noop` core configuration and execution are reusable by legacy and plan
+  paths; other workloads remain on their transitional interfaces.
+- Storage exposes reusable configuration values and pure engine validation;
+  buffer components own fixed pool identities.
+- The CLI now requires a top-level root from the command line or environment
+  and accepts direct `-p` plan execution.
+- Result TOML/Markdown and the plan marker are new unversioned benchmark data
+  formats. Legacy artifacts and markers remain supported during migration.
+- No catalog, row, index, redo, checkpoint, recovery, or other persisted
+  storage format changed. No unsafe code was added.
+- RFC 0028 and `docs/benchmark-tool.md` describe the shipped Phase 1 contract
+  and the revised later-phase prerequisites.
 
 ## Test Cases
 
-1. Strict parser round trips the authoritative raw/validated `trx-noop` plan
-   and rejects unknown root, engine, phase, and workload fields.
-2. Phase decoding defaults omitted `kind` to prepare, defaults benchmark
-   repetition to zero warm-ups/one measured run, and rejects measurement
-   fields on prepare phases.
-3. Validation rejects empty plans, missing/repeated/non-final benchmark phases,
-   zero workload/repetition values, invalid worker/session relationships, and
-   checked-arithmetic overflow before the root exists.
-4. Replay validation accepts `trx-noop` warm-up and repeated measured runs and
-   has a deterministic rejection seam for future state-consuming workloads.
-5. Engine-default includes resolve relative to the plan directory, accept only
-   `[engine]`, reject unknown or recursive-include content, and report I/O/TOML
-   errors before root creation.
-6. Every engine overlay leaf independently proves precedence of storage
-   default, included default, and local override; nested partial overlays do not
-   erase sibling values.
-7. Public storage configuration values expose every benchmark-configurable
-   input, reflect validation normalization, and match the configuration
-   consumed by bootstrap; no parallel snapshot types are required.
-8. Invalid transaction, mandatory-runtime, buffer, filesystem, and path values
-   fail through pure validation without creating directories or layout markers.
-9. Fixture validation and runtime dispatch call the explicit requirement/effect
-   extension points in phase order; `trx-noop` leaves both states unchanged.
-10. Executor tests prove strict prepare/run ordering, complete task draining,
-    workload-session closure, phase fences, engine shutdown, first-error
-    retention, and no later execution after prepare, warm-up, or measured
-    failure.
-11. Deterministic clock tests cover raw timestamp scaling, equal timestamps as
-    zero samples, reversed timestamps as failures, and wall-time exclusion of
-    stats and framework setup.
-12. Histogram tests cover exact checked count/sum, one-hour range rejection,
-    session merge, run merge, average calculation, direct merged p95/p99, and
-    rejection of incompatible/overflowing distributions.
-13. Aggregate tests sum operations and wall durations, calculate throughput
-    from those sums, merge samples rather than percentiles, and preserve every
-    per-run result separately.
-14. `trx-noop` tests place the sample boundary before transaction begin and
-    after successful commit, produce one sample and operation per transaction,
-    and exclude session open/close from unit latency while retaining them in
-    wall time.
-15. Warm-up runs execute and can fail but never contribute counters, internal
-    diagnostics, samples, wall time, or aggregate values.
-16. Internal-stat tests preserve all existing metric names/order and verify
-    counter-delta, byte, nanosecond, frame, endpoint-gauge, and lifetime-peak
-    classifications; no diagnostic is added to the benchmark aggregate.
-17. A no-effect commit may report positive logical operations with zero public
-    transaction commit/transaction-stat deltas without failing invariants.
-18. Successful binary smoke execution of a temporary `trx-noop` plan creates
-    one new root, one engine lifetime, a valid plan marker, canonical TOML, and
-    matching Markdown with resolved configuration, per-run results, and a
-    merged aggregate.
-19. Failed bootstrap, prepare, warm-up, and measured-run smoke cases write a
-    failed report when possible, preserve earlier completed diagnostics, omit
-    incomplete latency/aggregate output, shut down the engine, and leave a
-    cleanup-safe root.
-20. TOML output serializes exact `u128` values as decimal strings, round trips
-    through the result model, and Markdown renders the same status,
-    configuration, counters, latency, and internal metrics.
-21. Artifact staging never installs only one member of the TOML/Markdown pair;
-    write failures retain the original execution error context.
-22. Cleanup accepts valid legacy and plan markers, rejects missing/malformed
-    markers without deleting the root, and removes only the explicitly selected
-    guarded root.
-23. Existing legacy prepare/run/output tests remain green, and legacy
-    `trx-noop` resolves through its narrow adapter without requiring a plan.
-24. Index and memory pool components assign their fixed `PoolRole` values while
-    evictable buffer configuration remains role-free.
-25. `rtk cargo nextest run -p doradb-bench`, `rtk cargo nextest run --workspace`,
-    and `rtk cargo nextest run -p doradb-storage --no-default-features --features libaio`
-    pass; `rtk cargo run -p doradb-bench -- --help` displays the plan surface
-    and transitional lifecycle commands.
+- Strict parsing rejects unknown root, engine, phase, defaults, and workload
+  fields; phase defaults and final-benchmark constraints are covered.
+- Plan-relative engine defaults, nested overlay merge, strict included-file
+  shape, shared index/data buffer shape, and normalized storage values are
+  covered.
+- Storage tests verify pure engine validation, typed internal diagnostics,
+  buffer sizing/path checks, fixed component pool roles, and bootstrap reuse of
+  the same validation path.
+- Measurement tests cover reversed raw timestamps, histogram range rejection,
+  merged percentiles, exact sums, and aggregate throughput from total wall
+  duration.
+- Output tests round-trip successful and failed complete reports, preserve
+  structured failures, and cover minimum and adaptive Markdown fences.
+- Binary tests cover required execution mode, environment root resolution and
+  explicit override, successful `trx-noop` plan execution, plan markers,
+  canonical artifacts, legacy lifecycle regression, and guarded cleanup.
+- Workspace and alternate-`libaio` nextest suites, formatting, clippy, style
+  structure, CLI help, and release smoke plans completed successfully.
 
 ## Open Questions
 
-None.
+None. Remaining workload migration, fixture state, repository templates, and
+checkpoint work is assigned to RFC 0028 phases 2 through 4.

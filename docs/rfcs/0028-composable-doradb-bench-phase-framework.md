@@ -615,9 +615,8 @@ requires separate justification and review outside this RFC.
     entity, merge, fixture, phase-role, and measurement contracts in this RFC.
   - Task Doc: `docs/tasks/000266-doradb-bench-plan-measurement-foundation.md`
   - Task Issue: `#969`
-  - Phase Status: `in-progress`
-  - Implementation Summary: Task 000266 implements the foundation and moves
-    `trx-noop` forward from Phase 2 as its real end-to-end proof workload.
+  - Phase Status: done
+  - Implementation Summary: Task 000266 shipped RFC 0028 Phase 1 with `trx-noop` as its proof workload. [Task Resolve Sync: docs/tasks/000266-doradb-bench-plan-measurement-foundation.md @ 2026-08-11]
 
 - **Phase 2: Migrate simple workloads and basic fixture state**
   - Prerequisites: Phase 1 plan, engine, fixture-extension, `trx-noop` dispatch,
