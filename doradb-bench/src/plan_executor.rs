@@ -144,7 +144,19 @@ async fn execute_phases(
                     }
                 }
 
-                let mut aggregate = BenchmarkAccumulator::new()?;
+                let mut aggregate = match BenchmarkAccumulator::new() {
+                    Ok(aggregate) => aggregate,
+                    Err(err) => {
+                        return fail_report(
+                            report,
+                            err,
+                            FailureBoundary::Measured,
+                            phase_index,
+                            PhaseKind::Benchmark,
+                            None,
+                        );
+                    }
+                };
                 for run_index in 1..=measurement.measured_runs.get() {
                     let outcome = match run_once(engine, clock, workload, true).await {
                         Ok(outcome) => outcome,
@@ -175,8 +187,31 @@ async fn execute_phases(
                             Some(run_index),
                         );
                     }
-                    let latency = outcome.latency.summary(LatencyUnit::TransactionLifecycle)?;
-                    aggregate.add_run(outcome.elapsed_nanos, outcome.counters, &outcome.latency)?;
+                    let latency = match outcome.latency.summary(LatencyUnit::TransactionLifecycle) {
+                        Ok(latency) => latency,
+                        Err(err) => {
+                            return fail_report(
+                                report,
+                                err,
+                                FailureBoundary::Measured,
+                                phase_index,
+                                PhaseKind::Benchmark,
+                                Some(run_index),
+                            );
+                        }
+                    };
+                    if let Err(err) =
+                        aggregate.add_run(outcome.elapsed_nanos, outcome.counters, &outcome.latency)
+                    {
+                        return fail_report(
+                            report,
+                            err,
+                            FailureBoundary::Measured,
+                            phase_index,
+                            PhaseKind::Benchmark,
+                            Some(run_index),
+                        );
+                    }
                     report.measured_runs.push(MeasuredRunResult {
                         run_index,
                         elapsed_nanos: outcome.elapsed_nanos,
@@ -189,7 +224,20 @@ async fn execute_phases(
                         internal_metrics: outcome.internal_metrics,
                     });
                 }
-                report.aggregate = Some(aggregate.finish(LatencyUnit::TransactionLifecycle)?);
+                let aggregate = match aggregate.finish(LatencyUnit::TransactionLifecycle) {
+                    Ok(aggregate) => aggregate,
+                    Err(err) => {
+                        return fail_report(
+                            report,
+                            err,
+                            FailureBoundary::Measured,
+                            phase_index,
+                            PhaseKind::Benchmark,
+                            None,
+                        );
+                    }
+                };
+                report.aggregate = Some(aggregate);
                 fixture.apply(FixtureEffect::None);
             }
         }

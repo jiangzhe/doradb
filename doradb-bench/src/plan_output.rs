@@ -189,12 +189,18 @@ fn render_markdown(report: &InvocationReport, canonical_toml: &str) -> String {
         ));
     }
     output.push_str("\n## Canonical Result\n\n");
-    output.push_str("```toml\n");
+    let fence_len = longest_backtick_run(canonical_toml)
+        .saturating_add(1)
+        .max(3);
+    let fence = "`".repeat(fence_len);
+    output.push_str(&fence);
+    output.push_str("toml\n");
     output.push_str(canonical_toml);
     if !canonical_toml.ends_with('\n') {
         output.push('\n');
     }
-    output.push_str("```\n");
+    output.push_str(&fence);
+    output.push('\n');
     output
 }
 
@@ -207,6 +213,20 @@ fn status_name(status: InvocationStatus) -> &'static str {
 
 fn markdown_inline(value: &str) -> String {
     value.replace('`', "'").replace('\n', " ")
+}
+
+fn longest_backtick_run(value: &str) -> usize {
+    let mut longest = 0;
+    let mut current = 0;
+    for byte in value.bytes() {
+        if byte == b'`' {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    longest
 }
 
 fn staged_path(path: &Path) -> PathBuf {
@@ -279,5 +299,39 @@ mod tests {
         assert_eq!(decoded, report);
         let markdown = fs::read_to_string(result_markdown_path(temp.path())).unwrap();
         assert!(markdown.contains(&encoded));
+    }
+
+    #[test]
+    fn failed_output_pair_round_trips_one_entity() {
+        let temp = TempDir::new().unwrap();
+        let mut report = report(temp.path());
+        let failure = InvocationFailure {
+            boundary: FailureBoundary::Measured,
+            phase_index: Some(1),
+            phase_kind: Some(PhaseKind::Benchmark),
+            run_index: Some(1),
+            message: "synthetic measurement failure".to_owned(),
+        };
+        report.fail(failure.clone());
+
+        write_plan_outputs(&report).unwrap();
+        let encoded = fs::read_to_string(result_toml_path(temp.path())).unwrap();
+        let decoded: InvocationReport = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded.failure.as_ref(), Some(&failure));
+        assert_eq!(decoded, report);
+    }
+
+    #[test]
+    fn canonical_toml_uses_adaptive_backtick_fence() {
+        let temp = TempDir::new().unwrap();
+        let report = report(temp.path());
+
+        let standard = render_markdown(&report, "plain = true\n");
+        assert!(standard.ends_with("```toml\nplain = true\n```\n"));
+
+        let canonical_toml = "message = \"before ```` after\"";
+        let adaptive = render_markdown(&report, canonical_toml);
+        let expected = format!("`````toml\n{canonical_toml}\n`````\n");
+        assert!(adaptive.ends_with(&expected));
     }
 }
