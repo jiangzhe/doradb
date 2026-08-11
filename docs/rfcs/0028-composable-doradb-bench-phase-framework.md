@@ -732,7 +732,7 @@ requires separate justification and review outside this RFC.
 
 ## Open Questions
 
-None for the current three-phase scope.
+None for the current four-phase scope.
 
 ## Future Work
 
