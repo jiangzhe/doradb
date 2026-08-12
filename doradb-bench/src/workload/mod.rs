@@ -18,6 +18,8 @@ mod util;
 pub(super) use ddl::{IndexDdlRunner, TableDdlRunner, benchmark_index_specs, benchmark_table_spec};
 pub(super) use insert::{InsertRandRunner, InsertSeqRunner};
 pub(super) use lock::LockTableRunner;
+pub use noop::TrxNoopConfig;
+pub(crate) use noop::run_trx_noop_operations;
 pub(super) use noop::{StmtNoopRunner, TrxNoopRunner};
 pub(super) use read::{
     IndexScanRunner, IndexStreamRunner, LookupRandRunner, LookupSeqRunner, TableScanRunner,

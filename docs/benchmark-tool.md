@@ -3,7 +3,9 @@
 `doradb-bench` is the standalone benchmark binary for DoraDB storage. It is a
 DoraDB-native harness: it uses the public storage facade, creates ordinary
 tables and sessions, and reports repeatable workload measurements without
-depending on storage internals.
+depending on storage internals. New composition work uses direct TOML plan
+execution; the `prepare`, nested `run`, and `cleanup` lifecycle commands remain
+available during the staged migration.
 
 The tool supports explicit data loading with `run insert-seq` or
 `run insert-rand`, read workloads over rows already loaded by earlier insert
@@ -27,12 +29,124 @@ Deferred benchmark coverage is tracked in:
 - `docs/backlogs/000072-add-batch-io-backend-efficiency-benchmark-baseline.md`
   for backend-comparison benchmarking beyond this crate.
 
-## Lifecycle
+## Plan Mode
+
+Execute one strict plan against a new root with:
+
+```bash
+rtk cargo run -p doradb-bench -- -r target/doradb-bench/trx-noop -p path/to/plan.toml
+```
+
+`-p` is the short form of `--plan`.
+
+The root is invocation-owned and never appears in plan input. It must not
+exist. Plan parsing, engine-default loading and merging, fixture validation,
+replay validation, and side-effect-free storage configuration validation all
+finish before the root is created. Plan mode then installs a guarded
+`benchmark-manifest.toml`, bootstraps one engine, and executes every phase in
+declaration order. Every worker is joined and every public session is closed
+before the next run or phase begins.
+
+The schema is unversioned and strict at every struct boundary. Unknown root,
+engine, phase, defaults, or workload fields are errors. Exactly one phase must
+set `kind = "benchmark"`, and it must be last. Omitted `kind` means `prepare`.
+Prepare phases execute once and reject `warmup_runs` and `measured_runs`.
+Benchmark phases default to zero warm-ups and one measured run. Warm-ups must
+succeed but their counters, samples, wall durations, and diagnostics are
+discarded. Repetition is accepted only for replay-safe workloads; Phase 1's
+`trx-noop` is replay-safe.
+
+This is a complete Phase 1 plan:
+
+```toml
+name = "transaction-lifecycle"
+engine_defaults = "engine-defaults.toml"
+
+[engine.transaction]
+log_sync = "none"
+
+[workload_defaults]
+threads = 4
+sessions = 16
+include_stats = false
+
+[[phase]]
+workload = { type = "trx-noop", num = 1000 }
+
+[[phase]]
+kind = "benchmark"
+warmup_runs = 1
+measured_runs = 5
+workload = { type = "trx-noop", num = 100000 }
+```
+
+`engine_defaults` is resolved relative to the plan's directory. Its document
+may contain only one strict `[engine]` tree and cannot include another file.
+Engine settings merge by leaf with this precedence:
+
+```text
+doradb-storage EngineConfig defaults < included [engine] < plan-local [engine]
+```
+
+The engine overlay mirrors all public effective builder inputs except the
+invocation root and storage-internal eviction-arbiter policy. Its nested tables
+are `mandatory_runtime`, `transaction`, `index_buffer`, `data_buffer`, and
+`file`; metadata-buffer bytes remain a direct `[engine]` leaf. Byte fields use
+integer byte counts. Paths inside `[engine]` retain their storage-root-relative
+meaning.
+Results record the complete benchmark-configurable, storage-normalized
+configuration, including aligned redo sizes. Eviction-arbiter policy remains a
+storage implementation detail and is not part of plan input or result output.
+
+The accepted engine leaves are:
+
+- `[engine]`: `meta_buffer_bytes`.
+- `[engine.mandatory_runtime]`: `worker_threads` and `concurrency_limit`.
+- `[engine.transaction]`: `log_write_io_depth`, `recovery_io_depth`,
+  `catalog_checkpoint_scan_io_depth`, `log_block_size_bytes`, `log_dir`,
+  `log_file_stem`, `log_file_max_size_bytes`, `log_sync`, `purge_threads`,
+  `gc_buckets`, and `recovery_disable_dml_validation`.
+- `[engine.index_buffer]` and `[engine.data_buffer]`: `swap_file`,
+  `max_file_size_bytes`, and `max_mem_size_bytes`.
+- `[engine.file]`: `io_depth`, `data_dir`, `readonly_buffer_size_bytes`, and
+  `catalog_file_name`.
+
+`[workload_defaults]` accepts `threads`, `sessions`, `value_size`,
+`batch_size`, and `include_stats`. Defaults are one thread, sessions equal to
+the resolved thread count, 128-byte values, batch size one, and diagnostics
+disabled. Phase 1's `trx-noop` workload requires positive `num` and accepts
+only `threads`, `sessions`, and `include_stats` overrides. Threads must not
+exceed sessions.
+
+`trx-noop` samples the `transaction-lifecycle` unit. Each sample starts
+immediately before public transaction begin and ends immediately after a
+successful commit. One calibrated quanta clock supplies raw hot-path
+timestamps and scaled wall boundaries. Each session owns a fixed-range HDR
+histogram; session and repeated-run aggregation merges distributions and exact
+duration sums. Aggregate throughput is total operations divided by total wall
+duration, while p95 and p99 come from the merged histogram.
+
+Plan mode writes `benchmark-result.toml` as the canonical machine-readable
+result and `benchmark-result.md` as a rendering of that same entity. Both are
+written for success and, when the guarded root exists, execution/bootstrap
+failure. A failed report retains completed earlier runs, identifies the
+phase/run boundary, and omits an incomplete run and aggregate. Exact `u128`
+wall, latency-sum, and diagnostic values are decimal strings in TOML.
+
+Optional internal metrics are diagnostics, not benchmark scores. Counter
+deltas use `counter-delta`; endpoint capacities, allocations, active tasks,
+and current lock counts use `end-gauge`; lifetime lock peaks use
+`lifetime-peak`. Units are explicit (`count`, `bytes`, `nanoseconds`, or
+`frames`). Diagnostics remain attached to individual measured runs and are not
+folded into the benchmark aggregate.
+
+## Transitional Lifecycle Commands
 
 The tool has three lifecycle commands.
 
-`--root` or `-r` is a global option shared by all lifecycle commands. It can be
-placed before the lifecycle command, or supplied through `DORADB_BENCH_ROOT`.
+`--root` or `-r` is a required top-level option and must precede a lifecycle
+command. It may instead be supplied through `DORADB_BENCH_ROOT`; an explicit
+CLI value overrides the environment variable.
 
 `prepare` requires the benchmark storage root to be a non-existing path. It
 creates that root, creates the configured benchmark table pool, and writes
@@ -71,9 +185,10 @@ range or if the prepared index mode is incompatible. `stmt-noop`, `trx-noop`,
 `table-ddl`, and `lock-table` do not require loaded rows.
 `index-ddl` permits either an empty or loaded table.
 
-`cleanup` requires `benchmark-manifest.toml` to exist under the storage root,
-then removes the entire benchmark storage root. There is no force mode; manifest
-presence is the cleanup safety marker.
+`cleanup` requires `benchmark-manifest.toml` to contain either a valid legacy
+manifest or an explicit plan marker, then removes the entire selected benchmark
+storage root. There is no force mode; a valid marker is the cleanup safety
+guard.
 
 ## Workloads
 
@@ -223,7 +338,8 @@ sizing control; only basic randomized paired mode accepts `--seed`.
 
 | Flag | Commands | Default | Usage |
 | --- | --- | --- | --- |
-| `--root`, `-r` | Global | `DORADB_BENCH_ROOT` when set | Selects the DoraDB storage root. An explicit CLI value overrides the environment variable. For `prepare`, the path must not exist. `benchmark-manifest.toml` is always stored directly under this root, and `cleanup` requires it before deleting the root. |
+| `--root`, `-r` | All invocations | Required unless `DORADB_BENCH_ROOT` is set | Selects the DoraDB storage root. It is a top-level option and must precede lifecycle commands. An explicit CLI value overrides the environment variable. For `prepare`, the path must not exist. `benchmark-manifest.toml` is always stored directly under this root, and `cleanup` requires it before deleting the root. |
+| `--plan`, `-p` | Plan mode | None | Executes the strict TOML plan at the provided path. It conflicts with lifecycle commands. |
 | `--index`, `-i` | `prepare` | `none` | Selects the persisted benchmark table index shape. `none` creates no secondary index. `unique` creates one unique secondary index on `logical_key`. `non-unique` creates one non-unique secondary index on `logical_key`. `index-ddl` requires `none` and restores that logical shape after each cycle. |
 | `--tables` | `prepare` | `1` | Positive number of ordinary benchmark tables. The first is the primary data-workload table; later tables are auxiliary lock targets. |
 | `--log-sync` | `prepare` | `fsync` | Persisted redo-log durability mode used by every later run. `fsync` and `fdatasync` submit the matching native file-sync operation; `none` skips durable sync and is crash-unsafe. |

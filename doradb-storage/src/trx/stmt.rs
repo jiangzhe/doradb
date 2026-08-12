@@ -1072,7 +1072,6 @@ fn assert_catalog_mutation_invariant<T>(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::buffer::PoolRole;
     use crate::catalog::storage::tables::TABLE_ID_TABLES;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
@@ -1185,7 +1184,6 @@ pub(crate) mod tests {
                 .storage_root(temp_dir.path().to_path_buf())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )

@@ -46,7 +46,7 @@ use zerocopy::FromZeros;
 /// Minimum number of frames required for global readonly pool.
 ///
 /// Very small pools provide little practical value and can stall eviction/load flow.
-const MIN_READONLY_POOL_PAGES: usize = 256;
+pub(super) const MIN_READONLY_POOL_PAGES: usize = 256;
 
 enum InflightBlockState {
     Loading(Arc<PageIOCompletion>),
@@ -139,7 +139,7 @@ impl ReadonlyBufferPool {
         role.assert_valid("global readonly buffer pool");
         let frame_plus_page = mem::size_of::<BufferFrame>() + mem::size_of::<Page>();
         let size = pool_size / frame_plus_page;
-        if size < MIN_READONLY_POOL_PAGES {
+        if pool_size < super::minimum_readonly_pool_bytes() {
             return Err(Report::new(ResourceError::BufferPoolSizeTooSmall)
                 .attach(format!(
                     "global readonly buffer pool sizing: role={role:?}, pool_size={pool_size}, frame_plus_page={frame_plus_page}, pages={size}, min_pages={MIN_READONLY_POOL_PAGES}"
@@ -3308,11 +3308,14 @@ pub(crate) mod tests {
                 EngineConfig::default()
                     .storage_root(root.path())
                     .meta_buffer(TEST_POOL_BYTES)
-                    .index_buffer(TEST_POOL_BYTES)
-                    .index_max_file_size(128usize * 1024 * 1024)
+                    .index_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .swap_file("index.swp")
+                            .max_mem_size(TEST_POOL_BYTES)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
                     .data_buffer(
                         EvictableBufferPoolConfig::default()
-                            .role(PoolRole::Mem)
                             .max_mem_size(TEST_POOL_BYTES)
                             .max_file_size(128usize * 1024 * 1024),
                     )

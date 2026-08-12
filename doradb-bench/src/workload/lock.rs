@@ -691,7 +691,7 @@ mod tests {
         .unwrap();
         let Command::Run {
             workload: WorkloadArgs::LockTable(args),
-        } = cli.command
+        } = cli.command.unwrap()
         else {
             panic!("expected lock-table workload");
         };

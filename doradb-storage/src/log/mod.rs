@@ -2437,7 +2437,7 @@ fn format_redo_sequence_range(first: u32, last: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::{PoolRole, test_page_id};
+    use crate::buffer::test_page_id;
     use crate::catalog::tests::table2;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
@@ -3014,7 +3014,6 @@ mod tests {
                 )
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
                         .max_mem_size(64u64 * 1024 * 1024)
                         .max_file_size(128u64 * 1024 * 1024),
                 ),
@@ -5218,7 +5217,6 @@ mod tests {
                     )
                     .data_buffer(
                         EvictableBufferPoolConfig::default()
-                            .role(PoolRole::Mem)
                             .max_mem_size(64u64 * 1024 * 1024)
                             .max_file_size(128u64 * 1024 * 1024),
                     ),

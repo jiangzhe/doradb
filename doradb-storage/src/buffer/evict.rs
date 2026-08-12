@@ -48,7 +48,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use zerocopy::FromZeros;
 // min buffer pool size is 64KB * 128 = 8MB.
-const MIN_IN_MEM_PAGES: usize = 128;
+pub(super) const MIN_IN_MEM_PAGES: usize = 128;
 
 /// EvictableBufferPool is a buffer pool which can evict
 /// pages to disk.
@@ -78,20 +78,18 @@ pub(crate) struct EvictableBufferPool {
 impl EvictableBufferPool {
     /// Create one evictable pool together with its storage-worker provision.
     pub(crate) fn create(
+        role: PoolRole,
         config: EvictableBufferPoolConfig,
         fs: QuiescentGuard<FileSystem>,
     ) -> RuntimeResult<(Self, SparseFile)> {
-        config.role.assert_valid("evictable buffer pool");
-        let buffer_pool_role = match config.role {
-            PoolRole::Meta => "meta",
+        let buffer_pool_role = match role {
             PoolRole::Index => "index",
             PoolRole::Mem => "mem",
-            PoolRole::Disk => "disk",
-            PoolRole::Invalid => unreachable!("pool role was validated above"),
+            other => panic!("unsupported evictable pool role {other:?}"),
         };
         let build_diagnostic =
             format!("buffer_pool_type=evictable, buffer_pool_role={buffer_pool_role}");
-        validate_swap_file_path_candidate(&config.data_swap_file)
+        validate_swap_file_path_candidate(&config.swap_file)
             .change_context(RuntimeError::BufferPoolInit)
             .attach_with(|| build_diagnostic.clone())?;
         // 1. Calculate memory usage.
@@ -100,24 +98,16 @@ impl EvictableBufferPool {
         let max_nbr = max_file_size / mem::size_of::<Page>();
         // We need to hold all frames in-memory, even if many pages
         // can not be loaded into memory at the same time.
-        let frame_total_bytes = frame_total_bytes(max_nbr);
-        assert!(
-            max_mem_size <= max_file_size,
-            "max mem size of buffer pool should be no more than max file size"
-        );
-        assert!(
-            max_mem_size > frame_total_bytes,
-            "max mem size of buffer pool can not hold all buffer frames"
-        );
-        let max_nbr_in_mem = (max_mem_size - frame_total_bytes) / mem::size_of::<Page>();
-        if max_nbr_in_mem < MIN_IN_MEM_PAGES {
+        let Some(max_nbr_in_mem) = super::evictable_resident_pages(max_file_size, max_mem_size)
+        else {
+            let frame_total_bytes = frame_total_bytes(max_nbr);
             return Err(Report::new(ResourceError::BufferPoolSizeTooSmall)
             .attach(format!(
-                "evictable buffer pool sizing: max_mem_size={max_mem_size}, max_file_size={max_file_size}, frame_total_bytes={frame_total_bytes}, in_mem_pages={max_nbr_in_mem}, min_in_mem_pages={MIN_IN_MEM_PAGES}"
+                "evictable buffer pool sizing: max_mem_size={max_mem_size}, max_file_size={max_file_size}, frame_total_bytes={frame_total_bytes}, min_in_mem_pages={MIN_IN_MEM_PAGES}"
             ))
             .change_context(RuntimeError::BufferPoolInit)
             .attach(build_diagnostic));
-        }
+        };
         let eviction_arbiter = config.eviction_arbiter_builder.build(max_nbr_in_mem);
 
         // 2. Initialize memory of frames and pages.
@@ -126,13 +116,13 @@ impl EvictableBufferPool {
             .attach_with(|| build_diagnostic.clone())?;
 
         // 3. Create the swap file and retain the opened descriptor for worker-owned IO.
-        let swap_file_path = path_to_utf8(&config.data_swap_file)
+        let swap_file_path = path_to_utf8(&config.swap_file)
             .change_context(RuntimeError::BufferPoolInit)
             .attach_with(|| build_diagnostic.clone())?;
         let file = SparseFile::create_or_trunc(
             swap_file_path,
             max_file_size,
-            match config.role {
+            match role {
                 PoolRole::Mem => MEM_POOL_SWAP_FILE_ID,
                 PoolRole::Index => INDEX_POOL_SWAP_FILE_ID,
                 other => panic!("unsupported pool role {other:?} in swap-file persisted id"),
@@ -148,7 +138,7 @@ impl EvictableBufferPool {
             in_mem: Arc::new(InMemPageSet::new(max_nbr_in_mem, eviction_arbiter)),
             inflight_io: Arc::new(InflightIO::default()),
             stats: BufferPoolStatsHandle::default(),
-            role: config.role,
+            role,
             arena,
         };
         Ok((pool, file))
@@ -1872,7 +1862,7 @@ pub(crate) mod tests {
     use crate::buffer::EvictionArbiterBuilder;
     use crate::buffer::guard::PageGuard;
     use crate::buffer::test_page_id;
-    use crate::component::{IndexPoolConfig, RegistryBuilder};
+    use crate::component::RegistryBuilder;
     use crate::conf::{EngineConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{ConfigError, DataIntegrityError, DiscloseResultExt, Result};
@@ -2054,8 +2044,7 @@ pub(crate) mod tests {
     ) {
         let (fs_owner, pool, storage) = build_raw_pool_for_test(
             EvictableBufferPoolConfig::default()
-                .role(PoolRole::Mem)
-                .data_swap_file(data_swap_file)
+                .swap_file(data_swap_file)
                 .max_mem_size(64u64 * 1024 * 1024)
                 .max_file_size(128u64 * 1024 * 1024),
         )
@@ -2126,7 +2115,7 @@ pub(crate) mod tests {
     fn build_raw_pool_for_test(
         config: EvictableBufferPoolConfig,
     ) -> Result<(QuiescentBox<FileSystem>, EvictableBufferPool, SparseFile)> {
-        let swap_file = config.data_swap_file_ref();
+        let swap_file = config.swap_file_ref();
         let storage_root = if swap_file.is_absolute() {
             swap_file
                 .parent()
@@ -2137,7 +2126,7 @@ pub(crate) mod tests {
         };
         let fs_owner = build_test_fs_owner_in(&storage_root)?;
         let fs = fs_owner.guard();
-        let (pool, storage) = EvictableBufferPool::create(config, fs).disclose()?;
+        let (pool, storage) = EvictableBufferPool::create(PoolRole::Mem, config, fs).disclose()?;
         Ok((fs_owner, pool, storage))
     }
 
@@ -2147,7 +2136,7 @@ pub(crate) mod tests {
 
     impl StartedEvictPool {
         fn new(config: EvictableBufferPoolConfig) -> Self {
-            let swap_file = config.data_swap_file_ref();
+            let swap_file = config.swap_file_ref();
             let (storage_root, data_swap_file) = if swap_file.is_absolute() {
                 (
                     swap_file
@@ -2163,14 +2152,18 @@ pub(crate) mod tests {
             } else {
                 (current_dir().unwrap(), swap_file.to_path_buf())
             };
-            let config = config.data_swap_file(data_swap_file);
+            let config = config.swap_file(data_swap_file);
             let engine = smol::block_on(async {
                 Engine::bootstrap(
                     EngineConfig::default()
                         .storage_root(storage_root)
                         .meta_buffer(TEST_META_POOL_BYTES)
-                        .index_buffer(TEST_INDEX_POOL_BYTES)
-                        .index_max_file_size(TEST_INDEX_MAX_FILE_BYTES)
+                        .index_buffer(
+                            EvictableBufferPoolConfig::default()
+                                .swap_file("index.swp")
+                                .max_mem_size(TEST_INDEX_POOL_BYTES)
+                                .max_file_size(TEST_INDEX_MAX_FILE_BYTES),
+                        )
                         .data_buffer(config)
                         .file(
                             FileSystemConfig::default()
@@ -2213,8 +2206,7 @@ pub(crate) mod tests {
         let temp_dir = TempDir::new().unwrap();
         let (_fs_owner, pool, _storage) = build_raw_pool_for_test(
             EvictableBufferPoolConfig::default()
-                .role(PoolRole::Mem)
-                .data_swap_file(temp_dir.path().join("data.swp"))
+                .swap_file(temp_dir.path().join("data.swp"))
                 .max_mem_size(64u64 * 1024 * 1024)
                 .max_file_size(128u64 * 1024 * 1024),
         )
@@ -2230,8 +2222,7 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let (_fs_owner, pool, _storage) = build_raw_pool_for_test(
                 EvictableBufferPoolConfig::default()
-                    .role(PoolRole::Mem)
-                    .data_swap_file(temp_dir.path().join("data.swp"))
+                    .swap_file(temp_dir.path().join("data.swp"))
                     .max_mem_size(64u64 * 1024 * 1024)
                     .max_file_size(128u64 * 1024 * 1024),
             )
@@ -2256,8 +2247,7 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let (_fs_owner, pool, _storage) = build_raw_pool_for_test(
                 EvictableBufferPoolConfig::default()
-                    .role(PoolRole::Mem)
-                    .data_swap_file(temp_dir.path().join("data.swp"))
+                    .swap_file(temp_dir.path().join("data.swp"))
                     .max_mem_size(64u64 * 1024 * 1024)
                     .max_file_size(128u64 * 1024 * 1024),
             )
@@ -2287,8 +2277,7 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let (_fs_owner, pool, _storage) = build_raw_pool_for_test(
                 EvictableBufferPoolConfig::default()
-                    .role(PoolRole::Mem)
-                    .data_swap_file(temp_dir.path().join("data.swp"))
+                    .swap_file(temp_dir.path().join("data.swp"))
                     .max_mem_size(64u64 * 1024 * 1024)
                     .max_file_size(128u64 * 1024 * 1024),
             )
@@ -2416,8 +2405,7 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let pool = StartedEvictPool::new(
                 EvictableBufferPoolConfig::default()
-                    .role(PoolRole::Mem)
-                    .data_swap_file(temp_dir.path().join("data.swp"))
+                    .swap_file(temp_dir.path().join("data.swp"))
                     .max_mem_size(1024u64 * 1024 * 128)
                     .max_file_size(1024u64 * 1024 * 256),
             );
@@ -2560,8 +2548,7 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let pool = StartedEvictPool::new(
                 EvictableBufferPoolConfig::default()
-                    .role(PoolRole::Mem)
-                    .data_swap_file(temp_dir.path().join("data.swp"))
+                    .swap_file(temp_dir.path().join("data.swp"))
                     .max_mem_size(1024u64 * 1024 * 128)
                     .max_file_size(1024u64 * 1024 * 256),
             );
@@ -2590,8 +2577,7 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let pool = StartedEvictPool::new(
                 EvictableBufferPoolConfig::default()
-                    .role(PoolRole::Mem)
-                    .data_swap_file(temp_dir.path().join("data.swp"))
+                    .swap_file(temp_dir.path().join("data.swp"))
                     .max_mem_size(1024u64 * 1024 * 128)
                     .max_file_size(1024u64 * 1024 * 256),
             );
@@ -2666,8 +2652,7 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let (_fs_owner, pool, _storage) = build_raw_pool_for_test(
                 EvictableBufferPoolConfig::default()
-                    .role(PoolRole::Mem)
-                    .data_swap_file(temp_dir.path().join("data.swp"))
+                    .swap_file(temp_dir.path().join("data.swp"))
                     .max_mem_size(64u64 * 1024 * 1024)
                     .max_file_size(128u64 * 1024 * 1024),
             )
@@ -2707,8 +2692,7 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let (_fs_owner, pool, storage) = build_raw_pool_for_test(
                 EvictableBufferPoolConfig::default()
-                    .role(PoolRole::Mem)
-                    .data_swap_file(temp_dir.path().join("data.swp"))
+                    .swap_file(temp_dir.path().join("data.swp"))
                     .max_mem_size(64u64 * 1024 * 1024)
                     .max_file_size(128u64 * 1024 * 1024),
             )
@@ -2762,8 +2746,7 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let (_fs_owner, pool, _storage) = build_raw_pool_for_test(
                 EvictableBufferPoolConfig::default()
-                    .role(PoolRole::Mem)
-                    .data_swap_file(temp_dir.path().join("data.swp"))
+                    .swap_file(temp_dir.path().join("data.swp"))
                     .max_mem_size(64u64 * 1024 * 1024)
                     .max_file_size(128u64 * 1024 * 1024),
             )
@@ -2821,8 +2804,7 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let (_fs_owner, pool, _storage) = build_raw_pool_for_test(
                 EvictableBufferPoolConfig::default()
-                    .role(PoolRole::Mem)
-                    .data_swap_file(temp_dir.path().join("data.swp"))
+                    .swap_file(temp_dir.path().join("data.swp"))
                     .max_mem_size(64u64 * 1024 * 1024)
                     .max_file_size(128u64 * 1024 * 1024),
             )
@@ -2857,8 +2839,7 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let (_fs_owner, pool, storage) = build_raw_pool_for_test(
                 EvictableBufferPoolConfig::default()
-                    .role(PoolRole::Mem)
-                    .data_swap_file(temp_dir.path().join("data.swp"))
+                    .swap_file(temp_dir.path().join("data.swp"))
                     .max_mem_size(64u64 * 1024 * 1024)
                     .max_file_size(128u64 * 1024 * 1024),
             )
@@ -2939,8 +2920,7 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let (_fs_owner, pool, storage) = build_raw_pool_for_test(
                 EvictableBufferPoolConfig::default()
-                    .role(PoolRole::Mem)
-                    .data_swap_file(temp_dir.path().join("data.swp"))
+                    .swap_file(temp_dir.path().join("data.swp"))
                     .max_mem_size(64u64 * 1024 * 1024)
                     .max_file_size(128u64 * 1024 * 1024),
             )
@@ -2989,8 +2969,7 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let (_fs_owner, pool, storage) = build_raw_pool_for_test(
                 EvictableBufferPoolConfig::default()
-                    .role(PoolRole::Mem)
-                    .data_swap_file(temp_dir.path().join("data.swp"))
+                    .swap_file(temp_dir.path().join("data.swp"))
                     .max_mem_size(64u64 * 1024 * 1024)
                     .max_file_size(128u64 * 1024 * 1024),
             )
@@ -3048,8 +3027,7 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let (_fs_owner, pool, _storage) = build_raw_pool_for_test(
                 EvictableBufferPoolConfig::default()
-                    .role(PoolRole::Mem)
-                    .data_swap_file(temp_dir.path().join("data.swp"))
+                    .swap_file(temp_dir.path().join("data.swp"))
                     .max_mem_size(64u64 * 1024 * 1024)
                     .max_file_size(128u64 * 1024 * 1024),
             )
@@ -3102,8 +3080,7 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let (_fs_owner, pool, storage) = build_raw_pool_for_test(
                 EvictableBufferPoolConfig::default()
-                    .role(PoolRole::Mem)
-                    .data_swap_file(temp_dir.path().join("data.swp"))
+                    .swap_file(temp_dir.path().join("data.swp"))
                     .max_mem_size(64u64 * 1024 * 1024)
                     .max_file_size(128u64 * 1024 * 1024),
             )
@@ -3190,8 +3167,7 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let (_fs_owner, pool, _storage) = build_raw_pool_for_test(
                 EvictableBufferPoolConfig::default()
-                    .role(PoolRole::Mem)
-                    .data_swap_file(temp_dir.path().join("data.swp"))
+                    .swap_file(temp_dir.path().join("data.swp"))
                     .max_mem_size(64u64 * 1024 * 1024)
                     .max_file_size(128u64 * 1024 * 1024),
             )
@@ -3235,8 +3211,7 @@ pub(crate) mod tests {
         let temp_dir = TempDir::new().unwrap();
         let pool = StartedEvictPool::new(
             EvictableBufferPoolConfig::default()
-                .role(PoolRole::Mem)
-                .data_swap_file(temp_dir.path().join("data.swp"))
+                .swap_file(temp_dir.path().join("data.swp"))
                 .max_mem_size(64u64 * 1024 * 130)
                 .max_file_size(128u64 * 1024 * 130),
         );
@@ -3288,8 +3263,7 @@ pub(crate) mod tests {
         let temp_dir = TempDir::new().unwrap();
         let pool = StartedEvictPool::new(
             EvictableBufferPoolConfig::default()
-                .role(PoolRole::Mem)
-                .data_swap_file(temp_dir.path().join("data.swp"))
+                .swap_file(temp_dir.path().join("data.swp"))
                 .max_mem_size(1024u64 * 1024 * 64)
                 .max_file_size(1024u64 * 1024 * 128),
         );
@@ -3319,8 +3293,7 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let pool = StartedEvictPool::new(
                 EvictableBufferPoolConfig::default()
-                    .role(PoolRole::Mem)
-                    .data_swap_file(temp_dir.path().join("data.swp"))
+                    .swap_file(temp_dir.path().join("data.swp"))
                     .max_mem_size(64u64 * 1024 * 130)
                     .max_file_size(128u64 * 1024 * 130),
             );
@@ -3359,8 +3332,7 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let (_fs_owner, pool, _storage) = build_raw_pool_for_test(
                 EvictableBufferPoolConfig::default()
-                    .role(PoolRole::Mem)
-                    .data_swap_file(temp_dir.path().join("data.swp"))
+                    .swap_file(temp_dir.path().join("data.swp"))
                     .max_mem_size(1024u64 * 1024 * 32)
                     .max_file_size(1024u64 * 1024 * 64),
             )
@@ -3397,8 +3369,7 @@ pub(crate) mod tests {
         let temp_dir = TempDir::new().unwrap();
         let pool = StartedEvictPool::new(
             EvictableBufferPoolConfig::default()
-                .role(PoolRole::Mem)
-                .data_swap_file(temp_dir.path().join("data.swp"))
+                .swap_file(temp_dir.path().join("data.swp"))
                 .max_mem_size(64u64 * 1024 * 1024)
                 .max_file_size(64u64 * 1024 * 2048),
         );
@@ -3477,8 +3448,7 @@ pub(crate) mod tests {
         let temp_dir = TempDir::new().unwrap();
         let pool = StartedEvictPool::new(
             EvictableBufferPoolConfig::default()
-                .role(PoolRole::Mem)
-                .data_swap_file(temp_dir.path().join("data.swp"))
+                .swap_file(temp_dir.path().join("data.swp"))
                 .max_mem_size(1024u64 * 1024 * 10)
                 .max_file_size(1024u64 * 1024 * 16)
                 .eviction_arbiter_builder(
@@ -3522,15 +3492,13 @@ pub(crate) mod tests {
             let temp_dir2 = TempDir::new().unwrap();
             let pool1 = StartedEvictPool::new(
                 EvictableBufferPoolConfig::default()
-                    .role(PoolRole::Mem)
-                    .data_swap_file(temp_dir1.path().join("data1.swp"))
+                    .swap_file(temp_dir1.path().join("data1.swp"))
                     .max_mem_size(1024u64 * 1024 * 32)
                     .max_file_size(1024u64 * 1024 * 64),
             );
             let pool2 = StartedEvictPool::new(
                 EvictableBufferPoolConfig::default()
-                    .role(PoolRole::Mem)
-                    .data_swap_file(temp_dir2.path().join("data2.swp"))
+                    .swap_file(temp_dir2.path().join("data2.swp"))
                     .max_mem_size(1024u64 * 1024 * 32)
                     .max_file_size(1024u64 * 1024 * 64),
             );
@@ -3565,7 +3533,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
             let err = builder
-                .build::<MemPool>(EvictableBufferPoolConfig::default().data_swap_file("data.bin"))
+                .build::<MemPool>(EvictableBufferPoolConfig::default().swap_file("data.bin"))
                 .await
                 .unwrap_err();
             assert_eq!(err.current_context(), &RuntimeError::BufferPoolInit);
@@ -3594,11 +3562,12 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
             let err = builder
-                .build::<IndexPool>(IndexPoolConfig::new(
-                    TEST_INDEX_POOL_BYTES,
-                    "index.bin",
-                    TEST_INDEX_MAX_FILE_BYTES,
-                ))
+                .build::<IndexPool>(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(TEST_INDEX_POOL_BYTES)
+                        .max_file_size(TEST_INDEX_MAX_FILE_BYTES)
+                        .swap_file("index.bin"),
+                )
                 .await
                 .unwrap_err();
             assert_eq!(err.current_context(), &RuntimeError::BufferPoolInit);
@@ -3617,11 +3586,10 @@ pub(crate) mod tests {
         let temp_dir = TempDir::new().unwrap();
         let fs_owner = build_test_fs_owner_in(temp_dir.path()).unwrap();
         let config = EvictableBufferPoolConfig::default()
-            .role(PoolRole::Mem)
-            .data_swap_file(temp_dir.path().join("data.swp"))
+            .swap_file(temp_dir.path().join("data.swp"))
             .max_mem_size(1024usize * 1024)
             .max_file_size(2usize * 1024 * 1024);
-        let err = match EvictableBufferPool::create(config, fs_owner.guard()) {
+        let err = match EvictableBufferPool::create(PoolRole::Mem, config, fs_owner.guard()) {
             Ok(_) => panic!("undersized evictable buffer pool should fail"),
             Err(err) => err,
         };
@@ -3640,11 +3608,10 @@ pub(crate) mod tests {
         let fs_owner = build_test_fs_owner_in(temp_dir.path()).unwrap();
         let swap_file = temp_dir.path().join("missing").join("data.swp");
         let config = EvictableBufferPoolConfig::default()
-            .role(PoolRole::Mem)
-            .data_swap_file(swap_file)
+            .swap_file(swap_file)
             .max_mem_size(32usize * 1024 * 1024)
             .max_file_size(64usize * 1024 * 1024);
-        let err = match EvictableBufferPool::create(config, fs_owner.guard()) {
+        let err = match EvictableBufferPool::create(PoolRole::Mem, config, fs_owner.guard()) {
             Ok(_) => panic!("swap file with a missing parent should fail"),
             Err(err) => err,
         };

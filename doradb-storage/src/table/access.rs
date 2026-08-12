@@ -4921,7 +4921,7 @@ mod tests {
     };
     use crate::buffer::BufferPool;
     use crate::buffer::frame::FrameKind;
-    use crate::buffer::{PoolRole, test_frame_kind};
+    use crate::buffer::test_frame_kind;
     use crate::catalog::tests::table4;
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableSpec,
@@ -10480,11 +10480,14 @@ mod tests {
             let engine = Engine::bootstrap(
                 EngineConfig::default()
                     .storage_root(temp_dir.path())
-                    .index_buffer(16u64 * 1024 * 1024)
-                    .index_max_file_size(32u64 * 1024 * 1024)
+                    .index_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .swap_file("index.swp")
+                            .max_mem_size(16u64 * 1024 * 1024)
+                            .max_file_size(32u64 * 1024 * 1024),
+                    )
                     .data_buffer(
                         EvictableBufferPoolConfig::default()
-                            .role(PoolRole::Mem)
                             .max_mem_size(64u64 * 1024 * 1024)
                             .max_file_size(128u64 * 1024 * 1024),
                     )
@@ -10621,7 +10624,7 @@ mod tests {
             let engine = Engine::bootstrap(
                 EngineConfig::default()
                     .storage_root(temp_dir.path())
-                    .data_buffer(EvictableBufferPoolConfig::default().role(PoolRole::Mem))
+                    .data_buffer(EvictableBufferPoolConfig::default())
                     .trx(TrxSysConfig::default().log_file_stem("redo_secidx_lwc_projection")),
             )
             .await
@@ -10684,7 +10687,7 @@ mod tests {
             let engine = Engine::bootstrap(
                 EngineConfig::default()
                     .storage_root(temp_dir.path())
-                    .data_buffer(EvictableBufferPoolConfig::default().role(PoolRole::Mem))
+                    .data_buffer(EvictableBufferPoolConfig::default())
                     .trx(TrxSysConfig::default().log_file_stem("redo_stream_validation_opt_out")),
             )
             .await
@@ -10748,7 +10751,7 @@ mod tests {
             let engine = Engine::bootstrap(
                 EngineConfig::default()
                     .storage_root(main_dir)
-                    .data_buffer(EvictableBufferPoolConfig::default().role(PoolRole::Mem))
+                    .data_buffer(EvictableBufferPoolConfig::default())
                     .trx(TrxSysConfig::default().log_file_stem("redo_secidx1")),
             )
             .await
@@ -11016,7 +11019,7 @@ mod tests {
             let engine = Engine::bootstrap(
                 EngineConfig::default()
                     .storage_root(temp_dir.path())
-                    .data_buffer(EvictableBufferPoolConfig::default().role(PoolRole::Mem))
+                    .data_buffer(EvictableBufferPoolConfig::default())
                     .trx(TrxSysConfig::default().log_file_stem("redo_secidx_uncommitted_delete")),
             )
             .await
@@ -11068,7 +11071,7 @@ mod tests {
             let engine = Engine::bootstrap(
                 EngineConfig::default()
                     .storage_root(temp_dir.path())
-                    .data_buffer(EvictableBufferPoolConfig::default().role(PoolRole::Mem))
+                    .data_buffer(EvictableBufferPoolConfig::default())
                     .trx(TrxSysConfig::default().log_file_stem("redo_secidx_late_delete")),
             )
             .await

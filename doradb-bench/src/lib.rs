@@ -1,6 +1,11 @@
 pub mod cli;
+pub mod engine_config;
 pub mod error;
 pub mod manifest;
+pub mod measurement;
 pub mod output;
+pub mod plan;
+pub mod plan_executor;
+pub mod plan_output;
 pub mod runner;
 pub mod workload;

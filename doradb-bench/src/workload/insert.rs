@@ -305,7 +305,7 @@ mod tests {
         .unwrap();
         let Command::Run {
             workload: WorkloadArgs::InsertRand(args),
-        } = cli.command
+        } = cli.command.unwrap()
         else {
             panic!("expected insert-rand workload");
         };
@@ -341,7 +341,7 @@ mod tests {
         .unwrap();
         let Command::Run {
             workload: WorkloadArgs::InsertSeq(args),
-        } = cli.command
+        } = cli.command.unwrap()
         else {
             panic!("expected insert-seq workload");
         };

@@ -164,6 +164,10 @@ pub(crate) enum ConfigError {
     InvalidMandatoryWorkerThreads,
     #[error("invalid mandatory runtime concurrency limit")]
     InvalidMandatoryConcurrencyLimit,
+    #[error("invalid buffer pool configuration")]
+    InvalidBufferPoolConfig,
+    #[error("invalid fixed buffer pool size")]
+    InvalidFixedBufferPoolSize,
 }
 
 /// Fieldless data-integrity-domain errors carried underneath `ErrorKind::DataIntegrity`.

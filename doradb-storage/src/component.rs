@@ -11,7 +11,6 @@ use std::marker::PhantomData;
 use std::mem::forget;
 use std::ops::Deref;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::path::PathBuf;
 use std::result::Result as StdResult;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::panicking;
@@ -776,29 +775,6 @@ impl MetaPoolConfig {
     #[inline]
     pub(crate) fn new(bytes: usize) -> Self {
         Self { bytes }
-    }
-}
-
-/// Configuration for the evictable index buffer pool.
-#[derive(Clone)]
-pub(crate) struct IndexPoolConfig {
-    /// Number of bytes reserved for index pages.
-    pub(crate) bytes: usize,
-    /// Swap file path backing evicted index pages.
-    pub(crate) swap_file: PathBuf,
-    /// Maximum size of the swap file in bytes.
-    pub(crate) max_file_size: usize,
-}
-
-impl IndexPoolConfig {
-    /// Creates index pool config with byte capacity, swap path, and file limit.
-    #[inline]
-    pub(crate) fn new(bytes: usize, swap_file: impl Into<PathBuf>, max_file_size: usize) -> Self {
-        Self {
-            bytes,
-            swap_file: swap_file.into(),
-            max_file_size,
-        }
     }
 }
 

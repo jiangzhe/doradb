@@ -690,7 +690,7 @@ mod tests {
             Cli::try_parse_from(["doradb-bench", "--root", "root", "run", "lookup-seq"]).unwrap();
         let Command::Run {
             workload: WorkloadArgs::LookupSeq(args),
-        } = cli.command
+        } = cli.command.unwrap()
         else {
             panic!("expected lookup-seq workload");
         };
@@ -703,7 +703,7 @@ mod tests {
             Cli::try_parse_from(["doradb-bench", "--root", "root", "run", "table-scan"]).unwrap();
         let Command::Run {
             workload: WorkloadArgs::TableScan(args),
-        } = cli.command
+        } = cli.command.unwrap()
         else {
             panic!("expected table-scan workload");
         };
@@ -733,7 +733,7 @@ mod tests {
         .unwrap();
         let Command::Run {
             workload: WorkloadArgs::LookupRand(args),
-        } = cli.command
+        } = cli.command.unwrap()
         else {
             panic!("expected lookup-rand workload");
         };
@@ -753,7 +753,7 @@ mod tests {
             Cli::try_parse_from(["doradb-bench", "--root", "root", "run", "index-stream"]).unwrap();
         let Command::Run {
             workload: WorkloadArgs::IndexStream(args),
-        } = cli.command
+        } = cli.command.unwrap()
         else {
             panic!("expected index-stream workload");
         };
@@ -784,7 +784,7 @@ mod tests {
         .unwrap();
         let Command::Run {
             workload: WorkloadArgs::IndexScan(args),
-        } = cli.command
+        } = cli.command.unwrap()
         else {
             panic!("expected index-scan workload");
         };
@@ -811,7 +811,7 @@ mod tests {
         .unwrap();
         let Command::Run {
             workload: WorkloadArgs::IndexStream(args),
-        } = cli.command
+        } = cli.command.unwrap()
         else {
             panic!("expected index-stream workload");
         };
@@ -839,7 +839,7 @@ mod tests {
         .unwrap();
         let Command::Run {
             workload: WorkloadArgs::IndexScan(args),
-        } = cli.command
+        } = cli.command.unwrap()
         else {
             panic!("expected index-scan workload");
         };

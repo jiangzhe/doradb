@@ -1842,7 +1842,6 @@ impl MandatoryInternalTask for FailedPrecommitCleanupJob {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::buffer::PoolRole;
     use crate::catalog::tests::table2;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig};
     use crate::engine::Engine;
@@ -1980,7 +1979,6 @@ pub(crate) mod tests {
                 )
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
                         .max_mem_size(64u64 * 1024 * 1024)
                         .max_file_size(128u64 * 1024 * 1024),
                 ),
@@ -2142,7 +2140,6 @@ pub(crate) mod tests {
                     .storage_root(main_dir)
                     .data_buffer(
                         EvictableBufferPoolConfig::default()
-                            .role(PoolRole::Mem)
                             .max_mem_size(128usize * 1024 * 1024)
                             .max_file_size(256usize * 1024 * 1024),
                     )
@@ -2180,7 +2177,6 @@ pub(crate) mod tests {
                     .storage_root(main_dir)
                     .data_buffer(
                         EvictableBufferPoolConfig::default()
-                            .role(PoolRole::Mem)
                             .max_mem_size(128usize * 1024 * 1024)
                             .max_file_size(256usize * 1024 * 1024),
                     )
@@ -2247,7 +2243,6 @@ pub(crate) mod tests {
                     .storage_root(main_dir)
                     .data_buffer(
                         EvictableBufferPoolConfig::default()
-                            .role(PoolRole::Mem)
                             .max_mem_size(128usize * 1024 * 1024)
                             .max_file_size(256usize * 1024 * 1024),
                     )
@@ -2318,7 +2313,6 @@ pub(crate) mod tests {
                     .storage_root(main_dir)
                     .data_buffer(
                         EvictableBufferPoolConfig::default()
-                            .role(PoolRole::Mem)
                             .max_mem_size(128usize * 1024 * 1024)
                             .max_file_size(256usize * 1024 * 1024),
                     )
