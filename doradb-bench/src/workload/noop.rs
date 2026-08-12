@@ -194,10 +194,10 @@ pub(crate) async fn run_stmt_noop_operations(
     let mut operations = 0u64;
     for _ in 0..number {
         if cancellation.is_some_and(RunCancellation::is_cancelled) {
-            trx.rollback().await?;
+            let _ = trx.rollback().await;
             return Ok(NoopOperationResult {
-                operations,
-                latency,
+                operations: 0,
+                latency: LatencyDistribution::new()?,
             });
         }
         if let Some(clock) = clock {

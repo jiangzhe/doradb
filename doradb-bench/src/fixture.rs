@@ -90,7 +90,6 @@ struct PrimaryPlanFixture {
     shape: PrimaryTableShape,
     next_key: u64,
     attempted_range: Option<KeyRange>,
-    possible_commit_fence: bool,
 }
 
 /// Ordered plan-time state for the implicit benchmark fixture.
@@ -133,7 +132,6 @@ impl FixturePlanState {
                     shape,
                     next_key: 0,
                     attempted_range: None,
-                    possible_commit_fence: false,
                 });
                 Ok(())
             }
@@ -153,7 +151,6 @@ impl FixturePlanState {
                     "plan attempted range",
                 )?);
                 primary.next_key = end;
-                primary.possible_commit_fence = true;
                 Ok(())
             }
         }
@@ -183,12 +180,18 @@ pub enum FixtureRuntimeEffect {
     },
 }
 
+/// Runtime state of the invocation's implicit primary benchmark table.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RuntimePrimaryFixture {
+    /// Planned logical table shape.
     pub(crate) shape: PrimaryTableShape,
+    /// Storage identifier returned by table creation.
     pub(crate) table_id: TableID,
+    /// First generated key not yet allocated to an insert phase.
     pub(crate) next_key: u64,
+    /// Contiguous range attempted by completed insert phases.
     pub(crate) attempted_range: Option<KeyRange>,
+    /// Greatest successful write-bearing insert commit.
     pub(crate) latest_write_fence: Option<TrxID>,
 }
 

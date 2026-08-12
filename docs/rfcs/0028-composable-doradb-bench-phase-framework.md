@@ -642,9 +642,9 @@ requires separate justification and review outside this RFC.
     commands, checkpoint/freeze, delete/update/mixed workloads, or performance
     gates.
   - Task Doc: `docs/tasks/000267-migrate-doradb-bench-simple-workloads-and-basic-fixture-state.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Issue: `#971`
+  - Phase Status: done
+  - Implementation Summary: Task 000267 shipped five simple workloads on the shared plan executor with typed basic fixture state, workload-specific measurement, durable templates, and success-only result artifacts. [Task Resolve Sync: docs/tasks/000267-migrate-doradb-bench-simple-workloads-and-basic-fixture-state.md @ 2026-08-12]
 
 - **Phase 3: Migrate dependent and coordinated workloads**
   - Prerequisites: Phase 2 can create the implicit fixture, load it, carry basic
