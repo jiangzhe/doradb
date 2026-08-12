@@ -1,0 +1,7 @@
+name = "transient table DDL"
+engine_defaults = "engine-defaults.toml"
+
+[[phase]]
+kind = "benchmark"
+measured_runs = 1
+workload = { type = "table-ddl", num = 1, threads = 1, sessions = 1 }

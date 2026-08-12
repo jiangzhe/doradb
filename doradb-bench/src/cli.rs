@@ -1,4 +1,5 @@
 use crate::error::{BenchError, Result};
+pub(super) use crate::fixture::IndexMode;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use doradb_storage::LogSync;
 use serde::{Deserialize, Serialize};
@@ -46,29 +47,6 @@ pub enum Command {
     },
     /// Remove the prepared benchmark storage root.
     Cleanup,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
-pub(super) enum IndexMode {
-    #[serde(rename = "none")]
-    #[value(name = "none")]
-    None,
-    #[serde(rename = "unique")]
-    #[value(name = "unique")]
-    Unique,
-    #[serde(rename = "non-unique")]
-    #[value(name = "non-unique")]
-    NonUnique,
-}
-
-impl fmt::Display for IndexMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::None => f.write_str("none"),
-            Self::Unique => f.write_str("unique"),
-            Self::NonUnique => f.write_str("non-unique"),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]

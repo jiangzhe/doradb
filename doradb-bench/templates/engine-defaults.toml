@@ -1,0 +1,13 @@
+[engine.transaction]
+log_sync = "fsync"
+
+[engine.index_buffer]
+max_mem_size = "512 MiB"
+max_file_size = "1 GiB"
+
+[engine.data_buffer]
+max_mem_size = "1 GiB"
+max_file_size = "2 GiB"
+
+[engine.file]
+readonly_buffer_size = "1 GiB"

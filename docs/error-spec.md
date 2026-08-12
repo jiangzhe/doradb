@@ -4,9 +4,9 @@
 
 Doradb separates error production from public error classification. Internal
 operations return the narrowest typed report that describes their failure.
-Public facades expose the stable `Error` wrapper and `ErrorKind` classification
-without discarding the typed report, its source frames, or diagnostic
-attachments.
+Public facades expose the stable `Error` wrapper and `ErrorKind`
+classification, plus the typed `OperationError` context for logical failures,
+without discarding the report, its source frames, or diagnostic attachments.
 
 The model has four layers:
 
@@ -21,7 +21,7 @@ is being performed.
 
 ## Domains and public classification
 
-The crate-private typed domains are:
+The typed error domains are:
 
 | Domain | Meaning | Public kind |
 | --- | --- | --- |
@@ -34,15 +34,21 @@ The crate-private typed domains are:
 | `RuntimeError` | an engine-owned runtime operation fails | `Runtime` |
 | `FatalError` | continued execution is unsafe and poison policy applies | `Fatal` |
 
+`OperationError` is public, copyable, and non-exhaustive so callers can handle
+specific logical outcomes. Its producers, result carrier, and disclosure into
+the public `Error` wrapper remain crate-private. All other typed domains are
+crate-private.
+
 `InternalError` is crate-private diagnostic structure for genuinely fallible
 internal contracts. It has no public kind and cannot be disclosed directly.
 An internal frame may remain below a Runtime or Fatal owner, but it never
 selects the public classification. Conditions proved impossible by ownership,
 construction, or locking are assertions instead of Internal errors.
 
-Public callers use `Error::kind`, `Error::is_kind`, `Error::report`, and
-`Error::into_report`. The report is the source of detail; the public kind is
-only its stable outer classification.
+Public callers use `Error::kind`, `Error::is_kind`, and
+`Error::operation_error` for classification. `Error::report` and
+`Error::into_report` expose the complete diagnostic report. The public kind
+remains its stable outer classification.
 
 ## Producer rules
 

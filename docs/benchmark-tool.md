@@ -52,11 +52,13 @@ engine, phase, defaults, or workload fields are errors. Exactly one phase must
 set `kind = "benchmark"`, and it must be last. Omitted `kind` means `prepare`.
 Prepare phases execute once and reject `warmup_runs` and `measured_runs`.
 Benchmark phases default to zero warm-ups and one measured run. Warm-ups must
-succeed but their counters, samples, wall durations, and diagnostics are
-discarded. Repetition is accepted only for replay-safe workloads; Phase 1's
-`trx-noop` is replay-safe.
+succeed but their counters, samples, wall durations, diagnostics, and effects
+are discarded. Repetition is accepted only for replay-safe workloads.
+`trx-noop` and `stmt-noop` are replay-safe; `create-table`, both insert
+workloads, and `table-ddl` reject warm-ups and require one measured run when
+selected as the benchmark.
 
-This is a complete Phase 1 plan:
+This is a complete no-op plan:
 
 ```toml
 name = "transaction-lifecycle"
@@ -91,47 +93,102 @@ doradb-storage EngineConfig defaults < included [engine] < plan-local [engine]
 The engine overlay mirrors all public effective builder inputs except the
 invocation root and storage-internal eviction-arbiter policy. Its nested tables
 are `mandatory_runtime`, `transaction`, `index_buffer`, `data_buffer`, and
-`file`; metadata-buffer bytes remain a direct `[engine]` leaf. Byte fields use
-integer byte counts. Paths inside `[engine]` retain their storage-root-relative
-meaning.
-Results record the complete benchmark-configurable, storage-normalized
-configuration, including aligned redo sizes. Eviction-arbiter policy remains a
-storage implementation detail and is not part of plan input or result output.
+`file`; metadata-buffer size remains a direct `[engine]` leaf. Every byte-sized
+input is a `byte-unit` string such as `"128 B"`, `"512 MiB"`, or `"1 GiB"`.
+Integer byte values and the former input names ending in `_bytes` are rejected.
+Paths inside `[engine]` retain their storage-root-relative meaning. Results
+record the complete storage-normalized configuration with exact numeric
+`*_bytes` fields, including aligned redo sizes. Eviction-arbiter policy remains
+a storage implementation detail and is not part of plan input or result output.
 
 The accepted engine leaves are:
 
-- `[engine]`: `meta_buffer_bytes`.
+- `[engine]`: `meta_buffer_size`.
 - `[engine.mandatory_runtime]`: `worker_threads` and `concurrency_limit`.
 - `[engine.transaction]`: `log_write_io_depth`, `recovery_io_depth`,
-  `catalog_checkpoint_scan_io_depth`, `log_block_size_bytes`, `log_dir`,
-  `log_file_stem`, `log_file_max_size_bytes`, `log_sync`, `purge_threads`,
+  `catalog_checkpoint_scan_io_depth`, `log_block_size`, `log_dir`,
+  `log_file_stem`, `log_file_max_size`, `log_sync`, `purge_threads`,
   `gc_buckets`, and `recovery_disable_dml_validation`.
 - `[engine.index_buffer]` and `[engine.data_buffer]`: `swap_file`,
-  `max_file_size_bytes`, and `max_mem_size_bytes`.
-- `[engine.file]`: `io_depth`, `data_dir`, `readonly_buffer_size_bytes`, and
+  `max_file_size`, and `max_mem_size`.
+- `[engine.file]`: `io_depth`, `data_dir`, `readonly_buffer_size`, and
   `catalog_file_name`.
 
 `[workload_defaults]` accepts `threads`, `sessions`, `value_size`,
 `batch_size`, and `include_stats`. Defaults are one thread, sessions equal to
 the resolved thread count, 128-byte values, batch size one, and diagnostics
-disabled. Phase 1's `trx-noop` workload requires positive `num` and accepts
-only `threads`, `sessions`, and `include_stats` overrides. Threads must not
-exceed sessions.
+disabled. `value_size` is a byte-unit string. Workload fields are:
 
-`trx-noop` samples the `transaction-lifecycle` unit. Each sample starts
-immediately before public transaction begin and ends immediately after a
-successful commit. One calibrated quanta clock supplies raw hot-path
-timestamps and scaled wall boundaries. Each session owns a fixed-range HDR
-histogram; session and repeated-run aggregation merges distributions and exact
-duration sums. Aggregate throughput is total operations divided by total wall
-duration, while p95 and p99 come from the merged histogram.
+- `create-table`: required `index = "none"|"unique"|"non-unique"` and optional
+  `include_stats`.
+- `stmt-noop` and `trx-noop`: required positive `num` plus optional `threads`,
+  `sessions`, and `include_stats`.
+- `insert-seq` and `insert-rand`: required positive `num` plus optional `seed`,
+  `threads`, `sessions`, byte-unit `value_size`, positive `batch_size`, and
+  `include_stats`.
+- `table-ddl`: optional positive `num` (default one) plus optional `threads`,
+  `sessions`, and `include_stats`.
+
+Threads must not exceed sessions. Phase-local worker settings override
+`[workload_defaults]`; an explicit thread override without a session override
+sets sessions equal to threads.
+
+Fixture resolution is ordered. `create-table` establishes one empty implicit
+primary table and rejects an existing primary. Insert phases require that
+table, inherit its index shape, and allocate fresh contiguous half-open key
+ranges from its generated-key cursor. Attempted ranges advance even when an
+insert ends in an expected duplicate-key or write-conflict outcome. No-op and
+transient table-DDL phases neither require nor invent a primary table. Runtime
+execution binds the planned shape to the returned table ID and retains the
+greatest commit ID from a batch that inserted at least one row.
+
+Each workload records an explicit end-to-end latency unit:
+
+| Workload | Unit | Samples in a successful measured run |
+| --- | --- | ---: |
+| `trx-noop` | `transaction-lifecycle` | one per transaction |
+| `stmt-noop` | `statement-execution` | one per statement |
+| `create-table` | `table-creation` | one |
+| `insert-seq`, `insert-rand` | `insert-batch-transaction` | one per nonempty session batch |
+| `table-ddl` | `table-create-drop-cycle` | one per complete create/drop cycle |
+
+Insert batch timing begins before transaction begin and ends after successful
+commit; it is not per-row latency. Table-DDL timing spans both create and drop.
+One calibrated quanta clock supplies raw hot-path timestamps and scaled wall
+boundaries. Each session owns a fixed-range HDR histogram; aggregation merges
+distributions and exact duration sums. Aggregate throughput is total logical
+attempts divided by total wall duration, while p95 and p99 come from the merged
+histogram.
+
+Insert duplicate-key and write-conflict errors are expected terminal outcomes.
+They are counted under `expected_outcomes.duplicate_key` and
+`expected_outcomes.write_conflict`, are not retried, and remain inside the
+enclosing batch latency. `operations` counts all attempts and must equal
+`inserted_rows + duplicate_key + write_conflict`. Every other error is fatal to
+the invocation.
 
 Plan mode writes `benchmark-result.toml` as the canonical machine-readable
-result and `benchmark-result.md` as a rendering of that same entity. Both are
-written for success and, when the guarded root exists, execution/bootstrap
-failure. A failed report retains completed earlier runs, identifies the
-phase/run boundary, and omits an incomplete run and aggregate. Exact `u128`
-wall, latency-sum, and diagnostic values are decimal strings in TOML.
+result and `benchmark-result.md` as a rendering of that same success-only
+entity. An unexpected bootstrap, workload, fixture, session-close, diagnostic,
+shutdown, or output error starts no later phase, cooperatively stops peers at
+their next workload safe point, drains all tasks and sessions, shuts down the
+engine, and emits no complete result pair. The guarded root and marker may
+remain for diagnosis and guarded cleanup. Exact `u128` wall, latency-sum, and
+diagnostic values are decimal strings in TOML.
+
+Checked-in complete plans can be run directly:
+
+```bash
+rtk cargo run -p doradb-bench -- -r target/bench-trx -p doradb-bench/templates/trx-noop.toml
+rtk cargo run -p doradb-bench -- -r target/bench-stmt -p doradb-bench/templates/stmt-noop.toml
+rtk cargo run -p doradb-bench -- -r target/bench-seq -p doradb-bench/templates/insert-seq.toml
+rtk cargo run -p doradb-bench -- -r target/bench-rand -p doradb-bench/templates/insert-rand.toml
+rtk cargo run -p doradb-bench -- -r target/bench-ddl -p doradb-bench/templates/table-ddl.toml
+```
+
+Every template includes `engine-defaults.toml` relative to its own directory.
+Insert templates create their required primary table in a prepare phase; no-op
+and table-DDL templates remain self-contained without irrelevant fixture setup.
 
 Optional internal metrics are diagnostics, not benchmark scores. Counter
 deltas use `counter-delta`; endpoint capacities, allocations, active tasks,

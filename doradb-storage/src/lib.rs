@@ -48,7 +48,7 @@ pub use conf::{
     TrxSysConfig,
 };
 pub use engine::Engine;
-pub use error::{Error, ErrorKind, Result};
+pub use error::{Error, ErrorKind, OperationError, Result};
 pub use lock::TableLockMode;
 pub use row::ops::{
     DeleteMvcc, RowMutation, ScanMvcc, SelectKey, SelectMvcc, TableMutationOutcome, UpdateCol,

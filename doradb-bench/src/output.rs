@@ -1,7 +1,6 @@
-use crate::cli::{
-    IndexMode, LockTableMode, LockTableScenario, LogSyncMode, TableLockScope, Workload,
-};
+use crate::cli::{LockTableMode, LockTableScenario, LogSyncMode, TableLockScope, Workload};
 use crate::error::{BenchError, Result};
+use crate::fixture::IndexMode;
 use crate::manifest::{internal_stats_csv_path, result_csv_path, result_markdown_path};
 use crate::measurement::{InternalMetric, InternalMetricKind, InternalMetricUnit};
 use doradb_storage::{

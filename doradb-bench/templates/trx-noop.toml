@@ -1,0 +1,8 @@
+name = "transaction lifecycle no-op"
+engine_defaults = "engine-defaults.toml"
+
+[[phase]]
+kind = "benchmark"
+warmup_runs = 1
+measured_runs = 3
+workload = { type = "trx-noop", num = 100000, threads = 1, sessions = 1 }

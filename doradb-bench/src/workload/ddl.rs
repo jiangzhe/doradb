@@ -1,11 +1,15 @@
-use crate::cli::{IndexMode, WorkerIterationArgs, Workload};
+use crate::cli::{WorkerIterationArgs, Workload};
 use crate::error::{BenchError, Result};
-use crate::manifest::{KeyRange, Manifest};
-use crate::workload::{CommonConfig, SessionPlan, SessionSummary, WorkloadConfig, WorkloadRunner};
-use doradb_storage::id::TableID;
-use doradb_storage::{
-    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, Session, TableSpec, ValKind,
+use crate::fixture::{
+    KeyRange, PrimaryTableShape, benchmark_index_specs, benchmark_non_unique_index_spec,
+    benchmark_table_spec,
 };
+use crate::manifest::Manifest;
+use crate::measurement::{LatencyDistribution, MeasurementClock};
+use crate::workload::RunCancellation;
+use crate::workload::{CommonConfig, SessionPlan, SessionSummary, WorkloadConfig, WorkloadRunner};
+use doradb_storage::Session;
+use doradb_storage::id::TableID;
 
 /// Resolved table-DDL configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,16 +66,11 @@ impl WorkloadRunner for TableDdlRunner {
         session: &mut Session,
         plan: &SessionPlan,
     ) -> Result<SessionSummary> {
-        let mut summary = SessionSummary::default();
-        for _ in 0..plan.number {
-            let table_id = session
-                .create_table(benchmark_table_spec(), Vec::new())
-                .await?;
-            summary.operations += 1;
-            session.drop_table(table_id).await?;
-            summary.operations += 1;
-        }
-        Ok(summary)
+        let result = run_table_ddl_operations(session, plan.number, None, None).await?;
+        Ok(SessionSummary {
+            operations: result.operations,
+            ..SessionSummary::default()
+        })
     }
 }
 
@@ -145,27 +144,83 @@ impl WorkloadRunner for IndexDdlRunner {
     }
 }
 
-/// Build the two-column schema shared by prepared and transient benchmark tables.
-pub(crate) fn benchmark_table_spec() -> TableSpec {
-    TableSpec::new(vec![
-        ColumnSpec::new("logical_key", ValKind::U64, ColumnAttributes::empty()),
-        ColumnSpec::new("payload", ValKind::VarByte, ColumnAttributes::empty()),
-    ])
+/// Result of one primary-table creation operation.
+pub(crate) struct CreateTableOperationResult {
+    /// Public ID returned for the new table.
+    pub(crate) table_id: TableID,
+    /// Exact table-creation latency sample.
+    pub(crate) latency: LatencyDistribution,
 }
 
-/// Build the prepared benchmark table's configured secondary-index shape.
-pub(crate) fn benchmark_index_specs(index: IndexMode) -> Vec<IndexSpec> {
-    match index {
-        IndexMode::None => Vec::new(),
-        IndexMode::Unique => vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
-        IndexMode::NonUnique => {
-            vec![benchmark_non_unique_index_spec()]
+/// Result of one session's transient table-DDL cycles.
+pub(crate) struct DdlOperationResult {
+    /// Successful create and drop operations.
+    pub(crate) operations: u64,
+    /// Completely settled create/drop cycles.
+    pub(crate) cycles: u64,
+    /// Exact create-through-drop latency samples.
+    pub(crate) latency: LatencyDistribution,
+}
+
+/// Shared primary-table creation core used by plan dispatch.
+pub(crate) async fn run_create_table_operation(
+    session: &mut Session,
+    shape: PrimaryTableShape,
+    clock: Option<&MeasurementClock>,
+) -> Result<CreateTableOperationResult> {
+    let mut latency = LatencyDistribution::new()?;
+    let started = clock.map(MeasurementClock::raw);
+    let table_id = session
+        .create_table(benchmark_table_spec(), benchmark_index_specs(shape.index))
+        .await?;
+    if let (Some(clock), Some(started)) = (clock, started) {
+        let stopped = clock.raw();
+        latency.record(clock.raw_delta_nanos(started, stopped)?)?;
+    }
+    Ok(CreateTableOperationResult { table_id, latency })
+}
+
+/// Shared transient table create/drop core used by legacy and plan dispatch.
+pub(crate) async fn run_table_ddl_operations(
+    session: &mut Session,
+    cycles: u64,
+    clock: Option<&MeasurementClock>,
+    cancellation: Option<&RunCancellation>,
+) -> Result<DdlOperationResult> {
+    let mut result = DdlOperationResult {
+        operations: 0,
+        cycles: 0,
+        latency: LatencyDistribution::new()?,
+    };
+    for _ in 0..cycles {
+        if cancellation.is_some_and(RunCancellation::is_cancelled) {
+            break;
+        }
+        let started = clock.map(MeasurementClock::raw);
+        let table_id = session
+            .create_table(benchmark_table_spec(), Vec::new())
+            .await?;
+        result.operations = result
+            .operations
+            .checked_add(1)
+            .ok_or_else(|| BenchError::message("DDL operation counter overflow"))?;
+        session.drop_table(table_id).await?;
+        result.operations = result
+            .operations
+            .checked_add(1)
+            .ok_or_else(|| BenchError::message("DDL operation counter overflow"))?;
+        result.cycles = result
+            .cycles
+            .checked_add(1)
+            .ok_or_else(|| BenchError::message("DDL cycle counter overflow"))?;
+        if let (Some(clock), Some(started)) = (clock, started) {
+            let stopped = clock.raw();
+            result
+                .latency
+                .record(clock.raw_delta_nanos(started, stopped)?)?;
         }
     }
-}
-
-fn benchmark_non_unique_index_spec() -> IndexSpec {
-    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::empty())
+    Ok(result)
 }
 
 fn resolve_ddl_common(manifest: &Manifest, args: &WorkerIterationArgs) -> Result<CommonConfig> {
@@ -191,7 +246,9 @@ fn validate_ddl_operation_count(cycles: u64) -> Result<()> {
 mod tests {
     use super::*;
     use crate::cli::{Cli, Command, WorkloadArgs};
+    use crate::fixture::IndexMode;
     use clap::Parser;
+    use doradb_storage::IndexAttributes;
 
     #[test]
     fn schema_index_specs_match_index_mode_without_primary_key() {

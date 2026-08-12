@@ -1,7 +1,9 @@
 use crate::cli::{validate_batch_size, validate_value_size, validate_workers};
 use crate::engine_config::{EngineConfigOverlay, ResolvedEngineConfig, resolve_engine_config};
 use crate::error::{BenchError, Result};
-pub use crate::workload::TrxNoopConfig;
+use crate::fixture::{FixturePlanEffect, FixturePlanState, IndexMode, KeyRange, PrimaryTableShape};
+use crate::measurement::LatencyUnit;
+use byte_unit::Byte;
 use doradb_storage::EngineConfig;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -43,8 +45,8 @@ pub struct WorkloadDefaults {
     pub threads: Option<NonZeroUsize>,
     /// Default public session count.
     pub sessions: Option<NonZeroUsize>,
-    /// Default generated value bytes.
-    pub value_size: Option<NonZeroUsize>,
+    /// Default generated value size.
+    pub value_size: Option<Byte>,
     /// Default operations per transaction.
     pub batch_size: Option<NonZeroU64>,
     /// Default engine-diagnostic capture setting.
@@ -52,19 +54,20 @@ pub struct WorkloadDefaults {
 }
 
 impl WorkloadDefaults {
-    #[inline]
     fn resolve(self) -> Result<ResolvedWorkloadDefaults> {
         let threads = self.threads.map_or(1, NonZeroUsize::get);
         let sessions = self.sessions.map_or(threads, NonZeroUsize::get);
-        let value_size = self.value_size.map_or(128, NonZeroUsize::get);
+        let value_size_bytes = self.value_size.map_or(Ok(128), |value| {
+            byte_usize(value, "workload_defaults.value_size")
+        })?;
         let batch_size = self.batch_size.map_or(1, NonZeroU64::get);
         validate_workers(threads, sessions)?;
-        validate_value_size(value_size)?;
+        validate_value_size(value_size_bytes)?;
         validate_batch_size(batch_size)?;
         Ok(ResolvedWorkloadDefaults {
             threads,
             sessions,
-            value_size,
+            value_size_bytes,
             batch_size,
             include_stats: self.include_stats.unwrap_or(false),
         })
@@ -80,7 +83,7 @@ pub struct ResolvedWorkloadDefaults {
     /// Default public session count.
     pub sessions: usize,
     /// Default generated value bytes.
-    pub value_size: usize,
+    pub value_size_bytes: usize,
     /// Default operations per transaction.
     pub batch_size: u64,
     /// Default engine-diagnostic capture setting.
@@ -113,12 +116,46 @@ pub enum PhaseKind {
     Benchmark,
 }
 
-/// Closed set of Phase 1 workload specifications.
+/// Closed set of plan-enabled simple workload specifications.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum WorkloadSpec {
+    /// Create the invocation's implicit primary table.
+    CreateTable(CreateTableSpec),
+    /// Execute no-op statements in public transactions.
+    StmtNoop(StmtNoopSpec),
     /// Begin and commit public transactions without statements.
     TrxNoop(TrxNoopSpec),
+    /// Insert generated sequential logical keys.
+    InsertSeq(InsertSpec),
+    /// Insert generated pseudo-random logical keys.
+    InsertRand(InsertSpec),
+    /// Create and drop transient tables.
+    TableDdl(TableDdlSpec),
+}
+
+/// Strict plan-local primary-table creation controls.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateTableSpec {
+    /// Secondary-index shape of the primary table.
+    pub index: IndexMode,
+    /// Optional engine-diagnostic override.
+    pub include_stats: Option<bool>,
+}
+
+/// Strict plan-local statement-noop controls.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StmtNoopSpec {
+    /// Positive aggregate statement count.
+    pub num: NonZeroU64,
+    /// Optional executor thread override.
+    pub threads: Option<NonZeroUsize>,
+    /// Optional public session override.
+    pub sessions: Option<NonZeroUsize>,
+    /// Optional engine-diagnostic override.
+    pub include_stats: Option<bool>,
 }
 
 /// Strict plan-local transaction-noop controls.
@@ -127,6 +164,40 @@ pub enum WorkloadSpec {
 pub struct TrxNoopSpec {
     /// Positive aggregate transaction count.
     pub num: NonZeroU64,
+    /// Optional executor thread override.
+    pub threads: Option<NonZeroUsize>,
+    /// Optional public session override.
+    pub sessions: Option<NonZeroUsize>,
+    /// Optional engine-diagnostic override.
+    pub include_stats: Option<bool>,
+}
+
+/// Strict plan-local generated-insert controls.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InsertSpec {
+    /// Positive aggregate insert-attempt count.
+    pub num: NonZeroU64,
+    /// Optional deterministic generation seed.
+    pub seed: Option<u64>,
+    /// Optional executor thread override.
+    pub threads: Option<NonZeroUsize>,
+    /// Optional public session override.
+    pub sessions: Option<NonZeroUsize>,
+    /// Optional generated payload-size override.
+    pub value_size: Option<Byte>,
+    /// Optional operations-per-transaction override.
+    pub batch_size: Option<NonZeroU64>,
+    /// Optional engine-diagnostic override.
+    pub include_stats: Option<bool>,
+}
+
+/// Strict plan-local transient table-DDL controls.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TableDdlSpec {
+    /// Optional positive create/drop cycle count; defaults to one.
+    pub num: Option<NonZeroU64>,
     /// Optional executor thread override.
     pub threads: Option<NonZeroUsize>,
     /// Optional public session override.
@@ -151,7 +222,7 @@ pub struct Plan {
     pub phases: Vec<Phase>,
 }
 
-/// Validated phase representation.
+/// Validated phase representation with its typed fixture transition.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Phase {
@@ -159,6 +230,8 @@ pub enum Phase {
     Prepare {
         /// Resolved workload.
         workload: ResolvedWorkload,
+        /// Effect applied after successful execution and verification.
+        fixture_effect: FixturePlanEffect,
     },
     /// Warm-up plus measured repetitions.
     Benchmark {
@@ -166,15 +239,25 @@ pub enum Phase {
         measurement: MeasurementSpec,
         /// Resolved workload.
         workload: ResolvedWorkload,
+        /// Effect applied after successful execution and verification.
+        fixture_effect: FixturePlanEffect,
     },
 }
 
 impl Phase {
     /// Borrow the resolved workload.
-    #[inline]
     pub fn workload(&self) -> &ResolvedWorkload {
         match self {
-            Self::Prepare { workload } | Self::Benchmark { workload, .. } => workload,
+            Self::Prepare { workload, .. } | Self::Benchmark { workload, .. } => workload,
+        }
+    }
+
+    /// Return the plan-time effect expected from this phase.
+    pub fn fixture_effect(&self) -> FixturePlanEffect {
+        match self {
+            Self::Prepare { fixture_effect, .. } | Self::Benchmark { fixture_effect, .. } => {
+                *fixture_effect
+            }
         }
     }
 }
@@ -189,52 +272,170 @@ pub struct MeasurementSpec {
     pub measured_runs: NonZeroU32,
 }
 
+/// Resolved primary-table creation configuration.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateTableConfig {
+    /// Complete primary-table shape.
+    pub shape: PrimaryTableShape,
+    /// Whether engine diagnostics are captured around the run.
+    pub include_stats: bool,
+}
+
+/// Resolved statement-noop configuration.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StmtNoopConfig {
+    /// Aggregate statement count.
+    pub num: u64,
+    /// Executor thread count.
+    pub threads: usize,
+    /// Independent public session count.
+    pub sessions: usize,
+    /// Whether engine diagnostics are captured around the run.
+    pub include_stats: bool,
+}
+
+/// Resolved transaction-noop configuration shared by plan and legacy dispatch.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrxNoopConfig {
+    /// Aggregate public transaction count.
+    pub num: u64,
+    /// Executor thread count.
+    pub threads: usize,
+    /// Independent public session count.
+    pub sessions: usize,
+    /// Whether engine diagnostics are captured around the run.
+    pub include_stats: bool,
+}
+
+/// Resolved generated-insert configuration.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InsertConfig {
+    /// Aggregate insert-attempt count.
+    pub num: u64,
+    /// Deterministic generation seed.
+    pub seed: u64,
+    /// Executor thread count.
+    pub threads: usize,
+    /// Independent public session count.
+    pub sessions: usize,
+    /// Generated payload bytes.
+    pub value_size_bytes: usize,
+    /// Maximum operations per transaction.
+    pub batch_size: u64,
+    /// Bound primary-table index shape.
+    pub index: IndexMode,
+    /// First generated key allocated to this workload.
+    pub key_start: u64,
+    /// Exact attempted generated-key range.
+    pub attempted_range: KeyRange,
+    /// Whether engine diagnostics are captured around the run.
+    pub include_stats: bool,
+}
+
+/// Resolved transient table-DDL configuration.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TableDdlConfig {
+    /// Create/drop cycle count.
+    pub num: u64,
+    /// Checked create-plus-drop operation count.
+    pub operations: u64,
+    /// Executor thread count.
+    pub threads: usize,
+    /// Independent public session count.
+    pub sessions: usize,
+    /// Whether engine diagnostics are captured around the run.
+    pub include_stats: bool,
+}
+
 /// Closed resolved workload dispatch.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum ResolvedWorkload {
+    /// Primary-table creation workload.
+    CreateTable(CreateTableConfig),
+    /// Statement-noop workload.
+    StmtNoop(StmtNoopConfig),
     /// Transaction-noop workload.
     TrxNoop(TrxNoopConfig),
+    /// Sequential generated insert workload.
+    InsertSeq(InsertConfig),
+    /// Pseudo-random generated insert workload.
+    InsertRand(InsertConfig),
+    /// Transient table-DDL workload.
+    TableDdl(TableDdlConfig),
 }
 
 impl ResolvedWorkload {
     /// Stable workload identity.
-    #[inline]
     pub fn identity(&self) -> &'static str {
         match self {
+            Self::CreateTable(_) => "create-table",
+            Self::StmtNoop(_) => "stmt-noop",
             Self::TrxNoop(_) => "trx-noop",
+            Self::InsertSeq(_) => "insert-seq",
+            Self::InsertRand(_) => "insert-rand",
+            Self::TableDdl(_) => "table-ddl",
         }
     }
 
     /// Return whether repeated execution against one fixture is safe.
-    #[inline]
     pub fn replay_policy(&self) -> ReplayPolicy {
         match self {
-            Self::TrxNoop(_) => ReplayPolicy::Safe,
-        }
-    }
-
-    /// Validate fixture requirements and return the effect applied on success.
-    #[inline]
-    pub fn validate_fixture(&self, _state: &FixturePlanState) -> Result<FixtureEffect> {
-        match self {
-            Self::TrxNoop(_) => Ok(FixtureEffect::None),
+            Self::StmtNoop(_) | Self::TrxNoop(_) => ReplayPolicy::Safe,
+            Self::CreateTable(_) | Self::InsertSeq(_) | Self::InsertRand(_) | Self::TableDdl(_) => {
+                ReplayPolicy::SingleRun
+            }
         }
     }
 
     /// Return the resolved worker/session counts.
-    #[inline]
     pub fn worker_counts(&self) -> (usize, usize) {
         match self {
+            Self::CreateTable(_) => (1, 1),
+            Self::StmtNoop(config) => (config.threads, config.sessions),
             Self::TrxNoop(config) => (config.threads, config.sessions),
+            Self::InsertSeq(config) | Self::InsertRand(config) => (config.threads, config.sessions),
+            Self::TableDdl(config) => (config.threads, config.sessions),
         }
     }
 
     /// Return whether engine diagnostics are requested.
-    #[inline]
     pub fn include_stats(&self) -> bool {
         match self {
+            Self::CreateTable(config) => config.include_stats,
+            Self::StmtNoop(config) => config.include_stats,
             Self::TrxNoop(config) => config.include_stats,
+            Self::InsertSeq(config) | Self::InsertRand(config) => config.include_stats,
+            Self::TableDdl(config) => config.include_stats,
+        }
+    }
+
+    /// Return the semantic latency unit for sampled executions.
+    pub fn latency_unit(&self) -> LatencyUnit {
+        match self {
+            Self::CreateTable(_) => LatencyUnit::TableCreation,
+            Self::StmtNoop(_) => LatencyUnit::StatementExecution,
+            Self::TrxNoop(_) => LatencyUnit::TransactionLifecycle,
+            Self::InsertSeq(_) | Self::InsertRand(_) => LatencyUnit::InsertBatchTransaction,
+            Self::TableDdl(_) => LatencyUnit::TableCreateDropCycle,
+        }
+    }
+
+    /// Return the exact successful sampled-run latency count.
+    pub fn expected_samples(&self) -> Result<u64> {
+        match self {
+            Self::CreateTable(_) => Ok(1),
+            Self::StmtNoop(config) => Ok(config.num),
+            Self::TrxNoop(config) => Ok(config.num),
+            Self::InsertSeq(config) | Self::InsertRand(config) => {
+                insert_sample_count(config.num, config.sessions, config.batch_size)
+            }
+            Self::TableDdl(config) => Ok(config.num),
         }
     }
 }
@@ -246,32 +447,6 @@ pub enum ReplayPolicy {
     Safe,
     /// Workload consumes or mutates fixture state and cannot be replayed.
     SingleRun,
-}
-
-/// Plan-time fixture state extension point.
-#[derive(Clone, Debug, Default)]
-pub struct FixturePlanState;
-
-impl FixturePlanState {
-    #[inline]
-    fn apply(&mut self, _effect: FixtureEffect) {}
-}
-
-/// Runtime fixture state extension point.
-#[derive(Debug, Default)]
-pub struct FixtureRuntimeState;
-
-impl FixtureRuntimeState {
-    /// Apply a successful workload's typed runtime effect.
-    #[inline]
-    pub fn apply(&mut self, _effect: FixtureEffect) {}
-}
-
-/// Typed fixture effect produced by a successful Phase 1 workload.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FixtureEffect {
-    /// No fixture state changes.
-    None,
 }
 
 /// Validated plan plus its storage-owned bootstrap configuration.
@@ -315,8 +490,7 @@ pub fn load_plan(source: &Path, storage_root: &Path) -> Result<LoadedPlan> {
     overlay.merge(raw.engine);
     let (engine_config, engine) = resolve_engine_config(storage_root, &overlay)?;
     let workload_defaults = raw.workload_defaults.resolve()?;
-    let phases = validate_phases(raw.phases, workload_defaults)?;
-    validate_fixture_and_replay(&phases)?;
+    let phases = validate_and_resolve_phases(raw.phases, workload_defaults)?;
     Ok(LoadedPlan {
         plan: Plan {
             name: raw.name,
@@ -329,33 +503,21 @@ pub fn load_plan(source: &Path, storage_root: &Path) -> Result<LoadedPlan> {
     })
 }
 
-fn validate_phases(
+fn validate_and_resolve_phases(
     raw_phases: Vec<RawPhase>,
     defaults: ResolvedWorkloadDefaults,
 ) -> Result<Vec<Phase>> {
-    if raw_phases.is_empty() {
-        return Err(BenchError::message("plan must contain at least one phase"));
-    }
-    let phase_count = raw_phases.len();
-    let mut benchmark_count = 0usize;
-    let mut phases = Vec::with_capacity(phase_count);
+    validate_phase_structure(&raw_phases)?;
+    let mut fixture = FixturePlanState::default();
+    let mut phases = Vec::with_capacity(raw_phases.len());
     for (index, raw) in raw_phases.into_iter().enumerate() {
-        let workload = resolve_workload(raw.workload, defaults)?;
-        match raw.kind {
-            PhaseKind::Prepare => {
-                if raw.warmup_runs.is_some() || raw.measured_runs.is_some() {
-                    return Err(BenchError::message(format!(
-                        "prepare phase {} must not specify warmup_runs or measured_runs",
-                        index + 1
-                    )));
-                }
-                phases.push(Phase::Prepare { workload });
-            }
+        let (workload, fixture_effect) = resolve_workload(raw.workload, defaults, &fixture)?;
+        let phase = match raw.kind {
+            PhaseKind::Prepare => Phase::Prepare {
+                workload,
+                fixture_effect,
+            },
             PhaseKind::Benchmark => {
-                benchmark_count += 1;
-                if index + 1 != phase_count {
-                    return Err(BenchError::message("benchmark phase must be last"));
-                }
                 let measurement = MeasurementSpec {
                     warmup_runs: raw.warmup_runs.unwrap_or(0),
                     measured_runs: raw.measured_runs.unwrap_or(NonZeroU32::MIN),
@@ -364,10 +526,47 @@ fn validate_phases(
                     .warmup_runs
                     .checked_add(measurement.measured_runs.get())
                     .ok_or_else(|| BenchError::message("benchmark repetition count overflow"))?;
-                phases.push(Phase::Benchmark {
+                let repeats = measurement.warmup_runs > 0 || measurement.measured_runs.get() > 1;
+                if repeats && workload.replay_policy() != ReplayPolicy::Safe {
+                    return Err(BenchError::message(format!(
+                        "phase {} workload {} is not replay-safe",
+                        index + 1,
+                        workload.identity()
+                    )));
+                }
+                Phase::Benchmark {
                     measurement,
                     workload,
-                });
+                    fixture_effect,
+                }
+            }
+        };
+        fixture.apply(fixture_effect)?;
+        phases.push(phase);
+    }
+    Ok(phases)
+}
+
+fn validate_phase_structure(raw_phases: &[RawPhase]) -> Result<()> {
+    if raw_phases.is_empty() {
+        return Err(BenchError::message("plan must contain at least one phase"));
+    }
+    let mut benchmark_count = 0usize;
+    for (index, raw) in raw_phases.iter().enumerate() {
+        match raw.kind {
+            PhaseKind::Prepare => {
+                if raw.warmup_runs.is_some() || raw.measured_runs.is_some() {
+                    return Err(BenchError::message(format!(
+                        "prepare phase {} must not specify warmup_runs or measured_runs",
+                        index + 1
+                    )));
+                }
+            }
+            PhaseKind::Benchmark => {
+                benchmark_count += 1;
+                if index + 1 != raw_phases.len() {
+                    return Err(BenchError::message("benchmark phase must be last"));
+                }
             }
         }
     }
@@ -375,7 +574,7 @@ fn validate_phases(
         0 => Err(BenchError::message(
             "plan must contain exactly one final benchmark phase",
         )),
-        1 => Ok(phases),
+        1 => Ok(()),
         _ => Err(BenchError::message(
             "plan must not contain multiple benchmark phases",
         )),
@@ -385,48 +584,140 @@ fn validate_phases(
 fn resolve_workload(
     spec: WorkloadSpec,
     defaults: ResolvedWorkloadDefaults,
-) -> Result<ResolvedWorkload> {
+    fixture: &FixturePlanState,
+) -> Result<(ResolvedWorkload, FixturePlanEffect)> {
     match spec {
+        WorkloadSpec::CreateTable(spec) => {
+            fixture.validate_create_primary()?;
+            let shape = PrimaryTableShape { index: spec.index };
+            Ok((
+                ResolvedWorkload::CreateTable(CreateTableConfig {
+                    shape,
+                    include_stats: spec.include_stats.unwrap_or(defaults.include_stats),
+                }),
+                FixturePlanEffect::CreatePrimary { shape },
+            ))
+        }
+        WorkloadSpec::StmtNoop(spec) => {
+            let (threads, sessions) = resolve_workers(spec.threads, spec.sessions, defaults)?;
+            Ok((
+                ResolvedWorkload::StmtNoop(StmtNoopConfig {
+                    num: spec.num.get(),
+                    threads,
+                    sessions,
+                    include_stats: spec.include_stats.unwrap_or(defaults.include_stats),
+                }),
+                FixturePlanEffect::None,
+            ))
+        }
         WorkloadSpec::TrxNoop(spec) => {
-            let threads = spec.threads.map_or(defaults.threads, NonZeroUsize::get);
-            let sessions = match (spec.threads, spec.sessions) {
-                (_, Some(sessions)) => sessions.get(),
-                (Some(threads), None) => threads.get(),
-                (None, None) => defaults.sessions,
-            };
-            validate_workers(threads, sessions)?;
-            let num = spec.num.get();
-            // Prove deterministic session partition endpoints are representable.
-            num.checked_add(0)
-                .ok_or_else(|| BenchError::message("trx-noop operation range overflow"))?;
-            Ok(ResolvedWorkload::TrxNoop(TrxNoopConfig {
-                num,
-                threads,
-                sessions,
-                include_stats: spec.include_stats.unwrap_or(defaults.include_stats),
-            }))
+            let (threads, sessions) = resolve_workers(spec.threads, spec.sessions, defaults)?;
+            Ok((
+                ResolvedWorkload::TrxNoop(TrxNoopConfig {
+                    num: spec.num.get(),
+                    threads,
+                    sessions,
+                    include_stats: spec.include_stats.unwrap_or(defaults.include_stats),
+                }),
+                FixturePlanEffect::None,
+            ))
+        }
+        WorkloadSpec::InsertSeq(spec) => resolve_insert(spec, defaults, fixture, false),
+        WorkloadSpec::InsertRand(spec) => resolve_insert(spec, defaults, fixture, true),
+        WorkloadSpec::TableDdl(spec) => {
+            let (threads, sessions) = resolve_workers(spec.threads, spec.sessions, defaults)?;
+            let num = spec.num.unwrap_or(NonZeroU64::MIN).get();
+            let operations = num
+                .checked_mul(2)
+                .ok_or_else(|| BenchError::message("DDL operation count overflow"))?;
+            Ok((
+                ResolvedWorkload::TableDdl(TableDdlConfig {
+                    num,
+                    operations,
+                    threads,
+                    sessions,
+                    include_stats: spec.include_stats.unwrap_or(defaults.include_stats),
+                }),
+                FixturePlanEffect::None,
+            ))
         }
     }
 }
 
-fn validate_fixture_and_replay(phases: &[Phase]) -> Result<()> {
-    let mut fixture = FixturePlanState;
-    for (index, phase) in phases.iter().enumerate() {
-        let workload = phase.workload();
-        let effect = workload.validate_fixture(&fixture)?;
-        if let Phase::Benchmark { measurement, .. } = phase {
-            let repeats = measurement.warmup_runs > 0 || measurement.measured_runs.get() > 1;
-            if repeats && workload.replay_policy() != ReplayPolicy::Safe {
-                return Err(BenchError::message(format!(
-                    "phase {} workload {} is not replay-safe",
-                    index + 1,
-                    workload.identity()
-                )));
-            }
+fn resolve_insert(
+    spec: InsertSpec,
+    defaults: ResolvedWorkloadDefaults,
+    fixture: &FixturePlanState,
+    random: bool,
+) -> Result<(ResolvedWorkload, FixturePlanEffect)> {
+    let (threads, sessions) = resolve_workers(spec.threads, spec.sessions, defaults)?;
+    let value_size_bytes = spec
+        .value_size
+        .map_or(Ok(defaults.value_size_bytes), |value| {
+            byte_usize(value, "insert.value_size")
+        })?;
+    let batch_size = spec.batch_size.map_or(defaults.batch_size, NonZeroU64::get);
+    validate_value_size(value_size_bytes)?;
+    validate_batch_size(batch_size)?;
+    let num = spec.num.get();
+    let (shape, attempted_range) = fixture.allocate_insert(num)?;
+    let config = InsertConfig {
+        num,
+        seed: spec.seed.unwrap_or(0),
+        threads,
+        sessions,
+        value_size_bytes,
+        batch_size,
+        index: shape.index,
+        key_start: attempted_range.start,
+        attempted_range,
+        include_stats: spec.include_stats.unwrap_or(defaults.include_stats),
+    };
+    let workload = if random {
+        ResolvedWorkload::InsertRand(config)
+    } else {
+        ResolvedWorkload::InsertSeq(config)
+    };
+    Ok((workload, FixturePlanEffect::Insert { attempted_range }))
+}
+
+fn resolve_workers(
+    thread_override: Option<NonZeroUsize>,
+    session_override: Option<NonZeroUsize>,
+    defaults: ResolvedWorkloadDefaults,
+) -> Result<(usize, usize)> {
+    let threads = thread_override.map_or(defaults.threads, NonZeroUsize::get);
+    let sessions = match (thread_override, session_override) {
+        (_, Some(sessions)) => sessions.get(),
+        (Some(threads), None) => threads.get(),
+        (None, None) => defaults.sessions,
+    };
+    validate_workers(threads, sessions)?;
+    Ok((threads, sessions))
+}
+
+fn insert_sample_count(num: u64, sessions: usize, batch_size: u64) -> Result<u64> {
+    let sessions_u64 = u64::try_from(sessions)
+        .map_err(|_| BenchError::message("insert session count exceeds u64"))?;
+    let base = num / sessions_u64;
+    let remainder = num % sessions_u64;
+    let mut samples = 0u64;
+    for session in 0..sessions_u64 {
+        let operations = base + u64::from(session < remainder);
+        if operations != 0 {
+            let batches =
+                operations / batch_size + u64::from(!operations.is_multiple_of(batch_size));
+            samples = samples
+                .checked_add(batches)
+                .ok_or_else(|| BenchError::message("insert latency sample count overflow"))?;
         }
-        fixture.apply(effect);
     }
-    Ok(())
+    Ok(samples)
+}
+
+fn byte_usize(value: Byte, field: &str) -> Result<usize> {
+    usize::try_from(value)
+        .map_err(|_| BenchError::message(format!("{field} exceeds addressable memory")))
 }
 
 #[cfg(test)]
@@ -452,33 +743,92 @@ mod tests {
     }
 
     #[test]
-    fn omitted_kind_is_prepare_and_benchmark_repetitions_default() {
+    fn fixture_fold_resolves_create_and_contiguous_inserts() {
         let raw = parse(
-            "[[phase]]\nworkload = { type = \"trx-noop\", num = 1 }\n\n[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"trx-noop\", num = 2 }\n",
+            "[[phase]]\nworkload = { type = \"create-table\", index = \"unique\" }\n\
+             [[phase]]\nworkload = { type = \"insert-seq\", num = 3 }\n\
+             [[phase]]\nkind = \"benchmark\"\nworkload = { type = \"insert-rand\", num = 2, value_size = \"128 B\" }\n",
         )
         .unwrap();
         let phases =
-            validate_phases(raw.phases, WorkloadDefaults::default().resolve().unwrap()).unwrap();
-        assert!(matches!(phases[0], Phase::Prepare { .. }));
-        let Phase::Benchmark { measurement, .. } = phases[1] else {
-            panic!("expected benchmark phase");
+            validate_and_resolve_phases(raw.phases, WorkloadDefaults::default().resolve().unwrap())
+                .unwrap();
+        let ResolvedWorkload::InsertSeq(first) = phases[1].workload() else {
+            panic!("expected sequential insert")
         };
-        assert_eq!(measurement.warmup_runs, 0);
-        assert_eq!(measurement.measured_runs.get(), 1);
+        let ResolvedWorkload::InsertRand(second) = phases[2].workload() else {
+            panic!("expected random insert")
+        };
+        assert_eq!(first.attempted_range, KeyRange { start: 0, len: 3 });
+        assert_eq!(second.attempted_range, KeyRange { start: 3, len: 2 });
+        assert_eq!(second.index, IndexMode::Unique);
+        assert_eq!(second.value_size_bytes, 128);
     }
 
     #[test]
-    fn invalid_phase_shapes_are_rejected() {
-        let defaults = WorkloadDefaults::default().resolve().unwrap();
-        assert!(validate_phases(Vec::new(), defaults).is_err());
-        let no_benchmark =
-            parse("[[phase]]\nworkload = { type = \"trx-noop\", num = 1 }\n").unwrap();
-        assert!(validate_phases(no_benchmark.phases, defaults).is_err());
-        let measured_prepare = parse(
-            "[[phase]]\nmeasured_runs = 1\nworkload = { type = \"trx-noop\", num = 1 }\n\n[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"trx-noop\", num = 1 }\n",
+    fn fixture_fold_rejects_missing_or_duplicate_primary() {
+        let missing = parse(
+            "[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"insert-seq\", num = 1 }\n",
         )
         .unwrap();
-        assert!(validate_phases(measured_prepare.phases, defaults).is_err());
+        assert!(
+            validate_and_resolve_phases(
+                missing.phases,
+                WorkloadDefaults::default().resolve().unwrap()
+            )
+            .is_err()
+        );
+        let duplicate = parse(
+            "[[phase]]\nworkload = { type = \"create-table\", index = \"none\" }\n\
+             [[phase]]\nworkload = { type = \"create-table\", index = \"none\" }\n\
+             [[phase]]\nkind = \"benchmark\"\nworkload = { type = \"trx-noop\", num = 1 }\n",
+        )
+        .unwrap();
+        assert!(
+            validate_and_resolve_phases(
+                duplicate.phases,
+                WorkloadDefaults::default().resolve().unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn mutating_benchmark_rejects_replay() {
+        let raw = parse(
+            "[[phase]]\nkind = \"benchmark\"\nwarmup_runs = 1\nworkload = { type = \"table-ddl\" }\n",
+        )
+        .unwrap();
+        assert!(
+            validate_and_resolve_phases(raw.phases, WorkloadDefaults::default().resolve().unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn insert_samples_sum_per_session_ceilings() {
+        assert_eq!(insert_sample_count(5, 2, 2).unwrap(), 3);
+        assert_eq!(insert_sample_count(3, 3, 100).unwrap(), 3);
+    }
+
+    #[test]
+    fn byte_values_require_strings_and_resolve_exactly() {
+        let raw = parse(
+            "[workload_defaults]\nvalue_size = \"512 B\"\n\
+             [[phase]]\nkind = \"benchmark\"\nworkload = { type = \"trx-noop\", num = 1 }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            raw.workload_defaults.resolve().unwrap().value_size_bytes,
+            512
+        );
+        assert!(
+            parse(
+                "[workload_defaults]\nvalue_size = 512\n\
+                 [[phase]]\nkind = \"benchmark\"\nworkload = { type = \"trx-noop\", num = 1 }\n"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -507,8 +857,58 @@ mod tests {
         )
         .unwrap();
         assert!(load_plan(&source, &root).is_err());
+    }
 
-        fs::write(plan_dir.join("defaults.toml"), "").unwrap();
-        assert!(load_plan(&source, &root).is_err());
+    #[test]
+    fn checked_in_templates_are_complete_and_use_durable_defaults() {
+        let templates = Path::new(env!("CARGO_MANIFEST_DIR")).join("templates");
+        let cases = [
+            ("trx-noop.toml", "trx-noop"),
+            ("stmt-noop.toml", "stmt-noop"),
+            ("insert-seq.toml", "insert-seq"),
+            ("insert-rand.toml", "insert-rand"),
+            ("table-ddl.toml", "table-ddl"),
+        ];
+        let temp = TempDir::new().unwrap();
+        for (index, (file, workload)) in cases.into_iter().enumerate() {
+            let loaded = load_plan(&templates.join(file), &temp.path().join(index.to_string()))
+                .unwrap_or_else(|error| panic!("{file} must load: {error}"));
+            assert_eq!(
+                loaded.plan.phases.last().unwrap().workload().identity(),
+                workload
+            );
+            assert_eq!(
+                loaded.plan.engine.transaction.log_sync,
+                crate::engine_config::LogSyncValue::Fsync
+            );
+            assert_eq!(
+                loaded.plan.engine.index_buffer.max_mem_size_bytes,
+                512 * 1024 * 1024
+            );
+            assert_eq!(
+                loaded.plan.engine.index_buffer.max_file_size_bytes,
+                1024 * 1024 * 1024
+            );
+            assert_eq!(
+                loaded.plan.engine.data_buffer.max_mem_size_bytes,
+                1024 * 1024 * 1024
+            );
+            assert_eq!(
+                loaded.plan.engine.data_buffer.max_file_size_bytes,
+                2 * 1024 * 1024 * 1024
+            );
+            assert_eq!(
+                loaded.plan.engine.file.readonly_buffer_size_bytes,
+                1024 * 1024 * 1024
+            );
+        }
+        let workload_templates = fs::read_dir(&templates)
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                (path.file_name()?.to_str()? != "engine-defaults.toml").then_some(path)
+            })
+            .count();
+        assert_eq!(workload_templates, 5);
     }
 }
