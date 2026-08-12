@@ -1,6 +1,6 @@
-use crate::cli::{IndexMode, validate_batch_size};
+use crate::cli::validate_batch_size;
 use crate::error::{BenchError, Result};
-use crate::manifest::KeyRange;
+use crate::fixture::{IndexMode, KeyRange};
 use crate::workload::SessionPlan;
 
 const SPLITMIX_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;

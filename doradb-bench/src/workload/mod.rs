@@ -2,11 +2,14 @@ use crate::cli::{
     LockTableMode, LockTableScenario, LogSyncMode, TableLockScope, Workload, validate_batch_size,
     validate_value_size, validate_workers,
 };
-use crate::error::Result;
-use crate::manifest::{DefaultsManifest, KeyRange, Manifest};
+use crate::error::{BenchError, Result};
+use crate::fixture::KeyRange;
+use crate::manifest::{DefaultsManifest, Manifest};
 use doradb_storage::id::TableID;
 use doradb_storage::{Engine, Session};
+use parking_lot::Mutex;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 mod ddl;
 mod insert;
@@ -15,16 +18,58 @@ mod noop;
 mod read;
 mod util;
 
-pub(super) use ddl::{IndexDdlRunner, TableDdlRunner, benchmark_index_specs, benchmark_table_spec};
+pub(super) use ddl::{IndexDdlRunner, TableDdlRunner};
+pub(crate) use ddl::{run_create_table_operation, run_table_ddl_operations};
+pub(crate) use insert::{InsertOperationSpec, run_insert_operations};
 pub(super) use insert::{InsertRandRunner, InsertSeqRunner};
 pub(super) use lock::LockTableRunner;
-pub use noop::TrxNoopConfig;
-pub(crate) use noop::run_trx_noop_operations;
 pub(super) use noop::{StmtNoopRunner, TrxNoopRunner};
+pub(crate) use noop::{run_stmt_noop_operations, run_trx_noop_operations};
 pub(super) use read::{
     IndexScanRunner, IndexStreamRunner, LookupRandRunner, LookupSeqRunner, TableScanRunner,
 };
 pub(super) use util::build_session_plans;
+
+/// First-error-wins cooperative cancellation shared by one plan run.
+pub(crate) struct RunCancellation {
+    cancelled: AtomicBool,
+    first_error: Mutex<Option<BenchError>>,
+}
+
+impl RunCancellation {
+    /// Construct an active run state.
+    pub(crate) fn new() -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+            first_error: Mutex::new(None),
+        }
+    }
+
+    /// Return whether a peer has published an invocation-fatal error.
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Publish an unexpected error without replacing the first publisher.
+    pub(crate) fn fail(&self, error: BenchError) {
+        let mut first_error = self.first_error.lock();
+        if first_error.is_none() {
+            *first_error = Some(error);
+            self.cancelled.store(true, Ordering::Release);
+        }
+    }
+
+    /// Take the primary error after every task has drained.
+    pub(crate) fn take_error(&self) -> Option<BenchError> {
+        self.first_error.lock().take()
+    }
+}
+
+impl Default for RunCancellation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Executes one workload's assigned operations through one public session.
 pub(super) trait WorkloadRunner: Clone + Send + Sync {
@@ -117,7 +162,7 @@ pub(super) trait WorkloadConfig: Sized {
     }
 
     /// Apply a successful workload's runtime manifest changes.
-    fn update_manifest(&self, _manifest: &mut Manifest) -> Result<bool> {
+    fn update_manifest(&self, _manifest: &mut Manifest, _summary: &SessionSummary) -> Result<bool> {
         Ok(false)
     }
 }

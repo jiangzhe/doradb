@@ -201,7 +201,9 @@ doradb-bench --root <storage-root> --plan <plan.toml>
 `--plan` selects phased execution directly; there is no `run` subcommand. Plan
 execution requires a non-existing storage root, creates it, bootstraps one
 engine, executes all phases, closes the engine, and leaves the root and result
-artifacts for inspection. `cleanup` may remain as a manifest-guarded safety
+artifacts for inspection after success. Unexpected failures emit no benchmark
+result artifacts; a guarded root may remain for diagnosis and cleanup.
+`cleanup` may remain as a manifest-guarded safety
 utility, but `prepare` and the nested per-workload commands are removed. There
 is no compatibility adapter or second workload execution path. [D2] [C1] [C5]
 [U3] [U6] [U8]
@@ -308,8 +310,10 @@ enum WorkloadSpec {
 }
 ```
 
-Omitted overlay/default fields use serde defaults; numeric and byte-size inputs
-are converted to validated types. `PhaseKind::default()` is `Prepare`;
+Omitted overlay/default fields use serde defaults. Byte-size plan inputs use
+human-readable `byte-unit` strings and resolved plan/result entities record
+exact numeric byte counts. Other numeric inputs are converted to validated
+types. `PhaseKind::default()` is `Prepare`;
 therefore prepare phases omit `kind`. Exactly one phase specifies
 `kind = "benchmark"`, and it must be last. Warm-up and measured-run fields are
 rejected on prepare phases. On the benchmark phase they default to zero warm-up
@@ -419,7 +423,8 @@ advanced workload dependencies. [D2] [C7] [C8] [U15]
 ### Complete workload plan templates
 
 Phase 2 introduces `doradb-bench/templates/`, the shared engine-defaults file,
-and complete plans for the four remaining simple workloads. Phase 3 adds
+and five complete simple-workload plans: it backfills the Phase 1 `trx-noop`
+template alongside the four newly migrated benchmark workloads. Phase 3 adds
 complete plans for the seven dependent/coordinated workloads, completing one
 static TOML file for each current workload. A template is an ordinary complete
 plan accepted by `--plan`; the executor has no template-only path. [D2] [C5]
@@ -476,10 +481,11 @@ formed by merging samples from equivalent measured runs rather than averaging
 percentiles. Histogram range overflow is an explicit run failure. [C4] [U5]
 
 The output records the resolved plan and engine configuration, per-run metrics,
-aggregate average/p95/p99, wall time, throughput, failures, and optional public
-internal-stat deltas. A failed warm-up or measured workload aborts later runs
-and leaves diagnostic output; it does not produce a successful latency summary.
-No CI performance threshold is introduced. [C4] [D7]
+aggregate average/p95/p99, wall time, throughput, expected workload outcomes,
+and optional public internal-stat deltas. A failed prepare, warm-up, or measured
+workload aborts later runs, drains accepted work, shuts down the engine, and
+emits no benchmark result artifact. No CI performance threshold is introduced.
+[C4] [D7]
 
 ### Checkpoint is the first new workload
 
@@ -626,7 +632,8 @@ requires separate justification and review outside this RFC.
     implicit primary-table shape, generated-key cursor, loaded range, and commit
     fence effects; instrument their latency units; introduce
     `doradb-bench/templates/engine-defaults.toml` and complete templates for the
-    four newly migrated current workloads; add smoke coverage and
+    four newly migrated current workloads plus the missing Phase 1 `trx-noop`
+    template; add smoke coverage and
     documentation.
   - Goals: Prove plan execution and basic prepare-to-benchmark composition with
     real workloads before adding dependent workload chains.
@@ -634,7 +641,7 @@ requires separate justification and review outside this RFC.
     dependency or table-pool coordination, removal of all legacy workload
     commands, checkpoint/freeze, delete/update/mixed workloads, or performance
     gates.
-  - Task Doc: `docs/tasks/TBD.md`
+  - Task Doc: `docs/tasks/000267-migrate-doradb-bench-simple-workloads-and-basic-fixture-state.md`
   - Task Issue: `#0`
   - Phase Status: `pending`
   - Implementation Summary: `pending`

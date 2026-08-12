@@ -270,29 +270,45 @@ pub(crate) enum ResourceError {
     BufferPoolSizeTooSmall,
 }
 
-/// Fieldless operation-domain errors carried underneath `ErrorKind::Operation`.
+/// Specific logical failures carried underneath [`ErrorKind::Operation`].
+///
+/// Public callers can retrieve this typed context through
+/// [`Error::operation_error`] while the storage engine retains ownership of
+/// error construction and disclosure.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ThisError)]
-pub(crate) enum OperationError {
+pub enum OperationError {
+    /// The requested table does not exist.
     #[error("table not found")]
     TableNotFound,
+    /// The requested table is being dropped.
     #[error("table is dropping")]
     TableDropping,
+    /// The admitted schema no longer matches the request.
     #[error("schema changed")]
     SchemaChanged,
+    /// The requested index does not exist.
     #[error("index not found")]
     IndexNotFound,
+    /// A unique key is already present.
     #[error("duplicate key")]
     DuplicateKey,
+    /// A concurrent writer owns the requested row or key.
     #[error("write conflict")]
     WriteConflict,
+    /// The DML request is structurally invalid.
     #[error("invalid DML input")]
     InvalidDmlInput,
+    /// Catalog metadata is invalid for the requested operation.
     #[error("invalid metadata")]
     InvalidMetadata,
+    /// A lock upgrade would have to wait.
     #[error("lock upgrade would block")]
     LockUpgradeWouldBlock,
+    /// The requested lock conversion is unsupported.
     #[error("lock conversion is not supported")]
     LockConversionNotSupported,
+    /// The requested lock conflicts with another lock family.
     #[error("lock family conflict")]
     LockFamilyConflict,
 }
@@ -1800,6 +1816,15 @@ impl Error {
         self.kind() == kind
     }
 
+    /// Return the specific operation failure when this is an operation error.
+    #[inline]
+    pub fn operation_error(&self) -> Option<OperationError> {
+        if self.kind() != ErrorKind::Operation {
+            return None;
+        }
+        self.0.downcast_ref::<OperationError>().copied()
+    }
+
     /// Return the underlying `error-stack` report.
     #[inline]
     pub fn report(&self) -> &Report<ErrorKind> {
@@ -2024,6 +2049,30 @@ mod tests {
     use error_stack::ResultExt;
     use std::cell::Cell;
     use std::io::Error as StdIoError;
+
+    #[test]
+    fn test_public_operation_error_returns_every_variant() {
+        let cases = [
+            OperationError::TableNotFound,
+            OperationError::TableDropping,
+            OperationError::SchemaChanged,
+            OperationError::IndexNotFound,
+            OperationError::DuplicateKey,
+            OperationError::WriteConflict,
+            OperationError::InvalidDmlInput,
+            OperationError::InvalidMetadata,
+            OperationError::LockUpgradeWouldBlock,
+            OperationError::LockConversionNotSupported,
+            OperationError::LockFamilyConflict,
+        ];
+        for operation_error in cases {
+            let error = Report::new(operation_error).disclose();
+            assert_eq!(error.operation_error(), Some(operation_error));
+        }
+
+        let config = Report::new(ConfigError::InvalidIoDepth).disclose();
+        assert_eq!(config.operation_error(), None);
+    }
 
     #[test]
     fn test_io_report_with_caller_attachment_preserves_detail() {

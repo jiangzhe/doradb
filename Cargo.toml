@@ -24,7 +24,7 @@ semistr = "0.1"
 smol = "2.0"
 easy-parallel = "3.3.1"
 toml = "1.1"
-byte-unit = "5"
+byte-unit = { version = "5", features = ["serde", "u128"] }
 ahash = "0.8"
 glob = "0.3"
 futures = "0.3"

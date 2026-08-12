@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod engine_config;
 pub mod error;
+pub mod fixture;
 pub mod manifest;
 pub mod measurement;
 pub mod output;

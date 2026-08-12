@@ -73,6 +73,33 @@ mod tests {
         })
     }
 
+    fn loaded_primary_row_count(root: &Path) -> u64 {
+        smol::block_on(async {
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root))
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let table_id = session.list_table_ids().unwrap()[0];
+            let mut trx = session.begin_trx().unwrap();
+            let rows = trx
+                .exec(async |stmt| {
+                    let mut rows = 0u64;
+                    stmt.table_scan_mvcc(table_id, &[0], |_| {
+                        rows += 1;
+                        true
+                    })
+                    .await?;
+                    Ok(rows)
+                })
+                .await
+                .unwrap();
+            trx.commit().await.unwrap();
+            session.close().await.unwrap();
+            engine.shutdown();
+            rows
+        })
+    }
+
     fn assert_all_tables_exclusively_lockable(root: &Path) {
         smol::block_on(async {
             let engine = Engine::bootstrap(EngineConfig::default().storage_root(root))
@@ -801,21 +828,21 @@ meta = "not accepted here"
 name = "trx-noop-smoke"
 
 [engine]
-meta_buffer_bytes = 16777216
+meta_buffer_size = "16 MiB"
 
 [engine.transaction]
 log_sync = "none"
 
 [engine.index_buffer]
-max_file_size_bytes = 67108864
-max_mem_size_bytes = 16777216
+max_file_size = "64 MiB"
+max_mem_size = "16 MiB"
 
 [engine.data_buffer]
-max_file_size_bytes = 67108864
-max_mem_size_bytes = 16777216
+max_file_size = "64 MiB"
+max_mem_size = "16 MiB"
 
 [engine.file]
-readonly_buffer_size_bytes = 33554432
+readonly_buffer_size = "32 MiB"
 
 [workload_defaults]
 threads = 2
@@ -841,7 +868,7 @@ workload = { type = "trx-noop", num = 4 }
         assert!(marker.contains("plan_source"));
 
         let result = fs::read_to_string(root.join("benchmark-result.toml")).unwrap();
-        assert!(result.contains("status = \"success\""));
+        assert!(!result.contains("status ="));
         assert!(result.contains("measured_runs = 2"));
         assert!(result.contains("unit = \"transaction-lifecycle\""));
         assert!(result.contains("kind = \"counter-delta\""));
@@ -855,5 +882,108 @@ workload = { type = "trx-noop", num = 4 }
         let cleanup_stdout = assert_success(run_bench(&root, &["cleanup"]));
         assert!(cleanup_stdout.contains("removed storage_root="));
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn plan_simple_workloads_execute_end_to_end() {
+        let temp = TempDir::new().unwrap();
+        let cases = [
+            (
+                "create-table",
+                r#"
+[[phase]]
+kind = "benchmark"
+workload = { type = "create-table", index = "non-unique" }
+"#,
+                "unit = \"table-creation\"",
+                "operations = 1",
+            ),
+            (
+                "stmt-noop",
+                r#"
+[[phase]]
+kind = "benchmark"
+workload = { type = "stmt-noop", num = 4, threads = 2, sessions = 3 }
+"#,
+                "unit = \"statement-execution\"",
+                "operations = 4",
+            ),
+            (
+                "insert-seq",
+                r#"
+[[phase]]
+workload = { type = "create-table", index = "none" }
+
+[[phase]]
+kind = "benchmark"
+workload = { type = "insert-seq", num = 5, threads = 2, sessions = 2, value_size = "16 B", batch_size = 2 }
+"#,
+                "unit = \"insert-batch-transaction\"",
+                "inserted_rows = 5",
+            ),
+            (
+                "insert-rand",
+                r#"
+[[phase]]
+workload = { type = "create-table", index = "unique" }
+
+[[phase]]
+kind = "benchmark"
+workload = { type = "insert-rand", num = 5, seed = 7, value_size = "16 B", batch_size = 2 }
+"#,
+                "unit = \"insert-batch-transaction\"",
+                "inserted_rows = 5",
+            ),
+            (
+                "table-ddl",
+                r#"
+[[phase]]
+kind = "benchmark"
+workload = { type = "table-ddl", num = 2, threads = 1, sessions = 2 }
+"#,
+                "unit = \"table-create-drop-cycle\"",
+                "operations = 4",
+            ),
+        ];
+
+        for (name, plan, latency_unit, counter) in cases {
+            let root = temp.path().join(format!("{name}-root"));
+            let plan_path = temp.path().join(format!("{name}.toml"));
+            fs::write(&plan_path, plan).unwrap();
+            assert_success(run_bench(&root, &["-p", plan_path.to_str().unwrap()]));
+            let result = fs::read_to_string(root.join("benchmark-result.toml")).unwrap();
+            assert!(result.contains(&format!("type = \"{name}\"")), "{result}");
+            assert!(result.contains(latency_unit), "{result}");
+            assert!(result.contains(counter), "{result}");
+            if matches!(name, "insert-seq" | "insert-rand") {
+                assert_eq!(loaded_primary_row_count(&root), 5);
+            }
+            assert_success(run_bench(&root, &["cleanup"]));
+        }
+    }
+
+    #[test]
+    fn plan_bootstrap_failure_emits_no_result_artifacts() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("bootstrap-failure-root");
+        let plan_path = temp.path().join("bootstrap-failure.toml");
+        fs::write(
+            &plan_path,
+            r#"
+[engine.file]
+data_dir = "benchmark-manifest.toml"
+
+[[phase]]
+kind = "benchmark"
+workload = { type = "trx-noop", num = 1 }
+"#,
+        )
+        .unwrap();
+
+        assert_failure(run_bench(&root, &["-p", plan_path.to_str().unwrap()]));
+        assert!(root.join("benchmark-manifest.toml").is_file());
+        assert!(!root.join("benchmark-result.toml").exists());
+        assert!(!root.join("benchmark-result.md").exists());
+        assert_success(run_bench(&root, &["cleanup"]));
     }
 }

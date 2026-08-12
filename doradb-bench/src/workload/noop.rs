@@ -1,11 +1,14 @@
 use crate::cli::{WorkerCountArgs, Workload};
-use crate::error::Result;
-use crate::manifest::{KeyRange, Manifest};
+use crate::error::{BenchError, Result};
+use crate::fixture::KeyRange;
+use crate::manifest::Manifest;
 use crate::measurement::{LatencyDistribution, MeasurementClock};
-use crate::workload::{CommonConfig, SessionPlan, SessionSummary, WorkloadConfig, WorkloadRunner};
+use crate::plan::TrxNoopConfig;
+use crate::workload::{
+    CommonConfig, RunCancellation, SessionPlan, SessionSummary, WorkloadConfig, WorkloadRunner,
+};
 use doradb_storage::id::TableID;
 use doradb_storage::{Error as StorageError, Session};
-use serde::{Deserialize, Serialize};
 
 /// Resolved statement-noop configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -60,19 +63,9 @@ impl WorkloadRunner for StmtNoopRunner {
         session: &mut Session,
         plan: &SessionPlan,
     ) -> Result<SessionSummary> {
-        if plan.number == 0 {
-            return Ok(SessionSummary::default());
-        }
-        let mut trx = session.begin_trx()?;
-        for _ in 0..plan.number {
-            if let Err(err) = trx.exec(async |_stmt| Ok::<(), StorageError>(())).await {
-                trx.rollback().await?;
-                return Err(err.into());
-            }
-        }
-        trx.commit().await?;
+        let result = run_stmt_noop_operations(session, plan.number, None, None).await?;
         Ok(SessionSummary {
-            operations: plan.number,
+            operations: result.operations,
             ..SessionSummary::default()
         })
     }
@@ -119,20 +112,6 @@ impl WorkloadConfig for LegacyTrxNoopConfig {
     }
 }
 
-/// Resolved transaction-noop configuration shared by plan and legacy dispatch.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct TrxNoopConfig {
-    /// Aggregate public transaction count.
-    pub num: u64,
-    /// Executor thread count.
-    pub threads: usize,
-    /// Independent public session count.
-    pub sessions: usize,
-    /// Whether engine diagnostics are captured around the run.
-    pub include_stats: bool,
-}
-
 /// Executes no-effect transaction cycles for one session.
 #[derive(Clone, Copy)]
 pub(crate) struct TrxNoopRunner;
@@ -150,12 +129,20 @@ impl WorkloadRunner for TrxNoopRunner {
         session: &mut Session,
         plan: &SessionPlan,
     ) -> Result<SessionSummary> {
-        run_trx_noop_operations(session, plan.number, None).await?;
+        let result = run_trx_noop_operations(session, plan.number, None, None).await?;
         Ok(SessionSummary {
-            operations: plan.number,
+            operations: result.operations,
             ..SessionSummary::default()
         })
     }
+}
+
+/// Result of one shared no-op operation loop.
+pub(crate) struct NoopOperationResult {
+    /// Number of completely settled logical operations.
+    pub(crate) operations: u64,
+    /// Optional exact operation latency samples.
+    pub(crate) latency: LatencyDistribution,
 }
 
 /// Shared transaction-noop operation loop used by legacy and plan dispatch.
@@ -163,9 +150,14 @@ pub(crate) async fn run_trx_noop_operations(
     session: &mut Session,
     number: u64,
     clock: Option<&MeasurementClock>,
-) -> Result<LatencyDistribution> {
+    cancellation: Option<&RunCancellation>,
+) -> Result<NoopOperationResult> {
     let mut latency = LatencyDistribution::new()?;
+    let mut operations = 0u64;
     for _ in 0..number {
+        if cancellation.is_some_and(RunCancellation::is_cancelled) {
+            break;
+        }
         if let Some(clock) = clock {
             let start = clock.raw();
             session.begin_trx()?.commit().await?;
@@ -174,8 +166,61 @@ pub(crate) async fn run_trx_noop_operations(
         } else {
             session.begin_trx()?.commit().await?;
         }
+        operations = operations
+            .checked_add(1)
+            .ok_or_else(|| BenchError::message("no-op counter overflow"))?;
     }
-    Ok(latency)
+    Ok(NoopOperationResult {
+        operations,
+        latency,
+    })
+}
+
+/// Shared statement-noop loop used by legacy and plan dispatch.
+pub(crate) async fn run_stmt_noop_operations(
+    session: &mut Session,
+    number: u64,
+    clock: Option<&MeasurementClock>,
+    cancellation: Option<&RunCancellation>,
+) -> Result<NoopOperationResult> {
+    let mut latency = LatencyDistribution::new()?;
+    if number == 0 || cancellation.is_some_and(RunCancellation::is_cancelled) {
+        return Ok(NoopOperationResult {
+            operations: 0,
+            latency,
+        });
+    }
+    let mut trx = session.begin_trx()?;
+    let mut operations = 0u64;
+    for _ in 0..number {
+        if cancellation.is_some_and(RunCancellation::is_cancelled) {
+            trx.rollback().await?;
+            return Ok(NoopOperationResult {
+                operations,
+                latency,
+            });
+        }
+        if let Some(clock) = clock {
+            let start = clock.raw();
+            if let Err(error) = trx.exec(async |_stmt| Ok::<(), StorageError>(())).await {
+                let _ = trx.rollback().await;
+                return Err(error.into());
+            }
+            let end = clock.raw();
+            latency.record(clock.raw_delta_nanos(start, end)?)?;
+        } else if let Err(error) = trx.exec(async |_stmt| Ok::<(), StorageError>(())).await {
+            let _ = trx.rollback().await;
+            return Err(error.into());
+        }
+        operations = operations
+            .checked_add(1)
+            .ok_or_else(|| BenchError::message("no-op counter overflow"))?;
+    }
+    trx.commit().await?;
+    Ok(NoopOperationResult {
+        operations,
+        latency,
+    })
 }
 
 fn resolve_noop_common(manifest: &Manifest, args: &WorkerCountArgs) -> Result<CommonConfig> {

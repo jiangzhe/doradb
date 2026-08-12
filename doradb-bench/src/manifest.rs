@@ -1,8 +1,9 @@
 use crate::cli::{
-    DEFAULT_BATCH_SIZE, DEFAULT_VALUE_SIZE, IndexMode, LogSyncMode, Workload, validate_batch_size,
+    DEFAULT_BATCH_SIZE, DEFAULT_VALUE_SIZE, LogSyncMode, Workload, validate_batch_size,
     validate_value_size, validate_workers,
 };
 use crate::error::{BenchError, Result};
+use crate::fixture::{IndexMode, KeyRange};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
@@ -35,20 +36,6 @@ pub(super) struct PlanManifest {
 pub(super) enum PlanManifestMode {
     /// Root belongs to direct plan execution.
     Plan,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct KeyRange {
-    pub(super) start: u64,
-    pub(super) len: u64,
-}
-
-impl KeyRange {
-    pub(super) fn end(&self) -> Result<u64> {
-        self.start
-            .checked_add(self.len)
-            .ok_or_else(|| BenchError::message("key range end overflow"))
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -201,12 +188,22 @@ impl Manifest {
         Ok(KeyRange { start, len: rows })
     }
 
+    #[cfg(test)]
     pub(super) fn record_insert_success(&mut self, rows: u64) -> Result<()> {
-        let next_key = next_key_after(self.runtime.next_key, rows)?;
+        self.record_insert_outcome(rows, rows)
+    }
+
+    pub(super) fn record_insert_outcome(&mut self, attempted: u64, inserted: u64) -> Result<()> {
+        if inserted > attempted {
+            return Err(BenchError::message(
+                "inserted rows must not exceed attempted rows",
+            ));
+        }
+        let next_key = next_key_after(self.runtime.next_key, attempted)?;
         let rows_inserted = self
             .runtime
             .rows_inserted
-            .checked_add(rows)
+            .checked_add(inserted)
             .ok_or_else(|| BenchError::message("inserted row counter overflow"))?;
         self.runtime.next_key = next_key;
         self.runtime.rows_inserted = rows_inserted;

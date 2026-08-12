@@ -70,6 +70,14 @@ impl Default for MeasurementClock {
 pub enum LatencyUnit {
     /// Public transaction begin-through-successful-commit lifecycle.
     TransactionLifecycle,
+    /// One public statement execution inside an active transaction.
+    StatementExecution,
+    /// One public primary-table creation request.
+    TableCreation,
+    /// One insert batch transaction from begin through successful commit.
+    InsertBatchTransaction,
+    /// One transient table create-through-successful-drop cycle.
+    TableCreateDropCycle,
 }
 
 /// Exact session-local latency samples and their HDR distribution.
@@ -170,11 +178,21 @@ impl LatencyDistribution {
     }
 }
 
+/// Checked counters for allowlisted terminal operation outcomes.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectedOutcomeCounters {
+    /// Insert attempts rejected because a unique key already exists.
+    pub duplicate_key: u64,
+    /// Insert attempts rejected by concurrent write ownership.
+    pub write_conflict: u64,
+}
+
 /// Additive successful workload counters.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkloadCounters {
-    /// Successful logical workload operations.
+    /// Terminal logical workload attempts, including expected insert outcomes.
     pub operations: u64,
     /// Rows inserted by successful operations.
     pub inserted_rows: u64,
@@ -184,6 +202,8 @@ pub struct WorkloadCounters {
     pub not_found: u64,
     /// Rows returned by successful scans or streams.
     pub rows_returned: u64,
+    /// Expected operation outcomes owned by the workload.
+    pub expected_outcomes: ExpectedOutcomeCounters,
 }
 
 impl WorkloadCounters {
@@ -197,6 +217,16 @@ impl WorkloadCounters {
         self.not_found = checked_counter(self.not_found, other.not_found, "not_found")?;
         self.rows_returned =
             checked_counter(self.rows_returned, other.rows_returned, "rows_returned")?;
+        self.expected_outcomes.duplicate_key = checked_counter(
+            self.expected_outcomes.duplicate_key,
+            other.expected_outcomes.duplicate_key,
+            "expected_outcomes.duplicate_key",
+        )?;
+        self.expected_outcomes.write_conflict = checked_counter(
+            self.expected_outcomes.write_conflict,
+            other.expected_outcomes.write_conflict,
+            "expected_outcomes.write_conflict",
+        )?;
         Ok(())
     }
 }

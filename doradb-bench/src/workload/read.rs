@@ -2,7 +2,8 @@ use crate::cli::{
     IndexScanArgs, IndexStreamArgs, ReadArgs, SeededReadArgs, Workload, validate_batch_size,
 };
 use crate::error::{BenchError, Result};
-use crate::manifest::{KeyRange, Manifest};
+use crate::fixture::KeyRange;
+use crate::manifest::Manifest;
 use crate::workload::util::{
     RandomScanRangeGenerator, effective_batch_size, generate_random_read_keys,
     generate_sequential_read_keys,

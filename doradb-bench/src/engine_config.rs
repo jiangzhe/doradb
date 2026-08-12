@@ -1,8 +1,6 @@
-use crate::error::Result;
-use doradb_storage::{
-    EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, LogSync, MandatoryRuntimeConfig,
-    TrxSysConfig,
-};
+use crate::error::{BenchError, Result};
+use byte_unit::Byte;
+use doradb_storage::{EngineConfig, EvictableBufferPoolConfig, LogSync};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -14,8 +12,8 @@ pub struct EngineConfigOverlay {
     pub mandatory_runtime: MandatoryRuntimeOverlay,
     /// Transaction-system overrides.
     pub transaction: TransactionConfigOverlay,
-    /// Metadata buffer-pool bytes.
-    pub meta_buffer_bytes: Option<u64>,
+    /// Metadata buffer-pool size.
+    pub meta_buffer_size: Option<Byte>,
     /// User-index buffer-pool overrides.
     pub index_buffer: EvictableBufferPoolConfigOverlay,
     /// Data buffer-pool overrides.
@@ -30,7 +28,7 @@ impl EngineConfigOverlay {
     pub fn merge(&mut self, other: Self) {
         self.mandatory_runtime.merge(other.mandatory_runtime);
         self.transaction.merge(other.transaction);
-        replace(&mut self.meta_buffer_bytes, other.meta_buffer_bytes);
+        replace(&mut self.meta_buffer_size, other.meta_buffer_size);
         self.index_buffer.merge(other.index_buffer);
         self.data_buffer.merge(other.data_buffer);
         self.file.merge(other.file);
@@ -65,14 +63,14 @@ pub struct TransactionConfigOverlay {
     pub recovery_io_depth: Option<usize>,
     /// Catalog-checkpoint redo-scan I/O depth.
     pub catalog_checkpoint_scan_io_depth: Option<usize>,
-    /// Redo block size in bytes.
-    pub log_block_size_bytes: Option<u64>,
+    /// Redo block size.
+    pub log_block_size: Option<Byte>,
     /// Redo directory relative to the storage root.
     pub log_dir: Option<PathBuf>,
     /// Redo log-family file stem.
     pub log_file_stem: Option<String>,
-    /// Maximum redo file size in bytes.
-    pub log_file_max_size_bytes: Option<u64>,
+    /// Maximum redo file size.
+    pub log_file_max_size: Option<Byte>,
     /// Redo durability mode.
     pub log_sync: Option<LogSyncValue>,
     /// Purge worker-thread count.
@@ -92,13 +90,10 @@ impl TransactionConfigOverlay {
             &mut self.catalog_checkpoint_scan_io_depth,
             other.catalog_checkpoint_scan_io_depth,
         );
-        replace(&mut self.log_block_size_bytes, other.log_block_size_bytes);
+        replace(&mut self.log_block_size, other.log_block_size);
         replace(&mut self.log_dir, other.log_dir);
         replace(&mut self.log_file_stem, other.log_file_stem);
-        replace(
-            &mut self.log_file_max_size_bytes,
-            other.log_file_max_size_bytes,
-        );
+        replace(&mut self.log_file_max_size, other.log_file_max_size);
         replace(&mut self.log_sync, other.log_sync);
         replace(&mut self.purge_threads, other.purge_threads);
         replace(&mut self.gc_buckets, other.gc_buckets);
@@ -115,18 +110,18 @@ impl TransactionConfigOverlay {
 pub struct EvictableBufferPoolConfigOverlay {
     /// Swap-file path relative to the storage root.
     pub swap_file: Option<PathBuf>,
-    /// Maximum swap-file bytes.
-    pub max_file_size_bytes: Option<u64>,
-    /// Maximum resident-memory bytes.
-    pub max_mem_size_bytes: Option<u64>,
+    /// Maximum swap-file size.
+    pub max_file_size: Option<Byte>,
+    /// Maximum resident-memory size.
+    pub max_mem_size: Option<Byte>,
 }
 
 impl EvictableBufferPoolConfigOverlay {
     #[inline]
     fn merge(&mut self, other: Self) {
         replace(&mut self.swap_file, other.swap_file);
-        replace(&mut self.max_file_size_bytes, other.max_file_size_bytes);
-        replace(&mut self.max_mem_size_bytes, other.max_mem_size_bytes);
+        replace(&mut self.max_file_size, other.max_file_size);
+        replace(&mut self.max_mem_size, other.max_mem_size);
     }
 }
 
@@ -138,8 +133,8 @@ pub struct FileSystemConfigOverlay {
     pub io_depth: Option<usize>,
     /// Data directory relative to the storage root.
     pub data_dir: Option<PathBuf>,
-    /// Readonly buffer-pool bytes.
-    pub readonly_buffer_size_bytes: Option<usize>,
+    /// Readonly buffer-pool size.
+    pub readonly_buffer_size: Option<Byte>,
     /// Catalog multi-table file name.
     pub catalog_file_name: Option<String>,
 }
@@ -149,10 +144,7 @@ impl FileSystemConfigOverlay {
     fn merge(&mut self, other: Self) {
         replace(&mut self.io_depth, other.io_depth);
         replace(&mut self.data_dir, other.data_dir);
-        replace(
-            &mut self.readonly_buffer_size_bytes,
-            other.readonly_buffer_size_bytes,
-        );
+        replace(&mut self.readonly_buffer_size, other.readonly_buffer_size);
         replace(&mut self.catalog_file_name, other.catalog_file_name);
     }
 }
@@ -322,7 +314,7 @@ pub fn resolve_engine_config(
     overlay: &EngineConfigOverlay,
 ) -> Result<(EngineConfig, ResolvedEngineConfig)> {
     let default = EngineConfig::default();
-    let mut mandatory = MandatoryRuntimeConfig::default();
+    let mut mandatory = default.mandatory_runtime;
     if let Some(value) = overlay.mandatory_runtime.worker_threads {
         mandatory = mandatory.worker_threads(value);
     }
@@ -330,7 +322,7 @@ pub fn resolve_engine_config(
         mandatory = mandatory.concurrency_limit(value);
     }
 
-    let mut transaction = TrxSysConfig::default();
+    let mut transaction = default.trx.clone();
     if let Some(value) = overlay.transaction.log_write_io_depth {
         transaction = transaction.log_write_io_depth(value);
     }
@@ -340,8 +332,8 @@ pub fn resolve_engine_config(
     if let Some(value) = overlay.transaction.catalog_checkpoint_scan_io_depth {
         transaction = transaction.catalog_checkpoint_scan_io_depth(value);
     }
-    if let Some(value) = overlay.transaction.log_block_size_bytes {
-        transaction = transaction.log_block_size(value);
+    if let Some(value) = overlay.transaction.log_block_size {
+        transaction = transaction.log_block_size(byte_u64(value, "transaction.log_block_size")?);
     }
     if let Some(value) = &overlay.transaction.log_dir {
         transaction = transaction.log_dir(value);
@@ -349,8 +341,9 @@ pub fn resolve_engine_config(
     if let Some(value) = &overlay.transaction.log_file_stem {
         transaction = transaction.log_file_stem(value);
     }
-    if let Some(value) = overlay.transaction.log_file_max_size_bytes {
-        transaction = transaction.log_file_max_size(value);
+    if let Some(value) = overlay.transaction.log_file_max_size {
+        transaction =
+            transaction.log_file_max_size(byte_u64(value, "transaction.log_file_max_size")?);
     }
     if let Some(value) = overlay.transaction.log_sync {
         transaction = transaction.log_sync(value.storage());
@@ -365,20 +358,26 @@ pub fn resolve_engine_config(
         transaction = transaction.recovery_disable_dml_validation(value);
     }
 
-    let index_buffer =
-        apply_evictable_buffer_overlay(default.index_buffer.clone(), &overlay.index_buffer);
-    let data_buffer =
-        apply_evictable_buffer_overlay(default.data_buffer.clone(), &overlay.data_buffer);
+    let index_buffer = apply_evictable_buffer_overlay(
+        default.index_buffer.clone(),
+        &overlay.index_buffer,
+        "index_buffer",
+    )?;
+    let data_buffer = apply_evictable_buffer_overlay(
+        default.data_buffer.clone(),
+        &overlay.data_buffer,
+        "data_buffer",
+    )?;
 
-    let mut file = FileSystemConfig::default();
+    let mut file = default.file.clone();
     if let Some(value) = overlay.file.io_depth {
         file = file.io_depth(value);
     }
     if let Some(value) = &overlay.file.data_dir {
         file = file.data_dir(value);
     }
-    if let Some(value) = overlay.file.readonly_buffer_size_bytes {
-        file = file.readonly_buffer_size(value);
+    if let Some(value) = overlay.file.readonly_buffer_size {
+        file = file.readonly_buffer_size(byte_usize(value, "file.readonly_buffer_size")?);
     }
     if let Some(value) = &overlay.file.catalog_file_name {
         file = file.catalog_file_name(value);
@@ -390,8 +389,10 @@ pub fn resolve_engine_config(
         .trx(transaction)
         .meta_buffer(
             overlay
-                .meta_buffer_bytes
-                .unwrap_or(default.meta_buffer.as_u64()),
+                .meta_buffer_size
+                .map_or(Ok(default.meta_buffer.as_u64()), |value| {
+                    byte_u64(value, "meta_buffer_size")
+                })?,
         )
         .index_buffer(index_buffer)
         .data_buffer(data_buffer)
@@ -404,23 +405,35 @@ pub fn resolve_engine_config(
 fn apply_evictable_buffer_overlay(
     mut config: EvictableBufferPoolConfig,
     overlay: &EvictableBufferPoolConfigOverlay,
-) -> EvictableBufferPoolConfig {
+    field: &str,
+) -> Result<EvictableBufferPoolConfig> {
     if let Some(value) = &overlay.swap_file {
         config = config.swap_file(value);
     }
-    if let Some(value) = overlay.max_file_size_bytes {
-        config = config.max_file_size(value);
+    if let Some(value) = overlay.max_file_size {
+        config = config.max_file_size(byte_u64(value, &format!("{field}.max_file_size"))?);
     }
-    if let Some(value) = overlay.max_mem_size_bytes {
-        config = config.max_mem_size(value);
+    if let Some(value) = overlay.max_mem_size {
+        config = config.max_mem_size(byte_u64(value, &format!("{field}.max_mem_size"))?);
     }
-    config
+    Ok(config)
 }
 
 fn replace<T>(target: &mut Option<T>, value: Option<T>) {
     if value.is_some() {
         *target = value;
     }
+}
+
+fn byte_u64(value: Byte, field: &str) -> Result<u64> {
+    value
+        .as_u64_checked()
+        .ok_or_else(|| BenchError::message(format!("{field} exceeds u64 bytes")))
+}
+
+fn byte_usize(value: Byte, field: &str) -> Result<usize> {
+    usize::try_from(value)
+        .map_err(|_| BenchError::message(format!("{field} exceeds addressable memory")))
 }
 
 #[cfg(test)]
@@ -437,20 +450,27 @@ mod tests {
         assert_eq!(base.transaction.purge_threads, Some(5));
         assert_eq!(base.transaction.gc_buckets, Some(8));
 
-        let mut base: EngineConfigOverlay =
-            toml::from_str("[index_buffer]\nmax_file_size_bytes = 128\nmax_mem_size_bytes = 64\n")
-                .unwrap();
-        let local = toml::from_str("[index_buffer]\nmax_mem_size_bytes = 96\n").unwrap();
+        let mut base: EngineConfigOverlay = toml::from_str(
+            "[index_buffer]\nmax_file_size = \"128 MiB\"\nmax_mem_size = \"64 MiB\"\n",
+        )
+        .unwrap();
+        let local = toml::from_str("[index_buffer]\nmax_mem_size = \"96 MiB\"\n").unwrap();
         base.merge(local);
-        assert_eq!(base.index_buffer.max_file_size_bytes, Some(128));
-        assert_eq!(base.index_buffer.max_mem_size_bytes, Some(96));
+        assert_eq!(
+            base.index_buffer.max_file_size,
+            Some(Byte::from_u64(128 * 1024 * 1024))
+        );
+        assert_eq!(
+            base.index_buffer.max_mem_size,
+            Some(Byte::from_u64(96 * 1024 * 1024))
+        );
     }
 
     #[test]
     fn resolved_config_uses_normalized_storage_values() {
         let temp = TempDir::new().unwrap();
         let overlay: EngineConfigOverlay = toml::from_str(
-            "[transaction]\nlog_block_size_bytes = 5000\nlog_file_max_size_bytes = 9000\n",
+            "[transaction]\nlog_block_size = \"5000 B\"\nlog_file_max_size = \"9000 B\"\n",
         )
         .unwrap();
         let (_, resolved) = resolve_engine_config(temp.path(), &overlay).unwrap();
@@ -462,7 +482,7 @@ mod tests {
     fn index_and_data_buffers_share_the_same_overlay_shape() {
         let temp = TempDir::new().unwrap();
         let overlay: EngineConfigOverlay = toml::from_str(
-            "[index_buffer]\nswap_file = \"custom-index.swp\"\nmax_file_size_bytes = 134217728\nmax_mem_size_bytes = 67108864\n\n[data_buffer]\nswap_file = \"custom-data.swp\"\nmax_file_size_bytes = 268435456\nmax_mem_size_bytes = 134217728\n",
+            "[index_buffer]\nswap_file = \"custom-index.swp\"\nmax_file_size = \"128 MiB\"\nmax_mem_size = \"64 MiB\"\n\n[data_buffer]\nswap_file = \"custom-data.swp\"\nmax_file_size = \"256 MiB\"\nmax_mem_size = \"128 MiB\"\n",
         )
         .unwrap();
         let (config, resolved) = resolve_engine_config(temp.path(), &overlay).unwrap();
@@ -496,5 +516,15 @@ mod tests {
         assert!(toml::from_str::<EngineConfigOverlay>("[file]\nunknown = 1").is_err());
         assert!(toml::from_str::<EngineConfigOverlay>("[data_buffer]\ntarget_free = 4").is_err());
         assert!(toml::from_str::<EngineConfigOverlay>("[index_buffer]\ntarget_free = 4").is_err());
+        assert!(toml::from_str::<EngineConfigOverlay>("meta_buffer_bytes = 4096").is_err());
+        assert!(toml::from_str::<EngineConfigOverlay>("meta_buffer_size = 4096").is_err());
+    }
+
+    #[test]
+    fn byte_values_use_checked_storage_boundaries() {
+        let temp = TempDir::new().unwrap();
+        let overlay: EngineConfigOverlay =
+            toml::from_str("meta_buffer_size = \"18446744073709551616 B\"\n").unwrap();
+        assert!(resolve_engine_config(temp.path(), &overlay).is_err());
     }
 }

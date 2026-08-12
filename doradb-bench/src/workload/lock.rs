@@ -1,6 +1,7 @@
 use crate::cli::{LockTableArgs, LockTableMode, LockTableScenario, TableLockScope, Workload};
 use crate::error::{BenchError, Result};
-use crate::manifest::{KeyRange, Manifest};
+use crate::fixture::KeyRange;
+use crate::manifest::Manifest;
 use crate::workload::util::RandomTableIndexGenerator;
 use crate::workload::{CommonConfig, SessionPlan, SessionSummary, WorkloadConfig, WorkloadRunner};
 use doradb_storage::id::TableID;
@@ -663,8 +664,8 @@ fn completed_summary(operations: u64) -> SessionSummary {
 mod tests {
     use super::*;
     use crate::cli::{Cli, Command, IndexMode, LogSyncMode, WorkloadArgs};
+    use crate::fixture::{benchmark_index_specs, benchmark_table_spec};
     use crate::manifest::DefaultsManifest;
-    use crate::workload::{benchmark_index_specs, benchmark_table_spec};
     use clap::Parser;
 
     #[test]

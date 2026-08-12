@@ -1,5 +1,6 @@
-use crate::cli::{IndexMode, LogSyncMode, PrepareArgs, WorkloadArgs};
+use crate::cli::{LogSyncMode, PrepareArgs, WorkloadArgs};
 use crate::error::{BenchError, Result};
+use crate::fixture::{IndexMode, benchmark_index_specs, benchmark_table_spec};
 use crate::manifest::{
     DefaultsManifest, Manifest, read_manifest, validate_cleanup_manifest, write_manifest,
     write_manifest_exclusive,
@@ -11,7 +12,7 @@ use crate::workload::{
     IndexDdlRunner, IndexScanRunner, IndexStreamRunner, InsertRandRunner, InsertSeqRunner,
     LockTableRunner, LookupRandRunner, LookupSeqRunner, SessionPlan, SessionSummary,
     StmtNoopRunner, TableDdlRunner, TableScanRunner, TrxNoopRunner, WorkloadConfig, WorkloadRunner,
-    benchmark_index_specs, benchmark_table_spec, build_session_plans,
+    build_session_plans,
 };
 use doradb_storage::id::TableID;
 use doradb_storage::{Engine, EngineConfig, Session, TrxSysConfig};
@@ -188,7 +189,7 @@ where
     };
     write_benchmark_outputs(&output_config, &metrics, &result, command_context)?;
 
-    if config.update_manifest(manifest)? {
+    if config.update_manifest(manifest, &summary)? {
         write_manifest(storage_root, manifest)?;
     }
     Ok(())

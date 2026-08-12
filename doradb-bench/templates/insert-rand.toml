@@ -1,0 +1,10 @@
+name = "random generated inserts"
+engine_defaults = "engine-defaults.toml"
+
+[[phase]]
+workload = { type = "create-table", index = "none" }
+
+[[phase]]
+kind = "benchmark"
+measured_runs = 1
+workload = { type = "insert-rand", num = 10000, threads = 1, sessions = 1, value_size = "128 B", batch_size = 100 }
