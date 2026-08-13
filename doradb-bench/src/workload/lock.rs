@@ -477,10 +477,13 @@ async fn run_contended_lifecycle(
             join_waiters(workers)?;
             blocker.unlock_table(table_id)?;
             let after = blocker.logical_lock_stats()?;
-            assert_eq!(
-                after.promoted_waiters, before.promoted_waiters,
-                "enqueue scenario must not promote a waiter"
-            );
+            if after.promoted_waiters != before.promoted_waiters {
+                return Err(BenchError::message(format!(
+                    "enqueue scenario must not promote a waiter: expected promoted waiter count \
+                     {}, found {}",
+                    before.promoted_waiters, after.promoted_waiters
+                )));
+            }
             return Ok(());
         }
 
@@ -514,11 +517,15 @@ async fn run_contended_lifecycle(
         join_waiters(workers)?;
         let expected_promotions = width as u64 - u64::from(cancel_index.is_some());
         let after = blocker.logical_lock_stats()?;
-        assert_eq!(
-            after.promoted_waiters - before.promoted_waiters,
-            expected_promotions,
-            "promotion count must match admitted non-cancelled waiters"
-        );
+        let actual_promotions = after
+            .promoted_waiters
+            .saturating_sub(before.promoted_waiters);
+        if actual_promotions != expected_promotions {
+            return Err(BenchError::message(format!(
+                "promotion count must match admitted non-cancelled waiters: expected \
+                 {expected_promotions}, found {actual_promotions}"
+            )));
+        }
         if mode == TableLockMode::Exclusive {
             let expected = (0..width)
                 .filter(|&index| Some(index) != cancel_index)
@@ -526,7 +533,12 @@ async fn run_contended_lifecycle(
             let actual = acquisition_order
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            assert_eq!(*actual, expected, "exclusive waiters must preserve FIFO");
+            if actual.as_slice() != expected.as_slice() {
+                return Err(BenchError::message(format!(
+                    "exclusive waiters must preserve FIFO: expected {expected:?}, found {:?}",
+                    actual.as_slice()
+                )));
+            }
         }
         Ok(())
     });

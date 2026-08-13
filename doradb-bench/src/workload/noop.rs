@@ -254,12 +254,21 @@ async fn run_stmt_noop_operations(
             let _ = trx.rollback().await;
             return Err(error.into());
         }
-        if let (Some(clock), Some(started)) = (clock, started) {
-            latency.record(clock.raw_delta_nanos(started, clock.raw())?)?;
-        }
-        operations = operations
-            .checked_add(1)
-            .ok_or_else(|| BenchError::message("no-op counter overflow"))?;
+        let next_operations = (|| -> Result<u64> {
+            if let (Some(clock), Some(started)) = (clock, started) {
+                latency.record(clock.raw_delta_nanos(started, clock.raw())?)?;
+            }
+            operations
+                .checked_add(1)
+                .ok_or_else(|| BenchError::message("no-op counter overflow"))
+        })();
+        operations = match next_operations {
+            Ok(operations) => operations,
+            Err(error) => {
+                let _ = trx.rollback().await;
+                return Err(error);
+            }
+        };
     }
     trx.commit().await?;
     Ok(NoopOperationResult {

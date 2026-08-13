@@ -33,6 +33,11 @@ pub(crate) fn validate_workers(threads: usize, sessions: usize) -> Result<()> {
     if sessions == 0 {
         return Err(BenchError::message("sessions must be positive"));
     }
+    if threads > sessions {
+        return Err(BenchError::message(format!(
+            "threads ({threads}) must not exceed sessions ({sessions})"
+        )));
+    }
     Ok(())
 }
 
@@ -81,5 +86,15 @@ mod tests {
         let plan = Cli::try_parse_from(["doradb-bench", "-r", "root", "-p", "p.toml"]).unwrap();
         assert_eq!(plan.root, PathBuf::from("root"));
         assert_eq!(plan.plan, PathBuf::from("p.toml"));
+    }
+
+    #[test]
+    fn worker_threads_must_not_exceed_sessions() {
+        validate_workers(1, 1).unwrap();
+        validate_workers(1, 2).unwrap();
+        assert_eq!(
+            validate_workers(2, 1).unwrap_err().to_string(),
+            "threads (2) must not exceed sessions (1)"
+        );
     }
 }

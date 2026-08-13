@@ -1355,6 +1355,25 @@ mod tests {
     }
 
     #[test]
+    fn worker_topology_is_validated_during_plan_resolution() {
+        let defaults = WorkloadDefaults {
+            threads: NonZeroUsize::new(2),
+            sessions: NonZeroUsize::new(1),
+            ..WorkloadDefaults::default()
+        };
+        assert_eq!(
+            defaults.resolve().unwrap_err().to_string(),
+            "threads (2) must not exceed sessions (1)"
+        );
+
+        let phase = "[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"stmt-noop\", num = 1, threads = 2, sessions = 1 }\n";
+        assert_eq!(
+            resolve(phase).unwrap_err().to_string(),
+            "threads (2) must not exceed sessions (1)"
+        );
+    }
+
+    #[test]
     fn checked_sample_equations_match_partitioning() {
         assert_eq!(aggregate_batch_count(5, 2, 2).unwrap(), 3);
         assert_eq!(aggregate_batch_count(3, 8, 100).unwrap(), 3);
