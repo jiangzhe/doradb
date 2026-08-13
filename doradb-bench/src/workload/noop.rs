@@ -1,152 +1,204 @@
-use crate::cli::{WorkerCountArgs, Workload};
 use crate::error::{BenchError, Result};
-use crate::fixture::KeyRange;
-use crate::manifest::Manifest;
-use crate::measurement::{LatencyDistribution, MeasurementClock};
-use crate::plan::TrxNoopConfig;
-use crate::workload::{
-    CommonConfig, RunCancellation, SessionPlan, SessionSummary, WorkloadConfig, WorkloadRunner,
+use crate::fixture::{FixturePlanEffect, FixtureRuntimeEffect};
+use crate::measurement::{LatencyDistribution, MeasurementClock, WorkloadCounters};
+use crate::plan::CountConfig;
+use crate::plan_executor::{
+    SessionExecutor, SessionExecutorConfig, SessionMeasurement, SessionOutcome,
 };
-use doradb_storage::id::TableID;
-use doradb_storage::{Error as StorageError, Session};
+use crate::workload::util::{
+    merge_measurement, operation_plans, require_no_binding, verify_no_effect, verify_samples,
+    verify_simple_counters,
+};
+use crate::workload::{RunCancellation, SessionPlan};
+use doradb_storage::{Engine, Error as StorageError, Session};
+use std::future::Future;
 
-/// Resolved statement-noop configuration.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct StmtNoopConfig {
-    common: CommonConfig,
-    num: u64,
-    loaded_range: KeyRange,
-}
-
-impl WorkloadConfig for StmtNoopConfig {
-    type Args = WorkerCountArgs;
-
-    const WORKLOAD: Workload = Workload::StmtNoop;
-
-    fn resolve(manifest: &Manifest, args: &Self::Args) -> Result<Self> {
-        let common = resolve_noop_common(manifest, args)?;
-        manifest.validate_workload_compatible(Self::WORKLOAD)?;
-        Ok(Self {
-            common,
-            num: args.operation_count(),
-            loaded_range: manifest.allocated_key_range(),
-        })
-    }
-
-    fn common(&self) -> &CommonConfig {
-        &self.common
-    }
-
-    fn operation_count(&self) -> u64 {
-        self.num
-    }
-
-    fn output_loaded_range(&self) -> KeyRange {
-        self.loaded_range
-    }
-}
-
-/// Executes no-op statements inside one transaction for one session.
+/// Statement-noop session executor.
 #[derive(Clone, Copy)]
-pub(crate) struct StmtNoopRunner;
+pub(crate) struct StmtNoopExecutor {
+    config: CountConfig,
+}
 
-impl WorkloadRunner for StmtNoopRunner {
-    type Config = StmtNoopConfig;
+impl SessionExecutor for StmtNoopExecutor {
+    type Config = SessionExecutorConfig<CountConfig>;
+    type Outcome = NoopSessionOutcome;
 
-    fn new(_config: &Self::Config, _table_id: TableID) -> Self {
-        Self
-    }
+    const IDENTITY: &'static str = "stmt-noop";
 
-    async fn run(
-        &self,
-        _engine: &doradb_storage::Engine,
-        session: &mut Session,
-        plan: &SessionPlan,
-    ) -> Result<SessionSummary> {
-        let result = run_stmt_noop_operations(session, plan.number, None, None).await?;
-        Ok(SessionSummary {
-            operations: result.operations,
-            ..SessionSummary::default()
+    fn new(config: Self::Config) -> Result<Self> {
+        require_no_binding(config.binding, Self::IDENTITY)?;
+        Ok(Self {
+            config: config.resolved,
         })
     }
+
+    fn threads(&self) -> usize {
+        self.config.threads
+    }
+
+    fn session_plans(&self) -> Result<Vec<SessionPlan>> {
+        operation_plans(self.config.num, self.config.sessions)
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _engine: &'a Engine,
+        session: &'a mut Session,
+        plan: &'a SessionPlan,
+        clock: Option<&'a MeasurementClock>,
+        cancellation: &'a RunCancellation,
+    ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a {
+        execute_stmt_noop_session(session, plan, clock, cancellation)
+    }
+
+    fn verify_outcome(
+        &self,
+        planned_effect: &FixturePlanEffect,
+        outcome: &Self::Outcome,
+        expected_samples: u64,
+    ) -> Result<FixtureRuntimeEffect> {
+        verify_noop(
+            Self::IDENTITY,
+            self.config.num,
+            planned_effect,
+            outcome,
+            expected_samples,
+        )
+    }
 }
 
-/// Legacy manifest/CLI adapter for the resolved transaction-noop configuration.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct LegacyTrxNoopConfig {
-    common: CommonConfig,
-    core: TrxNoopConfig,
-    loaded_range: KeyRange,
+/// Transaction-noop session executor.
+#[derive(Clone, Copy)]
+pub(crate) struct TrxNoopExecutor {
+    config: CountConfig,
 }
 
-impl WorkloadConfig for LegacyTrxNoopConfig {
-    type Args = WorkerCountArgs;
+impl SessionExecutor for TrxNoopExecutor {
+    type Config = SessionExecutorConfig<CountConfig>;
+    type Outcome = NoopSessionOutcome;
 
-    const WORKLOAD: Workload = Workload::TrxNoop;
+    const IDENTITY: &'static str = "trx-noop";
 
-    fn resolve(manifest: &Manifest, args: &Self::Args) -> Result<Self> {
-        let common = resolve_noop_common(manifest, args)?;
-        manifest.validate_workload_compatible(Self::WORKLOAD)?;
+    fn new(config: Self::Config) -> Result<Self> {
+        require_no_binding(config.binding, Self::IDENTITY)?;
         Ok(Self {
-            common,
-            core: TrxNoopConfig {
-                num: args.operation_count(),
-                threads: common.threads,
-                sessions: common.sessions,
-                include_stats: common.include_stats,
+            config: config.resolved,
+        })
+    }
+
+    fn threads(&self) -> usize {
+        self.config.threads
+    }
+
+    fn session_plans(&self) -> Result<Vec<SessionPlan>> {
+        operation_plans(self.config.num, self.config.sessions)
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _engine: &'a Engine,
+        session: &'a mut Session,
+        plan: &'a SessionPlan,
+        clock: Option<&'a MeasurementClock>,
+        cancellation: &'a RunCancellation,
+    ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a {
+        execute_trx_noop_session(session, plan, clock, cancellation)
+    }
+
+    fn verify_outcome(
+        &self,
+        planned_effect: &FixturePlanEffect,
+        outcome: &Self::Outcome,
+        expected_samples: u64,
+    ) -> Result<FixtureRuntimeEffect> {
+        verify_noop(
+            Self::IDENTITY,
+            self.config.num,
+            planned_effect,
+            outcome,
+            expected_samples,
+        )
+    }
+}
+
+/// Session-local outcome shared by both no-op identities.
+pub(crate) struct NoopSessionOutcome {
+    measurement: SessionMeasurement,
+}
+
+impl SessionOutcome for NoopSessionOutcome {
+    fn empty() -> Result<Self> {
+        Ok(Self {
+            measurement: SessionMeasurement {
+                counters: WorkloadCounters::default(),
+                latency: LatencyDistribution::new()?,
             },
-            loaded_range: manifest.allocated_key_range(),
         })
     }
 
-    fn common(&self) -> &CommonConfig {
-        &self.common
+    fn merge(&mut self, other: Self) -> Result<()> {
+        merge_measurement(&mut self.measurement, other.measurement)
     }
 
-    fn operation_count(&self) -> u64 {
-        self.core.num
-    }
-
-    fn output_loaded_range(&self) -> KeyRange {
-        self.loaded_range
+    fn into_measurement(self) -> SessionMeasurement {
+        self.measurement
     }
 }
 
-/// Executes no-effect transaction cycles for one session.
-#[derive(Clone, Copy)]
-pub(crate) struct TrxNoopRunner;
-
-impl WorkloadRunner for TrxNoopRunner {
-    type Config = LegacyTrxNoopConfig;
-
-    fn new(_config: &Self::Config, _table_id: TableID) -> Self {
-        Self
-    }
-
-    async fn run(
-        &self,
-        _engine: &doradb_storage::Engine,
-        session: &mut Session,
-        plan: &SessionPlan,
-    ) -> Result<SessionSummary> {
-        let result = run_trx_noop_operations(session, plan.number, None, None).await?;
-        Ok(SessionSummary {
-            operations: result.operations,
-            ..SessionSummary::default()
-        })
-    }
-}
-
-/// Result of one shared no-op operation loop.
-pub(crate) struct NoopOperationResult {
+/// Result of one no-op operation loop.
+struct NoopOperationResult {
     /// Number of completely settled logical operations.
-    pub(crate) operations: u64,
+    operations: u64,
     /// Optional exact operation latency samples.
-    pub(crate) latency: LatencyDistribution,
+    latency: LatencyDistribution,
 }
 
-/// Shared transaction-noop operation loop used by legacy and plan dispatch.
-pub(crate) async fn run_trx_noop_operations(
+async fn execute_stmt_noop_session(
+    session: &mut Session,
+    plan: &SessionPlan,
+    clock: Option<&MeasurementClock>,
+    cancellation: &RunCancellation,
+) -> Result<NoopSessionOutcome> {
+    let result = run_stmt_noop_operations(session, plan.number, clock, Some(cancellation)).await?;
+    Ok(noop_outcome(result))
+}
+
+async fn execute_trx_noop_session(
+    session: &mut Session,
+    plan: &SessionPlan,
+    clock: Option<&MeasurementClock>,
+    cancellation: &RunCancellation,
+) -> Result<NoopSessionOutcome> {
+    let result = run_trx_noop_operations(session, plan.number, clock, Some(cancellation)).await?;
+    Ok(noop_outcome(result))
+}
+
+fn noop_outcome(result: NoopOperationResult) -> NoopSessionOutcome {
+    NoopSessionOutcome {
+        measurement: SessionMeasurement {
+            counters: WorkloadCounters {
+                operations: result.operations,
+                ..WorkloadCounters::default()
+            },
+            latency: result.latency,
+        },
+    }
+}
+
+fn verify_noop(
+    identity: &str,
+    operations: u64,
+    planned_effect: &FixturePlanEffect,
+    outcome: &NoopSessionOutcome,
+    expected_samples: u64,
+) -> Result<FixtureRuntimeEffect> {
+    verify_samples(identity, &outcome.measurement.latency, expected_samples)?;
+    verify_simple_counters(identity, outcome.measurement.counters, operations)?;
+    verify_no_effect(planned_effect)
+}
+
+/// Execute public transaction-noop operations.
+async fn run_trx_noop_operations(
     session: &mut Session,
     number: u64,
     clock: Option<&MeasurementClock>,
@@ -158,13 +210,10 @@ pub(crate) async fn run_trx_noop_operations(
         if cancellation.is_some_and(RunCancellation::is_cancelled) {
             break;
         }
-        if let Some(clock) = clock {
-            let start = clock.raw();
-            session.begin_trx()?.commit().await?;
-            let end = clock.raw();
-            latency.record(clock.raw_delta_nanos(start, end)?)?;
-        } else {
-            session.begin_trx()?.commit().await?;
+        let started = clock.map(MeasurementClock::raw);
+        session.begin_trx()?.commit().await?;
+        if let (Some(clock), Some(started)) = (clock, started) {
+            latency.record(clock.raw_delta_nanos(started, clock.raw())?)?;
         }
         operations = operations
             .checked_add(1)
@@ -176,8 +225,8 @@ pub(crate) async fn run_trx_noop_operations(
     })
 }
 
-/// Shared statement-noop loop used by legacy and plan dispatch.
-pub(crate) async fn run_stmt_noop_operations(
+/// Execute public statement-noop operations in one session transaction.
+async fn run_stmt_noop_operations(
     session: &mut Session,
     number: u64,
     clock: Option<&MeasurementClock>,
@@ -200,82 +249,30 @@ pub(crate) async fn run_stmt_noop_operations(
                 latency: LatencyDistribution::new()?,
             });
         }
-        if let Some(clock) = clock {
-            let start = clock.raw();
-            if let Err(error) = trx.exec(async |_stmt| Ok::<(), StorageError>(())).await {
-                let _ = trx.rollback().await;
-                return Err(error.into());
-            }
-            let end = clock.raw();
-            latency.record(clock.raw_delta_nanos(start, end)?)?;
-        } else if let Err(error) = trx.exec(async |_stmt| Ok::<(), StorageError>(())).await {
+        let started = clock.map(MeasurementClock::raw);
+        if let Err(error) = trx.exec(async |_stmt| Ok::<(), StorageError>(())).await {
             let _ = trx.rollback().await;
             return Err(error.into());
         }
-        operations = operations
-            .checked_add(1)
-            .ok_or_else(|| BenchError::message("no-op counter overflow"))?;
+        let next_operations = (|| -> Result<u64> {
+            if let (Some(clock), Some(started)) = (clock, started) {
+                latency.record(clock.raw_delta_nanos(started, clock.raw())?)?;
+            }
+            operations
+                .checked_add(1)
+                .ok_or_else(|| BenchError::message("no-op counter overflow"))
+        })();
+        operations = match next_operations {
+            Ok(operations) => operations,
+            Err(error) => {
+                let _ = trx.rollback().await;
+                return Err(error);
+            }
+        };
     }
     trx.commit().await?;
     Ok(NoopOperationResult {
         operations,
         latency,
     })
-}
-
-fn resolve_noop_common(manifest: &Manifest, args: &WorkerCountArgs) -> Result<CommonConfig> {
-    let worker = args.worker();
-    CommonConfig::resolve(
-        &manifest.defaults,
-        worker.thread_override(),
-        worker.session_override(),
-        None,
-        None,
-        worker.include_stats(),
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::cli::{Cli, Command, IndexMode, LogSyncMode, WorkloadArgs};
-    use crate::manifest::DefaultsManifest;
-    use clap::Parser;
-
-    #[test]
-    fn noop_config_resolves_worker_controls() {
-        let cli = Cli::try_parse_from([
-            "doradb-bench",
-            "--root",
-            "root",
-            "run",
-            "stmt-noop",
-            "--num",
-            "3",
-            "--threads",
-            "1",
-            "--sessions",
-            "2",
-            "--include-stats",
-        ])
-        .unwrap();
-        let Command::Run {
-            workload: WorkloadArgs::StmtNoop(args),
-        } = cli.command.unwrap()
-        else {
-            panic!("expected stmt-noop workload");
-        };
-        let manifest = Manifest::new_with_defaults(
-            1,
-            IndexMode::None,
-            DefaultsManifest::new(1, 1, 128, 1, LogSyncMode::None).unwrap(),
-        );
-        let config = StmtNoopConfig::resolve(&manifest, &args).unwrap();
-        assert_eq!(config.operation_count(), 3);
-        assert_eq!(config.common.threads, 1);
-        assert_eq!(config.common.sessions, 2);
-        assert_eq!(config.common.log_sync, LogSyncMode::None);
-        assert!(config.common.include_stats);
-        assert_eq!(config.loaded_range, KeyRange { start: 0, len: 0 });
-    }
 }

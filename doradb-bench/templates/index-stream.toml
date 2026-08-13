@@ -1,0 +1,14 @@
+name = "public secondary-index streams"
+engine_defaults = "engine-defaults.toml"
+
+[[phase]]
+workload = { type = "create-table", index = "non-unique" }
+
+[[phase]]
+workload = { type = "insert-seq", num = 10000, batch_size = 100 }
+
+[[phase]]
+kind = "benchmark"
+warmup_runs = 1
+measured_runs = 3
+workload = { type = "index-stream", num = 1000, range = 100, seed = 42, threads = 1, sessions = 1 }

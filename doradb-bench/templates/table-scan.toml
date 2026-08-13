@@ -1,0 +1,14 @@
+name = "complete table scans"
+engine_defaults = "engine-defaults.toml"
+
+[[phase]]
+workload = { type = "create-table", index = "none" }
+
+[[phase]]
+workload = { type = "insert-seq", num = 10000, batch_size = 100 }
+
+[[phase]]
+kind = "benchmark"
+warmup_runs = 1
+measured_runs = 3
+workload = { type = "table-scan", num = 10, threads = 1, sessions = 1, batch_size = 1 }

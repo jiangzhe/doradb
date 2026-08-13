@@ -3,6 +3,7 @@ use hdrhistogram::Histogram;
 use quanta::{Clock, Instant};
 use serde::de::Error as DeserializeError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::fmt;
 use std::result::Result as StdResult;
 use std::sync::Arc;
 
@@ -78,6 +79,44 @@ pub enum LatencyUnit {
     InsertBatchTransaction,
     /// One transient table create-through-successful-drop cycle.
     TableCreateDropCycle,
+    /// One lookup batch transaction from begin through successful commit.
+    LookupBatchTransaction,
+    /// One table-scan batch transaction from begin through successful commit.
+    TableScanBatchTransaction,
+    /// One materialized index-scan batch transaction.
+    IndexScanBatchTransaction,
+    /// One public index stream from begin through exhaustion and commit.
+    IndexStreamTransaction,
+    /// One index create-through-successful-drop cycle.
+    IndexCreateDropCycle,
+    /// One session-retained table-lock lifecycle including session close.
+    TableLockSessionRetainedLifecycle,
+    /// One transaction-retained table-lock lifecycle including commit.
+    TableLockTransactionRetainedLifecycle,
+    /// One paired or specialized table-lock lifecycle.
+    TableLockOperationLifecycle,
+}
+
+impl fmt::Display for LatencyUnit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::TransactionLifecycle => "transaction-lifecycle",
+            Self::StatementExecution => "statement-execution",
+            Self::TableCreation => "table-creation",
+            Self::InsertBatchTransaction => "insert-batch-transaction",
+            Self::TableCreateDropCycle => "table-create-drop-cycle",
+            Self::LookupBatchTransaction => "lookup-batch-transaction",
+            Self::TableScanBatchTransaction => "table-scan-batch-transaction",
+            Self::IndexScanBatchTransaction => "index-scan-batch-transaction",
+            Self::IndexStreamTransaction => "index-stream-transaction",
+            Self::IndexCreateDropCycle => "index-create-drop-cycle",
+            Self::TableLockSessionRetainedLifecycle => "table-lock-session-retained-lifecycle",
+            Self::TableLockTransactionRetainedLifecycle => {
+                "table-lock-transaction-retained-lifecycle"
+            }
+            Self::TableLockOperationLifecycle => "table-lock-operation-lifecycle",
+        })
+    }
 }
 
 /// Exact session-local latency samples and their HDR distribution.

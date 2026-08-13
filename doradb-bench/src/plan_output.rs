@@ -1,5 +1,4 @@
 use crate::error::{BenchError, Result};
-use crate::manifest::{result_markdown_path, result_toml_path};
 use crate::measurement::{
     BenchmarkAggregate, InternalMetric, MeasuredRunResult, WorkloadCounters, u128_decimal,
 };
@@ -8,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{Error as IoError, ErrorKind};
 use std::path::{Path, PathBuf};
+
+const RESULT_TOML_FILE_NAME: &str = "benchmark-result.toml";
 
 /// Diagnostics retained from one successful prepare phase.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -26,7 +27,7 @@ pub struct PreparePhaseResult {
     pub internal_metrics: Vec<InternalMetric>,
 }
 
-/// Canonical success-only entity shared by TOML and Markdown artifacts.
+/// Canonical success-only benchmark result entity.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct InvocationReport {
@@ -44,84 +45,74 @@ pub struct InvocationReport {
     pub aggregate: BenchmarkAggregate,
 }
 
-/// Atomically stage and install canonical TOML and Markdown artifacts as a pair.
-pub fn write_plan_outputs(report: &InvocationReport) -> Result<()> {
+/// Atomically stage and install the canonical TOML artifact.
+pub fn write_plan_output(report: &InvocationReport) -> Result<PathBuf> {
     let toml_path = result_toml_path(&report.root);
-    let markdown_path = result_markdown_path(&report.root);
+    let absolute_path = absolute_result_path(&report.root)?;
     let toml_staged = staged_path(&toml_path);
-    let markdown_staged = staged_path(&markdown_path);
     let result = (|| {
         remove_if_exists(&toml_staged)?;
-        remove_if_exists(&markdown_staged)?;
         let toml = toml::to_string_pretty(report)?;
-        let markdown = render_markdown(report, &toml);
         fs::write(&toml_staged, toml).map_err(|err| artifact_error(&toml_staged, err))?;
-        fs::write(&markdown_staged, markdown)
-            .map_err(|err| artifact_error(&markdown_staged, err))?;
         fs::rename(&toml_staged, &toml_path).map_err(|err| artifact_error(&toml_path, err))?;
-        if let Err(err) = fs::rename(&markdown_staged, &markdown_path) {
-            let _ = fs::remove_file(&toml_path);
-            return Err(artifact_error(&markdown_path, err));
-        }
         Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&toml_staged);
-        let _ = fs::remove_file(&markdown_staged);
     }
-    result
+    result.map(|()| absolute_path)
 }
 
-fn render_markdown(report: &InvocationReport, canonical_toml: &str) -> String {
+/// Render the successful aggregate and detailed result location for stdout.
+pub(crate) fn render_stdout_summary(
+    report: &InvocationReport,
+    detailed_result: &Path,
+) -> Result<String> {
+    let workload = report
+        .plan
+        .phases
+        .last()
+        .ok_or_else(|| BenchError::message("benchmark report has no final workload"))?
+        .workload();
     let aggregate = &report.aggregate;
-    let mut output = String::new();
-    output.push_str("# DoraDB Benchmark Plan Result\n\n");
-    output.push_str("- Status: `success`\n");
-    output.push_str(&format!("- Root: `{}`\n", report.root.display()));
-    output.push_str(&format!("- Plan: `{}`\n", report.plan_source.display()));
-    if let Some(name) = &report.plan.name {
-        output.push_str(&format!("- Name: `{name}`\n"));
-    }
-    output.push_str("\n## Completed Results\n\n");
-    output.push_str(&format!(
-        "- Prepare phases: `{}`\n- Measured runs: `{}`\n- Operations: `{}`\n- Elapsed nanoseconds: `{}`\n- Operations/second: `{:.3}`\n- Average latency nanoseconds: `{:.3}`\n- P95 nanoseconds: `{}`\n- P99 nanoseconds: `{}`\n",
-        report.prepare_phases.len(),
-        report.measured_runs.len(),
+    Ok(format!(
+        "DoraDB benchmark summary\n\
+         workload: {}\n\
+         measured_runs: {}\n\
+         operations: {}\n\
+         elapsed_nanos: {}\n\
+         operations_per_second: {:.3}\n\
+         latency_unit: {}\n\
+         average_latency_nanos: {:.3}\n\
+         p95_latency_nanos: {}\n\
+         p99_latency_nanos: {}\n\
+         detailed_result: {}",
+        workload.identity(),
+        aggregate.measured_runs,
         aggregate.counters.operations,
         aggregate.elapsed_nanos,
         aggregate.operations_per_second,
+        aggregate.latency.unit,
         aggregate.latency.average_nanos,
         aggregate.latency.p95_nanos,
-        aggregate.latency.p99_nanos
-    ));
-    output.push_str("\n## Canonical Result\n\n");
-    let fence_len = longest_backtick_run(canonical_toml)
-        .saturating_add(1)
-        .max(3);
-    let fence = "`".repeat(fence_len);
-    output.push_str(&fence);
-    output.push_str("toml\n");
-    output.push_str(canonical_toml);
-    if !canonical_toml.ends_with('\n') {
-        output.push('\n');
-    }
-    output.push_str(&fence);
-    output.push('\n');
-    output
+        aggregate.latency.p99_nanos,
+        detailed_result.display()
+    ))
 }
 
-fn longest_backtick_run(value: &str) -> usize {
-    let mut longest = 0;
-    let mut current = 0;
-    for byte in value.bytes() {
-        if byte == b'`' {
-            current += 1;
-            longest = longest.max(current);
-        } else {
-            current = 0;
-        }
-    }
-    longest
+fn result_toml_path(storage_root: &Path) -> PathBuf {
+    storage_root.join(RESULT_TOML_FILE_NAME)
+}
+
+fn absolute_result_path(storage_root: &Path) -> Result<PathBuf> {
+    fs::canonicalize(storage_root)
+        .map(|root| root.join(RESULT_TOML_FILE_NAME))
+        .map_err(|err| {
+            BenchError::message(format!(
+                "failed to resolve benchmark artifact directory {}: {err}",
+                storage_root.display()
+            ))
+        })
 }
 
 fn staged_path(path: &Path) -> PathBuf {
@@ -152,7 +143,7 @@ mod tests {
     use crate::fixture::FixturePlanEffect;
     use crate::measurement::{LatencySummary, LatencyUnit};
     use crate::plan::{
-        MeasurementSpec, Phase, ResolvedWorkload, ResolvedWorkloadDefaults, TrxNoopConfig,
+        CountConfig, MeasurementSpec, Phase, ResolvedWorkload, ResolvedWorkloadDefaults,
     };
     use std::num::NonZeroU32;
     use tempfile::TempDir;
@@ -182,7 +173,7 @@ mod tests {
                         warmup_runs: 0,
                         measured_runs: NonZeroU32::MIN,
                     },
-                    workload: ResolvedWorkload::TrxNoop(TrxNoopConfig {
+                    workload: ResolvedWorkload::TrxNoop(CountConfig {
                         num: 1,
                         threads: 1,
                         sessions: 1,
@@ -211,40 +202,62 @@ mod tests {
     }
 
     #[test]
-    fn success_output_pair_round_trips_one_entity() {
+    fn canonical_output_round_trips_one_entity() {
         let temp = TempDir::new().unwrap();
         let report = report(temp.path());
-        write_plan_outputs(&report).unwrap();
+        let installed = write_plan_output(&report).unwrap();
+        assert_eq!(
+            installed,
+            fs::canonicalize(temp.path())
+                .unwrap()
+                .join(RESULT_TOML_FILE_NAME)
+        );
         let encoded = fs::read_to_string(result_toml_path(temp.path())).unwrap();
         let decoded: InvocationReport = toml::from_str(&encoded).unwrap();
         assert_eq!(decoded, report);
         assert!(!encoded.contains("status ="));
         assert!(!encoded.contains("failure"));
-        let markdown = fs::read_to_string(result_markdown_path(temp.path())).unwrap();
-        assert!(markdown.contains(&encoded));
+        assert!(!staged_path(&installed).exists());
+        assert!(!temp.path().join("benchmark-result.md").exists());
     }
 
     #[test]
-    fn output_install_failure_leaves_no_complete_pair() {
+    fn output_install_failure_leaves_no_complete_artifact() {
         let temp = TempDir::new().unwrap();
-        fs::create_dir(result_markdown_path(temp.path())).unwrap();
-        let error = write_plan_outputs(&report(temp.path())).unwrap_err();
+        fs::create_dir(result_toml_path(temp.path())).unwrap();
+        let error = write_plan_output(&report(temp.path())).unwrap_err();
         assert!(
             error
                 .to_string()
                 .contains("failed to write benchmark artifact")
         );
-        assert!(!result_toml_path(temp.path()).exists());
-        assert!(result_markdown_path(temp.path()).is_dir());
+        assert!(result_toml_path(temp.path()).is_dir());
+        assert!(!staged_path(&result_toml_path(temp.path())).exists());
     }
 
     #[test]
-    fn canonical_toml_uses_adaptive_backtick_fence() {
+    fn stdout_summary_uses_stable_labels_and_absolute_result_path() {
         let temp = TempDir::new().unwrap();
         let report = report(temp.path());
-        let canonical_toml = "message = \"before ```` after\"";
-        let adaptive = render_markdown(&report, canonical_toml);
-        let expected = format!("`````toml\n{canonical_toml}\n`````\n");
-        assert!(adaptive.ends_with(&expected));
+        let detailed_result = fs::canonicalize(temp.path())
+            .unwrap()
+            .join(RESULT_TOML_FILE_NAME);
+        assert_eq!(
+            render_stdout_summary(&report, &detailed_result).unwrap(),
+            format!(
+                "DoraDB benchmark summary\n\
+                 workload: trx-noop\n\
+                 measured_runs: 1\n\
+                 operations: 1\n\
+                 elapsed_nanos: 10\n\
+                 operations_per_second: 100000000.000\n\
+                 latency_unit: transaction-lifecycle\n\
+                 average_latency_nanos: 10.000\n\
+                 p95_latency_nanos: 10\n\
+                 p99_latency_nanos: 10\n\
+                 detailed_result: {}",
+                detailed_result.display()
+            )
+        );
     }
 }

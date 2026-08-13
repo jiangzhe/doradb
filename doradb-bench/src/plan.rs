@@ -1,11 +1,15 @@
 use crate::cli::{validate_batch_size, validate_value_size, validate_workers};
 use crate::engine_config::{EngineConfigOverlay, ResolvedEngineConfig, resolve_engine_config};
 use crate::error::{BenchError, Result};
-use crate::fixture::{FixturePlanEffect, FixturePlanState, IndexMode, KeyRange, PrimaryTableShape};
+use crate::fixture::{
+    FixturePlanEffect, FixturePlanState, FixtureRequirement, IndexMode, IndexRequirement, KeyRange,
+    LoadRequirement, PrimaryTableShape,
+};
 use crate::measurement::LatencyUnit;
 use byte_unit::Byte;
 use doradb_storage::EngineConfig;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::fs;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
@@ -82,7 +86,7 @@ pub struct ResolvedWorkloadDefaults {
     pub threads: usize,
     /// Default public session count.
     pub sessions: usize,
-    /// Default generated value bytes.
+    /// Default generated payload bytes.
     pub value_size_bytes: usize,
     /// Default operations per transaction.
     pub batch_size: u64,
@@ -116,53 +120,55 @@ pub enum PhaseKind {
     Benchmark,
 }
 
-/// Closed set of plan-enabled simple workload specifications.
+/// Closed set of plan workload specifications.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum WorkloadSpec {
-    /// Create the invocation's implicit primary table.
+    /// Create the invocation's implicit homogeneous table pool.
     CreateTable(CreateTableSpec),
     /// Execute no-op statements in public transactions.
-    StmtNoop(StmtNoopSpec),
+    StmtNoop(CountWorkerSpec),
     /// Begin and commit public transactions without statements.
-    TrxNoop(TrxNoopSpec),
+    TrxNoop(CountWorkerSpec),
     /// Insert generated sequential logical keys.
     InsertSeq(InsertSpec),
     /// Insert generated pseudo-random logical keys.
     InsertRand(InsertSpec),
     /// Create and drop transient tables.
-    TableDdl(TableDdlSpec),
+    TableDdl(IterationWorkerSpec),
+    /// Lookup sequential logical keys through the unique index.
+    LookupSeq(ReadSpec),
+    /// Lookup seeded random logical keys through the unique index.
+    LookupRand(SeededReadSpec),
+    /// Execute complete table scans.
+    TableScan(OptionalReadSpec),
+    /// Execute materialized secondary-index range scans.
+    IndexScan(IndexScanSpec),
+    /// Execute public secondary-index streams.
+    IndexStream(IndexStreamSpec),
+    /// Create and drop a non-unique secondary index.
+    IndexDdl(IterationWorkerSpec),
+    /// Execute table-lock lifecycle scenarios.
+    LockTable(LockTableSpec),
 }
 
-/// Strict plan-local primary-table creation controls.
+/// Strict plan-local table-pool creation controls.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateTableSpec {
-    /// Secondary-index shape of the primary table.
+    /// Secondary-index shape shared by the table pool.
     pub index: IndexMode,
+    /// Optional positive table count; defaults to one.
+    pub tables: Option<NonZeroUsize>,
     /// Optional engine-diagnostic override.
     pub include_stats: Option<bool>,
 }
 
-/// Strict plan-local statement-noop controls.
+/// Strict controls shared by counted no-op workloads.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct StmtNoopSpec {
-    /// Positive aggregate statement count.
-    pub num: NonZeroU64,
-    /// Optional executor thread override.
-    pub threads: Option<NonZeroUsize>,
-    /// Optional public session override.
-    pub sessions: Option<NonZeroUsize>,
-    /// Optional engine-diagnostic override.
-    pub include_stats: Option<bool>,
-}
-
-/// Strict plan-local transaction-noop controls.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TrxNoopSpec {
-    /// Positive aggregate transaction count.
+pub struct CountWorkerSpec {
+    /// Positive aggregate operation count.
     pub num: NonZeroU64,
     /// Optional executor thread override.
     pub threads: Option<NonZeroUsize>,
@@ -192,12 +198,212 @@ pub struct InsertSpec {
     pub include_stats: Option<bool>,
 }
 
-/// Strict plan-local transient table-DDL controls.
+/// Strict controls shared by optional-count DDL workloads.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct TableDdlSpec {
-    /// Optional positive create/drop cycle count; defaults to one.
+pub struct IterationWorkerSpec {
+    /// Optional positive iteration count; defaults to one.
     pub num: Option<NonZeroU64>,
+    /// Optional executor thread override.
+    pub threads: Option<NonZeroUsize>,
+    /// Optional public session override.
+    pub sessions: Option<NonZeroUsize>,
+    /// Optional engine-diagnostic override.
+    pub include_stats: Option<bool>,
+}
+
+/// Strict plan-local lookup controls.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadSpec {
+    /// Positive aggregate request count.
+    pub num: NonZeroU64,
+    /// Optional executor thread override.
+    pub threads: Option<NonZeroUsize>,
+    /// Optional public session override.
+    pub sessions: Option<NonZeroUsize>,
+    /// Optional operations-per-transaction override.
+    pub batch_size: Option<NonZeroU64>,
+    /// Optional engine-diagnostic override.
+    pub include_stats: Option<bool>,
+}
+
+/// Strict seeded lookup controls.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeededReadSpec {
+    /// Positive aggregate request count.
+    pub num: NonZeroU64,
+    /// Optional deterministic seed.
+    pub seed: Option<u64>,
+    /// Optional executor thread override.
+    pub threads: Option<NonZeroUsize>,
+    /// Optional public session override.
+    pub sessions: Option<NonZeroUsize>,
+    /// Optional operations-per-transaction override.
+    pub batch_size: Option<NonZeroU64>,
+    /// Optional engine-diagnostic override.
+    pub include_stats: Option<bool>,
+}
+
+/// Strict optional-count table-scan controls.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OptionalReadSpec {
+    /// Optional positive scan count; defaults to one.
+    pub num: Option<NonZeroU64>,
+    /// Optional executor thread override.
+    pub threads: Option<NonZeroUsize>,
+    /// Optional public session override.
+    pub sessions: Option<NonZeroUsize>,
+    /// Optional operations-per-transaction override.
+    pub batch_size: Option<NonZeroU64>,
+    /// Optional engine-diagnostic override.
+    pub include_stats: Option<bool>,
+}
+
+/// Strict materialized index-scan controls.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndexScanSpec {
+    /// Positive aggregate scan count.
+    pub num: NonZeroU64,
+    /// Optional positive logical-key range.
+    pub range: Option<NonZeroU64>,
+    /// Optional deterministic seed.
+    pub seed: Option<u64>,
+    /// Optional executor thread override.
+    pub threads: Option<NonZeroUsize>,
+    /// Optional public session override.
+    pub sessions: Option<NonZeroUsize>,
+    /// Optional scans-per-transaction override.
+    pub batch_size: Option<NonZeroU64>,
+    /// Optional engine-diagnostic override.
+    pub include_stats: Option<bool>,
+}
+
+/// Strict public index-stream controls.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndexStreamSpec {
+    /// Optional positive stream count; defaults to one.
+    pub num: Option<NonZeroU64>,
+    /// Optional positive logical-key range.
+    pub range: Option<NonZeroU64>,
+    /// Optional deterministic seed.
+    pub seed: Option<u64>,
+    /// Optional executor thread override.
+    pub threads: Option<NonZeroUsize>,
+    /// Optional public session override.
+    pub sessions: Option<NonZeroUsize>,
+    /// Optional engine-diagnostic override.
+    pub include_stats: Option<bool>,
+}
+
+/// Logical lock ownership scope.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TableLockScope {
+    /// Retain claims on the public session.
+    #[default]
+    Session,
+    /// Retain claims until public transaction completion.
+    Transaction,
+}
+
+impl fmt::Display for TableLockScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Session => f.write_str("session"),
+            Self::Transaction => f.write_str("transaction"),
+        }
+    }
+}
+
+/// Table-lock scenario vocabulary.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LockTableScenario {
+    /// Configurable session- or transaction-scope acquisition.
+    #[default]
+    Basic,
+    /// Covered nested transaction claims under session ownership.
+    NestedCovered,
+    /// Same-scope shared-to-exclusive conversion.
+    Convert,
+    /// Enqueue and cancel a known waiter prefix.
+    Enqueue,
+    /// Cancel the FIFO head.
+    CancelHead,
+    /// Cancel a middle FIFO node.
+    CancelMiddle,
+    /// Cancel the FIFO tail.
+    CancelTail,
+    /// Promote a known waiter prefix.
+    Promote,
+    /// Exercise transaction-owned first-touch admission.
+    FirstTouch,
+    /// Close several transaction claims at commit.
+    ScopeClose,
+}
+
+impl fmt::Display for LockTableScenario {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Basic => "basic",
+            Self::NestedCovered => "nested-covered",
+            Self::Convert => "convert",
+            Self::Enqueue => "enqueue",
+            Self::CancelHead => "cancel-head",
+            Self::CancelMiddle => "cancel-middle",
+            Self::CancelTail => "cancel-tail",
+            Self::Promote => "promote",
+            Self::FirstTouch => "first-touch",
+            Self::ScopeClose => "scope-close",
+        })
+    }
+}
+
+/// Requested table-lock mode.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LockTableMode {
+    /// Shared table lock.
+    #[default]
+    Shared,
+    /// Exclusive table lock.
+    Exclusive,
+}
+
+impl fmt::Display for LockTableMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Shared => f.write_str("shared"),
+            Self::Exclusive => f.write_str("exclusive"),
+        }
+    }
+}
+
+/// Strict table-lock workload controls.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LockTableSpec {
+    /// Positive aggregate lifecycle count.
+    pub num: NonZeroU64,
+    /// Optional scenario; defaults to basic.
+    pub scenario: Option<LockTableScenario>,
+    /// Optional mode; defaults to shared.
+    pub mode: Option<LockTableMode>,
+    /// Optional positive width; defaults to one.
+    pub width: Option<NonZeroUsize>,
+    /// Optional ownership scope; defaults to session.
+    pub scope: Option<TableLockScope>,
+    /// Optional paired-release selection; defaults to false.
+    pub unlock: Option<bool>,
+    /// Optional random table selection; defaults to false.
+    pub random: Option<bool>,
+    /// Optional deterministic random-selection seed.
+    pub seed: Option<u64>,
     /// Optional executor thread override.
     pub threads: Option<NonZeroUsize>,
     /// Optional public session override.
@@ -252,11 +458,11 @@ impl Phase {
         }
     }
 
-    /// Return the plan-time effect expected from this phase.
-    pub fn fixture_effect(&self) -> FixturePlanEffect {
+    /// Borrow the plan-time effect expected from this phase.
+    pub fn fixture_effect(&self) -> &FixturePlanEffect {
         match self {
             Self::Prepare { fixture_effect, .. } | Self::Benchmark { fixture_effect, .. } => {
-                *fixture_effect
+                fixture_effect
             }
         }
     }
@@ -272,35 +478,23 @@ pub struct MeasurementSpec {
     pub measured_runs: NonZeroU32,
 }
 
-/// Resolved primary-table creation configuration.
+/// Resolved table-pool creation configuration.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateTableConfig {
-    /// Complete primary-table shape.
+    /// Common table shape.
     pub shape: PrimaryTableShape,
+    /// Positive ordered table count.
+    pub table_count: usize,
     /// Whether engine diagnostics are captured around the run.
     pub include_stats: bool,
 }
 
-/// Resolved statement-noop configuration.
+/// Resolved counted no-op configuration.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct StmtNoopConfig {
-    /// Aggregate statement count.
-    pub num: u64,
-    /// Executor thread count.
-    pub threads: usize,
-    /// Independent public session count.
-    pub sessions: usize,
-    /// Whether engine diagnostics are captured around the run.
-    pub include_stats: bool,
-}
-
-/// Resolved transaction-noop configuration shared by plan and legacy dispatch.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct TrxNoopConfig {
-    /// Aggregate public transaction count.
+pub struct CountConfig {
+    /// Aggregate operation count.
     pub num: u64,
     /// Executor thread count.
     pub threads: usize,
@@ -336,10 +530,10 @@ pub struct InsertConfig {
     pub include_stats: bool,
 }
 
-/// Resolved transient table-DDL configuration.
+/// Resolved create/drop DDL configuration.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct TableDdlConfig {
+pub struct DdlConfig {
     /// Create/drop cycle count.
     pub num: u64,
     /// Checked create-plus-drop operation count.
@@ -352,22 +546,108 @@ pub struct TableDdlConfig {
     pub include_stats: bool,
 }
 
+/// Resolved batched read configuration.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadConfig {
+    /// Aggregate read-operation count.
+    pub num: u64,
+    /// Deterministic generation seed.
+    pub seed: u64,
+    /// Executor thread count.
+    pub threads: usize,
+    /// Independent public session count.
+    pub sessions: usize,
+    /// Maximum operations per transaction.
+    pub batch_size: u64,
+    /// Candidate loaded logical-key range.
+    pub loaded_range: KeyRange,
+    /// Optional logical-key range width for index scans.
+    pub range: Option<u64>,
+    /// Whether engine diagnostics are captured around the run.
+    pub include_stats: bool,
+}
+
+/// Resolved public index-stream configuration.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndexStreamConfig {
+    /// Aggregate stream count.
+    pub num: u64,
+    /// Deterministic generation seed.
+    pub seed: u64,
+    /// Executor thread count.
+    pub threads: usize,
+    /// Independent public session count.
+    pub sessions: usize,
+    /// Candidate loaded logical-key range.
+    pub loaded_range: KeyRange,
+    /// Logical-key range width.
+    pub range: u64,
+    /// Whether engine diagnostics are captured around the run.
+    pub include_stats: bool,
+}
+
+/// Resolved table-lock configuration.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LockTableConfig {
+    /// Aggregate lifecycle count.
+    pub num: u64,
+    /// Resolved scenario.
+    pub scenario: LockTableScenario,
+    /// Resolved requested lock mode.
+    pub mode: LockTableMode,
+    /// Resolved scenario width.
+    pub width: usize,
+    /// Resolved ownership scope.
+    pub scope: TableLockScope,
+    /// Whether basic lifecycles use paired release.
+    pub unlock: bool,
+    /// Whether paired basic lifecycles select tables randomly.
+    pub random: bool,
+    /// Deterministic selection seed.
+    pub seed: u64,
+    /// Minimum required ordered table-pool width.
+    pub minimum_tables: usize,
+    /// Executor thread count.
+    pub threads: usize,
+    /// Independent public session count.
+    pub sessions: usize,
+    /// Whether engine diagnostics are captured around the run.
+    pub include_stats: bool,
+}
+
 /// Closed resolved workload dispatch.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum ResolvedWorkload {
-    /// Primary-table creation workload.
+    /// Table-pool creation workload.
     CreateTable(CreateTableConfig),
     /// Statement-noop workload.
-    StmtNoop(StmtNoopConfig),
+    StmtNoop(CountConfig),
     /// Transaction-noop workload.
-    TrxNoop(TrxNoopConfig),
+    TrxNoop(CountConfig),
     /// Sequential generated insert workload.
     InsertSeq(InsertConfig),
     /// Pseudo-random generated insert workload.
     InsertRand(InsertConfig),
     /// Transient table-DDL workload.
-    TableDdl(TableDdlConfig),
+    TableDdl(DdlConfig),
+    /// Sequential unique-index lookup workload.
+    LookupSeq(ReadConfig),
+    /// Random unique-index lookup workload.
+    LookupRand(ReadConfig),
+    /// Full table-scan workload.
+    TableScan(ReadConfig),
+    /// Materialized index-range-scan workload.
+    IndexScan(ReadConfig),
+    /// Public index-range-stream workload.
+    IndexStream(IndexStreamConfig),
+    /// Index create/drop workload.
+    IndexDdl(DdlConfig),
+    /// Logical table-lock workload.
+    LockTable(LockTableConfig),
 }
 
 impl ResolvedWorkload {
@@ -380,16 +660,63 @@ impl ResolvedWorkload {
             Self::InsertSeq(_) => "insert-seq",
             Self::InsertRand(_) => "insert-rand",
             Self::TableDdl(_) => "table-ddl",
+            Self::LookupSeq(_) => "lookup-seq",
+            Self::LookupRand(_) => "lookup-rand",
+            Self::TableScan(_) => "table-scan",
+            Self::IndexScan(_) => "index-scan",
+            Self::IndexStream(_) => "index-stream",
+            Self::IndexDdl(_) => "index-ddl",
+            Self::LockTable(_) => "lock-table",
+        }
+    }
+
+    /// Return the fixture capability consumed by this workload.
+    pub(crate) fn fixture_requirement(&self) -> FixtureRequirement {
+        match self {
+            Self::CreateTable(_) => FixtureRequirement::AbsentPrimary,
+            Self::InsertSeq(_) | Self::InsertRand(_) => FixtureRequirement::Primary {
+                index: IndexRequirement::Any,
+                load: LoadRequirement::Optional,
+            },
+            Self::LookupSeq(_) | Self::LookupRand(_) => FixtureRequirement::Primary {
+                index: IndexRequirement::Exact(IndexMode::Unique),
+                load: LoadRequirement::Committed,
+            },
+            Self::TableScan(_) => FixtureRequirement::Primary {
+                index: IndexRequirement::Any,
+                load: LoadRequirement::Committed,
+            },
+            Self::IndexScan(_) | Self::IndexStream(_) => FixtureRequirement::Primary {
+                index: IndexRequirement::Secondary,
+                load: LoadRequirement::Committed,
+            },
+            Self::IndexDdl(_) => FixtureRequirement::Primary {
+                index: IndexRequirement::Exact(IndexMode::None),
+                load: LoadRequirement::Optional,
+            },
+            Self::LockTable(config) => FixtureRequirement::TablePool {
+                minimum: config.minimum_tables,
+            },
+            Self::StmtNoop(_) | Self::TrxNoop(_) | Self::TableDdl(_) => FixtureRequirement::None,
         }
     }
 
     /// Return whether repeated execution against one fixture is safe.
     pub fn replay_policy(&self) -> ReplayPolicy {
         match self {
-            Self::StmtNoop(_) | Self::TrxNoop(_) => ReplayPolicy::Safe,
-            Self::CreateTable(_) | Self::InsertSeq(_) | Self::InsertRand(_) | Self::TableDdl(_) => {
-                ReplayPolicy::SingleRun
-            }
+            Self::StmtNoop(_)
+            | Self::TrxNoop(_)
+            | Self::LookupSeq(_)
+            | Self::LookupRand(_)
+            | Self::TableScan(_)
+            | Self::IndexScan(_)
+            | Self::IndexStream(_)
+            | Self::LockTable(_) => ReplayPolicy::Safe,
+            Self::CreateTable(_)
+            | Self::InsertSeq(_)
+            | Self::InsertRand(_)
+            | Self::TableDdl(_)
+            | Self::IndexDdl(_) => ReplayPolicy::SingleRun,
         }
     }
 
@@ -397,10 +724,15 @@ impl ResolvedWorkload {
     pub fn worker_counts(&self) -> (usize, usize) {
         match self {
             Self::CreateTable(_) => (1, 1),
-            Self::StmtNoop(config) => (config.threads, config.sessions),
-            Self::TrxNoop(config) => (config.threads, config.sessions),
+            Self::StmtNoop(config) | Self::TrxNoop(config) => (config.threads, config.sessions),
             Self::InsertSeq(config) | Self::InsertRand(config) => (config.threads, config.sessions),
-            Self::TableDdl(config) => (config.threads, config.sessions),
+            Self::TableDdl(config) | Self::IndexDdl(config) => (config.threads, config.sessions),
+            Self::LookupSeq(config)
+            | Self::LookupRand(config)
+            | Self::TableScan(config)
+            | Self::IndexScan(config) => (config.threads, config.sessions),
+            Self::IndexStream(config) => (config.threads, config.sessions),
+            Self::LockTable(config) => (config.threads, config.sessions),
         }
     }
 
@@ -408,10 +740,15 @@ impl ResolvedWorkload {
     pub fn include_stats(&self) -> bool {
         match self {
             Self::CreateTable(config) => config.include_stats,
-            Self::StmtNoop(config) => config.include_stats,
-            Self::TrxNoop(config) => config.include_stats,
+            Self::StmtNoop(config) | Self::TrxNoop(config) => config.include_stats,
             Self::InsertSeq(config) | Self::InsertRand(config) => config.include_stats,
-            Self::TableDdl(config) => config.include_stats,
+            Self::TableDdl(config) | Self::IndexDdl(config) => config.include_stats,
+            Self::LookupSeq(config)
+            | Self::LookupRand(config)
+            | Self::TableScan(config)
+            | Self::IndexScan(config) => config.include_stats,
+            Self::IndexStream(config) => config.include_stats,
+            Self::LockTable(config) => config.include_stats,
         }
     }
 
@@ -423,19 +760,48 @@ impl ResolvedWorkload {
             Self::TrxNoop(_) => LatencyUnit::TransactionLifecycle,
             Self::InsertSeq(_) | Self::InsertRand(_) => LatencyUnit::InsertBatchTransaction,
             Self::TableDdl(_) => LatencyUnit::TableCreateDropCycle,
+            Self::LookupSeq(_) | Self::LookupRand(_) => LatencyUnit::LookupBatchTransaction,
+            Self::TableScan(_) => LatencyUnit::TableScanBatchTransaction,
+            Self::IndexScan(_) => LatencyUnit::IndexScanBatchTransaction,
+            Self::IndexStream(_) => LatencyUnit::IndexStreamTransaction,
+            Self::IndexDdl(_) => LatencyUnit::IndexCreateDropCycle,
+            Self::LockTable(config)
+                if config.scenario == LockTableScenario::Basic && !config.unlock =>
+            {
+                match config.scope {
+                    TableLockScope::Session => LatencyUnit::TableLockSessionRetainedLifecycle,
+                    TableLockScope::Transaction => {
+                        LatencyUnit::TableLockTransactionRetainedLifecycle
+                    }
+                }
+            }
+            Self::LockTable(_) => LatencyUnit::TableLockOperationLifecycle,
         }
     }
 
     /// Return the exact successful sampled-run latency count.
     pub fn expected_samples(&self) -> Result<u64> {
         match self {
-            Self::CreateTable(_) => Ok(1),
-            Self::StmtNoop(config) => Ok(config.num),
-            Self::TrxNoop(config) => Ok(config.num),
+            Self::CreateTable(config) => u64::try_from(config.table_count)
+                .map_err(|_| BenchError::message("table count exceeds u64")),
+            Self::StmtNoop(config) | Self::TrxNoop(config) => Ok(config.num),
             Self::InsertSeq(config) | Self::InsertRand(config) => {
-                insert_sample_count(config.num, config.sessions, config.batch_size)
+                aggregate_batch_count(config.num, config.sessions, config.batch_size)
             }
-            Self::TableDdl(config) => Ok(config.num),
+            Self::TableDdl(config) | Self::IndexDdl(config) => Ok(config.num),
+            Self::LookupSeq(config)
+            | Self::LookupRand(config)
+            | Self::TableScan(config)
+            | Self::IndexScan(config) => {
+                aggregate_batch_count(config.num, config.sessions, config.batch_size)
+            }
+            Self::IndexStream(config) => Ok(config.num),
+            Self::LockTable(config)
+                if config.scenario == LockTableScenario::Basic && !config.unlock =>
+            {
+                nonempty_session_count(config.num, config.sessions)
+            }
+            Self::LockTable(config) => Ok(config.num),
         }
     }
 }
@@ -512,6 +878,7 @@ fn validate_and_resolve_phases(
     let mut phases = Vec::with_capacity(raw_phases.len());
     for (index, raw) in raw_phases.into_iter().enumerate() {
         let (workload, fixture_effect) = resolve_workload(raw.workload, defaults, &fixture)?;
+        fixture.validate(workload.fixture_requirement())?;
         let phase = match raw.kind {
             PhaseKind::Prepare => Phase::Prepare {
                 workload,
@@ -541,7 +908,7 @@ fn validate_and_resolve_phases(
                 }
             }
         };
-        fixture.apply(fixture_effect)?;
+        fixture.apply(phase.fixture_effect())?;
         phases.push(phase);
     }
     Ok(phases)
@@ -570,14 +937,12 @@ fn validate_phase_structure(raw_phases: &[RawPhase]) -> Result<()> {
             }
         }
     }
-    match benchmark_count {
-        0 => Err(BenchError::message(
+    if benchmark_count == 1 {
+        Ok(())
+    } else {
+        Err(BenchError::message(
             "plan must contain exactly one final benchmark phase",
-        )),
-        1 => Ok(()),
-        _ => Err(BenchError::message(
-            "plan must not contain multiple benchmark phases",
-        )),
+        ))
     }
 }
 
@@ -586,62 +951,133 @@ fn resolve_workload(
     defaults: ResolvedWorkloadDefaults,
     fixture: &FixturePlanState,
 ) -> Result<(ResolvedWorkload, FixturePlanEffect)> {
+    let no_effect = |workload| Ok((workload, FixturePlanEffect::None));
     match spec {
         WorkloadSpec::CreateTable(spec) => {
-            fixture.validate_create_primary()?;
             let shape = PrimaryTableShape { index: spec.index };
+            let table_count = spec.tables.map_or(1, NonZeroUsize::get);
             Ok((
                 ResolvedWorkload::CreateTable(CreateTableConfig {
                     shape,
+                    table_count,
                     include_stats: spec.include_stats.unwrap_or(defaults.include_stats),
                 }),
-                FixturePlanEffect::CreatePrimary { shape },
+                FixturePlanEffect::CreateTables { shape, table_count },
             ))
         }
         WorkloadSpec::StmtNoop(spec) => {
-            let (threads, sessions) = resolve_workers(spec.threads, spec.sessions, defaults)?;
-            Ok((
-                ResolvedWorkload::StmtNoop(StmtNoopConfig {
-                    num: spec.num.get(),
-                    threads,
-                    sessions,
-                    include_stats: spec.include_stats.unwrap_or(defaults.include_stats),
-                }),
-                FixturePlanEffect::None,
-            ))
+            no_effect(ResolvedWorkload::StmtNoop(resolve_count(spec, defaults)?))
         }
         WorkloadSpec::TrxNoop(spec) => {
-            let (threads, sessions) = resolve_workers(spec.threads, spec.sessions, defaults)?;
-            Ok((
-                ResolvedWorkload::TrxNoop(TrxNoopConfig {
-                    num: spec.num.get(),
-                    threads,
-                    sessions,
-                    include_stats: spec.include_stats.unwrap_or(defaults.include_stats),
-                }),
-                FixturePlanEffect::None,
-            ))
+            no_effect(ResolvedWorkload::TrxNoop(resolve_count(spec, defaults)?))
         }
         WorkloadSpec::InsertSeq(spec) => resolve_insert(spec, defaults, fixture, false),
         WorkloadSpec::InsertRand(spec) => resolve_insert(spec, defaults, fixture, true),
         WorkloadSpec::TableDdl(spec) => {
+            no_effect(ResolvedWorkload::TableDdl(resolve_ddl(spec, defaults)?))
+        }
+        WorkloadSpec::LookupSeq(spec) => {
+            let loaded_range = fixture.loaded_range()?;
+            no_effect(ResolvedWorkload::LookupSeq(resolve_read(
+                spec.num.get(),
+                0,
+                spec.threads,
+                spec.sessions,
+                spec.batch_size,
+                spec.include_stats,
+                defaults,
+                loaded_range,
+                None,
+            )?))
+        }
+        WorkloadSpec::LookupRand(spec) => {
+            let loaded_range = fixture.loaded_range()?;
+            no_effect(ResolvedWorkload::LookupRand(resolve_read(
+                spec.num.get(),
+                spec.seed.unwrap_or(0),
+                spec.threads,
+                spec.sessions,
+                spec.batch_size,
+                spec.include_stats,
+                defaults,
+                loaded_range,
+                None,
+            )?))
+        }
+        WorkloadSpec::TableScan(spec) => {
+            let loaded_range = fixture.loaded_range()?;
+            no_effect(ResolvedWorkload::TableScan(resolve_read(
+                spec.num.unwrap_or(NonZeroU64::MIN).get(),
+                0,
+                spec.threads,
+                spec.sessions,
+                spec.batch_size,
+                spec.include_stats,
+                defaults,
+                loaded_range,
+                None,
+            )?))
+        }
+        WorkloadSpec::IndexScan(spec) => {
+            let loaded_range = fixture.loaded_range()?;
+            let range = resolve_range(spec.range, loaded_range)?;
+            no_effect(ResolvedWorkload::IndexScan(resolve_read(
+                spec.num.get(),
+                spec.seed.unwrap_or(0),
+                spec.threads,
+                spec.sessions,
+                spec.batch_size,
+                spec.include_stats,
+                defaults,
+                loaded_range,
+                Some(range),
+            )?))
+        }
+        WorkloadSpec::IndexStream(spec) => {
+            let loaded_range = fixture.loaded_range()?;
             let (threads, sessions) = resolve_workers(spec.threads, spec.sessions, defaults)?;
-            let num = spec.num.unwrap_or(NonZeroU64::MIN).get();
-            let operations = num
-                .checked_mul(2)
-                .ok_or_else(|| BenchError::message("DDL operation count overflow"))?;
-            Ok((
-                ResolvedWorkload::TableDdl(TableDdlConfig {
-                    num,
-                    operations,
-                    threads,
-                    sessions,
-                    include_stats: spec.include_stats.unwrap_or(defaults.include_stats),
-                }),
-                FixturePlanEffect::None,
-            ))
+            no_effect(ResolvedWorkload::IndexStream(IndexStreamConfig {
+                num: spec.num.unwrap_or(NonZeroU64::MIN).get(),
+                seed: spec.seed.unwrap_or(0),
+                threads,
+                sessions,
+                loaded_range,
+                range: resolve_range(spec.range, loaded_range)?,
+                include_stats: spec.include_stats.unwrap_or(defaults.include_stats),
+            }))
+        }
+        WorkloadSpec::IndexDdl(spec) => {
+            no_effect(ResolvedWorkload::IndexDdl(resolve_ddl(spec, defaults)?))
+        }
+        WorkloadSpec::LockTable(spec) => {
+            no_effect(ResolvedWorkload::LockTable(resolve_lock(spec, defaults)?))
         }
     }
+}
+
+fn resolve_count(spec: CountWorkerSpec, defaults: ResolvedWorkloadDefaults) -> Result<CountConfig> {
+    let (threads, sessions) = resolve_workers(spec.threads, spec.sessions, defaults)?;
+    Ok(CountConfig {
+        num: spec.num.get(),
+        threads,
+        sessions,
+        include_stats: spec.include_stats.unwrap_or(defaults.include_stats),
+    })
+}
+
+fn resolve_ddl(spec: IterationWorkerSpec, defaults: ResolvedWorkloadDefaults) -> Result<DdlConfig> {
+    let (threads, sessions) = resolve_workers(spec.threads, spec.sessions, defaults)?;
+    let num = spec.num.unwrap_or(NonZeroU64::MIN).get();
+    let operations = num
+        .checked_mul(2)
+        .ok_or_else(|| BenchError::message("DDL operation count overflow"))?;
+    Ok(DdlConfig {
+        num,
+        operations,
+        threads,
+        sessions,
+        include_stats: spec.include_stats.unwrap_or(defaults.include_stats),
+    })
 }
 
 fn resolve_insert(
@@ -681,6 +1117,141 @@ fn resolve_insert(
     Ok((workload, FixturePlanEffect::Insert { attempted_range }))
 }
 
+#[expect(clippy::too_many_arguments, reason = "closed read schema is explicit")]
+fn resolve_read(
+    num: u64,
+    seed: u64,
+    threads: Option<NonZeroUsize>,
+    sessions: Option<NonZeroUsize>,
+    batch_size: Option<NonZeroU64>,
+    include_stats: Option<bool>,
+    defaults: ResolvedWorkloadDefaults,
+    loaded_range: KeyRange,
+    range: Option<u64>,
+) -> Result<ReadConfig> {
+    let (threads, sessions) = resolve_workers(threads, sessions, defaults)?;
+    let batch_size = batch_size.map_or(defaults.batch_size, NonZeroU64::get);
+    validate_batch_size(batch_size)?;
+    Ok(ReadConfig {
+        num,
+        seed,
+        threads,
+        sessions,
+        batch_size,
+        loaded_range,
+        range,
+        include_stats: include_stats.unwrap_or(defaults.include_stats),
+    })
+}
+
+fn resolve_range(range: Option<NonZeroU64>, loaded_range: KeyRange) -> Result<u64> {
+    let range = range.map_or(loaded_range.len, NonZeroU64::get);
+    if range > loaded_range.len {
+        return Err(BenchError::message(format!(
+            "index scan range ({range}) exceeds loaded key range length ({})",
+            loaded_range.len
+        )));
+    }
+    Ok(range)
+}
+
+fn resolve_lock(
+    spec: LockTableSpec,
+    defaults: ResolvedWorkloadDefaults,
+) -> Result<LockTableConfig> {
+    let scenario = spec.scenario.unwrap_or_default();
+    let mode = spec.mode.unwrap_or_default();
+    let width = spec.width.map_or(1, NonZeroUsize::get);
+    let scope = spec.scope.unwrap_or_default();
+    let unlock = spec.unlock.unwrap_or(false);
+    let random = spec.random.unwrap_or(false);
+    if scenario == LockTableScenario::Basic {
+        if width != 1 {
+            return Err(BenchError::message(
+                "lock-table basic scenario requires width one",
+            ));
+        }
+        if random && !unlock {
+            return Err(BenchError::message(
+                "lock-table random selection requires paired release",
+            ));
+        }
+        if spec.seed.is_some() && !random {
+            return Err(BenchError::message(
+                "lock-table seed requires random selection",
+            ));
+        }
+    } else {
+        if spec.scope.is_some()
+            || spec.unlock.is_some()
+            || spec.random.is_some()
+            || spec.seed.is_some()
+        {
+            return Err(BenchError::message(format!(
+                "lock-table scenario {scenario} rejects scope, unlock, random, and seed"
+            )));
+        }
+        if scenario == LockTableScenario::Convert
+            && (mode != LockTableMode::Exclusive || width != 1)
+        {
+            return Err(BenchError::message(
+                "lock-table convert requires exclusive mode and width one",
+            ));
+        }
+        if scenario == LockTableScenario::FirstTouch
+            && (mode != LockTableMode::Shared || width != 1)
+        {
+            return Err(BenchError::message(
+                "lock-table first-touch requires shared mode and width one",
+            ));
+        }
+        if scenario == LockTableScenario::CancelMiddle && width < 3 {
+            return Err(BenchError::message(
+                "lock-table cancel-middle requires width at least three",
+            ));
+        }
+    }
+    let (threads, sessions) = resolve_workers(spec.threads, spec.sessions, defaults)?;
+    if is_contended(scenario) && sessions != 1 {
+        return Err(BenchError::message(format!(
+            "lock-table scenario {scenario} requires exactly one session"
+        )));
+    }
+    let minimum_tables = if matches!(
+        scenario,
+        LockTableScenario::NestedCovered | LockTableScenario::ScopeClose
+    ) {
+        width
+    } else {
+        1
+    };
+    Ok(LockTableConfig {
+        num: spec.num.get(),
+        scenario,
+        mode,
+        width,
+        scope,
+        unlock,
+        random,
+        seed: spec.seed.unwrap_or(0),
+        minimum_tables,
+        threads,
+        sessions,
+        include_stats: spec.include_stats.unwrap_or(defaults.include_stats),
+    })
+}
+
+fn is_contended(scenario: LockTableScenario) -> bool {
+    matches!(
+        scenario,
+        LockTableScenario::Enqueue
+            | LockTableScenario::CancelHead
+            | LockTableScenario::CancelMiddle
+            | LockTableScenario::CancelTail
+            | LockTableScenario::Promote
+    )
+}
+
 fn resolve_workers(
     thread_override: Option<NonZeroUsize>,
     session_override: Option<NonZeroUsize>,
@@ -696,23 +1267,28 @@ fn resolve_workers(
     Ok((threads, sessions))
 }
 
-fn insert_sample_count(num: u64, sessions: usize, batch_size: u64) -> Result<u64> {
-    let sessions_u64 = u64::try_from(sessions)
-        .map_err(|_| BenchError::message("insert session count exceeds u64"))?;
+fn aggregate_batch_count(num: u64, sessions: usize, batch_size: u64) -> Result<u64> {
+    let sessions_u64 =
+        u64::try_from(sessions).map_err(|_| BenchError::message("session count exceeds u64"))?;
     let base = num / sessions_u64;
     let remainder = num % sessions_u64;
     let mut samples = 0u64;
     for session in 0..sessions_u64 {
         let operations = base + u64::from(session < remainder);
         if operations != 0 {
-            let batches =
-                operations / batch_size + u64::from(!operations.is_multiple_of(batch_size));
+            let batches = operations.div_ceil(batch_size);
             samples = samples
                 .checked_add(batches)
-                .ok_or_else(|| BenchError::message("insert latency sample count overflow"))?;
+                .ok_or_else(|| BenchError::message("latency sample count overflow"))?;
         }
     }
     Ok(samples)
+}
+
+fn nonempty_session_count(num: u64, sessions: usize) -> Result<u64> {
+    let sessions =
+        u64::try_from(sessions).map_err(|_| BenchError::message("session count exceeds u64"))?;
+    Ok(num.min(sessions))
 }
 
 fn byte_usize(value: Byte, field: &str) -> Result<usize> {
@@ -731,136 +1307,81 @@ mod tests {
         toml::from_str(raw)
     }
 
-    #[test]
-    fn strict_plan_rejects_unknown_fields_at_every_boundary() {
-        assert!(parse("unknown = 1\nphase = []").is_err());
-        assert!(
-            parse("[[phase]]\nunknown = 1\nworkload = { type = \"trx-noop\", num = 1 }").is_err()
-        );
-        assert!(
-            parse("[[phase]]\nworkload = { type = \"trx-noop\", num = 1, unknown = 1 }").is_err()
-        );
+    fn resolve(raw: &str) -> Result<Vec<Phase>> {
+        let raw = parse(raw).unwrap();
+        validate_and_resolve_phases(raw.phases, WorkloadDefaults::default().resolve().unwrap())
     }
 
     #[test]
-    fn fixture_fold_resolves_create_and_contiguous_inserts() {
-        let raw = parse(
-            "[[phase]]\nworkload = { type = \"create-table\", index = \"unique\" }\n\
-             [[phase]]\nworkload = { type = \"insert-seq\", num = 3 }\n\
-             [[phase]]\nkind = \"benchmark\"\nworkload = { type = \"insert-rand\", num = 2, value_size = \"128 B\" }\n",
-        )
-        .unwrap();
-        let phases =
-            validate_and_resolve_phases(raw.phases, WorkloadDefaults::default().resolve().unwrap())
-                .unwrap();
-        let ResolvedWorkload::InsertSeq(first) = phases[1].workload() else {
-            panic!("expected sequential insert")
+    fn strict_schema_accepts_new_workloads_and_rejects_old_random_name() {
+        for workload in [
+            "lookup-seq",
+            "lookup-rand",
+            "table-scan",
+            "index-scan",
+            "index-stream",
+            "index-ddl",
+            "lock-table",
+        ] {
+            let controls = if workload == "lock-table" {
+                "num = 1"
+            } else if matches!(workload, "table-scan" | "index-stream" | "index-ddl") {
+                ""
+            } else {
+                "num = 1"
+            };
+            let raw = format!(
+                "[[phase]]\nkind = \"benchmark\"\nworkload = {{ type = \"{workload}\", {controls} }}\n"
+            );
+            assert!(parse(&raw).is_ok(), "{workload}");
+        }
+        assert!(parse("[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"lock-table\", num = 1, rand = true }").is_err());
+    }
+
+    #[test]
+    fn fixture_fold_rejects_reads_without_compatible_committed_load() {
+        let no_load = "[[phase]]\nworkload = { type = \"create-table\", index = \"unique\" }\n[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"lookup-seq\", num = 1 }\n";
+        assert!(resolve(no_load).is_err());
+        let wrong_shape = "[[phase]]\nworkload = { type = \"create-table\", index = \"none\" }\n[[phase]]\nworkload = { type = \"insert-seq\", num = 1 }\n[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"lookup-seq\", num = 1 }\n";
+        assert!(resolve(wrong_shape).is_err());
+    }
+
+    #[test]
+    fn lock_contracts_and_pool_width_are_checked() {
+        let invalid = "[[phase]]\nworkload = { type = \"create-table\", index = \"none\", tables = 2 }\n[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"lock-table\", num = 1, scenario = \"scope-close\", width = 3 }\n";
+        assert!(resolve(invalid).is_err());
+        let irrelevant = "[[phase]]\nworkload = { type = \"create-table\", index = \"none\" }\n[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"lock-table\", num = 1, scenario = \"promote\", sessions = 1, unlock = false }\n";
+        assert!(resolve(irrelevant).is_err());
+    }
+
+    #[test]
+    fn worker_topology_is_validated_during_plan_resolution() {
+        let defaults = WorkloadDefaults {
+            threads: NonZeroUsize::new(2),
+            sessions: NonZeroUsize::new(1),
+            ..WorkloadDefaults::default()
         };
-        let ResolvedWorkload::InsertRand(second) = phases[2].workload() else {
-            panic!("expected random insert")
-        };
-        assert_eq!(first.attempted_range, KeyRange { start: 0, len: 3 });
-        assert_eq!(second.attempted_range, KeyRange { start: 3, len: 2 });
-        assert_eq!(second.index, IndexMode::Unique);
-        assert_eq!(second.value_size_bytes, 128);
-    }
-
-    #[test]
-    fn fixture_fold_rejects_missing_or_duplicate_primary() {
-        let missing = parse(
-            "[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"insert-seq\", num = 1 }\n",
-        )
-        .unwrap();
-        assert!(
-            validate_and_resolve_phases(
-                missing.phases,
-                WorkloadDefaults::default().resolve().unwrap()
-            )
-            .is_err()
-        );
-        let duplicate = parse(
-            "[[phase]]\nworkload = { type = \"create-table\", index = \"none\" }\n\
-             [[phase]]\nworkload = { type = \"create-table\", index = \"none\" }\n\
-             [[phase]]\nkind = \"benchmark\"\nworkload = { type = \"trx-noop\", num = 1 }\n",
-        )
-        .unwrap();
-        assert!(
-            validate_and_resolve_phases(
-                duplicate.phases,
-                WorkloadDefaults::default().resolve().unwrap()
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn mutating_benchmark_rejects_replay() {
-        let raw = parse(
-            "[[phase]]\nkind = \"benchmark\"\nwarmup_runs = 1\nworkload = { type = \"table-ddl\" }\n",
-        )
-        .unwrap();
-        assert!(
-            validate_and_resolve_phases(raw.phases, WorkloadDefaults::default().resolve().unwrap())
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn insert_samples_sum_per_session_ceilings() {
-        assert_eq!(insert_sample_count(5, 2, 2).unwrap(), 3);
-        assert_eq!(insert_sample_count(3, 3, 100).unwrap(), 3);
-    }
-
-    #[test]
-    fn byte_values_require_strings_and_resolve_exactly() {
-        let raw = parse(
-            "[workload_defaults]\nvalue_size = \"512 B\"\n\
-             [[phase]]\nkind = \"benchmark\"\nworkload = { type = \"trx-noop\", num = 1 }\n",
-        )
-        .unwrap();
         assert_eq!(
-            raw.workload_defaults.resolve().unwrap().value_size_bytes,
-            512
+            defaults.resolve().unwrap_err().to_string(),
+            "threads (2) must not exceed sessions (1)"
         );
-        assert!(
-            parse(
-                "[workload_defaults]\nvalue_size = 512\n\
-                 [[phase]]\nkind = \"benchmark\"\nworkload = { type = \"trx-noop\", num = 1 }\n"
-            )
-            .is_err()
+
+        let phase = "[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"stmt-noop\", num = 1, threads = 2, sessions = 1 }\n";
+        assert_eq!(
+            resolve(phase).unwrap_err().to_string(),
+            "threads (2) must not exceed sessions (1)"
         );
     }
 
     #[test]
-    fn engine_defaults_are_plan_relative_and_strict() {
-        let temp = TempDir::new().unwrap();
-        let plan_dir = temp.path().join("plans");
-        fs::create_dir(&plan_dir).unwrap();
-        fs::write(
-            plan_dir.join("defaults.toml"),
-            "[engine.transaction]\npurge_threads = 3\n",
-        )
-        .unwrap();
-        let source = plan_dir.join("plan.toml");
-        fs::write(
-            &source,
-            "engine_defaults = \"defaults.toml\"\n[engine.transaction]\npurge_threads = 4\n\n[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"trx-noop\", num = 1 }\n",
-        )
-        .unwrap();
-        let root = temp.path().join("root");
-        let loaded = load_plan(&source, &root).unwrap();
-        assert_eq!(loaded.plan.engine.transaction.purge_threads, 4);
-
-        fs::write(
-            plan_dir.join("defaults.toml"),
-            "engine_defaults = \"recursive.toml\"\n[engine]\n",
-        )
-        .unwrap();
-        assert!(load_plan(&source, &root).is_err());
+    fn checked_sample_equations_match_partitioning() {
+        assert_eq!(aggregate_batch_count(5, 2, 2).unwrap(), 3);
+        assert_eq!(aggregate_batch_count(3, 8, 100).unwrap(), 3);
+        assert_eq!(nonempty_session_count(3, 8).unwrap(), 3);
     }
 
     #[test]
-    fn checked_in_templates_are_complete_and_use_durable_defaults() {
+    fn checked_in_templates_are_the_exact_complete_workload_inventory() {
         let templates = Path::new(env!("CARGO_MANIFEST_DIR")).join("templates");
         let cases = [
             ("trx-noop.toml", "trx-noop"),
@@ -868,14 +1389,21 @@ mod tests {
             ("insert-seq.toml", "insert-seq"),
             ("insert-rand.toml", "insert-rand"),
             ("table-ddl.toml", "table-ddl"),
+            ("lookup-seq.toml", "lookup-seq"),
+            ("lookup-rand.toml", "lookup-rand"),
+            ("table-scan.toml", "table-scan"),
+            ("index-scan.toml", "index-scan"),
+            ("index-stream.toml", "index-stream"),
+            ("index-ddl.toml", "index-ddl"),
+            ("lock-table.toml", "lock-table"),
         ];
         let temp = TempDir::new().unwrap();
-        for (index, (file, workload)) in cases.into_iter().enumerate() {
+        for (index, (file, identity)) in cases.into_iter().enumerate() {
             let loaded = load_plan(&templates.join(file), &temp.path().join(index.to_string()))
                 .unwrap_or_else(|error| panic!("{file} must load: {error}"));
             assert_eq!(
                 loaded.plan.phases.last().unwrap().workload().identity(),
-                workload
+                identity
             );
             assert_eq!(
                 loaded.plan.engine.transaction.log_sync,
@@ -885,30 +1413,17 @@ mod tests {
                 loaded.plan.engine.index_buffer.max_mem_size_bytes,
                 512 * 1024 * 1024
             );
-            assert_eq!(
-                loaded.plan.engine.index_buffer.max_file_size_bytes,
-                1024 * 1024 * 1024
-            );
-            assert_eq!(
-                loaded.plan.engine.data_buffer.max_mem_size_bytes,
-                1024 * 1024 * 1024
-            );
-            assert_eq!(
-                loaded.plan.engine.data_buffer.max_file_size_bytes,
-                2 * 1024 * 1024 * 1024
-            );
-            assert_eq!(
-                loaded.plan.engine.file.readonly_buffer_size_bytes,
-                1024 * 1024 * 1024
-            );
         }
-        let workload_templates = fs::read_dir(&templates)
+        let mut actual = fs::read_dir(&templates)
             .unwrap()
             .filter_map(|entry| {
-                let path = entry.ok()?.path();
-                (path.file_name()?.to_str()? != "engine-defaults.toml").then_some(path)
+                let name = entry.ok()?.file_name().into_string().ok()?;
+                (name != "engine-defaults.toml").then_some(name)
             })
-            .count();
-        assert_eq!(workload_templates, 5);
+            .collect::<Vec<_>>();
+        actual.sort();
+        let mut expected = cases.map(|(file, _)| file.to_owned()).to_vec();
+        expected.sort();
+        assert_eq!(actual, expected);
     }
 }

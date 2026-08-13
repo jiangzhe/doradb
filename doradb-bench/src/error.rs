@@ -16,9 +16,9 @@ pub enum BenchError {
     Io(#[from] io::Error),
     #[error("storage error: {0}")]
     Storage(#[from] doradb_storage::Error),
-    #[error("manifest decode error: {0}")]
+    #[error("TOML decode error: {0}")]
     TomlDecode(#[from] TomlDecodeError),
-    #[error("manifest encode error: {0}")]
+    #[error("TOML encode error: {0}")]
     TomlEncode(#[from] TomlEncodeError),
 }
 
