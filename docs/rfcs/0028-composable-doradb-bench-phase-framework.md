@@ -202,11 +202,10 @@ doradb-bench --root <storage-root> --plan <plan.toml>
 execution requires a non-existing storage root, creates it, bootstraps one
 engine, executes all phases, closes the engine, and leaves the root and result
 artifacts for inspection after success. Unexpected failures emit no benchmark
-result artifacts; a guarded root may remain for diagnosis and cleanup.
-`cleanup` may remain as a manifest-guarded safety
-utility, but `prepare` and the nested per-workload commands are removed. There
-is no compatibility adapter or second workload execution path. [D2] [C1] [C5]
-[U3] [U6] [U8]
+result artifacts; the root may remain for diagnosis and user-managed deletion.
+`--plan` is required, and `cleanup`, `prepare`, and the nested per-workload
+commands are removed. There is no compatibility adapter or second workload
+execution path. [D2] [C1] [C5] [U3] [U6] [U8]
 
 The TOML schema has no version field. Deserialization rejects unknown fields so
 misspellings fail before root creation. A benchmark-tool change may alter the
@@ -392,9 +391,9 @@ keep typed internal coordination. [C2] [C8] [U3]
 The primary-table manifest is replaced as an execution authority by validated
 fixture state. Insert phases update the implicit primary table's key allocation
 and loaded ranges; read phases consume that state; multi-table lock workloads
-consume the implicit ordered table pool. An internal run manifest may remain as
-a cleanup marker and diagnostic artifact, but it is not a second user-authored
-plan or workload configuration. [C3] [U1] [U3] [U14]
+consume the implicit ordered table pool. No internal run manifest remains;
+successful canonical results record the plan source and complete normalized
+plan, while failed roots are inspected directly. [C3] [U1] [U3] [U14]
 
 All currently documented workloads must execute through the plan before Phase 3
 is complete. Their storage semantics, deterministic generation, batching, and
@@ -661,8 +660,8 @@ requires separate justification and review outside this RFC.
   - Non-goals: Checkpoint/freeze, delete/update/mixed workloads, restart/cold
     lifecycle, parallel phases, fixture reset, compatibility adapters, or
     performance gates.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
+  - Task Doc: `docs/tasks/000268-migrate-doradb-bench-dependent-and-coordinated-workloads.md`
+  - Task Issue: `#973`
   - Phase Status: `pending`
   - Implementation Summary: `pending`
 

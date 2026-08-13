@@ -1,278 +1,317 @@
-use crate::cli::{InsertArgs, Workload};
 use crate::error::{BenchError, Result};
-use crate::fixture::{IndexMode, KeyRange};
-use crate::manifest::Manifest;
-use crate::measurement::{LatencyDistribution, MeasurementClock};
-use crate::workload::util::{effective_batch_size, generate_insert_keys, generate_payload};
-use crate::workload::{
-    CommonConfig, RunCancellation, SessionPlan, SessionSummary, WorkloadConfig, WorkloadRunner,
+use crate::fixture::{FixturePlanEffect, FixtureRuntimeEffect, IndexMode, PrimaryBinding};
+use crate::measurement::{
+    ExpectedOutcomeCounters, LatencyDistribution, MeasurementClock, WorkloadCounters,
 };
+use crate::plan::InsertConfig;
+use crate::plan_executor::{
+    SessionExecutor, SessionExecutorConfig, SessionMeasurement, SessionOutcome,
+};
+use crate::workload::util::{effective_batch_size, generate_insert_keys, generate_payload};
+use crate::workload::util::{merge_measurement, require_primary, verify_samples};
+use crate::workload::{RunCancellation, SessionPlan, build_session_plans};
 use doradb_storage::id::{TableID, TrxID};
-use doradb_storage::{OperationError, Session, Val};
+use doradb_storage::{Engine, OperationError, Session, Val};
+use std::future::Future;
 
-/// Resolved sequential-insert configuration.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct InsertSeqConfig {
-    common: CommonConfig,
-    index: IndexMode,
-    num: u64,
-    seed: u64,
-    execution_range: KeyRange,
-    output_loaded_range: KeyRange,
-}
-
-impl WorkloadConfig for InsertSeqConfig {
-    type Args = InsertArgs;
-
-    const WORKLOAD: Workload = Workload::InsertSeq;
-
-    fn resolve(manifest: &Manifest, args: &Self::Args) -> Result<Self> {
-        let (common, num, seed, execution_range, output_loaded_range) =
-            resolve_insert_config(manifest, args)?;
-        manifest.validate_workload_compatible(Self::WORKLOAD)?;
-        Ok(Self {
-            common,
-            index: manifest.index,
-            num,
-            seed,
-            execution_range,
-            output_loaded_range,
-        })
-    }
-
-    fn common(&self) -> &CommonConfig {
-        &self.common
-    }
-
-    fn operation_count(&self) -> u64 {
-        self.num
-    }
-
-    fn execution_range(&self) -> KeyRange {
-        self.execution_range
-    }
-
-    fn output_loaded_range(&self) -> KeyRange {
-        self.output_loaded_range
-    }
-
-    fn seed(&self) -> u64 {
-        self.seed
-    }
-
-    fn update_manifest(&self, manifest: &mut Manifest, summary: &SessionSummary) -> Result<bool> {
-        manifest.record_insert_outcome(self.num, summary.inserted_rows)?;
-        Ok(true)
-    }
-}
-
-/// Executes sequential-key inserts for one session.
+/// Sequential-insert session executor.
 #[derive(Clone, Copy)]
-pub(crate) struct InsertSeqRunner {
-    index: IndexMode,
-    seed: u64,
-    value_size: usize,
-    batch_size: u64,
-    table_id: TableID,
+pub(crate) struct InsertSeqExecutor {
+    state: InsertExecutorState,
 }
 
-impl WorkloadRunner for InsertSeqRunner {
-    type Config = InsertSeqConfig;
+impl SessionExecutor for InsertSeqExecutor {
+    type Config = SessionExecutorConfig<InsertConfig>;
+    type Outcome = InsertSessionOutcome;
 
-    fn new(config: &Self::Config, table_id: TableID) -> Self {
-        Self {
-            index: config.index,
-            seed: config.seed,
-            value_size: config.common.value_size,
-            batch_size: config.common.batch_size,
-            table_id,
-        }
-    }
+    const IDENTITY: &'static str = "insert-seq";
 
-    async fn run(
-        &self,
-        _engine: &doradb_storage::Engine,
-        session: &mut Session,
-        plan: &SessionPlan,
-    ) -> Result<SessionSummary> {
-        let result = run_insert_operations(
-            session,
-            InsertOperationSpec {
-                table_id: self.table_id,
-                random: false,
-                index: self.index,
-                seed: self.seed,
-                value_size: self.value_size,
-                batch_size: self.batch_size,
-            },
-            plan,
-            None,
-            None,
-        )
-        .await?;
-        Ok(SessionSummary {
-            operations: result.operations,
-            inserted_rows: result.inserted_rows,
-            failures: result
-                .duplicate_key
-                .checked_add(result.write_conflict)
-                .ok_or_else(|| BenchError::message("insert failure overflow"))?,
-            ..SessionSummary::default()
-        })
-    }
-}
-
-/// Resolved random-insert configuration.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct InsertRandConfig {
-    common: CommonConfig,
-    index: IndexMode,
-    num: u64,
-    seed: u64,
-    execution_range: KeyRange,
-    output_loaded_range: KeyRange,
-}
-
-impl WorkloadConfig for InsertRandConfig {
-    type Args = InsertArgs;
-
-    const WORKLOAD: Workload = Workload::InsertRand;
-
-    fn resolve(manifest: &Manifest, args: &Self::Args) -> Result<Self> {
-        let (common, num, seed, execution_range, output_loaded_range) =
-            resolve_insert_config(manifest, args)?;
-        manifest.validate_workload_compatible(Self::WORKLOAD)?;
+    fn new(config: Self::Config) -> Result<Self> {
         Ok(Self {
-            common,
-            index: manifest.index,
-            num,
-            seed,
-            execution_range,
-            output_loaded_range,
+            state: build_insert_state(config, Self::IDENTITY, false)?,
         })
     }
 
-    fn common(&self) -> &CommonConfig {
-        &self.common
+    fn threads(&self) -> usize {
+        self.state.config.threads
     }
 
-    fn operation_count(&self) -> u64 {
-        self.num
-    }
-
-    fn execution_range(&self) -> KeyRange {
-        self.execution_range
-    }
-
-    fn output_loaded_range(&self) -> KeyRange {
-        self.output_loaded_range
-    }
-
-    fn random(&self) -> bool {
-        true
-    }
-
-    fn seed(&self) -> u64 {
-        self.seed
-    }
-
-    fn update_manifest(&self, manifest: &mut Manifest, summary: &SessionSummary) -> Result<bool> {
-        manifest.record_insert_outcome(self.num, summary.inserted_rows)?;
-        Ok(true)
-    }
-}
-
-/// Executes seeded random-key inserts for one session.
-#[derive(Clone, Copy)]
-pub(crate) struct InsertRandRunner {
-    index: IndexMode,
-    seed: u64,
-    value_size: usize,
-    batch_size: u64,
-    table_id: TableID,
-}
-
-impl WorkloadRunner for InsertRandRunner {
-    type Config = InsertRandConfig;
-
-    fn new(config: &Self::Config, table_id: TableID) -> Self {
-        Self {
-            index: config.index,
-            seed: config.seed,
-            value_size: config.common.value_size,
-            batch_size: config.common.batch_size,
-            table_id,
-        }
-    }
-
-    async fn run(
-        &self,
-        _engine: &doradb_storage::Engine,
-        session: &mut Session,
-        plan: &SessionPlan,
-    ) -> Result<SessionSummary> {
-        let result = run_insert_operations(
-            session,
-            InsertOperationSpec {
-                table_id: self.table_id,
-                random: true,
-                index: self.index,
-                seed: self.seed,
-                value_size: self.value_size,
-                batch_size: self.batch_size,
-            },
-            plan,
-            None,
-            None,
+    fn session_plans(&self) -> Result<Vec<SessionPlan>> {
+        build_session_plans(
+            self.state.config.attempted_range,
+            self.state.config.sessions,
         )
-        .await?;
-        Ok(SessionSummary {
-            operations: result.operations,
-            inserted_rows: result.inserted_rows,
-            failures: result
-                .duplicate_key
-                .checked_add(result.write_conflict)
-                .ok_or_else(|| BenchError::message("insert failure overflow"))?,
-            ..SessionSummary::default()
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _engine: &'a Engine,
+        session: &'a mut Session,
+        plan: &'a SessionPlan,
+        clock: Option<&'a MeasurementClock>,
+        cancellation: &'a RunCancellation,
+    ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a {
+        execute_insert_session(&self.state, session, plan, clock, cancellation)
+    }
+
+    fn verify_outcome(
+        &self,
+        planned_effect: &FixturePlanEffect,
+        outcome: &Self::Outcome,
+        expected_samples: u64,
+    ) -> Result<FixtureRuntimeEffect> {
+        verify_insert_outcome(
+            Self::IDENTITY,
+            &self.state,
+            planned_effect,
+            outcome,
+            expected_samples,
+        )
+    }
+}
+
+/// Seeded-random-insert session executor.
+#[derive(Clone, Copy)]
+pub(crate) struct InsertRandExecutor {
+    state: InsertExecutorState,
+}
+
+impl SessionExecutor for InsertRandExecutor {
+    type Config = SessionExecutorConfig<InsertConfig>;
+    type Outcome = InsertSessionOutcome;
+
+    const IDENTITY: &'static str = "insert-rand";
+
+    fn new(config: Self::Config) -> Result<Self> {
+        Ok(Self {
+            state: build_insert_state(config, Self::IDENTITY, true)?,
         })
+    }
+
+    fn threads(&self) -> usize {
+        self.state.config.threads
+    }
+
+    fn session_plans(&self) -> Result<Vec<SessionPlan>> {
+        build_session_plans(
+            self.state.config.attempted_range,
+            self.state.config.sessions,
+        )
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _engine: &'a Engine,
+        session: &'a mut Session,
+        plan: &'a SessionPlan,
+        clock: Option<&'a MeasurementClock>,
+        cancellation: &'a RunCancellation,
+    ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a {
+        execute_insert_session(&self.state, session, plan, clock, cancellation)
+    }
+
+    fn verify_outcome(
+        &self,
+        planned_effect: &FixturePlanEffect,
+        outcome: &Self::Outcome,
+        expected_samples: u64,
+    ) -> Result<FixtureRuntimeEffect> {
+        verify_insert_outcome(
+            Self::IDENTITY,
+            &self.state,
+            planned_effect,
+            outcome,
+            expected_samples,
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+struct InsertExecutorState {
+    config: InsertConfig,
+    primary: PrimaryBinding,
+    random: bool,
+}
+
+/// Session-local outcome shared by both insert identities.
+pub(crate) struct InsertSessionOutcome {
+    measurement: SessionMeasurement,
+    latest_write_fence: Option<TrxID>,
+}
+
+impl SessionOutcome for InsertSessionOutcome {
+    fn empty() -> Result<Self> {
+        Ok(Self {
+            measurement: SessionMeasurement {
+                counters: WorkloadCounters::default(),
+                latency: LatencyDistribution::new()?,
+            },
+            latest_write_fence: None,
+        })
+    }
+
+    fn merge(&mut self, other: Self) -> Result<()> {
+        merge_measurement(&mut self.measurement, other.measurement)?;
+        if let Some(fence) = other.latest_write_fence {
+            self.latest_write_fence = Some(
+                self.latest_write_fence
+                    .map_or(fence, |current| current.max(fence)),
+            );
+        }
+        Ok(())
+    }
+
+    fn into_measurement(self) -> SessionMeasurement {
+        self.measurement
     }
 }
 
 /// Result of one session's completely settled insert batches.
-pub(crate) struct InsertOperationResult {
+struct InsertOperationResult {
     /// Terminal logical insert attempts.
-    pub(crate) operations: u64,
+    operations: u64,
     /// Successful row insertions.
-    pub(crate) inserted_rows: u64,
+    inserted_rows: u64,
     /// Expected duplicate-key outcomes.
-    pub(crate) duplicate_key: u64,
+    duplicate_key: u64,
     /// Expected write-conflict outcomes.
-    pub(crate) write_conflict: u64,
+    write_conflict: u64,
     /// Exact batch-transaction latency samples.
-    pub(crate) latency: LatencyDistribution,
+    latency: LatencyDistribution,
     /// Greatest write-bearing batch commit ID.
-    pub(crate) latest_write_fence: Option<TrxID>,
+    latest_write_fence: Option<TrxID>,
 }
 
 /// Storage and generation inputs shared by one insert operation core.
 #[derive(Clone, Copy)]
-pub(crate) struct InsertOperationSpec {
+struct InsertOperationSpec {
     /// Runtime primary table target.
-    pub(crate) table_id: TableID,
+    table_id: TableID,
     /// Whether keys use the seeded random order.
-    pub(crate) random: bool,
+    random: bool,
     /// Bound primary-table index shape.
-    pub(crate) index: IndexMode,
+    index: IndexMode,
     /// Deterministic payload and key seed.
-    pub(crate) seed: u64,
+    seed: u64,
     /// Generated payload bytes.
-    pub(crate) value_size: usize,
+    value_size: usize,
     /// Maximum operations per transaction.
-    pub(crate) batch_size: u64,
+    batch_size: u64,
 }
 
-/// Shared generated-insert core used by legacy and plan dispatch.
-pub(crate) async fn run_insert_operations(
+fn build_insert_state(
+    config: SessionExecutorConfig<InsertConfig>,
+    identity: &str,
+    random: bool,
+) -> Result<InsertExecutorState> {
+    let primary = require_primary(config.binding, identity)?;
+    let resolved = config.resolved;
+    if primary.shape.index != resolved.index
+        || primary
+            .loaded_range
+            .map_or(0, |range| range.end().unwrap_or(u64::MAX))
+            != resolved.key_start
+        || resolved.attempted_range.start != resolved.key_start
+        || resolved.attempted_range.len != resolved.num
+    {
+        return Err(BenchError::message(
+            "insert runtime binding differs from the resolved plan",
+        ));
+    }
+    Ok(InsertExecutorState {
+        config: resolved,
+        primary,
+        random,
+    })
+}
+
+async fn execute_insert_session(
+    state: &InsertExecutorState,
+    session: &mut Session,
+    plan: &SessionPlan,
+    clock: Option<&MeasurementClock>,
+    cancellation: &RunCancellation,
+) -> Result<InsertSessionOutcome> {
+    let result = run_insert_operations(
+        session,
+        InsertOperationSpec {
+            table_id: state.primary.table_id,
+            random: state.random,
+            index: state.config.index,
+            seed: state.config.seed,
+            value_size: state.config.value_size_bytes,
+            batch_size: state.config.batch_size,
+        },
+        plan,
+        clock,
+        Some(cancellation),
+    )
+    .await?;
+    Ok(InsertSessionOutcome {
+        measurement: SessionMeasurement {
+            counters: WorkloadCounters {
+                operations: result.operations,
+                inserted_rows: result.inserted_rows,
+                expected_outcomes: ExpectedOutcomeCounters {
+                    duplicate_key: result.duplicate_key,
+                    write_conflict: result.write_conflict,
+                },
+                ..WorkloadCounters::default()
+            },
+            latency: result.latency,
+        },
+        latest_write_fence: result.latest_write_fence,
+    })
+}
+
+fn verify_insert_outcome(
+    identity: &str,
+    state: &InsertExecutorState,
+    planned_effect: &FixturePlanEffect,
+    outcome: &InsertSessionOutcome,
+    expected_samples: u64,
+) -> Result<FixtureRuntimeEffect> {
+    verify_samples(identity, &outcome.measurement.latency, expected_samples)?;
+    let counters = outcome.measurement.counters;
+    let terminal = counters
+        .inserted_rows
+        .checked_add(counters.expected_outcomes.duplicate_key)
+        .and_then(|value| value.checked_add(counters.expected_outcomes.write_conflict))
+        .ok_or_else(|| BenchError::message("insert terminal counter overflow"))?;
+    if counters.operations != state.config.num
+        || counters.operations != terminal
+        || counters.found != 0
+        || counters.not_found != 0
+        || counters.rows_returned != 0
+    {
+        return Err(BenchError::message(format!(
+            "{identity} counters violate the insert equation"
+        )));
+    }
+    let FixturePlanEffect::Insert {
+        attempted_range: planned,
+    } = planned_effect
+    else {
+        return Err(BenchError::message(
+            "insert runtime effect differs from the resolved fixture effect",
+        ));
+    };
+    if *planned != state.config.attempted_range
+        || (counters.inserted_rows == 0) != outcome.latest_write_fence.is_none()
+    {
+        return Err(BenchError::message(
+            "insert runtime effect differs from the resolved fixture effect",
+        ));
+    }
+    Ok(FixtureRuntimeEffect::Insert {
+        attempted_range: *planned,
+        inserted_rows: counters.inserted_rows,
+        latest_write_fence: outcome.latest_write_fence,
+    })
+}
+
+/// Execute generated inserts with expected terminal-outcome classification.
+async fn run_insert_operations(
     session: &mut Session,
     spec: InsertOperationSpec,
     plan: &SessionPlan,
@@ -307,25 +346,16 @@ pub(crate) async fn run_insert_operations(
                 .await
             {
                 Ok(()) => {
-                    result.inserted_rows =
-                        checked_insert_counter(result.inserted_rows, 1, "inserted row counter")?;
-                    batch_inserted =
-                        checked_insert_counter(batch_inserted, 1, "batch inserted row counter")?;
+                    result.inserted_rows = checked(result.inserted_rows, 1, "inserted rows")?;
+                    batch_inserted = checked(batch_inserted, 1, "batch inserted rows")?;
                 }
                 Err(error) => match error.operation_error() {
                     Some(OperationError::DuplicateKey) => {
-                        result.duplicate_key = checked_insert_counter(
-                            result.duplicate_key,
-                            1,
-                            "duplicate-key counter",
-                        )?;
+                        result.duplicate_key = checked(result.duplicate_key, 1, "duplicate keys")?;
                     }
                     Some(OperationError::WriteConflict) => {
-                        result.write_conflict = checked_insert_counter(
-                            result.write_conflict,
-                            1,
-                            "write-conflict counter",
-                        )?;
+                        result.write_conflict =
+                            checked(result.write_conflict, 1, "write conflicts")?;
                     }
                     _ => {
                         let primary = BenchError::from(error);
@@ -334,8 +364,7 @@ pub(crate) async fn run_insert_operations(
                     }
                 },
             }
-            result.operations =
-                checked_insert_counter(result.operations, 1, "insert operation counter")?;
+            result.operations = checked(result.operations, 1, "insert operations")?;
         }
         let fence = trx.commit().await?;
         if batch_inserted != 0 {
@@ -346,191 +375,16 @@ pub(crate) async fn run_insert_operations(
             );
         }
         if let (Some(clock), Some(started)) = (clock, started) {
-            let stopped = clock.raw();
             result
                 .latency
-                .record(clock.raw_delta_nanos(started, stopped)?)?;
+                .record(clock.raw_delta_nanos(started, clock.raw())?)?;
         }
     }
     Ok(result)
 }
 
-fn resolve_insert_config(
-    manifest: &Manifest,
-    args: &InsertArgs,
-) -> Result<(CommonConfig, u64, u64, KeyRange, KeyRange)> {
-    let common_args = args.common();
-    let worker = common_args.worker();
-    let common = CommonConfig::resolve(
-        &manifest.defaults,
-        worker.thread_override(),
-        worker.session_override(),
-        common_args.value_size_override(),
-        common_args.batch_size_override(),
-        worker.include_stats(),
-    )?;
-    let num = args.operation_count();
-    let execution_range = manifest.key_range(num)?;
-    let output_loaded_range = KeyRange {
-        start: 0,
-        len: execution_range.end()?,
-    };
-    Ok((
-        common,
-        num,
-        args.seed(),
-        execution_range,
-        output_loaded_range,
-    ))
-}
-
-fn checked_insert_counter(current: u64, addition: u64, label: &str) -> Result<u64> {
+fn checked(current: u64, addition: u64, label: &str) -> Result<u64> {
     current
         .checked_add(addition)
-        .ok_or_else(|| BenchError::message(format!("{label} overflow")))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::cli::{Cli, Command, LogSyncMode, WorkloadArgs};
-    use crate::fixture::{benchmark_index_specs, benchmark_table_spec};
-    use crate::manifest::DefaultsManifest;
-    use clap::Parser;
-    use doradb_storage::{Engine, EngineConfig};
-    use tempfile::TempDir;
-
-    #[test]
-    fn insert_config_inherits_defaults_and_resolves_ranges() {
-        let cli = Cli::try_parse_from([
-            "doradb-bench",
-            "--root",
-            "root",
-            "run",
-            "insert-rand",
-            "--num",
-            "10",
-            "--seed",
-            "7",
-        ])
-        .unwrap();
-        let Command::Run {
-            workload: WorkloadArgs::InsertRand(args),
-        } = cli.command.unwrap()
-        else {
-            panic!("expected insert-rand workload");
-        };
-        let manifest = Manifest::new_with_defaults(
-            1,
-            IndexMode::Unique,
-            DefaultsManifest::new(2, 4, 256, 8, LogSyncMode::Fsync).unwrap(),
-        );
-        let config = InsertRandConfig::resolve(&manifest, &args).unwrap();
-
-        assert_eq!(config.common.threads, 2);
-        assert_eq!(config.common.sessions, 4);
-        assert_eq!(config.common.value_size, 256);
-        assert_eq!(config.common.batch_size, 8);
-        assert_eq!(config.common.log_sync, LogSyncMode::Fsync);
-        assert_eq!(config.execution_range, KeyRange { start: 0, len: 10 });
-        assert_eq!(config.output_loaded_range, KeyRange { start: 0, len: 10 });
-        assert!(config.random());
-        assert_eq!(config.seed(), 7);
-    }
-
-    #[test]
-    fn insert_config_updates_manifest_after_success() {
-        let cli = Cli::try_parse_from([
-            "doradb-bench",
-            "--root",
-            "root",
-            "run",
-            "insert-seq",
-            "--num",
-            "4",
-        ])
-        .unwrap();
-        let Command::Run {
-            workload: WorkloadArgs::InsertSeq(args),
-        } = cli.command.unwrap()
-        else {
-            panic!("expected insert-seq workload");
-        };
-        let mut manifest = Manifest::new(1, IndexMode::None);
-        manifest.record_insert_success(5).unwrap();
-        let config = InsertSeqConfig::resolve(&manifest, &args).unwrap();
-
-        assert_eq!(config.execution_range, KeyRange { start: 5, len: 4 });
-        assert_eq!(config.output_loaded_range, KeyRange { start: 0, len: 9 });
-        assert!(
-            config
-                .update_manifest(
-                    &mut manifest,
-                    &SessionSummary {
-                        operations: 4,
-                        inserted_rows: 4,
-                        ..SessionSummary::default()
-                    }
-                )
-                .unwrap()
-        );
-        assert_eq!(manifest.runtime.next_key, 9);
-        assert_eq!(manifest.runtime.rows_inserted, 9);
-    }
-
-    #[test]
-    fn insert_core_counts_duplicate_key_and_commits_the_reusable_transaction() {
-        smol::block_on(async {
-            let temp = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(EngineConfig::default().storage_root(temp.path()))
-                .await
-                .unwrap();
-            let mut session = engine.new_session().unwrap();
-            let table_id = session
-                .create_table(
-                    benchmark_table_spec(),
-                    benchmark_index_specs(IndexMode::Unique),
-                )
-                .await
-                .unwrap();
-            let plan = SessionPlan {
-                session_index: 0,
-                key_start: 10,
-                number: 4,
-            };
-            let keys = generate_insert_keys(true, IndexMode::None, 2, &plan).unwrap();
-            assert!(
-                keys.iter()
-                    .enumerate()
-                    .any(|(index, key)| keys[..index].contains(key))
-            );
-
-            let result = run_insert_operations(
-                &mut session,
-                InsertOperationSpec {
-                    table_id,
-                    random: true,
-                    index: IndexMode::None,
-                    seed: 2,
-                    value_size: 16,
-                    batch_size: 4,
-                },
-                &plan,
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-            assert_eq!(result.operations, 4);
-            assert_eq!(result.write_conflict, 0);
-            assert!(result.duplicate_key > 0);
-            assert_eq!(
-                result.operations,
-                result.inserted_rows + result.duplicate_key
-            );
-            assert!(result.latest_write_fence.is_some());
-            session.close().await.unwrap();
-            engine.shutdown();
-        });
-    }
+        .ok_or_else(|| BenchError::message(format!("{label} counter overflow")))
 }

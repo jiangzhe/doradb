@@ -1,0 +1,14 @@
+name = "sequential unique-index lookups"
+engine_defaults = "engine-defaults.toml"
+
+[[phase]]
+workload = { type = "create-table", index = "unique" }
+
+[[phase]]
+workload = { type = "insert-seq", num = 10000, batch_size = 100 }
+
+[[phase]]
+kind = "benchmark"
+warmup_runs = 1
+measured_runs = 3
+workload = { type = "lookup-seq", num = 10000, threads = 1, sessions = 1, batch_size = 100 }

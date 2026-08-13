@@ -1,0 +1,13 @@
+name = "secondary-index create and drop"
+engine_defaults = "engine-defaults.toml"
+
+[[phase]]
+workload = { type = "create-table", index = "none" }
+
+[[phase]]
+workload = { type = "insert-seq", num = 10000, batch_size = 100 }
+
+[[phase]]
+kind = "benchmark"
+measured_runs = 1
+workload = { type = "index-ddl", num = 1, threads = 1, sessions = 1 }

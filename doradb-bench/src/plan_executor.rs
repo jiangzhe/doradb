@@ -1,31 +1,118 @@
 use crate::error::{BenchError, Result};
 use crate::fixture::{
-    FixturePlanEffect, FixtureRuntimeEffect, FixtureRuntimeState, KeyRange, PrimaryTableShape,
+    FixtureBinding, FixturePlanEffect, FixtureRuntimeEffect, FixtureRuntimeState,
 };
-use crate::manifest::write_plan_manifest_exclusive;
 use crate::measurement::{
-    BenchmarkAccumulator, BenchmarkAggregate, ExpectedOutcomeCounters, InternalMetric,
-    LatencyDistribution, MeasuredRunResult, MeasurementClock, WorkloadCounters,
-    operations_per_second,
+    BenchmarkAccumulator, BenchmarkAggregate, InternalMetric, LatencyDistribution,
+    MeasuredRunResult, MeasurementClock, WorkloadCounters, operations_per_second,
 };
 use crate::output::{capture_internal_stats, plan_internal_metrics};
-use crate::plan::{
-    InsertConfig, Phase, Plan, ResolvedWorkload, StmtNoopConfig, TableDdlConfig, TrxNoopConfig,
-    load_plan,
+use crate::plan::{Phase, Plan, ResolvedWorkload, load_plan};
+use crate::plan_output::{
+    InvocationReport, PreparePhaseResult, render_stdout_summary, write_plan_output,
 };
-use crate::plan_output::{InvocationReport, PreparePhaseResult, write_plan_outputs};
 use crate::workload::{
-    InsertOperationSpec, RunCancellation, SessionPlan, build_session_plans,
-    run_create_table_operation, run_insert_operations, run_stmt_noop_operations,
-    run_table_ddl_operations, run_trx_noop_operations,
+    CreateTableExecutor, IndexDdlExecutor, IndexScanExecutor, IndexStreamExecutor,
+    InsertRandExecutor, InsertSeqExecutor, LockTableExecutor, LookupRandExecutor,
+    LookupSeqExecutor, RunCancellation, SessionPlan, StmtNoopExecutor, TableDdlExecutor,
+    TableScanExecutor, TrxNoopExecutor,
 };
-use doradb_storage::id::{TableID, TrxID};
 use doradb_storage::{Engine, Session};
 use easy_parallel::Parallel;
 use smol::{Executor, channel};
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Resolved plan input and runtime fixture binding used to build one executor.
+pub(crate) struct SessionExecutorConfig<C> {
+    /// Workload-specific resolved plan configuration.
+    pub(crate) resolved: C,
+    /// Runtime fixture capability selected by the phase coordinator.
+    pub(crate) binding: FixtureBinding,
+}
+
+impl<C> SessionExecutorConfig<C> {
+    fn new(resolved: C, binding: FixtureBinding) -> Self {
+        Self { resolved, binding }
+    }
+}
+
+/// Common measurement projection produced by every typed session outcome.
+pub(crate) struct SessionMeasurement {
+    /// Successful logical workload counters.
+    pub(crate) counters: WorkloadCounters,
+    /// Exact session-local latency distribution.
+    pub(crate) latency: LatencyDistribution,
+}
+
+/// Merge and project one workload-specific session outcome.
+pub(crate) trait SessionOutcome: Send + Sized + 'static {
+    /// Construct an empty aggregate outcome.
+    fn empty() -> Result<Self>;
+
+    /// Checked merge of one completely joined session outcome.
+    fn merge(&mut self, other: Self) -> Result<()>;
+
+    /// Consume the typed outcome after workload verification.
+    fn into_measurement(self) -> SessionMeasurement;
+}
+
+/// Static workload implementation used by the generic public-session runner.
+pub(crate) trait SessionExecutor: Clone + Send + Sync + Sized + 'static {
+    /// Constructor input, which related workloads may share.
+    type Config;
+    /// Typed session result, which related workloads may share.
+    type Outcome: SessionOutcome;
+
+    /// Stable workload identity used for dispatch and diagnostics.
+    const IDENTITY: &'static str;
+
+    /// Validate the runtime binding and construct the executor.
+    fn new(config: Self::Config) -> Result<Self>;
+
+    /// Executor thread count.
+    fn threads(&self) -> usize;
+
+    /// Deterministic public-session assignments.
+    fn session_plans(&self) -> Result<Vec<SessionPlan>>;
+
+    /// Execute one session assignment without owning session close.
+    fn execute<'a>(
+        &'a self,
+        engine: &'a Engine,
+        session: &'a mut Session,
+        plan: &'a SessionPlan,
+        clock: Option<&'a MeasurementClock>,
+        cancellation: &'a RunCancellation,
+    ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a;
+
+    /// Complete workload-specific timing that ends after successful close.
+    fn after_session_close(
+        &self,
+        _outcome: &mut Self::Outcome,
+        _clock: Option<&MeasurementClock>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Verify workload-specific state after every declared session has joined.
+    fn finish_run<'a>(
+        &'a self,
+        _engine: &'a Engine,
+    ) -> impl Future<Output = Result<()>> + Send + 'a {
+        async { Ok(()) }
+    }
+
+    /// Verify counters, samples, and fixture effects before phase advancement.
+    fn verify_outcome(
+        &self,
+        planned_effect: &FixturePlanEffect,
+        outcome: &Self::Outcome,
+        expected_samples: u64,
+    ) -> Result<FixtureRuntimeEffect>;
+}
 
 struct RunOutcome {
     elapsed_nanos: u128,
@@ -33,21 +120,6 @@ struct RunOutcome {
     latency: LatencyDistribution,
     internal_metrics: Vec<InternalMetric>,
     effect: FixtureRuntimeEffect,
-}
-
-struct SessionOutcome {
-    counters: WorkloadCounters,
-    latency: LatencyDistribution,
-    table_id: Option<TableID>,
-    latest_write_fence: Option<TrxID>,
-}
-
-#[derive(Clone, Copy)]
-struct InsertSessionExecution {
-    config: InsertConfig,
-    table_id: TableID,
-    random: bool,
-    sample_latency: bool,
 }
 
 struct InvocationResults {
@@ -59,23 +131,13 @@ struct InvocationResults {
 /// Parse and execute one plan against one new invocation-owned storage root.
 pub async fn execute_plan(storage_root: PathBuf, plan_source: PathBuf) -> Result<()> {
     let loaded = load_plan(&plan_source, &storage_root)?;
-    // Construct/calibrate after complete validation and before root creation.
     let clock = MeasurementClock::new();
     prepare_plan_root(&storage_root)?;
-    if let Err(error) = write_plan_manifest_exclusive(
-        &storage_root,
-        &loaded.plan.source,
-        loaded.plan.name.as_deref(),
-    ) {
-        let _ = fs::remove_dir_all(&storage_root);
-        return Err(error);
-    }
 
     let engine = Engine::bootstrap(loaded.engine_config).await?;
     let operation_result = execute_phases(&engine, &clock, &loaded.plan).await;
     engine.shutdown();
     let results = operation_result?;
-
     let report = InvocationReport {
         root: storage_root.clone(),
         plan_source: loaded.plan.source.clone(),
@@ -84,13 +146,8 @@ pub async fn execute_plan(storage_root: PathBuf, plan_source: PathBuf) -> Result
         measured_runs: results.measured_runs,
         aggregate: results.aggregate,
     };
-    write_plan_outputs(&report)?;
-    println!(
-        "completed benchmark plan={} storage_root={} measured_runs={}",
-        report.plan_source.display(),
-        report.root.display(),
-        report.measured_runs.len()
-    );
+    let detailed_result = write_plan_output(&report)?;
+    println!("{}", render_stdout_summary(&report, &detailed_result)?);
     Ok(())
 }
 
@@ -111,9 +168,10 @@ async fn execute_phases(
                 workload,
                 fixture_effect,
             } => {
-                let table_id = bind_runtime_fixture(workload, &fixture)?;
-                let outcome = run_once(engine, clock, workload, table_id, false).await?;
-                verify_run_outcome(workload, *fixture_effect, &outcome, false)?;
+                let binding = fixture.bind(workload.fixture_requirement())?;
+                let outcome =
+                    dispatch_workload(engine, clock, workload, binding, fixture_effect, false)
+                        .await?;
                 fixture.apply(outcome.effect)?;
                 prepare_phases.push(PreparePhaseResult {
                     phase_index,
@@ -129,17 +187,18 @@ async fn execute_phases(
                 fixture_effect,
             } => {
                 for _ in 0..measurement.warmup_runs {
-                    let table_id = bind_runtime_fixture(workload, &fixture)?;
-                    let outcome = run_once(engine, clock, workload, table_id, true).await?;
-                    verify_run_outcome(workload, *fixture_effect, &outcome, true)?;
+                    let binding = fixture.bind(workload.fixture_requirement())?;
+                    dispatch_workload(engine, clock, workload, binding, fixture_effect, true)
+                        .await?;
                 }
 
                 let mut aggregate = BenchmarkAccumulator::new()?;
                 let mut phase_effect = None;
                 for run_index in 1..=measurement.measured_runs.get() {
-                    let table_id = bind_runtime_fixture(workload, &fixture)?;
-                    let outcome = run_once(engine, clock, workload, table_id, true).await?;
-                    verify_run_outcome(workload, *fixture_effect, &outcome, true)?;
+                    let binding = fixture.bind(workload.fixture_requirement())?;
+                    let outcome =
+                        dispatch_workload(engine, clock, workload, binding, fixture_effect, true)
+                            .await?;
                     let latency = outcome.latency.summary(workload.latency_unit())?;
                     aggregate.add_run(outcome.elapsed_nanos, outcome.counters, &outcome.latency)?;
                     measured_runs.push(MeasuredRunResult {
@@ -177,171 +236,185 @@ async fn execute_phases(
     })
 }
 
-fn bind_runtime_fixture(
+async fn dispatch_workload(
+    engine: &Engine,
+    clock: &MeasurementClock,
     workload: &ResolvedWorkload,
-    fixture: &FixtureRuntimeState,
-) -> Result<Option<TableID>> {
+    binding: FixtureBinding,
+    planned_effect: &FixturePlanEffect,
+    sample_latency: bool,
+) -> Result<RunOutcome> {
     match workload {
-        ResolvedWorkload::CreateTable(_) => {
-            if fixture.primary().is_some() {
-                return Err(BenchError::message(
-                    "create-table runtime binding found an existing primary fixture",
-                ));
-            }
-            Ok(None)
+        ResolvedWorkload::CreateTable(config) => {
+            run_executor::<CreateTableExecutor>(
+                engine,
+                clock,
+                workload,
+                SessionExecutorConfig::new(*config, binding),
+                planned_effect,
+                sample_latency,
+            )
+            .await
         }
-        ResolvedWorkload::InsertSeq(config) | ResolvedWorkload::InsertRand(config) => {
-            let primary = fixture.primary().ok_or_else(|| {
-                BenchError::message("insert runtime binding requires a primary fixture")
-            })?;
-            if primary.shape.index != config.index {
-                return Err(BenchError::message(
-                    "insert runtime primary shape differs from the resolved plan",
-                ));
-            }
-            if primary.next_key != config.key_start
-                || config.attempted_range.start != config.key_start
-                || config.attempted_range.len != config.num
-            {
-                return Err(BenchError::message(
-                    "insert runtime key cursor differs from the resolved plan",
-                ));
-            }
-            Ok(Some(primary.table_id))
+        ResolvedWorkload::StmtNoop(config) => {
+            run_executor::<StmtNoopExecutor>(
+                engine,
+                clock,
+                workload,
+                SessionExecutorConfig::new(*config, binding),
+                planned_effect,
+                sample_latency,
+            )
+            .await
         }
-        ResolvedWorkload::StmtNoop(_)
-        | ResolvedWorkload::TrxNoop(_)
-        | ResolvedWorkload::TableDdl(_) => Ok(None),
+        ResolvedWorkload::TrxNoop(config) => {
+            run_executor::<TrxNoopExecutor>(
+                engine,
+                clock,
+                workload,
+                SessionExecutorConfig::new(*config, binding),
+                planned_effect,
+                sample_latency,
+            )
+            .await
+        }
+        ResolvedWorkload::InsertSeq(config) => {
+            run_executor::<InsertSeqExecutor>(
+                engine,
+                clock,
+                workload,
+                SessionExecutorConfig::new(*config, binding),
+                planned_effect,
+                sample_latency,
+            )
+            .await
+        }
+        ResolvedWorkload::InsertRand(config) => {
+            run_executor::<InsertRandExecutor>(
+                engine,
+                clock,
+                workload,
+                SessionExecutorConfig::new(*config, binding),
+                planned_effect,
+                sample_latency,
+            )
+            .await
+        }
+        ResolvedWorkload::TableDdl(config) => {
+            run_executor::<TableDdlExecutor>(
+                engine,
+                clock,
+                workload,
+                SessionExecutorConfig::new(*config, binding),
+                planned_effect,
+                sample_latency,
+            )
+            .await
+        }
+        ResolvedWorkload::LookupSeq(config) => {
+            run_executor::<LookupSeqExecutor>(
+                engine,
+                clock,
+                workload,
+                SessionExecutorConfig::new(*config, binding),
+                planned_effect,
+                sample_latency,
+            )
+            .await
+        }
+        ResolvedWorkload::LookupRand(config) => {
+            run_executor::<LookupRandExecutor>(
+                engine,
+                clock,
+                workload,
+                SessionExecutorConfig::new(*config, binding),
+                planned_effect,
+                sample_latency,
+            )
+            .await
+        }
+        ResolvedWorkload::TableScan(config) => {
+            run_executor::<TableScanExecutor>(
+                engine,
+                clock,
+                workload,
+                SessionExecutorConfig::new(*config, binding),
+                planned_effect,
+                sample_latency,
+            )
+            .await
+        }
+        ResolvedWorkload::IndexScan(config) => {
+            run_executor::<IndexScanExecutor>(
+                engine,
+                clock,
+                workload,
+                SessionExecutorConfig::new(*config, binding),
+                planned_effect,
+                sample_latency,
+            )
+            .await
+        }
+        ResolvedWorkload::IndexStream(config) => {
+            run_executor::<IndexStreamExecutor>(
+                engine,
+                clock,
+                workload,
+                SessionExecutorConfig::new(*config, binding),
+                planned_effect,
+                sample_latency,
+            )
+            .await
+        }
+        ResolvedWorkload::IndexDdl(config) => {
+            run_executor::<IndexDdlExecutor>(
+                engine,
+                clock,
+                workload,
+                SessionExecutorConfig::new(*config, binding),
+                planned_effect,
+                sample_latency,
+            )
+            .await
+        }
+        ResolvedWorkload::LockTable(config) => {
+            run_executor::<LockTableExecutor>(
+                engine,
+                clock,
+                workload,
+                SessionExecutorConfig::new(*config, binding),
+                planned_effect,
+                sample_latency,
+            )
+            .await
+        }
     }
 }
 
-fn verify_run_outcome(
+async fn run_executor<E>(
+    engine: &Engine,
+    clock: &MeasurementClock,
     workload: &ResolvedWorkload,
-    planned_effect: FixturePlanEffect,
-    outcome: &RunOutcome,
-    sampled: bool,
-) -> Result<()> {
-    let expected_samples = if sampled {
+    config: E::Config,
+    planned_effect: &FixturePlanEffect,
+    sample_latency: bool,
+) -> Result<RunOutcome>
+where
+    E: SessionExecutor,
+{
+    if E::IDENTITY != workload.identity() {
+        return Err(BenchError::message(format!(
+            "executor identity {} does not match resolved workload {}",
+            E::IDENTITY,
+            workload.identity()
+        )));
+    }
+    let executor = E::new(config)?;
+    let expected_samples = if sample_latency {
         workload.expected_samples()?
     } else {
         0
     };
-    if outcome.latency.sample_count() != expected_samples {
-        return Err(BenchError::message(format!(
-            "{} latency sample count ({}) does not match expected samples ({expected_samples})",
-            workload.identity(),
-            outcome.latency.sample_count()
-        )));
-    }
-
-    match workload {
-        ResolvedWorkload::CreateTable(config) => {
-            require_simple_counters(workload, outcome.counters, 1)?;
-            match (planned_effect, outcome.effect) {
-                (
-                    FixturePlanEffect::CreatePrimary { shape: planned },
-                    FixtureRuntimeEffect::CreatePrimary { shape, .. },
-                ) if planned == config.shape && shape == config.shape => Ok(()),
-                _ => Err(BenchError::message(
-                    "create-table runtime effect differs from the resolved fixture effect",
-                )),
-            }
-        }
-        ResolvedWorkload::StmtNoop(config) => {
-            require_simple_counters(workload, outcome.counters, config.num)?;
-            require_none_effect(planned_effect, outcome.effect)
-        }
-        ResolvedWorkload::TrxNoop(config) => {
-            require_simple_counters(workload, outcome.counters, config.num)?;
-            require_none_effect(planned_effect, outcome.effect)
-        }
-        ResolvedWorkload::TableDdl(config) => {
-            require_simple_counters(workload, outcome.counters, config.operations)?;
-            require_none_effect(planned_effect, outcome.effect)
-        }
-        ResolvedWorkload::InsertSeq(config) | ResolvedWorkload::InsertRand(config) => {
-            let counters = outcome.counters;
-            let terminal = counters
-                .inserted_rows
-                .checked_add(counters.expected_outcomes.duplicate_key)
-                .and_then(|value| value.checked_add(counters.expected_outcomes.write_conflict))
-                .ok_or_else(|| BenchError::message("insert terminal counter overflow"))?;
-            if counters.operations != config.num || counters.operations != terminal {
-                return Err(BenchError::message(format!(
-                    "{} counters do not satisfy operations = inserted_rows + duplicate_key + write_conflict",
-                    workload.identity()
-                )));
-            }
-            if counters.found != 0 || counters.not_found != 0 || counters.rows_returned != 0 {
-                return Err(BenchError::message(format!(
-                    "{} produced unexpected read counters",
-                    workload.identity()
-                )));
-            }
-            match (planned_effect, outcome.effect) {
-                (
-                    FixturePlanEffect::Insert {
-                        attempted_range: planned,
-                    },
-                    FixtureRuntimeEffect::Insert {
-                        attempted_range,
-                        inserted_rows,
-                        latest_write_fence,
-                    },
-                ) if planned == config.attempted_range
-                    && attempted_range == planned
-                    && inserted_rows == counters.inserted_rows
-                    && (inserted_rows == 0) == latest_write_fence.is_none() =>
-                {
-                    Ok(())
-                }
-                _ => Err(BenchError::message(
-                    "insert runtime effect differs from the resolved fixture effect",
-                )),
-            }
-        }
-    }
-}
-
-fn require_simple_counters(
-    workload: &ResolvedWorkload,
-    counters: WorkloadCounters,
-    operations: u64,
-) -> Result<()> {
-    if counters.operations != operations
-        || counters.inserted_rows != 0
-        || counters.found != 0
-        || counters.not_found != 0
-        || counters.rows_returned != 0
-        || counters.expected_outcomes != ExpectedOutcomeCounters::default()
-    {
-        return Err(BenchError::message(format!(
-            "{} produced invalid counters",
-            workload.identity()
-        )));
-    }
-    Ok(())
-}
-
-fn require_none_effect(
-    planned_effect: FixturePlanEffect,
-    runtime_effect: FixtureRuntimeEffect,
-) -> Result<()> {
-    if planned_effect != FixturePlanEffect::None || runtime_effect != FixtureRuntimeEffect::None {
-        return Err(BenchError::message(
-            "no-effect workload produced a fixture transition",
-        ));
-    }
-    Ok(())
-}
-
-async fn run_once(
-    engine: &Engine,
-    clock: &MeasurementClock,
-    workload: &ResolvedWorkload,
-    table_id: Option<TableID>,
-    sample_latency: bool,
-) -> Result<RunOutcome> {
     let stats_state = if workload.include_stats() {
         let session = engine.new_session()?;
         match capture_internal_stats(&session) {
@@ -353,11 +426,11 @@ async fn run_once(
     };
 
     let started = clock.now();
-    let run_result = run_session_workers(engine, clock, workload, table_id, sample_latency).await;
+    let run_result =
+        run_session_workers(engine, clock, &executor, sample_latency.then_some(clock)).await;
     let stopped = clock.now();
     let elapsed_result = clock.wall_delta_nanos(started, stopped);
-
-    let session_outcome = match run_result {
+    let outcome = match run_result {
         Ok(result) => result,
         Err(error) => {
             if let Some((mut session, _)) = stats_state {
@@ -366,15 +439,7 @@ async fn run_once(
             return Err(error);
         }
     };
-    let elapsed_nanos = match elapsed_result {
-        Ok(elapsed) => elapsed,
-        Err(error) => {
-            if let Some((mut session, _)) = stats_state {
-                let _ = session.close().await;
-            }
-            return Err(error);
-        }
-    };
+    let elapsed_nanos = elapsed_result?;
 
     let internal_metrics = if let Some((mut session, before)) = stats_state {
         let metrics_result =
@@ -382,35 +447,18 @@ async fn run_once(
         let close_result = session.close().await.map_err(BenchError::from);
         match (metrics_result, close_result) {
             (Ok(metrics), Ok(())) => metrics,
-            (Err(error), _) => return Err(error),
-            (Ok(_), Err(error)) => return Err(error),
+            (Err(error), _) | (Ok(_), Err(error)) => return Err(error),
         }
     } else {
         Vec::new()
     };
 
-    let effect = match workload {
-        ResolvedWorkload::CreateTable(config) => FixtureRuntimeEffect::CreatePrimary {
-            shape: config.shape,
-            table_id: session_outcome.table_id.ok_or_else(|| {
-                BenchError::message("create-table completed without a returned table ID")
-            })?,
-        },
-        ResolvedWorkload::InsertSeq(config) | ResolvedWorkload::InsertRand(config) => {
-            FixtureRuntimeEffect::Insert {
-                attempted_range: config.attempted_range,
-                inserted_rows: session_outcome.counters.inserted_rows,
-                latest_write_fence: session_outcome.latest_write_fence,
-            }
-        }
-        ResolvedWorkload::StmtNoop(_)
-        | ResolvedWorkload::TrxNoop(_)
-        | ResolvedWorkload::TableDdl(_) => FixtureRuntimeEffect::None,
-    };
+    let effect = executor.verify_outcome(planned_effect, &outcome, expected_samples)?;
+    let measurement = outcome.into_measurement();
     Ok(RunOutcome {
         elapsed_nanos,
-        counters: session_outcome.counters,
-        latency: session_outcome.latency,
+        counters: measurement.counters,
+        latency: measurement.latency,
         internal_metrics,
         effect,
     })
@@ -425,326 +473,77 @@ async fn close_stats_session<T>(mut session: Session, result: Result<T>) -> Resu
     }
 }
 
-async fn run_session_workers(
+async fn run_session_workers<E>(
     engine: &Engine,
     clock: &MeasurementClock,
-    workload: &ResolvedWorkload,
-    table_id: Option<TableID>,
-    sample_latency: bool,
-) -> Result<SessionOutcome> {
+    executor: &E,
+    sample_clock: Option<&MeasurementClock>,
+) -> Result<E::Outcome>
+where
+    E: SessionExecutor,
+{
+    let plans = executor.session_plans()?;
     let cancellation = Arc::new(RunCancellation::new());
-    match workload {
-        ResolvedWorkload::CreateTable(config) => {
-            execute_create_session(
-                engine,
-                clock.clone(),
-                config.shape,
-                sample_latency,
-                cancellation,
-            )
-            .await
-        }
-        ResolvedWorkload::StmtNoop(config) => {
-            let plans = build_session_plans(
-                KeyRange {
-                    start: 0,
-                    len: config.num,
-                },
-                config.sessions,
-            )?;
-            let executor = Executor::new();
-            let tasks = plans
-                .into_iter()
-                .map(|plan| {
-                    executor.spawn(execute_stmt_noop_session(
+    let task_executor = Executor::new();
+    let tasks = plans
+        .into_iter()
+        .map(|plan| {
+            let workload_executor = executor.clone();
+            let cancellation = Arc::clone(&cancellation);
+            let clock = clock.clone();
+            task_executor.spawn(async move {
+                let mut session = match engine.new_session() {
+                    Ok(session) => session,
+                    Err(error) => {
+                        cancellation.fail(error.into());
+                        return None;
+                    }
+                };
+                let run_result = workload_executor
+                    .execute(
                         engine,
-                        clock.clone(),
-                        *config,
-                        plan,
-                        sample_latency,
-                        Arc::clone(&cancellation),
-                    ))
-                })
-                .collect();
-            drive_session_tasks(&executor, config.threads, tasks, cancellation)
-        }
-        ResolvedWorkload::TrxNoop(config) => {
-            let plans = build_session_plans(
-                KeyRange {
-                    start: 0,
-                    len: config.num,
-                },
-                config.sessions,
-            )?;
-            let executor = Executor::new();
-            let tasks = plans
-                .into_iter()
-                .map(|plan| {
-                    executor.spawn(execute_trx_noop_session(
-                        engine,
-                        clock.clone(),
-                        *config,
-                        plan,
-                        sample_latency,
-                        Arc::clone(&cancellation),
-                    ))
-                })
-                .collect();
-            drive_session_tasks(&executor, config.threads, tasks, cancellation)
-        }
-        ResolvedWorkload::InsertSeq(config) | ResolvedWorkload::InsertRand(config) => {
-            let table_id = table_id
-                .ok_or_else(|| BenchError::message("insert workload has no bound table ID"))?;
-            let plans = build_session_plans(config.attempted_range, config.sessions)?;
-            let random = matches!(workload, ResolvedWorkload::InsertRand(_));
-            let executor = Executor::new();
-            let tasks = plans
-                .into_iter()
-                .map(|plan| {
-                    executor.spawn(execute_insert_session(
-                        engine,
-                        clock.clone(),
-                        InsertSessionExecution {
-                            config: *config,
-                            table_id,
-                            random,
-                            sample_latency,
-                        },
-                        plan,
-                        Arc::clone(&cancellation),
-                    ))
-                })
-                .collect();
-            drive_session_tasks(&executor, config.threads, tasks, cancellation)
-        }
-        ResolvedWorkload::TableDdl(config) => {
-            let plans = build_session_plans(
-                KeyRange {
-                    start: 0,
-                    len: config.num,
-                },
-                config.sessions,
-            )?;
-            let executor = Executor::new();
-            let tasks = plans
-                .into_iter()
-                .map(|plan| {
-                    executor.spawn(execute_table_ddl_session(
-                        engine,
-                        clock.clone(),
-                        *config,
-                        plan,
-                        sample_latency,
-                        Arc::clone(&cancellation),
-                    ))
-                })
-                .collect();
-            drive_session_tasks(&executor, config.threads, tasks, cancellation)
-        }
-    }
+                        &mut session,
+                        &plan,
+                        sample_clock.map(|_| &clock),
+                        &cancellation,
+                    )
+                    .await;
+                let mut outcome = match run_result {
+                    Ok(outcome) => Some(outcome),
+                    Err(error) => {
+                        cancellation.fail(error);
+                        None
+                    }
+                };
+                match session.close().await {
+                    Ok(()) => {
+                        if let Some(outcome) = outcome.as_mut()
+                            && let Err(error) = workload_executor
+                                .after_session_close(outcome, sample_clock.map(|_| &clock))
+                        {
+                            cancellation.fail(error);
+                        }
+                    }
+                    Err(error) => cancellation.fail(error.into()),
+                }
+                outcome
+            })
+        })
+        .collect();
+    let outcome = drive_session_tasks(&task_executor, executor.threads(), tasks, cancellation)?;
+    executor.finish_run(engine).await?;
+    Ok(outcome)
 }
 
-async fn execute_create_session(
-    engine: &Engine,
-    clock: MeasurementClock,
-    shape: PrimaryTableShape,
-    sample_latency: bool,
-    cancellation: Arc<RunCancellation>,
-) -> Result<SessionOutcome> {
-    let mut session = match engine.new_session() {
-        Ok(session) => session,
-        Err(error) => {
-            cancellation.fail(error.into());
-            return Err(cancellation
-                .take_error()
-                .ok_or_else(|| BenchError::message("missing create-table session error"))?);
-        }
-    };
-    let run_result =
-        run_create_table_operation(&mut session, shape, sample_latency.then_some(&clock)).await;
-    let outcome = match run_result {
-        Ok(result) => Some(SessionOutcome {
-            counters: WorkloadCounters {
-                operations: 1,
-                ..WorkloadCounters::default()
-            },
-            latency: result.latency,
-            table_id: Some(result.table_id),
-            latest_write_fence: None,
-        }),
-        Err(error) => {
-            cancellation.fail(error);
-            None
-        }
-    };
-    if let Err(error) = session.close().await {
-        cancellation.fail(error.into());
-    }
-    if let Some(error) = cancellation.take_error() {
-        Err(error)
-    } else {
-        outcome.ok_or_else(|| BenchError::message("create-table produced no outcome"))
-    }
-}
-
-async fn execute_stmt_noop_session(
-    engine: &Engine,
-    clock: MeasurementClock,
-    _config: StmtNoopConfig,
-    plan: SessionPlan,
-    sample_latency: bool,
-    cancellation: Arc<RunCancellation>,
-) -> Option<SessionOutcome> {
-    let mut session = open_workload_session(engine, &cancellation)?;
-    let result = run_stmt_noop_operations(
-        &mut session,
-        plan.number,
-        sample_latency.then_some(&clock),
-        Some(&cancellation),
-    )
-    .await
-    .map(|result| SessionOutcome {
-        counters: WorkloadCounters {
-            operations: result.operations,
-            ..WorkloadCounters::default()
-        },
-        latency: result.latency,
-        table_id: None,
-        latest_write_fence: None,
-    });
-    finish_workload_session(session, result, &cancellation).await
-}
-
-async fn execute_trx_noop_session(
-    engine: &Engine,
-    clock: MeasurementClock,
-    _config: TrxNoopConfig,
-    plan: SessionPlan,
-    sample_latency: bool,
-    cancellation: Arc<RunCancellation>,
-) -> Option<SessionOutcome> {
-    let mut session = open_workload_session(engine, &cancellation)?;
-    let result = run_trx_noop_operations(
-        &mut session,
-        plan.number,
-        sample_latency.then_some(&clock),
-        Some(&cancellation),
-    )
-    .await
-    .map(|result| SessionOutcome {
-        counters: WorkloadCounters {
-            operations: result.operations,
-            ..WorkloadCounters::default()
-        },
-        latency: result.latency,
-        table_id: None,
-        latest_write_fence: None,
-    });
-    finish_workload_session(session, result, &cancellation).await
-}
-
-async fn execute_insert_session(
-    engine: &Engine,
-    clock: MeasurementClock,
-    execution: InsertSessionExecution,
-    plan: SessionPlan,
-    cancellation: Arc<RunCancellation>,
-) -> Option<SessionOutcome> {
-    let mut session = open_workload_session(engine, &cancellation)?;
-    let result = run_insert_operations(
-        &mut session,
-        InsertOperationSpec {
-            table_id: execution.table_id,
-            random: execution.random,
-            index: execution.config.index,
-            seed: execution.config.seed,
-            value_size: execution.config.value_size_bytes,
-            batch_size: execution.config.batch_size,
-        },
-        &plan,
-        execution.sample_latency.then_some(&clock),
-        Some(&cancellation),
-    )
-    .await
-    .map(|result| SessionOutcome {
-        counters: WorkloadCounters {
-            operations: result.operations,
-            inserted_rows: result.inserted_rows,
-            expected_outcomes: ExpectedOutcomeCounters {
-                duplicate_key: result.duplicate_key,
-                write_conflict: result.write_conflict,
-            },
-            ..WorkloadCounters::default()
-        },
-        latency: result.latency,
-        table_id: None,
-        latest_write_fence: result.latest_write_fence,
-    });
-    finish_workload_session(session, result, &cancellation).await
-}
-
-async fn execute_table_ddl_session(
-    engine: &Engine,
-    clock: MeasurementClock,
-    _config: TableDdlConfig,
-    plan: SessionPlan,
-    sample_latency: bool,
-    cancellation: Arc<RunCancellation>,
-) -> Option<SessionOutcome> {
-    let mut session = open_workload_session(engine, &cancellation)?;
-    let result = run_table_ddl_operations(
-        &mut session,
-        plan.number,
-        sample_latency.then_some(&clock),
-        Some(&cancellation),
-    )
-    .await
-    .map(|result| SessionOutcome {
-        counters: WorkloadCounters {
-            operations: result.operations,
-            ..WorkloadCounters::default()
-        },
-        latency: result.latency,
-        table_id: None,
-        latest_write_fence: None,
-    });
-    finish_workload_session(session, result, &cancellation).await
-}
-
-fn open_workload_session(engine: &Engine, cancellation: &RunCancellation) -> Option<Session> {
-    match engine.new_session() {
-        Ok(session) => Some(session),
-        Err(error) => {
-            cancellation.fail(error.into());
-            None
-        }
-    }
-}
-
-async fn finish_workload_session<T>(
-    mut session: Session,
-    result: Result<T>,
-    cancellation: &RunCancellation,
-) -> Option<T> {
-    let value = match result {
-        Ok(value) => Some(value),
-        Err(error) => {
-            cancellation.fail(error);
-            None
-        }
-    };
-    if let Err(error) = session.close().await {
-        cancellation.fail(error.into());
-    }
-    value
-}
-
-fn drive_session_tasks(
+fn drive_session_tasks<O>(
     executor: &Executor<'_>,
     threads: usize,
-    tasks: Vec<smol::Task<Option<SessionOutcome>>>,
+    tasks: Vec<smol::Task<Option<O>>>,
     cancellation: Arc<RunCancellation>,
-) -> Result<SessionOutcome> {
+) -> Result<O>
+where
+    O: SessionOutcome,
+{
     let (signal, shutdown) = channel::unbounded::<()>();
     let shutdown_receiver = shutdown.clone();
     let (_workers, result) = Parallel::new()
@@ -758,45 +557,26 @@ fn drive_session_tasks(
     result
 }
 
-async fn collect_session_results(
-    tasks: Vec<smol::Task<Option<SessionOutcome>>>,
+async fn collect_session_results<O>(
+    tasks: Vec<smol::Task<Option<O>>>,
     cancellation: Arc<RunCancellation>,
-) -> Result<SessionOutcome> {
-    let mut counters = WorkloadCounters::default();
-    let mut latency = LatencyDistribution::new()?;
-    let mut table_id = None;
-    let mut latest_write_fence = None;
+) -> Result<O>
+where
+    O: SessionOutcome,
+{
+    let mut outcome = O::empty()?;
     for task in tasks {
         let Some(result) = task.await else {
             continue;
         };
-        if let Err(error) = counters.merge(result.counters) {
+        if let Err(error) = outcome.merge(result) {
             cancellation.fail(error);
-        }
-        if let Err(error) = latency.merge(&result.latency) {
-            cancellation.fail(error);
-        }
-        if let Some(result_table_id) = result.table_id
-            && table_id.replace(result_table_id).is_some()
-        {
-            cancellation.fail(BenchError::message(
-                "multiple sessions returned a primary table ID",
-            ));
-        }
-        if let Some(fence) = result.latest_write_fence {
-            latest_write_fence =
-                Some(latest_write_fence.map_or(fence, |current: TrxID| current.max(fence)));
         }
     }
     if let Some(error) = cancellation.take_error() {
         Err(error)
     } else {
-        Ok(SessionOutcome {
-            counters,
-            latency,
-            table_id,
-            latest_write_fence,
-        })
+        Ok(outcome)
     }
 }
 
@@ -813,4 +593,71 @@ fn prepare_plan_root(storage_root: &Path) -> Result<()> {
             storage_root.display()
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_shared_config<A, B>()
+    where
+        A: SessionExecutor,
+        B: SessionExecutor<Config = A::Config>,
+    {
+    }
+
+    fn assert_shared_outcome<A, B>()
+    where
+        A: SessionExecutor,
+        B: SessionExecutor<Outcome = A::Outcome>,
+    {
+    }
+
+    #[test]
+    fn related_executor_identities_share_associated_types() {
+        assert_shared_config::<StmtNoopExecutor, TrxNoopExecutor>();
+        assert_shared_outcome::<StmtNoopExecutor, TrxNoopExecutor>();
+        assert_shared_config::<InsertSeqExecutor, InsertRandExecutor>();
+        assert_shared_outcome::<InsertSeqExecutor, InsertRandExecutor>();
+        assert_shared_config::<TableDdlExecutor, IndexDdlExecutor>();
+        assert_shared_outcome::<TableDdlExecutor, IndexDdlExecutor>();
+        assert_shared_config::<LookupSeqExecutor, LookupRandExecutor>();
+        assert_shared_outcome::<LookupSeqExecutor, IndexStreamExecutor>();
+    }
+
+    #[test]
+    fn executor_identities_match_resolved_workload_names() {
+        assert_eq!(
+            [
+                CreateTableExecutor::IDENTITY,
+                StmtNoopExecutor::IDENTITY,
+                TrxNoopExecutor::IDENTITY,
+                InsertSeqExecutor::IDENTITY,
+                InsertRandExecutor::IDENTITY,
+                TableDdlExecutor::IDENTITY,
+                LookupSeqExecutor::IDENTITY,
+                LookupRandExecutor::IDENTITY,
+                TableScanExecutor::IDENTITY,
+                IndexScanExecutor::IDENTITY,
+                IndexStreamExecutor::IDENTITY,
+                IndexDdlExecutor::IDENTITY,
+                LockTableExecutor::IDENTITY,
+            ],
+            [
+                "create-table",
+                "stmt-noop",
+                "trx-noop",
+                "insert-seq",
+                "insert-rand",
+                "table-ddl",
+                "lookup-seq",
+                "lookup-rand",
+                "table-scan",
+                "index-scan",
+                "index-stream",
+                "index-ddl",
+                "lock-table",
+            ]
+        );
+    }
 }

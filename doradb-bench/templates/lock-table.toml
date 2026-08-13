@@ -1,0 +1,11 @@
+name = "paired random shared table locks"
+engine_defaults = "engine-defaults.toml"
+
+[[phase]]
+workload = { type = "create-table", index = "none", tables = 16 }
+
+[[phase]]
+kind = "benchmark"
+warmup_runs = 1
+measured_runs = 3
+workload = { type = "lock-table", num = 10000, scenario = "basic", mode = "shared", scope = "session", unlock = true, random = true, seed = 42, threads = 4, sessions = 16 }

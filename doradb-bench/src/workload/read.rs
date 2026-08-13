@@ -1,453 +1,494 @@
-use crate::cli::{
-    IndexScanArgs, IndexStreamArgs, ReadArgs, SeededReadArgs, Workload, validate_batch_size,
-};
 use crate::error::{BenchError, Result};
-use crate::fixture::KeyRange;
-use crate::manifest::Manifest;
+use crate::fixture::{FixturePlanEffect, FixtureRuntimeEffect, KeyRange, PrimaryBinding};
+use crate::measurement::{LatencyDistribution, MeasurementClock, WorkloadCounters};
+use crate::plan::{IndexStreamConfig, ReadConfig};
+use crate::plan_executor::{
+    SessionExecutor, SessionExecutorConfig, SessionMeasurement, SessionOutcome,
+};
 use crate::workload::util::{
     RandomScanRangeGenerator, effective_batch_size, generate_random_read_keys,
-    generate_sequential_read_keys,
+    generate_sequential_read_keys, merge_measurement, operation_plans, require_primary,
+    verify_no_effect, verify_no_write_counters, verify_read_shape, verify_samples,
 };
-use crate::workload::{CommonConfig, SessionPlan, SessionSummary, WorkloadConfig, WorkloadRunner};
+use crate::workload::{RunCancellation, SessionPlan};
 use doradb_storage::id::TableID;
-use doradb_storage::{Error as StorageError, SelectKey, SelectMvcc, Session, Val};
+use doradb_storage::{Engine, SelectKey, SelectMvcc, Session, Val};
+use std::future::Future;
 
-/// Resolved sequential-lookup configuration.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct LookupSeqConfig {
-    common: CommonConfig,
-    num: u64,
-    loaded_range: KeyRange,
+/// Sequential lookup session executor.
+#[derive(Clone, Copy)]
+pub(crate) struct LookupSeqExecutor {
+    state: ReadExecutorState,
 }
 
-impl WorkloadConfig for LookupSeqConfig {
-    type Args = ReadArgs;
+impl SessionExecutor for LookupSeqExecutor {
+    type Config = SessionExecutorConfig<ReadConfig>;
+    type Outcome = ReadSessionOutcome;
 
-    const WORKLOAD: Workload = Workload::LookupSeq;
+    const IDENTITY: &'static str = "lookup-seq";
 
-    fn resolve(manifest: &Manifest, args: &Self::Args) -> Result<Self> {
-        let common = resolve_read_common(manifest, args)?;
-        let num = required_operation_count(args, Self::WORKLOAD)?;
-        manifest.validate_workload_compatible(Self::WORKLOAD)?;
+    fn new(config: Self::Config) -> Result<Self> {
         Ok(Self {
-            common,
-            num,
-            loaded_range: manifest.loaded_key_range()?,
+            state: build_read_state(config, Self::IDENTITY, ReadOperationType::LookupSeq)?,
         })
     }
 
-    fn common(&self) -> &CommonConfig {
-        &self.common
+    fn threads(&self) -> usize {
+        self.state.config.threads
     }
 
-    fn operation_count(&self) -> u64 {
-        self.num
+    fn session_plans(&self) -> Result<Vec<SessionPlan>> {
+        operation_plans(self.state.config.num, self.state.config.sessions)
     }
 
-    fn output_loaded_range(&self) -> KeyRange {
-        self.loaded_range
-    }
-}
-
-/// Executes sequential unique-index lookups for one session.
-#[derive(Clone, Copy)]
-pub(crate) struct LookupSeqRunner {
-    loaded_range: KeyRange,
-    batch_size: u64,
-    table_id: TableID,
-}
-
-impl WorkloadRunner for LookupSeqRunner {
-    type Config = LookupSeqConfig;
-
-    fn new(config: &Self::Config, table_id: TableID) -> Self {
-        Self {
-            loaded_range: config.loaded_range,
-            batch_size: config.common.batch_size,
-            table_id,
-        }
+    fn execute<'a>(
+        &'a self,
+        _engine: &'a Engine,
+        session: &'a mut Session,
+        plan: &'a SessionPlan,
+        clock: Option<&'a MeasurementClock>,
+        cancellation: &'a RunCancellation,
+    ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a {
+        execute_read_session(&self.state, session, plan, clock, cancellation)
     }
 
-    async fn run(
+    fn verify_outcome(
         &self,
-        _engine: &doradb_storage::Engine,
-        session: &mut Session,
-        plan: &SessionPlan,
-    ) -> Result<SessionSummary> {
-        let keys = generate_sequential_read_keys(self.loaded_range, plan)?;
-        lookup_keys(session, self.batch_size, self.table_id, &keys).await
-    }
-}
-
-/// Resolved random-lookup configuration.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct LookupRandConfig {
-    common: CommonConfig,
-    num: u64,
-    seed: u64,
-    loaded_range: KeyRange,
-}
-
-impl WorkloadConfig for LookupRandConfig {
-    type Args = SeededReadArgs;
-
-    const WORKLOAD: Workload = Workload::LookupRand;
-
-    fn resolve(manifest: &Manifest, args: &Self::Args) -> Result<Self> {
-        let common = resolve_read_common(manifest, args.read())?;
-        let num = required_operation_count(args.read(), Self::WORKLOAD)?;
-        manifest.validate_workload_compatible(Self::WORKLOAD)?;
-        Ok(Self {
-            common,
-            num,
-            seed: args.seed(),
-            loaded_range: manifest.loaded_key_range()?,
-        })
-    }
-
-    fn common(&self) -> &CommonConfig {
-        &self.common
-    }
-
-    fn operation_count(&self) -> u64 {
-        self.num
-    }
-
-    fn output_loaded_range(&self) -> KeyRange {
-        self.loaded_range
-    }
-
-    fn random(&self) -> bool {
-        true
-    }
-
-    fn seed(&self) -> u64 {
-        self.seed
-    }
-}
-
-/// Executes seeded random unique-index lookups for one session.
-#[derive(Clone, Copy)]
-pub(crate) struct LookupRandRunner {
-    seed: u64,
-    loaded_range: KeyRange,
-    batch_size: u64,
-    table_id: TableID,
-}
-
-impl WorkloadRunner for LookupRandRunner {
-    type Config = LookupRandConfig;
-
-    fn new(config: &Self::Config, table_id: TableID) -> Self {
-        Self {
-            seed: config.seed,
-            loaded_range: config.loaded_range,
-            batch_size: config.common.batch_size,
-            table_id,
-        }
-    }
-
-    async fn run(
-        &self,
-        _engine: &doradb_storage::Engine,
-        session: &mut Session,
-        plan: &SessionPlan,
-    ) -> Result<SessionSummary> {
-        let keys = generate_random_read_keys(self.seed, self.loaded_range, plan)?;
-        lookup_keys(session, self.batch_size, self.table_id, &keys).await
-    }
-}
-
-/// Resolved table-scan configuration.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct TableScanConfig {
-    common: CommonConfig,
-    num: u64,
-    loaded_range: KeyRange,
-}
-
-impl WorkloadConfig for TableScanConfig {
-    type Args = ReadArgs;
-
-    const WORKLOAD: Workload = Workload::TableScan;
-
-    fn resolve(manifest: &Manifest, args: &Self::Args) -> Result<Self> {
-        let common = resolve_read_common(manifest, args)?;
-        manifest.validate_workload_compatible(Self::WORKLOAD)?;
-        Ok(Self {
-            common,
-            num: args.operation_count().unwrap_or(1),
-            loaded_range: manifest.loaded_key_range()?,
-        })
-    }
-
-    fn common(&self) -> &CommonConfig {
-        &self.common
-    }
-
-    fn operation_count(&self) -> u64 {
-        self.num
-    }
-
-    fn output_loaded_range(&self) -> KeyRange {
-        self.loaded_range
-    }
-}
-
-/// Executes full table-scan iterations for one session.
-#[derive(Clone, Copy)]
-pub(crate) struct TableScanRunner {
-    batch_size: u64,
-    table_id: TableID,
-}
-
-impl WorkloadRunner for TableScanRunner {
-    type Config = TableScanConfig;
-
-    fn new(config: &Self::Config, table_id: TableID) -> Self {
-        Self {
-            batch_size: config.common.batch_size,
-            table_id,
-        }
-    }
-
-    async fn run(
-        &self,
-        _engine: &doradb_storage::Engine,
-        session: &mut Session,
-        plan: &SessionPlan,
-    ) -> Result<SessionSummary> {
-        table_scan_iterations(session, self.batch_size, self.table_id, plan.number).await
-    }
-}
-
-/// Resolved materialized index-range-scan configuration.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct IndexScanConfig {
-    common: CommonConfig,
-    num: u64,
-    seed: u64,
-    loaded_range: KeyRange,
-    range_len: u64,
-}
-
-impl WorkloadConfig for IndexScanConfig {
-    type Args = IndexScanArgs;
-
-    const WORKLOAD: Workload = Workload::IndexScan;
-
-    fn resolve(manifest: &Manifest, args: &Self::Args) -> Result<Self> {
-        let common = resolve_read_common(manifest, args.read())?;
-        let num = required_operation_count(args.read(), Self::WORKLOAD)?;
-        manifest.validate_workload_compatible(Self::WORKLOAD)?;
-        let loaded_range = manifest.loaded_key_range()?;
-        Ok(Self {
-            common,
-            num,
-            seed: args.seed(),
-            loaded_range,
-            range_len: resolve_scan_range(args.range_override(), loaded_range)?,
-        })
-    }
-
-    fn common(&self) -> &CommonConfig {
-        &self.common
-    }
-
-    fn operation_count(&self) -> u64 {
-        self.num
-    }
-
-    fn output_loaded_range(&self) -> KeyRange {
-        self.loaded_range
-    }
-
-    fn random(&self) -> bool {
-        true
-    }
-
-    fn seed(&self) -> u64 {
-        self.seed
-    }
-
-    fn scan_range(&self) -> Option<u64> {
-        Some(self.range_len)
-    }
-}
-
-/// Executes seeded materialized index range scans for one session.
-#[derive(Clone, Copy)]
-pub(crate) struct IndexScanRunner {
-    seed: u64,
-    loaded_range: KeyRange,
-    range_len: u64,
-    batch_size: u64,
-    table_id: TableID,
-}
-
-impl WorkloadRunner for IndexScanRunner {
-    type Config = IndexScanConfig;
-
-    fn new(config: &Self::Config, table_id: TableID) -> Self {
-        Self {
-            seed: config.seed,
-            loaded_range: config.loaded_range,
-            range_len: config.range_len,
-            batch_size: config.common.batch_size,
-            table_id,
-        }
-    }
-
-    async fn run(
-        &self,
-        _engine: &doradb_storage::Engine,
-        session: &mut Session,
-        plan: &SessionPlan,
-    ) -> Result<SessionSummary> {
-        index_scan_ranges(
-            session,
-            self.batch_size,
-            self.table_id,
-            self.seed,
-            self.loaded_range,
-            self.range_len,
-            plan,
+        planned_effect: &FixturePlanEffect,
+        outcome: &Self::Outcome,
+        expected_samples: u64,
+    ) -> Result<FixtureRuntimeEffect> {
+        verify_read_outcome(
+            Self::IDENTITY,
+            &self.state,
+            planned_effect,
+            outcome,
+            expected_samples,
         )
-        .await
     }
 }
 
-/// Resolved public index-range-stream configuration.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct IndexStreamConfig {
-    common: CommonConfig,
-    num: u64,
-    seed: u64,
-    loaded_range: KeyRange,
-    range_len: u64,
+/// Seeded-random lookup session executor.
+#[derive(Clone, Copy)]
+pub(crate) struct LookupRandExecutor {
+    state: ReadExecutorState,
 }
 
-impl WorkloadConfig for IndexStreamConfig {
-    type Args = IndexStreamArgs;
+impl SessionExecutor for LookupRandExecutor {
+    type Config = SessionExecutorConfig<ReadConfig>;
+    type Outcome = ReadSessionOutcome;
 
-    const WORKLOAD: Workload = Workload::IndexStream;
+    const IDENTITY: &'static str = "lookup-rand";
 
-    fn resolve(manifest: &Manifest, args: &Self::Args) -> Result<Self> {
-        let common = resolve_worker_common(manifest, args)?;
-        manifest.validate_workload_compatible(Self::WORKLOAD)?;
-        let loaded_range = manifest.loaded_key_range()?;
+    fn new(config: Self::Config) -> Result<Self> {
         Ok(Self {
-            common,
-            num: args.iterations(),
-            seed: args.seed(),
-            loaded_range,
-            range_len: resolve_scan_range(args.range_override(), loaded_range)?,
+            state: build_read_state(config, Self::IDENTITY, ReadOperationType::LookupRand)?,
         })
     }
 
-    fn common(&self) -> &CommonConfig {
-        &self.common
+    fn threads(&self) -> usize {
+        self.state.config.threads
     }
 
-    fn operation_count(&self) -> u64 {
-        self.num
+    fn session_plans(&self) -> Result<Vec<SessionPlan>> {
+        operation_plans(self.state.config.num, self.state.config.sessions)
     }
 
-    fn output_loaded_range(&self) -> KeyRange {
-        self.loaded_range
+    fn execute<'a>(
+        &'a self,
+        _engine: &'a Engine,
+        session: &'a mut Session,
+        plan: &'a SessionPlan,
+        clock: Option<&'a MeasurementClock>,
+        cancellation: &'a RunCancellation,
+    ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a {
+        execute_read_session(&self.state, session, plan, clock, cancellation)
     }
 
-    fn random(&self) -> bool {
-        true
-    }
-
-    fn seed(&self) -> u64 {
-        self.seed
-    }
-
-    fn scan_range(&self) -> Option<u64> {
-        Some(self.range_len)
-    }
-}
-
-/// Executes public index range streams for one session.
-#[derive(Clone, Copy)]
-pub(crate) struct IndexStreamRunner {
-    seed: u64,
-    loaded_range: KeyRange,
-    range_len: u64,
-    table_id: TableID,
-}
-
-impl WorkloadRunner for IndexStreamRunner {
-    type Config = IndexStreamConfig;
-
-    fn new(config: &Self::Config, table_id: TableID) -> Self {
-        Self {
-            seed: config.seed,
-            loaded_range: config.loaded_range,
-            range_len: config.range_len,
-            table_id,
-        }
-    }
-
-    async fn run(
+    fn verify_outcome(
         &self,
-        _engine: &doradb_storage::Engine,
-        session: &mut Session,
-        plan: &SessionPlan,
-    ) -> Result<SessionSummary> {
-        index_stream_iterations(
-            session,
-            self.table_id,
-            self.seed,
-            self.loaded_range,
-            self.range_len,
-            plan,
+        planned_effect: &FixturePlanEffect,
+        outcome: &Self::Outcome,
+        expected_samples: u64,
+    ) -> Result<FixtureRuntimeEffect> {
+        verify_read_outcome(
+            Self::IDENTITY,
+            &self.state,
+            planned_effect,
+            outcome,
+            expected_samples,
         )
-        .await
     }
 }
 
-fn resolve_read_common(manifest: &Manifest, args: &ReadArgs) -> Result<CommonConfig> {
-    let common_args = args.common();
-    let worker = common_args.worker();
-    CommonConfig::resolve(
-        &manifest.defaults,
-        worker.thread_override(),
-        worker.session_override(),
-        None,
-        common_args.batch_size_override(),
-        worker.include_stats(),
-    )
+/// Full table-scan session executor.
+#[derive(Clone, Copy)]
+pub(crate) struct TableScanExecutor {
+    state: ReadExecutorState,
 }
 
-fn resolve_worker_common(manifest: &Manifest, args: &IndexStreamArgs) -> Result<CommonConfig> {
-    let worker = args.worker();
-    CommonConfig::resolve(
-        &manifest.defaults,
-        worker.thread_override(),
-        worker.session_override(),
-        None,
-        None,
-        worker.include_stats(),
-    )
+impl SessionExecutor for TableScanExecutor {
+    type Config = SessionExecutorConfig<ReadConfig>;
+    type Outcome = ReadSessionOutcome;
+
+    const IDENTITY: &'static str = "table-scan";
+
+    fn new(config: Self::Config) -> Result<Self> {
+        Ok(Self {
+            state: build_read_state(config, Self::IDENTITY, ReadOperationType::TableScan)?,
+        })
+    }
+
+    fn threads(&self) -> usize {
+        self.state.config.threads
+    }
+
+    fn session_plans(&self) -> Result<Vec<SessionPlan>> {
+        operation_plans(self.state.config.num, self.state.config.sessions)
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _engine: &'a Engine,
+        session: &'a mut Session,
+        plan: &'a SessionPlan,
+        clock: Option<&'a MeasurementClock>,
+        cancellation: &'a RunCancellation,
+    ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a {
+        execute_read_session(&self.state, session, plan, clock, cancellation)
+    }
+
+    fn verify_outcome(
+        &self,
+        planned_effect: &FixturePlanEffect,
+        outcome: &Self::Outcome,
+        expected_samples: u64,
+    ) -> Result<FixtureRuntimeEffect> {
+        verify_read_outcome(
+            Self::IDENTITY,
+            &self.state,
+            planned_effect,
+            outcome,
+            expected_samples,
+        )
+    }
 }
 
-fn resolve_scan_range(range_override: Option<u64>, loaded_range: KeyRange) -> Result<u64> {
-    let range_len = range_override.unwrap_or(loaded_range.len);
-    if range_len > loaded_range.len {
+/// Materialized index-scan session executor.
+#[derive(Clone, Copy)]
+pub(crate) struct IndexScanExecutor {
+    state: ReadExecutorState,
+}
+
+impl SessionExecutor for IndexScanExecutor {
+    type Config = SessionExecutorConfig<ReadConfig>;
+    type Outcome = ReadSessionOutcome;
+
+    const IDENTITY: &'static str = "index-scan";
+
+    fn new(config: Self::Config) -> Result<Self> {
+        Ok(Self {
+            state: build_read_state(config, Self::IDENTITY, ReadOperationType::IndexScan)?,
+        })
+    }
+
+    fn threads(&self) -> usize {
+        self.state.config.threads
+    }
+
+    fn session_plans(&self) -> Result<Vec<SessionPlan>> {
+        operation_plans(self.state.config.num, self.state.config.sessions)
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _engine: &'a Engine,
+        session: &'a mut Session,
+        plan: &'a SessionPlan,
+        clock: Option<&'a MeasurementClock>,
+        cancellation: &'a RunCancellation,
+    ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a {
+        execute_read_session(&self.state, session, plan, clock, cancellation)
+    }
+
+    fn verify_outcome(
+        &self,
+        planned_effect: &FixturePlanEffect,
+        outcome: &Self::Outcome,
+        expected_samples: u64,
+    ) -> Result<FixtureRuntimeEffect> {
+        verify_read_outcome(
+            Self::IDENTITY,
+            &self.state,
+            planned_effect,
+            outcome,
+            expected_samples,
+        )
+    }
+}
+
+/// Public index-stream session executor.
+#[derive(Clone, Copy)]
+pub(crate) struct IndexStreamExecutor {
+    state: ReadExecutorState,
+}
+
+impl SessionExecutor for IndexStreamExecutor {
+    type Config = SessionExecutorConfig<IndexStreamConfig>;
+    type Outcome = ReadSessionOutcome;
+
+    const IDENTITY: &'static str = "index-stream";
+
+    fn new(config: Self::Config) -> Result<Self> {
+        let resolved = config.resolved;
+        let read_config = ReadConfig {
+            num: resolved.num,
+            seed: resolved.seed,
+            threads: resolved.threads,
+            sessions: resolved.sessions,
+            batch_size: 1,
+            loaded_range: resolved.loaded_range,
+            range: Some(resolved.range),
+            include_stats: resolved.include_stats,
+        };
+        Ok(Self {
+            state: build_read_state(
+                SessionExecutorConfig {
+                    resolved: read_config,
+                    binding: config.binding,
+                },
+                Self::IDENTITY,
+                ReadOperationType::IndexStream,
+            )?,
+        })
+    }
+
+    fn threads(&self) -> usize {
+        self.state.config.threads
+    }
+
+    fn session_plans(&self) -> Result<Vec<SessionPlan>> {
+        operation_plans(self.state.config.num, self.state.config.sessions)
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _engine: &'a Engine,
+        session: &'a mut Session,
+        plan: &'a SessionPlan,
+        clock: Option<&'a MeasurementClock>,
+        cancellation: &'a RunCancellation,
+    ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a {
+        execute_read_session(&self.state, session, plan, clock, cancellation)
+    }
+
+    fn verify_outcome(
+        &self,
+        planned_effect: &FixturePlanEffect,
+        outcome: &Self::Outcome,
+        expected_samples: u64,
+    ) -> Result<FixtureRuntimeEffect> {
+        verify_read_outcome(
+            Self::IDENTITY,
+            &self.state,
+            planned_effect,
+            outcome,
+            expected_samples,
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ReadExecutorState {
+    config: ReadConfig,
+    primary: PrimaryBinding,
+    operation: ReadOperationType,
+}
+
+/// Session-local outcome shared by all read identities.
+pub(crate) struct ReadSessionOutcome {
+    measurement: SessionMeasurement,
+}
+
+impl SessionOutcome for ReadSessionOutcome {
+    fn empty() -> Result<Self> {
+        Ok(Self {
+            measurement: SessionMeasurement {
+                counters: WorkloadCounters::default(),
+                latency: LatencyDistribution::new()?,
+            },
+        })
+    }
+
+    fn merge(&mut self, other: Self) -> Result<()> {
+        merge_measurement(&mut self.measurement, other.measurement)
+    }
+
+    fn into_measurement(self) -> SessionMeasurement {
+        self.measurement
+    }
+}
+
+/// Closed read operation shape.
+#[derive(Clone, Copy)]
+enum ReadOperationType {
+    /// Sequential unique-index lookups.
+    LookupSeq,
+    /// Seeded random unique-index lookups.
+    LookupRand,
+    /// Complete table scans.
+    TableScan,
+    /// Materialized secondary-index range scans.
+    IndexScan,
+    /// Public secondary-index range streams.
+    IndexStream,
+}
+
+/// Bound storage and generation inputs for one read session.
+#[derive(Clone, Copy)]
+struct ReadOperationSpec {
+    /// Read operation shape.
+    operation: ReadOperationType,
+    /// Bound primary table ID.
+    table_id: TableID,
+    /// Candidate loaded logical-key range.
+    loaded_range: KeyRange,
+    /// Deterministic request seed.
+    seed: u64,
+    /// Maximum operations per transaction.
+    batch_size: u64,
+    /// Logical-key width for index range reads.
+    range: Option<u64>,
+}
+
+/// Result of one session's committed read operations.
+struct ReadOperationResult {
+    /// Successful read counters.
+    counters: WorkloadCounters,
+    /// Exact transaction-lifecycle latency samples.
+    latency: LatencyDistribution,
+}
+
+fn build_read_state(
+    config: SessionExecutorConfig<ReadConfig>,
+    identity: &str,
+    operation: ReadOperationType,
+) -> Result<ReadExecutorState> {
+    let primary = require_primary(config.binding, identity)?;
+    if primary.loaded_range != Some(config.resolved.loaded_range) {
         return Err(BenchError::message(format!(
-            "--range ({range_len}) must not exceed loaded key range length ({})",
-            loaded_range.len
+            "{identity} runtime loaded range differs from the resolved plan"
         )));
     }
-    Ok(range_len)
+    Ok(ReadExecutorState {
+        config: config.resolved,
+        primary,
+        operation,
+    })
 }
 
-fn required_operation_count(args: &ReadArgs, workload: Workload) -> Result<u64> {
-    args.operation_count()
-        .ok_or_else(|| BenchError::message(format!("{workload} workload requires --num")))
+async fn execute_read_session(
+    state: &ReadExecutorState,
+    session: &mut Session,
+    plan: &SessionPlan,
+    clock: Option<&MeasurementClock>,
+    cancellation: &RunCancellation,
+) -> Result<ReadSessionOutcome> {
+    let result = run_read_operations(
+        session,
+        ReadOperationSpec {
+            operation: state.operation,
+            table_id: state.primary.table_id,
+            loaded_range: state.config.loaded_range,
+            seed: state.config.seed,
+            batch_size: state.config.batch_size,
+            range: state.config.range,
+        },
+        plan,
+        clock,
+        Some(cancellation),
+    )
+    .await?;
+    Ok(ReadSessionOutcome {
+        measurement: SessionMeasurement {
+            counters: result.counters,
+            latency: result.latency,
+        },
+    })
+}
+
+fn verify_read_outcome(
+    identity: &str,
+    state: &ReadExecutorState,
+    planned_effect: &FixturePlanEffect,
+    outcome: &ReadSessionOutcome,
+    expected_samples: u64,
+) -> Result<FixtureRuntimeEffect> {
+    verify_samples(identity, &outcome.measurement.latency, expected_samples)?;
+    let counters = outcome.measurement.counters;
+    match state.operation {
+        ReadOperationType::LookupSeq | ReadOperationType::LookupRand => {
+            verify_no_write_counters(identity, counters)?;
+            if counters.operations != state.config.num
+                || counters.found.checked_add(counters.not_found) != Some(state.config.num)
+                || counters.rows_returned != counters.found
+            {
+                return Err(BenchError::message(format!(
+                    "{identity} counters violate the lookup equation"
+                )));
+            }
+        }
+        ReadOperationType::TableScan | ReadOperationType::IndexStream => {
+            verify_read_shape(identity, counters, state.config.num, false)?;
+        }
+        ReadOperationType::IndexScan => {
+            verify_read_shape(identity, counters, state.config.num, true)?;
+        }
+    }
+    verify_no_effect(planned_effect)
+}
+
+/// Execute one session's read operations with cooperative batch boundaries.
+async fn run_read_operations(
+    session: &mut Session,
+    spec: ReadOperationSpec,
+    plan: &SessionPlan,
+    clock: Option<&MeasurementClock>,
+    cancellation: Option<&RunCancellation>,
+) -> Result<ReadOperationResult> {
+    match spec.operation {
+        ReadOperationType::LookupSeq | ReadOperationType::LookupRand => {
+            let keys = if matches!(spec.operation, ReadOperationType::LookupSeq) {
+                generate_sequential_read_keys(spec.loaded_range, plan)?
+            } else {
+                generate_random_read_keys(spec.seed, spec.loaded_range, plan)?
+            };
+            lookup_keys(
+                session,
+                spec.batch_size,
+                spec.table_id,
+                &keys,
+                clock,
+                cancellation,
+            )
+            .await
+        }
+        ReadOperationType::TableScan => {
+            table_scans(
+                session,
+                spec.batch_size,
+                spec.table_id,
+                plan.number,
+                clock,
+                cancellation,
+            )
+            .await
+        }
+        ReadOperationType::IndexScan => index_scans(session, spec, plan, clock, cancellation).await,
+        ReadOperationType::IndexStream => {
+            index_streams(session, spec, plan, clock, cancellation).await
+        }
+    }
 }
 
 async fn lookup_keys(
@@ -455,395 +496,254 @@ async fn lookup_keys(
     batch_size: u64,
     table_id: TableID,
     keys: &[u64],
-) -> Result<SessionSummary> {
+    clock: Option<&MeasurementClock>,
+    cancellation: Option<&RunCancellation>,
+) -> Result<ReadOperationResult> {
+    let mut result = empty_result()?;
     if keys.is_empty() {
-        return Ok(SessionSummary::default());
+        return Ok(result);
     }
     let batch_size = effective_batch_size(batch_size, keys.len() as u64)?;
-    let mut summary = SessionSummary::default();
     for batch in keys.chunks(batch_size) {
-        summary.merge(lookup_key_batch(session, table_id, batch).await?);
-    }
-    Ok(summary)
-}
-
-async fn lookup_key_batch(
-    session: &mut Session,
-    table_id: TableID,
-    keys: &[u64],
-) -> Result<SessionSummary> {
-    let mut trx = session.begin_trx()?;
-    let mut summary = SessionSummary::default();
-    for key in keys {
-        let select_key = SelectKey::new(0, vec![Val::from(*key)]);
-        let lookup = trx
-            .exec(async |stmt| {
-                stmt.table_lookup_unique_mvcc(
-                    table_id,
-                    select_key.index_no,
-                    &select_key.vals,
-                    &[0, 1],
-                )
-                .await
-            })
-            .await;
-        match lookup {
-            Ok(SelectMvcc::Found(_)) => {
-                summary.operations += 1;
-                summary.found += 1;
-                summary.rows_returned += 1;
-            }
-            Ok(SelectMvcc::NotFound) => {
-                summary.operations += 1;
-                summary.not_found += 1;
-            }
-            Err(err) => {
-                trx.rollback().await?;
-                return Err(err.into());
-            }
+        if cancellation.is_some_and(RunCancellation::is_cancelled) {
+            break;
         }
-    }
-    trx.commit().await?;
-    Ok(summary)
-}
-
-async fn table_scan_iterations(
-    session: &mut Session,
-    batch_size: u64,
-    table_id: TableID,
-    iterations: u64,
-) -> Result<SessionSummary> {
-    validate_batch_size(batch_size)?;
-    if iterations == 0 {
-        return Ok(SessionSummary::default());
-    }
-    let mut remaining = iterations;
-    let mut summary = SessionSummary::default();
-    while remaining > 0 {
-        let batch_iterations = batch_size.min(remaining);
-        summary.merge(table_scan_batch(session, table_id, batch_iterations).await?);
-        remaining -= batch_iterations;
-    }
-    Ok(summary)
-}
-
-async fn table_scan_batch(
-    session: &mut Session,
-    table_id: TableID,
-    iterations: u64,
-) -> Result<SessionSummary> {
-    let mut trx = session.begin_trx()?;
-    let mut summary = SessionSummary::default();
-    for _ in 0..iterations {
-        let scan = trx
-            .exec(async |stmt| {
-                let mut rows = 0u64;
-                stmt.table_scan_mvcc(table_id, &[0, 1], |_| {
-                    rows += 1;
-                    true
-                })
-                .await?;
-                Ok(rows)
-            })
-            .await;
-        match scan {
-            Ok(rows) => {
-                summary.operations += 1;
-                summary.rows_returned += rows;
-            }
-            Err(err) => {
-                trx.rollback().await?;
-                return Err(err.into());
-            }
-        }
-    }
-    trx.commit().await?;
-    Ok(summary)
-}
-
-async fn index_scan_ranges(
-    session: &mut Session,
-    batch_size: u64,
-    table_id: TableID,
-    seed: u64,
-    loaded_range: KeyRange,
-    range_len: u64,
-    plan: &SessionPlan,
-) -> Result<SessionSummary> {
-    if plan.number == 0 {
-        return Ok(SessionSummary::default());
-    }
-    let batch_size = effective_batch_size(batch_size, plan.number)?;
-    let mut ranges = RandomScanRangeGenerator::new(seed, loaded_range, range_len, plan)?;
-    let mut remaining = plan.number;
-    let mut summary = SessionSummary::default();
-    while remaining > 0 {
-        let batch_len = remaining.min(batch_size as u64);
-        let mut bounds = Vec::with_capacity(batch_len as usize);
-        for _ in 0..batch_len {
-            let range = ranges.next_range()?;
-            bounds.push((range.start, range.end()?));
-        }
-        summary.merge(index_scan_range_batch(session, table_id, &bounds).await?);
-        remaining -= batch_len;
-    }
-    Ok(summary)
-}
-
-async fn index_scan_range_batch(
-    session: &mut Session,
-    table_id: TableID,
-    bounds: &[(u64, u64)],
-) -> Result<SessionSummary> {
-    let mut trx = session.begin_trx()?;
-    let mut summary = SessionSummary::default();
-    for (start, end) in bounds {
-        let lower = [Val::from(*start)];
-        let upper = [Val::from(*end)];
-        let scan = trx
-            .exec(async |stmt| {
-                stmt.table_index_scan_mvcc(table_id, 0, &lower[..]..&upper[..], &[0, 1])
+        let started = clock.map(MeasurementClock::raw);
+        let mut trx = session.begin_trx()?;
+        let mut batch_counters = WorkloadCounters::default();
+        for key in batch {
+            let select_key = SelectKey::new(0, vec![Val::from(*key)]);
+            let lookup = trx
+                .exec(async |stmt| {
+                    stmt.table_lookup_unique_mvcc(
+                        table_id,
+                        select_key.index_no,
+                        &select_key.vals,
+                        &[0, 1],
+                    )
                     .await
-            })
-            .await;
-        match scan {
-            Ok(scan) => {
-                let rows = scan.unwrap_rows().len() as u64;
-                summary.operations += 1;
-                summary.rows_returned += rows;
-                if rows == 0 {
-                    summary.not_found += 1;
-                } else {
-                    summary.found += 1;
+                })
+                .await;
+            match lookup {
+                Ok(SelectMvcc::Found(_)) => {
+                    batch_counters.operations =
+                        checked(batch_counters.operations, 1, "operations")?;
+                    batch_counters.found = checked(batch_counters.found, 1, "found")?;
+                    batch_counters.rows_returned =
+                        checked(batch_counters.rows_returned, 1, "rows returned")?;
+                }
+                Ok(SelectMvcc::NotFound) => {
+                    batch_counters.operations =
+                        checked(batch_counters.operations, 1, "operations")?;
+                    batch_counters.not_found = checked(batch_counters.not_found, 1, "not found")?;
+                }
+                Err(error) => {
+                    let primary = BenchError::from(error);
+                    let _ = trx.rollback().await;
+                    return Err(primary);
                 }
             }
-            Err(err) => {
-                trx.rollback().await?;
-                return Err(err.into());
-            }
         }
+        trx.commit().await?;
+        result.counters.merge(batch_counters)?;
+        record_latency(&mut result.latency, clock, started)?;
     }
-    trx.commit().await?;
-    Ok(summary)
+    Ok(result)
 }
 
-async fn index_stream_iterations(
+async fn table_scans(
     session: &mut Session,
+    batch_size: u64,
     table_id: TableID,
-    seed: u64,
-    loaded_range: KeyRange,
-    range_len: u64,
+    iterations: u64,
+    clock: Option<&MeasurementClock>,
+    cancellation: Option<&RunCancellation>,
+) -> Result<ReadOperationResult> {
+    let mut result = empty_result()?;
+    let batch_size = effective_batch_size(batch_size, iterations)? as u64;
+    let mut remaining = iterations;
+    while remaining != 0 {
+        if cancellation.is_some_and(RunCancellation::is_cancelled) {
+            break;
+        }
+        let count = remaining.min(batch_size);
+        let started = clock.map(MeasurementClock::raw);
+        let mut trx = session.begin_trx()?;
+        let mut batch = WorkloadCounters::default();
+        for _ in 0..count {
+            let scan = trx
+                .exec(async |stmt| {
+                    let mut rows = 0u64;
+                    stmt.table_scan_mvcc(table_id, &[0, 1], |_| {
+                        rows += 1;
+                        true
+                    })
+                    .await?;
+                    Ok(rows)
+                })
+                .await;
+            match scan {
+                Ok(rows) => {
+                    batch.operations = checked(batch.operations, 1, "operations")?;
+                    batch.rows_returned = checked(batch.rows_returned, rows, "rows returned")?;
+                }
+                Err(error) => {
+                    let primary = BenchError::from(error);
+                    let _ = trx.rollback().await;
+                    return Err(primary);
+                }
+            }
+        }
+        trx.commit().await?;
+        result.counters.merge(batch)?;
+        record_latency(&mut result.latency, clock, started)?;
+        remaining -= count;
+    }
+    Ok(result)
+}
+
+async fn index_scans(
+    session: &mut Session,
+    spec: ReadOperationSpec,
     plan: &SessionPlan,
-) -> Result<SessionSummary> {
-    let mut ranges = RandomScanRangeGenerator::new(seed, loaded_range, range_len, plan)?;
-    let mut summary = SessionSummary::default();
+    clock: Option<&MeasurementClock>,
+    cancellation: Option<&RunCancellation>,
+) -> Result<ReadOperationResult> {
+    let mut result = empty_result()?;
+    if plan.number == 0 {
+        return Ok(result);
+    }
+    let batch_size = effective_batch_size(spec.batch_size, plan.number)? as u64;
+    let mut ranges = RandomScanRangeGenerator::new(
+        spec.seed,
+        spec.loaded_range,
+        required_range(spec.range)?,
+        plan,
+    )?;
+    let mut remaining = plan.number;
+    while remaining != 0 {
+        if cancellation.is_some_and(RunCancellation::is_cancelled) {
+            break;
+        }
+        let count = remaining.min(batch_size);
+        let started = clock.map(MeasurementClock::raw);
+        let mut trx = session.begin_trx()?;
+        let mut batch = WorkloadCounters::default();
+        for _ in 0..count {
+            let range = ranges.next_range()?;
+            let lower = [Val::from(range.start)];
+            let upper = [Val::from(range.end()?)];
+            let scan = trx
+                .exec(async |stmt| {
+                    stmt.table_index_scan_mvcc(spec.table_id, 0, &lower[..]..&upper[..], &[0, 1])
+                        .await
+                })
+                .await;
+            match scan {
+                Ok(scan) => {
+                    let rows = u64::try_from(scan.unwrap_rows().len())
+                        .map_err(|_| BenchError::message("scan row count exceeds u64"))?;
+                    batch.operations = checked(batch.operations, 1, "operations")?;
+                    batch.rows_returned = checked(batch.rows_returned, rows, "rows returned")?;
+                    if rows == 0 {
+                        batch.not_found = checked(batch.not_found, 1, "not found")?;
+                    } else {
+                        batch.found = checked(batch.found, 1, "found")?;
+                    }
+                }
+                Err(error) => {
+                    let primary = BenchError::from(error);
+                    let _ = trx.rollback().await;
+                    return Err(primary);
+                }
+            }
+        }
+        trx.commit().await?;
+        result.counters.merge(batch)?;
+        record_latency(&mut result.latency, clock, started)?;
+        remaining -= count;
+    }
+    Ok(result)
+}
+
+async fn index_streams(
+    session: &mut Session,
+    spec: ReadOperationSpec,
+    plan: &SessionPlan,
+    clock: Option<&MeasurementClock>,
+    cancellation: Option<&RunCancellation>,
+) -> Result<ReadOperationResult> {
+    let mut result = empty_result()?;
+    let mut ranges = RandomScanRangeGenerator::new(
+        spec.seed,
+        spec.loaded_range,
+        required_range(spec.range)?,
+        plan,
+    )?;
     for _ in 0..plan.number {
+        if cancellation.is_some_and(RunCancellation::is_cancelled) {
+            break;
+        }
         let range = ranges.next_range()?;
         let lower = [Val::from(range.start)];
         let upper = [Val::from(range.end()?)];
+        let started = clock.map(MeasurementClock::raw);
         let mut trx = session.begin_trx()?;
         let scan_result = async {
             let mut stream = trx
                 .stream_stmt()
-                .table_index_scan_mvcc(table_id, 0, &lower[..]..&upper[..], &[0, 1])
+                .table_index_scan_mvcc(spec.table_id, 0, &lower[..]..&upper[..], &[0, 1])
                 .await?;
             let mut rows = 0u64;
             while stream.next().await?.is_some() {
-                rows += 1;
+                rows = rows
+                    .checked_add(1)
+                    .ok_or_else(|| BenchError::message("stream row count overflow"))?;
             }
-            Ok::<u64, StorageError>(rows)
+            Ok::<u64, BenchError>(rows)
         }
         .await;
         let rows = match scan_result {
             Ok(rows) => rows,
-            Err(err) => {
-                trx.rollback().await?;
-                return Err(err.into());
+            Err(error) => {
+                let primary = error;
+                let _ = trx.rollback().await;
+                return Err(primary);
             }
         };
         trx.commit().await?;
-        summary.operations += 1;
-        summary.rows_returned += rows;
+        result.counters.operations = checked(result.counters.operations, 1, "operations")?;
+        result.counters.rows_returned =
+            checked(result.counters.rows_returned, rows, "rows returned")?;
+        record_latency(&mut result.latency, clock, started)?;
     }
-    Ok(summary)
+    Ok(result)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::cli::{Cli, Command, IndexMode, LogSyncMode, WorkloadArgs};
-    use crate::manifest::DefaultsManifest;
-    use clap::Parser;
+fn empty_result() -> Result<ReadOperationResult> {
+    Ok(ReadOperationResult {
+        counters: WorkloadCounters::default(),
+        latency: LatencyDistribution::new()?,
+    })
+}
 
-    fn loaded_manifest(index: IndexMode, batch_size: u64) -> Manifest {
-        let mut manifest = Manifest::new_with_defaults(
-            1,
-            index,
-            DefaultsManifest::new(2, 4, 128, batch_size, LogSyncMode::Fsync).unwrap(),
-        );
-        manifest.record_insert_success(3).unwrap();
-        manifest
+fn required_range(range: Option<u64>) -> Result<u64> {
+    range.ok_or_else(|| BenchError::message("index read has no resolved range"))
+}
+
+fn record_latency(
+    latency: &mut LatencyDistribution,
+    clock: Option<&MeasurementClock>,
+    started: Option<u64>,
+) -> Result<()> {
+    if let (Some(clock), Some(started)) = (clock, started) {
+        latency.record(clock.raw_delta_nanos(started, clock.raw())?)?;
     }
+    Ok(())
+}
 
-    #[test]
-    fn lookup_requires_operation_count() {
-        let cli =
-            Cli::try_parse_from(["doradb-bench", "--root", "root", "run", "lookup-seq"]).unwrap();
-        let Command::Run {
-            workload: WorkloadArgs::LookupSeq(args),
-        } = cli.command.unwrap()
-        else {
-            panic!("expected lookup-seq workload");
-        };
-        assert!(LookupSeqConfig::resolve(&loaded_manifest(IndexMode::Unique, 1), &args).is_err());
-    }
-
-    #[test]
-    fn table_scan_defaults_to_one_and_inherits_batch_size() {
-        let cli =
-            Cli::try_parse_from(["doradb-bench", "--root", "root", "run", "table-scan"]).unwrap();
-        let Command::Run {
-            workload: WorkloadArgs::TableScan(args),
-        } = cli.command.unwrap()
-        else {
-            panic!("expected table-scan workload");
-        };
-        let config = TableScanConfig::resolve(&loaded_manifest(IndexMode::None, 6), &args).unwrap();
-        assert_eq!(config.operation_count(), 1);
-        assert_eq!(config.common.batch_size, 6);
-        assert_eq!(config.loaded_range, KeyRange { start: 0, len: 3 });
-    }
-
-    #[test]
-    fn seeded_read_config_resolves_seed_and_overrides() {
-        let cli = Cli::try_parse_from([
-            "doradb-bench",
-            "--root",
-            "root",
-            "run",
-            "lookup-rand",
-            "--num",
-            "5",
-            "--seed",
-            "7",
-            "--batch-size",
-            "2",
-            "--sessions",
-            "3",
-        ])
-        .unwrap();
-        let Command::Run {
-            workload: WorkloadArgs::LookupRand(args),
-        } = cli.command.unwrap()
-        else {
-            panic!("expected lookup-rand workload");
-        };
-        let config =
-            LookupRandConfig::resolve(&loaded_manifest(IndexMode::Unique, 1), &args).unwrap();
-        assert_eq!(config.operation_count(), 5);
-        assert_eq!(config.common.threads, 2);
-        assert_eq!(config.common.sessions, 3);
-        assert_eq!(config.common.batch_size, 2);
-        assert!(config.random());
-        assert_eq!(config.seed(), 7);
-    }
-
-    #[test]
-    fn index_stream_defaults_to_one_iteration() {
-        let cli =
-            Cli::try_parse_from(["doradb-bench", "--root", "root", "run", "index-stream"]).unwrap();
-        let Command::Run {
-            workload: WorkloadArgs::IndexStream(args),
-        } = cli.command.unwrap()
-        else {
-            panic!("expected index-stream workload");
-        };
-        let config =
-            IndexStreamConfig::resolve(&loaded_manifest(IndexMode::Unique, 1), &args).unwrap();
-        assert_eq!(config.operation_count(), 1);
-        assert_eq!(config.loaded_range, KeyRange { start: 0, len: 3 });
-        assert_eq!(config.scan_range(), Some(3));
-        assert_eq!(config.seed(), 0);
-        assert!(config.random());
-    }
-
-    #[test]
-    fn index_range_configs_resolve_explicit_range_and_index_compatibility() {
-        let cli = Cli::try_parse_from([
-            "doradb-bench",
-            "--root",
-            "root",
-            "run",
-            "index-scan",
-            "--num",
-            "1",
-            "--range",
-            "2",
-            "--seed",
-            "7",
-        ])
-        .unwrap();
-        let Command::Run {
-            workload: WorkloadArgs::IndexScan(args),
-        } = cli.command.unwrap()
-        else {
-            panic!("expected index-scan workload");
-        };
-        for index in [IndexMode::Unique, IndexMode::NonUnique] {
-            let config = IndexScanConfig::resolve(&loaded_manifest(index, 1), &args).unwrap();
-            assert_eq!(config.scan_range(), Some(2));
-            assert_eq!(config.seed(), 7);
-        }
-        assert!(IndexScanConfig::resolve(&loaded_manifest(IndexMode::None, 1), &args).is_err());
-
-        let cli = Cli::try_parse_from([
-            "doradb-bench",
-            "--root",
-            "root",
-            "run",
-            "index-stream",
-            "--num",
-            "2",
-            "--range",
-            "2",
-            "--seed",
-            "9",
-        ])
-        .unwrap();
-        let Command::Run {
-            workload: WorkloadArgs::IndexStream(args),
-        } = cli.command.unwrap()
-        else {
-            panic!("expected index-stream workload");
-        };
-        for index in [IndexMode::Unique, IndexMode::NonUnique] {
-            let config = IndexStreamConfig::resolve(&loaded_manifest(index, 1), &args).unwrap();
-            assert_eq!(config.scan_range(), Some(2));
-            assert_eq!(config.seed(), 9);
-        }
-        assert!(IndexStreamConfig::resolve(&loaded_manifest(IndexMode::None, 1), &args).is_err());
-    }
-
-    #[test]
-    fn index_range_configs_reject_range_larger_than_loaded_span() {
-        let cli = Cli::try_parse_from([
-            "doradb-bench",
-            "--root",
-            "root",
-            "run",
-            "index-scan",
-            "--num",
-            "1",
-            "--range",
-            "4",
-        ])
-        .unwrap();
-        let Command::Run {
-            workload: WorkloadArgs::IndexScan(args),
-        } = cli.command.unwrap()
-        else {
-            panic!("expected index-scan workload");
-        };
-        assert!(IndexScanConfig::resolve(&loaded_manifest(IndexMode::Unique, 1), &args).is_err());
-    }
+fn checked(current: u64, addition: u64, label: &str) -> Result<u64> {
+    current
+        .checked_add(addition)
+        .ok_or_else(|| BenchError::message(format!("read {label} counter overflow")))
 }

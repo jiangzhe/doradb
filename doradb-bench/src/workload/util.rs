@@ -1,7 +1,13 @@
 use crate::cli::validate_batch_size;
 use crate::error::{BenchError, Result};
-use crate::fixture::{IndexMode, KeyRange};
+use crate::fixture::{
+    FixtureBinding, FixturePlanEffect, FixtureRuntimeEffect, IndexMode, KeyRange, PrimaryBinding,
+};
+use crate::measurement::{ExpectedOutcomeCounters, LatencyDistribution, WorkloadCounters};
+use crate::plan_executor::SessionMeasurement;
 use crate::workload::SessionPlan;
+use doradb_storage::id::TableID;
+use std::sync::Arc;
 
 const SPLITMIX_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
 const PAYLOAD_SALT: u64 = 0x4d2b_f14a_17b8_7d83;
@@ -120,6 +126,137 @@ pub(crate) fn build_session_plans(range: KeyRange, sessions: usize) -> Result<Ve
             .ok_or_else(|| BenchError::message("session key range overflow"))?;
     }
     Ok(session_plans)
+}
+
+/// Partition a zero-based aggregate operation count across public sessions.
+pub(super) fn operation_plans(num: u64, sessions: usize) -> Result<Vec<SessionPlan>> {
+    build_session_plans(KeyRange { start: 0, len: num }, sessions)
+}
+
+/// Require a workload that consumes no runtime fixture binding.
+pub(super) fn require_no_binding(binding: FixtureBinding, identity: &str) -> Result<()> {
+    if matches!(binding, FixtureBinding::None) {
+        Ok(())
+    } else {
+        Err(BenchError::message(format!(
+            "{identity} received an unexpected fixture binding"
+        )))
+    }
+}
+
+/// Extract the typed primary-table binding required by a workload.
+pub(super) fn require_primary(binding: FixtureBinding, identity: &str) -> Result<PrimaryBinding> {
+    let FixtureBinding::Primary(primary) = binding else {
+        return Err(BenchError::message(format!(
+            "{identity} has no primary fixture binding"
+        )));
+    };
+    Ok(primary)
+}
+
+/// Extract the ordered table-pool binding required by a workload.
+pub(super) fn require_table_pool(
+    binding: FixtureBinding,
+    identity: &str,
+) -> Result<Arc<[TableID]>> {
+    let FixtureBinding::TablePool(table_ids) = binding else {
+        return Err(BenchError::message(format!(
+            "{identity} has no table-pool fixture binding"
+        )));
+    };
+    Ok(table_ids)
+}
+
+/// Checked merge of the measurement fields common to typed outcomes.
+pub(super) fn merge_measurement(
+    aggregate: &mut SessionMeasurement,
+    other: SessionMeasurement,
+) -> Result<()> {
+    aggregate.counters.merge(other.counters)?;
+    aggregate.latency.merge(&other.latency)
+}
+
+/// Verify the exact latency sample count for one workload execution.
+pub(super) fn verify_samples(
+    identity: &str,
+    latency: &LatencyDistribution,
+    expected_samples: u64,
+) -> Result<()> {
+    if latency.sample_count() == expected_samples {
+        Ok(())
+    } else {
+        Err(BenchError::message(format!(
+            "{identity} latency sample count ({}) does not match expected samples ({expected_samples})",
+            latency.sample_count()
+        )))
+    }
+}
+
+/// Verify counters for a workload with only a logical operation count.
+pub(super) fn verify_simple_counters(
+    identity: &str,
+    counters: WorkloadCounters,
+    operations: u64,
+) -> Result<()> {
+    if counters.operations != operations
+        || counters.inserted_rows != 0
+        || counters.found != 0
+        || counters.not_found != 0
+        || counters.rows_returned != 0
+        || counters.expected_outcomes != ExpectedOutcomeCounters::default()
+    {
+        Err(BenchError::message(format!(
+            "{identity} produced invalid counters"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+/// Reject write counters from a read-only workload.
+pub(super) fn verify_no_write_counters(identity: &str, counters: WorkloadCounters) -> Result<()> {
+    if counters.inserted_rows != 0
+        || counters.expected_outcomes != ExpectedOutcomeCounters::default()
+    {
+        Err(BenchError::message(format!(
+            "{identity} produced unexpected write counters"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+/// Verify the shared scan/stream counter equations.
+pub(super) fn verify_read_shape(
+    identity: &str,
+    counters: WorkloadCounters,
+    operations: u64,
+    classified: bool,
+) -> Result<()> {
+    verify_no_write_counters(identity, counters)?;
+    let classification_valid = if classified {
+        counters.found.checked_add(counters.not_found) == Some(operations)
+    } else {
+        counters.found == 0 && counters.not_found == 0
+    };
+    if counters.operations != operations || !classification_valid {
+        Err(BenchError::message(format!(
+            "{identity} produced invalid read counters"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+/// Verify and return the absence of a fixture transition.
+pub(super) fn verify_no_effect(planned_effect: &FixturePlanEffect) -> Result<FixtureRuntimeEffect> {
+    if matches!(planned_effect, FixturePlanEffect::None) {
+        Ok(FixtureRuntimeEffect::None)
+    } else {
+        Err(BenchError::message(
+            "no-effect workload received a fixture transition",
+        ))
+    }
 }
 
 /// Bound a configured transaction batch size by an operation count.
@@ -302,6 +439,73 @@ fn key_at_loaded_offset(loaded_range: KeyRange, offset: u64) -> Result<u64> {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn shared_measurement_merge_is_checked_and_additive() {
+        let mut aggregate = SessionMeasurement {
+            counters: WorkloadCounters {
+                operations: 2,
+                ..WorkloadCounters::default()
+            },
+            latency: LatencyDistribution::new().unwrap(),
+        };
+        aggregate.latency.record(10).unwrap();
+        let mut other = SessionMeasurement {
+            counters: WorkloadCounters {
+                operations: 3,
+                found: 1,
+                ..WorkloadCounters::default()
+            },
+            latency: LatencyDistribution::new().unwrap(),
+        };
+        other.latency.record(20).unwrap();
+
+        merge_measurement(&mut aggregate, other).unwrap();
+        assert_eq!(aggregate.counters.operations, 5);
+        assert_eq!(aggregate.counters.found, 1);
+        assert_eq!(aggregate.latency.sample_count(), 2);
+    }
+
+    #[test]
+    fn shared_verification_helpers_reject_wrong_shapes() {
+        let latency = LatencyDistribution::new().unwrap();
+        verify_samples("test", &latency, 0).unwrap();
+        assert!(verify_samples("test", &latency, 1).is_err());
+
+        let counters = WorkloadCounters {
+            operations: 2,
+            ..WorkloadCounters::default()
+        };
+        verify_simple_counters("test", counters, 2).unwrap();
+        assert!(verify_simple_counters("test", counters, 3).is_err());
+        assert!(verify_read_shape("test", counters, 2, false).is_ok());
+        assert!(verify_read_shape("test", counters, 2, true).is_err());
+
+        assert!(verify_no_effect(&FixturePlanEffect::None).is_ok());
+        assert!(
+            verify_no_effect(&FixturePlanEffect::CreateTables {
+                shape: crate::fixture::PrimaryTableShape {
+                    index: IndexMode::None,
+                },
+                table_count: 1,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn shared_binding_helpers_enforce_binding_shapes() {
+        require_no_binding(FixtureBinding::None, "none").unwrap();
+        assert!(require_primary(FixtureBinding::None, "primary").is_err());
+        assert!(require_table_pool(FixtureBinding::None, "pool").is_err());
+
+        let table_ids: Arc<[TableID]> = vec![TableID::new(7), TableID::new(8)].into();
+        assert_eq!(
+            &*require_table_pool(FixtureBinding::TablePool(Arc::clone(&table_ids)), "pool")
+                .unwrap(),
+            &*table_ids
+        );
+    }
 
     #[test]
     fn partition_rows_across_sessions() {
