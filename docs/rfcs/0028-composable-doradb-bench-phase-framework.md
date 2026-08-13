@@ -662,8 +662,8 @@ requires separate justification and review outside this RFC.
     performance gates.
   - Task Doc: `docs/tasks/000268-migrate-doradb-bench-dependent-and-coordinated-workloads.md`
   - Task Issue: `#973`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase Status: done
+  - Implementation Summary: Implemented RFC 0028 Phase 3 with all twelve workloads on one plan-only typed executor, capability-checked fixture composition, workload-owned execution and verification, and one canonical success artifact. [Task Resolve Sync: docs/tasks/000268-migrate-doradb-bench-dependent-and-coordinated-workloads.md @ 2026-08-13]
 
 - **Phase 4: Isolated single-table checkpoint benchmark**
   - Prerequisites: Phase 3 has migrated every existing workload and can compose
