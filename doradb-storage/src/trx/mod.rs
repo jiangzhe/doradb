@@ -745,6 +745,13 @@ impl TrxContext {
 pub(crate) struct TrxRuntime<'r> {
     ctx: &'r TrxContext,
     attachment: &'r TrxAttachment,
+    #[cfg_attr(
+        not(debug_assertions),
+        expect(
+            dead_code,
+            reason = "transaction locks participate in debug-only lower-level write assertions"
+        )
+    )]
     locks: &'r TransactionLockState,
 }
 

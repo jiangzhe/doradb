@@ -63,10 +63,18 @@ impl SessionExecutor for LockTableExecutor {
         engine: &'a Engine,
         session: &'a mut Session,
         plan: &'a SessionPlan,
-        clock: Option<&'a MeasurementClock>,
+        clock: &'a MeasurementClock,
+        sample_latency: bool,
         cancellation: &'a RunCancellation,
     ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a {
-        execute_lock_session(engine, session, &self.spec, plan, clock, cancellation)
+        execute_lock_session(
+            engine,
+            session,
+            &self.spec,
+            plan,
+            sample_latency.then_some(clock),
+            cancellation,
+        )
     }
 
     fn after_session_close(

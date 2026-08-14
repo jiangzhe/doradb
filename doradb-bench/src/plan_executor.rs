@@ -4,18 +4,19 @@ use crate::fixture::{
 };
 use crate::measurement::{
     BenchmarkAccumulator, BenchmarkAggregate, InternalMetric, LatencyDistribution,
-    MeasuredRunResult, MeasurementClock, WorkloadCounters, operations_per_second,
+    MeasuredRunResult, MeasurementClock, WorkloadCounters, WorkloadMetrics, operations_per_second,
 };
 use crate::output::{capture_internal_stats, plan_internal_metrics};
 use crate::plan::{Phase, Plan, ResolvedWorkload, load_plan};
 use crate::plan_output::{
-    InvocationReport, PreparePhaseResult, render_stdout_summary, write_plan_output,
+    InvocationReport, PreparePhaseResult, absolute_result_path, render_stdout_summary,
+    write_plan_output,
 };
 use crate::workload::{
-    CreateTableExecutor, IndexDdlExecutor, IndexScanExecutor, IndexStreamExecutor,
-    InsertRandExecutor, InsertSeqExecutor, LockTableExecutor, LookupRandExecutor,
-    LookupSeqExecutor, RunCancellation, SessionPlan, StmtNoopExecutor, TableDdlExecutor,
-    TableScanExecutor, TrxNoopExecutor,
+    CheckpointTableExecutor, CreateTableExecutor, FreezeTableExecutor, IndexDdlExecutor,
+    IndexScanExecutor, IndexStreamExecutor, InsertRandExecutor, InsertSeqExecutor,
+    LockTableExecutor, LookupRandExecutor, LookupSeqExecutor, RunCancellation, SessionPlan,
+    StmtNoopExecutor, TableDdlExecutor, TableScanExecutor, TrxNoopExecutor,
 };
 use doradb_storage::{Engine, Session};
 use easy_parallel::Parallel;
@@ -55,6 +56,11 @@ pub(crate) trait SessionOutcome: Send + Sized + 'static {
     /// Checked merge of one completely joined session outcome.
     fn merge(&mut self, other: Self) -> Result<()>;
 
+    /// Project verified workload-specific metrics before consuming the outcome.
+    fn workload_metrics(&self) -> Option<WorkloadMetrics> {
+        None
+    }
+
     /// Consume the typed outcome after workload verification.
     fn into_measurement(self) -> SessionMeasurement;
 }
@@ -84,7 +90,8 @@ pub(crate) trait SessionExecutor: Clone + Send + Sync + Sized + 'static {
         engine: &'a Engine,
         session: &'a mut Session,
         plan: &'a SessionPlan,
-        clock: Option<&'a MeasurementClock>,
+        clock: &'a MeasurementClock,
+        sample_latency: bool,
         cancellation: &'a RunCancellation,
     ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a;
 
@@ -119,6 +126,7 @@ struct RunOutcome {
     counters: WorkloadCounters,
     latency: LatencyDistribution,
     internal_metrics: Vec<InternalMetric>,
+    workload_metrics: Option<WorkloadMetrics>,
     effect: FixtureRuntimeEffect,
 }
 
@@ -146,8 +154,10 @@ pub async fn execute_plan(storage_root: PathBuf, plan_source: PathBuf) -> Result
         measured_runs: results.measured_runs,
         aggregate: results.aggregate,
     };
-    let detailed_result = write_plan_output(&report)?;
-    println!("{}", render_stdout_summary(&report, &detailed_result)?);
+    let detailed_result = absolute_result_path(&report.root)?;
+    let stdout_summary = render_stdout_summary(&report, &detailed_result)?;
+    write_plan_output(&report)?;
+    println!("{stdout_summary}");
     Ok(())
 }
 
@@ -178,6 +188,7 @@ async fn execute_phases(
                     workload: workload.identity().to_owned(),
                     elapsed_nanos: outcome.elapsed_nanos,
                     counters: outcome.counters,
+                    workload_metrics: outcome.workload_metrics,
                     internal_metrics: outcome.internal_metrics,
                 });
             }
@@ -210,6 +221,7 @@ async fn execute_phases(
                             outcome.elapsed_nanos,
                         ),
                         latency,
+                        workload_metrics: outcome.workload_metrics,
                         internal_metrics: outcome.internal_metrics,
                     });
                     if !matches!(outcome.effect, FixtureRuntimeEffect::None) {
@@ -388,6 +400,28 @@ async fn dispatch_workload(
             )
             .await
         }
+        ResolvedWorkload::FreezeTable(config) => {
+            run_executor::<FreezeTableExecutor>(
+                engine,
+                clock,
+                workload,
+                SessionExecutorConfig::new(*config, binding),
+                planned_effect,
+                sample_latency,
+            )
+            .await
+        }
+        ResolvedWorkload::CheckpointTable(config) => {
+            run_executor::<CheckpointTableExecutor>(
+                engine,
+                clock,
+                workload,
+                SessionExecutorConfig::new(*config, binding),
+                planned_effect,
+                sample_latency,
+            )
+            .await
+        }
     }
 }
 
@@ -426,8 +460,7 @@ where
     };
 
     let started = clock.now();
-    let run_result =
-        run_session_workers(engine, clock, &executor, sample_latency.then_some(clock)).await;
+    let run_result = run_session_workers(engine, clock, &executor, sample_latency).await;
     let stopped = clock.now();
     let elapsed_result = clock.wall_delta_nanos(started, stopped);
     let outcome = match run_result {
@@ -454,12 +487,14 @@ where
     };
 
     let effect = executor.verify_outcome(planned_effect, &outcome, expected_samples)?;
+    let workload_metrics = outcome.workload_metrics();
     let measurement = outcome.into_measurement();
     Ok(RunOutcome {
         elapsed_nanos,
         counters: measurement.counters,
         latency: measurement.latency,
         internal_metrics,
+        workload_metrics,
         effect,
     })
 }
@@ -477,7 +512,7 @@ async fn run_session_workers<E>(
     engine: &Engine,
     clock: &MeasurementClock,
     executor: &E,
-    sample_clock: Option<&MeasurementClock>,
+    sample_latency: bool,
 ) -> Result<E::Outcome>
 where
     E: SessionExecutor,
@@ -504,7 +539,8 @@ where
                         engine,
                         &mut session,
                         &plan,
-                        sample_clock.map(|_| &clock),
+                        &clock,
+                        sample_latency,
                         &cancellation,
                     )
                     .await;
@@ -519,7 +555,7 @@ where
                     Ok(()) => {
                         if let Some(outcome) = outcome.as_mut()
                             && let Err(error) = workload_executor
-                                .after_session_close(outcome, sample_clock.map(|_| &clock))
+                                .after_session_close(outcome, sample_latency.then_some(&clock))
                         {
                             cancellation.fail(error);
                         }
@@ -642,6 +678,8 @@ mod tests {
                 IndexStreamExecutor::IDENTITY,
                 IndexDdlExecutor::IDENTITY,
                 LockTableExecutor::IDENTITY,
+                FreezeTableExecutor::IDENTITY,
+                CheckpointTableExecutor::IDENTITY,
             ],
             [
                 "create-table",
@@ -657,6 +695,8 @@ mod tests {
                 "index-stream",
                 "index-ddl",
                 "lock-table",
+                "freeze-table",
+                "checkpoint-table",
             ]
         );
     }

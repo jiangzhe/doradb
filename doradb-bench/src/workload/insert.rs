@@ -48,10 +48,17 @@ impl SessionExecutor for InsertSeqExecutor {
         _engine: &'a Engine,
         session: &'a mut Session,
         plan: &'a SessionPlan,
-        clock: Option<&'a MeasurementClock>,
+        clock: &'a MeasurementClock,
+        sample_latency: bool,
         cancellation: &'a RunCancellation,
     ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a {
-        execute_insert_session(&self.state, session, plan, clock, cancellation)
+        execute_insert_session(
+            &self.state,
+            session,
+            plan,
+            sample_latency.then_some(clock),
+            cancellation,
+        )
     }
 
     fn verify_outcome(
@@ -104,10 +111,17 @@ impl SessionExecutor for InsertRandExecutor {
         _engine: &'a Engine,
         session: &'a mut Session,
         plan: &'a SessionPlan,
-        clock: Option<&'a MeasurementClock>,
+        clock: &'a MeasurementClock,
+        sample_latency: bool,
         cancellation: &'a RunCancellation,
     ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a {
-        execute_insert_session(&self.state, session, plan, clock, cancellation)
+        execute_insert_session(
+            &self.state,
+            session,
+            plan,
+            sample_latency.then_some(clock),
+            cancellation,
+        )
     }
 
     fn verify_outcome(

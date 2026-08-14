@@ -99,6 +99,14 @@ The candidate range may contain gaps after expected insert outcomes; lookup
 loaded index-free primary. Lock workloads bind the ordered pool and validate
 their minimum width.
 
+`freeze-table` requires exactly one index-free primary, a nonempty candidate
+range, at least one successfully inserted row, a latest write-bearing commit
+fence, and no installed frozen fixture. Its required `max_rows` must be below
+both the planned candidate count and the runtime successful-row count. A
+successful freeze installs a typed canonical-batch summary. `checkpoint-table`
+requires and consumes that summary, so duplicate freeze and
+checkpoint-before-freeze plans fail in the ordered fixture fold.
+
 ## Workloads
 
 All serde-facing counts, ranges, widths, and table counts are positive.
@@ -116,6 +124,8 @@ All serde-facing counts, ranges, widths, and table counts are positive.
 | `index-stream` | optional `num`, `range`, `seed` | committed secondary index | safe |
 | `index-ddl` | optional `num` | index-free primary, load optional | single run |
 | `lock-table` | required `num`; lock controls below | ordered table pool | safe |
+| `freeze-table` | required `max_rows` | one loaded, unfrozen, index-free primary | single run |
+| `checkpoint-table` | none | one frozen index-free primary | single run |
 
 Sequential lookups wrap over the candidate range. Random lookups use seeded
 selection with replacement. Materialized index scans and streams choose seeded
@@ -127,6 +137,28 @@ effort and preserves the original error.
 Index DDL creates the fixed non-unique logical-key index, uses the exact
 returned index number for drop, and counts two operations per completed cycle.
 A create or drop failure is invocation-fatal.
+
+### Maintenance controls and terminal policy
+
+Maintenance workloads accept only their listed controls plus optional
+`include_stats`; they do not accept worker, session, count, batching, or value
+controls. Both always use one executor thread and one idle public session after
+all preceding phase sessions have closed. Because they consume fixture state,
+both reject any warm-up and more than one measured run.
+
+`freeze-table` calls the public `Session::freeze_table` once. It accepts only a
+new `Frozen` outcome for the bound table and verifies that the canonical batch
+has nonzero pages and approximate rows while leaving a nonempty hot suffix.
+`AlreadyFrozen`, cancellation, a mismatched table, an empty batch, or a batch
+covering all successfully inserted rows is invocation-fatal.
+
+`checkpoint-table` starts its total sample immediately before the first public
+`Session::checkpoint_table` attempt. Every `Delayed` outcome is handed without
+reinterpretation to `Session::wait_for_checkpoint_retry`, followed by a fresh
+public checkpoint attempt. The workload does not poll, sleep, impose a retry
+limit, or wait on the latest insert commit fence. It succeeds only on
+`Published { silent: false, .. }`; silent publication, cancellation, and public
+API errors are invocation-fatal.
 
 ### Lock controls
 
@@ -166,6 +198,8 @@ leaked.
 | retained session lock | `table-lock-session-retained-lifecycle` | nonempty sessions |
 | retained transaction lock | `table-lock-transaction-retained-lifecycle` | nonempty sessions |
 | paired/specialized lock | `table-lock-operation-lifecycle` | `num` |
+| `freeze-table` | `table-freeze` | 1 |
+| `checkpoint-table` | `table-checkpoint` | 1 |
 
 Read batch samples start immediately before transaction begin and end after
 successful commit. Stream samples include begin, full exhaustion, drop, and
@@ -182,11 +216,22 @@ Counter equations are verified before phase state advances:
 - Index scan: `operations = found + not_found`; returned rows are actual.
 - DDL: `operations = 2 * num`.
 - Locks: `operations = num`; unrelated counters are zero.
+- Freeze and checkpoint: `operations = 1`; unrelated counters are zero.
 
 Each session owns an HDR histogram. Results merge exact distributions rather
 than averaging percentiles. Aggregate throughput is total operations divided
 by total wall duration. Optional internal metrics are typed as counter deltas,
 end gauges, or lifetime peaks with explicit count/byte/nanosecond/frame units.
+
+Freeze results also retain canonical `approximate_rows`, `page_count`, and
+`stable_page_count` fields. Checkpoint results retain checked `attempt_count`,
+`attempt_elapsed_nanos`, `retry_wait_count`, and
+`retry_wait_elapsed_nanos` fields, with
+`attempt_count = retry_wait_count + 1`. Attempt and wait durations cover the
+public calls inside the one total checkpoint sample; matching and loop
+orchestration may account for the remaining total interval. Prepare metrics
+are retained on their phase result, measured metrics on their run result, and
+warm-up metrics are discarded.
 
 ## Results and failure behavior
 
@@ -194,6 +239,8 @@ After atomically installing the result, a successful invocation prints the
 final benchmark workload, measured-run count, aggregate operations and elapsed
 nanoseconds, throughput, latency unit, mean, p95, p99, and the absolute detailed
 result path to stdout.
+For a final `checkpoint-table`, the summary additionally prints the four
+checkpoint attempt/wait fields from its single measured run.
 
 Success installs only:
 
@@ -213,13 +260,14 @@ The root remains available for diagnosis and user-managed deletion.
 ## Templates
 
 `doradb-bench/templates/` contains one complete directly executable plan for
-each of the twelve workloads:
+each of the thirteen workloads:
 
 ```text
 trx-noop.toml        stmt-noop.toml       insert-seq.toml
 insert-rand.toml     table-ddl.toml       lookup-seq.toml
 lookup-rand.toml     table-scan.toml      index-scan.toml
 index-stream.toml    index-ddl.toml       lock-table.toml
+checkpoint-table.toml
 ```
 
 Every plan includes the colocated `engine-defaults.toml`, contains all required

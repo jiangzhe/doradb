@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod tests {
+    use doradb_bench::measurement::{LatencyUnit, WorkloadMetrics};
     use doradb_bench::plan_output::InvocationReport;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -250,5 +251,81 @@ mod tests {
         assert!(!String::from_utf8_lossy(&output.stdout).contains("DoraDB benchmark summary"));
         assert!(assert_failure(output).contains("requires loaded benchmark data"));
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn single_table_checkpoint_plan_publishes_canonical_metrics() {
+        let temp = TempDir::new().unwrap();
+        let phases = "\n[[phase]]\nworkload = { type = \"create-table\", index = \"none\" }\n\
+                      [[phase]]\nworkload = { type = \"insert-seq\", num = 8, value_size = \"32 KiB\", batch_size = 8 }\n\
+                      [[phase]]\nworkload = { type = \"freeze-table\", max_rows = 4 }\n\
+                      [[phase]]\nkind = \"benchmark\"\nwarmup_runs = 0\nmeasured_runs = 1\n\
+                      workload = { type = \"checkpoint-table\" }\n";
+        let source = temp.path().join("checkpoint.toml");
+        fs::write(
+            &source,
+            format!("name = \"checkpoint\"\n[engine.transaction]\nlog_sync = \"none\"\n{phases}"),
+        )
+        .unwrap();
+        let root = temp.path().join("checkpoint-root");
+        let stdout = assert_success(run_bench(&root, &["--plan", source.to_str().unwrap()]));
+        let report: InvocationReport =
+            toml::from_str(&fs::read_to_string(root.join("benchmark-result.toml")).unwrap())
+                .unwrap();
+        assert_eq!(report.prepare_phases.len(), 3);
+        let Some(WorkloadMetrics::FreezeTable {
+            approximate_rows,
+            page_count,
+            stable_page_count,
+        }) = report.prepare_phases[2].workload_metrics
+        else {
+            panic!("freeze prepare phase must retain its canonical metrics")
+        };
+        assert!(approximate_rows > 0 && approximate_rows < 8);
+        assert!(page_count > 0);
+        assert!(stable_page_count <= page_count);
+        assert_eq!(report.measured_runs.len(), 1);
+        let Some(WorkloadMetrics::CheckpointTable {
+            attempt_count,
+            attempt_elapsed_nanos,
+            retry_wait_count,
+            retry_wait_elapsed_nanos,
+        }) = report.measured_runs[0].workload_metrics
+        else {
+            panic!("checkpoint measured run must retain retry metrics")
+        };
+        assert_eq!(attempt_count, retry_wait_count + 1);
+        assert!(attempt_elapsed_nanos > 0);
+        if retry_wait_count == 0 {
+            assert_eq!(retry_wait_elapsed_nanos, 0);
+        }
+        assert_eq!(report.aggregate.counters.operations, 1);
+        assert_eq!(report.aggregate.latency.sample_count, 1);
+        assert_eq!(report.aggregate.latency.unit, LatencyUnit::TableCheckpoint);
+        assert!(stdout.contains(&format!("checkpoint_attempt_count: {attempt_count}\n")));
+        assert!(stdout.contains(&format!(
+            "checkpoint_retry_wait_count: {retry_wait_count}\n"
+        )));
+    }
+
+    #[test]
+    fn whole_page_freeze_failure_retains_root_without_success_artifact() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("invalid-freeze.toml");
+        fs::write(
+            &source,
+            "[engine.transaction]\nlog_sync = \"none\"\n\
+             [[phase]]\nworkload = { type = \"create-table\", index = \"none\" }\n\
+             [[phase]]\nworkload = { type = \"insert-seq\", num = 8, value_size = \"128 B\", batch_size = 8 }\n\
+             [[phase]]\nkind = \"benchmark\"\nwarmup_runs = 0\nmeasured_runs = 1\n\
+             workload = { type = \"freeze-table\", max_rows = 4 }\n",
+        )
+        .unwrap();
+        let root = temp.path().join("invalid-freeze-root");
+        let output = run_bench(&root, &["--plan", source.to_str().unwrap()]);
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("DoraDB benchmark summary"));
+        assert!(assert_failure(output).contains("did not install a nonempty proper prefix"));
+        assert!(root.exists());
+        assert!(!root.join("benchmark-result.toml").exists());
     }
 }

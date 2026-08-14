@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 mod ddl;
 mod insert;
 mod lock;
+mod maintenance;
 mod noop;
 mod read;
 mod util;
@@ -12,6 +13,7 @@ mod util;
 pub(crate) use ddl::{CreateTableExecutor, IndexDdlExecutor, TableDdlExecutor};
 pub(crate) use insert::{InsertRandExecutor, InsertSeqExecutor};
 pub(crate) use lock::LockTableExecutor;
+pub(crate) use maintenance::{CheckpointTableExecutor, FreezeTableExecutor};
 pub(crate) use noop::{StmtNoopExecutor, TrxNoopExecutor};
 pub(crate) use read::{
     IndexScanExecutor, IndexStreamExecutor, LookupRandExecutor, LookupSeqExecutor,
