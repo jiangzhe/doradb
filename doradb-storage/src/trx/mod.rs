@@ -4452,6 +4452,17 @@ pub(crate) mod tests {
         }
     }
 
+    /// Roll back a prepared production transaction whose undo is physically linked.
+    #[inline]
+    pub(crate) async fn rollback_production_prepared_for_test(prepared: PreparedTrx) {
+        let mut precommit = prepared.fill_cts(TrxID::new(1));
+        assert_eq!(
+            precommit.rollback_failed_precommit().await,
+            FailedPrecommitRollbackOutcome::RolledBack,
+            "test prepared transaction rollback must complete"
+        );
+    }
+
     #[inline]
     fn finish_production_committed_for_test(engine: &Engine, committed: CommittedTrx) {
         if let Some(gc_no) = committed.gc_no(engine.inner().trx_sys.gc_buckets.len()) {

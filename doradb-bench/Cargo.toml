@@ -18,6 +18,7 @@ byte-unit = { workspace = true }
 clap = { workspace = true }
 doradb-storage = { path = "../doradb-storage" }
 easy-parallel = { workspace = true }
+event-listener = { workspace = true }
 hdrhistogram = { workspace = true }
 quanta = { workspace = true }
 parking_lot = { workspace = true }

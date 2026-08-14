@@ -1563,14 +1563,14 @@ mod tests {
                 let ResolvedWorkload::InsertSeq(insert) = loaded.plan.phases[1].workload() else {
                     panic!("checkpoint template must load sequential rows")
                 };
-                assert_eq!(insert.num, 1_000_000);
+                assert_eq!(insert.num, 100_000);
                 assert_eq!((insert.threads, insert.sessions), (4, 16));
                 assert_eq!(insert.value_size_bytes, 128);
-                assert_eq!(insert.batch_size, 1_000);
+                assert_eq!(insert.batch_size, 100);
                 let ResolvedWorkload::FreezeTable(freeze) = loaded.plan.phases[2].workload() else {
                     panic!("checkpoint template must freeze the primary")
                 };
-                assert_eq!(freeze.max_rows, 500_000);
+                assert_eq!(freeze.max_rows, 50_000);
                 let Phase::Benchmark { measurement, .. } = &loaded.plan.phases[3] else {
                     panic!("checkpoint template must end in a benchmark")
                 };
