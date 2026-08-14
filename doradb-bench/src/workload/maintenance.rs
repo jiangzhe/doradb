@@ -168,6 +168,7 @@ impl SessionExecutor for CheckpointTableExecutor {
     }
 }
 
+/// Aggregated result from the single freeze-table session.
 pub(crate) struct FreezeSessionOutcome {
     measurement: SessionMeasurement,
     summary: Option<FrozenFixtureSummary>,
@@ -206,6 +207,7 @@ impl SessionOutcome for FreezeSessionOutcome {
     }
 }
 
+/// Aggregated result from the single checkpoint-table session.
 pub(crate) struct CheckpointSessionOutcome {
     measurement: SessionMeasurement,
     metrics: Option<CheckpointBreakdown>,
@@ -257,6 +259,23 @@ impl CheckpointBreakdown {
             retry_wait_elapsed_nanos: self.retry_wait_elapsed_nanos,
         }
     }
+}
+
+struct CheckpointOperationResult {
+    measurement: SessionMeasurement,
+    metrics: CheckpointBreakdown,
+}
+
+trait CheckpointSession {
+    fn attempt_checkpoint(
+        &mut self,
+        table_id: TableID,
+    ) -> impl Future<Output = Result<CheckpointOutcome>> + Send;
+
+    fn wait_for_retry(
+        &mut self,
+        reason: CheckpointDelayReason,
+    ) -> impl Future<Output = Result<()>> + Send;
 }
 
 fn empty_measurement() -> Result<SessionMeasurement> {
@@ -348,18 +367,6 @@ fn verify_frozen_outcome(
     })
 }
 
-trait CheckpointSession {
-    fn attempt_checkpoint(
-        &mut self,
-        table_id: TableID,
-    ) -> impl Future<Output = Result<CheckpointOutcome>> + Send;
-
-    fn wait_for_retry(
-        &mut self,
-        reason: CheckpointDelayReason,
-    ) -> impl Future<Output = Result<()>> + Send;
-}
-
 impl CheckpointSession for Session {
     async fn attempt_checkpoint(&mut self, table_id: TableID) -> Result<CheckpointOutcome> {
         self.checkpoint_table(table_id)
@@ -387,11 +394,6 @@ async fn execute_checkpoint_session(
         measurement: result.measurement,
         metrics: Some(result.metrics),
     })
-}
-
-struct CheckpointOperationResult {
-    measurement: SessionMeasurement,
-    metrics: CheckpointBreakdown,
 }
 
 async fn run_checkpoint_operations<S: CheckpointSession>(
@@ -514,6 +516,7 @@ fn accumulate_elapsed(total: u128, elapsed: u64, label: &str) -> Result<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::measurement::LatencyUnit;
     use doradb_storage::CheckpointCancelReason;
     use doradb_storage::id::TrxID;
     use event_listener::Event;
@@ -526,7 +529,7 @@ mod tests {
     struct MockCheckpointSession {
         outcomes: VecDeque<Result<CheckpointOutcome>>,
         waits: Vec<CheckpointDelayReason>,
-        clock: std::sync::Arc<Mock>,
+        clock: Arc<Mock>,
         attempt_nanos: u64,
         wait_nanos: u64,
     }
@@ -635,7 +638,7 @@ mod tests {
         let latency = result
             .measurement
             .latency
-            .summary(crate::measurement::LatencyUnit::TableCheckpoint)
+            .summary(LatencyUnit::TableCheckpoint)
             .unwrap();
         assert_eq!(latency.sample_count, 1);
         assert_eq!(latency.sum_nanos, 70);

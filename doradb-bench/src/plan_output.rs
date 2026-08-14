@@ -127,10 +127,7 @@ pub(crate) fn render_stdout_summary(
     Ok(summary)
 }
 
-fn result_toml_path(storage_root: &Path) -> PathBuf {
-    storage_root.join(RESULT_TOML_FILE_NAME)
-}
-
+/// Resolve the canonical result artifact to an absolute path.
 pub(crate) fn absolute_result_path(storage_root: &Path) -> Result<PathBuf> {
     fs::canonicalize(storage_root)
         .map(|root| root.join(RESULT_TOML_FILE_NAME))
@@ -140,6 +137,10 @@ pub(crate) fn absolute_result_path(storage_root: &Path) -> Result<PathBuf> {
                 storage_root.display()
             ))
         })
+}
+
+fn result_toml_path(storage_root: &Path) -> PathBuf {
+    storage_root.join(RESULT_TOML_FILE_NAME)
 }
 
 fn staged_path(path: &Path) -> PathBuf {

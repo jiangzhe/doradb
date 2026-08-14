@@ -1,7 +1,7 @@
 ---
 id: 000269
 title: Add Single-Table Checkpoint Benchmark
-status: proposal
+status: implemented
 created: 2026-08-14
 github_issue: 975
 ---
@@ -10,40 +10,32 @@ github_issue: 975
 
 ## Summary
 
-Implement RFC 0028 Phase 4 by adding strict `freeze-table` and
+Implemented RFC 0028 Phase 4 by adding strict `freeze-table` and
 `checkpoint-table` workloads to the composable `doradb-bench` plan executor.
-The new benchmark creates one index-free table, loads committed rows, freezes a
-nonempty proper row-page prefix, and measures one non-silent table checkpoint
-through the existing public storage APIs.
+The shipped benchmark creates one index-free table, loads committed rows,
+freezes a verified nonempty proper row-page prefix, and measures one non-silent
+table checkpoint through public storage APIs.
 
-Freeze and checkpoint become typed fixture transitions rather than special
-top-level commands. Checkpoint measurement covers the first public attempt
-through successful publication and separately reports checkpoint-attempt and
-semantic retry-wait counts and durations. The task also adds one complete
-checkpoint template, unit and end-to-end coverage, and benchmark-tool
-documentation without changing storage checkpoint behavior.
+Freeze and checkpoint are typed fixture transitions. Checkpoint measurement
+spans the first public attempt through successful publication and reports
+checked attempt and semantic retry-wait counts and durations. A complete
+template, success-only result metrics, documentation, unit coverage, and
+end-to-end lifecycle coverage ship with the workloads.
 
 ## Context
 
-RFC 0028 Phases 1 through 3 have established the strict TOML plan model,
-resolved engine configuration, one sequential plan executor, exact latency
-measurement, all twelve existing workloads, capability-checked plan/runtime
-fixture state, and one complete template per workload. Phase 3 specifically
-provides the Phase 4 prerequisites: one implicit primary table can be created,
-loaded by a sequential insert phase, bound to its runtime `TableID`, and handed
-to a final benchmark workload after every preceding session has closed.
+RFC 0028 Phases 1 through 3 established the strict TOML plan model, resolved
+engine configuration, sequential phase executor, latency measurement, twelve
+existing workloads, capability-checked fixture state, and complete workload
+templates. Phase 4 used that composition boundary to add the first new
+maintenance workloads without introducing a separate command or execution
+path.
 
-Storage already exposes the complete public maintenance boundary needed by the
-benchmark. `Session::freeze_table` returns the canonical frozen-batch summary;
-`Session::checkpoint_table` distinguishes published, delayed, and cancelled
-outcomes; and `Session::wait_for_checkpoint_retry` waits on the exact public
-delay reason. The benchmark must drive these APIs explicitly rather than call
-`checkpoint_table_with_wait`, because the combined helper intentionally hides
-the attempt and wait boundaries that Phase 4 must report.
-
-This remains one narrow benchmark-layer task. It does not cross the RFC
-complexity gate because it consumes existing storage interfaces and does not
-change transaction, checkpoint, recovery, persisted-format, or I/O semantics.
+Storage already exposed the required public boundary:
+`Session::freeze_table`, `Session::checkpoint_table`, and
+`Session::wait_for_checkpoint_retry`. The benchmark drives these operations
+separately because the combined storage helper hides the attempt and wait
+boundaries required by checkpoint metrics.
 
 Parent RFC:
 
@@ -51,7 +43,12 @@ Parent RFC:
 
 Source Backlogs:
 
-- `docs/backlogs/000147-doradb-bench-checkpoint-lifecycle-scenarios.md`
+- `docs/backlogs/closed/000147-doradb-bench-checkpoint-lifecycle-scenarios.md`
+
+Related Backlogs:
+
+- `docs/backlogs/000074-expand-runtime-lookup-benchmark-coverage.md`
+- `docs/backlogs/000184-dynamic-table-file-expansion.md`
 
 Issue Labels:
 
@@ -62,311 +59,193 @@ Issue Labels:
 ## Goals
 
 - Add strict serde-facing and resolved `freeze-table` and `checkpoint-table`
-  workload variants to the closed plan model.
-- Require exactly one index-free, successfully loaded primary table and prove a
-  nonempty proper frozen prefix at both the plan and runtime boundaries.
-- Represent frozen-batch installation and checkpoint consumption as typed plan
-  and runtime fixture effects.
-- Execute freeze and checkpoint with one idle public session after every prior
-  phase participant has drained, with no concurrent foreground transaction.
-- Measure one checkpoint from immediately before its first public attempt until
-  a non-silent `Published` outcome, including all semantic retry waits.
-- Report checked attempt and retry-wait counts and elapsed nanoseconds beside
-  the existing total checkpoint latency sample.
-- Preserve the shared workload phase model: either maintenance workload may be
-  a prepare or final benchmark phase, but both are state-consuming single-run
-  workloads.
-- Add a directly runnable `checkpoint-table.toml`, parser and state-machine
-  tests, a public-API end-to-end smoke test, and current benchmark documentation.
+  workload variants.
+- Require one index-free, successfully loaded primary and verify a nonempty
+  proper frozen prefix at plan and runtime boundaries.
+- Represent frozen installation and checkpoint consumption as typed fixture
+  effects applied only after verified execution and session close.
+- Execute maintenance through one idle public session after preceding phase
+  participants drain.
+- Measure checkpoint through all semantic retry waits and one non-silent
+  publication.
+- Report checked attempt/wait counts and durations beside the total checkpoint
+  latency sample.
+- Preserve the shared phase, replay, artifact, and diagnostics contracts.
+- Ship a runnable template, benchmark documentation, deterministic unit tests,
+  and public-API smoke coverage.
 
 ## Non-Goals
 
-- No delete, update, overwrite, mixed read/write, or deletion-checkpoint
-  fixture.
-- No foreground/checkpoint interference benchmark, parallel phase, actor
-  graph, barrier language, or offered-rate scheduling.
-- No multiple-table or secondary-index checkpoint benchmark.
-- No automatic checkpoint policy, catalog checkpoint, redo-truncation policy,
-  purge-completion workload, or background checkpoint scheduler.
-- No restart, reopen, cold-cache, persisted lookup, or persisted scan scenario.
-- No warm-up, repeated checkpoint sample, independent-root repetition, fixture
-  reset, or fixture cloning.
-- No change to `doradb-storage` checkpoint algorithms, public APIs,
-  transaction semantics, recovery, persistent formats, I/O backends, or unsafe
-  code.
-- No compatibility layer or schema version for the intentionally unversioned
-  benchmark plan and result formats.
-- No benchmark performance threshold in routine tests or CI.
+- Delete, update, overwrite, mixed read/write, or deletion-checkpoint fixtures.
+- Foreground/checkpoint interference, parallel phases, actor graphs, barriers,
+  or offered-rate scheduling.
+- Multiple-table, secondary-index, catalog, or automatic-policy checkpoints.
+- Restart, reopen, cold-cache, persisted lookup, or persisted scan scenarios.
+- Warm-up, repeated checkpoint samples, fixture reset, or fixture cloning.
+- Storage checkpoint algorithm, transaction, recovery, persisted-format, I/O
+  backend, or unsafe-code changes.
+- A plan/result compatibility layer or benchmark performance threshold.
+- Dynamic table-file growth; it remains storage design work in backlog 000184.
 
 ## Plan
 
-### RFC phase contract
+### Workload and fixture model
 
-Rely on the completed Phase 3 contracts for table creation, sequential insert
-load, committed runtime facts, the primary `TableID`, the latest write-bearing
-commit fence, exhaustive workload dispatch, structural phase fences, and
-success-only artifacts. Phase 4 has no separate phase-local choice or following
-RFC phase. This task resolves its remaining local decisions: raw controls,
-fixture requirements/effects, maintenance replay policy, latency units,
-attempt/wait accounting, terminal checkpoint outcomes, template values, and
-test fixtures.
+The closed workload model includes strict `freeze-table` and
+`checkpoint-table` variants. Freeze requires positive `max_rows`; both accept
+only the common optional diagnostics override. Their resolved configurations
+use fixed `(1, 1)` worker/session topology, `SingleRun` replay, one expected
+operation, and `table-freeze` or `table-checkpoint` latency units.
 
-Do not edit the RFC phase plan during task creation. During `$task-resolve`,
-replace Phase 4's pending task/issue/status/summary fields with the implemented
-outcome. Keep backlog 000147 open because restart, cold reads, foreground
-interference, and the other lifecycle slices remain deferred.
+Fixture planning adds explicit freeze-candidate and frozen-primary
+requirements. A freeze candidate is exactly one index-free table with a
+nonempty committed load, a latest write-bearing commit fence, no installed
+frozen state, and a row budget below the planned candidate count. Checkpoint
+requires the frozen state produced by a prior successful freeze.
 
-### Strict plan and resolved workload model
+Plan effects install `Freeze { max_rows }` and consume it with `Checkpoint`.
+Runtime effects carry a `FrozenFixtureSummary` containing the requested budget,
+approximate rows, page count, and stable-page count. Effects apply only after
+the session closes and executor verification succeeds.
 
-Extend `WorkloadSpec` with strict newtype variants backed by these raw shapes:
+Freeze accepts only a matching `FreezeOutcome::Frozen` batch whose page and row
+counts prove a nonempty proper prefix. Whole-page freezing can exceed the
+requested row boundary, so runtime verification additionally requires
+`approximate_rows < inserted_rows`. Existing or cancelled batches fail the
+invocation.
 
-```rust
-struct FreezeTableSpec {
-    max_rows: NonZeroUsize,
-    include_stats: Option<bool>,
-}
+### Maintenance execution and cancellation
 
-struct CheckpointTableSpec {
-    include_stats: Option<bool>,
-}
-```
+Both workloads use one `SessionPlan` and one public `Session`. Freeze measures
+one `Session::freeze_table` call and records one logical operation only after
+the returned batch is verified.
 
-Both structs use `deny_unknown_fields`. `max_rows` is required because the plan
-must state the intended frozen-prefix budget. Maintenance workloads do not
-accept `threads`, `sessions`, `num`, batching, or unrelated workload controls.
-Their resolved configurations materialize `include_stats`; freeze additionally
-stores `max_rows` as the `usize` required by the public API. Both report fixed
-worker/session counts `(1, 1)` regardless of global workload defaults.
+Checkpoint repeatedly calls `Session::checkpoint_table`. Every delayed reason
+is passed unchanged to `Session::wait_for_checkpoint_retry` before a fresh
+attempt. Attempt and retry-wait counts and nanoseconds use checked arithmetic;
+a successful result preserves the invariant:
 
-Add matching `ResolvedWorkload` variants and exhaustive handling for identity,
-fixture requirement, diagnostics, replay policy, worker counts, latency unit,
-and expected samples. `freeze-table` uses `table-freeze`, `checkpoint-table`
-uses `table-checkpoint`, and both expect one operation and one latency sample
-when measured. Both use `ReplayPolicy::SingleRun`, so any warm-up or more than
-one measured run fails plan validation before root creation.
+`attempt_count = retry_wait_count + 1`
 
-### Frozen fixture capability and transitions
+Only `Published { silent: false, .. }` succeeds. Silent publication, storage
+cancellation, public API errors, timing failures, and metric overflow fail the
+invocation without a success artifact.
 
-Extend `FixtureRequirement` with explicit freeze-candidate and frozen-primary
-capabilities rather than weakening the existing generic primary requirement.
-The freeze candidate requires:
+The shared first-error-wins `RunCancellation` includes a lossless async
+notification. Checkpoint checks the atomic predicate between attempts and
+races semantic retry waiting against that notification, so a peer failure can
+drain a delayed checkpoint task promptly. There is no benchmark-owned polling,
+attempt limit, or wall-clock retry deadline.
 
-- exactly one table in the implicit table pool;
-- `IndexMode::None`;
-- a nonempty planned insert range and successful runtime inserted rows plus a
-  latest write-bearing commit fence;
-- no currently installed frozen-batch state; and
-- `0 < max_rows < planned candidate-row count` during resolution.
+### Measurement, output, and artifacts
 
-The frozen-primary requirement repeats the exact table-count and index-shape
-checks and requires frozen state produced by a preceding successful freeze.
-Existing ordinary primary requirements remain unchanged.
+The session-executor measurement boundary uses a mandatory shared
+`MeasurementClock` plus an explicit sample flag. Existing workloads retain
+their prior optional timing behavior; maintenance always uses the clock for
+breakdown metrics and records a histogram sample only for a measured phase.
 
-Add `Freeze { max_rows }` and `Checkpoint` variants to `FixturePlanEffect`.
-Plan state stores the active frozen budget after freeze and clears it after
-checkpoint. Duplicate freeze and checkpoint-before-freeze therefore fail in
-the ordered fixture fold.
+Strict `WorkloadMetrics` variants retain verified freeze summary fields and
+checkpoint attempt/wait fields. Metrics flow through prepare results and
+measured runs; warm-up outcomes remain discarded and generic aggregation is
+unchanged. The single measured checkpoint run is authoritative for its
+breakdown, while aggregate latency remains authoritative for the total sample.
 
-Runtime primary state stores a copyable `FrozenFixtureSummary` containing the
-requested budget, approximate frozen rows, page count, and stable-page count.
-Expose this summary through the typed primary binding used by maintenance
-executors. Add corresponding runtime effects that install the verified summary
-after freeze and consume it after checkpoint; effects still apply only after
-the workload session has closed and outcome verification succeeds.
+Successful checkpoint summaries include attempt/wait counts and durations.
+Failures preserve the invocation root for diagnosis but emit neither
+`benchmark-result.toml` nor a success summary.
 
-Before invoking storage, freeze verifies `max_rows < inserted_rows` from the
-runtime binding. After `Session::freeze_table`, accept only
-`FreezeOutcome::Frozen` for the bound `TableID` and require a nonempty page/row
-batch with `approximate_rows < inserted_rows`. The postcondition is essential:
-storage freezes whole row pages, so a plan-level row-budget comparison alone
-cannot prove that a proper hot suffix survived. Treat `AlreadyFrozen` and every
-`Cancelled` reason as unexpected invocation failures. Convert public `usize`
-batch counts to portable `u64` result fields with checked conversions.
-
-The latest insert commit fence is a committed-load proof only. Do not wait on
-it before checkpoint, because cutoff or active-root delay belongs inside the
-measured checkpoint retry lifecycle.
-
-### Maintenance workload execution
-
-Add `doradb-bench/src/workload/maintenance.rs` with `FreezeTableExecutor` and
-`CheckpointTableExecutor`, exported through `workload/mod.rs` and selected by
-the exhaustive dispatcher in `plan_executor.rs`. Both use exactly one
-`SessionPlan` and one idle public `Session`.
-
-Change the crate-private `SessionExecutor::execute` measurement input from an
-optional clock to the invocation's mandatory shared `MeasurementClock` plus an
-explicit `sample_latency` boolean. Existing executors continue passing
-`sample_latency.then_some(clock)` to their operation helpers, preserving their
-timing behavior. Maintenance execution always uses the clock for structured
-breakdown metrics and records the histogram sample only when
-`sample_latency` is true.
-
-Freeze times one call to `Session::freeze_table`; its prepare phase records no
-histogram sample, while a final benchmark freeze records the complete public
-request as one sample. It records one logical operation only after the verified
-`Frozen` outcome.
-
-Checkpoint uses the following exact loop:
-
-1. Capture the total-sample start immediately before the first
-   `Session::checkpoint_table` call.
-2. Capture raw boundaries around every checkpoint attempt, increment the
-   checked attempt count, and accumulate attempt nanoseconds.
-3. On `CheckpointOutcome::Delayed { reason }`, capture raw boundaries around
-   `Session::wait_for_checkpoint_retry(reason)`, increment the checked retry
-   wait count, accumulate wait nanoseconds, and start a fresh public attempt.
-4. Treat every `Cancelled` outcome and public error as an invocation failure.
-5. Treat `Published { silent: true, .. }` as a contract failure because the
-   verified nonempty frozen prefix must publish a user-table root.
-6. Stop only at `Published { silent: false, .. }`, capture the total end, and
-   verify `attempt_count == retry_wait_count + 1`.
-7. Record one logical checkpoint operation and, when measured, one total
-   latency sample spanning the first attempt through publication.
-
-Use only public semantic waits. Do not poll, sleep, impose a benchmark-owned
-retry limit, or reinterpret storage delay reasons. Storage poison, lifecycle
-termination, and shutdown continue to propagate through the public APIs and
-the existing first-error-wins plan failure path.
-
-### Workload-specific result metrics
-
-Add a strict serializable `WorkloadMetrics` enum to `measurement.rs` with
-`freeze-table` and `checkpoint-table` variants. Freeze metrics contain:
-
-- `approximate_rows: u64`;
-- `page_count: u64`;
-- `stable_page_count: u64`.
-
-Checkpoint metrics contain:
-
-- `attempt_count: u64`;
-- `attempt_elapsed_nanos: u128` using the existing decimal-string serde helper;
-- `retry_wait_count: u64`;
-- `retry_wait_elapsed_nanos: u128` using the same helper.
-
-Add a default `SessionOutcome::workload_metrics` projection returning `None` so
-existing workloads need no result-specific behavior. Maintenance outcomes
-return their verified typed metrics before they are consumed into generic
-counters and latency.
-
-Carry `Option<WorkloadMetrics>` through `RunOutcome`, `PreparePhaseResult`, and
-`MeasuredRunResult`. Warm-up outcomes remain discarded. Keep
-`BenchmarkAggregate` generic: checkpoint is restricted to one measured run, so
-the measured-run metrics are the authoritative breakdown while aggregate
-latency remains the authoritative total sample. Extend the successful stdout
-summary with attempt/wait counts and nanoseconds when the final workload is
-`checkpoint-table`; other summaries remain unchanged.
-
-Use checked count and duration accumulation throughout. Attempt plus wait time
-is a breakdown of public calls inside the total sample, not an equality with
-the sample: outcome matching and loop orchestration legitimately occupy the
-remaining interval.
-
-### Template, documentation, and artifacts
-
-Add `doradb-bench/templates/checkpoint-table.toml` as the thirteenth complete
-workload plan. It explicitly includes `engine-defaults.toml` and uses this
-fixture:
-
-- one `create-table` phase with `index = "none"`;
-- one `insert-seq` phase with 1,000,000 rows, four threads, sixteen sessions,
-  128-byte values, and batch size 1,000;
-- one prepare `freeze-table` phase with `max_rows = 500,000`; and
-- one final `checkpoint-table` benchmark with `warmup_runs = 0` and
-  `measured_runs = 1`.
-
-Update the exact template inventory test from twelve to thirteen workloads and
-validate the checkpoint template's complete phase shape, not just its final
-identity. Update `docs/benchmark-tool.md` with maintenance controls, fixed
-topology, fixture requirements/effects, replay restrictions, latency units,
-checkpoint terminal policy, attempt/wait metrics, and the new template.
-
-Preserve the existing success-only artifact contract. Any invalid runtime
-prefix, freeze/checkpoint outcome, timing failure, metric overflow, session
-close failure, or engine shutdown failure emits no `benchmark-result.toml` or
-success summary; the invocation root remains for diagnosis.
+The thirteenth workload template composes create-table, sequential insert,
+prepare freeze, and one measured checkpoint. It uses 100,000 inserted 128-byte
+rows, batch size 100, and a 50,000-row freeze budget so it remains directly
+runnable within the current fixed table-file capacity.
 
 ## Implementation Notes
 
+RFC 0028 Phase 4 shipped with the two typed maintenance workloads, verified
+fixture transitions, public semantic waits, structured metrics, one runnable
+template, documentation, and end-to-end coverage. The implementation retained
+the existing sequential plan executor and storage public APIs.
+
+The originally proposed one-million-row load and 500,000-row freeze failed
+during real template execution with `StorageFileCapacityExceeded`. Investigation
+confirmed that `TABLE_FILE_INITIAL_SIZE` is 16 MiB and currently also acts as
+the effective maximum because the active-root allocation map and recovery
+rebuild path never expand. A diagnostic 50,000-row freeze checkpointed
+successfully, so the shipped template was reduced to 100,000 inserted rows and
+a 50,000-row prefix. Dynamic, failure-atomic table-file growth was deferred to
+backlog 000184 rather than widening this benchmark-layer task.
+
+Review found that `CheckpointTableExecutor` discarded `RunCancellation` and
+could remain blocked in a semantic retry wait after a peer failure. The final
+implementation forwards cancellation through the checkpoint helpers and races
+retry readiness with a lossless notification. Per review clarification, no
+independent attempt cap or deadline was introduced.
+
+Full nextest validation exposed a flaky storage poison test whose cleanup
+discarded a prepared production transaction even though undo was physically
+linked. Test support now performs the real failed-precommit rollback before
+cleanup. This is test-only hardening and does not change storage runtime
+semantics.
+
+Release compilation also showed that `TrxRuntime::locks` is used only by
+debug-only lower-level write assertions. The field remains part of the runtime
+proof view and carries a release-only dead-code expectation instead of removing
+the debug assertion or changing transaction behavior.
+
+Final verification completed successfully:
+
+- `rtk cargo nextest run --workspace`: 1,701 tests passed.
+- `rtk cargo nextest run -p doradb-bench`: 69 tests passed after style cleanup.
+- `rtk cargo check -p doradb-bench --release`: completed without warnings.
+- `tools/style_audit.rs --diff-base origin/main`: 15 branch-diff Rust files
+  passed formatting, workspace Clippy with warnings denied, and repository
+  structure checks.
+
 ## Impacts
 
-- `doradb-bench/src/plan.rs`: raw and resolved maintenance types, exhaustive
-  workload behavior, strict resolution, replay policy, latency units, and
-  template inventory assertions.
-- `doradb-bench/src/fixture.rs`: freeze/frozen requirements, planned and runtime
-  frozen state, typed bindings and effects, proper-prefix validation, and state
-  transition tests.
-- `doradb-bench/src/measurement.rs`: maintenance latency units and strict
-  `WorkloadMetrics` result entities.
-- `doradb-bench/src/plan_executor.rs`: mandatory clock/sample flag, maintenance
-  dispatch, workload-metric projection, result propagation, and phase effects.
-- `doradb-bench/src/plan_output.rs`: optional per-phase/per-run workload metrics
-  and checkpoint-specific stdout fields.
-- `doradb-bench/src/workload/mod.rs` and new
-  `doradb-bench/src/workload/maintenance.rs`: public-session freeze/checkpoint
-  operation logic, outcome verification, retry accounting, and fixture effects.
-- `doradb-bench/tests/lifecycle.rs`: successful and failure-path checkpoint
-  plans through the benchmark binary and public storage facade.
-- `doradb-bench/templates/checkpoint-table.toml`: directly runnable Phase 4
-  benchmark plan.
-- `docs/benchmark-tool.md`: author-facing maintenance plan, measurement, result,
-  and template contracts.
-- No `doradb-storage` source, public API, persisted data, recovery path, backend,
-  or unsafe inventory changes are expected.
+- `doradb-bench` plan and fixture models now expose strict maintenance
+  workloads and typed frozen-state transitions.
+- Workload execution now includes one-session freeze/checkpoint executors,
+  cancellation-aware semantic retry waiting, and workload-specific metrics.
+- Result TOML and stdout gain optional maintenance metrics; existing workload
+  schemas and aggregate calculations remain unchanged.
+- Benchmark documentation and template inventory now cover thirteen complete
+  workloads, including isolated checkpoint.
+- `event-listener` is a direct benchmark dependency for cancellation wakeup.
+- Storage production APIs, persisted data, checkpoint/recovery algorithms, and
+  I/O backends are unchanged. Storage source changes are limited to test
+  cleanup support and a release-only lint expectation.
 
 ## Test Cases
 
-1. Strict parsing accepts the two new workload spellings and valid controls,
-   rejects unknown or worker/batching fields, rejects zero/missing freeze
-   budgets, and serializes complete resolved maintenance configurations.
-2. Plan resolution assigns fixed `(1, 1)` maintenance topology, one expected
-   sample, the two new latency units, and single-run replay policy; warm-up and
-   repeated measured maintenance runs fail before root creation.
-3. Plan fixture folds reject freeze without a table, an indexed or multi-table
-   fixture, missing committed load, `max_rows >= candidate rows`, duplicate
-   freeze, and checkpoint without frozen state. A successful checkpoint consumes
-   the planned frozen state.
-4. Runtime fixture tests require successful inserted rows and a commit fence,
-   reject a runtime budget that is not below successful rows, install the exact
-   checked frozen summary, bind it to checkpoint, and clear it only after a
-   verified checkpoint effect.
-5. Freeze executor tests accept only a matching nonempty `Frozen` batch with a
-   proper row prefix; `AlreadyFrozen`, cancellation, wrong-table, empty-batch,
-   whole-table, and integer-conversion paths fail without producing an effect.
-6. Checkpoint accounting tests cover immediate publication and one or several
-   delayed outcomes, checked duration/count accumulation, exact reason handoff,
-   `attempts = waits + 1`, silent publication rejection, cancellation, public
-   error propagation, and exactly one total sample when measured.
-7. Measurement and output tests round-trip both strict workload-metric variants,
-   retain them on prepare and measured-run results, discard warm-up metrics,
-   preserve generic aggregate math, and render checkpoint attempt/wait stdout
-   fields without changing other workload summaries.
-8. The inventory test loads exactly thirteen workload templates and verifies
-   that `checkpoint-table.toml` includes shared defaults, creates one index-free
-   table, performs the specified sequential load, freezes 500,000 rows, and ends
-   with an explicit zero-warm-up/one-run checkpoint benchmark.
-9. A successful end-to-end smoke plan inserts eight 32-KiB rows, freezes with
-   `max_rows = 4`, and checkpoints through public storage APIs. Assert a
-   nonempty proper multi-page frozen prefix, one non-silent checkpoint operation,
-   one total latency sample, valid attempt/wait equations, canonical metrics,
-   and one success artifact. Do not require a nonzero retry count because purge
-   scheduling may make the first attempt ready.
-10. A failure smoke plan keeps all inserted rows on one row page while specifying
-    a smaller plan-valid row budget. Runtime proper-prefix verification must
-    reject the whole-page freeze, emit no success artifact or stdout summary,
-    and leave the diagnostic root intact.
-11. Concurrent and wait-sensitive coverage uses storage predicates, supplied
-    timing/accounting inputs, or the public retry API rather than sleeps.
-    `.config/nextest.toml` remains the timeout and hang-detection authority.
-12. Run focused benchmark tests during development and finish with
-    `rtk cargo nextest run --workspace`, formatting checks, and workspace Clippy
-    with warnings denied. No alternate `libaio` pass is required because the
-    task changes no storage or backend-neutral I/O implementation.
+- Strict parsing accepts valid maintenance controls and rejects missing,
+  unknown, worker, batching, zero-budget, and replay-incompatible fields.
+- Resolution proves fixed topology, latency units, expected samples, typed
+  requirements/effects, and single-run policy before root creation.
+- Plan and runtime fixture tests reject incompatible table count/index shape,
+  missing load/frozen state, duplicate freeze, invalid budgets, and improper
+  whole-page frozen prefixes.
+- Freeze executor tests cover matching proper batches plus existing, cancelled,
+  empty, wrong-table, whole-table, and conversion failures.
+- Checkpoint tests cover immediate and delayed publication, exact reason
+  handoff, count/duration accounting, sample suppression for prepare, silent or
+  cancelled outcomes, public errors, pre-cancellation, and cancellation during
+  a pending retry wait.
+- Measurement/output tests round-trip strict maintenance metrics and preserve
+  warm-up exclusion, aggregate math, success-only artifacts, and
+  checkpoint-specific stdout fields.
+- Template inventory validates all thirteen workload plans and the complete
+  checkpoint phase shape and capacity-safe values.
+- End-to-end tests cover successful public-API freeze/checkpoint publication and
+  runtime rejection of a whole-page prefix with no success artifact.
+- Workspace nextest, release compilation, and the mandatory style gate pass.
 
 ## Open Questions
 
-None. Restart, cold persisted reads, foreground interference, multi-table and
-secondary-index checkpoints, deletion/catalog checkpointing, automatic policy,
-and independent-fixture repetition remain outside RFC 0028 Phase 4 and stay
-available through backlog 000147 or later scoped planning.
+- Failure-atomic dynamic table-file expansion remains in
+  `docs/backlogs/000184-dynamic-table-file-expansion.md`.
+- Cold persisted lookup measurement remains in
+  `docs/backlogs/000074-expand-runtime-lookup-benchmark-coverage.md`.
+- Foreground interference, restart/reopen, multiple-table, secondary-index,
+  deletion, catalog, and automatic checkpoint lifecycle benchmarks remain
+  outside RFC 0028 and require separately scoped follow-up work.

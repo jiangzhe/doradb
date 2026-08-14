@@ -57,6 +57,7 @@ impl MeasurementClock {
             .ok_or_else(|| BenchError::message("measurement wall clock moved backwards"))
     }
 
+    /// Construct a deterministic clock and its controllable mock source.
     #[cfg(test)]
     pub(crate) fn mock() -> (Self, Arc<quanta::Mock>) {
         let (clock, mock) = Clock::mock();
