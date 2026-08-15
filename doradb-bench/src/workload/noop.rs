@@ -45,10 +45,11 @@ impl SessionExecutor for StmtNoopExecutor {
         _engine: &'a Engine,
         session: &'a mut Session,
         plan: &'a SessionPlan,
-        clock: Option<&'a MeasurementClock>,
+        clock: &'a MeasurementClock,
+        sample_latency: bool,
         cancellation: &'a RunCancellation,
     ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a {
-        execute_stmt_noop_session(session, plan, clock, cancellation)
+        execute_stmt_noop_session(session, plan, sample_latency.then_some(clock), cancellation)
     }
 
     fn verify_outcome(
@@ -99,10 +100,11 @@ impl SessionExecutor for TrxNoopExecutor {
         _engine: &'a Engine,
         session: &'a mut Session,
         plan: &'a SessionPlan,
-        clock: Option<&'a MeasurementClock>,
+        clock: &'a MeasurementClock,
+        sample_latency: bool,
         cancellation: &'a RunCancellation,
     ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a {
-        execute_trx_noop_session(session, plan, clock, cancellation)
+        execute_trx_noop_session(session, plan, sample_latency.then_some(clock), cancellation)
     }
 
     fn verify_outcome(

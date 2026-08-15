@@ -1,6 +1,7 @@
 use crate::error::{BenchError, Result};
 use crate::measurement::{
-    BenchmarkAggregate, InternalMetric, MeasuredRunResult, WorkloadCounters, u128_decimal,
+    BenchmarkAggregate, InternalMetric, MeasuredRunResult, WorkloadCounters, WorkloadMetrics,
+    u128_decimal,
 };
 use crate::plan::Plan;
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,8 @@ pub struct PreparePhaseResult {
     pub elapsed_nanos: u128,
     /// Successful logical workload counters.
     pub counters: WorkloadCounters,
+    /// Optional workload-specific metrics from the prepare execution.
+    pub workload_metrics: Option<WorkloadMetrics>,
     /// Optional typed engine diagnostics.
     pub internal_metrics: Vec<InternalMetric>,
 }
@@ -75,7 +78,7 @@ pub(crate) fn render_stdout_summary(
         .ok_or_else(|| BenchError::message("benchmark report has no final workload"))?
         .workload();
     let aggregate = &report.aggregate;
-    Ok(format!(
+    let mut summary = format!(
         "DoraDB benchmark summary\n\
          workload: {}\n\
          measured_runs: {}\n\
@@ -85,8 +88,7 @@ pub(crate) fn render_stdout_summary(
          latency_unit: {}\n\
          average_latency_nanos: {:.3}\n\
          p95_latency_nanos: {}\n\
-         p99_latency_nanos: {}\n\
-         detailed_result: {}",
+         p99_latency_nanos: {}",
         workload.identity(),
         aggregate.measured_runs,
         aggregate.counters.operations,
@@ -95,16 +97,38 @@ pub(crate) fn render_stdout_summary(
         aggregate.latency.unit,
         aggregate.latency.average_nanos,
         aggregate.latency.p95_nanos,
-        aggregate.latency.p99_nanos,
-        detailed_result.display()
-    ))
+        aggregate.latency.p99_nanos
+    );
+    if workload.identity() == "checkpoint-table" {
+        let metrics = report
+            .measured_runs
+            .first()
+            .and_then(|run| run.workload_metrics)
+            .ok_or_else(|| BenchError::message("checkpoint report has no workload metrics"))?;
+        let WorkloadMetrics::CheckpointTable {
+            attempt_count,
+            attempt_elapsed_nanos,
+            retry_wait_count,
+            retry_wait_elapsed_nanos,
+        } = metrics
+        else {
+            return Err(BenchError::message(
+                "checkpoint report has incompatible workload metrics",
+            ));
+        };
+        summary.push_str(&format!(
+            "\ncheckpoint_attempt_count: {attempt_count}\n\
+             checkpoint_attempt_elapsed_nanos: {attempt_elapsed_nanos}\n\
+             checkpoint_retry_wait_count: {retry_wait_count}\n\
+             checkpoint_retry_wait_elapsed_nanos: {retry_wait_elapsed_nanos}"
+        ));
+    }
+    summary.push_str(&format!("\ndetailed_result: {}", detailed_result.display()));
+    Ok(summary)
 }
 
-fn result_toml_path(storage_root: &Path) -> PathBuf {
-    storage_root.join(RESULT_TOML_FILE_NAME)
-}
-
-fn absolute_result_path(storage_root: &Path) -> Result<PathBuf> {
+/// Resolve the canonical result artifact to an absolute path.
+pub(crate) fn absolute_result_path(storage_root: &Path) -> Result<PathBuf> {
     fs::canonicalize(storage_root)
         .map(|root| root.join(RESULT_TOML_FILE_NAME))
         .map_err(|err| {
@@ -113,6 +137,10 @@ fn absolute_result_path(storage_root: &Path) -> Result<PathBuf> {
                 storage_root.display()
             ))
         })
+}
+
+fn result_toml_path(storage_root: &Path) -> PathBuf {
+    storage_root.join(RESULT_TOML_FILE_NAME)
 }
 
 fn staged_path(path: &Path) -> PathBuf {
@@ -141,9 +169,10 @@ mod tests {
     use super::*;
     use crate::engine_config::{EngineConfigOverlay, resolve_engine_config};
     use crate::fixture::FixturePlanEffect;
-    use crate::measurement::{LatencySummary, LatencyUnit};
+    use crate::measurement::{LatencySummary, LatencyUnit, WorkloadMetrics};
     use crate::plan::{
-        CountConfig, MeasurementSpec, Phase, ResolvedWorkload, ResolvedWorkloadDefaults,
+        CheckpointTableConfig, CountConfig, MeasurementSpec, Phase, ResolvedWorkload,
+        ResolvedWorkloadDefaults,
     };
     use std::num::NonZeroU32;
     use tempfile::TempDir;
@@ -259,5 +288,43 @@ mod tests {
                 detailed_result.display()
             )
         );
+    }
+
+    #[test]
+    fn checkpoint_stdout_summary_includes_attempt_and_wait_breakdown() {
+        let temp = TempDir::new().unwrap();
+        let mut report = report(temp.path());
+        let Phase::Benchmark {
+            workload,
+            fixture_effect,
+            ..
+        } = &mut report.plan.phases[0]
+        else {
+            unreachable!()
+        };
+        *workload = ResolvedWorkload::CheckpointTable(CheckpointTableConfig {
+            include_stats: false,
+        });
+        *fixture_effect = FixturePlanEffect::Checkpoint;
+        report.aggregate.latency.unit = LatencyUnit::TableCheckpoint;
+        report.measured_runs.push(MeasuredRunResult {
+            run_index: 1,
+            elapsed_nanos: 10,
+            counters: report.aggregate.counters,
+            operations_per_second: report.aggregate.operations_per_second,
+            latency: report.aggregate.latency.clone(),
+            workload_metrics: Some(WorkloadMetrics::CheckpointTable {
+                attempt_count: 3,
+                attempt_elapsed_nanos: 7,
+                retry_wait_count: 2,
+                retry_wait_elapsed_nanos: 2,
+            }),
+            internal_metrics: Vec::new(),
+        });
+        let summary = render_stdout_summary(&report, Path::new("result.toml")).unwrap();
+        assert!(summary.contains("checkpoint_attempt_count: 3\n"));
+        assert!(summary.contains("checkpoint_attempt_elapsed_nanos: 7\n"));
+        assert!(summary.contains("checkpoint_retry_wait_count: 2\n"));
+        assert!(summary.contains("checkpoint_retry_wait_elapsed_nanos: 2\n"));
     }
 }

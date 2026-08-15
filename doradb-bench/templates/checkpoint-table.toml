@@ -1,0 +1,17 @@
+name = "single-table checkpoint"
+engine_defaults = "engine-defaults.toml"
+
+[[phase]]
+workload = { type = "create-table", index = "none" }
+
+[[phase]]
+workload = { type = "insert-seq", num = 100000, threads = 4, sessions = 16, value_size = "128 B", batch_size = 100 }
+
+[[phase]]
+workload = { type = "freeze-table", max_rows = 50000 }
+
+[[phase]]
+kind = "benchmark"
+warmup_runs = 0
+measured_runs = 1
+workload = { type = "checkpoint-table" }

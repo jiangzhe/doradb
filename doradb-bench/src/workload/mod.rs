@@ -1,10 +1,12 @@
 use crate::error::BenchError;
+use event_listener::Event;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod ddl;
 mod insert;
 mod lock;
+mod maintenance;
 mod noop;
 mod read;
 mod util;
@@ -12,6 +14,7 @@ mod util;
 pub(crate) use ddl::{CreateTableExecutor, IndexDdlExecutor, TableDdlExecutor};
 pub(crate) use insert::{InsertRandExecutor, InsertSeqExecutor};
 pub(crate) use lock::LockTableExecutor;
+pub(crate) use maintenance::{CheckpointTableExecutor, FreezeTableExecutor};
 pub(crate) use noop::{StmtNoopExecutor, TrxNoopExecutor};
 pub(crate) use read::{
     IndexScanExecutor, IndexStreamExecutor, LookupRandExecutor, LookupSeqExecutor,
@@ -22,6 +25,7 @@ pub(crate) use util::build_session_plans;
 /// First-error-wins cooperative cancellation shared by one plan run.
 pub(crate) struct RunCancellation {
     cancelled: AtomicBool,
+    cancelled_event: Event,
     first_error: Mutex<Option<BenchError>>,
 }
 
@@ -30,6 +34,7 @@ impl RunCancellation {
     pub(crate) fn new() -> Self {
         Self {
             cancelled: AtomicBool::new(false),
+            cancelled_event: Event::new(),
             first_error: Mutex::new(None),
         }
     }
@@ -39,12 +44,34 @@ impl RunCancellation {
         self.cancelled.load(Ordering::Acquire)
     }
 
+    /// Wait until a peer publishes an invocation-fatal error.
+    pub(crate) async fn wait_for_cancellation(&self) {
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            let listener = self.cancelled_event.listen();
+            if self.is_cancelled() {
+                return;
+            }
+            listener.await;
+        }
+    }
+
     /// Publish an unexpected error without replacing the first publisher.
     pub(crate) fn fail(&self, error: BenchError) {
-        let mut first_error = self.first_error.lock();
-        if first_error.is_none() {
-            *first_error = Some(error);
-            self.cancelled.store(true, Ordering::Release);
+        let published = {
+            let mut first_error = self.first_error.lock();
+            if first_error.is_some() {
+                false
+            } else {
+                *first_error = Some(error);
+                self.cancelled.store(true, Ordering::Release);
+                true
+            }
+        };
+        if published {
+            self.cancelled_event.notify(usize::MAX);
         }
     }
 

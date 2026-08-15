@@ -668,21 +668,25 @@ requires separate justification and review outside this RFC.
 - **Phase 4: Isolated single-table checkpoint benchmark**
   - Prerequisites: Phase 3 has migrated every existing workload and can compose
     table creation, sequential insert load, and one final benchmark workload.
-  - Scope: Add typed freeze and checkpoint workloads, public semantic retry
-    waits, checkpoint attempt/wait metrics, the one-table/no-index/no-foreground
-    single-run `doradb-bench/templates/checkpoint-table.toml` plan, unit tests,
-    an end-to-end smoke test, and documentation.
+  - Scope: Add typed freeze and checkpoint workloads, cancellation-aware public
+    semantic retry waits, checkpoint attempt/wait metrics, the
+    one-table/no-index/no-foreground single-run
+    `doradb-bench/templates/checkpoint-table.toml` plan, unit tests, an
+    end-to-end smoke test, and documentation.
   - Goals: Deliver checkpoint as the first new composition workload and cover
     the isolated checkpoint slice of backlog 000147.
   - Non-goals: Delete fixtures, foreground interference, multiple tables,
     secondary indexes, automatic checkpoint policy, restart/cold reads,
-    deletion/catalog checkpoints, warm-up, or repeated checkpoint fixtures.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+    deletion/catalog checkpoints, warm-up, repeated checkpoint fixtures, or
+    dynamic table-file expansion.
+  - Task Doc: `docs/tasks/000269-single-table-checkpoint-benchmark.md`
+  - Task Issue: `#975`
+  - Phase Status: done
+  - Implementation Summary: Implemented RFC 0028 Phase 4 with typed freeze/checkpoint workloads, verified fixture transitions, cancellation-aware semantic retry waits, structured metrics, a capacity-safe template, documentation, and end-to-end coverage; dynamic table-file expansion was deferred to backlog 000184. [Task Resolve Sync: docs/tasks/000269-single-table-checkpoint-benchmark.md @ 2026-08-14]
   - Related Backlogs:
-    - `docs/backlogs/000147-doradb-bench-checkpoint-lifecycle-scenarios.md`
+    - `docs/backlogs/closed/000147-doradb-bench-checkpoint-lifecycle-scenarios.md`
+    - `docs/backlogs/000074-expand-runtime-lookup-benchmark-coverage.md`
+    - `docs/backlogs/000184-dynamic-table-file-expansion.md`
 
 ## Test Strategy
 

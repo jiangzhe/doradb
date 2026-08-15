@@ -56,6 +56,18 @@ impl MeasurementClock {
             .map(|duration| duration.as_nanos())
             .ok_or_else(|| BenchError::message("measurement wall clock moved backwards"))
     }
+
+    /// Construct a deterministic clock and its controllable mock source.
+    #[cfg(test)]
+    pub(crate) fn mock() -> (Self, Arc<quanta::Mock>) {
+        let (clock, mock) = Clock::mock();
+        (
+            Self {
+                clock: Arc::new(clock),
+            },
+            mock,
+        )
+    }
 }
 
 impl Default for MeasurementClock {
@@ -95,6 +107,10 @@ pub enum LatencyUnit {
     TableLockTransactionRetainedLifecycle,
     /// One paired or specialized table-lock lifecycle.
     TableLockOperationLifecycle,
+    /// One public table-freeze request.
+    TableFreeze,
+    /// One public table-checkpoint retry lifecycle through publication.
+    TableCheckpoint,
 }
 
 impl fmt::Display for LatencyUnit {
@@ -115,8 +131,38 @@ impl fmt::Display for LatencyUnit {
                 "table-lock-transaction-retained-lifecycle"
             }
             Self::TableLockOperationLifecycle => "table-lock-operation-lifecycle",
+            Self::TableFreeze => "table-freeze",
+            Self::TableCheckpoint => "table-checkpoint",
         })
     }
+}
+
+/// Strict workload-specific metrics retained beside generic counters and latency.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum WorkloadMetrics {
+    /// Verified canonical frozen-page batch summary.
+    FreezeTable {
+        /// Approximate non-deleted rows selected by the frozen batch.
+        approximate_rows: u64,
+        /// Number of selected row pages.
+        page_count: u64,
+        /// Number of pages whose undo chains no longer need rescanning.
+        stable_page_count: u64,
+    },
+    /// Public checkpoint-attempt and semantic retry-wait breakdown.
+    CheckpointTable {
+        /// Number of public checkpoint attempts through publication.
+        attempt_count: u64,
+        /// Time spent inside public checkpoint attempts.
+        #[serde(with = "u128_decimal")]
+        attempt_elapsed_nanos: u128,
+        /// Number of public semantic retry waits.
+        retry_wait_count: u64,
+        /// Time spent inside public semantic retry waits.
+        #[serde(with = "u128_decimal")]
+        retry_wait_elapsed_nanos: u128,
+    },
 }
 
 /// Exact session-local latency samples and their HDR distribution.
@@ -347,6 +393,8 @@ pub struct MeasuredRunResult {
     pub operations_per_second: f64,
     /// Latency summary for this measured repetition.
     pub latency: LatencySummary,
+    /// Optional workload-specific metrics for this repetition.
+    pub workload_metrics: Option<WorkloadMetrics>,
     /// Optional typed engine diagnostics captured around the run.
     pub internal_metrics: Vec<InternalMetric>,
 }
@@ -537,5 +585,35 @@ mod tests {
         let encoded = toml::to_string(&metric).unwrap();
         assert!(encoded.contains(&format!("value = \"{}\"", u128::MAX)));
         assert_eq!(toml::from_str::<InternalMetric>(&encoded).unwrap(), metric);
+    }
+
+    #[test]
+    fn workload_metrics_round_trip_strictly() {
+        let cases = [
+            WorkloadMetrics::FreezeTable {
+                approximate_rows: 4,
+                page_count: 2,
+                stable_page_count: 1,
+            },
+            WorkloadMetrics::CheckpointTable {
+                attempt_count: 3,
+                attempt_elapsed_nanos: u128::MAX,
+                retry_wait_count: 2,
+                retry_wait_elapsed_nanos: u128::MAX - 1,
+            },
+        ];
+        for metrics in cases {
+            let encoded = toml::to_string(&metrics).unwrap();
+            assert_eq!(
+                toml::from_str::<WorkloadMetrics>(&encoded).unwrap(),
+                metrics
+            );
+        }
+        assert!(
+            toml::from_str::<WorkloadMetrics>(
+                "type = \"freeze-table\"\napproximate_rows = 1\npage_count = 1\nstable_page_count = 1\nunknown = 1\n"
+            )
+            .is_err()
+        );
     }
 }

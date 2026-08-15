@@ -101,6 +101,13 @@ pub enum FixtureRequirement {
         /// Checked minimum table count.
         minimum: usize,
     },
+    /// Consume one loaded index-free primary that can install a frozen prefix.
+    FreezeCandidate {
+        /// Requested frozen-prefix row budget.
+        max_rows: usize,
+    },
+    /// Consume one index-free primary with an installed frozen-prefix summary.
+    FrozenPrimary,
 }
 
 /// Plan-time fixture transition produced by one successful phase.
@@ -121,6 +128,13 @@ pub enum FixturePlanEffect {
         /// Exact nonempty range allocated to this insert phase.
         attempted_range: KeyRange,
     },
+    /// Install the planned active frozen-prefix budget.
+    Freeze {
+        /// Requested frozen-prefix row budget.
+        max_rows: usize,
+    },
+    /// Consume the planned active frozen-prefix state.
+    Checkpoint,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -129,6 +143,7 @@ struct PrimaryPlanFixture {
     table_count: usize,
     next_key: u64,
     attempted_range: Option<KeyRange>,
+    frozen_max_rows: Option<usize>,
 }
 
 /// Ordered plan-time state for the implicit benchmark fixture.
@@ -177,6 +192,50 @@ impl FixturePlanState {
                 }
                 Ok(())
             }
+            FixtureRequirement::FreezeCandidate { max_rows } => {
+                let primary = self.primary.as_ref().ok_or_else(|| {
+                    BenchError::message("freeze-table requires a preceding create-table phase")
+                })?;
+                validate_maintenance_primary(primary.shape, primary.table_count, "freeze-table")?;
+                let candidate_rows = primary
+                    .attempted_range
+                    .filter(|range| !range.is_empty())
+                    .ok_or_else(|| {
+                        BenchError::message(
+                            "freeze-table requires a preceding nonempty insert phase",
+                        )
+                    })?
+                    .len;
+                let max_rows = u64::try_from(max_rows)
+                    .map_err(|_| BenchError::message("freeze-table max_rows exceeds u64"))?;
+                if max_rows == 0 || max_rows >= candidate_rows {
+                    return Err(BenchError::message(format!(
+                        "freeze-table max_rows ({max_rows}) must be below candidate rows ({candidate_rows})"
+                    )));
+                }
+                if primary.frozen_max_rows.is_some() {
+                    return Err(BenchError::message(
+                        "freeze-table requires no active frozen fixture",
+                    ));
+                }
+                Ok(())
+            }
+            FixtureRequirement::FrozenPrimary => {
+                let primary = self.primary.as_ref().ok_or_else(|| {
+                    BenchError::message("checkpoint-table requires a preceding create-table phase")
+                })?;
+                validate_maintenance_primary(
+                    primary.shape,
+                    primary.table_count,
+                    "checkpoint-table",
+                )?;
+                if primary.frozen_max_rows.is_none() {
+                    return Err(BenchError::message(
+                        "checkpoint-table requires a preceding successful freeze-table phase",
+                    ));
+                }
+                Ok(())
+            }
         }
     }
 
@@ -220,6 +279,7 @@ impl FixturePlanState {
                     table_count,
                     next_key: 0,
                     attempted_range: None,
+                    frozen_max_rows: None,
                 });
                 Ok(())
             }
@@ -241,13 +301,42 @@ impl FixturePlanState {
                 primary.next_key = end;
                 Ok(())
             }
+            FixturePlanEffect::Freeze { max_rows } => {
+                self.validate(FixtureRequirement::FreezeCandidate { max_rows })?;
+                let primary = self.primary.as_mut().ok_or_else(|| {
+                    BenchError::message("freeze fixture effect requires a primary table")
+                })?;
+                primary.frozen_max_rows = Some(max_rows);
+                Ok(())
+            }
+            FixturePlanEffect::Checkpoint => {
+                self.validate(FixtureRequirement::FrozenPrimary)?;
+                let primary = self.primary.as_mut().ok_or_else(|| {
+                    BenchError::message("checkpoint fixture effect requires a primary table")
+                })?;
+                primary.frozen_max_rows = None;
+                Ok(())
+            }
         }
     }
 }
 
+/// Verified runtime summary of the active canonical frozen-page batch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FrozenFixtureSummary {
+    /// Requested frozen-prefix row budget.
+    pub(crate) max_rows: usize,
+    /// Approximate non-deleted rows selected by the batch.
+    pub(crate) approximate_rows: u64,
+    /// Number of selected row pages.
+    pub(crate) page_count: u64,
+    /// Number of pages whose undo chains no longer need rescanning.
+    pub(crate) stable_page_count: u64,
+}
+
 /// Runtime fixture transition returned by one completely drained workload.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum FixtureRuntimeEffect {
+pub(crate) enum FixtureRuntimeEffect {
     /// The workload does not modify the implicit fixture.
     None,
     /// Bind the planned table pool to ordered runtime identifiers.
@@ -266,6 +355,13 @@ pub enum FixtureRuntimeEffect {
         /// Greatest commit ID from a batch that inserted at least one row.
         latest_write_fence: Option<TrxID>,
     },
+    /// Install one verified canonical frozen-page batch summary.
+    Freeze {
+        /// Exact verified frozen fixture state.
+        summary: FrozenFixtureSummary,
+    },
+    /// Consume the verified canonical frozen-page batch summary.
+    Checkpoint,
 }
 
 /// Typed primary-table runtime binding.
@@ -281,6 +377,8 @@ pub(crate) struct PrimaryBinding {
     pub(crate) inserted_rows: u64,
     /// Greatest successful write-bearing insert commit.
     pub(crate) latest_write_fence: Option<TrxID>,
+    /// Verified active frozen-page batch, when installed.
+    pub(crate) frozen: Option<FrozenFixtureSummary>,
 }
 
 /// Typed runtime binding returned after requirement validation.
@@ -302,6 +400,7 @@ struct RuntimePrimaryFixture {
     attempted_range: Option<KeyRange>,
     inserted_rows: u64,
     latest_write_fence: Option<TrxID>,
+    frozen: Option<FrozenFixtureSummary>,
 }
 
 /// Runtime state of the invocation's implicit benchmark fixture.
@@ -334,6 +433,7 @@ impl FixtureRuntimeState {
                     loaded_range: primary.attempted_range,
                     inserted_rows: primary.inserted_rows,
                     latest_write_fence: primary.latest_write_fence,
+                    frozen: primary.frozen,
                 };
                 if load == LoadRequirement::Committed
                     && (binding.loaded_range.is_none_or(KeyRange::is_empty)
@@ -358,6 +458,56 @@ impl FixtureRuntimeState {
                 }
                 Ok(FixtureBinding::TablePool(Arc::clone(&primary.table_ids)))
             }
+            FixtureRequirement::FreezeCandidate { max_rows } => {
+                let primary = self
+                    .primary
+                    .as_ref()
+                    .ok_or_else(|| BenchError::message("runtime primary fixture is missing"))?;
+                validate_maintenance_primary(
+                    primary.shape,
+                    primary.table_ids.len(),
+                    "freeze-table",
+                )?;
+                if primary.attempted_range.is_none_or(KeyRange::is_empty)
+                    || primary.inserted_rows == 0
+                    || primary.latest_write_fence.is_none()
+                {
+                    return Err(BenchError::message(
+                        "freeze-table requires successfully committed loaded data",
+                    ));
+                }
+                let max_rows_u64 = u64::try_from(max_rows)
+                    .map_err(|_| BenchError::message("freeze-table max_rows exceeds u64"))?;
+                if max_rows_u64 == 0 || max_rows_u64 >= primary.inserted_rows {
+                    return Err(BenchError::message(format!(
+                        "freeze-table max_rows ({max_rows}) must be below inserted rows ({})",
+                        primary.inserted_rows
+                    )));
+                }
+                if primary.frozen.is_some() {
+                    return Err(BenchError::message(
+                        "freeze-table runtime fixture is already frozen",
+                    ));
+                }
+                Ok(FixtureBinding::Primary(runtime_primary_binding(primary)))
+            }
+            FixtureRequirement::FrozenPrimary => {
+                let primary = self
+                    .primary
+                    .as_ref()
+                    .ok_or_else(|| BenchError::message("runtime primary fixture is missing"))?;
+                validate_maintenance_primary(
+                    primary.shape,
+                    primary.table_ids.len(),
+                    "checkpoint-table",
+                )?;
+                if primary.frozen.is_none() {
+                    return Err(BenchError::message(
+                        "checkpoint-table runtime fixture has no frozen batch",
+                    ));
+                }
+                Ok(FixtureBinding::Primary(runtime_primary_binding(primary)))
+            }
         }
     }
 
@@ -378,6 +528,7 @@ impl FixtureRuntimeState {
                     attempted_range: None,
                     inserted_rows: 0,
                     latest_write_fence: None,
+                    frozen: None,
                 });
                 Ok(())
             }
@@ -415,6 +566,43 @@ impl FixtureRuntimeState {
                             .latest_write_fence
                             .map_or(fence, |current| current.max(fence)),
                     );
+                }
+                Ok(())
+            }
+            FixtureRuntimeEffect::Freeze { summary } => {
+                let primary = self.primary.as_mut().ok_or_else(|| {
+                    BenchError::message("runtime freeze effect requires a primary table")
+                })?;
+                validate_maintenance_primary(
+                    primary.shape,
+                    primary.table_ids.len(),
+                    "freeze-table",
+                )?;
+                let max_rows = u64::try_from(summary.max_rows)
+                    .map_err(|_| BenchError::message("freeze-table max_rows exceeds u64"))?;
+                if primary.frozen.is_some()
+                    || max_rows == 0
+                    || max_rows >= primary.inserted_rows
+                    || summary.approximate_rows == 0
+                    || summary.approximate_rows >= primary.inserted_rows
+                    || summary.page_count == 0
+                    || summary.stable_page_count > summary.page_count
+                {
+                    return Err(BenchError::message(
+                        "runtime freeze effect has an invalid frozen summary",
+                    ));
+                }
+                primary.frozen = Some(summary);
+                Ok(())
+            }
+            FixtureRuntimeEffect::Checkpoint => {
+                let primary = self.primary.as_mut().ok_or_else(|| {
+                    BenchError::message("runtime checkpoint effect requires a primary table")
+                })?;
+                if primary.frozen.take().is_none() {
+                    return Err(BenchError::message(
+                        "runtime checkpoint effect has no frozen batch to consume",
+                    ));
                 }
                 Ok(())
             }
@@ -456,6 +644,35 @@ fn validate_index(actual: IndexMode, requirement: IndexRequirement) -> Result<()
         Err(BenchError::message(format!(
             "fixture index shape {actual} is incompatible with workload requirement"
         )))
+    }
+}
+
+fn validate_maintenance_primary(
+    shape: PrimaryTableShape,
+    table_count: usize,
+    identity: &str,
+) -> Result<()> {
+    if table_count != 1 {
+        return Err(BenchError::message(format!(
+            "{identity} requires exactly one table; found {table_count}"
+        )));
+    }
+    if shape.index != IndexMode::None {
+        return Err(BenchError::message(format!(
+            "{identity} requires an index-free primary table"
+        )));
+    }
+    Ok(())
+}
+
+fn runtime_primary_binding(primary: &RuntimePrimaryFixture) -> PrimaryBinding {
+    PrimaryBinding {
+        table_id: primary.table_ids[0],
+        shape: primary.shape,
+        loaded_range: primary.attempted_range,
+        inserted_rows: primary.inserted_rows,
+        latest_write_fence: primary.latest_write_fence,
+        frozen: primary.frozen,
     }
 }
 
@@ -557,5 +774,97 @@ mod tests {
             panic!("expected table-pool binding")
         };
         assert_eq!(&*ids, &[TableID::new(7), TableID::new(8)]);
+    }
+
+    #[test]
+    fn plan_freeze_and_checkpoint_are_ordered_consuming_transitions() {
+        let shape = PrimaryTableShape {
+            index: IndexMode::None,
+        };
+        let mut state = FixturePlanState::default();
+        assert!(
+            state
+                .validate(FixtureRequirement::FreezeCandidate { max_rows: 4 })
+                .is_err()
+        );
+        state
+            .apply(&FixturePlanEffect::CreateTables {
+                shape,
+                table_count: 1,
+            })
+            .unwrap();
+        state
+            .apply(&FixturePlanEffect::Insert {
+                attempted_range: KeyRange { start: 0, len: 8 },
+            })
+            .unwrap();
+        assert!(
+            state
+                .validate(FixtureRequirement::FreezeCandidate { max_rows: 8 })
+                .is_err()
+        );
+        state
+            .apply(&FixturePlanEffect::Freeze { max_rows: 4 })
+            .unwrap();
+        assert!(
+            state
+                .validate(FixtureRequirement::FreezeCandidate { max_rows: 4 })
+                .is_err()
+        );
+        state.apply(&FixturePlanEffect::Checkpoint).unwrap();
+        assert!(state.validate(FixtureRequirement::FrozenPrimary).is_err());
+    }
+
+    #[test]
+    fn runtime_freeze_summary_is_bound_and_consumed_exactly_once() {
+        let shape = PrimaryTableShape {
+            index: IndexMode::None,
+        };
+        let mut state = FixtureRuntimeState::default();
+        state
+            .apply(FixtureRuntimeEffect::CreateTables {
+                shape,
+                table_ids: vec![TableID::new(7)].into(),
+            })
+            .unwrap();
+        state
+            .apply(FixtureRuntimeEffect::Insert {
+                attempted_range: KeyRange { start: 0, len: 8 },
+                inserted_rows: 8,
+                latest_write_fence: Some(TrxID::new(11)),
+            })
+            .unwrap();
+        assert!(
+            state
+                .bind(FixtureRequirement::FreezeCandidate { max_rows: 8 })
+                .is_err()
+        );
+        let FixtureBinding::Primary(candidate) = state
+            .bind(FixtureRequirement::FreezeCandidate { max_rows: 4 })
+            .unwrap()
+        else {
+            panic!("expected freeze primary binding")
+        };
+        assert_eq!(candidate.inserted_rows, 8);
+        assert_eq!(candidate.frozen, None);
+
+        let summary = FrozenFixtureSummary {
+            max_rows: 4,
+            approximate_rows: 4,
+            page_count: 2,
+            stable_page_count: 1,
+        };
+        state
+            .apply(FixtureRuntimeEffect::Freeze { summary })
+            .unwrap();
+        let FixtureBinding::Primary(frozen) =
+            state.bind(FixtureRequirement::FrozenPrimary).unwrap()
+        else {
+            panic!("expected frozen primary binding")
+        };
+        assert_eq!(frozen.frozen, Some(summary));
+        state.apply(FixtureRuntimeEffect::Checkpoint).unwrap();
+        assert!(state.bind(FixtureRequirement::FrozenPrimary).is_err());
+        assert!(state.apply(FixtureRuntimeEffect::Checkpoint).is_err());
     }
 }

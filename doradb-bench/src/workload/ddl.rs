@@ -54,10 +54,11 @@ impl SessionExecutor for CreateTableExecutor {
         _engine: &'a Engine,
         session: &'a mut Session,
         _plan: &'a SessionPlan,
-        clock: Option<&'a MeasurementClock>,
+        clock: &'a MeasurementClock,
+        sample_latency: bool,
         _cancellation: &'a RunCancellation,
     ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a {
-        execute_create_table_session(self.config, session, clock)
+        execute_create_table_session(self.config, session, sample_latency.then_some(clock))
     }
 
     fn verify_outcome(
@@ -139,10 +140,17 @@ impl SessionExecutor for TableDdlExecutor {
         _engine: &'a Engine,
         session: &'a mut Session,
         plan: &'a SessionPlan,
-        clock: Option<&'a MeasurementClock>,
+        clock: &'a MeasurementClock,
+        sample_latency: bool,
         cancellation: &'a RunCancellation,
     ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a {
-        execute_ddl_session(session, None, plan, clock, cancellation)
+        execute_ddl_session(
+            session,
+            None,
+            plan,
+            sample_latency.then_some(clock),
+            cancellation,
+        )
     }
 
     fn verify_outcome(
@@ -194,14 +202,15 @@ impl SessionExecutor for IndexDdlExecutor {
         _engine: &'a Engine,
         session: &'a mut Session,
         plan: &'a SessionPlan,
-        clock: Option<&'a MeasurementClock>,
+        clock: &'a MeasurementClock,
+        sample_latency: bool,
         cancellation: &'a RunCancellation,
     ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a {
         execute_ddl_session(
             session,
             Some(self.primary.table_id),
             plan,
-            clock,
+            sample_latency.then_some(clock),
             cancellation,
         )
     }

@@ -42,3 +42,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Task 000269 implemented the isolated public freeze/checkpoint lifecycle, semantic retry waiting, metrics, template, documentation, and smoke coverage; cold persisted lookup expansion remains tracked by backlog 000074.
+- Closed By: backlog close
+- Reference: docs/tasks/000269-single-table-checkpoint-benchmark.md; docs/rfcs/0028-composable-doradb-bench-phase-framework.md; docs/backlogs/000074-expand-runtime-lookup-benchmark-coverage.md
+- Closed At: 2026-08-14

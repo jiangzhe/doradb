@@ -745,6 +745,13 @@ impl TrxContext {
 pub(crate) struct TrxRuntime<'r> {
     ctx: &'r TrxContext,
     attachment: &'r TrxAttachment,
+    #[cfg_attr(
+        not(debug_assertions),
+        expect(
+            dead_code,
+            reason = "transaction locks participate in debug-only lower-level write assertions"
+        )
+    )]
     locks: &'r TransactionLockState,
 }
 
@@ -4443,6 +4450,17 @@ pub(crate) mod tests {
                 )
             }
         }
+    }
+
+    /// Roll back a prepared production transaction whose undo is physically linked.
+    #[inline]
+    pub(crate) async fn rollback_production_prepared_for_test(prepared: PreparedTrx) {
+        let mut precommit = prepared.fill_cts(TrxID::new(1));
+        assert_eq!(
+            precommit.rollback_failed_precommit().await,
+            FailedPrecommitRollbackOutcome::RolledBack,
+            "test prepared transaction rollback must complete"
+        );
     }
 
     #[inline]

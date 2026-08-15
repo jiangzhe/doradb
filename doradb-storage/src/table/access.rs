@@ -4962,9 +4962,9 @@ mod tests {
     use crate::trx::stmt::tests as stmt_tests;
     use crate::trx::sys::tests::fatal_rollback_retention_count;
     use crate::trx::tests::{
-        commit_preparing_shared_trx_status, discard_production_prepared_for_test,
-        prepare_event_is_installed, prepare_shared_trx_status, prepare_transaction,
-        rollback_preparing_shared_trx_status, shared_trx_status, transaction_status_for_test,
+        commit_preparing_shared_trx_status, prepare_event_is_installed, prepare_shared_trx_status,
+        prepare_transaction, rollback_preparing_shared_trx_status,
+        rollback_production_prepared_for_test, shared_trx_status, transaction_status_for_test,
     };
     use crate::trx::undo::RowUndoKind;
     use crate::trx::ver_map::RowPageState;
@@ -8041,7 +8041,7 @@ mod tests {
             };
             let (result, ()) = futures::join!(update, poison);
             assert_unrelated_poison_fatal(&result.unwrap_err());
-            discard_production_prepared_for_test(prepared);
+            rollback_production_prepared_for_test(prepared).await;
         });
     }
 
