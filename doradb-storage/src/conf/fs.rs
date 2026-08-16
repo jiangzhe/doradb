@@ -1,13 +1,16 @@
 use crate::buffer::minimum_readonly_pool_bytes;
 use crate::conf::path::{path_to_utf8, validate_catalog_file_name};
 use crate::error::{ConfigError, ConfigResult, IoResult};
+use crate::file::cow_file::COW_FILE_PAGE_SIZE;
 use crate::file::fs::{FileSystem, StorageIOWorkerBuilder, build_file_system};
+use crate::file::multi_table_file::MULTI_TABLE_FILE_INITIAL_SIZE;
+use crate::file::table_file::TABLE_FILE_INITIAL_SIZE;
 use error_stack::{Report, ResultExt};
 use std::path::{Component as PathComponent, Path, PathBuf};
 
 use super::consts::{
-    DEFAULT_CATALOG_FILE_NAME, DEFAULT_TABLE_FILE_DATA_DIR, DEFAULT_TABLE_FILE_IO_DEPTH,
-    DEFAULT_TABLE_FILE_READONLY_BUFFER_SIZE,
+    DEFAULT_CATALOG_FILE_NAME, DEFAULT_COW_FILE_MAX_SIZE, DEFAULT_TABLE_FILE_DATA_DIR,
+    DEFAULT_TABLE_FILE_IO_DEPTH, DEFAULT_TABLE_FILE_READONLY_BUFFER_SIZE,
 };
 
 /// Configuration for table and catalog file-system resources.
@@ -21,6 +24,8 @@ pub struct FileSystemConfig {
     pub readonly_buffer_size: usize,
     /// Catalog multi-table file name.
     pub catalog_file_name: String,
+    /// Maximum logical size in bytes of each durable CoW table or catalog file.
+    pub cow_file_max_size: usize,
 }
 
 impl FileSystemConfig {
@@ -52,6 +57,13 @@ impl FileSystemConfig {
         self
     }
 
+    /// Set the maximum logical size of each durable CoW table or catalog file.
+    #[inline]
+    pub fn cow_file_max_size(mut self, cow_file_max_size: usize) -> Self {
+        self.cow_file_max_size = cow_file_max_size;
+        self
+    }
+
     /// Validate and normalize construction inputs for the file system.
     #[inline]
     pub(crate) fn validate(self) -> ConfigResult<ValidatedFileSystemConfig> {
@@ -75,12 +87,24 @@ impl FileSystemConfig {
                 )),
             );
         }
+        let cow_file_max_pages = self.cow_file_max_size / COW_FILE_PAGE_SIZE;
+        if self.cow_file_max_size < TABLE_FILE_INITIAL_SIZE
+            || self.cow_file_max_size < MULTI_TABLE_FILE_INITIAL_SIZE
+            || !self.cow_file_max_size.is_multiple_of(COW_FILE_PAGE_SIZE)
+            || cow_file_max_pages == 0
+        {
+            return Err(Report::new(ConfigError::InvalidCowFileSize).attach(format!(
+                "file.cow_file_max_size={}, table_initial_size={TABLE_FILE_INITIAL_SIZE}, multi_table_initial_size={MULTI_TABLE_FILE_INITIAL_SIZE}, cow_file_page_size={COW_FILE_PAGE_SIZE}",
+                self.cow_file_max_size
+            )));
+        }
         let data_dir = validate_data_dir(&self.data_dir)
             .attach_with(|| format!("invalid data_dir: {}", self.data_dir.display()))?;
         Ok(ValidatedFileSystemConfig {
             io_depth: self.io_depth,
             data_dir,
             catalog_file_name: self.catalog_file_name,
+            cow_file_max_pages,
         })
     }
 }
@@ -93,6 +117,7 @@ impl Default for FileSystemConfig {
             data_dir: PathBuf::from(DEFAULT_TABLE_FILE_DATA_DIR),
             readonly_buffer_size: DEFAULT_TABLE_FILE_READONLY_BUFFER_SIZE,
             catalog_file_name: String::from(DEFAULT_CATALOG_FILE_NAME),
+            cow_file_max_size: DEFAULT_COW_FILE_MAX_SIZE,
         }
     }
 }
@@ -103,13 +128,19 @@ pub(crate) struct ValidatedFileSystemConfig {
     io_depth: usize,
     data_dir: PathBuf,
     catalog_file_name: String,
+    cow_file_max_pages: usize,
 }
 
 impl ValidatedFileSystemConfig {
     /// Build the table file-system and its storage IO worker.
     #[inline]
     pub(crate) fn build_engine_parts(self) -> IoResult<(FileSystem, StorageIOWorkerBuilder)> {
-        build_file_system(self.io_depth, self.data_dir, self.catalog_file_name)
+        build_file_system(
+            self.io_depth,
+            self.data_dir,
+            self.catalog_file_name,
+            self.cow_file_max_pages,
+        )
     }
 }
 
@@ -167,6 +198,39 @@ mod tests {
             err,
             ConfigError::PathMustNotContainParentTraversal,
             &["parent traversal", "../data"],
+        );
+
+        assert_eq!(
+            FileSystemConfig::default().cow_file_max_size,
+            DEFAULT_COW_FILE_MAX_SIZE
+        );
+        for invalid_size in [
+            TABLE_FILE_INITIAL_SIZE - COW_FILE_PAGE_SIZE,
+            TABLE_FILE_INITIAL_SIZE + 1,
+        ] {
+            let err = FileSystemConfig::default()
+                .cow_file_max_size(invalid_size)
+                .validate()
+                .unwrap_err();
+            assert_config_report(
+                err,
+                ConfigError::InvalidCowFileSize,
+                &[
+                    "file.cow_file_max_size",
+                    "table_initial_size",
+                    "multi_table_initial_size",
+                    "cow_file_page_size",
+                ],
+            );
+        }
+
+        let validated = FileSystemConfig::default()
+            .cow_file_max_size(TABLE_FILE_INITIAL_SIZE * 3)
+            .validate()
+            .unwrap();
+        assert_eq!(
+            validated.cow_file_max_pages,
+            TABLE_FILE_INITIAL_SIZE * 3 / COW_FILE_PAGE_SIZE
         );
     }
 }

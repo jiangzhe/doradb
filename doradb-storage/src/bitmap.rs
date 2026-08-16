@@ -1,4 +1,4 @@
-use crate::serde::{Deser, MinBytesHint, Ser, Serde, min_bytes_hint};
+use crate::serde::{Deser, DeserResult, MinBytesHint, Ser, Serde, min_bytes_hint};
 use parking_lot::Mutex;
 use std::iter::once;
 use std::mem;
@@ -472,6 +472,36 @@ impl AllocMap {
         self.allocated.load(Ordering::Relaxed)
     }
 
+    /// Build a strictly larger allocation map while preserving current state.
+    ///
+    /// Bits outside the source map's logical length are cleared, including a
+    /// speculative out-of-range bit that an exhausted partial bitmap word may
+    /// contain. The source map is not modified.
+    #[inline]
+    pub(crate) fn expanded(&self, new_len: usize) -> Self {
+        assert!(
+            new_len > self.len,
+            "allocation map expansion must increase capacity: current_len={}, new_len={new_len}",
+            self.len
+        );
+        let source = self.inner.lock();
+        let mut bitmap = new_bitmap(new_len);
+        bitmap[..source.bitmap.len()].copy_from_slice(&source.bitmap);
+        let tail_bits = self.len % 64;
+        if tail_bits != 0 {
+            let tail_idx = self.len / 64;
+            bitmap[tail_idx] &= (1u64 << tail_bits) - 1;
+        }
+        AllocMap {
+            len: new_len,
+            allocated: AtomicUsize::new(self.allocated.load(Ordering::Relaxed)),
+            inner: Mutex::new(FreeBitmap {
+                free_unit_idx: source.free_unit_idx,
+                bitmap,
+            }),
+        }
+    }
+
     /// Try to allocate a new object, returns index of object.
     #[expect(clippy::manual_div_ceil, reason = "code style")]
     #[inline]
@@ -593,10 +623,7 @@ impl Deser for AllocMap {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<u64>() * 3);
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(
-        input: &S,
-        start_idx: usize,
-    ) -> crate::serde::DeserResult<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let (idx, len) = input.deser_u64(start_idx)?;
         let (idx, allocated) = input.deser_u64(idx)?;
         let (mut idx, free_unit_idx) = input.deser_u64(idx)?;
@@ -994,6 +1021,43 @@ mod tests {
         let g1 = alloc_map.inner.lock();
         let g2 = alloc_map2.inner.lock();
         assert!(*g1 == *g2);
+    }
+
+    #[test]
+    fn test_alloc_map_expansion_preserves_state_and_source() {
+        let source = AllocMap::new(128);
+        for idx in 0..96 {
+            assert!(source.allocate_at(idx));
+        }
+        assert!(source.deallocate(17));
+        assert_eq!(source.try_allocate(), Some(17));
+
+        let expanded = source.expanded(256);
+        assert_eq!(source.len(), 128);
+        assert_eq!(expanded.len(), 256);
+        assert_eq!(source.allocated(), 96);
+        assert_eq!(expanded.allocated(), 96);
+        for idx in 0..128 {
+            assert_eq!(expanded.is_allocated(idx), source.is_allocated(idx));
+        }
+        for idx in 128..256 {
+            assert!(!expanded.is_allocated(idx));
+        }
+    }
+
+    #[test]
+    fn test_alloc_map_expansion_clears_partial_word_tail() {
+        let source = AllocMap::new(65);
+        for expected in 0..65 {
+            assert_eq!(source.try_allocate(), Some(expected));
+        }
+        assert_eq!(source.try_allocate(), None);
+
+        let expanded = source.expanded(130);
+        assert_eq!(expanded.allocated(), 65);
+        assert_eq!(expanded.try_allocate(), Some(65));
+        assert_eq!(source.len(), 65);
+        assert_eq!(source.allocated(), 65);
     }
 
     #[test]

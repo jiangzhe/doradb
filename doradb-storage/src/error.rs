@@ -168,6 +168,8 @@ pub(crate) enum ConfigError {
     InvalidBufferPoolConfig,
     #[error("invalid fixed buffer pool size")]
     InvalidFixedBufferPoolSize,
+    #[error("invalid CoW file size")]
+    InvalidCowFileSize,
 }
 
 /// Fieldless data-integrity-domain errors carried underneath `ErrorKind::DataIntegrity`.

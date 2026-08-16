@@ -14,7 +14,7 @@ use crate::file::block_integrity::{
 use crate::file::cow_file::{
     ActiveRoot as GenericActiveRoot, COW_FILE_PAGE_SIZE, CowCodec, CowFile, CowWriteBarrier,
     MutableCowFile, MutableCowRoot, MutableWriterClaim, MutableWriterFile, OldCowRoot, ParsedMeta,
-    SUPER_BLOCK_ID, allocate_cow_block, validate_active_meta_block_id,
+    SUPER_BLOCK_ID, validate_active_meta_block_id,
 };
 use crate::file::fs::BackgroundWriteRequest;
 use crate::file::meta_block::{
@@ -179,11 +179,13 @@ impl MultiTableFile {
     #[inline]
     pub(super) async fn open_or_create(
         file_path: impl AsRef<str>,
+        max_pages: usize,
     ) -> IoResult<MultiTableFileOpenOutcome> {
         let file_path = file_path.as_ref();
         let file = match CowFile::create(
             file_path,
             MULTI_TABLE_FILE_INITIAL_SIZE,
+            max_pages,
             CATALOG_MTB_FILE_ID,
             multi_table_codec(),
             false,
@@ -194,7 +196,12 @@ impl MultiTableFile {
                 )));
             }
             Err(err) if err.current_context().kind() == IoErrorKind::AlreadyExists => {
-                CowFile::open(file_path, CATALOG_MTB_FILE_ID, multi_table_codec())?
+                CowFile::open(
+                    file_path,
+                    max_pages,
+                    CATALOG_MTB_FILE_ID,
+                    multi_table_codec(),
+                )?
             }
             Err(err) => return Err(err),
         };
@@ -213,6 +220,19 @@ impl MultiTableFile {
     ) -> RuntimeResult<MultiTableActiveRoot> {
         self.file
             .load_active_root_from_pool(FileKind::CatalogMultiTableFile, disk_pool, disk_guard)
+            .await
+    }
+
+    /// Reconcile the opened sparse extent before installing a loaded root.
+    #[inline]
+    pub(crate) async fn reconcile_loaded_root_capacity(
+        &self,
+        active_root: &MultiTableActiveRoot,
+        file_path: &str,
+        background_writes: &IOClient<BackgroundWriteRequest>,
+    ) -> RuntimeResult<()> {
+        self.file
+            .reconcile_loaded_root_capacity(active_root, file_path, background_writes)
             .await
     }
 
@@ -370,9 +390,11 @@ impl MutableMultiTableFile {
 
     /// Reserve the final meta block for a catalog checkpoint publication.
     #[inline]
-    pub(crate) fn reserve_publish_meta_block(&mut self) -> ResourceResult<BlockID> {
-        self.new_root
-            .reserve_publish_meta_block("multi-table publish root could not allocate meta block")
+    pub(crate) fn reserve_publish_meta_block(&mut self) -> RuntimeResult<BlockID> {
+        self.file.file().reserve_publish_meta_block(
+            &mut self.new_root,
+            "multi-table publish root could not allocate meta block",
+        )
     }
 
     /// Reserve the final meta block and clear the displaced active meta block.
@@ -463,8 +485,8 @@ impl MutableMultiTableFile {
 
 impl MutableCowFile for MutableMultiTableFile {
     #[inline]
-    fn allocate_block(&mut self) -> ResourceResult<BlockID> {
-        allocate_cow_block(
+    fn allocate_block(&mut self) -> RuntimeResult<BlockID> {
+        self.file.file().allocate_block(
             &mut self.new_root,
             "multi-table file could not allocate block",
         )
@@ -536,6 +558,17 @@ fn validate_multi_table_root(
         FileKind::CatalogMultiTableFile,
         "multi-table-meta",
     )?;
+    parsed_meta
+        .alloc_map
+        .len()
+        .checked_mul(COW_FILE_PAGE_SIZE)
+        .ok_or_else(|| {
+            Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
+                "file={}, alloc_map_len={}, page_size={COW_FILE_PAGE_SIZE}",
+                FileKind::CatalogMultiTableFile,
+                parsed_meta.alloc_map.len()
+            ))
+        })?;
     if parsed_meta.meta.next_table_id > USER_TABLE_ID_LIMIT {
         return Err(
             Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
@@ -557,8 +590,35 @@ fn validate_multi_table_root(
                 root.pivot_row_id
             )));
         }
+        if let Some(root_block_id) = root.checkpoint_root_block_id() {
+            let root_idx = usize::try_from(root_block_id.as_u64()).map_err(|_| {
+                Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
+                    "file={}, descriptor_slot={idx}, table_id={}, root_block_id={root_block_id}, alloc_map_len={}",
+                    FileKind::CatalogMultiTableFile,
+                    root.table_id,
+                    parsed_meta.alloc_map.len()
+                ))
+            })?;
+            if root_idx >= parsed_meta.alloc_map.len()
+                || !parsed_meta.alloc_map.is_allocated(root_idx)
+            {
+                return Err(Report::new(DataIntegrityError::InvalidRootInvariant).attach(
+                    format!(
+                        "file={}, descriptor_slot={idx}, table_id={}, root_block_id={root_block_id}, alloc_map_len={}",
+                        FileKind::CatalogMultiTableFile,
+                        root.table_id,
+                        parsed_meta.alloc_map.len()
+                    ),
+                ));
+            }
+        }
     }
     Ok(())
+}
+
+#[inline]
+fn multi_table_meta_payload_len(meta: &MultiTableMetaBlock, alloc_map: &AllocMap) -> usize {
+    MultiTableMetaBlockSerView::new(meta, alloc_map).ser_len()
 }
 
 #[inline]
@@ -584,9 +644,11 @@ fn build_multi_table_meta_block(root: &MultiTableActiveRoot) -> ResourceResult<D
 #[inline]
 fn multi_table_codec() -> CowCodec<MultiTableMetaBlock> {
     CowCodec {
+        file_kind: FileKind::CatalogMultiTableFile,
         parse_super_block: parse_multi_table_super_block,
         parse_meta_block: parse_multi_table_meta_block,
         validate_root: validate_multi_table_root,
+        meta_payload_len: multi_table_meta_payload_len,
         build_meta_block: build_multi_table_meta_block,
         build_super_block: build_multi_table_super_block,
     }
@@ -689,6 +751,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_multi_table_meta_rejects_allocation_map_beyond_inline_capacity() {
+        let mut root = MultiTableActiveRoot::new();
+        root.alloc_map = AllocMap::new(600_000);
+        let err = match build_multi_table_meta_block(&root) {
+            Ok(_) => panic!("oversized catalog allocation map must not serialize"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.current_context(),
+            &ResourceError::StorageFileCapacityExceeded
+        );
+        let report = format!("{err:?}");
+        assert!(report.contains("payload too large"), "{report}");
+    }
+
     async fn publish_checkpoint_for_test(
         mtb: &Arc<MultiTableFile>,
         background_writes: &IOClient<BackgroundWriteRequest>,
@@ -697,6 +775,15 @@ mod tests {
         table_roots: [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
     ) {
         let mut mutable = MutableMultiTableFile::fork(mtb, background_writes);
+        for root in &table_roots {
+            if let Some(block_id) = root.checkpoint_root_block_id() {
+                let _ = mutable
+                    .new_root
+                    .root
+                    .alloc_map
+                    .allocate_at(usize::from(block_id));
+            }
+        }
         mutable.apply_checkpoint_metadata(catalog_replay_start_ts, next_table_id, table_roots);
         let (_, old_root) = mutable.commit().await.unwrap();
         drop(old_root);
@@ -848,6 +935,110 @@ mod tests {
             let reloaded = mtb.load_snapshot();
             assert_eq!(reloaded.catalog_replay_start_ts, TrxID::new(8));
             assert_eq!(reloaded.meta.first_redo_log_seq, 3);
+        });
+    }
+
+    #[test]
+    fn test_multi_table_file_growth_repairs_abandoned_tail_and_reopens_committed_capacity() {
+        smol::block_on(async {
+            let (_dir, fs) = build_test_fs();
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_guard = global.create_base_guard();
+            let mtb = fs
+                .open_or_create_multi_table_file(global.guard(), &disk_guard)
+                .await
+                .unwrap();
+
+            let mut abandoned = MutableMultiTableFile::fork(&mtb, fs.background_writes());
+            let initial_pages = abandoned.root().alloc_map.len();
+            let free_pages = initial_pages - abandoned.root().alloc_map.allocated();
+            for _ in 0..free_pages {
+                assert!(usize::from(abandoned.allocate_block().unwrap()) < initial_pages);
+            }
+            let first_expanded_block = abandoned.allocate_block().unwrap();
+            assert!(usize::from(first_expanded_block) >= initial_pages);
+            assert_eq!(abandoned.root().alloc_map.len(), initial_pages * 2);
+            assert_eq!(
+                mtb.sparse_file().logical_len(),
+                MULTI_TABLE_FILE_INITIAL_SIZE * 2
+            );
+            drop(abandoned);
+            drop(mtb);
+
+            let repaired = fs
+                .open_or_create_multi_table_file(global.guard(), &disk_guard)
+                .await
+                .unwrap();
+            assert_eq!(
+                repaired.active_root_unchecked().alloc_map.len(),
+                initial_pages
+            );
+            assert_eq!(
+                repaired.sparse_file().logical_len(),
+                MULTI_TABLE_FILE_INITIAL_SIZE
+            );
+
+            let mut expanded = MutableMultiTableFile::fork(&repaired, fs.background_writes());
+            let free_pages = initial_pages - expanded.root().alloc_map.allocated();
+            for _ in 0..=free_pages {
+                expanded.allocate_block().unwrap();
+            }
+            let snapshot = repaired.load_snapshot();
+            expanded.apply_checkpoint_metadata(
+                TrxID::new(2),
+                snapshot.meta.next_table_id,
+                snapshot.meta.table_roots,
+            );
+            let (expanded, old_root) = expanded.commit().await.unwrap();
+            drop(old_root);
+            drop(repaired);
+            drop(expanded);
+
+            let reopened = fs
+                .open_or_create_multi_table_file(global.guard(), &disk_guard)
+                .await
+                .unwrap();
+            assert_eq!(
+                reopened.active_root_unchecked().alloc_map.len(),
+                initial_pages * 2
+            );
+            assert_eq!(
+                reopened.sparse_file().logical_len(),
+                MULTI_TABLE_FILE_INITIAL_SIZE * 2
+            );
+        });
+    }
+
+    #[test]
+    fn test_multi_table_file_reopen_rejects_shorter_than_published_capacity() {
+        smol::block_on(async {
+            let (_dir, fs) = build_test_fs();
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_guard = global.create_base_guard();
+            let mtb = fs
+                .open_or_create_multi_table_file(global.guard(), &disk_guard)
+                .await
+                .unwrap();
+            let path = fs.catalog_mtb_file_path();
+            drop(mtb);
+            OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len((COW_FILE_PAGE_SIZE * 2) as u64)
+                .unwrap();
+
+            let err = fs
+                .open_or_create_multi_table_file(global.guard(), &disk_guard)
+                .await
+                .err()
+                .expect("short catalog file must fail to open");
+            assert_eq!(err.current_context(), &RuntimeError::FileRootAccess);
+            assert_eq!(
+                err.downcast_ref::<DataIntegrityError>().copied(),
+                Some(DataIntegrityError::InvalidRootInvariant)
+            );
+            assert_eq!(std::fs::metadata(path).unwrap().len(), 131_072);
         });
     }
 

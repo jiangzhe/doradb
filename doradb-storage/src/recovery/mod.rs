@@ -1126,7 +1126,11 @@ impl<'a> RecoveryCoordinator<'a> {
         for row in rows.values() {
             match &row.kind {
                 RowRedoKind::Insert(page_id, vals) => {
-                    if cts < heap_redo_start_ts {
+                    // Rows below the published pivot are represented by the
+                    // checkpointed LWC root. Frozen tail pages can contain
+                    // commits newer than the successor page's create fence,
+                    // so the replay timestamp alone cannot classify them.
+                    if !should_replay_heap_row(row.row_id, pivot_row_id, cts, heap_redo_start_ts) {
                         continue;
                     }
                     table
@@ -1141,7 +1145,7 @@ impl<'a> RecoveryCoordinator<'a> {
                         .await?;
                 }
                 RowRedoKind::Update(page_id, vals) => {
-                    if cts < heap_redo_start_ts {
+                    if !should_replay_heap_row(row.row_id, pivot_row_id, cts, heap_redo_start_ts) {
                         continue;
                     }
                     table
@@ -1233,10 +1237,21 @@ fn invalid_user_table_keyed_redo(
         ))
 }
 
+#[inline]
+fn should_replay_heap_row(
+    row_id: RowID,
+    pivot_row_id: RowID,
+    cts: TrxID,
+    heap_redo_start_ts: TrxID,
+) -> bool {
+    row_id >= pivot_row_id && cts >= heap_redo_start_ts
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        RecoveryCoordinator, invalid_user_table_keyed_redo, validate_create_table_reloaded_root_ts,
+        RecoveryCoordinator, invalid_user_table_keyed_redo, should_replay_heap_row,
+        validate_create_table_reloaded_root_ts,
     };
     use crate::catalog::storage::publish_first_redo_log_seq_for_test;
     use crate::catalog::storage::tests::mark_catalog_ddl;
@@ -1256,7 +1271,7 @@ mod tests {
     use crate::file::cow_file::{COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID};
     use crate::file::table_file::MutableTableFile;
     use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
-    use crate::index::{COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE, ColumnBlockIndex};
+    use crate::index::{COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE, ColumnBlockIndex, RowLocation};
     use crate::log::LogSync;
     use crate::log::block_group::TrxLog;
     use crate::log::format::{
@@ -1283,6 +1298,30 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_heap_replay_requires_row_at_or_above_published_pivot() {
+        let pivot_row_id = RowID::new(100);
+        let replay_start_ts = TrxID::new(10);
+        assert!(!should_replay_heap_row(
+            RowID::new(99),
+            pivot_row_id,
+            TrxID::new(11),
+            replay_start_ts,
+        ));
+        assert!(!should_replay_heap_row(
+            RowID::new(100),
+            pivot_row_id,
+            TrxID::new(9),
+            replay_start_ts,
+        ));
+        assert!(should_replay_heap_row(
+            RowID::new(100),
+            pivot_row_id,
+            replay_start_ts,
+            replay_start_ts,
+        ));
+    }
 
     const LIGHTWEIGHT_RECOVERY_BUFFER_BYTES: usize = 16 * 1024 * 1024;
     const LIGHTWEIGHT_RECOVERY_MAX_FILE_BYTES: usize = 32 * 1024 * 1024;
@@ -3873,6 +3912,163 @@ mod tests {
                 vec![Val::from(8u32), Val::from("hot-row")]
             );
 
+            trx.commit().await.unwrap();
+
+            drop(table);
+            drop(session);
+            drop(engine);
+        })
+    }
+
+    #[test]
+    fn test_log_recover_skips_checkpointed_tail_insert_newer_than_heap_redo_start() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let log_file_stem = "recover-checkpointed-tail";
+            let engine = Engine::bootstrap(lightweight_recovery_engine_config(
+                main_dir.clone(),
+                log_file_stem,
+            ))
+            .await
+            .unwrap();
+
+            let mut setup_session = engine.new_session().unwrap();
+            let table_id = setup_session
+                .create_table(
+                    TableSpec::new(vec![
+                        ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
+                        ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                    ]),
+                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
+                )
+                .await
+                .unwrap();
+            engine
+                .new_session()
+                .unwrap()
+                .checkpoint_catalog()
+                .await
+                .unwrap();
+
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
+            let payload = "x".repeat(1024);
+            let mut insert_trx = setup_session.begin_trx().unwrap();
+            let mut row_ids = Vec::with_capacity(200);
+            for id in 0..200u32 {
+                row_ids.push(
+                    trx_insert_row(
+                        &mut insert_trx,
+                        &table,
+                        vec![Val::from(id), Val::from(payload.as_str())],
+                    )
+                    .await
+                    .unwrap(),
+                );
+            }
+            let insert_cts = insert_trx.commit().await.unwrap();
+
+            let mut checkpoint_session = engine.new_session().unwrap();
+            let frozen_batch =
+                assert_freeze_created(checkpoint_session.freeze_table(table_id, 1).await.unwrap());
+            assert_eq!(frozen_batch.page_count(), 1);
+
+            let deleted_row_id = row_ids[0];
+            let cold_row_id = row_ids[1];
+            let hot_row_id = *row_ids.last().unwrap();
+            let mut delete_trx = setup_session.begin_trx().unwrap();
+            let delete = trx_delete_row(
+                &mut delete_trx,
+                &table,
+                &SelectKey::new(0, vec![Val::from(0u32)]),
+            )
+            .await;
+            assert!(matches!(delete, Ok(DeleteMvcc::Deleted)));
+            let delete_cts = delete_trx.commit().await.unwrap();
+
+            checkpoint_session
+                .wait_for_gc_horizon_after(delete_cts)
+                .await
+                .unwrap();
+            assert_checkpoint_published(&mut checkpoint_session, table_id).await;
+            let active_root = table.file().active_root_unchecked();
+            let pivot_row_id = active_root.pivot_row_id;
+            let heap_redo_start_ts = active_root.heap_redo_start_ts;
+            assert!(deleted_row_id < pivot_row_id);
+            assert!(cold_row_id < pivot_row_id);
+            assert!(hot_row_id >= pivot_row_id);
+            assert!(insert_cts >= heap_redo_start_ts);
+
+            drop(table);
+            drop(checkpoint_session);
+            drop(setup_session);
+            drop(engine);
+
+            let engine =
+                Engine::bootstrap(lightweight_recovery_engine_config(main_dir, log_file_stem))
+                    .await
+                    .unwrap();
+
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
+            assert_eq!(
+                table.file().active_root_unchecked().pivot_row_id,
+                pivot_row_id
+            );
+            let mut session = engine.new_session().unwrap();
+            let guards = session.pool_guards();
+            assert!(matches!(
+                table.find_row(&guards, cold_row_id).await.unwrap(),
+                RowLocation::LwcBlock(..)
+            ));
+            assert!(matches!(
+                table.find_row(&guards, hot_row_id).await.unwrap(),
+                RowLocation::RowPage(..)
+            ));
+            drop(guards);
+
+            let mut trx = session.begin_trx().unwrap();
+            let deleted_row = trx_select_row_mvcc(
+                &mut trx,
+                &table,
+                &SelectKey::new(0, vec![Val::from(0u32)]),
+                &[0, 1],
+            )
+            .await;
+            assert!(matches!(deleted_row, Ok(SelectMvcc::NotFound)));
+            let cold_row = trx_select_row_mvcc(
+                &mut trx,
+                &table,
+                &SelectKey::new(0, vec![Val::from(1u32)]),
+                &[0, 1],
+            )
+            .await;
+            assert_eq!(
+                cold_row.unwrap().unwrap_found(),
+                vec![Val::from(1u32), Val::from(payload.as_str())]
+            );
+            let hot_row = trx_select_row_mvcc(
+                &mut trx,
+                &table,
+                &SelectKey::new(0, vec![Val::from(199u32)]),
+                &[0, 1],
+            )
+            .await;
+            assert_eq!(
+                hot_row.unwrap().unwrap_found(),
+                vec![Val::from(199u32), Val::from(payload.as_str())]
+            );
             trx.commit().await.unwrap();
 
             drop(table);

@@ -168,6 +168,12 @@ impl SparseFile {
         self.file_id
     }
 
+    /// Return the tracked logical length of this sparse file.
+    #[inline]
+    pub(crate) fn logical_len(&self) -> usize {
+        self.max_len.load(Ordering::Acquire)
+    }
+
     /// Allocate enough space for data of given length to persist
     /// at end of the file.
     #[inline]
@@ -196,35 +202,51 @@ impl SparseFile {
 
     /// Grow the file to given size.
     #[inline]
-    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
-    #[cfg_attr(
-        all(feature = "iouring", test),
-        expect(dead_code, reason = "pending dead-code audit")
-    )]
     pub(crate) fn extend_to(&self, max_len: usize) -> IoResult<()> {
         let _size_guard = self.size_lock.lock();
         let curr_len = self.max_len.load(Ordering::Acquire);
         if max_len <= curr_len {
             return Ok(());
         }
+        self.resize_to(max_len, "file_extend")
+    }
+
+    /// Shrink a durable CoW file during startup reconciliation.
+    ///
+    /// No runtime or catalog storage may be installed while this operation is
+    /// in progress. Live allocators never use this primitive.
+    #[inline]
+    pub(crate) fn truncate_to(&self, max_len: usize) -> IoResult<()> {
+        let _size_guard = self.size_lock.lock();
+        let curr_len = self.max_len.load(Ordering::Acquire);
+        if max_len >= curr_len {
+            return Ok(());
+        }
+        self.resize_to(max_len, "file_truncate")
+    }
+
+    #[inline]
+    fn resize_to(&self, max_len: usize, operation: &'static str) -> IoResult<()> {
+        let truncate_len = i64::try_from(max_len).map_err(|_| {
+            Report::new(IoError::from(IoErrorKind::InvalidInput))
+                .attach(format!("op={operation}, requested_len={max_len}"))
+        })?;
         // SAFETY: `self.fd` is a live owned file descriptor and `max_len` is
         // the requested logical file length for this sparse file.
-        let retcode = unsafe { ftruncate(self.fd, max_len as i64) };
+        let retcode = unsafe { ftruncate(self.fd, truncate_len) };
         if retcode == 0 {
+            self.max_len.store(max_len, Ordering::Release);
             return Ok(());
         }
         debug_assert!(retcode == -1);
         let err = StdIoError::last_os_error();
-        Err(Report::new(IoError::from(err.kind())).attach(format!("op=file_resize, {err}")))
+        Err(Report::new(IoError::from(err.kind()))
+            .attach(format!("op={operation}, requested_len={max_len}, {err}")))
     }
 
     /// Get the logical size and allocated size of this file.
     #[inline]
     #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
-    #[cfg_attr(
-        all(feature = "iouring", test),
-        expect(dead_code, reason = "pending dead-code audit")
-    )]
     pub(crate) fn size(&self) -> IoResult<(usize, usize)> {
         sparse_file_size(self.fd)
     }
@@ -1133,6 +1155,34 @@ mod tests {
         assert!(file.alloc(STORAGE_SECTOR_SIZE).as_ref().is_err_and(|err| {
             *err.current_context() == ResourceError::StorageFileCapacityExceeded
         }));
+    }
+
+    #[test]
+    fn test_sparse_file_resize_tracks_logical_length_and_preserves_sparse_tail() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("resize.bin");
+        let file_path = file_path.to_string_lossy().into_owned();
+        let initial_len = STORAGE_SECTOR_SIZE;
+        let expanded_len = 16 * 1024 * 1024;
+        let file = SparseFile::create_or_trunc(&file_path, initial_len, UNTRACKED_FILE_ID).unwrap();
+
+        assert_eq!(file.logical_len(), initial_len);
+        let (_, allocated_before) = file.size().unwrap();
+        file.extend_to(expanded_len).unwrap();
+        assert_eq!(file.logical_len(), expanded_len);
+        assert_eq!(file.size().unwrap().0, expanded_len);
+        assert!(
+            file.size().unwrap().1 < expanded_len,
+            "unwritten sparse tail unexpectedly consumed its logical length"
+        );
+
+        file.extend_to(initial_len).unwrap();
+        assert_eq!(file.logical_len(), expanded_len);
+        assert_eq!(file.size().unwrap().1, allocated_before);
+
+        file.truncate_to(initial_len).unwrap();
+        assert_eq!(file.logical_len(), initial_len);
+        assert_eq!(file.size().unwrap().0, initial_len);
     }
 
     #[test]

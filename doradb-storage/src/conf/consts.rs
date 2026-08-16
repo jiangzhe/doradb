@@ -18,6 +18,8 @@ pub(crate) const DEFAULT_TABLE_FILE_DATA_DIR: &str = ".";
 pub(crate) const DEFAULT_TABLE_FILE_READONLY_BUFFER_SIZE: usize = 256 * 1024 * 1024;
 /// Default unified catalog multi-table file name under `data_dir`.
 pub(crate) const DEFAULT_CATALOG_FILE_NAME: &str = "catalog.mtb";
+/// Default maximum logical size of each durable CoW table or catalog file.
+pub const DEFAULT_COW_FILE_MAX_SIZE: usize = 16 * 1024 * 1024 * 1024;
 
 /// Required suffix for ephemeral swap files managed by evictable buffer pools.
 pub(crate) const SWAP_FILE_SUFFIX: &str = ".swp";
