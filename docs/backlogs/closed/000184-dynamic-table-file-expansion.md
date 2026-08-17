@@ -28,4 +28,10 @@ A public table checkpoint or index publication that needs blocks beyond the curr
 
 ## Notes (Optional)
 
+## Close Reason
 
+- Type: implemented
+- Detail: Implemented via docs/tasks/000270-failure-atomic-dynamic-cow-file-expansion.md
+- Closed By: backlog close
+- Reference: User decision
+- Closed At: 2026-08-17

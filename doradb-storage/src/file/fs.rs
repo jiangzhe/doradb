@@ -1731,6 +1731,7 @@ pub(crate) struct FileSystem {
     io_backend_stats: BackendStatsHandle,
     storage_service_stats: StorageServiceStatsHandle,
     configured_io_depth: usize,
+    cow_file_max_pages: usize,
     data_dir: PathBuf,
     // Catalog multi-table file name.
     catalog_file_name: String,
@@ -1838,7 +1839,13 @@ impl FileSystem {
         trunc: bool,
     ) -> IoResult<MutableTableFile> {
         let file_path = self.user_table_file_path(table_id);
-        let table_file = TableFile::create(&file_path, TABLE_FILE_INITIAL_SIZE, table_id, trunc)?;
+        let table_file = TableFile::create(
+            &file_path,
+            TABLE_FILE_INITIAL_SIZE,
+            self.cow_file_max_pages,
+            table_id,
+            trunc,
+        )?;
         let initial_pages = TABLE_FILE_INITIAL_SIZE / COW_FILE_PAGE_SIZE;
         let active_root = ActiveRoot::new(TrxID::new(0), initial_pages, metadata);
         Ok(MutableTableFile::new_without_barrier(
@@ -1858,7 +1865,7 @@ impl FileSystem {
     ) -> RuntimeResult<Arc<TableFile>> {
         let file_path = self.user_table_file_path(table_id);
         let table_file = Arc::new(
-            TableFile::open(&file_path, table_id)
+            TableFile::open(&file_path, self.cow_file_max_pages, table_id)
                 .change_context(RuntimeError::FileRootAccess)
                 .attach_with(|| {
                     format!("operation=open_table_file, table_id={table_id}, file_path={file_path}")
@@ -1866,6 +1873,9 @@ impl FileSystem {
         );
         let active_root = table_file
             .load_active_root_from_pool(&disk_pool, disk_guard)
+            .await?;
+        table_file
+            .reconcile_loaded_root_capacity(&active_root, &file_path, self.background_writes())
             .await?;
         let old_root = table_file.install_loaded_root(active_root);
         debug_assert!(old_root.is_none());
@@ -1997,7 +2007,7 @@ impl FileSystem {
         disk_guard: &PoolGuard,
     ) -> RuntimeResult<Arc<MultiTableFile>> {
         let file_path = self.catalog_mtb_file_path();
-        match MultiTableFile::open_or_create(&file_path)
+        match MultiTableFile::open_or_create(&file_path, self.cow_file_max_pages)
             .await
             .change_context(RuntimeError::FileRootAccess)
             .attach_with(|| {
@@ -2007,6 +2017,12 @@ impl FileSystem {
                 let active_root = mtb
                     .load_active_root_from_pool(&disk_pool, disk_guard)
                     .await?;
+                mtb.reconcile_loaded_root_capacity(
+                    &active_root,
+                    &file_path,
+                    self.background_writes(),
+                )
+                .await?;
                 let old_root = mtb.install_loaded_root(active_root);
                 debug_assert!(old_root.is_none());
                 Ok(mtb)
@@ -2083,6 +2099,7 @@ pub(crate) fn build_file_system(
     io_depth: usize,
     data_dir: PathBuf,
     catalog_file_name: String,
+    cow_file_max_pages: usize,
 ) -> IoResult<(FileSystem, StorageIOWorkerBuilder)> {
     let backend = StorageBackend::setup(io_depth)?;
     let stats = backend.stats_handle();
@@ -2096,6 +2113,7 @@ pub(crate) fn build_file_system(
             io_backend_stats: stats,
             storage_service_stats: builder.stats.clone(),
             configured_io_depth: io_depth,
+            cow_file_max_pages,
             data_dir,
             catalog_file_name,
         },
@@ -2166,7 +2184,7 @@ pub(crate) mod tests {
     use crate::{DiskPool, IndexPool, MemPool, MetaPool};
     use event_listener::Event;
     use smol::Timer;
-    use std::fs::{create_dir, write};
+    use std::fs::{OpenOptions, create_dir, write};
     use std::io::Error as StdIoError;
     use std::num::NonZeroUsize;
     use std::ops::Deref;
@@ -3094,11 +3112,62 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_user_table_stale_tail_repair_fsync_failure_prevents_open() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let table_id = test_user_table_id(296);
+            let mutable = fs
+                .create_table_file(table_id, make_metadata(), false)
+                .unwrap();
+            let (table_file, old_root) = mutable.commit(TrxID::new(1), false).await.unwrap();
+            drop(old_root);
+            drop(table_file);
+
+            let path = fs.user_table_file_path(table_id);
+            OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len((TABLE_FILE_INITIAL_SIZE * 2) as u64)
+                .unwrap();
+            let identity = StorageBackendFileIdentity::from_path(&path).unwrap();
+            let hook_guard = install_storage_backend_test_hook(Arc::new(
+                FailingStorageOpHook::new(IOKind::Fsync, identity),
+            ));
+            let global = global_readonly_pool_scope(TEST_READONLY_BUFFER_BYTES);
+            let disk_guard = global.create_base_guard();
+            let err = fs
+                .open_table_file(table_id, global.guard(), &disk_guard)
+                .await
+                .err()
+                .expect("repair fsync failure must prevent table-file open");
+            assert_eq!(err.current_context(), &RuntimeError::FileRootAccess);
+            assert!(err.downcast_ref::<IoError>().is_some());
+            let report = format!("{err:?}");
+            assert!(report.contains("phase=fsync"), "{report}");
+            assert!(report.contains("reconcile_cow_file_capacity"), "{report}");
+            drop(hook_guard);
+
+            let reopened = fs
+                .open_table_file(table_id, global.guard(), &disk_guard)
+                .await
+                .unwrap();
+            assert_eq!(
+                reopened.sparse_file().logical_len(),
+                TABLE_FILE_INITIAL_SIZE
+            );
+        });
+    }
+
+    #[test]
     fn test_catalog_commit_submits_backend_fsync_after_root_writes() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let path = fs.catalog_mtb_file_path();
-            let mtb = match MultiTableFile::open_or_create(&path).await.unwrap() {
+            let mtb = match MultiTableFile::open_or_create(&path, fs.cow_file_max_pages)
+                .await
+                .unwrap()
+            {
                 MultiTableFileOpenOutcome::Created(mtb) => mtb,
                 MultiTableFileOpenOutcome::Opened(_) => {
                     panic!("fresh catalog path should create a multi-table file")
@@ -3122,6 +3191,130 @@ pub(crate) mod tests {
             );
             drop(mtb);
             drop(fs);
+        });
+    }
+
+    #[test]
+    fn test_table_file_growth_clamps_to_configured_non_power_of_two_ceiling() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let fs = build_test_fs_with_config_in(
+                temp_dir.path(),
+                FileSystemConfig::default().cow_file_max_size(TABLE_FILE_INITIAL_SIZE * 3),
+            )
+            .unwrap();
+            let table_id = test_user_table_id(294);
+            let mutable = fs
+                .create_table_file(table_id, make_metadata(), false)
+                .unwrap();
+            let (table_file, old_root) = mutable.commit(TrxID::new(1), false).await.unwrap();
+            drop(old_root);
+            let global = global_readonly_pool_scope(TEST_READONLY_BUFFER_BYTES);
+            let mut mutable = MutableTableFile::fork(
+                &table_file,
+                fs.background_writes(),
+                global.guard(),
+                global.create_base_guard(),
+            );
+
+            let initial_pages = TABLE_FILE_INITIAL_SIZE / COW_FILE_PAGE_SIZE;
+            let first_free = initial_pages - mutable.root().alloc_map.allocated();
+            for _ in 0..=first_free {
+                mutable.allocate_block().unwrap();
+            }
+            assert_eq!(mutable.root().alloc_map.len(), initial_pages * 2);
+            let second_free = initial_pages * 2 - mutable.root().alloc_map.allocated();
+            for _ in 0..=second_free {
+                mutable.allocate_block().unwrap();
+            }
+            assert_eq!(mutable.root().alloc_map.len(), initial_pages * 3);
+            assert_eq!(
+                table_file.sparse_file().logical_len(),
+                TABLE_FILE_INITIAL_SIZE * 3
+            );
+
+            while mutable.root().alloc_map.allocated() < initial_pages * 3 {
+                mutable.allocate_block().unwrap();
+            }
+            let err = mutable.allocate_block().unwrap_err();
+            assert_eq!(err.current_context(), &RuntimeError::FileRootAccess);
+            assert_eq!(
+                err.downcast_ref::<crate::error::ResourceError>().copied(),
+                Some(crate::error::ResourceError::StorageFileCapacityExceeded)
+            );
+            let report = format!("{err:?}");
+            assert!(report.contains("maximum_pages=768"), "{report}");
+            assert_eq!(mutable.root().alloc_map.len(), initial_pages * 3);
+            assert_eq!(
+                table_file.sparse_file().logical_len(),
+                TABLE_FILE_INITIAL_SIZE * 3
+            );
+        });
+    }
+
+    #[test]
+    fn test_open_expanded_table_file_above_lowered_ceiling_uses_existing_free_pages() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let table_id = test_user_table_id(295);
+            {
+                let fs = build_test_fs_with_config_in(
+                    temp_dir.path(),
+                    FileSystemConfig::default().cow_file_max_size(TABLE_FILE_INITIAL_SIZE * 2),
+                )
+                .unwrap();
+                let mutable = fs
+                    .create_table_file(table_id, make_metadata(), false)
+                    .unwrap();
+                let (table_file, old_root) = mutable.commit(TrxID::new(1), false).await.unwrap();
+                drop(old_root);
+                let global = global_readonly_pool_scope(TEST_READONLY_BUFFER_BYTES);
+                let mut mutable = MutableTableFile::fork(
+                    &table_file,
+                    fs.background_writes(),
+                    global.guard(),
+                    global.create_base_guard(),
+                );
+                let initial_pages = mutable.root().alloc_map.len();
+                let free_pages = initial_pages - mutable.root().alloc_map.allocated();
+                for _ in 0..=free_pages {
+                    mutable.allocate_block().unwrap();
+                }
+                let (published, old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
+                drop(old_root);
+                drop(published);
+                drop(table_file);
+            }
+
+            let fs = build_test_fs_with_config_in(
+                temp_dir.path(),
+                FileSystemConfig::default().cow_file_max_size(TABLE_FILE_INITIAL_SIZE),
+            )
+            .unwrap();
+            let global = global_readonly_pool_scope(TEST_READONLY_BUFFER_BYTES);
+            let disk_guard = global.create_base_guard();
+            let table_file = fs
+                .open_table_file(table_id, global.guard(), &disk_guard)
+                .await
+                .unwrap();
+            let initial_pages = TABLE_FILE_INITIAL_SIZE / COW_FILE_PAGE_SIZE;
+            assert_eq!(
+                table_file.active_root_unchecked().alloc_map.len(),
+                initial_pages * 2
+            );
+            let mut mutable = MutableTableFile::fork(
+                &table_file,
+                fs.background_writes(),
+                global.guard(),
+                disk_guard,
+            );
+            let block_id = mutable.allocate_block().unwrap();
+            assert!(usize::from(block_id) >= initial_pages);
+            assert_eq!(mutable.root().alloc_map.len(), initial_pages * 2);
+            assert_eq!(
+                table_file.sparse_file().logical_len(),
+                TABLE_FILE_INITIAL_SIZE * 2
+            );
         });
     }
 

@@ -3337,18 +3337,28 @@ pub(crate) mod tests {
             let base_page_id = 7u64;
 
             // Prepare one more block than cache capacity to force drop-only eviction.
-            for i in 0..=capacity {
-                let block_id = BlockID::from(base_page_id + i as u64);
-                let payload = format!("page-{i}");
-                write_payload_with_pool(
-                    &engine.inner().table_fs,
-                    &table_file,
-                    &pool,
-                    block_id,
-                    payload.as_bytes(),
-                )
-                .await;
+            let mut mutable = MutableTableFile::fork(
+                &table_file,
+                engine.inner().table_fs.background_writes(),
+                pool.clone(),
+                pool.create_base_guard(),
+            );
+            let mut written = 0usize;
+            while written <= capacity {
+                let block_id = mutable.allocate_block().unwrap();
+                if block_id < BlockID::from(base_page_id) {
+                    continue;
+                }
+                assert_eq!(block_id, BlockID::from(base_page_id + written as u64));
+                let payload = format!("page-{written}");
+                let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
+                buf.as_bytes_mut()[..payload.len()].copy_from_slice(payload.as_bytes());
+                mutable.write_block(block_id, buf).await.unwrap();
+                written += 1;
             }
+            let (published_file, old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
+            drop(old_root);
+            drop(published_file);
             drop(table_file);
 
             let table_file = engine

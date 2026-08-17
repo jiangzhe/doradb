@@ -114,6 +114,38 @@ phase.
 
 ## 5. Space Management And GC
 
+New user `.tbl` files and `catalog.mtb` begin with a 16 MiB sparse logical
+extent (256 64-KiB pages). The allocation-map length in each CoW root is the
+root's logical capacity. When a mutable root exhausts that map, the shared CoW
+allocator doubles its page count, clamped to `FileSystemConfig::cow_file_max_size`.
+The default ceiling is 16 GiB and applies independently to every physical user
+table file and to the catalog file; it is neither eagerly allocated nor a
+combined quota.
+
+Growth is failure-atomic with root publication:
+
+1. build a larger allocation map without changing the mutable root
+2. verify the concrete table or catalog meta payload still fits one checksummed page
+3. extend the sparse logical file with `ftruncate`
+4. install the larger mutable map and allocate from the new range
+5. publish data, meta, and the inactive super slot through the existing `fsync`
+
+No sync is added at extension time. Until publication `fsync` succeeds, the old
+active root remains authoritative. User-table metadata size depends on schema
+and secondary-index roots, so its exact inline allocation-map ceiling is
+file-specific. The fixed catalog payload can represent about 31.9 GiB of
+64-KiB pages. Candidate growth is rejected with a typed capacity error before
+`ftruncate` if either concrete inline format would overflow.
+
+Startup validates all concrete top-level roots before reconciling the sparse
+extent. A file shorter than the selected root's map capacity is corruption and
+is never auto-extended. A longer file is an abandoned unpublished sparse tail;
+startup truncates it to the selected published capacity, durably syncs that
+repair, and only then installs the loaded user-table or catalog root. Existing
+published roots larger than a newly lowered configured ceiling remain valid and
+may use their existing free pages, but cannot grow again until the ceiling is
+raised.
+
 Pages move through three states:
 
 1. `Allocated`

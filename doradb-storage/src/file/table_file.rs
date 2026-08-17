@@ -2,9 +2,9 @@ use crate::bitmap::AllocMap;
 use crate::buffer::{PoolGuard, ReadonlyBufferPool};
 use crate::catalog::table::TableMetadata;
 use crate::error::{
-    CompletionErrorBridge, CompletionResult, DataIntegrityResult, IoResult, MultiDomainResultExt,
-    ResourceError, ResourceResult, RuntimeError, RuntimeOrFatalResult, RuntimeOrFatalResultExt,
-    RuntimeResult,
+    CompletionErrorBridge, CompletionResult, DataIntegrityError, DataIntegrityResult, IoResult,
+    MultiDomainResultExt, ResourceError, ResourceResult, RuntimeError, RuntimeOrFatalResult,
+    RuntimeOrFatalResultExt, RuntimeResult,
 };
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, BlockIntegritySpec, max_payload_len, validate_block,
@@ -13,7 +13,7 @@ use crate::file::block_integrity::{
 use crate::file::cow_file::{
     ActiveRoot as GenericActiveRoot, COW_FILE_PAGE_SIZE, CowCodec, CowFile, CowWriteBarrier,
     MutableCowFile, MutableCowRoot, MutableWriterClaim, MutableWriterFile, OldCowRoot, ParsedMeta,
-    SUPER_BLOCK_ID, allocate_cow_block, validate_active_meta_block_id,
+    SUPER_BLOCK_ID, validate_active_meta_block_id,
 };
 use crate::file::fs::BackgroundWriteRequest;
 use crate::file::meta_block::{
@@ -141,6 +141,7 @@ impl TableFile {
     pub(super) fn create(
         file_path: impl AsRef<str>,
         initial_size: usize,
+        max_pages: usize,
         table_id: TableID,
         trunc: bool,
     ) -> IoResult<Self> {
@@ -148,6 +149,7 @@ impl TableFile {
         let file = CowFile::create(
             file_path,
             initial_size,
+            max_pages,
             FileID::from(table_id.as_u64()),
             table_codec(),
             trunc,
@@ -156,8 +158,17 @@ impl TableFile {
     }
 
     #[inline]
-    pub(super) fn open(file_path: impl AsRef<str>, table_id: TableID) -> IoResult<Self> {
-        let file = CowFile::open(file_path, FileID::from(table_id.as_u64()), table_codec())?;
+    pub(super) fn open(
+        file_path: impl AsRef<str>,
+        max_pages: usize,
+        table_id: TableID,
+    ) -> IoResult<Self> {
+        let file = CowFile::open(
+            file_path,
+            max_pages,
+            FileID::from(table_id.as_u64()),
+            table_codec(),
+        )?;
         Ok(TableFile { file })
     }
 
@@ -170,6 +181,19 @@ impl TableFile {
     ) -> RuntimeResult<ActiveRoot> {
         self.file
             .load_active_root_from_pool(FileKind::TableFile, disk_pool, disk_guard)
+            .await
+    }
+
+    /// Reconcile the opened sparse extent before installing a loaded root.
+    #[inline]
+    pub(crate) async fn reconcile_loaded_root_capacity(
+        &self,
+        active_root: &ActiveRoot,
+        file_path: &str,
+        background_writes: &IOClient<BackgroundWriteRequest>,
+    ) -> RuntimeResult<()> {
+        self.file
+            .reconcile_loaded_root_capacity(active_root, file_path, background_writes)
             .await
     }
 
@@ -454,12 +478,7 @@ impl MutableTableFile {
                 "column block-index invariant violated: LWC block start row regressed: start_row_id={start_row_id}, last_end={last_end}, file_id={}",
                 self.file.sparse_file().file_id()
             );
-            let block_id = allocate_cow_block(
-                &mut self.new_root,
-                "table file could not allocate LWC block",
-            )
-            .change_context(RuntimeError::FileRootAccess)
-            .attach_with(|| {
+            let block_id = self.allocate_block().attach_with(|| {
                 format!(
                     "operation=apply_lwc_blocks, phase=allocate_block, file_id={}",
                     self.file.sparse_file().file_id()
@@ -539,8 +558,10 @@ impl MutableTableFile {
 
 impl MutableCowFile for MutableTableFile {
     #[inline]
-    fn allocate_block(&mut self) -> ResourceResult<BlockID> {
-        allocate_cow_block(&mut self.new_root, "table file could not allocate block")
+    fn allocate_block(&mut self) -> RuntimeResult<BlockID> {
+        self.file
+            .file()
+            .allocate_block(&mut self.new_root, "table file could not allocate block")
     }
 
     #[inline]
@@ -648,7 +669,101 @@ fn validate_table_root(
         meta_block_id,
         FileKind::TableFile,
         "table-meta",
+    )?;
+    parsed_meta
+        .alloc_map
+        .len()
+        .checked_mul(COW_FILE_PAGE_SIZE)
+        .ok_or_else(|| {
+            Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
+                "file={}, alloc_map_len={}, page_size={COW_FILE_PAGE_SIZE}",
+                FileKind::TableFile,
+                parsed_meta.alloc_map.len()
+            ))
+        })?;
+    validate_table_root_block(
+        &parsed_meta.alloc_map,
+        parsed_meta.meta.column_block_index_root,
+        "column_block_index_root",
+    )?;
+    if parsed_meta.meta.secondary_index_roots.len()
+        != parsed_meta.meta.metadata.idx.index_slot_count()
+    {
+        return Err(
+            Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
+                "file={}, secondary_root_count={}, index_slot_count={}",
+                FileKind::TableFile,
+                parsed_meta.meta.secondary_index_roots.len(),
+                parsed_meta.meta.metadata.idx.index_slot_count()
+            )),
+        );
+    }
+    for (index_no, root_block_id) in parsed_meta
+        .meta
+        .secondary_index_roots
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        if parsed_meta.meta.metadata.idx.index_spec(index_no).is_none() {
+            if root_block_id != SUPER_BLOCK_ID {
+                return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+                .attach(format!(
+                    "file={}, inactive_secondary_index_no={index_no}, root_block_id={root_block_id}, expected_sentinel={SUPER_BLOCK_ID}",
+                    FileKind::TableFile
+                )));
+            }
+        } else {
+            validate_table_root_block(
+                &parsed_meta.alloc_map,
+                root_block_id,
+                "secondary_index_root",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[inline]
+fn validate_table_root_block(
+    alloc_map: &AllocMap,
+    block_id: BlockID,
+    block_kind: &'static str,
+) -> DataIntegrityResult<()> {
+    if block_id == SUPER_BLOCK_ID {
+        return Ok(());
+    }
+    let idx = usize::try_from(block_id.as_u64()).map_err(|_| {
+        Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
+            "file={}, block={block_kind}, block_id={block_id}, alloc_map_len={}",
+            FileKind::TableFile,
+            alloc_map.len()
+        ))
+    })?;
+    if idx >= alloc_map.len() || !alloc_map.is_allocated(idx) {
+        return Err(
+            Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
+                "file={}, block={block_kind}, block_id={block_id}, alloc_map_len={}",
+                FileKind::TableFile,
+                alloc_map.len()
+            )),
+        );
+    }
+    Ok(())
+}
+
+#[inline]
+fn table_meta_payload_len(meta: &TableMeta, alloc_map: &AllocMap) -> usize {
+    MetaBlockSerView::new(
+        meta.metadata.ser_view(),
+        meta.column_block_index_root,
+        &meta.secondary_index_roots,
+        alloc_map,
+        meta.pivot_row_id,
+        meta.heap_redo_start_ts,
+        meta.deletion_cutoff_ts,
     )
+    .ser_len()
 }
 
 #[inline]
@@ -696,9 +811,11 @@ fn build_table_super_block(root: &ActiveRoot) -> DirectBuf {
 #[inline]
 fn table_codec() -> CowCodec<TableMeta> {
     CowCodec {
+        file_kind: FileKind::TableFile,
         parse_super_block: parse_table_super_block,
         parse_meta_block: parse_table_meta_block,
         validate_root: validate_table_root,
+        meta_payload_len: table_meta_payload_len,
         build_meta_block: build_table_meta_block,
         build_super_block: build_table_super_block,
     }
@@ -1521,6 +1638,151 @@ mod tests {
                 disk_pool.global_pool().clone(),
                 disk_pool.create_base_guard(),
             );
+        });
+    }
+
+    #[test]
+    fn test_table_file_growth_repairs_abandoned_tail_and_reopens_committed_capacity() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let table_id = test_user_table_id(147);
+            let mutable = fs
+                .create_table_file(table_id, build_test_metadata(), false)
+                .unwrap();
+            let (table_file, old_root) = mutable.commit(TrxID::new(1), false).await.unwrap();
+            drop(old_root);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+
+            let mut abandoned = MutableTableFile::fork(
+                &table_file,
+                fs.background_writes(),
+                global.guard(),
+                global.create_base_guard(),
+            );
+            let initial_pages = abandoned.root().alloc_map.len();
+            let free_pages = initial_pages - abandoned.root().alloc_map.allocated();
+            for _ in 0..free_pages {
+                assert!(usize::from(abandoned.allocate_block().unwrap()) < initial_pages);
+            }
+            assert_eq!(
+                table_file.sparse_file().logical_len(),
+                TABLE_FILE_INITIAL_SIZE
+            );
+            let first_expanded_block = abandoned.allocate_block().unwrap();
+            assert!(usize::from(first_expanded_block) >= initial_pages);
+            assert_eq!(abandoned.root().alloc_map.len(), initial_pages * 2);
+            assert_eq!(
+                table_file.sparse_file().logical_len(),
+                TABLE_FILE_INITIAL_SIZE * 2
+            );
+            drop(abandoned);
+            drop(table_file);
+
+            let disk_guard = global.create_base_guard();
+            let repaired = fs
+                .open_table_file(table_id, global.guard(), &disk_guard)
+                .await
+                .unwrap();
+            assert_eq!(
+                repaired.active_root_unchecked().alloc_map.len(),
+                initial_pages
+            );
+            assert_eq!(
+                repaired.sparse_file().logical_len(),
+                TABLE_FILE_INITIAL_SIZE
+            );
+
+            let mut expanded = MutableTableFile::fork(
+                &repaired,
+                fs.background_writes(),
+                global.guard(),
+                disk_guard.clone(),
+            );
+            let free_pages = initial_pages - expanded.root().alloc_map.allocated();
+            for _ in 0..=free_pages {
+                expanded.allocate_block().unwrap();
+            }
+            assert_eq!(expanded.root().alloc_map.len(), initial_pages * 2);
+            let (expanded, old_root) = expanded.commit(TrxID::new(2), false).await.unwrap();
+            drop(old_root);
+            drop(repaired);
+            drop(expanded);
+
+            let reopened = fs
+                .open_table_file(table_id, global.guard(), &disk_guard)
+                .await
+                .unwrap();
+            assert_eq!(
+                reopened.active_root_unchecked().alloc_map.len(),
+                initial_pages * 2
+            );
+            assert_eq!(
+                reopened.sparse_file().logical_len(),
+                TABLE_FILE_INITIAL_SIZE * 2
+            );
+        });
+    }
+
+    #[test]
+    fn test_validate_table_root_rejects_unallocated_top_level_roots() {
+        let metadata = build_test_metadata();
+        let alloc_map = AllocMap::new(TABLE_FILE_INITIAL_SIZE / COW_FILE_PAGE_SIZE);
+        assert!(alloc_map.allocate_at(usize::from(SUPER_BLOCK_ID)));
+        let meta_block_id = BlockID::new(1);
+        assert!(alloc_map.allocate_at(usize::from(meta_block_id)));
+        let parsed = ParsedMeta {
+            meta: TableMeta {
+                metadata,
+                column_block_index_root: BlockID::new(9),
+                secondary_index_roots: vec![SUPER_BLOCK_ID],
+                pivot_row_id: RowID::new(0),
+                heap_redo_start_ts: TrxID::new(1),
+                deletion_cutoff_ts: TrxID::new(1),
+            },
+            alloc_map,
+        };
+        let err = validate_table_root(meta_block_id, &parsed).unwrap_err();
+        assert_eq!(
+            err.current_context(),
+            &DataIntegrityError::InvalidRootInvariant
+        );
+        assert!(format!("{err:?}").contains("column_block_index_root"));
+    }
+
+    #[test]
+    fn test_table_file_reopen_rejects_shorter_than_published_capacity() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let table_id = test_user_table_id(148);
+            let mutable = fs
+                .create_table_file(table_id, build_test_metadata(), false)
+                .unwrap();
+            let (table_file, old_root) = mutable.commit(TrxID::new(1), false).await.unwrap();
+            drop(old_root);
+            drop(table_file);
+
+            let path = fs.user_table_file_path(table_id);
+            OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len((COW_FILE_PAGE_SIZE * 2) as u64)
+                .unwrap();
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let err = fs
+                .open_table_file(table_id, global.guard(), &global.create_base_guard())
+                .await
+                .err()
+                .expect("short table file must fail to open");
+            assert_eq!(err.current_context(), &RuntimeError::FileRootAccess);
+            assert_eq!(
+                err.downcast_ref::<DataIntegrityError>().copied(),
+                Some(DataIntegrityError::InvalidRootInvariant)
+            );
+            let report = format!("{err:?}");
+            assert!(report.contains("expected_len=16777216"), "{report}");
+            assert!(report.contains("actual_len=131072"), "{report}");
+            assert_eq!(std::fs::metadata(path).unwrap().len(), 131_072);
         });
     }
 }

@@ -1248,25 +1248,6 @@ mod tests {
         )
     }
 
-    async fn write_payload(
-        fs: &FileSystem,
-        table_file: &Arc<TableFile>,
-        readonly_pool: &QuiescentGuard<ReadonlyBufferPool>,
-        block_id: BlockID,
-        payload: &[u8],
-    ) {
-        let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
-        buf.as_bytes_mut()[..payload.len()].copy_from_slice(payload);
-        let mutable = MutableTableFile::fork(
-            table_file,
-            fs.background_writes(),
-            readonly_pool.clone(),
-            readonly_pool.create_base_guard(),
-        );
-        mutable.write_block(block_id, buf).await.unwrap();
-        drop(mutable);
-    }
-
     #[derive(Clone)]
     struct ReadonlyPressureFixture {
         file: Arc<TableFile>,
@@ -1383,11 +1364,29 @@ mod tests {
         let capacity = disk_pool.capacity();
         let pool = disk_pool.clone_inner();
         let base = 32u64;
-        for i in 0..=capacity {
-            let block_id = BlockID::from(base + i as u64);
-            let payload = format!("page-{i}");
-            write_payload(fs, &table_file, &pool, block_id, payload.as_bytes()).await;
+        let mut mutable = MutableTableFile::fork(
+            &table_file,
+            fs.background_writes(),
+            pool.clone(),
+            pool.create_base_guard(),
+        );
+        let mut written = 0usize;
+        while written <= capacity {
+            let block_id = mutable.allocate_block().unwrap();
+            if block_id < BlockID::from(base) {
+                continue;
+            }
+            assert_eq!(block_id, BlockID::from(base + written as u64));
+            let payload = format!("page-{written}");
+            let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
+            buf.as_bytes_mut()[..payload.len()].copy_from_slice(payload.as_bytes());
+            mutable.write_block(block_id, buf).await.unwrap();
+            written += 1;
         }
+        let (published_file, old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
+        drop(old_root);
+        drop(published_file);
+        drop(table_file);
 
         let disk_guard = pool.create_base_guard();
         let file = fs

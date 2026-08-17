@@ -137,6 +137,8 @@ pub struct FileSystemConfigOverlay {
     pub readonly_buffer_size: Option<Byte>,
     /// Catalog multi-table file name.
     pub catalog_file_name: Option<String>,
+    /// Maximum logical size of each durable CoW table or catalog file.
+    pub cow_file_max_size: Option<Byte>,
 }
 
 impl FileSystemConfigOverlay {
@@ -146,6 +148,7 @@ impl FileSystemConfigOverlay {
         replace(&mut self.data_dir, other.data_dir);
         replace(&mut self.readonly_buffer_size, other.readonly_buffer_size);
         replace(&mut self.catalog_file_name, other.catalog_file_name);
+        replace(&mut self.cow_file_max_size, other.cow_file_max_size);
     }
 }
 
@@ -228,6 +231,7 @@ impl ResolvedEngineConfig {
                 data_dir: config.file.data_dir.clone(),
                 readonly_buffer_size_bytes: config.file.readonly_buffer_size,
                 catalog_file_name: config.file.catalog_file_name.clone(),
+                cow_file_max_size_bytes: config.file.cow_file_max_size,
             },
         }
     }
@@ -306,6 +310,8 @@ pub struct ResolvedFileSystemConfig {
     pub readonly_buffer_size_bytes: usize,
     /// Catalog multi-table file name.
     pub catalog_file_name: String,
+    /// Maximum logical bytes for each durable CoW table or catalog file.
+    pub cow_file_max_size_bytes: usize,
 }
 
 /// Apply a merged overlay to authoritative storage defaults and validate it.
@@ -381,6 +387,9 @@ pub fn resolve_engine_config(
     }
     if let Some(value) = &overlay.file.catalog_file_name {
         file = file.catalog_file_name(value);
+    }
+    if let Some(value) = overlay.file.cow_file_max_size {
+        file = file.cow_file_max_size(byte_usize(value, "file.cow_file_max_size")?);
     }
 
     let config = EngineConfig::default()
@@ -476,6 +485,10 @@ mod tests {
         let (_, resolved) = resolve_engine_config(temp.path(), &overlay).unwrap();
         assert_eq!(resolved.transaction.log_block_size_bytes, 8192);
         assert!(resolved.transaction.log_file_max_size_bytes >= 8192);
+        assert_eq!(
+            resolved.file.cow_file_max_size_bytes,
+            doradb_storage::DEFAULT_COW_FILE_MAX_SIZE
+        );
     }
 
     #[test]
@@ -526,5 +539,25 @@ mod tests {
         let overlay: EngineConfigOverlay =
             toml::from_str("meta_buffer_size = \"18446744073709551616 B\"\n").unwrap();
         assert!(resolve_engine_config(temp.path(), &overlay).is_err());
+    }
+
+    #[test]
+    fn cow_file_max_size_overlay_merges_and_round_trips() {
+        let temp = TempDir::new().unwrap();
+        let mut base: EngineConfigOverlay = toml::from_str(
+            "[file]\ncow_file_max_size = \"32 MiB\"\ncatalog_file_name = \"custom.mtb\"\n",
+        )
+        .unwrap();
+        let local: EngineConfigOverlay =
+            toml::from_str("[file]\ncow_file_max_size = \"48 MiB\"\n").unwrap();
+        base.merge(local);
+
+        let (config, resolved) = resolve_engine_config(temp.path(), &base).unwrap();
+        assert_eq!(config.file.cow_file_max_size, 48 * 1024 * 1024);
+        assert_eq!(resolved.file.cow_file_max_size_bytes, 48 * 1024 * 1024);
+        assert_eq!(resolved.file.catalog_file_name, "custom.mtb");
+        let encoded = toml::to_string(&resolved).unwrap();
+        let decoded: ResolvedEngineConfig = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded, resolved);
     }
 }

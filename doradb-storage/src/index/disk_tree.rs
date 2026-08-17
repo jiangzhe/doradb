@@ -2271,9 +2271,7 @@ mod tests {
     use super::*;
     use crate::buffer::{global_readonly_pool_scope, table_readonly_pool};
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey};
-    use crate::error::{
-        CompletionErrorBridge, CompletionResult, DataIntegrityError, IoError, ResourceResult,
-    };
+    use crate::error::{CompletionErrorBridge, CompletionResult, DataIntegrityError, IoError};
     use crate::file::block_integrity::checksum_offset;
     use crate::file::build_test_fs;
     use crate::file::table_file::MutableTableFile;
@@ -2589,7 +2587,7 @@ mod tests {
     }
 
     impl MutableCowFile for FailingDiskTreeWriteFile {
-        fn allocate_block(&mut self) -> ResourceResult<BlockID> {
+        fn allocate_block(&mut self) -> RuntimeResult<BlockID> {
             self.inner.allocate_block()
         }
 
