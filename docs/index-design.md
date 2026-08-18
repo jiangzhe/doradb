@@ -106,10 +106,25 @@ This traversal is intentionally weak and monotonic rather than a fixed
 statement-start candidate snapshot. A mutable source resumes strictly after
 its last consumed exact key and is not reopened after exhaustion. Entries
 inserted behind that point may be missed, entries ahead may be observed, and
-buffered stale entries are discarded by latest row/key revalidation. Unique
-driver updates must preserve their encoded logical key; non-unique exact keys
-include `RowID`, and current-statement undo tags exclude self-produced rows.
-There are no predicate, next-key, or gap locks.
+buffered stale entries are discarded by latest row/key revalidation.
+Non-unique exact keys include `RowID`, and current-statement undo tags exclude
+self-produced rows. There are no predicate, next-key, or gap locks.
+
+An actual encoded-key change through a unique driver is classified only after
+the exact current row is owned and the callback has returned its sparse update.
+The operation leaves that row and every old index entry physically unchanged,
+retains its provisional row lock, and stores the owned update until traversal
+is exhausted. This prevents a newly published unique key from shadowing an
+unread candidate from the other source and lets duplicate source candidates be
+suppressed by the existing statement ownership tags.
+
+Deferred updates are applied in callback order through the normal row and index
+maintenance primitives. Same-key updates remain immediate. The deferred list
+is memory-only and intentionally uncapped, so its memory grows with the number
+of changed driver keys and their sparse payloads in addition to retained undo.
+Constraint or storage failures can occur after all callbacks run. Because old
+keys are released only as each row is applied, key swaps and cycles are not a
+supported permutation algorithm and can return the normal duplicate-key error.
 
 ## 5. Summary
 

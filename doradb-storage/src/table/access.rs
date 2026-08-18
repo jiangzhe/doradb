@@ -3413,6 +3413,7 @@ impl<'op> UserTableAccessor<'op> {
                     .await?;
             }
         }
+        mutator.apply_deferred_index_updates().await?;
         Ok(outcome)
     }
 

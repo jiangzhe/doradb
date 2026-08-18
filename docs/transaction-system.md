@@ -468,9 +468,10 @@ statement-tagged provisional `Lock`; a cold row retains its deletion-buffer
 claim plus a provisional cold `Lock` undo. A foreign active owner conflicts,
 while a preparing owner is awaited only before the callback and then resolved
 again. The callback is never retried. `Skip` and an empty update synchronously
-unlink the provisional undo and release ownership; delete or non-empty update
-converts the same entry into its final operation. A callback or later storage
-error leaves the provisional effect for ordinary statement rollback.
+unlink the provisional undo and release ownership. Delete, key-preserving
+update, and non-unique-driver update paths convert the same entry immediately.
+A callback or later storage error leaves the provisional effect for ordinary
+statement rollback.
 
 Under the hot-row latch, current-statement exclusion and foreign-owner
 admission precede latest-image deletion and key validation. This order is
@@ -485,9 +486,30 @@ The selected index range is a weak monotonic current-read traversal, without
 predicate or gap locks. Concurrent movement may cause omissions or later
 entries to appear. A latest hot image tagged with the current transaction and
 `StmtNo` is skipped before callback execution, preventing self-produced
-replacement rows from being processed again. A unique driver update must keep
-its encoded logical key unchanged; other indexes retain normal immediate
-maintenance and constraint checks.
+replacement rows from being processed again. The successful exact-key hot lock
+or cold deletion-buffer claim is the selection linearization point: a writer
+that commits before it may be observed, while every foreign writer conflicts
+after it.
+
+An update that changes a unique driver's encoded logical key keeps its
+provisional lock, old row, and all old index entries unchanged until both index
+sources are exhausted. The statement caches the owned sparse update and stable
+undo box without rerunning the callback. It then applies deferred updates in
+callback order through the ordinary hot/cold update, row-move, index,
+uniqueness, redo, and rollback paths. A hot lock captured by checkpoint
+transition resumes through the same transaction's cold deletion-buffer marker
+after authoritative route publication. Same-key updates and all other actions
+remain immediate.
+
+This delayed list is memory-only, uncapped, and proportional to the number and
+payload size of unique-driver key-changing updates. Row locks are retained
+longer, callback order no longer implies physical effect order, and a duplicate
+or storage error can occur after later callbacks have run. Old keys are released
+one row at a time during application, so swaps and longer key cycles are not
+special-cased and may fail with the ordinary duplicate-key error. On error or
+future cancellation, pending stable undo boxes are synchronously folded back
+into ordinary statement/transaction rollback ownership before their carrier is
+consumed.
 
 Finite effectful session maintenance reserves one outer `Maintenance`
 operation, acquires owned `TableMetadata(S)` followed by `TableData(IS)`, and

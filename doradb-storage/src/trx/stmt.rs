@@ -53,6 +53,13 @@ impl<T> QuadResultExt<T> for QuadResult<T> {
     }
 }
 
+/// Cached unique-driver update whose provisional row lock remains installed.
+struct DeferredIndexUpdate {
+    row_id: RowID,
+    update: Vec<UpdateCol>,
+    undo: OwnedRowUndo,
+}
+
 /// Mutable effects accumulated by one statement before success or rollback.
 ///
 /// These effects merge into transaction-level `TrxEffects` when the statement
@@ -61,6 +68,7 @@ impl<T> QuadResultExt<T> for QuadResult<T> {
 pub(crate) struct StmtEffects {
     stmt_no: StmtNo,
     row_undo: RowUndoLogs,
+    deferred_index_updates: Vec<DeferredIndexUpdate>,
     index_undo: IndexUndoLogs,
     redo: RedoLogs,
 }
@@ -76,6 +84,7 @@ impl StmtEffects {
         StmtEffects {
             stmt_no,
             row_undo: RowUndoLogs::empty(),
+            deferred_index_updates: Vec::new(),
             index_undo: IndexUndoLogs::empty(),
             redo: RedoLogs::default(),
         }
@@ -88,6 +97,7 @@ impl StmtEffects {
         StmtEffects {
             stmt_no: NON_FOREGROUND_STMT_NO,
             row_undo: RowUndoLogs::empty(),
+            deferred_index_updates: Vec::new(),
             index_undo: IndexUndoLogs::empty(),
             redo: RedoLogs::default(),
         }
@@ -109,6 +119,110 @@ impl StmtEffects {
             undo.stmt_no
         );
         self.row_undo.push(undo);
+    }
+
+    /// Moves the newest provisional lock into statement-owned deferred storage.
+    #[inline]
+    pub(crate) fn defer_index_update(
+        &mut self,
+        table_id: TableID,
+        row_id: RowID,
+        update: Vec<UpdateCol>,
+    ) {
+        let undo = self
+            .row_undo
+            .last()
+            .expect("deferred index update requires a provisional row lock");
+        assert!(
+            undo.table_id == table_id
+                && undo.row_id == row_id
+                && undo.stmt_no == self.stmt_no
+                && matches!(undo.kind, RowUndoKind::Lock),
+            "deferred index update must capture the newest matching provisional lock: effects_stmt_no={}, undo_stmt_no={}, table_id={table_id}, undo_table_id={}, row_id={row_id}, undo_row_id={}, undo_kind={:?}",
+            self.stmt_no,
+            undo.stmt_no,
+            undo.table_id,
+            undo.row_id,
+            undo.kind
+        );
+        let undo = self
+            .row_undo
+            .pop()
+            .expect("validated deferred index update lock must remain newest");
+        self.deferred_index_updates.push(DeferredIndexUpdate {
+            row_id,
+            update,
+            undo,
+        });
+    }
+
+    /// Prepares deferred updates for callback-order activation through `pop`.
+    #[inline]
+    pub(crate) fn begin_deferred_index_update_application(&mut self) {
+        self.deferred_index_updates.reverse();
+    }
+
+    /// Restores the next deferred lock before returning its cached update.
+    #[inline]
+    pub(crate) fn activate_next_deferred_index_update(
+        &mut self,
+    ) -> Option<(RowID, Vec<UpdateCol>)> {
+        let DeferredIndexUpdate {
+            row_id,
+            update,
+            undo,
+        } = self.deferred_index_updates.pop()?;
+        // Restore the stable box owner before any assertion or other panic can
+        // unwind this synchronous activation path.
+        self.row_undo.push(undo);
+        let undo = self
+            .row_undo
+            .last()
+            .expect("activated deferred index update must restore row undo ownership");
+        assert!(
+            undo.row_id == row_id
+                && undo.stmt_no == self.stmt_no
+                && matches!(undo.kind, RowUndoKind::Lock),
+            "deferred index update activation must restore its exact provisional lock: effects_stmt_no={}, undo_stmt_no={}, row_id={}, undo_row_id={}, undo_kind={:?}",
+            self.stmt_no,
+            undo.stmt_no,
+            row_id,
+            undo.row_id,
+            undo.kind
+        );
+        Some((row_id, update))
+    }
+
+    /// Returns the newest ordinary row undo restored for physical mutation.
+    #[inline]
+    pub(crate) fn last_row_undo(&self) -> &OwnedRowUndo {
+        self.row_undo
+            .last()
+            .expect("owned row mutation requires a newest ordinary row undo")
+    }
+
+    /// Requires that no operation-local deferred ownership remains.
+    #[inline]
+    pub(crate) fn assert_no_deferred_index_updates(&self) {
+        assert!(
+            self.deferred_index_updates.is_empty(),
+            "statement boundary requires every deferred index update to be settled"
+        );
+    }
+
+    /// Returns whether unique-driver updates are awaiting physical application.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn has_deferred_index_updates(&self) -> bool {
+        !self.deferred_index_updates.is_empty()
+    }
+
+    /// Restores every pending lock to ordinary row rollback ownership.
+    #[inline]
+    pub(crate) fn settle_deferred_index_updates(&mut self) {
+        for deferred in self.deferred_index_updates.drain(..) {
+            self.row_undo.push(deferred.undo);
+        }
     }
 
     /// Rewrite the latest provisional row undo lock into its final operation.
@@ -224,6 +338,7 @@ impl StmtEffects {
     /// Moves successful statement effects into the active transaction effects.
     #[inline]
     pub(crate) fn merge_into_trx_effects(&mut self, trx_effects: &mut TrxEffects) {
+        self.assert_no_deferred_index_updates();
         trx_effects.merge_statement_effects(
             &mut self.row_undo,
             &mut self.index_undo,
@@ -239,6 +354,7 @@ impl StmtEffects {
     /// and private mandatory panic settlement share this mechanical operation.
     #[inline]
     pub(crate) fn fold_cancelled_into_trx_effects(&mut self, trx_effects: &mut TrxEffects) {
+        self.settle_deferred_index_updates();
         self.redo.clear();
         trx_effects.row_undo_mut().merge(&mut self.row_undo);
         trx_effects.index_undo_mut().merge(&mut self.index_undo);
@@ -251,6 +367,7 @@ impl StmtEffects {
         table_cache: &mut TableCache<'_>,
         pool_guards: &PoolGuards,
     ) -> RuntimeResult<()> {
+        self.settle_deferred_index_updates();
         self.row_undo.rollback(table_cache, pool_guards).await
     }
 
@@ -278,6 +395,7 @@ impl StmtEffects {
     /// Discards every statement-local effect after fatal transaction cleanup.
     #[inline]
     fn take_for_fatal_retention(&mut self) -> FatalRollbackRetention {
+        self.settle_deferred_index_updates();
         self.redo.clear();
         FatalRollbackRetention::Statement {
             row_undo: mem::take(&mut self.row_undo),
@@ -591,7 +709,12 @@ impl<'stmt> Statement<'stmt> {
     /// resumed strictly after its last consumed exact key, while the captured
     /// DiskTree cursor advances incrementally. Each callback runs only after
     /// exact candidate revalidation and row ownership acquisition. Updates
-    /// driven by a unique index must preserve that index's encoded logical key.
+    /// driven by a unique index that change its encoded logical key retain row
+    /// ownership and apply only after candidate traversal is exhausted. This
+    /// keeps old index entries discoverable and invokes each callback at most
+    /// once, but it can report a later uniqueness or storage error after all
+    /// callbacks have run. Deferred updates are memory-only and intentionally
+    /// uncapped; callbacks must not depend on candidate-order physical effects.
     #[inline]
     pub async fn table_index_mutate_mvcc<'r, R, F>(
         &mut self,
@@ -605,6 +728,7 @@ impl<'stmt> Statement<'stmt> {
         F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<RowMutation>,
     {
         const OPERATION: &str = "table_index_mutate_mvcc";
+        self.effects.assert_no_deferred_index_updates();
         let (table, layout) = self
             .admit_user_table(
                 table_id,
@@ -625,11 +749,19 @@ impl<'stmt> Statement<'stmt> {
             .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
             .disclose()?;
         let validate_updates = !self.disable_dml_validation;
-        let (rt, effects) = self.runtime_and_effects_mut();
-        table
-            .accessor_with_layout(&layout)
-            .table_index_mutate_mvcc(rt, effects, index_no, range, validate_updates, mutate_row)
-            .await
+        let result = {
+            let (rt, effects) = self.runtime_and_effects_mut();
+            table
+                .accessor_with_layout(&layout)
+                .table_index_mutate_mvcc(rt, effects, index_no, range, validate_updates, mutate_row)
+                .await
+        };
+        if result.is_err() {
+            self.effects.settle_deferred_index_updates();
+        } else {
+            self.effects.assert_no_deferred_index_updates();
+        }
+        result
     }
 
     /// Looks up one unique-key row in a catalog-owned user table by table id.
@@ -1219,6 +1351,7 @@ pub(crate) mod tests {
 
     fn assert_stmt_effects_empty(effects: &StmtEffects) {
         assert!(effects.row_undo.is_empty());
+        assert!(effects.deferred_index_updates.is_empty());
         assert!(effects.index_undo.is_empty());
         assert!(effects.redo.is_empty());
     }

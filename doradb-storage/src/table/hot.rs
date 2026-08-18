@@ -44,6 +44,14 @@ pub(super) enum DeleteInternal {
     RetryInTransition,
 }
 
+/// Result of resuming a retained provisional hot-row lock.
+pub(super) enum ResumeOwnedRow<'a> {
+    /// The exact retained undo head still owns this row.
+    Ok(RowWriteAccess<'a>),
+    /// Checkpoint transition requires authoritative route publication first.
+    RetryInTransition,
+}
+
 /// Hot row-page insert context shared by catalog and user-table accessors.
 pub(super) struct RowInserter<'m, 'r> {
     metadata: &'m TableMetadata,
@@ -306,6 +314,47 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
                 }
             }
         }
+    }
+
+    /// Reacquires write access for the exact provisional lock restored last.
+    #[inline]
+    pub(super) fn resume_owned_row(&self, effects: &StmtEffects) -> ResumeOwnedRow<'g> {
+        let page_guard = self.page_guard;
+        let page = page_guard.page();
+        let row_id = self.row_id;
+        assert!(
+            page.row_id_in_valid_range(row_id),
+            "retained hot-row lock route must still contain its row: table_id={}, page_id={}, row_id={row_id}",
+            self.table_id,
+            page_guard.page_id()
+        );
+        let ver_map = page_guard.unwrap_vmap();
+        let state_guard = ver_map.read_state();
+        if *state_guard == RowPageState::Transition {
+            return ResumeOwnedRow::RetryInTransition;
+        }
+        let access = page_guard.write_row_with_state_guard(page.row_idx(row_id), state_guard);
+        let undo = effects.last_row_undo();
+        assert!(
+            undo.table_id == self.table_id
+                && undo.row_id == row_id
+                && undo.stmt_no == effects.stmt_no()
+                && matches!(undo.kind, RowUndoKind::Lock),
+            "retained hot-row lock must be the newest matching provisional undo: effects_stmt_no={}, undo_stmt_no={}, table_id={}, undo_table_id={}, row_id={row_id}, undo_row_id={}, undo_kind={:?}",
+            effects.stmt_no(),
+            undo.stmt_no,
+            self.table_id,
+            undo.table_id,
+            undo.row_id,
+            undo.kind
+        );
+        assert!(
+            access.owned_by_undo(self.rt.ctx(), undo),
+            "retained hot-row lock must remain the exact transaction-owned undo head: table_id={}, page_id={}, row_id={row_id}",
+            self.table_id,
+            page_guard.page_id()
+        );
+        ResumeOwnedRow::Ok(access)
     }
 
     /// Delete the hot row after validating that it belongs to the page.
