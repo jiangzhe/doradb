@@ -33,6 +33,7 @@ use crate::trx::group::{Commit, CommitJoin, GroupCommit};
 use crate::trx::purge::PurgeTestHook;
 use crate::trx::purge::{DroppedTableFileCleanupQueue, GCBucket, Purge, TableRootQueue};
 use crate::trx::sys_trx::SysTrx;
+use crate::trx::undo::RowUndoRollbackContext;
 use crate::trx::{
     FailedPrecommitCleanupJob, FailedPrecommitReason, FatalRollbackRetention, MAX_COMMIT_TS,
     MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, PrecommitTrx, PreparedTrx,
@@ -1355,6 +1356,7 @@ impl TransactionSystem {
         let gc_no = inner.gc_no();
         let status = Arc::clone(inner.ctx().status());
         let pool_guards = attachment.pool_guards();
+        let rollback_context = RowUndoRollbackContext::new(pool_guards, &self.poisoner);
         let mut table_cache = TableCache::new(&self.catalog);
         if let Err(err) = inner
             .index_undo_mut()
@@ -1380,7 +1382,7 @@ impl TransactionSystem {
         }
         if let Err(err) = inner
             .row_undo_mut()
-            .rollback(&mut table_cache, pool_guards)
+            .rollback(&mut table_cache, rollback_context)
             .await
         {
             drop(table_cache);
@@ -1390,15 +1392,21 @@ impl TransactionSystem {
             attachment.notify_operation_transition();
             let retention = inner.retain_and_discard_after_fatal_rollback(attachment);
             self.retain_fatal_rollback(retention);
-            let report = err
-                .change_context(FatalError::RollbackAccess)
-                .attach(format!("{operation}: row undo rollback failed"));
-            obs::error!(
-                "event=engine_poison component=trx action=poison result=error error={:?}",
-                report
-            );
-            let error = self.poisoner.poison(report);
-            return Err(error.into_report());
+            return match err {
+                RuntimeOrFatalError::Runtime(report) => {
+                    let report = report
+                        .change_context(FatalError::RollbackAccess)
+                        .attach(format!("{operation}: row undo rollback failed"));
+                    obs::error!(
+                        "event=engine_poison component=trx action=poison result=error error={:?}",
+                        report
+                    );
+                    Err(self.poisoner.poison(report).into_report())
+                }
+                RuntimeOrFatalError::Fatal(report) => {
+                    Err(report.attach(format!("{operation}: row undo rollback failed")))
+                }
+            };
         }
         // Rollback access can pin table/layout/index state in its operation
         // cache. Release those owners before bindings and transaction locks.
@@ -1748,6 +1756,8 @@ fn recovery_initial_trx_ts(max_recovered_cts: TrxID) -> DataIntegrityResult<TrxI
 async fn run_trx_cleanup_job(job: &mut SessionOperationCleanupJob) {
     let operation_key = job.operation_key;
     let trx_id = job.trx_id;
+    #[cfg(test)]
+    tests::run_abandoned_cleanup_test_hook(trx_id);
     if job.claim.is_none() {
         let runtime = job
             .runtime
@@ -1883,9 +1893,15 @@ pub(crate) mod tests {
     }
 
     type TerminalRollbackTestHook = Arc<dyn Fn(TrxID, &'static str) + Send + Sync + 'static>;
+    type AbandonedCleanupTestHook = Arc<dyn Fn(TrxID) + Send + Sync + 'static>;
 
     fn terminal_rollback_test_hook_slot() -> &'static Mutex<Option<TerminalRollbackTestHook>> {
         static HOOK: OnceLock<Mutex<Option<TerminalRollbackTestHook>>> = OnceLock::new();
+        HOOK.get_or_init(|| Mutex::new(None))
+    }
+
+    fn abandoned_cleanup_test_hook_slot() -> &'static Mutex<Option<AbandonedCleanupTestHook>> {
+        static HOOK: OnceLock<Mutex<Option<AbandonedCleanupTestHook>>> = OnceLock::new();
         HOOK.get_or_init(|| Mutex::new(None))
     }
 
@@ -1898,6 +1914,18 @@ pub(crate) mod tests {
         #[inline]
         fn drop(&mut self) {
             *terminal_rollback_test_hook_slot().lock() = self.previous.take();
+        }
+    }
+
+    /// Guard that restores the previous abandoned-cleanup hook on drop.
+    pub(crate) struct AbandonedCleanupTestHookGuard {
+        previous: Option<AbandonedCleanupTestHook>,
+    }
+
+    impl Drop for AbandonedCleanupTestHookGuard {
+        #[inline]
+        fn drop(&mut self) {
+            *abandoned_cleanup_test_hook_slot().lock() = self.previous.take();
         }
     }
 
@@ -1916,6 +1944,24 @@ pub(crate) mod tests {
         let hook = terminal_rollback_test_hook_slot().lock().clone();
         if let Some(hook) = hook {
             hook(trx_id, operation);
+        }
+    }
+
+    /// Install a test-only hook before abandoned cleanup claims ownership.
+    #[inline]
+    pub(crate) fn install_abandoned_cleanup_test_hook(
+        hook: AbandonedCleanupTestHook,
+    ) -> AbandonedCleanupTestHookGuard {
+        let mut slot = abandoned_cleanup_test_hook_slot().lock();
+        let previous = slot.replace(hook);
+        AbandonedCleanupTestHookGuard { previous }
+    }
+
+    #[inline]
+    pub(crate) fn run_abandoned_cleanup_test_hook(trx_id: TrxID) {
+        let hook = abandoned_cleanup_test_hook_slot().lock().clone();
+        if let Some(hook) = hook {
+            hook(trx_id);
         }
     }
 
@@ -1939,6 +1985,31 @@ pub(crate) mod tests {
                     .any(|undo| undo.table_id == table_id && undo.row_id == row_id),
                 _ => false,
             })
+    }
+
+    pub(crate) fn retains_active_row_undo(
+        trx_sys: &TransactionSystem,
+        table_id: TableID,
+        row_id: RowID,
+    ) -> bool {
+        trx_sys
+            .fatal_rollback_retention
+            .lock()
+            .iter()
+            .any(|retention| match retention {
+                FatalRollbackRetention::Active { row_undo, .. } => row_undo
+                    .iter()
+                    .any(|undo| undo.table_id == table_id && undo.row_id == row_id),
+                _ => false,
+            })
+    }
+
+    /// Returns whether purge bookkeeping still owns an active snapshot.
+    pub(crate) fn has_active_sts(trx_sys: &TransactionSystem, sts: TrxID) -> bool {
+        trx_sys.gc_buckets.iter().any(|bucket| {
+            let active = bucket.active_sts_list.lock();
+            active.active.contains(&sts) && !active.deleted.contains(&sts)
+        })
     }
 
     pub(crate) fn retains_precommit_row_undo(

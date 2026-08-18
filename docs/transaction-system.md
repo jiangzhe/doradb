@@ -745,6 +745,14 @@ precommit performs no rollback or active-STS removal.
 - Row undo is rolled back in reverse order. `Insert` marks the hot row deleted,
   `Delete` clears the delete bit, `Update` restores before-image columns, and
   a pure `Lock` leaves row data unchanged.
+- User-table row undo resolves each entry from the current hot/cold pivot. A
+  cold-origin or already-published cold row removes its transaction-owned
+  deletion marker. An exact hot page is unlinked synchronously. If that page is
+  in checkpoint transition, or its recorded generation is temporarily absent
+  while the pivot remains hot, rollback retains the current boxed undo,
+  releases every page and row guard, and waits for either authoritative route
+  publication or engine poison before retrying from the pivot. The entry is
+  popped only after hot unlink or cold-marker removal succeeds.
 - Index undo removes inserted claims, restores merged delete-masked claims, and
   unmasks deferred deletes so MemIndex returns to the pre-transaction state.
 - Runtime unique-key branches are transaction-local MVCC aids. They are kept

@@ -44,7 +44,7 @@ use crate::error::{
     CompletionErrorBridge, DiscloseError, DiscloseResultExt, Error, FatalError, FatalResult,
     LifecycleError, LifecycleOrFatalError, LifecycleOrFatalResult, LifecycleResult,
     MultiDomainResultExt, OperationOrFatalResult, ResourceError, Result, RuntimeError,
-    RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult, SharedFatalError,
+    RuntimeOrFatalError, RuntimeOrFatalResult, SharedFatalError,
 };
 use crate::id::{SessionID, SessionOperationKey, TableID, TrxID};
 use crate::lock::{
@@ -58,7 +58,9 @@ use crate::notify::EventNotifyOnDrop;
 use crate::obs;
 use crate::poison::PoisonAwareListener;
 use crate::session::{SessionRuntime, TrxAttachment, WeakSessionRef};
-use crate::trx::undo::{IndexPurgeEntry, IndexUndoLogs, RowUndoHead, RowUndoLogs, UndoStatus};
+use crate::trx::undo::{
+    IndexPurgeEntry, IndexUndoLogs, RowUndoHead, RowUndoLogs, RowUndoRollbackContext, UndoStatus,
+};
 use error_stack::{Report, ResultExt};
 use event_listener::{Event, EventListener};
 use futures::FutureExt;
@@ -2954,7 +2956,7 @@ impl PrecommitTrxPayload {
     }
 
     #[inline]
-    async fn rollback(&mut self, attachment: &TrxAttachment) -> RuntimeResult<()> {
+    async fn rollback(&mut self, attachment: &TrxAttachment) -> RuntimeOrFatalResult<()> {
         let PrecommitTrxPayload::User {
             sts,
             row_undo,
@@ -2966,11 +2968,13 @@ impl PrecommitTrxPayload {
         };
         let trx_sys = &attachment.engine().trx_sys;
         let pool_guards = attachment.pool_guards();
+        let rollback_context =
+            RowUndoRollbackContext::new(pool_guards, &attachment.engine().poisoner);
         let mut table_cache = TableCache::new(&trx_sys.catalog);
         index_undo
             .rollback(&mut table_cache, pool_guards, *sts)
             .await?;
-        row_undo.rollback(&mut table_cache, pool_guards).await
+        row_undo.rollback(&mut table_cache, rollback_context).await
     }
 
     #[inline]
@@ -2983,9 +2987,10 @@ impl PrecommitTrxPayload {
     }
 
     #[inline]
-    fn release_prepare_waiters(&self) {
-        if let PrecommitTrxPayload::User { status, .. } = self {
-            status.finish_preparing();
+    fn prepare_waiter_status(&self) -> Option<Arc<SharedTrxStatus>> {
+        match self {
+            PrecommitTrxPayload::User { status, .. } => Some(Arc::clone(status)),
+            PrecommitTrxPayload::System(_) => None,
         }
     }
 
@@ -3136,15 +3141,33 @@ impl PrecommitTrx {
         if let (Some(payload), Some(attachment)) = (self.payload.as_mut(), self.attachment.as_ref())
         {
             if let Err(err) = payload.rollback(attachment).await {
-                let report = err
-                    .change_context(FatalError::RollbackAccess)
-                    .attach("failed-precommit rollback failed");
-                obs::error!(
-                    "event=engine_poison component=trx action=poison result=error error={:?}",
-                    report
-                );
-                let _ = attachment.engine().poisoner.poison(report);
-                self.finish_failed_precommit_with_retention();
+                match err {
+                    RuntimeOrFatalError::Runtime(report) => {
+                        let poisoner = attachment.engine().poisoner.clone();
+                        let prepare_status = self.finish_failed_precommit_with_retention();
+                        let report = report
+                            .change_context(FatalError::RollbackAccess)
+                            .attach("failed-precommit rollback failed");
+                        obs::error!(
+                            "event=engine_poison component=trx action=poison result=error error={:?}",
+                            report
+                        );
+                        let _ = poisoner.poison(report);
+                        if let Some(status) = prepare_status {
+                            status.finish_preparing();
+                        }
+                    }
+                    RuntimeOrFatalError::Fatal(report) => {
+                        let prepare_status = self.finish_failed_precommit_with_retention();
+                        obs::error!(
+                            "event=trx_cleanup component=trx action=retain result=error error={:?}",
+                            report.attach("failed-precommit row rollback failed")
+                        );
+                        if let Some(status) = prepare_status {
+                            status.finish_preparing();
+                        }
+                    }
+                }
                 return FailedPrecommitRollbackOutcome::FailedRetained;
             }
             payload.record_rollback_for_purge(attachment);
@@ -3161,15 +3184,20 @@ impl PrecommitTrx {
     #[inline]
     fn retain_failed_precommit_without_rollback(&mut self) {
         self.redo_bin.take();
-        self.finish_failed_precommit_with_retention();
+        if let Some(status) = self.finish_failed_precommit_with_retention() {
+            status.finish_preparing();
+        }
     }
 
     #[inline]
-    fn finish_failed_precommit_with_retention(&mut self) {
+    fn finish_failed_precommit_with_retention(&mut self) -> Option<Arc<SharedTrxStatus>> {
+        let prepare_status = self
+            .payload
+            .as_ref()
+            .and_then(PrecommitTrxPayload::prepare_waiter_status);
         let released = self.release_transaction_locks();
         let attachment = self.finish_carried_session_rollback_without_reuse(released);
         if let Some(payload) = self.payload.take() {
-            payload.release_prepare_waiters();
             if let Some(attachment) = attachment {
                 attachment
                     .engine()
@@ -3183,6 +3211,7 @@ impl PrecommitTrx {
                 mem::forget(payload);
             }
         }
+        prepare_status
     }
 
     /// Discard an attachmentless rejected precommit transaction.
@@ -3872,7 +3901,7 @@ pub(crate) mod tests {
     }
 
     #[inline]
-    fn transaction_entry(trx: &Transaction) -> Arc<SessionOperationEntry> {
+    pub(crate) fn transaction_entry(trx: &Transaction) -> Arc<SessionOperationEntry> {
         resolve_active_parts_for_test(trx)
             .expect("test transaction must resolve")
             .0

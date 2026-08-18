@@ -8,12 +8,14 @@ use super::{DeleteMarker, Table};
 use crate::bitmap::Bitmap;
 use crate::buffer::PoolGuards;
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
-use crate::error::RuntimeResult;
+use crate::error::{FatalResult, RuntimeResult};
 use crate::id::{PageID, RowID, TableID, TrxID};
+use crate::poison::EnginePoisoner;
 use crate::row::RowPage;
 use crate::trx::undo::{RowUndoKind, UndoStatus};
 use crate::trx::ver_map::{RowPageState, RowVersionMap};
 use crate::trx::{MAX_SNAPSHOT_TS, SharedTrxStatus, trx_is_committed};
+use futures::FutureExt;
 use std::mem::take;
 use std::sync::Arc;
 
@@ -109,6 +111,43 @@ impl FrozenPageScanMode {
 }
 
 impl Table {
+    /// Wait until checkpoint publishes a cold route for a transitioning row.
+    #[inline]
+    pub(crate) async fn wait_transition_route_or_poison(
+        &self,
+        poisoner: &EnginePoisoner,
+        row_id: RowID,
+    ) -> FatalResult<()> {
+        loop {
+            poisoner.ensure_healthy()?;
+            if row_id < self.mem.blk_idx().pivot_row_id() {
+                return Ok(());
+            }
+            let route_epoch = self.mem.blk_idx().route_epoch();
+            #[cfg(test)]
+            tests::run_before_listener_hook().await;
+            let poison_listener = poisoner.listener();
+            #[cfg(test)]
+            tests::run_after_listener_hook().await;
+            poisoner.ensure_healthy()?;
+            if row_id < self.mem.blk_idx().pivot_row_id() {
+                return Ok(());
+            }
+
+            // The route epoch is only a wake hint. The pivot remains the
+            // authoritative route, and the final health check makes an
+            // already-published checkpoint failure win the wake race.
+            let route_wait = self.mem.blk_idx().wait_route_since(route_epoch).fuse();
+            let poison_wait = poison_listener.fuse();
+            futures::pin_mut!(route_wait);
+            futures::pin_mut!(poison_wait);
+            futures::select! {
+                () = route_wait => (),
+                () = poison_wait => (),
+            }
+        }
+    }
+
     pub(super) async fn load_frozen_pages_for_transition(
         &self,
         guards: &PoolGuards,
@@ -831,7 +870,7 @@ fn active_writer_sts(trx_id: TrxID) -> TrxID {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::bitmap::Bitmap;
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
@@ -844,9 +883,92 @@ mod tests {
     use crate::trx::ver_map::{RowPageState, RowVersionMap};
     use crate::trx::{MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, NON_FOREGROUND_STMT_NO};
     use crate::value::{Val, ValKind};
+    use std::cell::RefCell;
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::thread;
+
+    type RouteWaitHook =
+        Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> + Send + 'static>;
+
+    thread_local! {
+        static BEFORE_LISTENER_HOOK: RefCell<Option<RouteWaitHook>> = RefCell::new(None);
+        static AFTER_LISTENER_HOOK: RefCell<Option<RouteWaitHook>> = RefCell::new(None);
+    }
+
+    /// Clears an unconsumed pre-registration hook when a test exits early.
+    pub(crate) struct BeforeListenerHookGuard;
+
+    impl Drop for BeforeListenerHookGuard {
+        fn drop(&mut self) {
+            BEFORE_LISTENER_HOOK.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+
+    /// Clears an unconsumed route-listener hook when a test exits early.
+    pub(crate) struct AfterListenerHookGuard;
+
+    impl Drop for AfterListenerHookGuard {
+        fn drop(&mut self) {
+            AFTER_LISTENER_HOOK.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+
+    /// Pause or mutate state after the epoch sample but before registration.
+    pub(crate) fn install_before_listener_hook<F, Fut>(hook: F) -> BeforeListenerHookGuard
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        BEFORE_LISTENER_HOOK.with(|slot| {
+            let old = slot
+                .borrow_mut()
+                .replace(Box::new(move || Box::pin(hook())));
+            assert!(
+                old.is_none(),
+                "transition-route pre-listener hook already installed"
+            );
+        });
+        BeforeListenerHookGuard
+    }
+
+    /// Pause or mutate state after route and poison listener registration.
+    pub(crate) fn install_after_listener_hook<F, Fut>(hook: F) -> AfterListenerHookGuard
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        AFTER_LISTENER_HOOK.with(|slot| {
+            let old = slot
+                .borrow_mut()
+                .replace(Box::new(move || Box::pin(hook())));
+            assert!(
+                old.is_none(),
+                "transition-route listener hook already installed"
+            );
+        });
+        AfterListenerHookGuard
+    }
+
+    pub(super) async fn run_before_listener_hook() {
+        let hook = BEFORE_LISTENER_HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
+    pub(super) async fn run_after_listener_hook() {
+        let hook = AFTER_LISTENER_HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
 
     struct FrozenAnalyzerFixture {
         page: RowPage,

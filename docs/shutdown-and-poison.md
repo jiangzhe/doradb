@@ -417,16 +417,23 @@ own health checks.
 
 ### Row-page transition routing
 
-A writer that finds its hot row page in `TRANSITION` cannot retry until the
-checkpoint publishes a cold route. Checkpoint failure after transition may
-prevent that publication, so the semantic waiter races route-epoch progress
+A writer or row-undo rollback that finds its original hot row page in
+`TRANSITION` cannot retry until the checkpoint publishes a cold route. An
+exact-generation page miss is the same unresolved route for rollback while
+the pivot still classifies the row as hot. Checkpoint failure after transition
+may prevent publication, so the shared table waiter races route-epoch progress
 with poison and checks health before and after the race. The checkpoint's
 irreversible guard is responsible for poisoning if it exits without a safe
 route publication.
 
-The writer releases the row page before waiting and retries authoritative
-routing after progress. Clean shutdown does not cancel this accepted
-foreground attempt; shutdown drains its session owner.
+The caller releases page-state and row guards before waiting and retries from
+the authoritative pivot after progress; the route epoch is only a wake hint.
+Foreground mutation retains its statement owner. Rollback retains the current
+boxed undo in `RowUndoLogs`, and the enclosing statement effects, terminal
+claim, abandoned cleanup job, or failed-precommit payload owns cancellation or
+fatal retention. A final successful health check authorizes the immediate
+synchronous retry. Clean shutdown does not cancel either accepted owner;
+shutdown drains the session operation or mandatory cleanup task.
 
 ### Maintenance progress and checkpoint retry
 
@@ -457,7 +464,7 @@ one row or add a new documented category.
 | --- | --- | --- | --- | --- |
 | Queued logical-lock acquisition | blocker release promotes FIFO prefix and completes success-only waiter | race poison only after entering `Waiting`; return first Fatal and cancel exact pending state | no direct cancellation; graceful session drain waits | `PendingClaimGuard`, then `FreshClaimsGuard` for an acquired prefix |
 | Hot/cold foreign prepare | owner commit or rollback drops the injected prepare notifier | registered and completion-race paths check poison before retry | no direct cancellation; active owner drains | row access/CDB guards plus statement/transaction owner |
-| Row-page transition route | checkpoint publishes a newer route epoch | route-or-poison race; fatal checkpoint guard supplies poison | no direct cancellation; active owner drains | row attempt and enclosing statement effects |
+| Row-page transition route | checkpoint publishes a newer route epoch; pivot is authoritative | route-or-poison race; fatal checkpoint guard supplies poison | no direct cancellation; active or mandatory owner drains | foreground row attempt, or vector-owned row undo plus statement/terminal/precommit owner |
 | GC/purge progress and checkpoint retry | monotonic progress, transaction terminal state, or table lifecycle change | poison terminates observation as Fatal | shutdown listener terminates observation | detached listeners and `SessionObserverPin` |
 | Mandatory caller capacity | permit release or admission close | capacity wait races poison; a won permit is acceptance | admission close wakes with Lifecycle shutdown | prepared caller owner before acceptance; mandatory supervisor after it |
 | I/O, page-I/O, redo, group-commit, and mandatory-result completions | owning service publishes success or a typed completion failure | use the completion's own failure channel; do not abandon submitted ownership merely because unrelated poison exists | ingress closes and accepted work is drained or completed by component owner | request owner, completion bridge, and service-specific quarantine/retention |

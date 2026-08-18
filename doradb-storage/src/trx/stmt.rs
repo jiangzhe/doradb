@@ -18,6 +18,7 @@ use crate::session::TrxAttachment;
 use crate::table::{DmlValidator, LazyRow, Table, TableRuntimeLayout};
 use crate::trx::undo::{
     IndexUndo, IndexUndoKind, IndexUndoLogs, OwnedRowUndo, RowUndoKind, RowUndoLogs,
+    RowUndoRollbackContext,
 };
 use crate::trx::{
     FatalRollbackRetention, NON_FOREGROUND_STMT_NO, SessionOperationCheckout, StmtNo,
@@ -201,6 +202,13 @@ impl StmtEffects {
             .expect("owned row mutation requires a newest ordinary row undo")
     }
 
+    /// Returns statement-owned row and index undo counts for tests.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn undo_counts(&self) -> (usize, usize) {
+        (self.row_undo.len(), self.index_undo.len())
+    }
+
     /// Requires that no operation-local deferred ownership remains.
     #[inline]
     pub(crate) fn assert_no_deferred_index_updates(&self) {
@@ -365,10 +373,10 @@ impl StmtEffects {
     pub(crate) async fn rollback_row(
         &mut self,
         table_cache: &mut TableCache<'_>,
-        pool_guards: &PoolGuards,
-    ) -> RuntimeResult<()> {
+        context: RowUndoRollbackContext<'_>,
+    ) -> RuntimeOrFatalResult<()> {
         self.settle_deferred_index_updates();
-        self.row_undo.rollback(table_cache, pool_guards).await
+        self.row_undo.rollback(table_cache, context).await
     }
 
     /// Rolls back statement-local secondary-index effects in reverse effect order.
@@ -1139,6 +1147,7 @@ impl<'stmt> Statement<'stmt> {
         let sts = self.inner.sts();
         let engine = self.attachment.engine();
         let pool_guards = self.attachment.pool_guards();
+        let rollback_context = RowUndoRollbackContext::new(pool_guards, &engine.poisoner);
         let mut table_cache = TableCache::new(engine.catalog());
         if let Err(err) = self
             .effects
@@ -1158,19 +1167,26 @@ impl<'stmt> Statement<'stmt> {
         }
         if let Err(err) = self
             .effects
-            .rollback_row(&mut table_cache, pool_guards)
+            .rollback_row(&mut table_cache, rollback_context)
             .await
         {
             let retention = self.effects.take_for_fatal_retention();
             engine.trx_sys.retain_fatal_rollback(retention);
-            let report = err
-                .change_context(FatalError::RollbackAccess)
-                .attach("statement row rollback failed");
-            obs::error!(
-                "event=engine_poison component=trx action=poison result=error error={:?}",
-                report
-            );
-            return Err(engine.poisoner.poison(report).into_report());
+            return match err {
+                RuntimeOrFatalError::Runtime(report) => {
+                    let report = report
+                        .change_context(FatalError::RollbackAccess)
+                        .attach("statement row rollback failed");
+                    obs::error!(
+                        "event=engine_poison component=trx action=poison result=error error={:?}",
+                        report
+                    );
+                    Err(engine.poisoner.poison(report).into_report())
+                }
+                RuntimeOrFatalError::Fatal(report) => {
+                    Err(report.attach("statement row rollback failed"))
+                }
+            };
         }
         self.effects.clear_redo();
         Ok(())
@@ -1486,7 +1502,10 @@ pub(crate) mod tests {
             assert_eq!(effects.index_undo.len(), 1);
 
             pause_next_row_rollback();
-            let mut row_rollback = Box::pin(effects.rollback_row(&mut table_cache, &pool_guards));
+            let rollback_context =
+                RowUndoRollbackContext::new(&pool_guards, &engine.inner().poisoner);
+            let mut row_rollback =
+                Box::pin(effects.rollback_row(&mut table_cache, rollback_context));
             assert!(futures::poll!(row_rollback.as_mut()).is_pending());
             drop(row_rollback);
             assert_eq!(effects.row_undo.len(), 1);

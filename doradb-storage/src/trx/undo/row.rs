@@ -1,8 +1,9 @@
 use crate::buffer::PoolGuards;
 use crate::buffer::page::VersionedPageID;
 use crate::catalog::{TableCache, is_catalog_table};
-use crate::error::RuntimeResult as Result;
+use crate::error::RuntimeOrFatalResult as Result;
 use crate::id::{RowID, TableID, TrxID};
+use crate::poison::EnginePoisoner;
 use crate::row::ops::{SelectKey, UndoCol, UpdateCol};
 use crate::runtime::{POLL_BUDGET, yield_now};
 use crate::trx::{
@@ -99,6 +100,35 @@ impl fmt::Debug for RowUndoKind {
     }
 }
 
+/// Outcome of one exact-page hot row-undo rollback attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RowUndoRollbackAttempt {
+    /// The exact undo was synchronously unlinked from the hot row.
+    Applied,
+    /// The undo's original page generation is no longer resident.
+    PageMissing,
+    /// The original page is retained by checkpoint transition.
+    Transition,
+}
+
+/// Borrowed engine authority required by row-undo rollback.
+#[derive(Clone, Copy)]
+pub(crate) struct RowUndoRollbackContext<'a> {
+    pool_guards: &'a PoolGuards,
+    poisoner: &'a EnginePoisoner,
+}
+
+impl<'a> RowUndoRollbackContext<'a> {
+    /// Build rollback authority from the terminal or statement owner.
+    #[inline]
+    pub(crate) fn new(pool_guards: &'a PoolGuards, poisoner: &'a EnginePoisoner) -> Self {
+        Self {
+            pool_guards,
+            poisoner,
+        }
+    }
+}
+
 /// RowUndoLogs is a collection of row undo logs.
 /// It owns the logs until GC clean them all at transaction level.
 #[derive(Default)]
@@ -134,7 +164,7 @@ impl RowUndoLogs {
     pub(crate) async fn rollback(
         &mut self,
         table_cache: &mut TableCache<'_>,
-        guards: &PoolGuards,
+        context: RowUndoRollbackContext<'_>,
     ) -> Result<()> {
         let mut budget = POLL_BUDGET;
         while !self.0.is_empty() {
@@ -154,15 +184,48 @@ impl RowUndoLogs {
                 }
                 if is_catalog_table(entry.table_id) {
                     let table = table_cache.must_get_catalog_table(entry.table_id);
-                    table.mem.rollback_row_undo(entry, guards, |_| {}).await?;
+                    if entry.page_id.is_some() {
+                        match table
+                            .mem
+                            .try_rollback_hot_row_undo(entry, context.pool_guards)
+                            .await?
+                        {
+                            RowUndoRollbackAttempt::Applied
+                            | RowUndoRollbackAttempt::PageMissing => (),
+                            RowUndoRollbackAttempt::Transition => {
+                                panic!(
+                                    "catalog row page cannot enter checkpoint transition: \
+                                     table_id={}, row_id={}",
+                                    entry.table_id, entry.row_id
+                                );
+                            }
+                        }
+                    }
                 } else {
                     let table = table_cache.must_get_user_table(entry.table_id).await;
-                    table
-                        .mem
-                        .rollback_row_undo(entry, guards, |row_id| {
-                            table.deletion_buffer().remove(row_id);
-                        })
-                        .await?;
+                    loop {
+                        if entry.page_id.is_none() {
+                            table.deletion_buffer().remove(entry.row_id);
+                            break;
+                        }
+                        if entry.row_id < table.mem.pivot_row_id() {
+                            table.deletion_buffer().remove(entry.row_id);
+                            break;
+                        }
+                        match table
+                            .mem
+                            .try_rollback_hot_row_undo(entry, context.pool_guards)
+                            .await?
+                        {
+                            RowUndoRollbackAttempt::Applied => break,
+                            RowUndoRollbackAttempt::PageMissing
+                            | RowUndoRollbackAttempt::Transition => {
+                                table
+                                    .wait_transition_route_or_poison(context.poisoner, entry.row_id)
+                                    .await?;
+                            }
+                        }
+                    }
                 }
             }
             self.0.pop();

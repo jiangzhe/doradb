@@ -28,4 +28,10 @@ Deterministically pause a checkpoint after transition markers are installed and 
 
 ## Notes (Optional)
 
+## Close Reason
 
+- Type: implemented
+- Detail: Implemented via docs/tasks/000272-row-undo-rollback-through-page-transition.md
+- Closed By: backlog close
+- Reference: User decision
+- Closed At: 2026-08-19
