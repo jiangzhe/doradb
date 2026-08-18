@@ -8,12 +8,14 @@ use super::{DeleteMarker, Table};
 use crate::bitmap::Bitmap;
 use crate::buffer::PoolGuards;
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
-use crate::error::RuntimeResult;
+use crate::error::{FatalResult, RuntimeResult};
 use crate::id::{PageID, RowID, TableID, TrxID};
+use crate::poison::EnginePoisoner;
 use crate::row::RowPage;
 use crate::trx::undo::{RowUndoKind, UndoStatus};
 use crate::trx::ver_map::{RowPageState, RowVersionMap};
 use crate::trx::{MAX_SNAPSHOT_TS, SharedTrxStatus, trx_is_committed};
+use futures::FutureExt;
 use std::mem::take;
 use std::sync::Arc;
 
@@ -109,6 +111,39 @@ impl FrozenPageScanMode {
 }
 
 impl Table {
+    /// Wait until checkpoint publishes a cold route for a transitioning row.
+    #[inline]
+    pub(crate) async fn wait_transition_route_or_poison(
+        &self,
+        poisoner: &EnginePoisoner,
+        row_id: RowID,
+    ) -> FatalResult<()> {
+        loop {
+            poisoner.ensure_healthy()?;
+            if row_id < self.mem.blk_idx().pivot_row_id() {
+                return Ok(());
+            }
+            let route_epoch = self.mem.blk_idx().route_epoch();
+            let poison_listener = poisoner.listener();
+            if row_id < self.mem.blk_idx().pivot_row_id() {
+                return Ok(());
+            }
+            poisoner.ensure_healthy()?;
+
+            // The route epoch is only a wake hint. The pivot remains the
+            // authoritative route, and the final health check makes an
+            // already-published checkpoint failure win the wake race.
+            let route_wait = self.mem.blk_idx().wait_route_since(route_epoch).fuse();
+            let poison_wait = poison_listener.fuse();
+            futures::pin_mut!(route_wait);
+            futures::pin_mut!(poison_wait);
+            futures::select! {
+                () = route_wait => (),
+                () = poison_wait => (),
+            }
+        }
+    }
+
     pub(super) async fn load_frozen_pages_for_transition(
         &self,
         guards: &PoolGuards,

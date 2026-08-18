@@ -9,10 +9,10 @@ use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::buffer::{EvictableBufferPool, PoolGuards};
 use crate::catalog::{TableColumnLayout, TableMetadata};
 use crate::error::{
-    DataIntegrityError, DataIntegrityResult, DiscloseError, DiscloseResultExt, FatalResult,
-    InternalError, MultiDomainResultExt, OperationError, OperationOrFatalResult,
-    OperationOrRuntimeError, OperationOrRuntimeResult, OperationResult, QuadResult, Result,
-    RuntimeError, RuntimeOrFatalResult, RuntimeResult,
+    DataIntegrityError, DataIntegrityResult, DiscloseError, DiscloseResultExt, InternalError,
+    MultiDomainResultExt, OperationError, OperationOrFatalResult, OperationOrRuntimeError,
+    OperationOrRuntimeResult, OperationResult, QuadResult, Result, RuntimeError,
+    RuntimeOrFatalResult, RuntimeResult,
 };
 use crate::file::FileKind;
 use crate::file::cow_file::SUPER_BLOCK_ID;
@@ -51,7 +51,6 @@ use crate::trx::{
 };
 use crate::value::Val;
 use error_stack::{Report, ResultExt};
-use futures::FutureExt;
 use index_mutate::IndexMutator;
 use std::marker::PhantomData;
 use std::mem;
@@ -662,40 +661,6 @@ impl<'op> UserTableAccessor<'op> {
         self.require_sec_idx(index_no)
             .expect("active user index slot")
             .is_unique()
-    }
-
-    #[inline]
-    async fn wait_transition_route_or_poison(
-        &self,
-        rt: TrxRuntime<'_>,
-        row_id: RowID,
-    ) -> FatalResult<()> {
-        let engine = rt.engine();
-        loop {
-            engine.poisoner.ensure_healthy()?;
-            if row_id < self.mem().blk_idx().pivot_row_id() {
-                return Ok(());
-            }
-            let route_epoch = self.mem().blk_idx().route_epoch();
-            let poison_listener = engine.poisoner.listener();
-            if row_id < self.mem().blk_idx().pivot_row_id() {
-                return Ok(());
-            }
-            engine.poisoner.ensure_healthy()?;
-
-            // Row pages in TRANSITION need either a newly published cold route
-            // or storage poison. Without the poison wake, writers could sleep
-            // after the checkpoint producer failed before route publication.
-            let route_wait = self.mem().blk_idx().wait_route_since(route_epoch).fuse();
-            let poison_wait = poison_listener.fuse();
-            futures::pin_mut!(route_wait);
-            futures::pin_mut!(poison_wait);
-            futures::select! {
-                () = route_wait => (),
-                () = poison_wait => (),
-            }
-            engine.poisoner.ensure_healthy()?;
-        }
     }
 
     #[inline]
@@ -4517,7 +4482,9 @@ impl<'op> UserTableAccessor<'op> {
                     input = returned_input;
                     // Release the row page so the checkpoint transition can complete.
                     drop(page_guard);
-                    self.wait_transition_route_or_poison(rt, row_id).await?;
+                    self.table
+                        .wait_transition_route_or_poison(&rt.engine().poisoner, row_id)
+                        .await?;
                 }
                 UpdateRowInplace::NoFreeSpaceOrFrozen(old_row_id, old_row, returned_input) => {
                     // In-place update failed after the old row was locked and
@@ -4705,7 +4672,9 @@ impl<'op> UserTableAccessor<'op> {
                 DeleteInternal::RetryInTransition => {
                     // Release the row page so the checkpoint transition can complete.
                     drop(page_guard);
-                    self.wait_transition_route_or_poison(rt, row_id).await?;
+                    self.table
+                        .wait_transition_route_or_poison(&rt.engine().poisoner, row_id)
+                        .await?;
                 }
                 DeleteInternal::Ok => {
                     // Successful row undo ownership excludes another writer,

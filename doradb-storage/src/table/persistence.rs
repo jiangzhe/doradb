@@ -2366,13 +2366,18 @@ mod tests {
     use super::*;
     use crate::buffer::BufferPool;
     use crate::buffer::guard::PageSharedGuard;
+    use crate::buffer::page::VersionedPageID;
     use crate::catalog::tests::wait_for_dropped_table_floor;
     use crate::catalog::{
-        ColumnAttributes, ColumnSpec, CurrentTableState, ResolvedVisibleTableMetadata, TableSpec,
+        ColumnAttributes, ColumnSpec, CurrentTableState, ResolvedVisibleTableMetadata, TableCache,
+        TableSpec,
     };
     use crate::conf::TrxSysConfig;
     use crate::engine::Engine;
-    use crate::error::{Error, FatalError, LifecycleError, RuntimeError, RuntimeOrFatalError};
+    use crate::error::{
+        DiscloseError, Error, FatalError, LifecycleError, OperationError, RuntimeError,
+        RuntimeOrFatalError,
+    };
     use crate::file::cow_file::tests::old_root_drop_count;
     use crate::index::RowLocation;
     use crate::io::install_storage_backend_test_hook;
@@ -2404,8 +2409,12 @@ mod tests {
     use crate::table::{DeleteMarker, TableTerminal};
     use crate::trx::purge::PurgeTestEvent;
     use crate::trx::stmt::tests as stmt_tests;
-    use crate::trx::tests::{discard_transaction_after_fatal_rollback, shared_trx_status};
-    use crate::trx::undo::{OwnedRowUndo, RowUndoHead, RowUndoKind};
+    use crate::trx::tests::{
+        discard_transaction_after_fatal_rollback, shared_trx_status, transaction_status_for_test,
+    };
+    use crate::trx::undo::{
+        OwnedRowUndo, RowUndoHead, RowUndoKind, RowUndoLogs, RowUndoRollbackContext, UndoStatus,
+    };
     use crate::trx::ver_map::RowPageState;
     use crate::trx::{MIN_ACTIVE_TRX_ID, NON_FOREGROUND_STMT_NO};
     use futures::FutureExt;
@@ -2520,6 +2529,30 @@ mod tests {
             RowLocation::NotFound => panic!("test row should exist"),
             RowLocation::LwcBlock(..) => panic!("test row should still be hot"),
         }
+    }
+
+    async fn hot_row_identity_for_key(
+        table: &Table,
+        session: &Session,
+        key: &SelectKey,
+    ) -> (RowID, VersionedPageID) {
+        let guards = session.pool_guards();
+        let (row_id, _) = bound_unique_index(table, &guards, key.index_no)
+            .lookup(&key.vals, session.last_cts())
+            .await
+            .unwrap()
+            .expect("test key should resolve to a hot row");
+        let page_id = match table.find_row(&guards, row_id).await.unwrap() {
+            RowLocation::RowPage(page_id) => page_id,
+            RowLocation::NotFound => panic!("test row should exist"),
+            RowLocation::LwcBlock(..) => panic!("test row should still be hot"),
+        };
+        let page_guard = table
+            .mem
+            .must_get_row_page_shared(&guards, page_id)
+            .await
+            .unwrap();
+        (row_id, page_guard.versioned_page_id())
     }
 
     async fn hot_page_state(table: &Table, guards: &PoolGuards, page_id: PageID) -> RowPageState {
@@ -5963,6 +5996,354 @@ mod tests {
             drop(table);
             drop(checkpoint_session);
             engine.shutdown();
+        });
+    }
+
+    #[test]
+    fn test_statement_row_rollback_waits_for_transition_route_publication() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "transition-row-rollback").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut checkpoint_session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut checkpoint_session, 1, 1, "rollback").await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let key = single_key(1);
+            let (row_id, versioned_page_id) =
+                hot_row_identity_for_key(&table, &checkpoint_session, &key).await;
+            let page_id = versioned_page_id.page_id;
+
+            assert_freeze_created(
+                checkpoint_session
+                    .freeze_table(table_id, usize::MAX)
+                    .await
+                    .unwrap(),
+            );
+            let target_ts = checkpoint_session.last_cts();
+            checkpoint_session
+                .wait_for_gc_horizon_after(target_ts)
+                .await
+                .unwrap();
+            wait_for_checkpoint_root_ready(&mut checkpoint_session, table_id).await;
+
+            let mut writer_session = engine.new_session().unwrap();
+            let mut writer = writer_session.begin_trx().unwrap();
+            let writer_status = transaction_status_for_test(&writer);
+            let (delete_done_tx, delete_done_rx) = flume::bounded(1);
+            let (return_error_tx, return_error_rx) = flume::bounded(1);
+            let statement_key = key.clone();
+            let mut statement = Box::pin(writer.exec(async move |stmt| {
+                let deleted = stmt
+                    .table_delete_unique_mvcc(table_id, statement_key.index_no, &statement_key.vals)
+                    .await?;
+                assert_eq!(deleted, crate::row::ops::DeleteMvcc::Deleted);
+                delete_done_tx.send_async(()).await.unwrap();
+                return_error_rx.recv_async().await.unwrap();
+                Err::<(), Error>(Report::new(OperationError::InvalidDmlInput).disclose())
+            }));
+            let delete_done = delete_done_rx.recv_async().fuse();
+            futures::pin_mut!(delete_done);
+            futures::select! {
+                result = statement.as_mut().fuse() => {
+                    panic!("statement completed before rollback was requested: {result:?}");
+                }
+                result = delete_done => result.unwrap(),
+            }
+
+            let (transition_entered_tx, transition_entered_rx) = flume::bounded(1);
+            let (publish_route_tx, publish_route_rx) = flume::bounded(1);
+            set_test_checkpoint_after_publish_admission_hook(&engine, move || async move {
+                transition_entered_tx.send_async(()).await.unwrap();
+                publish_route_rx.recv_async().await.unwrap();
+            });
+            let mut checkpoint = Box::pin(checkpoint_session.checkpoint_table(table_id).fuse());
+            let transition_entered = transition_entered_rx.recv_async().fuse();
+            futures::pin_mut!(transition_entered);
+            futures::select! {
+                result = checkpoint.as_mut() => {
+                    panic!("checkpoint completed before transition inspection: {result:?}");
+                }
+                result = transition_entered => result.unwrap(),
+            }
+
+            let before_wait = engine.inner().poisoner.test_observation_counts();
+            return_error_tx.send_async(()).await.unwrap();
+            assert!(matches!(
+                futures::poll!(statement.as_mut()),
+                std::task::Poll::Pending
+            ));
+            let after_wait = engine.inner().poisoner.test_observation_counts();
+            assert!(after_wait.0 > before_wait.0);
+            assert!(after_wait.1 > before_wait.1);
+
+            assert!(row_id >= table.mem.pivot_row_id());
+            let page_guard = table
+                .mem
+                .must_get_row_page_shared(&writer_session.pool_guards(), page_id)
+                .await
+                .unwrap();
+            let page = page_guard.page();
+            let row_idx = page.row_idx(row_id);
+            assert_eq!(
+                page_guard.unwrap_vmap().inspect_state(),
+                RowPageState::Transition
+            );
+            assert!(page.is_deleted(row_idx));
+            let undo_guard = page_guard.unwrap_vmap().read_latch(row_idx);
+            let undo_head = undo_guard
+                .as_ref()
+                .expect("transition rollback must retain its hot undo head");
+            assert_eq!(undo_head.next.main.entry.as_ref().row_id, row_id);
+            assert!(matches!(
+                undo_head.next.main.entry.as_ref().kind,
+                RowUndoKind::Delete
+            ));
+            let UndoStatus::Ref(head_status) = &undo_head.next.main.status else {
+                panic!("active rollback undo must retain shared transaction status");
+            };
+            assert!(Arc::ptr_eq(head_status, &writer_status));
+            let Some(DeleteMarker::Ref(marker_status)) = table.deletion_buffer().get(row_id) else {
+                panic!("transition rollback must retain its cold delete marker");
+            };
+            assert!(Arc::ptr_eq(&marker_status, &writer_status));
+            drop(undo_guard);
+            drop(page_guard);
+
+            publish_route_tx.send_async(()).await.unwrap();
+            let outcome = checkpoint.await.unwrap();
+            assert!(matches!(outcome, CheckpointOutcome::Published { .. }));
+            let statement_error = statement.await.unwrap_err();
+            assert_eq!(
+                statement_error
+                    .report()
+                    .downcast_ref::<OperationError>()
+                    .copied(),
+                Some(OperationError::InvalidDmlInput)
+            );
+            assert!(row_id < table.mem.pivot_row_id());
+            assert!(table.deletion_buffer().get(row_id).is_none());
+
+            let selected = trx_select_row_mvcc_by_id(&mut writer, table_id, &key, &[0, 1])
+                .await
+                .unwrap();
+            assert!(matches!(selected, SelectMvcc::Found(_)));
+            writer.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_missing_generation_row_rollback_retains_entry_until_route_publication() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "missing-page-row-rollback").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 1, 1, "missing").await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let key = single_key(1);
+            let (row_id, versioned_page_id) =
+                hot_row_identity_for_key(&table, &session, &key).await;
+            let stale_page_id = VersionedPageID {
+                page_id: versioned_page_id.page_id,
+                generation: versioned_page_id.generation.saturating_add(1),
+            };
+            let status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 200));
+            table
+                .deletion_buffer()
+                .put_ref(row_id, Arc::clone(&status), session.last_cts())
+                .unwrap();
+            let mut row_undo = RowUndoLogs::empty();
+            row_undo.push(OwnedRowUndo::new(
+                NON_FOREGROUND_STMT_NO,
+                table_id,
+                Some(stale_page_id),
+                row_id,
+                RowUndoKind::Delete,
+            ));
+            let mut table_cache = TableCache::new(engine.inner().core.catalog());
+            let pool_guards = session.pool_guards();
+            let rollback_context =
+                RowUndoRollbackContext::new(&pool_guards, &engine.inner().poisoner);
+            let mut rollback = Box::pin(row_undo.rollback(&mut table_cache, rollback_context));
+            assert!(matches!(
+                futures::poll!(rollback.as_mut()),
+                std::task::Poll::Pending
+            ));
+            drop(rollback);
+            assert_eq!(row_undo.len(), 1);
+            let Some(DeleteMarker::Ref(actual)) = table.deletion_buffer().get(row_id) else {
+                panic!("missing-page rollback must retain its cold marker while pivot is hot");
+            };
+            assert!(Arc::ptr_eq(&actual, &status));
+
+            let mut rollback = Box::pin(row_undo.rollback(&mut table_cache, rollback_context));
+            assert!(matches!(
+                futures::poll!(rollback.as_mut()),
+                std::task::Poll::Pending
+            ));
+            table
+                .mem
+                .blk_idx()
+                .update_column_root(row_id + 1, SUPER_BLOCK_ID)
+                .await;
+            rollback.await.unwrap();
+            assert!(row_undo.is_empty());
+            assert!(table.deletion_buffer().get(row_id).is_none());
+        });
+    }
+
+    #[test]
+    fn test_missing_generation_row_rollback_preserves_checkpoint_poison_and_entry() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "missing-page-row-poison").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 1, 1, "poison").await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let key = single_key(1);
+            let (row_id, versioned_page_id) =
+                hot_row_identity_for_key(&table, &session, &key).await;
+            let stale_page_id = VersionedPageID {
+                page_id: versioned_page_id.page_id,
+                generation: versioned_page_id.generation.saturating_add(1),
+            };
+            let status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 201));
+            table
+                .deletion_buffer()
+                .put_ref(row_id, Arc::clone(&status), session.last_cts())
+                .unwrap();
+            let mut row_undo = RowUndoLogs::empty();
+            row_undo.push(OwnedRowUndo::new(
+                NON_FOREGROUND_STMT_NO,
+                table_id,
+                Some(stale_page_id),
+                row_id,
+                RowUndoKind::Delete,
+            ));
+            let mut table_cache = TableCache::new(engine.inner().core.catalog());
+            let pool_guards = session.pool_guards();
+            let rollback_context =
+                RowUndoRollbackContext::new(&pool_guards, &engine.inner().poisoner);
+            let mut rollback = Box::pin(row_undo.rollback(&mut table_cache, rollback_context));
+            assert!(matches!(
+                futures::poll!(rollback.as_mut()),
+                std::task::Poll::Pending
+            ));
+            engine
+                .inner()
+                .poisoner
+                .poison(Report::new(FatalError::CheckpointWrite).attach("test checkpoint poison"));
+            let err = rollback.await.unwrap_err();
+            let RuntimeOrFatalError::Fatal(report) = err else {
+                panic!("route poison must remain Fatal");
+            };
+            assert_eq!(*report.current_context(), FatalError::CheckpointWrite);
+            assert_eq!(row_undo.len(), 1);
+            let Some(DeleteMarker::Ref(actual)) = table.deletion_buffer().get(row_id) else {
+                panic!("poisoned rollback must retain its unresolved cold marker");
+            };
+            assert!(Arc::ptr_eq(&actual, &status));
+            drop(session);
+            drop(table);
+            engine.shutdown();
+        });
+    }
+
+    #[test]
+    fn test_row_rollback_fast_paths_do_not_observe_poison() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "row-rollback-fast-paths").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 1, 1, "fast").await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let key = single_key(1);
+            let (row_id, versioned_page_id) =
+                hot_row_identity_for_key(&table, &session, &key).await;
+            let page_id = versioned_page_id.page_id;
+            let pool_guards = session.pool_guards();
+            let rollback_context =
+                RowUndoRollbackContext::new(&pool_guards, &engine.inner().poisoner);
+            let mut table_cache = TableCache::new(engine.inner().core.catalog());
+
+            let page_guard = table
+                .mem
+                .must_get_row_page_shared(&pool_guards, page_id)
+                .await
+                .unwrap();
+            assert_eq!(page_guard.versioned_page_id(), versioned_page_id);
+            let status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 300));
+            let hot_undo = OwnedRowUndo::new(
+                NON_FOREGROUND_STMT_NO,
+                table_id,
+                Some(versioned_page_id),
+                row_id,
+                RowUndoKind::Delete,
+            );
+            let row_idx = page_guard.page().row_idx(row_id);
+            *page_guard.unwrap_vmap().write_latch(row_idx) = Some(Box::new(RowUndoHead::new(
+                Arc::clone(&status),
+                hot_undo.leak(),
+            )));
+            page_guard.write_row_by_id(row_id).delete_row();
+            drop(page_guard);
+            let mut hot_logs = RowUndoLogs::empty();
+            hot_logs.push(hot_undo);
+            let before = engine.inner().poisoner.test_observation_counts();
+            hot_logs
+                .rollback(&mut table_cache, rollback_context)
+                .await
+                .unwrap();
+            assert_eq!(engine.inner().poisoner.test_observation_counts(), before);
+            assert!(hot_logs.is_empty());
+
+            let cold_origin_row_id = row_id + 10_000;
+            table
+                .deletion_buffer()
+                .put_ref(cold_origin_row_id, Arc::clone(&status), session.last_cts())
+                .unwrap();
+            let mut cold_origin_logs = RowUndoLogs::empty();
+            cold_origin_logs.push(OwnedRowUndo::new(
+                NON_FOREGROUND_STMT_NO,
+                table_id,
+                None,
+                cold_origin_row_id,
+                RowUndoKind::Delete,
+            ));
+            let before = engine.inner().poisoner.test_observation_counts();
+            cold_origin_logs
+                .rollback(&mut table_cache, rollback_context)
+                .await
+                .unwrap();
+            assert_eq!(engine.inner().poisoner.test_observation_counts(), before);
+            assert!(cold_origin_logs.is_empty());
+
+            table
+                .mem
+                .blk_idx()
+                .update_column_root(row_id + 1, SUPER_BLOCK_ID)
+                .await;
+            table
+                .deletion_buffer()
+                .put_ref(row_id, Arc::clone(&status), session.last_cts())
+                .unwrap();
+            let mut below_pivot_logs = RowUndoLogs::empty();
+            below_pivot_logs.push(OwnedRowUndo::new(
+                NON_FOREGROUND_STMT_NO,
+                table_id,
+                Some(versioned_page_id),
+                row_id,
+                RowUndoKind::Delete,
+            ));
+            let before = engine.inner().poisoner.test_observation_counts();
+            below_pivot_logs
+                .rollback(&mut table_cache, rollback_context)
+                .await
+                .unwrap();
+            assert_eq!(engine.inner().poisoner.test_observation_counts(), before);
+            assert!(below_pivot_logs.is_empty());
         });
     }
 

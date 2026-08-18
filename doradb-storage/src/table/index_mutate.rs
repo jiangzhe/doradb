@@ -160,7 +160,8 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                 drop(locked);
                 drop(page_guard);
                 accessor
-                    .wait_transition_route_or_poison(self.rt, candidate.row_id)
+                    .table
+                    .wait_transition_route_or_poison(&self.rt.engine().poisoner, candidate.row_id)
                     .await
                     .disclose()?;
                 return Ok(CandidateProgress::RetryLocation);
@@ -507,9 +508,15 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                             ResumeOwnedRow::RetryInTransition => (),
                         }
                     }
+                    // Checkpoint has sealed this hot page while the deferred
+                    // update still owns its provisional undo. Release the page
+                    // before waiting for either authoritative cold-route
+                    // publication or poison; after a normal wake, the loop
+                    // re-resolves the row instead of assuming its location.
                     drop(page_guard);
                     accessor
-                        .wait_transition_route_or_poison(self.rt, row_id)
+                        .table
+                        .wait_transition_route_or_poison(&self.rt.engine().poisoner, row_id)
                         .await
                         .disclose()?;
                 }

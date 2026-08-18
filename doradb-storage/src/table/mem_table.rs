@@ -34,7 +34,8 @@ use crate::row::ops::{
 use crate::row::{Row, RowPage, RowRead, estimate_max_row_count, var_len_for_insert};
 use crate::trx::row::FindOldVersion;
 use crate::trx::stmt::StmtEffects;
-use crate::trx::undo::{IndexBranch, OwnedRowUndo, RowUndoKind};
+use crate::trx::undo::{IndexBranch, OwnedRowUndo, RowUndoKind, RowUndoRollbackAttempt};
+use crate::trx::ver_map::RowPageState;
 use crate::trx::{MIN_SNAPSHOT_TS, RetiredRowPageBatch, TrxRuntime};
 use crate::value::Val;
 use error_stack::{Report, ResultExt};
@@ -412,35 +413,30 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         .await
     }
 
-    /// Roll back one row undo record against hot row state or cold-row hooks.
+    /// Try to roll back one row undo record against its exact hot page.
     #[inline]
-    pub(crate) async fn rollback_row_undo<F>(
+    pub(crate) async fn try_rollback_hot_row_undo(
         &self,
         entry: &mut OwnedRowUndo,
         guards: &PoolGuards,
-        on_cold_row_rollback: F,
-    ) -> RuntimeResult<()>
-    where
-        F: FnOnce(RowID),
-    {
-        let Some(page_id) = entry.page_id else {
-            on_cold_row_rollback(entry.row_id);
-            return Ok(());
-        };
-        if entry.row_id < self.pivot_row_id() {
-            on_cold_row_rollback(entry.row_id);
-            return Ok(());
-        }
+    ) -> RuntimeResult<RowUndoRollbackAttempt> {
+        let page_id = entry
+            .page_id
+            .expect("hot row-undo rollback requires an original page generation");
         let page_guard = self.get_row_page_versioned_shared(guards, page_id).await?;
         let Some(page_guard) = page_guard else {
-            return Ok(());
+            return Ok(RowUndoRollbackAttempt::PageMissing);
         };
+        let page = page_guard.page();
+        let state_guard = page_guard.unwrap_vmap().read_state();
+        if *state_guard == RowPageState::Transition {
+            return Ok(RowUndoRollbackAttempt::Transition);
+        }
         let metadata = self.metadata();
-        // TODO: we should retry or wait for notification if rollback happens on a page
-        // in transition state. This will be handled in a future task.
-        let mut access = page_guard.write_row_by_id(entry.row_id);
+        let mut access =
+            page_guard.write_row_with_state_guard(page.row_idx(entry.row_id), state_guard);
         access.rollback_first_undo(metadata, entry);
-        Ok(())
+        Ok(RowUndoRollbackAttempt::Applied)
     }
 
     /// Lock an in-memory row page for exclusive access if it is present.
@@ -3298,6 +3294,7 @@ fn invalid_scan_start<T>(table_id: TableID, start_row_id: RowID) -> InternalResu
 mod tests {
     use super::{MemTable, NoTrxUpsertChange};
     use crate::buffer::guard::PageGuard;
+    use crate::buffer::page::VersionedPageID;
     use crate::buffer::{BufferPool, EvictableBufferPool};
     use crate::buffer::{PoolGuards, PoolRole};
     use crate::catalog::{
@@ -3318,9 +3315,11 @@ mod tests {
         tests::{SessionTestExt, assert_checkpoint_published, wait_for_session_idle},
     };
     use crate::table::tests::*;
-    use crate::trx::MIN_SNAPSHOT_TS;
     use crate::trx::stmt::tests as stmt_tests;
+    use crate::trx::tests::shared_trx_status;
+    use crate::trx::undo::{OwnedRowUndo, RowUndoHead, RowUndoKind, RowUndoRollbackAttempt};
     use crate::trx::ver_map::RowPageState;
+    use crate::trx::{MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, NON_FOREGROUND_STMT_NO};
     use crate::value::{Val, ValKind};
     use futures::FutureExt;
     use std::panic::AssertUnwindSafe;
@@ -4801,6 +4800,149 @@ mod tests {
             );
             wait_for_session_idle(&engine.inner().session_registry, session.id()).await;
             engine.shutdown();
+        });
+    }
+
+    #[test]
+    fn test_hot_row_undo_attempt_classifies_page_state_and_generation() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "row_undo_attempt").await;
+            let table_id = test_user_table_id(10_016);
+            let mem_table = test_mem_table(&engine, table_id).await;
+            let mut session = engine.new_session().unwrap();
+            let row_id = insert_mem_mvcc(
+                &mut session,
+                table_id,
+                &mem_table,
+                vec![Val::from(1i32), Val::from("rollback")],
+            )
+            .await;
+            let page_id = match mem_table
+                .find_row(&session.pool_guards(), row_id)
+                .await
+                .unwrap()
+            {
+                RowLocation::RowPage(page_id) => page_id,
+                RowLocation::NotFound => panic!("inserted rollback row should exist"),
+                RowLocation::LwcBlock(..) => panic!("standalone MemTable should remain hot"),
+            };
+
+            for state in [RowPageState::Active, RowPageState::Frozen] {
+                let page_guard = mem_table
+                    .must_get_row_page_shared(&session.pool_guards(), page_id)
+                    .await
+                    .unwrap();
+                *page_guard.unwrap_vmap().write_state() = state;
+                let status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 100));
+                let mut undo = OwnedRowUndo::new(
+                    NON_FOREGROUND_STMT_NO,
+                    table_id,
+                    Some(page_guard.versioned_page_id()),
+                    row_id,
+                    RowUndoKind::Delete,
+                );
+                let row_idx = page_guard.page().row_idx(row_id);
+                *page_guard.unwrap_vmap().write_latch(row_idx) =
+                    Some(Box::new(RowUndoHead::new(status, undo.leak())));
+                page_guard.write_row_by_id(row_id).delete_row();
+                assert!(page_guard.page().is_deleted(row_idx));
+                drop(page_guard);
+
+                assert_eq!(
+                    mem_table
+                        .try_rollback_hot_row_undo(&mut undo, &session.pool_guards())
+                        .await
+                        .unwrap(),
+                    RowUndoRollbackAttempt::Applied
+                );
+                let page_guard = mem_table
+                    .must_get_row_page_shared(&session.pool_guards(), page_id)
+                    .await
+                    .unwrap();
+                assert!(!page_guard.page().is_deleted(row_idx));
+                assert!(page_guard.unwrap_vmap().read_latch(row_idx).is_none());
+            }
+
+            let page_guard = mem_table
+                .must_get_row_page_shared(&session.pool_guards(), page_id)
+                .await
+                .unwrap();
+            *page_guard.unwrap_vmap().write_state() = RowPageState::Frozen;
+            let status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 101));
+            let mut undo = OwnedRowUndo::new(
+                NON_FOREGROUND_STMT_NO,
+                table_id,
+                Some(page_guard.versioned_page_id()),
+                row_id,
+                RowUndoKind::Delete,
+            );
+            let row_idx = page_guard.page().row_idx(row_id);
+            *page_guard.unwrap_vmap().write_latch(row_idx) =
+                Some(Box::new(RowUndoHead::new(status, undo.leak())));
+            page_guard.write_row_by_id(row_id).delete_row();
+            *page_guard.unwrap_vmap().write_state() = RowPageState::Transition;
+            let dirty_before = page_guard.bf().is_dirty();
+            let frozen_version_before = page_guard.unwrap_vmap().frozen_mutation_version();
+            drop(page_guard);
+
+            assert_eq!(
+                mem_table
+                    .try_rollback_hot_row_undo(&mut undo, &session.pool_guards())
+                    .await
+                    .unwrap(),
+                RowUndoRollbackAttempt::Transition
+            );
+            let page_guard = mem_table
+                .must_get_row_page_shared(&session.pool_guards(), page_id)
+                .await
+                .unwrap();
+            assert_eq!(
+                page_guard.unwrap_vmap().inspect_state(),
+                RowPageState::Transition
+            );
+            assert!(page_guard.page().is_deleted(row_idx));
+            assert!(page_guard.unwrap_vmap().read_latch(row_idx).is_some());
+            assert_eq!(page_guard.bf().is_dirty(), dirty_before);
+            assert_eq!(
+                page_guard.unwrap_vmap().frozen_mutation_version(),
+                frozen_version_before
+            );
+            *page_guard.unwrap_vmap().write_state() = RowPageState::Frozen;
+            drop(page_guard);
+            assert_eq!(
+                mem_table
+                    .try_rollback_hot_row_undo(&mut undo, &session.pool_guards())
+                    .await
+                    .unwrap(),
+                RowUndoRollbackAttempt::Applied
+            );
+
+            let page_guard = mem_table
+                .must_get_row_page_shared(&session.pool_guards(), page_id)
+                .await
+                .unwrap();
+            *page_guard.unwrap_vmap().write_state() = RowPageState::Active;
+            let versioned_page_id = page_guard.versioned_page_id();
+            drop(page_guard);
+            let mut stale_undo = OwnedRowUndo::new(
+                NON_FOREGROUND_STMT_NO,
+                table_id,
+                Some(VersionedPageID {
+                    page_id: versioned_page_id.page_id,
+                    generation: versioned_page_id.generation.saturating_add(1),
+                }),
+                row_id,
+                RowUndoKind::Delete,
+            );
+            assert_eq!(
+                mem_table
+                    .try_rollback_hot_row_undo(&mut stale_undo, &session.pool_guards())
+                    .await
+                    .unwrap(),
+                RowUndoRollbackAttempt::PageMissing
+            );
         });
     }
 

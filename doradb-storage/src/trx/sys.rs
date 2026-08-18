@@ -33,6 +33,7 @@ use crate::trx::group::{Commit, CommitJoin, GroupCommit};
 use crate::trx::purge::PurgeTestHook;
 use crate::trx::purge::{DroppedTableFileCleanupQueue, GCBucket, Purge, TableRootQueue};
 use crate::trx::sys_trx::SysTrx;
+use crate::trx::undo::RowUndoRollbackContext;
 use crate::trx::{
     FailedPrecommitCleanupJob, FailedPrecommitReason, FatalRollbackRetention, MAX_COMMIT_TS,
     MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, PrecommitTrx, PreparedTrx,
@@ -1355,6 +1356,7 @@ impl TransactionSystem {
         let gc_no = inner.gc_no();
         let status = Arc::clone(inner.ctx().status());
         let pool_guards = attachment.pool_guards();
+        let rollback_context = RowUndoRollbackContext::new(pool_guards, &self.poisoner);
         let mut table_cache = TableCache::new(&self.catalog);
         if let Err(err) = inner
             .index_undo_mut()
@@ -1380,7 +1382,7 @@ impl TransactionSystem {
         }
         if let Err(err) = inner
             .row_undo_mut()
-            .rollback(&mut table_cache, pool_guards)
+            .rollback(&mut table_cache, rollback_context)
             .await
         {
             drop(table_cache);
@@ -1390,15 +1392,21 @@ impl TransactionSystem {
             attachment.notify_operation_transition();
             let retention = inner.retain_and_discard_after_fatal_rollback(attachment);
             self.retain_fatal_rollback(retention);
-            let report = err
-                .change_context(FatalError::RollbackAccess)
-                .attach(format!("{operation}: row undo rollback failed"));
-            obs::error!(
-                "event=engine_poison component=trx action=poison result=error error={:?}",
-                report
-            );
-            let error = self.poisoner.poison(report);
-            return Err(error.into_report());
+            return match err {
+                RuntimeOrFatalError::Runtime(report) => {
+                    let report = report
+                        .change_context(FatalError::RollbackAccess)
+                        .attach(format!("{operation}: row undo rollback failed"));
+                    obs::error!(
+                        "event=engine_poison component=trx action=poison result=error error={:?}",
+                        report
+                    );
+                    Err(self.poisoner.poison(report).into_report())
+                }
+                RuntimeOrFatalError::Fatal(report) => {
+                    Err(report.attach(format!("{operation}: row undo rollback failed")))
+                }
+            };
         }
         // Rollback access can pin table/layout/index state in its operation
         // cache. Release those owners before bindings and transaction locks.
