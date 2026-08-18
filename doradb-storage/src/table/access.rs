@@ -4919,12 +4919,11 @@ mod tests {
     use crate::session::Session;
     use crate::session::tests::{
         SessionTestExt, assert_checkpoint_published, remove_session_for_test,
-        wait_for_checkpoint_purge,
+        wait_for_checkpoint_purge, wait_for_checkpoint_root_ready,
     };
     use crate::table::hot::{
         DeleteInternal, HotRowMutator, InsertRowIntoPage, RowInserter, UpdateRowInplace,
     };
-    use crate::table::lifecycle::TableCheckpointRootMutationScope;
     use crate::table::tests::*;
     use crate::table::{CheckpointOutcome, FreezeOutcome};
     use crate::table::{ColumnDeletionBuffer, DeleteMarker, Table};
@@ -4941,6 +4940,7 @@ mod tests {
     use crate::trx::{MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID, Transaction};
     use crate::value::{Val, ValKind};
     use error_stack::Report;
+    use futures::FutureExt;
     use smol::Timer;
     use smol::future::yield_now;
     use std::io::Error as StdIoError;
@@ -9621,13 +9621,26 @@ mod tests {
             let engine =
                 evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
             let table_id = create_table2_for_test(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            insert_rows(table_id, &mut session, 1, 1, "lock").await;
-            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+            let mut checkpoint_session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut checkpoint_session, 1, 1, "lock").await;
+            assert_freeze_created(
+                checkpoint_session
+                    .freeze_table(table_id, usize::MAX)
+                    .await
+                    .unwrap(),
+            );
+            let target_ts = checkpoint_session.last_cts();
+            checkpoint_session
+                .wait_for_gc_horizon_after(target_ts)
+                .await
+                .unwrap();
+            wait_for_checkpoint_root_ready(&mut checkpoint_session, table_id).await;
 
             let key = single_key(1i32);
-            let mut trx = session.begin_trx().unwrap();
-            let pool_guards = session.pool_guards();
+            let mut writer_session = engine.new_session().unwrap();
+            let mut trx = writer_session.begin_trx().unwrap();
+            let writer_status = transaction_status_for_test(&trx);
+            let pool_guards = writer_session.pool_guards();
             let index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
@@ -9635,7 +9648,7 @@ mod tests {
             );
             let (row_id, _) = index.lookup(&key.vals, trx.sts()).await.unwrap().unwrap();
             let page_id = match table_for_internal_assertion(&engine, table_id)
-                .find_row(&session.pool_guards(), row_id)
+                .find_row(&writer_session.pool_guards(), row_id)
                 .await
                 .unwrap()
             {
@@ -9644,103 +9657,103 @@ mod tests {
                 RowLocation::LwcBlock(..) => unreachable!("row page expected"),
             };
 
-            let res: Result<()> = trx
-                .exec(async |stmt| {
-                    let page_guard = engine
-                        .inner()
-                        .pools
-                        .mem
-                        .get_page::<RowPage>(
-                            session.pool_guards().mem_guard(),
-                            page_id,
-                            LatchFallbackMode::Shared,
-                        )
-                        .await
-                        .expect("buffer-pool read failed in test")
-                        .lock_shared_async()
-                        .await
-                        .unwrap();
-                    stmt.acquire_table_write_metadata_lock(table_id)
-                        .await
-                        .disclose()?;
-                    stmt.acquire_table_write_data_lock(table_id)
-                        .await
-                        .disclose()?;
-                    let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
-                    let table = table_for_internal_assertion(&engine, table_id);
-                    let layout = table.layout_snapshot();
-                    let accessor = table.accessor_with_layout(&layout);
-                    // Hot-row writes acquire ownership by installing a `Lock`
-                    // undo entry at the row's undo head. That entry is the
-                    // row-level write lock and the rollback anchor that is
-                    // later rewritten to Insert/Update/Delete.
-                    let mut lock_row = HotRowMutator::new(
-                        accessor.table_id(),
-                        accessor.metadata(),
-                        rt,
-                        &page_guard,
-                        row_id,
+            let (lock_installed_tx, lock_installed_rx) = flume::bounded(1);
+            let (return_error_tx, return_error_rx) = flume::bounded(1);
+            let mut statement = Box::pin(trx.exec(async |stmt| {
+                let page_guard = engine
+                    .inner()
+                    .pools
+                    .mem
+                    .get_page::<RowPage>(
+                        writer_session.pool_guards().mem_guard(),
+                        page_id,
+                        LatchFallbackMode::Shared,
                     )
-                    .lock_for_write(effects, Some((key.index_no, &key.vals)))
+                    .await
+                    .expect("buffer-pool read failed in test")
+                    .lock_shared_async()
                     .await
                     .unwrap();
-                    match &mut lock_row {
-                        LockRowForWrite::Ok(access) => {
-                            drop(access.take());
-                        }
-                        _ => panic!("lock should succeed"),
+                stmt.acquire_table_write_metadata_lock(table_id)
+                    .await
+                    .disclose()?;
+                stmt.acquire_table_write_data_lock(table_id)
+                    .await
+                    .disclose()?;
+                let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
+                let table = table_for_internal_assertion(&engine, table_id);
+                let layout = table.layout_snapshot();
+                let accessor = table.accessor_with_layout(&layout);
+                // Hot-row writes acquire ownership by installing a `Lock`
+                // undo entry at the row's undo head. That entry is the
+                // row-level write lock and the rollback anchor that is
+                // later rewritten to Insert/Update/Delete.
+                let mut lock_row = HotRowMutator::new(
+                    accessor.table_id(),
+                    accessor.metadata(),
+                    rt,
+                    &page_guard,
+                    row_id,
+                )
+                .lock_for_write(effects, Some((key.index_no, &key.vals)))
+                .await
+                .unwrap();
+                match &mut lock_row {
+                    LockRowForWrite::Ok(access) => {
+                        drop(access.take());
                     }
+                    _ => panic!("lock should succeed"),
+                }
+                drop(lock_row);
+                drop(page_guard);
+                lock_installed_tx.send_async(()).await.unwrap();
+                return_error_rx.recv_async().await.unwrap();
+                Err(Report::new(OperationError::InvalidDmlInput).disclose())
+            }));
+            let lock_installed = lock_installed_rx.recv_async().fuse();
+            futures::pin_mut!(lock_installed);
+            futures::select! {
+                result = statement.as_mut().fuse() => {
+                    panic!("statement completed before installing row lock: {result:?}");
+                }
+                result = lock_installed => result.unwrap(),
+            }
 
-                    let table = table_for_internal_assertion(&engine, table_id);
-                    let mut checkpoint_attempt = table
-                        .checkpoint_workflow
-                        .begin_checkpoint(&table.lifecycle)
-                        .unwrap();
-                    let root_lease =
-                        TableCheckpointRootMutationScope::acquire(Arc::clone(&table)).unwrap();
-                    let frozen_pages = checkpoint_attempt.batch().unwrap().pages.clone();
-                    let transition_pages = table
-                        .load_frozen_pages_for_transition(&session.pool_guards(), &frozen_pages)
-                        .await
-                        .unwrap();
-                    let delay = table.prepare_page_transition(
-                        &transition_pages,
-                        checkpoint_attempt.batch_mut().unwrap(),
-                        stmt.runtime().sts(),
-                        &engine.inner().maintenance_test,
-                    );
-                    assert!(delay.is_none());
-                    let transition_lease = table
-                        .checkpoint_workflow
-                        .try_begin_transition(&table.lifecycle)
-                        .unwrap();
-                    table.apply_page_transition(
-                        &transition_pages,
-                        checkpoint_attempt.batch_mut().unwrap(),
-                        stmt.runtime().sts(),
-                        &engine.inner().maintenance_test,
-                    );
+            let (transition_entered_tx, transition_entered_rx) = flume::bounded(1);
+            let (publish_route_tx, publish_route_rx) = flume::bounded(1);
+            engine
+                .inner()
+                .maintenance_test
+                .install_checkpoint_after_publish_admission_hook(move || async move {
+                    transition_entered_tx.send_async(()).await.unwrap();
+                    publish_route_rx.recv_async().await.unwrap();
+                });
+            let mut checkpoint = Box::pin(checkpoint_session.checkpoint_table(table_id).fuse());
+            let transition_entered = transition_entered_rx.recv_async().fuse();
+            futures::pin_mut!(transition_entered);
+            futures::select! {
+                result = checkpoint.as_mut() => {
+                    panic!("checkpoint completed before transition inspection: {result:?}");
+                }
+                result = transition_entered => result.unwrap(),
+            }
 
-                    let marker = table_for_internal_assertion(&engine, table_id)
-                        .deletion_buffer()
-                        .get(row_id)
-                        .unwrap();
-                    match marker {
-                        DeleteMarker::Ref(status) => {
-                            assert!(std::sync::Arc::ptr_eq(&status, stmt.runtime().status()));
-                        }
-                        DeleteMarker::Committed(_) => {
-                            panic!("uncommitted lock should remain as marker ref")
-                        }
-                    }
-                    table.checkpoint_workflow.finish_publication();
-                    drop(transition_lease);
-                    drop(root_lease);
-                    drop(lock_row);
-                    drop(page_guard);
-                    Err(Report::new(OperationError::InvalidDmlInput).disclose())
-                })
-                .await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let Some(DeleteMarker::Ref(marker_status)) = table.deletion_buffer().get(row_id) else {
+                panic!("uncommitted lock should remain as marker ref");
+            };
+            assert!(Arc::ptr_eq(&marker_status, &writer_status));
+            assert!(row_id >= table.mem.pivot_row_id());
+
+            publish_route_tx.send_async(()).await.unwrap();
+            assert!(matches!(
+                checkpoint.await.unwrap(),
+                CheckpointOutcome::Published { .. }
+            ));
+            assert!(row_id < table.mem.pivot_row_id());
+
+            return_error_tx.send_async(()).await.unwrap();
+            let res: Result<()> = statement.await;
             assert_eq!(
                 res.unwrap_err()
                     .report()
@@ -9748,6 +9761,7 @@ mod tests {
                     .copied(),
                 Some(OperationError::InvalidDmlInput)
             );
+            assert!(table.deletion_buffer().get(row_id).is_none());
             trx.rollback().await.unwrap();
         });
     }
