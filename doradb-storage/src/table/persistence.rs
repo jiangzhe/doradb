@@ -2372,16 +2372,18 @@ mod tests {
         ColumnAttributes, ColumnSpec, CurrentTableState, ResolvedVisibleTableMetadata, TableCache,
         TableSpec,
     };
+    use crate::completion::Completion;
     use crate::conf::TrxSysConfig;
     use crate::engine::Engine;
     use crate::error::{
-        DiscloseError, Error, FatalError, LifecycleError, OperationError, RuntimeError,
-        RuntimeOrFatalError,
+        DiscloseError, Error, FatalError, LifecycleError, OperationError, ResourceError,
+        RuntimeError, RuntimeOrFatalError,
     };
     use crate::file::cow_file::tests::old_root_drop_count;
     use crate::index::RowLocation;
     use crate::io::install_storage_backend_test_hook;
     use crate::row::ops::{SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
+    use crate::runtime::mandatory::MandatoryInternalTask;
     use crate::session::{
         Session,
         tests::{
@@ -2391,6 +2393,9 @@ mod tests {
         },
     };
     use crate::table::checkpoint_workflow::FrozenPageValidationState;
+    use crate::table::page_transition::tests::{
+        install_after_listener_hook, install_before_listener_hook,
+    };
     use crate::table::persistence::test_hooks::{
         ForceCheckpointCommitErrorGuard, ForcePostPublishCheckpointErrorGuard,
         set_test_checkpoint_after_publish_admission_hook, set_test_checkpoint_after_trx_start_hook,
@@ -2409,16 +2414,29 @@ mod tests {
     use crate::table::{DeleteMarker, TableTerminal};
     use crate::trx::purge::PurgeTestEvent;
     use crate::trx::stmt::tests as stmt_tests;
+    use crate::trx::sys::tests::{
+        fatal_rollback_retention_count, has_active_sts, install_abandoned_cleanup_test_hook,
+        retains_active_row_undo,
+    };
     use crate::trx::tests::{
-        discard_transaction_after_fatal_rollback, shared_trx_status, transaction_status_for_test,
+        discard_transaction_after_fatal_rollback, lock_owner, prepare_transaction,
+        shared_trx_status, transaction_entry, transaction_status_for_test,
     };
     use crate::trx::undo::{
         OwnedRowUndo, RowUndoHead, RowUndoKind, RowUndoLogs, RowUndoRollbackContext, UndoStatus,
     };
     use crate::trx::ver_map::RowPageState;
-    use crate::trx::{MIN_ACTIVE_TRX_ID, NON_FOREGROUND_STMT_NO};
+    use crate::trx::{
+        FailedPrecommitCleanupJob, FailedPrecommitReason, MIN_ACTIVE_TRX_ID,
+        NON_FOREGROUND_STMT_NO, PrepareListenerResult, SessionOperationEntry,
+        SessionOperationState,
+    };
     use futures::FutureExt;
+    use smol::future::yield_now;
     use std::cmp::Ordering;
+    use std::future::{Future, poll_fn};
+    use std::pin::Pin;
+    use std::ptr::from_ref;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::task::Poll;
@@ -2553,6 +2571,77 @@ mod tests {
             .await
             .unwrap();
         (row_id, page_guard.versioned_page_id())
+    }
+
+    async fn setup_frozen_transition_row(
+        engine: &Engine,
+        checkpoint_session: &mut Session,
+        value: &str,
+    ) -> (TableID, Arc<Table>, SelectKey, RowID, VersionedPageID) {
+        let table_id = create_table2_for_test(engine).await;
+        insert_rows(table_id, checkpoint_session, 1, 1, value).await;
+        let table = table_for_internal_assertion(engine, table_id);
+        let key = single_key(1);
+        let (row_id, page_id) = hot_row_identity_for_key(&table, checkpoint_session, &key).await;
+        assert_freeze_created(
+            checkpoint_session
+                .freeze_table(table_id, usize::MAX)
+                .await
+                .unwrap(),
+        );
+        let target_ts = checkpoint_session.last_cts();
+        checkpoint_session
+            .wait_for_gc_horizon_after(target_ts)
+            .await
+            .unwrap();
+        wait_for_checkpoint_root_ready(checkpoint_session, table_id).await;
+        (table_id, table, key, row_id, page_id)
+    }
+
+    fn install_transition_publication_pause(
+        engine: &Engine,
+    ) -> (flume::Receiver<()>, flume::Sender<()>) {
+        let (entered_tx, entered_rx) = flume::bounded(1);
+        let (publish_tx, publish_rx) = flume::bounded(1);
+        set_test_checkpoint_after_publish_admission_hook(engine, move || async move {
+            entered_tx.send_async(()).await.unwrap();
+            publish_rx.recv_async().await.unwrap();
+        });
+        (entered_rx, publish_tx)
+    }
+
+    async fn wait_for_route_listener(engine: &Engine, registrations_before: usize) {
+        while engine.inner().poisoner.test_observation_counts().1 == registrations_before {
+            yield_now().await;
+        }
+    }
+
+    async fn drive_until_route_listener<F>(
+        mut future: Pin<&mut F>,
+        engine: &Engine,
+        registrations_before: usize,
+    ) where
+        F: Future,
+    {
+        poll_fn(|cx| match future.as_mut().poll(cx) {
+            Poll::Ready(_) => panic!("rollback completed before entering route wait"),
+            Poll::Pending
+                if engine.inner().poisoner.test_observation_counts().1 > registrations_before =>
+            {
+                Poll::Ready(())
+            }
+            Poll::Pending => Poll::Pending,
+        })
+        .await;
+    }
+
+    async fn wait_for_operation_state(
+        entry: &SessionOperationEntry,
+        expected: SessionOperationState,
+    ) {
+        while entry.inspect().state != expected {
+            yield_now().await;
+        }
     }
 
     async fn hot_page_state(table: &Table, guards: &PoolGuards, page_id: PageID) -> RowPageState {
@@ -6037,18 +6126,22 @@ mod tests {
                     .table_delete_unique_mvcc(table_id, statement_key.index_no, &statement_key.vals)
                     .await?;
                 assert_eq!(deleted, crate::row::ops::DeleteMvcc::Deleted);
-                delete_done_tx.send_async(()).await.unwrap();
+                let effects = stmt_tests::statement_effects_mut(stmt);
+                assert_eq!(effects.undo_counts(), (1, 1));
+                let undo = effects.last_row_undo();
+                let undo_addr = from_ref(&**undo).addr();
+                delete_done_tx.send_async(undo_addr).await.unwrap();
                 return_error_rx.recv_async().await.unwrap();
                 Err::<(), Error>(Report::new(OperationError::InvalidDmlInput).disclose())
             }));
             let delete_done = delete_done_rx.recv_async().fuse();
             futures::pin_mut!(delete_done);
-            futures::select! {
+            let owned_undo_addr = futures::select! {
                 result = statement.as_mut().fuse() => {
                     panic!("statement completed before rollback was requested: {result:?}");
                 }
                 result = delete_done => result.unwrap(),
-            }
+            };
 
             let (transition_entered_tx, transition_entered_rx) = flume::bounded(1);
             let (publish_route_tx, publish_route_rx) = flume::bounded(1);
@@ -6093,6 +6186,10 @@ mod tests {
             let undo_head = undo_guard
                 .as_ref()
                 .expect("transition rollback must retain its hot undo head");
+            assert_eq!(
+                from_ref(undo_head.next.main.entry.as_ref()).addr(),
+                owned_undo_addr
+            );
             assert_eq!(undo_head.next.main.entry.as_ref().row_id, row_id);
             assert!(matches!(
                 undo_head.next.main.entry.as_ref().kind,
@@ -6109,10 +6206,26 @@ mod tests {
             drop(undo_guard);
             drop(page_guard);
 
+            let mut reader_session = engine.new_session().unwrap();
+            let mut reader = reader_session.begin_trx().unwrap();
+            let visible = trx_select_row_mvcc_by_id(&mut reader, table_id, &key, &[0, 1])
+                .await
+                .unwrap();
+            let SelectMvcc::Found(vals) = visible else {
+                panic!("MVCC must reconstruct the pre-delete transition image");
+            };
+            assert_eq!(vals, vec![Val::from(1i32), Val::from("rollback")]);
+            reader.commit().await.unwrap();
+
             publish_route_tx.send_async(()).await.unwrap();
             let outcome = checkpoint.await.unwrap();
             assert!(matches!(outcome, CheckpointOutcome::Published { .. }));
             let statement_error = statement.await.unwrap_err();
+            assert_eq!(
+                engine.inner().poisoner.test_observation_counts().1,
+                before_wait.1 + 1,
+                "one route publication must require exactly one registered wait"
+            );
             assert_eq!(
                 statement_error
                     .report()
@@ -6128,6 +6241,566 @@ mod tests {
                 .unwrap();
             assert!(matches!(selected, SelectMvcc::Found(_)));
             writer.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_move_update_terminal_rollback_unwinds_replacement_before_transition_wait() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "move-rollback-transition").await;
+            let mut checkpoint_session = engine.new_session().unwrap();
+            let (table_id, table, old_key, old_row_id, old_page_id) =
+                setup_frozen_transition_row(&engine, &mut checkpoint_session, "original").await;
+
+            let mut writer_session = engine.new_session().unwrap();
+            let mut writer = writer_session.begin_trx().unwrap();
+            let writer_status = transaction_status_for_test(&writer);
+            let updated = trx_update_row_by_id(
+                &mut writer,
+                table_id,
+                &old_key,
+                vec![UpdateCol {
+                    idx: 0,
+                    val: Val::from(101i32),
+                }],
+            )
+            .await
+            .unwrap();
+            let UpdateMvcc::Updated(replacement_row_id) = updated else {
+                panic!("frozen key update must produce a replacement row");
+            };
+            assert_ne!(replacement_row_id, old_row_id);
+            let replacement_page_id = match table
+                .find_row(&writer_session.pool_guards(), replacement_row_id)
+                .await
+                .unwrap()
+            {
+                RowLocation::RowPage(page_id) => page_id,
+                RowLocation::NotFound | RowLocation::LwcBlock(..) => {
+                    panic!("replacement row must remain hot")
+                }
+            };
+            let replacement_guard = table
+                .mem
+                .must_get_row_page_shared(&writer_session.pool_guards(), replacement_page_id)
+                .await
+                .unwrap();
+            let replacement_idx = replacement_guard.page().row_idx(replacement_row_id);
+            assert!(!replacement_guard.page().is_deleted(replacement_idx));
+            let replacement_undo = replacement_guard.unwrap_vmap().read_latch(replacement_idx);
+            let replacement_head = replacement_undo
+                .as_ref()
+                .expect("frozen move replacement must retain insert undo");
+            assert!(matches!(
+                replacement_head.next.main.entry.as_ref().kind,
+                RowUndoKind::Insert
+            ));
+            let UndoStatus::Ref(replacement_status) = &replacement_head.next.main.status else {
+                panic!("move replacement must retain shared transaction status");
+            };
+            assert!(Arc::ptr_eq(replacement_status, &writer_status));
+            drop(replacement_undo);
+            drop(replacement_guard);
+
+            let (transition_entered, publish_route) = install_transition_publication_pause(&engine);
+            let mut checkpoint = Box::pin(checkpoint_session.checkpoint_table(table_id).fuse());
+            let entered = transition_entered.recv_async().fuse();
+            futures::pin_mut!(entered);
+            futures::select! {
+                result = checkpoint.as_mut() => {
+                    panic!("checkpoint completed before move rollback inspection: {result:?}");
+                }
+                result = entered => result.unwrap(),
+            }
+
+            let listener_before = engine.inner().poisoner.test_observation_counts().1;
+            let mut rollback = Box::pin(writer.rollback());
+            assert!(matches!(
+                futures::poll!(rollback.as_mut()),
+                std::task::Poll::Pending
+            ));
+            wait_for_route_listener(&engine, listener_before).await;
+
+            let replacement_guard = table
+                .mem
+                .must_get_row_page_shared(&writer_session.pool_guards(), replacement_page_id)
+                .await
+                .unwrap();
+            let replacement_idx = replacement_guard.page().row_idx(replacement_row_id);
+            assert!(replacement_guard.page().is_deleted(replacement_idx));
+            assert!(
+                replacement_guard
+                    .unwrap_vmap()
+                    .read_latch(replacement_idx)
+                    .is_none()
+            );
+            drop(replacement_guard);
+
+            let old_guard = table
+                .mem
+                .must_get_row_page_shared(&writer_session.pool_guards(), old_page_id.page_id)
+                .await
+                .unwrap();
+            let old_idx = old_guard.page().row_idx(old_row_id);
+            assert_eq!(
+                old_guard.unwrap_vmap().inspect_state(),
+                RowPageState::Transition
+            );
+            assert!(old_guard.page().is_deleted(old_idx));
+            let old_undo = old_guard.unwrap_vmap().read_latch(old_idx);
+            let old_head = old_undo
+                .as_ref()
+                .expect("old transition row must retain delete undo");
+            assert!(matches!(
+                old_head.next.main.entry.as_ref().kind,
+                RowUndoKind::Delete
+            ));
+            let UndoStatus::Ref(old_status) = &old_head.next.main.status else {
+                panic!("old move owner must retain shared status");
+            };
+            assert!(Arc::ptr_eq(old_status, &writer_status));
+            let Some(DeleteMarker::Ref(marker_status)) = table.deletion_buffer().get(old_row_id)
+            else {
+                panic!("old move row must retain transition marker");
+            };
+            assert!(Arc::ptr_eq(&marker_status, &writer_status));
+            drop(old_undo);
+            drop(old_guard);
+
+            let new_key = single_key(101);
+            assert!(
+                bound_unique_index(&table, &writer_session.pool_guards(), new_key.index_no,)
+                    .lookup(&new_key.vals, writer_status.ts())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+
+            publish_route.send_async(()).await.unwrap();
+            assert!(matches!(
+                checkpoint.await.unwrap(),
+                CheckpointOutcome::Published { .. }
+            ));
+            rollback.await.unwrap();
+            assert!(table.deletion_buffer().get(old_row_id).is_none());
+
+            let mut reader = checkpoint_session.begin_trx().unwrap();
+            let old = trx_select_row_mvcc_by_id(&mut reader, table_id, &old_key, &[0, 1])
+                .await
+                .unwrap();
+            assert_eq!(
+                old,
+                SelectMvcc::Found(vec![Val::from(1i32), Val::from("original")])
+            );
+            let new = trx_select_row_mvcc_by_id(&mut reader, table_id, &new_key, &[0, 1])
+                .await
+                .unwrap();
+            assert!(matches!(new, SelectMvcc::NotFound));
+            reader.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_statement_cancellation_during_transition_rollback_resumes_in_cleanup() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "statement-transition-cancel").await;
+            let mut checkpoint_session = engine.new_session().unwrap();
+            let (table_id, table, key, row_id, page_id) =
+                setup_frozen_transition_row(&engine, &mut checkpoint_session, "cancel").await;
+
+            let mut writer_session = engine.new_session().unwrap();
+            let mut writer = writer_session.begin_trx().unwrap();
+            let entry = transaction_entry(&writer);
+            let trx_id = writer.trx_id();
+            let writer_status = transaction_status_for_test(&writer);
+            let (delete_done_tx, delete_done_rx) = flume::bounded(1);
+            let (return_error_tx, return_error_rx) = flume::bounded(1);
+            let statement_key = key.clone();
+            let mut statement = Box::pin(writer.exec(async move |stmt| {
+                let deleted = stmt
+                    .table_delete_unique_mvcc(table_id, statement_key.index_no, &statement_key.vals)
+                    .await?;
+                assert_eq!(deleted, crate::row::ops::DeleteMvcc::Deleted);
+                let undo = stmt_tests::statement_effects_mut(stmt).last_row_undo();
+                delete_done_tx
+                    .send_async(from_ref(&**undo).addr())
+                    .await
+                    .unwrap();
+                return_error_rx.recv_async().await.unwrap();
+                Err::<(), Error>(Report::new(OperationError::InvalidDmlInput).disclose())
+            }));
+            let deleted = delete_done_rx.recv_async().fuse();
+            futures::pin_mut!(deleted);
+            let owned_undo_addr = futures::select! {
+                result = statement.as_mut().fuse() => {
+                    panic!("statement completed before transition setup: {result:?}");
+                }
+                result = deleted => result.unwrap(),
+            };
+
+            let (transition_entered, publish_route) = install_transition_publication_pause(&engine);
+            let mut checkpoint = Box::pin(checkpoint_session.checkpoint_table(table_id).fuse());
+            let entered = transition_entered.recv_async().fuse();
+            futures::pin_mut!(entered);
+            futures::select! {
+                result = checkpoint.as_mut() => {
+                    panic!("checkpoint completed before statement cancellation: {result:?}");
+                }
+                result = entered => result.unwrap(),
+            }
+
+            return_error_tx.send_async(()).await.unwrap();
+            assert!(matches!(
+                futures::poll!(statement.as_mut()),
+                std::task::Poll::Pending
+            ));
+            let (cleanup_entered_tx, cleanup_entered_rx) = flume::bounded(1);
+            let (cleanup_release_tx, cleanup_release_rx) = flume::bounded(1);
+            let _cleanup_hook = install_abandoned_cleanup_test_hook(Arc::new(move |observed| {
+                if observed == trx_id {
+                    cleanup_entered_tx.send(()).unwrap();
+                    cleanup_release_rx.recv().unwrap();
+                }
+            }));
+            drop(statement);
+            cleanup_entered_rx.recv_async().await.unwrap();
+            assert_eq!(entry.inspect().state, SessionOperationState::CleanupReady);
+            assert!(entry.inspect().cleanup_requested);
+
+            let old_guard = table
+                .mem
+                .must_get_row_page_shared(&writer_session.pool_guards(), page_id.page_id)
+                .await
+                .unwrap();
+            assert_eq!(
+                old_guard.unwrap_vmap().inspect_state(),
+                RowPageState::Transition
+            );
+            let old_idx = old_guard.page().row_idx(row_id);
+            assert!(old_guard.page().is_deleted(old_idx));
+            let old_undo = old_guard.unwrap_vmap().read_latch(old_idx);
+            let old_head = old_undo
+                .as_ref()
+                .expect("cancelled statement must leave its row undo linked");
+            assert_eq!(
+                from_ref(old_head.next.main.entry.as_ref()).addr(),
+                owned_undo_addr
+            );
+            drop(old_undo);
+            drop(old_guard);
+            let Some(DeleteMarker::Ref(marker_status)) = table.deletion_buffer().get(row_id) else {
+                panic!("cancelled transition rollback must retain marker ownership");
+            };
+            assert!(Arc::ptr_eq(&marker_status, &writer_status));
+
+            cleanup_release_tx.send(()).unwrap();
+            wait_for_operation_state(&entry, SessionOperationState::Completing).await;
+            drop(writer);
+            publish_route.send_async(()).await.unwrap();
+            assert!(matches!(
+                checkpoint.await.unwrap(),
+                CheckpointOutcome::Published { .. }
+            ));
+            wait_for_session_idle(&engine.inner().session_registry, writer_session.id()).await;
+            assert_eq!(entry.inspect().state, SessionOperationState::Terminal);
+            assert!(table.deletion_buffer().get(row_id).is_none());
+            assert_eq!(fatal_rollback_retention_count(&engine.inner().trx_sys), 0);
+
+            let mut reader = writer_session.begin_trx().unwrap();
+            let visible = trx_select_row_mvcc_by_id(&mut reader, table_id, &key, &[0, 1])
+                .await
+                .unwrap();
+            assert!(matches!(visible, SelectMvcc::Found(_)));
+            reader.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_terminal_rollback_waiter_cancellation_does_not_cancel_transition_cleanup() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "terminal-transition-cancel").await;
+            let mut checkpoint_session = engine.new_session().unwrap();
+            let (table_id, table, key, row_id, _) =
+                setup_frozen_transition_row(&engine, &mut checkpoint_session, "terminal").await;
+
+            let mut writer_session = engine.new_session().unwrap();
+            let mut writer = writer_session.begin_trx().unwrap();
+            let deleted = trx_delete_row_by_id(&mut writer, table_id, &key)
+                .await
+                .unwrap();
+            assert_eq!(deleted, crate::row::ops::DeleteMvcc::Deleted);
+            let entry = transaction_entry(&writer);
+            let owner = lock_owner(&writer).unwrap();
+            let writer_status = transaction_status_for_test(&writer);
+            assert!(lock_entry_count(&engine, owner) > 0);
+
+            let (transition_entered, publish_route) = install_transition_publication_pause(&engine);
+            let mut checkpoint = Box::pin(checkpoint_session.checkpoint_table(table_id).fuse());
+            let entered = transition_entered.recv_async().fuse();
+            futures::pin_mut!(entered);
+            futures::select! {
+                result = checkpoint.as_mut() => {
+                    panic!("checkpoint completed before terminal rollback: {result:?}");
+                }
+                result = entered => result.unwrap(),
+            }
+
+            let listener_before = engine.inner().poisoner.test_observation_counts().1;
+            let mut rollback = Box::pin(writer.rollback());
+            assert!(matches!(
+                futures::poll!(rollback.as_mut()),
+                std::task::Poll::Pending
+            ));
+            wait_for_route_listener(&engine, listener_before).await;
+            assert_eq!(entry.inspect().state, SessionOperationState::Completing);
+            let Some(DeleteMarker::Ref(marker_status)) = table.deletion_buffer().get(row_id) else {
+                panic!("terminal transition rollback must retain marker while waiting");
+            };
+            assert!(Arc::ptr_eq(&marker_status, &writer_status));
+
+            drop(rollback);
+            publish_route.send_async(()).await.unwrap();
+            assert!(matches!(
+                checkpoint.await.unwrap(),
+                CheckpointOutcome::Published { .. }
+            ));
+            wait_for_operation_state(&entry, SessionOperationState::Terminal).await;
+            assert!(!writer_session.in_trx().unwrap());
+            assert_eq!(lock_entry_count(&engine, owner), 0);
+            assert!(table.deletion_buffer().get(row_id).is_none());
+
+            let mut reader = writer_session.begin_trx().unwrap();
+            let visible = trx_select_row_mvcc_by_id(&mut reader, table_id, &key, &[0, 1])
+                .await
+                .unwrap();
+            assert!(matches!(visible, SelectMvcc::Found(_)));
+            reader.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_failed_precommit_rollback_waits_for_transition_before_releasing_observers() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "precommit-transition-rollback").await;
+            let mut checkpoint_session = engine.new_session().unwrap();
+            let (table_id, table, key, row_id, _) =
+                setup_frozen_transition_row(&engine, &mut checkpoint_session, "precommit").await;
+
+            let mut writer_session = engine.new_session().unwrap();
+            let mut writer = writer_session.begin_trx().unwrap();
+            let deleted = trx_delete_row_by_id(&mut writer, table_id, &key)
+                .await
+                .unwrap();
+            assert_eq!(deleted, crate::row::ops::DeleteMvcc::Deleted);
+            let status = transaction_status_for_test(&writer);
+            let sts = writer.sts();
+            let owner = lock_owner(&writer).unwrap();
+            assert!(has_active_sts(&engine.inner().trx_sys, sts));
+            let prepared = prepare_transaction(writer).unwrap();
+            assert!(status.preparing());
+            let PrepareListenerResult::Registered(prepare_listener) = status.prepare_listener()
+            else {
+                panic!("prepared rollback test must register a prepare waiter");
+            };
+            let precommit = prepared.fill_cts(TrxID::new(91_272));
+
+            let (transition_entered, publish_route) = install_transition_publication_pause(&engine);
+            let mut checkpoint = Box::pin(checkpoint_session.checkpoint_table(table_id).fuse());
+            let entered = transition_entered.recv_async().fuse();
+            futures::pin_mut!(entered);
+            futures::select! {
+                result = checkpoint.as_mut() => {
+                    panic!("checkpoint completed before failed-precommit rollback: {result:?}");
+                }
+                result = entered => result.unwrap(),
+            }
+
+            let completion = Arc::new(Completion::new());
+            let mut job = FailedPrecommitCleanupJob::new(
+                vec![precommit],
+                Arc::clone(&completion),
+                FailedPrecommitReason::Resource(ResourceError::InsufficientMemory),
+            );
+            let listener_before = engine.inner().poisoner.test_observation_counts().1;
+            let mut cleanup = Box::pin(MandatoryInternalTask::run(&mut job));
+            drive_until_route_listener(cleanup.as_mut(), &engine, listener_before).await;
+            let mut completion_wait = Box::pin(completion.wait_result());
+            assert!(matches!(
+                futures::poll!(completion_wait.as_mut()),
+                Poll::Pending
+            ));
+            assert!(status.preparing());
+            assert!(writer_session.in_trx().unwrap());
+            assert!(lock_entry_count(&engine, owner) > 0);
+            let Some(DeleteMarker::Ref(marker_status)) = table.deletion_buffer().get(row_id) else {
+                panic!("failed-precommit transition rollback must retain marker");
+            };
+            assert!(Arc::ptr_eq(&marker_status, &status));
+
+            publish_route.send_async(()).await.unwrap();
+            assert!(matches!(
+                checkpoint.await.unwrap(),
+                CheckpointOutcome::Published { .. }
+            ));
+            cleanup.await;
+            let completion_error = completion_wait.await.unwrap_err();
+            assert_eq!(
+                completion_error.downcast_ref::<ResourceError>().copied(),
+                Some(ResourceError::InsufficientMemory)
+            );
+            prepare_listener.wait_primary_for_test();
+            assert!(!status.preparing());
+            assert!(!writer_session.in_trx().unwrap());
+            assert_eq!(lock_entry_count(&engine, owner), 0);
+            assert!(table.deletion_buffer().get(row_id).is_none());
+            assert!(!has_active_sts(&engine.inner().trx_sys, sts));
+
+            let mut reader = writer_session.begin_trx().unwrap();
+            let visible = trx_select_row_mvcc_by_id(&mut reader, table_id, &key, &[0, 1])
+                .await
+                .unwrap();
+            assert!(matches!(visible, SelectMvcc::Found(_)));
+            reader.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_poison_retains_terminal_transition_rollback_ownership() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "terminal-transition-poison").await;
+            let mut checkpoint_session = engine.new_session().unwrap();
+            let (table_id, table, key, row_id, page_id) =
+                setup_frozen_transition_row(&engine, &mut checkpoint_session, "poison").await;
+
+            let mut writer_session = engine.new_session().unwrap();
+            let mut writer = writer_session.begin_trx().unwrap();
+            let deleted = trx_delete_row_by_id(&mut writer, table_id, &key)
+                .await
+                .unwrap();
+            assert_eq!(deleted, crate::row::ops::DeleteMvcc::Deleted);
+            let entry = transaction_entry(&writer);
+            let trx_id = writer.trx_id();
+            let writer_status = transaction_status_for_test(&writer);
+
+            let (transition_entered, publish_failure) =
+                install_transition_publication_pause(&engine);
+            let failure = ForceLwcBuildErrorGuard::new(&engine);
+            let mut checkpoint = Box::pin(checkpoint_session.checkpoint_table(table_id).fuse());
+            let entered = transition_entered.recv_async().fuse();
+            futures::pin_mut!(entered);
+            futures::select! {
+                result = checkpoint.as_mut() => {
+                    panic!("checkpoint completed before poison rollback setup: {result:?}");
+                }
+                result = entered => result.unwrap(),
+            }
+
+            let listener_before = engine.inner().poisoner.test_observation_counts().1;
+            let mut rollback = Box::pin(writer.rollback());
+            assert!(matches!(futures::poll!(rollback.as_mut()), Poll::Pending));
+            wait_for_route_listener(&engine, listener_before).await;
+
+            let page_guard = table
+                .mem
+                .must_get_row_page_shared(&writer_session.pool_guards(), page_id.page_id)
+                .await
+                .unwrap();
+            let row_idx = page_guard.page().row_idx(row_id);
+            assert_eq!(
+                page_guard.unwrap_vmap().inspect_state(),
+                RowPageState::Transition
+            );
+            assert!(page_guard.page().is_deleted(row_idx));
+            let undo_guard = page_guard.unwrap_vmap().read_latch(row_idx);
+            let undo_head = undo_guard
+                .as_ref()
+                .expect("poisoned transition rollback must retain undo head");
+            let retained_undo_addr = from_ref(undo_head.next.main.entry.as_ref()).addr();
+            let Some(DeleteMarker::Ref(marker_status)) = table.deletion_buffer().get(row_id) else {
+                panic!("poisoned transition rollback must retain marker");
+            };
+            assert!(Arc::ptr_eq(&marker_status, &writer_status));
+            drop(undo_guard);
+            drop(page_guard);
+
+            publish_failure.send_async(()).await.unwrap();
+            let checkpoint_error = checkpoint.await.unwrap_err();
+            assert_eq!(
+                checkpoint_error
+                    .report()
+                    .downcast_ref::<FatalError>()
+                    .copied(),
+                Some(FatalError::CheckpointWrite)
+            );
+            let rollback_error = rollback.await.unwrap_err();
+            assert_eq!(
+                rollback_error
+                    .report()
+                    .downcast_ref::<FatalError>()
+                    .copied(),
+                Some(FatalError::CheckpointWrite)
+            );
+            assert_ne!(
+                rollback_error
+                    .report()
+                    .downcast_ref::<FatalError>()
+                    .copied(),
+                Some(FatalError::RollbackAccess)
+            );
+            assert_eq!(entry.inspect().state, SessionOperationState::FailedRetained);
+            assert_eq!(fatal_rollback_retention_count(&engine.inner().trx_sys), 1);
+            assert!(retains_active_row_undo(
+                &engine.inner().trx_sys,
+                table_id,
+                row_id
+            ));
+
+            let page_guard = table
+                .mem
+                .must_get_row_page_shared(&writer_session.pool_guards(), page_id.page_id)
+                .await
+                .unwrap();
+            let undo_guard = page_guard.unwrap_vmap().read_latch(row_idx);
+            let undo_head = undo_guard
+                .as_ref()
+                .expect("fatal retention must keep exact transition undo linked");
+            assert_eq!(
+                from_ref(undo_head.next.main.entry.as_ref()).addr(),
+                retained_undo_addr
+            );
+            assert!(page_guard.page().is_deleted(row_idx));
+            assert_eq!(
+                page_guard.unwrap_vmap().inspect_state(),
+                RowPageState::Transition
+            );
+            let Some(DeleteMarker::Ref(actual_marker)) = table.deletion_buffer().get(row_id) else {
+                panic!("fatal retention must preserve transition marker");
+            };
+            assert!(Arc::ptr_eq(&actual_marker, &writer_status));
+            drop(undo_guard);
+            drop(page_guard);
+
+            let reuse_error = match writer_session.begin_trx() {
+                Ok(_) => panic!("failed-retained session must reject reuse"),
+                Err(err) => err,
+            };
+            assert_eq!(entry.inspect().trx_id, Some(trx_id));
+            assert_eq!(
+                reuse_error.report().downcast_ref::<FatalError>().copied(),
+                Some(FatalError::CheckpointWrite)
+            );
+            drop(failure);
+            remove_session_for_test(&engine.inner().session_registry, checkpoint_session.id());
+            remove_session_for_test(&engine.inner().session_registry, writer_session.id());
+            drop(table);
+            drop(checkpoint_session);
+            drop(writer_session);
+            engine.shutdown();
         });
     }
 
@@ -6164,11 +6837,15 @@ mod tests {
             let pool_guards = session.pool_guards();
             let rollback_context =
                 RowUndoRollbackContext::new(&pool_guards, &engine.inner().poisoner);
+            let before_wait = engine.inner().poisoner.test_observation_counts();
             let mut rollback = Box::pin(row_undo.rollback(&mut table_cache, rollback_context));
             assert!(matches!(
                 futures::poll!(rollback.as_mut()),
                 std::task::Poll::Pending
             ));
+            let after_wait = engine.inner().poisoner.test_observation_counts();
+            assert!(after_wait.0 > before_wait.0);
+            assert!(after_wait.1 > before_wait.1);
             drop(rollback);
             assert_eq!(row_undo.len(), 1);
             let Some(DeleteMarker::Ref(actual)) = table.deletion_buffer().get(row_id) else {
@@ -6344,6 +7021,109 @@ mod tests {
                 .unwrap();
             assert_eq!(engine.inner().poisoner.test_observation_counts(), before);
             assert!(below_pivot_logs.is_empty());
+        });
+    }
+
+    #[derive(Clone, Copy)]
+    enum TransitionRouteRegistrationCase {
+        RouteBeforeListener,
+        RouteAfterListener,
+        Poison,
+        RouteAndPoison,
+    }
+
+    async fn assert_transition_route_registration_case(case: TransitionRouteRegistrationCase) {
+        let temp_dir = TempDir::new().unwrap();
+        let stem = match case {
+            TransitionRouteRegistrationCase::RouteBeforeListener => "route-before-listener",
+            TransitionRouteRegistrationCase::RouteAfterListener => "route-after-listener",
+            TransitionRouteRegistrationCase::Poison => "poison-before-recheck",
+            TransitionRouteRegistrationCase::RouteAndPoison => "route-poison-before-recheck",
+        };
+        let engine = lightweight_test_engine(&temp_dir, stem).await;
+        let table_id = create_table2_for_test(&engine).await;
+        let table = table_for_internal_assertion(&engine, table_id);
+        let row_id = RowID::new(10);
+        let _before_hook = matches!(case, TransitionRouteRegistrationCase::RouteBeforeListener)
+            .then(|| {
+                let hook_table = Arc::clone(&table);
+                install_before_listener_hook(move || async move {
+                    hook_table
+                        .mem
+                        .blk_idx()
+                        .update_column_root(row_id + 1, SUPER_BLOCK_ID)
+                        .await;
+                })
+            });
+        let _after_hook = (!matches!(case, TransitionRouteRegistrationCase::RouteBeforeListener))
+            .then(|| {
+                let hook_table = Arc::clone(&table);
+                let hook_poisoner = engine.inner().poisoner.clone();
+                install_after_listener_hook(move || async move {
+                    if matches!(
+                        case,
+                        TransitionRouteRegistrationCase::RouteAfterListener
+                            | TransitionRouteRegistrationCase::RouteAndPoison
+                    ) {
+                        hook_table
+                            .mem
+                            .blk_idx()
+                            .update_column_root(row_id + 1, SUPER_BLOCK_ID)
+                            .await;
+                    }
+                    if matches!(
+                        case,
+                        TransitionRouteRegistrationCase::Poison
+                            | TransitionRouteRegistrationCase::RouteAndPoison
+                    ) {
+                        hook_poisoner.poison(
+                            Report::new(FatalError::CheckpointWrite)
+                                .attach("test transition-route registration poison"),
+                        );
+                    }
+                })
+            });
+
+        let before = engine.inner().poisoner.test_observation_counts();
+        let result = table
+            .wait_transition_route_or_poison(&engine.inner().poisoner, row_id)
+            .await;
+        let after = engine.inner().poisoner.test_observation_counts();
+        match case {
+            TransitionRouteRegistrationCase::RouteBeforeListener
+            | TransitionRouteRegistrationCase::RouteAfterListener => result.unwrap(),
+            TransitionRouteRegistrationCase::Poison
+            | TransitionRouteRegistrationCase::RouteAndPoison => {
+                let report = result.unwrap_err();
+                assert_eq!(*report.current_context(), FatalError::CheckpointWrite);
+            }
+        }
+        assert_eq!(
+            after.1,
+            before.1 + 1,
+            "each registration boundary must install exactly one poison listener"
+        );
+        drop(table);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn test_transition_route_registration_boundaries_preserve_precedence() {
+        smol::block_on(async {
+            assert_transition_route_registration_case(
+                TransitionRouteRegistrationCase::RouteBeforeListener,
+            )
+            .await;
+            assert_transition_route_registration_case(
+                TransitionRouteRegistrationCase::RouteAfterListener,
+            )
+            .await;
+            assert_transition_route_registration_case(TransitionRouteRegistrationCase::Poison)
+                .await;
+            assert_transition_route_registration_case(
+                TransitionRouteRegistrationCase::RouteAndPoison,
+            )
+            .await;
         });
     }
 

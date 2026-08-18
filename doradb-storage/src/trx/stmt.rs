@@ -202,6 +202,13 @@ impl StmtEffects {
             .expect("owned row mutation requires a newest ordinary row undo")
     }
 
+    /// Returns statement-owned row and index undo counts for tests.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn undo_counts(&self) -> (usize, usize) {
+        (self.row_undo.len(), self.index_undo.len())
+    }
+
     /// Requires that no operation-local deferred ownership remains.
     #[inline]
     pub(crate) fn assert_no_deferred_index_updates(&self) {

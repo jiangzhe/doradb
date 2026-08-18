@@ -3323,6 +3323,7 @@ mod tests {
     use crate::value::{Val, ValKind};
     use futures::FutureExt;
     use std::panic::AssertUnwindSafe;
+    use std::ptr::addr_eq;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -4883,6 +4884,10 @@ mod tests {
                 Some(Box::new(RowUndoHead::new(status, undo.leak())));
             page_guard.write_row_by_id(row_id).delete_row();
             *page_guard.unwrap_vmap().write_state() = RowPageState::Transition;
+            let row_before = page_guard
+                .page()
+                .row(row_idx)
+                .clone_vals(mem_table.metadata().col.as_ref());
             let dirty_before = page_guard.bf().is_dirty();
             let frozen_version_before = page_guard.unwrap_vmap().frozen_mutation_version();
             drop(page_guard);
@@ -4903,7 +4908,19 @@ mod tests {
                 RowPageState::Transition
             );
             assert!(page_guard.page().is_deleted(row_idx));
-            assert!(page_guard.unwrap_vmap().read_latch(row_idx).is_some());
+            assert_eq!(
+                page_guard
+                    .page()
+                    .row(row_idx)
+                    .clone_vals(mem_table.metadata().col.as_ref()),
+                row_before
+            );
+            let undo_guard = page_guard.unwrap_vmap().read_latch(row_idx);
+            let undo_head = undo_guard
+                .as_ref()
+                .expect("transition attempt must retain the exact undo head");
+            assert!(addr_eq(undo_head.next.main.entry.as_ref(), &*undo));
+            drop(undo_guard);
             assert_eq!(page_guard.bf().is_dirty(), dirty_before);
             assert_eq!(
                 page_guard.unwrap_vmap().frozen_mutation_version(),

@@ -3901,7 +3901,7 @@ pub(crate) mod tests {
     }
 
     #[inline]
-    fn transaction_entry(trx: &Transaction) -> Arc<SessionOperationEntry> {
+    pub(crate) fn transaction_entry(trx: &Transaction) -> Arc<SessionOperationEntry> {
         resolve_active_parts_for_test(trx)
             .expect("test transaction must resolve")
             .0
