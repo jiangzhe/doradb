@@ -18,8 +18,8 @@ use crate::index::{LwcRowLocation, RowLocation};
 use crate::row::RowPage;
 use crate::row::ops::{RowMutation, RowUpdateInput, TableMutationOutcome, UpdateCol};
 use crate::table::dml_validator::DmlValidator;
-use crate::table::hot::{DeleteInternal, HotRowMutator, UpdateRowInplace};
-use crate::table::{DeletionClaim, DeletionError, TableRootSnapshot};
+use crate::table::hot::{DeleteInternal, HotRowMutator, ResumeOwnedRow, UpdateRowInplace};
+use crate::table::{DeleteMarker, DeletionClaim, DeletionError, TableRootSnapshot};
 use crate::trx::TrxRuntime;
 use crate::trx::row::{BoundIndexCandidate, LockRowForWrite, RowWriteAccess};
 use crate::trx::stmt::StmtEffects;
@@ -336,13 +336,18 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                 accessor
                     .validate_table_mutation_update(self.validator.as_ref(), &update)
                     .disclose()?;
-                if candidate.unique {
-                    self.validate_unique_driver_update(&mut lazy_row, candidate, &update)?;
-                }
+                let defer = candidate.unique
+                    && self.unique_driver_key_changed(&mut lazy_row, candidate, &update)?;
                 if update.is_empty() {
                     *value_buffer = lazy_row.into_reusable_buffer();
                     self.cancel_owned_cold_row(candidate.row_id);
                     drop(persisted);
+                } else if defer {
+                    *value_buffer = lazy_row.into_reusable_buffer();
+                    drop(persisted);
+                    // TODO: evaluate if caching entire cold row is better than rescan.
+                    self.effects
+                        .defer_index_update(accessor.table_id(), candidate.row_id, update);
                 } else {
                     let (old_row, reusable) = lazy_row.into_full_row().disclose()?;
                     *value_buffer = reusable;
@@ -418,107 +423,224 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                 accessor
                     .validate_table_mutation_update(self.validator.as_ref(), &update)
                     .disclose()?;
-                if candidate.unique {
-                    self.validate_unique_driver_update(&mut lazy_row, candidate, &update)?;
-                }
+                let defer = candidate.unique
+                    && self.unique_driver_key_changed(&mut lazy_row, candidate, &update)?;
                 let (access, reusable) = lazy_row.into_hot_write_reusable_buffer();
                 *value_buffer = reusable;
                 if update.is_empty() {
                     self.cancel_owned_hot_row(access);
                     return Ok(None);
                 }
-                let result = HotRowMutator::new(
-                    accessor.table_id(),
-                    accessor.metadata(),
-                    self.rt,
-                    page_guard,
-                    candidate.row_id,
-                )
-                .update_owned_row(
-                    self.effects,
-                    RowUpdateInput::Sparse(update),
-                    access,
-                );
-                match result {
-                    UpdateRowInplace::Ok(new_row_id, index_change_cols) => {
-                        debug_assert_eq!(candidate.row_id, new_row_id);
-                        if !index_change_cols.is_empty() {
-                            accessor
-                                .update_indexes_only_key_change(
-                                    self.rt,
-                                    self.effects,
-                                    candidate.row_id,
-                                    page_guard,
-                                    &index_change_cols,
-                                    self.root_snapshot,
-                                )
-                                .await
-                                .attach("index-driven mutation hot key change")
-                                .disclose()?;
-                        }
-                        Ok(None)
-                    }
-                    UpdateRowInplace::NoFreeSpaceOrFrozen(old_row_id, old_row, update) => {
-                        let old_index_keys = WriteIndexKeySet::from_full_row(accessor, &old_row);
-                        let move_guard = accessor
-                            .mem()
-                            .must_get_row_page_shared(self.rt.pool_guards(), page_guard.page_id())
-                            .await
-                            .disclose()?;
-                        let (new_row_id, index_change_cols, new_guard) = accessor
-                            .move_update_for_space(
-                                self.rt,
-                                self.effects,
-                                old_row,
-                                update,
-                                old_row_id,
-                                move_guard,
-                            )
-                            .await
-                            .disclose()?;
-                        let proof = accessor.owned_row_page_index_set_proof(
-                            old_row_id,
-                            old_index_keys,
-                            self.root_snapshot,
-                        );
-                        if index_change_cols.is_empty() {
-                            accessor
-                                .update_indexes_only_row_id_change(
-                                    self.rt,
-                                    self.effects,
-                                    old_row_id,
-                                    new_row_id,
-                                    proof,
-                                )
-                                .await
-                                .attach("index-driven mutation hot move index update")
-                                .disclose()?;
-                        } else {
-                            accessor
-                                .update_indexes_may_both_change(
-                                    self.rt,
-                                    self.effects,
-                                    RowIdMove::new(old_row_id, new_row_id),
-                                    &index_change_cols,
-                                    &new_guard,
-                                    proof,
-                                )
-                                .await
-                                .attach("index-driven mutation hot move index update")
-                                .disclose()?;
-                        }
-                        Ok(None)
-                    }
-                    UpdateRowInplace::RowDeleted(_)
-                    | UpdateRowInplace::RowNotFound(_)
-                    | UpdateRowInplace::RetryInTransition(_) => {
-                        unreachable!(
-                            "owned hot candidate changed while its write latch was retained"
+                if defer {
+                    drop(access);
+                    self.effects
+                        .defer_index_update(accessor.table_id(), candidate.row_id, update);
+                } else {
+                    self.update_owned_hot_row(candidate.row_id, page_guard, access, update)
+                        .await?;
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    /// Applies every cached key-changing update after index traversal ends.
+    pub(super) async fn apply_deferred_index_updates(&mut self) -> Result<()> {
+        #[cfg(test)]
+        if self.effects.has_deferred_index_updates() {
+            tests::maybe_pause_before_deferred_application().await;
+        }
+        self.effects.begin_deferred_index_update_application();
+        while let Some((row_id, update)) = self.effects.activate_next_deferred_index_update() {
+            self.apply_deferred_index_update(row_id, update).await?;
+        }
+        Ok(())
+    }
+
+    /// Resumes the exact retained hot or cold ownership for one cached update.
+    async fn apply_deferred_index_update(
+        &mut self,
+        row_id: RowID,
+        update: Vec<UpdateCol>,
+    ) -> Result<()> {
+        let accessor = self.accessor;
+        loop {
+            match accessor
+                .resolve_row_location(self.rt.pool_guards(), row_id)
+                .await
+                .disclose()?
+            {
+                RowLocation::NotFound => {
+                    panic!(
+                        "deferred index update lost its retained row route: table_id={}, row_id={row_id}",
+                        accessor.table_id()
+                    );
+                }
+                RowLocation::RowPage(page_id) => {
+                    let Some(page_guard) = accessor
+                        .mem()
+                        .try_get_validated_row_page_shared_result(
+                            self.rt.pool_guards(),
+                            page_id,
+                            row_id,
                         )
+                        .await
+                        .disclose()?
+                    else {
+                        continue;
+                    };
+                    {
+                        let resumed = HotRowMutator::new(
+                            accessor.table_id(),
+                            accessor.metadata(),
+                            self.rt,
+                            &page_guard,
+                            row_id,
+                        )
+                        .resume_owned_row(self.effects);
+                        match resumed {
+                            ResumeOwnedRow::Ok(access) => {
+                                self.update_owned_hot_row(row_id, &page_guard, access, update)
+                                    .await?;
+                                return Ok(());
+                            }
+                            ResumeOwnedRow::RetryInTransition => (),
+                        }
                     }
+                    drop(page_guard);
+                    accessor
+                        .wait_transition_route_or_poison(self.rt, row_id)
+                        .await
+                        .disclose()?;
+                }
+                RowLocation::LwcBlock(location) => {
+                    let old_row = accessor
+                        .read_lwc_full_row(
+                            self.rt.pool_guards(),
+                            location.block_id,
+                            location.row_idx,
+                            location.row_shape_fingerprint,
+                        )
+                        .await
+                        .disclose()?;
+                    let owns_marker = matches!(
+                        accessor.lwc_deletion_buffer().get(row_id),
+                        Some(DeleteMarker::Ref(status)) if Arc::ptr_eq(&status, self.rt.status())
+                    );
+                    assert!(
+                        owns_marker,
+                        "deferred cold index update must retain its transaction-owned deletion marker: table_id={}, row_id={row_id}",
+                        accessor.table_id()
+                    );
+                    accessor
+                        .update_owned_cold_row(
+                            self.rt,
+                            self.effects,
+                            row_id,
+                            old_row,
+                            update,
+                            self.root_snapshot,
+                        )
+                        .await
+                        .disclose()?;
+                    return Ok(());
                 }
             }
         }
+    }
+
+    /// Reuses the ordinary owned-hot update, move, and index-maintenance paths.
+    async fn update_owned_hot_row(
+        &mut self,
+        row_id: RowID,
+        page_guard: &PageSharedGuard<RowPage>,
+        access: RowWriteAccess<'_>,
+        update: Vec<UpdateCol>,
+    ) -> Result<()> {
+        let accessor = self.accessor;
+        let result = HotRowMutator::new(
+            accessor.table_id(),
+            accessor.metadata(),
+            self.rt,
+            page_guard,
+            row_id,
+        )
+        .update_owned_row(self.effects, RowUpdateInput::Sparse(update), access);
+        match result {
+            UpdateRowInplace::Ok(new_row_id, index_change_cols) => {
+                debug_assert_eq!(row_id, new_row_id);
+                if !index_change_cols.is_empty() {
+                    accessor
+                        .update_indexes_only_key_change(
+                            self.rt,
+                            self.effects,
+                            row_id,
+                            page_guard,
+                            &index_change_cols,
+                            self.root_snapshot,
+                        )
+                        .await
+                        .attach("index-driven mutation hot key change")
+                        .disclose()?;
+                }
+            }
+            UpdateRowInplace::NoFreeSpaceOrFrozen(old_row_id, old_row, update) => {
+                let old_index_keys = WriteIndexKeySet::from_full_row(accessor, &old_row);
+                let move_guard = accessor
+                    .mem()
+                    .must_get_row_page_shared(self.rt.pool_guards(), page_guard.page_id())
+                    .await
+                    .disclose()?;
+                let (new_row_id, index_change_cols, new_guard) = accessor
+                    .move_update_for_space(
+                        self.rt,
+                        self.effects,
+                        old_row,
+                        update,
+                        old_row_id,
+                        move_guard,
+                    )
+                    .await
+                    .disclose()?;
+                let proof = accessor.owned_row_page_index_set_proof(
+                    old_row_id,
+                    old_index_keys,
+                    self.root_snapshot,
+                );
+                if index_change_cols.is_empty() {
+                    accessor
+                        .update_indexes_only_row_id_change(
+                            self.rt,
+                            self.effects,
+                            old_row_id,
+                            new_row_id,
+                            proof,
+                        )
+                        .await
+                        .attach("index-driven mutation hot move index update")
+                        .disclose()?;
+                } else {
+                    accessor
+                        .update_indexes_may_both_change(
+                            self.rt,
+                            self.effects,
+                            RowIdMove::new(old_row_id, new_row_id),
+                            &index_change_cols,
+                            &new_guard,
+                            proof,
+                        )
+                        .await
+                        .attach("index-driven mutation hot move index update")
+                        .disclose()?;
+                }
+            }
+            UpdateRowInplace::RowDeleted(_)
+            | UpdateRowInplace::RowNotFound(_)
+            | UpdateRowInplace::RetryInTransition(_) => {
+                unreachable!("retained owned hot row changed before physical update")
+            }
+        }
+        Ok(())
     }
 
     #[inline]
@@ -541,12 +663,12 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
         });
     }
 
-    fn validate_unique_driver_update(
+    fn unique_driver_key_changed(
         &self,
         lazy_row: &mut LazyRow<'_>,
         candidate: &BoundIndexCandidate<'_>,
         update: &[UpdateCol],
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let index_no = candidate.index_no;
         let index_spec = self
             .accessor
@@ -567,28 +689,22 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                 .disclose()?;
             key_vals.push(val);
         }
-        if !candidate.matches_key(&key_vals) {
-            return Err(Report::new(OperationError::InvalidDmlInput)
-                .attach(format!(
-                    "operation=table_index_mutate_mvcc, table_id={}, index_no={index_no}, row_id={}, unique driver key must remain unchanged",
-                    self.accessor.table_id(),
-                    candidate.row_id
-                ))
-                .disclose());
-        }
-        Ok(())
+        Ok(!candidate.matches_key(&key_vals))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::catalog::tests::table4;
+    use crate::catalog::tests::{table3, table4};
     use crate::error::{DiscloseResultExt, OperationError};
-    use crate::index::IndexInsert;
+    use crate::index::{IndexInsert, RowLocation};
     use crate::row::ops::{
         DeleteMvcc, RowMutation, SelectMvcc, TableMutationOutcome, UpdateCol, UpdateMvcc,
     };
-    use crate::session::tests::{SessionTestExt, assert_checkpoint_published};
+    use crate::session::tests::{
+        SessionTestExt, assert_checkpoint_published, wait_for_session_idle,
+    };
+    use crate::table::DeleteMarker;
     use crate::table::tests::*;
     use crate::trx::MAX_SNAPSHOT_TS;
     use crate::trx::tests::{
@@ -596,8 +712,52 @@ mod tests {
     };
     use crate::value::Val;
     use smol::future::yield_now;
+    use std::cell::{Cell, RefCell};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    thread_local! {
+        static DEFERRED_APPLICATION_PAUSE: RefCell<Option<flume::Receiver<()>>> = const { RefCell::new(None) };
+        static DEFERRED_APPLICATION_PAUSED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    fn pause_next_deferred_application() -> flume::Sender<()> {
+        let (resume_tx, resume_rx) = flume::bounded(1);
+        DEFERRED_APPLICATION_PAUSED.set(false);
+        DEFERRED_APPLICATION_PAUSE.with(|slot| {
+            let old = slot.borrow_mut().replace(resume_rx);
+            assert!(
+                old.is_none(),
+                "deferred-application pause already installed"
+            );
+        });
+        resume_tx
+    }
+
+    pub(super) async fn maybe_pause_before_deferred_application() {
+        let receiver = DEFERRED_APPLICATION_PAUSE.with(|slot| slot.borrow_mut().take());
+        if let Some(receiver) = receiver {
+            DEFERRED_APPLICATION_PAUSED.set(true);
+            receiver.recv_async().await.unwrap();
+        }
+    }
+
+    async fn poll_until_deferred_application_pauses<F>(mut future: Pin<&mut F>)
+    where
+        F: Future,
+    {
+        for _ in 0..512 {
+            assert!(futures::poll!(future.as_mut()).is_pending());
+            if DEFERRED_APPLICATION_PAUSED.get() {
+                return;
+            }
+            yield_now().await;
+        }
+        panic!("index mutation did not reach deferred application pause");
+    }
 
     #[test]
     fn test_table_index_mutate_mvcc_mixed_cold_hot_actions() {
@@ -739,37 +899,146 @@ mod tests {
     }
 
     #[test]
-    fn test_table_index_mutate_mvcc_unique_driver_key_change_rolls_back() {
+    fn test_table_index_mutate_mvcc_unique_driver_key_changes_apply_after_traversal() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let engine = lightweight_test_engine(&temp_dir, "index_mutate_unique_reject").await;
+            let engine = lightweight_test_engine(&temp_dir, "index_mutate_unique_change").await;
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 3, "original").await;
 
             let mut trx = session.begin_trx().unwrap();
+            let mut callbacks = Vec::new();
+            let outcome = trx
+                .exec(async |stmt| {
+                    stmt.table_index_mutate_mvcc(table_id, 0, .., |row| {
+                        let id = row.val(0)?.as_i32().unwrap();
+                        callbacks.push(id);
+                        Ok(RowMutation::Update(vec![UpdateCol {
+                            idx: 0,
+                            val: Val::from(id + 100),
+                        }]))
+                    })
+                    .await
+                })
+                .await
+                .unwrap();
+            assert_eq!(callbacks, vec![0, 1, 2]);
+            assert_eq!(
+                outcome,
+                TableMutationOutcome {
+                    delete_count: 0,
+                    update_count: 3,
+                }
+            );
+            trx.commit().await.unwrap();
+
+            let mut reader = session.begin_trx().unwrap();
+            assert_eq!(
+                scan_table_pairs(&mut reader, table_id).await,
+                vec![
+                    (100, "original".to_owned()),
+                    (101, "original".to_owned()),
+                    (102, "original".to_owned()),
+                ]
+            );
+            reader.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_table_index_mutate_mvcc_unique_driver_change_moves_frozen_row() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                lightweight_test_engine(&temp_dir, "index_mutate_unique_frozen_move").await;
+            let table_id = table3(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let mut setup = session.begin_trx().unwrap();
+            setup
+                .exec(async |stmt| {
+                    stmt.table_insert_mvcc(table_id, vec![Val::from("old")])
+                        .await?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            setup.commit().await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+
+            let mut writer = session.begin_trx().unwrap();
+            let outcome = writer
+                .exec(async |stmt| {
+                    stmt.table_index_mutate_mvcc(table_id, 0, .., |row| {
+                        assert_eq!(row.val(0)?.as_str(), Some("old"));
+                        Ok(RowMutation::Update(vec![UpdateCol {
+                            idx: 0,
+                            val: Val::from("new-variable-length-key"),
+                        }]))
+                    })
+                    .await
+                })
+                .await
+                .unwrap();
+            assert_eq!(outcome.update_count, 1);
+            writer.commit().await.unwrap();
+
+            let old_key = [Val::from("old")];
+            let new_key = [Val::from("new-variable-length-key")];
+            let mut reader = session.begin_trx().unwrap();
+            let (old_row, new_row) = reader
+                .exec(async |stmt| {
+                    let old_row = stmt
+                        .table_lookup_unique_mvcc(table_id, 0, &old_key, &[0])
+                        .await?;
+                    let new_row = stmt
+                        .table_lookup_unique_mvcc(table_id, 0, &new_key, &[0])
+                        .await?;
+                    Ok((old_row, new_row))
+                })
+                .await
+                .unwrap();
+            assert!(old_row.not_found());
+            assert_eq!(
+                new_row.unwrap_found(),
+                vec![Val::from("new-variable-length-key")]
+            );
+            reader.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_table_index_mutate_mvcc_unique_driver_duplicate_settles_pending_locks() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "index_mutate_unique_duplicate").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 3, "original").await;
+
+            let mut trx = session.begin_trx().unwrap();
+            let mut callbacks = Vec::new();
             let result = trx
                 .exec(async |stmt| {
                     stmt.table_index_mutate_mvcc(table_id, 0, .., |row| {
-                        Ok(match row.val(0)?.as_i32().unwrap() {
-                            0 => RowMutation::Update(vec![UpdateCol {
-                                idx: 1,
-                                val: Val::from("must-rollback"),
-                            }]),
-                            1 => RowMutation::Update(vec![UpdateCol {
-                                idx: 0,
-                                val: Val::from(100i32),
-                            }]),
-                            _ => RowMutation::Skip,
-                        })
+                        let id = row.val(0)?.as_i32().unwrap();
+                        callbacks.push(id);
+                        Ok(RowMutation::Update(vec![UpdateCol {
+                            idx: 0,
+                            val: Val::from(if id == 0 { 2 } else { id + 100 }),
+                        }]))
                     })
                     .await
                 })
                 .await;
-            let error = result.unwrap_err();
+            assert_eq!(callbacks, vec![0, 1, 2]);
             assert_eq!(
-                error.report().downcast_ref::<OperationError>().copied(),
-                Some(OperationError::InvalidDmlInput)
+                result
+                    .unwrap_err()
+                    .report()
+                    .downcast_ref::<OperationError>()
+                    .copied(),
+                Some(OperationError::DuplicateKey)
             );
             assert_eq!(
                 scan_table_pairs(&mut trx, table_id).await,
@@ -780,6 +1049,233 @@ mod tests {
                 ]
             );
             trx.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_table_index_mutate_mvcc_unique_driver_changes_mixed_cold_hot() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "index_mutate_unique_mixed")
+                    .await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 3, "cold").await;
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+            assert_checkpoint_published(&mut session, table_id).await;
+            insert_rows(table_id, &mut session, 10, 3, "hot").await;
+
+            let mut trx = session.begin_trx().unwrap();
+            let mut callbacks = Vec::new();
+            let outcome = trx
+                .exec(async |stmt| {
+                    stmt.table_index_mutate_mvcc(table_id, 0, .., |row| {
+                        let id = row.val(0)?.as_i32().unwrap();
+                        callbacks.push(id);
+                        Ok(RowMutation::Update(vec![UpdateCol {
+                            idx: 0,
+                            val: Val::from(id + 100),
+                        }]))
+                    })
+                    .await
+                })
+                .await
+                .unwrap();
+            assert_eq!(callbacks, vec![0, 1, 2, 10, 11, 12]);
+            assert_eq!(outcome.update_count, 6);
+            trx.commit().await.unwrap();
+
+            let mut reader = session.begin_trx().unwrap();
+            assert_eq!(
+                scan_table_pairs(&mut reader, table_id).await,
+                vec![
+                    (100, "cold".to_owned()),
+                    (101, "cold".to_owned()),
+                    (102, "cold".to_owned()),
+                    (110, "hot".to_owned()),
+                    (111, "hot".to_owned()),
+                    (112, "hot".to_owned()),
+                ]
+            );
+            reader.commit().await.unwrap();
+        });
+    }
+
+    async fn assert_deferred_hot_lock_resumes_after_cold_publication(commit: bool) {
+        let temp_dir = TempDir::new().unwrap();
+        let stem = if commit {
+            "index_mutate_transition_commit"
+        } else {
+            "index_mutate_transition_rollback"
+        };
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, stem).await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut maintenance_session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut maintenance_session, 1, 1, "original").await;
+
+        let key = single_key(1i32);
+        let probe = maintenance_session.begin_trx().unwrap();
+        let row_id = bound_unique_index(
+            &table_for_internal_assertion(&engine, table_id),
+            &maintenance_session.pool_guards(),
+            key.index_no,
+        )
+        .lookup(&key.vals, probe.sts())
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+        probe.commit().await.unwrap();
+        assert_freeze_created(
+            maintenance_session
+                .freeze_table(table_id, usize::MAX)
+                .await
+                .unwrap(),
+        );
+
+        let resume = pause_next_deferred_application();
+        let mut writer_session = engine.new_session().unwrap();
+        let mut writer = writer_session.begin_trx().unwrap();
+        let writer_status = transaction_status_for_test(&writer);
+        let mut mutation = Box::pin(writer.exec(async |stmt| {
+            stmt.table_index_mutate_mvcc(table_id, 0, .., |row| {
+                assert_eq!(row.val(0)?.as_i32(), Some(1));
+                Ok(RowMutation::Update(vec![UpdateCol {
+                    idx: 0,
+                    val: Val::from(101i32),
+                }]))
+            })
+            .await
+        }));
+        poll_until_deferred_application_pauses(mutation.as_mut()).await;
+
+        assert_checkpoint_published(&mut maintenance_session, table_id).await;
+        let table = table_for_internal_assertion(&engine, table_id);
+        assert!(matches!(
+            table
+                .find_row(&maintenance_session.pool_guards(), row_id)
+                .await
+                .unwrap(),
+            RowLocation::LwcBlock(_)
+        ));
+        assert!(matches!(
+            table.deletion_buffer().get(row_id),
+            Some(DeleteMarker::Ref(status)) if Arc::ptr_eq(&status, &writer_status)
+        ));
+
+        resume.send_async(()).await.unwrap();
+        let outcome = mutation.as_mut().await.unwrap();
+        assert_eq!(outcome.update_count, 1);
+        drop(mutation);
+        if commit {
+            writer.commit().await.unwrap();
+        } else {
+            writer.rollback().await.unwrap();
+        }
+
+        let mut reader = maintenance_session.begin_trx().unwrap();
+        let expected = if commit {
+            vec![(101, "original".to_owned())]
+        } else {
+            vec![(1, "original".to_owned())]
+        };
+        assert_eq!(scan_table_pairs(&mut reader, table_id).await, expected);
+        reader.commit().await.unwrap();
+    }
+
+    #[test]
+    fn test_table_index_mutate_mvcc_deferred_hot_lock_resumes_after_cold_publication() {
+        smol::block_on(async {
+            assert_deferred_hot_lock_resumes_after_cold_publication(true).await;
+            assert_deferred_hot_lock_resumes_after_cold_publication(false).await;
+        });
+    }
+
+    #[test]
+    fn test_table_index_mutate_mvcc_cancellation_retains_deferred_undo_ownership() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "index_mutate_deferred_cancel").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 1, 1, "original").await;
+
+            let resume = pause_next_deferred_application();
+            let session_id = session.id();
+            let mut writer = session.begin_trx().unwrap();
+            let mut mutation = Box::pin(writer.exec(async |stmt| {
+                stmt.table_index_mutate_mvcc(table_id, 0, .., |_| {
+                    Ok(RowMutation::Update(vec![UpdateCol {
+                        idx: 0,
+                        val: Val::from(101i32),
+                    }]))
+                })
+                .await
+            }));
+            poll_until_deferred_application_pauses(mutation.as_mut()).await;
+            drop(resume);
+            drop(mutation);
+
+            wait_for_session_idle(&engine.inner().session_registry, session_id).await;
+            let mut reader = session.begin_trx().unwrap();
+            assert_eq!(
+                scan_table_pairs(&mut reader, table_id).await,
+                vec![(1, "original".to_owned())]
+            );
+            reader.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_table_index_mutate_mvcc_deferred_update_retains_write_conflict() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "index_mutate_deferred_conflict").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut setup_session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut setup_session, 1, 1, "original").await;
+
+            let resume = pause_next_deferred_application();
+            let mut writer_session = engine.new_session().unwrap();
+            let mut writer = writer_session.begin_trx().unwrap();
+            let mut mutation = Box::pin(writer.exec(async |stmt| {
+                stmt.table_index_mutate_mvcc(table_id, 0, .., |_| {
+                    Ok(RowMutation::Update(vec![UpdateCol {
+                        idx: 0,
+                        val: Val::from(101i32),
+                    }]))
+                })
+                .await
+            }));
+            poll_until_deferred_application_pauses(mutation.as_mut()).await;
+
+            let mut competitor_session = engine.new_session().unwrap();
+            let mut competitor = competitor_session.begin_trx().unwrap();
+            let result = trx_update_row_by_id(
+                &mut competitor,
+                table_id,
+                &single_key(1i32),
+                vec![UpdateCol {
+                    idx: 1,
+                    val: Val::from("competitor"),
+                }],
+            )
+            .await;
+            assert_eq!(
+                result
+                    .unwrap_err()
+                    .report()
+                    .downcast_ref::<OperationError>()
+                    .copied(),
+                Some(OperationError::WriteConflict)
+            );
+            competitor.rollback().await.unwrap();
+
+            resume.send_async(()).await.unwrap();
+            assert_eq!(mutation.as_mut().await.unwrap().update_count, 1);
+            drop(mutation);
+            writer.commit().await.unwrap();
         });
     }
 

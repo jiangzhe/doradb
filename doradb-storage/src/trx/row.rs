@@ -23,6 +23,7 @@ use error_stack::Report;
 use parking_lot::RwLockReadGuard;
 use std::collections::{BTreeMap, BTreeSet};
 use std::mem;
+use std::ptr::addr_eq;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1108,6 +1109,14 @@ impl<'a> RowWriteAccess<'a> {
         self.guard
             .as_ref()
             .is_some_and(|head| ctx.is_same_trx(head.as_ref()) && head.stmt_no() == stmt_no)
+    }
+
+    /// Returns whether the current undo head is the exact supplied owned entry.
+    #[inline]
+    pub(crate) fn owned_by_undo(&self, ctx: &TrxContext, undo: &OwnedRowUndo) -> bool {
+        self.guard.as_ref().is_some_and(|head| {
+            ctx.is_same_trx(head.as_ref()) && addr_eq(head.next.main.entry.as_ref(), &**undo)
+        })
     }
 
     /// Marks the row as deleted in the page image.

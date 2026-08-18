@@ -274,6 +274,9 @@ impl UndoVal for UpdateCol {
 ///
 /// The callback is invoked at most once for each eligible original row. Update
 /// replacements created by the operation are not offered to the callback again.
+/// An index-driven update that changes its unique driver's encoded key may be
+/// cached and physically applied after candidate traversal, so callbacks must
+/// not depend on candidate-order physical effects from other rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowMutation {
     /// Leave the row unchanged.
