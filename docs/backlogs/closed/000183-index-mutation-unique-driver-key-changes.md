@@ -28,4 +28,10 @@ Unique-driver key-changing updates work across mixed MemIndex and DiskTree range
 
 ## Notes (Optional)
 
+## Close Reason
 
+- Type: implemented
+- Detail: Implemented via docs/tasks/000271-index-mutation-unique-driver-key-changes.md
+- Closed By: backlog close
+- Reference: docs/tasks/000271-index-mutation-unique-driver-key-changes.md; GitHub PR #981
+- Closed At: 2026-08-18
