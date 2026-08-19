@@ -4,6 +4,7 @@ title: Direct Transaction Statement APIs
 status: proposal
 tags: [storage-engine, transaction, api, rollback]
 created: 2026-08-19
+github_issue: 986
 ---
 
 # RFC-0029: Direct Transaction Statement APIs
@@ -21,13 +22,20 @@ after a settled method returns is outside that statement and cannot silently
 redefine its success or rollback policy.
 
 The implementation keeps the existing statement carrier, effect buffers,
-rollback machinery, and cancellation ownership behind a crate-private runner.
-It also adds an atomic batch-insert DML so callers can deliberately insert many
-rows in one statement after arbitrary multi-DML callbacks are removed. The
-program is split into three phases: extract and verify the private runner, add
-the complete direct API beside the legacy API, and then retire the callback
-surface while migrating all code, tests, examples, benchmarks, and
-documentation.
+rollback machinery, and cancellation ownership in `Transaction::exec`. During
+the additive phase, direct methods reuse that existing settlement path with an
+engine-controlled callback. During callback retirement, `exec` becomes
+transaction-module-private, accepts an owned one-shot `Statement`, and settles
+the operation through `StmtState` after the facade is consumed. Every normal
+no-op, read, and DML method consumes `Statement`, so internal code also cannot
+compose two normal operations into one statement. Private catalog batching
+uses a distinct reusable `CatalogStatement`. The RFC also adds an atomic
+batch-insert DML so callers can deliberately insert many rows in one statement
+after arbitrary multi-DML callbacks are removed. The program is split into two
+phases: add the complete direct API beside the legacy API and migrate ordinary
+tests, then establish the owned internal boundary, retire the public callback
+surface, and migrate the remaining production code, runner-focused tests,
+examples, benchmarks, and documentation.
 
 ## Context
 
@@ -60,18 +68,26 @@ rather than a second statement-completion result. [U5]
 The current rollback algorithm is already suitable for this boundary. When an
 internal statement callback propagates `Err`, `Transaction::exec` rolls back
 secondary-index effects before row effects, clears redo, and only then returns
-the error. A direct method can reuse the same logic through a private runner,
-so this RFC does not move rollback into every low-level DML or add a temporary
-public failure-latch state. Existing `StmtState` drop behavior also remains the
+the error. A direct method can reuse `exec` internally with a closure that
+returns exactly one operation result. This RFC therefore does not move rollback
+into every low-level DML, add a second runner, or add a temporary public
+failure-latch state. Existing `StmtState` drop behavior also remains the
 authority for a cancelled checked-out public statement future. [D2] [D7]
-[C1] [C2] [C3]
+[C1] [C2] [C3] [U10]
+
+Hiding the callback is not the only final invariant. The normal internal
+statement facade must also be one-shot so a future direct wrapper or focused
+internal caller cannot accidentally compose two normal operations under one
+effect boundary. Once public callback retirement begins, `exec` therefore
+lends `Statement` by value, every normal operation consumes it, and `StmtState`
+settles the result after that owned operation ends. [C1] [C2] [U11]
 
 Private catalog staging has intentionally different semantics. It batches
 multiple catalog-row mutations through one held private transaction and merges
 complete and partial undo into transaction effects even when a staging callback
 returns an ordinary error, so whole-private-transaction rollback owns cleanup.
 That crate-private behavior remains separate from the public direct statement
-runner. [D2] [C1] [C6]
+settlement path. [D2] [C1] [C6]
 
 Existing public examples and focused tests also demonstrate a real need for a
 deliberate multi-row DML. The quick-start example inserts two rows in one
@@ -171,9 +187,9 @@ Issue Labels:
 - [U5] The user selected the first-principles direction: hide `Statement`,
   remove public `Transaction::exec`, expose reads and DML directly on
   `Transaction`, and perform read-then-DML sequences at transaction level.
-- [U6] The user rejected one large implementation task and selected three
-  phases: private runner foundation, additive direct APIs, and atomic public
-  callback retirement with complete test and documentation migration.
+- [U6] The user initially rejected one large implementation task and selected
+  three phases: private runner foundation, additive direct APIs, and atomic
+  public callback retirement with complete test and documentation migration.
 - [U7] In Round 2, the user selected an explicit public
   `Transaction::noop()` so the statement lifecycle baseline remains available.
 - [U8] In a Round 2 revision, the user selected successful empty insert batches
@@ -182,6 +198,22 @@ Issue Labels:
 - [U9] In Round 2, the user selected the existing stream-constructor
   cancellation policy: after checkout, cancellation checks the transaction
   core in ordinarily and leaves the transaction reusable.
+- [U10] During Phase 1 task planning, the user determined that a distinct
+  `run_statement` extraction is unnecessary because `Transaction::exec`
+  already owns the complete settlement path. Direct methods reuse `exec`
+  internally during the additive phase, and callback retirement retains that
+  entry point as the non-public runner. This supersedes the original
+  three-phase split with two phases.
+- [U11] During the two-phase revision, the user required the final owned
+  `Statement` boundary to constrain internal use as well as external callers.
+  The final private `exec` takes `Statement` by value, every normal operation
+  consumes it, settlement moves to `StmtState`, and intentional private catalog
+  batching uses a distinct reusable facade.
+- [U12] The user moved ordinary existing-test migration into Phase 1 so the
+  additive direct API receives broad behavioral coverage and Phase 2 does not
+  accumulate nearly all migration work. Only runner-focused tests remain for
+  owned-boundary adaptation in Phase 2; alternatives remain limited to
+  materially significant architectural directions.
 
 ### Source Backlogs
 
@@ -246,8 +278,11 @@ first successful statement; the caller may continue or explicitly roll back
 the transaction. This replaces callback-defined compound statement semantics
 with explicit transaction sequencing. [D2] [U5]
 
-`Statement` and `StreamStmt` cease to be public exports. `IndexScanMvccStream`
-remains public because it is the owned result of a direct streaming read.
+`Statement` and `StreamStmt` cease to be public exports. The former becomes the
+owned one-shot normal-operation facade described in Decision 2; intentional
+catalog batching moves to a distinct `CatalogStatement` rather than retaining
+a reusable normal facade. `IndexScanMvccStream` remains public because it is the
+owned result of a direct streaming read.
 The streaming method borrows `&mut Transaction` for the returned stream's
 lifetime, so no later direct method or terminal transaction operation can begin
 until that stream completes or is dropped. Stream construction, iteration
@@ -265,17 +300,39 @@ Public validation remains mandatory; the current public
 `Transaction`. Recovery and other proven internal callers retain their own
 explicit validation policy. [C3] [C8]
 
-### 2. A crate-private runner retains statement ownership machinery
+### 2. Existing `exec` becomes the owned private statement runner
 
-Extract the current public `Transaction::exec` implementation into a
-crate-private runner, provisionally named `run_statement`. It continues to
-construct `StmtState`, lend a crate-private `Statement` or equivalently named
-internal facade, await one engine-controlled operation closure, and settle the
-result. Public direct methods are thin wrappers whose internal closure returns
-the exact result of one read or DML implementation; no arbitrary public
-callback can observe or replace that intermediate result. [C1] [C2] [U5]
+Reuse the current public `Transaction::exec` entry point as the single
+non-streaming statement settlement path. During the additive phase, public
+direct methods are thin wrappers that call the existing borrowed-callback
+`exec` with an engine-controlled closure returning the exact result of one read
+or DML implementation. No separate `run_statement` helper or
+runner-extraction phase is added. [C1] [C2] [U5] [U10]
 
-The runner preserves the current outcome policy:
+During callback retirement, make `exec` private to the transaction module and
+change its internal callback boundary from borrowed to owned:
+
+```rust
+async fn exec<T, F>(&mut self, operation: F) -> Result<T>
+where
+    F: for<'stmt> AsyncFnOnce(Statement<'stmt>) -> Result<T>;
+```
+
+Every normal operation entry point on `Statement` consumes `self`, including
+the internal no-op, reads, single-row DML, batch insert, and full-table or
+index-driven mutation. Its fields remain private to the statement
+implementation. Consequently one internal `exec` closure can invoke at most
+one normal statement operation; a direct wrapper cannot accidentally compose a
+second read or DML after the first operation starts. Row-decision callbacks
+remain nested inputs to one consuming mutation method and never receive the
+statement facade. [C1] [C2] [D3] [U11]
+
+`StmtState`, rather than the consumed `Statement`, becomes the normal settlement
+owner. The runner constructs `StmtState`, lends an owned `Statement` whose
+fields borrow the checked-out core and statement effects, and awaits the one
+operation. The operation future and owned facade are destroyed before
+settlement regains access to `StmtState`. A consuming `StmtState` completion
+path then applies the result policy:
 
 1. `Ok(value)` merges statement row undo, index undo, and redo into the
    transaction before returning `value`.
@@ -285,17 +342,19 @@ The runner preserves the current outcome policy:
 3. Rollback failure retains residual ownership, poisons storage, discards the
    transaction entry through the existing fatal path, and returns Fatal in
    precedence to the initiating error.
-4. Dropping an unpolled non-streaming direct-method future routed through this
-   runner performs no checkout.
-5. Dropping such a future after checkout synchronously folds residual statement
-   ownership into the transaction and terminally routes the complete
-   transaction through existing cleanup.
+4. Dropping an unpolled non-streaming direct-method future performs no checkout.
+5. Dropping such a future after checkout first destroys the owned operation
+   future, then synchronously folds residual statement ownership into the
+   transaction and terminally routes the complete transaction through existing
+   cleanup.
 
-The extraction adds no second checkout, heap allocation, registry lookup,
-shared lock, notification, or cleanup message to successful direct statements.
-The temporary public `exec` in Phases 1 and 2 delegates to the same runner, so
-there is one implementation of public statement settlement during the
-transition. [D7] [C1] [C2]
+The owned facade and `StmtState` settlement refactor add no second async
+wrapper, checkout, heap allocation, registry lookup, shared lock, notification,
+or cleanup message to successful direct statements. Passing the small
+borrow-carrying facade by value remains stack-only. During the additive phase,
+legacy callers and direct methods enter the same public `exec` implementation;
+the retirement phase changes its signature and visibility only after repository
+callers migrate. [D7] [C1] [C2] [U10] [U11]
 
 Streaming reads remain on their specialized crate-private checkout/state path,
 because settlement occurs at stream exhaustion, error, or drop rather than when
@@ -304,16 +363,23 @@ the constructor future returns. This path exposes only the direct
 preserves ordinary transaction reuse when the constructor itself is cancelled
 after checkout. [C3] [U9]
 
-`PrivateTransaction::stage_statement` remains a separate crate-private runner.
-Its merge-on-error policy and intentional repeated catalog mutations must not
-be generalized into the public runner or direct API. [C1] [C6]
+`PrivateTransaction::stage_statement` remains a separate crate-private runner
+with a reusable `CatalogStatement`. Its callback continues to borrow
+`&mut CatalogStatement`, catalog storage helpers migrate to that type, and the
+facade exposes only the catalog operations needed for intentional repeated
+catalog-row mutations. Its merge-on-error and panic-settlement policy remains
+unchanged and must not be generalized into normal `exec`. The two facades may
+share lower-level implementation helpers, but a reusable normal user-table
+statement capability is not retained. [C1] [C2] [C6] [U11]
 
 ### 3. Statement results are no longer caller-injected completion results
 
 A direct method returns exactly its operation result, such as `Result<RowID>`,
-`Result<UpdateMvcc>`, or `Result<ScanMvcc>`. The engine does not accept a second
-generic callback result and does not store, compare, clone, or replay an
-ordinary public error after disclosure. Consequently this RFC adds no
+`Result<UpdateMvcc>`, or `Result<ScanMvcc>`. The public boundary does not accept
+a second caller-selected callback result, and the final owned internal closure
+can invoke at most one consuming normal operation. The engine does not store,
+compare, clone, or replay an ordinary public error after disclosure.
+Consequently this RFC adds no
 `StatementAborted` error and no dual-result or ordinary-error precedence
 matrix. [D5] [C7] [U4] [U5]
 
@@ -333,9 +399,9 @@ handle is dropped. [D2] [U4] [U5]
 
 Caller errors from `table_mutate_mvcc` and `table_index_mutate_mvcc` row
 callbacks are different: those callbacks produce `RowMutation` decisions
-inside the DML future. Their errors propagate through the private runner and
-roll back the entire current mutation statement before the direct DML method
-returns. [C2] [D3]
+inside the DML future. Their errors propagate through the internal `exec` path
+and roll back the entire current mutation statement before the direct DML
+method returns. [C2] [D3]
 
 ### 4. A direct no-op preserves the statement lifecycle baseline
 
@@ -345,19 +411,25 @@ Add one explicit engine-controlled no-op:
 pub async fn noop(&mut self) -> Result<()>;
 ```
 
-`noop()` runs through the same private statement runner as non-streaming reads
-and DML. It obtains one checkout and `StmtNo`, creates an empty `StmtEffects`,
+`noop()` runs through the same internal `exec` path as non-streaming reads and
+DML. It obtains one checkout and `StmtNo`, creates an empty `StmtEffects`,
 merges that empty state on success, and checks the transaction core in before
 returning `Ok(())`. It performs no table admission, logical-lock acquisition,
-row or index access, redo generation, or persisted work. It accepts no caller
-callback or alternate result, so it cannot recreate the completion ambiguity
-removed with `exec`. Checked-out future cancellation follows the same terminal
-transaction-cancellation policy as every other runner-backed direct method.
+row or index access, redo generation, or persisted work. Its engine-controlled
+closure accepts no caller callback or alternate result, so it cannot recreate
+the completion ambiguity removed with public `exec`. Checked-out future
+cancellation follows the same terminal transaction-cancellation policy as
+every other non-streaming direct method.
 [D2] [D7] [C1] [C11] [U7]
 
+After callback retirement, the internal no-op is a consuming
+`Statement::noop(self)` operation. It preserves the same owned one-shot
+invariant as reads and DML rather than treating an ignored reusable facade as a
+successful statement. [C1] [C2] [U11]
+
 The existing `stmt-noop` workload retains its public identity, latency unit,
-counter semantics, and no-fixture requirement. Phase 2 measures the direct
-no-op against the legacy empty-`exec` baseline; Phase 3 changes that workload
+counter semantics, and no-fixture requirement. Phase 1 measures the direct
+no-op against the legacy empty-`exec` baseline; Phase 2 changes that workload
 and the weak-handle statement baseline to call `Transaction::noop()` while
 retaining their lifecycle-only meaning. [C11] [U7]
 
@@ -386,9 +458,13 @@ method returns. The error retains its typed source and attaches the failing
 zero-based batch index when a row-specific attempt had begun. [C2] [C4] [C5]
 [U3]
 
+The internal batch operation consumes one owned `Statement`; its per-row loop
+is implementation work within that single operation and does not expose the
+facade for a second normal operation. [C2] [C4] [U3] [U11]
+
 An empty `rows` input follows the same successful batch path. The invocation
-enters the private runner, obtains its checkout and `StmtNo`, admits and binds
-the target table, vacuously validates every input row, and acquires
+enters the internal `exec` path, obtains its checkout and `StmtNo`, admits and
+binds the target table, vacuously validates every input row, and acquires
 transaction-lifetime `TableData(IX)`. The insertion loop performs zero
 iterations and returns `Ok(Vec::new())` without allocating a RowID or creating
 row, index, or redo effects. Table-admission and lock failures retain their
@@ -411,10 +487,21 @@ are outside this RFC. [U3] [U5]
 ### 6. Public retirement includes complete semantic migration
 
 Adding direct methods beside the legacy API is an intermediate rollout step,
-not a compatibility commitment. The final phase removes public
-`Transaction::exec`, removes `Statement` and `StreamStmt` from crate exports,
-and migrates every repository consumer and test according to its intended
-statement boundary. [C8] [U2] [U6]
+not a compatibility commitment. The final phase removes public availability of
+`Transaction::exec` by making it transaction-module-private and owned,
+removes `Statement` and `StreamStmt` from crate exports, introduces the
+separate reusable `CatalogStatement`, and migrates every repository consumer
+and test according to its intended statement boundary. [C8] [U2] [U6] [U10]
+[U11]
+
+Migration begins in the additive phase rather than accumulating in callback
+retirement. Phase 1 reviews and migrates ordinary unit and integration tests to
+the direct API as each operation reaches feature parity. Tests remain on public
+`exec` only when their subject is the legacy callback contract, `StmtState`,
+residual ownership, rollback cancellation, fatal retention, or another
+statement-runner invariant that Phase 2 must deliberately adapt to the owned
+boundary. Production callers, examples, benchmarks, and public documentation
+remain unchanged until Phase 2. [D6] [C1] [C2] [C8] [C9] [U12]
 
 Migration follows these rules:
 
@@ -425,24 +512,28 @@ Migration follows these rules:
    `table_insert_batch_mvcc`; independent inserts become separate direct
    statements.
 4. Mixed public DML callbacks become separate statements or a purpose-built
-   single DML. Tests of an internal same-statement invariant use the private
-   runner or lower-level statement context rather than preserving that public
-   composition API.
-5. Callback-injected error tests become focused private-runner rollback tests;
-   they are not translated into a new public error-injection facility.
+   single DML. Tests of an internal same-statement invariant use lower-level
+   `StmtState`, effects, or a focused consuming test operation rather than
+   preserving a reusable normal composition API.
+5. Callback-injected error tests become focused owned-`exec` or `StmtState`
+   rollback tests; they are not translated into a new public error-injection
+   facility.
 6. Streaming callers use the direct stream-construction method and retain the
    same exclusive transaction borrow for the stream lifetime.
-7. Private catalog staging continues through its private batching interface.
+7. Private catalog staging migrates to reusable `CatalogStatement` and retains
+   its private batching and merge-on-error policy.
 8. Empty successful callbacks and lifecycle baselines become direct `noop()`
    calls; the `stmt-noop` benchmark remains a no-fixture statement-execution
    control rather than being removed or redefined as table work.
+9. Internal helpers that accept `&mut Statement` migrate to direct transaction
+   methods, consuming normal-operation helpers, lower-level implementation
+   functions, or `CatalogStatement` according to their actual boundary.
 
-All existing tests must be reviewed during public retirement. Ordinary API and
-behavior tests migrate to direct methods. Only tests whose subject is
-`StmtState`, residual effect ownership, rollback cancellation, fatal
-retention, or another private statement invariant may invoke the private
-runner directly. No test-only public `exec` compatibility shim remains after
-the phase completes. [D6] [D7] [U6]
+Phase 2 revisits the explicitly retained runner-focused tests while changing
+`exec` to its owned signature. Each remaining private invocation receives an
+owned one-shot `Statement`; no test-only reusable normal facade or public
+compatibility shim remains after the phase completes. [D6] [D7] [U6] [U10]
+[U11] [U12]
 
 ## Alternatives Considered
 
@@ -455,9 +546,13 @@ the phase completes. [D6] [D7] [U6]
   or ordinary error with meaning different from the DML result, so the engine
   needs failure latching and policy for propagated, replaced, or swallowed
   errors. It also requires a separate public story for read-only completion.
+  This differs from the selected final internal facade, where every operation
+  consumes `Statement` and no caller-controlled completion result remains.
 - Why Not Chosen: The callback's dual result meaning is the root problem. A
-  consuming facade restricts operation order but does not remove that boundary.
-- References: [B1], [U3], [U4], [U5], [C1], [C2]
+  consuming public facade restricts operation order but does not remove that
+  boundary. Ownership is adopted only behind the direct public API after
+  callback retirement.
+- References: [B1], [U3], [U4], [U5], [U11], [C1], [C2]
 
 ### Alternative B: Separate read, DML, and completion types
 
@@ -483,22 +578,25 @@ the phase completes. [D6] [D7] [U6]
   rule for a different callback error. Most of that machinery becomes
   unnecessary after direct methods hide the intermediate DML result.
 - Why Not Chosen: It solves a transient API state rather than the selected final
-  boundary. The private runner already rolls back before a direct public method
-  returns.
+  boundary. The internal `exec` path already rolls back before a direct public
+  method returns.
 - References: [B1], [C1], [C2], [C7], [U4], [U5]
 
 ### Alternative D: One atomic implementation task
 
-- Summary: Extract the runner, add direct APIs, remove the legacy API, and
-  migrate every caller and test in one task.
+- Summary: Add direct APIs, establish owned private `exec`, split the catalog
+  facade, and migrate every caller and test in one task.
 - Analysis: The production direction is coherent, but the repository currently
-  has a broad callback call-site surface. Combining ownership refactoring, new
-  batch behavior, API feature parity, public removal, and semantic test
-  migration makes review and failure localization unnecessarily difficult.
-- Why Not Chosen: Three phases provide independently testable ownership, API,
-  and retirement boundaries without establishing long-term compatibility for
-  the legacy API.
-- References: [C1], [C2], [C8], [C9], [U6]
+  has a broad callback call-site surface. Combining ownership and catalog-facade
+  refactoring, new batch behavior, API feature parity, public removal, and
+  semantic test migration makes review and failure localization unnecessarily
+  difficult.
+- Why Not Chosen: Two phases provide independently testable additive-API and
+  retirement boundaries without creating a separate runner-extraction phase or
+  establishing long-term compatibility for the legacy API. Moving ordinary
+  test migration into the additive phase balances review load while preserving
+  a feature-parity gate before public retirement.
+- References: [C1], [C2], [C6], [C8], [C9], [U6], [U10], [U11], [U12]
 
 ### Alternative E: Direct APIs without batch insert
 
@@ -512,34 +610,20 @@ the phase completes. [D6] [D7] [U6]
   reopening arbitrary DML composition.
 - References: [C4], [C5], [C9], [U3]
 
-### Alternative F: Reject an empty batch as invalid DML
-
-- Summary: Return `OperationError::InvalidDmlInput` for
-  `table_insert_batch_mvcc(table_id, Vec::new())`, optionally before table-data
-  lock acquisition.
-- Analysis: Rejection can catch accidentally empty application batches and
-  avoid a table-data claim, but it adds a special input branch to an operation
-  whose validation and insertion loops already compose over zero rows. It also
-  forces callers that naturally form empty batches to guard the method call.
-- Why Not Chosen: A vacuous batch has an unambiguous ordered result and can
-  follow the exact table-scoped statement path. The separate `noop()` method
-  remains the table-independent lifecycle control.
-- References: [C2], [C11], [U7], [U8]
-
-### Alternative G: Retire the public statement no-op baseline
+### Alternative F: Retire the public statement no-op baseline
 
 - Summary: Remove `stmt-noop` and the weak-handle statement baseline, or
   redefine them to execute a table read after callback retirement.
 - Analysis: Removal loses the established checkout/check-in control, while a
   table read measures admission, binding, and access work in addition to the
-  statement carrier. A crate-private runner is not callable from the standalone
+  statement carrier. Private `exec` is not callable from the standalone
   benchmark crate.
 - Why Not Chosen: The small, engine-controlled `noop()` method retains a useful
   public lifecycle and performance diagnostic without exposing arbitrary
   callbacks.
 - References: [D7], [C11], [U7]
 
-### Alternative H: Stream-constructor cancellation discards the transaction
+### Alternative G: Stream-constructor cancellation discards the transaction
 
 - Summary: Apply the runner-backed terminal cancellation policy after a stream
   constructor has checked out the transaction but before it returns a stream.
@@ -550,6 +634,22 @@ the phase completes. [D6] [D7] [U6]
 - Why Not Chosen: Ordinary check-in preserves the implemented stream behavior
   and transaction reuse without weakening mutation-effect ownership.
 - References: [C3], [D7], [U9]
+
+### Alternative H: Keep a reusable borrowed `Statement` internally
+
+- Summary: Remove public exports and make the existing borrowed-callback
+  `exec` private without changing `Statement` operation receivers or moving
+  settlement to `StmtState`.
+- Analysis: External callers could no longer catch or replace an intermediate
+  DML result, so the public rollback-before-error guarantee would hold. However,
+  any future direct wrapper or focused internal caller could still invoke two
+  normal reads or DML operations under one effect boundary. Visibility would
+  rely on convention rather than encode the selected engine invariant.
+- Why Not Chosen: The one-operation boundary applies to internal normal
+  statement construction as well as the public API. An owned consuming facade
+  makes accidental normal composition unrepresentable while the separate
+  reusable `CatalogStatement` preserves the one intentional batching policy.
+- References: [B1], [C1], [C2], [C6], [U11]
 
 ## Unsafe Considerations
 
@@ -568,12 +668,15 @@ timeouts nor hang-detection configuration. [D6]
 
 The program must cover:
 
-1. Private runner success, ordinary error, index-before-row rollback, redo
-   discard, fatal rollback retention, unpolled drop, checked-out cancellation,
-   and later transaction reuse or discard as appropriate.
+1. Owned private `exec` success, ordinary error, index-before-row rollback,
+   redo discard, fatal rollback retention, unpolled drop, checked-out
+   cancellation, and later transaction reuse or discard as appropriate.
+   Settlement tests verify that the operation future and owned facade end
+   before `StmtState` merges or rolls back effects.
 2. Direct `noop()` success obtains and ordinarily returns one checkout,
    consumes one `StmtNo`, and creates no table binding, logical lock, mutation
    effect, or redo; checked-out cancellation terminally cancels the transaction.
+   Final internal coverage uses the consuming `Statement::noop(self)` path.
 3. Every direct read and DML method with the same typed result and attachment
    behavior as its current `Statement` counterpart.
 4. A direct DML error observed only after all statement effects are rolled back;
@@ -594,15 +697,23 @@ The program must cover:
    within or outside the batch, write conflict, row/index/storage failure after
    a nonempty prefix, cancellation, fatal rollback, redo commit, restart
    recovery, and whole-transaction rollback after batch success.
-9. Private catalog create/drop table and index batches retain their existing
-   whole-private-transaction rollback semantics.
+9. Reusable `CatalogStatement` supports intentional repeated create/drop table
+   and index catalog mutations while retaining existing whole-private-
+   transaction rollback, ordinary-error merge, and panic-settlement semantics.
 10. Public examples and benchmarks compile without importing `Statement` or
     `StreamStmt`; `stmt-noop` and the weak-handle statement baseline call direct
     `noop()` without changing their lifecycle-only meaning. Positive
     compilation coverage is authoritative, and no new compile-fail harness is
     introduced solely to prove removed exports.
-11. Migration review classifies every former multi-operation callback rather
-    than mechanically changing its syntax.
+11. Phase 1 migration review classifies every ordinary test callback and moves
+    it to direct methods rather than mechanically changing syntax. Each test
+    left on public `exec` records the runner invariant that requires Phase 2
+    adaptation.
+12. Final compilation and visibility review prove that normal `exec` takes
+    `Statement` by value, every normal no-op/read/DML receiver consumes `self`,
+    no reusable `&mut Statement` helper remains, and only `CatalogStatement`
+    exposes the selected repeated-mutation capability. No new compile-fail
+    harness is required solely for this structural invariant.
 
 Phase tasks run focused tests during development, followed by
 `cargo nextest run --workspace`. The final retirement phase also runs the
@@ -615,53 +726,46 @@ empty-`exec` `stmt-noop` path, then leaves `stmt-noop` backed by `noop()` after
 callback retirement with the same identity, latency unit, counters, and
 no-fixture requirement. It also compares point read/write, index-stream, and
 insert workload baselines before removal. Successful direct single-operation
-statements add no shared coordination. Batch-insert measurements report
-per-batch and per-row cost across representative batch sizes; they do not
-redefine existing per-operation benchmark counters without an explicit
-workload change. [D7] [C9] [C11] [U7]
+statements add no shared coordination, and the final owned-facade/`StmtState`
+settlement refactor is measured against the additive direct-method baseline.
+Batch-insert measurements report per-batch and per-row cost across
+representative batch sizes; they do not redefine existing per-operation
+benchmark counters without an explicit workload change. [D7] [C9] [C11] [U7]
+[U11]
 
 ## Implementation Phases
 
-- **Phase 1: Private Statement Runner Boundary**
+- **Phase 1: Direct Transaction APIs And Batch Insert**
   - Prerequisites: Existing cancellation-safe `StmtState`, residual rollback
     ownership, and fatal retention from task 000247 remain authoritative.
-  - Scope: Extract the body of public `Transaction::exec` into one crate-private
-    runner; make the temporary public `exec` delegate to it; preserve
-    `PrivateTransaction::stage_statement` as a separate policy; add focused
-    rollback, fatal, cancellation, and successful-path equivalence coverage.
-  - Goals: Establish one reviewed internal statement settlement boundary that
-    direct APIs can reuse without changing public behavior or duplicating
-    rollback logic.
-  - Non-goals: No direct public statement methods, including `noop()` or table
-    methods; no batch insert, callback API removal, visibility change, broad
-    call-site migration, or persisted-format change.
-  - After This Phase: The legacy public API behaves as before, but all normal
-    public statement completion is implemented by the private runner selected
-    for later direct methods.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
-  - Related Backlogs:
-    - `docs/backlogs/000186-statement-failure-rollback-before-error-return.md`
-
-- **Phase 2: Direct Transaction APIs And Batch Insert**
-  - Prerequisites: Phase 1's private runner and focused settlement coverage are
-    complete.
+  - Phase-local Choices: Non-streaming direct methods call the existing
+    `Transaction::exec` implementation with an engine-controlled closure that
+    returns exactly one operation result. No separate statement runner is
+    introduced; streaming retains its specialized checkout/state path.
+    Ordinary existing tests migrate as each direct operation reaches parity,
+    while runner-focused tests remain on public `exec` for Phase 2 adaptation.
   - Scope: Add direct `Transaction::noop()` plus the complete read, DML, and
     stream methods; add atomic single-table batch insert with the selected
-    normal-path empty-input behavior; reuse the private runner and current
-    stream checkout machinery; add focused public API, rollback, batch,
-    stream-constructor, recovery, and performance coverage while retaining the
-    legacy public callback API temporarily.
+    normal-path empty-input behavior; reuse existing `Transaction::exec`
+    internally for non-streaming settlement and reuse the current stream
+    checkout machinery; add focused public API, rollback, batch,
+    stream-constructor, recovery, and performance coverage; review every
+    existing unit and integration test, migrate ordinary behavior coverage to
+    direct methods, and classify the tests intentionally retained on the legacy
+    callback API while that API remains public temporarily.
   - Goals: Reach feature parity for supported public statement operations,
-    preserve an explicit lifecycle baseline, and prove the selected result and
-    cancellation boundaries before any existing public entry point is removed.
-  - Non-goals: No mass repository migration, no removal or deprecation-warning
-    attribute for `exec`, no visibility change for `Statement` or `StreamStmt`,
-    no arbitrary mixed-DML batch, and no persistent batch format.
-  - After This Phase: Callers can use the complete direct API, but backlog
-    000186 remains open because the legacy callback surface is still public.
+    preserve an explicit lifecycle baseline, prove the selected result and
+    cancellation boundaries, and exercise the direct surface through the broad
+    existing test suite before any public entry point is removed.
+  - Non-goals: No production, example, benchmark, or public-documentation
+    migration; no removal or deprecation-warning attribute for `exec`; no
+    visibility change for `Statement` or `StreamStmt`; no owned internal
+    `Statement` signature or catalog-facade split yet; no arbitrary mixed-DML
+    batch; and no persistent batch format.
+  - After This Phase: Callers can use the complete direct API, ordinary tests
+    use it, and the remaining `exec` tests are explicitly runner-focused.
+    Backlog 000186 remains open because the legacy callback surface is still
+    public.
   - Task Doc: `docs/tasks/TBD.md`
   - Task Issue: `#0`
   - Phase Status: `pending`
@@ -669,26 +773,41 @@ workload change. [D7] [C9] [C11] [U7]
   - Related Backlogs:
     - `docs/backlogs/000186-statement-failure-rollback-before-error-return.md`
 
-- **Phase 3: Callback API Retirement And Complete Migration**
-  - Prerequisites: Phase 2 direct APIs have feature parity, focused behavioral
-    coverage, and acceptable successful-path measurements.
-  - Scope: Remove public `Transaction::exec`; remove `Statement` and
-    `StreamStmt` exports; migrate all production code, examples, benchmarks,
-    documentation, and existing tests; migrate `stmt-noop` and the weak-handle
-    statement baseline to direct `noop()` without changing their measurement
-    contract; classify every multi-operation callback; retain private-runner
-    access only in focused internal ownership tests; remove all transitional
-    wrappers and callback-oriented public documentation.
+- **Phase 2: Callback API Retirement And Complete Migration**
+  - Prerequisites: Phase 1 direct APIs have feature parity, focused behavioral
+    coverage, acceptable successful-path measurements, and ordinary existing
+    tests migrated to the direct surface with runner-focused exceptions
+    classified.
+  - Phase-local Choices: Retain the existing `exec` name but make it
+    transaction-module-private and change its callback to receive owned
+    `Statement`; make every normal operation consume the facade; move normal
+    merge, rollback, fatal, and cancellation settlement authority to
+    `StmtState`; and migrate private catalog batching to reusable
+    `CatalogStatement`.
+  - Scope: Remove `Transaction::exec`, `Statement`, and `StreamStmt` from the
+    public API; implement the owned private `exec` and consuming normal
+    operation receivers; split reusable catalog operations into
+    `CatalogStatement`; migrate all production code, examples, benchmarks, and
+    documentation plus the remaining runner-focused tests; migrate `stmt-noop`
+    and the weak-handle statement baseline to direct `noop()` without changing
+    their measurement contract; adapt each retained multi-operation or
+    callback-injection test to the owned boundary or lower-level statement
+    machinery; retain private owned `exec` access only in focused internal
+    ownership tests; remove callback-oriented public documentation.
   - Goals: Make direct `Transaction` methods the sole public statement boundary,
-    eliminate caller-injected completion semantics, finish repository-wide
-    migration without reducing behavior coverage, and satisfy backlog 000186.
-  - Non-goals: No removal of the crate-private runner, no change to private
-    catalog batching, no generic user-error channel, no new mutation family,
-    and no persisted-format or recovery-protocol change.
+    eliminate caller-injected completion semantics, make a second normal
+    operation unrepresentable for internal `exec` callers, finish
+    repository-wide migration without reducing behavior coverage, and satisfy
+    backlog 000186.
+  - Non-goals: No removal or required renaming of private `exec`, no reusable
+    normal statement facade, no semantic change to private catalog batching, no
+    generic user-error channel, no new mutation family, and no persisted-format
+    or recovery-protocol change.
   - After This Phase: The public callback API no longer exists, normal tests use
-    direct methods, focused internal tests alone can access statement ownership
-    machinery, and the source backlog is ready for implemented closure through
-    task/RFC resolution.
+    direct methods, focused internal tests alone can access the owned normal
+    statement machinery, intentional repeated mutations exist only through
+    `CatalogStatement`, and the source backlog is ready for implemented closure
+    through task/RFC resolution.
   - Task Doc: `docs/tasks/TBD.md`
   - Task Issue: `#0`
   - Phase Status: `pending`
@@ -706,6 +825,12 @@ workload change. [D7] [C9] [C11] [U7]
   required.
 - Existing rollback, fatal retention, and cancellation ownership remain reused
   and independently testable.
+- Reusing `exec` avoids a redundant runner wrapper and standalone extraction
+  phase.
+- Owned consuming normal operations enforce the one-operation statement
+  boundary for internal code as well as public callers.
+- `CatalogStatement` makes the one intentional reusable batching policy
+  explicit instead of sharing the normal facade.
 - Direct read-then-DML sequencing remains available at transaction level.
 - Direct `noop()` preserves a table-independent checkout/check-in lifecycle
   control for diagnostics and performance comparison.
@@ -713,6 +838,8 @@ workload change. [D7] [C9] [C11] [U7]
   checkout, table admission, and lock work.
 - The additive phase validates feature parity before the incompatible public
   removal.
+- Migrating ordinary tests in the additive phase broadens direct-API coverage
+  and prevents callback retirement from accumulating all migration risk.
 - Hiding `Statement` and `StreamStmt` narrows the public ownership surface.
 
 ### Negative
@@ -724,6 +851,13 @@ workload change. [D7] [C9] [C11] [U7]
 - Arbitrary mixed-DML callbacks are removed; purpose-built batch operations are
   required when one statement must perform several physical changes.
 - The transition temporarily carries both direct and callback APIs.
+- During the additive phase, direct methods internally call an entry point that
+  remains public until the retirement phase changes its visibility.
+- Phase 1 includes a repository-wide semantic test review rather than only new
+  focused tests for the additive methods.
+- The retirement phase must refactor settlement from `Statement` into
+  `StmtState` and migrate catalog helpers to a separate facade in addition to
+  the broad call-site migration.
 - The public surface retains a lifecycle-only `noop()` method that has no data
   behavior outside diagnostics, measurement, and explicit empty statements.
 - Empty insert batches still acquire and retain table admission and
@@ -736,8 +870,9 @@ workload change. [D7] [C9] [C11] [U7]
 ## Open Questions
 
 No blocking questions remain after Round 2. The direct no-op, empty-batch, and
-stream-constructor cancellation contracts are fixed by Decisions 1, 2, 4, and
-5.
+stream-constructor cancellation contracts, owned normal facade, `StmtState`
+settlement owner, and reusable catalog split are fixed by Decisions 1, 2, 4,
+and 5.
 
 ## Future Work
 
