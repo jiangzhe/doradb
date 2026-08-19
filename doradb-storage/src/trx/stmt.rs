@@ -905,6 +905,48 @@ impl<'stmt> Statement<'stmt> {
             .disclose()
     }
 
+    /// Atomically inserts one validated batch into a catalog-owned user table.
+    #[inline]
+    pub(super) async fn table_insert_batch_mvcc(
+        &mut self,
+        table_id: TableID,
+        rows: Vec<Vec<Val>>,
+    ) -> Result<Vec<RowID>> {
+        const OPERATION: &str = "table_insert_batch_mvcc";
+        let (table, layout) = self
+            .admit_user_table(table_id, TableAdmissionRequest::TableWrite, OPERATION)
+            .await
+            .disclose()?;
+        let validator = DmlValidator::new(layout.metadata());
+        for (batch_index, row) in rows.iter().enumerate() {
+            validator
+                .validate_full_row(row)
+                .change_context(OperationError::InvalidDmlInput)
+                .attach_with(|| {
+                    format!("operation={OPERATION}, table_id={table_id}, batch_index={batch_index}")
+                })
+                .disclose()?;
+        }
+        self.acquire_table_write_data_lock(table_id)
+            .await
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+            .disclose()?;
+        let mut row_ids = Vec::with_capacity(rows.len());
+        let (rt, effects) = self.runtime_and_effects_mut();
+        let accessor = table.accessor_with_layout(&layout);
+        for (batch_index, row) in rows.into_iter().enumerate() {
+            let row_id = accessor
+                .insert_mvcc(rt, effects, row)
+                .await
+                .attach_with(|| {
+                    format!("operation={OPERATION}, table_id={table_id}, batch_index={batch_index}")
+                })
+                .disclose()?;
+            row_ids.push(row_id);
+        }
+        Ok(row_ids)
+    }
+
     /// Inserts or replaces one catalog-owned user-table row by table id and unique key.
     ///
     /// Strong table-runtime access is internal and operation-local.
@@ -1378,6 +1420,8 @@ pub(crate) mod tests {
         assert_stmt_effects_empty(&effects);
     }
 
+    // RFC-0029 Phase 2 runner coverage: exact statement-number allocation is
+    // inspected through raw statement effects across success and failure.
     #[test]
     fn test_public_statements_consume_monotonic_statement_numbers() {
         smol::block_on(async {
@@ -1576,6 +1620,8 @@ pub(crate) mod tests {
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
 
+            // RFC-0029 Phase 2 runner coverage: private catalog panic
+            // injection verifies the legacy callback panic boundary.
             let panic = AssertUnwindSafe(trx.exec(async |stmt| {
                 let key = SelectKey::new(1, vec![Val::from(TableID::new(42))]);
                 stmt.catalog_delete_primary_key_mvcc(
@@ -1620,7 +1666,7 @@ pub(crate) mod tests {
             let table_id = TableID::new(91_225);
 
             let err = trx
-                .exec(async |stmt| stmt.table_scan_mvcc(table_id, &[0], |_| true).await)
+                .table_scan_mvcc(table_id, &[0], |_| true)
                 .await
                 .unwrap_err();
 
@@ -1649,6 +1695,8 @@ pub(crate) mod tests {
                 LockMode::IntentExclusive,
             )
             .unwrap();
+            // RFC-0029 Phase 2 runner coverage: raw-effect injection forces
+            // index-before-row rollback and fatal residual retention.
             let res: Result<()> = trx
                 .exec(async |stmt| {
                     assert_eq!(transaction_lock_owner(stmt), trx_owner);

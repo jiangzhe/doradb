@@ -158,6 +158,8 @@ mod tests {
     use crate::session::tests::SessionTestExt;
     use tempfile::TempDir;
 
+    // RFC-0029 Phase 2 runner coverage: private catalog row composition and
+    // same-statement delete assertions require the legacy statement facade.
     #[test]
     fn test_tables_delete_by_id() {
         smol::block_on(async {

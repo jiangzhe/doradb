@@ -17,6 +17,7 @@
 //!    d) If less than current STS, return current version.
 mod admission;
 pub(crate) mod group;
+mod interface;
 pub(crate) mod purge;
 mod readonly;
 pub(crate) mod retention;
@@ -4517,6 +4518,8 @@ pub(crate) mod tests {
         static PSEUDO_SYSBENCH_VAR1: [u8; 60] = [3; 60];
         static PSEUDO_SYSBENCH_VAR2: [u8; 120] = [4; 120];
 
+        // RFC-0029 Phase 2 runner coverage: tests inject raw redo without a
+        // physical row operation through the legacy statement effects.
         trx.exec(async |stmt| {
             // Simulate one sysbench record:
             // uint64 + int32 + int32 + char(60) + char(120)
@@ -5105,6 +5108,8 @@ pub(crate) mod tests {
         });
     }
 
+    // RFC-0029 Phase 2 runner coverage: raw statement effects verify success
+    // merge into transaction-owned undo and redo.
     #[test]
     fn test_statement_success_merges_statement_effects_into_transaction_effects() {
         smol::block_on(async {
@@ -5149,6 +5154,8 @@ pub(crate) mod tests {
         });
     }
 
+    // RFC-0029 Phase 2 runner coverage: an unpolled legacy callback future
+    // must not check out the transaction core.
     #[test]
     fn test_unpolled_statement_future_leaves_transaction_reusable() {
         smol::block_on(async {
@@ -5167,6 +5174,8 @@ pub(crate) mod tests {
         });
     }
 
+    // RFC-0029 Phase 2 runner coverage: dropping a checked-out legacy callback
+    // terminally transfers transaction cleanup ownership.
     #[test]
     fn test_dropped_polled_statement_future_terminally_cancels_transaction() {
         smol::block_on(async {
@@ -5193,7 +5202,7 @@ pub(crate) mod tests {
                 entry.inspect().state,
                 SessionOperationState::Voluntary(None)
             );
-            let err = trx.exec(async |_| Ok::<(), Error>(())).await.unwrap_err();
+            let err = trx.noop().await.unwrap_err();
             assert_eq!(
                 err.report().downcast_ref::<LifecycleError>().copied(),
                 Some(LifecycleError::TransactionDiscarded)
@@ -5203,6 +5212,8 @@ pub(crate) mod tests {
         });
     }
 
+    // RFC-0029 Phase 2 runner coverage: cancellation folds raw effects and
+    // transaction locks into terminal cleanup.
     #[test]
     fn test_dropped_effectful_statement_discards_redo_and_terminally_releases_locks() {
         smol::block_on(async {
@@ -5280,6 +5291,8 @@ pub(crate) mod tests {
         } else {
             pause_next_row_rollback();
         }
+        // RFC-0029 Phase 2 runner coverage: cancellation during legacy
+        // statement rollback folds residual row and index undo into cleanup.
         let mut exec = Box::pin(trx.exec(async |stmt| {
             stmt.table_insert_mvcc(table_id, vec![Val::from(value), Val::from("cancelled")])
                 .await?;
@@ -5297,7 +5310,7 @@ pub(crate) mod tests {
         .await;
         drop(exec);
 
-        let err = trx.exec(async |_| Ok::<(), Error>(())).await.unwrap_err();
+        let err = trx.noop().await.unwrap_err();
         assert_eq!(
             err.report().downcast_ref::<LifecycleError>().copied(),
             Some(LifecycleError::TransactionDiscarded)
@@ -5306,10 +5319,7 @@ pub(crate) mod tests {
 
         let mut verify = session.begin_trx().unwrap();
         let select = verify
-            .exec(async |stmt| {
-                stmt.table_lookup_unique_mvcc(table_id, 0, &[Val::from(value)], &[0, 1])
-                    .await
-            })
+            .table_lookup_unique_mvcc(table_id, 0, &[Val::from(value)], &[0, 1])
             .await
             .unwrap();
         assert!(
@@ -5363,6 +5373,8 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let mut blocker = Some(blocker);
+        // RFC-0029 Phase 2 runner coverage: dropping a legacy callback while
+        // its raw logical-lock request waits or is provisionally promoted.
         let mut exec = Box::pin(trx.exec(async |stmt| {
             stmt_tests::acquire_transaction_lock(stmt, resource, LockMode::Shared).await?;
             Ok::<(), Error>(())
@@ -5459,6 +5471,8 @@ pub(crate) mod tests {
         effects.install_ddl_redo(DDLRedo::DropTable(TableID::new(42)));
     }
 
+    // RFC-0029 Phase 2 runner coverage: raw redo injection distinguishes
+    // successful effect merge from callback-error rollback.
     #[test]
     fn test_statement_error_rolls_back_only_statement_effects() {
         smol::block_on(async {
@@ -5507,6 +5521,8 @@ pub(crate) mod tests {
         });
     }
 
+    // RFC-0029 Phase 2 runner coverage: raw statement lock acquisition proves
+    // callback completion retains transaction-lifetime claims.
     #[test]
     fn test_statement_completion_retains_transaction_locks_until_terminal_cleanup() {
         smol::block_on(async {
@@ -6159,14 +6175,10 @@ pub(crate) mod tests {
             let entry = transaction_entry(&trx);
             let trx_id = trx.trx_id();
             let owner = lock_owner(&trx).unwrap();
-            trx.exec(async |stmt| {
-                stmt.table_insert_mvcc(
-                    table_id,
-                    vec![Val::from(91_270i32), Val::from("terminal-rollback")],
-                )
-                .await?;
-                Ok(())
-            })
+            trx.table_insert_mvcc(
+                table_id,
+                vec![Val::from(91_270i32), Val::from("terminal-rollback")],
+            )
             .await
             .unwrap();
             assert!(lock_entry_count(&engine, owner) > 0);
@@ -6211,14 +6223,10 @@ pub(crate) mod tests {
             let mut trx = session.begin_trx().unwrap();
             let entry = transaction_entry(&trx);
             let trx_id = trx.trx_id();
-            trx.exec(async |stmt| {
-                stmt.table_insert_mvcc(
-                    table_id,
-                    vec![Val::from(91_271i32), Val::from("terminal-shutdown")],
-                )
-                .await?;
-                Ok(())
-            })
+            trx.table_insert_mvcc(
+                table_id,
+                vec![Val::from(91_271i32), Val::from("terminal-shutdown")],
+            )
             .await
             .unwrap();
 
@@ -6268,14 +6276,10 @@ pub(crate) mod tests {
             let entry = transaction_entry(&trx);
             let trx_id = trx.trx_id();
             let operation_key = trx.operation_key;
-            trx.exec(async |stmt| {
-                stmt.table_insert_mvcc(
-                    table_id,
-                    vec![Val::from(91_272i32), Val::from("terminal-duplicate")],
-                )
-                .await?;
-                Ok(())
-            })
+            trx.table_insert_mvcc(
+                table_id,
+                vec![Val::from(91_272i32), Val::from("terminal-duplicate")],
+            )
             .await
             .unwrap();
 
@@ -6327,14 +6331,10 @@ pub(crate) mod tests {
             let entry = transaction_entry(&trx);
             let trx_id = trx.trx_id();
             let owner = lock_owner(&trx).unwrap();
-            trx.exec(async |stmt| {
-                stmt.table_insert_mvcc(
-                    table_id,
-                    vec![Val::from(91_273i32), Val::from("pre-handoff-rollback")],
-                )
-                .await?;
-                Ok(())
-            })
+            trx.table_insert_mvcc(
+                table_id,
+                vec![Val::from(91_273i32), Val::from("pre-handoff-rollback")],
+            )
             .await
             .unwrap();
             assert!(lock_entry_count(&engine, owner) > 0);
@@ -6428,13 +6428,7 @@ pub(crate) mod tests {
 
             let mut trx3 = session3.begin_trx().unwrap();
             let row_id3 = trx3
-                .exec(async |stmt| {
-                    stmt.table_insert_mvcc(
-                        table_id,
-                        vec![Val::from(91_263i32), Val::from(&large[..])],
-                    )
-                    .await
-                })
+                .table_insert_mvcc(table_id, vec![Val::from(91_263i32), Val::from(&large[..])])
                 .await
                 .unwrap();
             let cached_page = session3.load_active_insert_page(table_id).unwrap();
@@ -6445,14 +6439,10 @@ pub(crate) mod tests {
             let mut writer = engine.new_session().unwrap();
             for i in 0..258 {
                 let mut trx = writer.begin_trx().unwrap();
-                trx.exec(async |stmt| {
-                    stmt.table_insert_mvcc(
-                        table_id,
-                        vec![Val::from(92_000i32 + i), Val::from(&large[..])],
-                    )
-                    .await?;
-                    Ok(())
-                })
+                trx.table_insert_mvcc(
+                    table_id,
+                    vec![Val::from(92_000i32 + i), Val::from(&large[..])],
+                )
                 .await
                 .unwrap();
                 trx.commit().await.unwrap();

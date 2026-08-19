@@ -436,6 +436,8 @@ mod tests {
     use crate::session::tests::SessionTestExt;
     use tempfile::TempDir;
 
+    // RFC-0029 Phase 2 runner coverage: private catalog row composition and
+    // same-statement delete assertions require the legacy statement facade.
     #[test]
     fn test_indexes_delete_by_id() {
         smol::block_on(async {
@@ -623,6 +625,8 @@ mod tests {
         });
     }
 
+    // RFC-0029 Phase 2 runner coverage: private catalog batch insert and
+    // delete composition requires the legacy statement facade.
     #[test]
     fn test_indexes_delete_by_table_id_counts_and_is_idempotent() {
         smol::block_on(async {
@@ -731,6 +735,8 @@ mod tests {
         });
     }
 
+    // RFC-0029 Phase 2 runner coverage: private catalog batch insert and
+    // delete composition requires the legacy statement facade.
     #[test]
     fn test_index_columns_delete_by_index_and_table_id() {
         smol::block_on(async {

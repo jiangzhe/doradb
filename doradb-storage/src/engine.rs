@@ -2057,6 +2057,8 @@ mod tests {
             smol::block_on(Engine::bootstrap(test_engine_config_for(root.path()))).unwrap();
         let mut session = engine.new_session().unwrap();
         let mut trx = session.begin_trx().unwrap();
+        // RFC-0029 Phase 2 runner coverage: engine shutdown waits for a
+        // deterministically cancelled checked-out legacy callback.
         let mut exec = Box::pin(trx.exec(async |_| {
             pending::<()>().await;
             Ok::<(), Error>(())

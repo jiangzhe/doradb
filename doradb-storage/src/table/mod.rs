@@ -1896,6 +1896,8 @@ pub(crate) mod tests {
         );
     }
 
+    // RFC-0029 Phase 2 runner coverage: raw statement-effect and intentional
+    // same-statement composition tests still require statement-taking helpers.
     pub(crate) async fn stmt_insert_row_by_id(
         stmt: &mut Statement<'_>,
         table_id: TableID,
@@ -1913,33 +1915,12 @@ pub(crate) mod tests {
             .await
     }
 
-    pub(crate) async fn stmt_update_row_by_id(
-        stmt: &mut Statement<'_>,
-        table_id: TableID,
-        key: &SelectKey,
-        update: Vec<UpdateCol>,
-    ) -> Result<UpdateMvcc> {
-        stmt.table_update_unique_mvcc(table_id, key.index_no, &key.vals, update)
-            .await
-    }
-
-    pub(crate) async fn stmt_select_row_mvcc_by_id(
-        stmt: &mut Statement<'_>,
-        table_id: TableID,
-        key: &SelectKey,
-        user_read_set: &[usize],
-    ) -> Result<SelectMvcc> {
-        stmt.table_lookup_unique_mvcc(table_id, key.index_no, &key.vals, user_read_set)
-            .await
-    }
-
     pub(crate) async fn trx_insert_row_by_id(
         trx: &mut Transaction,
         table_id: TableID,
         cols: Vec<Val>,
     ) -> Result<RowID> {
-        trx.exec(async |stmt| stmt_insert_row_by_id(stmt, table_id, cols).await)
-            .await
+        trx.table_insert_mvcc(table_id, cols).await
     }
 
     pub(crate) async fn trx_delete_row_by_id(
@@ -1947,7 +1928,7 @@ pub(crate) mod tests {
         table_id: TableID,
         key: &SelectKey,
     ) -> Result<DeleteMvcc> {
-        trx.exec(async |stmt| stmt_delete_row_by_id(stmt, table_id, key).await)
+        trx.table_delete_unique_mvcc(table_id, key.index_no, &key.vals)
             .await
     }
 
@@ -1957,7 +1938,7 @@ pub(crate) mod tests {
         key: &SelectKey,
         update: Vec<UpdateCol>,
     ) -> Result<UpdateMvcc> {
-        trx.exec(async |stmt| stmt_update_row_by_id(stmt, table_id, key, update).await)
+        trx.table_update_unique_mvcc(table_id, key.index_no, &key.vals, update)
             .await
     }
 
@@ -1967,7 +1948,7 @@ pub(crate) mod tests {
         key: &SelectKey,
         user_read_set: &[usize],
     ) -> Result<SelectMvcc> {
-        trx.exec(async |stmt| stmt_select_row_mvcc_by_id(stmt, table_id, key, user_read_set).await)
+        trx.table_lookup_unique_mvcc(table_id, key.index_no, &key.vals, user_read_set)
             .await
     }
 
@@ -2206,11 +2187,7 @@ pub(crate) mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let err = trx
-                .exec(async |stmt| {
-                    stmt.table_insert_mvcc(table_id, vec![Val::from(1i32)])
-                        .await?;
-                    Ok(())
-                })
+                .table_insert_mvcc(table_id, vec![Val::from(1i32)])
                 .await
                 .unwrap_err();
             assert_invalid_dml_input(err);
@@ -2218,14 +2195,10 @@ pub(crate) mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let err = trx
-                .exec(async |stmt| {
-                    stmt.table_insert_mvcc(
-                        table_id,
-                        vec![Val::from("wrong-id-type"), Val::from("name")],
-                    )
-                    .await?;
-                    Ok(())
-                })
+                .table_insert_mvcc(
+                    table_id,
+                    vec![Val::from("wrong-id-type"), Val::from("name")],
+                )
                 .await
                 .unwrap_err();
             assert_invalid_dml_input(err);
@@ -2233,24 +2206,16 @@ pub(crate) mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let err = trx
-                .exec(async |stmt| {
-                    stmt.table_insert_mvcc(table_id, vec![Val::Null, Val::from("name")])
-                        .await?;
-                    Ok(())
-                })
+                .table_insert_mvcc(table_id, vec![Val::Null, Val::from("name")])
                 .await
                 .unwrap_err();
             assert_invalid_dml_input(err);
             trx.rollback().await.unwrap();
 
             let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| {
-                stmt.table_insert_mvcc(table_id, vec![Val::from(1i32), Val::Null])
-                    .await?;
-                Ok(())
-            })
-            .await
-            .unwrap();
+            trx.table_insert_mvcc(table_id, vec![Val::from(1i32), Val::Null])
+                .await
+                .unwrap();
             trx.commit().await.unwrap();
         });
     }
@@ -2264,6 +2229,8 @@ pub(crate) mod tests {
             let mut session = engine.new_session().unwrap();
 
             let mut trx = session.begin_trx().unwrap();
+            // RFC-0029 Phase 2 runner coverage: validation opt-out remains
+            // available only through the legacy statement facade.
             trx.exec(async |stmt| {
                 stmt.disable_dml_validation()
                     .table_insert_mvcc(table_id, vec![Val::from(1i32), Val::from("name")])
@@ -2276,11 +2243,7 @@ pub(crate) mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let err = trx
-                .exec(async |stmt| {
-                    stmt.table_insert_mvcc(table_id, vec![Val::from(2i32)])
-                        .await?;
-                    Ok(())
-                })
+                .table_insert_mvcc(table_id, vec![Val::from(2i32)])
                 .await
                 .unwrap_err();
             assert_invalid_dml_input(err);
@@ -2304,55 +2267,39 @@ pub(crate) mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let err = trx
-                .exec(async |stmt| {
-                    stmt.table_upsert_unique_mvcc(
-                        table_id,
-                        1,
-                        vec![Val::from(2i32), Val::from("new")],
-                    )
-                    .await?;
-                    Ok(())
-                })
+                .table_upsert_unique_mvcc(table_id, 1, vec![Val::from(2i32), Val::from("new")])
                 .await
                 .unwrap_err();
             assert_invalid_dml_input(err);
             trx.rollback().await.unwrap();
 
             let mut trx = session.begin_trx().unwrap();
+            let key = SelectKey::new(0, vec![Val::from(1i32)]);
             let err = trx
-                .exec(async |stmt| {
-                    let key = SelectKey::new(0, vec![Val::from(1i32)]);
-                    stmt.table_update_unique_mvcc(
-                        table_id,
-                        key.index_no,
-                        &key.vals,
-                        vec![
-                            UpdateCol {
-                                idx: 1,
-                                val: Val::from("new"),
-                            },
-                            UpdateCol {
-                                idx: 1,
-                                val: Val::from("duplicate"),
-                            },
-                        ],
-                    )
-                    .await?;
-                    Ok(())
-                })
+                .table_update_unique_mvcc(
+                    table_id,
+                    key.index_no,
+                    &key.vals,
+                    vec![
+                        UpdateCol {
+                            idx: 1,
+                            val: Val::from("new"),
+                        },
+                        UpdateCol {
+                            idx: 1,
+                            val: Val::from("duplicate"),
+                        },
+                    ],
+                )
                 .await
                 .unwrap_err();
             assert_invalid_dml_input(err);
             trx.rollback().await.unwrap();
 
             let mut trx = session.begin_trx().unwrap();
+            let key = SelectKey::new(1, vec![Val::from("old")]);
             let err = trx
-                .exec(async |stmt| {
-                    let key = SelectKey::new(1, vec![Val::from("old")]);
-                    stmt.table_delete_unique_mvcc(table_id, key.index_no, &key.vals)
-                        .await?;
-                    Ok(())
-                })
+                .table_delete_unique_mvcc(table_id, key.index_no, &key.vals)
                 .await
                 .unwrap_err();
             assert_invalid_dml_input(err);
@@ -2563,13 +2510,9 @@ pub(crate) mod tests {
 
     pub(crate) async fn scan_table_i32s(trx: &mut Transaction, table_id: TableID) -> Vec<i32> {
         let mut rows = Vec::new();
-        trx.exec(async |stmt| {
-            stmt.table_scan_mvcc(table_id, &[0], |vals| {
-                rows.push(vals[0].as_i32().unwrap());
-                true
-            })
-            .await?;
-            Ok(())
+        trx.table_scan_mvcc(table_id, &[0], |vals| {
+            rows.push(vals[0].as_i32().unwrap());
+            true
         })
         .await
         .unwrap();
@@ -2582,16 +2525,12 @@ pub(crate) mod tests {
         table_id: TableID,
     ) -> Vec<(i32, String)> {
         let mut rows = Vec::new();
-        trx.exec(async |stmt| {
-            stmt.table_scan_mvcc(table_id, &[0, 1], |vals| {
-                rows.push((
-                    vals[0].as_i32().unwrap(),
-                    vals[1].as_str().unwrap().to_string(),
-                ));
-                true
-            })
-            .await?;
-            Ok(())
+        trx.table_scan_mvcc(table_id, &[0, 1], |vals| {
+            rows.push((
+                vals[0].as_i32().unwrap(),
+                vals[1].as_str().unwrap().to_string(),
+            ));
+            true
         })
         .await
         .unwrap();

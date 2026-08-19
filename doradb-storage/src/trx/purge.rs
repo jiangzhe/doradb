@@ -1453,15 +1453,14 @@ mod tests {
     use crate::catalog::tests::table1;
     use crate::conf::{DEFAULT_GC_BUCKETS, EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
-    use crate::error::{FatalError, Result, RuntimeError};
+    use crate::error::{FatalError, RuntimeError};
     use crate::id::{PageID, RowID, TableID};
     use crate::index::RowLocation;
     use crate::latch::LatchFallbackMode;
     use crate::row::RowPage;
-    use crate::row::ops::{DeleteMvcc, SelectKey};
+    use crate::row::ops::SelectKey;
     use crate::table::tests::bound_unique_index;
     use crate::table::{DeleteMarker, TableRedoReplayFloor};
-    use crate::trx::stmt::Statement;
     use crate::trx::tests::shared_trx_status;
     use crate::trx::undo::{OwnedRowUndo, RowUndoKind, RowUndoLogs};
     use crate::trx::{
@@ -1566,23 +1565,6 @@ mod tests {
         if trx_sys.poisoner.poison_error().is_none() {
             listener.await;
         }
-    }
-
-    async fn stmt_insert_row(
-        stmt: &mut Statement<'_>,
-        table_id: TableID,
-        cols: Vec<Val>,
-    ) -> Result<RowID> {
-        stmt.table_insert_mvcc(table_id, cols).await
-    }
-
-    async fn stmt_delete_row(
-        stmt: &mut Statement<'_>,
-        table_id: TableID,
-        key: &SelectKey,
-    ) -> Result<DeleteMvcc> {
-        stmt.table_delete_unique_mvcc(table_id, key.index_no, &key.vals)
-            .await
     }
 
     #[inline]
@@ -2487,12 +2469,9 @@ mod tests {
                 .unwrap();
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| {
-                stmt_insert_row(stmt, table_id, vec![Val::from(1001i32)]).await?;
-                Ok(())
-            })
-            .await
-            .unwrap();
+            trx.table_insert_mvcc(table_id, vec![Val::from(1001i32)])
+                .await
+                .unwrap();
             trx.commit().await.unwrap();
             drop(session);
             let pool_guards = full_pool_guards(&engine);
@@ -2582,12 +2561,9 @@ mod tests {
                 .unwrap();
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| {
-                stmt_insert_row(stmt, table_id, vec![Val::from(1002i32)]).await?;
-                Ok(())
-            })
-            .await
-            .unwrap();
+            trx.table_insert_mvcc(table_id, vec![Val::from(1002i32)])
+                .await
+                .unwrap();
             trx.commit().await.unwrap();
             drop(session);
             let pool_guards = full_pool_guards(&engine);
@@ -2681,12 +2657,9 @@ mod tests {
                 .unwrap();
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| {
-                stmt_insert_row(stmt, table_id, vec![Val::from(1003i32)]).await?;
-                Ok(())
-            })
-            .await
-            .unwrap();
+            trx.table_insert_mvcc(table_id, vec![Val::from(1003i32)])
+                .await
+                .unwrap();
             trx.commit().await.unwrap();
             drop(session);
             let pool_guards = full_pool_guards(&engine);
@@ -2799,12 +2772,9 @@ mod tests {
                 .unwrap();
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| {
-                stmt_insert_row(stmt, table_id, vec![Val::from(1004i32)]).await?;
-                Ok(())
-            })
-            .await
-            .unwrap();
+            trx.table_insert_mvcc(table_id, vec![Val::from(1004i32)])
+                .await
+                .unwrap();
             trx.commit().await.unwrap();
             drop(session);
             let pool_guards = full_pool_guards(&engine);
@@ -3467,10 +3437,7 @@ mod tests {
             for i in 0..PURGE_SIZE {
                 let mut trx = session.begin_trx().unwrap();
                 let res = trx
-                    .exec(async |stmt| {
-                        stmt_insert_row(stmt, table_id, vec![Val::from(i as i32)]).await?;
-                        Ok(())
-                    })
+                    .table_insert_mvcc(table_id, vec![Val::from(i as i32)])
                     .await;
                 assert!(res.is_ok());
                 purge_target = trx.commit().await.unwrap();
@@ -3480,10 +3447,7 @@ mod tests {
                 let mut trx = session.begin_trx().unwrap();
                 let key = SelectKey::new(0, vec![Val::from(i as i32)]);
                 let res = trx
-                    .exec(async |stmt| {
-                        stmt_delete_row(stmt, table_id, &key).await?;
-                        Ok(())
-                    })
+                    .table_delete_unique_mvcc(table_id, key.index_no, &key.vals)
                     .await;
                 assert!(res.is_ok());
                 purge_target = trx.commit().await.unwrap();
@@ -3548,10 +3512,7 @@ mod tests {
             for i in 0..PURGE_SIZE {
                 let mut trx = session.begin_trx().unwrap();
                 let res = trx
-                    .exec(async |stmt| {
-                        stmt_insert_row(stmt, table_id, vec![Val::from(i as i32)]).await?;
-                        Ok(())
-                    })
+                    .table_insert_mvcc(table_id, vec![Val::from(i as i32)])
                     .await;
                 assert!(res.is_ok());
                 purge_target = trx.commit().await.unwrap();
@@ -3561,10 +3522,7 @@ mod tests {
                 let mut trx = session.begin_trx().unwrap();
                 let key = SelectKey::new(0, vec![Val::from(i as i32)]);
                 let res = trx
-                    .exec(async |stmt| {
-                        stmt_delete_row(stmt, table_id, &key).await?;
-                        Ok(())
-                    })
+                    .table_delete_unique_mvcc(table_id, key.index_no, &key.vals)
                     .await;
                 assert!(res.is_ok());
                 purge_target = trx.commit().await.unwrap();

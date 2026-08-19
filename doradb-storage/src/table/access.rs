@@ -5188,14 +5188,7 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let inserted = trx
-                .exec(async |stmt| {
-                    stmt.table_upsert_unique_mvcc(
-                        table_id,
-                        0,
-                        vec![Val::from(1i32), Val::from("hello")],
-                    )
-                    .await
-                })
+                .table_upsert_unique_mvcc(table_id, 0, vec![Val::from(1i32), Val::from("hello")])
                 .await
                 .unwrap();
             let inserted_row_id = match inserted {
@@ -5206,14 +5199,7 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let updated = trx
-                .exec(async |stmt| {
-                    stmt.table_upsert_unique_mvcc(
-                        table_id,
-                        0,
-                        vec![Val::from(1i32), Val::from("world")],
-                    )
-                    .await
-                })
+                .table_upsert_unique_mvcc(table_id, 0, vec![Val::from(1i32), Val::from("world")])
                 .await
                 .unwrap();
             assert_eq!(updated, UpsertMvcc::Updated(inserted_row_id));
@@ -5290,63 +5276,58 @@ mod tests {
 
             let large_payload = vec![b'b'; LARGE_PAYLOAD_SIZE];
             let mut writer = session.begin_trx().unwrap();
-            let new_row_id = writer
-                .exec(async |stmt| {
-                    let updated = stmt
-                        .table_upsert_unique_mvcc(
-                            table_id,
-                            0,
-                            vec![
-                                Val::from(0i32),
-                                Val::from("name0"),
-                                Val::from(&large_payload[..]),
-                            ],
-                        )
-                        .await?;
-                    let new_row_id = match updated {
-                        UpsertMvcc::Updated(row_id) => row_id,
-                        UpsertMvcc::Inserted(row_id) => {
-                            panic!("expected full-row move update, inserted row_id={row_id}")
-                        }
-                    };
-                    assert_ne!(new_row_id, old_row_id);
-                    assert_unique_index_entry(
-                        &table_for_internal_assertion(&engine, table_id),
-                        &session.pool_guards(),
-                        &key,
-                        stmt.runtime().sts(),
-                        new_row_id,
-                        false,
-                    )
-                    .await;
-                    let table = table_for_internal_assertion(&engine, table_id);
-                    let layout = table.layout_snapshot();
-                    let guards = session.pool_guards();
-                    let non_unique = layout
-                        .secondary_index(1)
-                        .unwrap()
-                        .non_unique_mem()
-                        .unwrap()
-                        .bind(guards.index_guard());
-                    let name_key = [Val::from("name0")];
-                    assert_eq!(
-                        non_unique
-                            .lookup_unique(&name_key, old_row_id, stmt.runtime().sts())
-                            .await
-                            .unwrap(),
-                        Some(false)
-                    );
-                    assert_eq!(
-                        non_unique
-                            .lookup_unique(&name_key, new_row_id, stmt.runtime().sts())
-                            .await
-                            .unwrap(),
-                        Some(true)
-                    );
-                    Ok(new_row_id)
-                })
+            let updated = writer
+                .table_upsert_unique_mvcc(
+                    table_id,
+                    0,
+                    vec![
+                        Val::from(0i32),
+                        Val::from("name0"),
+                        Val::from(&large_payload[..]),
+                    ],
+                )
                 .await
                 .unwrap();
+            let new_row_id = match updated {
+                UpsertMvcc::Updated(row_id) => row_id,
+                UpsertMvcc::Inserted(row_id) => {
+                    panic!("expected full-row move update, inserted row_id={row_id}")
+                }
+            };
+            assert_ne!(new_row_id, old_row_id);
+            assert_unique_index_entry(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &key,
+                writer.sts(),
+                new_row_id,
+                false,
+            )
+            .await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let layout = table.layout_snapshot();
+            let guards = session.pool_guards();
+            let non_unique = layout
+                .secondary_index(1)
+                .unwrap()
+                .non_unique_mem()
+                .unwrap()
+                .bind(guards.index_guard());
+            let name_key = [Val::from("name0")];
+            assert_eq!(
+                non_unique
+                    .lookup_unique(&name_key, old_row_id, writer.sts())
+                    .await
+                    .unwrap(),
+                Some(false)
+            );
+            assert_eq!(
+                non_unique
+                    .lookup_unique(&name_key, new_row_id, writer.sts())
+                    .await
+                    .unwrap(),
+                Some(true)
+            );
             writer.commit().await.unwrap();
 
             let mut fresh_reader = session.begin_trx().unwrap();
@@ -5405,14 +5386,11 @@ mod tests {
 
             let mut trx1 = session.begin_trx().unwrap();
             assert!(matches!(
-                trx1.exec(async |stmt| {
-                    stmt.table_upsert_unique_mvcc(
-                        table_id,
-                        0,
-                        vec![Val::from(1i32), Val::from("held")],
-                    )
-                    .await
-                })
+                trx1.table_upsert_unique_mvcc(
+                    table_id,
+                    0,
+                    vec![Val::from(1i32), Val::from("held")],
+                )
                 .await
                 .unwrap(),
                 UpsertMvcc::Updated(_)
@@ -5421,14 +5399,7 @@ mod tests {
             let mut session2 = engine.new_session().unwrap();
             let mut trx2 = session2.begin_trx().unwrap();
             let err = trx2
-                .exec(async |stmt| {
-                    stmt.table_upsert_unique_mvcc(
-                        table_id,
-                        0,
-                        vec![Val::from(1i32), Val::from("conflict")],
-                    )
-                    .await
-                })
+                .table_upsert_unique_mvcc(table_id, 0, vec![Val::from(1i32), Val::from("conflict")])
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -5440,14 +5411,11 @@ mod tests {
 
             let mut trx1 = session.begin_trx().unwrap();
             assert!(matches!(
-                trx1.exec(async |stmt| {
-                    stmt.table_upsert_unique_mvcc(
-                        table_id,
-                        0,
-                        vec![Val::from(2i32), Val::from("first")],
-                    )
-                    .await
-                })
+                trx1.table_upsert_unique_mvcc(
+                    table_id,
+                    0,
+                    vec![Val::from(2i32), Val::from("first")],
+                )
                 .await
                 .unwrap(),
                 UpsertMvcc::Inserted(_)
@@ -5455,14 +5423,7 @@ mod tests {
 
             let mut trx2 = session2.begin_trx().unwrap();
             let err = trx2
-                .exec(async |stmt| {
-                    stmt.table_upsert_unique_mvcc(
-                        table_id,
-                        0,
-                        vec![Val::from(2i32), Val::from("second")],
-                    )
-                    .await
-                })
+                .table_upsert_unique_mvcc(table_id, 0, vec![Val::from(2i32), Val::from("second")])
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -5724,7 +5685,7 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let err = trx
-                .exec(async |stmt| stmt.table_scan_mvcc(table_id, &[0, 1], |_| true).await)
+                .table_scan_mvcc(table_id, &[0, 1], |_| true)
                 .await
                 .unwrap_err();
 
@@ -6044,62 +6005,53 @@ mod tests {
             .await;
 
             let mut writer = session.begin_trx().unwrap();
-            writer
-                .exec(async |stmt| {
-                    let res = stmt_update_row_by_id(
-                        stmt,
-                        table_id,
-                        &key,
-                        vec![UpdateCol {
-                            idx: 1,
-                            val: Val::from("updated"),
-                        }],
-                    )
-                    .await;
-                    let new_row_id = match res {
-                        Ok(UpdateMvcc::Updated(row_id)) => row_id,
-                        other => panic!("expected update success, got {other:?}"),
-                    };
-                    assert_ne!(old_row_id, new_row_id);
-                    assert_unique_index_entry(
-                        &table_for_internal_assertion(&engine, table_id),
-                        &session.pool_guards(),
-                        &key,
-                        stmt.runtime().sts(),
-                        new_row_id,
-                        false,
-                    )
-                    .await;
-                    assert!(matches!(
-                        table_for_internal_assertion(&engine, table_id)
-                            .find_row(&session.pool_guards(), new_row_id)
-                            .await
-                            .unwrap(),
-                        RowLocation::RowPage(_)
-                    ));
-                    match table_for_internal_assertion(&engine, table_id)
-                        .deletion_buffer()
-                        .get(old_row_id)
-                        .unwrap()
-                    {
-                        DeleteMarker::Ref(status) => {
-                            assert!(Arc::ptr_eq(&status, stmt.runtime().status()));
-                        }
-                        DeleteMarker::Committed(_) => {
-                            panic!("update should hold an in-flight delete marker")
-                        }
-                    }
-
-                    let res = stmt_select_row_mvcc_by_id(stmt, table_id, &key, &[0, 1]).await;
-                    assert!(matches!(
-                        res,
-                        Ok(SelectMvcc::Found(vals))
-                            if vals == vec![Val::from(1i32), Val::from("updated")]
-                    ));
-                    Ok(())
-                })
-                .await
-                .unwrap();
+            let writer_status = transaction_status_for_test(&writer);
+            let new_row_id = match trx_update_row_by_id(
+                &mut writer,
+                table_id,
+                &key,
+                vec![UpdateCol {
+                    idx: 1,
+                    val: Val::from("updated"),
+                }],
+            )
+            .await
+            {
+                Ok(UpdateMvcc::Updated(row_id)) => row_id,
+                other => panic!("expected update success, got {other:?}"),
+            };
+            assert_ne!(old_row_id, new_row_id);
+            assert_unique_index_entry(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &key,
+                writer.sts(),
+                new_row_id,
+                false,
+            )
+            .await;
+            assert!(matches!(
+                table_for_internal_assertion(&engine, table_id)
+                    .find_row(&session.pool_guards(), new_row_id)
+                    .await
+                    .unwrap(),
+                RowLocation::RowPage(_)
+            ));
+            match table_for_internal_assertion(&engine, table_id)
+                .deletion_buffer()
+                .get(old_row_id)
+                .unwrap()
+            {
+                DeleteMarker::Ref(status) => assert!(Arc::ptr_eq(&status, &writer_status)),
+                DeleteMarker::Committed(_) => {
+                    panic!("update should hold an in-flight delete marker")
+                }
+            }
+            assert!(matches!(
+                trx_select_row_mvcc_by_id(&mut writer, table_id, &key, &[0, 1]).await,
+                Ok(SelectMvcc::Found(vals))
+                    if vals == vec![Val::from(1i32), Val::from("updated")]
+            ));
             old_reader = expect_trx_select(table_id, old_reader, &key, |vals| {
                 assert_eq!(vals, vec![Val::from(1i32), Val::from("name")]);
             })
@@ -6203,50 +6155,44 @@ mod tests {
             .await;
 
             let mut writer = session.begin_trx().unwrap();
-            writer
-                .exec(async |stmt| {
-                    let res = stmt_update_row_by_id(
-                        stmt,
-                        table_id,
-                        &old_key,
-                        vec![
-                            UpdateCol {
-                                idx: 0,
-                                val: Val::from(20i32),
-                            },
-                            UpdateCol {
-                                idx: 1,
-                                val: Val::from("moved"),
-                            },
-                        ],
-                    )
-                    .await;
-                    let new_row_id = match res {
-                        Ok(UpdateMvcc::Updated(row_id)) => row_id,
-                        other => panic!("expected update success, got {other:?}"),
-                    };
-                    assert_unique_index_entry(
-                        &table_for_internal_assertion(&engine, table_id),
-                        &session.pool_guards(),
-                        &old_key,
-                        stmt.runtime().sts(),
-                        old_row_id,
-                        true,
-                    )
-                    .await;
-                    assert_unique_index_entry(
-                        &table_for_internal_assertion(&engine, table_id),
-                        &session.pool_guards(),
-                        &new_key,
-                        stmt.runtime().sts(),
-                        new_row_id,
-                        false,
-                    )
-                    .await;
-                    Ok(())
-                })
-                .await
-                .unwrap();
+            let new_row_id = match trx_update_row_by_id(
+                &mut writer,
+                table_id,
+                &old_key,
+                vec![
+                    UpdateCol {
+                        idx: 0,
+                        val: Val::from(20i32),
+                    },
+                    UpdateCol {
+                        idx: 1,
+                        val: Val::from("moved"),
+                    },
+                ],
+            )
+            .await
+            {
+                Ok(UpdateMvcc::Updated(row_id)) => row_id,
+                other => panic!("expected update success, got {other:?}"),
+            };
+            assert_unique_index_entry(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &old_key,
+                writer.sts(),
+                old_row_id,
+                true,
+            )
+            .await;
+            assert_unique_index_entry(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &new_key,
+                writer.sts(),
+                new_row_id,
+                false,
+            )
+            .await;
             writer.commit().await.unwrap();
 
             expect_select_not_found_committed(table_id, &mut session, &old_key).await;
@@ -6609,49 +6555,43 @@ mod tests {
             .await;
 
             let mut writer = session.begin_trx().unwrap();
-            writer
-                .exec(async |stmt| {
-                    let res = stmt_update_row_by_id(
-                        stmt,
-                        table_id,
-                        &old_key,
-                        vec![
-                            UpdateCol {
-                                idx: 0,
-                                val: Val::from(2i32),
-                            },
-                            UpdateCol {
-                                idx: 1,
-                                val: Val::from("claimed"),
-                            },
-                        ],
-                    )
-                    .await;
-                    let new_row_id = match res {
-                        Ok(UpdateMvcc::Updated(row_id)) => row_id,
-                        other => panic!("expected update success, got {other:?}"),
-                    };
-                    assert_ne!(claimed_row_id, new_row_id);
-                    assert_unique_index_entry(
-                        &table_for_internal_assertion(&engine, table_id),
-                        &session.pool_guards(),
-                        &claimed_key,
-                        stmt.runtime().sts(),
-                        new_row_id,
-                        false,
-                    )
-                    .await;
-                    assert!(matches!(
-                        table_for_internal_assertion(&engine, table_id)
-                            .find_row(&session.pool_guards(), claimed_row_id)
-                            .await
-                            .unwrap(),
-                        RowLocation::LwcBlock(..)
-                    ));
-                    Ok(())
-                })
-                .await
-                .unwrap();
+            let new_row_id = match trx_update_row_by_id(
+                &mut writer,
+                table_id,
+                &old_key,
+                vec![
+                    UpdateCol {
+                        idx: 0,
+                        val: Val::from(2i32),
+                    },
+                    UpdateCol {
+                        idx: 1,
+                        val: Val::from("claimed"),
+                    },
+                ],
+            )
+            .await
+            {
+                Ok(UpdateMvcc::Updated(row_id)) => row_id,
+                other => panic!("expected update success, got {other:?}"),
+            };
+            assert_ne!(claimed_row_id, new_row_id);
+            assert_unique_index_entry(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &claimed_key,
+                writer.sts(),
+                new_row_id,
+                false,
+            )
+            .await;
+            assert!(matches!(
+                table_for_internal_assertion(&engine, table_id)
+                    .find_row(&session.pool_guards(), claimed_row_id)
+                    .await
+                    .unwrap(),
+                RowLocation::LwcBlock(..)
+            ));
 
             // Keep the statement changes in the transaction so transaction rollback
             // exercises index undo before row undo. That is the path where the
@@ -6731,48 +6671,42 @@ mod tests {
                     .delete_marker_purgeability(claimed_row_id, writer.sts()),
                 Some(true)
             );
-            writer
-                .exec(async |stmt| {
-                    let res = stmt_update_row_by_id(
-                        stmt,
-                        table_id,
-                        &old_key,
-                        vec![
-                            UpdateCol {
-                                idx: 0,
-                                val: Val::from(2i32),
-                            },
-                            UpdateCol {
-                                idx: 1,
-                                val: Val::from("claimed"),
-                            },
-                        ],
-                    )
-                    .await;
-                    let new_row_id = match res {
-                        Ok(UpdateMvcc::Updated(row_id)) => row_id,
-                        other => panic!("expected update success, got {other:?}"),
-                    };
-                    assert_unique_index_entry(
-                        &table_for_internal_assertion(&engine, table_id),
-                        &session.pool_guards(),
-                        &claimed_key,
-                        stmt.runtime().sts(),
-                        new_row_id,
-                        false,
-                    )
-                    .await;
-                    assert!(matches!(
-                        table_for_internal_assertion(&engine, table_id)
-                            .find_row(&session.pool_guards(), claimed_row_id)
-                            .await
-                            .unwrap(),
-                        RowLocation::LwcBlock(..)
-                    ));
-                    Ok(())
-                })
-                .await
-                .unwrap();
+            let new_row_id = match trx_update_row_by_id(
+                &mut writer,
+                table_id,
+                &old_key,
+                vec![
+                    UpdateCol {
+                        idx: 0,
+                        val: Val::from(2i32),
+                    },
+                    UpdateCol {
+                        idx: 1,
+                        val: Val::from("claimed"),
+                    },
+                ],
+            )
+            .await
+            {
+                Ok(UpdateMvcc::Updated(row_id)) => row_id,
+                other => panic!("expected update success, got {other:?}"),
+            };
+            assert_unique_index_entry(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &claimed_key,
+                writer.sts(),
+                new_row_id,
+                false,
+            )
+            .await;
+            assert!(matches!(
+                table_for_internal_assertion(&engine, table_id)
+                    .find_row(&session.pool_guards(), claimed_row_id)
+                    .await
+                    .unwrap(),
+                RowLocation::LwcBlock(..)
+            ));
 
             // This is the stale GC attempt from the original delete. While the
             // replacement claim owns the unique key, GC observes a row-id mismatch
@@ -6870,6 +6804,8 @@ mod tests {
                 .await
                 .unwrap();
             let insert = vec![Val::from(2i32), Val::from("insert")];
+            // RFC-0029 Phase 2 runner coverage: raw TableAccessor insertion
+            // injects page state and statement effects under explicit locks.
             let res: Result<()> = trx
                 .exec(async |stmt| {
                     stmt.acquire_table_write_metadata_lock(table_id)
@@ -6946,6 +6882,8 @@ mod tests {
                 .lock_shared_async()
                 .await
                 .unwrap();
+            // RFC-0029 Phase 2 runner coverage: raw TableAccessor update
+            // injects page state and statement effects under explicit locks.
             let res: Result<()> = trx
                 .exec(async |stmt| {
                     stmt.acquire_table_write_metadata_lock(table_id)
@@ -7460,13 +7398,9 @@ mod tests {
             {
                 let mut trx = session2.begin_trx().unwrap();
                 let mut res_len = 0usize;
-                trx.exec(async |stmt| {
-                    stmt.table_scan_mvcc(table_id, &[0], |_| {
-                        res_len += 1;
-                        true
-                    })
-                    .await?;
-                    Ok(())
+                trx.table_scan_mvcc(table_id, &[0], |_| {
+                    res_len += 1;
+                    true
                 })
                 .await
                 .unwrap();
@@ -7488,13 +7422,9 @@ mod tests {
             {
                 let mut trx = session2.begin_trx().unwrap();
                 let mut res_len = 0usize;
-                trx.exec(async |stmt| {
-                    stmt.table_scan_mvcc(table_id, &[0], |_| {
-                        res_len += 1;
-                        true
-                    })
-                    .await?;
-                    Ok(())
+                trx.table_scan_mvcc(table_id, &[0], |_| {
+                    res_len += 1;
+                    true
                 })
                 .await
                 .unwrap();
@@ -7508,13 +7438,9 @@ mod tests {
             {
                 let mut trx = session2.begin_trx().unwrap();
                 let mut res_len = 0usize;
-                trx.exec(async |stmt| {
-                    stmt.table_scan_mvcc(table_id, &[0], |_| {
-                        res_len += 1;
-                        true
-                    })
-                    .await?;
-                    Ok(())
+                trx.table_scan_mvcc(table_id, &[0], |_| {
+                    res_len += 1;
+                    true
                 })
                 .await
                 .unwrap();
@@ -7819,15 +7745,12 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let rows = trx
-                .exec(async |stmt| {
-                    stmt.table_index_lookup_mvcc(
-                        table_id,
-                        non_unique_key.index_no,
-                        &non_unique_key.vals,
-                        &[0, 1],
-                    )
-                    .await
-                })
+                .table_index_lookup_mvcc(
+                    table_id,
+                    non_unique_key.index_no,
+                    &non_unique_key.vals,
+                    &[0, 1],
+                )
                 .await
                 .unwrap()
                 .unwrap_rows();
@@ -7891,6 +7814,8 @@ mod tests {
             let engine = lightweight_test_engine(&temp_dir, "prepare_completion_won_poison").await;
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
+            // RFC-0029 Phase 2 runner coverage: raw statement runtime poison
+            // injection verifies completion-wins wait precedence.
             let result: Result<()> = trx
                 .exec(async |stmt| {
                     stmt.runtime().engine().poisoner.poison(
@@ -8113,16 +8038,13 @@ mod tests {
             let mut writer = writer_session.begin_trx().unwrap();
             let mutate = async {
                 let result = writer
-                    .exec(async |stmt| {
-                        stmt.table_mutate_mvcc(table_id, |_| {
-                            callbacks.fetch_add(1, Ordering::SeqCst);
-                            table
-                                .deletion_buffer()
-                                .put_ref(row_id, Arc::clone(&owner), MAX_SNAPSHOT_TS)
-                                .unwrap();
-                            Ok(RowMutation::Delete)
-                        })
-                        .await
+                    .table_mutate_mvcc(table_id, |_| {
+                        callbacks.fetch_add(1, Ordering::SeqCst);
+                        table
+                            .deletion_buffer()
+                            .put_ref(row_id, Arc::clone(&owner), MAX_SNAPSHOT_TS)
+                            .unwrap();
+                        Ok(RowMutation::Delete)
                     })
                     .await;
                 if result.is_ok() {
@@ -8168,12 +8090,9 @@ mod tests {
             let mut writer = writer_session.begin_trx().unwrap();
             let mutate = async {
                 let result = writer
-                    .exec(async |stmt| {
-                        stmt.table_mutate_mvcc(table_id, |_| {
-                            callbacks.fetch_add(1, Ordering::SeqCst);
-                            Ok(RowMutation::Delete)
-                        })
-                        .await
+                    .table_mutate_mvcc(table_id, |_| {
+                        callbacks.fetch_add(1, Ordering::SeqCst);
+                        Ok(RowMutation::Delete)
                     })
                     .await;
                 if result.is_ok() {
@@ -8213,36 +8132,32 @@ mod tests {
             insert_rows(table_id, &mut session, 0, 5, "original").await;
 
             let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| {
-                let mut callbacks = 0usize;
-                let outcome = stmt
-                    .table_mutate_mvcc(table_id, |row| {
-                        callbacks += 1;
-                        assert_eq!(row.column_count(), 2);
-                        let first = row.val(0)?.as_i32().unwrap();
-                        assert_eq!(row.val(0)?.as_i32().unwrap(), first);
-                        if first % 2 == 0 {
-                            Ok(RowMutation::Update(vec![UpdateCol {
-                                idx: 1,
-                                val: Val::from(format!("updated-{first}").as_str()),
-                            }]))
-                        } else {
-                            Ok(RowMutation::Skip)
-                        }
-                    })
-                    .await?;
-                assert_eq!(callbacks, 5);
-                assert_eq!(
-                    outcome,
-                    TableMutationOutcome {
-                        delete_count: 0,
-                        update_count: 3,
+            let mut callbacks = 0usize;
+            let outcome = trx
+                .table_mutate_mvcc(table_id, |row| {
+                    callbacks += 1;
+                    assert_eq!(row.column_count(), 2);
+                    let first = row.val(0)?.as_i32().unwrap();
+                    assert_eq!(row.val(0)?.as_i32().unwrap(), first);
+                    if first % 2 == 0 {
+                        Ok(RowMutation::Update(vec![UpdateCol {
+                            idx: 1,
+                            val: Val::from(format!("updated-{first}").as_str()),
+                        }]))
+                    } else {
+                        Ok(RowMutation::Skip)
                     }
-                );
-                Ok(())
-            })
-            .await
-            .unwrap();
+                })
+                .await
+                .unwrap();
+            assert_eq!(callbacks, 5);
+            assert_eq!(
+                outcome,
+                TableMutationOutcome {
+                    delete_count: 0,
+                    update_count: 3,
+                }
+            );
             trx.commit().await.unwrap();
 
             let mut trx = session.begin_trx().unwrap();
@@ -8257,20 +8172,16 @@ mod tests {
                 ]
             );
             let before_error = scan_table_pairs(&mut trx, table_id).await;
-            let result: Result<()> = trx
-                .exec(async |stmt| {
-                    stmt.table_mutate_mvcc(table_id, |row| {
-                        let id = row.val(0)?.as_i32().unwrap();
-                        if id == 2 {
-                            _ = row.val(2)?;
-                        }
-                        Ok(RowMutation::Update(vec![UpdateCol {
-                            idx: 1,
-                            val: Val::from("should-rollback"),
-                        }]))
-                    })
-                    .await?;
-                    Ok(())
+            let result = trx
+                .table_mutate_mvcc(table_id, |row| {
+                    let id = row.val(0)?.as_i32().unwrap();
+                    if id == 2 {
+                        _ = row.val(2)?;
+                    }
+                    Ok(RowMutation::Update(vec![UpdateCol {
+                        idx: 1,
+                        val: Val::from("should-rollback"),
+                    }]))
                 })
                 .await;
             assert_eq!(
@@ -8352,11 +8263,8 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
             let outcome = trx
-                .exec(async |stmt| {
-                    stmt.table_mutate_mvcc(table_id, |_| -> Result<RowMutation> {
-                        panic!("empty table must not invoke mutation callback")
-                    })
-                    .await
+                .table_mutate_mvcc(table_id, |_| -> Result<RowMutation> {
+                    panic!("empty table must not invoke mutation callback")
                 })
                 .await
                 .unwrap();
@@ -8383,6 +8291,8 @@ mod tests {
             insert_rows(table_id, &mut session, 10, 1, "hot").await;
 
             let mut trx = session.begin_trx().unwrap();
+            // RFC-0029 Phase 2 runner coverage: same-statement raw redo
+            // inspection distinguishes physical cold and hot deletes.
             trx.exec(async |stmt| {
                 for id in [0, 10] {
                     let key = single_key(id);
@@ -8435,6 +8345,8 @@ mod tests {
             insert_rows(table_id, &mut session, 10, 3, "hot").await;
 
             let mut trx = session.begin_trx().unwrap();
+            // RFC-0029 Phase 2 runner coverage: same-statement raw redo
+            // inspection classifies mixed full-table mutation effects.
             let outcome = trx
                 .exec(async |stmt| {
                     let outcome = stmt
@@ -8535,22 +8447,18 @@ mod tests {
                 (11, "hot".to_owned()),
             ];
             let mut trx = session.begin_trx().unwrap();
-            let result: Result<()> = trx
-                .exec(async |stmt| {
-                    stmt.table_mutate_mvcc(table_id, |row| {
-                        let id = row.val(0)?.as_i32().unwrap();
-                        match id {
-                            0 | 10 => Ok(RowMutation::Delete),
-                            1 => Ok(RowMutation::Update(vec![UpdateCol {
-                                idx: 1,
-                                val: Val::from("changed"),
-                            }])),
-                            11 => Err(Report::new(OperationError::InvalidDmlInput).disclose()),
-                            _ => unreachable!(),
-                        }
-                    })
-                    .await?;
-                    Ok(())
+            let result = trx
+                .table_mutate_mvcc(table_id, |row| {
+                    let id = row.val(0)?.as_i32().unwrap();
+                    match id {
+                        0 | 10 => Ok(RowMutation::Delete),
+                        1 => Ok(RowMutation::Update(vec![UpdateCol {
+                            idx: 1,
+                            val: Val::from("changed"),
+                        }])),
+                        11 => Err(Report::new(OperationError::InvalidDmlInput).disclose()),
+                        _ => unreachable!(),
+                    }
                 })
                 .await;
             assert_eq!(
@@ -8597,18 +8505,15 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let outcome = trx
-                .exec(async |stmt| {
-                    stmt.table_mutate_mvcc(table_id, |row| {
-                        Ok(match row.val(0)?.as_i32().unwrap() {
-                            0 | 10 => RowMutation::Delete,
-                            1 | 11 => RowMutation::Update(vec![UpdateCol {
-                                idx: 1,
-                                val: Val::from("changed"),
-                            }]),
-                            _ => unreachable!(),
-                        })
+                .table_mutate_mvcc(table_id, |row| {
+                    Ok(match row.val(0)?.as_i32().unwrap() {
+                        0 | 10 => RowMutation::Delete,
+                        1 | 11 => RowMutation::Update(vec![UpdateCol {
+                            idx: 1,
+                            val: Val::from("changed"),
+                        }]),
+                        _ => unreachable!(),
                     })
-                    .await
                 })
                 .await
                 .unwrap();
@@ -8650,16 +8555,13 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let outcome = trx
-                .exec(async |stmt| {
-                    stmt.table_mutate_mvcc(table_id, |row| {
-                        let id = row.val(0)?.as_i32().unwrap();
-                        Ok(if id % 2 == 0 {
-                            RowMutation::Delete
-                        } else {
-                            RowMutation::Skip
-                        })
+                .table_mutate_mvcc(table_id, |row| {
+                    let id = row.val(0)?.as_i32().unwrap();
+                    Ok(if id % 2 == 0 {
+                        RowMutation::Delete
+                    } else {
+                        RowMutation::Skip
                     })
-                    .await
                 })
                 .await
                 .unwrap();
@@ -8668,10 +8570,7 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let rows = trx
-                .exec(async |stmt| {
-                    stmt.table_index_lookup_mvcc(table_id, 1, &[Val::from("shared")], &[0])
-                        .await
-                })
+                .table_index_lookup_mvcc(table_id, 1, &[Val::from("shared")], &[0])
                 .await
                 .unwrap();
             assert_eq!(
@@ -8695,25 +8594,19 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let outcome = trx
-                .exec(async |stmt| {
-                    stmt.table_mutate_mvcc(table_id, |row| {
-                        let id = row.val(0)?.as_i32().unwrap();
-                        Ok(if id % 2 == 0 {
-                            RowMutation::Delete
-                        } else {
-                            RowMutation::Skip
-                        })
+                .table_mutate_mvcc(table_id, |row| {
+                    let id = row.val(0)?.as_i32().unwrap();
+                    Ok(if id % 2 == 0 {
+                        RowMutation::Delete
+                    } else {
+                        RowMutation::Skip
                     })
-                    .await
                 })
                 .await
                 .unwrap();
             assert_eq!(outcome.delete_count, 2);
             let rows = trx
-                .exec(async |stmt| {
-                    stmt.table_index_lookup_mvcc(table_id, 1, &[Val::from("shared")], &[0])
-                        .await
-                })
+                .table_index_lookup_mvcc(table_id, 1, &[Val::from("shared")], &[0])
                 .await
                 .unwrap();
             assert_eq!(
@@ -8730,10 +8623,7 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let rows = trx
-                .exec(async |stmt| {
-                    stmt.table_index_lookup_mvcc(table_id, 1, &[Val::from("shared")], &[0])
-                        .await
-                })
+                .table_index_lookup_mvcc(table_id, 1, &[Val::from("shared")], &[0])
                 .await
                 .unwrap();
             assert_eq!(
@@ -8774,10 +8664,7 @@ mod tests {
             let deleted = trx_delete_row_by_id(&mut trx, table_id, &key).await;
             assert!(matches!(deleted, Ok(DeleteMvcc::Deleted)));
             let rows = trx
-                .exec(async |stmt| {
-                    stmt.table_index_lookup_mvcc(table_id, 1, &[Val::from("shared")], &[0])
-                        .await
-                })
+                .table_index_lookup_mvcc(table_id, 1, &[Val::from("shared")], &[0])
                 .await
                 .unwrap();
             assert_eq!(
@@ -8796,10 +8683,7 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let rows = trx
-                .exec(async |stmt| {
-                    stmt.table_index_lookup_mvcc(table_id, 1, &[Val::from("shared")], &[0])
-                        .await
-                })
+                .table_index_lookup_mvcc(table_id, 1, &[Val::from("shared")], &[0])
                 .await
                 .unwrap();
             assert_eq!(
@@ -8824,10 +8708,7 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let rows = trx
-                .exec(async |stmt| {
-                    stmt.table_index_lookup_mvcc(table_id, 1, &[Val::from("shared")], &[0])
-                        .await
-                })
+                .table_index_lookup_mvcc(table_id, 1, &[Val::from("shared")], &[0])
                 .await
                 .unwrap();
             assert_eq!(
@@ -8862,18 +8743,15 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let outcome = trx
-                .exec(async |stmt| {
-                    stmt.table_mutate_mvcc(table_id, |row| {
-                        Ok(match row.val(0)?.as_i32().unwrap() {
-                            1 => RowMutation::Delete,
-                            2 => RowMutation::Update(vec![UpdateCol {
-                                idx: 0,
-                                val: Val::from(1i32),
-                            }]),
-                            _ => unreachable!(),
-                        })
+                .table_mutate_mvcc(table_id, |row| {
+                    Ok(match row.val(0)?.as_i32().unwrap() {
+                        1 => RowMutation::Delete,
+                        2 => RowMutation::Update(vec![UpdateCol {
+                            idx: 0,
+                            val: Val::from(1i32),
+                        }]),
+                        _ => unreachable!(),
                     })
-                    .await
                 })
                 .await
                 .unwrap();
@@ -8888,20 +8766,16 @@ mod tests {
             let second_table_id = create_table2_for_test(&engine).await;
             insert_rows(second_table_id, &mut session, 1, 2, "name").await;
             let mut trx = session.begin_trx().unwrap();
-            let result: Result<()> = trx
-                .exec(async |stmt| {
-                    stmt.table_mutate_mvcc(second_table_id, |row| {
-                        Ok(match row.val(0)?.as_i32().unwrap() {
-                            1 => RowMutation::Update(vec![UpdateCol {
-                                idx: 0,
-                                val: Val::from(2i32),
-                            }]),
-                            2 => RowMutation::Delete,
-                            _ => unreachable!(),
-                        })
+            let result = trx
+                .table_mutate_mvcc(second_table_id, |row| {
+                    Ok(match row.val(0)?.as_i32().unwrap() {
+                        1 => RowMutation::Update(vec![UpdateCol {
+                            idx: 0,
+                            val: Val::from(2i32),
+                        }]),
+                        2 => RowMutation::Delete,
+                        _ => unreachable!(),
                     })
-                    .await?;
-                    Ok(())
                 })
                 .await;
             assert_eq!(
@@ -8946,19 +8820,14 @@ mod tests {
             ));
             writer.commit().await.unwrap();
 
-            older
-                .exec(async |stmt| {
-                    let outcome = stmt
-                        .table_mutate_mvcc(table_id, |row| {
-                            assert_eq!(row.val(1)?.as_str(), Some("newer"));
-                            Ok(RowMutation::Update(Vec::new()))
-                        })
-                        .await?;
-                    assert_eq!(outcome.update_count, 1);
-                    Ok(())
+            let outcome = older
+                .table_mutate_mvcc(table_id, |row| {
+                    assert_eq!(row.val(1)?.as_str(), Some("newer"));
+                    Ok(RowMutation::Update(Vec::new()))
                 })
                 .await
                 .unwrap();
+            assert_eq!(outcome.update_count, 1);
             older.commit().await.unwrap();
         });
     }
@@ -8996,22 +8865,17 @@ mod tests {
             expect_delete_committed(table_id, &mut writer_session, &single_key(1)).await;
 
             let mut seen = Vec::new();
-            older
-                .exec(async |stmt| {
-                    let outcome = stmt
-                        .table_mutate_mvcc(table_id, |row| {
-                            seen.push((
-                                row.val(0)?.as_i32().unwrap(),
-                                row.val(1)?.as_str().unwrap().to_owned(),
-                            ));
-                            Ok(RowMutation::Update(Vec::new()))
-                        })
-                        .await?;
-                    assert_eq!(outcome.update_count, 1);
-                    Ok(())
+            let outcome = older
+                .table_mutate_mvcc(table_id, |row| {
+                    seen.push((
+                        row.val(0)?.as_i32().unwrap(),
+                        row.val(1)?.as_str().unwrap().to_owned(),
+                    ));
+                    Ok(RowMutation::Update(Vec::new()))
                 })
                 .await
                 .unwrap();
+            assert_eq!(outcome.update_count, 1);
             assert_eq!(seen, vec![(0, "newer".to_owned())]);
             older.commit().await.unwrap();
         });
@@ -9032,24 +8896,20 @@ mod tests {
             insert_rows(table_id, &mut session, 10, 2, "hot").await;
 
             let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| {
-                let outcome = stmt
-                    .table_mutate_mvcc(table_id, |row| {
-                        let id = row.val(0)?.as_i32().unwrap();
-                        Ok(RowMutation::Update(vec![UpdateCol {
-                            idx: 0,
-                            val: Val::from(id + 100),
-                        }]))
-                    })
-                    .await?;
-                assert_eq!(
-                    outcome.update_count, 5,
-                    "replacement rows must not be revisited"
-                );
-                Ok(())
-            })
-            .await
-            .unwrap();
+            let outcome = trx
+                .table_mutate_mvcc(table_id, |row| {
+                    let id = row.val(0)?.as_i32().unwrap();
+                    Ok(RowMutation::Update(vec![UpdateCol {
+                        idx: 0,
+                        val: Val::from(id + 100),
+                    }]))
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome.update_count, 5,
+                "replacement rows must not be revisited"
+            );
             trx.commit().await.unwrap();
 
             let mut reader = session.begin_trx().unwrap();
@@ -9073,18 +8933,14 @@ mod tests {
             insert_rows(table_id, &mut session, 0, 3, "name").await;
 
             let mut trx = session.begin_trx().unwrap();
-            let result: Result<()> = trx
-                .exec(async |stmt| {
-                    stmt.table_mutate_mvcc(table_id, |row| {
-                        let id = row.val(0)?.as_i32().unwrap();
-                        let new_id = if id < 2 { 10 } else { id };
-                        Ok(RowMutation::Update(vec![UpdateCol {
-                            idx: 0,
-                            val: Val::from(new_id),
-                        }]))
-                    })
-                    .await?;
-                    Ok(())
+            let result = trx
+                .table_mutate_mvcc(table_id, |row| {
+                    let id = row.val(0)?.as_i32().unwrap();
+                    let new_id = if id < 2 { 10 } else { id };
+                    Ok(RowMutation::Update(vec![UpdateCol {
+                        idx: 0,
+                        val: Val::from(new_id),
+                    }]))
                 })
                 .await;
             assert_eq!(
@@ -9138,21 +8994,17 @@ mod tests {
             drop(page_guard);
 
             let mut trx = session.begin_trx().unwrap();
-            let result: Result<()> = trx
-                .exec(async |stmt| {
-                    stmt.table_mutate_mvcc(table_id, |row| {
-                        let id = row.val(0)?.as_i32().unwrap();
-                        Ok(if id == 0 {
-                            RowMutation::Update(vec![UpdateCol {
-                                idx: 0,
-                                val: Val::from(1i32),
-                            }])
-                        } else {
-                            RowMutation::Skip
-                        })
+            let result = trx
+                .table_mutate_mvcc(table_id, |row| {
+                    let id = row.val(0)?.as_i32().unwrap();
+                    Ok(if id == 0 {
+                        RowMutation::Update(vec![UpdateCol {
+                            idx: 0,
+                            val: Val::from(1i32),
+                        }])
+                    } else {
+                        RowMutation::Skip
                     })
-                    .await?;
-                    Ok(())
                 })
                 .await;
             assert_eq!(
@@ -9199,20 +9051,11 @@ mod tests {
             insert_rows(table_id, &mut writer_session, 0, 1, "name").await;
 
             let mut writer = writer_session.begin_trx().unwrap();
-            writer
-                .exec(async |stmt| {
-                    assert_eq!(
-                        stmt.table_mutate_mvcc(table_id, |_| {
-                            Ok(RowMutation::Update(Vec::new()))
-                        })
-                        .await?
-                        .update_count,
-                        1,
-                    );
-                    Ok(())
-                })
+            let outcome = writer
+                .table_mutate_mvcc(table_id, |_| Ok(RowMutation::Update(Vec::new())))
                 .await
                 .unwrap();
+            assert_eq!(outcome.update_count, 1);
 
             let mut freeze_session = engine.new_session().unwrap();
             let freeze_session_id = freeze_session.id();
@@ -9278,14 +9121,10 @@ mod tests {
             ));
 
             let mut callbacks = 0usize;
-            let result: Result<()> = first
-                .exec(async |stmt| {
-                    stmt.table_mutate_mvcc(table_id, |_| {
-                        callbacks += 1;
-                        Ok(RowMutation::Skip)
-                    })
-                    .await?;
-                    Ok(())
+            let result = first
+                .table_mutate_mvcc(table_id, |_| {
+                    callbacks += 1;
+                    Ok(RowMutation::Skip)
                 })
                 .await;
             assert_eq!(
@@ -9344,9 +9183,7 @@ mod tests {
 
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| stmt.table_scan_mvcc(table_id, &[0], |_| true).await)
-                .await
-                .unwrap();
+            trx.table_scan_mvcc(table_id, &[0], |_| true).await.unwrap();
             trx.rollback().await.unwrap();
             table.mark_dropped_lifecycle();
         });
@@ -9518,13 +9355,9 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let mut rows = Vec::new();
-            trx.exec(async |stmt| {
-                stmt.table_scan_mvcc(table_id, &[0], |vals| {
-                    rows.push(vals[0].as_i32().unwrap());
-                    rows.len() < 3
-                })
-                .await?;
-                Ok(())
+            trx.table_scan_mvcc(table_id, &[0], |vals| {
+                rows.push(vals[0].as_i32().unwrap());
+                rows.len() < 3
             })
             .await
             .unwrap();
@@ -9659,6 +9492,8 @@ mod tests {
 
             let (lock_installed_tx, lock_installed_rx) = flume::bounded(1);
             let (return_error_tx, return_error_rx) = flume::bounded(1);
+            // RFC-0029 Phase 2 runner coverage: callback error injection after
+            // raw row-lock installation pauses statement rollback.
             let mut statement = Box::pin(trx.exec(async |stmt| {
                 let page_guard = engine
                     .inner()
@@ -10319,6 +10154,8 @@ mod tests {
             let mut hook_guard = None;
             let mut read_hook = None;
 
+            // RFC-0029 Phase 2 runner coverage: raw statement runtime/effects
+            // install a deterministic buffer read-failure hook mid-operation.
             let res: Result<()> = trx
                 .exec(async |stmt| {
                     let _row_id = match stmt_insert_row_by_id(
@@ -10573,13 +10410,10 @@ mod tests {
     ) -> Vec<Vec<Val>> {
         let key_vals = [Val::from(key)];
         let read_set = [0usize, 1];
-        trx.exec(async |stmt| {
-            stmt.table_index_lookup_mvcc(table_id, 1, &key_vals, &read_set)
-                .await
-        })
-        .await
-        .unwrap()
-        .unwrap_rows()
+        trx.table_index_lookup_mvcc(table_id, 1, &key_vals, &read_set)
+            .await
+            .unwrap()
+            .unwrap_rows()
     }
 
     async fn secondary_index_stream_rows(
@@ -10590,8 +10424,7 @@ mod tests {
         let key_vals = [Val::from(key)];
         let read_set = [0usize, 1];
         let mut stream = trx
-            .stream_stmt()
-            .table_index_scan_mvcc(table_id, 1, &key_vals[..]..=&key_vals[..], &read_set)
+            .table_index_scan_mvcc_stream(table_id, 1, &key_vals[..]..=&key_vals[..], &read_set)
             .await
             .unwrap();
         let mut rows = Vec::new();
@@ -10638,10 +10471,7 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let rows = trx
-                .exec(async |stmt| {
-                    stmt.table_index_lookup_mvcc(table_id, 1, &key_vals, &read_set)
-                        .await
-                })
+                .table_index_lookup_mvcc(table_id, 1, &key_vals, &read_set)
                 .await
                 .unwrap()
                 .unwrap_rows();
@@ -10650,8 +10480,7 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let mut stream = trx
-                .stream_stmt()
-                .table_index_scan_mvcc(table_id, 1, &key_vals[..]..=&key_vals[..], &read_set)
+                .table_index_scan_mvcc_stream(table_id, 1, &key_vals[..]..=&key_vals[..], &read_set)
                 .await
                 .unwrap();
             let mut rows = Vec::new();
@@ -10689,8 +10518,7 @@ mod tests {
             let key_vals = [Val::from(7i32)];
             let mut trx = session.begin_trx().unwrap();
             let err = match trx
-                .stream_stmt()
-                .table_index_scan_mvcc(table_id, 1, &key_vals[..]..=&key_vals[..], &[])
+                .table_index_scan_mvcc_stream(table_id, 1, &key_vals[..]..=&key_vals[..], &[])
                 .await
             {
                 Ok(_) => panic!("empty read set should fail stream construction"),
@@ -10701,6 +10529,8 @@ mod tests {
                 Some(OperationError::InvalidDmlInput)
             );
 
+            // RFC-0029 Phase 2 runner coverage: stream validation opt-out
+            // remains available only through the legacy StreamStmt facade.
             let mut stream = trx
                 .stream_stmt()
                 .disable_validation()
@@ -10712,8 +10542,7 @@ mod tests {
             drop(stream);
 
             let err = match trx
-                .stream_stmt()
-                .table_index_scan_mvcc(table_id, 1, &key_vals[..]..=&key_vals[..], &[])
+                .table_index_scan_mvcc_stream(table_id, 1, &key_vals[..]..=&key_vals[..], &[])
                 .await
             {
                 Ok(_) => panic!("empty read set should fail after opt-out stream"),
@@ -10762,15 +10591,7 @@ mod tests {
                 let mut trx = session.begin_trx().unwrap();
                 let key = SelectKey::new(1, vec![Val::from(1i32)]);
                 let res = trx
-                    .exec(async |stmt| {
-                        stmt.table_index_lookup_mvcc(
-                            table_id,
-                            key.index_no,
-                            &key.vals,
-                            user_read_set,
-                        )
-                        .await
-                    })
+                    .table_index_lookup_mvcc(table_id, key.index_no, &key.vals, user_read_set)
                     .await;
                 trx.commit().await.unwrap();
                 assert!(res.unwrap().unwrap_rows().len() == 1);
@@ -10778,15 +10599,12 @@ mod tests {
                 let mut trx = session.begin_trx().unwrap();
                 let key_vals = [Val::from(1i32)];
                 let rows = trx
-                    .exec(async |stmt| {
-                        stmt.table_index_scan_mvcc(
-                            table_id,
-                            1,
-                            &key_vals[..]..=&key_vals[..],
-                            user_read_set,
-                        )
-                        .await
-                    })
+                    .table_index_scan_mvcc(
+                        table_id,
+                        1,
+                        &key_vals[..]..=&key_vals[..],
+                        user_read_set,
+                    )
                     .await
                     .unwrap()
                     .unwrap_rows();
@@ -10795,8 +10613,7 @@ mod tests {
 
                 let mut trx = session.begin_trx().unwrap();
                 let mut stream = trx
-                    .stream_stmt()
-                    .table_index_scan_mvcc(
+                    .table_index_scan_mvcc_stream(
                         table_id,
                         1,
                         &key_vals[..]..=&key_vals[..],
@@ -10817,8 +10634,12 @@ mod tests {
                 let lower = [Val::from(1i32)];
                 let upper = [Val::from(4i32)];
                 let mut stream = trx
-                    .stream_stmt()
-                    .table_index_scan_mvcc(table_id, 0, &lower[..]..&upper[..], user_read_set)
+                    .table_index_scan_mvcc_stream(
+                        table_id,
+                        0,
+                        &lower[..]..&upper[..],
+                        user_read_set,
+                    )
                     .await
                     .unwrap();
                 let mut rows = Vec::new();
@@ -10836,15 +10657,7 @@ mod tests {
 
                 let mut trx = session.begin_trx().unwrap();
                 let rows = trx
-                    .exec(async |stmt| {
-                        stmt.table_index_scan_mvcc(
-                            table_id,
-                            0,
-                            &lower[..]..&upper[..],
-                            user_read_set,
-                        )
-                        .await
-                    })
+                    .table_index_scan_mvcc(table_id, 0, &lower[..]..&upper[..], user_read_set)
                     .await
                     .unwrap()
                     .unwrap_rows();
@@ -10853,8 +10666,7 @@ mod tests {
 
                 let mut trx = session.begin_trx().unwrap();
                 let mut stream = trx
-                    .stream_stmt()
-                    .table_index_scan_mvcc(table_id, 1, .., user_read_set)
+                    .table_index_scan_mvcc_stream(table_id, 1, .., user_read_set)
                     .await
                     .unwrap();
                 assert!(stream.next().await.unwrap().is_some());
@@ -10865,11 +10677,7 @@ mod tests {
                 assert!(matches!(res, Ok(SelectMvcc::Found(_))));
 
                 let mut trx = session.begin_trx().unwrap();
-                let err = match trx
-                    .stream_stmt()
-                    .table_index_scan_mvcc(table_id, 1, .., &[])
-                    .await
-                {
+                let err = match trx.table_index_scan_mvcc_stream(table_id, 1, .., &[]).await {
                     Ok(_) => panic!("empty read set should fail stream construction"),
                     Err(err) => err,
                 };
@@ -10882,8 +10690,7 @@ mod tests {
                 let mut trx = session.begin_trx().unwrap();
                 let invalid_key_vals = [Val::from(1i32), Val::from(2i32)];
                 let err = match trx
-                    .stream_stmt()
-                    .table_index_scan_mvcc(
+                    .table_index_scan_mvcc_stream(
                         table_id,
                         1,
                         &invalid_key_vals[..]..=&invalid_key_vals[..],
@@ -10913,15 +10720,7 @@ mod tests {
                 let mut trx = session.begin_trx().unwrap();
                 let key = SelectKey::new(1, vec![Val::from(0i32)]);
                 let res = trx
-                    .exec(async |stmt| {
-                        stmt.table_index_lookup_mvcc(
-                            table_id,
-                            key.index_no,
-                            &key.vals,
-                            user_read_set,
-                        )
-                        .await
-                    })
+                    .table_index_lookup_mvcc(table_id, key.index_no, &key.vals, user_read_set)
                     .await;
                 trx.commit().await.unwrap();
                 assert!(res.unwrap().unwrap_rows().len() == 2);
@@ -10930,8 +10729,12 @@ mod tests {
                 let lower = [Val::from(0i32)];
                 let upper = [Val::from(5i32)];
                 let mut stream = trx
-                    .stream_stmt()
-                    .table_index_scan_mvcc(table_id, 1, &lower[..]..&upper[..], user_read_set)
+                    .table_index_scan_mvcc_stream(
+                        table_id,
+                        1,
+                        &lower[..]..&upper[..],
+                        user_read_set,
+                    )
                     .await
                     .unwrap();
                 let mut rows = Vec::new();
@@ -10950,15 +10753,7 @@ mod tests {
 
                 let mut trx = session.begin_trx().unwrap();
                 let rows = trx
-                    .exec(async |stmt| {
-                        stmt.table_index_scan_mvcc(
-                            table_id,
-                            1,
-                            &lower[..]..&upper[..],
-                            user_read_set,
-                        )
-                        .await
-                    })
+                    .table_index_scan_mvcc(table_id, 1, &lower[..]..&upper[..], user_read_set)
                     .await
                     .unwrap()
                     .unwrap_rows();
@@ -10980,15 +10775,7 @@ mod tests {
                 let mut trx = session.begin_trx().unwrap();
                 let key = SelectKey::new(1, vec![Val::from(0i32)]);
                 let res = trx
-                    .exec(async |stmt| {
-                        stmt.table_index_lookup_mvcc(
-                            table_id,
-                            key.index_no,
-                            &key.vals,
-                            user_read_set,
-                        )
-                        .await
-                    })
+                    .table_index_lookup_mvcc(table_id, key.index_no, &key.vals, user_read_set)
                     .await;
                 _ = trx.commit().await.unwrap();
                 assert!(res.unwrap().unwrap_rows().len() == 1);

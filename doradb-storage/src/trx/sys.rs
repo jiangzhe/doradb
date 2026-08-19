@@ -2401,13 +2401,8 @@ pub(crate) mod tests {
             let s = [1u8; 196];
             for i in 0..COUNT {
                 let mut trx = session.begin_trx().unwrap();
-                trx.exec(async |stmt| {
-                    let insert = vec![Val::from(i as i32), Val::from(&s[..])];
-                    stmt.table_insert_mvcc(table_id, insert).await?;
-                    Ok(())
-                })
-                .await
-                .unwrap();
+                let insert = vec![Val::from(i as i32), Val::from(&s[..])];
+                trx.table_insert_mvcc(table_id, insert).await.unwrap();
                 trx.commit().await.unwrap();
             }
             drop(session);
@@ -2510,15 +2505,10 @@ pub(crate) mod tests {
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
             let value = [7u8; 196];
-            trx.exec(async |stmt| {
-                for i in 0..384 {
-                    let insert = vec![Val::from(i), Val::from(&value[..])];
-                    stmt.table_insert_mvcc(table_id, insert).await?;
-                }
-                Ok(())
-            })
-            .await
-            .unwrap();
+            let rows = (0..384)
+                .map(|i| vec![Val::from(i), Val::from(&value[..])])
+                .collect();
+            trx.table_insert_batch_mvcc(table_id, rows).await.unwrap();
             let (entry, status) = capture_transaction_cleanup_state(&engine, &trx);
 
             let err = trx.commit().await.unwrap_err();

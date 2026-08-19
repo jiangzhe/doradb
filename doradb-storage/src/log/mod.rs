@@ -3096,11 +3096,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let mut warmup = session.begin_trx().unwrap();
             warmup
-                .exec(async |stmt| {
-                    stmt.table_insert_mvcc(table_id, vec![Val::from(0), Val::from("warmup")])
-                        .await?;
-                    Ok(())
-                })
+                .table_insert_mvcc(table_id, vec![Val::from(0), Val::from("warmup")])
                 .await
                 .unwrap();
             warmup.commit().await.unwrap();
@@ -3120,14 +3116,10 @@ mod tests {
             fs::create_dir(log_file_name(&file_prefix, next_seq)).unwrap();
 
             let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| {
-                stmt.table_insert_mvcc(
-                    table_id,
-                    vec![Val::from(1), Val::from("rotation-create-failure")],
-                )
-                .await?;
-                Ok(())
-            })
+            trx.table_insert_mvcc(
+                table_id,
+                vec![Val::from(1), Val::from("rotation-create-failure")],
+            )
             .await
             .unwrap();
 
@@ -3194,13 +3186,9 @@ mod tests {
 
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| {
-                stmt.table_insert_mvcc(table_id, vec![Val::from(1), Val::from("handoff")])
-                    .await?;
-                Ok(())
-            })
-            .await
-            .unwrap();
+            trx.table_insert_mvcc(table_id, vec![Val::from(1), Val::from("handoff")])
+                .await
+                .unwrap();
             assert!(session.in_trx().unwrap());
 
             let mut commit_fut = Box::pin(trx.commit());
@@ -3252,13 +3240,9 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let sts = trx.sts();
             assert_eq!(engine.inner().trx_sys.min_active_sts(), sts);
-            trx.exec(async |stmt| {
-                stmt.table_insert_mvcc(table_id, vec![Val::from(2), Val::from("shutdown")])
-                    .await?;
-                Ok(())
-            })
-            .await
-            .unwrap();
+            trx.table_insert_mvcc(table_id, vec![Val::from(2), Val::from("shutdown")])
+                .await
+                .unwrap();
 
             let mut commit_fut = Box::pin(trx.commit());
             let waker = noop_waker();
@@ -3313,13 +3297,9 @@ mod tests {
             let table_id = table2(&engine).await;
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| {
-                stmt.table_insert_mvcc(table_id, vec![Val::from(1), Val::from("closed")])
-                    .await?;
-                Ok(())
-            })
-            .await
-            .unwrap();
+            trx.table_insert_mvcc(table_id, vec![Val::from(1), Val::from("closed")])
+                .await
+                .unwrap();
 
             {
                 let mut group_commit_g = engine.inner().trx_sys.redo_log.group_commit.lock();
@@ -3365,13 +3345,9 @@ mod tests {
 
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| {
-                stmt.table_insert_mvcc(table_id, vec![Val::from(1), Val::from("sync-fail")])
-                    .await?;
-                Ok(())
-            })
-            .await
-            .unwrap();
+            trx.table_insert_mvcc(table_id, vec![Val::from(1), Val::from("sync-fail")])
+                .await
+                .unwrap();
 
             let mut commit_fut = Box::pin(trx.commit());
             let waker = noop_waker();
@@ -5229,14 +5205,9 @@ mod tests {
             {
                 for i in 0..SIZE {
                     let mut trx = session.begin_trx().unwrap();
-                    trx.exec(async |stmt| {
-                        let s = format!("{}", i);
-                        let insert = vec![Val::from(i), Val::from(&s[..])];
-                        stmt.table_insert_mvcc(table_id, insert).await?;
-                        Ok(())
-                    })
-                    .await
-                    .unwrap();
+                    let s = format!("{}", i);
+                    let insert = vec![Val::from(i), Val::from(&s[..])];
+                    trx.table_insert_mvcc(table_id, insert).await.unwrap();
                     trx.commit().await.unwrap();
                 }
             }

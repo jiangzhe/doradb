@@ -782,25 +782,22 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let mut callbacks = 0usize;
             let outcome = trx
-                .exec(async |stmt| {
-                    stmt.table_index_mutate_mvcc(table_id, 0, .., |row| {
-                        callbacks += 1;
-                        Ok(match row.val(0)?.as_i32().unwrap() {
-                            0 => RowMutation::Update(vec![UpdateCol {
-                                idx: 1,
-                                val: Val::from("cold-updated"),
-                            }]),
-                            1 | 12 => RowMutation::Delete,
-                            2 => RowMutation::Skip,
-                            10 => RowMutation::Update(vec![UpdateCol {
-                                idx: 1,
-                                val: Val::from("hot-updated"),
-                            }]),
-                            11 => RowMutation::Update(Vec::new()),
-                            _ => unreachable!(),
-                        })
+                .table_index_mutate_mvcc(table_id, 0, .., |row| {
+                    callbacks += 1;
+                    Ok(match row.val(0)?.as_i32().unwrap() {
+                        0 => RowMutation::Update(vec![UpdateCol {
+                            idx: 1,
+                            val: Val::from("cold-updated"),
+                        }]),
+                        1 | 12 => RowMutation::Delete,
+                        2 => RowMutation::Skip,
+                        10 => RowMutation::Update(vec![UpdateCol {
+                            idx: 1,
+                            val: Val::from("hot-updated"),
+                        }]),
+                        11 => RowMutation::Update(Vec::new()),
+                        _ => unreachable!(),
                     })
-                    .await
                 })
                 .await
                 .unwrap();
@@ -826,10 +823,7 @@ mod tests {
             );
             let deleted_hot_key = [Val::from(12i32)];
             let deleted_hot_row = reader
-                .exec(async |stmt| {
-                    stmt.table_lookup_unique_mvcc(table_id, 0, &deleted_hot_key, &[0])
-                        .await
-                })
+                .table_lookup_unique_mvcc(table_id, 0, &deleted_hot_key, &[0])
                 .await
                 .unwrap();
             assert!(matches!(deleted_hot_row, SelectMvcc::NotFound));
@@ -884,17 +878,9 @@ mod tests {
             let mut callbacks = 0usize;
             let mut writer = session.begin_trx().unwrap();
             let outcome = writer
-                .exec(async |stmt| {
-                    stmt.table_index_mutate_mvcc(
-                        table_id,
-                        0,
-                        &range_key[..]..=&range_key[..],
-                        |_| {
-                            callbacks += 1;
-                            Ok(RowMutation::Skip)
-                        },
-                    )
-                    .await
+                .table_index_mutate_mvcc(table_id, 0, &range_key[..]..=&range_key[..], |_| {
+                    callbacks += 1;
+                    Ok(RowMutation::Skip)
                 })
                 .await
                 .unwrap();
@@ -917,16 +903,13 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let mut callbacks = Vec::new();
             let outcome = trx
-                .exec(async |stmt| {
-                    stmt.table_index_mutate_mvcc(table_id, 0, .., |row| {
-                        let id = row.val(0)?.as_i32().unwrap();
-                        callbacks.push(id);
-                        Ok(RowMutation::Update(vec![UpdateCol {
-                            idx: 0,
-                            val: Val::from(id + 100),
-                        }]))
-                    })
-                    .await
+                .table_index_mutate_mvcc(table_id, 0, .., |row| {
+                    let id = row.val(0)?.as_i32().unwrap();
+                    callbacks.push(id);
+                    Ok(RowMutation::Update(vec![UpdateCol {
+                        idx: 0,
+                        val: Val::from(id + 100),
+                    }]))
                 })
                 .await
                 .unwrap();
@@ -963,11 +946,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let mut setup = session.begin_trx().unwrap();
             setup
-                .exec(async |stmt| {
-                    stmt.table_insert_mvcc(table_id, vec![Val::from("old")])
-                        .await?;
-                    Ok(())
-                })
+                .table_insert_mvcc(table_id, vec![Val::from("old")])
                 .await
                 .unwrap();
             setup.commit().await.unwrap();
@@ -975,15 +954,12 @@ mod tests {
 
             let mut writer = session.begin_trx().unwrap();
             let outcome = writer
-                .exec(async |stmt| {
-                    stmt.table_index_mutate_mvcc(table_id, 0, .., |row| {
-                        assert_eq!(row.val(0)?.as_str(), Some("old"));
-                        Ok(RowMutation::Update(vec![UpdateCol {
-                            idx: 0,
-                            val: Val::from("new-variable-length-key"),
-                        }]))
-                    })
-                    .await
+                .table_index_mutate_mvcc(table_id, 0, .., |row| {
+                    assert_eq!(row.val(0)?.as_str(), Some("old"));
+                    Ok(RowMutation::Update(vec![UpdateCol {
+                        idx: 0,
+                        val: Val::from("new-variable-length-key"),
+                    }]))
                 })
                 .await
                 .unwrap();
@@ -993,16 +969,12 @@ mod tests {
             let old_key = [Val::from("old")];
             let new_key = [Val::from("new-variable-length-key")];
             let mut reader = session.begin_trx().unwrap();
-            let (old_row, new_row) = reader
-                .exec(async |stmt| {
-                    let old_row = stmt
-                        .table_lookup_unique_mvcc(table_id, 0, &old_key, &[0])
-                        .await?;
-                    let new_row = stmt
-                        .table_lookup_unique_mvcc(table_id, 0, &new_key, &[0])
-                        .await?;
-                    Ok((old_row, new_row))
-                })
+            let old_row = reader
+                .table_lookup_unique_mvcc(table_id, 0, &old_key, &[0])
+                .await
+                .unwrap();
+            let new_row = reader
+                .table_lookup_unique_mvcc(table_id, 0, &new_key, &[0])
                 .await
                 .unwrap();
             assert!(old_row.not_found());
@@ -1026,16 +998,13 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let mut callbacks = Vec::new();
             let result = trx
-                .exec(async |stmt| {
-                    stmt.table_index_mutate_mvcc(table_id, 0, .., |row| {
-                        let id = row.val(0)?.as_i32().unwrap();
-                        callbacks.push(id);
-                        Ok(RowMutation::Update(vec![UpdateCol {
-                            idx: 0,
-                            val: Val::from(if id == 0 { 2 } else { id + 100 }),
-                        }]))
-                    })
-                    .await
+                .table_index_mutate_mvcc(table_id, 0, .., |row| {
+                    let id = row.val(0)?.as_i32().unwrap();
+                    callbacks.push(id);
+                    Ok(RowMutation::Update(vec![UpdateCol {
+                        idx: 0,
+                        val: Val::from(if id == 0 { 2 } else { id + 100 }),
+                    }]))
                 })
                 .await;
             assert_eq!(callbacks, vec![0, 1, 2]);
@@ -1076,16 +1045,13 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let mut callbacks = Vec::new();
             let outcome = trx
-                .exec(async |stmt| {
-                    stmt.table_index_mutate_mvcc(table_id, 0, .., |row| {
-                        let id = row.val(0)?.as_i32().unwrap();
-                        callbacks.push(id);
-                        Ok(RowMutation::Update(vec![UpdateCol {
-                            idx: 0,
-                            val: Val::from(id + 100),
-                        }]))
-                    })
-                    .await
+                .table_index_mutate_mvcc(table_id, 0, .., |row| {
+                    let id = row.val(0)?.as_i32().unwrap();
+                    callbacks.push(id);
+                    Ok(RowMutation::Update(vec![UpdateCol {
+                        idx: 0,
+                        val: Val::from(id + 100),
+                    }]))
                 })
                 .await
                 .unwrap();
@@ -1145,15 +1111,12 @@ mod tests {
         let mut writer_session = engine.new_session().unwrap();
         let mut writer = writer_session.begin_trx().unwrap();
         let writer_status = transaction_status_for_test(&writer);
-        let mut mutation = Box::pin(writer.exec(async |stmt| {
-            stmt.table_index_mutate_mvcc(table_id, 0, .., |row| {
-                assert_eq!(row.val(0)?.as_i32(), Some(1));
-                Ok(RowMutation::Update(vec![UpdateCol {
-                    idx: 0,
-                    val: Val::from(101i32),
-                }]))
-            })
-            .await
+        let mut mutation = Box::pin(writer.table_index_mutate_mvcc(table_id, 0, .., |row| {
+            assert_eq!(row.val(0)?.as_i32(), Some(1));
+            Ok(RowMutation::Update(vec![UpdateCol {
+                idx: 0,
+                val: Val::from(101i32),
+            }]))
         }));
         poll_until_deferred_application_pauses(mutation.as_mut()).await;
 
@@ -1211,14 +1174,11 @@ mod tests {
             let resume = pause_next_deferred_application();
             let session_id = session.id();
             let mut writer = session.begin_trx().unwrap();
-            let mut mutation = Box::pin(writer.exec(async |stmt| {
-                stmt.table_index_mutate_mvcc(table_id, 0, .., |_| {
-                    Ok(RowMutation::Update(vec![UpdateCol {
-                        idx: 0,
-                        val: Val::from(101i32),
-                    }]))
-                })
-                .await
+            let mut mutation = Box::pin(writer.table_index_mutate_mvcc(table_id, 0, .., |_| {
+                Ok(RowMutation::Update(vec![UpdateCol {
+                    idx: 0,
+                    val: Val::from(101i32),
+                }]))
             }));
             poll_until_deferred_application_pauses(mutation.as_mut()).await;
             drop(resume);
@@ -1246,14 +1206,11 @@ mod tests {
             let resume = pause_next_deferred_application();
             let mut writer_session = engine.new_session().unwrap();
             let mut writer = writer_session.begin_trx().unwrap();
-            let mut mutation = Box::pin(writer.exec(async |stmt| {
-                stmt.table_index_mutate_mvcc(table_id, 0, .., |_| {
-                    Ok(RowMutation::Update(vec![UpdateCol {
-                        idx: 0,
-                        val: Val::from(101i32),
-                    }]))
-                })
-                .await
+            let mut mutation = Box::pin(writer.table_index_mutate_mvcc(table_id, 0, .., |_| {
+                Ok(RowMutation::Update(vec![UpdateCol {
+                    idx: 0,
+                    val: Val::from(101i32),
+                }]))
             }));
             poll_until_deferred_application_pauses(mutation.as_mut()).await;
 
@@ -1294,16 +1251,10 @@ mod tests {
             let table_id = table4(&engine).await;
             let mut session = engine.new_session().unwrap();
             let mut setup = session.begin_trx().unwrap();
-            setup
-                .exec(async |stmt| {
-                    for id in 0..5i32 {
-                        stmt.table_insert_mvcc(table_id, vec![Val::from(id), Val::from(id)])
-                            .await?;
-                    }
-                    Ok(())
-                })
-                .await
-                .unwrap();
+            let rows = (0..5i32)
+                .map(|id| vec![Val::from(id), Val::from(id)])
+                .collect();
+            setup.table_insert_batch_mvcc(table_id, rows).await.unwrap();
             setup.commit().await.unwrap();
 
             let lower = [Val::from(0i32)];
@@ -1311,16 +1262,13 @@ mod tests {
             let mut callbacks = 0usize;
             let mut writer = session.begin_trx().unwrap();
             let outcome = writer
-                .exec(async |stmt| {
-                    stmt.table_index_mutate_mvcc(table_id, 1, &lower[..]..=&upper[..], |row| {
-                        callbacks += 1;
-                        let value = row.val(1)?.as_i32().unwrap();
-                        Ok(RowMutation::Update(vec![UpdateCol {
-                            idx: 1,
-                            val: Val::from(value + 1),
-                        }]))
-                    })
-                    .await
+                .table_index_mutate_mvcc(table_id, 1, &lower[..]..=&upper[..], |row| {
+                    callbacks += 1;
+                    let value = row.val(1)?.as_i32().unwrap();
+                    Ok(RowMutation::Update(vec![UpdateCol {
+                        idx: 1,
+                        val: Val::from(value + 1),
+                    }]))
                 })
                 .await
                 .unwrap();
@@ -1340,12 +1288,9 @@ mod tests {
             let mut reader = session.begin_trx().unwrap();
             let mut rows = Vec::new();
             reader
-                .exec(async |stmt| {
-                    stmt.table_scan_mvcc(table_id, &[0, 1], |vals| {
-                        rows.push((vals[0].as_i32().unwrap(), vals[1].as_i32().unwrap()));
-                        true
-                    })
-                    .await
+                .table_scan_mvcc(table_id, &[0, 1], |vals| {
+                    rows.push((vals[0].as_i32().unwrap(), vals[1].as_i32().unwrap()));
+                    true
                 })
                 .await
                 .unwrap();
@@ -1377,15 +1322,12 @@ mod tests {
             let mut owner_session = engine.new_session().unwrap();
             let mut owner = owner_session.begin_trx().unwrap();
             let outcome = owner
-                .exec(async |stmt| {
-                    stmt.table_index_mutate_mvcc(table_id, 0, .., |row| {
-                        Ok(match row.val(0)?.as_i32().unwrap() {
-                            0 => RowMutation::Skip,
-                            10 => RowMutation::Update(Vec::new()),
-                            _ => unreachable!(),
-                        })
+                .table_index_mutate_mvcc(table_id, 0, .., |row| {
+                    Ok(match row.val(0)?.as_i32().unwrap() {
+                        0 => RowMutation::Skip,
+                        10 => RowMutation::Update(Vec::new()),
+                        _ => unreachable!(),
                     })
-                    .await
                 })
                 .await
                 .unwrap();
@@ -1429,6 +1371,8 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
 
+            // RFC-0029 Phase 2 runner coverage: intentional same-statement
+            // insert plus index mutation proves replacement-row exclusion.
             let outcome = trx
                 .exec(async |stmt| {
                     stmt.table_insert_mvcc(table_id, vec![Val::from(7i32), Val::from("inserted")])
@@ -1444,13 +1388,10 @@ mod tests {
 
             let mut callbacks = 0usize;
             let outcome = trx
-                .exec(async |stmt| {
-                    stmt.table_index_mutate_mvcc(table_id, 0, .., |row| {
-                        callbacks += 1;
-                        assert_eq!(row.val(0)?.as_i32(), Some(7));
-                        Ok(RowMutation::Skip)
-                    })
-                    .await
+                .table_index_mutate_mvcc(table_id, 0, .., |row| {
+                    callbacks += 1;
+                    assert_eq!(row.val(0)?.as_i32(), Some(7));
+                    Ok(RowMutation::Skip)
                 })
                 .await
                 .unwrap();
@@ -1483,12 +1424,9 @@ mod tests {
             let mut competitor_session = engine.new_session().unwrap();
             let mut competitor = competitor_session.begin_trx().unwrap();
             let result = competitor
-                .exec(async |stmt| {
-                    stmt.table_index_mutate_mvcc(table_id, 0, &key[..]..=&key[..], |_| {
-                        callbacks += 1;
-                        Ok(RowMutation::Skip)
-                    })
-                    .await
+                .table_index_mutate_mvcc(table_id, 0, &key[..]..=&key[..], |_| {
+                    callbacks += 1;
+                    Ok(RowMutation::Skip)
                 })
                 .await;
             assert_eq!(
@@ -1537,12 +1475,9 @@ mod tests {
             let mut competitor_session = engine.new_session().unwrap();
             let mut competitor = competitor_session.begin_trx().unwrap();
             let result = competitor
-                .exec(async |stmt| {
-                    stmt.table_index_mutate_mvcc(table_id, 0, &old_key[..]..=&old_key[..], |_| {
-                        callbacks += 1;
-                        Ok(RowMutation::Skip)
-                    })
-                    .await
+                .table_index_mutate_mvcc(table_id, 0, &old_key[..]..=&old_key[..], |_| {
+                    callbacks += 1;
+                    Ok(RowMutation::Skip)
                 })
                 .await;
             assert_eq!(
@@ -1586,12 +1521,9 @@ mod tests {
             let mut competitor = competitor_session.begin_trx().unwrap();
             let mutate = async {
                 competitor
-                    .exec(async |stmt| {
-                        stmt.table_index_mutate_mvcc(table_id, 0, &key[..]..=&key[..], |_| {
-                            callbacks.fetch_add(1, Ordering::SeqCst);
-                            Ok(RowMutation::Skip)
-                        })
-                        .await
+                    .table_index_mutate_mvcc(table_id, 0, &key[..]..=&key[..], |_| {
+                        callbacks.fetch_add(1, Ordering::SeqCst);
+                        Ok(RowMutation::Skip)
                     })
                     .await
             };
