@@ -382,9 +382,7 @@ mod tests {
             let trx_owner = LockOwner::transaction(session_id, trx.trx_id());
             let metadata = LockResource::TableMetadata(table_id);
 
-            trx.exec(async |stmt| stmt.table_scan_mvcc(table_id, &[0], |_| true).await)
-                .await
-                .unwrap();
+            trx.table_scan_mvcc(table_id, &[0], |_| true).await.unwrap();
 
             {
                 let checkout = trx.checkout().unwrap();
@@ -425,7 +423,7 @@ mod tests {
 
             let before = session.logical_lock_stats().unwrap();
             let first = trx
-                .exec(async |stmt| stmt.table_scan_mvcc(table_id, &[0], |_| true).await)
+                .table_scan_mvcc(table_id, &[0], |_| true)
                 .await
                 .unwrap_err();
             assert_eq!(operation_error(&first), Some(OperationError::TableNotFound));
@@ -448,7 +446,7 @@ mod tests {
             assert!(owner_has_grant(&engine, owner, metadata, LockMode::Shared));
 
             let retry = trx
-                .exec(async |stmt| stmt.table_scan_mvcc(table_id, &[0], |_| true).await)
+                .table_scan_mvcc(table_id, &[0], |_| true)
                 .await
                 .unwrap_err();
             assert_eq!(operation_error(&retry), Some(OperationError::TableNotFound));
@@ -479,7 +477,7 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
 
             let err = trx
-                .exec(async |stmt| stmt.table_lookup_unique_mvcc(table_id, 99, &[], &[0]).await)
+                .table_lookup_unique_mvcc(table_id, 99, &[], &[0])
                 .await
                 .unwrap_err();
             assert_eq!(operation_error(&err), Some(OperationError::IndexNotFound));
@@ -511,9 +509,7 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let metadata = LockResource::TableMetadata(table_id);
             pause_after_transaction_metadata_grant();
-            let mut exec = Box::pin(
-                trx.exec(async |stmt| stmt.table_scan_mvcc(table_id, &[0], |_| true).await),
-            );
+            let mut exec = Box::pin(trx.table_scan_mvcc(table_id, &[0], |_| true));
 
             assert!(matches!(
                 futures::poll!(exec.as_mut()),
@@ -540,7 +536,7 @@ mod tests {
 
             drop(exec);
 
-            let err = trx.exec(async |_| Ok::<(), Error>(())).await.unwrap_err();
+            let err = trx.noop().await.unwrap_err();
             assert_eq!(
                 err.report().downcast_ref::<LifecycleError>().copied(),
                 Some(LifecycleError::TransactionDiscarded)
@@ -576,27 +572,13 @@ mod tests {
                     .unwrap();
 
                 let err = old_trx
-                    .exec(async |stmt| {
-                        stmt.table_insert_mvcc(
-                            table_id,
-                            vec![Val::from(1i32), Val::from(&b"old"[..])],
-                        )
-                        .await
-                        .map(|_| ())
-                    })
+                    .table_insert_mvcc(table_id, vec![Val::from(1i32), Val::from(&b"old"[..])])
                     .await
                     .unwrap_err();
                 assert_eq!(operation_error(&err), Some(OperationError::SchemaChanged));
                 let after_first = old_session.logical_lock_stats().unwrap();
                 let retry = old_trx
-                    .exec(async |stmt| {
-                        stmt.table_insert_mvcc(
-                            table_id,
-                            vec![Val::from(2i32), Val::from(&b"retry"[..])],
-                        )
-                        .await
-                        .map(|_| ())
-                    })
+                    .table_insert_mvcc(table_id, vec![Val::from(2i32), Val::from(&b"retry"[..])])
                     .await
                     .unwrap_err();
                 assert_eq!(operation_error(&retry), Some(OperationError::SchemaChanged));
@@ -670,28 +652,22 @@ mod tests {
                     .unwrap();
 
                 old_trx
-                    .exec(async |stmt| stmt.table_scan_mvcc(table_id, &[0], |_| true).await)
+                    .table_scan_mvcc(table_id, &[0], |_| true)
                     .await
                     .unwrap();
                 let surviving = old_trx
-                    .exec(async |stmt| {
-                        stmt.table_lookup_unique_mvcc(table_id, 0, &[Val::from(7i32)], &[0])
-                            .await
-                    })
+                    .table_lookup_unique_mvcc(table_id, 0, &[Val::from(7i32)], &[0])
                     .await
                     .unwrap();
                 assert!(matches!(surviving, crate::row::ops::SelectMvcc::NotFound));
 
                 let new_index_err = old_trx
-                    .exec(async |stmt| {
-                        stmt.table_index_lookup_mvcc(
-                            table_id,
-                            usize::from(new_index_no),
-                            &[Val::from(&b"new"[..])],
-                            &[0],
-                        )
-                        .await
-                    })
+                    .table_index_lookup_mvcc(
+                        table_id,
+                        usize::from(new_index_no),
+                        &[Val::from(&b"new"[..])],
+                        &[0],
+                    )
                     .await
                     .unwrap_err();
                 assert_eq!(
@@ -700,14 +676,7 @@ mod tests {
                 );
 
                 let write_err = old_trx
-                    .exec(async |stmt| {
-                        stmt.table_insert_mvcc(
-                            table_id,
-                            vec![Val::from(8i32), Val::from(&b"stale"[..])],
-                        )
-                        .await
-                        .map(|_| ())
-                    })
+                    .table_insert_mvcc(table_id, vec![Val::from(8i32), Val::from(&b"stale"[..])])
                     .await
                     .unwrap_err();
                 assert_eq!(
@@ -736,15 +705,12 @@ mod tests {
                 let mut fresh_trx = fresh_session.begin_trx().unwrap();
                 if attributes.contains(IndexAttributes::UK) {
                     let fresh_result = fresh_trx
-                        .exec(async |stmt| {
-                            stmt.table_lookup_unique_mvcc(
-                                table_id,
-                                usize::from(new_index_no),
-                                &[Val::from(&b"new"[..])],
-                                &[0],
-                            )
-                            .await
-                        })
+                        .table_lookup_unique_mvcc(
+                            table_id,
+                            usize::from(new_index_no),
+                            &[Val::from(&b"new"[..])],
+                            &[0],
+                        )
                         .await
                         .unwrap();
                     assert!(matches!(
@@ -753,15 +719,12 @@ mod tests {
                     ));
                 } else {
                     let fresh_result = fresh_trx
-                        .exec(async |stmt| {
-                            stmt.table_index_lookup_mvcc(
-                                table_id,
-                                usize::from(new_index_no),
-                                &[Val::from(&b"new"[..])],
-                                &[0],
-                            )
-                            .await
-                        })
+                        .table_index_lookup_mvcc(
+                            table_id,
+                            usize::from(new_index_no),
+                            &[Val::from(&b"new"[..])],
+                            &[0],
+                        )
                         .await
                         .unwrap();
                     assert!(matches!(
@@ -789,7 +752,7 @@ mod tests {
             let mut bound_session = engine.new_session().unwrap();
             let mut bound_trx = bound_session.begin_trx().unwrap();
             bound_trx
-                .exec(async |stmt| stmt.table_scan_mvcc(table_id, &[0], |_| true).await)
+                .table_scan_mvcc(table_id, &[0], |_| true)
                 .await
                 .unwrap();
 
@@ -869,7 +832,7 @@ mod tests {
             let mut bound_trx = bound_session.begin_trx().unwrap();
             let bound_owner = LockOwner::transaction(bound_session_id, bound_trx.trx_id());
             bound_trx
-                .exec(async |stmt| stmt.table_scan_mvcc(table_id, &[0], |_| true).await)
+                .table_scan_mvcc(table_id, &[0], |_| true)
                 .await
                 .unwrap();
             let before_current_cts = engine
@@ -952,7 +915,7 @@ mod tests {
             let mut bound_trx = bound_session.begin_trx().unwrap();
             let bound_owner = LockOwner::transaction(bound_session_id, bound_trx.trx_id());
             bound_trx
-                .exec(async |stmt| stmt.table_scan_mvcc(table_id, &[0], |_| true).await)
+                .table_scan_mvcc(table_id, &[0], |_| true)
                 .await
                 .unwrap();
             let before_current_cts = engine
@@ -1066,10 +1029,7 @@ mod tests {
             assert!(metadata.idx.index_spec(0).is_none());
 
             let err = old_trx
-                .exec(async |stmt| {
-                    stmt.table_lookup_unique_mvcc(table_id, 0, &[Val::from(1i32)], &[0])
-                        .await
-                })
+                .table_lookup_unique_mvcc(table_id, 0, &[Val::from(1i32)], &[0])
                 .await
                 .unwrap_err();
             assert_eq!(operation_error(&err), Some(OperationError::SchemaChanged));
@@ -1140,7 +1100,7 @@ mod tests {
             ));
 
             let err = old_trx
-                .exec(async |stmt| stmt.table_scan_mvcc(table_id, &[0], |_| true).await)
+                .table_scan_mvcc(table_id, &[0], |_| true)
                 .await
                 .unwrap_err();
             assert_eq!(operation_error(&err), Some(OperationError::SchemaChanged));

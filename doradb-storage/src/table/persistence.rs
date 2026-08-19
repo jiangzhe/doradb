@@ -2923,6 +2923,8 @@ mod tests {
         });
     }
 
+    // RFC-0029 Phase 2 runner coverage: raw statement runtime inspection
+    // captures the transaction read-proof root snapshot.
     #[test]
     fn test_trx_read_proof_root_snapshot_captures_active_root() {
         smol::block_on(async {
@@ -4644,6 +4646,8 @@ mod tests {
                 .lock()
                 .take()
                 .expect("reader hook should install an active transaction");
+            // RFC-0029 Phase 2 runner coverage: raw statement runtime
+            // inspection captures a delayed checkpoint read proof.
             reader
                 .exec(async |stmt| {
                     let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
@@ -6121,6 +6125,8 @@ mod tests {
             let (delete_done_tx, delete_done_rx) = flume::bounded(1);
             let (return_error_tx, return_error_rx) = flume::bounded(1);
             let statement_key = key.clone();
+            // RFC-0029 Phase 2 runner coverage: callback error injection pauses
+            // statement row rollback at transition-route publication.
             let mut statement = Box::pin(writer.exec(async move |stmt| {
                 let deleted = stmt
                     .table_delete_unique_mvcc(table_id, statement_key.index_no, &statement_key.vals)
@@ -6418,6 +6424,8 @@ mod tests {
             let (delete_done_tx, delete_done_rx) = flume::bounded(1);
             let (return_error_tx, return_error_rx) = flume::bounded(1);
             let statement_key = key.clone();
+            // RFC-0029 Phase 2 runner coverage: cancelling a callback during
+            // row rollback transfers residual transition cleanup ownership.
             let mut statement = Box::pin(writer.exec(async move |stmt| {
                 let deleted = stmt
                     .table_delete_unique_mvcc(table_id, statement_key.index_no, &statement_key.vals)

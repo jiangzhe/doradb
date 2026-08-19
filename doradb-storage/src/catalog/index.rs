@@ -3906,8 +3906,7 @@ pub(crate) mod tests {
     }
 
     async fn trx_insert_row(trx: &mut Transaction, table: &Table, cols: Vec<Val>) -> Result<RowID> {
-        trx.exec(async |stmt| stmt.table_insert_mvcc(table.table_id(), cols).await)
-            .await
+        trx.table_insert_mvcc(table.table_id(), cols).await
     }
 
     async fn insert_one_row(table: &Table, session: &mut Session, values: Vec<Val>) -> RowID {
@@ -3933,10 +3932,7 @@ pub(crate) mod tests {
     async fn delete_one_row(table: &Table, session: &mut Session, key: &SelectKey) {
         let mut trx = session.begin_trx().unwrap();
         let delete = trx
-            .exec(async |stmt| {
-                stmt.table_delete_unique_mvcc(table.table_id(), key.index_no, &key.vals)
-                    .await
-            })
+            .table_delete_unique_mvcc(table.table_id(), key.index_no, &key.vals)
             .await;
         if !matches!(delete, Ok(DeleteMvcc::Deleted)) {
             panic!("delete should succeed: {delete:?}");
@@ -3952,10 +3948,7 @@ pub(crate) mod tests {
     ) -> RowID {
         let mut trx = session.begin_trx().unwrap();
         let result = trx
-            .exec(async |stmt| {
-                stmt.table_update_unique_mvcc(table.table_id(), key.index_no, &key.vals, update)
-                    .await
-            })
+            .table_update_unique_mvcc(table.table_id(), key.index_no, &key.vals, update)
             .await;
         let Ok(UpdateMvcc::Updated(row_id)) = result else {
             panic!("update should succeed: {result:?}");

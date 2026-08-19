@@ -445,6 +445,8 @@ mod tests {
     use error_stack::Report;
     use tempfile::TempDir;
 
+    // RFC-0029 Phase 2 runner coverage: same-statement index inspection before
+    // callback return verifies delete rollback ordering.
     #[test]
     fn test_column_delete_rollback() {
         smol::block_on(async {
@@ -552,6 +554,8 @@ mod tests {
         });
     }
 
+    // RFC-0029 Phase 2 runner coverage: callback error injection after raw
+    // index inspection drives statement-local insert rollback.
     #[test]
     fn test_unique_insert_rollback_restores_deleted_owner_even_when_row_missing() {
         smol::block_on(async {
@@ -661,6 +665,8 @@ mod tests {
         });
     }
 
+    // RFC-0029 Phase 2 runner coverage: callback error injection after raw
+    // stale-owner inspection drives statement-local insert rollback.
     #[test]
     fn test_unique_insert_rollback_restores_delete_marked_stale_hot_owner() {
         smol::block_on(async {

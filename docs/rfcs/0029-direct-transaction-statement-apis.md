@@ -766,10 +766,10 @@ benchmark counters without an explicit workload change. [D7] [C9] [C11] [U7]
     use it, and the remaining `exec` tests are explicitly runner-focused.
     Backlog 000186 remains open because the legacy callback surface is still
     public.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000273-direct-transaction-apis-and-atomic-batch-insert.md`
+  - Task Issue: `#988`
+  - Phase Status: done
+  - Implementation Summary: Implemented Phase 1 direct Transaction APIs and atomic batch insert, migrated ordinary storage tests, retained and classified runner-only coverage, and verified correctness and paired performance without changing settlement or persisted formats. [Task Resolve Sync: docs/tasks/000273-direct-transaction-apis-and-atomic-batch-insert.md @ 2026-08-19]
   - Related Backlogs:
     - `docs/backlogs/000186-statement-failure-rollback-before-error-return.md`
 

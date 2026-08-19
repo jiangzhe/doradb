@@ -3425,6 +3425,8 @@ mod tests {
         vec![Val::from(id), Val::from(name), Val::from(payload)]
     }
 
+    // RFC-0029 Phase 2 runner coverage: raw MemTable tests require direct
+    // runtime/effect access and explicit logical-lock injection.
     async fn insert_mem_mvcc(
         session: &mut Session,
         table_id: TableID,
@@ -3553,6 +3555,8 @@ mod tests {
         });
     }
 
+    // RFC-0029 Phase 2 runner coverage: raw MemTable upsert uses injected
+    // runtime/effects outside the catalog-owned public table boundary.
     #[test]
     fn test_mem_table_upsert_unique_insert_and_update() {
         smol::block_on(async {
@@ -3632,6 +3636,8 @@ mod tests {
         });
     }
 
+    // RFC-0029 Phase 2 runner coverage: raw MemTable write-conflict setup uses
+    // injected runtime/effects and explicit transaction locks.
     #[test]
     fn test_mem_table_upsert_unique_missing_key_write_conflict() {
         smol::block_on(async {
@@ -4304,6 +4310,8 @@ mod tests {
         });
     }
 
+    // RFC-0029 Phase 2 runner coverage: raw MemTable delete inspects and
+    // injects statement-local effects directly.
     #[test]
     fn test_mem_table_delete_unique_mvcc_marks_non_unique_index() {
         smol::block_on(async {
@@ -4386,6 +4394,8 @@ mod tests {
         });
     }
 
+    // RFC-0029 Phase 2 runner coverage: raw MemTable update composes physical
+    // index mutation with statement-local effect inspection.
     #[test]
     fn test_mem_table_update_key_change_updates_unique_and_non_unique_indexes() {
         smol::block_on(async {
@@ -4690,6 +4700,8 @@ mod tests {
         });
     }
 
+    // RFC-0029 Phase 2 runner coverage: raw MemTable transition-state panic
+    // injection verifies callback panic cancellation and cleanup.
     #[test]
     fn test_mem_table_transition_update_and_delete_panic() {
         smol::block_on(async {

@@ -52,7 +52,7 @@ pub use error::{Error, ErrorKind, OperationError, Result};
 pub use lock::TableLockMode;
 pub use row::ops::{
     DeleteMvcc, RowMutation, ScanMvcc, SelectKey, SelectMvcc, TableMutationOutcome, UpdateCol,
-    UpdateMvcc,
+    UpdateMvcc, UpsertMvcc,
 };
 pub use session::{
     CatalogRedoMaintenanceOutcome, RedoTruncationBlockerInfo, RedoTruncationOutcome, Session,

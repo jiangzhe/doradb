@@ -2735,6 +2735,8 @@ pub(crate) mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let trx_owner = trx_tests::lock_owner(&trx).unwrap();
+            // RFC-0029 Phase 2 runner coverage: statement and transaction
+            // logical-lock ownership identity is inspected through the facade.
             trx.exec(async |stmt| {
                 assert_eq!(stmt_tests::transaction_lock_owner(stmt), trx_owner);
                 let key = single_key(0i32);
@@ -2780,13 +2782,9 @@ pub(crate) mod tests {
             let mut trx = session.begin_trx().unwrap();
             let owner = trx_tests::lock_owner(&trx).unwrap();
 
-            trx.exec(async |stmt| {
-                stmt.table_insert_mvcc(table_id, vec![Val::from(10i32), Val::from("a")])
-                    .await?;
-                Ok(())
-            })
-            .await
-            .unwrap();
+            trx.table_insert_mvcc(table_id, vec![Val::from(10i32), Val::from("a")])
+                .await
+                .unwrap();
             assert!(has_lock_entry(
                 &engine,
                 owner,
@@ -2803,13 +2801,9 @@ pub(crate) mod tests {
             ));
             assert_eq!(lock_entry_count(&engine, owner), 2);
 
-            trx.exec(async |stmt| {
-                stmt.table_insert_mvcc(table_id, vec![Val::from(11i32), Val::from("b")])
-                    .await?;
-                Ok(())
-            })
-            .await
-            .unwrap();
+            trx.table_insert_mvcc(table_id, vec![Val::from(11i32), Val::from("b")])
+                .await
+                .unwrap();
             assert_eq!(lock_entry_count(&engine, owner), 2);
 
             trx.rollback().await.unwrap();
@@ -3315,17 +3309,12 @@ pub(crate) mod tests {
                 .unwrap();
 
             let mut read_trx = session.begin_trx().unwrap();
-            read_trx
-                .exec(async |stmt| {
-                    let key = single_key(0i32);
-                    let selected = stmt
-                        .table_lookup_unique_mvcc(table_id, key.index_no, &key.vals, &[0, 1])
-                        .await?;
-                    assert!(selected.is_found());
-                    Ok(())
-                })
+            let key = single_key(0i32);
+            let selected = read_trx
+                .table_lookup_unique_mvcc(table_id, key.index_no, &key.vals, &[0, 1])
                 .await
                 .unwrap();
+            assert!(selected.is_found());
             read_trx.commit().await.unwrap();
 
             let mut write_trx = session.begin_trx().unwrap();
@@ -3706,6 +3695,8 @@ pub(crate) mod tests {
             let mut corrupt_session = engine.new_session().unwrap();
             let mut corrupt_trx = corrupt_session.begin_trx().unwrap();
 
+            // RFC-0029 Phase 2 runner coverage: raw private catalog mutation
+            // intentionally injects metadata corruption in one statement.
             corrupt_trx
                 .exec(async |stmt| {
                     let deleted = engine
@@ -4768,12 +4759,9 @@ pub(crate) mod tests {
             );
 
             let mut trx = session.begin_trx().unwrap();
+            let key = single_key(11);
             let err = trx
-                .exec(async |stmt| {
-                    let key = single_key(11);
-                    stmt.table_lookup_unique_mvcc(table_id, key.index_no, &key.vals, &[0, 1])
-                        .await
-                })
+                .table_lookup_unique_mvcc(table_id, key.index_no, &key.vals, &[0, 1])
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -4882,6 +4870,8 @@ pub(crate) mod tests {
             let mut reader_trx = reader_session.begin_trx().unwrap();
             let (held_tx, held_rx) = flume::bounded(1);
             let (release_tx, release_rx) = flume::bounded(1);
+            // RFC-0029 Phase 2 runner coverage: checked-out callback
+            // cancellation while holding a raw metadata claim.
             let mut reader_fut = Box::pin(reader_trx.exec(async |stmt| {
                 stmt_tests::acquire_transaction_lock(
                     stmt,

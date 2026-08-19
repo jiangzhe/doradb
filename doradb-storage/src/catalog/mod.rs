@@ -2126,12 +2126,9 @@ pub(crate) mod tests {
 
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| {
-                stmt.table_insert_mvcc(table_id, vec![Val::I32(7)]).await?;
-                Ok(())
-            })
-            .await
-            .unwrap();
+            trx.table_insert_mvcc(table_id, vec![Val::I32(7)])
+                .await
+                .unwrap();
             trx.commit().await.unwrap();
 
             engine
@@ -2243,24 +2240,16 @@ pub(crate) mod tests {
             let mut session = engine.new_session().unwrap();
 
             let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| {
-                stmt.table_insert_mvcc(checkpointed_table_id, vec![Val::I32(7)])
-                    .await?;
-                Ok(())
-            })
-            .await
-            .unwrap();
+            trx.table_insert_mvcc(checkpointed_table_id, vec![Val::I32(7)])
+                .await
+                .unwrap();
             trx.commit().await.unwrap();
 
             let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| {
-                stmt.table_insert_mvcc(
-                    replay_only_table_id,
-                    vec![Val::I32(9), Val::from("replay-backed")],
-                )
-                .await?;
-                Ok(())
-            })
+            trx.table_insert_mvcc(
+                replay_only_table_id,
+                vec![Val::I32(9), Val::from("replay-backed")],
+            )
             .await
             .unwrap();
             trx.commit().await.unwrap();

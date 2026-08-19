@@ -3716,13 +3716,9 @@ pub(crate) mod tests {
         let payload = [7u8; 196];
         for value in 0..256 {
             let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| {
-                stmt.table_insert_mvcc(table_id, vec![Val::from(value), Val::from(&payload[..])])
-                    .await?;
-                Ok(())
-            })
-            .await
-            .unwrap();
+            trx.table_insert_mvcc(table_id, vec![Val::from(value), Val::from(&payload[..])])
+                .await
+                .unwrap();
             trx.commit().await.unwrap();
             if redo_file_path(main_dir, log_file_stem, target_file_seq).exists() {
                 return table_id;
@@ -3774,14 +3770,10 @@ pub(crate) mod tests {
     async fn commit_redo_durability_anchor(session: &mut Session, table_id: TableID) {
         let payload = [9u8; 196];
         let mut trx = session.begin_trx().unwrap();
-        trx.exec(async |stmt| {
-            stmt.table_insert_mvcc(
-                table_id,
-                vec![Val::from(10_000i32), Val::from(&payload[..])],
-            )
-            .await?;
-            Ok(())
-        })
+        trx.table_insert_mvcc(
+            table_id,
+            vec![Val::from(10_000i32), Val::from(&payload[..])],
+        )
         .await
         .unwrap();
         trx.commit().await.unwrap();
@@ -4494,13 +4486,9 @@ pub(crate) mod tests {
             let table_id = create_cache_test_table(&mut session).await;
 
             let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| {
-                stmt.table_insert_mvcc(table_id, vec![Val::from(1i32)])
-                    .await?;
-                Ok(())
-            })
-            .await
-            .unwrap();
+            trx.table_insert_mvcc(table_id, vec![Val::from(1i32)])
+                .await
+                .unwrap();
             trx.commit().await.unwrap();
 
             let pin = session.pin_observer().unwrap();
@@ -5284,7 +5272,7 @@ pub(crate) mod tests {
             assert!(state.lifecycle.lock().change_ev.is_none());
 
             let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |_stmt| Ok(())).await.unwrap();
+            trx.noop().await.unwrap();
             assert!(state.lifecycle.lock().change_ev.is_none());
             trx.rollback().await.unwrap();
             assert!(state.lifecycle.lock().change_ev.is_none());

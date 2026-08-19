@@ -54,6 +54,7 @@ doradb-storage/src/trx/stmt.rs,Statement::table_delete_unique_mvcc,4
 doradb-storage/src/trx/stmt.rs,Statement::table_index_lookup_mvcc,2
 doradb-storage/src/trx/stmt.rs,Statement::table_index_mutate_mvcc,3
 doradb-storage/src/trx/stmt.rs,Statement::table_index_scan_mvcc,3
+doradb-storage/src/trx/stmt.rs,Statement::table_insert_batch_mvcc,4
 doradb-storage/src/trx/stmt.rs,Statement::table_insert_mvcc,4
 doradb-storage/src/trx/stmt.rs,Statement::table_lookup_unique_mvcc,2
 doradb-storage/src/trx/stmt.rs,Statement::table_mutate_mvcc,2

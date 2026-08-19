@@ -1747,8 +1747,7 @@ mod tests {
         table_id: TableID,
         cols: Vec<Val>,
     ) -> Result<RowID> {
-        trx.exec(async |stmt| stmt.table_insert_mvcc(table_id, cols).await)
-            .await
+        trx.table_insert_mvcc(table_id, cols).await
     }
 
     async fn trx_delete_row(
@@ -1764,11 +1763,8 @@ mod tests {
         table_id: TableID,
         key: &SelectKey,
     ) -> Result<DeleteMvcc> {
-        trx.exec(async |stmt| {
-            stmt.table_delete_unique_mvcc(table_id, key.index_no, &key.vals)
-                .await
-        })
-        .await
+        trx.table_delete_unique_mvcc(table_id, key.index_no, &key.vals)
+            .await
     }
 
     async fn trx_update_row_by_id(
@@ -1777,11 +1773,8 @@ mod tests {
         key: &SelectKey,
         update: Vec<UpdateCol>,
     ) -> Result<UpdateMvcc> {
-        trx.exec(async |stmt| {
-            stmt.table_update_unique_mvcc(table_id, key.index_no, &key.vals, update)
-                .await
-        })
-        .await
+        trx.table_update_unique_mvcc(table_id, key.index_no, &key.vals, update)
+            .await
     }
 
     async fn trx_select_row_mvcc(
@@ -1790,11 +1783,8 @@ mod tests {
         key: &SelectKey,
         user_read_set: &[usize],
     ) -> Result<SelectMvcc> {
-        trx.exec(async |stmt| {
-            stmt.table_lookup_unique_mvcc(table.table_id(), key.index_no, &key.vals, user_read_set)
-                .await
-        })
-        .await
+        trx.table_lookup_unique_mvcc(table.table_id(), key.index_no, &key.vals, user_read_set)
+            .await
     }
 
     fn index_ddl_columns() -> Vec<ColumnSpec> {
@@ -1850,6 +1840,8 @@ mod tests {
     async fn commit_create_index_catalog_ddl(engine: &Engine, table_id: TableID) -> TrxID {
         let mut session = engine.new_session().unwrap();
         let mut trx = session.begin_trx().unwrap();
+        // RFC-0029 Phase 2 runner coverage: private catalog DDL composes
+        // multiple catalog mutations in one statement.
         trx.exec(async |stmt| {
             assert!(
                 engine
@@ -1930,6 +1922,8 @@ mod tests {
     async fn commit_drop_index_catalog_ddl(engine: &Engine, table_id: TableID) -> TrxID {
         let mut session = engine.new_session().unwrap();
         let mut trx = session.begin_trx().unwrap();
+        // RFC-0029 Phase 2 runner coverage: private catalog DDL composes
+        // multiple catalog mutations in one statement.
         trx.exec(async |stmt| {
             assert_eq!(
                 engine
@@ -3617,19 +3611,15 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let rows = trx
-                .exec(async |stmt| {
-                    Ok(stmt
-                        .table_index_lookup_mvcc(
-                            table.table_id(),
-                            name_key.index_no,
-                            &name_key.vals,
-                            &[0, 1],
-                        )
-                        .await?
-                        .unwrap_rows())
-                })
+                .table_index_lookup_mvcc(
+                    table.table_id(),
+                    name_key.index_no,
+                    &name_key.vals,
+                    &[0, 1],
+                )
                 .await
-                .unwrap();
+                .unwrap()
+                .unwrap_rows();
             assert_eq!(
                 rows,
                 vec![
@@ -3700,23 +3690,20 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let outcome = trx
-                .exec(async |stmt| {
-                    stmt.table_mutate_mvcc(table_id, |row| {
-                        Ok(match row.val(0)?.as_u32().unwrap() {
-                            0 | 10 => RowMutation::Delete,
-                            1 => RowMutation::Update(vec![UpdateCol {
-                                idx: 1,
-                                val: Val::from("cold-updated"),
-                            }]),
-                            11 => RowMutation::Update(vec![UpdateCol {
-                                idx: 1,
-                                val: Val::from("hot-updated"),
-                            }]),
-                            2 => RowMutation::Skip,
-                            _ => unreachable!(),
-                        })
+                .table_mutate_mvcc(table_id, |row| {
+                    Ok(match row.val(0)?.as_u32().unwrap() {
+                        0 | 10 => RowMutation::Delete,
+                        1 => RowMutation::Update(vec![UpdateCol {
+                            idx: 1,
+                            val: Val::from("cold-updated"),
+                        }]),
+                        11 => RowMutation::Update(vec![UpdateCol {
+                            idx: 1,
+                            val: Val::from("hot-updated"),
+                        }]),
+                        2 => RowMutation::Skip,
+                        _ => unreachable!(),
                     })
-                    .await
                 })
                 .await
                 .unwrap();
@@ -3733,21 +3720,16 @@ mod tests {
                     .unwrap();
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
-            let mut rows = trx
-                .exec(async |stmt| {
-                    let mut rows = Vec::new();
-                    stmt.table_scan_mvcc(table_id, &[0, 1], |row| {
-                        rows.push((
-                            row[0].as_u32().unwrap(),
-                            row[1].as_str().unwrap().to_owned(),
-                        ));
-                        true
-                    })
-                    .await?;
-                    Ok(rows)
-                })
-                .await
-                .unwrap();
+            let mut rows = Vec::new();
+            trx.table_scan_mvcc(table_id, &[0, 1], |row| {
+                rows.push((
+                    row[0].as_u32().unwrap(),
+                    row[1].as_str().unwrap().to_owned(),
+                ));
+                true
+            })
+            .await
+            .unwrap();
             rows.sort_unstable();
             assert_eq!(
                 rows,
@@ -3758,21 +3740,14 @@ mod tests {
                 ]
             );
             let cold_rows = trx
-                .exec(async |stmt| {
-                    Ok(stmt
-                        .table_index_lookup_mvcc(table_id, 1, &[Val::from("cold")], &[0])
-                        .await?
-                        .unwrap_rows())
-                })
+                .table_index_lookup_mvcc(table_id, 1, &[Val::from("cold")], &[0])
                 .await
-                .unwrap();
+                .unwrap()
+                .unwrap_rows();
             assert_eq!(cold_rows, vec![vec![Val::from(2u32)]]);
             for deleted_id in [0u32, 10] {
                 let deleted = trx
-                    .exec(async |stmt| {
-                        stmt.table_lookup_unique_mvcc(table_id, 0, &[Val::from(deleted_id)], &[0])
-                            .await
-                    })
+                    .table_lookup_unique_mvcc(table_id, 0, &[Val::from(deleted_id)], &[0])
                     .await
                     .unwrap();
                 assert_eq!(deleted, SelectMvcc::NotFound);
