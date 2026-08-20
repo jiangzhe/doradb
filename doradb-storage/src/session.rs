@@ -3750,19 +3750,19 @@ pub(crate) mod tests {
         let registry = &engine.inner().session_registry;
         let state = Arc::new(new_session_state_for_test(engine, session_id));
         let key = SessionOperationKey::new(session_id, OperationID::new(1));
-        let mut inner = state
-            .lifecycle
-            .lock()
-            .public_trx_cache
-            .take()
-            .expect("test session must start with one public transaction cache");
-        inner.init(
-            trx_id,
-            sts,
-            gc_no,
-            session_id,
-            FamilyLockAuthority::new(session_id),
-        );
+        let (mut inner, authority) = {
+            let mut lifecycle = state.lifecycle.lock();
+            let inner = lifecycle
+                .public_trx_cache
+                .take()
+                .expect("test session must start with one public transaction cache");
+            let authority = lifecycle
+                .lock_authority
+                .take()
+                .expect("test session must start with one family lock authority");
+            (inner, authority)
+        };
+        inner.init(trx_id, sts, gc_no, session_id, authority);
         let entry = SessionOperationEntry::new_public_transaction(key, inner);
         {
             let mut lifecycle = state.lifecycle.lock();

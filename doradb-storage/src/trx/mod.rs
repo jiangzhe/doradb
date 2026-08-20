@@ -3531,7 +3531,7 @@ pub(crate) mod tests {
         Session, SessionRegistry, SessionShutdownWait,
         tests::{
             SessionTestExt, TerminalAttachmentOutcome, TerminalAttachmentTestHookGuard,
-            active_operation_count, assert_existing_transaction_error,
+            active_operation_count, assert_existing_transaction_error, create_test_transaction,
             install_terminal_attachment_test_hook, remove_session_for_test,
             session_has_public_trx_cache, session_registry_len, wait_for_session_idle,
         },
@@ -6280,6 +6280,49 @@ pub(crate) mod tests {
 
             drop(hook);
             session.begin_trx().unwrap().rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_synthetic_transaction_commit_finalization_returns_session_authority() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("trx_synthetic_commit_finalization").await;
+            let registry = &engine.inner().session_registry;
+            let session_id = engine.inner().next_session_id();
+            let trx_id = MIN_ACTIVE_TRX_ID + 71;
+            let (trx, state) =
+                create_test_transaction(&engine, session_id, trx_id, TrxID::new(71), 0);
+            let claim = trx.claim_terminal().unwrap();
+            let (_entry, inner, attachment) = claim.into_parts();
+            let mut prepared = inner.prepare(attachment);
+            let payload = prepared
+                .payload
+                .take()
+                .expect("synthetic transaction must retain its prepared payload");
+            let PreparedTrxPayload::User { status, .. } = payload else {
+                panic!("synthetic transaction must retain user status")
+            };
+            let released = prepared
+                .release_transaction_locks()
+                .expect("synthetic transaction must release its family authority");
+            let attachment = prepared
+                .attachment
+                .take()
+                .expect("synthetic transaction must retain its terminal attachment");
+            let inner = prepared
+                .trx_inner
+                .take()
+                .expect("synthetic transaction must retain its reusable core");
+            drop(prepared);
+
+            let cts = TrxID::new(91_513);
+            status.commit_prepared(cts);
+            attachment.commit(released, cts, inner);
+
+            assert_eq!(active_operation_count(registry), 0);
+            assert!(session_has_public_trx_cache(registry, session_id));
+            remove_session_for_test(registry, session_id);
+            drop(state);
         });
     }
 
