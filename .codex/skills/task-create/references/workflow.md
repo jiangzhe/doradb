@@ -76,14 +76,20 @@ Produce an initial design package containing:
 
 1. Problem framing and success criteria.
 2. Current-state analysis grounded in documentation and code.
-3. At least three explicitly labeled proposals:
-   - `First-Principles Proposal`
-   - `Long-Term Evolution Proposal`
-   - `Original-Requirement-Fit Proposal`
-   - additional proposals only when they add real strategic value
+3. One best-overall recommended direction and zero to four alternatives.
 4. Scope, rationale, tradeoffs, drawbacks, and alignment or conflict with the
-   original request for each proposal.
-5. A best-overall recommendation with rationale.
+   original request for each presented direction.
+5. An explanation of how the recommendation was challenged through the
+   `First-Principles Proposal`, `Long-Term Evolution Proposal`, and
+   `Original-Requirement-Fit Proposal` lenses without requiring one output per
+   lens.
+
+Include an alternative only when it is important, large, and materially changes
+the implementation strategy, architecture, subsystem boundaries, public
+contract, data model, correctness approach, rollout, or long-term direction.
+Do not invent alternatives to reach a minimum count. Exclude small changes,
+local tactics, tuning choices, and implementation details; capture them within
+the chosen direction's design details and tradeoffs instead.
 
 Include a concise `Source References` block with:
 
@@ -94,10 +100,11 @@ Include a concise `Source References` block with:
 - conversation references (`[U#]`) only when user constraints materially
   affect scope or direction.
 
-Cite a relevant token in every proposal and the recommendation. Do not use
-low-value citation padding.
+Cite a relevant token in every presented alternative and the recommendation.
+Do not use low-value citation padding.
 
-For RFC-linked work, every proposal and the recommendation must state:
+For RFC-linked work, every presented alternative and the recommendation must
+state:
 
 - how target-phase prerequisites are satisfied;
 - which phase-local choices are resolved;
@@ -109,9 +116,10 @@ why the original direction is weaker when the recommendation conflicts with
 it. Effort-only variants such as easy, medium, and hard are insufficient unless
 they represent materially different strategic directions.
 
-The labeled proposal taxonomy applies only to proposal rounds. Capture the
-chosen direction and materially relevant rejected alternatives naturally in
-the final task document.
+The proposal lenses apply only to proposal rounds. Capture the chosen direction
+and no more than four materially relevant, large rejected alternatives
+naturally in the final task document. Omit minor variants and omit the rejected
+alternatives entirely when none clears the strategic-alternative gate.
 
 Ask for user feedback. Round 1 is incomplete without explicit input.
 

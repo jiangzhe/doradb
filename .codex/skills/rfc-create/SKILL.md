@@ -51,25 +51,37 @@ major decision and alternative.
 
 ## Round 1: Proposals
 
-Present goal, scope, direction, current-state analysis, and at least these
-three explicitly labeled proposals:
+Present goal, scope, direction, current-state analysis, one recommended
+direction, and one to four alternatives. Use these lenses to challenge the
+direction; treat them as analysis lenses, not mandatory proposal slots:
 
 - `First-Principles Proposal`
 - `Long-Term Evolution Proposal`
 - `Original-Requirement-Fit Proposal`
 
-For each proposal, explain its scope, rationale, tradeoffs, drawbacks, and
-alignment or conflict with the original request. State scope expansion
-explicitly and identify a prerequisite or Phase 0 candidate when useful.
+Include an alternative only when it is important, large, and materially changes
+the architecture, subsystem boundaries, public contract, data model,
+correctness approach, rollout or phase structure, or long-term direction. Do
+not invent alternatives to reach a minimum count. Exclude small changes, local
+tactics, tuning choices, and implementation details; fold them into the chosen
+direction's design details and tradeoffs instead. Omit any lens that does not
+produce a qualifying alternative. If no important, large alternative qualifies,
+report that the proposal gate is incomplete and request user feedback instead
+of drafting the RFC.
+
+For each presented direction, explain its scope, rationale, tradeoffs,
+drawbacks, and alignment or conflict with the original request. State scope
+expansion explicitly and identify a prerequisite or Phase 0 candidate when
+useful.
 
 Recommend the best overall direction for correctness and project evolution.
 Do not default to the original request or use effort tiers as substitutes for
 materially different strategies. Explain why the original direction is weaker
 when the recommendation conflicts with it.
 
-Use the labeled proposal taxonomy only during proposal rounds. Record the
-chosen direction and materially relevant alternatives in the final RFC's
-normal `Decision` and `Alternatives Considered` sections.
+Use the proposal lenses only during proposal rounds. Record the chosen direction
+in `Decision`. Record one to four materially relevant, large rejected
+alternatives in `Alternatives Considered`, and omit minor variants.
 
 Ask for user feedback. Round 1 is incomplete without explicit input.
 
@@ -104,7 +116,7 @@ Incorporate feedback and finalize:
 - goals, non-goals, and scope boundaries;
 - interfaces, contracts, and correctness direction;
 - implementation phases and their actionable boundaries;
-- alternatives and explicit rejection rationale;
+- one to four major alternatives and explicit rejection rationale;
 - consequences, risks, and test strategy;
 - open questions and future work.
 
@@ -132,6 +144,7 @@ Ensure the formal RFC is:
 1. Decision-complete for implementation direction.
 2. Explicit about goal, scope, and change direction.
 3. Grounded in document, code, conversation, and backlog evidence.
-4. Explicit about alternatives and rejection rationale.
+4. Explicit about one to four important, large alternatives and rejection
+   rationale, without elevating small changes into alternatives.
 5. Phase-structured for downstream task and issue tracking.
 6. Based on materially different strategic proposals.
