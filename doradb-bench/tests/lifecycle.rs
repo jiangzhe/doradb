@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use doradb_bench::measurement::{LatencyUnit, WorkloadMetrics};
+    use doradb_bench::measurement::{LatencyUnit, WorkloadCounters, WorkloadMetrics};
     use doradb_bench::plan_output::InvocationReport;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -77,6 +77,16 @@ mod tests {
         assert!(!root.join("benchmark-result.csv").exists());
         assert!(!root.join("benchmark-internal-stats.csv").exists());
         (root, report)
+    }
+
+    fn assert_update_counters(counters: WorkloadCounters) {
+        assert_eq!(counters.operations, counters.updated_rows);
+        assert_eq!(counters.inserted_rows, 0);
+        assert_eq!(counters.found, 0);
+        assert_eq!(counters.not_found, 0);
+        assert_eq!(counters.rows_returned, 0);
+        assert_eq!(counters.expected_outcomes.duplicate_key, 0);
+        assert_eq!(counters.expected_outcomes.write_conflict, 0);
     }
 
     #[test]
@@ -198,6 +208,66 @@ mod tests {
         let (_root, report) = execute_plan(&temp, "index-ddl", phases);
         assert_eq!(report.aggregate.counters.operations, 2);
         assert_eq!(report.aggregate.latency.sample_count, 1);
+    }
+
+    #[test]
+    fn random_index_updates_replay_unique_keys_and_non_unique_payloads() {
+        let temp = TempDir::new().unwrap();
+        let unique = "\n[[phase]]\nworkload = { type = \"create-table\", index = \"unique\" }\n\
+                      [[phase]]\nworkload = { type = \"insert-seq\", num = 12, batch_size = 4 }\n\
+                      [[phase]]\nkind = \"benchmark\"\nwarmup_runs = 1\nmeasured_runs = 3\n\
+                      workload = { type = \"update-rand\", num = 11, seed = 7, change_key = true, threads = 2, sessions = 3, value_size = \"17 B\", batch_size = 2 }\n";
+        let (_root, report) = execute_plan(&temp, "update-unique", unique);
+        assert_eq!(report.measured_runs.len(), 3);
+        let updated_rows = report.measured_runs[0].counters.updated_rows;
+        assert!(updated_rows > 0);
+        for run in &report.measured_runs {
+            assert_update_counters(run.counters);
+            assert_eq!(run.counters.updated_rows, updated_rows);
+            assert_eq!(run.latency.unit, LatencyUnit::UpdateRangeTransaction);
+            assert_eq!(run.latency.sample_count, 6);
+        }
+        assert_update_counters(report.aggregate.counters);
+        assert_eq!(report.aggregate.counters.updated_rows, updated_rows * 3);
+        assert_eq!(report.aggregate.latency.sample_count, 18);
+
+        let non_unique = "\n[[phase]]\nworkload = { type = \"create-table\", index = \"non-unique\" }\n\
+                          [[phase]]\nworkload = { type = \"insert-rand\", num = 32, seed = 2, batch_size = 8 }\n\
+                          [[phase]]\nkind = \"benchmark\"\nwarmup_runs = 1\nmeasured_runs = 2\n\
+                          workload = { type = \"update-rand\", num = 12, seed = 5, change_key = false, threads = 2, sessions = 4, value_size = \"9 B\", batch_size = 2 }\n";
+        let (_root, report) = execute_plan(&temp, "update-non-unique", non_unique);
+        assert_eq!(report.measured_runs.len(), 2);
+        assert!(report.prepare_phases[1].counters.inserted_rows > 0);
+        for run in &report.measured_runs {
+            assert_update_counters(run.counters);
+            assert_eq!(run.latency.unit, LatencyUnit::UpdateRangeTransaction);
+            assert_eq!(run.latency.sample_count, 8);
+        }
+        assert_update_counters(report.aggregate.counters);
+        assert_eq!(report.aggregate.latency.sample_count, 16);
+    }
+
+    #[test]
+    fn checked_in_update_template_executes_end_to_end() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("update-template-root");
+        let template = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("templates")
+            .join("update-rand.toml");
+        let stdout = assert_success(run_bench(&root, &["--plan", template.to_str().unwrap()]));
+        let report: InvocationReport =
+            toml::from_str(&fs::read_to_string(root.join("benchmark-result.toml")).unwrap())
+                .unwrap();
+        assert!(stdout.contains("workload: update-rand\n"));
+        assert_eq!(report.measured_runs.len(), 3);
+        for run in &report.measured_runs {
+            assert_update_counters(run.counters);
+            assert!(run.counters.updated_rows > 0);
+            assert_eq!(run.latency.unit, LatencyUnit::UpdateRangeTransaction);
+            assert_eq!(run.latency.sample_count, 12);
+        }
+        assert_update_counters(report.aggregate.counters);
+        assert_eq!(report.aggregate.latency.sample_count, 36);
     }
 
     #[test]

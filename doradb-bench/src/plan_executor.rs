@@ -16,7 +16,7 @@ use crate::workload::{
     CheckpointTableExecutor, CreateTableExecutor, FreezeTableExecutor, IndexDdlExecutor,
     IndexScanExecutor, IndexStreamExecutor, InsertRandExecutor, InsertSeqExecutor,
     LockTableExecutor, LookupRandExecutor, LookupSeqExecutor, RunCancellation, SessionPlan,
-    StmtNoopExecutor, TableDdlExecutor, TableScanExecutor, TrxNoopExecutor,
+    StmtNoopExecutor, TableDdlExecutor, TableScanExecutor, TrxNoopExecutor, UpdateRandExecutor,
 };
 use doradb_storage::{Engine, Session};
 use easy_parallel::Parallel;
@@ -32,11 +32,17 @@ pub(crate) struct SessionExecutorConfig<C> {
     pub(crate) resolved: C,
     /// Runtime fixture capability selected by the phase coordinator.
     pub(crate) binding: FixtureBinding,
+    /// Zero-based execution position across warm-up and measured repetitions.
+    pub(crate) execution_ordinal: u32,
 }
 
 impl<C> SessionExecutorConfig<C> {
-    fn new(resolved: C, binding: FixtureBinding) -> Self {
-        Self { resolved, binding }
+    fn new(resolved: C, binding: FixtureBinding, execution_ordinal: u32) -> Self {
+        Self {
+            resolved,
+            binding,
+            execution_ordinal,
+        }
     }
 }
 
@@ -85,15 +91,15 @@ pub(crate) trait SessionExecutor: Clone + Send + Sync + Sized + 'static {
     fn session_plans(&self) -> Result<Vec<SessionPlan>>;
 
     /// Execute one session assignment without owning session close.
-    fn execute<'a>(
-        &'a self,
-        engine: &'a Engine,
-        session: &'a mut Session,
-        plan: &'a SessionPlan,
-        clock: &'a MeasurementClock,
+    fn execute(
+        &self,
+        engine: &Engine,
+        session: &mut Session,
+        plan: &SessionPlan,
+        clock: &MeasurementClock,
         sample_latency: bool,
-        cancellation: &'a RunCancellation,
-    ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a;
+        cancellation: &RunCancellation,
+    ) -> impl Future<Output = Result<Self::Outcome>> + Send;
 
     /// Complete workload-specific timing that ends after successful close.
     fn after_session_close(
@@ -105,10 +111,7 @@ pub(crate) trait SessionExecutor: Clone + Send + Sync + Sized + 'static {
     }
 
     /// Verify workload-specific state after every declared session has joined.
-    fn finish_run<'a>(
-        &'a self,
-        _engine: &'a Engine,
-    ) -> impl Future<Output = Result<()>> + Send + 'a {
+    fn finish_run(&self, _engine: &Engine) -> impl Future<Output = Result<()>> + Send {
         async { Ok(()) }
     }
 
@@ -180,7 +183,7 @@ async fn execute_phases(
             } => {
                 let binding = fixture.bind(workload.fixture_requirement())?;
                 let outcome =
-                    dispatch_workload(engine, clock, workload, binding, fixture_effect, false)
+                    dispatch_workload(engine, clock, workload, binding, fixture_effect, false, 0)
                         .await?;
                 fixture.apply(outcome.effect)?;
                 prepare_phases.push(PreparePhaseResult {
@@ -197,19 +200,40 @@ async fn execute_phases(
                 workload,
                 fixture_effect,
             } => {
-                for _ in 0..measurement.warmup_runs {
+                for execution_ordinal in 0..measurement.warmup_runs {
                     let binding = fixture.bind(workload.fixture_requirement())?;
-                    dispatch_workload(engine, clock, workload, binding, fixture_effect, true)
-                        .await?;
+                    dispatch_workload(
+                        engine,
+                        clock,
+                        workload,
+                        binding,
+                        fixture_effect,
+                        true,
+                        execution_ordinal,
+                    )
+                    .await?;
                 }
 
                 let mut aggregate = BenchmarkAccumulator::new()?;
                 let mut phase_effect = None;
                 for run_index in 1..=measurement.measured_runs.get() {
+                    let execution_ordinal = measurement
+                        .warmup_runs
+                        .checked_add(run_index - 1)
+                        .ok_or_else(|| {
+                            BenchError::message("benchmark execution ordinal overflow")
+                        })?;
                     let binding = fixture.bind(workload.fixture_requirement())?;
-                    let outcome =
-                        dispatch_workload(engine, clock, workload, binding, fixture_effect, true)
-                            .await?;
+                    let outcome = dispatch_workload(
+                        engine,
+                        clock,
+                        workload,
+                        binding,
+                        fixture_effect,
+                        true,
+                        execution_ordinal,
+                    )
+                    .await?;
                     let latency = outcome.latency.summary(workload.latency_unit())?;
                     aggregate.add_run(outcome.elapsed_nanos, outcome.counters, &outcome.latency)?;
                     measured_runs.push(MeasuredRunResult {
@@ -255,6 +279,7 @@ async fn dispatch_workload(
     binding: FixtureBinding,
     planned_effect: &FixturePlanEffect,
     sample_latency: bool,
+    execution_ordinal: u32,
 ) -> Result<RunOutcome> {
     match workload {
         ResolvedWorkload::CreateTable(config) => {
@@ -262,7 +287,7 @@ async fn dispatch_workload(
                 engine,
                 clock,
                 workload,
-                SessionExecutorConfig::new(*config, binding),
+                SessionExecutorConfig::new(*config, binding, execution_ordinal),
                 planned_effect,
                 sample_latency,
             )
@@ -273,7 +298,7 @@ async fn dispatch_workload(
                 engine,
                 clock,
                 workload,
-                SessionExecutorConfig::new(*config, binding),
+                SessionExecutorConfig::new(*config, binding, execution_ordinal),
                 planned_effect,
                 sample_latency,
             )
@@ -284,7 +309,7 @@ async fn dispatch_workload(
                 engine,
                 clock,
                 workload,
-                SessionExecutorConfig::new(*config, binding),
+                SessionExecutorConfig::new(*config, binding, execution_ordinal),
                 planned_effect,
                 sample_latency,
             )
@@ -295,7 +320,7 @@ async fn dispatch_workload(
                 engine,
                 clock,
                 workload,
-                SessionExecutorConfig::new(*config, binding),
+                SessionExecutorConfig::new(*config, binding, execution_ordinal),
                 planned_effect,
                 sample_latency,
             )
@@ -306,7 +331,18 @@ async fn dispatch_workload(
                 engine,
                 clock,
                 workload,
-                SessionExecutorConfig::new(*config, binding),
+                SessionExecutorConfig::new(*config, binding, execution_ordinal),
+                planned_effect,
+                sample_latency,
+            )
+            .await
+        }
+        ResolvedWorkload::UpdateRand(config) => {
+            run_executor::<UpdateRandExecutor>(
+                engine,
+                clock,
+                workload,
+                SessionExecutorConfig::new(*config, binding, execution_ordinal),
                 planned_effect,
                 sample_latency,
             )
@@ -317,7 +353,7 @@ async fn dispatch_workload(
                 engine,
                 clock,
                 workload,
-                SessionExecutorConfig::new(*config, binding),
+                SessionExecutorConfig::new(*config, binding, execution_ordinal),
                 planned_effect,
                 sample_latency,
             )
@@ -328,7 +364,7 @@ async fn dispatch_workload(
                 engine,
                 clock,
                 workload,
-                SessionExecutorConfig::new(*config, binding),
+                SessionExecutorConfig::new(*config, binding, execution_ordinal),
                 planned_effect,
                 sample_latency,
             )
@@ -339,7 +375,7 @@ async fn dispatch_workload(
                 engine,
                 clock,
                 workload,
-                SessionExecutorConfig::new(*config, binding),
+                SessionExecutorConfig::new(*config, binding, execution_ordinal),
                 planned_effect,
                 sample_latency,
             )
@@ -350,7 +386,7 @@ async fn dispatch_workload(
                 engine,
                 clock,
                 workload,
-                SessionExecutorConfig::new(*config, binding),
+                SessionExecutorConfig::new(*config, binding, execution_ordinal),
                 planned_effect,
                 sample_latency,
             )
@@ -361,7 +397,7 @@ async fn dispatch_workload(
                 engine,
                 clock,
                 workload,
-                SessionExecutorConfig::new(*config, binding),
+                SessionExecutorConfig::new(*config, binding, execution_ordinal),
                 planned_effect,
                 sample_latency,
             )
@@ -372,7 +408,7 @@ async fn dispatch_workload(
                 engine,
                 clock,
                 workload,
-                SessionExecutorConfig::new(*config, binding),
+                SessionExecutorConfig::new(*config, binding, execution_ordinal),
                 planned_effect,
                 sample_latency,
             )
@@ -383,7 +419,7 @@ async fn dispatch_workload(
                 engine,
                 clock,
                 workload,
-                SessionExecutorConfig::new(*config, binding),
+                SessionExecutorConfig::new(*config, binding, execution_ordinal),
                 planned_effect,
                 sample_latency,
             )
@@ -394,7 +430,7 @@ async fn dispatch_workload(
                 engine,
                 clock,
                 workload,
-                SessionExecutorConfig::new(*config, binding),
+                SessionExecutorConfig::new(*config, binding, execution_ordinal),
                 planned_effect,
                 sample_latency,
             )
@@ -405,7 +441,7 @@ async fn dispatch_workload(
                 engine,
                 clock,
                 workload,
-                SessionExecutorConfig::new(*config, binding),
+                SessionExecutorConfig::new(*config, binding, execution_ordinal),
                 planned_effect,
                 sample_latency,
             )
@@ -416,7 +452,7 @@ async fn dispatch_workload(
                 engine,
                 clock,
                 workload,
-                SessionExecutorConfig::new(*config, binding),
+                SessionExecutorConfig::new(*config, binding, execution_ordinal),
                 planned_effect,
                 sample_latency,
             )
@@ -670,6 +706,7 @@ mod tests {
                 TrxNoopExecutor::IDENTITY,
                 InsertSeqExecutor::IDENTITY,
                 InsertRandExecutor::IDENTITY,
+                UpdateRandExecutor::IDENTITY,
                 TableDdlExecutor::IDENTITY,
                 LookupSeqExecutor::IDENTITY,
                 LookupRandExecutor::IDENTITY,
@@ -687,6 +724,7 @@ mod tests {
                 "trx-noop",
                 "insert-seq",
                 "insert-rand",
+                "update-rand",
                 "table-ddl",
                 "lookup-seq",
                 "lookup-rand",

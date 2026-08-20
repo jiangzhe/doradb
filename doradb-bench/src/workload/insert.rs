@@ -12,7 +12,6 @@ use crate::workload::util::{merge_measurement, require_primary, verify_samples};
 use crate::workload::{RunCancellation, SessionPlan, build_session_plans};
 use doradb_storage::id::{TableID, TrxID};
 use doradb_storage::{Engine, OperationError, Session, Val};
-use std::future::Future;
 
 /// Sequential-insert session executor.
 #[derive(Clone, Copy)]
@@ -43,15 +42,15 @@ impl SessionExecutor for InsertSeqExecutor {
         )
     }
 
-    fn execute<'a>(
-        &'a self,
-        _engine: &'a Engine,
-        session: &'a mut Session,
-        plan: &'a SessionPlan,
-        clock: &'a MeasurementClock,
+    async fn execute(
+        &self,
+        _engine: &Engine,
+        session: &mut Session,
+        plan: &SessionPlan,
+        clock: &MeasurementClock,
         sample_latency: bool,
-        cancellation: &'a RunCancellation,
-    ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a {
+        cancellation: &RunCancellation,
+    ) -> Result<Self::Outcome> {
         execute_insert_session(
             &self.state,
             session,
@@ -59,6 +58,7 @@ impl SessionExecutor for InsertSeqExecutor {
             sample_latency.then_some(clock),
             cancellation,
         )
+        .await
     }
 
     fn verify_outcome(
@@ -106,15 +106,15 @@ impl SessionExecutor for InsertRandExecutor {
         )
     }
 
-    fn execute<'a>(
-        &'a self,
-        _engine: &'a Engine,
-        session: &'a mut Session,
-        plan: &'a SessionPlan,
-        clock: &'a MeasurementClock,
+    async fn execute(
+        &self,
+        _engine: &Engine,
+        session: &mut Session,
+        plan: &SessionPlan,
+        clock: &MeasurementClock,
         sample_latency: bool,
-        cancellation: &'a RunCancellation,
-    ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a {
+        cancellation: &RunCancellation,
+    ) -> Result<Self::Outcome> {
         execute_insert_session(
             &self.state,
             session,
@@ -122,6 +122,7 @@ impl SessionExecutor for InsertRandExecutor {
             sample_latency.then_some(clock),
             cancellation,
         )
+        .await
     }
 
     fn verify_outcome(
@@ -294,6 +295,7 @@ fn verify_insert_outcome(
         .ok_or_else(|| BenchError::message("insert terminal counter overflow"))?;
     if counters.operations != state.config.num
         || counters.operations != terminal
+        || counters.updated_rows != 0
         || counters.found != 0
         || counters.not_found != 0
         || counters.rows_returned != 0

@@ -16,7 +16,6 @@ use crate::workload::{RunCancellation, SessionPlan};
 use doradb_storage::id::TableID;
 use doradb_storage::{CheckpointDelayReason, CheckpointOutcome, Engine, FreezeOutcome, Session};
 use smol::future::or;
-use std::future::Future;
 
 /// Single-table frozen-prefix executor.
 #[derive(Clone, Copy)]
@@ -54,16 +53,16 @@ impl SessionExecutor for FreezeTableExecutor {
         operation_plans(1, 1)
     }
 
-    fn execute<'a>(
-        &'a self,
-        _engine: &'a Engine,
-        session: &'a mut Session,
-        _plan: &'a SessionPlan,
-        clock: &'a MeasurementClock,
+    async fn execute(
+        &self,
+        _engine: &Engine,
+        session: &mut Session,
+        _plan: &SessionPlan,
+        clock: &MeasurementClock,
         sample_latency: bool,
-        _cancellation: &'a RunCancellation,
-    ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a {
-        execute_freeze_session(session, self.primary, self.config, clock, sample_latency)
+        _cancellation: &RunCancellation,
+    ) -> Result<Self::Outcome> {
+        execute_freeze_session(session, self.primary, self.config, clock, sample_latency).await
     }
 
     fn verify_outcome(
@@ -125,15 +124,15 @@ impl SessionExecutor for CheckpointTableExecutor {
         operation_plans(1, 1)
     }
 
-    fn execute<'a>(
-        &'a self,
-        _engine: &'a Engine,
-        session: &'a mut Session,
-        _plan: &'a SessionPlan,
-        clock: &'a MeasurementClock,
+    async fn execute(
+        &self,
+        _engine: &Engine,
+        session: &mut Session,
+        _plan: &SessionPlan,
+        clock: &MeasurementClock,
         sample_latency: bool,
-        cancellation: &'a RunCancellation,
-    ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a {
+        cancellation: &RunCancellation,
+    ) -> Result<Self::Outcome> {
         execute_checkpoint_session(
             session,
             self.primary.table_id,
@@ -141,6 +140,7 @@ impl SessionExecutor for CheckpointTableExecutor {
             sample_latency,
             cancellation,
         )
+        .await
     }
 
     fn verify_outcome(

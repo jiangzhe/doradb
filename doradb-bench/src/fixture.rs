@@ -265,6 +265,14 @@ impl FixturePlanState {
             .ok_or_else(|| BenchError::message("read workload requires loaded benchmark data"))
     }
 
+    /// Return the current primary-table shape.
+    pub(crate) fn primary_shape(&self) -> Result<PrimaryTableShape> {
+        self.primary
+            .as_ref()
+            .map(|primary| primary.shape)
+            .ok_or_else(|| BenchError::message("workload requires a preceding create-table phase"))
+    }
+
     /// Apply one already-validated transition before resolving the next phase.
     pub(crate) fn apply(&mut self, effect: &FixturePlanEffect) -> Result<()> {
         match *effect {

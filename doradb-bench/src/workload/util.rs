@@ -200,6 +200,7 @@ pub(super) fn verify_simple_counters(
 ) -> Result<()> {
     if counters.operations != operations
         || counters.inserted_rows != 0
+        || counters.updated_rows != 0
         || counters.found != 0
         || counters.not_found != 0
         || counters.rows_returned != 0
@@ -216,6 +217,7 @@ pub(super) fn verify_simple_counters(
 /// Reject write counters from a read-only workload.
 pub(super) fn verify_no_write_counters(identity: &str, counters: WorkloadCounters) -> Result<()> {
     if counters.inserted_rows != 0
+        || counters.updated_rows != 0
         || counters.expected_outcomes != ExpectedOutcomeCounters::default()
     {
         Err(BenchError::message(format!(
@@ -449,6 +451,7 @@ mod tests {
         let mut aggregate = SessionMeasurement {
             counters: WorkloadCounters {
                 operations: 2,
+                updated_rows: 2,
                 ..WorkloadCounters::default()
             },
             latency: LatencyDistribution::new().unwrap(),
@@ -457,6 +460,7 @@ mod tests {
         let mut other = SessionMeasurement {
             counters: WorkloadCounters {
                 operations: 3,
+                updated_rows: 3,
                 found: 1,
                 ..WorkloadCounters::default()
             },
@@ -466,6 +470,7 @@ mod tests {
 
         merge_measurement(&mut aggregate, other).unwrap();
         assert_eq!(aggregate.counters.operations, 5);
+        assert_eq!(aggregate.counters.updated_rows, 5);
         assert_eq!(aggregate.counters.found, 1);
         assert_eq!(aggregate.latency.sample_count(), 2);
     }
@@ -484,6 +489,13 @@ mod tests {
         assert!(verify_simple_counters("test", counters, 3).is_err());
         assert!(verify_read_shape("test", counters, 2, false).is_ok());
         assert!(verify_read_shape("test", counters, 2, true).is_err());
+        let updated = WorkloadCounters {
+            operations: 2,
+            updated_rows: 1,
+            ..WorkloadCounters::default()
+        };
+        assert!(verify_simple_counters("test", updated, 2).is_err());
+        assert!(verify_read_shape("test", updated, 2, false).is_err());
 
         assert!(verify_no_effect(&FixturePlanEffect::None).is_ok());
         assert!(

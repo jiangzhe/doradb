@@ -9,6 +9,7 @@ mod lock;
 mod maintenance;
 mod noop;
 mod read;
+mod update;
 mod util;
 
 pub(crate) use ddl::{CreateTableExecutor, IndexDdlExecutor, TableDdlExecutor};
@@ -20,6 +21,7 @@ pub(crate) use read::{
     IndexScanExecutor, IndexStreamExecutor, LookupRandExecutor, LookupSeqExecutor,
     TableScanExecutor,
 };
+pub(crate) use update::UpdateRandExecutor;
 pub(crate) use util::build_session_plans;
 
 /// First-error-wins cooperative cancellation shared by one plan run.

@@ -15,7 +15,6 @@ use crate::workload::util::{
 use crate::workload::{RunCancellation, SessionPlan};
 use doradb_storage::id::TableID;
 use doradb_storage::{Engine, Session};
-use std::future::Future;
 use std::sync::Arc;
 
 /// Ordered table-pool creation executor.
@@ -49,16 +48,16 @@ impl SessionExecutor for CreateTableExecutor {
         )
     }
 
-    fn execute<'a>(
-        &'a self,
-        _engine: &'a Engine,
-        session: &'a mut Session,
-        _plan: &'a SessionPlan,
-        clock: &'a MeasurementClock,
+    async fn execute(
+        &self,
+        _engine: &Engine,
+        session: &mut Session,
+        _plan: &SessionPlan,
+        clock: &MeasurementClock,
         sample_latency: bool,
-        _cancellation: &'a RunCancellation,
-    ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a {
-        execute_create_table_session(self.config, session, sample_latency.then_some(clock))
+        _cancellation: &RunCancellation,
+    ) -> Result<Self::Outcome> {
+        execute_create_table_session(self.config, session, sample_latency.then_some(clock)).await
     }
 
     fn verify_outcome(
@@ -135,15 +134,15 @@ impl SessionExecutor for TableDdlExecutor {
         operation_plans(self.config.num, self.config.sessions)
     }
 
-    fn execute<'a>(
-        &'a self,
-        _engine: &'a Engine,
-        session: &'a mut Session,
-        plan: &'a SessionPlan,
-        clock: &'a MeasurementClock,
+    async fn execute(
+        &self,
+        _engine: &Engine,
+        session: &mut Session,
+        plan: &SessionPlan,
+        clock: &MeasurementClock,
         sample_latency: bool,
-        cancellation: &'a RunCancellation,
-    ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a {
+        cancellation: &RunCancellation,
+    ) -> Result<Self::Outcome> {
         execute_ddl_session(
             session,
             None,
@@ -151,6 +150,7 @@ impl SessionExecutor for TableDdlExecutor {
             sample_latency.then_some(clock),
             cancellation,
         )
+        .await
     }
 
     fn verify_outcome(
@@ -197,15 +197,15 @@ impl SessionExecutor for IndexDdlExecutor {
         operation_plans(self.config.num, self.config.sessions)
     }
 
-    fn execute<'a>(
-        &'a self,
-        _engine: &'a Engine,
-        session: &'a mut Session,
-        plan: &'a SessionPlan,
-        clock: &'a MeasurementClock,
+    async fn execute(
+        &self,
+        _engine: &Engine,
+        session: &mut Session,
+        plan: &SessionPlan,
+        clock: &MeasurementClock,
         sample_latency: bool,
-        cancellation: &'a RunCancellation,
-    ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a {
+        cancellation: &RunCancellation,
+    ) -> Result<Self::Outcome> {
         execute_ddl_session(
             session,
             Some(self.primary.table_id),
@@ -213,6 +213,7 @@ impl SessionExecutor for IndexDdlExecutor {
             sample_latency.then_some(clock),
             cancellation,
         )
+        .await
     }
 
     fn verify_outcome(

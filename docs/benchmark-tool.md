@@ -116,6 +116,7 @@ All serde-facing counts, ranges, widths, and table counts are positive.
 | `create-table` | required `index`; optional `tables` | absent primary | single run |
 | `stmt-noop`, `trx-noop` | required `num` | none | safe |
 | `insert-seq`, `insert-rand` | required `num`; optional `seed`, `value_size`, `batch_size` | any primary | single run |
+| `update-rand` | required `num`; optional `seed`, `change_key`, `value_size`, `batch_size` | committed secondary index | safe, benchmark only |
 | `table-ddl` | optional `num` | none | single run |
 | `lookup-seq` | required `num`; optional `batch_size` | committed unique primary | safe |
 | `lookup-rand` | lookup controls plus optional `seed` | committed unique primary | safe |
@@ -133,6 +134,29 @@ half-open bounds; omitted `range` spans the full candidate range and an
 oversized range is rejected. Table scans iterate all visible rows. Read
 batching is per declared session. A statement/stream error rolls back best
 effort and preserves the original error.
+
+`update-rand` requires a committed primary with a unique or non-unique
+secondary index and is allowed only as the final benchmark phase. `num` is an
+aggregate logical-key-width budget, while `batch_size` is the preferred width
+of one half-open range transaction. Neither is an exact row count: candidate
+gaps, overlapping ranges, and duplicate non-unique keys can make actual work
+smaller or larger than a configured width. Sessions own contiguous nonempty
+candidate-key shards, and their seeded random ranges remain inside those
+disjoint shards. Ranges may overlap within one session, and budgets smaller
+than the session count leave some sessions with no transaction.
+`seed` defaults to zero and `change_key` defaults to false; worker, payload,
+batch, and diagnostic omissions inherit the normal workload defaults. Update
+payload size must be positive.
+
+Every matched row receives a deterministic payload. Payload variants alternate
+across warm-up and measured executions, and a value equal to the preferred
+variant is replaced by the other variant so every callback-selected row
+changes. With `change_key = true`, even execution ordinals move matched keys
+from the original candidate domain into an equal-width disjoint domain; odd
+ordinals replay the same relative ranges in the alternate domain and move the
+same union back. Unique and non-unique multiplicity are preserved. All
+repetitions share the evolving fixture and therefore accumulate MVCC, index,
+undo, and redo history rather than representing independently cloned states.
 
 Index DDL creates the fixed non-unique logical-key index, uses the exact
 returned index number for drop, and counts two operations per completed cycle.
@@ -189,6 +213,7 @@ leaked.
 | `stmt-noop` | `statement-execution` | `num` |
 | `create-table` | `table-creation` | `tables` |
 | inserts | `insert-batch-transaction` | sum of per-session batch ceilings |
+| `update-rand` | `update-range-transaction` | sum of per-session key-width-budget batch ceilings |
 | `table-ddl` | `table-create-drop-cycle` | `num` |
 | lookups | `lookup-batch-transaction` | sum of per-session batch ceilings |
 | `table-scan` | `table-scan-batch-transaction` | sum of per-session batch ceilings |
@@ -206,10 +231,15 @@ successful commit. Stream samples include begin, full exhaustion, drop, and
 commit. Retained session-lock samples finish only after successful session
 close; retained transaction-lock samples finish after the releasing commit.
 Specialized samples include all coordination and participant cleanup.
+For random updates, the exact sample equation is
+`sum(ceil(session_budget / batch_size))`; a zero-budget session contributes
+zero. The equation uses planned key widths, not matched rows.
 
 Counter equations are verified before phase state advances:
 
 - Inserts: `operations = inserted_rows + duplicate_key + write_conflict`.
+- Random updates: `operations = updated_rows`; all other generic counters are
+  zero. There is deliberately no equation between `num` and `updated_rows`.
 - Lookups: `operations = found + not_found`; `rows_returned = found`.
 - Table scan and index stream: `operations = num`; outcome classifications are
   zero and `rows_returned` is actual cardinality.
@@ -222,6 +252,9 @@ Each session owns an HDR histogram. Results merge exact distributions rather
 than averaging percentiles. Aggregate throughput is total operations divided
 by total wall duration. Optional internal metrics are typed as counter deltas,
 end gauges, or lifetime peaks with explicit count/byte/nanosecond/frame units.
+For `update-rand`, throughput therefore means actual updated rows per wall
+second, while every successfully committed range transaction contributes one
+latency sample even when its range matches no row.
 
 Freeze results also retain canonical `approximate_rows`, `page_count`, and
 `stable_page_count` fields. Checkpoint results retain checked `attempt_count`,
@@ -260,12 +293,13 @@ The root remains available for diagnosis and user-managed deletion.
 ## Templates
 
 `doradb-bench/templates/` contains one complete directly executable plan for
-each of the thirteen workloads:
+each of the fourteen workloads:
 
 ```text
 trx-noop.toml        stmt-noop.toml       insert-seq.toml
 insert-rand.toml     table-ddl.toml       lookup-seq.toml
-lookup-rand.toml     table-scan.toml      index-scan.toml
+update-rand.toml     lookup-rand.toml     table-scan.toml
+index-scan.toml
 index-stream.toml    index-ddl.toml       lock-table.toml
 checkpoint-table.toml
 ```

@@ -1,0 +1,14 @@
+name = "seeded random secondary-index updates"
+engine_defaults = "engine-defaults.toml"
+
+[[phase]]
+workload = { type = "create-table", index = "unique" }
+
+[[phase]]
+workload = { type = "insert-seq", num = 1000, batch_size = 100 }
+
+[[phase]]
+kind = "benchmark"
+warmup_runs = 1
+measured_runs = 3
+workload = { type = "update-rand", num = 1000, seed = 42, change_key = true, threads = 2, sessions = 4, value_size = "128 B", batch_size = 100 }

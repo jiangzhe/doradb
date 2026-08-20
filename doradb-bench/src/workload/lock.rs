@@ -14,7 +14,6 @@ use doradb_storage::id::TableID;
 use doradb_storage::{Engine, Session, TableLockMode};
 use smol::channel;
 use smol::future::or;
-use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -58,15 +57,15 @@ impl SessionExecutor for LockTableExecutor {
         operation_plans(self.config.num, self.config.sessions)
     }
 
-    fn execute<'a>(
-        &'a self,
-        engine: &'a Engine,
-        session: &'a mut Session,
-        plan: &'a SessionPlan,
-        clock: &'a MeasurementClock,
+    async fn execute(
+        &self,
+        engine: &Engine,
+        session: &mut Session,
+        plan: &SessionPlan,
+        clock: &MeasurementClock,
         sample_latency: bool,
-        cancellation: &'a RunCancellation,
-    ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a {
+        cancellation: &RunCancellation,
+    ) -> Result<Self::Outcome> {
         execute_lock_session(
             engine,
             session,
@@ -75,6 +74,7 @@ impl SessionExecutor for LockTableExecutor {
             sample_latency.then_some(clock),
             cancellation,
         )
+        .await
     }
 
     fn after_session_close(
@@ -93,11 +93,8 @@ impl SessionExecutor for LockTableExecutor {
         Ok(())
     }
 
-    fn finish_run<'a>(
-        &'a self,
-        engine: &'a Engine,
-    ) -> impl Future<Output = Result<()>> + Send + 'a {
-        verify_lock_release(engine, &self.spec.table_ids)
+    async fn finish_run(&self, engine: &Engine) -> Result<()> {
+        verify_lock_release(engine, &self.spec.table_ids).await
     }
 
     fn verify_outcome(

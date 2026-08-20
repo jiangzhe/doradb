@@ -89,6 +89,8 @@ pub enum LatencyUnit {
     TableCreation,
     /// One insert batch transaction from begin through successful commit.
     InsertBatchTransaction,
+    /// One index update range transaction from begin through successful commit.
+    UpdateRangeTransaction,
     /// One transient table create-through-successful-drop cycle.
     TableCreateDropCycle,
     /// One lookup batch transaction from begin through successful commit.
@@ -120,6 +122,7 @@ impl fmt::Display for LatencyUnit {
             Self::StatementExecution => "statement-execution",
             Self::TableCreation => "table-creation",
             Self::InsertBatchTransaction => "insert-batch-transaction",
+            Self::UpdateRangeTransaction => "update-range-transaction",
             Self::TableCreateDropCycle => "table-create-drop-cycle",
             Self::LookupBatchTransaction => "lookup-batch-transaction",
             Self::TableScanBatchTransaction => "table-scan-batch-transaction",
@@ -277,10 +280,12 @@ pub struct ExpectedOutcomeCounters {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkloadCounters {
-    /// Terminal logical workload attempts, including expected insert outcomes.
+    /// Workload-defined logical operations used for throughput.
     pub operations: u64,
     /// Rows inserted by successful operations.
     pub inserted_rows: u64,
+    /// Rows updated by successful range-mutation operations.
+    pub updated_rows: u64,
     /// Successful point lookups that found a row.
     pub found: u64,
     /// Successful point lookups that found no row.
@@ -298,6 +303,7 @@ impl WorkloadCounters {
         self.operations = checked_counter(self.operations, other.operations, "operations")?;
         self.inserted_rows =
             checked_counter(self.inserted_rows, other.inserted_rows, "inserted_rows")?;
+        self.updated_rows = checked_counter(self.updated_rows, other.updated_rows, "updated_rows")?;
         self.found = checked_counter(self.found, other.found, "found")?;
         self.not_found = checked_counter(self.not_found, other.not_found, "not_found")?;
         self.rows_returned =
@@ -542,6 +548,30 @@ mod tests {
     fn histogram_rejects_values_over_one_hour() {
         let mut distribution = LatencyDistribution::new().unwrap();
         assert!(distribution.record(HIGHEST_LATENCY_NANOS + 1).is_err());
+    }
+
+    #[test]
+    fn updated_row_counter_merge_is_checked() {
+        let mut counters = WorkloadCounters {
+            updated_rows: 2,
+            ..WorkloadCounters::default()
+        };
+        counters
+            .merge(WorkloadCounters {
+                updated_rows: 3,
+                ..WorkloadCounters::default()
+            })
+            .unwrap();
+        assert_eq!(counters.updated_rows, 5);
+        counters.updated_rows = u64::MAX;
+        assert!(
+            counters
+                .merge(WorkloadCounters {
+                    updated_rows: 1,
+                    ..WorkloadCounters::default()
+                })
+                .is_err()
+        );
     }
 
     #[test]
