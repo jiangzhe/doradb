@@ -29,3 +29,11 @@ A public Transaction::exec callback cannot invoke two DML attempts through one S
 ## Notes (Optional)
 
 Consume the public DML capability when an attempt begins, so admission or validation failure cannot be followed by a second DML in the same statement. Planning should decide whether multiple read-only operations before the single DML remain supported. One public DML call may still mutate many rows internally; the restriction is on public DML invocations, not physical row effects.
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000274-retire-callback-statement-apis-and-complete-migration.md
+- Closed By: backlog close
+- Reference: User decision
+- Closed At: 2026-08-20

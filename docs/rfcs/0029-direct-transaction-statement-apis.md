@@ -234,7 +234,7 @@ Issue Labels:
 ### Source Backlogs
 
 - [B1]
-  `docs/backlogs/000186-statement-failure-rollback-before-error-return.md`
+  `docs/backlogs/closed/000186-statement-failure-rollback-before-error-return.md`
 
 ## Decision
 
@@ -815,7 +815,7 @@ benchmark counters without an explicit workload change. [D7] [C9] [C11] [U7]
   - Phase Status: done
   - Implementation Summary: Implemented Phase 1 direct Transaction APIs and atomic batch insert, migrated ordinary storage tests, retained and classified runner-only coverage, and verified correctness and paired performance without changing settlement or persisted formats. [Task Resolve Sync: docs/tasks/000273-direct-transaction-apis-and-atomic-batch-insert.md @ 2026-08-19]
   - Related Backlogs:
-    - `docs/backlogs/000186-statement-failure-rollback-before-error-return.md`
+    - `docs/backlogs/closed/000186-statement-failure-rollback-before-error-return.md`
 
 - **Phase 2: Callback API Retirement And Complete Migration**
   - Prerequisites: Phase 1 direct APIs have feature parity, focused behavioral
@@ -855,14 +855,14 @@ benchmark counters without an explicit workload change. [D7] [C9] [C11] [U7]
   - After This Phase: The public callback API no longer exists, normal tests use
     direct methods, focused internal tests alone can access the owned normal
     statement machinery, intentional repeated catalog mutations exist only
-    through purpose-built consuming DML, and the source backlog is ready for
-    implemented closure through task/RFC resolution.
+    through purpose-built consuming DML, and the source backlog is closed as
+    implemented by task 000274.
   - Task Doc: `docs/tasks/000274-retire-callback-statement-apis-and-complete-migration.md`
   - Task Issue: `#990`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase Status: done
+  - Implementation Summary: Implemented RFC-0029 Phase 2 with direct `Transaction` methods as the sole public statement boundary, owned consuming statements for public and private execution, rollback-before-return for ordinary failures, purpose-built catalog batches, and complete repository migration. No persisted format, recovery protocol, or transaction atomicity behavior changed. [Task Resolve Sync: docs/tasks/000274-retire-callback-statement-apis-and-complete-migration.md @ 2026-08-20]
   - Related Backlogs:
-    - `docs/backlogs/000186-statement-failure-rollback-before-error-return.md`
+    - `docs/backlogs/closed/000186-statement-failure-rollback-before-error-return.md`
 
 ## Consequences
 
@@ -939,7 +939,7 @@ batch policy and transaction-local validation policy are fixed by Decisions 1,
 
 ## References
 
-- `docs/backlogs/000186-statement-failure-rollback-before-error-return.md`
+- `docs/backlogs/closed/000186-statement-failure-rollback-before-error-return.md`
 - `docs/transaction-system.md`
 - `docs/index-design.md`
 - `docs/table-file.md`
