@@ -11,7 +11,7 @@ use crate::error::{MultiDomainResultExt, RuntimeError, RuntimeOrFatalResult, Run
 use crate::id::TableID;
 use crate::row::ops::DeleteMvcc;
 use crate::row::{Row, RowRead};
-use crate::trx::stmt::Statement;
+use crate::trx::PrivateTransaction;
 use crate::value::Val;
 use crate::value::ValKind;
 use error_stack::ResultExt;
@@ -57,15 +57,10 @@ impl Indexes<'_> {
     /// asserted at the statement boundary.
     pub(crate) async fn insert(
         &self,
-        stmt: &mut Statement<'_>,
+        trx: &mut PrivateTransaction,
         obj: &IndexObject,
     ) -> RuntimeOrFatalResult<()> {
-        let cols = vec![
-            Val::from(obj.table_id),
-            Val::from(obj.index_no),
-            Val::from(obj.index_attributes.bits()),
-        ];
-        stmt.catalog_insert_mvcc(self.table, cols)
+        trx.catalog_insert_mvcc(self.table, cols_from_index_object(obj))
             .await
             .map(|_| ())
             .attach_with(|| {
@@ -76,16 +71,28 @@ impl Indexes<'_> {
             })
     }
 
+    /// Insert an ordered index batch through one private statement.
+    pub(crate) async fn insert_batch(
+        &self,
+        trx: &mut PrivateTransaction,
+        objects: &[IndexObject],
+    ) -> RuntimeOrFatalResult<()> {
+        let rows = objects.iter().map(cols_from_index_object).collect();
+        trx.catalog_insert_batch_mvcc(self.table, rows)
+            .await
+            .attach("operation=catalog_indexes_insert_batch")
+    }
+
     /// Delete an index by (table_id, index_no).
     pub(crate) async fn delete_by_id(
         &self,
-        stmt: &mut Statement<'_>,
+        trx: &mut PrivateTransaction,
         table_id: TableID,
         index_no: u16,
     ) -> RuntimeOrFatalResult<bool> {
-        let key_vals = [Val::from(table_id), Val::from(index_no)];
-        let res = stmt
-            .catalog_delete_primary_key_mvcc(self.table, PK_NO_INDEXES, &key_vals, true)
+        let key_vals = vec![Val::from(table_id), Val::from(index_no)];
+        let res = trx
+            .catalog_delete_primary_key_mvcc(self.table, PK_NO_INDEXES, key_vals)
             .await
             .attach_with(|| {
                 format!(
@@ -98,19 +105,21 @@ impl Indexes<'_> {
     /// Delete all indexes for one table and return the number of deleted rows.
     pub(crate) async fn delete_by_table_id(
         &self,
-        stmt: &mut Statement<'_>,
+        trx: &mut PrivateTransaction,
         table_id: TableID,
     ) -> RuntimeOrFatalResult<usize> {
         let indexes = self
-            .list_uncommitted_by_table_id(stmt.runtime().pool_guards(), table_id)
+            .list_uncommitted_by_table_id(trx.pool_guards(), table_id)
             .await?;
-        let mut deleted = 0;
-        for index in indexes {
-            if self.delete_by_id(stmt, table_id, index.index_no).await? {
-                deleted += 1;
-            }
-        }
-        Ok(deleted)
+        let keys = indexes
+            .into_iter()
+            .map(|index| vec![Val::from(table_id), Val::from(index.index_no)])
+            .collect();
+        trx.catalog_delete_primary_key_batch_mvcc(self.table, PK_NO_INDEXES, keys)
+            .await
+            .attach_with(|| {
+                format!("operation=catalog_indexes_delete_by_table, table_id={table_id}")
+            })
     }
 
     /// List all indexes by given table id.
@@ -153,19 +162,13 @@ impl IndexColumns<'_> {
     ///
     /// The enumerated `index_column_no` makes the composite primary key unique
     /// by construction. Operation failures are invariant violations.
+    #[cfg(test)]
     pub(crate) async fn insert(
         &self,
-        stmt: &mut Statement<'_>,
+        trx: &mut PrivateTransaction,
         obj: &IndexColumnObject,
     ) -> RuntimeOrFatalResult<()> {
-        let cols = vec![
-            Val::from(obj.table_id),
-            Val::from(obj.index_no),
-            Val::from(obj.index_column_no),
-            Val::from(obj.column_no),
-            Val::from(obj.index_order as u8),
-        ];
-        stmt.catalog_insert_mvcc(self.table, cols)
+        trx.catalog_insert_mvcc(self.table, cols_from_index_column_object(obj))
             .await
             .map(|_| ())
             .attach_with(|| {
@@ -176,78 +179,72 @@ impl IndexColumns<'_> {
             })
     }
 
-    async fn delete_by_id(
+    /// Insert an ordered index-column batch through one private statement.
+    pub(crate) async fn insert_batch(
         &self,
-        stmt: &mut Statement<'_>,
-        table_id: TableID,
-        index_no: u16,
-        index_column_no: u16,
-    ) -> RuntimeOrFatalResult<bool> {
-        let key_vals = [
-            Val::from(table_id),
-            Val::from(index_no),
-            Val::from(index_column_no),
-        ];
-        let res = stmt
-            .catalog_delete_primary_key_mvcc(self.table, PK_NO_INDEX_COLUMNS, &key_vals, true)
+        trx: &mut PrivateTransaction,
+        objects: &[IndexColumnObject],
+    ) -> RuntimeOrFatalResult<()> {
+        let rows = objects.iter().map(cols_from_index_column_object).collect();
+        trx.catalog_insert_batch_mvcc(self.table, rows)
             .await
-            .attach_with(|| {
-                format!(
-                    "operation=catalog_index_columns_delete, table_id={table_id}, index_no={index_no}, index_column_no={index_column_no}"
-                )
-            })?;
-        Ok(matches!(res, DeleteMvcc::Deleted))
+            .attach("operation=catalog_index_columns_insert_batch")
     }
 
     /// Delete all index-column rows by `(table_id, index_no)`.
     pub(crate) async fn delete_by_index(
         &self,
-        stmt: &mut Statement<'_>,
+        trx: &mut PrivateTransaction,
         table_id: TableID,
         index_no: u16,
     ) -> RuntimeOrFatalResult<usize> {
         let index_columns = self
-            .list_uncommitted_by_table_id(stmt.runtime().pool_guards(), table_id)
+            .list_uncommitted_by_table_id(trx.pool_guards(), table_id)
             .await?;
-        let mut deleted = 0;
-        for index_column in index_columns
+        let keys = index_columns
             .into_iter()
             .filter(|index_column| index_column.index_no == index_no)
-        {
-            if self
-                .delete_by_id(stmt, table_id, index_no, index_column.index_column_no)
-                .await?
-            {
-                deleted += 1;
-            }
-        }
-        Ok(deleted)
+            .map(|index_column| {
+                vec![
+                    Val::from(table_id),
+                    Val::from(index_no),
+                    Val::from(index_column.index_column_no),
+                ]
+            })
+            .collect();
+        trx.catalog_delete_primary_key_batch_mvcc(self.table, PK_NO_INDEX_COLUMNS, keys)
+            .await
+            .attach_with(|| {
+                format!(
+                    "operation=catalog_index_columns_delete_by_index, table_id={table_id}, index_no={index_no}"
+                )
+            })
     }
 
     /// Delete all index-column rows for one table and return the number of deleted rows.
     pub(crate) async fn delete_by_table_id(
         &self,
-        stmt: &mut Statement<'_>,
+        trx: &mut PrivateTransaction,
         table_id: TableID,
     ) -> RuntimeOrFatalResult<usize> {
         let index_columns = self
-            .list_uncommitted_by_table_id(stmt.runtime().pool_guards(), table_id)
+            .list_uncommitted_by_table_id(trx.pool_guards(), table_id)
             .await?;
-        let mut deleted = 0;
-        for index_column in index_columns {
-            if self
-                .delete_by_id(
-                    stmt,
-                    table_id,
-                    index_column.index_no,
-                    index_column.index_column_no,
-                )
-                .await?
-            {
-                deleted += 1;
-            }
-        }
-        Ok(deleted)
+        let keys = index_columns
+            .into_iter()
+            .map(|index_column| {
+                vec![
+                    Val::from(table_id),
+                    Val::from(index_column.index_no),
+                    Val::from(index_column.index_column_no),
+                ]
+            })
+            .collect();
+        trx.catalog_delete_primary_key_batch_mvcc(self.table, PK_NO_INDEX_COLUMNS, keys)
+            .await
+            .attach_with(|| {
+                format!("operation=catalog_index_columns_delete_by_table, table_id={table_id}")
+            })
     }
 
     /// List all index-column rows of one table from uncommitted-visible rows.
@@ -277,6 +274,26 @@ impl IndexColumns<'_> {
             .attach_with(|| format!("operation=list_catalog_index_columns, table_id={table_id}"))?;
         Ok(res)
     }
+}
+
+#[inline]
+fn cols_from_index_object(obj: &IndexObject) -> Vec<Val> {
+    vec![
+        Val::from(obj.table_id),
+        Val::from(obj.index_no),
+        Val::from(obj.index_attributes.bits()),
+    ]
+}
+
+#[inline]
+fn cols_from_index_column_object(obj: &IndexColumnObject) -> Vec<Val> {
+    vec![
+        Val::from(obj.table_id),
+        Val::from(obj.index_no),
+        Val::from(obj.index_column_no),
+        Val::from(obj.column_no),
+        Val::from(obj.index_order as u8),
+    ]
 }
 
 /// Return static table definition of `catalog.indexes`.
@@ -429,22 +446,19 @@ fn row_to_index_column_object(col_layout: &TableColumnLayout, row: Row<'_>) -> I
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::storage::tests::mark_catalog_ddl;
+    use crate::catalog::storage::tests::begin_catalog_test_trx;
     use crate::catalog::tests::open_catalog_test_engine;
-    use crate::error::DiscloseResultExt;
     use crate::log::redo::DDLRedo;
     use crate::session::tests::SessionTestExt;
     use tempfile::TempDir;
 
-    // RFC-0029 Phase 2 runner coverage: private catalog row composition and
-    // same-statement delete assertions require the legacy statement facade.
     #[test]
     fn test_indexes_delete_by_id() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
             let engine = open_catalog_test_engine(main_dir, None).await;
-            let mut session = engine.new_session().unwrap();
+            let session = engine.new_session().unwrap();
 
             let idx_42_0 = IndexObject {
                 table_id: TableID::new(42),
@@ -462,72 +476,42 @@ mod tests {
                 index_attributes: IndexAttributes::PK,
             };
 
-            let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| {
-                engine
-                    .inner()
-                    .core
-                    .catalog()
-                    .storage
-                    .indexes()
-                    .insert(stmt, &idx_42_0)
-                    .await
-                    .disclose()?;
-                engine
-                    .inner()
-                    .core
-                    .catalog()
-                    .storage
-                    .indexes()
-                    .insert(stmt, &idx_42_1)
-                    .await
-                    .disclose()?;
-                engine
-                    .inner()
-                    .core
-                    .catalog()
-                    .storage
-                    .indexes()
-                    .insert(stmt, &idx_43_0)
-                    .await
-                    .disclose()?;
-                Ok(())
-            })
-            .await
-            .unwrap();
-            mark_catalog_ddl(&mut trx, DDLRedo::CreateTable(TableID::new(42)));
-            trx.commit().await.unwrap();
+            let mut trx = begin_catalog_test_trx(&session);
+            engine
+                .inner()
+                .core
+                .catalog()
+                .storage
+                .indexes()
+                .insert_batch(trx.trx(), &[idx_42_0, idx_42_1, idx_43_0])
+                .await
+                .unwrap();
+            trx.commit(DDLRedo::CreateTable(TableID::new(42))).await;
 
-            let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| {
-                assert!(
-                    engine
-                        .inner()
-                        .core
-                        .catalog()
-                        .storage
-                        .indexes()
-                        .delete_by_id(stmt, TableID::new(42), 1)
-                        .await
-                        .disclose()?
-                );
-                assert!(
-                    !engine
-                        .inner()
-                        .core
-                        .catalog()
-                        .storage
-                        .indexes()
-                        .delete_by_id(stmt, TableID::new(42), 9)
-                        .await
-                        .disclose()?
-                );
-                Ok(())
-            })
-            .await
-            .unwrap();
-            mark_catalog_ddl(&mut trx, DDLRedo::DropTable(TableID::new(42)));
-            trx.commit().await.unwrap();
+            let mut trx = begin_catalog_test_trx(&session);
+            assert!(
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .storage
+                    .indexes()
+                    .delete_by_id(trx.trx(), TableID::new(42), 1)
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                !engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .storage
+                    .indexes()
+                    .delete_by_id(trx.trx(), TableID::new(42), 9)
+                    .await
+                    .unwrap()
+            );
+            trx.commit(DDLRedo::DropTable(TableID::new(42))).await;
 
             let idx_42 = engine
                 .inner()
@@ -553,47 +537,41 @@ mod tests {
             assert_eq!(idx_43.len(), 1);
             assert_eq!(idx_43[0].index_no, 0);
 
-            let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| {
-                assert!(
-                    !engine
-                        .inner()
-                        .core
-                        .catalog()
-                        .storage
-                        .indexes()
-                        .delete_by_id(stmt, TableID::new(42), 1)
-                        .await
-                        .disclose()?
-                );
-                assert!(
-                    engine
-                        .inner()
-                        .core
-                        .catalog()
-                        .storage
-                        .indexes()
-                        .delete_by_id(stmt, TableID::new(42), 0)
-                        .await
-                        .disclose()?
-                );
-                assert!(
-                    engine
-                        .inner()
-                        .core
-                        .catalog()
-                        .storage
-                        .indexes()
-                        .delete_by_id(stmt, TableID::new(43), 0)
-                        .await
-                        .disclose()?
-                );
-                Ok(())
-            })
-            .await
-            .unwrap();
-            mark_catalog_ddl(&mut trx, DDLRedo::DropTable(TableID::new(42)));
-            trx.commit().await.unwrap();
+            let mut trx = begin_catalog_test_trx(&session);
+            assert!(
+                !engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .storage
+                    .indexes()
+                    .delete_by_id(trx.trx(), TableID::new(42), 1)
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .storage
+                    .indexes()
+                    .delete_by_id(trx.trx(), TableID::new(42), 0)
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .storage
+                    .indexes()
+                    .delete_by_id(trx.trx(), TableID::new(43), 0)
+                    .await
+                    .unwrap()
+            );
+            trx.commit(DDLRedo::DropTable(TableID::new(42))).await;
 
             assert!(
                 engine
@@ -625,15 +603,13 @@ mod tests {
         });
     }
 
-    // RFC-0029 Phase 2 runner coverage: private catalog batch insert and
-    // delete composition requires the legacy statement facade.
     #[test]
     fn test_indexes_delete_by_table_id_counts_and_is_idempotent() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
             let engine = open_catalog_test_engine(main_dir, None).await;
-            let mut session = engine.new_session().unwrap();
+            let session = engine.new_session().unwrap();
 
             let indexes = [
                 IndexObject {
@@ -653,58 +629,44 @@ mod tests {
                 },
             ];
 
-            let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| {
-                for index in &indexes {
-                    engine
-                        .inner()
-                        .core
-                        .catalog()
-                        .storage
-                        .indexes()
-                        .insert(stmt, index)
-                        .await
-                        .disclose()?;
-                }
-                Ok(())
-            })
-            .await
-            .unwrap();
-            mark_catalog_ddl(&mut trx, DDLRedo::CreateTable(TableID::new(42)));
-            trx.commit().await.unwrap();
+            let mut trx = begin_catalog_test_trx(&session);
+            engine
+                .inner()
+                .core
+                .catalog()
+                .storage
+                .indexes()
+                .insert_batch(trx.trx(), &indexes)
+                .await
+                .unwrap();
+            trx.commit(DDLRedo::CreateTable(TableID::new(42))).await;
 
-            let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| {
-                assert_eq!(
-                    engine
-                        .inner()
-                        .core
-                        .catalog()
-                        .storage
-                        .indexes()
-                        .delete_by_table_id(stmt, TableID::new(42))
-                        .await
-                        .unwrap(),
-                    2
-                );
-                assert_eq!(
-                    engine
-                        .inner()
-                        .core
-                        .catalog()
-                        .storage
-                        .indexes()
-                        .delete_by_table_id(stmt, TableID::new(42))
-                        .await
-                        .unwrap(),
-                    0
-                );
-                Ok(())
-            })
-            .await
-            .unwrap();
-            mark_catalog_ddl(&mut trx, DDLRedo::DropTable(TableID::new(42)));
-            trx.commit().await.unwrap();
+            let mut trx = begin_catalog_test_trx(&session);
+            assert_eq!(
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .storage
+                    .indexes()
+                    .delete_by_table_id(trx.trx(), TableID::new(42))
+                    .await
+                    .unwrap(),
+                2
+            );
+            assert_eq!(
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .storage
+                    .indexes()
+                    .delete_by_table_id(trx.trx(), TableID::new(42))
+                    .await
+                    .unwrap(),
+                0
+            );
+            trx.commit(DDLRedo::DropTable(TableID::new(42))).await;
 
             assert!(
                 engine
@@ -735,15 +697,13 @@ mod tests {
         });
     }
 
-    // RFC-0029 Phase 2 runner coverage: private catalog batch insert and
-    // delete composition requires the legacy statement facade.
     #[test]
     fn test_index_columns_delete_by_index_and_table_id() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
             let engine = open_catalog_test_engine(main_dir, None).await;
-            let mut session = engine.new_session().unwrap();
+            let session = engine.new_session().unwrap();
 
             let index_columns = [
                 IndexColumnObject {
@@ -776,58 +736,44 @@ mod tests {
                 },
             ];
 
-            let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| {
-                for index_column in &index_columns {
-                    engine
-                        .inner()
-                        .core
-                        .catalog()
-                        .storage
-                        .index_columns()
-                        .insert(stmt, index_column)
-                        .await
-                        .disclose()?;
-                }
-                Ok(())
-            })
-            .await
-            .unwrap();
-            mark_catalog_ddl(&mut trx, DDLRedo::CreateTable(TableID::new(42)));
-            trx.commit().await.unwrap();
+            let mut trx = begin_catalog_test_trx(&session);
+            engine
+                .inner()
+                .core
+                .catalog()
+                .storage
+                .index_columns()
+                .insert_batch(trx.trx(), &index_columns)
+                .await
+                .unwrap();
+            trx.commit(DDLRedo::CreateTable(TableID::new(42))).await;
 
-            let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| {
-                assert_eq!(
-                    engine
-                        .inner()
-                        .core
-                        .catalog()
-                        .storage
-                        .index_columns()
-                        .delete_by_index(stmt, TableID::new(42), 1)
-                        .await
-                        .unwrap(),
-                    2
-                );
-                assert_eq!(
-                    engine
-                        .inner()
-                        .core
-                        .catalog()
-                        .storage
-                        .index_columns()
-                        .delete_by_index(stmt, TableID::new(42), 1)
-                        .await
-                        .unwrap(),
-                    0
-                );
-                Ok(())
-            })
-            .await
-            .unwrap();
-            mark_catalog_ddl(&mut trx, DDLRedo::DropTable(TableID::new(42)));
-            trx.commit().await.unwrap();
+            let mut trx = begin_catalog_test_trx(&session);
+            assert_eq!(
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .storage
+                    .index_columns()
+                    .delete_by_index(trx.trx(), TableID::new(42), 1)
+                    .await
+                    .unwrap(),
+                2
+            );
+            assert_eq!(
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .storage
+                    .index_columns()
+                    .delete_by_index(trx.trx(), TableID::new(42), 1)
+                    .await
+                    .unwrap(),
+                0
+            );
+            trx.commit(DDLRedo::DropTable(TableID::new(42))).await;
 
             let remaining_42 = engine
                 .inner()
@@ -841,38 +787,32 @@ mod tests {
             assert_eq!(remaining_42.len(), 1);
             assert_eq!(remaining_42[0].index_no, 0);
 
-            let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| {
-                assert_eq!(
-                    engine
-                        .inner()
-                        .core
-                        .catalog()
-                        .storage
-                        .index_columns()
-                        .delete_by_table_id(stmt, TableID::new(42))
-                        .await
-                        .unwrap(),
-                    1
-                );
-                assert_eq!(
-                    engine
-                        .inner()
-                        .core
-                        .catalog()
-                        .storage
-                        .index_columns()
-                        .delete_by_table_id(stmt, TableID::new(42))
-                        .await
-                        .unwrap(),
-                    0
-                );
-                Ok(())
-            })
-            .await
-            .unwrap();
-            mark_catalog_ddl(&mut trx, DDLRedo::DropTable(TableID::new(42)));
-            trx.commit().await.unwrap();
+            let mut trx = begin_catalog_test_trx(&session);
+            assert_eq!(
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .storage
+                    .index_columns()
+                    .delete_by_table_id(trx.trx(), TableID::new(42))
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .storage
+                    .index_columns()
+                    .delete_by_table_id(trx.trx(), TableID::new(42))
+                    .await
+                    .unwrap(),
+                0
+            );
+            trx.commit(DDLRedo::DropTable(TableID::new(42))).await;
 
             assert!(
                 engine

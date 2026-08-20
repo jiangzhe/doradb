@@ -1941,11 +1941,12 @@ mod tests {
         bucket.get_purge_list(TrxID::new(11), &mut purge);
         assert_eq!(purge.len(), 1);
         assert_eq!(purge[0].sts(), None);
+        let Some(CommittedTrxPayload::System(payload)) = purge[0].payload.as_ref() else {
+            panic!("purge entry must retain its system transaction payload");
+        };
         assert_eq!(
-            purge[0]
-                .retired_row_pages()
-                .map(|batch| batch.page_ids.as_ref()),
-            Some(&[PageID::new(19)][..])
+            payload.retired_row_pages.page_ids.as_ref(),
+            &[PageID::new(19)]
         );
     }
 

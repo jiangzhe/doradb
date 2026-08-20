@@ -1951,7 +1951,7 @@ fn validate_primary_key_contract(
 pub(crate) mod tests {
     use super::*;
     use crate::catalog::storage::tables::TABLE_ID_TABLES;
-    use crate::catalog::storage::tests::mark_catalog_ddl;
+    use crate::catalog::storage::tests::begin_catalog_test_trx;
     use crate::catalog::tests::{
         assert_dropped_table_floor, assert_dropped_table_runtime,
         assert_no_dropped_table_operational_state, wait_for_dropped_table_floor,
@@ -1963,8 +1963,8 @@ pub(crate) mod tests {
     };
     use crate::engine::Engine;
     use crate::error::{
-        DiscloseError, DiscloseResultExt, Error, ErrorKind, FatalError, IoError, LifecycleError,
-        OperationError, RuntimeError,
+        DiscloseError, Error, ErrorKind, FatalError, IoError, LifecycleError, OperationError,
+        RuntimeError,
     };
     use crate::id::{SessionID, TrxID};
     use crate::io::install_storage_backend_test_hook;
@@ -1978,7 +1978,6 @@ pub(crate) mod tests {
     use crate::table::tests::*;
     use crate::trx::MAX_SNAPSHOT_TS;
     use crate::trx::purge::PurgeTestEvent;
-    use crate::trx::stmt::tests as stmt_tests;
     use crate::trx::tests as trx_tests;
     use crate::value::{Val, ValKind};
     use std::path::Path;
@@ -2735,29 +2734,23 @@ pub(crate) mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let trx_owner = trx_tests::lock_owner(&trx).unwrap();
-            // RFC-0029 Phase 2 runner coverage: statement and transaction
-            // logical-lock ownership identity is inspected through the facade.
-            trx.exec(async |stmt| {
-                assert_eq!(stmt_tests::transaction_lock_owner(stmt), trx_owner);
-                let key = single_key(0i32);
-                let selected = stmt
-                    .table_lookup_unique_mvcc(table_id, key.index_no, &key.vals, &[0, 1])
-                    .await?;
-                assert!(selected.is_found());
-                let repeated = stmt
-                    .table_lookup_unique_mvcc(table_id, key.index_no, &key.vals, &[0, 1])
-                    .await?;
-                assert!(repeated.is_found());
-                assert_eq!(lock_entry_count(&engine, trx_owner), 1);
-                assert!(!has_lock_resource(
-                    &engine,
-                    trx_owner,
-                    LockResource::TableData(table_id),
-                ));
-                Ok(())
-            })
-            .await
-            .unwrap();
+            let key = single_key(0i32);
+            let selected = trx
+                .table_lookup_unique_mvcc(table_id, key.index_no, &key.vals, &[0, 1])
+                .await
+                .unwrap();
+            assert!(selected.is_found());
+            let repeated = trx
+                .table_lookup_unique_mvcc(table_id, key.index_no, &key.vals, &[0, 1])
+                .await
+                .unwrap();
+            assert!(repeated.is_found());
+            assert_eq!(lock_entry_count(&engine, trx_owner), 1);
+            assert!(!has_lock_resource(
+                &engine,
+                trx_owner,
+                LockResource::TableData(table_id),
+            ));
 
             assert_eq!(lock_entry_count(&engine, trx_owner), 1);
             assert!(has_lock_entry(
@@ -3228,12 +3221,9 @@ pub(crate) mod tests {
                     .send_async(trx_tests::lock_owner(&writer_trx).unwrap())
                     .await
                     .unwrap();
-                trx_insert_row_by_id(
-                    &mut writer_trx,
-                    table_id,
-                    vec![Val::from(31_001i32), Val::from("blocked")],
-                )
-                .await?;
+                writer_trx
+                    .table_insert_mvcc(table_id, vec![Val::from(31_001i32), Val::from("blocked")])
+                    .await?;
                 writer_trx.commit().await?;
                 Ok::<(), Error>(())
             });
@@ -3318,13 +3308,13 @@ pub(crate) mod tests {
             read_trx.commit().await.unwrap();
 
             let mut write_trx = session.begin_trx().unwrap();
-            let err = trx_insert_row_by_id(
-                &mut write_trx,
-                table_id,
-                vec![Val::from(31_101i32), Val::from("same-session-s")],
-            )
-            .await
-            .unwrap_err();
+            let err = write_trx
+                .table_insert_mvcc(
+                    table_id,
+                    vec![Val::from(31_101i32), Val::from("same-session-s")],
+                )
+                .await
+                .unwrap_err();
             assert_eq!(
                 err.report().downcast_ref::<OperationError>().copied(),
                 Some(OperationError::LockFamilyConflict)
@@ -3351,8 +3341,7 @@ pub(crate) mod tests {
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
 
-            trx_insert_row_by_id(
-                &mut trx,
+            trx.table_insert_mvcc(
                 table_id,
                 vec![Val::from(31_301i32), Val::from("same-session-ix")],
             )
@@ -3541,12 +3530,9 @@ pub(crate) mod tests {
                     .send_async(trx_tests::lock_owner(&writer_trx).unwrap())
                     .await
                     .unwrap();
-                trx_insert_row_by_id(
-                    &mut writer_trx,
-                    table_id,
-                    vec![Val::from(31_201i32), Val::from("external")],
-                )
-                .await?;
+                writer_trx
+                    .table_insert_mvcc(table_id, vec![Val::from(31_201i32), Val::from("external")])
+                    .await?;
                 writer_trx.commit().await?;
                 Ok::<(), Error>(())
             });
@@ -3562,13 +3548,10 @@ pub(crate) mod tests {
 
             let mut same_session_trx = session.begin_trx().unwrap();
             let same_session_owner = trx_tests::lock_owner(&same_session_trx).unwrap();
-            trx_insert_row_by_id(
-                &mut same_session_trx,
-                table_id,
-                vec![Val::from(31_202i32), Val::from("covered")],
-            )
-            .await
-            .unwrap();
+            same_session_trx
+                .table_insert_mvcc(table_id, vec![Val::from(31_202i32), Val::from("covered")])
+                .await
+                .unwrap();
             assert!(has_lock_entry(
                 &engine,
                 same_session_owner,
@@ -3692,29 +3675,19 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
             let table_id = create_table2_for_test(&engine).await;
-            let mut corrupt_session = engine.new_session().unwrap();
-            let mut corrupt_trx = corrupt_session.begin_trx().unwrap();
-
-            // RFC-0029 Phase 2 runner coverage: raw private catalog mutation
-            // intentionally injects metadata corruption in one statement.
-            corrupt_trx
-                .exec(async |stmt| {
-                    let deleted = engine
-                        .inner()
-                        .core
-                        .catalog()
-                        .storage
-                        .tables()
-                        .delete_by_id(stmt, table_id)
-                        .await
-                        .disclose()?;
-                    assert!(deleted);
-                    Ok(())
-                })
+            let corrupt_session = engine.new_session().unwrap();
+            let mut corrupt_trx = begin_catalog_test_trx(&corrupt_session);
+            let deleted = engine
+                .inner()
+                .core
+                .catalog()
+                .storage
+                .tables()
+                .delete_by_id(corrupt_trx.trx(), table_id)
                 .await
                 .unwrap();
-            mark_catalog_ddl(&mut corrupt_trx, DDLRedo::DropTable(table_id));
-            corrupt_trx.commit().await.unwrap();
+            assert!(deleted);
+            corrupt_trx.commit(DDLRedo::DropTable(table_id)).await;
 
             let mut drop_session = engine.new_session().unwrap();
             let table = table_for_internal_assertion(&engine, table_id);
@@ -4648,13 +4621,10 @@ pub(crate) mod tests {
             assert_eq!(stale_read.commit().await.unwrap(), TrxID::new(0));
 
             let mut stale_write = session.begin_trx().unwrap();
-            let err = trx_insert_row_by_id(
-                &mut stale_write,
-                table_id,
-                vec![Val::from(2), Val::from("blocked")],
-            )
-            .await
-            .unwrap_err();
+            let err = stale_write
+                .table_insert_mvcc(table_id, vec![Val::from(2), Val::from("blocked")])
+                .await
+                .unwrap_err();
             assert_eq!(
                 err.report().downcast_ref::<OperationError>().copied(),
                 Some(OperationError::TableNotFound)
@@ -4868,31 +4838,10 @@ pub(crate) mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut reader_session = engine.new_session().unwrap();
             let mut reader_trx = reader_session.begin_trx().unwrap();
-            let (held_tx, held_rx) = flume::bounded(1);
-            let (release_tx, release_rx) = flume::bounded(1);
-            // RFC-0029 Phase 2 runner coverage: checked-out callback
-            // cancellation while holding a raw metadata claim.
-            let mut reader_fut = Box::pin(reader_trx.exec(async |stmt| {
-                stmt_tests::acquire_transaction_lock(
-                    stmt,
-                    LockResource::TableMetadata(table_id),
-                    LockMode::Shared,
-                )
-                .await?;
-                held_tx.send_async(()).await.unwrap();
-                release_rx.recv_async().await.unwrap();
-                Ok(())
-            }));
-
-            loop {
-                if held_rx.try_recv().is_ok() {
-                    break;
-                }
-                assert!(matches!(
-                    futures::poll!(reader_fut.as_mut()),
-                    std::task::Poll::Pending
-                ));
-            }
+            reader_trx
+                .table_scan_mvcc(table_id, &[0], |_| true)
+                .await
+                .unwrap();
 
             let mut drop_session = engine.new_session().unwrap();
             let mut drop_fut = Box::pin(drop_session.drop_table(table_id));
@@ -4901,12 +4850,6 @@ pub(crate) mod tests {
                 std::task::Poll::Pending
             ));
 
-            release_tx.send_async(()).await.unwrap();
-            reader_fut.await.unwrap();
-            assert!(matches!(
-                futures::poll!(drop_fut.as_mut()),
-                std::task::Poll::Pending
-            ));
             assert_eq!(reader_trx.commit().await.unwrap(), TrxID::new(0));
             drop_fut.await.unwrap();
         });
@@ -4920,13 +4863,10 @@ pub(crate) mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut writer_session = engine.new_session().unwrap();
             let mut writer_trx = writer_session.begin_trx().unwrap();
-            trx_insert_row_by_id(
-                &mut writer_trx,
-                table_id,
-                vec![Val::from(91), Val::from("writer")],
-            )
-            .await
-            .unwrap();
+            writer_trx
+                .table_insert_mvcc(table_id, vec![Val::from(91), Val::from("writer")])
+                .await
+                .unwrap();
 
             let mut drop_session = engine.new_session().unwrap();
             let mut drop_fut = Box::pin(drop_session.drop_table(table_id));
@@ -4985,12 +4925,12 @@ pub(crate) mod tests {
             let (table_spec, index_specs) = drop_table_test_spec();
             let table_id = session.create_table(table_spec, index_specs).await.unwrap();
             let mut trx = session.begin_trx().unwrap();
-            let insert = trx_insert_row_by_id(
-                &mut trx,
-                table_id,
-                vec![Val::from(7), Val::from("checkpoint-covered")],
-            )
-            .await;
+            let insert = trx
+                .table_insert_mvcc(
+                    table_id,
+                    vec![Val::from(7), Val::from("checkpoint-covered")],
+                )
+                .await;
             let Ok(_) = insert else {
                 panic!("insert should succeed: {insert:?}");
             };

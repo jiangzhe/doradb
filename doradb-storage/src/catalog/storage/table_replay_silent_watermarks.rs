@@ -14,7 +14,7 @@ use crate::id::{TableID, TrxID};
 use crate::row::ops::DeleteMvcc;
 use crate::row::{Row, RowRead};
 use crate::table::NoTrxUpsertChange;
-use crate::trx::stmt::Statement;
+use crate::trx::PrivateTransaction;
 use crate::value::Val;
 use crate::value::ValKind;
 use error_stack::{Report, ResultExt};
@@ -106,16 +106,14 @@ impl TableReplaySilentWatermarks<'_> {
     /// Delete one watermark row by user table id.
     pub(crate) async fn delete_by_table_id(
         &self,
-        stmt: &mut Statement<'_>,
+        trx: &mut PrivateTransaction,
         table_id: TableID,
     ) -> RuntimeOrFatalResult<bool> {
-        let key_vals = [Val::from(table_id)];
-        let res = stmt
+        let res = trx
             .catalog_delete_primary_key_mvcc(
                 self.table,
                 PK_NO_TABLE_REPLAY_SILENT_WATERMARKS,
-                &key_vals,
-                true,
+                vec![Val::from(table_id)],
             )
             .await
             .attach_with(|| {

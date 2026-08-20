@@ -10,7 +10,7 @@ use crate::workload::util::{
     verify_simple_counters,
 };
 use crate::workload::{RunCancellation, SessionPlan};
-use doradb_storage::{Engine, Error as StorageError, Session};
+use doradb_storage::{Engine, Session};
 use std::future::Future;
 
 /// Statement-noop session executor.
@@ -252,7 +252,7 @@ async fn run_stmt_noop_operations(
             });
         }
         let started = clock.map(MeasurementClock::raw);
-        if let Err(error) = trx.exec(async |_stmt| Ok::<(), StorageError>(())).await {
+        if let Err(error) = trx.noop().await {
             let _ = trx.rollback().await;
             return Err(error.into());
         }

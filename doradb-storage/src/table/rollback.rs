@@ -433,7 +433,6 @@ mod tests {
     use crate::catalog::tests::table4;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
-    use crate::error::{DiscloseError, OperationError, Result};
     use crate::id::RowID;
     use crate::index::RowLocation;
     use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
@@ -442,11 +441,8 @@ mod tests {
     use crate::table::tests::*;
     use crate::trx::MAX_SNAPSHOT_TS;
     use crate::value::Val;
-    use error_stack::Report;
     use tempfile::TempDir;
 
-    // RFC-0029 Phase 2 runner coverage: same-statement index inspection before
-    // callback return verifies delete rollback ordering.
     #[test]
     fn test_column_delete_rollback() {
         smol::block_on(async {
@@ -472,22 +468,17 @@ mod tests {
             trx.commit().await.unwrap();
 
             let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| {
-                let res = stmt_delete_row_by_id(stmt, table_id, &key).await;
-                assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
-                assert_unique_index_entry(
-                    &table_for_internal_assertion(&engine, table_id),
-                    &session.pool_guards(),
-                    &key,
-                    stmt.runtime().sts(),
-                    old_row_id,
-                    true,
-                )
-                .await;
-                Ok(())
-            })
-            .await
-            .unwrap();
+            let res = trx_delete_row_by_id(&mut trx, table_id, &key).await;
+            assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
+            assert_unique_index_entry(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &key,
+                trx.sts(),
+                old_row_id,
+                true,
+            )
+            .await;
             trx.rollback().await.unwrap();
             assert_unique_index_entry(
                 &table_for_internal_assertion(&engine, table_id),
@@ -554,8 +545,6 @@ mod tests {
         });
     }
 
-    // RFC-0029 Phase 2 runner coverage: callback error injection after raw
-    // index inspection drives statement-local insert rollback.
     #[test]
     fn test_unique_insert_rollback_restores_deleted_owner_even_when_row_missing() {
         smol::block_on(async {
@@ -610,36 +599,20 @@ mod tests {
             .await;
 
             let mut trx = session.begin_trx().unwrap();
-            let res: Result<()> = trx
-                .exec(async |stmt| {
-                    let new_row_id = unwrap_insert_result(
-                        stmt_insert_row_by_id(
-                            stmt,
-                            table_id,
-                            vec![Val::from(10_001i32), Val::from("reborn")],
-                        )
-                        .await,
-                    );
-                    assert_ne!(new_row_id, RowID::new(stale_row_id));
-                    assert_unique_index_entry(
-                        &table_for_internal_assertion(&engine, table_id),
-                        &session.pool_guards(),
-                        &key,
-                        stmt.runtime().sts(),
-                        new_row_id,
-                        false,
-                    )
-                    .await;
-                    Err(Report::new(OperationError::InvalidDmlInput).disclose())
-                })
-                .await;
-            assert_eq!(
-                res.unwrap_err()
-                    .report()
-                    .downcast_ref::<OperationError>()
-                    .copied(),
-                Some(OperationError::InvalidDmlInput)
+            let new_row_id = unwrap_insert_result(
+                trx.table_insert_mvcc(table_id, vec![Val::from(10_001i32), Val::from("reborn")])
+                    .await,
             );
+            assert_ne!(new_row_id, RowID::new(stale_row_id));
+            assert_unique_index_entry(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &key,
+                trx.sts(),
+                new_row_id,
+                false,
+            )
+            .await;
             trx.rollback().await.unwrap();
 
             assert_unique_index_entry(
@@ -665,8 +638,6 @@ mod tests {
         });
     }
 
-    // RFC-0029 Phase 2 runner coverage: callback error injection after raw
-    // stale-owner inspection drives statement-local insert rollback.
     #[test]
     fn test_unique_insert_rollback_restores_delete_marked_stale_hot_owner() {
         smol::block_on(async {
@@ -730,36 +701,20 @@ mod tests {
             );
 
             let mut trx = session.begin_trx().unwrap();
-            let res: Result<()> = trx
-                .exec(async |stmt| {
-                    let new_row_id = unwrap_insert_result(
-                        stmt_insert_row_by_id(
-                            stmt,
-                            table_id,
-                            vec![Val::from(2i32), Val::from("two")],
-                        )
-                        .await,
-                    );
-                    assert_ne!(new_row_id, old_row_id);
-                    assert_unique_index_entry(
-                        &table_for_internal_assertion(&engine, table_id),
-                        &session.pool_guards(),
-                        &stale_key,
-                        stmt.runtime().sts(),
-                        new_row_id,
-                        false,
-                    )
-                    .await;
-                    Err(Report::new(OperationError::InvalidDmlInput).disclose())
-                })
-                .await;
-            assert_eq!(
-                res.unwrap_err()
-                    .report()
-                    .downcast_ref::<OperationError>()
-                    .copied(),
-                Some(OperationError::InvalidDmlInput)
+            let new_row_id = unwrap_insert_result(
+                trx.table_insert_mvcc(table_id, vec![Val::from(2i32), Val::from("two")])
+                    .await,
             );
+            assert_ne!(new_row_id, old_row_id);
+            assert_unique_index_entry(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &stale_key,
+                trx.sts(),
+                new_row_id,
+                false,
+            )
+            .await;
             trx.rollback().await.unwrap();
 
             assert_unique_index_entry(
@@ -862,20 +817,17 @@ mod tests {
                 let user_read_set = &[0usize, 1];
                 let mut trx = session.begin_trx().unwrap();
                 for i in 0i32..5i32 {
-                    let res =
-                        trx_insert_row_by_id(&mut trx, table_id, vec![Val::from(i), Val::from(i)])
-                            .await;
+                    let res = trx
+                        .table_insert_mvcc(table_id, vec![Val::from(i), Val::from(i)])
+                        .await;
                     assert!(res.is_ok());
                 }
                 trx.commit().await.unwrap();
 
                 let mut trx = session.begin_trx().unwrap();
-                let res = trx_insert_row_by_id(
-                    &mut trx,
-                    table_id,
-                    vec![Val::from(5i32), Val::from(5i32)],
-                )
-                .await;
+                let res = trx
+                    .table_insert_mvcc(table_id, vec![Val::from(5i32), Val::from(5i32)])
+                    .await;
                 assert!(res.is_ok());
                 trx.rollback().await.unwrap();
 
@@ -921,9 +873,9 @@ mod tests {
                 let key = SelectKey::new(0, vec![Val::from(3i32)]);
                 let res = trx_delete_row_by_id(&mut trx, table_id, &key).await;
                 assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
-                let res =
-                    trx_insert_row_by_id(&mut trx, table_id, vec![Val::from(3), Val::from(3)])
-                        .await;
+                let res = trx
+                    .table_insert_mvcc(table_id, vec![Val::from(3), Val::from(3)])
+                    .await;
                 assert!(res.is_ok());
                 trx.rollback().await.unwrap();
 

@@ -1292,15 +1292,62 @@ pub(crate) mod tests {
     use crate::index::{ColumnBlockIndex, ColumnDeleteDeltaPatch};
     use crate::log::redo::{DDLRedo, RowRedoKind};
     use crate::row::ops::{SelectKey, UpdateCol};
-    use crate::trx::Transaction;
-    use crate::trx::tests::install_transaction_ddl_redo;
+    use crate::session::tests::begin_test_mandatory_private_trx;
+    use crate::session::{MandatoryOperationGuard, Session};
+    use crate::trx::PrivateTransaction;
     use crate::value::{Val, ValKind};
     use tempfile::TempDir;
 
-    /// Attach one catalog DDL marker after test catalog DML has merged.
-    pub(crate) fn mark_catalog_ddl(trx: &mut Transaction, ddl: DDLRedo) {
-        install_transaction_ddl_redo(trx, ddl)
-            .expect("test catalog transaction must remain available");
+    /// Focused mandatory/private ownership harness for catalog accessor tests.
+    pub(crate) struct CatalogTestTransaction {
+        operation: MandatoryOperationGuard,
+        trx: Option<PrivateTransaction>,
+    }
+
+    impl CatalogTestTransaction {
+        /// Return the active private transaction.
+        pub(crate) fn trx(&mut self) -> &mut PrivateTransaction {
+            self.trx
+                .as_mut()
+                .expect("catalog test transaction must remain active")
+        }
+
+        /// Commit catalog changes and finish the mandatory test operation.
+        pub(crate) async fn commit(mut self, ddl: DDLRedo) -> TrxID {
+            let mut trx = self
+                .trx
+                .take()
+                .expect("catalog test transaction must remain active");
+            trx.install_ddl_redo(ddl);
+            let cts = trx
+                .commit_catalog_ddl()
+                .await
+                .expect("catalog test transaction must commit");
+            self.operation.assert_finish_ready();
+            self.operation.finish();
+            cts
+        }
+
+        /// Roll back catalog changes and finish the mandatory test operation.
+        pub(crate) async fn rollback(mut self) {
+            self.trx
+                .take()
+                .expect("catalog test transaction must remain active")
+                .rollback_catalog_ddl()
+                .await
+                .expect("catalog test transaction must roll back");
+            self.operation.assert_finish_ready();
+            self.operation.finish();
+        }
+    }
+
+    /// Begin one focused catalog accessor transaction.
+    pub(crate) fn begin_catalog_test_trx(session: &Session) -> CatalogTestTransaction {
+        let (operation, trx) = begin_test_mandatory_private_trx(session);
+        CatalogTestTransaction {
+            operation,
+            trx: Some(trx),
+        }
     }
 
     fn expect_runtime_report(error: RuntimeOrFatalError) -> Report<RuntimeError> {

@@ -40,59 +40,45 @@ async fn run() -> ExampleResult<()> {
     let mut write_trx = session.begin_trx()?;
     // Insert two rows in one statement.
     write_trx
-        .exec(async |stmt| {
-            stmt.table_insert_mvcc(table_id, vec![Val::from(1i32), Val::from("alice")])
-                .await?;
-            stmt.table_insert_mvcc(table_id, vec![Val::from(2i32), Val::from("bob")])
-                .await?;
-            Ok(())
-        })
+        .table_insert_batch_mvcc(
+            table_id,
+            vec![
+                vec![Val::from(1i32), Val::from("alice")],
+                vec![Val::from(2i32), Val::from("bob")],
+            ],
+        )
         .await?;
 
     let id_one = SelectKey::new(0, vec![Val::from(1i32)]);
     // Update one row by its unique id key.
-    write_trx
-        .exec(async |stmt| {
-            let res = stmt
-                .table_update_unique_mvcc(
-                    table_id,
-                    id_one.index_no,
-                    &id_one.vals,
-                    vec![UpdateCol {
-                        idx: 1,
-                        val: Val::from("ada"),
-                    }],
-                )
-                .await?;
-            assert!(res.is_updated());
-            Ok(())
-        })
+    let updated = write_trx
+        .table_update_unique_mvcc(
+            table_id,
+            id_one.index_no,
+            &id_one.vals,
+            vec![UpdateCol {
+                idx: 1,
+                val: Val::from("ada"),
+            }],
+        )
         .await?;
+    assert!(updated.is_updated());
 
     let id_two = SelectKey::new(0, vec![Val::from(2i32)]);
     // Delete one row by its unique id key.
-    write_trx
-        .exec(async |stmt| {
-            let res = stmt
-                .table_delete_unique_mvcc(table_id, id_two.index_no, &id_two.vals)
-                .await?;
-            assert!(res.is_deleted());
-            Ok(())
-        })
+    let deleted = write_trx
+        .table_delete_unique_mvcc(table_id, id_two.index_no, &id_two.vals)
         .await?;
+    assert!(deleted.is_deleted());
     write_trx.commit().await?;
 
     let mut read_trx = session.begin_trx()?;
     let mut scanned_rows = Vec::new();
     // Scan visible rows from the table.
     read_trx
-        .exec(async |stmt| {
-            stmt.table_scan_mvcc(table_id, &[0, 1], |vals| {
-                scanned_rows.push(row_pair(vals));
-                true
-            })
-            .await?;
-            Ok(())
+        .table_scan_mvcc(table_id, &[0, 1], |vals| {
+            scanned_rows.push(row_pair(vals));
+            true
         })
         .await?;
     scanned_rows.sort_unstable();
@@ -100,10 +86,7 @@ async fn run() -> ExampleResult<()> {
 
     // Lookup one row through the unique id index.
     let found = read_trx
-        .exec(async |stmt| {
-            stmt.table_lookup_unique_mvcc(table_id, id_one.index_no, &id_one.vals, &[0, 1])
-                .await
-        })
+        .table_lookup_unique_mvcc(table_id, id_one.index_no, &id_one.vals, &[0, 1])
         .await?
         .unwrap_found();
     assert_eq!(row_pair(found), (1, String::from("ada")));
@@ -111,10 +94,7 @@ async fn run() -> ExampleResult<()> {
     let name_key = SelectKey::new(1, vec![Val::from("ada")]);
     // Scan rows that match one secondary-index key.
     let mut matching_rows = read_trx
-        .exec(async |stmt| {
-            stmt.table_index_lookup_mvcc(table_id, name_key.index_no, &name_key.vals, &[0, 1])
-                .await
-        })
+        .table_index_lookup_mvcc(table_id, name_key.index_no, &name_key.vals, &[0, 1])
         .await?
         .unwrap_rows()
         .into_iter()
@@ -125,8 +105,7 @@ async fn run() -> ExampleResult<()> {
 
     // Stream the same secondary-index match one row at a time.
     let mut stream = read_trx
-        .stream_stmt()
-        .table_index_scan_mvcc(
+        .table_index_scan_mvcc_stream(
             table_id,
             name_key.index_no,
             &name_key.vals[..]..=&name_key.vals[..],

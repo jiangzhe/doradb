@@ -46,6 +46,7 @@ doradb-storage/src/table/index_mutate.rs,IndexMutator::mutate_index_candidate,1
 doradb-storage/src/table/index_mutate.rs,IndexMutator::mutate_owned_hot_index_candidate,2
 doradb-storage/src/table/index_mutate.rs,IndexMutator::unique_driver_key_changed,1
 doradb-storage/src/table/index_mutate.rs,IndexMutator::update_owned_hot_row,5
+doradb-storage/src/trx/interface.rs,Transaction::table_index_scan_mvcc_stream,1
 doradb-storage/src/trx/mod.rs,Transaction::commit,2
 doradb-storage/src/trx/mod.rs,Transaction::exec,2
 doradb-storage/src/trx/mod.rs,Transaction::lock_table,2
@@ -62,5 +63,5 @@ doradb-storage/src/trx/stmt.rs,Statement::table_scan_mvcc,2
 doradb-storage/src/trx/stmt.rs,Statement::table_update_unique_mvcc,5
 doradb-storage/src/trx/stmt.rs,Statement::table_upsert_unique_mvcc,5
 doradb-storage/src/trx/stream_stmt.rs,IndexScanMvccStream::next,2
-doradb-storage/src/trx/stream_stmt.rs,StreamStmt::table_index_scan_mvcc,5
+doradb-storage/src/trx/stream_stmt.rs,StreamStmtState::table_index_scan_mvcc_stream,4
 doradb-storage/src/value.rs,ValKind::try_from,1

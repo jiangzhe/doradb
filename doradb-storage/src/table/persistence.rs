@@ -2376,13 +2376,12 @@ mod tests {
     use crate::conf::TrxSysConfig;
     use crate::engine::Engine;
     use crate::error::{
-        DiscloseError, Error, FatalError, LifecycleError, OperationError, ResourceError,
-        RuntimeError, RuntimeOrFatalError,
+        Error, FatalError, LifecycleError, ResourceError, RuntimeError, RuntimeOrFatalError,
     };
     use crate::file::cow_file::tests::old_root_drop_count;
     use crate::index::RowLocation;
     use crate::io::install_storage_backend_test_hook;
-    use crate::row::ops::{SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
+    use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
     use crate::runtime::mandatory::MandatoryInternalTask;
     use crate::session::{
         Session,
@@ -2413,14 +2412,13 @@ mod tests {
     use crate::table::tests::*;
     use crate::table::{DeleteMarker, TableTerminal};
     use crate::trx::purge::PurgeTestEvent;
-    use crate::trx::stmt::tests as stmt_tests;
     use crate::trx::sys::tests::{
-        fatal_rollback_retention_count, has_active_sts, install_abandoned_cleanup_test_hook,
-        retains_active_row_undo,
+        fatal_rollback_retention_count, has_active_sts, retains_active_row_undo,
     };
     use crate::trx::tests::{
-        discard_transaction_after_fatal_rollback, lock_owner, prepare_transaction,
-        shared_trx_status, transaction_entry, transaction_status_for_test,
+        discard_transaction_after_fatal_rollback, lock_owner, observe_table_root_snapshot,
+        prepare_transaction, shared_trx_status, transaction_delete_undo_observation,
+        transaction_entry, transaction_status_for_test,
     };
     use crate::trx::undo::{
         OwnedRowUndo, RowUndoHead, RowUndoKind, RowUndoLogs, RowUndoRollbackContext, UndoStatus,
@@ -2923,8 +2921,6 @@ mod tests {
         });
     }
 
-    // RFC-0029 Phase 2 runner coverage: raw statement runtime inspection
-    // captures the transaction read-proof root snapshot.
     #[test]
     fn test_trx_read_proof_root_snapshot_captures_active_root() {
         smol::block_on(async {
@@ -2947,39 +2943,23 @@ mod tests {
             assert_checkpoint_published(&mut session, table_id).await;
 
             let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| {
-                let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
-                let proof = rt.read_proof();
-                let snapshot =
-                    table_for_internal_assertion(&engine, table_id).root_snapshot(&proof);
-                let _effects_addr = effects as *mut _;
-                table_for_internal_assertion(&engine, table_id).with_active_root(
-                    &proof,
-                    |active_root| {
-                        assert_eq!(snapshot.root_ts(), active_root.root_ts);
-                        assert_eq!(snapshot.pivot_row_id(), active_root.pivot_row_id);
-                        assert_eq!(
-                            snapshot.column_block_index_root(),
-                            active_root.column_block_index_root
-                        );
-                        assert_eq!(
-                            snapshot.deletion_cutoff_ts(),
-                            active_root.deletion_cutoff_ts
-                        );
-                        assert_eq!(
-                            snapshot.secondary_index_root(0),
-                            active_root.secondary_index_roots[0]
-                        );
-                        assert_eq!(
-                            snapshot.root_is_visible_to(rt.sts()),
-                            active_root.effective_ts() < rt.sts()
-                        );
-                    },
-                );
-                Ok(())
-            })
-            .await
-            .unwrap();
+            let table = table_for_internal_assertion(&engine, table_id);
+            let observed = observe_table_root_snapshot(&mut trx, &table, 0)
+                .await
+                .unwrap();
+            let active_root = table.file().active_root_unchecked();
+            assert_eq!(observed.root_ts, active_root.root_ts);
+            assert_eq!(observed.pivot_row_id, active_root.pivot_row_id);
+            assert_eq!(
+                observed.column_block_index_root,
+                active_root.column_block_index_root
+            );
+            assert_eq!(observed.deletion_cutoff_ts, active_root.deletion_cutoff_ts);
+            assert_eq!(
+                observed.secondary_index_root,
+                active_root.secondary_index_roots[0]
+            );
+            assert_eq!(observed.visible, active_root.effective_ts() < observed.sts);
             trx.rollback().await.unwrap();
         });
     }
@@ -4646,22 +4626,13 @@ mod tests {
                 .lock()
                 .take()
                 .expect("reader hook should install an active transaction");
-            // RFC-0029 Phase 2 runner coverage: raw statement runtime
-            // inspection captures a delayed checkpoint read proof.
-            reader
-                .exec(async |stmt| {
-                    let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
-                    let proof = rt.read_proof();
-                    let snapshot =
-                        table_for_internal_assertion(&engine, table_id).root_snapshot(&proof);
-                    let _effects_addr = effects as *mut _;
-                    assert!(snapshot.root_ts() < rt.sts());
-                    assert_eq!(snapshot.effective_ts(), effective_ts);
-                    assert!(!snapshot.root_is_visible_to(rt.sts()));
-                    Ok(())
-                })
+            let table = table_for_internal_assertion(&engine, table_id);
+            let observed = observe_table_root_snapshot(&mut reader, &table, 0)
                 .await
                 .unwrap();
+            assert!(observed.root_ts < observed.sts);
+            assert_eq!(observed.effective_ts, effective_ts);
+            assert!(!observed.visible);
             reader.commit().await.unwrap();
             session
                 .wait_for_gc_horizon_after(effective_ts)
@@ -6093,7 +6064,7 @@ mod tests {
     }
 
     #[test]
-    fn test_statement_row_rollback_waits_for_transition_route_publication() {
+    fn test_transaction_row_rollback_waits_for_transition_route_publication() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "transition-row-rollback").await;
@@ -6122,32 +6093,13 @@ mod tests {
             let mut writer_session = engine.new_session().unwrap();
             let mut writer = writer_session.begin_trx().unwrap();
             let writer_status = transaction_status_for_test(&writer);
-            let (delete_done_tx, delete_done_rx) = flume::bounded(1);
-            let (return_error_tx, return_error_rx) = flume::bounded(1);
-            let statement_key = key.clone();
-            // RFC-0029 Phase 2 runner coverage: callback error injection pauses
-            // statement row rollback at transition-route publication.
-            let mut statement = Box::pin(writer.exec(async move |stmt| {
-                let deleted = stmt
-                    .table_delete_unique_mvcc(table_id, statement_key.index_no, &statement_key.vals)
-                    .await?;
-                assert_eq!(deleted, crate::row::ops::DeleteMvcc::Deleted);
-                let effects = stmt_tests::statement_effects_mut(stmt);
-                assert_eq!(effects.undo_counts(), (1, 1));
-                let undo = effects.last_row_undo();
-                let undo_addr = from_ref(&**undo).addr();
-                delete_done_tx.send_async(undo_addr).await.unwrap();
-                return_error_rx.recv_async().await.unwrap();
-                Err::<(), Error>(Report::new(OperationError::InvalidDmlInput).disclose())
-            }));
-            let delete_done = delete_done_rx.recv_async().fuse();
-            futures::pin_mut!(delete_done);
-            let owned_undo_addr = futures::select! {
-                result = statement.as_mut().fuse() => {
-                    panic!("statement completed before rollback was requested: {result:?}");
-                }
-                result = delete_done => result.unwrap(),
-            };
+            let deleted = writer
+                .table_delete_unique_mvcc(table_id, key.index_no, &key.vals)
+                .await
+                .unwrap();
+            assert_eq!(deleted, DeleteMvcc::Deleted);
+            let (undo_counts, owned_undo_addr) = transaction_delete_undo_observation(&writer);
+            assert_eq!(undo_counts, (1, 1));
 
             let (transition_entered_tx, transition_entered_rx) = flume::bounded(1);
             let (publish_route_tx, publish_route_rx) = flume::bounded(1);
@@ -6166,11 +6118,12 @@ mod tests {
             }
 
             let before_wait = engine.inner().poisoner.test_observation_counts();
-            return_error_tx.send_async(()).await.unwrap();
+            let mut rollback = Box::pin(writer.rollback());
             assert!(matches!(
-                futures::poll!(statement.as_mut()),
+                futures::poll!(rollback.as_mut()),
                 std::task::Poll::Pending
             ));
+            wait_for_route_listener(&engine, before_wait.1).await;
             let after_wait = engine.inner().poisoner.test_observation_counts();
             assert!(after_wait.0 > before_wait.0);
             assert!(after_wait.1 > before_wait.1);
@@ -6226,27 +6179,21 @@ mod tests {
             publish_route_tx.send_async(()).await.unwrap();
             let outcome = checkpoint.await.unwrap();
             assert!(matches!(outcome, CheckpointOutcome::Published { .. }));
-            let statement_error = statement.await.unwrap_err();
+            rollback.await.unwrap();
             assert_eq!(
                 engine.inner().poisoner.test_observation_counts().1,
                 before_wait.1 + 1,
                 "one route publication must require exactly one registered wait"
             );
-            assert_eq!(
-                statement_error
-                    .report()
-                    .downcast_ref::<OperationError>()
-                    .copied(),
-                Some(OperationError::InvalidDmlInput)
-            );
             assert!(row_id < table.mem.pivot_row_id());
             assert!(table.deletion_buffer().get(row_id).is_none());
 
-            let selected = trx_select_row_mvcc_by_id(&mut writer, table_id, &key, &[0, 1])
+            let mut reader = reader_session.begin_trx().unwrap();
+            let selected = trx_select_row_mvcc_by_id(&mut reader, table_id, &key, &[0, 1])
                 .await
                 .unwrap();
             assert!(matches!(selected, SelectMvcc::Found(_)));
-            writer.rollback().await.unwrap();
+            reader.commit().await.unwrap();
         });
     }
 
@@ -6403,124 +6350,6 @@ mod tests {
                 .await
                 .unwrap();
             assert!(matches!(new, SelectMvcc::NotFound));
-            reader.commit().await.unwrap();
-        });
-    }
-
-    #[test]
-    fn test_statement_cancellation_during_transition_rollback_resumes_in_cleanup() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine = lightweight_test_engine(&temp_dir, "statement-transition-cancel").await;
-            let mut checkpoint_session = engine.new_session().unwrap();
-            let (table_id, table, key, row_id, page_id) =
-                setup_frozen_transition_row(&engine, &mut checkpoint_session, "cancel").await;
-
-            let mut writer_session = engine.new_session().unwrap();
-            let mut writer = writer_session.begin_trx().unwrap();
-            let entry = transaction_entry(&writer);
-            let trx_id = writer.trx_id();
-            let writer_status = transaction_status_for_test(&writer);
-            let (delete_done_tx, delete_done_rx) = flume::bounded(1);
-            let (return_error_tx, return_error_rx) = flume::bounded(1);
-            let statement_key = key.clone();
-            // RFC-0029 Phase 2 runner coverage: cancelling a callback during
-            // row rollback transfers residual transition cleanup ownership.
-            let mut statement = Box::pin(writer.exec(async move |stmt| {
-                let deleted = stmt
-                    .table_delete_unique_mvcc(table_id, statement_key.index_no, &statement_key.vals)
-                    .await?;
-                assert_eq!(deleted, crate::row::ops::DeleteMvcc::Deleted);
-                let undo = stmt_tests::statement_effects_mut(stmt).last_row_undo();
-                delete_done_tx
-                    .send_async(from_ref(&**undo).addr())
-                    .await
-                    .unwrap();
-                return_error_rx.recv_async().await.unwrap();
-                Err::<(), Error>(Report::new(OperationError::InvalidDmlInput).disclose())
-            }));
-            let deleted = delete_done_rx.recv_async().fuse();
-            futures::pin_mut!(deleted);
-            let owned_undo_addr = futures::select! {
-                result = statement.as_mut().fuse() => {
-                    panic!("statement completed before transition setup: {result:?}");
-                }
-                result = deleted => result.unwrap(),
-            };
-
-            let (transition_entered, publish_route) = install_transition_publication_pause(&engine);
-            let mut checkpoint = Box::pin(checkpoint_session.checkpoint_table(table_id).fuse());
-            let entered = transition_entered.recv_async().fuse();
-            futures::pin_mut!(entered);
-            futures::select! {
-                result = checkpoint.as_mut() => {
-                    panic!("checkpoint completed before statement cancellation: {result:?}");
-                }
-                result = entered => result.unwrap(),
-            }
-
-            return_error_tx.send_async(()).await.unwrap();
-            assert!(matches!(
-                futures::poll!(statement.as_mut()),
-                std::task::Poll::Pending
-            ));
-            let (cleanup_entered_tx, cleanup_entered_rx) = flume::bounded(1);
-            let (cleanup_release_tx, cleanup_release_rx) = flume::bounded(1);
-            let _cleanup_hook = install_abandoned_cleanup_test_hook(Arc::new(move |observed| {
-                if observed == trx_id {
-                    cleanup_entered_tx.send(()).unwrap();
-                    cleanup_release_rx.recv().unwrap();
-                }
-            }));
-            drop(statement);
-            cleanup_entered_rx.recv_async().await.unwrap();
-            assert_eq!(entry.inspect().state, SessionOperationState::CleanupReady);
-            assert!(entry.inspect().cleanup_requested);
-
-            let old_guard = table
-                .mem
-                .must_get_row_page_shared(&writer_session.pool_guards(), page_id.page_id)
-                .await
-                .unwrap();
-            assert_eq!(
-                old_guard.unwrap_vmap().inspect_state(),
-                RowPageState::Transition
-            );
-            let old_idx = old_guard.page().row_idx(row_id);
-            assert!(old_guard.page().is_deleted(old_idx));
-            let old_undo = old_guard.unwrap_vmap().read_latch(old_idx);
-            let old_head = old_undo
-                .as_ref()
-                .expect("cancelled statement must leave its row undo linked");
-            assert_eq!(
-                from_ref(old_head.next.main.entry.as_ref()).addr(),
-                owned_undo_addr
-            );
-            drop(old_undo);
-            drop(old_guard);
-            let Some(DeleteMarker::Ref(marker_status)) = table.deletion_buffer().get(row_id) else {
-                panic!("cancelled transition rollback must retain marker ownership");
-            };
-            assert!(Arc::ptr_eq(&marker_status, &writer_status));
-
-            cleanup_release_tx.send(()).unwrap();
-            wait_for_operation_state(&entry, SessionOperationState::Completing).await;
-            drop(writer);
-            publish_route.send_async(()).await.unwrap();
-            assert!(matches!(
-                checkpoint.await.unwrap(),
-                CheckpointOutcome::Published { .. }
-            ));
-            wait_for_session_idle(&engine.inner().session_registry, writer_session.id()).await;
-            assert_eq!(entry.inspect().state, SessionOperationState::Terminal);
-            assert!(table.deletion_buffer().get(row_id).is_none());
-            assert_eq!(fatal_rollback_retention_count(&engine.inner().trx_sys), 0);
-
-            let mut reader = writer_session.begin_trx().unwrap();
-            let visible = trx_select_row_mvcc_by_id(&mut reader, table_id, &key, &[0, 1])
-                .await
-                .unwrap();
-            assert!(matches!(visible, SelectMvcc::Found(_)));
             reader.commit().await.unwrap();
         });
     }
@@ -7159,7 +6988,7 @@ mod tests {
             let mut write_trx = write_session.begin_trx().unwrap();
             {
                 let insert = vec![Val::from(10_000i32), Val::from("new")];
-                let res = trx_insert_row_by_id(&mut write_trx, table_id, insert).await;
+                let res = write_trx.table_insert_mvcc(table_id, insert).await;
                 assert!(res.is_ok());
             }
 
@@ -7244,7 +7073,7 @@ mod tests {
                 .expect("test table should exist");
             let mut session = engine.new_session().unwrap();
             let name = "z".repeat(512);
-            insert_rows_direct(table_id, &mut session, 0, 150, &name).await;
+            insert_rows(table_id, &mut session, 0, 150, &name).await;
 
             assert_freeze_created(
                 session
@@ -7794,13 +7623,9 @@ mod tests {
             let mut writer = engine.new_session().unwrap();
             wait_for_checkpoint_root_ready(&mut writer, table_id).await;
             let mut trx = writer.begin_trx().unwrap();
-            trx_insert_row_by_id(
-                &mut trx,
-                table_id,
-                vec![Val::from(1i32), Val::from("blocked")],
-            )
-            .await
-            .unwrap();
+            trx.table_insert_mvcc(table_id, vec![Val::from(1i32), Val::from("blocked")])
+                .await
+                .unwrap();
 
             let mut checkpoint_session = engine.new_session().unwrap();
             let table = table_for_internal_assertion(&engine, table_id);

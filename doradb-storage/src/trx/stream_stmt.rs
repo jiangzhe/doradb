@@ -1,7 +1,6 @@
 use crate::buffer::EvictableBufferPool;
 use crate::error::{
-    DiscloseResultExt, MultiDomainResultExt, OperationError, OperationOrFatalResult, Result,
-    RuntimeResult,
+    DiscloseResultExt, OperationError, OperationOrFatalResult, Result, RuntimeResult,
 };
 use crate::id::TableID;
 use crate::index::{
@@ -22,20 +21,25 @@ use std::sync::Arc;
 
 use super::admission::admit_user_table;
 
-const INDEX_SCAN_STREAM_OPERATION: &str = "table_index_scan_mvcc";
+pub(super) const INDEX_SCAN_STREAM_OPERATION: &str = "table_index_scan_mvcc";
 
-struct StreamStmtState {
+pub(super) struct StreamStmtState {
     checkout: SessionOperationCheckout,
     _stmt_no: StmtNo,
+    dml_validation_disabled: bool,
 }
 
 impl StreamStmtState {
     #[inline]
-    fn new(mut checkout: SessionOperationCheckout) -> Self {
+    pub(super) fn new(
+        mut checkout: SessionOperationCheckout,
+        dml_validation_disabled: bool,
+    ) -> Self {
         let stmt_no = checkout.inner_mut().next_stmt_no();
         Self {
             checkout,
             _stmt_no: stmt_no,
+            dml_validation_disabled,
         }
     }
 
@@ -64,6 +68,57 @@ impl StreamStmtState {
             INDEX_SCAN_STREAM_OPERATION,
         )
         .await
+    }
+
+    /// Creates a validated MVCC secondary-index row stream for a user table.
+    #[inline]
+    pub(super) async fn table_index_scan_mvcc_stream<'trx, 'r, R>(
+        mut self,
+        table_id: TableID,
+        index_no: usize,
+        range: R,
+        read_set: &[usize],
+    ) -> Result<IndexScanMvccStream<'trx>>
+    where
+        R: RangeBounds<&'r [Val]>,
+    {
+        let (table, layout) = self
+            .admit_user_table(table_id, TableAdmissionRequest::IndexRead { index_no })
+            .await
+            .disclose()?;
+        if !self.dml_validation_disabled {
+            DmlValidator::new(layout.metadata())
+                .validate_index_scan(index_no, &range, read_set)
+                .change_context(OperationError::InvalidDmlInput)
+                .attach_with(|| {
+                    format!("operation={INDEX_SCAN_STREAM_OPERATION}, table_id={table_id}")
+                })
+                .disclose()?;
+        }
+        let index = layout.secondary_index(index_no).disclose()?;
+        let unique = index.is_unique();
+        let encoder = index.key_encoder_arc();
+        let range = if unique {
+            encoder.encode_range(range)
+        } else {
+            encoder.encode_non_unique_range(range)
+        };
+        let rt = self.runtime();
+        let accessor = table.accessor_with_layout(&layout);
+        let candidate_stream = accessor
+            .index_scan_candidates(rt, index_no, range)
+            .disclose()?;
+        let state = IndexScanMvccStreamState {
+            candidate_stream,
+            table,
+            layout,
+            index_no,
+            unique,
+            encoder,
+            read_set: read_set.to_vec(),
+            stmt_state: self,
+        };
+        Ok(IndexScanMvccStream::new(state))
     }
 }
 
@@ -201,98 +256,5 @@ impl Drop for IndexScanMvccStream<'_> {
     #[inline]
     fn drop(&mut self) {
         self.close();
-    }
-}
-
-/// Statement facade for public caller-driven transaction streams.
-pub struct StreamStmt<'trx> {
-    trx: &'trx mut Transaction,
-    disable_validation: bool,
-}
-
-impl<'trx> StreamStmt<'trx> {
-    #[inline]
-    pub(super) fn new(trx: &'trx mut Transaction) -> Self {
-        Self {
-            trx,
-            disable_validation: false,
-        }
-    }
-
-    /// Disable default DML shape, type, and read-set validation for this stream.
-    ///
-    /// Validation is enabled by default. Disable it only when the caller has
-    /// already validated every `table_index_scan_mvcc` argument against the
-    /// target table metadata for this statement:
-    ///
-    /// - `index_no` names an active secondary index on the target table.
-    /// - Every bounded range side has exactly the target index key column count.
-    /// - Every bounded range value matches the corresponding indexed column type.
-    /// - `read_set` is non-empty, strictly increasing, and contains only
-    ///   in-range table column numbers.
-    ///
-    /// Violating these preconditions may surface as debug assertions or
-    /// internal errors instead of `InvalidDmlInput`.
-    #[inline]
-    pub fn disable_validation(mut self) -> Self {
-        self.disable_validation = true;
-        self
-    }
-
-    /// Creates a public MVCC secondary-index row stream for a user table.
-    #[inline]
-    pub async fn table_index_scan_mvcc<'r, R>(
-        self,
-        table_id: TableID,
-        index_no: usize,
-        range: R,
-        read_set: &[usize],
-    ) -> Result<IndexScanMvccStream<'trx>>
-    where
-        R: RangeBounds<&'r [Val]>,
-    {
-        let checkout = self
-            .trx
-            .checkout()
-            .attach_with(|| format!("operation={INDEX_SCAN_STREAM_OPERATION}"))
-            .disclose()?;
-        let mut stmt_state = StreamStmtState::new(checkout);
-        let (table, layout) = stmt_state
-            .admit_user_table(table_id, TableAdmissionRequest::IndexRead { index_no })
-            .await
-            .disclose()?;
-        if !self.disable_validation {
-            DmlValidator::new(layout.metadata())
-                .validate_index_scan(index_no, &range, read_set)
-                .change_context(OperationError::InvalidDmlInput)
-                .attach_with(|| {
-                    format!("operation={INDEX_SCAN_STREAM_OPERATION}, table_id={table_id}")
-                })
-                .disclose()?;
-        }
-        let index = layout.secondary_index(index_no).disclose()?;
-        let unique = index.is_unique();
-        let encoder = index.key_encoder_arc();
-        let range = if unique {
-            encoder.encode_range(range)
-        } else {
-            encoder.encode_non_unique_range(range)
-        };
-        let rt = stmt_state.runtime();
-        let accessor = table.accessor_with_layout(&layout);
-        let candidate_stream = accessor
-            .index_scan_candidates(rt, index_no, range)
-            .disclose()?;
-        let state = IndexScanMvccStreamState {
-            candidate_stream,
-            table,
-            layout,
-            index_no,
-            unique,
-            encoder,
-            read_set: read_set.to_vec(),
-            stmt_state,
-        };
-        Ok(IndexScanMvccStream::new(state))
     }
 }

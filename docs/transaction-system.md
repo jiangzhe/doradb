@@ -175,8 +175,10 @@ MemIndex cleanup is the separate registered-reader case. Its
 it cannot mint `TrxReadProof`, and the captured root cannot outlive the active
 STS registration.
 
-Each user statement runs through `Transaction::exec(async |stmt| { ... })`.
-Every successfully checked-out public, private, or public stream statement
+Each public user statement is one direct `Transaction` no-op, read, DML, or
+stream-construction method. Non-streaming methods use a transaction-module-
+private owned runner; streaming uses its specialized checkout/state path.
+Every successfully checked-out public, private, or streaming statement
 receives one monotonically increasing transaction-local `StmtNo`. Read-only and
 failed statements consume numbers, and terminal transaction reset restarts the
 counter. `StmtNo` is runtime-only: each foreground row undo entry carries it so
@@ -279,10 +281,12 @@ versioned page tokens through the catalog table's shared insert free list, so
 catalog insert capacity remains available across sessions without requiring a
 user-table runtime cache entry.
 
-`StmtState` owns the per-operation checkout and statement effects while public
-`Transaction::exec` is active. It lends one `Statement` facade with direct
-disjoint borrows of the checked-out `TrxInner`, operation attachment, and
-effects; DML methods therefore do not resolve the entry or unwrap the carrier.
+`StmtState` owns the per-operation checkout and statement effects while one
+direct non-streaming transaction method is active. The private runner passes
+one owned internal `Statement` with direct disjoint borrows of the checked-out
+`TrxInner`, operation attachment, and effects. Every high-level operation
+consumes that capability, so the engine-controlled operation can issue exactly
+one read or DML; DML methods do not resolve the entry or unwrap the carrier.
 Normal public statement finish returns the core to its checked-in payload
 position inside outer `Voluntary` ownership. This ends only the
 operation-local checkout, not the semantic transaction lifetime; the weak
@@ -291,17 +295,17 @@ statements borrow the core and attachment directly from `PrivateTransaction`,
 settle their statement effects into the held `TrxInner`, and never check the
 core through the entry between logical catalog-table boundaries.
 
-Dropping an unpolled `Transaction::exec` future performs no checkout. Once
-checkout succeeds, dropping the future is terminal for that public
-transaction. The callback and any pending acquisition guard are destroyed
-first. `StmtState` then discards statement redo, appends residual row and index
+Dropping an unpolled direct non-streaming method future performs no checkout.
+Once checkout succeeds, dropping the future is terminal for that public
+transaction. The owned operation future and any pending acquisition guard are
+destroyed first. `StmtState` then discards statement redo, appends residual row and index
 undo after prior transaction undo, and returns the complete core directly as
 outer `CleanupReady`. It never exposes an intervening
 available payload position. The exact-identity cleanup job claims the
 core and performs whole-transaction rollback; later calls through the stale
-public facade return `TransactionDiscarded`. An ordinary callback error is
-different: statement-local rollback completes before ordinary check-in, so
-the transaction remains reusable.
+public facade return `TransactionDiscarded`. An ordinary operation error is
+different: statement-local rollback completes before ordinary check-in, so the
+transaction remains reusable.
 
 Explicit commit and rollback consume the public handle, suppress drop
 abandonment, and claim the same entry and core through
@@ -375,23 +379,35 @@ duplicate hints are neutral. Registry resolution uses only the operation key;
 the cleanup claim atomically validates the message's `TrxID`, claimable state,
 and physical payload ownership under the entry mutex.
 
-`Statement` is a borrowed facade over operation-local runtime access and
-carrier-owned statement-local `StmtEffects`; callers cannot construct or
-finish it directly. Public statements settle through `StmtState`; private
-catalog statements use a fresh effect accumulator borrowed alongside the
-continuously held checkout. Private ordinary errors merge complete and partial
-undo for whole-transaction rollback, while panic settlement discards
-incomplete statement redo and folds residual undo before resuming the unwind.
+`Statement` is a transaction-module-private, owned one-shot facade over
+operation-local runtime access and carrier-owned statement-local `StmtEffects`;
+callers cannot name, construct, or finish it directly, and each high-level
+operation consumes it. Public statements settle through `StmtState`; private
+catalog statements use a fresh private carrier and effect accumulator borrowed
+alongside the continuously held checkout. Public and private ordinary errors
+roll back the current statement index effects before row effects and discard
+its redo before returning. Panic settlement discards incomplete statement redo
+and folds residual undo before resuming the unwind.
 Foreground table APIs receive `TrxRuntime` by value when they need pool guards,
 insert-page cache access, or runtime lock assertions, while pure row MVCC
-helpers continue to receive `&TrxContext`. When the callback succeeds,
+helpers continue to receive `&TrxContext`. When the owned operation succeeds,
 statement row undo, index undo, and redo effects merge into the active
-transaction. When the callback returns an ordinary error, only the current
+transaction. When the operation returns an ordinary error, only the current
 statement effects are rolled back and the original error is returned. If that
 rollback cannot access required storage, the rollback failure is fatal: storage
 is poisoned and the operation entry becomes `FailedRetained`. The retained
 entry stays registry-visible, blocks session reuse and shutdown, and makes
 later commit or rollback attempts return an error.
+
+Each public `Transaction` starts with DML validation enabled. Calling
+`disable_dml_validation(true)` changes the policy for subsequent direct reads,
+DML, and stream construction; calling it with `false` restores validation.
+Non-streaming statements copy the current setting into their owned internal
+operation, and stream construction reads it before checkout. The setting is
+transaction-local, survives ordinary statement settlement, and cannot change
+while an operation or returned stream exclusively borrows the transaction. It
+bypasses caller-input validation only: table/index admission, schema checks,
+lock acquisition, MVCC ownership, and storage invariants remain mandatory.
 
 Logical lock ownership is tracked outside `TrxContext`. One boxed
 `FamilyLockAuthority` is allocated per session and moves linearly into
@@ -405,9 +421,10 @@ Catalog DDL mutations are owned by `CatalogStorage` and use one private
 statement per logical catalog table, retaining same-table row batches in one
 effect boundary. `StmtEffects` carries only DML redo. After every catalog-table
 statement and invariant check succeeds, `PrivateTransaction` installs exactly
-one `DDLRedo` marker directly in `TrxEffects`; an ordinary staging error leaves
-all accumulated undo available for whole-transaction rollback and leaves the
-transaction-level DDL slot empty.
+one `DDLRedo` marker directly in `TrxEffects`; an ordinary staging error first
+rolls back the current private statement, leaves prior successful statement
+undo available for whole-transaction rollback, and leaves the transaction-
+level DDL slot empty.
 
 Transaction locks close on commit,
 rollback, no-op discard, or fatal transaction discard. DDL and maintenance
@@ -420,8 +437,9 @@ exact scope index and does not scan manager resources.
 See [Lock System](./lock-system.md) for the resource and mode model, the
 implemented manager structures, and the pre-RFC redesign study.
 
-Foreground table access enters through lock-aware `Statement` APIs and a
-positive transaction-lifetime `TransactionTableBinding`. A binding hit is
+Foreground table access enters through direct `Transaction` APIs, backed by
+lock-aware consuming internal `Statement` operations and a positive
+transaction-lifetime `TransactionTableBinding`. A binding hit is
 checked before any new metadata-lock request and reuses the STS-visible
 metadata, current `Table`, current `TableRuntimeLayout`, and transaction-owned
 `TableMetadata(S)` already stored for that table. On first touch, admission

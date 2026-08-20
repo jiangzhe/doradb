@@ -63,32 +63,15 @@ impl CatalogStorage {
             })
             .collect::<Vec<_>>();
 
-        trx.stage_statement(async |stmt| self.tables().insert(stmt, &table).await)
-            .await?;
-        trx.stage_statement(async |stmt| {
-            for column in &columns {
-                self.columns().insert(stmt, column).await?;
-            }
-            Ok(())
-        })
-        .await?;
+        self.tables().insert(trx, &table).await?;
+        self.columns().insert_batch(trx, &columns).await?;
         if !indexes.is_empty() {
-            trx.stage_statement(async |stmt| {
-                for index in &indexes {
-                    self.indexes().insert(stmt, index).await?;
-                }
-                Ok(())
-            })
-            .await?;
+            self.indexes().insert_batch(trx, &indexes).await?;
         }
         if !index_columns.is_empty() {
-            trx.stage_statement(async |stmt| {
-                for index_column in &index_columns {
-                    self.index_columns().insert(stmt, index_column).await?;
-                }
-                Ok(())
-            })
-            .await?;
+            self.index_columns()
+                .insert_batch(trx, &index_columns)
+                .await?;
         }
         trx.install_ddl_redo(DDLRedo::CreateTable(table_id));
         Ok(())
@@ -103,12 +86,9 @@ impl CatalogStorage {
     ) -> RuntimeOrFatalResult<()> {
         validate_catalog_engine_health(trx, "stage_drop_table")?;
 
-        let index_columns_deleted = trx
-            .stage_statement(async |stmt| {
-                self.index_columns()
-                    .delete_by_table_id(stmt, table_id)
-                    .await
-            })
+        let index_columns_deleted = self
+            .index_columns()
+            .delete_by_table_id(trx, table_id)
             .await?;
         let expected_index_columns = metadata
             .idx
@@ -120,38 +100,29 @@ impl CatalogStorage {
             "drop-table catalog invariant violated: index-column delete count mismatch, table_id={table_id}"
         );
 
-        let indexes_deleted = trx
-            .stage_statement(async |stmt| self.indexes().delete_by_table_id(stmt, table_id).await)
-            .await?;
+        let indexes_deleted = self.indexes().delete_by_table_id(trx, table_id).await?;
         assert_eq!(
             indexes_deleted,
             metadata.idx.active_index_count(),
             "drop-table catalog invariant violated: index delete count mismatch, table_id={table_id}"
         );
 
-        let columns_deleted = trx
-            .stage_statement(async |stmt| self.columns().delete_by_table_id(stmt, table_id).await)
-            .await?;
+        let columns_deleted = self.columns().delete_by_table_id(trx, table_id).await?;
         assert_eq!(
             columns_deleted,
             metadata.col.col_count(),
             "drop-table catalog invariant violated: column delete count mismatch, table_id={table_id}"
         );
 
-        let table_deleted = trx
-            .stage_statement(async |stmt| self.tables().delete_by_id(stmt, table_id).await)
-            .await?;
+        let table_deleted = self.tables().delete_by_id(trx, table_id).await?;
         assert!(
             table_deleted,
             "drop-table catalog invariant violated: validated table row is missing, table_id={table_id}"
         );
 
-        trx.stage_statement(async |stmt| {
-            self.table_replay_silent_watermarks()
-                .delete_by_table_id(stmt, table_id)
-                .await
-        })
-        .await?;
+        self.table_replay_silent_watermarks()
+            .delete_by_table_id(trx, table_id)
+            .await?;
 
         trx.install_ddl_redo(DDLRedo::DropTable(table_id));
         Ok(())
@@ -186,55 +157,46 @@ impl CatalogStorage {
                 )
             });
 
-        trx.stage_statement(async |stmt| {
-            let table_deleted = self.tables().delete_by_id(stmt, table_id).await?;
-            assert!(
-                table_deleted,
-                "create-index catalog invariant violated: validated table row is missing, table_id={table_id}"
-            );
-            self.tables()
-                .insert(
-                    stmt,
-                    &TableObject {
-                        table_id,
-                        next_index_no: new_metadata.idx.next_index_no(),
-                    },
-                )
-                .await
-        })
-        .await?;
-        trx.stage_statement(async |stmt| {
-            self.indexes()
-                .insert(
-                    stmt,
-                    &IndexObject {
-                        table_id,
-                        index_no,
-                        index_attributes: index_spec.attributes,
-                    },
-                )
-                .await
-        })
-        .await?;
-        if !index_spec.cols.is_empty() {
-            trx.stage_statement(async |stmt| {
-                for (index_column_no, index_key) in index_spec.cols.iter().enumerate() {
-                    self.index_columns()
-                        .insert(
-                            stmt,
-                            &IndexColumnObject {
-                                table_id,
-                                index_no,
-                                index_column_no: index_column_no as u16,
-                                column_no: index_key.col_no,
-                                index_order: index_key.order,
-                            },
-                        )
-                        .await?;
-                }
-                Ok(())
-            })
+        let table_deleted = self
+            .tables()
+            .replace(
+                trx,
+                &TableObject {
+                    table_id,
+                    next_index_no: new_metadata.idx.next_index_no(),
+                },
+            )
             .await?;
+        assert!(
+            table_deleted,
+            "create-index catalog invariant violated: validated table row is missing, table_id={table_id}"
+        );
+        self.indexes()
+            .insert(
+                trx,
+                &IndexObject {
+                    table_id,
+                    index_no,
+                    index_attributes: index_spec.attributes,
+                },
+            )
+            .await?;
+        if !index_spec.cols.is_empty() {
+            let index_columns = index_spec
+                .cols
+                .iter()
+                .enumerate()
+                .map(|(index_column_no, index_key)| IndexColumnObject {
+                    table_id,
+                    index_no,
+                    index_column_no: index_column_no as u16,
+                    column_no: index_key.col_no,
+                    index_order: index_key.order,
+                })
+                .collect::<Vec<_>>();
+            self.index_columns()
+                .insert_batch(trx, &index_columns)
+                .await?;
         }
 
         trx.install_ddl_redo(DDLRedo::CreateIndex { table_id, index_no });
@@ -265,12 +227,9 @@ impl CatalogStorage {
                 )
             });
 
-        let deleted_columns = trx
-            .stage_statement(async |stmt| {
-                self.index_columns()
-                    .delete_by_index(stmt, table_id, index_no)
-                    .await
-            })
+        let deleted_columns = self
+            .index_columns()
+            .delete_by_index(trx, table_id, index_no)
             .await?;
         assert_eq!(
             deleted_columns,
@@ -278,11 +237,7 @@ impl CatalogStorage {
             "drop-index catalog invariant violated: index-column delete count mismatch, table_id={table_id}, index_no={index_no}"
         );
 
-        let index_deleted = trx
-            .stage_statement(async |stmt| {
-                self.indexes().delete_by_id(stmt, table_id, index_no).await
-            })
-            .await?;
+        let index_deleted = self.indexes().delete_by_id(trx, table_id, index_no).await?;
         assert!(
             index_deleted,
             "drop-index catalog invariant violated: validated index row is missing, table_id={table_id}, index_no={index_no}"

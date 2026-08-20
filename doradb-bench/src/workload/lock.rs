@@ -370,9 +370,7 @@ async fn run_specialized_lifecycle(
         LockTableScenario::FirstTouch => {
             let table_id = stable_table(&spec.table_ids, plan)?;
             let mut trx = session.begin_trx()?;
-            let scan = trx
-                .exec(async |stmt| stmt.table_scan_mvcc(table_id, &[0], |_| true).await)
-                .await;
+            let scan = trx.table_scan_mvcc(table_id, &[0], |_| true).await;
             if let Err(error) = scan {
                 let primary = BenchError::from(error);
                 let _ = trx.rollback().await;

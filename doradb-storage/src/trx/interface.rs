@@ -1,13 +1,15 @@
-use crate::error::Result;
+use crate::error::{DiscloseResultExt, MultiDomainResultExt, Result};
 use crate::id::{RowID, TableID};
 use crate::row::ops::{
     DeleteMvcc, RowMutation, ScanMvcc, SelectMvcc, TableMutationOutcome, UpdateCol, UpdateMvcc,
     UpsertMvcc,
 };
 use crate::table::LazyRow;
-use crate::trx::{IndexScanMvccStream, StreamStmt, Transaction};
+use crate::trx::{IndexScanMvccStream, Transaction};
 use crate::value::Val;
 use std::ops::RangeBounds;
+
+use super::stream_stmt::{INDEX_SCAN_STREAM_OPERATION, StreamStmtState};
 
 impl Transaction {
     /// Executes one empty statement through the normal transaction settlement path.
@@ -192,8 +194,13 @@ impl Transaction {
     where
         R: RangeBounds<&'r [Val]>,
     {
-        StreamStmt::new(self)
-            .table_index_scan_mvcc(table_id, index_no, range, read_set)
+        let dml_validation_disabled = self.dml_validation_disabled;
+        let checkout = self
+            .checkout()
+            .attach_with(|| format!("operation={INDEX_SCAN_STREAM_OPERATION}"))
+            .disclose()?;
+        StreamStmtState::new(checkout, dml_validation_disabled)
+            .table_index_scan_mvcc_stream(table_id, index_no, range, read_set)
             .await
     }
 }

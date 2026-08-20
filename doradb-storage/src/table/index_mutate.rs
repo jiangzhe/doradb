@@ -448,8 +448,12 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
     /// Applies every cached key-changing update after index traversal ends.
     pub(super) async fn apply_deferred_index_updates(&mut self) -> Result<()> {
         #[cfg(test)]
-        if self.effects.has_deferred_index_updates() {
-            tests::maybe_pause_before_deferred_application().await;
+        {
+            use crate::trx::stmt::tests::has_deferred_index_updates;
+
+            if has_deferred_index_updates(self.effects) {
+                tests::maybe_pause_before_deferred_application().await;
+            }
         }
         self.effects.begin_deferred_index_update_application();
         while let Some((row_id, update)) = self.effects.activate_next_deferred_index_update() {
@@ -1363,7 +1367,7 @@ mod tests {
     }
 
     #[test]
-    fn test_table_index_mutate_mvcc_skips_same_statement_but_not_later_statement() {
+    fn test_table_index_mutate_mvcc_visits_row_inserted_by_prior_direct_operation() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "index_mutate_stmt_identity").await;
@@ -1371,20 +1375,9 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
 
-            // RFC-0029 Phase 2 runner coverage: intentional same-statement
-            // insert plus index mutation proves replacement-row exclusion.
-            let outcome = trx
-                .exec(async |stmt| {
-                    stmt.table_insert_mvcc(table_id, vec![Val::from(7i32), Val::from("inserted")])
-                        .await?;
-                    stmt.table_index_mutate_mvcc(table_id, 0, .., |_| {
-                        panic!("a row produced by this statement must not reach the callback")
-                    })
-                    .await
-                })
+            trx.table_insert_mvcc(table_id, vec![Val::from(7i32), Val::from("inserted")])
                 .await
                 .unwrap();
-            assert_eq!(outcome, TableMutationOutcome::default());
 
             let mut callbacks = 0usize;
             let outcome = trx
@@ -1396,6 +1389,18 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(callbacks, 1);
+            assert_eq!(outcome, TableMutationOutcome::default());
+
+            let mut later_callbacks = 0usize;
+            let outcome = trx
+                .table_index_mutate_mvcc(table_id, 0, .., |row| {
+                    later_callbacks += 1;
+                    assert_eq!(row.val(0)?.as_i32(), Some(7));
+                    Ok(RowMutation::Skip)
+                })
+                .await
+                .unwrap();
+            assert_eq!(later_callbacks, 1);
             assert_eq!(outcome, TableMutationOutcome::default());
             trx.commit().await.unwrap();
         });

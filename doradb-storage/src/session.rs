@@ -3404,7 +3404,9 @@ pub(crate) mod tests {
     use crate::trx::retention::{
         RedoTruncationBlocker, tests::install_redo_cleanup_before_unlink_hook,
     };
-    use crate::trx::tests::{private_transaction_inner_ptr, trx_inner};
+    use crate::trx::tests::{
+        private_noop, private_transaction_inner_ptr, session_operation_entry_inner_ptr, trx_inner,
+    };
     use crate::trx::{MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, SessionOperationSnapshot, TrxInner};
     use crate::value::{Val, ValKind};
     use futures::task::noop_waker;
@@ -3954,6 +3956,20 @@ pub(crate) mod tests {
         fn last_cts(&self) -> TrxID;
         fn load_active_insert_page(&mut self, table_id: TableID) -> Option<VersionedPageID>;
         fn save_active_insert_page(&mut self, table_id: TableID, page_id: VersionedPageID);
+    }
+
+    /// Begin one test-owned mandatory private transaction for focused catalog storage tests.
+    pub(crate) fn begin_test_mandatory_private_trx(
+        session: &Session,
+    ) -> (MandatoryOperationGuard, PrivateTransaction) {
+        let mut operation = session
+            .pin_operation(SessionOperationKind::Ddl)
+            .expect("catalog test operation must be admitted")
+            .into_mandatory();
+        let trx = operation
+            .begin_private_trx()
+            .expect("catalog test private transaction must begin");
+        (operation, trx)
     }
 
     impl SessionTestExt for Session {
@@ -5160,7 +5176,7 @@ pub(crate) mod tests {
                 "private transaction must use a core distinct from the parked public cache"
             );
             assert_eq!(
-                entry.inner_ptr_for_test(),
+                session_operation_entry_inner_ptr(&entry),
                 None,
                 "running private transaction must hold its core outside the entry"
             );
@@ -5176,10 +5192,10 @@ pub(crate) mod tests {
                 *nested_begin_err.current_context(),
                 LifecycleError::ExistingTransaction
             );
-            trx.stage_statement(async |_stmt| Ok(())).await.unwrap();
+            private_noop(&mut trx).await.unwrap();
             assert_eq!(private_transaction_inner_ptr(&trx), first_inner);
-            assert_eq!(entry.inner_ptr_for_test(), None);
-            trx.stage_statement(async |_stmt| Ok(())).await.unwrap();
+            assert_eq!(session_operation_entry_inner_ptr(&entry), None);
+            private_noop(&mut trx).await.unwrap();
             assert_eq!(private_transaction_inner_ptr(&trx), first_inner);
             assert_eq!(
                 entry.inspect().state,
@@ -5232,7 +5248,7 @@ pub(crate) mod tests {
                 second_inner, public_cache_ptr,
                 "each private transaction must remain separate from the public cache"
             );
-            assert_eq!(entry.inner_ptr_for_test(), None);
+            assert_eq!(session_operation_entry_inner_ptr(&entry), None);
             assert_eq!(
                 state
                     .lifecycle
