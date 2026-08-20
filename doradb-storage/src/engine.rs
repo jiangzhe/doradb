@@ -818,9 +818,8 @@ mod tests {
         session_registry_len,
     };
     use crate::thread::{SpawnTestEvent, fail_spawn_named_with_observer, observe_spawn_named};
-    use crate::trx::tests::add_pseudo_redo_log_entry;
+    use crate::trx::tests::{add_pseudo_redo_log_entry, pending_statement};
     use std::fs;
-    use std::future::pending;
     use std::io::Error as StdIoError;
     use std::os::unix::fs::symlink;
     use std::panic::{self, AssertUnwindSafe};
@@ -2057,12 +2056,7 @@ mod tests {
             smol::block_on(Engine::bootstrap(test_engine_config_for(root.path()))).unwrap();
         let mut session = engine.new_session().unwrap();
         let mut trx = session.begin_trx().unwrap();
-        // RFC-0029 Phase 2 runner coverage: engine shutdown waits for a
-        // deterministically cancelled checked-out legacy callback.
-        let mut exec = Box::pin(trx.exec(async |_| {
-            pending::<()>().await;
-            Ok::<(), Error>(())
-        }));
+        let mut exec = Box::pin(pending_statement(&mut trx));
         smol::block_on(async {
             assert!(matches!(
                 futures::poll!(exec.as_mut()),

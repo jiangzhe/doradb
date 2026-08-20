@@ -66,5 +66,5 @@ pub use table::{
     FrozenPageBatchInfo, LazyRow, MemIndexCleanupDelay, MemIndexCleanupOutcome,
     MemIndexCleanupStats, SecondaryMemIndexCleanupIndexStats,
 };
-pub use trx::{IndexScanMvccStream, Statement, StreamStmt, Transaction};
+pub use trx::{IndexScanMvccStream, Transaction};
 pub use value::{MemVar, Val, ValKind, ValType};

@@ -151,8 +151,9 @@ Disclosure is approved only at one of these boundaries:
 - a public Doradb method returning the public `Result` alias;
 - an external trait whose signature is fixed to the public result;
 - a constrained carrier's disclosure implementation; or
-- the three callback-mutation helpers that must forward an arbitrary public
-  `Error` returned by `Statement::table_mutate_mvcc`'s caller.
+- the three row-mutation adapters that must forward an arbitrary public
+  `Error` returned by a direct `Transaction` mutation method's caller-supplied
+  row-decision callback.
 
 Reusable private helpers do not return public `Result` merely to make `?`
 compile. Test helpers follow the same rule: test a typed producer as typed, and
@@ -299,10 +300,10 @@ The principal convergence owners are:
 | value and rows | public decode/access adapters and fixed external traits |
 | engine | public bootstrap, new-session admission, and shutdown facades |
 | session | public table, checkpoint, retention, and transaction operations |
-| transaction | public lock, statement execution, commit, and rollback |
-| statement/stream | public DML and stream iteration methods |
+| transaction | public lock, direct no-op/read/DML/stream construction, commit, and rollback |
+| stream | public iteration over an already-constructed MVCC stream |
 | log configuration | fixed `FromStr` adapter over typed validation |
-| catalog/table | public semantic facades plus callback mutation error transport |
+| catalog/table | public semantic facades plus row-decision callback error transport |
 | recovery/startup | typed recovery helpers beneath public Engine bootstrap |
 
 Lower buffer, file, log internals, index, table, purge, retention, recovery, and

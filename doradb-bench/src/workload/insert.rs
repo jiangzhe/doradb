@@ -355,11 +355,8 @@ async fn run_insert_operations(
         for key in batch {
             let payload = generate_payload(*key, spec.seed, spec.value_size);
             let row = vec![Val::from(*key), Val::from(&payload[..])];
-            match trx
-                .exec(async |stmt| stmt.table_insert_mvcc(spec.table_id, row).await.map(|_| ()))
-                .await
-            {
-                Ok(()) => {
+            match trx.table_insert_mvcc(spec.table_id, row).await {
+                Ok(_) => {
                     result.inserted_rows = checked(result.inserted_rows, 1, "inserted rows")?;
                     batch_inserted = checked(batch_inserted, 1, "batch inserted rows")?;
                 }

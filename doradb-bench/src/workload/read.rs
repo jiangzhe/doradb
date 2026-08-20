@@ -549,15 +549,7 @@ async fn lookup_keys(
         for key in batch {
             let select_key = SelectKey::new(0, vec![Val::from(*key)]);
             let lookup = trx
-                .exec(async |stmt| {
-                    stmt.table_lookup_unique_mvcc(
-                        table_id,
-                        select_key.index_no,
-                        &select_key.vals,
-                        &[0, 1],
-                    )
-                    .await
-                })
+                .table_lookup_unique_mvcc(table_id, select_key.index_no, &select_key.vals, &[0, 1])
                 .await;
             match lookup {
                 Ok(SelectMvcc::Found(_)) => {
@@ -606,17 +598,14 @@ async fn table_scans(
         let mut trx = session.begin_trx()?;
         let mut batch = WorkloadCounters::default();
         for _ in 0..count {
+            let mut rows = 0u64;
             let scan = trx
-                .exec(async |stmt| {
-                    let mut rows = 0u64;
-                    stmt.table_scan_mvcc(table_id, &[0, 1], |_| {
-                        rows += 1;
-                        true
-                    })
-                    .await?;
-                    Ok(rows)
+                .table_scan_mvcc(table_id, &[0, 1], |_| {
+                    rows += 1;
+                    true
                 })
-                .await;
+                .await
+                .map(|()| rows);
             match scan {
                 Ok(rows) => {
                     batch.operations = checked(batch.operations, 1, "operations")?;
@@ -669,10 +658,7 @@ async fn index_scans(
             let lower = [Val::from(range.start)];
             let upper = [Val::from(range.end()?)];
             let scan = trx
-                .exec(async |stmt| {
-                    stmt.table_index_scan_mvcc(spec.table_id, 0, &lower[..]..&upper[..], &[0, 1])
-                        .await
-                })
+                .table_index_scan_mvcc(spec.table_id, 0, &lower[..]..&upper[..], &[0, 1])
                 .await;
             match scan {
                 Ok(scan) => {
@@ -726,8 +712,7 @@ async fn index_streams(
         let mut trx = session.begin_trx()?;
         let scan_result = async {
             let mut stream = trx
-                .stream_stmt()
-                .table_index_scan_mvcc(spec.table_id, 0, &lower[..]..&upper[..], &[0, 1])
+                .table_index_scan_mvcc_stream(spec.table_id, 0, &lower[..]..&upper[..], &[0, 1])
                 .await?;
             let mut rows = 0u64;
             while stream.next().await?.is_some() {

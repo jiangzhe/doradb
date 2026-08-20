@@ -1155,6 +1155,7 @@ fn unique_key_from_full_row(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::lifecycle::{CheckpointPublishLease, TableCheckpointRootMutationScope};
+    use crate::buffer::guard::PageSharedGuard;
     use crate::buffer::page::PAGE_SIZE;
     use crate::buffer::{PoolGuard, PoolGuards, ReadonlyBufferPool};
     use crate::catalog::tests::table2;
@@ -1165,8 +1166,8 @@ pub(crate) mod tests {
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{
-        CompletionErrorBridge, DataIntegrityError, Error, FatalError, OperationError, Result,
-        RuntimeResult,
+        CompletionErrorBridge, DataIntegrityError, DiscloseError, DiscloseResultExt, Error,
+        FatalError, OperationError, Result, RuntimeResult,
     };
     use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
     use crate::file::cow_file::{COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID};
@@ -1183,14 +1184,18 @@ pub(crate) mod tests {
     use crate::lock::tests::{LockDebugEntryState, debug_snapshot};
     use crate::lock::{LockFamily, LockMode, LockOwner, LockResource};
     use crate::quiescent::QuiescentGuard;
+    use crate::row::RowPage;
     use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
     use crate::session::{Session, tests::SessionTestExt};
+    use crate::table::hot::{
+        DeleteInternal, HotRowMutator, InsertRowIntoPage, RowInserter, UpdateRowInplace,
+    };
     use crate::table::{
         DeleteMarker, DmlValidationError, FreezeOutcome, FrozenPageBatchInfo, Table,
         TableRuntimeLayout,
     };
-    use crate::trx::Transaction;
-    use crate::trx::stmt::Statement;
+    use crate::trx::stmt::StmtEffects;
+    use crate::trx::{Transaction, TrxRuntime};
     use crate::value::{Val, ValKind};
     use smol::Timer;
     use std::fs::OpenOptions;
@@ -1896,33 +1901,6 @@ pub(crate) mod tests {
         );
     }
 
-    // RFC-0029 Phase 2 runner coverage: raw statement-effect and intentional
-    // same-statement composition tests still require statement-taking helpers.
-    pub(crate) async fn stmt_insert_row_by_id(
-        stmt: &mut Statement<'_>,
-        table_id: TableID,
-        cols: Vec<Val>,
-    ) -> Result<RowID> {
-        stmt.table_insert_mvcc(table_id, cols).await
-    }
-
-    pub(crate) async fn stmt_delete_row_by_id(
-        stmt: &mut Statement<'_>,
-        table_id: TableID,
-        key: &SelectKey,
-    ) -> Result<DeleteMvcc> {
-        stmt.table_delete_unique_mvcc(table_id, key.index_no, &key.vals)
-            .await
-    }
-
-    pub(crate) async fn trx_insert_row_by_id(
-        trx: &mut Transaction,
-        table_id: TableID,
-        cols: Vec<Val>,
-    ) -> Result<RowID> {
-        trx.table_insert_mvcc(table_id, cols).await
-    }
-
     pub(crate) async fn trx_delete_row_by_id(
         trx: &mut Transaction,
         table_id: TableID,
@@ -1940,6 +1918,113 @@ pub(crate) mod tests {
     ) -> Result<UpdateMvcc> {
         trx.table_update_unique_mvcc(table_id, key.index_no, &key.vals, update)
             .await
+    }
+
+    /// Run the raw transition-page insert and update primitives for one test operation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn transition_insert_update_operation(
+        rt: TrxRuntime<'_>,
+        effects: &mut StmtEffects,
+        table: &Table,
+        insert_page_guard: PageSharedGuard<RowPage>,
+        insert: Vec<Val>,
+        page_guard: &PageSharedGuard<RowPage>,
+        row_id: RowID,
+        key: &SelectKey,
+        update: Vec<UpdateCol>,
+    ) -> Result<(bool, bool)> {
+        let layout = table.layout_snapshot();
+        let metadata = layout.metadata();
+        let insert_retry = matches!(
+            RowInserter::new(table.mem.table_id(), metadata, rt).insert_to_page(
+                effects,
+                insert_page_guard,
+                insert,
+                crate::trx::undo::RowUndoKind::Insert,
+                vec![],
+            ),
+            InsertRowIntoPage::NoSpaceOrFrozen(_, _, _)
+        );
+        let update_retry = matches!(
+            HotRowMutator::new(table.mem.table_id(), metadata, rt, page_guard, row_id,)
+                .update_inplace(
+                    effects,
+                    key.index_no,
+                    &key.vals,
+                    crate::row::ops::RowUpdateInput::Sparse(update),
+                    false,
+                )
+                .await
+                .disclose()?,
+            UpdateRowInplace::RetryInTransition(_)
+        );
+        Ok((insert_retry, update_retry))
+    }
+
+    /// Run the raw transition-page delete primitive for one test operation.
+    pub(crate) async fn transition_delete_operation(
+        rt: TrxRuntime<'_>,
+        effects: &mut StmtEffects,
+        table: &Table,
+        page_guard: &PageSharedGuard<RowPage>,
+        row_id: RowID,
+        key: &SelectKey,
+    ) -> Result<bool> {
+        let layout = table.layout_snapshot();
+        let metadata = layout.metadata();
+        Ok(matches!(
+            HotRowMutator::new(table.mem.table_id(), metadata, rt, page_guard, row_id,)
+                .delete(effects, key.index_no, &key.vals, false)
+                .await
+                .disclose()?,
+            DeleteInternal::RetryInTransition
+        ))
+    }
+
+    /// Install one hot-row write lock, pause, and then force operation rollback.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn lock_hot_row_then_wait_and_error_operation(
+        rt: TrxRuntime<'_>,
+        effects: &mut StmtEffects,
+        table: &Table,
+        page_guard: PageSharedGuard<RowPage>,
+        row_id: RowID,
+        key: &SelectKey,
+        lock_installed: flume::Sender<bool>,
+        return_error: flume::Receiver<()>,
+    ) -> Result<()> {
+        use crate::trx::row::LockRowForWrite;
+
+        let layout = table.layout_snapshot();
+        let locked = {
+            match HotRowMutator::new(
+                table.mem.table_id(),
+                layout.metadata(),
+                rt,
+                &page_guard,
+                row_id,
+            )
+            .lock_for_write(effects, Some((key.index_no, &key.vals)))
+            .await
+            .disclose()?
+            {
+                LockRowForWrite::Ok(mut access) => {
+                    drop(access.take());
+                    true
+                }
+                LockRowForWrite::WriteConflict
+                | LockRowForWrite::InvalidIndex
+                | LockRowForWrite::RetryInTransition => false,
+            }
+        };
+        drop(page_guard);
+        if lock_installed.send_async(locked).await.is_err() || !locked {
+            return Err(error_stack::Report::new(OperationError::InvalidDmlInput).disclose());
+        }
+        if return_error.recv_async().await.is_err() {
+            return Err(error_stack::Report::new(OperationError::InvalidDmlInput).disclose());
+        }
+        Err(error_stack::Report::new(OperationError::InvalidDmlInput).disclose())
     }
 
     pub(crate) async fn trx_select_row_mvcc_by_id(
@@ -2221,37 +2306,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_statement_dml_validation_opt_out_is_statement_local() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine = lightweight_test_engine(&temp_dir, "stmt_dml_validation_opt_out").await;
-            let table_id = create_table2_for_test(&engine).await;
-            let mut session = engine.new_session().unwrap();
-
-            let mut trx = session.begin_trx().unwrap();
-            // RFC-0029 Phase 2 runner coverage: validation opt-out remains
-            // available only through the legacy statement facade.
-            trx.exec(async |stmt| {
-                stmt.disable_dml_validation()
-                    .table_insert_mvcc(table_id, vec![Val::from(1i32), Val::from("name")])
-                    .await?;
-                Ok(())
-            })
-            .await
-            .unwrap();
-            trx.commit().await.unwrap();
-
-            let mut trx = session.begin_trx().unwrap();
-            let err = trx
-                .table_insert_mvcc(table_id, vec![Val::from(2i32)])
-                .await
-                .unwrap_err();
-            assert_invalid_dml_input(err);
-            trx.rollback().await.unwrap();
-        });
-    }
-
-    #[test]
     fn test_statement_unique_dml_validation_default_on() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
@@ -2381,7 +2435,7 @@ pub(crate) mod tests {
         mut trx: Transaction,
         insert: Vec<Val>,
     ) -> Transaction {
-        let res = trx_insert_row_by_id(&mut trx, table_id, insert).await;
+        let res = trx.table_insert_mvcc(table_id, insert).await;
         if res.is_err() {
             panic!("res={:?}", res);
         }
@@ -2493,7 +2547,7 @@ pub(crate) mod tests {
         values: Vec<Val>,
     ) -> RowID {
         let mut trx = session.begin_trx().unwrap();
-        let insert = trx_insert_row_by_id(&mut trx, table_id, values).await;
+        let insert = trx.table_insert_mvcc(table_id, values).await;
         let Ok(row_id) = insert else {
             panic!("insert should succeed: {insert:?}");
         };
@@ -3117,22 +3171,6 @@ pub(crate) mod tests {
         for i in 0..count {
             let insert = vec![Val::from(start + i), Val::from(name)];
             trx = expect_trx_insert(table_id, trx, insert).await;
-        }
-        trx.commit().await.unwrap();
-    }
-
-    pub(crate) async fn insert_rows_direct(
-        table_id: TableID,
-        session: &mut Session,
-        start: i32,
-        count: i32,
-        name: &str,
-    ) {
-        let mut trx = session.begin_trx().unwrap();
-        for i in 0..count {
-            let insert = vec![Val::from(start + i), Val::from(name)];
-            let res = trx_insert_row_by_id(&mut trx, table_id, insert).await;
-            assert!(res.is_ok());
         }
         trx.commit().await.unwrap();
     }

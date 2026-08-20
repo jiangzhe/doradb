@@ -4899,8 +4899,8 @@ mod tests {
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{
-        DataIntegrityError, DiscloseError, DiscloseResultExt, Error, ErrorKind, FatalError,
-        InternalError, IoError, OperationError, Result, RuntimeError,
+        DataIntegrityError, DiscloseError, Error, ErrorKind, FatalError, IoError, OperationError,
+        Result, RuntimeError,
     };
     use crate::file::cow_file::SUPER_BLOCK_ID;
     use crate::id::{PageID, RowID, TableID, TrxID};
@@ -4909,33 +4909,27 @@ mod tests {
     use crate::latch::LatchFallbackMode;
     use crate::lock::tests::LockDebugEntryState;
     use crate::lock::{LockMode, LockResource};
-    use crate::log::redo::RowRedoKind;
-    use crate::poison::PoisonAwareListener;
     use crate::row::RowPage;
     use crate::row::ops::{
-        DeleteMvcc, RowMutation, RowUpdateInput, ScanMvcc, SelectKey, SelectMvcc,
-        TableMutationOutcome, UpdateCol, UpdateMvcc, UpsertMvcc,
+        DeleteMvcc, RowMutation, ScanMvcc, SelectKey, SelectMvcc, TableMutationOutcome, UpdateCol,
+        UpdateMvcc, UpsertMvcc,
     };
     use crate::session::Session;
     use crate::session::tests::{
         SessionTestExt, assert_checkpoint_published, remove_session_for_test,
         wait_for_checkpoint_purge, wait_for_checkpoint_root_ready,
     };
-    use crate::table::hot::{
-        DeleteInternal, HotRowMutator, InsertRowIntoPage, RowInserter, UpdateRowInplace,
-    };
     use crate::table::tests::*;
     use crate::table::{CheckpointOutcome, FreezeOutcome};
     use crate::table::{ColumnDeletionBuffer, DeleteMarker, Table};
-    use crate::trx::row::LockRowForWrite;
-    use crate::trx::stmt::tests as stmt_tests;
     use crate::trx::sys::tests::fatal_rollback_retention_count;
     use crate::trx::tests::{
-        commit_preparing_shared_trx_status, prepare_event_is_installed, prepare_shared_trx_status,
-        prepare_transaction, rollback_preparing_shared_trx_status,
-        rollback_production_prepared_for_test, shared_trx_status, transaction_status_for_test,
+        commit_preparing_shared_trx_status, lock_hot_row_then_wait_and_error,
+        prepare_event_is_installed, prepare_shared_trx_status, prepare_transaction,
+        rollback_preparing_shared_trx_status, rollback_production_prepared_for_test,
+        shared_trx_status, transaction_redo_kind_counts, transaction_status_for_test,
+        transition_delete, transition_insert_update,
     };
-    use crate::trx::undo::RowUndoKind;
     use crate::trx::ver_map::RowPageState;
     use crate::trx::{MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID, Transaction};
     use crate::value::{Val, ValKind};
@@ -5077,7 +5071,7 @@ mod tests {
                 // insert [1, "world"]
                 let insert = vec![Val::from(1i32), Val::from("world")];
                 let mut trx = session.begin_trx().unwrap();
-                let res = trx_insert_row_by_id(&mut trx, table_id, insert).await;
+                let res = trx.table_insert_mvcc(table_id, insert).await;
                 let err = res.unwrap_err();
                 assert_eq!(
                     err.report().downcast_ref::<OperationError>().copied(),
@@ -5090,14 +5084,14 @@ mod tests {
                 // insert [2, "hello"], but not commit
                 let insert1 = vec![Val::from(2i32), Val::from("hello")];
                 let mut trx1 = session.begin_trx().unwrap();
-                let res = trx_insert_row_by_id(&mut trx1, table_id, insert1).await;
+                let res = trx1.table_insert_mvcc(table_id, insert1).await;
                 assert!(res.is_ok());
 
                 // begin concurrent transaction and insert [2, "world"]
                 let mut session2 = engine.new_session().unwrap();
                 let insert2 = vec![Val::from(2i32), Val::from("world")];
                 let mut trx2 = session2.begin_trx().unwrap();
-                let res = trx_insert_row_by_id(&mut trx2, table_id, insert2).await;
+                let res = trx2.table_insert_mvcc(table_id, insert2).await;
                 // still dup key because circuit breaker on index search.
                 let err = res.unwrap_err();
                 assert_eq!(
@@ -6804,67 +6798,25 @@ mod tests {
                 .await
                 .unwrap();
             let insert = vec![Val::from(2i32), Val::from("insert")];
-            // RFC-0029 Phase 2 runner coverage: raw TableAccessor insertion
-            // injects page state and statement effects under explicit locks.
-            let res: Result<()> = trx
-                .exec(async |stmt| {
-                    stmt.acquire_table_write_metadata_lock(table_id)
-                        .await
-                        .disclose()?;
-                    stmt.acquire_table_write_data_lock(table_id)
-                        .await
-                        .disclose()?;
-                    let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
-                    let table = table_for_internal_assertion(&engine, table_id);
-                    let layout = table.layout_snapshot();
-                    let accessor = table.accessor_with_layout(&layout);
-                    let insert_res = RowInserter::new(accessor.table_id(), accessor.metadata(), rt)
-                        .insert_to_page(
-                            effects,
-                            insert_page_guard,
-                            insert,
-                            RowUndoKind::Insert,
-                            vec![],
-                        );
-                    assert!(matches!(
-                        insert_res,
-                        InsertRowIntoPage::NoSpaceOrFrozen(_, _, _)
-                    ));
-
-                    let update = vec![UpdateCol {
-                        idx: 1,
-                        val: Val::from("world"),
-                    }];
-                    let table = table_for_internal_assertion(&engine, table_id);
-                    let layout = table.layout_snapshot();
-                    let accessor = table.accessor_with_layout(&layout);
-                    let res = HotRowMutator::new(
-                        accessor.table_id(),
-                        accessor.metadata(),
-                        rt,
-                        &page_guard,
-                        row_id,
-                    )
-                    .update_inplace(
-                        effects,
-                        key.index_no,
-                        &key.vals,
-                        RowUpdateInput::Sparse(update),
-                        false,
-                    )
-                    .await
-                    .disclose()?;
-                    assert!(matches!(res, UpdateRowInplace::RetryInTransition(_)));
-                    Err(Report::new(OperationError::InvalidDmlInput).disclose())
-                })
-                .await;
-            assert_eq!(
-                res.unwrap_err()
-                    .report()
-                    .downcast_ref::<OperationError>()
-                    .copied(),
-                Some(OperationError::InvalidDmlInput)
-            );
+            let table = table_for_internal_assertion(&engine, table_id);
+            let update = vec![UpdateCol {
+                idx: 1,
+                val: Val::from("world"),
+            }];
+            let (insert_retry, update_retry) = transition_insert_update(
+                &mut trx,
+                &table,
+                insert_page_guard,
+                insert,
+                &page_guard,
+                row_id,
+                &key,
+                update,
+            )
+            .await
+            .unwrap();
+            assert!(insert_retry);
+            assert!(update_retry);
             trx.rollback().await.unwrap();
 
             let mut trx = session.begin_trx().unwrap();
@@ -6882,41 +6834,9 @@ mod tests {
                 .lock_shared_async()
                 .await
                 .unwrap();
-            // RFC-0029 Phase 2 runner coverage: raw TableAccessor update
-            // injects page state and statement effects under explicit locks.
-            let res: Result<()> = trx
-                .exec(async |stmt| {
-                    stmt.acquire_table_write_metadata_lock(table_id)
-                        .await
-                        .disclose()?;
-                    stmt.acquire_table_write_data_lock(table_id)
-                        .await
-                        .disclose()?;
-                    let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
-                    let table = table_for_internal_assertion(&engine, table_id);
-                    let layout = table.layout_snapshot();
-                    let accessor = table.accessor_with_layout(&layout);
-                    let res = HotRowMutator::new(
-                        accessor.table_id(),
-                        accessor.metadata(),
-                        rt,
-                        &page_guard,
-                        row_id,
-                    )
-                    .delete(effects, key.index_no, &key.vals, false)
-                    .await
-                    .disclose()?;
-                    assert!(matches!(res, DeleteInternal::RetryInTransition));
-                    Err(Report::new(OperationError::InvalidDmlInput).disclose())
-                })
-                .await;
-            assert_eq!(
-                res.unwrap_err()
-                    .report()
-                    .downcast_ref::<OperationError>()
-                    .copied(),
-                Some(OperationError::InvalidDmlInput)
-            );
+            let table = table_for_internal_assertion(&engine, table_id);
+            let delete_retry = transition_delete(&mut trx, &table, &page_guard, row_id, &key).await;
+            assert!(delete_retry.unwrap());
             trx.rollback().await.unwrap();
         });
     }
@@ -7311,7 +7231,7 @@ mod tests {
                 {
                     let insert = vec![Val::from(&s[..0])];
                     let mut trx = session.begin_trx().unwrap();
-                    let res = trx_insert_row_by_id(&mut trx, table_id, insert).await;
+                    let res = trx.table_insert_mvcc(table_id, insert).await;
                     assert!(res.is_ok());
                     trx.commit().await.unwrap();
                 }
@@ -7351,7 +7271,7 @@ mod tests {
                 for i in 0usize..COUNT {
                     let insert = vec![Val::from(&s[..BASE + i])];
                     let mut trx = session.begin_trx().unwrap();
-                    let res = trx_insert_row_by_id(&mut trx, table_id, insert).await;
+                    let res = trx.table_insert_mvcc(table_id, insert).await;
                     assert!(res.is_ok());
                     trx.commit().await.unwrap();
                 }
@@ -7804,33 +7724,6 @@ mod tests {
                 "ordinary hot update must not enter the prepare slow path"
             );
             writer.rollback().await.unwrap();
-        });
-    }
-
-    #[test]
-    fn test_prepare_completion_won_registration_rechecks_poison() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine = lightweight_test_engine(&temp_dir, "prepare_completion_won_poison").await;
-            let mut session = engine.new_session().unwrap();
-            let mut trx = session.begin_trx().unwrap();
-            // RFC-0029 Phase 2 runner coverage: raw statement runtime poison
-            // injection verifies completion-wins wait precedence.
-            let result: Result<()> = trx
-                .exec(async |stmt| {
-                    stmt.runtime().engine().poisoner.poison(
-                        Report::new(FatalError::StorageIo)
-                            .attach("unrelated foreground wait poison: completion won"),
-                    );
-                    stmt.runtime()
-                        .wait_prepare_or_poison(PoisonAwareListener::recheck_only())
-                        .await
-                        .disclose()
-                })
-                .await;
-
-            assert_unrelated_poison_fatal(&result.unwrap_err());
-            trx.rollback().await.unwrap();
         });
     }
 
@@ -8291,42 +8184,19 @@ mod tests {
             insert_rows(table_id, &mut session, 10, 1, "hot").await;
 
             let mut trx = session.begin_trx().unwrap();
-            // RFC-0029 Phase 2 runner coverage: same-statement raw redo
-            // inspection distinguishes physical cold and hot deletes.
-            trx.exec(async |stmt| {
-                for id in [0, 10] {
-                    let key = single_key(id);
-                    assert_eq!(
-                        stmt.table_delete_unique_mvcc(table_id, key.index_no, &key.vals)
-                            .await?,
-                        DeleteMvcc::Deleted
-                    );
-                }
-
-                let rows = &stmt_tests::statement_redo(stmt)
-                    .dml
-                    .get(&table_id)
-                    .unwrap()
-                    .rows;
-                let mut cold_deletes = 0;
-                let mut hot_deletes = 0;
-                for row in rows.values() {
-                    match row.kind {
-                        RowRedoKind::Delete(None) => cold_deletes += 1,
-                        RowRedoKind::Delete(Some(_)) => hot_deletes += 1,
-                        RowRedoKind::Insert(..)
-                        | RowRedoKind::Update(..)
-                        | RowRedoKind::DeleteByPrimaryKey(_)
-                        | RowRedoKind::UpdateByPrimaryKey(..) => {
-                            panic!("user-table delete must emit physical delete redo")
-                        }
-                    }
-                }
-                assert_eq!((cold_deletes, hot_deletes), (1, 1));
-                Ok(())
-            })
-            .await
-            .unwrap();
+            for id in [0, 10] {
+                let key = single_key(id);
+                assert_eq!(
+                    trx.table_delete_unique_mvcc(table_id, key.index_no, &key.vals)
+                        .await
+                        .unwrap(),
+                    DeleteMvcc::Deleted
+                );
+            }
+            assert_eq!(
+                transaction_redo_kind_counts(&mut trx, table_id).unwrap(),
+                (1, 1, 0, 0)
+            );
             trx.commit().await.unwrap();
         });
     }
@@ -8345,52 +8215,23 @@ mod tests {
             insert_rows(table_id, &mut session, 10, 3, "hot").await;
 
             let mut trx = session.begin_trx().unwrap();
-            // RFC-0029 Phase 2 runner coverage: same-statement raw redo
-            // inspection classifies mixed full-table mutation effects.
             let outcome = trx
-                .exec(async |stmt| {
-                    let outcome = stmt
-                        .table_mutate_mvcc(table_id, |row| {
-                            let id = row.val(0)?.as_i32().unwrap();
-                            Ok(match id {
-                                0 | 10 => RowMutation::Delete,
-                                1 => RowMutation::Update(vec![UpdateCol {
-                                    idx: 1,
-                                    val: Val::from("cold-updated"),
-                                }]),
-                                11 => RowMutation::Update(vec![UpdateCol {
-                                    idx: 1,
-                                    val: Val::from("hot-updated"),
-                                }]),
-                                12 => RowMutation::Update(Vec::new()),
-                                2 => RowMutation::Skip,
-                                _ => unreachable!(),
-                            })
-                        })
-                        .await?;
-                    let rows = &stmt_tests::statement_redo(stmt)
-                        .dml
-                        .get(&table_id)
-                        .unwrap()
-                        .rows;
-                    let mut cold_deletes = 0;
-                    let mut hot_deletes = 0;
-                    let mut inserts = 0;
-                    let mut updates = 0;
-                    for row in rows.values() {
-                        match row.kind {
-                            RowRedoKind::Delete(None) => cold_deletes += 1,
-                            RowRedoKind::Delete(Some(_)) => hot_deletes += 1,
-                            RowRedoKind::Insert(..) => inserts += 1,
-                            RowRedoKind::Update(..) => updates += 1,
-                            RowRedoKind::DeleteByPrimaryKey(_)
-                            | RowRedoKind::UpdateByPrimaryKey(..) => {
-                                panic!("user-table mutation must emit physical redo")
-                            }
-                        }
-                    }
-                    assert_eq!((cold_deletes, hot_deletes, inserts, updates), (2, 1, 1, 1));
-                    Ok(outcome)
+                .table_mutate_mvcc(table_id, |row| {
+                    let id = row.val(0)?.as_i32().unwrap();
+                    Ok(match id {
+                        0 | 10 => RowMutation::Delete,
+                        1 => RowMutation::Update(vec![UpdateCol {
+                            idx: 1,
+                            val: Val::from("cold-updated"),
+                        }]),
+                        11 => RowMutation::Update(vec![UpdateCol {
+                            idx: 1,
+                            val: Val::from("hot-updated"),
+                        }]),
+                        12 => RowMutation::Update(Vec::new()),
+                        2 => RowMutation::Skip,
+                        _ => unreachable!(),
+                    })
                 })
                 .await
                 .unwrap();
@@ -8400,6 +8241,10 @@ mod tests {
                     delete_count: 2,
                     update_count: 3,
                 }
+            );
+            assert_eq!(
+                transaction_redo_kind_counts(&mut trx, table_id).unwrap(),
+                (2, 1, 1, 1)
             );
             trx.commit().await.unwrap();
 
@@ -9492,66 +9337,37 @@ mod tests {
 
             let (lock_installed_tx, lock_installed_rx) = flume::bounded(1);
             let (return_error_tx, return_error_rx) = flume::bounded(1);
-            // RFC-0029 Phase 2 runner coverage: callback error injection after
-            // raw row-lock installation pauses statement rollback.
-            let mut statement = Box::pin(trx.exec(async |stmt| {
-                let page_guard = engine
-                    .inner()
-                    .pools
-                    .mem
-                    .get_page::<RowPage>(
-                        writer_session.pool_guards().mem_guard(),
-                        page_id,
-                        LatchFallbackMode::Shared,
-                    )
-                    .await
-                    .expect("buffer-pool read failed in test")
-                    .lock_shared_async()
-                    .await
-                    .unwrap();
-                stmt.acquire_table_write_metadata_lock(table_id)
-                    .await
-                    .disclose()?;
-                stmt.acquire_table_write_data_lock(table_id)
-                    .await
-                    .disclose()?;
-                let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
-                let table = table_for_internal_assertion(&engine, table_id);
-                let layout = table.layout_snapshot();
-                let accessor = table.accessor_with_layout(&layout);
-                // Hot-row writes acquire ownership by installing a `Lock`
-                // undo entry at the row's undo head. That entry is the
-                // row-level write lock and the rollback anchor that is
-                // later rewritten to Insert/Update/Delete.
-                let mut lock_row = HotRowMutator::new(
-                    accessor.table_id(),
-                    accessor.metadata(),
-                    rt,
-                    &page_guard,
-                    row_id,
+            let page_guard = engine
+                .inner()
+                .pools
+                .mem
+                .get_page::<RowPage>(
+                    writer_session.pool_guards().mem_guard(),
+                    page_id,
+                    LatchFallbackMode::Shared,
                 )
-                .lock_for_write(effects, Some((key.index_no, &key.vals)))
+                .await
+                .expect("buffer-pool read failed in test")
+                .lock_shared_async()
                 .await
                 .unwrap();
-                match &mut lock_row {
-                    LockRowForWrite::Ok(access) => {
-                        drop(access.take());
-                    }
-                    _ => panic!("lock should succeed"),
-                }
-                drop(lock_row);
-                drop(page_guard);
-                lock_installed_tx.send_async(()).await.unwrap();
-                return_error_rx.recv_async().await.unwrap();
-                Err(Report::new(OperationError::InvalidDmlInput).disclose())
-            }));
+            let table = table_for_internal_assertion(&engine, table_id);
+            let mut statement = Box::pin(lock_hot_row_then_wait_and_error(
+                &mut trx,
+                &table,
+                page_guard,
+                row_id,
+                &key,
+                lock_installed_tx,
+                return_error_rx,
+            ));
             let lock_installed = lock_installed_rx.recv_async().fuse();
             futures::pin_mut!(lock_installed);
             futures::select! {
                 result = statement.as_mut().fuse() => {
                     panic!("statement completed before installing row lock: {result:?}");
                 }
-                result = lock_installed => result.unwrap(),
+                result = lock_installed => assert!(result.unwrap()),
             }
 
             let (transition_entered_tx, transition_entered_rx) = flume::bounded(1);
@@ -9612,12 +9428,8 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let _row_id = unwrap_insert_result(
-                trx_insert_row_by_id(
-                    &mut trx,
-                    table_id,
-                    vec![Val::from(1), Val::from("cached-row")],
-                )
-                .await,
+                trx.table_insert_mvcc(table_id, vec![Val::from(1), Val::from("cached-row")])
+                    .await,
             );
             trx.commit().await.unwrap();
 
@@ -9634,12 +9446,8 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let next_row_id = unwrap_insert_result(
-                trx_insert_row_by_id(
-                    &mut trx,
-                    table_id,
-                    vec![Val::from(2), Val::from("still-cached")],
-                )
-                .await,
+                trx.table_insert_mvcc(table_id, vec![Val::from(2), Val::from("still-cached")])
+                    .await,
             );
             trx.commit().await.unwrap();
 
@@ -9678,12 +9486,8 @@ mod tests {
 
         let mut trx = session.begin_trx().unwrap();
         let first_row_id = unwrap_insert_result(
-            trx_insert_row_by_id(
-                &mut trx,
-                table_id,
-                vec![Val::from(1), Val::from("first-session")],
-            )
-            .await,
+            trx.table_insert_mvcc(table_id, vec![Val::from(1), Val::from("first-session")])
+                .await,
         );
         trx.commit().await.unwrap();
         let first_page_id = match table_for_internal_assertion(&engine, table_id)
@@ -9705,12 +9509,8 @@ mod tests {
         let mut next_session = engine.new_session().unwrap();
         let mut trx = next_session.begin_trx().unwrap();
         let next_row_id = unwrap_insert_result(
-            trx_insert_row_by_id(
-                &mut trx,
-                table_id,
-                vec![Val::from(2), Val::from("next-session")],
-            )
-            .await,
+            trx.table_insert_mvcc(table_id, vec![Val::from(2), Val::from("next-session")])
+                .await,
         );
         trx.commit().await.unwrap();
         let next_page_id = match table_for_internal_assertion(&engine, table_id)
@@ -9751,12 +9551,8 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let _row_id = unwrap_insert_result(
-                trx_insert_row_by_id(
-                    &mut trx,
-                    table_id,
-                    vec![Val::from(1), Val::from("cached-row")],
-                )
-                .await,
+                trx.table_insert_mvcc(table_id, vec![Val::from(1), Val::from("cached-row")])
+                    .await,
             );
             trx.commit().await.unwrap();
 
@@ -9786,12 +9582,8 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let _post_gc_row_id = unwrap_insert_result(
-                trx_insert_row_by_id(
-                    &mut trx,
-                    table_id,
-                    vec![Val::from(2), Val::from("post-gc-row")],
-                )
-                .await,
+                trx.table_insert_mvcc(table_id, vec![Val::from(2), Val::from("post-gc-row")])
+                    .await,
             );
             trx.commit().await.unwrap();
 
@@ -9817,12 +9609,8 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let stale_row_id = unwrap_insert_result(
-                trx_insert_row_by_id(
-                    &mut trx,
-                    table_id,
-                    vec![Val::from(1), Val::from("cached-row")],
-                )
-                .await,
+                trx.table_insert_mvcc(table_id, vec![Val::from(1), Val::from("cached-row")])
+                    .await,
             );
             trx.commit().await.unwrap();
 
@@ -9854,12 +9642,8 @@ mod tests {
             for key in 2..258 {
                 let mut trx = session.begin_trx().unwrap();
                 let row_id = unwrap_insert_result(
-                    trx_insert_row_by_id(
-                        &mut trx,
-                        table_id,
-                        vec![Val::from(key), Val::from(&large[..])],
-                    )
-                    .await,
+                    trx.table_insert_mvcc(table_id, vec![Val::from(key), Val::from(&large[..])])
+                        .await,
                 );
                 trx.commit().await.unwrap();
                 match table_for_internal_assertion(&engine, table_id)
@@ -9926,12 +9710,8 @@ mod tests {
             let large = "r".repeat(48 * 1024);
             let mut trx = session.begin_trx().unwrap();
             let _row_id = unwrap_insert_result(
-                trx_insert_row_by_id(
-                    &mut trx,
-                    table_id,
-                    vec![Val::from(1), Val::from(&large[..])],
-                )
-                .await,
+                trx.table_insert_mvcc(table_id, vec![Val::from(1), Val::from(&large[..])])
+                    .await,
             );
             trx.commit().await.unwrap();
 
@@ -9983,12 +9763,9 @@ mod tests {
             let expected_error_kind = StdIoError::from_raw_os_error(libc::EIO).kind();
 
             let mut trx = session.begin_trx().unwrap();
-            let res = trx_insert_row_by_id(
-                &mut trx,
-                table_id,
-                vec![Val::from(100), Val::from("reload-fails")],
-            )
-            .await;
+            let res = trx
+                .table_insert_mvcc(table_id, vec![Val::from(100), Val::from("reload-fails")])
+                .await;
             trx.rollback().await.unwrap();
             assert!(
                 res.as_ref().is_err_and(|err| err
@@ -10016,12 +9793,9 @@ mod tests {
 
             let large = "r".repeat(48 * 1024);
             let mut trx = session.begin_trx().unwrap();
-            let _row_id = match trx_insert_row_by_id(
-                &mut trx,
-                table_id,
-                vec![Val::from(1), Val::from(&large[..])],
-            )
-            .await
+            let _row_id = match trx
+                .table_insert_mvcc(table_id, vec![Val::from(1), Val::from(&large[..])])
+                .await
             {
                 Ok(row_id) => row_id,
                 res => panic!("res={res:?}"),
@@ -10142,7 +9916,7 @@ mod tests {
     }
 
     #[test]
-    fn test_statement_rollback_poisons_runtime_on_row_page_reload_error() {
+    fn test_transaction_rollback_poisons_runtime_on_row_page_reload_error() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine = evictable_test_engine(&temp_dir, 9u64 * 1024 * 1024, "redo_testsys").await;
@@ -10151,76 +9925,56 @@ mod tests {
             let large = "r".repeat(48 * 1024);
             let mut writer = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
-            let mut hook_guard = None;
-            let mut read_hook = None;
+            trx.table_insert_mvcc(table_id, vec![Val::from(1), Val::from(&large[..])])
+                .await
+                .unwrap();
 
-            // RFC-0029 Phase 2 runner coverage: raw statement runtime/effects
-            // install a deterministic buffer read-failure hook mid-operation.
-            let res: Result<()> = trx
-                .exec(async |stmt| {
-                    let _row_id = match stmt_insert_row_by_id(
-                        stmt,
-                        table_id,
-                        vec![Val::from(1), Val::from(&large[..])],
-                    )
-                    .await
-                    {
-                        Ok(row_id) => row_id,
-                        res => panic!("res={res:?}"),
-                    };
-
-                    let cached_page = session.load_active_insert_page(table_id).unwrap();
-
-                    for i in 2..258 {
-                        expect_insert_committed(
-                            table_id,
-                            &mut writer,
-                            vec![Val::from(i), Val::from(&large[..])],
-                        )
-                        .await;
-                        if test_frame_kind(
-                            &table_for_internal_assertion(&engine, table_id).mem.mem_pool,
-                            cached_page.page_id,
-                        ) == FrameKind::Evicted
-                        {
-                            break;
-                        }
-                    }
-                    // Timer audit: buffer-eviction/I/O test coordination.
-                    let mut evicted = false;
-                    for _ in 0..20 {
-                        if test_frame_kind(
-                            &table_for_internal_assertion(&engine, table_id).mem.mem_pool,
-                            cached_page.page_id,
-                        ) == FrameKind::Evicted
-                        {
-                            evicted = true;
-                            break;
-                        }
-                        Timer::after(Duration::from_millis(50)).await;
-                    }
-                    assert!(
-                        evicted,
-                        "statement rollback page should be evicted before repro"
-                    );
-
-                    let mem_pool_file =
-                        StorageBackendFileIdentity::from_path(temp_dir.path().join("data.swp"))
-                            .unwrap();
-                    let hook = Arc::new(FailingPageReadHook::for_page(
-                        mem_pool_file,
-                        cached_page.page_id,
-                        libc::EIO,
-                    ));
-                    hook_guard = Some(install_storage_backend_test_hook(hook.clone()));
-                    read_hook = Some(hook);
-
-                    Err(Report::new(OperationError::InvalidDmlInput).disclose())
-                })
+            let cached_page = session.load_active_insert_page(table_id).unwrap();
+            for i in 2..258 {
+                expect_insert_committed(
+                    table_id,
+                    &mut writer,
+                    vec![Val::from(i), Val::from(&large[..])],
+                )
                 .await;
+                if test_frame_kind(
+                    &table_for_internal_assertion(&engine, table_id).mem.mem_pool,
+                    cached_page.page_id,
+                ) == FrameKind::Evicted
+                {
+                    break;
+                }
+            }
+            // Timer audit: buffer-eviction/I/O test coordination.
+            let mut evicted = false;
+            for _ in 0..20 {
+                if test_frame_kind(
+                    &table_for_internal_assertion(&engine, table_id).mem.mem_pool,
+                    cached_page.page_id,
+                ) == FrameKind::Evicted
+                {
+                    evicted = true;
+                    break;
+                }
+                Timer::after(Duration::from_millis(50)).await;
+            }
+            assert!(
+                evicted,
+                "transaction rollback page should be evicted before repro"
+            );
+
+            let mem_pool_file =
+                StorageBackendFileIdentity::from_path(temp_dir.path().join("data.swp")).unwrap();
+            let read_hook = Arc::new(FailingPageReadHook::for_page(
+                mem_pool_file,
+                cached_page.page_id,
+                libc::EIO,
+            ));
+            let _hook_guard = install_storage_backend_test_hook(read_hook.clone());
+            let res = trx.rollback().await;
 
             let rollback_error =
-                res.expect_err("row-page reload failure must fail statement rollback");
+                res.expect_err("row-page reload failure must fail transaction rollback");
             let expected_io_kind = StdIoError::from_raw_os_error(libc::EIO).kind();
             assert_eq!(rollback_error.kind(), ErrorKind::Fatal);
             assert_eq!(
@@ -10254,16 +10008,14 @@ mod tests {
                 1
             );
             assert!(
-                read_hook
-                    .as_ref()
-                    .is_some_and(|hook: &Arc<FailingPageReadHook>| hook.call_count() > 0),
-                "statement rollback should reload the evicted page"
+                read_hook.call_count() > 0,
+                "transaction rollback should reload the evicted page"
             );
             let poison_error = engine
                 .inner()
                 .poisoner
                 .poison_error()
-                .expect("statement rollback failure must poison the runtime");
+                .expect("transaction rollback failure must poison the runtime");
             assert_eq!(poison_error.current_context(), &FatalError::RollbackAccess);
             assert_eq!(
                 poison_error.downcast_ref::<RuntimeError>().copied(),
@@ -10283,8 +10035,6 @@ mod tests {
                 "failed-retained operation must keep the session unavailable"
             );
 
-            let err = trx.rollback().await.unwrap_err();
-            assert!(err.report().downcast_ref::<InternalError>().is_none());
             remove_session_for_test(&engine.inner().session_registry, session.id());
         });
     }
@@ -10346,12 +10096,9 @@ mod tests {
                     let row_id = (batch * 64 + i) as i32;
                     let seed = format!("{:08x}", row_id);
                     let key = seed.repeat(64);
-                    let res = trx_insert_row_by_id(
-                        &mut trx,
-                        table_id,
-                        vec![Val::from(row_id), Val::from(&key[..])],
-                    )
-                    .await;
+                    let res = trx
+                        .table_insert_mvcc(table_id, vec![Val::from(row_id), Val::from(&key[..])])
+                        .await;
                     assert!(res.is_ok(), "res={res:?}");
                     inserted.push((row_id, key));
                 }
@@ -10450,9 +10197,9 @@ mod tests {
             let mut session = engine.new_session().unwrap();
 
             let mut insert = session.begin_trx().unwrap();
-            let res =
-                trx_insert_row_by_id(&mut insert, table_id, vec![Val::from(10), Val::from(7)])
-                    .await;
+            let res = insert
+                .table_insert_mvcc(table_id, vec![Val::from(10), Val::from(7)])
+                .await;
             assert!(res.is_ok());
             insert.commit().await.unwrap();
 
@@ -10494,7 +10241,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stream_stmt_validation_opt_out_is_stream_local() {
+    fn test_transaction_stream_validation_opt_out_can_be_reenabled_and_is_transaction_local() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine = Engine::bootstrap(
@@ -10509,9 +10256,9 @@ mod tests {
             let mut session = engine.new_session().unwrap();
 
             let mut insert = session.begin_trx().unwrap();
-            let res =
-                trx_insert_row_by_id(&mut insert, table_id, vec![Val::from(10), Val::from(7)])
-                    .await;
+            let res = insert
+                .table_insert_mvcc(table_id, vec![Val::from(10), Val::from(7)])
+                .await;
             assert!(res.is_ok());
             insert.commit().await.unwrap();
 
@@ -10529,17 +10276,16 @@ mod tests {
                 Some(OperationError::InvalidDmlInput)
             );
 
-            // RFC-0029 Phase 2 runner coverage: stream validation opt-out
-            // remains available only through the legacy StreamStmt facade.
+            trx.disable_dml_validation(true);
+            trx.noop().await.unwrap();
             let mut stream = trx
-                .stream_stmt()
-                .disable_validation()
-                .table_index_scan_mvcc(table_id, 1, &key_vals[..]..=&key_vals[..], &[])
+                .table_index_scan_mvcc_stream(table_id, 1, &key_vals[..]..=&key_vals[..], &[])
                 .await
                 .unwrap();
             assert_eq!(stream.next().await.unwrap(), Some(Vec::new()));
             assert_eq!(stream.next().await.unwrap(), None);
             drop(stream);
+            trx.disable_dml_validation(false);
 
             let err = match trx
                 .table_index_scan_mvcc_stream(table_id, 1, &key_vals[..]..=&key_vals[..], &[])
@@ -10553,6 +10299,20 @@ mod tests {
                 Some(OperationError::InvalidDmlInput)
             );
             trx.commit().await.unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            let err = match trx
+                .table_index_scan_mvcc_stream(table_id, 1, &key_vals[..]..=&key_vals[..], &[])
+                .await
+            {
+                Ok(_) => panic!("empty read set should fail in a new transaction"),
+                Err(err) => err,
+            };
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::InvalidDmlInput)
+            );
+            trx.rollback().await.unwrap();
         });
     }
 
@@ -10575,9 +10335,9 @@ mod tests {
                 let user_read_set = &[0usize, 1];
                 let mut trx = session.begin_trx().unwrap();
                 for i in 0i32..5i32 {
-                    let res =
-                        trx_insert_row_by_id(&mut trx, table_id, vec![Val::from(i), Val::from(i)])
-                            .await;
+                    let res = trx
+                        .table_insert_mvcc(table_id, vec![Val::from(i), Val::from(i)])
+                        .await;
                     assert!(res.is_ok());
                 }
                 trx.commit().await.unwrap();
@@ -10799,9 +10559,9 @@ mod tests {
             let mut session = engine.new_session().unwrap();
 
             let mut insert = session.begin_trx().unwrap();
-            let res =
-                trx_insert_row_by_id(&mut insert, table_id, vec![Val::from(10), Val::from(7)])
-                    .await;
+            let res = insert
+                .table_insert_mvcc(table_id, vec![Val::from(10), Val::from(7)])
+                .await;
             assert!(res.is_ok());
             insert.commit().await.unwrap();
 
@@ -10851,9 +10611,9 @@ mod tests {
             let mut session = engine.new_session().unwrap();
 
             let mut insert = session.begin_trx().unwrap();
-            let res =
-                trx_insert_row_by_id(&mut insert, table_id, vec![Val::from(10), Val::from(7)])
-                    .await;
+            let res = insert
+                .table_insert_mvcc(table_id, vec![Val::from(10), Val::from(7)])
+                .await;
             assert!(res.is_ok());
             insert.commit().await.unwrap();
 

@@ -531,11 +531,11 @@ abandoned session:
     -> release explicit session-owned logical locks
 ```
 
-Public statement-future cancellation composes with the same terminal proof
-boundary:
+Public direct-operation future cancellation composes with the same terminal
+proof boundary:
 
 ```text
-drop callback and pending acquisition
+drop owned operation future and pending acquisition
     -> fold residual statement undo into transaction undo and discard statement redo
     -> check the complete transaction core in as CleanupReady
     -> worker rolls back transaction effects
@@ -544,8 +544,8 @@ drop callback and pending acquisition
     -> consume ReleasedTransactionLocks at session rollback completion
 ```
 
-The callback future is destroyed before its `StmtState`, so a queued waiter or
-promoted-but-unobserved request is cancelled by its call-local pending guard
+The owned operation future is destroyed before its `StmtState`, so a queued
+waiter or promoted-but-unobserved request is cancelled by its call-local pending guard
 before the core becomes cleanup-claimable. An accepted transaction claim is not
 released inline; it remains attached to `TrxInner` until whole-transaction
 rollback reaches the ordering above.

@@ -38,7 +38,7 @@ pub(crate) use sys_trx::{RetiredRowPageBatch, SysTrxPayload};
 
 use crate::buffer::PoolGuards;
 use crate::buffer::page::VersionedPageID;
-use crate::catalog::{TableCache, is_catalog_table};
+use crate::catalog::{CatalogTable, TableCache, is_catalog_table};
 use crate::completion::Completion;
 use crate::engine::EngineCore;
 use crate::error::{
@@ -47,7 +47,7 @@ use crate::error::{
     MultiDomainResultExt, OperationOrFatalResult, ResourceError, Result, RuntimeError,
     RuntimeOrFatalError, RuntimeOrFatalResult, SharedFatalError,
 };
-use crate::id::{SessionID, SessionOperationKey, TableID, TrxID};
+use crate::id::{RowID, SessionID, SessionOperationKey, TableID, TrxID};
 use crate::lock::{
     FamilyLockAuthority, FreshClaimsGuard, LockMode, LockResource, LockScope, LockScopeState,
     TableLockMode, TransactionLockState,
@@ -58,10 +58,12 @@ use crate::map::FastHashMap;
 use crate::notify::EventNotifyOnDrop;
 use crate::obs;
 use crate::poison::PoisonAwareListener;
+use crate::row::ops::DeleteMvcc;
 use crate::session::{SessionRuntime, TrxAttachment, WeakSessionRef};
 use crate::trx::undo::{
     IndexPurgeEntry, IndexUndoLogs, RowUndoHead, RowUndoLogs, RowUndoRollbackContext, UndoStatus,
 };
+use crate::value::Val;
 use error_stack::{Report, ResultExt};
 use event_listener::{Event, EventListener};
 use futures::FutureExt;
@@ -75,9 +77,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub(crate) use admission::TableAdmissionRequest;
-pub use stmt::Statement;
-use stmt::{StmtEffects, StmtState};
-pub use stream_stmt::{IndexScanMvccStream, StreamStmt};
+use stmt::{PrivateStmtState, Statement, StmtState};
+pub use stream_stmt::IndexScanMvccStream;
 /// Minimum snapshot timestamp assigned by the transaction system.
 pub(crate) const MIN_SNAPSHOT_TS: TrxID = TrxID::new(1);
 /// Exclusive upper bound for snapshot timestamps.
@@ -129,6 +130,7 @@ pub struct Transaction {
     sts: TrxID,
     operation_key: SessionOperationKey,
     session: WeakSessionRef,
+    dml_validation_disabled: bool,
     terminal_started: bool,
 }
 
@@ -146,6 +148,7 @@ impl Transaction {
             sts,
             operation_key,
             session,
+            dml_validation_disabled: false,
             terminal_started: false,
         }
     }
@@ -233,6 +236,19 @@ impl Transaction {
         self.sts
     }
 
+    /// Enable or disable validation for subsequent direct table and stream operations.
+    ///
+    /// Validation is enabled by default. Disable it only after proving row
+    /// shapes, value types, nullability, sparse updates, lookup keys, index
+    /// ranges, and read sets against the target table metadata. The setting is
+    /// transaction-local and remains in effect until changed again. Invalid
+    /// trusted input may surface as a debug assertion or internal error instead
+    /// of `InvalidDmlInput`.
+    #[inline]
+    pub fn disable_dml_validation(&mut self, disable: bool) {
+        self.dml_validation_disabled = disable;
+    }
+
     /// Acquires an explicit transaction-lifetime table lock.
     #[inline]
     pub async fn lock_table(&mut self, table_id: TableID, mode: TableLockMode) -> Result<()> {
@@ -244,49 +260,35 @@ impl Transaction {
         checkout.lock_table(table_id, mode).await.disclose()
     }
 
-    /// Creates a statement facade for public caller-driven transaction streams.
+    /// Executes one engine-selected owned statement operation.
     #[inline]
-    pub fn stream_stmt(&mut self) -> StreamStmt<'_> {
-        StreamStmt::new(self)
-    }
-
-    /// Executes one scoped statement callback inside this active transaction.
-    ///
-    /// Successful callbacks merge statement-local row undo, index undo, and
-    /// redo effects into the transaction. Ordinary callback errors roll back
-    /// only the current statement and leave previous successful statements
-    /// transaction-owned. Dropping the future before its first poll performs no
-    /// checkout. Dropping it after checkout synchronously settles
-    /// statement-local ownership, terminally cancels the transaction, and
-    /// queues whole-transaction rollback. The public transaction facade is
-    /// discarded after that cancellation.
-    #[inline]
-    pub async fn exec<T, F>(&mut self, f: F) -> Result<T>
+    async fn exec<T, F>(&mut self, action: F) -> Result<T>
     where
-        F: for<'borrow> AsyncFnOnce(&'borrow mut Statement<'_>) -> Result<T>,
+        F: for<'stmt> AsyncFnOnce(Statement<'stmt>) -> Result<T>,
     {
         let checkout = self
             .checkout()
             .attach("operation=execute_statement")
             .disclose()?;
-        let mut stmt_state = StmtState::public(checkout);
+        let mut stmt_state = StmtState::public(checkout, self.dml_validation_disabled);
         enum ExecOutcome<T> {
             Success(T),
             StatementError(Error),
             FatalRollback(Report<FatalError>),
         }
-        let outcome = {
-            let mut stmt = stmt_state.statement();
-            match f(&mut stmt).await {
-                Ok(value) => {
-                    stmt.merge_effects();
-                    ExecOutcome::Success(value)
-                }
-                Err(err) => match stmt.rollback_effects().await {
-                    Ok(()) => ExecOutcome::StatementError(err),
-                    Err(rollback_err) => ExecOutcome::FatalRollback(rollback_err),
-                },
+        let stmt_result = {
+            let stmt = stmt_state.statement();
+            action(stmt).await
+        };
+        let outcome = match stmt_result {
+            Ok(value) => {
+                stmt_state.merge_effects();
+                ExecOutcome::Success(value)
             }
+            Err(err) => match stmt_state.rollback_effects().await {
+                Ok(()) => ExecOutcome::StatementError(err),
+                Err(rollback_err) => ExecOutcome::FatalRollback(rollback_err),
+            },
         };
         match outcome {
             ExecOutcome::Success(value) => {
@@ -399,36 +401,105 @@ impl PrivateTransaction {
             .ensure_healthy()
     }
 
-    /// Execute one private statement without returning the core to its entry.
-    ///
-    /// Ordinary errors retain all complete and partial undo in transaction
-    /// effects for whole-transaction rollback. A callback panic discards
-    /// incomplete redo, folds residual undo into the transaction, and resumes
-    /// the original unwind while this facade still owns the checkout.
+    /// Execute one owned private statement without returning the core to its entry.
     #[inline]
-    pub(crate) async fn stage_statement<T, F>(&mut self, f: F) -> RuntimeOrFatalResult<T>
+    async fn exec<T, F>(&mut self, operation: F) -> RuntimeOrFatalResult<T>
     where
-        F: for<'borrow> AsyncFnOnce(&'borrow mut Statement<'_>) -> RuntimeOrFatalResult<T>,
+        F: for<'stmt> AsyncFnOnce(Statement<'stmt>) -> RuntimeOrFatalResult<T>,
     {
-        let checkout = self.checkout_mut();
-        let stmt_no = checkout.inner_mut().next_stmt_no();
-        let mut effects = StmtEffects::new(stmt_no);
-        let outcome = AssertUnwindSafe(async {
-            let (inner, attachment) = checkout.inner_and_attachment_mut();
-            let mut stmt = Statement::new(inner, attachment, &mut effects);
-            let result = f(&mut stmt).await;
-            stmt.merge_effects();
-            result
-        })
-        .catch_unwind()
-        .await;
+        let mut stmt_state = PrivateStmtState::new(self.checkout_mut());
+        let outcome = {
+            let stmt = stmt_state.statement();
+            AssertUnwindSafe(operation(stmt)).catch_unwind().await
+        };
         match outcome {
-            Ok(result) => result,
+            Ok(Ok(value)) => {
+                stmt_state.merge_effects();
+                Ok(value)
+            }
+            Ok(Err(err)) => match stmt_state.rollback_effects().await {
+                Ok(()) => Err(err),
+                Err(rollback_err) => Err(RuntimeOrFatalError::Fatal(rollback_err)),
+            },
             Err(panic) => {
-                effects.fold_cancelled_into_trx_effects(checkout.inner_mut().effects_mut());
+                stmt_state.fold_cancelled_into_transaction();
                 resume_unwind(panic);
             }
         }
+    }
+
+    /// Return the retained private transaction's buffer-pool guards.
+    #[inline]
+    pub(crate) fn pool_guards(&self) -> &PoolGuards {
+        self.checkout().attachment().pool_guards()
+    }
+
+    /// Insert one catalog row through one owned private statement.
+    #[inline]
+    pub(crate) async fn catalog_insert_mvcc(
+        &mut self,
+        table: &CatalogTable,
+        cols: Vec<Val>,
+    ) -> RuntimeOrFatalResult<RowID> {
+        self.exec(async move |stmt| stmt.catalog_insert_mvcc(table, cols).await)
+            .await
+    }
+
+    /// Insert one ordered catalog row batch through one owned private statement.
+    #[inline]
+    pub(crate) async fn catalog_insert_batch_mvcc(
+        &mut self,
+        table: &CatalogTable,
+        rows: Vec<Vec<Val>>,
+    ) -> RuntimeOrFatalResult<()> {
+        self.exec(async move |stmt| stmt.catalog_insert_batch_mvcc(table, rows).await)
+            .await
+    }
+
+    /// Delete one exact catalog primary-key row through one owned statement.
+    #[inline]
+    pub(crate) async fn catalog_delete_primary_key_mvcc(
+        &mut self,
+        table: &CatalogTable,
+        index_no: usize,
+        key_vals: Vec<Val>,
+    ) -> RuntimeOrFatalResult<DeleteMvcc> {
+        self.exec(async move |stmt| {
+            stmt.catalog_delete_primary_key_mvcc(table, index_no, &key_vals, true)
+                .await
+        })
+        .await
+    }
+
+    /// Delete an ordered catalog primary-key batch through one owned statement.
+    #[inline]
+    pub(crate) async fn catalog_delete_primary_key_batch_mvcc(
+        &mut self,
+        table: &CatalogTable,
+        index_no: usize,
+        keys: Vec<Vec<Val>>,
+    ) -> RuntimeOrFatalResult<usize> {
+        self.exec(async move |stmt| {
+            stmt.catalog_delete_primary_key_batch_mvcc(table, index_no, keys)
+                .await
+        })
+        .await
+    }
+
+    /// Replace one catalog metadata row through one delete-then-insert statement.
+    #[inline]
+    pub(crate) async fn catalog_replace_primary_key_mvcc(
+        &mut self,
+        table: &CatalogTable,
+        index_no: usize,
+        key_vals: Vec<Val>,
+        cols: Vec<Val>,
+    ) -> RuntimeOrFatalResult<DeleteMvcc> {
+        self.exec(async move |stmt| {
+            stmt.catalog_replace_primary_key_mvcc(table, index_no, &key_vals, cols)
+                .await
+        })
+        .await
     }
 
     /// Install the exact catalog DDL marker after every catalog statement succeeds.
@@ -1065,13 +1136,6 @@ pub(crate) enum SessionOperationState {
 }
 
 impl SessionOperationState {
-    /// Returns whether this state still blocks operation admission and shutdown.
-    #[cfg(test)]
-    #[inline]
-    pub(crate) const fn active(self) -> bool {
-        !matches!(self, Self::Terminal)
-    }
-
     /// Returns the stable snake-case diagnostic label.
     #[inline]
     pub(crate) const fn label(self) -> &'static str {
@@ -1223,17 +1287,6 @@ impl SessionOperationEntry {
             trx_id: inner.trx_id,
             cleanup_requested: inner.cleanup_requested,
         }
-    }
-
-    /// Returns the checked-in core allocation address for lifecycle tests.
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn inner_ptr_for_test(&self) -> Option<usize> {
-        self.inner
-            .lock()
-            .trx_inner
-            .as_deref()
-            .map(|inner| inner as *const TrxInner as usize)
     }
 
     /// Validate that accepted mandatory execution may start a private transaction.
@@ -2155,16 +2208,6 @@ impl SessionOperationCompletionClaim {
             .as_ref()
             .expect("active completion claim retains terminal attachment")
             .engine()
-    }
-
-    /// Returns the exact transaction identity retained by this claim.
-    #[cfg(test)]
-    #[inline]
-    pub(crate) const fn trx_id(&self) -> TrxID {
-        self.attachment
-            .as_ref()
-            .expect("active completion claim retains terminal attachment")
-            .trx_id()
     }
 }
 
@@ -3377,15 +3420,6 @@ impl CommittedTrx {
     }
 
     #[inline]
-    #[cfg(test)]
-    fn retired_row_pages(&self) -> Option<&RetiredRowPageBatch> {
-        match self.payload.as_ref() {
-            Some(CommittedTrxPayload::System(payload)) => Some(&payload.retired_row_pages),
-            Some(CommittedTrxPayload::User { .. }) | None => None,
-        }
-    }
-
-    #[inline]
     fn into_retired_row_pages(mut self) -> Option<RetiredRowPageBatch> {
         match self.payload.take() {
             Some(CommittedTrxPayload::System(payload)) => Some(payload.retired_row_pages),
@@ -3469,7 +3503,9 @@ fn is_catalog_metadata_ddl(ddl: Option<&DDLRedo>) -> bool {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::buffer::EvictableBufferPool;
     use crate::buffer::frame::FrameKind;
+    use crate::buffer::guard::PageSharedGuard;
     use crate::buffer::page::PAGE_SIZE;
     use crate::buffer::test_frame_kind;
     use crate::catalog::storage::tables::TABLE_ID_TABLES;
@@ -3480,7 +3516,7 @@ pub(crate) mod tests {
     use crate::error::{InternalError, OperationError};
     use crate::file::cow_file::tests::old_root_drop_count;
     use crate::file::table_file::{MutableTableFile, TableFile};
-    use crate::id::{OperationID, PageID, RowID, SessionID};
+    use crate::id::{BlockID, OperationID, PageID, RowID, SessionID};
     use crate::io::{
         IOKind, StdIoResult, StorageBackendFileIdentity, StorageBackendOp, StorageBackendTestHook,
         install_storage_backend_test_hook,
@@ -3489,7 +3525,8 @@ pub(crate) mod tests {
     use crate::lock::{LockManager, LockOwner};
     use crate::log::redo::{RowRedo, RowRedoKind};
     use crate::quiescent::QuiescentGuard;
-    use crate::row::ops::SelectKey;
+    use crate::row::RowPage;
+    use crate::row::ops::{DeleteMvcc, SelectKey, UpdateCol, UpdateMvcc, UpsertMvcc};
     use crate::session::{
         Session, SessionRegistry, SessionShutdownWait,
         tests::{
@@ -3499,7 +3536,7 @@ pub(crate) mod tests {
             session_has_public_trx_cache, session_registry_len, wait_for_session_idle,
         },
     };
-    use crate::table::test_user_table_id;
+    use crate::table::{MemTable, Table, test_user_table_id};
     use crate::trx::stmt::tests as stmt_tests;
     use crate::trx::sys::tests::{
         TerminalRollbackTestHookGuard, fatal_rollback_retention_count,
@@ -3518,6 +3555,7 @@ pub(crate) mod tests {
     use std::io::Error as IoError;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::pin::Pin;
+    use std::ptr::from_ref;
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
     use std::thread::{scope, sleep, spawn};
@@ -3560,6 +3598,168 @@ pub(crate) mod tests {
             terminal: AtomicBool::new(terminal),
             terminal_ev: Event::new(),
         }
+    }
+
+    /// Hold one checked-out statement pending for cancellation tests.
+    pub(crate) async fn pending_statement(trx: &mut Transaction) -> Result<()> {
+        trx.exec(async |stmt| {
+            let _stmt = stmt;
+            pending::<()>().await;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Insert into a standalone MemTable through production statement settlement.
+    pub(crate) async fn mem_table_insert_mvcc(
+        trx: &mut Transaction,
+        mem_table: &MemTable<EvictableBufferPool, EvictableBufferPool>,
+        cols: Vec<Val>,
+    ) -> Result<RowID> {
+        trx.exec(async move |stmt| stmt_tests::mem_table_insert_mvcc(stmt, mem_table, cols).await)
+            .await
+    }
+
+    /// Upsert into a standalone MemTable through production statement settlement.
+    pub(crate) async fn mem_table_upsert_unique_mvcc(
+        trx: &mut Transaction,
+        mem_table: &MemTable<EvictableBufferPool, EvictableBufferPool>,
+        cols: Vec<Val>,
+    ) -> Result<UpsertMvcc> {
+        trx.exec(async move |stmt| {
+            stmt_tests::mem_table_upsert_unique_mvcc(stmt, mem_table, cols).await
+        })
+        .await
+    }
+
+    /// Update a standalone MemTable through production statement settlement.
+    pub(crate) async fn mem_table_update_unique_mvcc(
+        trx: &mut Transaction,
+        mem_table: &MemTable<EvictableBufferPool, EvictableBufferPool>,
+        key: &SelectKey,
+        update: Vec<UpdateCol>,
+    ) -> Result<UpdateMvcc> {
+        trx.exec(async move |stmt| {
+            stmt_tests::mem_table_update_unique_mvcc(stmt, mem_table, key, update).await
+        })
+        .await
+    }
+
+    /// Delete from a standalone MemTable through production statement settlement.
+    pub(crate) async fn mem_table_delete_unique_mvcc(
+        trx: &mut Transaction,
+        mem_table: &MemTable<EvictableBufferPool, EvictableBufferPool>,
+        key: &SelectKey,
+    ) -> Result<DeleteMvcc> {
+        trx.exec(async move |stmt| {
+            stmt_tests::mem_table_delete_unique_mvcc(stmt, mem_table, key).await
+        })
+        .await
+    }
+
+    /// Apply one index-only key change through production statement settlement.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn mem_table_duplicate_index_key_change(
+        trx: &mut Transaction,
+        mem_table: &MemTable<EvictableBufferPool, EvictableBufferPool>,
+        page_guard: PageSharedGuard<RowPage>,
+        row_id: RowID,
+        old_key: SelectKey,
+        new_key: SelectKey,
+    ) -> Result<()> {
+        trx.exec(async move |stmt| {
+            stmt_tests::mem_table_duplicate_index_key_change(
+                stmt, mem_table, page_guard, row_id, old_key, new_key,
+            )
+            .await
+        })
+        .await
+    }
+
+    /// Run the focused transition-page insert/update operation through settlement.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn transition_insert_update(
+        trx: &mut Transaction,
+        table: &Table,
+        insert_page_guard: PageSharedGuard<RowPage>,
+        insert: Vec<Val>,
+        page_guard: &PageSharedGuard<RowPage>,
+        row_id: RowID,
+        key: &SelectKey,
+        update: Vec<UpdateCol>,
+    ) -> Result<(bool, bool)> {
+        trx.exec(async move |stmt| {
+            stmt_tests::transition_insert_update(
+                stmt,
+                table,
+                insert_page_guard,
+                insert,
+                page_guard,
+                row_id,
+                key,
+                update,
+            )
+            .await
+        })
+        .await
+    }
+
+    /// Run the focused transition-page delete operation through settlement.
+    pub(crate) async fn transition_delete(
+        trx: &mut Transaction,
+        table: &Table,
+        page_guard: &PageSharedGuard<RowPage>,
+        row_id: RowID,
+        key: &SelectKey,
+    ) -> Result<bool> {
+        trx.exec(async move |stmt| {
+            stmt_tests::transition_delete(stmt, table, page_guard, row_id, key).await
+        })
+        .await
+    }
+
+    /// Install one hot-row lock and pause before forcing statement rollback.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn lock_hot_row_then_wait_and_error(
+        trx: &mut Transaction,
+        table: &Table,
+        page_guard: PageSharedGuard<RowPage>,
+        row_id: RowID,
+        key: &SelectKey,
+        lock_installed: flume::Sender<bool>,
+        return_error: flume::Receiver<()>,
+    ) -> Result<()> {
+        trx.exec(async move |stmt| {
+            stmt_tests::lock_hot_row_then_wait_and_error(
+                stmt,
+                table,
+                page_guard,
+                row_id,
+                key,
+                lock_installed,
+                return_error,
+            )
+            .await
+        })
+        .await
+    }
+
+    /// Execute one empty private statement without returning its held checkout.
+    pub(crate) async fn private_noop(trx: &mut PrivateTransaction) -> RuntimeOrFatalResult<()> {
+        trx.exec(async |_| Ok(())).await
+    }
+
+    /// Return the checked-in transaction core address retained by one entry.
+    #[inline]
+    pub(crate) fn session_operation_entry_inner_ptr(
+        entry: &SessionOperationEntry,
+    ) -> Option<usize> {
+        entry
+            .inner
+            .lock()
+            .trx_inner
+            .as_deref()
+            .map(|inner| inner as *const TrxInner as usize)
     }
 
     /// Publish one committed result on a test-controlled shared status.
@@ -3621,19 +3821,77 @@ pub(crate) mod tests {
         inner
     }
 
-    /// Install one transaction-level DDL marker for catalog and recovery tests.
-    pub(crate) fn install_transaction_ddl_redo(
-        trx: &mut Transaction,
-        ddl: DDLRedo,
-    ) -> LifecycleOrFatalResult<()> {
-        let mut checkout = trx.checkout()?;
-        checkout.inner_mut().effects_mut().install_ddl_redo(ddl);
-        Ok(())
-    }
-
     /// Return the core allocation held by one running private transaction.
     pub(crate) fn private_transaction_inner_ptr(trx: &PrivateTransaction) -> usize {
         trx.checkout().inner() as *const TrxInner as usize
+    }
+
+    /// Owned observation returned by the proof-bound root snapshot test operation.
+    pub(crate) struct RootSnapshotObservation {
+        pub(crate) root_ts: TrxID,
+        pub(crate) effective_ts: TrxID,
+        pub(crate) pivot_row_id: RowID,
+        pub(crate) column_block_index_root: BlockID,
+        pub(crate) deletion_cutoff_ts: TrxID,
+        pub(crate) secondary_index_root: BlockID,
+        pub(crate) visible: bool,
+        pub(crate) sts: TrxID,
+    }
+
+    /// Capture one proof-bound table root through the production statement runner.
+    pub(crate) async fn observe_table_root_snapshot(
+        trx: &mut Transaction,
+        table: &Table,
+        index_no: usize,
+    ) -> Result<RootSnapshotObservation> {
+        trx.exec(async |stmt| {
+            let rt = stmt.runtime();
+            let proof = rt.read_proof();
+            let snapshot = table.root_snapshot(&proof);
+            Ok(RootSnapshotObservation {
+                root_ts: snapshot.root_ts(),
+                effective_ts: snapshot.effective_ts(),
+                pivot_row_id: snapshot.pivot_row_id(),
+                column_block_index_root: snapshot.column_block_index_root(),
+                deletion_cutoff_ts: snapshot.deletion_cutoff_ts(),
+                secondary_index_root: snapshot.secondary_index_root(index_no),
+                visible: snapshot.root_is_visible_to(rt.sts()),
+                sts: rt.sts(),
+            })
+        })
+        .await
+    }
+
+    /// Count physical row redo kinds currently owned by one transaction.
+    pub(crate) fn transaction_redo_kind_counts(
+        trx: &mut Transaction,
+        table_id: TableID,
+    ) -> Result<(usize, usize, usize, usize)> {
+        let checkout = trx.checkout().disclose()?;
+        let rows = &checkout
+            .inner()
+            .effects
+            .redo
+            .dml
+            .get(&table_id)
+            .expect("test transaction must own table redo")
+            .rows;
+        let mut cold_deletes = 0;
+        let mut hot_deletes = 0;
+        let mut inserts = 0;
+        let mut updates = 0;
+        for row in rows.values() {
+            match row.kind {
+                RowRedoKind::Delete(None) => cold_deletes += 1,
+                RowRedoKind::Delete(Some(_)) => hot_deletes += 1,
+                RowRedoKind::Insert(..) => inserts += 1,
+                RowRedoKind::Update(..) => updates += 1,
+                RowRedoKind::DeleteByPrimaryKey(_) | RowRedoKind::UpdateByPrimaryKey(..) => {
+                    panic!("user-table transaction must contain physical redo")
+                }
+            }
+        }
+        Ok((cold_deletes, hot_deletes, inserts, updates))
     }
 
     /// Return the exact number of snapshot timestamps registered for GC.
@@ -4218,26 +4476,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_operation_state_activity_labels() {
-        for state in [
-            SessionOperationState::Voluntary(None),
-            SessionOperationState::Voluntary(Some(InternalTrxState::Running)),
-            SessionOperationState::CleanupReady,
-            SessionOperationState::Completing,
-            SessionOperationState::Mandatory(None),
-            SessionOperationState::Mandatory(Some(InternalTrxState::Completing)),
-            SessionOperationState::FailedRetained,
-        ] {
-            assert!(
-                state.active(),
-                "state should block shutdown: {}",
-                state.label()
-            );
-        }
-        assert!(!SessionOperationState::Terminal.active());
-    }
-
-    #[test]
     fn test_failed_entry_remains_an_active_operation_blocker() {
         smol::block_on(async {
             let (_temp_dir, engine) =
@@ -4439,6 +4677,25 @@ pub(crate) mod tests {
         .expect("test transaction must be active")
     }
 
+    /// Return the transaction-level undo state installed by one completed delete.
+    #[inline]
+    pub(crate) fn transaction_delete_undo_observation(
+        trx: &Transaction,
+    ) -> ((usize, usize), usize) {
+        with_transaction_inner(trx, "query_test_delete_undo", |inner| {
+            let undo = inner
+                .effects
+                .row_undo
+                .last()
+                .expect("completed delete must retain one row undo entry");
+            (
+                (inner.effects.row_undo.len(), inner.effects.index_undo.len()),
+                from_ref(&**undo).addr(),
+            )
+        })
+        .expect("test transaction must be active")
+    }
+
     #[inline]
     fn begin_production_test_transaction(engine: &Engine) -> (Session, Transaction) {
         let mut session = engine.new_session().unwrap();
@@ -4518,12 +4775,12 @@ pub(crate) mod tests {
         static PSEUDO_SYSBENCH_VAR1: [u8; 60] = [3; 60];
         static PSEUDO_SYSBENCH_VAR2: [u8; 120] = [4; 120];
 
-        // RFC-0029 Phase 2 runner coverage: tests inject raw redo without a
-        // physical row operation through the legacy statement effects.
-        trx.exec(async |stmt| {
+        // Focused owned-runner tests inject raw redo without a physical row
+        // operation.
+        trx.exec(async |mut stmt| {
             // Simulate one sysbench record:
             // uint64 + int32 + int32 + char(60) + char(120)
-            stmt_tests::statement_effects_mut(stmt).insert_row_redo(
+            stmt_tests::statement_effects_mut(&mut stmt).insert_row_redo(
                 USER_TABLE_ID_START,
                 RowRedo {
                     row_id: RowID::new(0),
@@ -5033,6 +5290,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_prepare_completion_won_registration_rechecks_poison() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("prepare_completion_won_poison").await;
+            let (_session, mut trx) = begin_production_test_transaction(&engine);
+            let result: Result<()> = trx
+                .exec(async |stmt| {
+                    stmt.runtime().engine().poisoner.poison(
+                        Report::new(FatalError::StorageIo)
+                            .attach("unrelated foreground wait poison: completion won"),
+                    );
+                    stmt.runtime()
+                        .wait_prepare_or_poison(PoisonAwareListener::recheck_only())
+                        .await
+                        .disclose()
+                })
+                .await;
+
+            let err = result.unwrap_err();
+            assert_eq!(err.kind(), crate::error::ErrorKind::Fatal);
+            assert_eq!(
+                err.report().downcast_ref::<FatalError>().copied(),
+                Some(FatalError::StorageIo)
+            );
+            assert!(format!("{err:?}").contains("unrelated foreground wait poison"));
+            trx.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
     fn test_cancelled_prepare_listener_leaves_event_for_completion() {
         let status = shared_trx_status(MIN_ACTIVE_TRX_ID + 90_003);
         status.mark_preparing();
@@ -5108,15 +5394,15 @@ pub(crate) mod tests {
         });
     }
 
-    // RFC-0029 Phase 2 runner coverage: raw statement effects verify success
-    // merge into transaction-owned undo and redo.
+    // Focused owned-runner coverage verifies raw statement effects merge into
+    // transaction-owned undo and redo.
     #[test]
     fn test_statement_success_merges_statement_effects_into_transaction_effects() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_stmt_effect_merge").await;
             let (_session, mut trx) = begin_production_test_transaction(&engine);
-            trx.exec(async |stmt| {
-                let effects = stmt_tests::statement_effects_mut(stmt);
+            trx.exec(async |mut stmt| {
+                let effects = stmt_tests::statement_effects_mut(&mut stmt);
                 effects.push_row_undo(OwnedRowUndo::new(
                     effects.stmt_no(),
                     TableID::new(12),
@@ -5154,8 +5440,7 @@ pub(crate) mod tests {
         });
     }
 
-    // RFC-0029 Phase 2 runner coverage: an unpolled legacy callback future
-    // must not check out the transaction core.
+    // An unpolled direct operation must not check out the transaction core.
     #[test]
     fn test_unpolled_statement_future_leaves_transaction_reusable() {
         smol::block_on(async {
@@ -5163,19 +5448,19 @@ pub(crate) mod tests {
             let (_session, mut trx) = begin_production_test_transaction(&engine);
             let entry = transaction_entry(&trx);
 
-            let exec = trx.exec(async |_| Ok::<(), Error>(()));
+            let exec = trx.noop();
             drop(exec);
 
             let snapshot = entry.inspect();
             assert_eq!(snapshot.state, SessionOperationState::Voluntary(None));
             assert!(!snapshot.cleanup_requested);
-            trx.exec(async |_| Ok::<(), Error>(())).await.unwrap();
+            trx.noop().await.unwrap();
             trx.rollback().await.unwrap();
         });
     }
 
-    // RFC-0029 Phase 2 runner coverage: dropping a checked-out legacy callback
-    // terminally transfers transaction cleanup ownership.
+    // Dropping a checked-out direct operation terminally transfers transaction
+    // cleanup ownership.
     #[test]
     fn test_dropped_polled_statement_future_terminally_cancels_transaction() {
         smol::block_on(async {
@@ -5183,10 +5468,7 @@ pub(crate) mod tests {
             let (session, mut trx) = begin_production_test_transaction(&engine);
             let session_id = session.id();
             let entry = transaction_entry(&trx);
-            let mut exec = Box::pin(trx.exec(async |_| {
-                pending::<()>().await;
-                Ok::<(), Error>(())
-            }));
+            let mut exec = Box::pin(pending_statement(&mut trx));
 
             assert!(matches!(
                 futures::poll!(exec.as_mut()),
@@ -5212,8 +5494,8 @@ pub(crate) mod tests {
         });
     }
 
-    // RFC-0029 Phase 2 runner coverage: cancellation folds raw effects and
-    // transaction locks into terminal cleanup.
+    // Focused owned-runner cancellation folds raw effects and transaction
+    // locks into terminal cleanup.
     #[test]
     fn test_dropped_effectful_statement_discards_redo_and_terminally_releases_locks() {
         smol::block_on(async {
@@ -5222,9 +5504,9 @@ pub(crate) mod tests {
             let session_id = session.id();
             let trx_owner = lock_owner(&trx).unwrap();
             let resource = LockResource::TableMetadata(TableID::new(91_430));
-            let mut exec = Box::pin(trx.exec(async |stmt| {
-                stmt_tests::acquire_transaction_lock(stmt, resource, LockMode::Shared).await?;
-                stmt_tests::statement_effects_mut(stmt).insert_row_redo(
+            let mut exec = Box::pin(trx.exec(async |mut stmt| {
+                stmt_tests::acquire_transaction_lock(&mut stmt, resource, LockMode::Shared).await?;
+                stmt_tests::statement_effects_mut(&mut stmt).insert_row_redo(
                     TableID::new(91_430),
                     RowRedo {
                         row_id: RowID::new(1),
@@ -5291,8 +5573,8 @@ pub(crate) mod tests {
         } else {
             pause_next_row_rollback();
         }
-        // RFC-0029 Phase 2 runner coverage: cancellation during legacy
-        // statement rollback folds residual row and index undo into cleanup.
+        // Focused owned-runner cancellation during statement rollback folds
+        // residual row and index undo into cleanup.
         let mut exec = Box::pin(trx.exec(async |stmt| {
             stmt.table_insert_mvcc(table_id, vec![Val::from(value), Val::from("cancelled")])
                 .await?;
@@ -5373,10 +5655,10 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let mut blocker = Some(blocker);
-        // RFC-0029 Phase 2 runner coverage: dropping a legacy callback while
-        // its raw logical-lock request waits or is provisionally promoted.
-        let mut exec = Box::pin(trx.exec(async |stmt| {
-            stmt_tests::acquire_transaction_lock(stmt, resource, LockMode::Shared).await?;
+        // Focused owned-runner cancellation while a raw logical-lock request
+        // waits or is provisionally promoted.
+        let mut exec = Box::pin(trx.exec(async |mut stmt| {
+            stmt_tests::acquire_transaction_lock(&mut stmt, resource, LockMode::Shared).await?;
             Ok::<(), Error>(())
         }));
 
@@ -5471,16 +5753,16 @@ pub(crate) mod tests {
         effects.install_ddl_redo(DDLRedo::DropTable(TableID::new(42)));
     }
 
-    // RFC-0029 Phase 2 runner coverage: raw redo injection distinguishes
-    // successful effect merge from callback-error rollback.
+    // Focused raw redo injection distinguishes successful effect merge from
+    // operation-error rollback.
     #[test]
     fn test_statement_error_rolls_back_only_statement_effects() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_stmt_error_rollback").await;
             let (_session, mut trx) = begin_production_test_transaction(&engine);
 
-            trx.exec(async |stmt| {
-                stmt_tests::statement_effects_mut(stmt).insert_row_redo(
+            trx.exec(async |mut stmt| {
+                stmt_tests::statement_effects_mut(&mut stmt).insert_row_redo(
                     TableID::new(12),
                     RowRedo {
                         row_id: RowID::new(23),
@@ -5493,8 +5775,8 @@ pub(crate) mod tests {
             .unwrap();
 
             let res: Result<()> = trx
-                .exec(async |stmt| {
-                    stmt_tests::statement_effects_mut(stmt).insert_row_redo(
+                .exec(async |mut stmt| {
+                    stmt_tests::statement_effects_mut(&mut stmt).insert_row_redo(
                         TableID::new(12),
                         RowRedo {
                             row_id: RowID::new(24),
@@ -5521,8 +5803,8 @@ pub(crate) mod tests {
         });
     }
 
-    // RFC-0029 Phase 2 runner coverage: raw statement lock acquisition proves
-    // callback completion retains transaction-lifetime claims.
+    // Focused raw statement lock acquisition proves operation completion
+    // retains transaction-lifetime claims.
     #[test]
     fn test_statement_completion_retains_transaction_locks_until_terminal_cleanup() {
         smol::block_on(async {
@@ -5534,56 +5816,58 @@ pub(crate) mod tests {
             acquire_transaction_lock_immediate(&mut trx, trx_resource, LockMode::IntentExclusive)
                 .unwrap();
 
-            trx.exec(async |stmt| {
-                assert_eq!(stmt_tests::transaction_lock_owner(stmt), trx_owner);
-                stmt_tests::acquire_transaction_lock(
-                    stmt,
-                    LockResource::TableMetadata(TableID::new(91_210)),
-                    LockMode::Shared,
-                )
-                .await?;
-                stmt_tests::acquire_transaction_lock(
-                    stmt,
-                    LockResource::TableMetadata(TableID::new(91_210)),
-                    LockMode::Shared,
-                )
-                .await?;
-                assert_eq!(lock_entry_count(&engine, trx_owner), 2);
-                Ok(())
-            })
-            .await
-            .unwrap();
+            let (owner, count) = trx
+                .exec(async |mut stmt| {
+                    let owner = stmt_tests::transaction_lock_owner(&stmt);
+                    stmt_tests::acquire_transaction_lock(
+                        &mut stmt,
+                        LockResource::TableMetadata(TableID::new(91_210)),
+                        LockMode::Shared,
+                    )
+                    .await?;
+                    stmt_tests::acquire_transaction_lock(
+                        &mut stmt,
+                        LockResource::TableMetadata(TableID::new(91_210)),
+                        LockMode::Shared,
+                    )
+                    .await?;
+                    Ok((owner, lock_entry_count(&engine, trx_owner)))
+                })
+                .await
+                .unwrap();
+            assert_eq!(owner, trx_owner);
+            assert_eq!(count, 2);
 
-            trx.exec(async |stmt| {
-                assert_eq!(stmt_tests::transaction_lock_owner(stmt), trx_owner);
-                stmt_tests::acquire_transaction_lock(
-                    stmt,
-                    LockResource::TableMetadata(TableID::new(91_211)),
-                    LockMode::Shared,
-                )
-                .await?;
-                stmt_tests::acquire_transaction_lock(
-                    stmt,
-                    LockResource::TableMetadata(TableID::new(91_211)),
-                    LockMode::Shared,
-                )
-                .await?;
-                assert_eq!(lock_entry_count(&engine, trx_owner), 3);
-                Ok(())
-            })
-            .await
-            .unwrap();
+            let (owner, count) = trx
+                .exec(async |mut stmt| {
+                    let owner = stmt_tests::transaction_lock_owner(&stmt);
+                    stmt_tests::acquire_transaction_lock(
+                        &mut stmt,
+                        LockResource::TableMetadata(TableID::new(91_211)),
+                        LockMode::Shared,
+                    )
+                    .await?;
+                    stmt_tests::acquire_transaction_lock(
+                        &mut stmt,
+                        LockResource::TableMetadata(TableID::new(91_211)),
+                        LockMode::Shared,
+                    )
+                    .await?;
+                    Ok((owner, lock_entry_count(&engine, trx_owner)))
+                })
+                .await
+                .unwrap();
+            assert_eq!(owner, trx_owner);
+            assert_eq!(count, 3);
 
             let res: Result<()> = trx
-                .exec(async |stmt| {
-                    assert_eq!(stmt_tests::transaction_lock_owner(stmt), trx_owner);
+                .exec(async |mut stmt| {
                     stmt_tests::acquire_transaction_lock(
-                        stmt,
+                        &mut stmt,
                         LockResource::TableMetadata(TableID::new(91_212)),
                         LockMode::Shared,
                     )
                     .await?;
-                    assert_eq!(lock_entry_count(&engine, trx_owner), 4);
                     Err(Report::new(OperationError::InvalidDmlInput).disclose())
                 })
                 .await;

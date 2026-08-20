@@ -2177,12 +2177,13 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         }
     }
 
+    /// Update one row through a unique index in a standalone memory table.
     #[inline]
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "reserved for future memory-only user tables")
     )]
-    async fn update_unique_mvcc(
+    pub(crate) async fn update_unique_mvcc(
         &self,
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
@@ -2734,8 +2735,9 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         Ok(())
     }
 
+    /// Move one unique-index key between row versions without changing row data.
     #[inline]
-    async fn update_unique_index_only_key_change(
+    pub(crate) async fn update_unique_index_only_key_change(
         &self,
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
@@ -3302,8 +3304,8 @@ mod tests {
     };
     use crate::engine::Engine;
     use crate::error::{
-        DataIntegrityError, DiscloseResultExt, InternalError, LifecycleError, OperationError,
-        OperationOrRuntimeError, ResourceError, RuntimeError,
+        DataIntegrityError, InternalError, LifecycleError, OperationError, ResourceError,
+        RuntimeError,
     };
     use crate::file::cow_file::SUPER_BLOCK_ID;
     use crate::id::{RowID, TableID, TrxID};
@@ -3315,8 +3317,10 @@ mod tests {
         tests::{SessionTestExt, assert_checkpoint_published, wait_for_session_idle},
     };
     use crate::table::tests::*;
-    use crate::trx::stmt::tests as stmt_tests;
-    use crate::trx::tests::shared_trx_status;
+    use crate::trx::tests::{
+        mem_table_delete_unique_mvcc, mem_table_duplicate_index_key_change, mem_table_insert_mvcc,
+        mem_table_update_unique_mvcc, mem_table_upsert_unique_mvcc, shared_trx_status,
+    };
     use crate::trx::undo::{OwnedRowUndo, RowUndoHead, RowUndoKind, RowUndoRollbackAttempt};
     use crate::trx::ver_map::RowPageState;
     use crate::trx::{MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, NON_FOREGROUND_STMT_NO};
@@ -3425,26 +3429,13 @@ mod tests {
         vec![Val::from(id), Val::from(name), Val::from(payload)]
     }
 
-    // RFC-0029 Phase 2 runner coverage: raw MemTable tests require direct
-    // runtime/effect access and explicit logical-lock injection.
     async fn insert_mem_mvcc(
         session: &mut Session,
-        table_id: TableID,
         mem_table: &TestMemTable,
         cols: Vec<Val>,
     ) -> RowID {
         let mut trx = session.begin_trx().unwrap();
-        let row_id = trx
-            .exec(async |stmt| {
-                stmt.acquire_table_write_metadata_lock(table_id)
-                    .await
-                    .disclose()?;
-                stmt.acquire_table_write_data_lock(table_id)
-                    .await
-                    .disclose()?;
-                let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
-                mem_table.insert_mvcc(rt, effects, cols).await.disclose()
-            })
+        let row_id = mem_table_insert_mvcc(&mut trx, mem_table, cols)
             .await
             .unwrap();
         trx.commit().await.unwrap();
@@ -3453,26 +3444,12 @@ mod tests {
 
     async fn update_mem_unique_mvcc(
         session: &mut Session,
-        table_id: TableID,
         mem_table: &TestMemTable,
         key: SelectKey,
         update: Vec<UpdateCol>,
     ) -> UpdateMvcc {
         let mut trx = session.begin_trx().unwrap();
-        let updated = trx
-            .exec(async |stmt| {
-                stmt.acquire_table_write_metadata_lock(table_id)
-                    .await
-                    .disclose()?;
-                stmt.acquire_table_write_data_lock(table_id)
-                    .await
-                    .disclose()?;
-                let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
-                mem_table
-                    .update_unique_mvcc(rt, effects, key.index_no, &key.vals, update, false)
-                    .await
-                    .disclose()
-            })
+        let updated = mem_table_update_unique_mvcc(&mut trx, mem_table, &key, update)
             .await
             .unwrap();
         trx.commit().await.unwrap();
@@ -3555,8 +3532,6 @@ mod tests {
         });
     }
 
-    // RFC-0029 Phase 2 runner coverage: raw MemTable upsert uses injected
-    // runtime/effects outside the catalog-owned public table boundary.
     #[test]
     fn test_mem_table_upsert_unique_insert_and_update() {
         smol::block_on(async {
@@ -3568,28 +3543,13 @@ mod tests {
             let mut session = engine.new_session().unwrap();
 
             let mut trx = session.begin_trx().unwrap();
-            let inserted = trx
-                .exec(async |stmt| {
-                    stmt.acquire_table_write_metadata_lock(mem_table_id)
-                        .await
-                        .disclose()?;
-                    stmt.acquire_table_write_data_lock(mem_table_id)
-                        .await
-                        .disclose()?;
-                    let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
-                    mem_table
-                        .upsert_unique_mvcc(
-                            rt,
-                            effects,
-                            0,
-                            vec![Val::from(1i32), Val::from("hello")],
-                            false,
-                        )
-                        .await
-                        .disclose()
-                })
-                .await
-                .unwrap();
+            let inserted = mem_table_upsert_unique_mvcc(
+                &mut trx,
+                &mem_table,
+                vec![Val::from(1i32), Val::from("hello")],
+            )
+            .await
+            .unwrap();
             let inserted_row_id = match inserted {
                 UpsertMvcc::Inserted(row_id) => row_id,
                 UpsertMvcc::Updated(row_id) => panic!("unexpected update row_id={row_id}"),
@@ -3597,28 +3557,13 @@ mod tests {
             trx.commit().await.unwrap();
 
             let mut trx = session.begin_trx().unwrap();
-            let updated = trx
-                .exec(async |stmt| {
-                    stmt.acquire_table_write_metadata_lock(mem_table_id)
-                        .await
-                        .disclose()?;
-                    stmt.acquire_table_write_data_lock(mem_table_id)
-                        .await
-                        .disclose()?;
-                    let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
-                    mem_table
-                        .upsert_unique_mvcc(
-                            rt,
-                            effects,
-                            0,
-                            vec![Val::from(1i32), Val::from("world")],
-                            false,
-                        )
-                        .await
-                        .disclose()
-                })
-                .await
-                .unwrap();
+            let updated = mem_table_upsert_unique_mvcc(
+                &mut trx,
+                &mem_table,
+                vec![Val::from(1i32), Val::from("world")],
+            )
+            .await
+            .unwrap();
             assert_eq!(updated, UpsertMvcc::Updated(inserted_row_id));
             trx.commit().await.unwrap();
 
@@ -3636,8 +3581,6 @@ mod tests {
         });
     }
 
-    // RFC-0029 Phase 2 runner coverage: raw MemTable write-conflict setup uses
-    // injected runtime/effects and explicit transaction locks.
     #[test]
     fn test_mem_table_upsert_unique_missing_key_write_conflict() {
         smol::block_on(async {
@@ -3650,25 +3593,11 @@ mod tests {
 
             let mut trx1 = session1.begin_trx().unwrap();
             assert!(matches!(
-                trx1.exec(async |stmt| {
-                    stmt.acquire_table_write_metadata_lock(mem_table_id)
-                        .await
-                        .disclose()?;
-                    stmt.acquire_table_write_data_lock(mem_table_id)
-                        .await
-                        .disclose()?;
-                    let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
-                    mem_table
-                        .upsert_unique_mvcc(
-                            rt,
-                            effects,
-                            0,
-                            vec![Val::from(2i32), Val::from("first")],
-                            false,
-                        )
-                        .await
-                        .disclose()
-                })
+                mem_table_upsert_unique_mvcc(
+                    &mut trx1,
+                    &mem_table,
+                    vec![Val::from(2i32), Val::from("first")],
+                )
                 .await
                 .unwrap(),
                 UpsertMvcc::Inserted(_)
@@ -3676,28 +3605,13 @@ mod tests {
 
             let mut session2 = engine.new_session().unwrap();
             let mut trx2 = session2.begin_trx().unwrap();
-            let err = trx2
-                .exec(async |stmt| {
-                    stmt.acquire_table_write_metadata_lock(mem_table_id)
-                        .await
-                        .disclose()?;
-                    stmt.acquire_table_write_data_lock(mem_table_id)
-                        .await
-                        .disclose()?;
-                    let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
-                    mem_table
-                        .upsert_unique_mvcc(
-                            rt,
-                            effects,
-                            0,
-                            vec![Val::from(2i32), Val::from("second")],
-                            false,
-                        )
-                        .await
-                        .disclose()
-                })
-                .await
-                .unwrap_err();
+            let err = mem_table_upsert_unique_mvcc(
+                &mut trx2,
+                &mem_table,
+                vec![Val::from(2i32), Val::from("second")],
+            )
+            .await
+            .unwrap_err();
             assert_eq!(
                 err.report().downcast_ref::<OperationError>().copied(),
                 Some(OperationError::WriteConflict)
@@ -4310,8 +4224,6 @@ mod tests {
         });
     }
 
-    // RFC-0029 Phase 2 runner coverage: raw MemTable delete inspects and
-    // injects statement-local effects directly.
     #[test]
     fn test_mem_table_delete_unique_mvcc_marks_non_unique_index() {
         smol::block_on(async {
@@ -4326,7 +4238,6 @@ mod tests {
 
             let row_id = insert_mem_mvcc(
                 &mut session,
-                mem_table_id,
                 &mem_table,
                 indexed_payload_row(10, "delete", b"payload"),
             )
@@ -4341,21 +4252,7 @@ mod tests {
             .await;
 
             let mut trx = session.begin_trx().unwrap();
-            let deleted = trx
-                .exec(async |stmt| {
-                    stmt.acquire_table_write_metadata_lock(mem_table_id)
-                        .await
-                        .disclose()?;
-                    stmt.acquire_table_write_data_lock(mem_table_id)
-                        .await
-                        .disclose()?;
-                    let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
-                    let key = single_key(10i32);
-                    mem_table
-                        .delete_unique_mvcc(rt, effects, key.index_no, &key.vals, false)
-                        .await
-                        .disclose()
-                })
+            let deleted = mem_table_delete_unique_mvcc(&mut trx, &mem_table, &single_key(10i32))
                 .await
                 .unwrap();
             assert_eq!(deleted, DeleteMvcc::Deleted);
@@ -4394,8 +4291,6 @@ mod tests {
         });
     }
 
-    // RFC-0029 Phase 2 runner coverage: raw MemTable update composes physical
-    // index mutation with statement-local effect inspection.
     #[test]
     fn test_mem_table_update_key_change_updates_unique_and_non_unique_indexes() {
         smol::block_on(async {
@@ -4410,14 +4305,12 @@ mod tests {
 
             let row_id = insert_mem_mvcc(
                 &mut session,
-                mem_table_id,
                 &mem_table,
                 indexed_payload_row(1, "old", b"payload"),
             )
             .await;
             insert_mem_mvcc(
                 &mut session,
-                mem_table_id,
                 &mem_table,
                 indexed_payload_row(20, "other", b"payload"),
             )
@@ -4425,7 +4318,6 @@ mod tests {
 
             let updated = update_mem_unique_mvcc(
                 &mut session,
-                mem_table_id,
                 &mem_table,
                 single_key(1i32),
                 vec![
@@ -4479,52 +4371,34 @@ mod tests {
             )
             .await;
 
+            let page_id = match mem_table
+                .find_row(&session.pool_guards(), row_id)
+                .await
+                .unwrap()
+            {
+                RowLocation::RowPage(page_id) => page_id,
+                RowLocation::NotFound => panic!("updated row should exist"),
+                RowLocation::LwcBlock(..) => panic!("standalone MemTable should not use LWC"),
+            };
+            let page_guard = mem_table
+                .must_get_row_page_shared(&session.pool_guards(), page_id)
+                .await
+                .unwrap();
             let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| {
-                stmt.acquire_table_write_metadata_lock(mem_table_id)
-                    .await
-                    .disclose()?;
-                stmt.acquire_table_write_data_lock(mem_table_id)
-                    .await
-                    .disclose()?;
-                let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
-                let page_id = match mem_table
-                    .find_row(rt.pool_guards(), row_id)
-                    .await
-                    .disclose()?
-                {
-                    RowLocation::RowPage(page_id) => page_id,
-                    RowLocation::NotFound => panic!("updated row should exist"),
-                    RowLocation::LwcBlock(..) => {
-                        panic!("standalone MemTable should not use LWC")
-                    }
-                };
-                let page_guard = mem_table
-                    .must_get_row_page_shared(rt.pool_guards(), page_id)
-                    .await
-                    .disclose()?;
-                let err = mem_table
-                    .update_unique_index_only_key_change(
-                        rt,
-                        effects,
-                        single_key(10i32),
-                        single_key(20i32),
-                        row_id,
-                        &page_guard,
-                    )
-                    .await
-                    .expect_err("duplicate unique key must be terminal");
-                let OperationOrRuntimeError::Operation(report) = err else {
-                    panic!("duplicate unique key must stay in the Operation domain")
-                };
-                assert_eq!(
-                    report.downcast_ref::<OperationError>().copied(),
-                    Some(OperationError::DuplicateKey)
-                );
-                Ok(())
-            })
+            let err = mem_table_duplicate_index_key_change(
+                &mut trx,
+                &mem_table,
+                page_guard,
+                row_id,
+                single_key(10i32),
+                single_key(20i32),
+            )
             .await
-            .unwrap();
+            .unwrap_err();
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::DuplicateKey)
+            );
             trx.rollback().await.unwrap();
 
             assert_unique_row(
@@ -4558,7 +4432,6 @@ mod tests {
                 let name = format!("name{id}");
                 let row_id = insert_mem_mvcc(
                     &mut session,
-                    mem_table_id,
                     &mem_table,
                     indexed_payload_row(id, &name, &base_payload),
                 )
@@ -4570,7 +4443,6 @@ mod tests {
             let old_row0 = row_ids[0];
             let updated = update_mem_unique_mvcc(
                 &mut session,
-                mem_table_id,
                 &mem_table,
                 single_key(0i32),
                 vec![UpdateCol {
@@ -4619,7 +4491,6 @@ mod tests {
             let old_row1 = row_ids[1];
             let updated = update_mem_unique_mvcc(
                 &mut session,
-                mem_table_id,
                 &mem_table,
                 single_key(1i32),
                 vec![
@@ -4700,8 +4571,6 @@ mod tests {
         });
     }
 
-    // RFC-0029 Phase 2 runner coverage: raw MemTable transition-state panic
-    // injection verifies callback panic cancellation and cleanup.
     #[test]
     fn test_mem_table_transition_update_and_delete_panic() {
         smol::block_on(async {
@@ -4713,7 +4582,6 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let row_id = insert_mem_mvcc(
                 &mut session,
-                mem_table_id,
                 &mem_table,
                 vec![Val::from(1i32), Val::from("transition")],
             )
@@ -4738,29 +4606,15 @@ mod tests {
 
             let key = single_key(1i32);
             let mut trx = session.begin_trx().unwrap();
-            let panic = AssertUnwindSafe(trx.exec(async |stmt| {
-                stmt.acquire_table_write_metadata_lock(mem_table_id)
-                    .await
-                    .disclose()?;
-                stmt.acquire_table_write_data_lock(mem_table_id)
-                    .await
-                    .disclose()?;
-                let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
-                mem_table
-                    .update_unique_mvcc(
-                        rt,
-                        effects,
-                        key.index_no,
-                        &key.vals,
-                        vec![UpdateCol {
-                            idx: 1,
-                            val: Val::from("updated"),
-                        }],
-                        false,
-                    )
-                    .await
-                    .disclose()
-            }))
+            let panic = AssertUnwindSafe(mem_table_update_unique_mvcc(
+                &mut trx,
+                &mem_table,
+                &key,
+                vec![UpdateCol {
+                    idx: 1,
+                    val: Val::from("updated"),
+                }],
+            ))
             .catch_unwind()
             .await
             .expect_err("standalone MemTable update must reject a transition page");
@@ -4781,22 +4635,10 @@ mod tests {
             wait_for_session_idle(&engine.inner().session_registry, session.id()).await;
 
             let mut trx = session.begin_trx().unwrap();
-            let panic = AssertUnwindSafe(trx.exec(async |stmt| {
-                stmt.acquire_table_write_metadata_lock(mem_table_id)
-                    .await
-                    .disclose()?;
-                stmt.acquire_table_write_data_lock(mem_table_id)
-                    .await
-                    .disclose()?;
-                let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
-                mem_table
-                    .delete_unique_mvcc(rt, effects, key.index_no, &key.vals, false)
-                    .await
-                    .disclose()
-            }))
-            .catch_unwind()
-            .await
-            .expect_err("standalone MemTable delete must reject a transition page");
+            let panic = AssertUnwindSafe(mem_table_delete_unique_mvcc(&mut trx, &mem_table, &key))
+                .catch_unwind()
+                .await
+                .expect_err("standalone MemTable delete must reject a transition page");
             let message = panic
                 .downcast_ref::<String>()
                 .map(String::as_str)
@@ -4827,7 +4669,6 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let row_id = insert_mem_mvcc(
                 &mut session,
-                table_id,
                 &mem_table,
                 vec![Val::from(1i32), Val::from("rollback")],
             )

@@ -52,43 +52,43 @@ session.close().await?;
 engine.shutdown()?;
 ```
 
-Insert, update, and delete rows by executing statements inside a transaction.
+Insert, update, and delete rows through direct transaction methods.
 
 ```rust
 use doradb_storage::{SelectKey, UpdateCol, Val};
 
 let mut trx = session.begin_trx()?;
 
-trx.exec(async |stmt| {
-    stmt.table_insert_mvcc(table_id, vec![Val::from(1i32), Val::from("alice")])
-        .await?;
-    Ok(())
-})
-.await?;
+trx.table_insert_mvcc(table_id, vec![Val::from(1i32), Val::from("alice")])
+    .await?;
 
 let key = SelectKey::new(0, vec![Val::from(1i32)]);
-trx.exec(async |stmt| {
-    stmt.table_update_unique_mvcc(
+let updated = trx
+    .table_update_unique_mvcc(
         table_id,
-        &key,
+        key.index_no,
+        &key.vals,
         vec![UpdateCol {
             idx: 1,
             val: Val::from("ada"),
         }],
     )
     .await?;
-    Ok(())
-})
-.await?;
+assert!(updated.is_updated());
 
-trx.exec(async |stmt| {
-    stmt.table_delete_unique_mvcc(table_id, &key, false).await?;
-    Ok(())
-})
-.await?;
+let deleted = trx
+    .table_delete_unique_mvcc(table_id, key.index_no, &key.vals)
+    .await?;
+assert!(deleted.is_deleted());
 
 trx.commit().await?;
 ```
+
+DML validation is enabled by default. Call
+`trx.disable_dml_validation(true)` only for input already proven against the
+table metadata; the setting applies to subsequent direct and streaming
+operations in that transaction. Call `disable_dml_validation(false)` to enable
+validation again.
 
 Scan rows, read one unique-key row, and scan matching rows through a secondary index.
 
@@ -98,30 +98,20 @@ use doradb_storage::{SelectKey, Val};
 let mut trx = session.begin_trx()?;
 let mut rows = Vec::new();
 
-trx.exec(async |stmt| {
-    stmt.table_scan_mvcc(table_id, &[0, 1], |vals| {
+trx.table_scan_mvcc(table_id, &[0, 1], |vals| {
         rows.push(vals);
         true
     })
     .await?;
-    Ok(())
-})
-.await?;
 
 let id_key = SelectKey::new(0, vec![Val::from(1i32)]);
 let _row = trx
-    .exec(async |stmt| {
-        stmt.table_lookup_unique_mvcc(table_id, &id_key, &[0, 1])
-            .await
-    })
+    .table_lookup_unique_mvcc(table_id, id_key.index_no, &id_key.vals, &[0, 1])
     .await?;
 
 let name_key = SelectKey::new(1, vec![Val::from("ada")]);
 let _matching_rows = trx
-    .exec(async |stmt| {
-        stmt.table_index_scan_mvcc(table_id, &name_key, &[0, 1])
-            .await
-    })
+    .table_index_lookup_mvcc(table_id, name_key.index_no, &name_key.vals, &[0, 1])
     .await?
     .unwrap_rows();
 
