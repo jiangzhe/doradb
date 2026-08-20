@@ -463,6 +463,7 @@ pub(crate) mod tests {
     use crate::serde::{Deser, Ser};
     use std::mem;
 
+    /// Returns page id for tests.
     #[inline]
     pub(crate) fn test_page_id(value: i32) -> PageID {
         PageID::new(u64::try_from(value).expect("test PageID must be non-negative"))

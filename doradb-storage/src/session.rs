@@ -3460,16 +3460,6 @@ pub(crate) mod tests {
     type TerminalAttachmentTestHook =
         Arc<dyn Fn(TrxID, TerminalAttachmentOutcome) + Send + Sync + 'static>;
 
-    fn terminal_attachment_test_hook_slot() -> &'static Mutex<Option<TerminalAttachmentTestHook>> {
-        static HOOK: OnceLock<Mutex<Option<TerminalAttachmentTestHook>>> = OnceLock::new();
-        HOOK.get_or_init(|| Mutex::new(None))
-    }
-
-    fn terminal_attachment_test_hook_install_lock() -> &'static Mutex<()> {
-        static INSTALL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        INSTALL_LOCK.get_or_init(|| Mutex::new(()))
-    }
-
     /// Guard that restores the previous terminal attachment hook on drop.
     pub(crate) struct TerminalAttachmentTestHookGuard {
         previous: Option<TerminalAttachmentTestHook>,
@@ -3480,6 +3470,78 @@ pub(crate) mod tests {
         #[inline]
         fn drop(&mut self) {
             *terminal_attachment_test_hook_slot().lock() = self.previous.take();
+        }
+    }
+
+    type TotalRowPagesAfterRuntimeResolutionHook =
+        Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + 'static>> + 'static>;
+
+    thread_local! {
+        static TEST_TOTAL_ROW_PAGES_AFTER_RUNTIME_RESOLUTION_HOOK:
+            RefCell<Option<TotalRowPagesAfterRuntimeResolutionHook>> = RefCell::new(None);
+    }
+
+    /// Test-only extension interface for session test ext.
+    pub(crate) trait SessionTestExt {
+        /// Provides test-only access to `in_trx`.
+        fn in_trx(&self) -> Result<bool>;
+        /// Provides test-only access to `pool_guards`.
+        fn pool_guards(&self) -> PoolGuards;
+        /// Provides test-only access to `engine`.
+        fn engine(&self) -> SessionRuntime;
+        /// Provides test-only access to `last_cts`.
+        fn last_cts(&self) -> TrxID;
+        /// Provides test-only access to `load_active_insert_page`.
+        fn load_active_insert_page(&mut self, table_id: TableID) -> Option<VersionedPageID>;
+        /// Provides test-only access to `save_active_insert_page`.
+        fn save_active_insert_page(&mut self, table_id: TableID, page_id: VersionedPageID);
+    }
+
+    impl SessionTestExt for Session {
+        #[inline]
+        fn in_trx(&self) -> Result<bool> {
+            const OPERATION: &str = "test_inspect_transaction_state";
+            let runtime = test_session_runtime(self)
+                .attach_with(|| format!("operation={OPERATION}"))
+                .disclose()?;
+            inspect_session_in_trx(runtime.state())
+                .attach_with(|| format!("operation={OPERATION}, session_id={}", self.id))
+                .disclose()
+        }
+
+        #[inline]
+        fn pool_guards(&self) -> PoolGuards {
+            test_session_runtime(self)
+                .expect("test session must be running")
+                .pool_guards()
+                .clone()
+        }
+
+        #[inline]
+        fn engine(&self) -> SessionRuntime {
+            test_session_runtime(self).expect("test session must be running")
+        }
+
+        #[inline]
+        fn last_cts(&self) -> TrxID {
+            let runtime = test_session_runtime(self).expect("test session must be running");
+            TrxID::new(runtime.state().last_cts.load(Ordering::SeqCst))
+        }
+
+        #[inline]
+        fn load_active_insert_page(&mut self, table_id: TableID) -> Option<VersionedPageID> {
+            test_session_runtime(self)
+                .expect("test session must be running")
+                .state()
+                .load_active_insert_page(table_id)
+        }
+
+        #[inline]
+        fn save_active_insert_page(&mut self, table_id: TableID, page_id: VersionedPageID) {
+            test_session_runtime(self)
+                .expect("test session must be running")
+                .state()
+                .save_active_insert_page(table_id, page_id);
         }
     }
 
@@ -3497,6 +3559,7 @@ pub(crate) mod tests {
         }
     }
 
+    /// Runs terminal attachment test hook for tests.
     #[inline]
     pub(crate) fn run_terminal_attachment_test_hook(
         trx_id: TrxID,
@@ -3531,38 +3594,6 @@ pub(crate) mod tests {
             registry.entries.remove_if(&session_id, |_id, registered| {
                 Arc::ptr_eq(registered, &state)
             });
-        }
-    }
-
-    type TotalRowPagesAfterRuntimeResolutionHook =
-        Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + 'static>> + 'static>;
-
-    thread_local! {
-        static TEST_TOTAL_ROW_PAGES_AFTER_RUNTIME_RESOLUTION_HOOK:
-            RefCell<Option<TotalRowPagesAfterRuntimeResolutionHook>> = RefCell::new(None);
-    }
-
-    fn set_test_total_row_pages_after_runtime_resolution_hook<F, Fut>(hook: F)
-    where
-        F: FnOnce() -> Fut + 'static,
-        Fut: Future<Output = ()> + 'static,
-    {
-        TEST_TOTAL_ROW_PAGES_AFTER_RUNTIME_RESOLUTION_HOOK.with(|slot| {
-            let old = slot
-                .borrow_mut()
-                .replace(Box::new(move || Box::pin(hook())));
-            assert!(
-                old.is_none(),
-                "total-row-pages runtime-resolution hook already installed"
-            );
-        });
-    }
-
-    pub(super) async fn run_test_total_row_pages_after_runtime_resolution_hook() {
-        let hook = TEST_TOTAL_ROW_PAGES_AFTER_RUNTIME_RESOLUTION_HOOK
-            .with(|slot| slot.borrow_mut().take());
-        if let Some(hook) = hook {
-            hook().await;
         }
     }
 
@@ -3613,6 +3644,202 @@ pub(crate) mod tests {
                 return Ok(());
             }
             select_all(vec![handoff_listener, poison_listener, shutdown_listener]).await;
+        }
+    }
+
+    /// Asserts checkpoint published in tests.
+    pub(crate) async fn assert_checkpoint_published(
+        session: &mut Session,
+        table_id: TableID,
+    ) -> TrxID {
+        let outcome = session.checkpoint_table_with_wait(table_id).await.unwrap();
+        let CheckpointOutcome::Published { checkpoint_ts, .. } = outcome else {
+            panic!("checkpoint should publish, got {outcome:?}");
+        };
+        checkpoint_ts
+    }
+
+    /// Waits for checkpoint purge in tests.
+    pub(crate) async fn wait_for_checkpoint_purge(session: &Session, redo_cts: TrxID) -> TrxID {
+        wait_for_purge_handoff(session, redo_cts).await.unwrap();
+        session
+            .wait_for_purge_completion_after(redo_cts)
+            .await
+            .unwrap()
+    }
+
+    /// Waits for checkpoint root ready in tests.
+    pub(crate) async fn wait_for_checkpoint_root_ready(session: &mut Session, table_id: TableID) {
+        let table = session
+            .engine()
+            .catalog()
+            .get_table_now(table_id)
+            .expect("test table should exist");
+        let effective_ts = table.file().active_root_unchecked().effective_ts();
+        let min_active_sts = session.engine().trx_sys.calc_min_active_sts_for_gc();
+        if effective_ts < min_active_sts {
+            return;
+        }
+        session
+            .wait_for_checkpoint_retry(CheckpointDelayReason::ActiveRoot {
+                table_id,
+                effective_ts,
+                min_active_sts,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Returns the number of registry-owned sessions for tests.
+    #[inline]
+    pub(crate) fn session_registry_len(registry: &SessionRegistry) -> usize {
+        registry.entries.len()
+    }
+
+    /// Count registry-owned operations that still block owner shutdown.
+    #[inline]
+    pub(crate) fn active_operation_count(registry: &SessionRegistry) -> usize {
+        registry
+            .entries
+            .iter()
+            .map(|entry| Arc::clone(entry.value()))
+            .filter(|session| {
+                matches!(
+                    &session.lifecycle.lock().slot,
+                    SessionOperationSlot::Active(_)
+                )
+            })
+            .count()
+    }
+
+    /// Return the coherent snapshot of one test session's active operation.
+    #[inline]
+    pub(crate) fn active_operation_snapshot(
+        registry: &SessionRegistry,
+        session_id: SessionID,
+    ) -> SessionOperationSnapshot {
+        active_operation_entry_for_test(registry, session_id).inspect()
+    }
+
+    /// Returns whether a registered session currently owns its public transaction cache.
+    #[inline]
+    pub(crate) fn session_has_public_trx_cache(
+        registry: &SessionRegistry,
+        session_id: SessionID,
+    ) -> bool {
+        registry
+            .session_state(session_id)
+            .is_some_and(|state| state.lifecycle.lock().public_trx_cache.is_some())
+    }
+
+    /// Removes one synthetic or failed-retained test session before engine teardown.
+    #[inline]
+    pub(crate) fn remove_session_for_test(registry: &SessionRegistry, session_id: SessionID) {
+        drop(registry.entries.remove(&session_id));
+    }
+
+    /// Create one registry-owned transaction with test-controlled ids.
+    #[inline]
+    pub(crate) fn create_test_transaction(
+        engine: &Engine,
+        session_id: SessionID,
+        trx_id: TrxID,
+        sts: TrxID,
+        gc_no: usize,
+    ) -> (Transaction, Arc<SessionState>) {
+        let registry = &engine.inner().session_registry;
+        let state = Arc::new(new_session_state_for_test(engine, session_id));
+        let key = SessionOperationKey::new(session_id, OperationID::new(1));
+        let mut inner = state
+            .lifecycle
+            .lock()
+            .public_trx_cache
+            .take()
+            .expect("test session must start with one public transaction cache");
+        inner.init(
+            trx_id,
+            sts,
+            gc_no,
+            session_id,
+            FamilyLockAuthority::new(session_id),
+        );
+        let entry = SessionOperationEntry::new_public_transaction(key, inner);
+        {
+            let mut lifecycle = state.lifecycle.lock();
+            lifecycle.next_operation_id = 2;
+            lifecycle.slot = SessionOperationSlot::Active(entry);
+        }
+        let runtime = SessionRuntime::new(Arc::clone(&state));
+        registry.insert(Arc::clone(&state));
+        (
+            Transaction::new(runtime.downgrade(), key, trx_id, sts),
+            state,
+        )
+    }
+
+    /// Begin one test-owned mandatory private transaction for focused catalog storage tests.
+    pub(crate) fn begin_test_mandatory_private_trx(
+        session: &Session,
+    ) -> (MandatoryOperationGuard, PrivateTransaction) {
+        let mut operation = session
+            .pin_operation(SessionOperationKind::Ddl)
+            .expect("catalog test operation must be admitted")
+            .into_mandatory();
+        let trx = operation
+            .begin_private_trx()
+            .expect("catalog test private transaction must begin");
+        (operation, trx)
+    }
+
+    /// Asserts existing transaction error in tests.
+    pub(crate) fn assert_existing_transaction_error(
+        err: &Error,
+        session_id: SessionID,
+        trx_id: TrxID,
+        state: &str,
+    ) {
+        assert_eq!(err.kind(), ErrorKind::Lifecycle);
+        assert_eq!(
+            err.report().downcast_ref::<LifecycleError>().copied(),
+            Some(LifecycleError::ExistingTransaction)
+        );
+        let diagnostic = format!("{:?}", err.report());
+        assert!(diagnostic.contains(&format!("session_id={session_id}")));
+        assert!(diagnostic.contains(&format!("trx_id={trx_id}")));
+        assert!(diagnostic.contains(&format!("state={state}")));
+    }
+
+    fn terminal_attachment_test_hook_slot() -> &'static Mutex<Option<TerminalAttachmentTestHook>> {
+        static HOOK: OnceLock<Mutex<Option<TerminalAttachmentTestHook>>> = OnceLock::new();
+        HOOK.get_or_init(|| Mutex::new(None))
+    }
+
+    fn terminal_attachment_test_hook_install_lock() -> &'static Mutex<()> {
+        static INSTALL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        INSTALL_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn set_test_total_row_pages_after_runtime_resolution_hook<F, Fut>(hook: F)
+    where
+        F: FnOnce() -> Fut + 'static,
+        Fut: Future<Output = ()> + 'static,
+    {
+        TEST_TOTAL_ROW_PAGES_AFTER_RUNTIME_RESOLUTION_HOOK.with(|slot| {
+            let old = slot
+                .borrow_mut()
+                .replace(Box::new(move || Box::pin(hook())));
+            assert!(
+                old.is_none(),
+                "total-row-pages runtime-resolution hook already installed"
+            );
+        });
+    }
+
+    pub(super) async fn run_test_total_row_pages_after_runtime_resolution_hook() {
+        let hook = TEST_TOTAL_ROW_PAGES_AFTER_RUNTIME_RESOLUTION_HOOK
+            .with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook().await;
         }
     }
 
@@ -3729,46 +3956,6 @@ pub(crate) mod tests {
         panic!("test setup did not create redo file {target_file_seq:08x}");
     }
 
-    pub(crate) async fn assert_checkpoint_published(
-        session: &mut Session,
-        table_id: TableID,
-    ) -> TrxID {
-        let outcome = session.checkpoint_table_with_wait(table_id).await.unwrap();
-        let CheckpointOutcome::Published { checkpoint_ts, .. } = outcome else {
-            panic!("checkpoint should publish, got {outcome:?}");
-        };
-        checkpoint_ts
-    }
-
-    pub(crate) async fn wait_for_checkpoint_purge(session: &Session, redo_cts: TrxID) -> TrxID {
-        wait_for_purge_handoff(session, redo_cts).await.unwrap();
-        session
-            .wait_for_purge_completion_after(redo_cts)
-            .await
-            .unwrap()
-    }
-
-    pub(crate) async fn wait_for_checkpoint_root_ready(session: &mut Session, table_id: TableID) {
-        let table = session
-            .engine()
-            .catalog()
-            .get_table_now(table_id)
-            .expect("test table should exist");
-        let effective_ts = table.file().active_root_unchecked().effective_ts();
-        let min_active_sts = session.engine().trx_sys.calc_min_active_sts_for_gc();
-        if effective_ts < min_active_sts {
-            return;
-        }
-        session
-            .wait_for_checkpoint_retry(CheckpointDelayReason::ActiveRoot {
-                table_id,
-                effective_ts,
-                min_active_sts,
-            })
-            .await
-            .unwrap();
-    }
-
     async fn commit_redo_durability_anchor(session: &mut Session, table_id: TableID) {
         let payload = [9u8; 196];
         let mut trx = session.begin_trx().unwrap();
@@ -3812,54 +3999,6 @@ pub(crate) mod tests {
         count
     }
 
-    /// Returns the number of registry-owned sessions for tests.
-    #[inline]
-    pub(crate) fn session_registry_len(registry: &SessionRegistry) -> usize {
-        registry.entries.len()
-    }
-
-    /// Count registry-owned operations that still block owner shutdown.
-    #[inline]
-    pub(crate) fn active_operation_count(registry: &SessionRegistry) -> usize {
-        registry
-            .entries
-            .iter()
-            .map(|entry| Arc::clone(entry.value()))
-            .filter(|session| {
-                matches!(
-                    &session.lifecycle.lock().slot,
-                    SessionOperationSlot::Active(_)
-                )
-            })
-            .count()
-    }
-
-    /// Return the coherent snapshot of one test session's active operation.
-    #[inline]
-    pub(crate) fn active_operation_snapshot(
-        registry: &SessionRegistry,
-        session_id: SessionID,
-    ) -> SessionOperationSnapshot {
-        active_operation_entry_for_test(registry, session_id).inspect()
-    }
-
-    /// Returns whether a registered session currently owns its public transaction cache.
-    #[inline]
-    pub(crate) fn session_has_public_trx_cache(
-        registry: &SessionRegistry,
-        session_id: SessionID,
-    ) -> bool {
-        registry
-            .session_state(session_id)
-            .is_some_and(|state| state.lifecycle.lock().public_trx_cache.is_some())
-    }
-
-    /// Removes one synthetic or failed-retained test session before engine teardown.
-    #[inline]
-    pub(crate) fn remove_session_for_test(registry: &SessionRegistry, session_id: SessionID) {
-        drop(registry.entries.remove(&session_id));
-    }
-
     #[inline]
     fn new_session_state_for_test(engine: &Engine, id: SessionID) -> SessionState {
         let seed = engine.new_session().unwrap();
@@ -3892,45 +4031,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// Create one registry-owned transaction with test-controlled ids.
-    #[inline]
-    pub(crate) fn create_test_transaction(
-        engine: &Engine,
-        session_id: SessionID,
-        trx_id: TrxID,
-        sts: TrxID,
-        gc_no: usize,
-    ) -> (Transaction, Arc<SessionState>) {
-        let registry = &engine.inner().session_registry;
-        let state = Arc::new(new_session_state_for_test(engine, session_id));
-        let key = SessionOperationKey::new(session_id, OperationID::new(1));
-        let mut inner = state
-            .lifecycle
-            .lock()
-            .public_trx_cache
-            .take()
-            .expect("test session must start with one public transaction cache");
-        inner.init(
-            trx_id,
-            sts,
-            gc_no,
-            session_id,
-            FamilyLockAuthority::new(session_id),
-        );
-        let entry = SessionOperationEntry::new_public_transaction(key, inner);
-        {
-            let mut lifecycle = state.lifecycle.lock();
-            lifecycle.next_operation_id = 2;
-            lifecycle.slot = SessionOperationSlot::Active(entry);
-        }
-        let runtime = SessionRuntime::new(Arc::clone(&state));
-        registry.insert(Arc::clone(&state));
-        (
-            Transaction::new(runtime.downgrade(), key, trx_id, sts),
-            state,
-        )
-    }
-
     fn inspect_session_in_trx(state: &SessionState) -> LifecycleResult<bool> {
         let lifecycle = state.lifecycle.lock();
         if lifecycle.disposition != SessionDisposition::Open {
@@ -3949,92 +4049,74 @@ pub(crate) mod tests {
         Ok(pin.runtime.clone())
     }
 
-    pub(crate) trait SessionTestExt {
-        fn in_trx(&self) -> Result<bool>;
-        fn pool_guards(&self) -> PoolGuards;
-        fn engine(&self) -> SessionRuntime;
-        fn last_cts(&self) -> TrxID;
-        fn load_active_insert_page(&mut self, table_id: TableID) -> Option<VersionedPageID>;
-        fn save_active_insert_page(&mut self, table_id: TableID, page_id: VersionedPageID);
-    }
+    fn run_observer_admission_shutdown_race(inspection: bool) {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let session = engine.new_session().unwrap();
+            if inspection {
+                let _ = engine
+                    .inner()
+                    .poisoner
+                    .poison(Report::new(FatalError::RedoWrite).attach("observer race poison"));
+            }
+            let barrier = Arc::new(Barrier::new(3));
 
-    /// Begin one test-owned mandatory private transaction for focused catalog storage tests.
-    pub(crate) fn begin_test_mandatory_private_trx(
-        session: &Session,
-    ) -> (MandatoryOperationGuard, PrivateTransaction) {
-        let mut operation = session
-            .pin_operation(SessionOperationKind::Ddl)
-            .expect("catalog test operation must be admitted")
-            .into_mandatory();
-        let trx = operation
-            .begin_private_trx()
-            .expect("catalog test private transaction must begin");
-        (operation, trx)
-    }
+            thread::scope(|scope| {
+                let shutdown_engine = &engine;
+                let shutdown_barrier = Arc::clone(&barrier);
+                let shutdown = scope.spawn(move || {
+                    shutdown_barrier.wait();
+                    shutdown_engine.try_shutdown()
+                });
+                let observer_barrier = Arc::clone(&barrier);
+                let observer = scope.spawn(move || {
+                    observer_barrier.wait();
+                    if inspection {
+                        session
+                            .pin_inspection()
+                            .map_err(LifecycleOrFatalError::from)
+                    } else {
+                        session.pin_observer()
+                    }
+                });
+                barrier.wait();
 
-    impl SessionTestExt for Session {
-        #[inline]
-        fn in_trx(&self) -> Result<bool> {
-            const OPERATION: &str = "test_inspect_transaction_state";
-            let runtime = test_session_runtime(self)
-                .attach_with(|| format!("operation={OPERATION}"))
-                .disclose()?;
-            inspect_session_in_trx(runtime.state())
-                .attach_with(|| format!("operation={OPERATION}, session_id={}", self.id))
-                .disclose()
-        }
-
-        #[inline]
-        fn pool_guards(&self) -> PoolGuards {
-            test_session_runtime(self)
-                .expect("test session must be running")
-                .pool_guards()
-                .clone()
-        }
-
-        #[inline]
-        fn engine(&self) -> SessionRuntime {
-            test_session_runtime(self).expect("test session must be running")
-        }
-
-        #[inline]
-        fn last_cts(&self) -> TrxID {
-            let runtime = test_session_runtime(self).expect("test session must be running");
-            TrxID::new(runtime.state().last_cts.load(Ordering::SeqCst))
-        }
-
-        #[inline]
-        fn load_active_insert_page(&mut self, table_id: TableID) -> Option<VersionedPageID> {
-            test_session_runtime(self)
-                .expect("test session must be running")
-                .state()
-                .load_active_insert_page(table_id)
-        }
-
-        #[inline]
-        fn save_active_insert_page(&mut self, table_id: TableID, page_id: VersionedPageID) {
-            test_session_runtime(self)
-                .expect("test session must be running")
-                .state()
-                .save_active_insert_page(table_id, page_id);
-        }
-    }
-
-    pub(crate) fn assert_existing_transaction_error(
-        err: &Error,
-        session_id: SessionID,
-        trx_id: TrxID,
-        state: &str,
-    ) {
-        assert_eq!(err.kind(), ErrorKind::Lifecycle);
-        assert_eq!(
-            err.report().downcast_ref::<LifecycleError>().copied(),
-            Some(LifecycleError::ExistingTransaction)
-        );
-        let diagnostic = format!("{:?}", err.report());
-        assert!(diagnostic.contains(&format!("session_id={session_id}")));
-        assert!(diagnostic.contains(&format!("trx_id={trx_id}")));
-        assert!(diagnostic.contains(&format!("state={state}")));
+                match (shutdown.join().unwrap(), observer.join().unwrap()) {
+                    (Ok(()), Err(err)) => {
+                        let LifecycleOrFatalError::Lifecycle(err) = err else {
+                            panic!("shutdown admission must remain Lifecycle")
+                        };
+                        assert_eq!(err.current_context(), &LifecycleError::Shutdown);
+                    }
+                    (Err(err), Ok(observer)) => {
+                        assert_eq!(
+                            err.report().downcast_ref::<LifecycleError>().copied(),
+                            Some(LifecycleError::ShutdownBusy)
+                        );
+                        assert_eq!(
+                            err.report().downcast_ref::<String>().map(String::as_str),
+                            Some(
+                                "origin=explicit, session_blocker=observer, operation_state=none, observer_count=1, cleanup_queued=false, mandatory_callers=0, mandatory_internal=0"
+                            )
+                        );
+                        drop(observer);
+                        engine.shutdown();
+                    }
+                    (Ok(()), Ok(observer)) => {
+                        drop(observer);
+                        panic!("shutdown completed after admitting an invisible observer");
+                    }
+                    (Err(shutdown_err), Err(observer_err)) => {
+                        panic!(
+                            "observer race produced two rejections: shutdown={shutdown_err:?}, observer={observer_err:?}"
+                        );
+                    }
+                }
+            });
+        });
     }
 
     #[test]
@@ -4371,76 +4453,6 @@ pub(crate) mod tests {
                 state.shutdown_wait().is_none(),
                 "release before listener installation must be visible to the predicate scan"
             );
-        });
-    }
-
-    fn run_observer_admission_shutdown_race(inspection: bool) {
-        smol::block_on(async {
-            let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
-                .await
-                .unwrap();
-            let session = engine.new_session().unwrap();
-            if inspection {
-                let _ = engine
-                    .inner()
-                    .poisoner
-                    .poison(Report::new(FatalError::RedoWrite).attach("observer race poison"));
-            }
-            let barrier = Arc::new(Barrier::new(3));
-
-            thread::scope(|scope| {
-                let shutdown_engine = &engine;
-                let shutdown_barrier = Arc::clone(&barrier);
-                let shutdown = scope.spawn(move || {
-                    shutdown_barrier.wait();
-                    shutdown_engine.try_shutdown()
-                });
-                let observer_barrier = Arc::clone(&barrier);
-                let observer = scope.spawn(move || {
-                    observer_barrier.wait();
-                    if inspection {
-                        session
-                            .pin_inspection()
-                            .map_err(LifecycleOrFatalError::from)
-                    } else {
-                        session.pin_observer()
-                    }
-                });
-                barrier.wait();
-
-                match (shutdown.join().unwrap(), observer.join().unwrap()) {
-                    (Ok(()), Err(err)) => {
-                        let LifecycleOrFatalError::Lifecycle(err) = err else {
-                            panic!("shutdown admission must remain Lifecycle")
-                        };
-                        assert_eq!(err.current_context(), &LifecycleError::Shutdown);
-                    }
-                    (Err(err), Ok(observer)) => {
-                        assert_eq!(
-                            err.report().downcast_ref::<LifecycleError>().copied(),
-                            Some(LifecycleError::ShutdownBusy)
-                        );
-                        assert_eq!(
-                            err.report().downcast_ref::<String>().map(String::as_str),
-                            Some(
-                                "origin=explicit, session_blocker=observer, operation_state=none, observer_count=1, cleanup_queued=false, mandatory_callers=0, mandatory_internal=0"
-                            )
-                        );
-                        drop(observer);
-                        engine.shutdown();
-                    }
-                    (Ok(()), Ok(observer)) => {
-                        drop(observer);
-                        panic!("shutdown completed after admitting an invisible observer");
-                    }
-                    (Err(shutdown_err), Err(observer_err)) => {
-                        panic!(
-                            "observer race produced two rejections: shutdown={shutdown_err:?}, observer={observer_err:?}"
-                        );
-                    }
-                }
-            });
         });
     }
 

@@ -2194,6 +2194,84 @@ where
 
 #[cfg(test)]
 mod tests {
+
+    use super::*;
+    use crate::buffer::BufferPool;
+    use crate::buffer::guard::PageSharedGuard;
+    use crate::buffer::page::VersionedPageID;
+    use crate::catalog::tests::wait_for_dropped_table_floor;
+    use crate::catalog::{
+        ColumnAttributes, ColumnSpec, CurrentTableState, ResolvedVisibleTableMetadata, TableCache,
+        TableSpec,
+    };
+    use crate::completion::Completion;
+    use crate::conf::TrxSysConfig;
+    use crate::engine::Engine;
+    use crate::error::{
+        Error, FatalError, LifecycleError, ResourceError, RuntimeError, RuntimeOrFatalError,
+    };
+    use crate::file::cow_file::tests::old_root_drop_count;
+    use crate::index::RowLocation;
+    use crate::io::install_storage_backend_test_hook;
+    use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
+    use crate::runtime::mandatory::MandatoryInternalTask;
+    use crate::session::{
+        Session,
+        tests::{
+            SessionTestExt, assert_checkpoint_published, assert_existing_transaction_error,
+            remove_session_for_test, wait_for_checkpoint_purge, wait_for_checkpoint_root_ready,
+            wait_for_purge_handoff, wait_for_session_idle,
+        },
+    };
+    use crate::table::checkpoint_workflow::FrozenPageValidationState;
+    use crate::table::page_transition::tests::{
+        install_after_listener_hook, install_before_listener_hook,
+    };
+    use crate::table::persistence::test_hooks::{
+        ForceCheckpointCommitErrorGuard, ForcePostPublishCheckpointErrorGuard,
+        set_test_checkpoint_after_publish_admission_hook, set_test_checkpoint_after_trx_start_hook,
+        set_test_checkpoint_retry_after_listener_registration_hook,
+        set_test_force_secondary_sidecar_error, set_test_freeze_after_loading_hook,
+        set_test_silent_watermark_mutation_hook,
+    };
+    use crate::table::test_hooks::{
+        ForceLwcBuildErrorGuard, set_test_frozen_page_row_scan_hook,
+        set_test_frozen_page_scan_hook, set_test_frozen_pages_ready_hook,
+        set_test_hot_row_write_before_state_lock_hook, set_test_locked_page_plan_rebuild_hook,
+        set_test_optimistic_page_plan_comparison_hook, set_test_stable_page_plans_refreshed_hook,
+        set_test_transition_page_published_hook,
+    };
+    use crate::table::tests::*;
+    use crate::table::{DeleteMarker, TableTerminal};
+    use crate::trx::purge::PurgeTestEvent;
+    use crate::trx::sys::tests::{
+        fatal_rollback_retention_count, has_active_sts, retains_active_row_undo,
+    };
+    use crate::trx::tests::{
+        discard_transaction_after_fatal_rollback, lock_owner, observe_table_root_snapshot,
+        prepare_transaction, shared_trx_status, transaction_delete_undo_observation,
+        transaction_entry, transaction_status_for_test,
+    };
+    use crate::trx::undo::{
+        OwnedRowUndo, RowUndoHead, RowUndoKind, RowUndoLogs, RowUndoRollbackContext, UndoStatus,
+    };
+    use crate::trx::ver_map::RowPageState;
+    use crate::trx::{
+        FailedPrecommitCleanupJob, FailedPrecommitReason, MIN_ACTIVE_TRX_ID,
+        NON_FOREGROUND_STMT_NO, PrepareListenerResult, SessionOperationEntry,
+        SessionOperationState,
+    };
+    use futures::FutureExt;
+    use smol::future::yield_now;
+    use std::cmp::Ordering;
+    use std::future::{Future, poll_fn};
+    use std::pin::Pin;
+    use std::ptr::from_ref;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+    use std::task::Poll;
+    use std::thread;
+    use tempfile::TempDir;
     pub(crate) mod test_hooks {
         use crate::engine::Engine;
         use crate::error::{FatalError, FatalResult, RuntimeError, RuntimeResult};
@@ -2363,137 +2441,12 @@ mod tests {
         }
     }
 
-    use super::*;
-    use crate::buffer::BufferPool;
-    use crate::buffer::guard::PageSharedGuard;
-    use crate::buffer::page::VersionedPageID;
-    use crate::catalog::tests::wait_for_dropped_table_floor;
-    use crate::catalog::{
-        ColumnAttributes, ColumnSpec, CurrentTableState, ResolvedVisibleTableMetadata, TableCache,
-        TableSpec,
-    };
-    use crate::completion::Completion;
-    use crate::conf::TrxSysConfig;
-    use crate::engine::Engine;
-    use crate::error::{
-        Error, FatalError, LifecycleError, ResourceError, RuntimeError, RuntimeOrFatalError,
-    };
-    use crate::file::cow_file::tests::old_root_drop_count;
-    use crate::index::RowLocation;
-    use crate::io::install_storage_backend_test_hook;
-    use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
-    use crate::runtime::mandatory::MandatoryInternalTask;
-    use crate::session::{
-        Session,
-        tests::{
-            SessionTestExt, assert_checkpoint_published, assert_existing_transaction_error,
-            remove_session_for_test, wait_for_checkpoint_purge, wait_for_checkpoint_root_ready,
-            wait_for_purge_handoff, wait_for_session_idle,
-        },
-    };
-    use crate::table::checkpoint_workflow::FrozenPageValidationState;
-    use crate::table::page_transition::tests::{
-        install_after_listener_hook, install_before_listener_hook,
-    };
-    use crate::table::persistence::test_hooks::{
-        ForceCheckpointCommitErrorGuard, ForcePostPublishCheckpointErrorGuard,
-        set_test_checkpoint_after_publish_admission_hook, set_test_checkpoint_after_trx_start_hook,
-        set_test_checkpoint_retry_after_listener_registration_hook,
-        set_test_force_secondary_sidecar_error, set_test_freeze_after_loading_hook,
-        set_test_silent_watermark_mutation_hook,
-    };
-    use crate::table::test_hooks::{
-        ForceLwcBuildErrorGuard, set_test_frozen_page_row_scan_hook,
-        set_test_frozen_page_scan_hook, set_test_frozen_pages_ready_hook,
-        set_test_hot_row_write_before_state_lock_hook, set_test_locked_page_plan_rebuild_hook,
-        set_test_optimistic_page_plan_comparison_hook, set_test_stable_page_plans_refreshed_hook,
-        set_test_transition_page_published_hook,
-    };
-    use crate::table::tests::*;
-    use crate::table::{DeleteMarker, TableTerminal};
-    use crate::trx::purge::PurgeTestEvent;
-    use crate::trx::sys::tests::{
-        fatal_rollback_retention_count, has_active_sts, retains_active_row_undo,
-    };
-    use crate::trx::tests::{
-        discard_transaction_after_fatal_rollback, lock_owner, observe_table_root_snapshot,
-        prepare_transaction, shared_trx_status, transaction_delete_undo_observation,
-        transaction_entry, transaction_status_for_test,
-    };
-    use crate::trx::undo::{
-        OwnedRowUndo, RowUndoHead, RowUndoKind, RowUndoLogs, RowUndoRollbackContext, UndoStatus,
-    };
-    use crate::trx::ver_map::RowPageState;
-    use crate::trx::{
-        FailedPrecommitCleanupJob, FailedPrecommitReason, MIN_ACTIVE_TRX_ID,
-        NON_FOREGROUND_STMT_NO, PrepareListenerResult, SessionOperationEntry,
-        SessionOperationState,
-    };
-    use futures::FutureExt;
-    use smol::future::yield_now;
-    use std::cmp::Ordering;
-    use std::future::{Future, poll_fn};
-    use std::pin::Pin;
-    use std::ptr::from_ref;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
-    use std::task::Poll;
-    use std::thread;
-    use tempfile::TempDir;
-
-    #[test]
-    fn test_maintenance_wait_stacks_shutdown_under_checkpoint_runtime() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine = lightweight_test_engine(&temp_dir, "maintenance-wait-shutdown").await;
-            let session = engine.new_session().unwrap();
-            let pin = session.pin_observer().unwrap();
-
-            thread::scope(|scope| {
-                let shutdown = scope.spawn(|| engine.shutdown());
-                while !pin.runtime.shutdown_started() {
-                    thread::yield_now();
-                }
-
-                let err =
-                    ensure_maintenance_wait_running(&pin, "test maintenance wait").unwrap_err();
-                let RuntimeOrFatalError::Runtime(err) = err else {
-                    panic!("shutdown must remain a recoverable checkpoint Runtime failure");
-                };
-                assert_eq!(*err.current_context(), RuntimeError::CheckpointExecution);
-                assert_eq!(
-                    err.downcast_ref::<LifecycleError>().copied(),
-                    Some(LifecycleError::Shutdown)
-                );
-
-                drop(pin);
-                shutdown.join().unwrap();
-            });
-        });
-    }
-
-    #[test]
-    fn test_maintenance_wait_preserves_existing_fatal_reason() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine = lightweight_test_engine(&temp_dir, "maintenance-wait-poison").await;
-            let session = engine.new_session().unwrap();
-            let pin = session.pin_observer().unwrap();
-            engine
-                .inner()
-                .poisoner
-                .poison(Report::new(FatalError::RedoWrite).attach("test redo poison"));
-
-            let err = ensure_maintenance_wait_running(&pin, "test maintenance wait").unwrap_err();
-            let RuntimeOrFatalError::Fatal(err) = err else {
-                panic!("existing poison must remain Fatal");
-            };
-            assert_eq!(*err.current_context(), FatalError::RedoWrite);
-
-            drop(pin);
-            drop(session);
-            engine.shutdown();
-        });
+    #[derive(Clone, Copy)]
+    enum TransitionRouteRegistrationCase {
+        RouteBeforeListener,
+        RouteAfterListener,
+        Poison,
+        RouteAndPoison,
     }
 
     async fn row_page_states(table: &Table, guards: &PoolGuards) -> Vec<RowPageState> {
@@ -2747,6 +2700,261 @@ mod tests {
                 .get_table_now(table_id)
                 .is_none()
         );
+    }
+
+    async fn assert_transition_route_registration_case(case: TransitionRouteRegistrationCase) {
+        let temp_dir = TempDir::new().unwrap();
+        let stem = match case {
+            TransitionRouteRegistrationCase::RouteBeforeListener => "route-before-listener",
+            TransitionRouteRegistrationCase::RouteAfterListener => "route-after-listener",
+            TransitionRouteRegistrationCase::Poison => "poison-before-recheck",
+            TransitionRouteRegistrationCase::RouteAndPoison => "route-poison-before-recheck",
+        };
+        let engine = lightweight_test_engine(&temp_dir, stem).await;
+        let table_id = create_table2_for_test(&engine).await;
+        let table = table_for_internal_assertion(&engine, table_id);
+        let row_id = RowID::new(10);
+        let _before_hook = matches!(case, TransitionRouteRegistrationCase::RouteBeforeListener)
+            .then(|| {
+                let hook_table = Arc::clone(&table);
+                install_before_listener_hook(move || async move {
+                    hook_table
+                        .mem
+                        .blk_idx()
+                        .update_column_root(row_id + 1, SUPER_BLOCK_ID)
+                        .await;
+                })
+            });
+        let _after_hook = (!matches!(case, TransitionRouteRegistrationCase::RouteBeforeListener))
+            .then(|| {
+                let hook_table = Arc::clone(&table);
+                let hook_poisoner = engine.inner().poisoner.clone();
+                install_after_listener_hook(move || async move {
+                    if matches!(
+                        case,
+                        TransitionRouteRegistrationCase::RouteAfterListener
+                            | TransitionRouteRegistrationCase::RouteAndPoison
+                    ) {
+                        hook_table
+                            .mem
+                            .blk_idx()
+                            .update_column_root(row_id + 1, SUPER_BLOCK_ID)
+                            .await;
+                    }
+                    if matches!(
+                        case,
+                        TransitionRouteRegistrationCase::Poison
+                            | TransitionRouteRegistrationCase::RouteAndPoison
+                    ) {
+                        hook_poisoner.poison(
+                            Report::new(FatalError::CheckpointWrite)
+                                .attach("test transition-route registration poison"),
+                        );
+                    }
+                })
+            });
+
+        let before = engine.inner().poisoner.test_observation_counts();
+        let result = table
+            .wait_transition_route_or_poison(&engine.inner().poisoner, row_id)
+            .await;
+        let after = engine.inner().poisoner.test_observation_counts();
+        match case {
+            TransitionRouteRegistrationCase::RouteBeforeListener
+            | TransitionRouteRegistrationCase::RouteAfterListener => result.unwrap(),
+            TransitionRouteRegistrationCase::Poison
+            | TransitionRouteRegistrationCase::RouteAndPoison => {
+                let report = result.unwrap_err();
+                assert_eq!(*report.current_context(), FatalError::CheckpointWrite);
+            }
+        }
+        assert_eq!(
+            after.1,
+            before.1 + 1,
+            "each registration boundary must install exactly one poison listener"
+        );
+        drop(table);
+        engine.shutdown();
+    }
+
+    async fn prepare_silent_checkpoint_failure(
+        engine: &Engine,
+        session: &mut Session,
+    ) -> (TableID, ActiveRoot) {
+        let table_id = create_table2_for_test(engine).await;
+        insert_rows(table_id, session, 0, 8, "silent-failure").await;
+        wait_for_checkpoint_root_ready(session, table_id).await;
+        let root = table_for_internal_assertion(engine, table_id)
+            .file()
+            .active_root_unchecked()
+            .clone();
+        (table_id, root)
+    }
+
+    fn assert_catalog_write_poisoned(err: &Error, engine: &Engine) {
+        assert_eq!(
+            err.report().downcast_ref::<FatalError>().copied(),
+            Some(FatalError::CatalogWrite)
+        );
+        assert!(
+            engine
+                .inner()
+                .poisoner
+                .poison_error()
+                .as_ref()
+                .is_some_and(|err| *err.current_context() == FatalError::CatalogWrite)
+        );
+    }
+
+    async fn assert_silent_watermark_absent(
+        engine: &Engine,
+        guards: &PoolGuards,
+        table_id: TableID,
+    ) {
+        let watermark = engine
+            .inner()
+            .core
+            .catalog()
+            .storage
+            .table_replay_silent_watermarks()
+            .find_uncommitted_by_table_id(guards, table_id)
+            .await
+            .unwrap();
+        assert!(watermark.is_none());
+    }
+
+    async fn assert_checkpoint_retirement_waits_for_reader(
+        purge_threads: usize,
+        log_file_stem: &str,
+    ) {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = Engine::bootstrap(
+            lightweight_test_engine_config(temp_dir.path(), log_file_stem).trx(
+                TrxSysConfig::default()
+                    .log_write_io_depth(1)
+                    .recovery_io_depth(1)
+                    .catalog_checkpoint_scan_io_depth(1)
+                    .log_file_stem(log_file_stem)
+                    .purge_threads(purge_threads),
+            ),
+        )
+        .await
+        .unwrap();
+        let table_id = create_table2_for_test(&engine).await;
+        let mut checkpoint_session = engine.new_session().unwrap();
+        insert_rows(
+            table_id,
+            &mut checkpoint_session,
+            0,
+            200,
+            &"retirement".repeat(128),
+        )
+        .await;
+        let insert_cts = checkpoint_session.last_cts();
+        wait_for_checkpoint_purge(&checkpoint_session, insert_cts).await;
+        wait_for_checkpoint_root_ready(&mut checkpoint_session, table_id).await;
+
+        let table = table_for_internal_assertion(&engine, table_id);
+        let mut reader_session = engine.new_session().unwrap();
+        let reader = reader_session.begin_trx().unwrap();
+        assert_freeze_created(
+            checkpoint_session
+                .freeze_table(table_id, usize::MAX)
+                .await
+                .unwrap(),
+        );
+        let retired_page_ids = table.checkpoint_workflow.frozen_page_ids().unwrap();
+        assert!(!retired_page_ids.is_empty());
+        let allocated_before_checkpoint = engine.inner().pools.mem.allocated();
+        let outcome = checkpoint_session
+            .checkpoint_table_with_wait(table_id)
+            .await
+            .unwrap();
+        let CheckpointOutcome::Published { redo_cts, .. } = outcome else {
+            panic!("checkpoint should publish, got {outcome:?}");
+        };
+
+        wait_for_purge_handoff(&checkpoint_session, redo_cts)
+            .await
+            .unwrap();
+        for page_id in &retired_page_ids {
+            let page = table
+                .mem
+                .must_get_row_page_shared(&checkpoint_session.pool_guards(), *page_id)
+                .await
+                .unwrap();
+            drop(page);
+        }
+        assert_eq!(
+            engine.inner().pools.mem.allocated(),
+            allocated_before_checkpoint,
+            "checkpoint-retired pages must remain allocated while the reader pins system CTS eligibility"
+        );
+
+        reader.commit().await.unwrap();
+        checkpoint_session
+            .wait_for_purge_completion_after(redo_cts)
+            .await
+            .unwrap();
+        assert!(
+            engine.inner().pools.mem.allocated() < allocated_before_checkpoint,
+            "checkpoint-retired pages must be deallocated after the reader releases the horizon"
+        );
+    }
+
+    #[test]
+    fn test_maintenance_wait_stacks_shutdown_under_checkpoint_runtime() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "maintenance-wait-shutdown").await;
+            let session = engine.new_session().unwrap();
+            let pin = session.pin_observer().unwrap();
+
+            thread::scope(|scope| {
+                let shutdown = scope.spawn(|| engine.shutdown());
+                while !pin.runtime.shutdown_started() {
+                    thread::yield_now();
+                }
+
+                let err =
+                    ensure_maintenance_wait_running(&pin, "test maintenance wait").unwrap_err();
+                let RuntimeOrFatalError::Runtime(err) = err else {
+                    panic!("shutdown must remain a recoverable checkpoint Runtime failure");
+                };
+                assert_eq!(*err.current_context(), RuntimeError::CheckpointExecution);
+                assert_eq!(
+                    err.downcast_ref::<LifecycleError>().copied(),
+                    Some(LifecycleError::Shutdown)
+                );
+
+                drop(pin);
+                shutdown.join().unwrap();
+            });
+        });
+    }
+
+    #[test]
+    fn test_maintenance_wait_preserves_existing_fatal_reason() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "maintenance-wait-poison").await;
+            let session = engine.new_session().unwrap();
+            let pin = session.pin_observer().unwrap();
+            engine
+                .inner()
+                .poisoner
+                .poison(Report::new(FatalError::RedoWrite).attach("test redo poison"));
+
+            let err = ensure_maintenance_wait_running(&pin, "test maintenance wait").unwrap_err();
+            let RuntimeOrFatalError::Fatal(err) = err else {
+                panic!("existing poison must remain Fatal");
+            };
+            assert_eq!(*err.current_context(), FatalError::RedoWrite);
+
+            drop(pin);
+            drop(session);
+            engine.shutdown();
+        });
     }
 
     #[test]
@@ -6861,89 +7069,6 @@ mod tests {
         });
     }
 
-    #[derive(Clone, Copy)]
-    enum TransitionRouteRegistrationCase {
-        RouteBeforeListener,
-        RouteAfterListener,
-        Poison,
-        RouteAndPoison,
-    }
-
-    async fn assert_transition_route_registration_case(case: TransitionRouteRegistrationCase) {
-        let temp_dir = TempDir::new().unwrap();
-        let stem = match case {
-            TransitionRouteRegistrationCase::RouteBeforeListener => "route-before-listener",
-            TransitionRouteRegistrationCase::RouteAfterListener => "route-after-listener",
-            TransitionRouteRegistrationCase::Poison => "poison-before-recheck",
-            TransitionRouteRegistrationCase::RouteAndPoison => "route-poison-before-recheck",
-        };
-        let engine = lightweight_test_engine(&temp_dir, stem).await;
-        let table_id = create_table2_for_test(&engine).await;
-        let table = table_for_internal_assertion(&engine, table_id);
-        let row_id = RowID::new(10);
-        let _before_hook = matches!(case, TransitionRouteRegistrationCase::RouteBeforeListener)
-            .then(|| {
-                let hook_table = Arc::clone(&table);
-                install_before_listener_hook(move || async move {
-                    hook_table
-                        .mem
-                        .blk_idx()
-                        .update_column_root(row_id + 1, SUPER_BLOCK_ID)
-                        .await;
-                })
-            });
-        let _after_hook = (!matches!(case, TransitionRouteRegistrationCase::RouteBeforeListener))
-            .then(|| {
-                let hook_table = Arc::clone(&table);
-                let hook_poisoner = engine.inner().poisoner.clone();
-                install_after_listener_hook(move || async move {
-                    if matches!(
-                        case,
-                        TransitionRouteRegistrationCase::RouteAfterListener
-                            | TransitionRouteRegistrationCase::RouteAndPoison
-                    ) {
-                        hook_table
-                            .mem
-                            .blk_idx()
-                            .update_column_root(row_id + 1, SUPER_BLOCK_ID)
-                            .await;
-                    }
-                    if matches!(
-                        case,
-                        TransitionRouteRegistrationCase::Poison
-                            | TransitionRouteRegistrationCase::RouteAndPoison
-                    ) {
-                        hook_poisoner.poison(
-                            Report::new(FatalError::CheckpointWrite)
-                                .attach("test transition-route registration poison"),
-                        );
-                    }
-                })
-            });
-
-        let before = engine.inner().poisoner.test_observation_counts();
-        let result = table
-            .wait_transition_route_or_poison(&engine.inner().poisoner, row_id)
-            .await;
-        let after = engine.inner().poisoner.test_observation_counts();
-        match case {
-            TransitionRouteRegistrationCase::RouteBeforeListener
-            | TransitionRouteRegistrationCase::RouteAfterListener => result.unwrap(),
-            TransitionRouteRegistrationCase::Poison
-            | TransitionRouteRegistrationCase::RouteAndPoison => {
-                let report = result.unwrap_err();
-                assert_eq!(*report.current_context(), FatalError::CheckpointWrite);
-            }
-        }
-        assert_eq!(
-            after.1,
-            before.1 + 1,
-            "each registration boundary must install exactly one poison listener"
-        );
-        drop(table);
-        engine.shutdown();
-    }
-
     #[test]
     fn test_transition_route_registration_boundaries_preserve_precedence() {
         smol::block_on(async {
@@ -7107,52 +7232,6 @@ mod tests {
                 root_before.deletion_cutoff_ts
             );
         });
-    }
-
-    async fn prepare_silent_checkpoint_failure(
-        engine: &Engine,
-        session: &mut Session,
-    ) -> (TableID, ActiveRoot) {
-        let table_id = create_table2_for_test(engine).await;
-        insert_rows(table_id, session, 0, 8, "silent-failure").await;
-        wait_for_checkpoint_root_ready(session, table_id).await;
-        let root = table_for_internal_assertion(engine, table_id)
-            .file()
-            .active_root_unchecked()
-            .clone();
-        (table_id, root)
-    }
-
-    fn assert_catalog_write_poisoned(err: &Error, engine: &Engine) {
-        assert_eq!(
-            err.report().downcast_ref::<FatalError>().copied(),
-            Some(FatalError::CatalogWrite)
-        );
-        assert!(
-            engine
-                .inner()
-                .poisoner
-                .poison_error()
-                .as_ref()
-                .is_some_and(|err| *err.current_context() == FatalError::CatalogWrite)
-        );
-    }
-
-    async fn assert_silent_watermark_absent(
-        engine: &Engine,
-        guards: &PoolGuards,
-        table_id: TableID,
-    ) {
-        let watermark = engine
-            .inner()
-            .core
-            .catalog()
-            .storage
-            .table_replay_silent_watermarks()
-            .find_uncommitted_by_table_id(guards, table_id)
-            .await
-            .unwrap();
-        assert!(watermark.is_none());
     }
 
     #[test]
@@ -7524,85 +7603,6 @@ mod tests {
                 || engine.inner().pools.mem.allocated() < allocated_before;
             assert!(reclaimed, "row pages should be reclaimed after purge");
         });
-    }
-
-    async fn assert_checkpoint_retirement_waits_for_reader(
-        purge_threads: usize,
-        log_file_stem: &str,
-    ) {
-        let temp_dir = TempDir::new().unwrap();
-        let engine = Engine::bootstrap(
-            lightweight_test_engine_config(temp_dir.path(), log_file_stem).trx(
-                TrxSysConfig::default()
-                    .log_write_io_depth(1)
-                    .recovery_io_depth(1)
-                    .catalog_checkpoint_scan_io_depth(1)
-                    .log_file_stem(log_file_stem)
-                    .purge_threads(purge_threads),
-            ),
-        )
-        .await
-        .unwrap();
-        let table_id = create_table2_for_test(&engine).await;
-        let mut checkpoint_session = engine.new_session().unwrap();
-        insert_rows(
-            table_id,
-            &mut checkpoint_session,
-            0,
-            200,
-            &"retirement".repeat(128),
-        )
-        .await;
-        let insert_cts = checkpoint_session.last_cts();
-        wait_for_checkpoint_purge(&checkpoint_session, insert_cts).await;
-        wait_for_checkpoint_root_ready(&mut checkpoint_session, table_id).await;
-
-        let table = table_for_internal_assertion(&engine, table_id);
-        let mut reader_session = engine.new_session().unwrap();
-        let reader = reader_session.begin_trx().unwrap();
-        assert_freeze_created(
-            checkpoint_session
-                .freeze_table(table_id, usize::MAX)
-                .await
-                .unwrap(),
-        );
-        let retired_page_ids = table.checkpoint_workflow.frozen_page_ids().unwrap();
-        assert!(!retired_page_ids.is_empty());
-        let allocated_before_checkpoint = engine.inner().pools.mem.allocated();
-        let outcome = checkpoint_session
-            .checkpoint_table_with_wait(table_id)
-            .await
-            .unwrap();
-        let CheckpointOutcome::Published { redo_cts, .. } = outcome else {
-            panic!("checkpoint should publish, got {outcome:?}");
-        };
-
-        wait_for_purge_handoff(&checkpoint_session, redo_cts)
-            .await
-            .unwrap();
-        for page_id in &retired_page_ids {
-            let page = table
-                .mem
-                .must_get_row_page_shared(&checkpoint_session.pool_guards(), *page_id)
-                .await
-                .unwrap();
-            drop(page);
-        }
-        assert_eq!(
-            engine.inner().pools.mem.allocated(),
-            allocated_before_checkpoint,
-            "checkpoint-retired pages must remain allocated while the reader pins system CTS eligibility"
-        );
-
-        reader.commit().await.unwrap();
-        checkpoint_session
-            .wait_for_purge_completion_after(redo_cts)
-            .await
-            .unwrap();
-        assert!(
-            engine.inner().pools.mem.allocated() < allocated_before_checkpoint,
-            "checkpoint-retired pages must be deallocated after the reader releases the horizon"
-        );
     }
 
     #[test]

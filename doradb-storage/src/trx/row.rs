@@ -1485,6 +1485,17 @@ pub(crate) mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::Arc;
 
+    /// Returns row write access for tests.
+    pub(crate) fn test_row_write_access<'a>(
+        page: &'a RowPage,
+        row_ver: &'a RowVersionMap,
+        dirty: &'a AtomicBool,
+        row_idx: usize,
+    ) -> RowWriteAccess<'a> {
+        let state_guard = row_ver.read_state();
+        RowWriteAccess::from_parts(page, row_ver, dirty, row_idx, state_guard)
+    }
+
     fn sparse_metadata() -> TableMetadata {
         TableMetadata::try_new_with_next_index_no(
             vec![
@@ -1556,16 +1567,6 @@ pub(crate) mod tests {
         row_idx: usize,
     ) -> RowReadAccess<'a> {
         RowReadAccess::from_state(page, row_idx, RowReadState::Recover(rec_map))
-    }
-
-    pub(crate) fn test_row_write_access<'a>(
-        page: &'a RowPage,
-        row_ver: &'a RowVersionMap,
-        dirty: &'a AtomicBool,
-        row_idx: usize,
-    ) -> RowWriteAccess<'a> {
-        let state_guard = row_ver.read_state();
-        RowWriteAccess::from_parts(page, row_ver, dirty, row_idx, state_guard)
     }
 
     #[test]

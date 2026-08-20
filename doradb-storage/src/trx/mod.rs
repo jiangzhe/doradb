@@ -3567,6 +3567,82 @@ pub(crate) mod tests {
             std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     }
 
+    /// Owned observation returned by the proof-bound root snapshot test operation.
+    pub(crate) struct RootSnapshotObservation {
+        /// `root_ts` value exposed to test helpers.
+        pub(crate) root_ts: TrxID,
+        /// `effective_ts` value exposed to test helpers.
+        pub(crate) effective_ts: TrxID,
+        /// `pivot_row_id` value exposed to test helpers.
+        pub(crate) pivot_row_id: RowID,
+        /// `column_block_index_root` value exposed to test helpers.
+        pub(crate) column_block_index_root: BlockID,
+        /// `deletion_cutoff_ts` value exposed to test helpers.
+        pub(crate) deletion_cutoff_ts: TrxID,
+        /// `secondary_index_root` value exposed to test helpers.
+        pub(crate) secondary_index_root: BlockID,
+        /// `visible` value exposed to test helpers.
+        pub(crate) visible: bool,
+        /// `sts` value exposed to test helpers.
+        pub(crate) sts: TrxID,
+    }
+
+    struct FailingPageReadHook {
+        file: StorageBackendFileIdentity,
+        offset: usize,
+        errno: i32,
+        calls: AtomicUsize,
+    }
+
+    impl FailingPageReadHook {
+        #[inline]
+        fn for_page(file: StorageBackendFileIdentity, page_id: PageID, errno: i32) -> Self {
+            Self {
+                file,
+                offset: usize::from(page_id) * PAGE_SIZE,
+                errno,
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        #[inline]
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        #[inline]
+        fn matches(&self, op: StorageBackendOp) -> bool {
+            op.kind() == IOKind::Read
+                && op.matches_file_identity(self.file)
+                && op.offset() == self.offset
+        }
+    }
+
+    impl StorageBackendTestHook for FailingPageReadHook {
+        fn on_submit(&self, op: StorageBackendOp) {
+            if self.matches(op) {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        fn on_complete(&self, op: StorageBackendOp, res: &mut StdIoResult<usize>) {
+            if self.matches(op) {
+                *res = Err(IoError::from_raw_os_error(self.errno));
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct TerminalBoundaryObservation {
+        outcome: TerminalAttachmentOutcome,
+        transaction_lock_entries: usize,
+        session_active: bool,
+        status_ts: Option<TrxID>,
+        session_lock_entries: usize,
+    }
+
+    type TerminalRollbackRelease = Arc<(Mutex<bool>, Condvar)>;
+
     /// Installs a thread-local pause after the optimistic prepare load.
     #[inline]
     pub(crate) fn install_prepare_listener_before_lock_hook(hook: impl FnOnce() + 'static) {
@@ -3576,15 +3652,6 @@ pub(crate) mod tests {
                 "prepare-listener test hook is already installed"
             );
         });
-    }
-
-    /// Runs and clears the thread-local prepare-listener pause.
-    #[inline]
-    pub(super) fn run_prepare_listener_before_lock_hook() {
-        let hook = PREPARE_LISTENER_BEFORE_LOCK_HOOK.with(|slot| slot.borrow_mut().take());
-        if let Some(hook) = hook {
-            hook();
-        }
     }
 
     /// Create one test-controlled shared transaction status.
@@ -3826,18 +3893,6 @@ pub(crate) mod tests {
         trx.checkout().inner() as *const TrxInner as usize
     }
 
-    /// Owned observation returned by the proof-bound root snapshot test operation.
-    pub(crate) struct RootSnapshotObservation {
-        pub(crate) root_ts: TrxID,
-        pub(crate) effective_ts: TrxID,
-        pub(crate) pivot_row_id: RowID,
-        pub(crate) column_block_index_root: BlockID,
-        pub(crate) deletion_cutoff_ts: TrxID,
-        pub(crate) secondary_index_root: BlockID,
-        pub(crate) visible: bool,
-        pub(crate) sts: TrxID,
-    }
-
     /// Capture one proof-bound table root through the production statement runner.
     pub(crate) async fn observe_table_root_snapshot(
         trx: &mut Transaction,
@@ -3906,6 +3961,199 @@ pub(crate) mod tests {
             .sum()
     }
 
+    /// Provides test-only access to `transaction_entry`.
+    #[inline]
+    pub(crate) fn transaction_entry(trx: &Transaction) -> Arc<SessionOperationEntry> {
+        resolve_active_parts_for_test(trx)
+            .expect("test transaction must resolve")
+            .0
+    }
+
+    /// Prepares transaction for tests.
+    #[inline]
+    pub(crate) fn prepare_transaction(trx: Transaction) -> Result<PreparedTrx> {
+        let claim = trx
+            .claim_terminal()
+            .attach("operation=prepare_active_transaction")
+            .disclose()?;
+        let (_entry, inner, attachment) = claim.into_parts();
+        Ok(inner.prepare(attachment))
+    }
+
+    /// Provides test-only access to `transaction_status_for_test`.
+    #[inline]
+    pub(crate) fn transaction_status_for_test(trx: &Transaction) -> Arc<SharedTrxStatus> {
+        with_transaction_inner(trx, "query_test_transaction_status", |inner| {
+            Arc::clone(inner.ctx().status())
+        })
+        .expect("test transaction must be active")
+    }
+
+    /// Return the transaction-level undo state installed by one completed delete.
+    #[inline]
+    pub(crate) fn transaction_delete_undo_observation(
+        trx: &Transaction,
+    ) -> ((usize, usize), usize) {
+        with_transaction_inner(trx, "query_test_delete_undo", |inner| {
+            let undo = inner
+                .effects
+                .row_undo
+                .last()
+                .expect("completed delete must retain one row undo entry");
+            (
+                (inner.effects.row_undo.len(), inner.effects.index_undo.len()),
+                from_ref(&**undo).addr(),
+            )
+        })
+        .expect("test transaction must be active")
+    }
+
+    /// Discards production prepared for tests.
+    #[inline]
+    pub(crate) fn discard_production_prepared_for_test(mut prepared: PreparedTrx) {
+        if let Some(payload) = prepared.payload.take() {
+            let attachment = prepared
+                .attachment
+                .as_ref()
+                .expect("production prepared transaction must carry attachment");
+            let trx_sys = &attachment.engine().trx_sys;
+            let PreparedTrxPayload::User {
+                status, gc_no, sts, ..
+            } = payload
+            else {
+                panic!("production prepared transaction must carry user payload")
+            };
+            trx_sys.record_rollback_for_purge(gc_no, sts);
+            status.finish_terminal();
+            status.finish_preparing();
+        }
+        prepared.redo_bin.take();
+        let released = prepared.release_transaction_locks();
+        match (
+            prepared.attachment.take(),
+            released,
+            prepared.trx_inner.take(),
+        ) {
+            (Some(attachment), Some(released), Some(inner)) => attachment.rollback(released, inner),
+            (None, None, None) => {}
+            _ => {
+                panic!(
+                    "production prepared terminal ownership requires matching attachment, \
+                     transaction-lock proof, and core"
+                )
+            }
+        }
+    }
+
+    /// Roll back a prepared production transaction whose undo is physically linked.
+    #[inline]
+    pub(crate) async fn rollback_production_prepared_for_test(prepared: PreparedTrx) {
+        let mut precommit = prepared.fill_cts(TrxID::new(1));
+        assert_eq!(
+            precommit.rollback_failed_precommit().await,
+            FailedPrecommitRollbackOutcome::RolledBack,
+            "test prepared transaction rollback must complete"
+        );
+    }
+
+    /// Add one redo log entry for tests that need a non-readonly transaction.
+    #[inline]
+    pub(crate) async fn add_pseudo_redo_log_entry(trx: &mut Transaction) {
+        use crate::catalog::USER_TABLE_ID_START;
+
+        static PSEUDO_SYSBENCH_VAR1: [u8; 60] = [3; 60];
+        static PSEUDO_SYSBENCH_VAR2: [u8; 120] = [4; 120];
+
+        // Focused owned-runner tests inject raw redo without a physical row
+        // operation.
+        trx.exec(async |mut stmt| {
+            // Simulate one sysbench record:
+            // uint64 + int32 + int32 + char(60) + char(120)
+            stmt_tests::statement_effects_mut(&mut stmt).insert_row_redo(
+                USER_TABLE_ID_START,
+                RowRedo {
+                    row_id: RowID::new(0),
+                    kind: RowRedoKind::Insert(
+                        PageID::new(0),
+                        vec![
+                            Val::U64(123),
+                            Val::U32(1),
+                            Val::U32(2),
+                            Val::from(&PSEUDO_SYSBENCH_VAR1[..]),
+                            Val::from(&PSEUDO_SYSBENCH_VAR2[..]),
+                        ],
+                    ),
+                },
+            );
+            Ok(())
+        })
+        .await
+        .expect("test transaction must be active")
+    }
+
+    /// Discard transaction state for tests that construct a transaction directly.
+    #[inline]
+    pub(crate) fn discard_transaction_after_fatal_rollback(trx: &mut Transaction) {
+        let (entry, attachment) =
+            resolve_active_parts_for_test(trx).expect("test transaction must be active");
+        let mut checkout = SessionOperationCheckout::new(entry, attachment).expect("test checkout");
+        checkout.discard_after_fatal_rollback();
+    }
+
+    /// Provides test-only access to `lock_owner`.
+    #[inline]
+    pub(crate) fn lock_owner(trx: &Transaction) -> Result<LockOwner> {
+        with_transaction_inner(trx, "read_transaction_lock_owner", |inner| {
+            Ok(inner.checked_lock_state().owner())
+        })?
+    }
+
+    /// Provides test-only access to `transaction_lock_covers`.
+    #[inline]
+    pub(crate) fn transaction_lock_covers(
+        trx: &Transaction,
+        resource: LockResource,
+        mode: LockMode,
+    ) -> Result<bool> {
+        with_transaction_inner(
+            trx,
+            "check_transaction_lock_state",
+            |inner| -> Result<bool> { Ok(inner.checked_lock_state().covers(resource, mode)) },
+        )?
+    }
+
+    /// Acquires transaction lock immediate for tests.
+    #[inline]
+    pub(crate) fn acquire_transaction_lock_immediate(
+        trx: &mut Transaction,
+        resource: LockResource,
+        mode: LockMode,
+    ) -> Result<()> {
+        let mut checkout = trx
+            .checkout()
+            .attach("operation=acquire_transaction_lock_immediate")
+            .disclose()?;
+        let (inner, attachment) = checkout.inner_and_attachment_mut();
+        let engine = attachment.engine();
+        let lock_manager = engine.lock_manager();
+        inner
+            .checked_lock_state_mut()
+            .acquire(lock_manager, &engine.poisoner, resource, mode)
+            .now_or_never()
+            .expect("test transaction lock acquisition unexpectedly waited")
+            .map(|_| ())
+            .disclose()
+    }
+
+    /// Runs and clears the thread-local prepare-listener pause.
+    #[inline]
+    pub(super) fn run_prepare_listener_before_lock_hook() {
+        let hook = PREPARE_LISTENER_BEFORE_LOCK_HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     /// Install a checked-in private core for entry state-machine tests.
     fn install_private_transaction(entry: &SessionOperationEntry, trx_inner: Box<TrxInner>) {
         let trx_id = trx_inner.trx_id();
@@ -3946,6 +4194,456 @@ pub(crate) mod tests {
 
     pub(super) async fn test_engine(log_file_stem: &str) -> (TempDir, Engine) {
         test_engine_with_mem_size(log_file_stem, 64usize * 1024 * 1024).await
+    }
+
+    async fn test_engine_with_mem_size(
+        log_file_stem: &str,
+        max_mem_size: usize,
+    ) -> (TempDir, Engine) {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = Engine::bootstrap(
+            EngineConfig::default()
+                .storage_root(temp_dir.path().to_path_buf())
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(max_mem_size)
+                        .max_file_size(128usize * 1024 * 1024),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .purge_threads(1)
+                        .log_file_stem(log_file_stem),
+                ),
+        )
+        .await
+        .unwrap();
+        (temp_dir, engine)
+    }
+
+    #[inline]
+    fn resolve_active_parts_for_test(
+        trx: &Transaction,
+    ) -> Result<(Arc<SessionOperationEntry>, TrxAttachment)> {
+        let runtime = trx
+            .session
+            .upgrade_for_terminal()
+            .ok_or_else(|| {
+                Report::new(LifecycleError::TransactionDiscarded).attach(format!(
+                    "operation_key={}, trx_id={}, reason=session_missing",
+                    trx.operation_key, trx.trx_id
+                ))
+            })
+            .disclose()?;
+        let entry = runtime
+            .state()
+            .resolve_operation(trx.operation_key)
+            .ok_or_else(|| {
+                Report::new(LifecycleError::TransactionDiscarded).attach(format!(
+                    "operation_key={}, trx_id={}, reason=transaction_not_resolvable",
+                    trx.operation_key, trx.trx_id
+                ))
+            })
+            .disclose()?;
+        let attachment = TrxAttachment::new(runtime, trx.operation_key, trx.trx_id);
+        Ok((entry, attachment))
+    }
+
+    #[inline]
+    fn with_transaction_inner<T>(
+        trx: &Transaction,
+        operation: &'static str,
+        f: impl FnOnce(&TrxInner) -> T,
+    ) -> Result<T> {
+        let entry = transaction_entry(trx);
+        let inner_slot = entry.inner.lock();
+        if inner_slot.state != SessionOperationState::Voluntary(None) {
+            return Err(Report::new(LifecycleError::ExistingTransaction)
+                .attach(format!(
+                    "operation={operation}, operation_key={}, state={}",
+                    entry.key(),
+                    inner_slot.state.label()
+                ))
+                .disclose());
+        }
+        let inner = inner_slot.trx_inner.as_ref().unwrap_or_else(|| {
+            panic!(
+                "active test transaction must retain its checked-in core: operation={operation}, operation_key={}",
+                entry.key()
+            )
+        });
+        Ok(f(inner))
+    }
+
+    #[inline]
+    fn with_transaction_inner_mut<T>(
+        trx: &mut Transaction,
+        operation: &'static str,
+        f: impl FnOnce(&mut TrxInner) -> T,
+    ) -> Result<T> {
+        let mut checkout = trx
+            .checkout()
+            .attach_with(|| format!("operation={operation}"))
+            .disclose()?;
+        Ok(f(checkout.inner_mut()))
+    }
+
+    #[inline]
+    fn transaction_gc_no(trx: &Transaction) -> usize {
+        with_transaction_inner(trx, "query_test_transaction_gc_bucket", TrxInner::gc_no)
+            .expect("test transaction must be active")
+    }
+
+    #[inline]
+    fn transaction_require_durability(trx: &Transaction) -> bool {
+        with_transaction_inner(
+            trx,
+            "query_test_transaction_durability",
+            TrxInner::require_durability,
+        )
+        .unwrap_or(false)
+    }
+
+    #[inline]
+    fn transaction_require_ordered_commit(trx: &Transaction) -> bool {
+        with_transaction_inner(
+            trx,
+            "query_test_transaction_ordered_commit",
+            TrxInner::require_ordered_commit,
+        )
+        .unwrap_or(false)
+    }
+
+    #[inline]
+    fn begin_production_test_transaction(engine: &Engine) -> (Session, Transaction) {
+        let mut session = engine.new_session().unwrap();
+        let trx = session.begin_trx().unwrap();
+        (session, trx)
+    }
+
+    #[inline]
+    fn finish_production_committed_for_test(engine: &Engine, committed: CommittedTrx) {
+        if let Some(gc_no) = committed.gc_no(engine.inner().trx_sys.gc_buckets.len()) {
+            engine.inner().trx_sys.gc_buckets[gc_no].record_committed_for_purge(vec![committed]);
+        }
+    }
+
+    #[inline]
+    fn discard_production_transaction_after_fatal_rollback(engine: &Engine, trx: &mut Transaction) {
+        let sts = trx.sts();
+        let gc_no = transaction_gc_no(trx);
+        let session_id = trx.operation_key.session_id();
+        discard_transaction_after_fatal_rollback(trx);
+        engine.inner().trx_sys.record_rollback_for_purge(gc_no, sts);
+        remove_session_for_test(&engine.inner().session_registry, session_id);
+    }
+
+    fn lock_entry_count(engine: &Engine, owner: LockOwner) -> usize {
+        debug_snapshot(engine.inner().core.lock_manager())
+            .entries
+            .iter()
+            .filter(|entry| entry.family == owner.family())
+            .count()
+    }
+
+    fn install_terminal_boundary_observer(
+        lock_manager: QuiescentGuard<LockManager>,
+        session_registry: Arc<SessionRegistry>,
+        operation_key: SessionOperationKey,
+        target_trx_id: TrxID,
+        status: Option<Arc<SharedTrxStatus>>,
+        session_owner: Option<LockOwner>,
+    ) -> (
+        TerminalAttachmentTestHookGuard,
+        mpsc::Receiver<TerminalBoundaryObservation>,
+    ) {
+        let session_id = operation_key.session_id();
+        let (observed_tx, observed_rx) = mpsc::channel();
+        let hook = Arc::new(move |trx_id, outcome| {
+            if trx_id != target_trx_id {
+                return;
+            }
+            let snapshot = debug_snapshot(&lock_manager);
+            let transaction_lock_entries = snapshot
+                .entries
+                .iter()
+                .filter(|entry| entry.family == LockOwner::transaction(session_id, trx_id).family())
+                .count();
+            let session_lock_entries = session_owner.map_or(0, |owner| {
+                snapshot
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.family == owner.family())
+                    .count()
+            });
+            observed_tx
+                .send(TerminalBoundaryObservation {
+                    outcome,
+                    transaction_lock_entries,
+                    session_active: session_registry
+                        .try_resolve_operation(operation_key)
+                        .is_some(),
+                    status_ts: status.as_ref().map(|status| status.ts()),
+                    session_lock_entries,
+                })
+                .expect("terminal attachment observer should report the boundary");
+        });
+        (install_terminal_attachment_test_hook(hook), observed_rx)
+    }
+
+    fn recv_terminal_boundary(
+        observed_rx: &mpsc::Receiver<TerminalBoundaryObservation>,
+    ) -> TerminalBoundaryObservation {
+        observed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("terminal attachment boundary should be observed")
+    }
+
+    fn wait_until(mut done: impl FnMut() -> bool, message: &'static str) {
+        // Timer audit: engine-shutdown/test-hook state inspection watchdog.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(Instant::now() < deadline, "{message}");
+            sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn terminal_rollback_hook_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn install_blocking_terminal_rollback_hook(
+        target_trx_id: TrxID,
+        target_operation: &'static str,
+    ) -> (
+        TerminalRollbackTestHookGuard,
+        mpsc::Receiver<&'static str>,
+        TerminalRollbackRelease,
+    ) {
+        let (started_tx, started_rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let hook_release = Arc::clone(&release);
+        let hook: Arc<dyn Fn(TrxID, &'static str) + Send + Sync> =
+            Arc::new(move |trx_id, operation| {
+                if trx_id != target_trx_id || operation != target_operation {
+                    return;
+                }
+                started_tx
+                    .send(operation)
+                    .expect("terminal rollback hook should report start");
+                let (released, cvar) = &*hook_release;
+                let released = released
+                    .lock()
+                    .expect("terminal rollback release mutex should not be poisoned");
+                let (released, timeout) = cvar
+                    .wait_timeout_while(released, Duration::from_secs(5), |released| !*released)
+                    .expect("terminal rollback release wait should not be poisoned");
+                assert!(
+                    *released && !timeout.timed_out(),
+                    "terminal rollback test hook was not released"
+                );
+            });
+        let guard = install_terminal_rollback_test_hook(hook);
+        (guard, started_rx, release)
+    }
+
+    fn release_terminal_rollback_hook(release: &TerminalRollbackRelease) {
+        let (released, cvar) = &**release;
+        *released
+            .lock()
+            .expect("terminal rollback release mutex should not be poisoned") = true;
+        cvar.notify_all();
+    }
+
+    fn has_lock_entry(
+        engine: &Engine,
+        owner: LockOwner,
+        resource: LockResource,
+        mode: LockMode,
+        state: LockDebugEntryState,
+    ) -> bool {
+        debug_snapshot(engine.inner().core.lock_manager())
+            .entries
+            .iter()
+            .any(|entry| {
+                (entry.pending_owner == Some(owner)
+                    || (entry.pending_owner.is_none() && entry.family == owner.family()))
+                    && entry.resource == resource
+                    && entry.mode == mode
+                    && entry.state == state
+            })
+    }
+
+    fn has_lock_resource(engine: &Engine, owner: LockOwner, resource: LockResource) -> bool {
+        debug_snapshot(engine.inner().core.lock_manager())
+            .entries
+            .iter()
+            .any(|entry| entry.family == owner.family() && entry.resource == resource)
+    }
+
+    async fn publish_initial_test_root(engine: &Engine, table_id_offset: u64) -> Arc<TableFile> {
+        let metadata = Arc::new(
+            TableMetadata::try_new(
+                vec![ColumnSpec::new(
+                    "c0",
+                    ValKind::U64,
+                    ColumnAttributes::empty(),
+                )],
+                vec![],
+            )
+            .expect("valid table metadata"),
+        );
+        let table_id = test_user_table_id(table_id_offset);
+        let mutable = engine
+            .inner()
+            .table_fs
+            .create_table_file(table_id, metadata, false)
+            .unwrap();
+        engine
+            .inner()
+            .trx_sys
+            .publish_table_file_root(mutable, TrxID::new(1), false)
+            .await
+            .unwrap()
+    }
+
+    async fn poll_until_statement_rollback_pauses<F>(mut exec: Pin<&mut F>, paused: fn() -> bool)
+    where
+        F: Future,
+    {
+        for _ in 0..512 {
+            assert!(matches!(
+                futures::poll!(exec.as_mut()),
+                std::task::Poll::Pending
+            ));
+            if paused() {
+                return;
+            }
+            yield_now().await;
+        }
+        panic!("statement rollback did not reach the requested pause predicate");
+    }
+
+    async fn assert_dropped_statement_rollback_residuals_are_transaction_owned(
+        log_file_stem: &str,
+        value: i32,
+        pause_index: bool,
+    ) {
+        let (_temp_dir, engine) = test_engine(log_file_stem).await;
+        let table_id = catalog_tests::table2(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        let session_id = session.id();
+        let mut trx = session.begin_trx().unwrap();
+        if pause_index {
+            pause_next_index_rollback();
+        } else {
+            pause_next_row_rollback();
+        }
+        // Focused owned-runner cancellation during statement rollback folds
+        // residual row and index undo into cleanup.
+        let mut exec = Box::pin(trx.exec(async |stmt| {
+            stmt.table_insert_mvcc(table_id, vec![Val::from(value), Val::from("cancelled")])
+                .await?;
+            Err::<(), Error>(Report::new(OperationError::InvalidDmlInput).disclose())
+        }));
+
+        poll_until_statement_rollback_pauses(
+            exec.as_mut(),
+            if pause_index {
+                index_rollback_paused
+            } else {
+                row_rollback_paused
+            },
+        )
+        .await;
+        drop(exec);
+
+        let err = trx.noop().await.unwrap_err();
+        assert_eq!(
+            err.report().downcast_ref::<LifecycleError>().copied(),
+            Some(LifecycleError::TransactionDiscarded)
+        );
+        wait_for_session_idle(&engine.inner().session_registry, session_id).await;
+
+        let mut verify = session.begin_trx().unwrap();
+        let select = verify
+            .table_lookup_unique_mvcc(table_id, 0, &[Val::from(value)], &[0, 1])
+            .await
+            .unwrap();
+        assert!(
+            select.not_found(),
+            "whole-transaction cleanup must consume the residual statement insert"
+        );
+        verify.rollback().await.unwrap();
+        engine.shutdown();
+    }
+
+    async fn assert_dropped_statement_waiter_cancelled(
+        log_file_stem: &str,
+        id: u64,
+        promote_before_drop: bool,
+    ) {
+        let (_temp_dir, engine) = test_engine(log_file_stem).await;
+        let (session, mut trx) = begin_production_test_transaction(&engine);
+        let session_id = session.id();
+        let trx_owner = lock_owner(&trx).unwrap();
+        let resource = LockResource::TableMetadata(TableID::new(id));
+        let blocker = LockOwner::transaction(SessionID::new(id), TrxID::new(id));
+        let mut blocker = TestLockOwner::new(blocker);
+        blocker
+            .acquire(
+                engine.inner().core.lock_manager(),
+                resource,
+                LockMode::Exclusive,
+            )
+            .await
+            .unwrap();
+        let mut blocker = Some(blocker);
+        // Focused owned-runner cancellation while a raw logical-lock request
+        // waits or is provisionally promoted.
+        let mut exec = Box::pin(trx.exec(async |mut stmt| {
+            stmt_tests::acquire_transaction_lock(&mut stmt, resource, LockMode::Shared).await?;
+            Ok::<(), Error>(())
+        }));
+
+        assert!(matches!(
+            futures::poll!(exec.as_mut()),
+            std::task::Poll::Pending
+        ));
+        assert!(has_lock_entry(
+            &engine,
+            trx_owner,
+            resource,
+            LockMode::Shared,
+            LockDebugEntryState::Waiting,
+        ));
+        if promote_before_drop {
+            blocker
+                .take()
+                .unwrap()
+                .close(engine.inner().core.lock_manager());
+            assert!(has_lock_entry(
+                &engine,
+                trx_owner,
+                resource,
+                LockMode::Shared,
+                LockDebugEntryState::Provisional,
+            ));
+        }
+
+        drop(exec);
+
+        assert!(!has_lock_resource(&engine, trx_owner, resource));
+        if let Some(blocker) = blocker {
+            blocker.close(engine.inner().core.lock_manager());
+        }
+        let err = trx.rollback().await.unwrap_err();
+        assert_eq!(
+            err.report().downcast_ref::<LifecycleError>().copied(),
+            Some(LifecycleError::TransactionDiscarded)
+        );
+        wait_for_session_idle(&engine.inner().session_registry, session_id).await;
+        engine.shutdown();
     }
 
     #[test]
@@ -4060,110 +4758,6 @@ pub(crate) mod tests {
             assert!(!second_status.terminal());
             second.rollback().await.unwrap();
         });
-    }
-
-    async fn test_engine_with_mem_size(
-        log_file_stem: &str,
-        max_mem_size: usize,
-    ) -> (TempDir, Engine) {
-        let temp_dir = TempDir::new().unwrap();
-        let engine = Engine::bootstrap(
-            EngineConfig::default()
-                .storage_root(temp_dir.path().to_path_buf())
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .max_mem_size(max_mem_size)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(
-                    TrxSysConfig::default()
-                        .purge_threads(1)
-                        .log_file_stem(log_file_stem),
-                ),
-        )
-        .await
-        .unwrap();
-        (temp_dir, engine)
-    }
-
-    struct FailingPageReadHook {
-        file: StorageBackendFileIdentity,
-        offset: usize,
-        errno: i32,
-        calls: AtomicUsize,
-    }
-
-    impl FailingPageReadHook {
-        #[inline]
-        fn for_page(file: StorageBackendFileIdentity, page_id: PageID, errno: i32) -> Self {
-            Self {
-                file,
-                offset: usize::from(page_id) * PAGE_SIZE,
-                errno,
-                calls: AtomicUsize::new(0),
-            }
-        }
-
-        #[inline]
-        fn call_count(&self) -> usize {
-            self.calls.load(Ordering::SeqCst)
-        }
-
-        #[inline]
-        fn matches(&self, op: StorageBackendOp) -> bool {
-            op.kind() == IOKind::Read
-                && op.matches_file_identity(self.file)
-                && op.offset() == self.offset
-        }
-    }
-
-    impl StorageBackendTestHook for FailingPageReadHook {
-        fn on_submit(&self, op: StorageBackendOp) {
-            if self.matches(op) {
-                self.calls.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
-        fn on_complete(&self, op: StorageBackendOp, res: &mut StdIoResult<usize>) {
-            if self.matches(op) {
-                *res = Err(IoError::from_raw_os_error(self.errno));
-            }
-        }
-    }
-
-    #[inline]
-    fn resolve_active_parts_for_test(
-        trx: &Transaction,
-    ) -> Result<(Arc<SessionOperationEntry>, TrxAttachment)> {
-        let runtime = trx
-            .session
-            .upgrade_for_terminal()
-            .ok_or_else(|| {
-                Report::new(LifecycleError::TransactionDiscarded).attach(format!(
-                    "operation_key={}, trx_id={}, reason=session_missing",
-                    trx.operation_key, trx.trx_id
-                ))
-            })
-            .disclose()?;
-        let entry = runtime
-            .state()
-            .resolve_operation(trx.operation_key)
-            .ok_or_else(|| {
-                Report::new(LifecycleError::TransactionDiscarded).attach(format!(
-                    "operation_key={}, trx_id={}, reason=transaction_not_resolvable",
-                    trx.operation_key, trx.trx_id
-                ))
-            })
-            .disclose()?;
-        let attachment = TrxAttachment::new(runtime, trx.operation_key, trx.trx_id);
-        Ok((entry, attachment))
-    }
-
-    #[inline]
-    pub(crate) fn transaction_entry(trx: &Transaction) -> Arc<SessionOperationEntry> {
-        resolve_active_parts_for_test(trx)
-            .expect("test transaction must resolve")
-            .0
     }
 
     #[test]
@@ -4592,446 +5186,6 @@ pub(crate) mod tests {
             drop(session);
             engine.shutdown();
         });
-    }
-
-    #[inline]
-    fn with_transaction_inner<T>(
-        trx: &Transaction,
-        operation: &'static str,
-        f: impl FnOnce(&TrxInner) -> T,
-    ) -> Result<T> {
-        let entry = transaction_entry(trx);
-        let inner_slot = entry.inner.lock();
-        if inner_slot.state != SessionOperationState::Voluntary(None) {
-            return Err(Report::new(LifecycleError::ExistingTransaction)
-                .attach(format!(
-                    "operation={operation}, operation_key={}, state={}",
-                    entry.key(),
-                    inner_slot.state.label()
-                ))
-                .disclose());
-        }
-        let inner = inner_slot.trx_inner.as_ref().unwrap_or_else(|| {
-            panic!(
-                "active test transaction must retain its checked-in core: operation={operation}, operation_key={}",
-                entry.key()
-            )
-        });
-        Ok(f(inner))
-    }
-
-    #[inline]
-    fn with_transaction_inner_mut<T>(
-        trx: &mut Transaction,
-        operation: &'static str,
-        f: impl FnOnce(&mut TrxInner) -> T,
-    ) -> Result<T> {
-        let mut checkout = trx
-            .checkout()
-            .attach_with(|| format!("operation={operation}"))
-            .disclose()?;
-        Ok(f(checkout.inner_mut()))
-    }
-
-    #[inline]
-    fn transaction_gc_no(trx: &Transaction) -> usize {
-        with_transaction_inner(trx, "query_test_transaction_gc_bucket", TrxInner::gc_no)
-            .expect("test transaction must be active")
-    }
-
-    #[inline]
-    fn transaction_require_durability(trx: &Transaction) -> bool {
-        with_transaction_inner(
-            trx,
-            "query_test_transaction_durability",
-            TrxInner::require_durability,
-        )
-        .unwrap_or(false)
-    }
-
-    #[inline]
-    fn transaction_require_ordered_commit(trx: &Transaction) -> bool {
-        with_transaction_inner(
-            trx,
-            "query_test_transaction_ordered_commit",
-            TrxInner::require_ordered_commit,
-        )
-        .unwrap_or(false)
-    }
-
-    #[inline]
-    pub(crate) fn prepare_transaction(trx: Transaction) -> Result<PreparedTrx> {
-        let claim = trx
-            .claim_terminal()
-            .attach("operation=prepare_active_transaction")
-            .disclose()?;
-        let (_entry, inner, attachment) = claim.into_parts();
-        Ok(inner.prepare(attachment))
-    }
-
-    #[inline]
-    pub(crate) fn transaction_status_for_test(trx: &Transaction) -> Arc<SharedTrxStatus> {
-        with_transaction_inner(trx, "query_test_transaction_status", |inner| {
-            Arc::clone(inner.ctx().status())
-        })
-        .expect("test transaction must be active")
-    }
-
-    /// Return the transaction-level undo state installed by one completed delete.
-    #[inline]
-    pub(crate) fn transaction_delete_undo_observation(
-        trx: &Transaction,
-    ) -> ((usize, usize), usize) {
-        with_transaction_inner(trx, "query_test_delete_undo", |inner| {
-            let undo = inner
-                .effects
-                .row_undo
-                .last()
-                .expect("completed delete must retain one row undo entry");
-            (
-                (inner.effects.row_undo.len(), inner.effects.index_undo.len()),
-                from_ref(&**undo).addr(),
-            )
-        })
-        .expect("test transaction must be active")
-    }
-
-    #[inline]
-    fn begin_production_test_transaction(engine: &Engine) -> (Session, Transaction) {
-        let mut session = engine.new_session().unwrap();
-        let trx = session.begin_trx().unwrap();
-        (session, trx)
-    }
-
-    #[inline]
-    pub(crate) fn discard_production_prepared_for_test(mut prepared: PreparedTrx) {
-        if let Some(payload) = prepared.payload.take() {
-            let attachment = prepared
-                .attachment
-                .as_ref()
-                .expect("production prepared transaction must carry attachment");
-            let trx_sys = &attachment.engine().trx_sys;
-            let PreparedTrxPayload::User {
-                status, gc_no, sts, ..
-            } = payload
-            else {
-                panic!("production prepared transaction must carry user payload")
-            };
-            trx_sys.record_rollback_for_purge(gc_no, sts);
-            status.finish_terminal();
-            status.finish_preparing();
-        }
-        prepared.redo_bin.take();
-        let released = prepared.release_transaction_locks();
-        match (
-            prepared.attachment.take(),
-            released,
-            prepared.trx_inner.take(),
-        ) {
-            (Some(attachment), Some(released), Some(inner)) => attachment.rollback(released, inner),
-            (None, None, None) => {}
-            _ => {
-                panic!(
-                    "production prepared terminal ownership requires matching attachment, \
-                     transaction-lock proof, and core"
-                )
-            }
-        }
-    }
-
-    /// Roll back a prepared production transaction whose undo is physically linked.
-    #[inline]
-    pub(crate) async fn rollback_production_prepared_for_test(prepared: PreparedTrx) {
-        let mut precommit = prepared.fill_cts(TrxID::new(1));
-        assert_eq!(
-            precommit.rollback_failed_precommit().await,
-            FailedPrecommitRollbackOutcome::RolledBack,
-            "test prepared transaction rollback must complete"
-        );
-    }
-
-    #[inline]
-    fn finish_production_committed_for_test(engine: &Engine, committed: CommittedTrx) {
-        if let Some(gc_no) = committed.gc_no(engine.inner().trx_sys.gc_buckets.len()) {
-            engine.inner().trx_sys.gc_buckets[gc_no].record_committed_for_purge(vec![committed]);
-        }
-    }
-
-    #[inline]
-    fn discard_production_transaction_after_fatal_rollback(engine: &Engine, trx: &mut Transaction) {
-        let sts = trx.sts();
-        let gc_no = transaction_gc_no(trx);
-        let session_id = trx.operation_key.session_id();
-        discard_transaction_after_fatal_rollback(trx);
-        engine.inner().trx_sys.record_rollback_for_purge(gc_no, sts);
-        remove_session_for_test(&engine.inner().session_registry, session_id);
-    }
-
-    /// Add one redo log entry for tests that need a non-readonly transaction.
-    #[inline]
-    pub(crate) async fn add_pseudo_redo_log_entry(trx: &mut Transaction) {
-        use crate::catalog::USER_TABLE_ID_START;
-
-        static PSEUDO_SYSBENCH_VAR1: [u8; 60] = [3; 60];
-        static PSEUDO_SYSBENCH_VAR2: [u8; 120] = [4; 120];
-
-        // Focused owned-runner tests inject raw redo without a physical row
-        // operation.
-        trx.exec(async |mut stmt| {
-            // Simulate one sysbench record:
-            // uint64 + int32 + int32 + char(60) + char(120)
-            stmt_tests::statement_effects_mut(&mut stmt).insert_row_redo(
-                USER_TABLE_ID_START,
-                RowRedo {
-                    row_id: RowID::new(0),
-                    kind: RowRedoKind::Insert(
-                        PageID::new(0),
-                        vec![
-                            Val::U64(123),
-                            Val::U32(1),
-                            Val::U32(2),
-                            Val::from(&PSEUDO_SYSBENCH_VAR1[..]),
-                            Val::from(&PSEUDO_SYSBENCH_VAR2[..]),
-                        ],
-                    ),
-                },
-            );
-            Ok(())
-        })
-        .await
-        .expect("test transaction must be active")
-    }
-
-    /// Discard transaction state for tests that construct a transaction directly.
-    #[inline]
-    pub(crate) fn discard_transaction_after_fatal_rollback(trx: &mut Transaction) {
-        let (entry, attachment) =
-            resolve_active_parts_for_test(trx).expect("test transaction must be active");
-        let mut checkout = SessionOperationCheckout::new(entry, attachment).expect("test checkout");
-        checkout.discard_after_fatal_rollback();
-    }
-
-    #[inline]
-    pub(crate) fn lock_owner(trx: &Transaction) -> Result<LockOwner> {
-        with_transaction_inner(trx, "read_transaction_lock_owner", |inner| {
-            Ok(inner.checked_lock_state().owner())
-        })?
-    }
-
-    #[inline]
-    pub(crate) fn transaction_lock_covers(
-        trx: &Transaction,
-        resource: LockResource,
-        mode: LockMode,
-    ) -> Result<bool> {
-        with_transaction_inner(
-            trx,
-            "check_transaction_lock_state",
-            |inner| -> Result<bool> { Ok(inner.checked_lock_state().covers(resource, mode)) },
-        )?
-    }
-
-    #[inline]
-    pub(crate) fn acquire_transaction_lock_immediate(
-        trx: &mut Transaction,
-        resource: LockResource,
-        mode: LockMode,
-    ) -> Result<()> {
-        let mut checkout = trx
-            .checkout()
-            .attach("operation=acquire_transaction_lock_immediate")
-            .disclose()?;
-        let (inner, attachment) = checkout.inner_and_attachment_mut();
-        let engine = attachment.engine();
-        let lock_manager = engine.lock_manager();
-        inner
-            .checked_lock_state_mut()
-            .acquire(lock_manager, &engine.poisoner, resource, mode)
-            .now_or_never()
-            .expect("test transaction lock acquisition unexpectedly waited")
-            .map(|_| ())
-            .disclose()
-    }
-
-    fn lock_entry_count(engine: &Engine, owner: LockOwner) -> usize {
-        debug_snapshot(engine.inner().core.lock_manager())
-            .entries
-            .iter()
-            .filter(|entry| entry.family == owner.family())
-            .count()
-    }
-
-    #[derive(Debug)]
-    struct TerminalBoundaryObservation {
-        outcome: TerminalAttachmentOutcome,
-        transaction_lock_entries: usize,
-        session_active: bool,
-        status_ts: Option<TrxID>,
-        session_lock_entries: usize,
-    }
-
-    fn install_terminal_boundary_observer(
-        lock_manager: QuiescentGuard<LockManager>,
-        session_registry: Arc<SessionRegistry>,
-        operation_key: SessionOperationKey,
-        target_trx_id: TrxID,
-        status: Option<Arc<SharedTrxStatus>>,
-        session_owner: Option<LockOwner>,
-    ) -> (
-        TerminalAttachmentTestHookGuard,
-        mpsc::Receiver<TerminalBoundaryObservation>,
-    ) {
-        let session_id = operation_key.session_id();
-        let (observed_tx, observed_rx) = mpsc::channel();
-        let hook = Arc::new(move |trx_id, outcome| {
-            if trx_id != target_trx_id {
-                return;
-            }
-            let snapshot = debug_snapshot(&lock_manager);
-            let transaction_lock_entries = snapshot
-                .entries
-                .iter()
-                .filter(|entry| entry.family == LockOwner::transaction(session_id, trx_id).family())
-                .count();
-            let session_lock_entries = session_owner.map_or(0, |owner| {
-                snapshot
-                    .entries
-                    .iter()
-                    .filter(|entry| entry.family == owner.family())
-                    .count()
-            });
-            observed_tx
-                .send(TerminalBoundaryObservation {
-                    outcome,
-                    transaction_lock_entries,
-                    session_active: session_registry
-                        .try_resolve_operation(operation_key)
-                        .is_some(),
-                    status_ts: status.as_ref().map(|status| status.ts()),
-                    session_lock_entries,
-                })
-                .expect("terminal attachment observer should report the boundary");
-        });
-        (install_terminal_attachment_test_hook(hook), observed_rx)
-    }
-
-    fn recv_terminal_boundary(
-        observed_rx: &mpsc::Receiver<TerminalBoundaryObservation>,
-    ) -> TerminalBoundaryObservation {
-        observed_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("terminal attachment boundary should be observed")
-    }
-
-    fn wait_until(mut done: impl FnMut() -> bool, message: &'static str) {
-        // Timer audit: engine-shutdown/test-hook state inspection watchdog.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !done() {
-            assert!(Instant::now() < deadline, "{message}");
-            sleep(Duration::from_millis(1));
-        }
-    }
-
-    fn terminal_rollback_hook_test_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    type TerminalRollbackRelease = Arc<(Mutex<bool>, Condvar)>;
-
-    fn install_blocking_terminal_rollback_hook(
-        target_trx_id: TrxID,
-        target_operation: &'static str,
-    ) -> (
-        TerminalRollbackTestHookGuard,
-        mpsc::Receiver<&'static str>,
-        TerminalRollbackRelease,
-    ) {
-        let (started_tx, started_rx) = mpsc::channel();
-        let release = Arc::new((Mutex::new(false), Condvar::new()));
-        let hook_release = Arc::clone(&release);
-        let hook: Arc<dyn Fn(TrxID, &'static str) + Send + Sync> =
-            Arc::new(move |trx_id, operation| {
-                if trx_id != target_trx_id || operation != target_operation {
-                    return;
-                }
-                started_tx
-                    .send(operation)
-                    .expect("terminal rollback hook should report start");
-                let (released, cvar) = &*hook_release;
-                let released = released
-                    .lock()
-                    .expect("terminal rollback release mutex should not be poisoned");
-                let (released, timeout) = cvar
-                    .wait_timeout_while(released, Duration::from_secs(5), |released| !*released)
-                    .expect("terminal rollback release wait should not be poisoned");
-                assert!(
-                    *released && !timeout.timed_out(),
-                    "terminal rollback test hook was not released"
-                );
-            });
-        let guard = install_terminal_rollback_test_hook(hook);
-        (guard, started_rx, release)
-    }
-
-    fn release_terminal_rollback_hook(release: &TerminalRollbackRelease) {
-        let (released, cvar) = &**release;
-        *released
-            .lock()
-            .expect("terminal rollback release mutex should not be poisoned") = true;
-        cvar.notify_all();
-    }
-
-    fn has_lock_entry(
-        engine: &Engine,
-        owner: LockOwner,
-        resource: LockResource,
-        mode: LockMode,
-        state: LockDebugEntryState,
-    ) -> bool {
-        debug_snapshot(engine.inner().core.lock_manager())
-            .entries
-            .iter()
-            .any(|entry| {
-                (entry.pending_owner == Some(owner)
-                    || (entry.pending_owner.is_none() && entry.family == owner.family()))
-                    && entry.resource == resource
-                    && entry.mode == mode
-                    && entry.state == state
-            })
-    }
-
-    fn has_lock_resource(engine: &Engine, owner: LockOwner, resource: LockResource) -> bool {
-        debug_snapshot(engine.inner().core.lock_manager())
-            .entries
-            .iter()
-            .any(|entry| entry.family == owner.family() && entry.resource == resource)
-    }
-
-    async fn publish_initial_test_root(engine: &Engine, table_id_offset: u64) -> Arc<TableFile> {
-        let metadata = Arc::new(
-            TableMetadata::try_new(
-                vec![ColumnSpec::new(
-                    "c0",
-                    ValKind::U64,
-                    ColumnAttributes::empty(),
-                )],
-                vec![],
-            )
-            .expect("valid table metadata"),
-        );
-        let table_id = test_user_table_id(table_id_offset);
-        let mutable = engine
-            .inner()
-            .table_fs
-            .create_table_file(table_id, metadata, false)
-            .unwrap();
-        engine
-            .inner()
-            .trx_sys
-            .publish_table_file_root(mutable, TrxID::new(1), false)
-            .await
-            .unwrap()
     }
 
     #[test]
@@ -5541,77 +5695,6 @@ pub(crate) mod tests {
         });
     }
 
-    async fn poll_until_statement_rollback_pauses<F>(mut exec: Pin<&mut F>, paused: fn() -> bool)
-    where
-        F: Future,
-    {
-        for _ in 0..512 {
-            assert!(matches!(
-                futures::poll!(exec.as_mut()),
-                std::task::Poll::Pending
-            ));
-            if paused() {
-                return;
-            }
-            yield_now().await;
-        }
-        panic!("statement rollback did not reach the requested pause predicate");
-    }
-
-    async fn assert_dropped_statement_rollback_residuals_are_transaction_owned(
-        log_file_stem: &str,
-        value: i32,
-        pause_index: bool,
-    ) {
-        let (_temp_dir, engine) = test_engine(log_file_stem).await;
-        let table_id = catalog_tests::table2(&engine).await;
-        let mut session = engine.new_session().unwrap();
-        let session_id = session.id();
-        let mut trx = session.begin_trx().unwrap();
-        if pause_index {
-            pause_next_index_rollback();
-        } else {
-            pause_next_row_rollback();
-        }
-        // Focused owned-runner cancellation during statement rollback folds
-        // residual row and index undo into cleanup.
-        let mut exec = Box::pin(trx.exec(async |stmt| {
-            stmt.table_insert_mvcc(table_id, vec![Val::from(value), Val::from("cancelled")])
-                .await?;
-            Err::<(), Error>(Report::new(OperationError::InvalidDmlInput).disclose())
-        }));
-
-        poll_until_statement_rollback_pauses(
-            exec.as_mut(),
-            if pause_index {
-                index_rollback_paused
-            } else {
-                row_rollback_paused
-            },
-        )
-        .await;
-        drop(exec);
-
-        let err = trx.noop().await.unwrap_err();
-        assert_eq!(
-            err.report().downcast_ref::<LifecycleError>().copied(),
-            Some(LifecycleError::TransactionDiscarded)
-        );
-        wait_for_session_idle(&engine.inner().session_registry, session_id).await;
-
-        let mut verify = session.begin_trx().unwrap();
-        let select = verify
-            .table_lookup_unique_mvcc(table_id, 0, &[Val::from(value)], &[0, 1])
-            .await
-            .unwrap();
-        assert!(
-            select.not_found(),
-            "whole-transaction cleanup must consume the residual statement insert"
-        );
-        verify.rollback().await.unwrap();
-        engine.shutdown();
-    }
-
     #[test]
     fn test_cancelled_index_rollback_folds_index_and_row_residuals() {
         smol::block_on(
@@ -5632,74 +5715,6 @@ pub(crate) mod tests {
                 false,
             ),
         );
-    }
-
-    async fn assert_dropped_statement_waiter_cancelled(
-        log_file_stem: &str,
-        id: u64,
-        promote_before_drop: bool,
-    ) {
-        let (_temp_dir, engine) = test_engine(log_file_stem).await;
-        let (session, mut trx) = begin_production_test_transaction(&engine);
-        let session_id = session.id();
-        let trx_owner = lock_owner(&trx).unwrap();
-        let resource = LockResource::TableMetadata(TableID::new(id));
-        let blocker = LockOwner::transaction(SessionID::new(id), TrxID::new(id));
-        let mut blocker = TestLockOwner::new(blocker);
-        blocker
-            .acquire(
-                engine.inner().core.lock_manager(),
-                resource,
-                LockMode::Exclusive,
-            )
-            .await
-            .unwrap();
-        let mut blocker = Some(blocker);
-        // Focused owned-runner cancellation while a raw logical-lock request
-        // waits or is provisionally promoted.
-        let mut exec = Box::pin(trx.exec(async |mut stmt| {
-            stmt_tests::acquire_transaction_lock(&mut stmt, resource, LockMode::Shared).await?;
-            Ok::<(), Error>(())
-        }));
-
-        assert!(matches!(
-            futures::poll!(exec.as_mut()),
-            std::task::Poll::Pending
-        ));
-        assert!(has_lock_entry(
-            &engine,
-            trx_owner,
-            resource,
-            LockMode::Shared,
-            LockDebugEntryState::Waiting,
-        ));
-        if promote_before_drop {
-            blocker
-                .take()
-                .unwrap()
-                .close(engine.inner().core.lock_manager());
-            assert!(has_lock_entry(
-                &engine,
-                trx_owner,
-                resource,
-                LockMode::Shared,
-                LockDebugEntryState::Provisional,
-            ));
-        }
-
-        drop(exec);
-
-        assert!(!has_lock_resource(&engine, trx_owner, resource));
-        if let Some(blocker) = blocker {
-            blocker.close(engine.inner().core.lock_manager());
-        }
-        let err = trx.rollback().await.unwrap_err();
-        assert_eq!(
-            err.report().downcast_ref::<LifecycleError>().copied(),
-            Some(LifecycleError::TransactionDiscarded)
-        );
-        wait_for_session_idle(&engine.inner().session_registry, session_id).await;
-        engine.shutdown();
     }
 
     #[test]

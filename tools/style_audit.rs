@@ -16,11 +16,12 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio, exit};
+use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{
     Attribute, Fields, GenericParam, Generics, ImplItem, Item, ItemImpl, ItemMod, ItemTrait,
-    ItemUse, Path as SynPath, TraitItem, Type, UseTree, Visibility,
+    ItemUse, Meta, MetaList, Path as SynPath, Token, TraitItem, Type, UseTree, Visibility,
 };
 
 const FMT_COMMAND: &[&str] = &["fmt", "--all", "--", "--check"];
@@ -57,6 +58,12 @@ enum ItemGroup {
     PublicFunction = 4,
     PrivateFunction = 5,
     Tests = 6,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ItemScope {
+    File,
+    TestsModule,
 }
 
 #[derive(Debug, Clone)]
@@ -600,13 +607,21 @@ fn audit_content(path: &str, content: &str) -> Vec<Violation> {
     };
 
     let mut out = Vec::new();
-    check_top_level_order(path, &parsed.items, &mut out);
+    check_item_scope(path, &parsed.items, &lines, ItemScope::File, &mut out);
     check_tests_module(path, &parsed.items, &mut out);
     check_test_import_scope(path, &parsed.items, &mut out);
-    check_impl_adjacency(path, &parsed.items, &mut out);
-    check_visible_docs(path, &parsed.items, &lines, &mut out);
-    check_function_attributes(path, &parsed.items, &mut out);
     check_qualified_paths(path, &parsed.items, &mut out);
+    for item in &parsed.items {
+        let Item::Mod(item_mod) = item else {
+            continue;
+        };
+        if !is_tests_module(item_mod) {
+            continue;
+        }
+        if let Some((_, items)) = &item_mod.content {
+            check_item_scope(path, items, &lines, ItemScope::TestsModule, &mut out);
+        }
+    }
     out.sort_by(|a, b| {
         a.path
             .cmp(&b.path)
@@ -615,6 +630,19 @@ fn audit_content(path: &str, content: &str) -> Vec<Violation> {
             .then(a.message.cmp(&b.message))
     });
     out
+}
+
+fn check_item_scope(
+    path: &str,
+    items: &[Item],
+    lines: &[String],
+    scope: ItemScope,
+    out: &mut Vec<Violation>,
+) {
+    check_top_level_order(path, items, scope, out);
+    check_impl_adjacency(path, items, out);
+    check_visible_docs(path, items, lines, out);
+    check_function_attributes(path, items, out);
 }
 
 fn parseable_rust_content(content: &str) -> String {
@@ -647,24 +675,24 @@ fn parseable_rust_content(content: &str) -> String {
     content
 }
 
-fn check_top_level_order(path: &str, items: &[Item], out: &mut Vec<Violation>) {
+fn check_top_level_order(path: &str, items: &[Item], scope: ItemScope, out: &mut Vec<Violation>) {
     let mut max_group: Option<ItemGroup> = None;
     for item in items {
-        let Some((group, label)) = item_group(item) else {
+        let Some((group, label)) = item_group(item, scope) else {
             continue;
         };
-        if let Some(previous) = max_group {
-            if group < previous {
-                out.push(violation(
-                    path,
-                    span_line(item.span()),
-                    "top-level-order",
-                    format!(
-                        "{label} appears after {}; expected order is uses, constants, types, public/high-level functions, private helpers, tests",
-                        group_label(previous)
-                    ),
-                ));
-            }
+        if let Some(previous) = max_group
+            && group < previous
+        {
+            out.push(violation(
+                path,
+                span_line(item.span()),
+                "top-level-order",
+                format!(
+                    "{label} appears after {}; expected order is uses, constants, types, public/high-level functions, private helpers, tests",
+                    group_label(previous)
+                ),
+            ));
         }
         max_group = Some(max_group.map_or(group, |previous| previous.max(group)));
     }
@@ -1110,21 +1138,21 @@ fn check_impl_method_docs(
     out: &mut Vec<Violation>,
 ) {
     for item in &item_impl.items {
-        if let ImplItem::Fn(method) = item {
-            if is_public_or_crate(&method.vis) {
-                check_doc_target(
-                    path,
-                    lines,
-                    &method.attrs,
-                    span_line(method.sig.fn_token.span),
-                    "public-doc",
-                    format!(
-                        "visible method `{}` requires a `///` doc comment",
-                        method.sig.ident
-                    ),
-                    out,
-                );
-            }
+        if let ImplItem::Fn(method) = item
+            && is_public_or_crate(&method.vis)
+        {
+            check_doc_target(
+                path,
+                lines,
+                &method.attrs,
+                span_line(method.sig.fn_token.span),
+                "public-doc",
+                format!(
+                    "visible method `{}` requires a `///` doc comment",
+                    method.sig.ident
+                ),
+                out,
+            );
         }
     }
 }
@@ -1254,18 +1282,23 @@ fn check_qualified_paths(path: &str, items: &[Item], out: &mut Vec<Violation>) {
     out.extend(visitor.violations);
 }
 
-fn item_group(item: &Item) -> Option<(ItemGroup, &'static str)> {
+fn item_group(item: &Item, scope: ItemScope) -> Option<(ItemGroup, &'static str)> {
     match item {
         Item::Use(_) => Some((ItemGroup::Use, "use import")),
         Item::Const(_) | Item::Static(_) => Some((ItemGroup::Constant, "constant")),
         Item::Enum(_) | Item::Struct(_) | Item::Trait(_) | Item::Type(_) | Item::Union(_) => {
             Some((ItemGroup::Type, "type definition"))
         }
+        Item::Fn(item_fn) if scope == ItemScope::TestsModule && has_test_attr(&item_fn.attrs) => {
+            Some((ItemGroup::Tests, "test function"))
+        }
         Item::Fn(item_fn) if is_public_or_crate(&item_fn.vis) => {
             Some((ItemGroup::PublicFunction, "public/high-level function"))
         }
         Item::Fn(_) => Some((ItemGroup::PrivateFunction, "private helper function")),
-        Item::Mod(item_mod) if is_tests_module(item_mod) => Some((ItemGroup::Tests, "tests")),
+        Item::Mod(item_mod) if scope == ItemScope::File && is_tests_module(item_mod) => {
+            Some((ItemGroup::Tests, "tests"))
+        }
         _ => None,
     }
 }
@@ -1321,8 +1354,28 @@ fn has_cfg_test(attrs: &[Attribute]) -> bool {
             && attr
                 .meta
                 .require_list()
-                .is_ok_and(|list| list.tokens.to_string().contains("test"))
+                .is_ok_and(|list| cfg_list_contains_test(list, false))
     })
+}
+
+fn cfg_list_contains_test(list: &MetaList, negated: bool) -> bool {
+    list.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+        .is_ok_and(|items| {
+            items
+                .iter()
+                .any(|meta| cfg_meta_contains_test(meta, negated))
+        })
+}
+
+fn cfg_meta_contains_test(meta: &Meta, negated: bool) -> bool {
+    match meta {
+        Meta::Path(path) => !negated && path.is_ident("test"),
+        Meta::List(list) if list.path.is_ident("not") => cfg_list_contains_test(list, !negated),
+        Meta::List(list) if list.path.is_ident("all") || list.path.is_ident("any") => {
+            cfg_list_contains_test(list, negated)
+        }
+        Meta::List(_) | Meta::NameValue(_) => false,
+    }
 }
 
 fn has_test_attr(attrs: &[Attribute]) -> bool {
@@ -1373,4 +1426,175 @@ fn violation(path: &str, line: usize, rule: &'static str, message: String) -> Vi
 
 fn normalize_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn violations(source: &str) -> Vec<Violation> {
+        audit_content("sample.rs", source)
+    }
+
+    fn cfg_matches(source: &str) -> bool {
+        let item = syn::parse_str::<ItemMod>(source).expect("test module should parse");
+        has_cfg_test(&item.attrs)
+    }
+
+    #[test]
+    fn audits_scope_rules_inside_inline_tests_module() {
+        let source = r#"#[cfg(test)]
+mod tests {
+    struct Worker;
+
+    fn divider() {}
+
+    impl Worker {}
+
+    impl Worker {}
+
+    pub(crate) fn visible_helper() {}
+
+    #[test]
+
+    fn test_case() {}
+
+    fn late_helper() {}
+}
+"#;
+
+        let violations = violations(source);
+        let rules = violations
+            .iter()
+            .map(|violation| violation.rule)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            rules,
+            BTreeSet::from([
+                "attribute-adjacency",
+                "impl-adjacency",
+                "impl-merge",
+                "public-doc",
+                "top-level-order",
+            ])
+        );
+        assert!(
+            violations.iter().any(|violation| {
+                violation.rule == "attribute-adjacency" && violation.line == 15
+            })
+        );
+    }
+
+    #[test]
+    fn accepts_well_ordered_inline_tests_module() {
+        let source = r#"#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const VALUE: usize = 1;
+
+    struct Case;
+
+    impl Case {
+        fn value() -> usize {
+            VALUE
+        }
+    }
+
+    fn helper() -> usize {
+        Case::value()
+    }
+
+    #[test]
+    fn value_matches() {
+        assert_eq!(helper(), VALUE);
+    }
+}
+"#;
+
+        let violations = violations(source);
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    #[test]
+    fn requires_helpers_before_test_functions() {
+        let source = r#"#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_case() {}
+
+    fn late_helper() {}
+}
+"#;
+
+        let violations = violations(source);
+        assert_eq!(violations.len(), 1, "{violations:#?}");
+        assert_eq!(violations[0].rule, "top-level-order");
+        assert_eq!(violations[0].line, 6);
+        assert!(violations[0].message.contains("appears after tests"));
+    }
+
+    #[test]
+    fn does_not_reapply_scope_checks_to_nested_modules() {
+        let source = r#"#[cfg(test)]
+mod tests {
+    mod nested {
+        #[allow(dead_code)]
+
+        fn helper() {}
+    }
+
+    #[test]
+    fn test_case() {}
+}
+"#;
+
+        let violations = violations(source);
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    #[test]
+    fn reports_qualified_paths_inside_tests_once() {
+        let source = r#"#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_case() {
+        crate::lower::function();
+    }
+}
+"#;
+
+        let violations = violations(source);
+        assert_eq!(
+            violations
+                .iter()
+                .filter(|violation| violation.rule == "qualified-path")
+                .count(),
+            1
+        );
+        assert_eq!(violations.len(), 1, "{violations:#?}");
+    }
+
+    #[test]
+    fn accepts_external_tests_module_declaration() {
+        let violations = violations("#[cfg(test)]\nmod tests;\n");
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    #[test]
+    fn recognizes_positive_cfg_test_predicates() {
+        assert!(cfg_matches("#[cfg(test)] mod tests {}"));
+        assert!(cfg_matches("#[cfg(all(unix, test))] mod tests {}"));
+        assert!(cfg_matches("#[cfg(any(test, windows))] mod tests {}"));
+        assert!(cfg_matches("#[cfg(not(not(test)))] mod tests {}"));
+    }
+
+    #[test]
+    fn rejects_non_test_cfg_predicates() {
+        assert!(!cfg_matches("#[cfg(not(test))] mod tests {}"));
+        assert!(!cfg_matches(
+            "#[cfg(feature = \"test-utils\")] mod tests {}"
+        ));
+        assert!(!cfg_matches("#[cfg(test_support)] mod tests {}"));
+    }
 }

@@ -1733,6 +1733,10 @@ mod tests {
 
     use super::*;
 
+    pub(super) fn create_row_page() -> RowPage {
+        RowPage::new_test_page()
+    }
+
     #[test]
     fn test_row_page_layout_contract() {
         assert_eq!(mem::size_of::<RowPageHeader>(), 32);
@@ -2037,9 +2041,5 @@ mod tests {
 
         let select = page.select(RowID::new(row_id));
         assert!(matches!(select, Select::RowDeleted(_)));
-    }
-
-    pub(super) fn create_row_page() -> RowPage {
-        RowPage::new_test_page()
     }
 }

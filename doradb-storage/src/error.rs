@@ -2052,6 +2052,15 @@ mod tests {
     use std::cell::Cell;
     use std::io::Error as StdIoError;
 
+    #[derive(Debug)]
+    struct UnknownAttachment;
+
+    impl Display for UnknownAttachment {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("unknown attachment")
+        }
+    }
+
     #[test]
     fn test_public_operation_error_returns_every_variant() {
         let cases = [
@@ -3279,15 +3288,6 @@ mod tests {
         let mut report = Report::new(FatalError::RedoWrite).expand();
         report.push(Report::new(FatalError::RedoSync));
         let _ = CompletionErrorBridge::capture(report.change_context(FatalError::Poisoned));
-    }
-
-    #[derive(Debug)]
-    struct UnknownAttachment;
-
-    impl Display for UnknownAttachment {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str("unknown attachment")
-        }
     }
 
     #[test]

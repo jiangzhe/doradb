@@ -348,12 +348,39 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
-    pub(crate) type IoSubmitHook = fn(io_context_t, c_long, *mut *mut iocb) -> i32;
-    pub(crate) type IoGeteventsHook = fn(io_context_t, c_long, c_long, *mut io_event) -> i32;
-
     static IO_SUBMIT_HOOK: Mutex<Option<IoSubmitHook>> = Mutex::new(None);
     static IO_GETEVENTS_HOOK: Mutex<Option<IoGeteventsHook>> = Mutex::new(None);
     static IO_GETEVENTS_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Test-only alias for io submit hook.
+    pub(crate) type IoSubmitHook = fn(io_context_t, c_long, *mut *mut iocb) -> i32;
+    /// Test-only alias for io getevents hook.
+    pub(crate) type IoGeteventsHook = fn(io_context_t, c_long, c_long, *mut io_event) -> i32;
+
+    struct Submission {
+        kind: IOKind,
+        operation: Operation,
+    }
+
+    impl IOSubmission for Submission {
+        fn operation(&mut self) -> &mut Operation {
+            &mut self.operation
+        }
+    }
+
+    /// Sets io submit hook for tests.
+    #[inline]
+    pub(crate) fn set_io_submit_hook(hook: Option<IoSubmitHook>) -> Option<IoSubmitHook> {
+        let mut guard = IO_SUBMIT_HOOK.lock().unwrap();
+        replace(&mut *guard, hook)
+    }
+
+    /// Sets io getevents hook for tests.
+    #[inline]
+    pub(crate) fn set_io_getevents_hook(hook: Option<IoGeteventsHook>) -> Option<IoGeteventsHook> {
+        let mut guard = IO_GETEVENTS_HOOK.lock().unwrap();
+        replace(&mut *guard, hook)
+    }
 
     #[inline]
     pub(super) fn current_io_submit_hook() -> Option<IoSubmitHook> {
@@ -361,20 +388,8 @@ pub(crate) mod tests {
     }
 
     #[inline]
-    pub(crate) fn set_io_submit_hook(hook: Option<IoSubmitHook>) -> Option<IoSubmitHook> {
-        let mut guard = IO_SUBMIT_HOOK.lock().unwrap();
-        replace(&mut *guard, hook)
-    }
-
-    #[inline]
     pub(super) fn current_io_getevents_hook() -> Option<IoGeteventsHook> {
         *IO_GETEVENTS_HOOK.lock().unwrap()
-    }
-
-    #[inline]
-    pub(crate) fn set_io_getevents_hook(hook: Option<IoGeteventsHook>) -> Option<IoGeteventsHook> {
-        let mut guard = IO_GETEVENTS_HOOK.lock().unwrap();
-        replace(&mut *guard, hook)
     }
 
     #[test]
@@ -585,16 +600,5 @@ pub(crate) mod tests {
         let delta = backend.stats_handle().snapshot().delta_since(baseline);
         assert_eq!(delta.submit_and_wait_calls, 2);
         assert_eq!(delta.wait_completions, 1);
-    }
-
-    struct Submission {
-        kind: IOKind,
-        operation: Operation,
-    }
-
-    impl IOSubmission for Submission {
-        fn operation(&mut self) -> &mut Operation {
-            &mut self.operation
-        }
     }
 }

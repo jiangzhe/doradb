@@ -555,22 +555,6 @@ mod tests {
         .row_shape_fingerprint()
     }
 
-    #[test]
-    fn test_lwc_persisted_layout_adaptation_preserves_source() {
-        let persisted = match LwcBlock::try_from_bytes(&[0u8; 1]) {
-            Ok(_) => panic!("short persisted LWC payload must fail"),
-            Err(err) => err,
-        };
-        assert_eq!(
-            persisted.current_context(),
-            &DataIntegrityError::InvalidPayload
-        );
-        assert_eq!(
-            persisted.downcast_ref::<LayoutError>().copied(),
-            Some(LayoutError::Mismatch)
-        );
-    }
-
     fn assert_lwc_data_integrity(err: Error, block_id: BlockID, expected: DataIntegrityError) {
         assert_eq!(
             err.report().downcast_ref::<DataIntegrityError>().copied(),
@@ -624,6 +608,22 @@ mod tests {
             builder.build(fingerprint).unwrap()
         };
         (metadata, buf)
+    }
+
+    #[test]
+    fn test_lwc_persisted_layout_adaptation_preserves_source() {
+        let persisted = match LwcBlock::try_from_bytes(&[0u8; 1]) {
+            Ok(_) => panic!("short persisted LWC payload must fail"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            persisted.current_context(),
+            &DataIntegrityError::InvalidPayload
+        );
+        assert_eq!(
+            persisted.downcast_ref::<LayoutError>().copied(),
+            Some(LayoutError::Mismatch)
+        );
     }
 
     #[test]

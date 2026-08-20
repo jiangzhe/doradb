@@ -1900,16 +1900,90 @@ pub(crate) mod tests {
     const TEST_WAIT_RETRIES: usize = 100;
     const TEST_WAIT_INTERVAL: Duration = Duration::from_millis(10);
 
+    struct StartedEvictPool {
+        engine: Engine,
+    }
+
+    impl StartedEvictPool {
+        fn new(config: EvictableBufferPoolConfig) -> Self {
+            let swap_file = config.swap_file_ref();
+            let (storage_root, data_swap_file) = if swap_file.is_absolute() {
+                (
+                    swap_file
+                        .parent()
+                        .expect("absolute test swap file must have a parent")
+                        .to_path_buf(),
+                    PathBuf::from(
+                        swap_file
+                            .file_name()
+                            .expect("absolute test swap file must have a file name"),
+                    ),
+                )
+            } else {
+                (current_dir().unwrap(), swap_file.to_path_buf())
+            };
+            let config = config.swap_file(data_swap_file);
+            let engine = smol::block_on(async {
+                Engine::bootstrap(
+                    EngineConfig::default()
+                        .storage_root(storage_root)
+                        .meta_buffer(TEST_META_POOL_BYTES)
+                        .index_buffer(
+                            EvictableBufferPoolConfig::default()
+                                .swap_file("index.swp")
+                                .max_mem_size(TEST_INDEX_POOL_BYTES)
+                                .max_file_size(TEST_INDEX_MAX_FILE_BYTES),
+                        )
+                        .data_buffer(config)
+                        .file(
+                            FileSystemConfig::default()
+                                .data_dir(".")
+                                .readonly_buffer_size(TEST_READONLY_BUFFER_BYTES),
+                        )
+                        .trx(TrxSysConfig::default()),
+                )
+                .await
+                .unwrap()
+            });
+            Self { engine }
+        }
+
+        fn owner_guard(&self) -> QuiescentGuard<EvictableBufferPool> {
+            self.engine.inner().pools.mem.clone()
+        }
+
+        fn shutdown(&self) {
+            self.engine.shutdown();
+        }
+    }
+
+    impl Deref for StartedEvictPool {
+        type Target = EvictableBufferPool;
+
+        fn deref(&self) -> &Self::Target {
+            &self.engine.inner().pools.mem
+        }
+    }
+
+    impl Drop for StartedEvictPool {
+        fn drop(&mut self) {
+            self.engine.shutdown();
+        }
+    }
+
+    /// Provides test-only access to `io_backend_stats_handle_identity`.
     #[inline]
     pub(crate) fn io_backend_stats_handle_identity(pool: &EvictableBufferPool) -> usize {
         fs_stats_handle_identity(&pool.fs)
     }
 
+    /// Provides test-only access to `frame_kind`.
     #[inline]
     pub(crate) fn frame_kind(pool: &EvictableBufferPool, page_id: PageID) -> FrameKind {
         pool.arena.frame(page_id).kind()
     }
 
+    /// Dispatches dirty pages for tests.
     pub(crate) async fn dispatch_dirty_pages_for_test(
         pool: QuiescentGuard<EvictableBufferPool>,
         page_count: usize,
@@ -1933,6 +2007,7 @@ pub(crate) mod tests {
         runtime.dispatch_io_writes(page_guards)
     }
 
+    /// Persists and evict page for tests.
     pub(crate) async fn persist_and_evict_page_for_test(
         pool: QuiescentGuard<EvictableBufferPool>,
         payload: &[u8],
@@ -2128,77 +2203,6 @@ pub(crate) mod tests {
         let fs = fs_owner.guard();
         let (pool, storage) = EvictableBufferPool::create(PoolRole::Mem, config, fs).disclose()?;
         Ok((fs_owner, pool, storage))
-    }
-
-    struct StartedEvictPool {
-        engine: Engine,
-    }
-
-    impl StartedEvictPool {
-        fn new(config: EvictableBufferPoolConfig) -> Self {
-            let swap_file = config.swap_file_ref();
-            let (storage_root, data_swap_file) = if swap_file.is_absolute() {
-                (
-                    swap_file
-                        .parent()
-                        .expect("absolute test swap file must have a parent")
-                        .to_path_buf(),
-                    PathBuf::from(
-                        swap_file
-                            .file_name()
-                            .expect("absolute test swap file must have a file name"),
-                    ),
-                )
-            } else {
-                (current_dir().unwrap(), swap_file.to_path_buf())
-            };
-            let config = config.swap_file(data_swap_file);
-            let engine = smol::block_on(async {
-                Engine::bootstrap(
-                    EngineConfig::default()
-                        .storage_root(storage_root)
-                        .meta_buffer(TEST_META_POOL_BYTES)
-                        .index_buffer(
-                            EvictableBufferPoolConfig::default()
-                                .swap_file("index.swp")
-                                .max_mem_size(TEST_INDEX_POOL_BYTES)
-                                .max_file_size(TEST_INDEX_MAX_FILE_BYTES),
-                        )
-                        .data_buffer(config)
-                        .file(
-                            FileSystemConfig::default()
-                                .data_dir(".")
-                                .readonly_buffer_size(TEST_READONLY_BUFFER_BYTES),
-                        )
-                        .trx(TrxSysConfig::default()),
-                )
-                .await
-                .unwrap()
-            });
-            Self { engine }
-        }
-
-        fn owner_guard(&self) -> QuiescentGuard<EvictableBufferPool> {
-            self.engine.inner().pools.mem.clone()
-        }
-
-        fn shutdown(&self) {
-            self.engine.shutdown();
-        }
-    }
-
-    impl Deref for StartedEvictPool {
-        type Target = EvictableBufferPool;
-
-        fn deref(&self) -> &Self::Target {
-            &self.engine.inner().pools.mem
-        }
-    }
-
-    impl Drop for StartedEvictPool {
-        fn drop(&mut self) {
-            self.engine.shutdown();
-        }
     }
 
     #[test]

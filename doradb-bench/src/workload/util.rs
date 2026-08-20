@@ -440,6 +440,10 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
+    fn loaded_range() -> KeyRange {
+        KeyRange { start: 0, len: 3 }
+    }
+
     #[test]
     fn shared_measurement_merge_is_checked_and_additive() {
         let mut aggregate = SessionMeasurement {
@@ -667,10 +671,6 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.len(), 31);
         assert_ne!(first, generate_payload(8, 11, 31));
-    }
-
-    fn loaded_range() -> KeyRange {
-        KeyRange { start: 0, len: 3 }
     }
 
     #[test]

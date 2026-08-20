@@ -1247,6 +1247,7 @@ pub(crate) mod tests {
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
+    /// Asserts dropped table runtime in tests.
     #[inline]
     pub(crate) fn assert_dropped_table_runtime(catalog: &Catalog, table_id: TableID) {
         assert!(catalog.retained_dropped_table_ids_now().contains(&table_id));
@@ -1258,6 +1259,7 @@ pub(crate) mod tests {
         );
     }
 
+    /// Asserts dropped table floor in tests.
     #[inline]
     pub(crate) fn assert_dropped_table_floor(catalog: &Catalog, table_id: TableID) {
         assert!(catalog.retained_dropped_table_ids_now().contains(&table_id));
@@ -1336,11 +1338,13 @@ pub(crate) mod tests {
         assert_no_dropped_table_operational_state(engine.inner().core.catalog(), table_id);
     }
 
+    /// Asserts no dropped table operational state in tests.
     #[inline]
     pub(crate) fn assert_no_dropped_table_operational_state(catalog: &Catalog, table_id: TableID) {
         assert!(!catalog.retained_dropped_table_ids_now().contains(&table_id));
     }
 
+    /// Provides test-only access to `catalog_test_engine_config`.
     #[inline]
     pub(crate) fn catalog_test_engine_config(
         main_dir: impl Into<PathBuf>,
@@ -1353,6 +1357,7 @@ pub(crate) mod tests {
         EngineConfig::default().storage_root(main_dir).trx(trx)
     }
 
+    /// Opens catalog test engine for tests.
     #[inline]
     pub(crate) async fn open_catalog_test_engine(
         main_dir: impl Into<PathBuf>,
@@ -1363,6 +1368,7 @@ pub(crate) mod tests {
             .unwrap()
     }
 
+    /// Executes catalog test engine error and verifies the expected test outcome.
     #[inline]
     pub(crate) async fn expect_catalog_test_engine_error(
         main_dir: impl Into<PathBuf>,

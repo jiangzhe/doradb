@@ -1873,6 +1873,20 @@ pub(crate) mod tests {
     use std::thread::spawn;
     use tempfile::TempDir;
 
+    type TerminalRollbackTestHook = Arc<dyn Fn(TrxID, &'static str) + Send + Sync + 'static>;
+
+    /// Guard that restores the previous terminal rollback test hook on drop.
+    pub(crate) struct TerminalRollbackTestHookGuard {
+        previous: Option<TerminalRollbackTestHook>,
+    }
+
+    impl Drop for TerminalRollbackTestHookGuard {
+        #[inline]
+        fn drop(&mut self) {
+            *terminal_rollback_test_hook_slot().lock() = self.previous.take();
+        }
+    }
+
     /// Build a transaction system around a caller-provided redo log for log tests.
     pub(crate) fn manual_log_processor_transaction_system(
         engine: &Engine,
@@ -1895,24 +1909,6 @@ pub(crate) mod tests {
         (trx_sys, purge_rx)
     }
 
-    type TerminalRollbackTestHook = Arc<dyn Fn(TrxID, &'static str) + Send + Sync + 'static>;
-    fn terminal_rollback_test_hook_slot() -> &'static Mutex<Option<TerminalRollbackTestHook>> {
-        static HOOK: OnceLock<Mutex<Option<TerminalRollbackTestHook>>> = OnceLock::new();
-        HOOK.get_or_init(|| Mutex::new(None))
-    }
-
-    /// Guard that restores the previous terminal rollback test hook on drop.
-    pub(crate) struct TerminalRollbackTestHookGuard {
-        previous: Option<TerminalRollbackTestHook>,
-    }
-
-    impl Drop for TerminalRollbackTestHookGuard {
-        #[inline]
-        fn drop(&mut self) {
-            *terminal_rollback_test_hook_slot().lock() = self.previous.take();
-        }
-    }
-
     /// Install a test-only hook invoked after terminal rollback worker ownership.
     #[inline]
     pub(crate) fn install_terminal_rollback_test_hook(
@@ -1923,6 +1919,7 @@ pub(crate) mod tests {
         TerminalRollbackTestHookGuard { previous }
     }
 
+    /// Runs terminal rollback test hook for tests.
     #[inline]
     pub(crate) fn run_terminal_rollback_test_hook(trx_id: TrxID, operation: &'static str) {
         let hook = terminal_rollback_test_hook_slot().lock().clone();
@@ -1936,6 +1933,7 @@ pub(crate) mod tests {
         trx_sys.fatal_rollback_retention.lock().len()
     }
 
+    /// Returns whether statement row undo holds in tests.
     pub(crate) fn retains_statement_row_undo(
         trx_sys: &TransactionSystem,
         table_id: TableID,
@@ -1953,6 +1951,7 @@ pub(crate) mod tests {
             })
     }
 
+    /// Returns whether active row undo holds in tests.
     pub(crate) fn retains_active_row_undo(
         trx_sys: &TransactionSystem,
         table_id: TableID,
@@ -1978,6 +1977,7 @@ pub(crate) mod tests {
         })
     }
 
+    /// Returns whether precommit row undo holds in tests.
     pub(crate) fn retains_precommit_row_undo(
         trx_sys: &TransactionSystem,
         table_id: TableID,
@@ -1995,6 +1995,10 @@ pub(crate) mod tests {
                     .any(|undo| undo.table_id == table_id && undo.row_id == row_id),
                 _ => false,
             })
+    }
+    fn terminal_rollback_test_hook_slot() -> &'static Mutex<Option<TerminalRollbackTestHook>> {
+        static HOOK: OnceLock<Mutex<Option<TerminalRollbackTestHook>>> = OnceLock::new();
+        HOOK.get_or_init(|| Mutex::new(None))
     }
 
     async fn build_trx_sys_redo_test_engine_with_log_file_max_size(
@@ -2023,48 +2027,6 @@ pub(crate) mod tests {
         .await
         .unwrap();
         (temp_dir, engine)
-    }
-
-    #[test]
-    fn redo_shutdown_releases_active_file_before_resuming_join_panic() {
-        let observer = observe_spawn_named(|event| {
-            if event == SpawnTestEvent::Finished("Log-Thread".to_owned()) {
-                panic::panic_any("injected redo finish panic");
-            }
-        });
-        let (_temp_dir, engine) =
-            smol::block_on(build_trx_sys_redo_test_engine_with_log_file_max_size(
-                "redo_shutdown_panic",
-                1024 * 1024,
-            ));
-        assert!(
-            engine
-                .inner()
-                .trx_sys
-                .redo_log
-                .group_commit
-                .lock()
-                .log_file
-                .is_some()
-        );
-
-        let payload = panic::catch_unwind(AssertUnwindSafe(|| engine.shutdown())).unwrap_err();
-        assert_eq!(
-            payload.downcast_ref::<&'static str>().copied(),
-            Some("injected redo finish panic")
-        );
-        assert!(
-            engine
-                .inner()
-                .trx_sys
-                .redo_log
-                .group_commit
-                .lock()
-                .log_file
-                .is_none()
-        );
-        engine.shutdown();
-        drop(observer);
     }
 
     fn add_large_system_redo(sys_trx: &mut SysTrx, value_count: usize) {
@@ -2109,6 +2071,48 @@ pub(crate) mod tests {
             Arc::clone(status)
         };
         (entry, status)
+    }
+
+    #[test]
+    fn redo_shutdown_releases_active_file_before_resuming_join_panic() {
+        let observer = observe_spawn_named(|event| {
+            if event == SpawnTestEvent::Finished("Log-Thread".to_owned()) {
+                panic::panic_any("injected redo finish panic");
+            }
+        });
+        let (_temp_dir, engine) =
+            smol::block_on(build_trx_sys_redo_test_engine_with_log_file_max_size(
+                "redo_shutdown_panic",
+                1024 * 1024,
+            ));
+        assert!(
+            engine
+                .inner()
+                .trx_sys
+                .redo_log
+                .group_commit
+                .lock()
+                .log_file
+                .is_some()
+        );
+
+        let payload = panic::catch_unwind(AssertUnwindSafe(|| engine.shutdown())).unwrap_err();
+        assert_eq!(
+            payload.downcast_ref::<&'static str>().copied(),
+            Some("injected redo finish panic")
+        );
+        assert!(
+            engine
+                .inner()
+                .trx_sys
+                .redo_log
+                .group_commit
+                .lock()
+                .log_file
+                .is_none()
+        );
+        engine.shutdown();
+        drop(observer);
     }
 
     #[test]

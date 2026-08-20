@@ -920,6 +920,13 @@ pub(crate) mod tests {
         }
     }
 
+    struct FrozenAnalyzerFixture {
+        page: RowPage,
+        map: RowVersionMap,
+        page_info: FrozenPage,
+        _undo_owners: Vec<OwnedRowUndo>,
+    }
+
     /// Pause or mutate state after the epoch sample but before registration.
     pub(crate) fn install_before_listener_hook<F, Fut>(hook: F) -> BeforeListenerHookGuard
     where
@@ -968,13 +975,6 @@ pub(crate) mod tests {
         if let Some(hook) = hook {
             hook().await;
         }
-    }
-
-    struct FrozenAnalyzerFixture {
-        page: RowPage,
-        map: RowVersionMap,
-        page_info: FrozenPage,
-        _undo_owners: Vec<OwnedRowUndo>,
     }
 
     fn frozen_analyzer_fixture(

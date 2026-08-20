@@ -1196,6 +1196,319 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    struct SyntheticPrepared {
+        moves: Arc<AtomicUsize>,
+        finishes: Arc<AtomicUsize>,
+        fail: bool,
+    }
+
+    impl PreparedExecution for SyntheticPrepared {
+        type Output = SyntheticOutput;
+        type Accepted = SyntheticAccepted;
+
+        const LABEL: &'static str = "synthetic_prepared";
+
+        #[inline]
+        fn metadata(&self) -> MandatoryTaskMetadata {
+            MandatoryTaskMetadata::operation(Self::LABEL, None)
+        }
+
+        #[inline]
+        fn accept(self) -> Self::Accepted {
+            self.moves.fetch_add(1, Ordering::Relaxed);
+            SyntheticAccepted {
+                moves: self.moves,
+                finishes: self.finishes,
+                fail: self.fail,
+            }
+        }
+    }
+
+    struct SyntheticAccepted {
+        moves: Arc<AtomicUsize>,
+        finishes: Arc<AtomicUsize>,
+        fail: bool,
+    }
+
+    impl AcceptedExecution for SyntheticAccepted {
+        type Output = SyntheticOutput;
+
+        #[inline]
+        async fn execute(&mut self) -> CompletionResult<Self::Output> {
+            if self.fail {
+                Err(CompletionErrorBridge::capture(
+                    Report::new(OperationError::TableNotFound).attach("synthetic error"),
+                ))
+            } else {
+                Ok(SyntheticOutput(self.moves.load(Ordering::Relaxed)))
+            }
+        }
+
+        #[inline]
+        fn finish(&mut self) {
+            self.finishes.fetch_add(1, Ordering::Relaxed);
+        }
+
+        #[inline]
+        async fn handle_panic(&mut self, _panic: Box<dyn Any + Send>) -> CompletionErrorBridge {
+            CompletionErrorBridge::capture(
+                Report::new(FatalError::MandatoryTaskPanic).attach("synthetic panic"),
+            )
+        }
+    }
+
+    #[derive(Debug)]
+    struct SyntheticOutput(usize);
+
+    struct ExecutePanicPrepared {
+        dropped: Arc<AtomicUsize>,
+        finishes: Arc<AtomicUsize>,
+        handled: Arc<AtomicUsize>,
+    }
+
+    impl PreparedExecution for ExecutePanicPrepared {
+        type Output = ();
+        type Accepted = ExecutePanicAccepted;
+
+        const LABEL: &'static str = "execute_panic";
+
+        #[inline]
+        fn metadata(&self) -> MandatoryTaskMetadata {
+            MandatoryTaskMetadata::operation(Self::LABEL, None)
+        }
+
+        #[inline]
+        fn accept(self) -> Self::Accepted {
+            ExecutePanicAccepted {
+                dropped: self.dropped,
+                finishes: self.finishes,
+                handled: self.handled,
+            }
+        }
+    }
+
+    struct ExecutePanicAccepted {
+        dropped: Arc<AtomicUsize>,
+        finishes: Arc<AtomicUsize>,
+        handled: Arc<AtomicUsize>,
+    }
+
+    impl Drop for ExecutePanicAccepted {
+        #[inline]
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    impl AcceptedExecution for ExecutePanicAccepted {
+        type Output = ();
+
+        #[inline]
+        async fn execute(&mut self) -> CompletionResult<Self::Output> {
+            panic!("synthetic accepted execution panic");
+        }
+
+        #[inline]
+        fn finish(&mut self) {
+            self.finishes.fetch_add(1, Ordering::Relaxed);
+        }
+
+        #[inline]
+        async fn handle_panic(&mut self, _panic: Box<dyn Any + Send>) -> CompletionErrorBridge {
+            self.handled.fetch_add(1, Ordering::Relaxed);
+            CompletionErrorBridge::capture(
+                Report::new(FatalError::MandatoryTaskPanic)
+                    .attach("synthetic accepted execution panic"),
+            )
+        }
+    }
+
+    struct SyntheticPanicInternal {
+        preserved: Arc<AtomicUsize>,
+        published: Arc<AtomicUsize>,
+        dropped: Arc<AtomicUsize>,
+        completion: Arc<Completion<()>>,
+    }
+
+    impl Drop for SyntheticPanicInternal {
+        #[inline]
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    impl MandatoryInternalTask for SyntheticPanicInternal {
+        const LABEL: &'static str = "synthetic_internal_panic";
+
+        #[inline]
+        fn metadata(&self) -> MandatoryTaskMetadata {
+            MandatoryTaskMetadata::transaction_cleanup(Self::LABEL, None)
+        }
+
+        #[inline]
+        async fn run(&mut self) {
+            panic!("synthetic mandatory internal task panic");
+        }
+
+        #[inline]
+        fn preserve_after_panic(&mut self) {
+            self.preserved.fetch_add(1, Ordering::Relaxed);
+        }
+
+        #[inline]
+        fn publish_panic(&mut self, error: CompletionErrorBridge) {
+            self.published.fetch_add(1, Ordering::Relaxed);
+            self.completion.complete(Err(error));
+        }
+    }
+
+    struct GatedPrepared {
+        started: Arc<Completion<()>>,
+        release: Arc<Completion<()>>,
+    }
+
+    impl PreparedExecution for GatedPrepared {
+        type Output = ();
+        type Accepted = GatedAccepted;
+
+        const LABEL: &'static str = "gated_operation";
+
+        #[inline]
+        fn metadata(&self) -> MandatoryTaskMetadata {
+            MandatoryTaskMetadata::operation(Self::LABEL, None)
+        }
+
+        #[inline]
+        fn accept(self) -> Self::Accepted {
+            GatedAccepted {
+                started: self.started,
+                release: self.release,
+            }
+        }
+    }
+
+    struct GatedAccepted {
+        started: Arc<Completion<()>>,
+        release: Arc<Completion<()>>,
+    }
+
+    impl AcceptedExecution for GatedAccepted {
+        type Output = ();
+
+        #[inline]
+        async fn execute(&mut self) -> CompletionResult<Self::Output> {
+            self.started.complete(Ok(()));
+            self.release.wait_result().await
+        }
+
+        #[inline]
+        fn finish(&mut self) {}
+
+        #[inline]
+        async fn handle_panic(&mut self, _panic: Box<dyn Any + Send>) -> CompletionErrorBridge {
+            CompletionErrorBridge::capture(
+                Report::new(FatalError::MandatoryTaskPanic).attach("gated operation panic"),
+            )
+        }
+    }
+
+    struct SignalInternal {
+        completed: Arc<Completion<()>>,
+    }
+
+    impl MandatoryInternalTask for SignalInternal {
+        const LABEL: &'static str = "signal_internal";
+
+        #[inline]
+        fn metadata(&self) -> MandatoryTaskMetadata {
+            MandatoryTaskMetadata::transaction_cleanup(Self::LABEL, None)
+        }
+
+        #[inline]
+        async fn run(&mut self) {
+            self.completed.complete(Ok(()));
+        }
+
+        #[inline]
+        fn preserve_after_panic(&mut self) {}
+
+        #[inline]
+        fn publish_panic(&mut self, error: CompletionErrorBridge) {
+            self.completed.complete(Err(error));
+        }
+    }
+
+    struct OverlapRendezvous {
+        registrations: AtomicUsize,
+        ready: Completion<()>,
+    }
+
+    impl OverlapRendezvous {
+        #[inline]
+        fn new() -> Self {
+            Self {
+                registrations: AtomicUsize::new(0),
+                ready: Completion::new(),
+            }
+        }
+
+        #[inline]
+        async fn arrive(&self) -> CompletionResult<()> {
+            let registrations = self.registrations.fetch_add(1, Ordering::AcqRel) + 1;
+            assert!(registrations <= 2, "overlap task registered more than once");
+            if registrations == 2 {
+                self.ready.complete(Ok(()));
+            }
+            self.ready.wait_result().await
+        }
+    }
+
+    struct OverlapPrepared {
+        rendezvous: Arc<OverlapRendezvous>,
+    }
+
+    impl PreparedExecution for OverlapPrepared {
+        type Output = ();
+        type Accepted = OverlapAccepted;
+
+        const LABEL: &'static str = "overlap_operation";
+
+        #[inline]
+        fn metadata(&self) -> MandatoryTaskMetadata {
+            MandatoryTaskMetadata::operation(Self::LABEL, None)
+        }
+
+        #[inline]
+        fn accept(self) -> Self::Accepted {
+            OverlapAccepted {
+                rendezvous: self.rendezvous,
+            }
+        }
+    }
+
+    struct OverlapAccepted {
+        rendezvous: Arc<OverlapRendezvous>,
+    }
+
+    impl AcceptedExecution for OverlapAccepted {
+        type Output = ();
+
+        #[inline]
+        async fn execute(&mut self) -> CompletionResult<Self::Output> {
+            self.rendezvous.arrive().await
+        }
+
+        #[inline]
+        fn finish(&mut self) {}
+
+        #[inline]
+        async fn handle_panic(&mut self, _panic: Box<dyn Any + Send>) -> CompletionErrorBridge {
+            CompletionErrorBridge::capture(
+                Report::new(FatalError::MandatoryTaskPanic).attach("overlap operation panic"),
+            )
+        }
+    }
+
     #[test]
     fn exclusive_completion_moves_non_clone_output_once() {
         struct NonClone(usize);
@@ -1288,319 +1601,6 @@ mod tests {
         drop(observer);
         assert_eq!(drops.load(Ordering::Relaxed), 2);
         assert_eq!(counters.detached_observer_count.load(Ordering::Relaxed), 2);
-    }
-
-    struct SyntheticPrepared {
-        moves: Arc<AtomicUsize>,
-        finishes: Arc<AtomicUsize>,
-        fail: bool,
-    }
-
-    struct SyntheticAccepted {
-        moves: Arc<AtomicUsize>,
-        finishes: Arc<AtomicUsize>,
-        fail: bool,
-    }
-
-    #[derive(Debug)]
-    struct SyntheticOutput(usize);
-
-    struct ExecutePanicPrepared {
-        dropped: Arc<AtomicUsize>,
-        finishes: Arc<AtomicUsize>,
-        handled: Arc<AtomicUsize>,
-    }
-
-    struct ExecutePanicAccepted {
-        dropped: Arc<AtomicUsize>,
-        finishes: Arc<AtomicUsize>,
-        handled: Arc<AtomicUsize>,
-    }
-
-    impl Drop for ExecutePanicAccepted {
-        #[inline]
-        fn drop(&mut self) {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    impl PreparedExecution for ExecutePanicPrepared {
-        type Output = ();
-        type Accepted = ExecutePanicAccepted;
-
-        const LABEL: &'static str = "execute_panic";
-
-        #[inline]
-        fn metadata(&self) -> MandatoryTaskMetadata {
-            MandatoryTaskMetadata::operation(Self::LABEL, None)
-        }
-
-        #[inline]
-        fn accept(self) -> Self::Accepted {
-            ExecutePanicAccepted {
-                dropped: self.dropped,
-                finishes: self.finishes,
-                handled: self.handled,
-            }
-        }
-    }
-
-    impl AcceptedExecution for ExecutePanicAccepted {
-        type Output = ();
-
-        #[inline]
-        async fn execute(&mut self) -> CompletionResult<Self::Output> {
-            panic!("synthetic accepted execution panic");
-        }
-
-        #[inline]
-        fn finish(&mut self) {
-            self.finishes.fetch_add(1, Ordering::Relaxed);
-        }
-
-        #[inline]
-        async fn handle_panic(&mut self, _panic: Box<dyn Any + Send>) -> CompletionErrorBridge {
-            self.handled.fetch_add(1, Ordering::Relaxed);
-            CompletionErrorBridge::capture(
-                Report::new(FatalError::MandatoryTaskPanic)
-                    .attach("synthetic accepted execution panic"),
-            )
-        }
-    }
-
-    struct SyntheticPanicInternal {
-        preserved: Arc<AtomicUsize>,
-        published: Arc<AtomicUsize>,
-        dropped: Arc<AtomicUsize>,
-        completion: Arc<Completion<()>>,
-    }
-
-    struct GatedPrepared {
-        started: Arc<Completion<()>>,
-        release: Arc<Completion<()>>,
-    }
-
-    struct GatedAccepted {
-        started: Arc<Completion<()>>,
-        release: Arc<Completion<()>>,
-    }
-
-    impl PreparedExecution for GatedPrepared {
-        type Output = ();
-        type Accepted = GatedAccepted;
-
-        const LABEL: &'static str = "gated_operation";
-
-        #[inline]
-        fn metadata(&self) -> MandatoryTaskMetadata {
-            MandatoryTaskMetadata::operation(Self::LABEL, None)
-        }
-
-        #[inline]
-        fn accept(self) -> Self::Accepted {
-            GatedAccepted {
-                started: self.started,
-                release: self.release,
-            }
-        }
-    }
-
-    impl AcceptedExecution for GatedAccepted {
-        type Output = ();
-
-        #[inline]
-        async fn execute(&mut self) -> CompletionResult<Self::Output> {
-            self.started.complete(Ok(()));
-            self.release.wait_result().await
-        }
-
-        #[inline]
-        fn finish(&mut self) {}
-
-        #[inline]
-        async fn handle_panic(&mut self, _panic: Box<dyn Any + Send>) -> CompletionErrorBridge {
-            CompletionErrorBridge::capture(
-                Report::new(FatalError::MandatoryTaskPanic).attach("gated operation panic"),
-            )
-        }
-    }
-
-    struct SignalInternal {
-        completed: Arc<Completion<()>>,
-    }
-
-    struct OverlapRendezvous {
-        registrations: AtomicUsize,
-        ready: Completion<()>,
-    }
-
-    impl OverlapRendezvous {
-        #[inline]
-        fn new() -> Self {
-            Self {
-                registrations: AtomicUsize::new(0),
-                ready: Completion::new(),
-            }
-        }
-
-        #[inline]
-        async fn arrive(&self) -> CompletionResult<()> {
-            let registrations = self.registrations.fetch_add(1, Ordering::AcqRel) + 1;
-            assert!(registrations <= 2, "overlap task registered more than once");
-            if registrations == 2 {
-                self.ready.complete(Ok(()));
-            }
-            self.ready.wait_result().await
-        }
-    }
-
-    struct OverlapPrepared {
-        rendezvous: Arc<OverlapRendezvous>,
-    }
-
-    struct OverlapAccepted {
-        rendezvous: Arc<OverlapRendezvous>,
-    }
-
-    impl PreparedExecution for OverlapPrepared {
-        type Output = ();
-        type Accepted = OverlapAccepted;
-
-        const LABEL: &'static str = "overlap_operation";
-
-        #[inline]
-        fn metadata(&self) -> MandatoryTaskMetadata {
-            MandatoryTaskMetadata::operation(Self::LABEL, None)
-        }
-
-        #[inline]
-        fn accept(self) -> Self::Accepted {
-            OverlapAccepted {
-                rendezvous: self.rendezvous,
-            }
-        }
-    }
-
-    impl AcceptedExecution for OverlapAccepted {
-        type Output = ();
-
-        #[inline]
-        async fn execute(&mut self) -> CompletionResult<Self::Output> {
-            self.rendezvous.arrive().await
-        }
-
-        #[inline]
-        fn finish(&mut self) {}
-
-        #[inline]
-        async fn handle_panic(&mut self, _panic: Box<dyn Any + Send>) -> CompletionErrorBridge {
-            CompletionErrorBridge::capture(
-                Report::new(FatalError::MandatoryTaskPanic).attach("overlap operation panic"),
-            )
-        }
-    }
-
-    impl MandatoryInternalTask for SignalInternal {
-        const LABEL: &'static str = "signal_internal";
-
-        #[inline]
-        fn metadata(&self) -> MandatoryTaskMetadata {
-            MandatoryTaskMetadata::transaction_cleanup(Self::LABEL, None)
-        }
-
-        #[inline]
-        async fn run(&mut self) {
-            self.completed.complete(Ok(()));
-        }
-
-        #[inline]
-        fn preserve_after_panic(&mut self) {}
-
-        #[inline]
-        fn publish_panic(&mut self, error: CompletionErrorBridge) {
-            self.completed.complete(Err(error));
-        }
-    }
-
-    impl Drop for SyntheticPanicInternal {
-        #[inline]
-        fn drop(&mut self) {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    impl MandatoryInternalTask for SyntheticPanicInternal {
-        const LABEL: &'static str = "synthetic_internal_panic";
-
-        #[inline]
-        fn metadata(&self) -> MandatoryTaskMetadata {
-            MandatoryTaskMetadata::transaction_cleanup(Self::LABEL, None)
-        }
-
-        #[inline]
-        async fn run(&mut self) {
-            panic!("synthetic mandatory internal task panic");
-        }
-
-        #[inline]
-        fn preserve_after_panic(&mut self) {
-            self.preserved.fetch_add(1, Ordering::Relaxed);
-        }
-
-        #[inline]
-        fn publish_panic(&mut self, error: CompletionErrorBridge) {
-            self.published.fetch_add(1, Ordering::Relaxed);
-            self.completion.complete(Err(error));
-        }
-    }
-
-    impl PreparedExecution for SyntheticPrepared {
-        type Output = SyntheticOutput;
-        type Accepted = SyntheticAccepted;
-
-        const LABEL: &'static str = "synthetic_prepared";
-
-        #[inline]
-        fn metadata(&self) -> MandatoryTaskMetadata {
-            MandatoryTaskMetadata::operation(Self::LABEL, None)
-        }
-
-        #[inline]
-        fn accept(self) -> Self::Accepted {
-            self.moves.fetch_add(1, Ordering::Relaxed);
-            SyntheticAccepted {
-                moves: self.moves,
-                finishes: self.finishes,
-                fail: self.fail,
-            }
-        }
-    }
-
-    impl AcceptedExecution for SyntheticAccepted {
-        type Output = SyntheticOutput;
-
-        #[inline]
-        async fn execute(&mut self) -> CompletionResult<Self::Output> {
-            if self.fail {
-                Err(CompletionErrorBridge::capture(
-                    Report::new(OperationError::TableNotFound).attach("synthetic error"),
-                ))
-            } else {
-                Ok(SyntheticOutput(self.moves.load(Ordering::Relaxed)))
-            }
-        }
-
-        #[inline]
-        fn finish(&mut self) {
-            self.finishes.fetch_add(1, Ordering::Relaxed);
-        }
-
-        #[inline]
-        async fn handle_panic(&mut self, _panic: Box<dyn Any + Send>) -> CompletionErrorBridge {
-            CompletionErrorBridge::capture(
-                Report::new(FatalError::MandatoryTaskPanic).attach("synthetic panic"),
-            )
-        }
     }
 
     #[test]

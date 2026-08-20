@@ -116,6 +116,7 @@ pub(crate) mod tests {
     use super::super::index_stream::{IndexBatchStream, IndexLookupCandidate};
     use crate::id::RowID;
 
+    /// Drains candidates for tests.
     pub(crate) async fn drain_candidates<S: IndexBatchStream<IndexLookupCandidate>>(
         stream: &mut S,
     ) -> Vec<IndexLookupCandidate> {
@@ -126,6 +127,7 @@ pub(crate) mod tests {
         candidates
     }
 
+    /// Drains row ids for tests.
     pub(crate) async fn drain_row_ids<S: IndexBatchStream<IndexLookupCandidate>>(
         stream: &mut S,
     ) -> Vec<RowID> {

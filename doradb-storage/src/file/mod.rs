@@ -871,11 +871,13 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
+    /// Returns file id for tests.
     #[inline]
     pub(crate) fn test_file_id(value: i32) -> FileID {
         FileID::new(u64::try_from(value).expect("test FileID must be non-negative"))
     }
 
+    /// Returns block id for tests.
     #[inline]
     pub(crate) fn test_block_id(value: i32) -> BlockID {
         BlockID::new(u64::try_from(value).expect("test BlockID must be non-negative"))

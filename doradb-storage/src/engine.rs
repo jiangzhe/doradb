@@ -832,63 +832,6 @@ mod tests {
 
     const TEST_POOL_BYTES: usize = 64 * 1024 * 1024;
 
-    #[test]
-    fn test_engine_lifecycle_rejected_admission_reports_state() {
-        let lifecycle = EngineLifecycle::new();
-        lifecycle.close_admission();
-        let err = match lifecycle.admit() {
-            Ok(_) => panic!("admission should be rejected after lifecycle closure"),
-            Err(err) => err,
-        };
-        assert_eq!(err.current_context(), &LifecycleError::Shutdown);
-        let output = format!("{err:?}");
-        assert!(output.contains("state=ShuttingDown"), "{output}");
-    }
-
-    #[test]
-    fn test_poisoned_engine_new_session_admission_remains_fatal() {
-        smol::block_on(async {
-            let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
-                .await
-                .unwrap();
-            let _ = engine
-                .inner()
-                .poisoner
-                .poison(Report::new(FatalError::RedoWrite).attach("test admission poison"));
-
-            let error = match engine.new_session() {
-                Ok(_) => panic!("poisoned engine must reject new sessions"),
-                Err(error) => error,
-            };
-            assert_eq!(error.kind(), ErrorKind::Fatal);
-            assert_eq!(
-                error.report().downcast_ref::<FatalError>().copied(),
-                Some(FatalError::RedoWrite)
-            );
-            assert!(error.report().downcast_ref::<LifecycleError>().is_none());
-        });
-    }
-
-    fn test_engine_config_for(root: &Path) -> EngineConfig {
-        EngineConfig::default()
-            .storage_root(root)
-            .meta_buffer(TEST_POOL_BYTES)
-            .index_buffer(
-                EvictableBufferPoolConfig::default()
-                    .swap_file("index.swp")
-                    .max_mem_size(TEST_POOL_BYTES)
-                    .max_file_size(128usize * 1024 * 1024),
-            )
-            .data_buffer(
-                EvictableBufferPoolConfig::default()
-                    .max_mem_size(TEST_POOL_BYTES)
-                    .max_file_size(128usize * 1024 * 1024),
-            )
-            .file(FileSystemConfig::default().readonly_buffer_size(TEST_POOL_BYTES))
-            .trx(TrxSysConfig::default())
-    }
-
     struct FailInitialRedoHeaderWriteHook {
         redo_path: PathBuf,
         log_started: Arc<AtomicBool>,
@@ -933,6 +876,99 @@ mod tests {
             }
             *res = Err(StdIoError::from_raw_os_error(libc::EIO));
         }
+    }
+
+    fn test_engine_config_for(root: &Path) -> EngineConfig {
+        EngineConfig::default()
+            .storage_root(root)
+            .meta_buffer(TEST_POOL_BYTES)
+            .index_buffer(
+                EvictableBufferPoolConfig::default()
+                    .swap_file("index.swp")
+                    .max_mem_size(TEST_POOL_BYTES)
+                    .max_file_size(128usize * 1024 * 1024),
+            )
+            .data_buffer(
+                EvictableBufferPoolConfig::default()
+                    .max_mem_size(TEST_POOL_BYTES)
+                    .max_file_size(128usize * 1024 * 1024),
+            )
+            .file(FileSystemConfig::default().readonly_buffer_size(TEST_POOL_BYTES))
+            .trx(TrxSysConfig::default())
+    }
+
+    fn wait_until_shutdown_begins(engine: &Engine) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while engine.inner().lifecycle.inspect_state() == EngineLifecycleState::Running {
+            assert!(
+                Instant::now() < deadline,
+                "shutdown did not close admission before timeout"
+            );
+            yield_now();
+        }
+    }
+
+    fn wait_until(mut done: impl FnMut() -> bool, message: &'static str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(Instant::now() < deadline, "{message}");
+            sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn lock_entry_count(engine: &Engine, owner: LockOwner) -> usize {
+        debug_snapshot(engine.inner().core.lock_manager())
+            .entries
+            .iter()
+            .filter(|entry| entry.family == owner.family())
+            .count()
+    }
+
+    #[inline]
+    fn assert_runtime_unavailable_after_shutdown(err: Error) {
+        assert_eq!(err.kind(), ErrorKind::Lifecycle);
+        assert_eq!(
+            err.report().downcast_ref::<LifecycleError>().copied(),
+            Some(LifecycleError::Shutdown)
+        );
+    }
+
+    #[test]
+    fn test_engine_lifecycle_rejected_admission_reports_state() {
+        let lifecycle = EngineLifecycle::new();
+        lifecycle.close_admission();
+        let err = match lifecycle.admit() {
+            Ok(_) => panic!("admission should be rejected after lifecycle closure"),
+            Err(err) => err,
+        };
+        assert_eq!(err.current_context(), &LifecycleError::Shutdown);
+        let output = format!("{err:?}");
+        assert!(output.contains("state=ShuttingDown"), "{output}");
+    }
+
+    #[test]
+    fn test_poisoned_engine_new_session_admission_remains_fatal() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
+            let _ = engine
+                .inner()
+                .poisoner
+                .poison(Report::new(FatalError::RedoWrite).attach("test admission poison"));
+
+            let error = match engine.new_session() {
+                Ok(_) => panic!("poisoned engine must reject new sessions"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), ErrorKind::Fatal);
+            assert_eq!(
+                error.report().downcast_ref::<FatalError>().copied(),
+                Some(FatalError::RedoWrite)
+            );
+            assert!(error.report().downcast_ref::<LifecycleError>().is_none());
+        });
     }
 
     #[test]
@@ -1161,42 +1197,6 @@ mod tests {
                 "phase=rollback_purge_dispatcher_spawn, cleanup=join_partial_purge_workers, join_panics=1"
             ),
             "report={output}"
-        );
-    }
-
-    fn wait_until_shutdown_begins(engine: &Engine) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while engine.inner().lifecycle.inspect_state() == EngineLifecycleState::Running {
-            assert!(
-                Instant::now() < deadline,
-                "shutdown did not close admission before timeout"
-            );
-            yield_now();
-        }
-    }
-
-    fn wait_until(mut done: impl FnMut() -> bool, message: &'static str) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !done() {
-            assert!(Instant::now() < deadline, "{message}");
-            sleep(Duration::from_millis(1));
-        }
-    }
-
-    fn lock_entry_count(engine: &Engine, owner: LockOwner) -> usize {
-        debug_snapshot(engine.inner().core.lock_manager())
-            .entries
-            .iter()
-            .filter(|entry| entry.family == owner.family())
-            .count()
-    }
-
-    #[inline]
-    fn assert_runtime_unavailable_after_shutdown(err: Error) {
-        assert_eq!(err.kind(), ErrorKind::Lifecycle);
-        assert_eq!(
-            err.report().downcast_ref::<LifecycleError>().copied(),
-            Some(LifecycleError::Shutdown)
         );
     }
 

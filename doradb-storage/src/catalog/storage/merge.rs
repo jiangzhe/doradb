@@ -448,6 +448,44 @@ mod tests {
     use crate::id::{RowID, TableID};
     use crate::value::ValKind;
 
+    fn catalog_column_vals(table_id: TableID, column_no: u16, name_len: usize) -> Vec<Val> {
+        let mut name = vec![b'x'; name_len];
+        if let Some(first) = name.first_mut() {
+            *first = b'a' + (column_no % 26) as u8;
+        }
+        vec![
+            Val::from(table_id),
+            Val::from(column_no),
+            Val::from(name),
+            Val::from(ValKind::U64 as u32),
+            Val::from(0u32),
+        ]
+    }
+
+    fn catalog_table_vals(table_id: TableID, next_index_no: u16) -> Vec<Val> {
+        vec![Val::from(table_id), Val::from(next_index_no)]
+    }
+
+    fn catalog_table_update(next_index_no: u16) -> Vec<UpdateCol> {
+        vec![UpdateCol {
+            idx: 1,
+            val: Val::from(next_index_no),
+        }]
+    }
+
+    fn folded_tables_with_base(base: Vec<(TableID, u16)>) -> CatalogFoldedRows {
+        let metadata = &catalog_definition_of_tables().metadata;
+        let rows = base
+            .into_iter()
+            .enumerate()
+            .map(|(idx, (table_id, next_index_no))| RowRecord {
+                row_id: RowID::new(idx as u64),
+                vals: catalog_table_vals(table_id, next_index_no),
+            })
+            .collect();
+        CatalogFoldedRows::from_base_rows(metadata, rows).unwrap()
+    }
+
     #[test]
     fn test_catalog_merge_key_builder_encodes_single_and_composite_keys() {
         let tables_metadata = &catalog_definition_of_tables().metadata;
@@ -659,43 +697,5 @@ mod tests {
         );
         assert!(report.contains("column_no=0"), "{report}");
         assert!(report.contains("row_value_count=0"), "{report}");
-    }
-
-    fn catalog_column_vals(table_id: TableID, column_no: u16, name_len: usize) -> Vec<Val> {
-        let mut name = vec![b'x'; name_len];
-        if let Some(first) = name.first_mut() {
-            *first = b'a' + (column_no % 26) as u8;
-        }
-        vec![
-            Val::from(table_id),
-            Val::from(column_no),
-            Val::from(name),
-            Val::from(ValKind::U64 as u32),
-            Val::from(0u32),
-        ]
-    }
-
-    fn catalog_table_vals(table_id: TableID, next_index_no: u16) -> Vec<Val> {
-        vec![Val::from(table_id), Val::from(next_index_no)]
-    }
-
-    fn catalog_table_update(next_index_no: u16) -> Vec<UpdateCol> {
-        vec![UpdateCol {
-            idx: 1,
-            val: Val::from(next_index_no),
-        }]
-    }
-
-    fn folded_tables_with_base(base: Vec<(TableID, u16)>) -> CatalogFoldedRows {
-        let metadata = &catalog_definition_of_tables().metadata;
-        let rows = base
-            .into_iter()
-            .enumerate()
-            .map(|(idx, (table_id, next_index_no))| RowRecord {
-                row_id: RowID::new(idx as u64),
-                vals: catalog_table_vals(table_id, next_index_no),
-            })
-            .collect();
-        CatalogFoldedRows::from_base_rows(metadata, rows).unwrap()
     }
 }

@@ -1299,30 +1299,6 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    #[test]
-    fn test_heap_replay_requires_row_at_or_above_published_pivot() {
-        let pivot_row_id = RowID::new(100);
-        let replay_start_ts = TrxID::new(10);
-        assert!(!should_replay_heap_row(
-            RowID::new(99),
-            pivot_row_id,
-            TrxID::new(11),
-            replay_start_ts,
-        ));
-        assert!(!should_replay_heap_row(
-            RowID::new(100),
-            pivot_row_id,
-            TrxID::new(9),
-            replay_start_ts,
-        ));
-        assert!(should_replay_heap_row(
-            RowID::new(100),
-            pivot_row_id,
-            replay_start_ts,
-            replay_start_ts,
-        ));
-    }
-
     const LIGHTWEIGHT_RECOVERY_BUFFER_BYTES: usize = 16 * 1024 * 1024;
     const LIGHTWEIGHT_RECOVERY_MAX_FILE_BYTES: usize = 32 * 1024 * 1024;
     const LIGHTWEIGHT_RECOVERY_READONLY_BUFFER_BYTES: usize = 32 * 1024 * 1024;
@@ -1377,48 +1353,6 @@ mod tests {
         assert!(report.contains("table_file"), "{report}");
         assert!(report.contains(block_kind), "{report}");
         assert!(report.contains(&format!("block_id={block_id}")), "{report}");
-    }
-
-    #[test]
-    fn test_invalid_user_table_keyed_redo_reports_invalid_payload() {
-        let table_id = TableID::new(42);
-        let cts = TrxID::new(11);
-        let cases = [
-            (
-                "DeleteByPrimaryKey",
-                RowRedoKind::DeleteByPrimaryKey(SelectKey::new(0, vec![Val::from(42u64)])),
-            ),
-            (
-                "UpdateByPrimaryKey",
-                RowRedoKind::UpdateByPrimaryKey(
-                    SelectKey::new(0, vec![Val::from(42u64)]),
-                    vec![UpdateCol {
-                        idx: 1,
-                        val: Val::from(7u64),
-                    }],
-                ),
-            ),
-        ];
-
-        for (expected_kind, kind) in cases {
-            let row = RowRedo {
-                row_id: RowID::new(9),
-                kind,
-            };
-            let err = invalid_user_table_keyed_redo(table_id, &row, cts);
-            let report = format!("{err:?}");
-            assert_eq!(
-                err.downcast_ref::<DataIntegrityError>().copied(),
-                Some(DataIntegrityError::InvalidPayload),
-                "{report}"
-            );
-            assert!(report.contains("key-based catalog redo"), "{report}");
-            assert!(report.contains("table_id=42"), "{report}");
-            assert!(!report.contains("page_id="), "{report}");
-            assert!(report.contains("row_id=9"), "{report}");
-            assert!(report.contains("cts=11"), "{report}");
-            assert!(report.contains(expected_kind), "{report}");
-        }
     }
 
     fn lightweight_recovery_engine_config(
@@ -1971,6 +1905,124 @@ mod tests {
         drop(table);
     }
 
+    fn corrupt_page_checksum(path: impl AsRef<Path>, page_id: impl Into<u64>) {
+        let page_id = page_id.into();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let offset = page_id * COW_FILE_PAGE_SIZE as u64 + (COW_FILE_PAGE_SIZE as u64 - 1);
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        let mut byte = [0u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        byte[0] ^= 0xFF;
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&byte).unwrap();
+        file.flush().unwrap();
+    }
+
+    fn rewrite_page_with_checksum(
+        path: impl AsRef<Path>,
+        page_id: impl Into<u64>,
+        rewrite: impl FnOnce(&mut [u8]),
+    ) {
+        let page_id = page_id.into();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let offset = page_id * COW_FILE_PAGE_SIZE as u64;
+        let mut page = vec![0u8; COW_FILE_PAGE_SIZE];
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.read_exact(&mut page).unwrap();
+        rewrite(&mut page);
+        write_block_checksum(&mut page);
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&page).unwrap();
+        file.flush().unwrap();
+    }
+
+    fn corrupt_blob_header_kind(
+        path: impl AsRef<Path>,
+        page_id: impl Into<u64>,
+        start_offset: u16,
+    ) {
+        let byte_offset = BLOCK_INTEGRITY_HEADER_SIZE
+            + COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE
+            + start_offset as usize;
+        rewrite_page_with_checksum(path, page_id, |page| {
+            page[byte_offset] = 0xFF;
+        });
+    }
+
+    #[test]
+    fn test_heap_replay_requires_row_at_or_above_published_pivot() {
+        let pivot_row_id = RowID::new(100);
+        let replay_start_ts = TrxID::new(10);
+        assert!(!should_replay_heap_row(
+            RowID::new(99),
+            pivot_row_id,
+            TrxID::new(11),
+            replay_start_ts,
+        ));
+        assert!(!should_replay_heap_row(
+            RowID::new(100),
+            pivot_row_id,
+            TrxID::new(9),
+            replay_start_ts,
+        ));
+        assert!(should_replay_heap_row(
+            RowID::new(100),
+            pivot_row_id,
+            replay_start_ts,
+            replay_start_ts,
+        ));
+    }
+
+    #[test]
+    fn test_invalid_user_table_keyed_redo_reports_invalid_payload() {
+        let table_id = TableID::new(42);
+        let cts = TrxID::new(11);
+        let cases = [
+            (
+                "DeleteByPrimaryKey",
+                RowRedoKind::DeleteByPrimaryKey(SelectKey::new(0, vec![Val::from(42u64)])),
+            ),
+            (
+                "UpdateByPrimaryKey",
+                RowRedoKind::UpdateByPrimaryKey(
+                    SelectKey::new(0, vec![Val::from(42u64)]),
+                    vec![UpdateCol {
+                        idx: 1,
+                        val: Val::from(7u64),
+                    }],
+                ),
+            ),
+        ];
+
+        for (expected_kind, kind) in cases {
+            let row = RowRedo {
+                row_id: RowID::new(9),
+                kind,
+            };
+            let err = invalid_user_table_keyed_redo(table_id, &row, cts);
+            let report = format!("{err:?}");
+            assert_eq!(
+                err.downcast_ref::<DataIntegrityError>().copied(),
+                Some(DataIntegrityError::InvalidPayload),
+                "{report}"
+            );
+            assert!(report.contains("key-based catalog redo"), "{report}");
+            assert!(report.contains("table_id=42"), "{report}");
+            assert!(!report.contains("page_id="), "{report}");
+            assert!(report.contains("row_id=9"), "{report}");
+            assert!(report.contains("cts=11"), "{report}");
+            assert!(report.contains(expected_kind), "{report}");
+        }
+    }
+
     #[test]
     fn test_recover_map_tracks_create_cts_and_entries() {
         let mut map = RowRecoveryMap::new(TrxID::new(7));
@@ -2445,58 +2497,6 @@ mod tests {
             .unwrap();
             assert_recovered_index_state(&recovered, table_id, 2, true).await;
             drop(recovered);
-        });
-    }
-
-    fn corrupt_page_checksum(path: impl AsRef<Path>, page_id: impl Into<u64>) {
-        let page_id = page_id.into();
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .unwrap();
-        let offset = page_id * COW_FILE_PAGE_SIZE as u64 + (COW_FILE_PAGE_SIZE as u64 - 1);
-        file.seek(SeekFrom::Start(offset)).unwrap();
-        let mut byte = [0u8; 1];
-        file.read_exact(&mut byte).unwrap();
-        byte[0] ^= 0xFF;
-        file.seek(SeekFrom::Start(offset)).unwrap();
-        file.write_all(&byte).unwrap();
-        file.flush().unwrap();
-    }
-
-    fn rewrite_page_with_checksum(
-        path: impl AsRef<Path>,
-        page_id: impl Into<u64>,
-        rewrite: impl FnOnce(&mut [u8]),
-    ) {
-        let page_id = page_id.into();
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .unwrap();
-        let offset = page_id * COW_FILE_PAGE_SIZE as u64;
-        let mut page = vec![0u8; COW_FILE_PAGE_SIZE];
-        file.seek(SeekFrom::Start(offset)).unwrap();
-        file.read_exact(&mut page).unwrap();
-        rewrite(&mut page);
-        write_block_checksum(&mut page);
-        file.seek(SeekFrom::Start(offset)).unwrap();
-        file.write_all(&page).unwrap();
-        file.flush().unwrap();
-    }
-
-    fn corrupt_blob_header_kind(
-        path: impl AsRef<Path>,
-        page_id: impl Into<u64>,
-        start_offset: u16,
-    ) {
-        let byte_offset = BLOCK_INTEGRITY_HEADER_SIZE
-            + COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE
-            + start_offset as usize;
-        rewrite_page_with_checksum(path, page_id, |page| {
-            page[byte_offset] = 0xFF;
         });
     }
 

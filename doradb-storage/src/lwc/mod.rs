@@ -2042,6 +2042,14 @@ mod tests {
         .row_shape_fingerprint()
     }
 
+    fn assert_invalid_payload<T>(result: DataIntegrityResult<T>) {
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|err| *err.current_context() == DataIntegrityError::InvalidPayload)
+        );
+    }
+
     #[test]
     fn test_lwc_primitive_serde() {
         // i8
@@ -2269,14 +2277,6 @@ mod tests {
         } else {
             panic!("expected bytes variant");
         }
-    }
-
-    fn assert_invalid_payload<T>(result: DataIntegrityResult<T>) {
-        assert!(
-            result
-                .as_ref()
-                .is_err_and(|err| *err.current_context() == DataIntegrityError::InvalidPayload)
-        );
     }
 
     #[test]

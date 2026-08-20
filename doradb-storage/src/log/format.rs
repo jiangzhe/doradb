@@ -757,6 +757,8 @@ mod tests {
     use super::*;
     use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
 
+    type CorruptCase = (&'static str, Box<dyn FnOnce(&mut [u8])>, DataIntegrityError);
+
     fn valid_super_block(slot_no: u32, generation: u64) -> RedoSuperBlock {
         let mut super_block =
             RedoSuperBlock::initial(7, STORAGE_SECTOR_SIZE * 2, STORAGE_SECTOR_SIZE * 8);
@@ -775,7 +777,9 @@ mod tests {
         assert_eq!(*err.current_context(), expected);
     }
 
-    type CorruptCase = (&'static str, Box<dyn FnOnce(&mut [u8])>, DataIntegrityError);
+    fn refresh_checksum(buf: &mut [u8]) {
+        write_block_checksum(buf);
+    }
 
     #[test]
     fn redo_block_header_serializes_fixed_layout() {
@@ -1221,9 +1225,5 @@ mod tests {
         let file = vec![0u8; REDO_DEFAULT_DATA_START_OFFSET];
         let err = select_redo_super_block(&file, 7).unwrap_err();
         assert_integrity_error(err, DataIntegrityError::InvalidMagic);
-    }
-
-    fn refresh_checksum(buf: &mut [u8]) {
-        write_block_checksum(buf);
     }
 }

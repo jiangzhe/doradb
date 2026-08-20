@@ -1350,15 +1350,6 @@ pub(crate) mod tests {
         }
     }
 
-    fn expect_runtime_report(error: RuntimeOrFatalError) -> Report<RuntimeError> {
-        match error {
-            RuntimeOrFatalError::Runtime(report) => report,
-            RuntimeOrFatalError::Fatal(report) => {
-                panic!("expected Runtime catalog failure, got Fatal: {report:?}")
-            }
-        }
-    }
-
     /// Publish a metadata-only catalog root with a test-controlled redo retention marker.
     pub(crate) async fn publish_first_redo_log_seq_for_test(
         storage: &CatalogStorage,
@@ -1371,6 +1362,15 @@ pub(crate) mod tests {
         )
         .await
     }
+
+    fn expect_runtime_report(error: RuntimeOrFatalError) -> Report<RuntimeError> {
+        match error {
+            RuntimeOrFatalError::Runtime(report) => report,
+            RuntimeOrFatalError::Fatal(report) => {
+                panic!("expected Runtime catalog failure, got Fatal: {report:?}")
+            }
+        }
+    }
     fn metadata_only_batch(replay_start_ts: TrxID) -> CatalogCheckpointBatch {
         CatalogCheckpointBatch {
             replay_start_ts,
@@ -1381,59 +1381,6 @@ pub(crate) mod tests {
             catalog_ddl_txn_count: 0,
             stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
         }
-    }
-
-    #[test]
-    fn test_static_catalog_definitions_expose_one_primary_key() {
-        for CatalogDefinition { table_id, metadata } in [
-            catalog_definition_of_tables(),
-            catalog_definition_of_columns(),
-            catalog_definition_of_indexes(),
-            catalog_definition_of_index_columns(),
-            catalog_definition_of_table_replay_silent_watermarks(),
-        ] {
-            let primary_keys = metadata
-                .idx
-                .active_indexes()
-                .filter(|(_, index_spec)| index_spec.primary_key())
-                .collect::<Vec<_>>();
-            assert_eq!(
-                primary_keys.len(),
-                1,
-                "catalog table {table_id} must expose exactly one primary key"
-            );
-            for key in &primary_keys[0].1.cols {
-                assert!(
-                    !metadata.col.nullable(usize::from(key.col_no)),
-                    "catalog table {table_id} primary key column {} must be non-null",
-                    key.col_no
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_catalog_leaf_validators_return_data_integrity_reports() {
-        let err = catalog_table_slot_checked(TABLE_ID_TABLES, 0).unwrap_err();
-        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
-
-        let metadata = &catalog_definition_of_tables().metadata;
-        let err = validate_catalog_row(metadata, &[], "catalog test row").unwrap_err();
-        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
-        let report = format!("{err:?}");
-        assert!(report.contains("catalog test row"), "{report}");
-
-        let err = table_replay_silent_watermark_object_from_vals(&[Val::from(1u32)]).unwrap_err();
-        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
-        let report = format!("{err:?}");
-        assert!(report.contains("table_id"), "{report}");
-        assert!(report.contains("index 0"), "{report}");
-
-        let err = table_replay_silent_watermark_object_from_vals(&[Val::from(1u64)]).unwrap_err();
-        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
-        let report = format!("{err:?}");
-        assert!(report.contains("heap_redo_start_ts"), "{report}");
-        assert!(report.contains("index 1"), "{report}");
     }
 
     async fn apply_metadata_only_checkpoint(
@@ -1672,6 +1619,59 @@ pub(crate) mod tests {
         assert!(report.contains(expected_message), "{report}");
         let current_replay_start_ts = storage.checkpoint_snapshot().catalog_replay_start_ts;
         assert_eq!(current_replay_start_ts, replay_start_ts);
+    }
+
+    #[test]
+    fn test_static_catalog_definitions_expose_one_primary_key() {
+        for CatalogDefinition { table_id, metadata } in [
+            catalog_definition_of_tables(),
+            catalog_definition_of_columns(),
+            catalog_definition_of_indexes(),
+            catalog_definition_of_index_columns(),
+            catalog_definition_of_table_replay_silent_watermarks(),
+        ] {
+            let primary_keys = metadata
+                .idx
+                .active_indexes()
+                .filter(|(_, index_spec)| index_spec.primary_key())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                primary_keys.len(),
+                1,
+                "catalog table {table_id} must expose exactly one primary key"
+            );
+            for key in &primary_keys[0].1.cols {
+                assert!(
+                    !metadata.col.nullable(usize::from(key.col_no)),
+                    "catalog table {table_id} primary key column {} must be non-null",
+                    key.col_no
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_catalog_leaf_validators_return_data_integrity_reports() {
+        let err = catalog_table_slot_checked(TABLE_ID_TABLES, 0).unwrap_err();
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
+
+        let metadata = &catalog_definition_of_tables().metadata;
+        let err = validate_catalog_row(metadata, &[], "catalog test row").unwrap_err();
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
+        let report = format!("{err:?}");
+        assert!(report.contains("catalog test row"), "{report}");
+
+        let err = table_replay_silent_watermark_object_from_vals(&[Val::from(1u32)]).unwrap_err();
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
+        let report = format!("{err:?}");
+        assert!(report.contains("table_id"), "{report}");
+        assert!(report.contains("index 0"), "{report}");
+
+        let err = table_replay_silent_watermark_object_from_vals(&[Val::from(1u64)]).unwrap_err();
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
+        let report = format!("{err:?}");
+        assert!(report.contains("heap_redo_start_ts"), "{report}");
+        assert!(report.contains("index 1"), "{report}");
     }
 
     #[test]

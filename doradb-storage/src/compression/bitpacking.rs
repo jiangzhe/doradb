@@ -1043,6 +1043,8 @@ fn value_fbp<T: BitPackable, const BITS: usize>(input: &[u8], min: T, idx: usize
 mod tests {
     use super::*;
 
+    const LEN: usize = 1000;
+
     trait FromU64: Sized {
         fn from_u64(val: u64) -> Self;
     }
@@ -1077,8 +1079,6 @@ mod tests {
         let decompressed = vec![T::ZERO; input_size];
         (input, compressed, decompressed)
     }
-
-    const LEN: usize = 1000;
 
     #[test]
     fn test_bitpack_i8() {

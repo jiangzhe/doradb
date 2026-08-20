@@ -1859,87 +1859,6 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use tempfile::TempDir;
 
-    fn owned_index_pool(pool_size: usize) -> QuiescentBox<FixedBufferPool> {
-        QuiescentBox::new(FixedBufferPool::with_capacity(PoolRole::Index, pool_size).unwrap())
-    }
-
-    fn owned_mem_pool(pool_size: usize) -> QuiescentBox<FixedBufferPool> {
-        QuiescentBox::new(FixedBufferPool::with_capacity(PoolRole::Mem, pool_size).unwrap())
-    }
-
-    fn fixed_pool_bytes(page_count: usize) -> usize {
-        page_count * (size_of::<BufferFrame>() + size_of::<Page>())
-    }
-
-    async fn append_test_row_pages(
-        index: &RowPageIndex,
-        pool_guard: &PoolGuard,
-        count: usize,
-        rows_per_page: u64,
-    ) -> Vec<PageID> {
-        let mut page_ids = Vec::with_capacity(count);
-        for idx in 0..count {
-            let page_id = test_page_id(10_000 + idx as i32);
-            loop {
-                if let Valid(_) = index
-                    .insert_row_page(pool_guard, rows_per_page, page_id, None)
-                    .await
-                    .expect("test row-page insertion should succeed")
-                {
-                    break;
-                }
-            }
-            page_ids.push(page_id);
-        }
-        page_ids
-    }
-
-    #[test]
-    fn test_row_page_index_node_reserves_checksum_footer() {
-        assert_eq!(mem::size_of::<RowPageIndexNode>(), PAGE_SIZE);
-        assert_eq!(
-            ROW_PAGE_INDEX_NODE_FOOTER_SIZE,
-            BLOCK_INTEGRITY_TRAILER_SIZE
-        );
-        assert_eq!(
-            ROW_PAGE_INDEX_NODE_USABLE_SIZE,
-            PAGE_SIZE - ROW_PAGE_INDEX_NODE_FOOTER_SIZE
-        );
-        assert_eq!(
-            mem::offset_of!(RowPageIndexNode, data),
-            ROW_PAGE_INDEX_NODE_HEADER_SIZE
-        );
-        assert_eq!(
-            mem::offset_of!(RowPageIndexNode, footer),
-            ROW_PAGE_INDEX_NODE_USABLE_SIZE
-        );
-        assert_eq!(
-            NBR_ENTRIES_IN_BRANCH,
-            (ROW_PAGE_INDEX_NODE_USABLE_SIZE - ROW_PAGE_INDEX_NODE_HEADER_SIZE) / ENTRY_SIZE
-        );
-        assert_eq!(NBR_ROW_PAGE_ENTRIES_IN_LEAF, NBR_ENTRIES_IN_BRANCH);
-    }
-
-    async fn fill_root_leaf_full(blk_idx: &RowPageIndex, pool_guard: &PoolGuard) {
-        let mut root = blk_idx
-            .pool
-            .get_page::<RowPageIndexNode>(
-                pool_guard,
-                blk_idx.root_page_id(),
-                LatchFallbackMode::Exclusive,
-            )
-            .await
-            .expect("test row-page-index root read should succeed")
-            .lock_exclusive_async()
-            .await
-            .unwrap();
-        let root = root.page_mut();
-        root.init_empty(0, RowID::new(0));
-        for i in 0..NBR_ROW_PAGE_ENTRIES_IN_LEAF {
-            root.leaf_add_entry(RowID::from(i), 1, test_page_id(i as i32));
-        }
-    }
-
     struct FailingInsertPagePool {
         inner: QuiescentGuard<FixedBufferPool>,
         fail_page_id: AtomicU64,
@@ -2042,6 +1961,105 @@ mod tests {
         ) -> impl Future<Output = RuntimeResult<Validation<FacadePageGuard<T>>>> + Send {
             self.inner.get_child_page(guard, p_guard, page_id, mode)
         }
+    }
+
+    fn owned_index_pool(pool_size: usize) -> QuiescentBox<FixedBufferPool> {
+        QuiescentBox::new(FixedBufferPool::with_capacity(PoolRole::Index, pool_size).unwrap())
+    }
+
+    fn owned_mem_pool(pool_size: usize) -> QuiescentBox<FixedBufferPool> {
+        QuiescentBox::new(FixedBufferPool::with_capacity(PoolRole::Mem, pool_size).unwrap())
+    }
+
+    fn fixed_pool_bytes(page_count: usize) -> usize {
+        page_count * (size_of::<BufferFrame>() + size_of::<Page>())
+    }
+
+    async fn append_test_row_pages(
+        index: &RowPageIndex,
+        pool_guard: &PoolGuard,
+        count: usize,
+        rows_per_page: u64,
+    ) -> Vec<PageID> {
+        let mut page_ids = Vec::with_capacity(count);
+        for idx in 0..count {
+            let page_id = test_page_id(10_000 + idx as i32);
+            loop {
+                if let Valid(_) = index
+                    .insert_row_page(pool_guard, rows_per_page, page_id, None)
+                    .await
+                    .expect("test row-page insertion should succeed")
+                {
+                    break;
+                }
+            }
+            page_ids.push(page_id);
+        }
+        page_ids
+    }
+
+    async fn fill_root_leaf_full(blk_idx: &RowPageIndex, pool_guard: &PoolGuard) {
+        let mut root = blk_idx
+            .pool
+            .get_page::<RowPageIndexNode>(
+                pool_guard,
+                blk_idx.root_page_id(),
+                LatchFallbackMode::Exclusive,
+            )
+            .await
+            .expect("test row-page-index root read should succeed")
+            .lock_exclusive_async()
+            .await
+            .unwrap();
+        let root = root.page_mut();
+        root.init_empty(0, RowID::new(0));
+        for i in 0..NBR_ROW_PAGE_ENTRIES_IN_LEAF {
+            root.leaf_add_entry(RowID::from(i), 1, test_page_id(i as i32));
+        }
+    }
+
+    fn first_i32_unique_index() -> IndexSpec {
+        IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)
+    }
+
+    fn make_test_metadata() -> Arc<TableMetadata> {
+        Arc::new(
+            TableMetadata::try_new(
+                vec![ColumnSpec {
+                    column_name: SemiStr::new("id"),
+                    column_type: ValKind::I32,
+                    column_attributes: ColumnAttributes::empty(),
+                }],
+                vec![first_i32_unique_index()],
+            )
+            .expect("valid table metadata"),
+        )
+    }
+
+    #[test]
+    fn test_row_page_index_node_reserves_checksum_footer() {
+        assert_eq!(mem::size_of::<RowPageIndexNode>(), PAGE_SIZE);
+        assert_eq!(
+            ROW_PAGE_INDEX_NODE_FOOTER_SIZE,
+            BLOCK_INTEGRITY_TRAILER_SIZE
+        );
+        assert_eq!(
+            ROW_PAGE_INDEX_NODE_USABLE_SIZE,
+            PAGE_SIZE - ROW_PAGE_INDEX_NODE_FOOTER_SIZE
+        );
+        assert_eq!(
+            mem::offset_of!(RowPageIndexNode, data),
+            ROW_PAGE_INDEX_NODE_HEADER_SIZE
+        );
+        assert_eq!(
+            mem::offset_of!(RowPageIndexNode, footer),
+            ROW_PAGE_INDEX_NODE_USABLE_SIZE
+        );
+        assert_eq!(
+            NBR_ENTRIES_IN_BRANCH,
+            (ROW_PAGE_INDEX_NODE_USABLE_SIZE - ROW_PAGE_INDEX_NODE_HEADER_SIZE) / ENTRY_SIZE
+        );
+        assert_eq!(NBR_ROW_PAGE_ENTRIES_IN_LEAF, NBR_ENTRIES_IN_BRANCH);
     }
 
     #[test]
@@ -3168,23 +3186,5 @@ mod tests {
             }
             assert_eq!(create_row_page_logs, NBR_ROW_PAGE_ENTRIES_IN_LEAF + 64);
         })
-    }
-
-    fn first_i32_unique_index() -> IndexSpec {
-        IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)
-    }
-
-    fn make_test_metadata() -> Arc<TableMetadata> {
-        Arc::new(
-            TableMetadata::try_new(
-                vec![ColumnSpec {
-                    column_name: SemiStr::new("id"),
-                    column_type: ValKind::I32,
-                    column_attributes: ColumnAttributes::empty(),
-                }],
-                vec![first_i32_unique_index()],
-            )
-            .expect("valid table metadata"),
-        )
     }
 }

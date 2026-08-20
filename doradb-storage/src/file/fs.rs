@@ -2203,12 +2203,14 @@ pub(crate) mod tests {
     const TEST_WAIT_RETRIES: usize = 2000;
     const TEST_WAIT_INTERVAL: Duration = Duration::from_millis(1);
 
+    /// Test fixture for test file system.
     pub(crate) struct TestFileSystem {
         fs: Option<QuiescentGuard<FileSystem>>,
         registry: ComponentRegistry,
     }
 
     impl TestFileSystem {
+        /// Shuts down the test fixture.
         #[inline]
         pub(crate) fn shutdown(&self) {
             self.registry
@@ -2216,6 +2218,7 @@ pub(crate) mod tests {
                 .propagate_or_suppress("test_filesystem_shutdown");
         }
 
+        /// Returns the test fixture guard.
         #[inline]
         pub(crate) fn guard(&self) -> QuiescentGuard<FileSystem> {
             self.fs
@@ -2224,16 +2227,19 @@ pub(crate) mod tests {
                 .clone()
         }
 
+        /// Provides test-only access to `disk_pool`.
         #[inline]
         pub(crate) fn disk_pool(&self) -> DiskPool {
             self.registry.dependency::<DiskPool>()
         }
 
+        /// Provides test-only access to `mem_pool`.
         #[inline]
         pub(crate) fn mem_pool(&self) -> QuiescentGuard<EvictableBufferPool> {
             self.registry.dependency::<MemPool>().clone_inner()
         }
 
+        /// Provides test-only access to `index_pool`.
         #[inline]
         pub(crate) fn index_pool(&self) -> QuiescentGuard<EvictableBufferPool> {
             self.registry.dependency::<IndexPool>().clone_inner()
@@ -2259,166 +2265,9 @@ pub(crate) mod tests {
         }
     }
 
-    #[inline]
-    pub(crate) fn io_backend_stats_handle_identity(fs: &FileSystem) -> usize {
-        fs.io_backend_stats.identity()
-    }
-
-    #[inline]
-    pub(crate) fn build_test_fs_owner_in(data_dir: &Path) -> Result<QuiescentBox<FileSystem>> {
-        let (fs, _workers) = FileSystemConfig::default()
-            .data_dir(data_dir)
-            .readonly_buffer_size(TEST_READONLY_BUFFER_BYTES)
-            .validate()
-            .disclose()?
-            .build_engine_parts()
-            .disclose()?;
-        Ok(QuiescentBox::new(fs))
-    }
-
-    fn build_test_engine(storage_root: &Path, file: FileSystemConfig) -> Result<Engine> {
-        smol::block_on(async {
-            Engine::bootstrap(
-                EngineConfig::default()
-                    .storage_root(storage_root)
-                    .meta_buffer(TEST_META_POOL_BYTES)
-                    .index_buffer(
-                        EvictableBufferPoolConfig::default()
-                            .swap_file("index.swp")
-                            .max_mem_size(TEST_INDEX_POOL_BYTES)
-                            .max_file_size(TEST_INDEX_MAX_FILE_BYTES),
-                    )
-                    .data_buffer(
-                        EvictableBufferPoolConfig::default()
-                            .max_mem_size(TEST_DATA_POOL_BYTES)
-                            .max_file_size(TEST_DATA_MAX_FILE_BYTES),
-                    )
-                    .file(file)
-                    .trx(TrxSysConfig::default()),
-            )
-            .await
-        })
-    }
-
-    fn build_test_fs_with_config_in(
-        data_dir: &Path,
-        file: FileSystemConfig,
-    ) -> Result<TestFileSystem> {
-        smol::block_on(async {
-            let file = file
-                .data_dir(data_dir)
-                .readonly_buffer_size(TEST_READONLY_BUFFER_BYTES);
-            let readonly_buffer_size = file.readonly_buffer_size;
-            let file = file.validate().disclose()?;
-            let mut builder = RegistryBuilder::new();
-            builder.build::<EnginePoisoner>(()).await.unwrap();
-            builder.build::<FileSystem>(file).await.disclose()?;
-            builder
-                .build::<DiskPool>(DiskPoolConfig::new(readonly_buffer_size))
-                .await
-                .disclose()?;
-            builder
-                .build::<MetaPool>(MetaPoolConfig::new(TEST_META_POOL_BYTES))
-                .await
-                .disclose()?;
-            builder
-                .build::<IndexPool>(
-                    EvictableBufferPoolConfig::default()
-                        .max_mem_size(TEST_INDEX_POOL_BYTES)
-                        .max_file_size(TEST_INDEX_MAX_FILE_BYTES)
-                        .swap_file(data_dir.join("index.swp")),
-                )
-                .await
-                .disclose()?;
-            builder
-                .build::<MemPool>(
-                    EvictableBufferPoolConfig::default()
-                        .max_mem_size(TEST_DATA_POOL_BYTES)
-                        .max_file_size(TEST_DATA_MAX_FILE_BYTES)
-                        .swap_file(data_dir.join("data.swp")),
-                )
-                .await
-                .disclose()?;
-            builder.build::<FileSystemWorkers>(()).await.disclose()?;
-            builder
-                .build::<SharedPoolEvictorWorkers>(())
-                .await
-                .disclose()?;
-            let registry = builder.finish();
-            let fs = registry.dependency::<FileSystem>();
-            Ok(TestFileSystem {
-                fs: Some(fs),
-                registry,
-            })
-        })
-    }
-
-    #[inline]
-    pub(crate) fn build_test_fs() -> (TempDir, TestFileSystem) {
-        let temp_dir = TempDir::new().unwrap();
-        let fs = build_test_fs_in(temp_dir.path());
-        (temp_dir, fs)
-    }
-
-    #[inline]
-    pub(crate) fn build_test_fs_in(data_dir: &Path) -> TestFileSystem {
-        build_test_fs_with_config_in(
-            data_dir,
-            FileSystemConfig::default().readonly_buffer_size(TEST_READONLY_BUFFER_BYTES),
-        )
-        .unwrap()
-    }
-
-    fn make_metadata() -> Arc<TableMetadata> {
-        Arc::new(
-            TableMetadata::try_new(
-                vec![ColumnSpec::new(
-                    "c0",
-                    ValKind::U32,
-                    ColumnAttributes::empty(),
-                )],
-                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
-            )
-            .expect("valid table metadata"),
-        )
-    }
-
-    async fn write_payload(
-        fs: &FileSystem,
-        table_file: &Arc<TableFile>,
-        block_id: BlockID,
-        payload: &[u8],
-    ) {
-        let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
-        buf.as_bytes_mut()[..payload.len()].copy_from_slice(payload);
-        let global = global_readonly_pool_scope(64 * 1024 * 1024);
-        let disk_pool = table_readonly_pool(&global, test_user_table_id(0), table_file);
-        let mutable = MutableTableFile::fork(
-            table_file,
-            fs.background_writes(),
-            disk_pool.global_pool().clone(),
-            disk_pool.create_base_guard(),
-        );
-        mutable.write_block(block_id, buf).await.unwrap();
-        drop(mutable);
-    }
-
     #[derive(Clone)]
     struct ControlledStorageOpHook {
         inner: Arc<ControlledStorageOpHookInner>,
-    }
-
-    struct ControlledStorageOpHookInner {
-        blocked_kind: IOKind,
-        blocked_file: StorageBackendFileIdentity,
-        recorded_files: Vec<StorageBackendFileIdentity>,
-        submits: Mutex<Vec<StorageBackendOp>>,
-        submit_count: AtomicUsize,
-        submit_ev: Event,
-        blocked_submits: AtomicUsize,
-        blocked_submit_ev: Event,
-        released: AtomicBool,
-        release_ev: Event,
     }
 
     impl ControlledStorageOpHook {
@@ -2524,6 +2373,19 @@ pub(crate) mod tests {
         }
     }
 
+    struct ControlledStorageOpHookInner {
+        blocked_kind: IOKind,
+        blocked_file: StorageBackendFileIdentity,
+        recorded_files: Vec<StorageBackendFileIdentity>,
+        submits: Mutex<Vec<StorageBackendOp>>,
+        submit_count: AtomicUsize,
+        submit_ev: Event,
+        blocked_submits: AtomicUsize,
+        blocked_submit_ev: Event,
+        released: AtomicBool,
+        release_ev: Event,
+    }
+
     struct FailingFirstWriteHook {
         file_path: PathBuf,
         failed: AtomicBool,
@@ -2559,11 +2421,6 @@ pub(crate) mod tests {
         inner: Arc<RecordingStorageOpHookInner>,
     }
 
-    struct RecordingStorageOpHookInner {
-        recorded_file: StorageBackendFileIdentity,
-        submits: Mutex<Vec<StorageBackendOp>>,
-    }
-
     impl RecordingStorageOpHook {
         fn new(recorded_file: StorageBackendFileIdentity) -> Self {
             Self {
@@ -2585,6 +2442,11 @@ pub(crate) mod tests {
                 self.inner.submits.lock().push(op);
             }
         }
+    }
+
+    struct RecordingStorageOpHookInner {
+        recorded_file: StorageBackendFileIdentity,
+        submits: Mutex<Vec<StorageBackendOp>>,
     }
 
     struct FailingStorageOpHook {
@@ -2716,6 +2578,154 @@ pub(crate) mod tests {
         fn drop(&mut self) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    /// Provides test-only access to `io_backend_stats_handle_identity`.
+    #[inline]
+    pub(crate) fn io_backend_stats_handle_identity(fs: &FileSystem) -> usize {
+        fs.io_backend_stats.identity()
+    }
+
+    /// Builds test fs owner in for tests.
+    #[inline]
+    pub(crate) fn build_test_fs_owner_in(data_dir: &Path) -> Result<QuiescentBox<FileSystem>> {
+        let (fs, _workers) = FileSystemConfig::default()
+            .data_dir(data_dir)
+            .readonly_buffer_size(TEST_READONLY_BUFFER_BYTES)
+            .validate()
+            .disclose()?
+            .build_engine_parts()
+            .disclose()?;
+        Ok(QuiescentBox::new(fs))
+    }
+
+    /// Builds test fs for tests.
+    #[inline]
+    pub(crate) fn build_test_fs() -> (TempDir, TestFileSystem) {
+        let temp_dir = TempDir::new().unwrap();
+        let fs = build_test_fs_in(temp_dir.path());
+        (temp_dir, fs)
+    }
+
+    /// Builds test fs in for tests.
+    #[inline]
+    pub(crate) fn build_test_fs_in(data_dir: &Path) -> TestFileSystem {
+        build_test_fs_with_config_in(
+            data_dir,
+            FileSystemConfig::default().readonly_buffer_size(TEST_READONLY_BUFFER_BYTES),
+        )
+        .unwrap()
+    }
+
+    fn build_test_engine(storage_root: &Path, file: FileSystemConfig) -> Result<Engine> {
+        smol::block_on(async {
+            Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(storage_root)
+                    .meta_buffer(TEST_META_POOL_BYTES)
+                    .index_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .swap_file("index.swp")
+                            .max_mem_size(TEST_INDEX_POOL_BYTES)
+                            .max_file_size(TEST_INDEX_MAX_FILE_BYTES),
+                    )
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .max_mem_size(TEST_DATA_POOL_BYTES)
+                            .max_file_size(TEST_DATA_MAX_FILE_BYTES),
+                    )
+                    .file(file)
+                    .trx(TrxSysConfig::default()),
+            )
+            .await
+        })
+    }
+
+    fn build_test_fs_with_config_in(
+        data_dir: &Path,
+        file: FileSystemConfig,
+    ) -> Result<TestFileSystem> {
+        smol::block_on(async {
+            let file = file
+                .data_dir(data_dir)
+                .readonly_buffer_size(TEST_READONLY_BUFFER_BYTES);
+            let readonly_buffer_size = file.readonly_buffer_size;
+            let file = file.validate().disclose()?;
+            let mut builder = RegistryBuilder::new();
+            builder.build::<EnginePoisoner>(()).await.unwrap();
+            builder.build::<FileSystem>(file).await.disclose()?;
+            builder
+                .build::<DiskPool>(DiskPoolConfig::new(readonly_buffer_size))
+                .await
+                .disclose()?;
+            builder
+                .build::<MetaPool>(MetaPoolConfig::new(TEST_META_POOL_BYTES))
+                .await
+                .disclose()?;
+            builder
+                .build::<IndexPool>(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(TEST_INDEX_POOL_BYTES)
+                        .max_file_size(TEST_INDEX_MAX_FILE_BYTES)
+                        .swap_file(data_dir.join("index.swp")),
+                )
+                .await
+                .disclose()?;
+            builder
+                .build::<MemPool>(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(TEST_DATA_POOL_BYTES)
+                        .max_file_size(TEST_DATA_MAX_FILE_BYTES)
+                        .swap_file(data_dir.join("data.swp")),
+                )
+                .await
+                .disclose()?;
+            builder.build::<FileSystemWorkers>(()).await.disclose()?;
+            builder
+                .build::<SharedPoolEvictorWorkers>(())
+                .await
+                .disclose()?;
+            let registry = builder.finish();
+            let fs = registry.dependency::<FileSystem>();
+            Ok(TestFileSystem {
+                fs: Some(fs),
+                registry,
+            })
+        })
+    }
+
+    fn make_metadata() -> Arc<TableMetadata> {
+        Arc::new(
+            TableMetadata::try_new(
+                vec![ColumnSpec::new(
+                    "c0",
+                    ValKind::U32,
+                    ColumnAttributes::empty(),
+                )],
+                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+            )
+            .expect("valid table metadata"),
+        )
+    }
+
+    async fn write_payload(
+        fs: &FileSystem,
+        table_file: &Arc<TableFile>,
+        block_id: BlockID,
+        payload: &[u8],
+    ) {
+        let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
+        buf.as_bytes_mut()[..payload.len()].copy_from_slice(payload);
+        let global = global_readonly_pool_scope(64 * 1024 * 1024);
+        let disk_pool = table_readonly_pool(&global, test_user_table_id(0), table_file);
+        let mutable = MutableTableFile::fork(
+            table_file,
+            fs.background_writes(),
+            disk_pool.global_pool().clone(),
+            disk_pool.create_base_guard(),
+        );
+        mutable.write_block(block_id, buf).await.unwrap();
+        drop(mutable);
     }
 
     fn op_kinds(ops: &[StorageBackendOp]) -> Vec<IOKind> {

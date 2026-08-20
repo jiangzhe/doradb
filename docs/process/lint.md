@@ -35,7 +35,9 @@ tools/style_audit.rs
 
 This command checks working-tree `.rs` files changed against
 `merge-base(origin/main, HEAD)` and reports formatting, clippy, and repository
-style violations.
+style violations. Scope-local structure checks also inspect the immediate items
+inside each file's top-level inline `#[cfg(test)] mod tests` module. File-level
+test-module placement and uniqueness checks remain limited to the file root.
 
 To audit against a different branch base, pass an explicit diff base:
 

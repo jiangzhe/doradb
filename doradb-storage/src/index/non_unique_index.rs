@@ -381,6 +381,136 @@ mod tests {
         entries.pop().unwrap()
     }
 
+    async fn run_test_suit_for_non_unique_index<P: BufferPool>(
+        index: GuardedNonUniqueMemIndex<'_, '_, P>,
+    ) {
+        // 测试用例1：基本插入和查找操作
+        let key = vec![Val::from(42i32)];
+        let row_id = 100u64;
+
+        // 测试插入
+        index
+            .insert_if_not_exists(&key, RowID::new(row_id), false, TrxID::new(100))
+            .await
+            .unwrap();
+
+        // 测试查找
+        assert_eq!(lookup_rows(&index, &key).await, vec![RowID::new(row_id)]);
+
+        // 测试不存在的键
+        let non_existent_key = vec![Val::from(43i32)];
+        assert!(lookup_rows(&index, &non_existent_key).await.is_empty());
+
+        // 测试用例2：重复插入
+        let new_row_id = 200u64;
+        index
+            .insert_if_not_exists(&key, RowID::new(new_row_id), false, TrxID::new(100))
+            .await
+            .unwrap();
+        // non-unique index allow duplicate key, but row id must be different.
+        assert_eq!(
+            lookup_rows(&index, &key).await,
+            vec![RowID::new(row_id), RowID::new(new_row_id)]
+        );
+
+        // 测试用例3：删除操作
+        assert!(
+            index
+                .compare_delete(&key, RowID::new(row_id), true, TrxID::new(100))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            lookup_rows(&index, &key).await,
+            vec![RowID::new(new_row_id)]
+        );
+
+        // 测试删除不存在的键 still ok
+        assert!(
+            index
+                .compare_delete(&key, RowID::new(1000), false, TrxID::new(100))
+                .await
+                .unwrap()
+        );
+
+        // 测试用例4：scan_values 操作
+        let values = scan_rows(&index).await;
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0], RowID::new(new_row_id));
+
+        // 测试用例5：多分区操作
+        let key1 = vec![Val::from(1i32)];
+        let key2 = vec![Val::from(2i32)];
+        let key3 = vec![Val::from(3i32)];
+
+        let row_id1 = 500u64;
+        let row_id2 = 600u64;
+        let row_id3 = 700u64;
+
+        // 插入多个键值对
+        index
+            .insert_if_not_exists(&key1, RowID::new(row_id1), false, TrxID::new(100))
+            .await
+            .unwrap();
+        index
+            .insert_if_not_exists(&key2, RowID::new(row_id2), false, TrxID::new(100))
+            .await
+            .unwrap();
+        index
+            .insert_if_not_exists(&key3, RowID::new(row_id3), false, TrxID::new(100))
+            .await
+            .unwrap();
+
+        // 验证所有键都能正确查找
+        assert_eq!(lookup_rows(&index, &key1).await.len(), 1);
+        assert_eq!(lookup_rows(&index, &key2).await.len(), 1);
+        assert_eq!(lookup_rows(&index, &key3).await.len(), 1);
+
+        // 验证 scan_values 包含所有值
+        let values = scan_rows(&index).await;
+        assert_eq!(values.len(), 4); // 包含之前插入的 row_id2
+
+        // 验证insert覆盖
+        let key4 = vec![Val::from(97i32)];
+        let row_id4 = 800u64;
+        let inserted = index
+            .insert_if_not_exists(&key4, RowID::new(row_id4), false, TrxID::new(100))
+            .await
+            .unwrap();
+        assert!(inserted.is_ok());
+        let masked = index
+            .mask_as_deleted(&key4, RowID::new(row_id4), TrxID::new(100))
+            .await
+            .unwrap();
+        assert!(masked);
+        let inserted = index
+            .insert_if_not_exists(&key4, RowID::new(row_id4), true, TrxID::new(100))
+            .await
+            .unwrap();
+        assert!(inserted.is_ok());
+        assert!(matches!(inserted, IndexInsert::Ok(true)));
+        assert_eq!(lookup_rows(&index, &key4).await, vec![RowID::new(row_id4)]);
+    }
+
+    async fn lookup_rows<P: BufferPool>(
+        index: &GuardedNonUniqueMemIndex<'_, '_, P>,
+        key: &[Val],
+    ) -> Vec<RowID> {
+        let range = index.index.encoder().encode_non_unique_equal_range(key);
+        let mut stream = index
+            .equal_scan_candidates(&range, TrxID::new(100))
+            .unwrap();
+        drain_row_ids(&mut stream).await
+    }
+
+    async fn scan_rows<P: BufferPool>(index: &GuardedNonUniqueMemIndex<'_, '_, P>) -> Vec<RowID> {
+        let range = KeyRange::new(Unbounded, Unbounded);
+        let mut stream = index
+            .index_scan_candidates(&range, TrxID::new(100))
+            .unwrap();
+        drain_row_ids(&mut stream).await
+    }
+
     #[test]
     fn test_non_unique_index() {
         smol::block_on(async {
@@ -755,135 +885,5 @@ mod tests {
             assert!(batch.entries[0].deleted);
             assert!(scan.next_batch().await.unwrap().is_none());
         })
-    }
-
-    async fn run_test_suit_for_non_unique_index<P: BufferPool>(
-        index: GuardedNonUniqueMemIndex<'_, '_, P>,
-    ) {
-        // 测试用例1：基本插入和查找操作
-        let key = vec![Val::from(42i32)];
-        let row_id = 100u64;
-
-        // 测试插入
-        index
-            .insert_if_not_exists(&key, RowID::new(row_id), false, TrxID::new(100))
-            .await
-            .unwrap();
-
-        // 测试查找
-        assert_eq!(lookup_rows(&index, &key).await, vec![RowID::new(row_id)]);
-
-        // 测试不存在的键
-        let non_existent_key = vec![Val::from(43i32)];
-        assert!(lookup_rows(&index, &non_existent_key).await.is_empty());
-
-        // 测试用例2：重复插入
-        let new_row_id = 200u64;
-        index
-            .insert_if_not_exists(&key, RowID::new(new_row_id), false, TrxID::new(100))
-            .await
-            .unwrap();
-        // non-unique index allow duplicate key, but row id must be different.
-        assert_eq!(
-            lookup_rows(&index, &key).await,
-            vec![RowID::new(row_id), RowID::new(new_row_id)]
-        );
-
-        // 测试用例3：删除操作
-        assert!(
-            index
-                .compare_delete(&key, RowID::new(row_id), true, TrxID::new(100))
-                .await
-                .unwrap()
-        );
-        assert_eq!(
-            lookup_rows(&index, &key).await,
-            vec![RowID::new(new_row_id)]
-        );
-
-        // 测试删除不存在的键 still ok
-        assert!(
-            index
-                .compare_delete(&key, RowID::new(1000), false, TrxID::new(100))
-                .await
-                .unwrap()
-        );
-
-        // 测试用例4：scan_values 操作
-        let values = scan_rows(&index).await;
-        assert_eq!(values.len(), 1);
-        assert_eq!(values[0], RowID::new(new_row_id));
-
-        // 测试用例5：多分区操作
-        let key1 = vec![Val::from(1i32)];
-        let key2 = vec![Val::from(2i32)];
-        let key3 = vec![Val::from(3i32)];
-
-        let row_id1 = 500u64;
-        let row_id2 = 600u64;
-        let row_id3 = 700u64;
-
-        // 插入多个键值对
-        index
-            .insert_if_not_exists(&key1, RowID::new(row_id1), false, TrxID::new(100))
-            .await
-            .unwrap();
-        index
-            .insert_if_not_exists(&key2, RowID::new(row_id2), false, TrxID::new(100))
-            .await
-            .unwrap();
-        index
-            .insert_if_not_exists(&key3, RowID::new(row_id3), false, TrxID::new(100))
-            .await
-            .unwrap();
-
-        // 验证所有键都能正确查找
-        assert_eq!(lookup_rows(&index, &key1).await.len(), 1);
-        assert_eq!(lookup_rows(&index, &key2).await.len(), 1);
-        assert_eq!(lookup_rows(&index, &key3).await.len(), 1);
-
-        // 验证 scan_values 包含所有值
-        let values = scan_rows(&index).await;
-        assert_eq!(values.len(), 4); // 包含之前插入的 row_id2
-
-        // 验证insert覆盖
-        let key4 = vec![Val::from(97i32)];
-        let row_id4 = 800u64;
-        let inserted = index
-            .insert_if_not_exists(&key4, RowID::new(row_id4), false, TrxID::new(100))
-            .await
-            .unwrap();
-        assert!(inserted.is_ok());
-        let masked = index
-            .mask_as_deleted(&key4, RowID::new(row_id4), TrxID::new(100))
-            .await
-            .unwrap();
-        assert!(masked);
-        let inserted = index
-            .insert_if_not_exists(&key4, RowID::new(row_id4), true, TrxID::new(100))
-            .await
-            .unwrap();
-        assert!(inserted.is_ok());
-        assert!(matches!(inserted, IndexInsert::Ok(true)));
-        assert_eq!(lookup_rows(&index, &key4).await, vec![RowID::new(row_id4)]);
-    }
-
-    async fn lookup_rows<P: BufferPool>(
-        index: &GuardedNonUniqueMemIndex<'_, '_, P>,
-        key: &[Val],
-    ) -> Vec<RowID> {
-        let range = index.index.encoder().encode_non_unique_equal_range(key);
-        let mut stream = index
-            .equal_scan_candidates(&range, TrxID::new(100))
-            .unwrap();
-        drain_row_ids(&mut stream).await
-    }
-
-    async fn scan_rows<P: BufferPool>(index: &GuardedNonUniqueMemIndex<'_, '_, P>) -> Vec<RowID> {
-        let range = KeyRange::new(Unbounded, Unbounded);
-        let mut stream = index
-            .index_scan_candidates(&range, TrxID::new(100))
-            .unwrap();
-        drain_row_ids(&mut stream).await
     }
 }

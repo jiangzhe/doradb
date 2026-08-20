@@ -283,6 +283,76 @@ mod tests {
     use std::thread::spawn;
     use std::time::{Duration, Instant};
 
+    struct Counter {
+        data: UnsafeCell<usize>,
+        mu: RawRwLock,
+    }
+    impl Counter {
+        #[inline]
+        fn new() -> Self {
+            Counter {
+                data: UnsafeCell::new(0),
+                mu: RawRwLock::new(),
+            }
+        }
+
+        #[inline]
+        fn inc(&self) {
+            // SAFETY: this helper holds the exclusive lock while mutating the
+            // counter stored in `UnsafeCell`.
+            unsafe {
+                self.mu.lock_exclusive();
+                *self.data.get() += 1;
+                self.mu.unlock_exclusive();
+            }
+        }
+
+        #[inline]
+        async fn inc_async(&self) {
+            // SAFETY: this helper holds the exclusive lock while mutating the
+            // counter stored in `UnsafeCell`.
+            unsafe {
+                self.mu.lock_exclusive_async().await;
+                *self.data.get() += 1;
+                self.mu.unlock_exclusive();
+            }
+        }
+
+        #[inline]
+        fn val(&self) -> usize {
+            // SAFETY: tests only read the counter after all worker activity is
+            // quiesced, so no concurrent mutation remains.
+            unsafe { *self.data.get() }
+        }
+    }
+    // SAFETY: shared references are synchronized by `RawRwLock`.
+    unsafe impl Sync for Counter {}
+
+    struct ParkingLotCounter {
+        data: UnsafeCell<usize>,
+        mu: ParkingLotRawRwLock,
+    }
+    impl ParkingLotCounter {
+        #[inline]
+        fn new() -> Self {
+            ParkingLotCounter {
+                data: UnsafeCell::new(0),
+                mu: ParkingLotRawRwLock::INIT,
+            }
+        }
+
+        #[inline]
+        fn inc(&self) {
+            // SAFETY: this helper holds the parking_lot exclusive raw lock while
+            // mutating the counter.
+            unsafe {
+                self.mu.lock_exclusive();
+                *self.data.get() += 1;
+                self.mu.unlock_exclusive();
+            }
+        }
+    }
+
     #[test]
     fn test_raw_rwlock_ops() {
         smol::block_on(async {
@@ -465,75 +535,5 @@ mod tests {
                 COUNT as f64 * 1_000_000_000f64 / dur1.as_nanos() as f64
             );
         });
-    }
-
-    struct Counter {
-        data: UnsafeCell<usize>,
-        mu: RawRwLock,
-    }
-    impl Counter {
-        #[inline]
-        fn new() -> Self {
-            Counter {
-                data: UnsafeCell::new(0),
-                mu: RawRwLock::new(),
-            }
-        }
-
-        #[inline]
-        fn inc(&self) {
-            // SAFETY: this helper holds the exclusive lock while mutating the
-            // counter stored in `UnsafeCell`.
-            unsafe {
-                self.mu.lock_exclusive();
-                *self.data.get() += 1;
-                self.mu.unlock_exclusive();
-            }
-        }
-
-        #[inline]
-        async fn inc_async(&self) {
-            // SAFETY: this helper holds the exclusive lock while mutating the
-            // counter stored in `UnsafeCell`.
-            unsafe {
-                self.mu.lock_exclusive_async().await;
-                *self.data.get() += 1;
-                self.mu.unlock_exclusive();
-            }
-        }
-
-        #[inline]
-        fn val(&self) -> usize {
-            // SAFETY: tests only read the counter after all worker activity is
-            // quiesced, so no concurrent mutation remains.
-            unsafe { *self.data.get() }
-        }
-    }
-    // SAFETY: shared references are synchronized by `RawRwLock`.
-    unsafe impl Sync for Counter {}
-
-    struct ParkingLotCounter {
-        data: UnsafeCell<usize>,
-        mu: ParkingLotRawRwLock,
-    }
-    impl ParkingLotCounter {
-        #[inline]
-        fn new() -> Self {
-            ParkingLotCounter {
-                data: UnsafeCell::new(0),
-                mu: ParkingLotRawRwLock::INIT,
-            }
-        }
-
-        #[inline]
-        fn inc(&self) {
-            // SAFETY: this helper holds the parking_lot exclusive raw lock while
-            // mutating the counter.
-            unsafe {
-                self.mu.lock_exclusive();
-                *self.data.get() += 1;
-                self.mu.unlock_exclusive();
-            }
-        }
     }
 }

@@ -894,6 +894,60 @@ mod tests {
         mutable_file.commit(ts, false).await.disclose()
     }
 
+    fn build_test_metadata() -> Arc<TableMetadata> {
+        Arc::new(
+            TableMetadata::try_new(
+                vec![
+                    ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
+                    ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
+                ],
+                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+            )
+            .expect("valid table metadata"),
+        )
+    }
+
+    fn page_buf(payload: &[u8]) -> DirectBuf {
+        let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
+        buf.data_mut()[..payload.len()].copy_from_slice(payload);
+        buf
+    }
+
+    fn first_unallocated_blocks(root: &ActiveRoot, count: usize) -> Vec<BlockID> {
+        (1..root.alloc_map.len())
+            .filter(|idx| !root.alloc_map.is_allocated(*idx))
+            .take(count)
+            .map(BlockID::from)
+            .collect()
+    }
+
+    fn overwrite_file_bytes(path: &str, offset: u64, bytes: &[u8]) {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    fn assert_table_meta_corruption(err: Error, page_id: BlockID, expected: DataIntegrityError) {
+        assert_eq!(err.kind(), ErrorKind::Runtime);
+        assert_eq!(
+            err.report().downcast_ref::<RuntimeError>().copied(),
+            Some(RuntimeError::FileRootAccess)
+        );
+        assert_eq!(
+            err.report().downcast_ref::<DataIntegrityError>().copied(),
+            Some(expected)
+        );
+        let report = format!("{err:?}");
+        assert!(report.contains("table_file"), "{report}");
+        assert!(report.contains("table_meta"), "{report}");
+        assert!(report.contains(&format!("block_id={page_id}")), "{report}");
+    }
+
     #[test]
     fn test_table_file() {
         smol::block_on(async {
@@ -1305,60 +1359,6 @@ mod tests {
             drop(fs);
             drop(table_file);
         });
-    }
-
-    fn build_test_metadata() -> Arc<TableMetadata> {
-        Arc::new(
-            TableMetadata::try_new(
-                vec![
-                    ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
-                    ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
-                ],
-                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
-            )
-            .expect("valid table metadata"),
-        )
-    }
-
-    fn page_buf(payload: &[u8]) -> DirectBuf {
-        let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
-        buf.data_mut()[..payload.len()].copy_from_slice(payload);
-        buf
-    }
-
-    fn first_unallocated_blocks(root: &ActiveRoot, count: usize) -> Vec<BlockID> {
-        (1..root.alloc_map.len())
-            .filter(|idx| !root.alloc_map.is_allocated(*idx))
-            .take(count)
-            .map(BlockID::from)
-            .collect()
-    }
-
-    fn overwrite_file_bytes(path: &str, offset: u64, bytes: &[u8]) {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .unwrap();
-        file.seek(SeekFrom::Start(offset)).unwrap();
-        file.write_all(bytes).unwrap();
-        file.sync_all().unwrap();
-    }
-
-    fn assert_table_meta_corruption(err: Error, page_id: BlockID, expected: DataIntegrityError) {
-        assert_eq!(err.kind(), ErrorKind::Runtime);
-        assert_eq!(
-            err.report().downcast_ref::<RuntimeError>().copied(),
-            Some(RuntimeError::FileRootAccess)
-        );
-        assert_eq!(
-            err.report().downcast_ref::<DataIntegrityError>().copied(),
-            Some(expected)
-        );
-        let report = format!("{err:?}");
-        assert!(report.contains("table_file"), "{report}");
-        assert!(report.contains("table_meta"), "{report}");
-        assert!(report.contains(&format!("block_id={page_id}")), "{report}");
     }
 
     #[test]

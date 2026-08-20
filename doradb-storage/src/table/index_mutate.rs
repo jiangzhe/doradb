@@ -770,6 +770,85 @@ mod tests {
         panic!("index mutation did not reach deferred application pause");
     }
 
+    async fn assert_deferred_hot_lock_resumes_after_cold_publication(commit: bool) {
+        let temp_dir = TempDir::new().unwrap();
+        let stem = if commit {
+            "index_mutate_transition_commit"
+        } else {
+            "index_mutate_transition_rollback"
+        };
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, stem).await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut maintenance_session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut maintenance_session, 1, 1, "original").await;
+
+        let key = single_key(1i32);
+        let probe = maintenance_session.begin_trx().unwrap();
+        let row_id = bound_unique_index(
+            &table_for_internal_assertion(&engine, table_id),
+            &maintenance_session.pool_guards(),
+            key.index_no,
+        )
+        .lookup(&key.vals, probe.sts())
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+        probe.commit().await.unwrap();
+        assert_freeze_created(
+            maintenance_session
+                .freeze_table(table_id, usize::MAX)
+                .await
+                .unwrap(),
+        );
+
+        let resume = pause_next_deferred_application();
+        let mut writer_session = engine.new_session().unwrap();
+        let mut writer = writer_session.begin_trx().unwrap();
+        let writer_status = transaction_status_for_test(&writer);
+        let mut mutation = Box::pin(writer.table_index_mutate_mvcc(table_id, 0, .., |row| {
+            assert_eq!(row.val(0)?.as_i32(), Some(1));
+            Ok(RowMutation::Update(vec![UpdateCol {
+                idx: 0,
+                val: Val::from(101i32),
+            }]))
+        }));
+        poll_until_deferred_application_pauses(mutation.as_mut()).await;
+
+        assert_checkpoint_published(&mut maintenance_session, table_id).await;
+        let table = table_for_internal_assertion(&engine, table_id);
+        assert!(matches!(
+            table
+                .find_row(&maintenance_session.pool_guards(), row_id)
+                .await
+                .unwrap(),
+            RowLocation::LwcBlock(_)
+        ));
+        assert!(matches!(
+            table.deletion_buffer().get(row_id),
+            Some(DeleteMarker::Ref(status)) if Arc::ptr_eq(&status, &writer_status)
+        ));
+
+        resume.send_async(()).await.unwrap();
+        let outcome = mutation.as_mut().await.unwrap();
+        assert_eq!(outcome.update_count, 1);
+        drop(mutation);
+        if commit {
+            writer.commit().await.unwrap();
+        } else {
+            writer.rollback().await.unwrap();
+        }
+
+        let mut reader = maintenance_session.begin_trx().unwrap();
+        let expected = if commit {
+            vec![(101, "original".to_owned())]
+        } else {
+            vec![(1, "original".to_owned())]
+        };
+        assert_eq!(scan_table_pairs(&mut reader, table_id).await, expected);
+        reader.commit().await.unwrap();
+    }
+
     #[test]
     fn test_table_index_mutate_mvcc_mixed_cold_hot_actions() {
         smol::block_on(async {
@@ -1077,85 +1156,6 @@ mod tests {
             );
             reader.commit().await.unwrap();
         });
-    }
-
-    async fn assert_deferred_hot_lock_resumes_after_cold_publication(commit: bool) {
-        let temp_dir = TempDir::new().unwrap();
-        let stem = if commit {
-            "index_mutate_transition_commit"
-        } else {
-            "index_mutate_transition_rollback"
-        };
-        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, stem).await;
-        let table_id = create_table2_for_test(&engine).await;
-        let mut maintenance_session = engine.new_session().unwrap();
-        insert_rows(table_id, &mut maintenance_session, 1, 1, "original").await;
-
-        let key = single_key(1i32);
-        let probe = maintenance_session.begin_trx().unwrap();
-        let row_id = bound_unique_index(
-            &table_for_internal_assertion(&engine, table_id),
-            &maintenance_session.pool_guards(),
-            key.index_no,
-        )
-        .lookup(&key.vals, probe.sts())
-        .await
-        .unwrap()
-        .unwrap()
-        .0;
-        probe.commit().await.unwrap();
-        assert_freeze_created(
-            maintenance_session
-                .freeze_table(table_id, usize::MAX)
-                .await
-                .unwrap(),
-        );
-
-        let resume = pause_next_deferred_application();
-        let mut writer_session = engine.new_session().unwrap();
-        let mut writer = writer_session.begin_trx().unwrap();
-        let writer_status = transaction_status_for_test(&writer);
-        let mut mutation = Box::pin(writer.table_index_mutate_mvcc(table_id, 0, .., |row| {
-            assert_eq!(row.val(0)?.as_i32(), Some(1));
-            Ok(RowMutation::Update(vec![UpdateCol {
-                idx: 0,
-                val: Val::from(101i32),
-            }]))
-        }));
-        poll_until_deferred_application_pauses(mutation.as_mut()).await;
-
-        assert_checkpoint_published(&mut maintenance_session, table_id).await;
-        let table = table_for_internal_assertion(&engine, table_id);
-        assert!(matches!(
-            table
-                .find_row(&maintenance_session.pool_guards(), row_id)
-                .await
-                .unwrap(),
-            RowLocation::LwcBlock(_)
-        ));
-        assert!(matches!(
-            table.deletion_buffer().get(row_id),
-            Some(DeleteMarker::Ref(status)) if Arc::ptr_eq(&status, &writer_status)
-        ));
-
-        resume.send_async(()).await.unwrap();
-        let outcome = mutation.as_mut().await.unwrap();
-        assert_eq!(outcome.update_count, 1);
-        drop(mutation);
-        if commit {
-            writer.commit().await.unwrap();
-        } else {
-            writer.rollback().await.unwrap();
-        }
-
-        let mut reader = maintenance_session.begin_trx().unwrap();
-        let expected = if commit {
-            vec![(101, "original".to_owned())]
-        } else {
-            vec![(1, "original".to_owned())]
-        };
-        assert_eq!(scan_table_pairs(&mut reader, table_id).await, expected);
-        reader.commit().await.unwrap();
     }
 
     #[test]
