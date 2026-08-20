@@ -219,6 +219,8 @@ mod tests {
     use std::collections::BTreeMap;
     use std::iter::repeat_n;
 
+    const TEST_LOG_BLOCK_SIZE: usize = 4096;
+
     fn redo_bin(cts: TrxID) -> TrxLog {
         TrxLog::new(
             RedoHeader {
@@ -293,8 +295,6 @@ mod tests {
             trx_inner: None,
         }
     }
-
-    const TEST_LOG_BLOCK_SIZE: usize = 4096;
 
     fn log_group(cts: TrxID, log_group: LogBlockGroup) -> CommitGroup {
         let physical_len = log_group.physical_len();

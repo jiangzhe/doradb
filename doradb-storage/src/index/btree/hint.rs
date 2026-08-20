@@ -101,6 +101,13 @@ mod tests {
     use super::*;
     use zerocopy::FromZeros as _;
 
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    fn expected_search_hints(hints: &[u32; 8], key_head: u32) -> (usize, usize) {
+        let i = hints.partition_point(|&h| h < key_head);
+        let j = hints.partition_point(|&h| h <= key_head);
+        (i, j)
+    }
+
     #[test]
     fn test_btree_hints_store_little_endian_heads() {
         let mut hints = BTreeHints::new_zeroed();
@@ -172,12 +179,5 @@ mod tests {
                 assert_eq!(res1, res2);
             }
         }
-    }
-
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    fn expected_search_hints(hints: &[u32; 8], key_head: u32) -> (usize, usize) {
-        let i = hints.partition_point(|&h| h < key_head);
-        let j = hints.partition_point(|&h| h <= key_head);
-        (i, j)
     }
 }

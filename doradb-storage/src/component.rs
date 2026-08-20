@@ -985,6 +985,173 @@ mod tests {
         fn shutdown(_component: &Self::Owned) {}
     }
 
+    struct CountedOwner {
+        dropped: Arc<AtomicUsize>,
+    }
+
+    impl Drop for CountedOwner {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+    }
+
+    struct DependencyComponent;
+
+    impl Supplier<ShelfGuardConsumer> for DependencyComponent {
+        type Provision = QuiescentGuard<CountedOwner>;
+    }
+    struct IndependentComponent;
+    struct ShelfGuardConsumer;
+
+    impl Component for ShelfGuardConsumer {
+        type Config = ();
+        type Owned = ();
+        type Access = ();
+        type Error = Infallible;
+
+        const NAME: &'static str = "ShelfGuardConsumer";
+
+        async fn build(
+            _config: Self::Config,
+            _registry: &mut ComponentRegistry,
+            _shelf: ShelfScope<'_, Self>,
+        ) -> StdResult<(), Self::Error> {
+            unreachable!("test-only component")
+        }
+
+        fn access(_owner: &QuiescentBox<Self::Owned>) -> Self::Access {}
+
+        fn shutdown(_component: &Self::Owned) {}
+    }
+    struct ShelfPanicComponent;
+    struct SuspectComponent;
+
+    impl Component for SuspectComponent {
+        type Config = ();
+        type Owned = SuspectOwned;
+        type Access = ();
+        type Error = Infallible;
+
+        const NAME: &'static str = "SuspectComponent";
+
+        async fn build(
+            _config: Self::Config,
+            _registry: &mut ComponentRegistry,
+            _shelf: ShelfScope<'_, Self>,
+        ) -> StdResult<(), Self::Error> {
+            unreachable!("test-only component")
+        }
+
+        fn access(_owner: &QuiescentBox<Self::Owned>) -> Self::Access {}
+
+        fn shutdown(_component: &Self::Owned) {
+            panic!("suspect shutdown");
+        }
+    }
+
+    struct SuspectOwned {
+        _dependency: QuiescentGuard<CountedOwner>,
+        _owner: CountedOwner,
+    }
+
+    macro_rules! counted_component {
+        ($component:ident, $access:ty, $access_expr:expr, $shutdown:block) => {
+            impl Component for $component {
+                type Config = ();
+                type Owned = CountedOwner;
+                type Access = $access;
+                type Error = Infallible;
+
+                const NAME: &'static str = stringify!($component);
+
+                async fn build(
+                    _config: Self::Config,
+                    _registry: &mut ComponentRegistry,
+                    _shelf: ShelfScope<'_, Self>,
+                ) -> StdResult<(), Self::Error> {
+                    unreachable!("test-only component")
+                }
+
+                fn access(owner: &QuiescentBox<Self::Owned>) -> Self::Access {
+                    ($access_expr)(owner)
+                }
+
+                fn shutdown(_component: &Self::Owned) $shutdown
+            }
+        };
+    }
+
+    counted_component!(
+        DependencyComponent,
+        QuiescentGuard<CountedOwner>,
+        |owner: &QuiescentBox<CountedOwner>| owner.guard(),
+        {}
+    );
+    counted_component!(
+        IndependentComponent,
+        (),
+        |_owner: &QuiescentBox<CountedOwner>| (),
+        {}
+    );
+
+    counted_component!(
+        ShelfPanicComponent,
+        (),
+        |_owner: &QuiescentBox<CountedOwner>| (),
+        {
+            panic!("builder shelf shutdown panic");
+        }
+    );
+
+    struct Upstream;
+
+    impl Component for Upstream {
+        type Config = ();
+        type Owned = ();
+        type Access = ();
+        type Error = Infallible;
+
+        const NAME: &'static str = "up";
+
+        async fn build(
+            _config: Self::Config,
+            _registry: &mut ComponentRegistry,
+            _shelf: ShelfScope<'_, Self>,
+        ) -> StdResult<(), Self::Error> {
+            unreachable!("test-only component")
+        }
+
+        fn access(_owner: &QuiescentBox<Self::Owned>) -> Self::Access {}
+
+        fn shutdown(_component: &Self::Owned) {}
+    }
+
+    impl Supplier<Downstream> for Upstream {
+        type Provision = usize;
+    }
+    struct Downstream;
+
+    impl Component for Downstream {
+        type Config = ();
+        type Owned = ();
+        type Access = ();
+        type Error = Infallible;
+
+        const NAME: &'static str = "down";
+
+        async fn build(
+            _config: Self::Config,
+            _registry: &mut ComponentRegistry,
+            _shelf: ShelfScope<'_, Self>,
+        ) -> StdResult<(), Self::Error> {
+            unreachable!("test-only component")
+        }
+
+        fn access(_owner: &QuiescentBox<Self::Owned>) -> Self::Access {}
+
+        fn shutdown(_component: &Self::Owned) {}
+    }
+
     #[test]
     fn test_component_registry_returns_typed_access_clone() {
         let mut registry = ComponentRegistry::new();
@@ -1163,124 +1330,6 @@ mod tests {
         assert_eq!(events.lock().as_slice(), &["access", "owner"]);
     }
 
-    struct CountedOwner {
-        dropped: Arc<AtomicUsize>,
-    }
-
-    impl Drop for CountedOwner {
-        fn drop(&mut self) {
-            self.dropped.fetch_add(1, AtomicOrdering::Relaxed);
-        }
-    }
-
-    struct DependencyComponent;
-    struct IndependentComponent;
-    struct ShelfGuardConsumer;
-    struct ShelfPanicComponent;
-    struct SuspectComponent;
-
-    struct SuspectOwned {
-        _dependency: QuiescentGuard<CountedOwner>,
-        _owner: CountedOwner,
-    }
-
-    macro_rules! counted_component {
-        ($component:ident, $access:ty, $access_expr:expr, $shutdown:block) => {
-            impl Component for $component {
-                type Config = ();
-                type Owned = CountedOwner;
-                type Access = $access;
-                type Error = Infallible;
-
-                const NAME: &'static str = stringify!($component);
-
-                async fn build(
-                    _config: Self::Config,
-                    _registry: &mut ComponentRegistry,
-                    _shelf: ShelfScope<'_, Self>,
-                ) -> StdResult<(), Self::Error> {
-                    unreachable!("test-only component")
-                }
-
-                fn access(owner: &QuiescentBox<Self::Owned>) -> Self::Access {
-                    ($access_expr)(owner)
-                }
-
-                fn shutdown(_component: &Self::Owned) $shutdown
-            }
-        };
-    }
-
-    counted_component!(
-        DependencyComponent,
-        QuiescentGuard<CountedOwner>,
-        |owner: &QuiescentBox<CountedOwner>| owner.guard(),
-        {}
-    );
-    counted_component!(
-        IndependentComponent,
-        (),
-        |_owner: &QuiescentBox<CountedOwner>| (),
-        {}
-    );
-
-    counted_component!(
-        ShelfPanicComponent,
-        (),
-        |_owner: &QuiescentBox<CountedOwner>| (),
-        {
-            panic!("builder shelf shutdown panic");
-        }
-    );
-
-    impl Component for ShelfGuardConsumer {
-        type Config = ();
-        type Owned = ();
-        type Access = ();
-        type Error = Infallible;
-
-        const NAME: &'static str = "ShelfGuardConsumer";
-
-        async fn build(
-            _config: Self::Config,
-            _registry: &mut ComponentRegistry,
-            _shelf: ShelfScope<'_, Self>,
-        ) -> StdResult<(), Self::Error> {
-            unreachable!("test-only component")
-        }
-
-        fn access(_owner: &QuiescentBox<Self::Owned>) -> Self::Access {}
-
-        fn shutdown(_component: &Self::Owned) {}
-    }
-
-    impl Supplier<ShelfGuardConsumer> for DependencyComponent {
-        type Provision = QuiescentGuard<CountedOwner>;
-    }
-
-    impl Component for SuspectComponent {
-        type Config = ();
-        type Owned = SuspectOwned;
-        type Access = ();
-        type Error = Infallible;
-
-        const NAME: &'static str = "SuspectComponent";
-
-        async fn build(
-            _config: Self::Config,
-            _registry: &mut ComponentRegistry,
-            _shelf: ShelfScope<'_, Self>,
-        ) -> StdResult<(), Self::Error> {
-            unreachable!("test-only component")
-        }
-
-        fn access(_owner: &QuiescentBox<Self::Owned>) -> Self::Access {}
-
-        fn shutdown(_component: &Self::Owned) {
-            panic!("suspect shutdown");
-        }
-    }
-
     #[test]
     fn test_degraded_registry_drop_leaks_only_suspect_guard_closure() {
         let dependency_dropped = Arc::new(AtomicUsize::new(0));
@@ -1351,55 +1400,6 @@ mod tests {
         );
         assert_eq!(dependency_dropped.load(AtomicOrdering::Relaxed), 1);
         assert_eq!(suspect_dropped.load(AtomicOrdering::Relaxed), 0);
-    }
-
-    struct Upstream;
-    struct Downstream;
-
-    impl Component for Upstream {
-        type Config = ();
-        type Owned = ();
-        type Access = ();
-        type Error = Infallible;
-
-        const NAME: &'static str = "up";
-
-        async fn build(
-            _config: Self::Config,
-            _registry: &mut ComponentRegistry,
-            _shelf: ShelfScope<'_, Self>,
-        ) -> StdResult<(), Self::Error> {
-            unreachable!("test-only component")
-        }
-
-        fn access(_owner: &QuiescentBox<Self::Owned>) -> Self::Access {}
-
-        fn shutdown(_component: &Self::Owned) {}
-    }
-
-    impl Component for Downstream {
-        type Config = ();
-        type Owned = ();
-        type Access = ();
-        type Error = Infallible;
-
-        const NAME: &'static str = "down";
-
-        async fn build(
-            _config: Self::Config,
-            _registry: &mut ComponentRegistry,
-            _shelf: ShelfScope<'_, Self>,
-        ) -> StdResult<(), Self::Error> {
-            unreachable!("test-only component")
-        }
-
-        fn access(_owner: &QuiescentBox<Self::Owned>) -> Self::Access {}
-
-        fn shutdown(_component: &Self::Owned) {}
-    }
-
-    impl Supplier<Downstream> for Upstream {
-        type Provision = usize;
     }
 
     #[test]

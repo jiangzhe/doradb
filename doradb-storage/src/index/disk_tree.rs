@@ -2288,109 +2288,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    #[test]
-    fn test_disk_tree_persisted_layout_adaptation_preserves_source_domain() {
-        let persisted = match persisted_disk_tree_node(&[0u8; 1]) {
-            Ok(_) => panic!("short persisted DiskTree node must fail"),
-            Err(err) => err,
-        };
-        assert_eq!(
-            persisted.current_context(),
-            &DataIntegrityError::InvalidPayload
-        );
-        assert_eq!(
-            persisted.downcast_ref::<LayoutError>().copied(),
-            Some(LayoutError::Mismatch)
-        );
-        assert!(format!("{persisted:?}").contains("field=node_layout"));
-    }
-
-    #[test]
-    #[should_panic(
-        expected = "DiskTree rewrite invariant violated: logical leaf entries are not strictly sorted"
-    )]
-    fn test_disk_tree_logical_entry_order_asserts() {
-        let entries = vec![
-            LogicalEntry::unique(vec![1], RowID::new(1)),
-            LogicalEntry::unique(vec![1], RowID::new(2)),
-        ];
-        validate_logical_entries_sorted(&entries);
-    }
-
-    fn test_row_ids<const N: usize>(values: [u64; N]) -> Vec<RowID> {
-        values.into_iter().map(RowID::new).collect()
-    }
-
-    fn full_key_range() -> KeyRange {
-        KeyRange::new(Bound::Unbounded, Bound::Unbounded)
-    }
-
-    async fn unique_scan_entries(tree: &UniqueDiskTree<'_>) -> Vec<(Vec<u8>, RowID)> {
-        let range = full_key_range();
-        let mut stream = tree.scan_candidate_stream(&range);
-        drain_candidates(&mut stream)
-            .await
-            .into_iter()
-            .map(|candidate| (candidate.encoded_key.as_bytes().to_vec(), candidate.row_id))
-            .collect()
-    }
-
-    async fn non_unique_scan_entries(tree: &NonUniqueDiskTree<'_>) -> Vec<(Vec<u8>, RowID)> {
-        let range = full_key_range();
-        let mut stream = tree.scan_candidate_stream(&range);
-        drain_candidates(&mut stream)
-            .await
-            .into_iter()
-            .map(|candidate| (candidate.encoded_key.as_bytes().to_vec(), candidate.row_id))
-            .collect()
-    }
-
-    async fn non_unique_prefix_scan_rows(tree: &NonUniqueDiskTree<'_>, key: &[Val]) -> Vec<RowID> {
-        let range = tree.encoder().encode_non_unique_equal_range(key);
-        let mut stream = tree.scan_candidate_stream(&range);
-        drain_row_ids(&mut stream).await
-    }
-
-    fn metadata_with_indexes() -> Arc<TableMetadata> {
-        Arc::new(
-            TableMetadata::try_new(
-                vec![
-                    ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
-                    ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::empty()),
-                ],
-                vec![
-                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK),
-                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::empty()),
-                ],
-            )
-            .expect("valid table metadata"),
-        )
-    }
-
-    fn metadata_with_varbyte_unique_index() -> Arc<TableMetadata> {
-        Arc::new(
-            TableMetadata::try_new(
-                vec![ColumnSpec::new(
-                    "c0",
-                    ValKind::VarByte,
-                    ColumnAttributes::empty(),
-                )],
-                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
-            )
-            .expect("valid table metadata"),
-        )
-    }
-
-    fn long_varbyte_key(idx: u32) -> Vec<u8> {
-        const KEY_LEN: usize = 1024;
-        let mut key = vec![0u8; KEY_LEN];
-        key[..mem::size_of::<u32>()].copy_from_slice(&idx.to_be_bytes());
-        for (pos, byte) in key[mem::size_of::<u32>()..].iter_mut().enumerate() {
-            *byte = (idx as u8).wrapping_mul(31).wrapping_add(pos as u8);
-        }
-        key
-    }
-
     macro_rules! unique_runtime {
         ($metadata:ident, $disk_pool:ident) => {
             UniqueDiskTreeRuntime::new(
@@ -2520,23 +2417,6 @@ mod tests {
         }
     }
 
-    fn encode_non_unique_exact_batch(
-        tree: &NonUniqueDiskTree<'_>,
-        entries: &[NonUniqueDiskTreeExact<'_>],
-    ) -> RuntimeResult<Vec<Vec<u8>>> {
-        let encoded = entries
-            .iter()
-            .map(|entry| {
-                tree.encoder()
-                    .encode_pair(entry.key, Val::from(entry.row_id))
-                    .as_bytes()
-                    .to_vec()
-            })
-            .collect::<Vec<_>>();
-        validate_sorted_unique_keys(encoded.iter().map(Vec::as_slice));
-        Ok(encoded)
-    }
-
     struct FailingDiskTreeWriteFile {
         inner: MutableTableFile,
         fail_leaf_at: Option<usize>,
@@ -2624,6 +2504,105 @@ mod tests {
         common_prefix_len: usize,
     }
 
+    #[derive(Debug)]
+    struct LeafBlock {
+        block_id: BlockID,
+        upper_fence: Option<Vec<u8>>,
+        common_prefix_len: usize,
+        keys: Vec<Vec<u8>>,
+    }
+
+    fn test_row_ids<const N: usize>(values: [u64; N]) -> Vec<RowID> {
+        values.into_iter().map(RowID::new).collect()
+    }
+
+    fn full_key_range() -> KeyRange {
+        KeyRange::new(Bound::Unbounded, Bound::Unbounded)
+    }
+
+    async fn unique_scan_entries(tree: &UniqueDiskTree<'_>) -> Vec<(Vec<u8>, RowID)> {
+        let range = full_key_range();
+        let mut stream = tree.scan_candidate_stream(&range);
+        drain_candidates(&mut stream)
+            .await
+            .into_iter()
+            .map(|candidate| (candidate.encoded_key.as_bytes().to_vec(), candidate.row_id))
+            .collect()
+    }
+
+    async fn non_unique_scan_entries(tree: &NonUniqueDiskTree<'_>) -> Vec<(Vec<u8>, RowID)> {
+        let range = full_key_range();
+        let mut stream = tree.scan_candidate_stream(&range);
+        drain_candidates(&mut stream)
+            .await
+            .into_iter()
+            .map(|candidate| (candidate.encoded_key.as_bytes().to_vec(), candidate.row_id))
+            .collect()
+    }
+
+    async fn non_unique_prefix_scan_rows(tree: &NonUniqueDiskTree<'_>, key: &[Val]) -> Vec<RowID> {
+        let range = tree.encoder().encode_non_unique_equal_range(key);
+        let mut stream = tree.scan_candidate_stream(&range);
+        drain_row_ids(&mut stream).await
+    }
+
+    fn metadata_with_indexes() -> Arc<TableMetadata> {
+        Arc::new(
+            TableMetadata::try_new(
+                vec![
+                    ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
+                    ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::empty()),
+                ],
+                vec![
+                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK),
+                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::empty()),
+                ],
+            )
+            .expect("valid table metadata"),
+        )
+    }
+
+    fn metadata_with_varbyte_unique_index() -> Arc<TableMetadata> {
+        Arc::new(
+            TableMetadata::try_new(
+                vec![ColumnSpec::new(
+                    "c0",
+                    ValKind::VarByte,
+                    ColumnAttributes::empty(),
+                )],
+                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
+            )
+            .expect("valid table metadata"),
+        )
+    }
+
+    fn long_varbyte_key(idx: u32) -> Vec<u8> {
+        const KEY_LEN: usize = 1024;
+        let mut key = vec![0u8; KEY_LEN];
+        key[..mem::size_of::<u32>()].copy_from_slice(&idx.to_be_bytes());
+        for (pos, byte) in key[mem::size_of::<u32>()..].iter_mut().enumerate() {
+            *byte = (idx as u8).wrapping_mul(31).wrapping_add(pos as u8);
+        }
+        key
+    }
+
+    fn encode_non_unique_exact_batch(
+        tree: &NonUniqueDiskTree<'_>,
+        entries: &[NonUniqueDiskTreeExact<'_>],
+    ) -> RuntimeResult<Vec<Vec<u8>>> {
+        let encoded = entries
+            .iter()
+            .map(|entry| {
+                tree.encoder()
+                    .encode_pair(entry.key, Val::from(entry.row_id))
+                    .as_bytes()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        validate_sorted_unique_keys(encoded.iter().map(Vec::as_slice));
+        Ok(encoded)
+    }
+
     async fn collect_node_summaries<F: DiskTreeSpec>(
         tree: &DiskTree<'_, F>,
     ) -> RuntimeResult<Vec<NodeSummary>> {
@@ -2654,14 +2633,6 @@ mod tests {
             }
         }
         Ok(summaries)
-    }
-
-    #[derive(Debug)]
-    struct LeafBlock {
-        block_id: BlockID,
-        upper_fence: Option<Vec<u8>>,
-        common_prefix_len: usize,
-        keys: Vec<Vec<u8>>,
     }
 
     async fn collect_leaf_blocks<F: DiskTreeSpec>(
@@ -2705,6 +2676,35 @@ mod tests {
         let mut key = format!("branch-prefix-{idx:06}-").into_bytes();
         key.resize(4096, b'x');
         key
+    }
+
+    #[test]
+    fn test_disk_tree_persisted_layout_adaptation_preserves_source_domain() {
+        let persisted = match persisted_disk_tree_node(&[0u8; 1]) {
+            Ok(_) => panic!("short persisted DiskTree node must fail"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            persisted.current_context(),
+            &DataIntegrityError::InvalidPayload
+        );
+        assert_eq!(
+            persisted.downcast_ref::<LayoutError>().copied(),
+            Some(LayoutError::Mismatch)
+        );
+        assert!(format!("{persisted:?}").contains("field=node_layout"));
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "DiskTree rewrite invariant violated: logical leaf entries are not strictly sorted"
+    )]
+    fn test_disk_tree_logical_entry_order_asserts() {
+        let entries = vec![
+            LogicalEntry::unique(vec![1], RowID::new(1)),
+            LogicalEntry::unique(vec![1], RowID::new(2)),
+        ];
+        validate_logical_entries_sorted(&entries);
     }
 
     #[test]

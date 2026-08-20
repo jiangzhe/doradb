@@ -1828,6 +1828,83 @@ mod tests {
         },
     }
 
+    struct WaitErrorBackend {
+        io_depth: usize,
+        inflight: VecDeque<BackendToken>,
+    }
+
+    impl WaitErrorBackend {
+        #[inline]
+        fn new(io_depth: usize) -> Self {
+            Self {
+                io_depth,
+                inflight: VecDeque::new(),
+            }
+        }
+    }
+
+    impl Backend for WaitErrorBackend {
+        type Prepared = BackendToken;
+        type SubmitBatch = VecDeque<BackendToken>;
+        type Events = ();
+
+        fn setup(io_depth: usize) -> IoResult<Self> {
+            Ok(Self::new(io_depth))
+        }
+
+        fn io_depth(&self) -> usize {
+            self.io_depth
+        }
+
+        fn new_submit_batch(&self) -> Self::SubmitBatch {
+            VecDeque::with_capacity(self.io_depth)
+        }
+
+        fn new_events(&self) -> Self::Events {}
+
+        fn prepare(&mut self, token: BackendToken, _operation: &mut Operation) -> Self::Prepared {
+            token
+        }
+
+        fn push_prepared(&mut self, batch: &mut Self::SubmitBatch, prepared: &mut Self::Prepared) {
+            batch.push_back(*prepared);
+        }
+
+        fn submit_batch(
+            &mut self,
+            batch: &mut Self::SubmitBatch,
+            limit: usize,
+        ) -> BackendResult<SubmitAttempt> {
+            let submit_count = limit.min(batch.len());
+            let Some(submitted) = NonZeroUsize::new(submit_count) else {
+                return Ok(SubmitAttempt::Noop);
+            };
+            for _ in 0..submit_count {
+                let token = batch
+                    .pop_front()
+                    .expect("test backend submit count must match staged tokens");
+                self.inflight.push_back(token);
+            }
+            Ok(SubmitAttempt::Submitted(submitted))
+        }
+
+        fn wait_at_least(
+            &mut self,
+            _events: &mut Self::Events,
+            _min_nr: usize,
+        ) -> BackendResult<Vec<(BackendToken, StdIoResult<usize>)>> {
+            Err(BackendError::wait(
+                "recovery_test",
+                StdIoError::from_raw_os_error(libc::EIO),
+                1,
+            ))
+        }
+
+        fn cleanup_submitted_io(&mut self, _submitted: usize) -> SubmittedIoCleanup {
+            SubmittedIoCleanup::DropAfterBackend
+        }
+    }
+
     fn simple_trx_log(cts: TrxID) -> TrxLog {
         TrxLog::new(
             RedoHeader {
@@ -1943,208 +2020,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_replay_planners_attach_owned_phase_to_read_ahead_spawn_failure() {
-        for (catalog_scan, phase) in [
-            (false, "phase=plan_recovery_redo_read_ahead"),
-            (true, "phase=plan_catalog_scan_redo_read_ahead"),
-        ] {
-            let dir = tempfile::tempdir().unwrap();
-            let descriptor = write_stream_log_file(
-                &dir.path().join("redo.log"),
-                STORAGE_SECTOR_SIZE,
-                1,
-                &[],
-                TestSegmentSeal::Open,
-            );
-            let planner = RedoReplayPlanner::new(vec![descriptor]);
-            let _failure = fail_spawn_named("Redo-ReadAhead");
-
-            let err = if catalog_scan {
-                planner.plan_catalog_scan(TrxID::new(0), 1).err()
-            } else {
-                planner.plan_recovery(TrxID::new(0), 1).err()
-            }
-            .expect("injected read-ahead spawn must fail planning");
-
-            assert_eq!(*err.current_context(), RuntimeError::RedoLogAccess);
-            assert!(err.frames().any(|frame| {
-                frame.downcast_ref::<RuntimeError>() == Some(&RuntimeError::BackgroundSpawn)
-            }));
-            assert!(err.downcast_ref::<IoError>().is_some());
-            let output = format!("{err:?}");
-            assert!(output.contains(phase), "report={output}");
-            assert_eq!(output.matches("thread_name=Redo-ReadAhead").count(), 1);
-        }
-    }
-
-    #[test]
-    fn test_redo_read_completion_preserves_owned_io_error() {
-        let expected_io_kind = StdIoError::from_raw_os_error(libc::EIO).kind();
-        let completion = RedoReadCompletion {
-            file_seq: 0x12,
-            offset: STORAGE_SECTOR_SIZE,
-            expected_bytes: STORAGE_SECTOR_SIZE,
-            actual_bytes: Err(StdIoError::from_raw_os_error(libc::EIO)),
-            buf: DirectBuf::zeroed(STORAGE_SECTOR_SIZE),
-        };
-
-        let err = match completion.validate() {
-            Ok(_) => panic!("injected redo read error must fail validation"),
-            Err(err) => err,
-        };
-
-        assert_eq!(*err.current_context(), IoError::from(expected_io_kind));
-        assert_eq!(
-            err.downcast_ref::<StdIoError>()
-                .and_then(StdIoError::raw_os_error),
-            Some(libc::EIO)
-        );
-        let output = format!("{err:?}");
-        assert!(output.contains("file_seq=00000012"), "{output}");
-        assert!(
-            output.contains(&format!("offset={STORAGE_SECTOR_SIZE}")),
-            "{output}"
-        );
-    }
-
-    struct WaitErrorBackend {
-        io_depth: usize,
-        inflight: VecDeque<BackendToken>,
-    }
-
-    impl WaitErrorBackend {
-        #[inline]
-        fn new(io_depth: usize) -> Self {
-            Self {
-                io_depth,
-                inflight: VecDeque::new(),
-            }
-        }
-    }
-
-    impl Backend for WaitErrorBackend {
-        type Prepared = BackendToken;
-        type SubmitBatch = VecDeque<BackendToken>;
-        type Events = ();
-
-        fn setup(io_depth: usize) -> IoResult<Self> {
-            Ok(Self::new(io_depth))
-        }
-
-        fn io_depth(&self) -> usize {
-            self.io_depth
-        }
-
-        fn new_submit_batch(&self) -> Self::SubmitBatch {
-            VecDeque::with_capacity(self.io_depth)
-        }
-
-        fn new_events(&self) -> Self::Events {}
-
-        fn prepare(&mut self, token: BackendToken, _operation: &mut Operation) -> Self::Prepared {
-            token
-        }
-
-        fn push_prepared(&mut self, batch: &mut Self::SubmitBatch, prepared: &mut Self::Prepared) {
-            batch.push_back(*prepared);
-        }
-
-        fn submit_batch(
-            &mut self,
-            batch: &mut Self::SubmitBatch,
-            limit: usize,
-        ) -> BackendResult<SubmitAttempt> {
-            let submit_count = limit.min(batch.len());
-            let Some(submitted) = NonZeroUsize::new(submit_count) else {
-                return Ok(SubmitAttempt::Noop);
-            };
-            for _ in 0..submit_count {
-                let token = batch
-                    .pop_front()
-                    .expect("test backend submit count must match staged tokens");
-                self.inflight.push_back(token);
-            }
-            Ok(SubmitAttempt::Submitted(submitted))
-        }
-
-        fn wait_at_least(
-            &mut self,
-            _events: &mut Self::Events,
-            _min_nr: usize,
-        ) -> BackendResult<Vec<(BackendToken, StdIoResult<usize>)>> {
-            Err(BackendError::wait(
-                "recovery_test",
-                StdIoError::from_raw_os_error(libc::EIO),
-                1,
-            ))
-        }
-
-        fn cleanup_submitted_io(&mut self, _submitted: usize) -> SubmittedIoCleanup {
-            SubmittedIoCleanup::DropAfterBackend
-        }
-    }
-
-    #[test]
-    fn test_read_ahead_send_item_stops_while_item_queue_full() {
-        let (items_tx, items_rx) = flume::bounded(1);
-        items_tx.send(RedoReadItem::End).unwrap();
-        let (_recycle_tx, recycle_rx) = flume::bounded(1);
-        let (stop_tx, stop_rx) = flume::bounded(1);
-        let (started_tx, started_rx) = flume::bounded(1);
-        let join = spawn(move || {
-            let mut worker = RedoReadAheadWorker {
-                segments: Vec::new(),
-                read_depth: 1,
-                items: items_tx,
-                recycle: recycle_rx,
-                stop: stop_rx,
-                stop_requested: false,
-                free: Vec::new(),
-                free_block_size: None,
-            };
-            started_tx.send(()).unwrap();
-            worker.send_item(RedoReadItem::End)
-        });
-
-        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        stop_tx.send(()).unwrap();
-        assert!(!join.join().unwrap());
-        assert_eq!(items_rx.len(), 1);
-    }
-
-    #[test]
-    fn test_read_ahead_drain_cleans_pending_reads_after_wait_error() {
-        let (items_tx, _items_rx) = flume::bounded(1);
-        let (_recycle_tx, recycle_rx) = flume::bounded(1);
-        let (_stop_tx, stop_rx) = flume::bounded(1);
-        let mut worker = RedoReadAheadWorker {
-            segments: Vec::new(),
-            read_depth: 1,
-            items: items_tx,
-            recycle: recycle_rx,
-            stop: stop_rx,
-            stop_requested: false,
-            free: Vec::new(),
-            free_block_size: Some(STORAGE_SECTOR_SIZE),
-        };
-        let mut driver = SubmissionDriver::new(WaitErrorBackend::new(1));
-        assert!(
-            driver
-                .push(RedoReadSubmission::new(
-                    TEST_FILE_SEQ,
-                    REDO_DEFAULT_DATA_START_OFFSET,
-                    0,
-                    DirectBuf::zeroed(STORAGE_SECTOR_SIZE),
-                ))
-                .is_ok()
-        );
-
-        assert_eq!(worker.drain_driver(&mut driver), 1);
-        assert_eq!(driver.pending_len(), 0);
-        assert_eq!(driver.submitted_len(), 0);
-    }
-
     async fn assert_stream_corrupted(stream: &mut RedoLogStream) {
         let err = stream.try_next().await.unwrap_err();
         assert_eq!(
@@ -2247,6 +2122,131 @@ mod tests {
         block.as_bytes_mut()[payload_start..payload_start + start_capacity].fill(1);
         patch_redo_block_checksum(block.as_bytes_mut());
         block
+    }
+
+    #[test]
+    fn test_replay_planners_attach_owned_phase_to_read_ahead_spawn_failure() {
+        for (catalog_scan, phase) in [
+            (false, "phase=plan_recovery_redo_read_ahead"),
+            (true, "phase=plan_catalog_scan_redo_read_ahead"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let descriptor = write_stream_log_file(
+                &dir.path().join("redo.log"),
+                STORAGE_SECTOR_SIZE,
+                1,
+                &[],
+                TestSegmentSeal::Open,
+            );
+            let planner = RedoReplayPlanner::new(vec![descriptor]);
+            let _failure = fail_spawn_named("Redo-ReadAhead");
+
+            let err = if catalog_scan {
+                planner.plan_catalog_scan(TrxID::new(0), 1).err()
+            } else {
+                planner.plan_recovery(TrxID::new(0), 1).err()
+            }
+            .expect("injected read-ahead spawn must fail planning");
+
+            assert_eq!(*err.current_context(), RuntimeError::RedoLogAccess);
+            assert!(err.frames().any(|frame| {
+                frame.downcast_ref::<RuntimeError>() == Some(&RuntimeError::BackgroundSpawn)
+            }));
+            assert!(err.downcast_ref::<IoError>().is_some());
+            let output = format!("{err:?}");
+            assert!(output.contains(phase), "report={output}");
+            assert_eq!(output.matches("thread_name=Redo-ReadAhead").count(), 1);
+        }
+    }
+
+    #[test]
+    fn test_redo_read_completion_preserves_owned_io_error() {
+        let expected_io_kind = StdIoError::from_raw_os_error(libc::EIO).kind();
+        let completion = RedoReadCompletion {
+            file_seq: 0x12,
+            offset: STORAGE_SECTOR_SIZE,
+            expected_bytes: STORAGE_SECTOR_SIZE,
+            actual_bytes: Err(StdIoError::from_raw_os_error(libc::EIO)),
+            buf: DirectBuf::zeroed(STORAGE_SECTOR_SIZE),
+        };
+
+        let err = match completion.validate() {
+            Ok(_) => panic!("injected redo read error must fail validation"),
+            Err(err) => err,
+        };
+
+        assert_eq!(*err.current_context(), IoError::from(expected_io_kind));
+        assert_eq!(
+            err.downcast_ref::<StdIoError>()
+                .and_then(StdIoError::raw_os_error),
+            Some(libc::EIO)
+        );
+        let output = format!("{err:?}");
+        assert!(output.contains("file_seq=00000012"), "{output}");
+        assert!(
+            output.contains(&format!("offset={STORAGE_SECTOR_SIZE}")),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn test_read_ahead_send_item_stops_while_item_queue_full() {
+        let (items_tx, items_rx) = flume::bounded(1);
+        items_tx.send(RedoReadItem::End).unwrap();
+        let (_recycle_tx, recycle_rx) = flume::bounded(1);
+        let (stop_tx, stop_rx) = flume::bounded(1);
+        let (started_tx, started_rx) = flume::bounded(1);
+        let join = spawn(move || {
+            let mut worker = RedoReadAheadWorker {
+                segments: Vec::new(),
+                read_depth: 1,
+                items: items_tx,
+                recycle: recycle_rx,
+                stop: stop_rx,
+                stop_requested: false,
+                free: Vec::new(),
+                free_block_size: None,
+            };
+            started_tx.send(()).unwrap();
+            worker.send_item(RedoReadItem::End)
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        stop_tx.send(()).unwrap();
+        assert!(!join.join().unwrap());
+        assert_eq!(items_rx.len(), 1);
+    }
+
+    #[test]
+    fn test_read_ahead_drain_cleans_pending_reads_after_wait_error() {
+        let (items_tx, _items_rx) = flume::bounded(1);
+        let (_recycle_tx, recycle_rx) = flume::bounded(1);
+        let (_stop_tx, stop_rx) = flume::bounded(1);
+        let mut worker = RedoReadAheadWorker {
+            segments: Vec::new(),
+            read_depth: 1,
+            items: items_tx,
+            recycle: recycle_rx,
+            stop: stop_rx,
+            stop_requested: false,
+            free: Vec::new(),
+            free_block_size: Some(STORAGE_SECTOR_SIZE),
+        };
+        let mut driver = SubmissionDriver::new(WaitErrorBackend::new(1));
+        assert!(
+            driver
+                .push(RedoReadSubmission::new(
+                    TEST_FILE_SEQ,
+                    REDO_DEFAULT_DATA_START_OFFSET,
+                    0,
+                    DirectBuf::zeroed(STORAGE_SECTOR_SIZE),
+                ))
+                .is_ok()
+        );
+
+        assert_eq!(worker.drain_driver(&mut driver), 1);
+        assert_eq!(driver.pending_len(), 0);
+        assert_eq!(driver.submitted_len(), 0);
     }
 
     #[test]

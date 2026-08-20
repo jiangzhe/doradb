@@ -318,6 +318,12 @@ mod tests {
         dropped: Arc<AtomicBool>,
     }
 
+    impl Drop for DropSpy {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+
     /// Returns whether two wrappers update the same outer `Arc` strong count.
     #[inline]
     pub(crate) fn shares_root<T>(
@@ -325,12 +331,6 @@ mod tests {
         second: &SyncQuiescentGuard<T>,
     ) -> bool {
         Arc::ptr_eq(&first.guard, &second.guard)
-    }
-
-    impl Drop for DropSpy {
-        fn drop(&mut self) {
-            self.dropped.store(true, Ordering::Release);
-        }
     }
 
     #[test]

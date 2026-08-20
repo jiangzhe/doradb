@@ -201,13 +201,13 @@ pub(crate) use self::tests::shares_keepalive_root;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quiescent::QuiescentBox;
+    use crate::quiescent::{QuiescentBox, test_sync_guards_share_root};
     use std::panic::catch_unwind;
 
     /// Returns whether two guards update the same keepalive `Arc` root.
     #[inline]
     pub(crate) fn shares_keepalive_root(first: &PoolGuard, second: &PoolGuard) -> bool {
-        crate::quiescent::test_sync_guards_share_root(&first._keepalive, &second._keepalive)
+        test_sync_guards_share_root(&first._keepalive, &second._keepalive)
     }
 
     fn test_guard() -> PoolGuard {

@@ -552,6 +552,21 @@ mod tests {
         );
     }
 
+    fn leaf_node(keys: &[&[u8]]) -> BTreeNodeBox {
+        let mut node = BTreeNodeBox::alloc(
+            0,
+            TrxID::new(1),
+            keys.first().copied().unwrap_or(&[]),
+            BTreeU64::INVALID_VALUE,
+            b"zzzz",
+            false,
+        );
+        for (idx, key) in keys.iter().enumerate() {
+            node.insert_at::<BTreeU64>(idx, key, BTreeU64::from(idx as u64 + 1));
+        }
+        node
+    }
+
     #[test]
     fn test_packed_sibling_upper_fence_selects_next_lower_fence() {
         let entries = [
@@ -798,21 +813,6 @@ mod tests {
             },
             &entries,
         );
-    }
-
-    fn leaf_node(keys: &[&[u8]]) -> BTreeNodeBox {
-        let mut node = BTreeNodeBox::alloc(
-            0,
-            TrxID::new(1),
-            keys.first().copied().unwrap_or(&[]),
-            BTreeU64::INVALID_VALUE,
-            b"zzzz",
-            false,
-        );
-        for (idx, key) in keys.iter().enumerate() {
-            node.insert_at::<BTreeU64>(idx, key, BTreeU64::from(idx as u64 + 1));
-        }
-        node
     }
 
     #[test]

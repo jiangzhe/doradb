@@ -1046,6 +1046,40 @@ mod tests {
     use crate::value::{ValKind, ValType};
     use std::ops::Bound::Unbounded;
 
+    struct UniqueDiskTreePut<'a> {
+        key: &'a [Val],
+        row_id: RowID,
+    }
+
+    struct NonUniqueDiskTreeExact<'a> {
+        key: &'a [Val],
+        row_id: RowID,
+    }
+
+    macro_rules! unique_runtime {
+        ($metadata:ident, $disk_pool:ident) => {
+            UniqueDiskTreeRuntime::new(
+                &$metadata.idx.index_specs()[0],
+                $metadata.as_ref(),
+                $disk_pool.file_kind(),
+                Arc::clone($disk_pool.sparse_file()),
+                $disk_pool.global_pool().clone(),
+            )
+        };
+    }
+
+    macro_rules! non_unique_runtime {
+        ($metadata:ident, $disk_pool:ident) => {
+            NonUniqueDiskTreeRuntime::new(
+                &$metadata.idx.index_specs()[1],
+                $metadata.as_ref(),
+                $disk_pool.file_kind(),
+                Arc::clone($disk_pool.sparse_file()),
+                $disk_pool.global_pool().clone(),
+            )
+        };
+    }
+
     fn test_row_ids<const N: usize>(values: [u64; N]) -> Vec<RowID> {
         values.into_iter().map(RowID::new).collect()
     }
@@ -1097,16 +1131,6 @@ mod tests {
         )
         .await
         .expect("non-unique MemIndex should be created")
-    }
-
-    struct UniqueDiskTreePut<'a> {
-        key: &'a [Val],
-        row_id: RowID,
-    }
-
-    struct NonUniqueDiskTreeExact<'a> {
-        key: &'a [Val],
-        row_id: RowID,
     }
 
     async fn non_unique_disk_tree_scan_rows(
@@ -1175,30 +1199,6 @@ mod tests {
             .expect("test secondary root publication should commit");
         drop(old_root);
         table
-    }
-
-    macro_rules! unique_runtime {
-        ($metadata:ident, $disk_pool:ident) => {
-            UniqueDiskTreeRuntime::new(
-                &$metadata.idx.index_specs()[0],
-                $metadata.as_ref(),
-                $disk_pool.file_kind(),
-                Arc::clone($disk_pool.sparse_file()),
-                $disk_pool.global_pool().clone(),
-            )
-        };
-    }
-
-    macro_rules! non_unique_runtime {
-        ($metadata:ident, $disk_pool:ident) => {
-            NonUniqueDiskTreeRuntime::new(
-                &$metadata.idx.index_specs()[1],
-                $metadata.as_ref(),
-                $disk_pool.file_kind(),
-                Arc::clone($disk_pool.sparse_file()),
-                $disk_pool.global_pool().clone(),
-            )
-        };
     }
 
     #[test]

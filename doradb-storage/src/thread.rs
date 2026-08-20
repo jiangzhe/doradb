@@ -103,6 +103,25 @@ mod tests {
         }
     }
 
+    pub(super) struct ObserveWorkerFinish {
+        worker: String,
+        observer: SpawnObserver,
+    }
+
+    impl ObserveWorkerFinish {
+        #[inline]
+        pub(super) fn new(worker: String, observer: SpawnObserver) -> Self {
+            ObserveWorkerFinish { worker, observer }
+        }
+    }
+
+    impl Drop for ObserveWorkerFinish {
+        #[inline]
+        fn drop(&mut self) {
+            (self.observer)(SpawnTestEvent::Finished(self.worker.clone()));
+        }
+    }
+
     /// Fail the next matching named spawn performed by the current test thread.
     #[inline]
     pub(crate) fn fail_spawn_named(name: impl Into<String>) -> SpawnFailureGuard {
@@ -165,25 +184,6 @@ mod tests {
     pub(super) fn observe_worker(worker: &str, observer: SpawnObserver) -> ObserveWorkerFinish {
         observer(SpawnTestEvent::Started(worker.to_owned()));
         ObserveWorkerFinish::new(worker.to_owned(), observer)
-    }
-
-    pub(super) struct ObserveWorkerFinish {
-        worker: String,
-        observer: SpawnObserver,
-    }
-
-    impl ObserveWorkerFinish {
-        #[inline]
-        pub(super) fn new(worker: String, observer: SpawnObserver) -> Self {
-            ObserveWorkerFinish { worker, observer }
-        }
-    }
-
-    impl Drop for ObserveWorkerFinish {
-        #[inline]
-        fn drop(&mut self) {
-            (self.observer)(SpawnTestEvent::Finished(self.worker.clone()));
-        }
     }
 
     #[test]

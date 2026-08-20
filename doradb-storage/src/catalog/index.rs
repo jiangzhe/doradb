@@ -2099,6 +2099,7 @@ pub(crate) mod tests {
         publication_gate: parking_lot::Mutex<Option<IndexDdlPublicationGate>>,
     }
 
+    /// Test fixture for index ddl test controller.
     #[derive(Clone, Default)]
     pub(crate) struct IndexDdlTestController {
         state: Arc<IndexDdlTestState>,
@@ -2164,6 +2165,7 @@ pub(crate) mod tests {
             (entered_rx, release_tx)
         }
 
+        /// Provides test-only access to `reach_publication_interval`.
         pub(crate) fn reach_publication_interval(&self, kind: IndexDdlKind) {
             let gate = {
                 let mut slot = self.state.publication_gate.lock();
@@ -2309,6 +2311,299 @@ pub(crate) mod tests {
 
     fn root_with_metadata(metadata: TableMetadata, root_ts: TrxID) -> ActiveRoot {
         ActiveRoot::new(root_ts, 128, Arc::new(metadata))
+    }
+
+    async fn lightweight_test_engine(temp_dir: &TempDir, log_file_stem: &str) -> Engine {
+        Engine::bootstrap(lightweight_test_engine_config(
+            temp_dir.path().to_path_buf(),
+            log_file_stem,
+        ))
+        .await
+        .unwrap()
+    }
+
+    fn table_for_internal_assertion(engine: &Engine, table_id: TableID) -> Arc<Table> {
+        engine
+            .inner()
+            .core
+            .catalog()
+            .get_table_now(table_id)
+            .expect("test table should exist")
+    }
+
+    fn lightweight_test_engine_config(
+        main_dir: impl Into<PathBuf>,
+        log_file_stem: &str,
+    ) -> EngineConfig {
+        EngineConfig::default()
+            .storage_root(main_dir)
+            .meta_buffer(LIGHTWEIGHT_TEST_BUFFER_BYTES)
+            .index_buffer(
+                EvictableBufferPoolConfig::default()
+                    .swap_file("index.swp")
+                    .max_mem_size(LIGHTWEIGHT_TEST_BUFFER_BYTES)
+                    .max_file_size(LIGHTWEIGHT_TEST_MAX_FILE_BYTES),
+            )
+            .data_buffer(
+                EvictableBufferPoolConfig::default()
+                    .max_mem_size(LIGHTWEIGHT_TEST_BUFFER_BYTES)
+                    .max_file_size(LIGHTWEIGHT_TEST_MAX_FILE_BYTES),
+            )
+            .trx(
+                TrxSysConfig::default()
+                    .log_write_io_depth(1)
+                    .recovery_io_depth(1)
+                    .catalog_checkpoint_scan_io_depth(1)
+                    .log_file_stem(log_file_stem)
+                    .purge_threads(1),
+            )
+            .file(
+                FileSystemConfig::default()
+                    .io_depth(1)
+                    .readonly_buffer_size(LIGHTWEIGHT_TEST_READONLY_BUFFER_BYTES)
+                    .data_dir("."),
+            )
+    }
+
+    async fn update_one_row(
+        table_id: TableID,
+        session: &mut Session,
+        key: &SelectKey,
+        update: Vec<UpdateCol>,
+    ) -> RowID {
+        let mut trx = session.begin_trx().unwrap();
+        let result = trx
+            .table_update_unique_mvcc(table_id, key.index_no, &key.vals, update)
+            .await;
+        let Ok(UpdateMvcc::Updated(row_id)) = result else {
+            panic!("update should succeed: {result:?}");
+        };
+        trx.commit().await.unwrap();
+        row_id
+    }
+
+    async fn assert_create_unique_index_rejects_cold_duplicates(
+        log_file_stem: &str,
+        cold_count: i32,
+        hot_count: i32,
+    ) {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, log_file_stem).await;
+        let table_id = table2(&engine).await;
+        let table = table_for_internal_assertion(&engine, table_id);
+        let mut session = engine.new_session().unwrap();
+        for primary_key in 0..cold_count {
+            insert_one_row(
+                table_id,
+                &mut session,
+                vec![Val::from(primary_key), Val::from("dup")],
+            )
+            .await;
+        }
+        assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+        for offset in 0..hot_count {
+            insert_one_row(
+                table_id,
+                &mut session,
+                vec![Val::from(100 + offset), Val::from("dup")],
+            )
+            .await;
+        }
+        assert_checkpoint_published(&mut session, table_id).await;
+        let before = index_ddl_snapshot(&engine, table_id, &table);
+
+        let err = session
+            .create_index(
+                table_id,
+                IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::UK),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.report().downcast_ref::<OperationError>().copied(),
+            Some(OperationError::DuplicateKey)
+        );
+        assert_index_ddl_snapshot_unchanged(&before, &engine, table_id, &table);
+        assert_eq!(table.metadata().idx.next_index_no(), 1);
+        assert!(table.metadata().idx.index_spec(1).is_none());
+    }
+
+    async fn assert_create_index_build_failure_cleanup(failure: CreateIndexTestFailure) {
+        let temp_dir = TempDir::new().unwrap();
+        let log_stem = match failure {
+            CreateIndexTestFailure::PopulateNonUnique => "create_index_population_failure",
+            CreateIndexTestFailure::AfterRuntimeStaged => "create_index_staged_failure",
+        };
+        let engine = lightweight_test_engine(&temp_dir, log_stem).await;
+        let table_id = table2(&engine).await;
+        let table = table_for_internal_assertion(&engine, table_id);
+        let mut session = engine.new_session().unwrap();
+        insert_one_row(
+            table_id,
+            &mut session,
+            vec![Val::from(1), Val::from("alpha")],
+        )
+        .await;
+        let before = index_ddl_snapshot(&engine, table_id, &table);
+        let allocated_before = engine.inner().pools.index.allocated();
+
+        engine
+            .inner()
+            .index_ddl_test
+            .set_create_failure(Some(failure));
+        let result = session
+            .create_index(
+                table_id,
+                IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+            )
+            .await;
+        engine.inner().index_ddl_test.set_create_failure(None);
+        let err = result.unwrap_err();
+
+        assert_eq!(
+            err.report().downcast_ref::<RuntimeError>().copied(),
+            Some(RuntimeError::IndexAccess)
+        );
+        assert_eq!(engine.inner().pools.index.allocated(), allocated_before);
+        assert_index_ddl_snapshot_unchanged(&before, &engine, table_id, &table);
+        assert_eq!(table.metadata().idx.next_index_no(), 1);
+        assert!(table.metadata().idx.index_spec(1).is_none());
+    }
+
+    async fn non_unique_mem_state(
+        table: &Table,
+        guards: &PoolGuards,
+        index_no: usize,
+        key: &str,
+        row_id: RowID,
+    ) -> Option<bool> {
+        let layout = table.layout_snapshot();
+        layout
+            .secondary_index(index_no)
+            .unwrap()
+            .non_unique_mem()
+            .unwrap()
+            .bind(guards.index_guard())
+            .lookup_unique(&[Val::from(key)], row_id, MAX_SNAPSHOT_TS)
+            .await
+            .unwrap()
+    }
+
+    fn single_key<V: Into<Val>>(value: V) -> SelectKey {
+        SelectKey {
+            index_no: 0,
+            vals: vec![value.into()],
+        }
+    }
+
+    fn name_key(value: &str) -> SelectKey {
+        SelectKey {
+            index_no: 1,
+            vals: vec![Val::from(value)],
+        }
+    }
+
+    fn active_secondary_root(table: &Table, index_no: usize) -> BlockID {
+        table.file().active_root_unchecked().secondary_index_roots[index_no]
+    }
+
+    async fn unique_runtime_lookup(
+        table: &Table,
+        index_no: usize,
+        guards: &PoolGuards,
+        key: &[Val],
+    ) -> Option<(RowID, bool)> {
+        let root = active_secondary_root(table, index_no);
+        let layout = table.layout_snapshot();
+        let index = layout
+            .secondary_index(index_no)
+            .unwrap()
+            .bind_unique_unchecked(guards, root)
+            .unwrap();
+        index.lookup(key, MAX_SNAPSHOT_TS).await.unwrap()
+    }
+
+    async fn non_unique_runtime_lookup(
+        layout: &Arc<TableRuntimeLayout>,
+        root: BlockID,
+        guards: &PoolGuards,
+        index_no: usize,
+        key: &[Val],
+    ) -> Vec<RowID> {
+        let index = layout.secondary_index(index_no).unwrap();
+        let range = index.key_encoder().encode_non_unique_equal_range(key);
+        let bound = index.bind_non_unique_unchecked(guards, root).unwrap();
+        let mut stream = bound
+            .equal_scan_candidates(&range, MAX_SNAPSHOT_TS)
+            .unwrap();
+        let mut rows = Vec::new();
+        while let Some(batch) = stream.next_batch().await.unwrap() {
+            rows.extend(batch.into_iter().map(|candidate| candidate.row_id));
+        }
+        rows
+    }
+
+    async fn non_unique_mem_index_prefix_scan(
+        layout: &Arc<TableRuntimeLayout>,
+        guards: &PoolGuards,
+        index_no: usize,
+        key: &[Val],
+    ) -> Vec<RowID> {
+        let index = layout.secondary_index(index_no).unwrap();
+        let range = index.key_encoder().encode_non_unique_equal_range(key);
+        let mem = index.non_unique_mem().unwrap().bind(guards.index_guard());
+        let mut stream = mem.equal_scan_candidates(&range, MAX_SNAPSHOT_TS).unwrap();
+        let mut rows = Vec::new();
+        while let Some(batch) = stream.next_batch().await.unwrap() {
+            rows.extend(batch.into_iter().map(|candidate| candidate.row_id));
+        }
+        rows
+    }
+
+    async fn non_unique_disk_tree_prefix_scan(
+        table: &Table,
+        guards: &PoolGuards,
+        key: &SelectKey,
+    ) -> Vec<RowID> {
+        let root = active_secondary_root(table, key.index_no);
+        let layout = table.layout_snapshot();
+        let index = layout.secondary_index(key.index_no).unwrap();
+        let range = index.key_encoder().encode_non_unique_equal_range(&key.vals);
+        let tree = index
+            .disk_runtime()
+            .open_non_unique_at(root, guards.disk_guard())
+            .unwrap();
+        let mut stream = tree.scan_candidate_stream(&range);
+        let mut rows = Vec::new();
+        while let Some(batch) = stream.next_batch().await.unwrap() {
+            rows.extend(batch.into_iter().map(|candidate| candidate.row_id));
+        }
+        rows
+    }
+
+    fn assert_root_metadata_unchanged(before: &ActiveRoot, table: &Table) {
+        let after = table.file().active_root_unchecked();
+        assert_eq!(after.slot_no, before.slot_no);
+        assert_eq!(after.root_ts, before.root_ts);
+        assert_eq!(after.effective_ts(), before.effective_ts());
+        assert_eq!(after.meta_block_id, before.meta_block_id);
+        assert_eq!(after.pivot_row_id, before.pivot_row_id);
+        assert_eq!(after.heap_redo_start_ts, before.heap_redo_start_ts);
+        assert_eq!(after.deletion_cutoff_ts, before.deletion_cutoff_ts);
+        assert_eq!(
+            after.secondary_index_roots, before.secondary_index_roots,
+            "secondary index roots changed"
+        );
+        assert_eq!(after.alloc_map.len(), before.alloc_map.len());
+        assert_eq!(after.alloc_map.allocated(), before.alloc_map.allocated());
+        assert!(
+            (0..before.alloc_map.len()).all(|block_id| {
+                after.alloc_map.is_allocated(block_id) == before.alloc_map.is_allocated(block_id)
+            }),
+            "table-file allocation map changed"
+        );
+        assert!(Arc::ptr_eq(&after.metadata, &before.metadata));
     }
 
     #[test]
@@ -3886,298 +4181,5 @@ pub(crate) mod tests {
             );
             assert_eq!(retained_live.metadata().idx.active_index_count(), 1);
         });
-    }
-
-    async fn lightweight_test_engine(temp_dir: &TempDir, log_file_stem: &str) -> Engine {
-        Engine::bootstrap(lightweight_test_engine_config(
-            temp_dir.path().to_path_buf(),
-            log_file_stem,
-        ))
-        .await
-        .unwrap()
-    }
-
-    fn table_for_internal_assertion(engine: &Engine, table_id: TableID) -> Arc<Table> {
-        engine
-            .inner()
-            .core
-            .catalog()
-            .get_table_now(table_id)
-            .expect("test table should exist")
-    }
-
-    fn lightweight_test_engine_config(
-        main_dir: impl Into<PathBuf>,
-        log_file_stem: &str,
-    ) -> EngineConfig {
-        EngineConfig::default()
-            .storage_root(main_dir)
-            .meta_buffer(LIGHTWEIGHT_TEST_BUFFER_BYTES)
-            .index_buffer(
-                EvictableBufferPoolConfig::default()
-                    .swap_file("index.swp")
-                    .max_mem_size(LIGHTWEIGHT_TEST_BUFFER_BYTES)
-                    .max_file_size(LIGHTWEIGHT_TEST_MAX_FILE_BYTES),
-            )
-            .data_buffer(
-                EvictableBufferPoolConfig::default()
-                    .max_mem_size(LIGHTWEIGHT_TEST_BUFFER_BYTES)
-                    .max_file_size(LIGHTWEIGHT_TEST_MAX_FILE_BYTES),
-            )
-            .trx(
-                TrxSysConfig::default()
-                    .log_write_io_depth(1)
-                    .recovery_io_depth(1)
-                    .catalog_checkpoint_scan_io_depth(1)
-                    .log_file_stem(log_file_stem)
-                    .purge_threads(1),
-            )
-            .file(
-                FileSystemConfig::default()
-                    .io_depth(1)
-                    .readonly_buffer_size(LIGHTWEIGHT_TEST_READONLY_BUFFER_BYTES)
-                    .data_dir("."),
-            )
-    }
-
-    async fn update_one_row(
-        table_id: TableID,
-        session: &mut Session,
-        key: &SelectKey,
-        update: Vec<UpdateCol>,
-    ) -> RowID {
-        let mut trx = session.begin_trx().unwrap();
-        let result = trx
-            .table_update_unique_mvcc(table_id, key.index_no, &key.vals, update)
-            .await;
-        let Ok(UpdateMvcc::Updated(row_id)) = result else {
-            panic!("update should succeed: {result:?}");
-        };
-        trx.commit().await.unwrap();
-        row_id
-    }
-
-    async fn assert_create_unique_index_rejects_cold_duplicates(
-        log_file_stem: &str,
-        cold_count: i32,
-        hot_count: i32,
-    ) {
-        let temp_dir = TempDir::new().unwrap();
-        let engine = lightweight_test_engine(&temp_dir, log_file_stem).await;
-        let table_id = table2(&engine).await;
-        let table = table_for_internal_assertion(&engine, table_id);
-        let mut session = engine.new_session().unwrap();
-        for primary_key in 0..cold_count {
-            insert_one_row(
-                table_id,
-                &mut session,
-                vec![Val::from(primary_key), Val::from("dup")],
-            )
-            .await;
-        }
-        assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-        for offset in 0..hot_count {
-            insert_one_row(
-                table_id,
-                &mut session,
-                vec![Val::from(100 + offset), Val::from("dup")],
-            )
-            .await;
-        }
-        assert_checkpoint_published(&mut session, table_id).await;
-        let before = index_ddl_snapshot(&engine, table_id, &table);
-
-        let err = session
-            .create_index(
-                table_id,
-                IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::UK),
-            )
-            .await
-            .unwrap_err();
-
-        assert_eq!(
-            err.report().downcast_ref::<OperationError>().copied(),
-            Some(OperationError::DuplicateKey)
-        );
-        assert_index_ddl_snapshot_unchanged(&before, &engine, table_id, &table);
-        assert_eq!(table.metadata().idx.next_index_no(), 1);
-        assert!(table.metadata().idx.index_spec(1).is_none());
-    }
-
-    async fn assert_create_index_build_failure_cleanup(failure: CreateIndexTestFailure) {
-        let temp_dir = TempDir::new().unwrap();
-        let log_stem = match failure {
-            CreateIndexTestFailure::PopulateNonUnique => "create_index_population_failure",
-            CreateIndexTestFailure::AfterRuntimeStaged => "create_index_staged_failure",
-        };
-        let engine = lightweight_test_engine(&temp_dir, log_stem).await;
-        let table_id = table2(&engine).await;
-        let table = table_for_internal_assertion(&engine, table_id);
-        let mut session = engine.new_session().unwrap();
-        insert_one_row(
-            table_id,
-            &mut session,
-            vec![Val::from(1), Val::from("alpha")],
-        )
-        .await;
-        let before = index_ddl_snapshot(&engine, table_id, &table);
-        let allocated_before = engine.inner().pools.index.allocated();
-
-        engine
-            .inner()
-            .index_ddl_test
-            .set_create_failure(Some(failure));
-        let result = session
-            .create_index(
-                table_id,
-                IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
-            )
-            .await;
-        engine.inner().index_ddl_test.set_create_failure(None);
-        let err = result.unwrap_err();
-
-        assert_eq!(
-            err.report().downcast_ref::<RuntimeError>().copied(),
-            Some(RuntimeError::IndexAccess)
-        );
-        assert_eq!(engine.inner().pools.index.allocated(), allocated_before);
-        assert_index_ddl_snapshot_unchanged(&before, &engine, table_id, &table);
-        assert_eq!(table.metadata().idx.next_index_no(), 1);
-        assert!(table.metadata().idx.index_spec(1).is_none());
-    }
-
-    async fn non_unique_mem_state(
-        table: &Table,
-        guards: &PoolGuards,
-        index_no: usize,
-        key: &str,
-        row_id: RowID,
-    ) -> Option<bool> {
-        let layout = table.layout_snapshot();
-        layout
-            .secondary_index(index_no)
-            .unwrap()
-            .non_unique_mem()
-            .unwrap()
-            .bind(guards.index_guard())
-            .lookup_unique(&[Val::from(key)], row_id, MAX_SNAPSHOT_TS)
-            .await
-            .unwrap()
-    }
-
-    fn single_key<V: Into<Val>>(value: V) -> SelectKey {
-        SelectKey {
-            index_no: 0,
-            vals: vec![value.into()],
-        }
-    }
-
-    fn name_key(value: &str) -> SelectKey {
-        SelectKey {
-            index_no: 1,
-            vals: vec![Val::from(value)],
-        }
-    }
-
-    fn active_secondary_root(table: &Table, index_no: usize) -> BlockID {
-        table.file().active_root_unchecked().secondary_index_roots[index_no]
-    }
-
-    async fn unique_runtime_lookup(
-        table: &Table,
-        index_no: usize,
-        guards: &PoolGuards,
-        key: &[Val],
-    ) -> Option<(RowID, bool)> {
-        let root = active_secondary_root(table, index_no);
-        let layout = table.layout_snapshot();
-        let index = layout
-            .secondary_index(index_no)
-            .unwrap()
-            .bind_unique_unchecked(guards, root)
-            .unwrap();
-        index.lookup(key, MAX_SNAPSHOT_TS).await.unwrap()
-    }
-
-    async fn non_unique_runtime_lookup(
-        layout: &Arc<TableRuntimeLayout>,
-        root: BlockID,
-        guards: &PoolGuards,
-        index_no: usize,
-        key: &[Val],
-    ) -> Vec<RowID> {
-        let index = layout.secondary_index(index_no).unwrap();
-        let range = index.key_encoder().encode_non_unique_equal_range(key);
-        let bound = index.bind_non_unique_unchecked(guards, root).unwrap();
-        let mut stream = bound
-            .equal_scan_candidates(&range, MAX_SNAPSHOT_TS)
-            .unwrap();
-        let mut rows = Vec::new();
-        while let Some(batch) = stream.next_batch().await.unwrap() {
-            rows.extend(batch.into_iter().map(|candidate| candidate.row_id));
-        }
-        rows
-    }
-
-    async fn non_unique_mem_index_prefix_scan(
-        layout: &Arc<TableRuntimeLayout>,
-        guards: &PoolGuards,
-        index_no: usize,
-        key: &[Val],
-    ) -> Vec<RowID> {
-        let index = layout.secondary_index(index_no).unwrap();
-        let range = index.key_encoder().encode_non_unique_equal_range(key);
-        let mem = index.non_unique_mem().unwrap().bind(guards.index_guard());
-        let mut stream = mem.equal_scan_candidates(&range, MAX_SNAPSHOT_TS).unwrap();
-        let mut rows = Vec::new();
-        while let Some(batch) = stream.next_batch().await.unwrap() {
-            rows.extend(batch.into_iter().map(|candidate| candidate.row_id));
-        }
-        rows
-    }
-
-    async fn non_unique_disk_tree_prefix_scan(
-        table: &Table,
-        guards: &PoolGuards,
-        key: &SelectKey,
-    ) -> Vec<RowID> {
-        let root = active_secondary_root(table, key.index_no);
-        let layout = table.layout_snapshot();
-        let index = layout.secondary_index(key.index_no).unwrap();
-        let range = index.key_encoder().encode_non_unique_equal_range(&key.vals);
-        let tree = index
-            .disk_runtime()
-            .open_non_unique_at(root, guards.disk_guard())
-            .unwrap();
-        let mut stream = tree.scan_candidate_stream(&range);
-        let mut rows = Vec::new();
-        while let Some(batch) = stream.next_batch().await.unwrap() {
-            rows.extend(batch.into_iter().map(|candidate| candidate.row_id));
-        }
-        rows
-    }
-
-    fn assert_root_metadata_unchanged(before: &ActiveRoot, table: &Table) {
-        let after = table.file().active_root_unchecked();
-        assert_eq!(after.slot_no, before.slot_no);
-        assert_eq!(after.root_ts, before.root_ts);
-        assert_eq!(after.effective_ts(), before.effective_ts());
-        assert_eq!(after.meta_block_id, before.meta_block_id);
-        assert_eq!(after.pivot_row_id, before.pivot_row_id);
-        assert_eq!(after.heap_redo_start_ts, before.heap_redo_start_ts);
-        assert_eq!(after.deletion_cutoff_ts, before.deletion_cutoff_ts);
-        assert_eq!(
-            after.secondary_index_roots, before.secondary_index_roots,
-            "secondary index roots changed"
-        );
-        assert_eq!(after.alloc_map.len(), before.alloc_map.len());
-        assert_eq!(after.alloc_map.allocated(), before.alloc_map.allocated());
-        assert!(
-            (0..before.alloc_map.len()).all(|block_id| {
-                after.alloc_map.is_allocated(block_id) == before.alloc_map.is_allocated(block_id)
-            }),
-            "table-file allocation map changed"
-        );
-        assert!(Arc::ptr_eq(&after.metadata, &before.metadata));
     }
 }

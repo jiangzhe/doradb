@@ -1084,6 +1084,208 @@ mod tests {
         );
     }
 
+    fn assert_fatal_storage_io(error: OperationOrFatalError) {
+        match error {
+            OperationOrFatalError::Fatal(report) => {
+                assert_eq!(*report.current_context(), FatalError::StorageIo);
+                assert!(
+                    format!("{report:?}").contains("pending-claim test poison"),
+                    "fatal report lost its source-bearing test attachment: {report:?}"
+                );
+            }
+            OperationOrFatalError::Operation(report) => {
+                panic!("poisoned lock wait returned Operation: {report:?}")
+            }
+        }
+    }
+
+    fn run_pending_claim_poison_phase(phase: PendingClaimTestPhase) {
+        smol::block_on(async {
+            let manager = LockManager::new();
+            let resource = table_data(850 + phase as u64);
+            let mut blocker = TestLockOwner::new(LockOwner::session_explicit(SessionID::new(850)));
+            blocker
+                .acquire(&manager, resource, LockMode::Exclusive)
+                .await
+                .unwrap();
+
+            let poisoner = EnginePoisoner::new();
+            let mut authority = FamilyLockAuthority::new(SessionID::new(851));
+            let (family, scope) = authority.parts();
+            let _hook = poison_pending_claim_at(phase);
+            let mut acquire =
+                Box::pin(family.acquire(scope, &manager, &poisoner, resource, LockMode::Shared));
+            let first_poll = poll!(acquire.as_mut());
+            let error = if phase == PendingClaimTestPhase::ListenerRegistered {
+                match first_poll {
+                    Poll::Ready(result) => result,
+                    Poll::Pending => panic!("listener-phase poison must complete the first poll"),
+                }
+            } else {
+                assert!(first_poll.is_pending());
+                assert!(blocker.release(&manager, resource));
+                acquire.as_mut().await
+            }
+            .unwrap_err();
+            assert_fatal_storage_io(error);
+            drop(acquire);
+
+            if phase == PendingClaimTestPhase::ListenerRegistered {
+                assert!(blocker.release(&manager, resource));
+            }
+            blocker.close(&manager);
+            family.assert_empty();
+            scope.assert_cleared();
+            assert!(debug_snapshot(&manager).entries.is_empty());
+        });
+    }
+
+    fn run_lifecycle_reference_model(
+        outer_owner: LockOwner,
+        child_owner: LockOwner,
+        mut seed: u64,
+    ) {
+        let manager = LockManager::new();
+        assert_eq!(outer_owner.family(), child_owner.family());
+        let mut family = FamilyLockState::new(outer_owner.family());
+        let mut scopes = [
+            LockScopeState::new(outer_owner),
+            LockScopeState::new(child_owner),
+        ];
+        let resources = [table_data(900), table_data(901), table_data(902)];
+        let modes = [
+            LockMode::IntentShared,
+            LockMode::IntentExclusive,
+            LockMode::Shared,
+            LockMode::Exclusive,
+        ];
+        let mut model = BTreeMap::<(usize, LockResource), (ClaimNo, LockMode)>::new();
+        let mut last_claim_no = 0;
+
+        for _step in 0..512 {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let scope_index = (seed as usize) % scopes.len();
+            let resource = resources[((seed >> 8) as usize) % resources.len()];
+            match (seed >> 16) % 8 {
+                0 => {
+                    if scope_index == 0 && model.keys().any(|(index, _resource)| *index == 1) {
+                        continue;
+                    }
+                    let expected_resources = model
+                        .keys()
+                        .filter(|(index, _resource)| *index == scope_index)
+                        .map(|(_index, resource)| *resource)
+                        .collect::<Vec<_>>();
+                    family.close_scope(&mut scopes[scope_index], &manager);
+                    for resource in expected_resources {
+                        model.remove(&(scope_index, resource));
+                    }
+                }
+                1 | 2 => {
+                    if scope_index == 0 && model.contains_key(&(1, resource)) {
+                        continue;
+                    }
+                    let expected = model.remove(&(scope_index, resource));
+                    assert_eq!(
+                        family.release(&mut scopes[scope_index], &manager, resource),
+                        expected.is_some()
+                    );
+                }
+                _ => {
+                    if scope_index == 0 && model.keys().any(|(index, _resource)| *index == 1) {
+                        continue;
+                    }
+                    let requested = modes[((seed >> 24) as usize) % modes.len()];
+                    let exact = model.get(&(scope_index, resource)).copied();
+                    let family_covers =
+                        model.iter().all(|(&(index, held_resource), &(_no, held))| {
+                            held_resource != resource
+                                || index == scope_index
+                                || held.covers(resource, requested)
+                        });
+                    let expected_success = match exact {
+                        Some((_claim_no, held)) if held.covers(resource, requested) => true,
+                        Some((_claim_no, held)) => {
+                            family_covers && requested.covers(resource, held)
+                        }
+                        None => family_covers,
+                    };
+                    let next_claim_no = family.next_claim_no;
+                    let result = family
+                        .acquire(
+                            &mut scopes[scope_index],
+                            &manager,
+                            healthy_test_poisoner(),
+                            resource,
+                            requested,
+                        )
+                        .now_or_never()
+                        .expect("reference-model acquisition unexpectedly waited");
+                    if expected_success {
+                        result.unwrap();
+                        let actual = scopes[scope_index].claims[&resource];
+                        if let Some((claim_no, _held)) = exact {
+                            assert_eq!(actual.claim_no, claim_no);
+                        } else {
+                            assert_eq!(actual.claim_no.as_u64(), next_claim_no);
+                            assert!(actual.claim_no.as_u64() > last_claim_no);
+                            last_claim_no = actual.claim_no.as_u64();
+                        }
+                        model.insert((scope_index, resource), (actual.claim_no, actual.mode));
+                    } else {
+                        assert!(result.is_err());
+                        assert_eq!(
+                            scopes[scope_index].claims.get(&resource).copied(),
+                            exact.map(|(claim_no, mode)| ScopeClaim { claim_no, mode })
+                        );
+                    }
+                    assert_eq!(
+                        family.next_claim_no,
+                        next_claim_no + u64::from(exact.is_none())
+                    );
+                }
+            }
+
+            for (index, scope) in scopes.iter().enumerate() {
+                assert_eq!(
+                    scope.claims.len(),
+                    model
+                        .keys()
+                        .filter(|(scope_index, _)| *scope_index == index)
+                        .count()
+                );
+                for (&resource, &claim) in &scope.claims {
+                    assert_eq!(
+                        model.get(&(index, resource)).copied(),
+                        Some((claim.claim_no, claim.mode))
+                    );
+                }
+            }
+            let expected_claims = model
+                .iter()
+                .map(|(&(index, resource), &(claim_no, mode))| {
+                    (resource, scopes[index].owner(), claim_no, mode)
+                })
+                .collect::<Vec<_>>();
+            let actual_claims = family_snapshot(&family)
+                .into_iter()
+                .map(|entry| (entry.0, entry.1, entry.2, entry.3))
+                .collect::<Vec<_>>();
+            let mut expected_claims = expected_claims;
+            expected_claims.sort_unstable_by_key(|entry| (entry.0, entry.1));
+            assert_eq!(actual_claims, expected_claims);
+            assert_manager_agreement(&family, &manager);
+        }
+
+        for scope in &mut scopes {
+            family.close_scope(scope, &manager);
+        }
+        family.assert_empty();
+        assert_manager_agreement(&family, &manager);
+    }
+
     #[test]
     fn new_authority_starts_with_one_empty_session_root() {
         let session_id = SessionID::new(9);
@@ -1669,62 +1871,6 @@ mod tests {
         });
     }
 
-    fn assert_fatal_storage_io(error: OperationOrFatalError) {
-        match error {
-            OperationOrFatalError::Fatal(report) => {
-                assert_eq!(*report.current_context(), FatalError::StorageIo);
-                assert!(
-                    format!("{report:?}").contains("pending-claim test poison"),
-                    "fatal report lost its source-bearing test attachment: {report:?}"
-                );
-            }
-            OperationOrFatalError::Operation(report) => {
-                panic!("poisoned lock wait returned Operation: {report:?}")
-            }
-        }
-    }
-
-    fn run_pending_claim_poison_phase(phase: PendingClaimTestPhase) {
-        smol::block_on(async {
-            let manager = LockManager::new();
-            let resource = table_data(850 + phase as u64);
-            let mut blocker = TestLockOwner::new(LockOwner::session_explicit(SessionID::new(850)));
-            blocker
-                .acquire(&manager, resource, LockMode::Exclusive)
-                .await
-                .unwrap();
-
-            let poisoner = EnginePoisoner::new();
-            let mut authority = FamilyLockAuthority::new(SessionID::new(851));
-            let (family, scope) = authority.parts();
-            let _hook = poison_pending_claim_at(phase);
-            let mut acquire =
-                Box::pin(family.acquire(scope, &manager, &poisoner, resource, LockMode::Shared));
-            let first_poll = poll!(acquire.as_mut());
-            let error = if phase == PendingClaimTestPhase::ListenerRegistered {
-                match first_poll {
-                    Poll::Ready(result) => result,
-                    Poll::Pending => panic!("listener-phase poison must complete the first poll"),
-                }
-            } else {
-                assert!(first_poll.is_pending());
-                assert!(blocker.release(&manager, resource));
-                acquire.as_mut().await
-            }
-            .unwrap_err();
-            assert_fatal_storage_io(error);
-            drop(acquire);
-
-            if phase == PendingClaimTestPhase::ListenerRegistered {
-                assert!(blocker.release(&manager, resource));
-            }
-            blocker.close(&manager);
-            family.assert_empty();
-            scope.assert_cleared();
-            assert!(debug_snapshot(&manager).entries.is_empty());
-        });
-    }
-
     #[test]
     fn pending_claim_poison_cancels_every_wait_to_accept_race() {
         for phase in [
@@ -1848,152 +1994,6 @@ mod tests {
             family.close_scope(&mut first, &manager);
             assert!(debug_snapshot(&manager).entries.is_empty());
         });
-    }
-
-    fn run_lifecycle_reference_model(
-        outer_owner: LockOwner,
-        child_owner: LockOwner,
-        mut seed: u64,
-    ) {
-        let manager = LockManager::new();
-        assert_eq!(outer_owner.family(), child_owner.family());
-        let mut family = FamilyLockState::new(outer_owner.family());
-        let mut scopes = [
-            LockScopeState::new(outer_owner),
-            LockScopeState::new(child_owner),
-        ];
-        let resources = [table_data(900), table_data(901), table_data(902)];
-        let modes = [
-            LockMode::IntentShared,
-            LockMode::IntentExclusive,
-            LockMode::Shared,
-            LockMode::Exclusive,
-        ];
-        let mut model = BTreeMap::<(usize, LockResource), (ClaimNo, LockMode)>::new();
-        let mut last_claim_no = 0;
-
-        for _step in 0..512 {
-            seed = seed
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            let scope_index = (seed as usize) % scopes.len();
-            let resource = resources[((seed >> 8) as usize) % resources.len()];
-            match (seed >> 16) % 8 {
-                0 => {
-                    if scope_index == 0 && model.keys().any(|(index, _resource)| *index == 1) {
-                        continue;
-                    }
-                    let expected_resources = model
-                        .keys()
-                        .filter(|(index, _resource)| *index == scope_index)
-                        .map(|(_index, resource)| *resource)
-                        .collect::<Vec<_>>();
-                    family.close_scope(&mut scopes[scope_index], &manager);
-                    for resource in expected_resources {
-                        model.remove(&(scope_index, resource));
-                    }
-                }
-                1 | 2 => {
-                    if scope_index == 0 && model.contains_key(&(1, resource)) {
-                        continue;
-                    }
-                    let expected = model.remove(&(scope_index, resource));
-                    assert_eq!(
-                        family.release(&mut scopes[scope_index], &manager, resource),
-                        expected.is_some()
-                    );
-                }
-                _ => {
-                    if scope_index == 0 && model.keys().any(|(index, _resource)| *index == 1) {
-                        continue;
-                    }
-                    let requested = modes[((seed >> 24) as usize) % modes.len()];
-                    let exact = model.get(&(scope_index, resource)).copied();
-                    let family_covers =
-                        model.iter().all(|(&(index, held_resource), &(_no, held))| {
-                            held_resource != resource
-                                || index == scope_index
-                                || held.covers(resource, requested)
-                        });
-                    let expected_success = match exact {
-                        Some((_claim_no, held)) if held.covers(resource, requested) => true,
-                        Some((_claim_no, held)) => {
-                            family_covers && requested.covers(resource, held)
-                        }
-                        None => family_covers,
-                    };
-                    let next_claim_no = family.next_claim_no;
-                    let result = family
-                        .acquire(
-                            &mut scopes[scope_index],
-                            &manager,
-                            healthy_test_poisoner(),
-                            resource,
-                            requested,
-                        )
-                        .now_or_never()
-                        .expect("reference-model acquisition unexpectedly waited");
-                    if expected_success {
-                        result.unwrap();
-                        let actual = scopes[scope_index].claims[&resource];
-                        if let Some((claim_no, _held)) = exact {
-                            assert_eq!(actual.claim_no, claim_no);
-                        } else {
-                            assert_eq!(actual.claim_no.as_u64(), next_claim_no);
-                            assert!(actual.claim_no.as_u64() > last_claim_no);
-                            last_claim_no = actual.claim_no.as_u64();
-                        }
-                        model.insert((scope_index, resource), (actual.claim_no, actual.mode));
-                    } else {
-                        assert!(result.is_err());
-                        assert_eq!(
-                            scopes[scope_index].claims.get(&resource).copied(),
-                            exact.map(|(claim_no, mode)| ScopeClaim { claim_no, mode })
-                        );
-                    }
-                    assert_eq!(
-                        family.next_claim_no,
-                        next_claim_no + u64::from(exact.is_none())
-                    );
-                }
-            }
-
-            for (index, scope) in scopes.iter().enumerate() {
-                assert_eq!(
-                    scope.claims.len(),
-                    model
-                        .keys()
-                        .filter(|(scope_index, _)| *scope_index == index)
-                        .count()
-                );
-                for (&resource, &claim) in &scope.claims {
-                    assert_eq!(
-                        model.get(&(index, resource)).copied(),
-                        Some((claim.claim_no, claim.mode))
-                    );
-                }
-            }
-            let expected_claims = model
-                .iter()
-                .map(|(&(index, resource), &(claim_no, mode))| {
-                    (resource, scopes[index].owner(), claim_no, mode)
-                })
-                .collect::<Vec<_>>();
-            let actual_claims = family_snapshot(&family)
-                .into_iter()
-                .map(|entry| (entry.0, entry.1, entry.2, entry.3))
-                .collect::<Vec<_>>();
-            let mut expected_claims = expected_claims;
-            expected_claims.sort_unstable_by_key(|entry| (entry.0, entry.1));
-            assert_eq!(actual_claims, expected_claims);
-            assert_manager_agreement(&family, &manager);
-        }
-
-        for scope in &mut scopes {
-            family.close_scope(scope, &manager);
-        }
-        family.assert_empty();
-        assert_manager_agreement(&family, &manager);
     }
 
     #[test]

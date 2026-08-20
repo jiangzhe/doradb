@@ -1404,6 +1404,7 @@ pub(crate) mod tests {
     }
 
     impl TestLockOwner {
+        /// Creates a new test fixture.
         #[inline]
         pub(crate) fn new(owner: LockOwner) -> Self {
             Self {
@@ -1412,6 +1413,7 @@ pub(crate) mod tests {
             }
         }
 
+        /// Acquires the test fixture resource.
         #[inline]
         pub(crate) async fn acquire(
             &mut self,
@@ -1437,6 +1439,7 @@ pub(crate) mod tests {
                 })
         }
 
+        /// Releases the test fixture resource.
         #[inline]
         pub(crate) fn release(&mut self, manager: &LockManager, resource: LockResource) -> bool {
             self.authority
@@ -1444,6 +1447,7 @@ pub(crate) mod tests {
                 .release(&mut self.scope, manager, resource)
         }
 
+        /// Closes the test fixture.
         #[inline]
         pub(crate) fn close(mut self, manager: &LockManager) {
             self.authority
@@ -1568,6 +1572,18 @@ pub(crate) mod tests {
         })
     }
 
+    fn count_entries(
+        snapshot: &LockDebugSnapshot,
+        resource: LockResource,
+        state: LockDebugEntryState,
+    ) -> usize {
+        snapshot
+            .entries
+            .iter()
+            .filter(|entry| entry.resource == resource && entry.state == state)
+            .count()
+    }
+
     #[test]
     fn lock_owner_identity_carries_family_and_exact_scope() {
         let session_id = SessionID::new(7);
@@ -1596,18 +1612,6 @@ pub(crate) mod tests {
             maintenance_owner.to_string(),
             "operation(session_id=7,operation_id=6)"
         );
-    }
-
-    fn count_entries(
-        snapshot: &LockDebugSnapshot,
-        resource: LockResource,
-        state: LockDebugEntryState,
-    ) -> usize {
-        snapshot
-            .entries
-            .iter()
-            .filter(|entry| entry.resource == resource && entry.state == state)
-            .count()
     }
 
     #[test]

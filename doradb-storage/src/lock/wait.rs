@@ -743,6 +743,24 @@ pub(in crate::lock) mod tests {
         }
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(in crate::lock) struct WaitSlabSnapshot {
+        pub(in crate::lock) slots_len: usize,
+        pub(in crate::lock) capacity: usize,
+        pub(in crate::lock) live_count: usize,
+        pub(in crate::lock) free_order: Vec<usize>,
+        pub(in crate::lock) generations: Vec<u64>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(in crate::lock) struct WaitQueueSnapshot {
+        pub(in crate::lock) head: Option<WaitNodeID>,
+        pub(in crate::lock) tail: Option<WaitNodeID>,
+        pub(in crate::lock) queue_order: Vec<WaitNodeID>,
+        pub(in crate::lock) occupied: Vec<WaitNodeID>,
+        pub(in crate::lock) slab: WaitSlabSnapshot,
+    }
+
     #[inline]
     pub(in crate::lock) fn poison_pending_claim_at(
         phase: PendingClaimTestPhase,
@@ -775,24 +793,6 @@ pub(in crate::lock) mod tests {
                     .attach(format!("pending-claim test poison at phase={phase:?}")),
             );
         }
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub(in crate::lock) struct WaitSlabSnapshot {
-        pub(in crate::lock) slots_len: usize,
-        pub(in crate::lock) capacity: usize,
-        pub(in crate::lock) live_count: usize,
-        pub(in crate::lock) free_order: Vec<usize>,
-        pub(in crate::lock) generations: Vec<u64>,
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub(in crate::lock) struct WaitQueueSnapshot {
-        pub(in crate::lock) head: Option<WaitNodeID>,
-        pub(in crate::lock) tail: Option<WaitNodeID>,
-        pub(in crate::lock) queue_order: Vec<WaitNodeID>,
-        pub(in crate::lock) occupied: Vec<WaitNodeID>,
-        pub(in crate::lock) slab: WaitSlabSnapshot,
     }
 
     #[inline]

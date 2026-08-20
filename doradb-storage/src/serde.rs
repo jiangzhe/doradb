@@ -1092,155 +1092,6 @@ fn combined_min_bytes(left: MinBytesHint, right: MinBytesHint) -> MinBytesHint {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_vec_serde() {
-        let vec = [TestStruct {
-            a: 1,
-            b: 2,
-            c: 3,
-            d: 4,
-        }];
-        let mut out = vec![0; vec.ser_len()];
-        vec.ser(&mut out[..], 0);
-        let (idx, val) = Vec::<TestStruct>::deser(&out[..], 0).unwrap();
-        assert_eq!(idx, out.len());
-        assert_eq!(
-            val,
-            vec![TestStruct {
-                a: 1,
-                b: 2,
-                c: 3,
-                d: 4
-            }]
-        );
-    }
-
-    #[test]
-    fn test_vec_deser_rejects_count_larger_than_remaining_input() {
-        let mut out = vec![0u8; mem::size_of::<u64>()];
-        out[..].ser_u64(0, u64::MAX);
-
-        let err = Vec::<TestStruct>::deser(&out[..], 0).unwrap_err();
-
-        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
-    }
-
-    #[test]
-    fn test_vec_deser_rejects_count_larger_than_min_byte_capacity() {
-        let mut out = vec![0u8; mem::size_of::<u64>() + mem::size_of::<u64>() * 2 - 1];
-        out[..].ser_u64(0, 2);
-
-        let err = Vec::<u64>::deser(&out[..], 0).unwrap_err();
-
-        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
-    }
-
-    #[test]
-    fn test_vec_deser_rejects_huge_count_before_allocation() {
-        let input = FakeLenInput {
-            len: usize::MAX as u64,
-            size: usize::MAX,
-        };
-
-        let err = Vec::<u64>::deser(&input, 0).unwrap_err();
-
-        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
-    }
-
-    #[test]
-    fn test_vec_deser_rejects_nonempty_type_without_min_hint() {
-        let mut out = vec![0u8; mem::size_of::<u64>() + 1];
-        out[..].ser_u64(0, 1);
-
-        let err = Vec::<NoHint>::deser(&out[..], 0).unwrap_err();
-
-        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
-    }
-
-    #[test]
-    fn test_vec_unit_deser_rejects_nonempty_count() {
-        let mut out = vec![0u8; mem::size_of::<u64>()];
-        out[..].ser_u64(0, 1);
-
-        let err = Vec::<()>::deser(&out[..], 0).unwrap_err();
-
-        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
-    }
-
-    #[test]
-    fn test_btree_map_serde() {
-        let map = BTreeMap::from([(
-            1,
-            TestStruct {
-                a: 1,
-                b: 2,
-                c: 3,
-                d: 4,
-            },
-        )]);
-        let mut out = vec![0; map.ser_len()];
-        map.ser(&mut out[..], 0);
-        let (idx, val) = BTreeMap::<u64, TestStruct>::deser(&out[..], 0).unwrap();
-        assert_eq!(idx, out.len());
-        assert_eq!(val, map);
-    }
-
-    #[test]
-    fn test_btree_map_deser_rejects_count_larger_than_remaining_input() {
-        let mut out = vec![0u8; mem::size_of::<u64>()];
-        out[..].ser_u64(0, u64::MAX);
-
-        let err = BTreeMap::<u64, TestStruct>::deser(&out[..], 0).unwrap_err();
-
-        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
-    }
-
-    #[test]
-    fn test_btree_map_deser_rejects_count_larger_than_min_byte_capacity() {
-        let mut out = vec![0u8; mem::size_of::<u64>() + (mem::size_of::<u64>() * 2) - 1];
-        out[..].ser_u64(0, 1);
-
-        let err = BTreeMap::<u64, u64>::deser(&out[..], 0).unwrap_err();
-
-        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
-    }
-
-    #[test]
-    fn test_index_spec_serde() {
-        let cols = vec![
-            IndexKey::new(0),
-            IndexKey {
-                col_no: 1,
-                order: IndexOrder::Desc,
-            },
-        ];
-        println!("cols ser_len={}", cols.ser_len());
-        let attributes = IndexAttributes::PK;
-        println!("attributes ser_len={}", attributes.ser_len());
-        let spec = IndexSpec { cols, attributes };
-        let len = spec.ser_len();
-        println!("index_spec ser_len={}", len);
-        let mut vec = vec![0u8; len];
-        let idx = spec.ser(&mut vec[..], 0);
-        assert_eq!(idx, len);
-        let (idx, parsed) = IndexSpec::deser(&vec[..], 0).unwrap();
-        assert_eq!(idx, len);
-        assert_eq!(parsed, spec);
-    }
-
-    #[test]
-    fn test_array_serde() {
-        let array = [0u8, 1, 2, 3, 4];
-        let len = array.ser_len();
-        assert_eq!(len, 5);
-        let mut vec = vec![0u8; len];
-        let idx = array.ser(&mut vec[..], 0);
-        assert_eq!(idx, len);
-        let (idx, res) = <[u8; 5]>::deser(&vec[..], 0).unwrap();
-        assert_eq!(idx, 5);
-        assert_eq!(res, array);
-    }
-
     #[derive(Debug, PartialEq, Eq)]
     struct TestStruct {
         a: u64,
@@ -1408,6 +1259,155 @@ mod tests {
         fn deser(&self, _idx: usize, _len: usize) -> DeserResult<(usize, &[u8])> {
             unreachable!("fake deserialization input")
         }
+    }
+
+    #[test]
+    fn test_vec_serde() {
+        let vec = [TestStruct {
+            a: 1,
+            b: 2,
+            c: 3,
+            d: 4,
+        }];
+        let mut out = vec![0; vec.ser_len()];
+        vec.ser(&mut out[..], 0);
+        let (idx, val) = Vec::<TestStruct>::deser(&out[..], 0).unwrap();
+        assert_eq!(idx, out.len());
+        assert_eq!(
+            val,
+            vec![TestStruct {
+                a: 1,
+                b: 2,
+                c: 3,
+                d: 4
+            }]
+        );
+    }
+
+    #[test]
+    fn test_vec_deser_rejects_count_larger_than_remaining_input() {
+        let mut out = vec![0u8; mem::size_of::<u64>()];
+        out[..].ser_u64(0, u64::MAX);
+
+        let err = Vec::<TestStruct>::deser(&out[..], 0).unwrap_err();
+
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
+    }
+
+    #[test]
+    fn test_vec_deser_rejects_count_larger_than_min_byte_capacity() {
+        let mut out = vec![0u8; mem::size_of::<u64>() + mem::size_of::<u64>() * 2 - 1];
+        out[..].ser_u64(0, 2);
+
+        let err = Vec::<u64>::deser(&out[..], 0).unwrap_err();
+
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
+    }
+
+    #[test]
+    fn test_vec_deser_rejects_huge_count_before_allocation() {
+        let input = FakeLenInput {
+            len: usize::MAX as u64,
+            size: usize::MAX,
+        };
+
+        let err = Vec::<u64>::deser(&input, 0).unwrap_err();
+
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
+    }
+
+    #[test]
+    fn test_vec_deser_rejects_nonempty_type_without_min_hint() {
+        let mut out = vec![0u8; mem::size_of::<u64>() + 1];
+        out[..].ser_u64(0, 1);
+
+        let err = Vec::<NoHint>::deser(&out[..], 0).unwrap_err();
+
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
+    }
+
+    #[test]
+    fn test_vec_unit_deser_rejects_nonempty_count() {
+        let mut out = vec![0u8; mem::size_of::<u64>()];
+        out[..].ser_u64(0, 1);
+
+        let err = Vec::<()>::deser(&out[..], 0).unwrap_err();
+
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
+    }
+
+    #[test]
+    fn test_btree_map_serde() {
+        let map = BTreeMap::from([(
+            1,
+            TestStruct {
+                a: 1,
+                b: 2,
+                c: 3,
+                d: 4,
+            },
+        )]);
+        let mut out = vec![0; map.ser_len()];
+        map.ser(&mut out[..], 0);
+        let (idx, val) = BTreeMap::<u64, TestStruct>::deser(&out[..], 0).unwrap();
+        assert_eq!(idx, out.len());
+        assert_eq!(val, map);
+    }
+
+    #[test]
+    fn test_btree_map_deser_rejects_count_larger_than_remaining_input() {
+        let mut out = vec![0u8; mem::size_of::<u64>()];
+        out[..].ser_u64(0, u64::MAX);
+
+        let err = BTreeMap::<u64, TestStruct>::deser(&out[..], 0).unwrap_err();
+
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
+    }
+
+    #[test]
+    fn test_btree_map_deser_rejects_count_larger_than_min_byte_capacity() {
+        let mut out = vec![0u8; mem::size_of::<u64>() + (mem::size_of::<u64>() * 2) - 1];
+        out[..].ser_u64(0, 1);
+
+        let err = BTreeMap::<u64, u64>::deser(&out[..], 0).unwrap_err();
+
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
+    }
+
+    #[test]
+    fn test_index_spec_serde() {
+        let cols = vec![
+            IndexKey::new(0),
+            IndexKey {
+                col_no: 1,
+                order: IndexOrder::Desc,
+            },
+        ];
+        println!("cols ser_len={}", cols.ser_len());
+        let attributes = IndexAttributes::PK;
+        println!("attributes ser_len={}", attributes.ser_len());
+        let spec = IndexSpec { cols, attributes };
+        let len = spec.ser_len();
+        println!("index_spec ser_len={}", len);
+        let mut vec = vec![0u8; len];
+        let idx = spec.ser(&mut vec[..], 0);
+        assert_eq!(idx, len);
+        let (idx, parsed) = IndexSpec::deser(&vec[..], 0).unwrap();
+        assert_eq!(idx, len);
+        assert_eq!(parsed, spec);
+    }
+
+    #[test]
+    fn test_array_serde() {
+        let array = [0u8, 1, 2, 3, 4];
+        let len = array.ser_len();
+        assert_eq!(len, 5);
+        let mut vec = vec![0u8; len];
+        let idx = array.ser(&mut vec[..], 0);
+        assert_eq!(idx, len);
+        let (idx, res) = <[u8; 5]>::deser(&vec[..], 0).unwrap();
+        assert_eq!(idx, 5);
+        assert_eq!(res, array);
     }
 
     #[test]

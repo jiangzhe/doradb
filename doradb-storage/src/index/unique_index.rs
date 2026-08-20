@@ -376,313 +376,6 @@ mod tests {
         entries.pop().unwrap()
     }
 
-    #[test]
-    fn test_single_key_btree_unique_index() {
-        smol::block_on(async {
-            let pool = QuiescentBox::new(
-                FixedBufferPool::with_capacity(PoolRole::Index, 1024usize * 1024 * 1024).unwrap(),
-            );
-            {
-                let pool_guard = (*pool).create_base_guard();
-                let index = test_unique_mem_index(
-                    &pool,
-                    &pool_guard,
-                    vec![ValType {
-                        kind: ValKind::I32,
-                        nullable: false,
-                    }],
-                )
-                .await;
-                run_test_suit_for_single_key_unique_index(index.bind(&pool_guard)).await;
-            }
-        });
-    }
-
-    #[test]
-    fn test_multi_key_btree_unique_index() {
-        smol::block_on(async {
-            let pool = QuiescentBox::new(
-                FixedBufferPool::with_capacity(PoolRole::Index, 1024usize * 1024 * 1024).unwrap(),
-            );
-            {
-                let pool_guard = (*pool).create_base_guard();
-                let index = test_unique_mem_index(
-                    &pool,
-                    &pool_guard,
-                    vec![
-                        ValType {
-                            kind: ValKind::VarByte,
-                            nullable: false,
-                        },
-                        ValType {
-                            kind: ValKind::I32,
-                            nullable: false,
-                        },
-                    ],
-                )
-                .await;
-                run_test_suit_for_multi_key_unique_index(index.bind(&pool_guard)).await;
-            }
-        });
-    }
-
-    #[test]
-    fn test_unique_mem_index_encoded_insertion_matches_logical_key() {
-        smol::block_on(async {
-            let pool = QuiescentBox::new(
-                FixedBufferPool::with_capacity(PoolRole::Index, 1024usize * 1024 * 1024).unwrap(),
-            );
-            let pool_guard = (*pool).create_base_guard();
-            let index = test_unique_mem_index(
-                &pool,
-                &pool_guard,
-                vec![
-                    ValType::new(ValKind::VarByte, false),
-                    ValType::new(ValKind::I32, true),
-                ],
-            )
-            .await;
-            let guarded = index.bind(&pool_guard);
-            let key = [Val::from("encoded"), Val::Null];
-            let encoded_key = index.encoder().encode(&key);
-            let row_id = RowID::new(10);
-
-            assert_eq!(
-                guarded
-                    .insert_encoded_if_not_exists(&encoded_key, row_id, false, TrxID::new(101),)
-                    .await
-                    .unwrap(),
-                IndexInsert::Ok(false)
-            );
-            assert_eq!(
-                guarded.lookup(&key, TrxID::new(102)).await.unwrap(),
-                Some((row_id, false))
-            );
-            assert_eq!(
-                guarded
-                    .insert_if_not_exists(&key, RowID::new(20), false, TrxID::new(103))
-                    .await
-                    .unwrap(),
-                IndexInsert::DuplicateKey(row_id, false)
-            );
-        });
-    }
-
-    #[test]
-    fn test_unique_mem_index_row_id_stream_bounds_and_drop() {
-        smol::block_on(async {
-            let pool = QuiescentBox::new(
-                FixedBufferPool::with_capacity(PoolRole::Index, 1024usize * 1024 * 1024).unwrap(),
-            );
-            let pool_guard = (*pool).create_base_guard();
-            let index = test_unique_mem_index(
-                &pool,
-                &pool_guard,
-                vec![ValType {
-                    kind: ValKind::I32,
-                    nullable: false,
-                }],
-            )
-            .await;
-            let guarded = index.bind(&pool_guard);
-            for key in 1..=5 {
-                assert!(
-                    guarded
-                        .insert_if_not_exists(
-                            &[Val::from(key)],
-                            RowID::new(key as u64 * 10),
-                            false,
-                            TrxID::new(100),
-                        )
-                        .await
-                        .unwrap()
-                        .is_ok()
-                );
-            }
-
-            let range = index
-                .encoder()
-                .encode_range(&[Val::from(2i32)][..]..&[Val::from(4i32)][..]);
-            let mut stream = guarded
-                .index_scan_candidates(&range, TrxID::new(101))
-                .unwrap();
-            assert_eq!(
-                drain_row_ids(&mut stream).await,
-                vec![RowID::new(20), RowID::new(30)]
-            );
-
-            let range = index.encoder().encode_range(..);
-            let mut stream = guarded
-                .index_scan_candidates(&range, TrxID::new(102))
-                .unwrap();
-            assert!(stream.next_batch().await.unwrap().is_some());
-            drop(stream);
-            assert_eq!(
-                guarded
-                    .lookup(&[Val::from(1i32)], TrxID::new(103))
-                    .await
-                    .unwrap(),
-                Some((RowID::new(10), false))
-            );
-        });
-    }
-
-    #[test]
-    fn test_unique_mem_index_compare_delete_encoded_entry_checks_snapshot() {
-        smol::block_on(async {
-            let pool = QuiescentBox::new(
-                FixedBufferPool::with_capacity(PoolRole::Index, 1024usize * 1024 * 1024).unwrap(),
-            );
-            let pool_guard = (*pool).create_base_guard();
-            let index = test_unique_mem_index(
-                &pool,
-                &pool_guard,
-                vec![ValType {
-                    kind: ValKind::I32,
-                    nullable: false,
-                }],
-            )
-            .await;
-            let key = vec![Val::from(42i32)];
-            let row_id = 100u64;
-            let guarded = index.bind(&pool_guard);
-            assert!(
-                guarded
-                    .insert_if_not_exists(&key, RowID::new(row_id), false, TrxID::new(100))
-                    .await
-                    .unwrap()
-                    .is_ok()
-            );
-
-            let active_entry = cleanup_entry(&index, &pool_guard, RowID::new(row_id + 1)).await;
-            assert!(!active_entry.deleted);
-            assert!(
-                !index
-                    .compare_delete_encoded_entry(
-                        &pool_guard,
-                        &active_entry.encoded_key,
-                        active_entry.row_id,
-                        true,
-                        TrxID::new(101),
-                    )
-                    .await
-                    .unwrap()
-            );
-            assert_eq!(
-                guarded.lookup(&key, TrxID::new(101)).await.unwrap(),
-                Some((RowID::new(row_id), false))
-            );
-
-            assert!(
-                guarded
-                    .mask_as_deleted(&key, RowID::new(row_id), TrxID::new(102))
-                    .await
-                    .unwrap()
-            );
-            let deleted_entry = cleanup_entry(&index, &pool_guard, RowID::new(row_id + 1)).await;
-            assert!(deleted_entry.deleted);
-            assert!(
-                !index
-                    .compare_delete_encoded_entry(
-                        &pool_guard,
-                        &deleted_entry.encoded_key,
-                        deleted_entry.row_id,
-                        false,
-                        TrxID::new(103),
-                    )
-                    .await
-                    .unwrap()
-            );
-            assert_eq!(
-                guarded.lookup(&key, TrxID::new(103)).await.unwrap(),
-                Some((RowID::new(row_id), true))
-            );
-            assert!(
-                index
-                    .compare_delete_encoded_entry(
-                        &pool_guard,
-                        &deleted_entry.encoded_key,
-                        deleted_entry.row_id,
-                        true,
-                        TrxID::new(104),
-                    )
-                    .await
-                    .unwrap()
-            );
-            assert_eq!(guarded.lookup(&key, TrxID::new(104)).await.unwrap(), None);
-        });
-    }
-
-    #[test]
-    fn test_unique_mem_index_cleanup_scan_filters_live_entries_by_policy() {
-        smol::block_on(async {
-            let pool = QuiescentBox::new(
-                FixedBufferPool::with_capacity(PoolRole::Index, 1024usize * 1024 * 1024).unwrap(),
-            );
-            let pool_guard = (*pool).create_base_guard();
-            let index = test_unique_mem_index(
-                &pool,
-                &pool_guard,
-                vec![ValType {
-                    kind: ValKind::I32,
-                    nullable: false,
-                }],
-            )
-            .await;
-            let guarded = index.bind(&pool_guard);
-
-            let cold_live_key = vec![Val::from(1i32)];
-            let hot_live_key = vec![Val::from(2i32)];
-            let cold_deleted_key = vec![Val::from(3i32)];
-            let hot_deleted_key = vec![Val::from(4i32)];
-            guarded
-                .insert_if_not_exists(&cold_live_key, RowID::new(10), false, TrxID::new(100))
-                .await
-                .unwrap();
-            guarded
-                .insert_if_not_exists(&hot_live_key, RowID::new(200), false, TrxID::new(100))
-                .await
-                .unwrap();
-            guarded
-                .insert_if_not_exists(&cold_deleted_key, RowID::new(30), false, TrxID::new(100))
-                .await
-                .unwrap();
-            assert!(
-                guarded
-                    .mask_as_deleted(&cold_deleted_key, RowID::new(30), TrxID::new(101))
-                    .await
-                    .unwrap()
-            );
-            guarded
-                .insert_if_not_exists(&hot_deleted_key, RowID::new(300), false, TrxID::new(100))
-                .await
-                .unwrap();
-            assert!(
-                guarded
-                    .mask_as_deleted(&hot_deleted_key, RowID::new(300), TrxID::new(101))
-                    .await
-                    .unwrap()
-            );
-
-            let mut scan = index.cleanup_scan(&pool_guard, RowID::new(100), true);
-            let batch = scan.next_batch().await.unwrap().unwrap();
-            assert_eq!(batch.skipped_live, 1);
-            assert_eq!(batch.skipped_hot_deleted, 1);
-            assert_eq!(batch.entries.len(), 2);
-            assert!(batch.entries.iter().any(|entry| !entry.deleted));
-            assert!(batch.entries.iter().any(|entry| entry.deleted));
-            assert!(scan.next_batch().await.unwrap().is_none());
-
-            let mut scan = index.cleanup_scan(&pool_guard, RowID::new(100), false);
-            let batch = scan.next_batch().await.unwrap().unwrap();
-            assert_eq!(batch.skipped_live, 2);
-            assert_eq!(batch.skipped_hot_deleted, 1);
-            assert_eq!(batch.entries.len(), 1);
-            assert!(batch.entries[0].deleted);
-            assert!(scan.next_batch().await.unwrap().is_none());
-        });
-    }
-
     async fn run_test_suit_for_single_key_unique_index<P: BufferPool>(
         index: GuardedUniqueMemIndex<'_, '_, P>,
     ) {
@@ -1045,5 +738,312 @@ mod tests {
             .index_scan_candidates(&range, TrxID::new(100))
             .unwrap();
         drain_row_ids(&mut stream).await
+    }
+
+    #[test]
+    fn test_single_key_btree_unique_index() {
+        smol::block_on(async {
+            let pool = QuiescentBox::new(
+                FixedBufferPool::with_capacity(PoolRole::Index, 1024usize * 1024 * 1024).unwrap(),
+            );
+            {
+                let pool_guard = (*pool).create_base_guard();
+                let index = test_unique_mem_index(
+                    &pool,
+                    &pool_guard,
+                    vec![ValType {
+                        kind: ValKind::I32,
+                        nullable: false,
+                    }],
+                )
+                .await;
+                run_test_suit_for_single_key_unique_index(index.bind(&pool_guard)).await;
+            }
+        });
+    }
+
+    #[test]
+    fn test_multi_key_btree_unique_index() {
+        smol::block_on(async {
+            let pool = QuiescentBox::new(
+                FixedBufferPool::with_capacity(PoolRole::Index, 1024usize * 1024 * 1024).unwrap(),
+            );
+            {
+                let pool_guard = (*pool).create_base_guard();
+                let index = test_unique_mem_index(
+                    &pool,
+                    &pool_guard,
+                    vec![
+                        ValType {
+                            kind: ValKind::VarByte,
+                            nullable: false,
+                        },
+                        ValType {
+                            kind: ValKind::I32,
+                            nullable: false,
+                        },
+                    ],
+                )
+                .await;
+                run_test_suit_for_multi_key_unique_index(index.bind(&pool_guard)).await;
+            }
+        });
+    }
+
+    #[test]
+    fn test_unique_mem_index_encoded_insertion_matches_logical_key() {
+        smol::block_on(async {
+            let pool = QuiescentBox::new(
+                FixedBufferPool::with_capacity(PoolRole::Index, 1024usize * 1024 * 1024).unwrap(),
+            );
+            let pool_guard = (*pool).create_base_guard();
+            let index = test_unique_mem_index(
+                &pool,
+                &pool_guard,
+                vec![
+                    ValType::new(ValKind::VarByte, false),
+                    ValType::new(ValKind::I32, true),
+                ],
+            )
+            .await;
+            let guarded = index.bind(&pool_guard);
+            let key = [Val::from("encoded"), Val::Null];
+            let encoded_key = index.encoder().encode(&key);
+            let row_id = RowID::new(10);
+
+            assert_eq!(
+                guarded
+                    .insert_encoded_if_not_exists(&encoded_key, row_id, false, TrxID::new(101),)
+                    .await
+                    .unwrap(),
+                IndexInsert::Ok(false)
+            );
+            assert_eq!(
+                guarded.lookup(&key, TrxID::new(102)).await.unwrap(),
+                Some((row_id, false))
+            );
+            assert_eq!(
+                guarded
+                    .insert_if_not_exists(&key, RowID::new(20), false, TrxID::new(103))
+                    .await
+                    .unwrap(),
+                IndexInsert::DuplicateKey(row_id, false)
+            );
+        });
+    }
+
+    #[test]
+    fn test_unique_mem_index_row_id_stream_bounds_and_drop() {
+        smol::block_on(async {
+            let pool = QuiescentBox::new(
+                FixedBufferPool::with_capacity(PoolRole::Index, 1024usize * 1024 * 1024).unwrap(),
+            );
+            let pool_guard = (*pool).create_base_guard();
+            let index = test_unique_mem_index(
+                &pool,
+                &pool_guard,
+                vec![ValType {
+                    kind: ValKind::I32,
+                    nullable: false,
+                }],
+            )
+            .await;
+            let guarded = index.bind(&pool_guard);
+            for key in 1..=5 {
+                assert!(
+                    guarded
+                        .insert_if_not_exists(
+                            &[Val::from(key)],
+                            RowID::new(key as u64 * 10),
+                            false,
+                            TrxID::new(100),
+                        )
+                        .await
+                        .unwrap()
+                        .is_ok()
+                );
+            }
+
+            let range = index
+                .encoder()
+                .encode_range(&[Val::from(2i32)][..]..&[Val::from(4i32)][..]);
+            let mut stream = guarded
+                .index_scan_candidates(&range, TrxID::new(101))
+                .unwrap();
+            assert_eq!(
+                drain_row_ids(&mut stream).await,
+                vec![RowID::new(20), RowID::new(30)]
+            );
+
+            let range = index.encoder().encode_range(..);
+            let mut stream = guarded
+                .index_scan_candidates(&range, TrxID::new(102))
+                .unwrap();
+            assert!(stream.next_batch().await.unwrap().is_some());
+            drop(stream);
+            assert_eq!(
+                guarded
+                    .lookup(&[Val::from(1i32)], TrxID::new(103))
+                    .await
+                    .unwrap(),
+                Some((RowID::new(10), false))
+            );
+        });
+    }
+
+    #[test]
+    fn test_unique_mem_index_compare_delete_encoded_entry_checks_snapshot() {
+        smol::block_on(async {
+            let pool = QuiescentBox::new(
+                FixedBufferPool::with_capacity(PoolRole::Index, 1024usize * 1024 * 1024).unwrap(),
+            );
+            let pool_guard = (*pool).create_base_guard();
+            let index = test_unique_mem_index(
+                &pool,
+                &pool_guard,
+                vec![ValType {
+                    kind: ValKind::I32,
+                    nullable: false,
+                }],
+            )
+            .await;
+            let key = vec![Val::from(42i32)];
+            let row_id = 100u64;
+            let guarded = index.bind(&pool_guard);
+            assert!(
+                guarded
+                    .insert_if_not_exists(&key, RowID::new(row_id), false, TrxID::new(100))
+                    .await
+                    .unwrap()
+                    .is_ok()
+            );
+
+            let active_entry = cleanup_entry(&index, &pool_guard, RowID::new(row_id + 1)).await;
+            assert!(!active_entry.deleted);
+            assert!(
+                !index
+                    .compare_delete_encoded_entry(
+                        &pool_guard,
+                        &active_entry.encoded_key,
+                        active_entry.row_id,
+                        true,
+                        TrxID::new(101),
+                    )
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                guarded.lookup(&key, TrxID::new(101)).await.unwrap(),
+                Some((RowID::new(row_id), false))
+            );
+
+            assert!(
+                guarded
+                    .mask_as_deleted(&key, RowID::new(row_id), TrxID::new(102))
+                    .await
+                    .unwrap()
+            );
+            let deleted_entry = cleanup_entry(&index, &pool_guard, RowID::new(row_id + 1)).await;
+            assert!(deleted_entry.deleted);
+            assert!(
+                !index
+                    .compare_delete_encoded_entry(
+                        &pool_guard,
+                        &deleted_entry.encoded_key,
+                        deleted_entry.row_id,
+                        false,
+                        TrxID::new(103),
+                    )
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                guarded.lookup(&key, TrxID::new(103)).await.unwrap(),
+                Some((RowID::new(row_id), true))
+            );
+            assert!(
+                index
+                    .compare_delete_encoded_entry(
+                        &pool_guard,
+                        &deleted_entry.encoded_key,
+                        deleted_entry.row_id,
+                        true,
+                        TrxID::new(104),
+                    )
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(guarded.lookup(&key, TrxID::new(104)).await.unwrap(), None);
+        });
+    }
+
+    #[test]
+    fn test_unique_mem_index_cleanup_scan_filters_live_entries_by_policy() {
+        smol::block_on(async {
+            let pool = QuiescentBox::new(
+                FixedBufferPool::with_capacity(PoolRole::Index, 1024usize * 1024 * 1024).unwrap(),
+            );
+            let pool_guard = (*pool).create_base_guard();
+            let index = test_unique_mem_index(
+                &pool,
+                &pool_guard,
+                vec![ValType {
+                    kind: ValKind::I32,
+                    nullable: false,
+                }],
+            )
+            .await;
+            let guarded = index.bind(&pool_guard);
+
+            let cold_live_key = vec![Val::from(1i32)];
+            let hot_live_key = vec![Val::from(2i32)];
+            let cold_deleted_key = vec![Val::from(3i32)];
+            let hot_deleted_key = vec![Val::from(4i32)];
+            guarded
+                .insert_if_not_exists(&cold_live_key, RowID::new(10), false, TrxID::new(100))
+                .await
+                .unwrap();
+            guarded
+                .insert_if_not_exists(&hot_live_key, RowID::new(200), false, TrxID::new(100))
+                .await
+                .unwrap();
+            guarded
+                .insert_if_not_exists(&cold_deleted_key, RowID::new(30), false, TrxID::new(100))
+                .await
+                .unwrap();
+            assert!(
+                guarded
+                    .mask_as_deleted(&cold_deleted_key, RowID::new(30), TrxID::new(101))
+                    .await
+                    .unwrap()
+            );
+            guarded
+                .insert_if_not_exists(&hot_deleted_key, RowID::new(300), false, TrxID::new(100))
+                .await
+                .unwrap();
+            assert!(
+                guarded
+                    .mask_as_deleted(&hot_deleted_key, RowID::new(300), TrxID::new(101))
+                    .await
+                    .unwrap()
+            );
+
+            let mut scan = index.cleanup_scan(&pool_guard, RowID::new(100), true);
+            let batch = scan.next_batch().await.unwrap().unwrap();
+            assert_eq!(batch.skipped_live, 1);
+            assert_eq!(batch.skipped_hot_deleted, 1);
+            assert_eq!(batch.entries.len(), 2);
+            assert!(batch.entries.iter().any(|entry| !entry.deleted));
+            assert!(batch.entries.iter().any(|entry| entry.deleted));
+            assert!(scan.next_batch().await.unwrap().is_none());
+
+            let mut scan = index.cleanup_scan(&pool_guard, RowID::new(100), false);
+            let batch = scan.next_batch().await.unwrap().unwrap();
+            assert_eq!(batch.skipped_live, 2);
+            assert_eq!(batch.skipped_hot_deleted, 1);
+            assert_eq!(batch.entries.len(), 1);
+            assert!(batch.entries[0].deleted);
+            assert!(scan.next_batch().await.unwrap().is_none());
+        });
     }
 }

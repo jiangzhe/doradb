@@ -3542,39 +3542,6 @@ mod tests {
         values.into_iter().map(RowID::new).collect()
     }
 
-    #[test]
-    fn test_column_index_layout_adaptation_preserves_layout_source() {
-        let err = match persisted_column_index_layout(
-            layout::try_ref_from_bytes::<ColumnBlockNodeHeader>(&[0u8; 1]),
-            "test_node_header",
-        ) {
-            Ok(_) => panic!("short column-index header must fail"),
-            Err(err) => err,
-        };
-
-        assert_eq!(err.current_context(), &DataIntegrityError::InvalidPayload);
-        assert_eq!(
-            err.downcast_ref::<LayoutError>().copied(),
-            Some(LayoutError::Mismatch)
-        );
-        assert!(format!("{err:?}").contains("field=test_node_header"));
-    }
-
-    #[test]
-    fn test_persisted_empty_column_index_page_is_invalid_payload() {
-        let mut page = DirectBuf::zeroed(COLUMN_BLOCK_PAGE_SIZE);
-        write_block_header(page.data_mut(), COLUMN_BLOCK_INDEX_BLOCK_SPEC);
-        write_block_checksum(page.data_mut());
-
-        let err = validate_persisted_column_block_index_page(
-            page.data(),
-            FileKind::TableFile,
-            test_block_id(42),
-        )
-        .unwrap_err();
-        assert_eq!(err.current_context(), &DataIntegrityError::InvalidPayload);
-    }
-
     fn test_row_id_range(start: u64, end: u64) -> Vec<RowID> {
         (start..end).map(RowID::new).collect()
     }
@@ -3633,6 +3600,98 @@ mod tests {
         let mut shape = ColumnBlockEntryShape::new(start, end, row_ids, delete_deltas);
         shape.delete_domain = delete_domain;
         shape.with_block_id(block_id)
+    }
+
+    async fn assert_search_type_lookup(
+        entries: Vec<ColumnBlockEntryInput>,
+        end_row_id: RowID,
+        probe_row_id: RowID,
+        expected_search_type: ColumnBlockLeafSearchType,
+        expected_block_id: impl Into<BlockID>,
+    ) {
+        let (_temp_dir, fs) = build_test_fs();
+        let background_writes = fs.background_writes();
+        let metadata = metadata();
+        let table = fs
+            .create_table_file(test_user_table_id(1), metadata, false)
+            .unwrap();
+        let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
+        drop(old_root);
+        let global = global_readonly_pool_scope(64 * 1024 * 1024);
+        let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
+        let disk_pool_guard = disk_pool.create_base_guard();
+        let mut mutable = MutableTableFile::fork(
+            &table,
+            background_writes,
+            disk_pool.global_pool().clone(),
+            disk_pool_guard.clone(),
+        );
+        let root_block_id = ColumnBlockIndex::new(
+            SUPER_BLOCK_ID,
+            RowID::new(0),
+            disk_pool.file_kind(),
+            disk_pool.sparse_file(),
+            disk_pool.global_pool(),
+            &disk_pool_guard,
+        )
+        .batch_insert(&mut mutable, &entries, end_row_id, TrxID::new(2))
+        .await
+        .unwrap();
+        let (_table, _old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
+
+        let index = ColumnBlockIndex::new(
+            root_block_id,
+            end_row_id,
+            disk_pool.file_kind(),
+            disk_pool.sparse_file(),
+            disk_pool.global_pool(),
+            &disk_pool_guard,
+        );
+        let entry = index.locate_block(probe_row_id).await.unwrap().unwrap();
+        assert_eq!(entry.block_id(), expected_block_id.into());
+        let node = index.read_node(entry.leaf_block_id).await.unwrap();
+        let header = node.leaf_header_ext().unwrap();
+        assert_eq!(header.search_type().unwrap(), expected_search_type);
+        assert!(
+            index
+                .locate_and_resolve_row(probe_row_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_column_index_layout_adaptation_preserves_layout_source() {
+        let err = match persisted_column_index_layout(
+            layout::try_ref_from_bytes::<ColumnBlockNodeHeader>(&[0u8; 1]),
+            "test_node_header",
+        ) {
+            Ok(_) => panic!("short column-index header must fail"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.current_context(), &DataIntegrityError::InvalidPayload);
+        assert_eq!(
+            err.downcast_ref::<LayoutError>().copied(),
+            Some(LayoutError::Mismatch)
+        );
+        assert!(format!("{err:?}").contains("field=test_node_header"));
+    }
+
+    #[test]
+    fn test_persisted_empty_column_index_page_is_invalid_payload() {
+        let mut page = DirectBuf::zeroed(COLUMN_BLOCK_PAGE_SIZE);
+        write_block_header(page.data_mut(), COLUMN_BLOCK_INDEX_BLOCK_SPEC);
+        write_block_checksum(page.data_mut());
+
+        let err = validate_persisted_column_block_index_page(
+            page.data(),
+            FileKind::TableFile,
+            test_block_id(42),
+        )
+        .unwrap_err();
+        assert_eq!(err.current_context(), &DataIntegrityError::InvalidPayload);
     }
 
     #[test]
@@ -3805,65 +3864,6 @@ mod tests {
                 1002
             );
         });
-    }
-
-    async fn assert_search_type_lookup(
-        entries: Vec<ColumnBlockEntryInput>,
-        end_row_id: RowID,
-        probe_row_id: RowID,
-        expected_search_type: ColumnBlockLeafSearchType,
-        expected_block_id: impl Into<BlockID>,
-    ) {
-        let (_temp_dir, fs) = build_test_fs();
-        let background_writes = fs.background_writes();
-        let metadata = metadata();
-        let table = fs
-            .create_table_file(test_user_table_id(1), metadata, false)
-            .unwrap();
-        let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
-        drop(old_root);
-        let global = global_readonly_pool_scope(64 * 1024 * 1024);
-        let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
-        let disk_pool_guard = disk_pool.create_base_guard();
-        let mut mutable = MutableTableFile::fork(
-            &table,
-            background_writes,
-            disk_pool.global_pool().clone(),
-            disk_pool_guard.clone(),
-        );
-        let root_block_id = ColumnBlockIndex::new(
-            SUPER_BLOCK_ID,
-            RowID::new(0),
-            disk_pool.file_kind(),
-            disk_pool.sparse_file(),
-            disk_pool.global_pool(),
-            &disk_pool_guard,
-        )
-        .batch_insert(&mut mutable, &entries, end_row_id, TrxID::new(2))
-        .await
-        .unwrap();
-        let (_table, _old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
-
-        let index = ColumnBlockIndex::new(
-            root_block_id,
-            end_row_id,
-            disk_pool.file_kind(),
-            disk_pool.sparse_file(),
-            disk_pool.global_pool(),
-            &disk_pool_guard,
-        );
-        let entry = index.locate_block(probe_row_id).await.unwrap().unwrap();
-        assert_eq!(entry.block_id(), expected_block_id.into());
-        let node = index.read_node(entry.leaf_block_id).await.unwrap();
-        let header = node.leaf_header_ext().unwrap();
-        assert_eq!(header.search_type().unwrap(), expected_search_type);
-        assert!(
-            index
-                .locate_and_resolve_row(probe_row_id)
-                .await
-                .unwrap()
-                .is_some()
-        );
     }
 
     #[test]

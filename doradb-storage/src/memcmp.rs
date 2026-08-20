@@ -1070,58 +1070,6 @@ mod tests {
         unsafe { &key.0.u.h.prefix }
     }
 
-    #[test]
-    fn test_mcf_sized() {
-        // int
-        run_test_mcf::<u8>();
-        run_test_mcf::<u16>();
-        run_test_mcf::<u32>();
-        run_test_mcf::<u64>();
-
-        run_test_mcf::<i8>();
-        run_test_mcf::<i16>();
-        run_test_mcf::<i32>();
-        run_test_mcf::<i64>();
-
-        // int + int
-        run_test_mcf2::<i32, i32>();
-        run_test_mcf2::<u32, u32>();
-        run_test_mcf2::<i64, i64>();
-        run_test_mcf2::<u64, u64>();
-    }
-
-    #[test]
-    fn test_mcf_varlen() {
-        run_test_mcf_varlen(gen_rand_bytes);
-    }
-
-    #[test]
-    fn test_mcf_float() {
-        let f0 = -1.0f64;
-        let mut buf0 = vec![];
-        f0.extend_mcf_to(&mut buf0);
-        assert_eq!(buf0.len(), 8);
-        assert!(buf0[0] & 0x80 == 0);
-
-        let f1 = -1.0f64;
-        let mut buf1 = vec![];
-        NullableMemCmpFormat::extend_nmcf_to(&f1, &mut buf1);
-        assert_eq!(buf1.len(), 9);
-        assert_eq!(buf1[0], NON_NULL_FLAG);
-        assert!(buf1[1] & 0x80 == 0);
-
-        let mut r = rand::rng();
-        let input1 = gen_input::<f32>(&mut r);
-        check_mcf_length(&input1[0]);
-        let input2 = gen_input::<f32>(&mut r);
-        check_nmcf_length(&input2[0]);
-
-        let input1 = gen_input::<f64>(&mut r);
-        check_mcf_length(&input1[0]);
-        let input2 = gen_input::<f64>(&mut r);
-        check_nmcf_length(&input2[0]);
-    }
-
     fn run_test_mcf<T>()
     where
         T: MemCmpFormat + NullableMemCmpFormat + Ord,
@@ -1380,6 +1328,58 @@ mod tests {
             s.push(r.sample(StandardUniform));
         }
         s
+    }
+
+    #[test]
+    fn test_mcf_sized() {
+        // int
+        run_test_mcf::<u8>();
+        run_test_mcf::<u16>();
+        run_test_mcf::<u32>();
+        run_test_mcf::<u64>();
+
+        run_test_mcf::<i8>();
+        run_test_mcf::<i16>();
+        run_test_mcf::<i32>();
+        run_test_mcf::<i64>();
+
+        // int + int
+        run_test_mcf2::<i32, i32>();
+        run_test_mcf2::<u32, u32>();
+        run_test_mcf2::<i64, i64>();
+        run_test_mcf2::<u64, u64>();
+    }
+
+    #[test]
+    fn test_mcf_varlen() {
+        run_test_mcf_varlen(gen_rand_bytes);
+    }
+
+    #[test]
+    fn test_mcf_float() {
+        let f0 = -1.0f64;
+        let mut buf0 = vec![];
+        f0.extend_mcf_to(&mut buf0);
+        assert_eq!(buf0.len(), 8);
+        assert!(buf0[0] & 0x80 == 0);
+
+        let f1 = -1.0f64;
+        let mut buf1 = vec![];
+        NullableMemCmpFormat::extend_nmcf_to(&f1, &mut buf1);
+        assert_eq!(buf1.len(), 9);
+        assert_eq!(buf1[0], NON_NULL_FLAG);
+        assert!(buf1[1] & 0x80 == 0);
+
+        let mut r = rand::rng();
+        let input1 = gen_input::<f32>(&mut r);
+        check_mcf_length(&input1[0]);
+        let input2 = gen_input::<f32>(&mut r);
+        check_nmcf_length(&input2[0]);
+
+        let input1 = gen_input::<f64>(&mut r);
+        check_mcf_length(&input1[0]);
+        let input2 = gen_input::<f64>(&mut r);
+        check_nmcf_length(&input2[0]);
     }
 
     #[test]

@@ -213,6 +213,87 @@ mod tests {
     use std::thread::spawn;
     use std::time::Instant;
 
+    struct Counter {
+        data: UnsafeCell<usize>,
+        mu: RawMutex,
+    }
+
+    impl Counter {
+        #[inline]
+        fn new() -> Self {
+            Counter {
+                data: UnsafeCell::new(0),
+                mu: RawMutex::new(),
+            }
+        }
+
+        #[inline]
+        fn inc(&self) -> usize {
+            // SAFETY: this helper acquires `mu` before touching `data` and
+            // releases it before returning.
+            unsafe {
+                self.mu.lock();
+                *self.data.get() += 1;
+                let v = *self.data.get();
+                self.mu.unlock();
+                v
+            }
+        }
+
+        #[inline]
+        async fn inc_async(&self) -> usize {
+            // SAFETY: this helper acquires `mu` asynchronously before touching
+            // `data` and releases it before returning.
+            unsafe {
+                self.mu.lock_async().await;
+                *self.data.get() += 1;
+                let v = *self.data.get();
+                self.mu.unlock();
+                v
+            }
+        }
+
+        #[inline]
+        fn val(&self) -> usize {
+            // SAFETY: tests only read the counter after all worker activity is
+            // quiesced, so no concurrent mutation remains.
+            unsafe { *self.data.get() }
+        }
+    }
+    // SAFETY: shared references are synchronized by `RawMutex`.
+    unsafe impl Sync for Counter {}
+
+    struct ParkingLotCounter {
+        data: UnsafeCell<usize>,
+        mu: ParkingLotRawMutex,
+    }
+
+    impl ParkingLotCounter {
+        #[inline]
+        fn new() -> Self {
+            ParkingLotCounter {
+                data: UnsafeCell::new(0),
+                mu: ParkingLotRawMutex::INIT,
+            }
+        }
+
+        #[inline]
+        fn inc(&self) -> usize {
+            // SAFETY: this helper holds the parking_lot raw mutex while it
+            // mutates and reads the counter.
+            unsafe {
+                self.mu.lock();
+                *self.data.get() += 1;
+                let v = *self.data.get();
+                self.mu.unlock();
+                v
+            }
+        }
+    }
+
+    // SAFETY: shared references are synchronized by `parking_lot::RawMutex`.
+    unsafe impl Sync for ParkingLotCounter {}
+
     #[test]
     fn test_mutex_ops() {
         let mu = Mutex::new(42i32);
@@ -425,85 +506,4 @@ mod tests {
             COUNT as f64 * 1_000_000_000f64 / dur.as_nanos() as f64
         );
     }
-
-    struct Counter {
-        data: UnsafeCell<usize>,
-        mu: RawMutex,
-    }
-
-    impl Counter {
-        #[inline]
-        fn new() -> Self {
-            Counter {
-                data: UnsafeCell::new(0),
-                mu: RawMutex::new(),
-            }
-        }
-
-        #[inline]
-        fn inc(&self) -> usize {
-            // SAFETY: this helper acquires `mu` before touching `data` and
-            // releases it before returning.
-            unsafe {
-                self.mu.lock();
-                *self.data.get() += 1;
-                let v = *self.data.get();
-                self.mu.unlock();
-                v
-            }
-        }
-
-        #[inline]
-        async fn inc_async(&self) -> usize {
-            // SAFETY: this helper acquires `mu` asynchronously before touching
-            // `data` and releases it before returning.
-            unsafe {
-                self.mu.lock_async().await;
-                *self.data.get() += 1;
-                let v = *self.data.get();
-                self.mu.unlock();
-                v
-            }
-        }
-
-        #[inline]
-        fn val(&self) -> usize {
-            // SAFETY: tests only read the counter after all worker activity is
-            // quiesced, so no concurrent mutation remains.
-            unsafe { *self.data.get() }
-        }
-    }
-    // SAFETY: shared references are synchronized by `RawMutex`.
-    unsafe impl Sync for Counter {}
-
-    struct ParkingLotCounter {
-        data: UnsafeCell<usize>,
-        mu: ParkingLotRawMutex,
-    }
-
-    impl ParkingLotCounter {
-        #[inline]
-        fn new() -> Self {
-            ParkingLotCounter {
-                data: UnsafeCell::new(0),
-                mu: ParkingLotRawMutex::INIT,
-            }
-        }
-
-        #[inline]
-        fn inc(&self) -> usize {
-            // SAFETY: this helper holds the parking_lot raw mutex while it
-            // mutates and reads the counter.
-            unsafe {
-                self.mu.lock();
-                *self.data.get() += 1;
-                let v = *self.data.get();
-                self.mu.unlock();
-                v
-            }
-        }
-    }
-
-    // SAFETY: shared references are synchronized by `parking_lot::RawMutex`.
-    unsafe impl Sync for ParkingLotCounter {}
 }

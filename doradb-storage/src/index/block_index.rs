@@ -453,6 +453,20 @@ mod tests {
         QuiescentBox::new(FixedBufferPool::with_capacity(PoolRole::Mem, pool_size).unwrap())
     }
 
+    fn make_test_metadata() -> Arc<TableMetadata> {
+        Arc::new(
+            TableMetadata::try_new(
+                vec![ColumnSpec {
+                    column_name: SemiStr::new("id"),
+                    column_type: ValKind::I32,
+                    column_attributes: ColumnAttributes::empty(),
+                }],
+                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
+            )
+            .expect("valid table metadata"),
+        )
+    }
+
     #[test]
     fn test_block_index_root_accessors_and_update() {
         smol::block_on(async {
@@ -480,20 +494,6 @@ mod tests {
                 .expect("test catalog block-index construction should succeed");
             assert_eq!(catalog_idx.pivot_row_id(), RowID::new(0));
         });
-    }
-
-    fn make_test_metadata() -> Arc<TableMetadata> {
-        Arc::new(
-            TableMetadata::try_new(
-                vec![ColumnSpec {
-                    column_name: SemiStr::new("id"),
-                    column_type: ValKind::I32,
-                    column_attributes: ColumnAttributes::empty(),
-                }],
-                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
-            )
-            .expect("valid table metadata"),
-        )
     }
 
     #[test]

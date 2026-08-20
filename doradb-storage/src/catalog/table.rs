@@ -2104,6 +2104,17 @@ pub(crate) mod tests {
         }
     }
 
+    struct TableDdlSnapshot {
+        effective_cts: TrxID,
+        metadata: Arc<TableMetadata>,
+        table: Arc<Table>,
+        history_count: Option<usize>,
+        retained_dropped_state: bool,
+        file_exists: bool,
+        lifecycle: TableTerminal,
+        poisoned: bool,
+    }
+
     fn set_create_table_failure(engine: &Engine, failure: Option<CreateTableTestFailure>) {
         engine.inner().table_ddl_test.set_create_failure(failure);
     }
@@ -2178,17 +2189,6 @@ pub(crate) mod tests {
             None
         );
         assert_no_dropped_table_operational_state(engine.inner().core.catalog(), table_id);
-    }
-
-    struct TableDdlSnapshot {
-        effective_cts: TrxID,
-        metadata: Arc<TableMetadata>,
-        table: Arc<Table>,
-        history_count: Option<usize>,
-        retained_dropped_state: bool,
-        file_exists: bool,
-        lifecycle: TableTerminal,
-        poisoned: bool,
     }
 
     fn table_ddl_snapshot(engine: &Engine, table_id: TableID, table: &Table) -> TableDdlSnapshot {

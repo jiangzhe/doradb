@@ -1375,73 +1375,11 @@ pub(crate) mod tests {
     const TEST_WAIT_RETRIES: usize = 100;
     const TEST_WAIT_INTERVAL: Duration = Duration::from_millis(10);
 
-    async fn wait_for<F>(mut predicate: F)
-    where
-        F: FnMut() -> bool,
-    {
-        for _ in 0..TEST_WAIT_RETRIES {
-            if predicate() {
-                return;
-            }
-            Timer::after(TEST_WAIT_INTERVAL).await;
-        }
-        panic!("condition was not satisfied before timeout");
-    }
-
-    #[inline]
-    fn test_user_file_id(offset: TableID) -> FileID {
-        FileID::from(test_user_table_id(offset.as_u64()))
-    }
-
-    fn key_state_is_loading(pool: &ReadonlyBufferPool, key: &BlockKey) -> bool {
-        pool.inflights
-            .get(key)
-            .is_some_and(|state| matches!(&*state, InflightBlockState::Loading(_)))
-    }
-
-    fn key_state_is_write_blocked(pool: &ReadonlyBufferPool, key: &BlockKey) -> bool {
-        pool.inflights
-            .get(key)
-            .is_some_and(|state| matches!(&*state, InflightBlockState::WriteBlocked))
-    }
-
-    fn assert_completion_data_integrity(err: Report<RuntimeError>) {
-        assert_eq!(err.current_context(), &RuntimeError::BufferPageAccess);
-        assert!(err.downcast_ref::<DataIntegrityError>().is_some());
-        let report = format!("{err:?}");
-        assert!(report.contains("wait for"), "{report}");
-        assert!(report.contains("buffer_pool_type=readonly"), "{report}");
-        assert!(report.contains("buffer_pool_role=disk"), "{report}");
-        assert!(
-            report.contains("operation=read_validated_block"),
-            "{report}"
-        );
-        assert!(report.contains("file_id="), "{report}");
-        assert!(report.contains("block_id="), "{report}");
-    }
-
-    fn frame_page_bytes(cap: usize) -> usize {
-        cap.max(MIN_READONLY_POOL_PAGES) * (mem::size_of::<BufferFrame>() + mem::size_of::<Page>())
-    }
-
     /// Test-only owner wrapper for one shared readonly pool.
     pub(crate) struct GlobalReadOnlyPoolScope {
         _temp_dir: TempDir,
         fs: Option<TestFileSystem>,
         owner: Option<QuiescentBox<ReadonlyBufferPool>>,
-    }
-
-    fn owned_global_pool(pool_size: usize) -> GlobalReadOnlyPoolScope {
-        let temp_dir = TempDir::new().unwrap();
-        let fs = build_test_fs_in(temp_dir.path());
-        let owner = QuiescentBox::new(
-            ReadonlyBufferPool::with_capacity(PoolRole::Disk, pool_size, fs.guard()).unwrap(),
-        );
-        GlobalReadOnlyPoolScope {
-            _temp_dir: temp_dir,
-            fs: Some(fs),
-            owner: Some(owner),
-        }
     }
 
     impl Deref for GlobalReadOnlyPoolScope {
@@ -1456,6 +1394,7 @@ pub(crate) mod tests {
     }
 
     impl GlobalReadOnlyPoolScope {
+        /// Returns the test fixture guard.
         #[inline]
         pub(crate) fn guard(&self) -> QuiescentGuard<ReadonlyBufferPool> {
             self.owner
@@ -1473,20 +1412,7 @@ pub(crate) mod tests {
         }
     }
 
-    #[inline]
-    pub(crate) fn global_readonly_pool_scope(pool_size: usize) -> GlobalReadOnlyPoolScope {
-        owned_global_pool(pool_size)
-    }
-
-    async fn publish_test_frame(global: &GlobalReadOnlyPoolScope, key: BlockKey) -> PageID {
-        let pool = global.guard();
-        let task_arena = pool.arena.arena_guard(pool.create_base_guard());
-        let (frame_id, page_guard) = ReadonlyPageReservation::reserve_page(&pool, task_arena)
-            .await
-            .unwrap();
-        ReadonlyPageReservation::from_reserved_page(pool, key, frame_id, page_guard).publish()
-    }
-
+    /// Test fixture for test readonly pool.
     #[derive(Clone)]
     pub(crate) struct TestReadonlyPool {
         file_kind: FileKind,
@@ -1495,31 +1421,37 @@ pub(crate) mod tests {
     }
 
     impl TestReadonlyPool {
+        /// Provides test-only access to `file_kind`.
         #[inline]
         pub(crate) fn file_kind(&self) -> FileKind {
             self.file_kind
         }
 
+        /// Provides test-only access to `sparse_file`.
         #[inline]
         pub(crate) fn sparse_file(&self) -> &Arc<SparseFile> {
             &self.file
         }
 
+        /// Provides test-only access to `global_pool`.
         #[inline]
         pub(crate) fn global_pool(&self) -> &QuiescentGuard<ReadonlyBufferPool> {
             &self.global
         }
 
+        /// Provides test-only access to `global_stats`.
         #[inline]
         pub(crate) fn global_stats(&self) -> BufferPoolCounters {
             self.global.stats()
         }
 
+        /// Creates base guard for tests.
         #[inline]
         pub(crate) fn create_base_guard(&self) -> PoolGuard {
             self.global.create_base_guard()
         }
 
+        /// Provides test-only access to `read_block`.
         #[inline]
         pub(crate) async fn read_block(
             &self,
@@ -1531,6 +1463,7 @@ pub(crate) mod tests {
                 .await
         }
 
+        /// Provides test-only access to `read_validated_block`.
         #[inline]
         pub(crate) async fn read_validated_block(
             &self,
@@ -1542,238 +1475,6 @@ pub(crate) mod tests {
                 .read_validated_block(self.file_kind, &self.file, guard, block_id, validator)
                 .await
         }
-    }
-
-    #[inline]
-    pub(crate) fn table_readonly_pool(
-        scope: &GlobalReadOnlyPoolScope,
-        _table_id: TableID,
-        table_file: &Arc<TableFile>,
-    ) -> TestReadonlyPool {
-        TestReadonlyPool {
-            file_kind: FileKind::TableFile,
-            file: Arc::clone(table_file.sparse_file()),
-            global: scope.guard(),
-        }
-    }
-
-    fn owned_readonly_pool(
-        _file_id: FileID,
-        file_kind: FileKind,
-        file: Arc<SparseFile>,
-        global: &GlobalReadOnlyPoolScope,
-    ) -> QuiescentBox<TestReadonlyPool> {
-        QuiescentBox::new(TestReadonlyPool {
-            file_kind,
-            file,
-            global: global.guard(),
-        })
-    }
-
-    #[test]
-    fn test_global_readonly_pool_shutdown_is_idempotent_before_worker_start() {
-        let pool = owned_global_pool(frame_page_bytes(2));
-
-        pool.signal_shutdown();
-        pool.signal_shutdown();
-    }
-
-    fn make_metadata() -> Arc<TableMetadata> {
-        Arc::new(
-            TableMetadata::try_new(
-                vec![ColumnSpec::new(
-                    "c0",
-                    ValKind::U32,
-                    ColumnAttributes::empty(),
-                )],
-                vec![],
-            )
-            .expect("valid table metadata"),
-        )
-    }
-
-    async fn commit_table_file(_fs: &FileSystem, table_file: MutableTableFile) -> Arc<TableFile> {
-        let (table_file, old_root) = table_file.commit(TrxID::new(1), false).await.unwrap();
-        drop(old_root);
-        table_file
-    }
-
-    async fn write_payload(
-        fs: &FileSystem,
-        table_file: &Arc<TableFile>,
-        page_id: BlockID,
-        payload: &[u8],
-    ) {
-        let global = global_readonly_pool_scope(frame_page_bytes(2));
-        let disk_pool = table_readonly_pool(&global, test_user_table_id(0), table_file);
-        write_payload_with_pool(fs, table_file, disk_pool.global_pool(), page_id, payload).await;
-    }
-
-    async fn write_payload_with_pool(
-        fs: &FileSystem,
-        table_file: &Arc<TableFile>,
-        readonly_pool: &QuiescentGuard<ReadonlyBufferPool>,
-        page_id: BlockID,
-        payload: &[u8],
-    ) {
-        let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
-        let bytes = buf.as_bytes_mut();
-        bytes[..payload.len()].copy_from_slice(payload);
-        let mutable = MutableTableFile::fork(
-            table_file,
-            fs.background_writes(),
-            readonly_pool.clone(),
-            readonly_pool.create_base_guard(),
-        );
-        mutable.write_block(page_id, buf).await.unwrap();
-        drop(mutable);
-    }
-
-    async fn write_page_bytes(
-        fs: &FileSystem,
-        table_file: &Arc<TableFile>,
-        page_id: BlockID,
-        bytes: &[u8],
-    ) {
-        let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
-        buf.as_bytes_mut().copy_from_slice(bytes);
-        let global = global_readonly_pool_scope(frame_page_bytes(2));
-        let disk_pool = table_readonly_pool(&global, test_user_table_id(0), table_file);
-        let mutable = MutableTableFile::fork(
-            table_file,
-            fs.background_writes(),
-            disk_pool.global_pool().clone(),
-            disk_pool.create_base_guard(),
-        );
-        mutable.write_block(page_id, buf).await.unwrap();
-        drop(mutable);
-    }
-
-    #[test]
-    fn test_readonly_pool_global_stats_track_single_miss_then_warm_hit() {
-        smol::block_on(async {
-            let (_temp_dir, fs) = build_test_fs();
-            let table_file = fs
-                .create_table_file(test_user_table_id(120), make_metadata(), false)
-                .unwrap();
-            let table_file = commit_table_file(&fs, table_file).await;
-            write_payload(&fs, &table_file, test_block_id(0), b"readonly-stats").await;
-
-            let scope = global_readonly_pool_scope(frame_page_bytes(4));
-            let pool = table_readonly_pool(&scope, test_user_table_id(120), &table_file);
-            let pool_guard = pool.create_base_guard();
-
-            let cold_start = pool.global_stats();
-            let cold_guard = pool
-                .read_block(&pool_guard, SUPER_BLOCK_ID)
-                .await
-                .expect("readonly cold read failed in test");
-            assert_eq!(&cold_guard.page()[..14], b"readonly-stats");
-            drop(cold_guard);
-
-            let cold_delta = pool.global_stats().delta_since(cold_start);
-            assert_eq!(cold_delta.cache_hits, 0);
-            assert_eq!(cold_delta.cache_misses, 1);
-            assert_eq!(cold_delta.miss_joins, 0);
-            assert_eq!(cold_delta.queued_reads, 1);
-            assert_eq!(cold_delta.running_reads, 1);
-            assert_eq!(cold_delta.completed_reads, 1);
-            assert_eq!(cold_delta.read_errors, 0);
-
-            let warm_start = pool.global_stats();
-            let warm_guard = pool
-                .read_block(&pool_guard, SUPER_BLOCK_ID)
-                .await
-                .expect("readonly warm read failed in test");
-            assert_eq!(&warm_guard.page()[..14], b"readonly-stats");
-            drop(warm_guard);
-
-            let warm_delta = pool.global_stats().delta_since(warm_start);
-            assert_eq!(warm_delta.cache_hits, 1);
-            assert_eq!(warm_delta.cache_misses, 0);
-            assert_eq!(warm_delta.queued_reads, 0);
-            assert_eq!(warm_delta.running_reads, 0);
-            assert_eq!(warm_delta.completed_reads, 0);
-        });
-    }
-
-    #[test]
-    fn test_readonly_pool_global_stats_are_shared_across_file_wrappers() {
-        smol::block_on(async {
-            let (_temp_dir, fs) = build_test_fs();
-            let table_file_a = fs
-                .create_table_file(test_user_table_id(121), make_metadata(), false)
-                .unwrap();
-            let table_file_a = commit_table_file(&fs, table_file_a).await;
-            write_payload(&fs, &table_file_a, test_block_id(0), b"readonly-shared-a").await;
-
-            let table_file_b = fs
-                .create_table_file(test_user_table_id(122), make_metadata(), false)
-                .unwrap();
-            let table_file_b = commit_table_file(&fs, table_file_b).await;
-            write_payload(&fs, &table_file_b, test_block_id(0), b"readonly-shared-b").await;
-
-            let scope = global_readonly_pool_scope(frame_page_bytes(4));
-            let pool_a = table_readonly_pool(&scope, test_user_table_id(121), &table_file_a);
-            let pool_b = table_readonly_pool(&scope, test_user_table_id(122), &table_file_b);
-            let pool_a_guard = pool_a.create_base_guard();
-
-            let start_a = pool_a.global_stats();
-            let start_b = pool_b.global_stats();
-            assert_eq!(start_a, start_b);
-
-            let guard_a = pool_a
-                .read_block(&pool_a_guard, test_block_id(0))
-                .await
-                .expect("readonly shared global read failed in test");
-            assert_eq!(&guard_a.page()[..17], b"readonly-shared-a");
-            drop(guard_a);
-
-            let delta_a = pool_a.global_stats().delta_since(start_a);
-            let delta_b = pool_b.global_stats().delta_since(start_b);
-            assert_eq!(delta_a, delta_b);
-            assert_eq!(delta_a.cache_hits, 0);
-            assert_eq!(delta_a.cache_misses, 1);
-            assert_eq!(delta_a.miss_joins, 0);
-            assert_eq!(delta_a.queued_reads, 1);
-            assert_eq!(delta_a.running_reads, 1);
-            assert_eq!(delta_a.completed_reads, 1);
-            assert_eq!(delta_a.read_errors, 0);
-        });
-    }
-
-    fn build_valid_persisted_lwc_block() -> Vec<u8> {
-        let mut buf = vec![0u8; COW_FILE_PAGE_SIZE];
-        let payload_start = write_block_header(&mut buf, LWC_BLOCK_SPEC);
-        let payload_end = payload_start + LWC_BLOCK_PAYLOAD_SIZE;
-        let page = LwcBlock::from_bytes_mut(&mut buf[payload_start..payload_end]);
-        page.header = LwcBlockHeader::new(1, 0, 0, 0);
-        write_block_checksum(&mut buf);
-        buf
-    }
-
-    fn build_valid_persisted_column_block_page() -> Vec<u8> {
-        let mut buf = vec![0u8; COW_FILE_PAGE_SIZE];
-        let payload_start = write_block_header(&mut buf, COLUMN_BLOCK_INDEX_BLOCK_SPEC);
-        let payload_end = payload_start + COLUMN_BLOCK_NODE_PAYLOAD_SIZE;
-        let header = ColumnBlockNodeHeader::new(0, 0, RowID::new(0), TrxID::new(1));
-        let header_bytes = layout::bytes_of(&header);
-        buf[payload_start..payload_start + COLUMN_BLOCK_HEADER_SIZE].copy_from_slice(header_bytes);
-        buf[payload_start + COLUMN_BLOCK_HEADER_SIZE..payload_end].fill(0);
-        write_block_checksum(&mut buf);
-        buf
-    }
-
-    fn build_valid_persisted_blob_page() -> Vec<u8> {
-        let mut buf = vec![0u8; COW_FILE_PAGE_SIZE];
-        let payload_start = write_block_header(&mut buf, COLUMN_DELETION_BLOB_BLOCK_SPEC);
-        let payload_end = payload_start + max_payload_len(COW_FILE_PAGE_SIZE);
-        let payload = &mut buf[payload_start..payload_end];
-        payload[..COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE].fill(0);
-        payload[8..10].copy_from_slice(&(1u16).to_le_bytes());
-        payload[COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE] = 7;
-        write_block_checksum(&mut buf);
-        buf
     }
 
     #[derive(Clone)]
@@ -1789,16 +1490,6 @@ pub(crate) mod tests {
     #[derive(Clone)]
     struct ControlledReadHook {
         inner: Arc<ControlledReadHookInner>,
-    }
-
-    struct ControlledReadHookInner {
-        fd: RawFd,
-        offset: usize,
-        result: ControlledReadResult,
-        calls: AtomicUsize,
-        start_ev: Event,
-        released: AtomicBool,
-        release_ev: Event,
     }
 
     impl ControlledReadHook {
@@ -1892,18 +1583,19 @@ pub(crate) mod tests {
         }
     }
 
-    #[derive(Clone)]
-    struct ControlledWriteHook {
-        inner: Arc<ControlledWriteHookInner>,
-    }
-
-    struct ControlledWriteHookInner {
+    struct ControlledReadHookInner {
         fd: RawFd,
         offset: usize,
+        result: ControlledReadResult,
         calls: AtomicUsize,
         start_ev: Event,
         released: AtomicBool,
         release_ev: Event,
+    }
+
+    #[derive(Clone)]
+    struct ControlledWriteHook {
+        inner: Arc<ControlledWriteHookInner>,
     }
 
     impl ControlledWriteHook {
@@ -1972,6 +1664,325 @@ pub(crate) mod tests {
                 smol::block_on(listener);
             }
         }
+    }
+
+    struct ControlledWriteHookInner {
+        fd: RawFd,
+        offset: usize,
+        calls: AtomicUsize,
+        start_ev: Event,
+        released: AtomicBool,
+        release_ev: Event,
+    }
+
+    /// Provides test-only access to `global_readonly_pool_scope`.
+    #[inline]
+    pub(crate) fn global_readonly_pool_scope(pool_size: usize) -> GlobalReadOnlyPoolScope {
+        owned_global_pool(pool_size)
+    }
+
+    /// Provides test-only access to `table_readonly_pool`.
+    #[inline]
+    pub(crate) fn table_readonly_pool(
+        scope: &GlobalReadOnlyPoolScope,
+        _table_id: TableID,
+        table_file: &Arc<TableFile>,
+    ) -> TestReadonlyPool {
+        TestReadonlyPool {
+            file_kind: FileKind::TableFile,
+            file: Arc::clone(table_file.sparse_file()),
+            global: scope.guard(),
+        }
+    }
+
+    async fn wait_for<F>(mut predicate: F)
+    where
+        F: FnMut() -> bool,
+    {
+        for _ in 0..TEST_WAIT_RETRIES {
+            if predicate() {
+                return;
+            }
+            Timer::after(TEST_WAIT_INTERVAL).await;
+        }
+        panic!("condition was not satisfied before timeout");
+    }
+
+    #[inline]
+    fn test_user_file_id(offset: TableID) -> FileID {
+        FileID::from(test_user_table_id(offset.as_u64()))
+    }
+
+    fn key_state_is_loading(pool: &ReadonlyBufferPool, key: &BlockKey) -> bool {
+        pool.inflights
+            .get(key)
+            .is_some_and(|state| matches!(&*state, InflightBlockState::Loading(_)))
+    }
+
+    fn key_state_is_write_blocked(pool: &ReadonlyBufferPool, key: &BlockKey) -> bool {
+        pool.inflights
+            .get(key)
+            .is_some_and(|state| matches!(&*state, InflightBlockState::WriteBlocked))
+    }
+
+    fn assert_completion_data_integrity(err: Report<RuntimeError>) {
+        assert_eq!(err.current_context(), &RuntimeError::BufferPageAccess);
+        assert!(err.downcast_ref::<DataIntegrityError>().is_some());
+        let report = format!("{err:?}");
+        assert!(report.contains("wait for"), "{report}");
+        assert!(report.contains("buffer_pool_type=readonly"), "{report}");
+        assert!(report.contains("buffer_pool_role=disk"), "{report}");
+        assert!(
+            report.contains("operation=read_validated_block"),
+            "{report}"
+        );
+        assert!(report.contains("file_id="), "{report}");
+        assert!(report.contains("block_id="), "{report}");
+    }
+
+    fn frame_page_bytes(cap: usize) -> usize {
+        cap.max(MIN_READONLY_POOL_PAGES) * (mem::size_of::<BufferFrame>() + mem::size_of::<Page>())
+    }
+
+    fn owned_global_pool(pool_size: usize) -> GlobalReadOnlyPoolScope {
+        let temp_dir = TempDir::new().unwrap();
+        let fs = build_test_fs_in(temp_dir.path());
+        let owner = QuiescentBox::new(
+            ReadonlyBufferPool::with_capacity(PoolRole::Disk, pool_size, fs.guard()).unwrap(),
+        );
+        GlobalReadOnlyPoolScope {
+            _temp_dir: temp_dir,
+            fs: Some(fs),
+            owner: Some(owner),
+        }
+    }
+
+    async fn publish_test_frame(global: &GlobalReadOnlyPoolScope, key: BlockKey) -> PageID {
+        let pool = global.guard();
+        let task_arena = pool.arena.arena_guard(pool.create_base_guard());
+        let (frame_id, page_guard) = ReadonlyPageReservation::reserve_page(&pool, task_arena)
+            .await
+            .unwrap();
+        ReadonlyPageReservation::from_reserved_page(pool, key, frame_id, page_guard).publish()
+    }
+
+    fn owned_readonly_pool(
+        _file_id: FileID,
+        file_kind: FileKind,
+        file: Arc<SparseFile>,
+        global: &GlobalReadOnlyPoolScope,
+    ) -> QuiescentBox<TestReadonlyPool> {
+        QuiescentBox::new(TestReadonlyPool {
+            file_kind,
+            file,
+            global: global.guard(),
+        })
+    }
+
+    fn make_metadata() -> Arc<TableMetadata> {
+        Arc::new(
+            TableMetadata::try_new(
+                vec![ColumnSpec::new(
+                    "c0",
+                    ValKind::U32,
+                    ColumnAttributes::empty(),
+                )],
+                vec![],
+            )
+            .expect("valid table metadata"),
+        )
+    }
+
+    async fn commit_table_file(_fs: &FileSystem, table_file: MutableTableFile) -> Arc<TableFile> {
+        let (table_file, old_root) = table_file.commit(TrxID::new(1), false).await.unwrap();
+        drop(old_root);
+        table_file
+    }
+
+    async fn write_payload(
+        fs: &FileSystem,
+        table_file: &Arc<TableFile>,
+        page_id: BlockID,
+        payload: &[u8],
+    ) {
+        let global = global_readonly_pool_scope(frame_page_bytes(2));
+        let disk_pool = table_readonly_pool(&global, test_user_table_id(0), table_file);
+        write_payload_with_pool(fs, table_file, disk_pool.global_pool(), page_id, payload).await;
+    }
+
+    async fn write_payload_with_pool(
+        fs: &FileSystem,
+        table_file: &Arc<TableFile>,
+        readonly_pool: &QuiescentGuard<ReadonlyBufferPool>,
+        page_id: BlockID,
+        payload: &[u8],
+    ) {
+        let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
+        let bytes = buf.as_bytes_mut();
+        bytes[..payload.len()].copy_from_slice(payload);
+        let mutable = MutableTableFile::fork(
+            table_file,
+            fs.background_writes(),
+            readonly_pool.clone(),
+            readonly_pool.create_base_guard(),
+        );
+        mutable.write_block(page_id, buf).await.unwrap();
+        drop(mutable);
+    }
+
+    async fn write_page_bytes(
+        fs: &FileSystem,
+        table_file: &Arc<TableFile>,
+        page_id: BlockID,
+        bytes: &[u8],
+    ) {
+        let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
+        buf.as_bytes_mut().copy_from_slice(bytes);
+        let global = global_readonly_pool_scope(frame_page_bytes(2));
+        let disk_pool = table_readonly_pool(&global, test_user_table_id(0), table_file);
+        let mutable = MutableTableFile::fork(
+            table_file,
+            fs.background_writes(),
+            disk_pool.global_pool().clone(),
+            disk_pool.create_base_guard(),
+        );
+        mutable.write_block(page_id, buf).await.unwrap();
+        drop(mutable);
+    }
+
+    fn build_valid_persisted_lwc_block() -> Vec<u8> {
+        let mut buf = vec![0u8; COW_FILE_PAGE_SIZE];
+        let payload_start = write_block_header(&mut buf, LWC_BLOCK_SPEC);
+        let payload_end = payload_start + LWC_BLOCK_PAYLOAD_SIZE;
+        let page = LwcBlock::from_bytes_mut(&mut buf[payload_start..payload_end]);
+        page.header = LwcBlockHeader::new(1, 0, 0, 0);
+        write_block_checksum(&mut buf);
+        buf
+    }
+
+    fn build_valid_persisted_column_block_page() -> Vec<u8> {
+        let mut buf = vec![0u8; COW_FILE_PAGE_SIZE];
+        let payload_start = write_block_header(&mut buf, COLUMN_BLOCK_INDEX_BLOCK_SPEC);
+        let payload_end = payload_start + COLUMN_BLOCK_NODE_PAYLOAD_SIZE;
+        let header = ColumnBlockNodeHeader::new(0, 0, RowID::new(0), TrxID::new(1));
+        let header_bytes = layout::bytes_of(&header);
+        buf[payload_start..payload_start + COLUMN_BLOCK_HEADER_SIZE].copy_from_slice(header_bytes);
+        buf[payload_start + COLUMN_BLOCK_HEADER_SIZE..payload_end].fill(0);
+        write_block_checksum(&mut buf);
+        buf
+    }
+
+    fn build_valid_persisted_blob_page() -> Vec<u8> {
+        let mut buf = vec![0u8; COW_FILE_PAGE_SIZE];
+        let payload_start = write_block_header(&mut buf, COLUMN_DELETION_BLOB_BLOCK_SPEC);
+        let payload_end = payload_start + max_payload_len(COW_FILE_PAGE_SIZE);
+        let payload = &mut buf[payload_start..payload_end];
+        payload[..COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE].fill(0);
+        payload[8..10].copy_from_slice(&(1u16).to_le_bytes());
+        payload[COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE] = 7;
+        write_block_checksum(&mut buf);
+        buf
+    }
+
+    #[test]
+    fn test_global_readonly_pool_shutdown_is_idempotent_before_worker_start() {
+        let pool = owned_global_pool(frame_page_bytes(2));
+
+        pool.signal_shutdown();
+        pool.signal_shutdown();
+    }
+
+    #[test]
+    fn test_readonly_pool_global_stats_track_single_miss_then_warm_hit() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let table_file = fs
+                .create_table_file(test_user_table_id(120), make_metadata(), false)
+                .unwrap();
+            let table_file = commit_table_file(&fs, table_file).await;
+            write_payload(&fs, &table_file, test_block_id(0), b"readonly-stats").await;
+
+            let scope = global_readonly_pool_scope(frame_page_bytes(4));
+            let pool = table_readonly_pool(&scope, test_user_table_id(120), &table_file);
+            let pool_guard = pool.create_base_guard();
+
+            let cold_start = pool.global_stats();
+            let cold_guard = pool
+                .read_block(&pool_guard, SUPER_BLOCK_ID)
+                .await
+                .expect("readonly cold read failed in test");
+            assert_eq!(&cold_guard.page()[..14], b"readonly-stats");
+            drop(cold_guard);
+
+            let cold_delta = pool.global_stats().delta_since(cold_start);
+            assert_eq!(cold_delta.cache_hits, 0);
+            assert_eq!(cold_delta.cache_misses, 1);
+            assert_eq!(cold_delta.miss_joins, 0);
+            assert_eq!(cold_delta.queued_reads, 1);
+            assert_eq!(cold_delta.running_reads, 1);
+            assert_eq!(cold_delta.completed_reads, 1);
+            assert_eq!(cold_delta.read_errors, 0);
+
+            let warm_start = pool.global_stats();
+            let warm_guard = pool
+                .read_block(&pool_guard, SUPER_BLOCK_ID)
+                .await
+                .expect("readonly warm read failed in test");
+            assert_eq!(&warm_guard.page()[..14], b"readonly-stats");
+            drop(warm_guard);
+
+            let warm_delta = pool.global_stats().delta_since(warm_start);
+            assert_eq!(warm_delta.cache_hits, 1);
+            assert_eq!(warm_delta.cache_misses, 0);
+            assert_eq!(warm_delta.queued_reads, 0);
+            assert_eq!(warm_delta.running_reads, 0);
+            assert_eq!(warm_delta.completed_reads, 0);
+        });
+    }
+
+    #[test]
+    fn test_readonly_pool_global_stats_are_shared_across_file_wrappers() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let table_file_a = fs
+                .create_table_file(test_user_table_id(121), make_metadata(), false)
+                .unwrap();
+            let table_file_a = commit_table_file(&fs, table_file_a).await;
+            write_payload(&fs, &table_file_a, test_block_id(0), b"readonly-shared-a").await;
+
+            let table_file_b = fs
+                .create_table_file(test_user_table_id(122), make_metadata(), false)
+                .unwrap();
+            let table_file_b = commit_table_file(&fs, table_file_b).await;
+            write_payload(&fs, &table_file_b, test_block_id(0), b"readonly-shared-b").await;
+
+            let scope = global_readonly_pool_scope(frame_page_bytes(4));
+            let pool_a = table_readonly_pool(&scope, test_user_table_id(121), &table_file_a);
+            let pool_b = table_readonly_pool(&scope, test_user_table_id(122), &table_file_b);
+            let pool_a_guard = pool_a.create_base_guard();
+
+            let start_a = pool_a.global_stats();
+            let start_b = pool_b.global_stats();
+            assert_eq!(start_a, start_b);
+
+            let guard_a = pool_a
+                .read_block(&pool_a_guard, test_block_id(0))
+                .await
+                .expect("readonly shared global read failed in test");
+            assert_eq!(&guard_a.page()[..17], b"readonly-shared-a");
+            drop(guard_a);
+
+            let delta_a = pool_a.global_stats().delta_since(start_a);
+            let delta_b = pool_b.global_stats().delta_since(start_b);
+            assert_eq!(delta_a, delta_b);
+            assert_eq!(delta_a.cache_hits, 0);
+            assert_eq!(delta_a.cache_misses, 1);
+            assert_eq!(delta_a.miss_joins, 0);
+            assert_eq!(delta_a.queued_reads, 1);
+            assert_eq!(delta_a.running_reads, 1);
+            assert_eq!(delta_a.completed_reads, 1);
+            assert_eq!(delta_a.read_errors, 0);
+        });
     }
 
     #[test]

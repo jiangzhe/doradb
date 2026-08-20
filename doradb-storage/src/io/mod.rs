@@ -920,6 +920,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
+    static STORAGE_BACKEND_TEST_HOOK_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+    static STORAGE_BACKEND_TEST_HOOK: Mutex<Option<StorageBackendHook>> = Mutex::new(None);
+
+    /// Test fixture for storage backend file identity.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) struct StorageBackendFileIdentity {
         dev: u64,
@@ -927,6 +931,7 @@ mod tests {
     }
 
     impl StorageBackendFileIdentity {
+        /// Provides test-only access to `from_path`.
         #[inline]
         pub(crate) fn from_path(path: impl AsRef<Path>) -> StdIoResult<Self> {
             let md = metadata(path)?;
@@ -955,6 +960,7 @@ mod tests {
         }
     }
 
+    /// Test fixture for storage backend op.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) struct StorageBackendOp {
         kind: IOKind,
@@ -963,57 +969,49 @@ mod tests {
     }
 
     impl StorageBackendOp {
+        /// Creates a new test fixture.
         #[inline]
         pub(crate) fn new(kind: IOKind, fd: RawFd, offset: usize) -> Self {
             Self { kind, fd, offset }
         }
 
+        /// Provides test-only access to `kind`.
         #[inline]
         pub(crate) fn kind(&self) -> IOKind {
             self.kind
         }
 
+        /// Provides test-only access to `fd`.
         #[inline]
         pub(crate) fn fd(&self) -> RawFd {
             self.fd
         }
 
+        /// Provides test-only access to `offset`.
         #[inline]
         pub(crate) fn offset(&self) -> usize {
             self.offset
         }
 
+        /// Returns whether the test fixture matches the requested operation.
         #[inline]
         pub(crate) fn matches_file_identity(&self, expected: StorageBackendFileIdentity) -> bool {
             StorageBackendFileIdentity::from_fd(self.fd).is_ok_and(|actual| actual == expected)
         }
     }
 
+    /// Test-only extension interface for storage backend test hook.
     pub(crate) trait StorageBackendTestHook: Send + Sync {
+        /// Provides test-only access to `on_submit`.
         fn on_submit(&self, _op: StorageBackendOp) {}
 
+        /// Provides test-only access to `on_complete`.
         fn on_complete(&self, _op: StorageBackendOp, _res: &mut StdIoResult<usize>) {}
     }
 
     type StorageBackendHook = Arc<dyn StorageBackendTestHook>;
 
-    static STORAGE_BACKEND_TEST_HOOK_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-    static STORAGE_BACKEND_TEST_HOOK: Mutex<Option<StorageBackendHook>> = Mutex::new(None);
-
-    #[inline]
-    fn lock_storage_backend_test_hook_gate() -> MutexGuard<'static, ()> {
-        STORAGE_BACKEND_TEST_HOOK_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-    }
-
-    #[inline]
-    fn lock_storage_backend_test_hook_state() -> MutexGuard<'static, Option<StorageBackendHook>> {
-        STORAGE_BACKEND_TEST_HOOK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-    }
-
+    /// Test fixture for installed storage backend test hook.
     pub(crate) struct InstalledStorageBackendTestHook {
         previous: Option<StorageBackendHook>,
         guard: Option<MutexGuard<'static, ()>>,
@@ -1027,101 +1025,9 @@ mod tests {
         }
     }
 
-    #[inline]
-    pub(crate) fn current_storage_backend_test_hook() -> Option<StorageBackendHook> {
-        lock_storage_backend_test_hook_state().clone()
-    }
-
-    #[inline]
-    pub(crate) fn set_storage_backend_test_hook(
-        hook: Option<StorageBackendHook>,
-    ) -> Option<StorageBackendHook> {
-        let mut guard = lock_storage_backend_test_hook_state();
-        replace(&mut *guard, hook)
-    }
-
-    #[inline]
-    fn install_storage_backend_test_hook_locked(
-        hook: StorageBackendHook,
-        guard: MutexGuard<'static, ()>,
-    ) -> InstalledStorageBackendTestHook {
-        InstalledStorageBackendTestHook {
-            previous: set_storage_backend_test_hook(Some(hook)),
-            guard: Some(guard),
-        }
-    }
-
-    #[inline]
-    pub(crate) fn install_storage_backend_test_hook(
-        hook: StorageBackendHook,
-    ) -> InstalledStorageBackendTestHook {
-        let guard = lock_storage_backend_test_hook_gate();
-        install_storage_backend_test_hook_locked(hook, guard)
-    }
-
     struct NoopStorageBackendTestHook;
 
     impl StorageBackendTestHook for NoopStorageBackendTestHook {}
-
-    #[test]
-    fn test_install_storage_backend_test_hook_clears_hook_on_drop() {
-        let hook: StorageBackendHook = Arc::new(NoopStorageBackendTestHook);
-        {
-            let _install = install_storage_backend_test_hook(hook.clone());
-            let current = current_storage_backend_test_hook().unwrap();
-            assert!(Arc::ptr_eq(&current, &hook));
-        }
-        assert!(current_storage_backend_test_hook().is_none());
-    }
-
-    #[test]
-    fn test_installed_storage_backend_test_hook_restores_previous_on_drop() {
-        let previous: StorageBackendHook = Arc::new(NoopStorageBackendTestHook);
-        let next: StorageBackendHook = Arc::new(NoopStorageBackendTestHook);
-        let guard = lock_storage_backend_test_hook_gate();
-        let replaced = set_storage_backend_test_hook(Some(previous.clone()));
-        assert!(replaced.is_none());
-
-        let install = install_storage_backend_test_hook_locked(next.clone(), guard);
-        let current = current_storage_backend_test_hook().unwrap();
-        assert!(Arc::ptr_eq(&current, &next));
-        drop(install);
-
-        let restored = current_storage_backend_test_hook().unwrap();
-        assert!(Arc::ptr_eq(&restored, &previous));
-        let cleared = set_storage_backend_test_hook(None).unwrap();
-        assert!(Arc::ptr_eq(&cleared, &previous));
-    }
-
-    #[test]
-    fn test_io_queue_drain_to_clamps_to_remaining_len() {
-        let mut queue = IOQueue::with_capacity(2);
-        queue.push(1u32);
-        queue.push(2u32);
-
-        let drained = queue.drain_to(5);
-        assert_eq!(drained, vec![1, 2]);
-        assert!(queue.is_empty());
-    }
-
-    #[test]
-    fn test_sync_operations_do_not_bind_buffers() {
-        let mut fsync = Operation::fsync(17);
-        assert_eq!(fsync.kind(), IOKind::Fsync);
-        assert_eq!(fsync.fd(), 17);
-        assert_eq!(fsync.offset(), 0);
-        assert_eq!(fsync.len(), 0);
-        assert!(fsync.buf().is_none());
-        assert!(fsync.take_buf().is_none());
-
-        let mut fdatasync = Operation::fdatasync(19);
-        assert_eq!(fdatasync.kind(), IOKind::Fdatasync);
-        assert_eq!(fdatasync.fd(), 19);
-        assert_eq!(fdatasync.offset(), 0);
-        assert_eq!(fdatasync.len(), 0);
-        assert!(fdatasync.buf().is_none());
-        assert!(fdatasync.take_buf().is_none());
-    }
 
     struct DriverBackend {
         io_depth: usize,
@@ -1277,11 +1183,6 @@ mod tests {
         }
     }
 
-    #[inline]
-    fn driver_submit_retry(reason: SubmitRetryReason) -> SubmitAttempt {
-        SubmitAttempt::Retry(SubmitRetry::new(reason, 1))
-    }
-
     struct PreparedDropCounter {
         token: BackendToken,
         drops: Arc<AtomicUsize>,
@@ -1410,6 +1311,120 @@ mod tests {
         fn on_complete(&self, op: StorageBackendOp, _res: &mut StdIoResult<usize>) {
             self.completes.lock().unwrap().push(op);
         }
+    }
+
+    /// Returns storage backend test hook for tests.
+    #[inline]
+    pub(crate) fn current_storage_backend_test_hook() -> Option<StorageBackendHook> {
+        lock_storage_backend_test_hook_state().clone()
+    }
+
+    /// Sets storage backend test hook for tests.
+    #[inline]
+    pub(crate) fn set_storage_backend_test_hook(
+        hook: Option<StorageBackendHook>,
+    ) -> Option<StorageBackendHook> {
+        let mut guard = lock_storage_backend_test_hook_state();
+        replace(&mut *guard, hook)
+    }
+
+    /// Installs storage backend test hook for tests.
+    #[inline]
+    pub(crate) fn install_storage_backend_test_hook(
+        hook: StorageBackendHook,
+    ) -> InstalledStorageBackendTestHook {
+        let guard = lock_storage_backend_test_hook_gate();
+        install_storage_backend_test_hook_locked(hook, guard)
+    }
+
+    #[inline]
+    fn lock_storage_backend_test_hook_gate() -> MutexGuard<'static, ()> {
+        STORAGE_BACKEND_TEST_HOOK_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    #[inline]
+    fn lock_storage_backend_test_hook_state() -> MutexGuard<'static, Option<StorageBackendHook>> {
+        STORAGE_BACKEND_TEST_HOOK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    #[inline]
+    fn install_storage_backend_test_hook_locked(
+        hook: StorageBackendHook,
+        guard: MutexGuard<'static, ()>,
+    ) -> InstalledStorageBackendTestHook {
+        InstalledStorageBackendTestHook {
+            previous: set_storage_backend_test_hook(Some(hook)),
+            guard: Some(guard),
+        }
+    }
+
+    #[inline]
+    fn driver_submit_retry(reason: SubmitRetryReason) -> SubmitAttempt {
+        SubmitAttempt::Retry(SubmitRetry::new(reason, 1))
+    }
+
+    #[test]
+    fn test_install_storage_backend_test_hook_clears_hook_on_drop() {
+        let hook: StorageBackendHook = Arc::new(NoopStorageBackendTestHook);
+        {
+            let _install = install_storage_backend_test_hook(hook.clone());
+            let current = current_storage_backend_test_hook().unwrap();
+            assert!(Arc::ptr_eq(&current, &hook));
+        }
+        assert!(current_storage_backend_test_hook().is_none());
+    }
+
+    #[test]
+    fn test_installed_storage_backend_test_hook_restores_previous_on_drop() {
+        let previous: StorageBackendHook = Arc::new(NoopStorageBackendTestHook);
+        let next: StorageBackendHook = Arc::new(NoopStorageBackendTestHook);
+        let guard = lock_storage_backend_test_hook_gate();
+        let replaced = set_storage_backend_test_hook(Some(previous.clone()));
+        assert!(replaced.is_none());
+
+        let install = install_storage_backend_test_hook_locked(next.clone(), guard);
+        let current = current_storage_backend_test_hook().unwrap();
+        assert!(Arc::ptr_eq(&current, &next));
+        drop(install);
+
+        let restored = current_storage_backend_test_hook().unwrap();
+        assert!(Arc::ptr_eq(&restored, &previous));
+        let cleared = set_storage_backend_test_hook(None).unwrap();
+        assert!(Arc::ptr_eq(&cleared, &previous));
+    }
+
+    #[test]
+    fn test_io_queue_drain_to_clamps_to_remaining_len() {
+        let mut queue = IOQueue::with_capacity(2);
+        queue.push(1u32);
+        queue.push(2u32);
+
+        let drained = queue.drain_to(5);
+        assert_eq!(drained, vec![1, 2]);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn test_sync_operations_do_not_bind_buffers() {
+        let mut fsync = Operation::fsync(17);
+        assert_eq!(fsync.kind(), IOKind::Fsync);
+        assert_eq!(fsync.fd(), 17);
+        assert_eq!(fsync.offset(), 0);
+        assert_eq!(fsync.len(), 0);
+        assert!(fsync.buf().is_none());
+        assert!(fsync.take_buf().is_none());
+
+        let mut fdatasync = Operation::fdatasync(19);
+        assert_eq!(fdatasync.kind(), IOKind::Fdatasync);
+        assert_eq!(fdatasync.fd(), 19);
+        assert_eq!(fdatasync.offset(), 0);
+        assert_eq!(fdatasync.len(), 0);
+        assert!(fdatasync.buf().is_none());
+        assert!(fdatasync.take_buf().is_none());
     }
 
     #[test]

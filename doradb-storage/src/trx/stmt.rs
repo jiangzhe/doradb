@@ -1507,6 +1507,12 @@ pub(crate) mod tests {
         static TEST_FORCE_STMT_INDEX_ROLLBACK_ERROR: Cell<bool> = const { Cell::new(false) };
     }
 
+    /// Return whether one statement retains deferred index updates.
+    #[inline]
+    pub(crate) fn has_deferred_index_updates(effects: &StmtEffects) -> bool {
+        !effects.deferred_index_updates.is_empty()
+    }
+
     pub(super) fn set_test_force_stmt_index_rollback_error(enabled: bool) {
         TEST_FORCE_STMT_INDEX_ROLLBACK_ERROR.with(|flag| flag.set(enabled));
     }
@@ -1545,12 +1551,6 @@ pub(crate) mod tests {
         stmt: &'borrow mut Statement<'_>,
     ) -> &'borrow mut StmtEffects {
         stmt.effects
-    }
-
-    /// Return whether one statement retains deferred index updates.
-    #[inline]
-    pub(crate) fn has_deferred_index_updates(effects: &StmtEffects) -> bool {
-        !effects.deferred_index_updates.is_empty()
     }
 
     #[inline]

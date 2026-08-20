@@ -1051,99 +1051,10 @@ mod tests {
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
-    #[test]
-    fn test_failure_rate_tracker_window() {
-        let tracker = FailureRateTracker::new(4);
-        tracker.record_success();
-        tracker.record_failure();
-        tracker.record_failure();
-        assert!((tracker.failure_rate() - 2.0 / 3.0).abs() < 1e-9);
-
-        tracker.record_success();
-        tracker.record_success();
-        // Window keeps latest 4 samples: failure, failure, success, success.
-        assert!((tracker.failure_rate() - 0.5).abs() < 1e-9);
-    }
-
-    #[test]
-    fn test_arbiter_decide_pressure_delta_and_hysteresis() {
-        let arbiter = EvictionArbiterBuilder::new()
-            .target_free(10)
-            .hysteresis(4)
-            .failure_rate_threshold(0.3)
-            .failure_window(128)
-            .dynamic_batch_bounds(4, 32)
-            .build(100);
-
-        // Triggered by low free frames.
-        let decision = arbiter.decide(95, 100, 0, 0.0, 1).unwrap();
-        assert!(decision.batch_size >= 9);
-
-        // Stop condition satisfied.
-        let no_evict = arbiter.decide(84, 100, 0, 0.0, 1);
-        assert!(no_evict.is_none());
-    }
-
-    #[test]
-    fn test_arbiter_decide_failure_rate_trigger_and_dynamic_batch() {
-        let arbiter = EvictionArbiterBuilder::new()
-            .target_free(10)
-            .hysteresis(4)
-            .failure_rate_threshold(0.2)
-            .failure_window(128)
-            .dynamic_batch_bounds(4, 40)
-            .build(100);
-
-        // Plenty of free frames, but failure rate is high so eviction still triggers.
-        let decision = arbiter.decide(50, 100, 0, 0.9, 1).unwrap();
-        assert!(decision.batch_size >= 20);
-
-        // Inflight evictions reduce effective batch.
-        let decision = arbiter.decide(50, 100, 8, 0.9, 1).unwrap();
-        assert!(decision.batch_size < 40);
-    }
-
-    #[test]
-    fn test_arbiter_builder_normalizes_invalid_inputs() {
-        let arbiter = EvictionArbiterBuilder::new()
-            .target_free_ratio(f64::NAN)
-            .hysteresis_ratio(f64::INFINITY)
-            .failure_rate_threshold(2.0)
-            .failure_window(0)
-            .dynamic_batch_bounds(0, 0)
-            .build(10);
-
-        // target_free_ratio falls back to default (0.10), then min-clamped to 1.
-        assert_eq!(arbiter.target_free, 1);
-        // hysteresis_ratio is clamped to 1.0, so hysteresis becomes target_free.
-        assert_eq!(arbiter.hysteresis, 1);
-        assert_eq!(arbiter.failure_rate_threshold, 1.0);
-        assert_eq!(arbiter.failure_window, 1);
-        assert_eq!(arbiter.min_batch, 1);
-        assert_eq!(arbiter.max_batch, 1);
-    }
-
-    #[test]
-    fn test_arbiter_builder_respects_explicit_values() {
-        let arbiter = EvictionArbiterBuilder::new()
-            .target_free(7)
-            .target_free_ratio(0.95)
-            .hysteresis(5)
-            .hysteresis_ratio(0.8)
-            .failure_rate_threshold(0.42)
-            .failure_window(17)
-            .dynamic_batch_bounds(9, 4)
-            .build(100);
-
-        // Absolute fields override ratio-derived defaults.
-        assert_eq!(arbiter.target_free, 7);
-        assert_eq!(arbiter.hysteresis, 5);
-        assert_eq!(arbiter.failure_rate_threshold, 0.42);
-        assert_eq!(arbiter.failure_window, 17);
-        // max_batch is normalized to be at least min_batch.
-        assert_eq!(arbiter.min_batch, 9);
-        assert_eq!(arbiter.max_batch, 9);
-    }
+    const TEST_POOL_BYTES: usize = 64 * 1024 * 130;
+    const TEST_POOL_MAX_FILE_BYTES: usize = 128 * 1024 * 260;
+    const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+    const TEST_WAIT_INTERVAL: Duration = Duration::from_millis(10);
 
     struct MockRuntime {
         resident: usize,
@@ -1198,54 +1109,6 @@ mod tests {
         fn execute(&self, _pages: Vec<PageExclusiveGuard<Page>>) -> Option<EventListener> {
             panic!("selection is not exercised by this scheduler test")
         }
-    }
-
-    fn test_policy() -> PressureDeltaClockPolicy {
-        PressureDeltaClockPolicy::new(
-            EvictionArbiterBuilder::new()
-                .target_free(2)
-                .hysteresis(1)
-                .dynamic_batch_bounds(1, 4)
-                .build(8),
-            1,
-        )
-    }
-
-    const TEST_POOL_BYTES: usize = 64 * 1024 * 130;
-    const TEST_POOL_MAX_FILE_BYTES: usize = 128 * 1024 * 260;
-    const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
-    const TEST_WAIT_INTERVAL: Duration = Duration::from_millis(10);
-
-    fn frame_page_bytes(capacity: usize) -> usize {
-        capacity * (mem::size_of::<BufferFrame>() + mem::size_of::<Page>())
-    }
-
-    fn wait_for(mut predicate: impl FnMut() -> bool) {
-        let deadline = Instant::now() + TEST_WAIT_TIMEOUT;
-        loop {
-            if predicate() {
-                return;
-            }
-            if Instant::now() >= deadline {
-                break;
-            }
-            thread::sleep(TEST_WAIT_INTERVAL);
-        }
-        panic!("condition was not satisfied before timeout");
-    }
-
-    fn make_metadata() -> Arc<TableMetadata> {
-        Arc::new(
-            TableMetadata::try_new(
-                vec![ColumnSpec::new(
-                    "c0",
-                    ValKind::U32,
-                    ColumnAttributes::empty(),
-                )],
-                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
-            )
-            .expect("valid table metadata"),
-        )
     }
 
     #[derive(Clone)]
@@ -1339,6 +1202,49 @@ mod tests {
         }
     }
 
+    fn test_policy() -> PressureDeltaClockPolicy {
+        PressureDeltaClockPolicy::new(
+            EvictionArbiterBuilder::new()
+                .target_free(2)
+                .hysteresis(1)
+                .dynamic_batch_bounds(1, 4)
+                .build(8),
+            1,
+        )
+    }
+
+    fn frame_page_bytes(capacity: usize) -> usize {
+        capacity * (mem::size_of::<BufferFrame>() + mem::size_of::<Page>())
+    }
+
+    fn wait_for(mut predicate: impl FnMut() -> bool) {
+        let deadline = Instant::now() + TEST_WAIT_TIMEOUT;
+        loop {
+            if predicate() {
+                return;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(TEST_WAIT_INTERVAL);
+        }
+        panic!("condition was not satisfied before timeout");
+    }
+
+    fn make_metadata() -> Arc<TableMetadata> {
+        Arc::new(
+            TableMetadata::try_new(
+                vec![ColumnSpec::new(
+                    "c0",
+                    ValKind::U32,
+                    ColumnAttributes::empty(),
+                )],
+                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+            )
+            .expect("valid table metadata"),
+        )
+    }
+
     async fn allocate_with_pressure(pool: &EvictableBufferPool, total_pages: usize) {
         let pool_guard = pool.create_base_guard();
         for _ in 0..total_pages {
@@ -1418,6 +1324,100 @@ mod tests {
             drop(g);
         }
         drop(pool_guard);
+    }
+
+    #[test]
+    fn test_failure_rate_tracker_window() {
+        let tracker = FailureRateTracker::new(4);
+        tracker.record_success();
+        tracker.record_failure();
+        tracker.record_failure();
+        assert!((tracker.failure_rate() - 2.0 / 3.0).abs() < 1e-9);
+
+        tracker.record_success();
+        tracker.record_success();
+        // Window keeps latest 4 samples: failure, failure, success, success.
+        assert!((tracker.failure_rate() - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_arbiter_decide_pressure_delta_and_hysteresis() {
+        let arbiter = EvictionArbiterBuilder::new()
+            .target_free(10)
+            .hysteresis(4)
+            .failure_rate_threshold(0.3)
+            .failure_window(128)
+            .dynamic_batch_bounds(4, 32)
+            .build(100);
+
+        // Triggered by low free frames.
+        let decision = arbiter.decide(95, 100, 0, 0.0, 1).unwrap();
+        assert!(decision.batch_size >= 9);
+
+        // Stop condition satisfied.
+        let no_evict = arbiter.decide(84, 100, 0, 0.0, 1);
+        assert!(no_evict.is_none());
+    }
+
+    #[test]
+    fn test_arbiter_decide_failure_rate_trigger_and_dynamic_batch() {
+        let arbiter = EvictionArbiterBuilder::new()
+            .target_free(10)
+            .hysteresis(4)
+            .failure_rate_threshold(0.2)
+            .failure_window(128)
+            .dynamic_batch_bounds(4, 40)
+            .build(100);
+
+        // Plenty of free frames, but failure rate is high so eviction still triggers.
+        let decision = arbiter.decide(50, 100, 0, 0.9, 1).unwrap();
+        assert!(decision.batch_size >= 20);
+
+        // Inflight evictions reduce effective batch.
+        let decision = arbiter.decide(50, 100, 8, 0.9, 1).unwrap();
+        assert!(decision.batch_size < 40);
+    }
+
+    #[test]
+    fn test_arbiter_builder_normalizes_invalid_inputs() {
+        let arbiter = EvictionArbiterBuilder::new()
+            .target_free_ratio(f64::NAN)
+            .hysteresis_ratio(f64::INFINITY)
+            .failure_rate_threshold(2.0)
+            .failure_window(0)
+            .dynamic_batch_bounds(0, 0)
+            .build(10);
+
+        // target_free_ratio falls back to default (0.10), then min-clamped to 1.
+        assert_eq!(arbiter.target_free, 1);
+        // hysteresis_ratio is clamped to 1.0, so hysteresis becomes target_free.
+        assert_eq!(arbiter.hysteresis, 1);
+        assert_eq!(arbiter.failure_rate_threshold, 1.0);
+        assert_eq!(arbiter.failure_window, 1);
+        assert_eq!(arbiter.min_batch, 1);
+        assert_eq!(arbiter.max_batch, 1);
+    }
+
+    #[test]
+    fn test_arbiter_builder_respects_explicit_values() {
+        let arbiter = EvictionArbiterBuilder::new()
+            .target_free(7)
+            .target_free_ratio(0.95)
+            .hysteresis(5)
+            .hysteresis_ratio(0.8)
+            .failure_rate_threshold(0.42)
+            .failure_window(17)
+            .dynamic_batch_bounds(9, 4)
+            .build(100);
+
+        // Absolute fields override ratio-derived defaults.
+        assert_eq!(arbiter.target_free, 7);
+        assert_eq!(arbiter.hysteresis, 5);
+        assert_eq!(arbiter.failure_rate_threshold, 0.42);
+        assert_eq!(arbiter.failure_window, 17);
+        // max_batch is normalized to be at least min_batch.
+        assert_eq!(arbiter.min_batch, 9);
+        assert_eq!(arbiter.max_batch, 9);
     }
 
     #[test]

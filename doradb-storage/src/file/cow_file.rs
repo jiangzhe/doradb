@@ -1069,6 +1069,28 @@ pub(crate) mod tests {
 
     static OLD_ROOT_DROPS: OnceLock<Mutex<FastHashMap<usize, usize>>> = OnceLock::new();
 
+    /// Returns root drop count for tests.
+    #[inline]
+    pub(crate) fn old_root_drop_count(ptr: usize) -> usize {
+        old_root_drops()
+            .lock()
+            .unwrap()
+            .get(&ptr)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    #[inline]
+    fn old_root_drops() -> &'static Mutex<FastHashMap<usize, usize>> {
+        OLD_ROOT_DROPS.get_or_init(|| Mutex::new(FastHashMap::default()))
+    }
+
+    #[inline]
+    pub(super) fn record_old_root_drop(ptr: usize) {
+        let mut drops = old_root_drops().lock().unwrap();
+        *drops.entry(ptr).or_default() += 1;
+    }
+
     #[test]
     fn validate_active_root_rejects_unallocated_reserved_super_block() {
         let alloc_map = AllocMap::new(8);
@@ -1155,26 +1177,5 @@ pub(crate) mod tests {
             (),
         ));
         root.rebuild_alloc_map_from_reachable(&BTreeSet::new());
-    }
-
-    #[inline]
-    fn old_root_drops() -> &'static Mutex<FastHashMap<usize, usize>> {
-        OLD_ROOT_DROPS.get_or_init(|| Mutex::new(FastHashMap::default()))
-    }
-
-    #[inline]
-    pub(super) fn record_old_root_drop(ptr: usize) {
-        let mut drops = old_root_drops().lock().unwrap();
-        *drops.entry(ptr).or_default() += 1;
-    }
-
-    #[inline]
-    pub(crate) fn old_root_drop_count(ptr: usize) -> usize {
-        old_root_drops()
-            .lock()
-            .unwrap()
-            .get(&ptr)
-            .copied()
-            .unwrap_or(0)
     }
 }

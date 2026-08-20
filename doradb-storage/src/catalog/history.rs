@@ -664,6 +664,49 @@ mod tests {
         TrxID::new(ts.as_u64() + 1)
     }
 
+    fn assert_dropped_runtime(entry: &UserTableEntry) {
+        assert!(matches!(
+            entry.dropped.as_ref(),
+            Some(DroppedTableOperationalState::Runtime { .. })
+        ));
+    }
+
+    fn assert_dropped_floor(entry: &UserTableEntry) {
+        assert!(matches!(
+            entry.dropped.as_ref(),
+            Some(DroppedTableOperationalState::Floor { .. })
+        ));
+    }
+
+    fn dropped_entry_fixture(
+        engine: &Engine,
+        table_id: TableID,
+    ) -> (
+        UserTableEntry,
+        Arc<Table>,
+        TrxID,
+        TrxID,
+        TableRedoReplayFloor,
+    ) {
+        let current = engine
+            .inner()
+            .core
+            .catalog()
+            .resolve_user_table_current(table_id)
+            .unwrap();
+        let initial_cts = current.effective_cts();
+        let table = Arc::clone(current.live_table().unwrap());
+        let metadata = Arc::clone(current.live_metadata().unwrap());
+        let drop_cts = after(initial_cts);
+        let replay_floor = TableRedoReplayFloor {
+            heap_redo_start_ts: TrxID::new(7),
+            deletion_cutoff_ts: TrxID::new(9),
+        };
+        let mut entry = UserTableEntry::new_live(initial_cts, metadata, Arc::clone(&table));
+        assert!(entry.publish_drop(drop_cts, Arc::clone(&table), replay_floor));
+        (entry, table, initial_cts, drop_cts, replay_floor)
+    }
+
     #[test]
     fn metadata_history_resolves_strict_boundaries_and_tombstones() {
         smol::block_on(async {
@@ -840,49 +883,6 @@ mod tests {
                     .is_none()
             );
         });
-    }
-
-    fn assert_dropped_runtime(entry: &UserTableEntry) {
-        assert!(matches!(
-            entry.dropped.as_ref(),
-            Some(DroppedTableOperationalState::Runtime { .. })
-        ));
-    }
-
-    fn assert_dropped_floor(entry: &UserTableEntry) {
-        assert!(matches!(
-            entry.dropped.as_ref(),
-            Some(DroppedTableOperationalState::Floor { .. })
-        ));
-    }
-
-    fn dropped_entry_fixture(
-        engine: &Engine,
-        table_id: TableID,
-    ) -> (
-        UserTableEntry,
-        Arc<Table>,
-        TrxID,
-        TrxID,
-        TableRedoReplayFloor,
-    ) {
-        let current = engine
-            .inner()
-            .core
-            .catalog()
-            .resolve_user_table_current(table_id)
-            .unwrap();
-        let initial_cts = current.effective_cts();
-        let table = Arc::clone(current.live_table().unwrap());
-        let metadata = Arc::clone(current.live_metadata().unwrap());
-        let drop_cts = after(initial_cts);
-        let replay_floor = TableRedoReplayFloor {
-            heap_redo_start_ts: TrxID::new(7),
-            deletion_cutoff_ts: TrxID::new(9),
-        };
-        let mut entry = UserTableEntry::new_live(initial_cts, metadata, Arc::clone(&table));
-        assert!(entry.publish_drop(drop_cts, Arc::clone(&table), replay_floor));
-        (entry, table, initial_cts, drop_cts, replay_floor)
     }
 
     #[test]

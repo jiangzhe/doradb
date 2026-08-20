@@ -4945,37 +4945,9 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
-    #[test]
-    fn test_foreground_root_layout_compatibility_uses_identity_and_slot_shape() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine = lightweight_test_engine(&temp_dir, "foreground_root_layout").await;
-            let table_id = create_table2_for_test(&engine).await;
-            let table = table_for_internal_assertion(&engine, table_id);
-            let layout = table.layout_snapshot();
-            let accessor = table.accessor_with_layout(&layout);
-            let root = table.file().active_root_unchecked().clone();
-
-            accessor.assert_foreground_root_layout_compatible(&root);
-
-            let mut identity_mismatch = root.clone();
-            identity_mismatch.metadata = Arc::new(identity_mismatch.metadata.as_ref().clone());
-            assert!(
-                catch_unwind(AssertUnwindSafe(|| {
-                    accessor.assert_foreground_root_layout_compatible(&identity_mismatch);
-                }))
-                .is_err()
-            );
-
-            let mut slot_mismatch = root;
-            slot_mismatch.secondary_index_roots.push(SUPER_BLOCK_ID);
-            assert!(
-                catch_unwind(AssertUnwindSafe(|| {
-                    accessor.assert_foreground_root_layout_compatible(&slot_mismatch);
-                }))
-                .is_err()
-            );
-        });
+    enum CachedInsertPageSessionEnd {
+        Close,
+        Drop,
     }
 
     async fn assert_secondary_mem_entries_absent(
@@ -5013,6 +4985,185 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    async fn setup_single_cold_row(
+        log_file_stem: &str,
+    ) -> (
+        TempDir,
+        Engine,
+        TableID,
+        Session,
+        Arc<Table>,
+        SelectKey,
+        RowID,
+    ) {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, log_file_stem).await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 1, 1, "cold").await;
+        assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+        assert_checkpoint_published(&mut session, table_id).await;
+        let table = table_for_internal_assertion(&engine, table_id);
+        let key = single_key(1);
+        let reader = session.begin_trx().unwrap();
+        let row_id = assert_row_in_lwc(&table, &session.pool_guards(), &key, reader.sts()).await;
+        reader.commit().await.unwrap();
+        (temp_dir, engine, table_id, session, table, key, row_id)
+    }
+
+    async fn checkpoint_cold_delete(
+        session: &mut Session,
+        table_id: TableID,
+        table: &Table,
+        key: &SelectKey,
+        row_id: RowID,
+    ) {
+        expect_delete_committed(table_id, session, key).await;
+        let marker_ts = delete_marker_ts(table.deletion_buffer().get(row_id).unwrap());
+        session.wait_for_gc_horizon_after(marker_ts).await.unwrap();
+        assert_checkpoint_published(session, table_id).await;
+        match table
+            .find_row(&session.pool_guards(), row_id)
+            .await
+            .unwrap()
+        {
+            RowLocation::LwcBlock(location) => assert!(location.durable_deleted),
+            RowLocation::RowPage(_) | RowLocation::NotFound => {
+                panic!("durably deleted row must retain its cold physical image")
+            }
+        }
+    }
+
+    fn assert_unrelated_poison_fatal(error: &Error) {
+        assert_eq!(error.kind(), ErrorKind::Fatal);
+        assert_eq!(
+            error.report().downcast_ref::<FatalError>().copied(),
+            Some(FatalError::StorageIo)
+        );
+        let report = format!("{error:?}");
+        assert!(
+            report.contains("unrelated foreground wait poison"),
+            "fatal propagation lost the first poison report: {report}"
+        );
+    }
+
+    async fn assert_session_end_returns_cached_insert_page(end: CachedInsertPageSessionEnd) {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(
+            &temp_dir,
+            64u64 * 1024 * 1024,
+            "cached_insert_page_session_end",
+        )
+        .await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+
+        let mut trx = session.begin_trx().unwrap();
+        let first_row_id = unwrap_insert_result(
+            trx.table_insert_mvcc(table_id, vec![Val::from(1), Val::from("first-session")])
+                .await,
+        );
+        trx.commit().await.unwrap();
+        let first_page_id = match table_for_internal_assertion(&engine, table_id)
+            .find_row(&session.pool_guards(), first_row_id)
+            .await
+            .unwrap()
+        {
+            RowLocation::RowPage(page_id) => page_id,
+            RowLocation::LwcBlock(..) | RowLocation::NotFound => {
+                panic!("inserted row should remain in the row store")
+            }
+        };
+
+        match end {
+            CachedInsertPageSessionEnd::Close => session.close().await.unwrap(),
+            CachedInsertPageSessionEnd::Drop => drop(session),
+        }
+
+        let mut next_session = engine.new_session().unwrap();
+        let mut trx = next_session.begin_trx().unwrap();
+        let next_row_id = unwrap_insert_result(
+            trx.table_insert_mvcc(table_id, vec![Val::from(2), Val::from("next-session")])
+                .await,
+        );
+        trx.commit().await.unwrap();
+        let next_page_id = match table_for_internal_assertion(&engine, table_id)
+            .find_row(&next_session.pool_guards(), next_row_id)
+            .await
+            .unwrap()
+        {
+            RowLocation::RowPage(page_id) => page_id,
+            RowLocation::LwcBlock(..) | RowLocation::NotFound => {
+                panic!("inserted row should remain in the row store")
+            }
+        };
+        assert_eq!(next_page_id, first_page_id);
+    }
+
+    async fn secondary_index_scan_rows(
+        trx: &mut Transaction,
+        table_id: TableID,
+        key: i32,
+    ) -> Vec<Vec<Val>> {
+        let key_vals = [Val::from(key)];
+        let read_set = [0usize, 1];
+        trx.table_index_lookup_mvcc(table_id, 1, &key_vals, &read_set)
+            .await
+            .unwrap()
+            .unwrap_rows()
+    }
+
+    async fn secondary_index_stream_rows(
+        trx: &mut Transaction,
+        table_id: TableID,
+        key: i32,
+    ) -> Vec<Vec<Val>> {
+        let key_vals = [Val::from(key)];
+        let read_set = [0usize, 1];
+        let mut stream = trx
+            .table_index_scan_mvcc_stream(table_id, 1, &key_vals[..]..=&key_vals[..], &read_set)
+            .await
+            .unwrap();
+        let mut rows = Vec::new();
+        while let Some(row) = stream.next().await.unwrap() {
+            rows.push(row);
+        }
+        rows
+    }
+
+    #[test]
+    fn test_foreground_root_layout_compatibility_uses_identity_and_slot_shape() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "foreground_root_layout").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let layout = table.layout_snapshot();
+            let accessor = table.accessor_with_layout(&layout);
+            let root = table.file().active_root_unchecked().clone();
+
+            accessor.assert_foreground_root_layout_compatible(&root);
+
+            let mut identity_mismatch = root.clone();
+            identity_mismatch.metadata = Arc::new(identity_mismatch.metadata.as_ref().clone());
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| {
+                    accessor.assert_foreground_root_layout_compatible(&identity_mismatch);
+                }))
+                .is_err()
+            );
+
+            let mut slot_mismatch = root;
+            slot_mismatch.secondary_index_roots.push(SUPER_BLOCK_ID);
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| {
+                    accessor.assert_foreground_root_layout_compatible(&slot_mismatch);
+                }))
+                .is_err()
+            );
+        });
     }
 
     #[test]
@@ -7514,55 +7665,6 @@ mod tests {
         ));
     }
 
-    async fn setup_single_cold_row(
-        log_file_stem: &str,
-    ) -> (
-        TempDir,
-        Engine,
-        TableID,
-        Session,
-        Arc<Table>,
-        SelectKey,
-        RowID,
-    ) {
-        let temp_dir = TempDir::new().unwrap();
-        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, log_file_stem).await;
-        let table_id = create_table2_for_test(&engine).await;
-        let mut session = engine.new_session().unwrap();
-        insert_rows(table_id, &mut session, 1, 1, "cold").await;
-        assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-        assert_checkpoint_published(&mut session, table_id).await;
-        let table = table_for_internal_assertion(&engine, table_id);
-        let key = single_key(1);
-        let reader = session.begin_trx().unwrap();
-        let row_id = assert_row_in_lwc(&table, &session.pool_guards(), &key, reader.sts()).await;
-        reader.commit().await.unwrap();
-        (temp_dir, engine, table_id, session, table, key, row_id)
-    }
-
-    async fn checkpoint_cold_delete(
-        session: &mut Session,
-        table_id: TableID,
-        table: &Table,
-        key: &SelectKey,
-        row_id: RowID,
-    ) {
-        expect_delete_committed(table_id, session, key).await;
-        let marker_ts = delete_marker_ts(table.deletion_buffer().get(row_id).unwrap());
-        session.wait_for_gc_horizon_after(marker_ts).await.unwrap();
-        assert_checkpoint_published(session, table_id).await;
-        match table
-            .find_row(&session.pool_guards(), row_id)
-            .await
-            .unwrap()
-        {
-            RowLocation::LwcBlock(location) => assert!(location.durable_deleted),
-            RowLocation::RowPage(_) | RowLocation::NotFound => {
-                panic!("durably deleted row must retain its cold physical image")
-            }
-        }
-    }
-
     #[test]
     fn test_unique_single_row_paths_reject_durable_deleted_candidate() {
         smol::block_on(async {
@@ -7677,19 +7779,6 @@ mod tests {
             assert!(rows.is_empty());
             trx.commit().await.unwrap();
         });
-    }
-
-    fn assert_unrelated_poison_fatal(error: &Error) {
-        assert_eq!(error.kind(), ErrorKind::Fatal);
-        assert_eq!(
-            error.report().downcast_ref::<FatalError>().copied(),
-            Some(FatalError::StorageIo)
-        );
-        let report = format!("{error:?}");
-        assert!(
-            report.contains("unrelated foreground wait poison"),
-            "fatal propagation lost the first poison report: {report}"
-        );
     }
 
     #[test]
@@ -9468,64 +9557,6 @@ mod tests {
         });
     }
 
-    enum CachedInsertPageSessionEnd {
-        Close,
-        Drop,
-    }
-
-    async fn assert_session_end_returns_cached_insert_page(end: CachedInsertPageSessionEnd) {
-        let temp_dir = TempDir::new().unwrap();
-        let engine = evictable_test_engine(
-            &temp_dir,
-            64u64 * 1024 * 1024,
-            "cached_insert_page_session_end",
-        )
-        .await;
-        let table_id = create_table2_for_test(&engine).await;
-        let mut session = engine.new_session().unwrap();
-
-        let mut trx = session.begin_trx().unwrap();
-        let first_row_id = unwrap_insert_result(
-            trx.table_insert_mvcc(table_id, vec![Val::from(1), Val::from("first-session")])
-                .await,
-        );
-        trx.commit().await.unwrap();
-        let first_page_id = match table_for_internal_assertion(&engine, table_id)
-            .find_row(&session.pool_guards(), first_row_id)
-            .await
-            .unwrap()
-        {
-            RowLocation::RowPage(page_id) => page_id,
-            RowLocation::LwcBlock(..) | RowLocation::NotFound => {
-                panic!("inserted row should remain in the row store")
-            }
-        };
-
-        match end {
-            CachedInsertPageSessionEnd::Close => session.close().await.unwrap(),
-            CachedInsertPageSessionEnd::Drop => drop(session),
-        }
-
-        let mut next_session = engine.new_session().unwrap();
-        let mut trx = next_session.begin_trx().unwrap();
-        let next_row_id = unwrap_insert_result(
-            trx.table_insert_mvcc(table_id, vec![Val::from(2), Val::from("next-session")])
-                .await,
-        );
-        trx.commit().await.unwrap();
-        let next_page_id = match table_for_internal_assertion(&engine, table_id)
-            .find_row(&next_session.pool_guards(), next_row_id)
-            .await
-            .unwrap()
-        {
-            RowLocation::RowPage(page_id) => page_id,
-            RowLocation::LwcBlock(..) | RowLocation::NotFound => {
-                panic!("inserted row should remain in the row store")
-            }
-        };
-        assert_eq!(next_page_id, first_page_id);
-    }
-
     #[test]
     fn test_session_close_returns_cached_insert_page() {
         smol::block_on(assert_session_end_returns_cached_insert_page(
@@ -10148,37 +10179,6 @@ mod tests {
             trx.commit().await.unwrap();
             assert_eq!(visible_rows, inserted.len());
         });
-    }
-
-    async fn secondary_index_scan_rows(
-        trx: &mut Transaction,
-        table_id: TableID,
-        key: i32,
-    ) -> Vec<Vec<Val>> {
-        let key_vals = [Val::from(key)];
-        let read_set = [0usize, 1];
-        trx.table_index_lookup_mvcc(table_id, 1, &key_vals, &read_set)
-            .await
-            .unwrap()
-            .unwrap_rows()
-    }
-
-    async fn secondary_index_stream_rows(
-        trx: &mut Transaction,
-        table_id: TableID,
-        key: i32,
-    ) -> Vec<Vec<Val>> {
-        let key_vals = [Val::from(key)];
-        let read_set = [0usize, 1];
-        let mut stream = trx
-            .table_index_scan_mvcc_stream(table_id, 1, &key_vals[..]..=&key_vals[..], &read_set)
-            .await
-            .unwrap();
-        let mut rows = Vec::new();
-        while let Some(row) = stream.next().await.unwrap() {
-            rows.push(row);
-        }
-        rows
     }
 
     #[test]

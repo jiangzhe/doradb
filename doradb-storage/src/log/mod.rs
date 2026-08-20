@@ -2482,6 +2482,351 @@ mod tests {
     const TEST_WAIT_RETRIES: usize = 100;
     const TEST_WAIT_INTERVAL: Duration = Duration::from_millis(10);
 
+    #[derive(Clone, Default)]
+    struct RecordingRedoWriteSubmitHook {
+        submits: Arc<Mutex<Vec<StorageBackendOp>>>,
+    }
+
+    impl RecordingRedoWriteSubmitHook {
+        fn submits(&self) -> Vec<StorageBackendOp> {
+            self.submits.lock().unwrap().clone()
+        }
+    }
+
+    impl StorageBackendTestHook for RecordingRedoWriteSubmitHook {
+        fn on_submit(&self, op: StorageBackendOp) {
+            if op.kind() == IOKind::Write {
+                self.submits.lock().unwrap().push(op);
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct ControlledRedoWriteHook {
+        inner: Arc<ControlledRedoWriteHookInner>,
+    }
+
+    impl ControlledRedoWriteHook {
+        fn new(fd: RawFd, errno: i32) -> Self {
+            Self::with_error(fd, Some(errno))
+        }
+
+        fn success(fd: RawFd) -> Self {
+            Self::with_error(fd, None)
+        }
+
+        fn with_error(fd: RawFd, errno: Option<i32>) -> Self {
+            Self {
+                inner: Arc::new(ControlledRedoWriteHookInner {
+                    fd,
+                    errno,
+                    calls: AtomicUsize::new(0),
+                    started: Event::new(),
+                    released: AtomicBool::new(false),
+                    release: Event::new(),
+                }),
+            }
+        }
+
+        fn matches(&self, op: StorageBackendOp) -> bool {
+            op.kind() == IOKind::Write && op.fd() == self.inner.fd
+        }
+
+        async fn wait_started(&self, expected_calls: usize) {
+            loop {
+                if self.inner.calls.load(Ordering::SeqCst) >= expected_calls {
+                    return;
+                }
+                event_listener::listener!(self.inner.started => listener);
+                if self.inner.calls.load(Ordering::SeqCst) >= expected_calls {
+                    return;
+                }
+                listener.await;
+            }
+        }
+
+        fn release(&self) {
+            self.inner.released.store(true, Ordering::SeqCst);
+            self.inner.release.notify(usize::MAX);
+        }
+    }
+
+    impl StorageBackendTestHook for ControlledRedoWriteHook {
+        fn on_submit(&self, op: StorageBackendOp) {
+            if self.matches(op) {
+                self.inner.calls.fetch_add(1, Ordering::SeqCst);
+                self.inner.started.notify(usize::MAX);
+            }
+        }
+
+        fn on_complete(&self, op: StorageBackendOp, res: &mut StdIoResult<usize>) {
+            if !self.matches(op) {
+                return;
+            }
+            loop {
+                if self.inner.released.load(Ordering::SeqCst) {
+                    break;
+                }
+                event_listener::listener!(self.inner.release => listener);
+                if self.inner.released.load(Ordering::SeqCst) {
+                    break;
+                }
+                smol::block_on(listener);
+            }
+            if let Some(errno) = self.inner.errno {
+                *res = Err(StdIoError::from_raw_os_error(errno));
+            }
+        }
+    }
+
+    struct ControlledRedoWriteHookInner {
+        fd: RawFd,
+        errno: Option<i32>,
+        calls: AtomicUsize,
+        started: Event,
+        released: AtomicBool,
+        release: Event,
+    }
+
+    #[derive(Clone)]
+    struct ControlledRedoSyncHook {
+        inner: Arc<ControlledRedoSyncHookInner>,
+    }
+
+    impl ControlledRedoSyncHook {
+        fn new(fd: RawFd, kind: IOKind, errno: i32) -> Self {
+            debug_assert!(matches!(kind, IOKind::Fsync | IOKind::Fdatasync));
+            Self {
+                inner: Arc::new(ControlledRedoSyncHookInner {
+                    fd,
+                    kind,
+                    errno,
+                    calls: AtomicUsize::new(0),
+                    started: Event::new(),
+                    released: AtomicBool::new(false),
+                    release: Event::new(),
+                }),
+            }
+        }
+
+        fn matches(&self, op: StorageBackendOp) -> bool {
+            op.fd() == self.inner.fd && op.kind() == self.inner.kind
+        }
+
+        async fn wait_started(&self, expected_calls: usize) {
+            loop {
+                if self.inner.calls.load(Ordering::SeqCst) >= expected_calls {
+                    return;
+                }
+                event_listener::listener!(self.inner.started => listener);
+                if self.inner.calls.load(Ordering::SeqCst) >= expected_calls {
+                    return;
+                }
+                listener.await;
+            }
+        }
+
+        fn release(&self) {
+            self.inner.released.store(true, Ordering::SeqCst);
+            self.inner.release.notify(usize::MAX);
+        }
+    }
+
+    impl StorageBackendTestHook for ControlledRedoSyncHook {
+        fn on_submit(&self, op: StorageBackendOp) {
+            if self.matches(op) {
+                self.inner.calls.fetch_add(1, Ordering::SeqCst);
+                self.inner.started.notify(usize::MAX);
+            }
+        }
+
+        fn on_complete(&self, op: StorageBackendOp, res: &mut StdIoResult<usize>) {
+            if !self.matches(op) {
+                return;
+            }
+            loop {
+                if self.inner.released.load(Ordering::SeqCst) {
+                    break;
+                }
+                event_listener::listener!(self.inner.release => listener);
+                if self.inner.released.load(Ordering::SeqCst) {
+                    break;
+                }
+                smol::block_on(listener);
+            }
+            if self.inner.errno != 0 {
+                *res = Err(StdIoError::from_raw_os_error(self.inner.errno));
+            }
+        }
+    }
+
+    struct ControlledRedoSyncHookInner {
+        fd: RawFd,
+        kind: IOKind,
+        errno: i32,
+        calls: AtomicUsize,
+        started: Event,
+        released: AtomicBool,
+        release: Event,
+    }
+
+    #[derive(Clone)]
+    struct RecordingRedoSyncHook {
+        calls: Arc<Mutex<Vec<StorageBackendOp>>>,
+    }
+
+    impl RecordingRedoSyncHook {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn calls(&self) -> Vec<StorageBackendOp> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl StorageBackendTestHook for RecordingRedoSyncHook {
+        fn on_submit(&self, op: StorageBackendOp) {
+            if matches!(op.kind(), IOKind::Fsync | IOKind::Fdatasync) {
+                self.calls.lock().unwrap().push(op);
+            }
+        }
+    }
+
+    struct ManualLogProcessorHarness {
+        trx_sys: TransactionSystem,
+        poisoner: QuiescentGuard<EnginePoisoner>,
+        _purge_rx: flume::Receiver<Purge>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum LogTestCompletionBatch {
+        AllFront,
+        OneBack,
+        WaitError,
+    }
+
+    struct LogTestBackend {
+        io_depth: usize,
+        inflight: VecDeque<(BackendToken, IOKind)>,
+        wait_batches: VecDeque<LogTestCompletionBatch>,
+    }
+
+    impl LogTestBackend {
+        fn complete_all(io_depth: usize) -> Self {
+            Self {
+                io_depth,
+                inflight: VecDeque::new(),
+                wait_batches: VecDeque::new(),
+            }
+        }
+
+        fn complete_one_back(io_depth: usize) -> Self {
+            Self {
+                io_depth,
+                inflight: VecDeque::new(),
+                wait_batches: VecDeque::from([LogTestCompletionBatch::OneBack]),
+            }
+        }
+
+        fn complete_all_then_wait_error(io_depth: usize) -> Self {
+            Self {
+                io_depth,
+                inflight: VecDeque::new(),
+                wait_batches: VecDeque::from([
+                    LogTestCompletionBatch::AllFront,
+                    LogTestCompletionBatch::WaitError,
+                ]),
+            }
+        }
+    }
+
+    impl Backend for LogTestBackend {
+        type Prepared = (BackendToken, IOKind);
+        type SubmitBatch = VecDeque<(BackendToken, IOKind)>;
+        type Events = ();
+
+        fn setup(io_depth: usize) -> IoResult<Self> {
+            Ok(Self::complete_all(io_depth))
+        }
+
+        fn io_depth(&self) -> usize {
+            self.io_depth
+        }
+
+        fn new_submit_batch(&self) -> Self::SubmitBatch {
+            VecDeque::with_capacity(self.io_depth)
+        }
+
+        fn new_events(&self) -> Self::Events {}
+
+        fn prepare(&mut self, token: BackendToken, operation: &mut Operation) -> Self::Prepared {
+            (token, operation.kind())
+        }
+
+        fn push_prepared(&mut self, batch: &mut Self::SubmitBatch, prepared: &mut Self::Prepared) {
+            batch.push_back(*prepared);
+        }
+
+        fn submit_batch(
+            &mut self,
+            batch: &mut Self::SubmitBatch,
+            limit: usize,
+        ) -> BackendResult<SubmitAttempt> {
+            let submit_count = limit.min(batch.len());
+            let Some(accepted) = NonZeroUsize::new(submit_count) else {
+                return Ok(SubmitAttempt::Noop);
+            };
+            for _ in 0..submit_count {
+                let token = batch
+                    .pop_front()
+                    .expect("submit batch length must match queued tokens");
+                self.inflight.push_back(token);
+            }
+            Ok(SubmitAttempt::Submitted(accepted))
+        }
+
+        fn wait_at_least(
+            &mut self,
+            _events: &mut Self::Events,
+            min_nr: usize,
+        ) -> BackendResult<Vec<(BackendToken, StdIoResult<usize>)>> {
+            assert!(
+                self.inflight.len() >= min_nr,
+                "test backend requires enough inflight work to satisfy wait"
+            );
+            match self
+                .wait_batches
+                .pop_front()
+                .unwrap_or(LogTestCompletionBatch::AllFront)
+            {
+                LogTestCompletionBatch::AllFront => Ok(self
+                    .inflight
+                    .drain(..)
+                    .map(|(token, kind)| (token, Ok(log_test_completion_len(kind))))
+                    .collect()),
+                LogTestCompletionBatch::OneBack => {
+                    let (token, kind) = self
+                        .inflight
+                        .pop_back()
+                        .expect("test backend must have one back completion");
+                    Ok(vec![(token, Ok(log_test_completion_len(kind)))])
+                }
+                LogTestCompletionBatch::WaitError => Err(BackendError::wait(
+                    "log_test",
+                    StdIoError::from_raw_os_error(libc::EIO),
+                    1,
+                )),
+            }
+        }
+
+        fn cleanup_submitted_io(&mut self, _submitted: usize) -> SubmittedIoCleanup {
+            SubmittedIoCleanup::DropAfterBackend
+        }
+    }
+
     async fn wait_for<F>(mut predicate: F)
     where
         F: FnMut() -> bool,
@@ -2643,219 +2988,6 @@ mod tests {
         assert!(header_completion.completed_result().unwrap().is_ok());
     }
 
-    #[derive(Clone, Default)]
-    struct RecordingRedoWriteSubmitHook {
-        submits: Arc<Mutex<Vec<StorageBackendOp>>>,
-    }
-
-    impl RecordingRedoWriteSubmitHook {
-        fn submits(&self) -> Vec<StorageBackendOp> {
-            self.submits.lock().unwrap().clone()
-        }
-    }
-
-    impl StorageBackendTestHook for RecordingRedoWriteSubmitHook {
-        fn on_submit(&self, op: StorageBackendOp) {
-            if op.kind() == IOKind::Write {
-                self.submits.lock().unwrap().push(op);
-            }
-        }
-    }
-
-    #[derive(Clone)]
-    struct ControlledRedoWriteHook {
-        inner: Arc<ControlledRedoWriteHookInner>,
-    }
-
-    struct ControlledRedoWriteHookInner {
-        fd: RawFd,
-        errno: Option<i32>,
-        calls: AtomicUsize,
-        started: Event,
-        released: AtomicBool,
-        release: Event,
-    }
-
-    impl ControlledRedoWriteHook {
-        fn new(fd: RawFd, errno: i32) -> Self {
-            Self::with_error(fd, Some(errno))
-        }
-
-        fn success(fd: RawFd) -> Self {
-            Self::with_error(fd, None)
-        }
-
-        fn with_error(fd: RawFd, errno: Option<i32>) -> Self {
-            Self {
-                inner: Arc::new(ControlledRedoWriteHookInner {
-                    fd,
-                    errno,
-                    calls: AtomicUsize::new(0),
-                    started: Event::new(),
-                    released: AtomicBool::new(false),
-                    release: Event::new(),
-                }),
-            }
-        }
-
-        fn matches(&self, op: StorageBackendOp) -> bool {
-            op.kind() == IOKind::Write && op.fd() == self.inner.fd
-        }
-
-        async fn wait_started(&self, expected_calls: usize) {
-            loop {
-                if self.inner.calls.load(Ordering::SeqCst) >= expected_calls {
-                    return;
-                }
-                event_listener::listener!(self.inner.started => listener);
-                if self.inner.calls.load(Ordering::SeqCst) >= expected_calls {
-                    return;
-                }
-                listener.await;
-            }
-        }
-
-        fn release(&self) {
-            self.inner.released.store(true, Ordering::SeqCst);
-            self.inner.release.notify(usize::MAX);
-        }
-    }
-
-    impl StorageBackendTestHook for ControlledRedoWriteHook {
-        fn on_submit(&self, op: StorageBackendOp) {
-            if self.matches(op) {
-                self.inner.calls.fetch_add(1, Ordering::SeqCst);
-                self.inner.started.notify(usize::MAX);
-            }
-        }
-
-        fn on_complete(&self, op: StorageBackendOp, res: &mut StdIoResult<usize>) {
-            if !self.matches(op) {
-                return;
-            }
-            loop {
-                if self.inner.released.load(Ordering::SeqCst) {
-                    break;
-                }
-                event_listener::listener!(self.inner.release => listener);
-                if self.inner.released.load(Ordering::SeqCst) {
-                    break;
-                }
-                smol::block_on(listener);
-            }
-            if let Some(errno) = self.inner.errno {
-                *res = Err(StdIoError::from_raw_os_error(errno));
-            }
-        }
-    }
-
-    #[derive(Clone)]
-    struct ControlledRedoSyncHook {
-        inner: Arc<ControlledRedoSyncHookInner>,
-    }
-
-    struct ControlledRedoSyncHookInner {
-        fd: RawFd,
-        kind: IOKind,
-        errno: i32,
-        calls: AtomicUsize,
-        started: Event,
-        released: AtomicBool,
-        release: Event,
-    }
-
-    impl ControlledRedoSyncHook {
-        fn new(fd: RawFd, kind: IOKind, errno: i32) -> Self {
-            debug_assert!(matches!(kind, IOKind::Fsync | IOKind::Fdatasync));
-            Self {
-                inner: Arc::new(ControlledRedoSyncHookInner {
-                    fd,
-                    kind,
-                    errno,
-                    calls: AtomicUsize::new(0),
-                    started: Event::new(),
-                    released: AtomicBool::new(false),
-                    release: Event::new(),
-                }),
-            }
-        }
-
-        fn matches(&self, op: StorageBackendOp) -> bool {
-            op.fd() == self.inner.fd && op.kind() == self.inner.kind
-        }
-
-        async fn wait_started(&self, expected_calls: usize) {
-            loop {
-                if self.inner.calls.load(Ordering::SeqCst) >= expected_calls {
-                    return;
-                }
-                event_listener::listener!(self.inner.started => listener);
-                if self.inner.calls.load(Ordering::SeqCst) >= expected_calls {
-                    return;
-                }
-                listener.await;
-            }
-        }
-
-        fn release(&self) {
-            self.inner.released.store(true, Ordering::SeqCst);
-            self.inner.release.notify(usize::MAX);
-        }
-    }
-
-    impl StorageBackendTestHook for ControlledRedoSyncHook {
-        fn on_submit(&self, op: StorageBackendOp) {
-            if self.matches(op) {
-                self.inner.calls.fetch_add(1, Ordering::SeqCst);
-                self.inner.started.notify(usize::MAX);
-            }
-        }
-
-        fn on_complete(&self, op: StorageBackendOp, res: &mut StdIoResult<usize>) {
-            if !self.matches(op) {
-                return;
-            }
-            loop {
-                if self.inner.released.load(Ordering::SeqCst) {
-                    break;
-                }
-                event_listener::listener!(self.inner.release => listener);
-                if self.inner.released.load(Ordering::SeqCst) {
-                    break;
-                }
-                smol::block_on(listener);
-            }
-            if self.inner.errno != 0 {
-                *res = Err(StdIoError::from_raw_os_error(self.inner.errno));
-            }
-        }
-    }
-
-    #[derive(Clone)]
-    struct RecordingRedoSyncHook {
-        calls: Arc<Mutex<Vec<StorageBackendOp>>>,
-    }
-
-    impl RecordingRedoSyncHook {
-        fn new() -> Self {
-            Self {
-                calls: Arc::new(Mutex::new(Vec::new())),
-            }
-        }
-
-        fn calls(&self) -> Vec<StorageBackendOp> {
-            self.calls.lock().unwrap().clone()
-        }
-    }
-
-    impl StorageBackendTestHook for RecordingRedoSyncHook {
-        fn on_submit(&self, op: StorageBackendOp) {
-            if matches!(op.kind(), IOKind::Fsync | IOKind::Fdatasync) {
-                self.calls.lock().unwrap().push(op);
-            }
-        }
-    }
-
     fn spawn_sys_commit_wait(
         trx_sys: QuiescentGuard<TransactionSystem>,
         marker: u64,
@@ -2894,28 +3026,6 @@ mod tests {
         assert!(report.contains(expected_op_kind), "{report}");
         assert!(report.contains("wait for redo group commit"), "{report}");
         assert!(!report.contains("propagate from other threads"), "{report}");
-    }
-
-    #[test]
-    fn test_redo_sync_completion_accepts_only_zero_success_result() {
-        assert!(redo_io_failure(IOKind::Fsync, Ok(0), 0).is_none());
-        assert!(redo_io_failure(IOKind::Fdatasync, Ok(0), 0).is_none());
-
-        let failure = redo_io_failure(IOKind::Fsync, Ok(1), 0)
-            .expect("nonzero sync result must retain a fatal report");
-        assert_eq!(*failure.current_context(), FatalError::RedoSync);
-        assert!(failure.downcast_ref::<crate::error::IoError>().is_some());
-        assert!(format!("{failure:?}").contains("op_kind=fsync"));
-
-        let failure = redo_io_failure(
-            IOKind::Fdatasync,
-            Err(StdIoError::from_raw_os_error(libc::EIO)),
-            0,
-        )
-        .expect("sync IO failure must retain a fatal report");
-        assert_eq!(*failure.current_context(), FatalError::RedoSync);
-        assert!(failure.downcast_ref::<crate::error::IoError>().is_some());
-        assert!(format!("{failure:?}").contains("op_kind=fdatasync"));
     }
 
     fn record_seal_group(
@@ -3023,12 +3133,6 @@ mod tests {
         (temp_dir, engine)
     }
 
-    struct ManualLogProcessorHarness {
-        trx_sys: TransactionSystem,
-        poisoner: QuiescentGuard<EnginePoisoner>,
-        _purge_rx: flume::Receiver<Purge>,
-    }
-
     fn manual_log_processor_harness(
         engine: &Engine,
         config: TrxSysConfig,
@@ -3040,6 +3144,215 @@ mod tests {
             poisoner: engine.inner().poisoner.clone(),
             _purge_rx: purge_rx,
         }
+    }
+
+    fn sync_group_for_order_test(cts: TrxID, ready: bool, log_bytes: usize) -> SyncGroup {
+        sync_group_for_order_test_with_log_fd(cts, ready, log_bytes, (log_bytes > 0).then_some(0))
+    }
+
+    fn sync_group_for_order_test_with_log_fd(
+        cts: TrxID,
+        ready: bool,
+        log_bytes: usize,
+        log_fd: Option<RawFd>,
+    ) -> SyncGroup {
+        SyncGroup {
+            trx_list: vec![PrecommitTrx {
+                cts,
+                redo_bin: None,
+                payload: None,
+                attachment: None,
+                lock_state: None,
+                trx_inner: None,
+            }],
+            max_cts: cts,
+            log_bytes,
+            log_fd,
+            write_meta: (log_bytes > 0)
+                .then_some(log_fd)
+                .flatten()
+                .map(|fd| RedoGroupWriteMeta {
+                    file_seq: 0,
+                    fd,
+                    offset: REDO_DEFAULT_DATA_START_OFFSET,
+                    end_offset: REDO_DEFAULT_DATA_START_OFFSET + log_bytes,
+                    min_redo_cts: cts,
+                    max_redo_cts: cts,
+                }),
+            writes: VecDeque::new(),
+            returned_bufs: Vec::new(),
+            completion: Arc::new(Completion::new()),
+            outstanding_requests: usize::from(!ready),
+            failure_reason: None,
+        }
+    }
+
+    fn sync_group_with_pending_write_for_test(cts: TrxID, fd: RawFd, offset: usize) -> SyncGroup {
+        let mut group = sync_group_for_order_test_with_log_fd(cts, true, 4096, Some(fd));
+        group.write_meta = Some(RedoGroupWriteMeta {
+            file_seq: 0,
+            fd,
+            offset,
+            end_offset: offset + 4096,
+            min_redo_cts: cts,
+            max_redo_cts: cts,
+        });
+        group.writes.push_back(LogWriteSubmission::group(
+            fd,
+            offset,
+            DirectBuf::zeroed(4096),
+            0,
+        ));
+        group
+    }
+
+    fn log_test_completion_len(kind: IOKind) -> usize {
+        match kind {
+            IOKind::Read | IOKind::Write => 4096,
+            IOKind::Fsync | IOKind::Fdatasync => 0,
+        }
+    }
+
+    fn assert_rotated_file_seal_sync_policy(
+        log_sync: LogSync,
+        expected_sync_kind: Option<IOKind>,
+        log_file_stem: &str,
+    ) {
+        smol::block_on(async {
+            let (_engine_temp_dir, engine) =
+                build_redo_test_engine(log_file_stem, LogSync::None).await;
+            let temp_dir = TempDir::new().unwrap();
+            let file_prefix = temp_dir
+                .path()
+                .join("standalone_seal_redo.log")
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let harness_prefix = temp_dir
+                .path()
+                .join("standalone_seal_harness_redo.log")
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let ended_log_file = create_log_file_for_test(&file_prefix, 0, 128 * 1024, 4096);
+            let ended_fd = ended_log_file.as_raw_fd();
+            let hook = RecordingRedoSyncHook::new();
+            let _install = install_storage_backend_test_hook(Arc::new(hook.clone()));
+            let (harness, mut write_driver) =
+                manual_redo_log_writer_for_seal(&engine, log_sync, harness_prefix);
+            let end_offset = REDO_DEFAULT_DATA_START_OFFSET + 4096;
+
+            let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
+            record_seal_group(
+                &mut sealer,
+                &ended_log_file,
+                TrxID::new(70),
+                TrxID::new(72),
+                end_offset,
+            );
+            finish_prefix_seal_for_test(&harness, &mut write_driver, &mut sealer, ended_log_file);
+
+            let bytes = fs::read(format!("{file_prefix}.00000000")).unwrap();
+            let slot1 = parse_redo_super_block(
+                &bytes[REDO_SUPER_BLOCK_SLOT_SIZE..][..REDO_SUPER_BLOCK_SLOT_SIZE],
+                0,
+                1,
+            )
+            .unwrap();
+            assert_eq!(slot1.slot_no, 1);
+            assert_eq!(slot1.generation, 1);
+            assert_eq!(slot1.durable_end_offset, end_offset as u64);
+            assert_eq!(slot1.min_redo_cts, 70);
+            assert_eq!(slot1.max_redo_cts, 72);
+
+            let calls = hook.calls();
+            match expected_sync_kind {
+                Some(kind) => {
+                    assert_eq!(calls.len(), 1);
+                    assert_eq!(calls[0].kind(), kind);
+                    assert_eq!(calls[0].fd(), ended_fd);
+                }
+                None => assert!(calls.is_empty()),
+            }
+
+            drop(harness);
+            engine.shutdown();
+        });
+    }
+
+    async fn assert_redo_sync_failure_poison_runtime_and_fail_waiters(
+        log_sync: LogSync,
+        sync_kind: IOKind,
+        log_file_stem: &str,
+    ) {
+        let (_temp_dir, engine) = build_redo_test_engine(log_file_stem, log_sync).await;
+        let redo_fd = {
+            engine
+                .inner()
+                .trx_sys
+                .redo_log
+                .group_commit
+                .lock()
+                .log_file
+                .as_ref()
+                .unwrap()
+                .as_raw_fd()
+        };
+        let hook = ControlledRedoSyncHook::new(redo_fd, sync_kind, libc::EIO);
+        let _install = install_storage_backend_test_hook(Arc::new(hook.clone()));
+
+        let commit1 = spawn_sys_commit_wait(engine.inner().core.trx_sys.clone(), 10);
+        hook.wait_started(1).await;
+
+        let commit2 = spawn_sys_commit_wait(engine.inner().core.trx_sys.clone(), 11);
+        wait_for(|| {
+            !engine
+                .inner()
+                .trx_sys
+                .redo_log
+                .group_commit
+                .lock()
+                .queue
+                .is_empty()
+        })
+        .await;
+
+        hook.release();
+
+        let res1 = commit1.join().unwrap();
+        let res2 = commit2.join().unwrap();
+        let expected_op_kind = format!("op_kind={}", sync_kind.as_str());
+        assert_propagated_completion_fatal(&res1, FatalError::RedoSync, &expected_op_kind);
+        assert_propagated_completion_fatal(&res2, FatalError::RedoSync, &expected_op_kind);
+        let poison = engine
+            .inner()
+            .poisoner
+            .ensure_healthy()
+            .expect_err("redo sync failure must poison runtime admission");
+        assert_eq!(*poison.current_context(), FatalError::RedoSync);
+        assert!(poison.downcast_ref::<IoError>().is_some(), "{poison:?}");
+    }
+
+    #[test]
+    fn test_redo_sync_completion_accepts_only_zero_success_result() {
+        assert!(redo_io_failure(IOKind::Fsync, Ok(0), 0).is_none());
+        assert!(redo_io_failure(IOKind::Fdatasync, Ok(0), 0).is_none());
+
+        let failure = redo_io_failure(IOKind::Fsync, Ok(1), 0)
+            .expect("nonzero sync result must retain a fatal report");
+        assert_eq!(*failure.current_context(), FatalError::RedoSync);
+        assert!(failure.downcast_ref::<crate::error::IoError>().is_some());
+        assert!(format!("{failure:?}").contains("op_kind=fsync"));
+
+        let failure = redo_io_failure(
+            IOKind::Fdatasync,
+            Err(StdIoError::from_raw_os_error(libc::EIO)),
+            0,
+        )
+        .expect("sync IO failure must retain a fatal report");
+        assert_eq!(*failure.current_context(), FatalError::RedoSync);
+        assert!(failure.downcast_ref::<crate::error::IoError>().is_some());
+        assert!(format!("{failure:?}").contains("op_kind=fdatasync"));
     }
 
     #[test]
@@ -3379,199 +3692,6 @@ mod tests {
 
             drop(session);
         });
-    }
-
-    fn sync_group_for_order_test(cts: TrxID, ready: bool, log_bytes: usize) -> SyncGroup {
-        sync_group_for_order_test_with_log_fd(cts, ready, log_bytes, (log_bytes > 0).then_some(0))
-    }
-
-    fn sync_group_for_order_test_with_log_fd(
-        cts: TrxID,
-        ready: bool,
-        log_bytes: usize,
-        log_fd: Option<RawFd>,
-    ) -> SyncGroup {
-        SyncGroup {
-            trx_list: vec![PrecommitTrx {
-                cts,
-                redo_bin: None,
-                payload: None,
-                attachment: None,
-                lock_state: None,
-                trx_inner: None,
-            }],
-            max_cts: cts,
-            log_bytes,
-            log_fd,
-            write_meta: (log_bytes > 0)
-                .then_some(log_fd)
-                .flatten()
-                .map(|fd| RedoGroupWriteMeta {
-                    file_seq: 0,
-                    fd,
-                    offset: REDO_DEFAULT_DATA_START_OFFSET,
-                    end_offset: REDO_DEFAULT_DATA_START_OFFSET + log_bytes,
-                    min_redo_cts: cts,
-                    max_redo_cts: cts,
-                }),
-            writes: VecDeque::new(),
-            returned_bufs: Vec::new(),
-            completion: Arc::new(Completion::new()),
-            outstanding_requests: usize::from(!ready),
-            failure_reason: None,
-        }
-    }
-
-    fn sync_group_with_pending_write_for_test(cts: TrxID, fd: RawFd, offset: usize) -> SyncGroup {
-        let mut group = sync_group_for_order_test_with_log_fd(cts, true, 4096, Some(fd));
-        group.write_meta = Some(RedoGroupWriteMeta {
-            file_seq: 0,
-            fd,
-            offset,
-            end_offset: offset + 4096,
-            min_redo_cts: cts,
-            max_redo_cts: cts,
-        });
-        group.writes.push_back(LogWriteSubmission::group(
-            fd,
-            offset,
-            DirectBuf::zeroed(4096),
-            0,
-        ));
-        group
-    }
-
-    #[derive(Clone, Copy)]
-    enum LogTestCompletionBatch {
-        AllFront,
-        OneBack,
-        WaitError,
-    }
-
-    struct LogTestBackend {
-        io_depth: usize,
-        inflight: VecDeque<(BackendToken, IOKind)>,
-        wait_batches: VecDeque<LogTestCompletionBatch>,
-    }
-
-    impl LogTestBackend {
-        fn complete_all(io_depth: usize) -> Self {
-            Self {
-                io_depth,
-                inflight: VecDeque::new(),
-                wait_batches: VecDeque::new(),
-            }
-        }
-
-        fn complete_one_back(io_depth: usize) -> Self {
-            Self {
-                io_depth,
-                inflight: VecDeque::new(),
-                wait_batches: VecDeque::from([LogTestCompletionBatch::OneBack]),
-            }
-        }
-
-        fn complete_all_then_wait_error(io_depth: usize) -> Self {
-            Self {
-                io_depth,
-                inflight: VecDeque::new(),
-                wait_batches: VecDeque::from([
-                    LogTestCompletionBatch::AllFront,
-                    LogTestCompletionBatch::WaitError,
-                ]),
-            }
-        }
-    }
-
-    impl Backend for LogTestBackend {
-        type Prepared = (BackendToken, IOKind);
-        type SubmitBatch = VecDeque<(BackendToken, IOKind)>;
-        type Events = ();
-
-        fn setup(io_depth: usize) -> IoResult<Self> {
-            Ok(Self::complete_all(io_depth))
-        }
-
-        fn io_depth(&self) -> usize {
-            self.io_depth
-        }
-
-        fn new_submit_batch(&self) -> Self::SubmitBatch {
-            VecDeque::with_capacity(self.io_depth)
-        }
-
-        fn new_events(&self) -> Self::Events {}
-
-        fn prepare(&mut self, token: BackendToken, operation: &mut Operation) -> Self::Prepared {
-            (token, operation.kind())
-        }
-
-        fn push_prepared(&mut self, batch: &mut Self::SubmitBatch, prepared: &mut Self::Prepared) {
-            batch.push_back(*prepared);
-        }
-
-        fn submit_batch(
-            &mut self,
-            batch: &mut Self::SubmitBatch,
-            limit: usize,
-        ) -> BackendResult<SubmitAttempt> {
-            let submit_count = limit.min(batch.len());
-            let Some(accepted) = NonZeroUsize::new(submit_count) else {
-                return Ok(SubmitAttempt::Noop);
-            };
-            for _ in 0..submit_count {
-                let token = batch
-                    .pop_front()
-                    .expect("submit batch length must match queued tokens");
-                self.inflight.push_back(token);
-            }
-            Ok(SubmitAttempt::Submitted(accepted))
-        }
-
-        fn wait_at_least(
-            &mut self,
-            _events: &mut Self::Events,
-            min_nr: usize,
-        ) -> BackendResult<Vec<(BackendToken, StdIoResult<usize>)>> {
-            assert!(
-                self.inflight.len() >= min_nr,
-                "test backend requires enough inflight work to satisfy wait"
-            );
-            match self
-                .wait_batches
-                .pop_front()
-                .unwrap_or(LogTestCompletionBatch::AllFront)
-            {
-                LogTestCompletionBatch::AllFront => Ok(self
-                    .inflight
-                    .drain(..)
-                    .map(|(token, kind)| (token, Ok(log_test_completion_len(kind))))
-                    .collect()),
-                LogTestCompletionBatch::OneBack => {
-                    let (token, kind) = self
-                        .inflight
-                        .pop_back()
-                        .expect("test backend must have one back completion");
-                    Ok(vec![(token, Ok(log_test_completion_len(kind)))])
-                }
-                LogTestCompletionBatch::WaitError => Err(BackendError::wait(
-                    "log_test",
-                    StdIoError::from_raw_os_error(libc::EIO),
-                    1,
-                )),
-            }
-        }
-
-        fn cleanup_submitted_io(&mut self, _submitted: usize) -> SubmittedIoCleanup {
-            SubmittedIoCleanup::DropAfterBackend
-        }
-    }
-
-    fn log_test_completion_len(kind: IOKind) -> usize {
-        match kind {
-            IOKind::Read | IOKind::Write => 4096,
-            IOKind::Fsync | IOKind::Fdatasync => 0,
-        }
     }
 
     #[test]
@@ -4175,73 +4295,6 @@ mod tests {
             let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
 
             finish_prefix_seal_for_test(&harness, &mut write_driver, &mut sealer, ended_log_file);
-
-            drop(harness);
-            engine.shutdown();
-        });
-    }
-
-    fn assert_rotated_file_seal_sync_policy(
-        log_sync: LogSync,
-        expected_sync_kind: Option<IOKind>,
-        log_file_stem: &str,
-    ) {
-        smol::block_on(async {
-            let (_engine_temp_dir, engine) =
-                build_redo_test_engine(log_file_stem, LogSync::None).await;
-            let temp_dir = TempDir::new().unwrap();
-            let file_prefix = temp_dir
-                .path()
-                .join("standalone_seal_redo.log")
-                .to_str()
-                .unwrap()
-                .to_owned();
-            let harness_prefix = temp_dir
-                .path()
-                .join("standalone_seal_harness_redo.log")
-                .to_str()
-                .unwrap()
-                .to_owned();
-            let ended_log_file = create_log_file_for_test(&file_prefix, 0, 128 * 1024, 4096);
-            let ended_fd = ended_log_file.as_raw_fd();
-            let hook = RecordingRedoSyncHook::new();
-            let _install = install_storage_backend_test_hook(Arc::new(hook.clone()));
-            let (harness, mut write_driver) =
-                manual_redo_log_writer_for_seal(&engine, log_sync, harness_prefix);
-            let end_offset = REDO_DEFAULT_DATA_START_OFFSET + 4096;
-
-            let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
-            record_seal_group(
-                &mut sealer,
-                &ended_log_file,
-                TrxID::new(70),
-                TrxID::new(72),
-                end_offset,
-            );
-            finish_prefix_seal_for_test(&harness, &mut write_driver, &mut sealer, ended_log_file);
-
-            let bytes = fs::read(format!("{file_prefix}.00000000")).unwrap();
-            let slot1 = parse_redo_super_block(
-                &bytes[REDO_SUPER_BLOCK_SLOT_SIZE..][..REDO_SUPER_BLOCK_SLOT_SIZE],
-                0,
-                1,
-            )
-            .unwrap();
-            assert_eq!(slot1.slot_no, 1);
-            assert_eq!(slot1.generation, 1);
-            assert_eq!(slot1.durable_end_offset, end_offset as u64);
-            assert_eq!(slot1.min_redo_cts, 70);
-            assert_eq!(slot1.max_redo_cts, 72);
-
-            let calls = hook.calls();
-            match expected_sync_kind {
-                Some(kind) => {
-                    assert_eq!(calls.len(), 1);
-                    assert_eq!(calls[0].kind(), kind);
-                    assert_eq!(calls[0].fd(), ended_fd);
-                }
-                None => assert!(calls.is_empty()),
-            }
 
             drop(harness);
             engine.shutdown();
@@ -5285,59 +5338,6 @@ mod tests {
             assert_eq!(*poison.current_context(), FatalError::RedoWrite);
             assert!(poison.downcast_ref::<IoError>().is_some(), "{poison:?}");
         });
-    }
-
-    async fn assert_redo_sync_failure_poison_runtime_and_fail_waiters(
-        log_sync: LogSync,
-        sync_kind: IOKind,
-        log_file_stem: &str,
-    ) {
-        let (_temp_dir, engine) = build_redo_test_engine(log_file_stem, log_sync).await;
-        let redo_fd = {
-            engine
-                .inner()
-                .trx_sys
-                .redo_log
-                .group_commit
-                .lock()
-                .log_file
-                .as_ref()
-                .unwrap()
-                .as_raw_fd()
-        };
-        let hook = ControlledRedoSyncHook::new(redo_fd, sync_kind, libc::EIO);
-        let _install = install_storage_backend_test_hook(Arc::new(hook.clone()));
-
-        let commit1 = spawn_sys_commit_wait(engine.inner().core.trx_sys.clone(), 10);
-        hook.wait_started(1).await;
-
-        let commit2 = spawn_sys_commit_wait(engine.inner().core.trx_sys.clone(), 11);
-        wait_for(|| {
-            !engine
-                .inner()
-                .trx_sys
-                .redo_log
-                .group_commit
-                .lock()
-                .queue
-                .is_empty()
-        })
-        .await;
-
-        hook.release();
-
-        let res1 = commit1.join().unwrap();
-        let res2 = commit2.join().unwrap();
-        let expected_op_kind = format!("op_kind={}", sync_kind.as_str());
-        assert_propagated_completion_fatal(&res1, FatalError::RedoSync, &expected_op_kind);
-        assert_propagated_completion_fatal(&res2, FatalError::RedoSync, &expected_op_kind);
-        let poison = engine
-            .inner()
-            .poisoner
-            .ensure_healthy()
-            .expect_err("redo sync failure must poison runtime admission");
-        assert_eq!(*poison.current_context(), FatalError::RedoSync);
-        assert!(poison.downcast_ref::<IoError>().is_some(), "{poison:?}");
     }
 
     #[test]

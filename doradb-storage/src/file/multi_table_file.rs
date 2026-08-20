@@ -694,6 +694,28 @@ mod tests {
     use std::io::{Seek, SeekFrom, Write};
     use std::num::NonZeroU64;
 
+    /// Publishes first redo log seq for tests.
+    pub(crate) async fn publish_first_redo_log_seq_for_test(
+        mtb: &Arc<MultiTableFile>,
+        background_writes: &IOClient<BackgroundWriteRequest>,
+        first_redo_log_seq: u32,
+    ) -> Result<()> {
+        let snapshot = mtb.load_snapshot();
+        let mut mutable = MutableMultiTableFile::fork(mtb, background_writes);
+        mutable.apply_checkpoint_metadata(
+            snapshot.catalog_replay_start_ts,
+            snapshot.meta.next_table_id,
+            snapshot.meta.table_roots,
+        );
+        mutable.new_root.root.first_redo_log_seq = first_redo_log_seq;
+        mutable
+            .reserve_publish_meta_block_reclaiming_displaced_meta(snapshot.meta_block_id)
+            .disclose()?;
+        let (_, old_root) = mutable.commit_prepared().await.disclose()?;
+        drop(old_root);
+        Ok(())
+    }
+
     fn overwrite_file_bytes(path: &str, offset: u64, bytes: &[u8]) {
         let mut file = OpenOptions::new()
             .read(true)
@@ -722,6 +744,28 @@ mod tests {
         assert!(report.contains("catalog.mtb"), "{report}");
         assert!(report.contains("multi-table-meta"), "{report}");
         assert!(report.contains(&format!("block_id={page_id}")), "{report}");
+    }
+
+    async fn publish_checkpoint_for_test(
+        mtb: &Arc<MultiTableFile>,
+        background_writes: &IOClient<BackgroundWriteRequest>,
+        catalog_replay_start_ts: TrxID,
+        next_table_id: TableID,
+        table_roots: [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
+    ) {
+        let mut mutable = MutableMultiTableFile::fork(mtb, background_writes);
+        for root in &table_roots {
+            if let Some(block_id) = root.checkpoint_root_block_id() {
+                let _ = mutable
+                    .new_root
+                    .root
+                    .alloc_map
+                    .allocate_at(usize::from(block_id));
+            }
+        }
+        mutable.apply_checkpoint_metadata(catalog_replay_start_ts, next_table_id, table_roots);
+        let (_, old_root) = mutable.commit().await.unwrap();
+        drop(old_root);
     }
 
     #[test]
@@ -767,28 +811,6 @@ mod tests {
         assert!(report.contains("payload too large"), "{report}");
     }
 
-    async fn publish_checkpoint_for_test(
-        mtb: &Arc<MultiTableFile>,
-        background_writes: &IOClient<BackgroundWriteRequest>,
-        catalog_replay_start_ts: TrxID,
-        next_table_id: TableID,
-        table_roots: [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
-    ) {
-        let mut mutable = MutableMultiTableFile::fork(mtb, background_writes);
-        for root in &table_roots {
-            if let Some(block_id) = root.checkpoint_root_block_id() {
-                let _ = mutable
-                    .new_root
-                    .root
-                    .alloc_map
-                    .allocate_at(usize::from(block_id));
-            }
-        }
-        mutable.apply_checkpoint_metadata(catalog_replay_start_ts, next_table_id, table_roots);
-        let (_, old_root) = mutable.commit().await.unwrap();
-        drop(old_root);
-    }
-
     #[test]
     #[should_panic(
         expected = "CoW allocation invariant violated: displaced meta block is not allocated"
@@ -816,27 +838,6 @@ mod tests {
                 .reserve_publish_meta_block_reclaiming_displaced_meta(displaced_meta_block_id)
                 .unwrap();
         });
-    }
-
-    pub(crate) async fn publish_first_redo_log_seq_for_test(
-        mtb: &Arc<MultiTableFile>,
-        background_writes: &IOClient<BackgroundWriteRequest>,
-        first_redo_log_seq: u32,
-    ) -> Result<()> {
-        let snapshot = mtb.load_snapshot();
-        let mut mutable = MutableMultiTableFile::fork(mtb, background_writes);
-        mutable.apply_checkpoint_metadata(
-            snapshot.catalog_replay_start_ts,
-            snapshot.meta.next_table_id,
-            snapshot.meta.table_roots,
-        );
-        mutable.new_root.root.first_redo_log_seq = first_redo_log_seq;
-        mutable
-            .reserve_publish_meta_block_reclaiming_displaced_meta(snapshot.meta_block_id)
-            .disclose()?;
-        let (_, old_root) = mutable.commit_prepared().await.disclose()?;
-        drop(old_root);
-        Ok(())
     }
 
     #[test]

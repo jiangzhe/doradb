@@ -307,6 +307,50 @@ mod tests {
         QuiescentBox::new(FixedBufferPool::with_capacity(PoolRole::Meta, 64 * 1024 * 1024).unwrap())
     }
 
+    async fn allocate_test_row_page(pool: &FixedBufferPool, pool_guard: &PoolGuard) -> PageID {
+        let g = pool
+            .allocate_page::<RowPageIndexNode>(pool_guard)
+            .await
+            .expect("test page allocation should succeed");
+        let page_id = g.page_id();
+        drop(g);
+        page_id
+    }
+
+    fn bump_generation_for_stale_guard(pool: &FixedBufferPool, page_id: PageID) -> u64 {
+        let frame = pool.arena.frame(page_id);
+        let held_version = frame.latch.version_acq();
+        frame.bump_generation();
+        held_version
+    }
+
+    async fn stale_facade_guard(
+        pool: &FixedBufferPool,
+        pool_guard: &PoolGuard,
+    ) -> (FacadePageGuard<RowPageIndexNode>, PageID, u64) {
+        let page_id = allocate_test_row_page(pool, pool_guard).await;
+        let g = pool
+            .get_page::<RowPageIndexNode>(pool_guard, page_id, LatchFallbackMode::Spin)
+            .await
+            .expect("buffer-pool read failed in test");
+        let held_version = bump_generation_for_stale_guard(pool, page_id);
+        (g, page_id, held_version)
+    }
+
+    async fn stale_optimistic_guard(
+        pool: &FixedBufferPool,
+        pool_guard: &PoolGuard,
+    ) -> (PageOptimisticGuard<RowPageIndexNode>, PageID, u64) {
+        let page_id = allocate_test_row_page(pool, pool_guard).await;
+        let g = pool
+            .get_page::<RowPageIndexNode>(pool_guard, page_id, LatchFallbackMode::Spin)
+            .await
+            .expect("buffer-pool read failed in test")
+            .downgrade();
+        let held_version = bump_generation_for_stale_guard(pool, page_id);
+        (g, page_id, held_version)
+    }
+
     #[test]
     fn test_fixed_buffer_pool_allocation_reports_runtime_context() {
         smol::block_on(async {
@@ -365,50 +409,6 @@ mod tests {
             assert!(output.contains("operation=allocate_page_at"), "{output}");
             assert!(output.contains("page_id=0"), "{output}");
         });
-    }
-
-    async fn allocate_test_row_page(pool: &FixedBufferPool, pool_guard: &PoolGuard) -> PageID {
-        let g = pool
-            .allocate_page::<RowPageIndexNode>(pool_guard)
-            .await
-            .expect("test page allocation should succeed");
-        let page_id = g.page_id();
-        drop(g);
-        page_id
-    }
-
-    fn bump_generation_for_stale_guard(pool: &FixedBufferPool, page_id: PageID) -> u64 {
-        let frame = pool.arena.frame(page_id);
-        let held_version = frame.latch.version_acq();
-        frame.bump_generation();
-        held_version
-    }
-
-    async fn stale_facade_guard(
-        pool: &FixedBufferPool,
-        pool_guard: &PoolGuard,
-    ) -> (FacadePageGuard<RowPageIndexNode>, PageID, u64) {
-        let page_id = allocate_test_row_page(pool, pool_guard).await;
-        let g = pool
-            .get_page::<RowPageIndexNode>(pool_guard, page_id, LatchFallbackMode::Spin)
-            .await
-            .expect("buffer-pool read failed in test");
-        let held_version = bump_generation_for_stale_guard(pool, page_id);
-        (g, page_id, held_version)
-    }
-
-    async fn stale_optimistic_guard(
-        pool: &FixedBufferPool,
-        pool_guard: &PoolGuard,
-    ) -> (PageOptimisticGuard<RowPageIndexNode>, PageID, u64) {
-        let page_id = allocate_test_row_page(pool, pool_guard).await;
-        let g = pool
-            .get_page::<RowPageIndexNode>(pool_guard, page_id, LatchFallbackMode::Spin)
-            .await
-            .expect("buffer-pool read failed in test")
-            .downgrade();
-        let held_version = bump_generation_for_stale_guard(pool, page_id);
-        (g, page_id, held_version)
     }
 
     #[test]
