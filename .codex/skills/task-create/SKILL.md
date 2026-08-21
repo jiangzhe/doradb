@@ -23,27 +23,17 @@ Read `references/workflow.md` completely before executing this workflow.
 
 Do not skip or reorder these gates.
 
-## Strategic Alternatives Quality Gate
+## Proposal Quality Gate
 
-Use these lenses to challenge the direction in Round 1; treat them as analysis
-lenses, not mandatory proposal slots:
+Include these explicit proposals in Round 1:
 
 - `First-Principles Proposal`
 - `Long-Term Evolution Proposal`
 - `Original-Requirement-Fit Proposal`
 
-Present one recommended direction and zero to four alternatives. Include an
-alternative only when it is important, large, and materially changes the
-implementation strategy, architecture, subsystem boundaries, public contract,
-data model, correctness approach, rollout, or long-term direction. Do not
-invent alternatives to reach a minimum count. Exclude small changes, local
-tactics, tuning choices, and implementation details; fold them into the chosen
-direction's design details and tradeoffs instead.
-
 Recommend the best overall direction for correctness and project evolution. Do
 not default to the original request, and do not use effort tiers as substitutes
-for materially different strategic directions. Omit any lens that does not
-produce a qualifying alternative.
+for materially different strategic directions.
 
 ## Write Boundary
 
