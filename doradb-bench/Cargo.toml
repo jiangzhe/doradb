@@ -22,6 +22,7 @@ event-listener = { workspace = true }
 hdrhistogram = { workspace = true }
 quanta = { workspace = true }
 parking_lot = { workspace = true }
+rustix = { workspace = true }
 serde = { workspace = true }
 smol = { workspace = true }
 thiserror = { workspace = true }

@@ -201,6 +201,7 @@ mod tests {
                     measurement: MeasurementSpec {
                         warmup_runs: 0,
                         measured_runs: NonZeroU32::MIN,
+                        pause: false,
                     },
                     workload: ResolvedWorkload::TrxNoop(CountConfig {
                         num: 1,
@@ -244,6 +245,7 @@ mod tests {
         let encoded = fs::read_to_string(result_toml_path(temp.path())).unwrap();
         let decoded: InvocationReport = toml::from_str(&encoded).unwrap();
         assert_eq!(decoded, report);
+        assert!(encoded.contains("pause = false"));
         assert!(!encoded.contains("status ="));
         assert!(!encoded.contains("failure"));
         assert!(!staged_path(&installed).exists());

@@ -20,9 +20,11 @@ use crate::workload::{
 };
 use doradb_storage::{Engine, Session};
 use easy_parallel::Parallel;
+use rustix::process::{Signal, getpid, kill_process};
 use smol::{Executor, channel};
 use std::fs;
 use std::future::Future;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -200,6 +202,9 @@ async fn execute_phases(
                 workload,
                 fixture_effect,
             } => {
+                if measurement.pause {
+                    pause_for_profiler(phase_index, workload.identity())?;
+                }
                 for execution_ordinal in 0..measurement.warmup_runs {
                     let binding = fixture.bind(workload.fixture_requirement())?;
                     dispatch_workload(
@@ -269,6 +274,77 @@ async fn execute_phases(
         measured_runs,
         aggregate: final_aggregate
             .ok_or_else(|| BenchError::message("plan completed without a benchmark aggregate"))?,
+    })
+}
+
+fn pause_for_profiler(phase_index: usize, workload: &str) -> Result<()> {
+    let pid = getpid();
+    let raw_pid = pid.as_raw_pid();
+    {
+        let stderr = io::stderr();
+        let mut stderr = stderr.lock();
+        write_pausing_notice(&mut stderr, raw_pid, phase_index, workload)?;
+    }
+
+    kill_process(pid, Signal::STOP).map_err(|error| {
+        BenchError::message(format!(
+            "failed to send SIGSTOP to benchmark process {raw_pid}: {error}"
+        ))
+    })?;
+
+    let stderr = io::stderr();
+    let mut stderr = stderr.lock();
+    write_resumed_notice(&mut stderr, raw_pid, phase_index, workload)
+}
+
+fn write_pausing_notice(
+    writer: &mut impl Write,
+    pid: i32,
+    phase_index: usize,
+    workload: &str,
+) -> Result<()> {
+    writeln!(
+        writer,
+        "DORADB_BENCH_PAUSING pid={pid} phase={phase_index} workload={workload} resume=SIGCONT"
+    )
+    .and_then(|()| {
+        writeln!(
+            writer,
+            "Attach the profiler to PID {pid} and verify that the process is stopped."
+        )
+    })
+    .and_then(|()| writeln!(writer, "Resume with: kill -CONT {pid}"))
+    .map_err(|error| {
+        BenchError::message(format!(
+            "failed to write profiler pause notice for process {pid}: {error}"
+        ))
+    })?;
+    writer.flush().map_err(|error| {
+        BenchError::message(format!(
+            "failed to flush profiler pause notice for process {pid}: {error}"
+        ))
+    })
+}
+
+fn write_resumed_notice(
+    writer: &mut impl Write,
+    pid: i32,
+    phase_index: usize,
+    workload: &str,
+) -> Result<()> {
+    writeln!(
+        writer,
+        "DORADB_BENCH_RESUMED pid={pid} phase={phase_index} workload={workload}"
+    )
+    .map_err(|error| {
+        BenchError::message(format!(
+            "failed to write profiler resume notice for process {pid}: {error}"
+        ))
+    })?;
+    writer.flush().map_err(|error| {
+        BenchError::message(format!(
+            "failed to flush profiler resume notice for process {pid}: {error}"
+        ))
     })
 }
 
@@ -670,6 +746,32 @@ fn prepare_plan_root(storage_root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::ErrorKind;
+
+    struct WriteFailure;
+
+    impl Write for WriteFailure {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(ErrorKind::BrokenPipe, "write failed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FlushFailure(Vec<u8>);
+
+    impl Write for FlushFailure {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(ErrorKind::BrokenPipe, "flush failed"))
+        }
+    }
 
     fn assert_shared_config<A, B>()
     where
@@ -683,6 +785,36 @@ mod tests {
         A: SessionExecutor,
         B: SessionExecutor<Outcome = A::Outcome>,
     {
+    }
+
+    #[test]
+    fn profiler_protocol_records_are_stable() {
+        let mut output = Vec::new();
+        write_pausing_notice(&mut output, 42, 3, "checkpoint-table").unwrap();
+        write_resumed_notice(&mut output, 42, 3, "checkpoint-table").unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "DORADB_BENCH_PAUSING pid=42 phase=3 workload=checkpoint-table resume=SIGCONT\n\
+             Attach the profiler to PID 42 and verify that the process is stopped.\n\
+             Resume with: kill -CONT 42\n\
+             DORADB_BENCH_RESUMED pid=42 phase=3 workload=checkpoint-table\n"
+        );
+    }
+
+    #[test]
+    fn profiler_pause_notice_maps_write_and_flush_failures() {
+        let write_error = write_pausing_notice(&mut WriteFailure, 42, 3, "trx-noop").unwrap_err();
+        assert_eq!(
+            write_error.to_string(),
+            "failed to write profiler pause notice for process 42: write failed"
+        );
+
+        let flush_error =
+            write_pausing_notice(&mut FlushFailure(Vec::new()), 42, 3, "trx-noop").unwrap_err();
+        assert_eq!(
+            flush_error.to_string(),
+            "failed to flush profiler pause notice for process 42: flush failed"
+        );
     }
 
     #[test]
