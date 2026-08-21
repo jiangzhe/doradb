@@ -1,11 +1,99 @@
 #[cfg(test)]
 mod tests {
     use doradb_bench::measurement::{LatencyUnit, WorkloadCounters, WorkloadMetrics};
+    use doradb_bench::plan::Phase;
     use doradb_bench::plan_output::InvocationReport;
+    use rustix::process::{Pid, Signal, kill_process};
     use std::fs;
+    use std::io::{BufRead, BufReader, Read};
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Output};
+    use std::process::{Child, Command, ExitStatus, Output, Stdio};
+    use std::sync::mpsc::{self, Receiver};
+    use std::thread::{self, JoinHandle};
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
+
+    const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(20);
+
+    struct ChildGuard {
+        child: Child,
+        running: bool,
+    }
+
+    impl ChildGuard {
+        fn new(child: Child) -> Self {
+            Self {
+                child,
+                running: true,
+            }
+        }
+
+        fn pid(&self) -> Pid {
+            Pid::from_child(&self.child)
+        }
+
+        fn resume(&self) {
+            kill_process(self.pid(), Signal::CONT).unwrap();
+        }
+
+        fn wait_until(&mut self, deadline: Instant) -> ExitStatus {
+            loop {
+                if let Some(status) = self.child.try_wait().unwrap() {
+                    self.running = false;
+                    return status;
+                }
+                assert!(Instant::now() < deadline, "benchmark child timed out");
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if self.running {
+                let _ = kill_process(self.pid(), Signal::CONT);
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+    }
+
+    fn capture_lines<R>(reader: R) -> (Receiver<String>, JoinHandle<String>)
+    where
+        R: Read + Send + 'static,
+    {
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let mut captured = String::new();
+            for line in BufReader::new(reader).lines() {
+                let line = line.unwrap();
+                captured.push_str(&line);
+                captured.push('\n');
+                let _ = sender.send(line);
+            }
+            captured
+        });
+        (receiver, handle)
+    }
+
+    fn wait_for_stopped(pid: i32, deadline: Instant) {
+        let status_path = format!("/proc/{pid}/status");
+        loop {
+            let status = fs::read_to_string(&status_path).unwrap();
+            if status
+                .lines()
+                .find_map(|line| line.strip_prefix("State:"))
+                .is_some_and(|state| state.trim_start().starts_with('T'))
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "child did not enter stopped state"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     fn run_bench(root: &Path, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_doradb-bench"))
@@ -49,10 +137,16 @@ mod tests {
         )
         .unwrap();
         let root = temp.path().join(format!("{name}-root"));
-        let stdout = assert_success(run_bench(&root, &["--plan", source.to_str().unwrap()]));
+        let output = run_bench(&root, &["--plan", source.to_str().unwrap()]);
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("DORADB_BENCH_"));
+        let stdout = assert_success(output);
         let encoded = fs::read_to_string(root.join("benchmark-result.toml")).unwrap();
         let report = toml::from_str(&encoded).unwrap();
         let report: InvocationReport = report;
+        let Phase::Benchmark { measurement, .. } = report.plan.phases.last().unwrap() else {
+            panic!("final phase must be a benchmark")
+        };
+        assert!(!measurement.pause);
         let workload = report.plan.phases.last().unwrap().workload().identity();
         assert!(stdout.contains("DoraDB benchmark summary\n"));
         assert!(stdout.contains(&format!("workload: {workload}\n")));
@@ -397,5 +491,73 @@ mod tests {
         assert!(assert_failure(output).contains("did not install a nonempty proper prefix"));
         assert!(root.exists());
         assert!(!root.join("benchmark-result.toml").exists());
+    }
+
+    #[test]
+    fn profiler_pause_stops_before_benchmark_and_resumes_to_success() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("profiler-pause.toml");
+        fs::write(
+            &source,
+            "name = \"profiler pause\"\n[engine.transaction]\nlog_sync = \"none\"\n\
+             [[phase]]\nworkload = { type = \"create-table\", index = \"none\" }\n\
+             [[phase]]\nkind = \"benchmark\"\npause = true\nwarmup_runs = 1\nmeasured_runs = 2\n\
+             workload = { type = \"trx-noop\", num = 2 }\n",
+        )
+        .unwrap();
+        let root = temp.path().join("profiler-pause-root");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_doradb-bench"))
+            .args([
+                "--root",
+                root.to_str().unwrap(),
+                "--plan",
+                source.to_str().unwrap(),
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        let (stdout_lines, stdout_handle) = capture_lines(child.stdout.take().unwrap());
+        let (stderr_lines, stderr_handle) = capture_lines(child.stderr.take().unwrap());
+        let mut child = ChildGuard::new(child);
+        let deadline = Instant::now() + SUBPROCESS_TIMEOUT;
+
+        let pausing = stderr_lines
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap();
+        assert_eq!(
+            pausing,
+            format!("DORADB_BENCH_PAUSING pid={pid} phase=2 workload=trx-noop resume=SIGCONT")
+        );
+        wait_for_stopped(pid, deadline);
+        assert!(child.child.try_wait().unwrap().is_none());
+        assert!(stdout_lines.try_recv().is_err());
+        assert!(!root.join("benchmark-result.toml").exists());
+
+        child.resume();
+        let status = child.wait_until(deadline);
+        assert!(status.success(), "benchmark child failed with {status}");
+        let stdout = stdout_handle.join().unwrap();
+        let stderr = stderr_handle.join().unwrap();
+        assert!(stdout.contains("DoraDB benchmark summary\n"));
+        assert!(stdout.contains("measured_runs: 2\n"));
+        assert!(stderr.contains(&format!(
+            "DORADB_BENCH_RESUMED pid={pid} phase=2 workload=trx-noop\n"
+        )));
+
+        let encoded = fs::read_to_string(root.join("benchmark-result.toml")).unwrap();
+        assert!(encoded.contains("pause = true"));
+        let report: InvocationReport = toml::from_str(&encoded).unwrap();
+        let Phase::Benchmark { measurement, .. } = &report.plan.phases[1] else {
+            panic!("final phase must be a benchmark")
+        };
+        assert!(measurement.pause);
+        assert_eq!(measurement.warmup_runs, 1);
+        assert_eq!(measurement.measured_runs.get(), 2);
+        assert_eq!(report.prepare_phases.len(), 1);
+        assert_eq!(report.measured_runs.len(), 2);
+        assert_eq!(report.aggregate.measured_runs, 2);
+        assert_eq!(report.aggregate.counters.operations, 4);
     }
 }

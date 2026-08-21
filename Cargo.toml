@@ -37,6 +37,7 @@ io-uring = "0.7"
 rand = "0.10"
 rand_chacha = "0.10"
 rand_distr = "0.6"
+rustix = { version = "1.1", features = ["process"] }
 tempfile = "3"
 quanta = { version = "0.12", default-features = false }
 hdrhistogram = { version = "7.5", default-features = false }
@@ -99,6 +100,7 @@ uninlined_format_args = "allow"
 unnecessary_wraps = "allow"
 unreadable_literal = "allow"
 unused_async = "allow"
+unused_async_trait_impl = "allow"
 unused_self = "allow"
 used_underscore_binding = "allow"
 verbose_bit_mask = "allow"

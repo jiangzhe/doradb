@@ -105,6 +105,8 @@ pub struct RawPhase {
     pub warmup_runs: Option<u32>,
     /// Positive benchmark measured repetition count.
     pub measured_runs: Option<NonZeroU32>,
+    /// Whether to stop before benchmark warm-ups for profiler attachment.
+    pub pause: Option<bool>,
     /// Workload specification.
     pub workload: WorkloadSpec,
 }
@@ -522,6 +524,8 @@ pub struct MeasurementSpec {
     pub warmup_runs: u32,
     /// Number of complete measured runs.
     pub measured_runs: NonZeroU32,
+    /// Whether to stop once before benchmark execution for profiler attachment.
+    pub pause: bool,
 }
 
 /// Resolved table-pool creation configuration.
@@ -1018,6 +1022,7 @@ fn validate_and_resolve_phases(
                 let measurement = MeasurementSpec {
                     warmup_runs: raw.warmup_runs.unwrap_or(0),
                     measured_runs: raw.measured_runs.unwrap_or(NonZeroU32::MIN),
+                    pause: raw.pause.unwrap_or(false),
                 };
                 measurement
                     .warmup_runs
@@ -1052,9 +1057,9 @@ fn validate_phase_structure(raw_phases: &[RawPhase]) -> Result<()> {
     for (index, raw) in raw_phases.iter().enumerate() {
         match raw.kind {
             PhaseKind::Prepare => {
-                if raw.warmup_runs.is_some() || raw.measured_runs.is_some() {
+                if raw.warmup_runs.is_some() || raw.measured_runs.is_some() || raw.pause.is_some() {
                     return Err(BenchError::message(format!(
-                        "prepare phase {} must not specify warmup_runs or measured_runs",
+                        "prepare phase {} must not specify warmup_runs, measured_runs, or pause",
                         index + 1
                     )));
                 }
@@ -1545,6 +1550,59 @@ mod tests {
     }
 
     #[test]
+    fn pause_is_strict_benchmark_only_and_normalized() {
+        #[derive(Debug, Deserialize, PartialEq, Serialize)]
+        struct PhaseDocument {
+            phase: Vec<Phase>,
+        }
+
+        for (raw_pause, expected) in [("pause = true\n", true), ("pause = false\n", false)] {
+            let phases = resolve(&format!(
+                "[[phase]]\nkind = \"benchmark\"\n{raw_pause}workload = {{ type = \"trx-noop\", num = 1 }}\n"
+            ))
+            .unwrap();
+            let Phase::Benchmark { measurement, .. } = &phases[0] else {
+                panic!("phase must resolve as benchmark")
+            };
+            assert_eq!(measurement.pause, expected);
+            let document = PhaseDocument { phase: phases };
+            let encoded = toml::to_string(&document).unwrap();
+            assert_eq!(toml::from_str::<PhaseDocument>(&encoded).unwrap(), document);
+        }
+
+        let defaulted = resolve(
+            "[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"trx-noop\", num = 1 }\n",
+        )
+        .unwrap();
+        let Phase::Benchmark { measurement, .. } = &defaulted[0] else {
+            panic!("phase must resolve as benchmark")
+        };
+        assert!(!measurement.pause);
+
+        for invalid in [
+            "[[phase]]\npause = true\nworkload = { type = \"trx-noop\", num = 1 }\n[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"trx-noop\", num = 1 }\n",
+            "[[phase]]\npause = false\nworkload = { type = \"trx-noop\", num = 1 }\n[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"trx-noop\", num = 1 }\n",
+        ] {
+            assert_eq!(
+                resolve(invalid).unwrap_err().to_string(),
+                "prepare phase 1 must not specify warmup_runs, measured_runs, or pause"
+            );
+        }
+        assert!(
+            parse(
+                "[[phase]]\nkind = \"benchmark\"\npause = 1\nworkload = { type = \"trx-noop\", num = 1 }\n"
+            )
+            .is_err()
+        );
+        assert!(
+            parse(
+                "[[phase]]\nkind = \"benchmark\"\npaused = true\nworkload = { type = \"trx-noop\", num = 1 }\n"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn update_plan_resolves_strict_controls_and_replay_contracts() {
         let phases = resolve(
             "[[phase]]\nworkload = { type = \"create-table\", index = \"non-unique\" }\n\
@@ -1786,6 +1844,7 @@ mod tests {
                 };
                 assert_eq!(measurement.warmup_runs, 0);
                 assert_eq!(measurement.measured_runs.get(), 1);
+                assert!(!measurement.pause);
             }
             if file == "update-rand.toml" {
                 assert_eq!(loaded.plan.phases.len(), 3);
@@ -1807,6 +1866,7 @@ mod tests {
                 };
                 assert_eq!(measurement.warmup_runs, 1);
                 assert_eq!(measurement.measured_runs.get(), 3);
+                assert!(!measurement.pause);
                 assert_eq!(update.num, 1_000);
                 assert_eq!(update.seed, 42);
                 assert!(update.change_key);

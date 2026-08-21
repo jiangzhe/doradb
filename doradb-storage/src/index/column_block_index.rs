@@ -3338,8 +3338,8 @@ fn decode_u32_bytes_strict(bytes: &[u8], expected_count: u16) -> DataIntegrityRe
     }
     let mut res = Vec::with_capacity(expected_count as usize);
     let mut prev = None;
-    for chunk in bytes.chunks_exact(mem::size_of::<u32>()) {
-        let value = u32::from_le_bytes(chunk.try_into().map_err(|_| invalid_node_payload())?);
+    for chunk in bytes.as_chunks::<{ mem::size_of::<u32>() }>().0 {
+        let value = u32::from_le_bytes(*chunk);
         if let Some(prev_value) = prev
             && value <= prev_value
         {

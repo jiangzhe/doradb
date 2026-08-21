@@ -29,9 +29,10 @@ normal directory-management tools for the host environment.
 The schema is unversioned and uses `deny_unknown_fields` throughout. Exactly
 one phase must use `kind = "benchmark"`, and it must be last. Omitted `kind`
 means a prepare phase. Prepare phases execute once and reject `warmup_runs` and
-`measured_runs`; the benchmark defaults to zero warm-ups and one measured run.
-Warm-ups must succeed but their counters, samples, diagnostics, and effects are
-discarded.
+`measured_runs`, and `pause`, including an explicit `pause = false`. The
+benchmark defaults to zero warm-ups, one measured run, and `pause = false`.
+Warm-ups must succeed but their counters, samples, diagnostics, and effects
+are discarded.
 
 ```toml
 name = "seeded random lookup"
@@ -77,6 +78,76 @@ and `include_stats`. Defaults are one thread, sessions equal to threads,
 override them. An explicit thread override without a session override sets
 sessions equal to threads. Both counts must be positive and threads must not
 exceed sessions.
+
+## Profiler attachment pause
+
+The final benchmark phase accepts an optional `pause` boolean. With
+`pause = true`, the coordinator completes every prepare phase, closes its
+sessions, applies its fixture effects, and then stops the complete benchmark
+process exactly once before the first warm-up or measured run. The pause is
+therefore outside workload timers, latency samples, internal-stat deltas, and
+aggregate calculations. The normalized boolean is retained in the resolved
+plan inside `benchmark-result.toml`.
+
+Before sending `SIGSTOP`, the benchmark flushes this stable record to standard
+error, followed by human-readable attachment and resume instructions:
+
+```text
+DORADB_BENCH_PAUSING pid=<pid> phase=<phase-index> workload=<identity> resume=SIGCONT
+```
+
+After an external `SIGCONT`, it emits:
+
+```text
+DORADB_BENCH_RESUMED pid=<pid> phase=<phase-index> workload=<identity>
+```
+
+The pausing record is emitted just before the self-stop, so observing the
+record alone does not prove the process is stopped. Automation must wait until
+Linux reports process state `T` or `t` in `/proc/<pid>/status` before attaching
+and eventually sending `SIGCONT`; an earlier `SIGCONT` can race ahead of
+`SIGSTOP`. The stop suspends all threads in the benchmark process. It does not
+stop external resources or guarantee that already-submitted kernel or device
+I/O makes no progress.
+
+### Samply checkpoint workflow
+
+The release profile retains debug information. The checked-in
+`checkpoint-table.toml` prepares the million-row fixture but intentionally
+omits `pause`, so routine runs never stop. For a profiling run, make a working
+copy of that plan, keep its `engine_defaults` path valid, and add `pause = true`
+to its final benchmark phase.
+
+In terminal 1, build release mode and start the working plan against a fresh
+root:
+
+```bash
+rtk cargo build --release -p doradb-bench
+target/release/doradb-bench \
+  --root target/doradb-bench/checkpoint-profile \
+  --plan path/to/checkpoint-profile.toml
+```
+
+After terminal 1 prints `DORADB_BENCH_PAUSING`, use terminal 2 to copy the PID,
+confirm the stopped state, and attach Samply. The optional flags retain the
+profile without opening the viewer:
+
+```bash
+pid=<pid>
+awk '/^State:/ { print $2 }' "/proc/$pid/status"  # must print T or t
+samply record -p "$pid"
+# Or: samply record --save-only --output checkpoint-profile.json.gz -p "$pid"
+```
+
+Once Samply is attached and waiting, resume the benchmark from terminal 3:
+
+```bash
+kill -CONT <pid>
+```
+
+Samply records the final checkpoint phase and exits when the benchmark
+process exits. Normal benchmark teardown remains part of the attached process
+profile.
 
 ## Fixture composition
 

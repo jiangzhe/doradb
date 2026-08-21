@@ -962,8 +962,8 @@ fn extend_segmented_bytes<T: BytesExtendable>(bs: &[u8], buf: &mut T) {
         buf.extend_from_byte_slice(&[0; SEG_LEN + 1]); // last byte is zero
         return;
     }
-    let mut chunks = bs.chunks_exact(SEG_LEN);
-    if chunks.remainder().is_empty() {
+    let (chunks, remainder) = bs.as_chunks::<SEG_LEN>();
+    if remainder.is_empty() {
         for c in chunks {
             buf.extend_from_byte_slice(c);
             buf.push_byte(FIX_SEG_FLAG);
@@ -972,13 +972,13 @@ fn extend_segmented_bytes<T: BytesExtendable>(bs: &[u8], buf: &mut T) {
         buf.update_last_byte(SEG_LEN as u8);
         // *buf.last_mut().unwrap() = SEG_LEN as u8;
     } else {
-        for c in chunks.by_ref() {
+        for c in chunks {
             buf.extend_from_byte_slice(c);
             buf.push_byte(FIX_SEG_FLAG);
         }
-        buf.extend_from_byte_slice(chunks.remainder());
-        buf.extend_repeat_n(0x00, SEG_LEN - chunks.remainder().len());
-        buf.push_byte(chunks.remainder().len() as u8);
+        buf.extend_from_byte_slice(remainder);
+        buf.extend_repeat_n(0x00, SEG_LEN - remainder.len());
+        buf.push_byte(remainder.len() as u8);
     }
 }
 
@@ -988,8 +988,8 @@ fn copy_segmented_bytes(bs: &[u8], mut buf: &mut [u8]) -> usize {
         buf[..SEG_LEN + 1].iter_mut().for_each(|b| *b = 0);
         return SEG_LEN + 1;
     }
-    let mut chunks = bs.chunks_exact(SEG_LEN);
-    if chunks.remainder().is_empty() {
+    let (chunks, remainder) = bs.as_chunks::<SEG_LEN>();
+    if remainder.is_empty() {
         let mut offset = 0;
         for c in chunks {
             buf[offset..offset + SEG_LEN].copy_from_slice(c);
@@ -1001,17 +1001,18 @@ fn copy_segmented_bytes(bs: &[u8], mut buf: &mut [u8]) -> usize {
         return offset;
     }
     let mut offset = 0usize;
-    for c in chunks.by_ref() {
+    for c in chunks {
         debug_assert!(c.len() == SEG_LEN);
         buf[..SEG_LEN].copy_from_slice(c);
         buf[SEG_LEN] = FIX_SEG_FLAG;
         buf = &mut buf[SEG_LEN + 1..];
         offset += SEG_LEN + 1
     }
-    let rem = chunks.remainder();
-    buf[..rem.len()].copy_from_slice(rem);
-    buf[rem.len()..SEG_LEN].iter_mut().for_each(|b| *b = 0);
-    buf[SEG_LEN] = chunks.remainder().len() as u8;
+    buf[..remainder.len()].copy_from_slice(remainder);
+    buf[remainder.len()..SEG_LEN]
+        .iter_mut()
+        .for_each(|b| *b = 0);
+    buf[SEG_LEN] = remainder.len() as u8;
     offset + SEG_LEN + 1
 }
 

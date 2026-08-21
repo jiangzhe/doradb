@@ -415,14 +415,12 @@ pub(crate) fn b1_pack<T: BitPackable>(input: &[T], res: &mut [u8]) {
 pub(crate) fn for_b1_pack<T: BitPackable>(input: &[T], min: T, res: &mut [u8]) {
     debug_assert!(input.len() <= res.len() * 8);
     // layer 1: batch 64
-    let chunks = input.chunks_exact(64);
-    let remainder = chunks.remainder();
+    let (chunks, remainder) = input.as_chunks::<64>();
 
-    let out_chunks = res.chunks_exact_mut(8);
+    let (out_chunks, _) = res.as_chunks_mut::<8>();
     let mut out_idx = chunks.len() * 8;
 
-    for (src, tgt) in chunks.zip(out_chunks) {
-        let src: &[T; 64] = src.try_into().unwrap();
+    for (src, tgt) in chunks.iter().zip(out_chunks) {
         let mut packed: u64 = 0;
         for i in 0..64 {
             let bit = (src[i].sub_to_u64(min)) & 1;
@@ -432,10 +430,8 @@ pub(crate) fn for_b1_pack<T: BitPackable>(input: &[T], min: T, res: &mut [u8]) {
     }
 
     // layer 2: batch 8
-    let rem_chunks = remainder.chunks_exact(8);
-    let rem_final = rem_chunks.remainder();
+    let (rem_chunks, rem_final) = remainder.as_chunks::<8>();
     for src in rem_chunks {
-        let src: &[T; 8] = src.try_into().unwrap();
         let mut packed_byte: u8 = 0;
         for i in 0..8 {
             let bit = src[i].sub_to_u8(min) & 1;
@@ -476,13 +472,12 @@ pub(crate) fn b1_unpack<T: BitPackable>(input: &[u8], res: &mut [T]) {
 pub(crate) fn for_b1_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
     debug_assert!(input.len() * 8 >= res.len());
     // layer 1: batch 64
-    let chunks = input.chunks_exact(8);
-    let out_chunks = res.chunks_exact_mut(64);
+    let (chunks, _) = input.as_chunks::<8>();
+    let (out_chunks, _) = res.as_chunks_mut::<64>();
     // determine input index by output index.
     let mut input_idx = out_chunks.len() * 8;
     let mut out_idx = out_chunks.len() * 64;
-    for (src, tgt) in chunks.zip(out_chunks) {
-        let src: &[u8; 8] = src.try_into().unwrap();
+    for (src, tgt) in chunks.iter().zip(out_chunks) {
         let packed = u64::from_le_bytes(*src);
 
         for i in 0..64 {
@@ -492,7 +487,7 @@ pub(crate) fn for_b1_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T])
     }
 
     // layer 2: batch 8
-    let rem_chunks = res[out_idx..].chunks_exact_mut(8);
+    let (rem_chunks, _) = res[out_idx..].as_chunks_mut::<8>();
     out_idx += rem_chunks.len() * 8;
     for tgt in rem_chunks {
         let packed = input[input_idx];
@@ -525,11 +520,10 @@ pub(crate) fn for_b1_unpack_extend<T: BitPackable, E: Extend<T>>(
     debug_assert!(len.div_ceil(8) == input.len());
     // layer 1: batch 64 first
     let mut tmp = [T::ZERO; 64];
-    let chunks = input[..len / 64 * 8].chunks_exact(8);
+    let chunks = input[..len / 64 * 8].as_chunks::<8>().0;
     let input_idx = chunks.len() * 8;
     for chunk in chunks {
-        let src: [u8; 8] = chunk.try_into().unwrap();
-        let packed = u64::from_le_bytes(src);
+        let packed = u64::from_le_bytes(*chunk);
         for i in 0..64 {
             let delta = ((packed >> i) & 1) as u8;
             tmp[i] = min.add_from_u8(delta);
@@ -575,14 +569,12 @@ pub(crate) fn b2_pack<T: BitPackable>(input: &[T], res: &mut [u8]) {
 pub(crate) fn for_b2_pack<T: BitPackable>(input: &[T], min: T, res: &mut [u8]) {
     debug_assert!(input.len() <= res.len() * 4);
     // layer 1: batch 32
-    let chunks = input.chunks_exact(32);
-    let remainder = chunks.remainder();
+    let (chunks, remainder) = input.as_chunks::<32>();
 
-    let out_chunks = res.chunks_exact_mut(8);
+    let (out_chunks, _) = res.as_chunks_mut::<8>();
     let mut out_idx = chunks.len() * 8;
 
-    for (src, tgt) in chunks.zip(out_chunks) {
-        let src: &[T; 32] = src.try_into().unwrap();
+    for (src, tgt) in chunks.iter().zip(out_chunks) {
         let mut packed: u64 = 0;
         for i in 0..32 {
             let val = src[i].sub_to_u64(min) & 3;
@@ -592,10 +584,8 @@ pub(crate) fn for_b2_pack<T: BitPackable>(input: &[T], min: T, res: &mut [u8]) {
     }
 
     // layer 2: batch 4
-    let rem_chunks = remainder.chunks_exact(4);
-    let rem_final = rem_chunks.remainder();
+    let (rem_chunks, rem_final) = remainder.as_chunks::<4>();
     for src in rem_chunks {
-        let src: &[T; 4] = src.try_into().unwrap();
         let mut packed_byte = 0u8;
         for i in 0..4 {
             let val = src[i].sub_to_u8(min) & 3;
@@ -635,13 +625,12 @@ pub(crate) fn b2_unpack<T: BitPackable>(input: &[u8], res: &mut [T]) {
 pub(crate) fn for_b2_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
     debug_assert!(input.len() * 4 >= res.len());
     // layer 1: batch 32
-    let chunks = input.chunks_exact(8);
-    let out_chunks = res.chunks_exact_mut(32);
+    let (chunks, _) = input.as_chunks::<8>();
+    let (out_chunks, _) = res.as_chunks_mut::<32>();
     // determine input index by output index.
     let mut input_idx = out_chunks.len() * 8;
     let mut out_idx = out_chunks.len() * 32;
-    for (src, tgt) in chunks.zip(out_chunks) {
-        let src: &[u8; 8] = src.try_into().unwrap();
+    for (src, tgt) in chunks.iter().zip(out_chunks) {
         let packed = u64::from_le_bytes(*src);
 
         for i in 0..32 {
@@ -651,7 +640,7 @@ pub(crate) fn for_b2_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T])
     }
 
     // layer 2: batch 4
-    let rem_chunks = res[out_idx..].chunks_exact_mut(4);
+    let (rem_chunks, _) = res[out_idx..].as_chunks_mut::<4>();
     out_idx += rem_chunks.len() * 4;
     for tgt in rem_chunks {
         let packed = input[input_idx];
@@ -686,12 +675,11 @@ pub(crate) fn for_b2_unpack_extend<T: BitPackable, E: Extend<T>>(
 
     // Layer 1: Batch 32
     let mut tmp = [T::ZERO; 32];
-    let chunks = input[..len / 32 * 4].chunks_exact(8);
+    let chunks = input[..len / 32 * 4].as_chunks::<8>().0;
     let input_idx = chunks.len() * 8;
 
     for chunk in chunks {
-        let src: [u8; 8] = chunk.try_into().unwrap();
-        let packed = u64::from_le_bytes(src);
+        let packed = u64::from_le_bytes(*chunk);
         for i in 0..32 {
             let delta = ((packed >> (i * 2)) & 3) as u8;
             tmp[i] = min.add_from_u8(delta);
@@ -737,14 +725,12 @@ pub(crate) fn b4_pack<T: BitPackable>(input: &[T], res: &mut [u8]) {
 pub(crate) fn for_b4_pack<T: BitPackable>(input: &[T], min: T, res: &mut [u8]) {
     debug_assert!(input.len() <= res.len() * 2);
     // layer 1: batch 16
-    let chunks = input.chunks_exact(16);
-    let remainder = chunks.remainder();
+    let (chunks, remainder) = input.as_chunks::<16>();
 
-    let out_chunks = res.chunks_exact_mut(8);
+    let (out_chunks, _) = res.as_chunks_mut::<8>();
     let mut out_idx = chunks.len() * 8;
 
-    for (src, tgt) in chunks.zip(out_chunks) {
-        let src: &[T; 16] = src.try_into().unwrap();
+    for (src, tgt) in chunks.iter().zip(out_chunks) {
         let mut packed: u64 = 0;
         for i in 0..16 {
             let val = src[i].sub_to_u64(min) & 15;
@@ -793,14 +779,13 @@ pub(crate) fn b4_unpack<T: BitPackable>(input: &[u8], res: &mut [T]) {
 pub(crate) fn for_b4_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
     debug_assert!(input.len() * 2 >= res.len());
     // layer 1: batch 16
-    let chunks = input.chunks_exact(8);
-    let out_chunks = res.chunks_exact_mut(16);
+    let (chunks, _) = input.as_chunks::<8>();
+    let (out_chunks, _) = res.as_chunks_mut::<16>();
     // determine input index by output index.
     let mut input_idx = out_chunks.len() * 8;
     let mut out_idx = out_chunks.len() * 16;
 
-    for (src, tgt) in chunks.zip(out_chunks) {
-        let src: &[u8; 8] = src.try_into().unwrap();
+    for (src, tgt) in chunks.iter().zip(out_chunks) {
         let packed = u64::from_le_bytes(*src);
 
         for i in 0..16 {
@@ -810,7 +795,7 @@ pub(crate) fn for_b4_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T])
     }
 
     // Layer 2: Batch 2
-    let rem_chunks = res[out_idx..].chunks_exact_mut(2);
+    let (rem_chunks, _) = res[out_idx..].as_chunks_mut::<2>();
     out_idx += rem_chunks.len() * 2;
 
     for tgt in rem_chunks {
@@ -841,12 +826,11 @@ pub(crate) fn for_b4_unpack_extend<T: BitPackable, E: Extend<T>>(
 
     // Layer 1: Batch 16
     let mut tmp = [T::ZERO; 16];
-    let chunks = input[..len / 16 * 2].chunks_exact(8);
+    let chunks = input[..len / 16 * 2].as_chunks::<8>().0;
     let input_idx = chunks.len() * 8;
 
     for chunk in chunks {
-        let src: [u8; 8] = chunk.try_into().unwrap();
-        let packed = u64::from_le_bytes(src);
+        let packed = u64::from_le_bytes(*chunk);
         for i in 0..16 {
             let delta = ((packed >> (i * 4)) & 15) as u8;
             tmp[i] = min.add_from_u8(delta);
