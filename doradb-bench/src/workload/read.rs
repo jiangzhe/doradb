@@ -13,7 +13,6 @@ use crate::workload::util::{
 use crate::workload::{RunCancellation, SessionPlan};
 use doradb_storage::id::TableID;
 use doradb_storage::{Engine, SelectKey, SelectMvcc, Session, Val};
-use std::future::Future;
 
 /// Sequential lookup session executor.
 #[derive(Clone, Copy)]
@@ -41,15 +40,15 @@ impl SessionExecutor for LookupSeqExecutor {
         operation_plans(self.state.config.num, self.state.config.sessions)
     }
 
-    fn execute<'a>(
-        &'a self,
-        _engine: &'a Engine,
-        session: &'a mut Session,
-        plan: &'a SessionPlan,
-        clock: &'a MeasurementClock,
+    async fn execute(
+        &self,
+        _engine: &Engine,
+        session: &mut Session,
+        plan: &SessionPlan,
+        clock: &MeasurementClock,
         sample_latency: bool,
-        cancellation: &'a RunCancellation,
-    ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a {
+        cancellation: &RunCancellation,
+    ) -> Result<Self::Outcome> {
         execute_read_session(
             &self.state,
             session,
@@ -57,6 +56,7 @@ impl SessionExecutor for LookupSeqExecutor {
             sample_latency.then_some(clock),
             cancellation,
         )
+        .await
     }
 
     fn verify_outcome(
@@ -101,15 +101,15 @@ impl SessionExecutor for LookupRandExecutor {
         operation_plans(self.state.config.num, self.state.config.sessions)
     }
 
-    fn execute<'a>(
-        &'a self,
-        _engine: &'a Engine,
-        session: &'a mut Session,
-        plan: &'a SessionPlan,
-        clock: &'a MeasurementClock,
+    async fn execute(
+        &self,
+        _engine: &Engine,
+        session: &mut Session,
+        plan: &SessionPlan,
+        clock: &MeasurementClock,
         sample_latency: bool,
-        cancellation: &'a RunCancellation,
-    ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a {
+        cancellation: &RunCancellation,
+    ) -> Result<Self::Outcome> {
         execute_read_session(
             &self.state,
             session,
@@ -117,6 +117,7 @@ impl SessionExecutor for LookupRandExecutor {
             sample_latency.then_some(clock),
             cancellation,
         )
+        .await
     }
 
     fn verify_outcome(
@@ -161,15 +162,15 @@ impl SessionExecutor for TableScanExecutor {
         operation_plans(self.state.config.num, self.state.config.sessions)
     }
 
-    fn execute<'a>(
-        &'a self,
-        _engine: &'a Engine,
-        session: &'a mut Session,
-        plan: &'a SessionPlan,
-        clock: &'a MeasurementClock,
+    async fn execute(
+        &self,
+        _engine: &Engine,
+        session: &mut Session,
+        plan: &SessionPlan,
+        clock: &MeasurementClock,
         sample_latency: bool,
-        cancellation: &'a RunCancellation,
-    ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a {
+        cancellation: &RunCancellation,
+    ) -> Result<Self::Outcome> {
         execute_read_session(
             &self.state,
             session,
@@ -177,6 +178,7 @@ impl SessionExecutor for TableScanExecutor {
             sample_latency.then_some(clock),
             cancellation,
         )
+        .await
     }
 
     fn verify_outcome(
@@ -221,15 +223,15 @@ impl SessionExecutor for IndexScanExecutor {
         operation_plans(self.state.config.num, self.state.config.sessions)
     }
 
-    fn execute<'a>(
-        &'a self,
-        _engine: &'a Engine,
-        session: &'a mut Session,
-        plan: &'a SessionPlan,
-        clock: &'a MeasurementClock,
+    async fn execute(
+        &self,
+        _engine: &Engine,
+        session: &mut Session,
+        plan: &SessionPlan,
+        clock: &MeasurementClock,
         sample_latency: bool,
-        cancellation: &'a RunCancellation,
-    ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a {
+        cancellation: &RunCancellation,
+    ) -> Result<Self::Outcome> {
         execute_read_session(
             &self.state,
             session,
@@ -237,6 +239,7 @@ impl SessionExecutor for IndexScanExecutor {
             sample_latency.then_some(clock),
             cancellation,
         )
+        .await
     }
 
     fn verify_outcome(
@@ -284,6 +287,7 @@ impl SessionExecutor for IndexStreamExecutor {
                 SessionExecutorConfig {
                     resolved: read_config,
                     binding: config.binding,
+                    execution_ordinal: config.execution_ordinal,
                 },
                 Self::IDENTITY,
                 ReadOperationType::IndexStream,
@@ -299,15 +303,15 @@ impl SessionExecutor for IndexStreamExecutor {
         operation_plans(self.state.config.num, self.state.config.sessions)
     }
 
-    fn execute<'a>(
-        &'a self,
-        _engine: &'a Engine,
-        session: &'a mut Session,
-        plan: &'a SessionPlan,
-        clock: &'a MeasurementClock,
+    async fn execute(
+        &self,
+        _engine: &Engine,
+        session: &mut Session,
+        plan: &SessionPlan,
+        clock: &MeasurementClock,
         sample_latency: bool,
-        cancellation: &'a RunCancellation,
-    ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a {
+        cancellation: &RunCancellation,
+    ) -> Result<Self::Outcome> {
         execute_read_session(
             &self.state,
             session,
@@ -315,6 +319,7 @@ impl SessionExecutor for IndexStreamExecutor {
             sample_latency.then_some(clock),
             cancellation,
         )
+        .await
     }
 
     fn verify_outcome(

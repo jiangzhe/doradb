@@ -11,7 +11,6 @@ use crate::workload::util::{
 };
 use crate::workload::{RunCancellation, SessionPlan};
 use doradb_storage::{Engine, Session};
-use std::future::Future;
 
 /// Statement-noop session executor.
 #[derive(Clone, Copy)]
@@ -40,16 +39,17 @@ impl SessionExecutor for StmtNoopExecutor {
         operation_plans(self.config.num, self.config.sessions)
     }
 
-    fn execute<'a>(
-        &'a self,
-        _engine: &'a Engine,
-        session: &'a mut Session,
-        plan: &'a SessionPlan,
-        clock: &'a MeasurementClock,
+    async fn execute(
+        &self,
+        _engine: &Engine,
+        session: &mut Session,
+        plan: &SessionPlan,
+        clock: &MeasurementClock,
         sample_latency: bool,
-        cancellation: &'a RunCancellation,
-    ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a {
+        cancellation: &RunCancellation,
+    ) -> Result<Self::Outcome> {
         execute_stmt_noop_session(session, plan, sample_latency.then_some(clock), cancellation)
+            .await
     }
 
     fn verify_outcome(
@@ -95,16 +95,16 @@ impl SessionExecutor for TrxNoopExecutor {
         operation_plans(self.config.num, self.config.sessions)
     }
 
-    fn execute<'a>(
-        &'a self,
-        _engine: &'a Engine,
-        session: &'a mut Session,
-        plan: &'a SessionPlan,
-        clock: &'a MeasurementClock,
+    async fn execute(
+        &self,
+        _engine: &Engine,
+        session: &mut Session,
+        plan: &SessionPlan,
+        clock: &MeasurementClock,
         sample_latency: bool,
-        cancellation: &'a RunCancellation,
-    ) -> impl Future<Output = Result<Self::Outcome>> + Send + 'a {
-        execute_trx_noop_session(session, plan, sample_latency.then_some(clock), cancellation)
+        cancellation: &RunCancellation,
+    ) -> Result<Self::Outcome> {
+        execute_trx_noop_session(session, plan, sample_latency.then_some(clock), cancellation).await
     }
 
     fn verify_outcome(

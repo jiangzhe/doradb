@@ -134,6 +134,8 @@ pub enum WorkloadSpec {
     InsertSeq(InsertSpec),
     /// Insert generated pseudo-random logical keys.
     InsertRand(InsertSpec),
+    /// Update seeded random logical-key ranges through a secondary index.
+    UpdateRand(UpdateSpec),
     /// Create and drop transient tables.
     TableDdl(IterationWorkerSpec),
     /// Lookup sequential logical keys through the unique index.
@@ -197,6 +199,28 @@ pub struct InsertSpec {
     /// Optional generated payload-size override.
     pub value_size: Option<Byte>,
     /// Optional operations-per-transaction override.
+    pub batch_size: Option<NonZeroU64>,
+    /// Optional engine-diagnostic override.
+    pub include_stats: Option<bool>,
+}
+
+/// Strict plan-local random index-update controls.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateSpec {
+    /// Positive aggregate logical-key-width budget.
+    pub num: NonZeroU64,
+    /// Optional deterministic range and payload seed.
+    pub seed: Option<u64>,
+    /// Optionally move logical keys between disjoint replay domains.
+    pub change_key: Option<bool>,
+    /// Optional executor thread override.
+    pub threads: Option<NonZeroUsize>,
+    /// Optional public session override.
+    pub sessions: Option<NonZeroUsize>,
+    /// Optional generated payload-size override.
+    pub value_size: Option<Byte>,
+    /// Optional preferred key-range width per transaction.
     pub batch_size: Option<NonZeroU64>,
     /// Optional engine-diagnostic override.
     pub include_stats: Option<bool>,
@@ -552,6 +576,34 @@ pub struct InsertConfig {
     pub include_stats: bool,
 }
 
+/// Resolved random index-update configuration.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateConfig {
+    /// Aggregate planned logical-key-width budget.
+    pub num: u64,
+    /// Deterministic range and payload seed.
+    pub seed: u64,
+    /// Whether updates move the logical index key.
+    pub change_key: bool,
+    /// Executor thread count.
+    pub threads: usize,
+    /// Independent public session count.
+    pub sessions: usize,
+    /// Generated payload bytes.
+    pub value_size_bytes: usize,
+    /// Preferred key-range width per transaction.
+    pub batch_size: u64,
+    /// Bound primary-table secondary-index shape.
+    pub index: IndexMode,
+    /// Original candidate loaded-key domain.
+    pub loaded_range: KeyRange,
+    /// Equal-width disjoint replay key domain.
+    pub alternate_range: KeyRange,
+    /// Whether engine diagnostics are captured around the run.
+    pub include_stats: bool,
+}
+
 /// Resolved single-table freeze configuration.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -672,6 +724,8 @@ pub enum ResolvedWorkload {
     InsertSeq(InsertConfig),
     /// Pseudo-random generated insert workload.
     InsertRand(InsertConfig),
+    /// Seeded random secondary-index update workload.
+    UpdateRand(UpdateConfig),
     /// Transient table-DDL workload.
     TableDdl(DdlConfig),
     /// Sequential unique-index lookup workload.
@@ -703,6 +757,7 @@ impl ResolvedWorkload {
             Self::TrxNoop(_) => "trx-noop",
             Self::InsertSeq(_) => "insert-seq",
             Self::InsertRand(_) => "insert-rand",
+            Self::UpdateRand(_) => "update-rand",
             Self::TableDdl(_) => "table-ddl",
             Self::LookupSeq(_) => "lookup-seq",
             Self::LookupRand(_) => "lookup-rand",
@@ -723,6 +778,10 @@ impl ResolvedWorkload {
             Self::InsertSeq(_) | Self::InsertRand(_) => FixtureRequirement::Primary {
                 index: IndexRequirement::Any,
                 load: LoadRequirement::Optional,
+            },
+            Self::UpdateRand(_) => FixtureRequirement::Primary {
+                index: IndexRequirement::Secondary,
+                load: LoadRequirement::Committed,
             },
             Self::LookupSeq(_) | Self::LookupRand(_) => FixtureRequirement::Primary {
                 index: IndexRequirement::Exact(IndexMode::Unique),
@@ -761,6 +820,7 @@ impl ResolvedWorkload {
             | Self::TableScan(_)
             | Self::IndexScan(_)
             | Self::IndexStream(_)
+            | Self::UpdateRand(_)
             | Self::LockTable(_) => ReplayPolicy::Safe,
             Self::CreateTable(_)
             | Self::InsertSeq(_)
@@ -778,6 +838,7 @@ impl ResolvedWorkload {
             Self::CreateTable(_) => (1, 1),
             Self::StmtNoop(config) | Self::TrxNoop(config) => (config.threads, config.sessions),
             Self::InsertSeq(config) | Self::InsertRand(config) => (config.threads, config.sessions),
+            Self::UpdateRand(config) => (config.threads, config.sessions),
             Self::TableDdl(config) | Self::IndexDdl(config) => (config.threads, config.sessions),
             Self::LookupSeq(config)
             | Self::LookupRand(config)
@@ -795,6 +856,7 @@ impl ResolvedWorkload {
             Self::CreateTable(config) => config.include_stats,
             Self::StmtNoop(config) | Self::TrxNoop(config) => config.include_stats,
             Self::InsertSeq(config) | Self::InsertRand(config) => config.include_stats,
+            Self::UpdateRand(config) => config.include_stats,
             Self::TableDdl(config) | Self::IndexDdl(config) => config.include_stats,
             Self::LookupSeq(config)
             | Self::LookupRand(config)
@@ -814,6 +876,7 @@ impl ResolvedWorkload {
             Self::StmtNoop(_) => LatencyUnit::StatementExecution,
             Self::TrxNoop(_) => LatencyUnit::TransactionLifecycle,
             Self::InsertSeq(_) | Self::InsertRand(_) => LatencyUnit::InsertBatchTransaction,
+            Self::UpdateRand(_) => LatencyUnit::UpdateRangeTransaction,
             Self::TableDdl(_) => LatencyUnit::TableCreateDropCycle,
             Self::LookupSeq(_) | Self::LookupRand(_) => LatencyUnit::LookupBatchTransaction,
             Self::TableScan(_) => LatencyUnit::TableScanBatchTransaction,
@@ -843,6 +906,9 @@ impl ResolvedWorkload {
                 .map_err(|_| BenchError::message("table count exceeds u64")),
             Self::StmtNoop(config) | Self::TrxNoop(config) => Ok(config.num),
             Self::InsertSeq(config) | Self::InsertRand(config) => {
+                aggregate_batch_count(config.num, config.sessions, config.batch_size)
+            }
+            Self::UpdateRand(config) => {
                 aggregate_batch_count(config.num, config.sessions, config.batch_size)
             }
             Self::TableDdl(config) | Self::IndexDdl(config) => Ok(config.num),
@@ -937,6 +1003,12 @@ fn validate_and_resolve_phases(
     for (index, raw) in raw_phases.into_iter().enumerate() {
         let (workload, fixture_effect) = resolve_workload(raw.workload, defaults, &fixture)?;
         fixture.validate(workload.fixture_requirement())?;
+        if raw.kind == PhaseKind::Prepare && matches!(workload, ResolvedWorkload::UpdateRand(_)) {
+            return Err(BenchError::message(format!(
+                "phase {} workload update-rand is allowed only as the final benchmark",
+                index + 1
+            )));
+        }
         let phase = match raw.kind {
             PhaseKind::Prepare => Phase::Prepare {
                 workload,
@@ -1031,6 +1103,9 @@ fn resolve_workload(
         }
         WorkloadSpec::InsertSeq(spec) => resolve_insert(spec, defaults, fixture, false),
         WorkloadSpec::InsertRand(spec) => resolve_insert(spec, defaults, fixture, true),
+        WorkloadSpec::UpdateRand(spec) => no_effect(ResolvedWorkload::UpdateRand(resolve_update(
+            spec, defaults, fixture,
+        )?)),
         WorkloadSpec::TableDdl(spec) => {
             no_effect(ResolvedWorkload::TableDdl(resolve_ddl(spec, defaults)?))
         }
@@ -1189,6 +1264,61 @@ fn resolve_insert(
         ResolvedWorkload::InsertSeq(config)
     };
     Ok((workload, FixturePlanEffect::Insert { attempted_range }))
+}
+
+fn resolve_update(
+    spec: UpdateSpec,
+    defaults: ResolvedWorkloadDefaults,
+    fixture: &FixturePlanState,
+) -> Result<UpdateConfig> {
+    let (threads, sessions) = resolve_workers(spec.threads, spec.sessions, defaults)?;
+    let value_size_bytes = spec
+        .value_size
+        .map_or(Ok(defaults.value_size_bytes), |value| {
+            byte_usize(value, "update.value_size")
+        })?;
+    let batch_size = spec.batch_size.map_or(defaults.batch_size, NonZeroU64::get);
+    validate_value_size(value_size_bytes)?;
+    if value_size_bytes == 0 {
+        return Err(BenchError::message("update value size must be positive"));
+    }
+    validate_batch_size(batch_size)?;
+
+    let loaded_range = fixture.loaded_range()?;
+    let loaded_end = loaded_range.end()?;
+    let sessions_u64 =
+        u64::try_from(sessions).map_err(|_| BenchError::message("session count exceeds u64"))?;
+    if sessions_u64 > loaded_range.len {
+        return Err(BenchError::message(format!(
+            "update sessions ({sessions}) exceed loaded key range length ({})",
+            loaded_range.len
+        )));
+    }
+    let alternate_range = KeyRange {
+        start: loaded_end,
+        len: loaded_range.len,
+    };
+    alternate_range.end()?;
+    let index = fixture.primary_shape()?.index;
+    if index == IndexMode::None {
+        return Err(BenchError::message(
+            "update-rand requires a unique or non-unique secondary index",
+        ));
+    }
+
+    Ok(UpdateConfig {
+        num: spec.num.get(),
+        seed: spec.seed.unwrap_or(0),
+        change_key: spec.change_key.unwrap_or(false),
+        threads,
+        sessions,
+        value_size_bytes,
+        batch_size,
+        index,
+        loaded_range,
+        alternate_range,
+        include_stats: spec.include_stats.unwrap_or(defaults.include_stats),
+    })
 }
 
 #[expect(clippy::too_many_arguments, reason = "closed read schema is explicit")]
@@ -1396,8 +1526,9 @@ mod tests {
             "index-stream",
             "index-ddl",
             "lock-table",
+            "update-rand",
         ] {
-            let controls = if workload == "lock-table" {
+            let controls = if matches!(workload, "lock-table" | "update-rand") {
                 "num = 1"
             } else if matches!(workload, "table-scan" | "index-stream" | "index-ddl") {
                 ""
@@ -1410,6 +1541,84 @@ mod tests {
             assert!(parse(&raw).is_ok(), "{workload}");
         }
         assert!(parse("[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"lock-table\", num = 1, rand = true }").is_err());
+        assert!(parse("[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"update-rand\", num = 1, range = 1 }").is_err());
+    }
+
+    #[test]
+    fn update_plan_resolves_strict_controls_and_replay_contracts() {
+        let phases = resolve(
+            "[[phase]]\nworkload = { type = \"create-table\", index = \"non-unique\" }\n\
+             [[phase]]\nworkload = { type = \"insert-seq\", num = 8 }\n\
+             [[phase]]\nkind = \"benchmark\"\nwarmup_runs = 1\nmeasured_runs = 2\n\
+             workload = { type = \"update-rand\", num = 11, seed = 9, change_key = true, threads = 2, sessions = 3, value_size = \"17 B\", batch_size = 2, include_stats = true }\n",
+        )
+        .unwrap();
+        let Phase::Benchmark {
+            measurement,
+            workload,
+            fixture_effect,
+        } = &phases[2]
+        else {
+            panic!("final phase must resolve update-rand")
+        };
+        let ResolvedWorkload::UpdateRand(config) = workload else {
+            panic!("final phase must resolve update-rand")
+        };
+        assert_eq!(measurement.warmup_runs, 1);
+        assert_eq!(measurement.measured_runs.get(), 2);
+        assert_eq!(config.num, 11);
+        assert_eq!(config.seed, 9);
+        assert!(config.change_key);
+        assert_eq!((config.threads, config.sessions), (2, 3));
+        assert_eq!(config.value_size_bytes, 17);
+        assert_eq!(config.batch_size, 2);
+        assert_eq!(config.index, IndexMode::NonUnique);
+        assert_eq!(config.loaded_range, KeyRange { start: 0, len: 8 });
+        assert_eq!(config.alternate_range, KeyRange { start: 8, len: 8 });
+        assert!(config.include_stats);
+        assert_eq!(fixture_effect, &FixturePlanEffect::None);
+        assert_eq!(workload.replay_policy(), ReplayPolicy::Safe);
+        assert_eq!(workload.worker_counts(), (2, 3));
+        assert_eq!(workload.latency_unit(), LatencyUnit::UpdateRangeTransaction);
+        assert_eq!(workload.expected_samples().unwrap(), 6);
+
+        let defaulted = resolve(
+            "[[phase]]\nworkload = { type = \"create-table\", index = \"unique\" }\n\
+             [[phase]]\nworkload = { type = \"insert-seq\", num = 2 }\n\
+             [[phase]]\nkind = \"benchmark\"\nworkload = { type = \"update-rand\", num = 1 }\n",
+        )
+        .unwrap();
+        let ResolvedWorkload::UpdateRand(config) = defaulted[2].workload() else {
+            panic!("defaulted phase must resolve update-rand")
+        };
+        assert_eq!(config.seed, 0);
+        assert!(!config.change_key);
+        assert_eq!((config.threads, config.sessions), (1, 1));
+        assert_eq!(config.value_size_bytes, 128);
+        assert_eq!(config.batch_size, 1);
+        assert!(!config.include_stats);
+    }
+
+    #[test]
+    fn update_plan_rejects_invalid_fixture_replay_and_range_contracts() {
+        let invalid = [
+            "[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"update-rand\", num = 1 }\n",
+            "[[phase]]\nworkload = { type = \"create-table\", index = \"unique\" }\n[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"update-rand\", num = 1 }\n",
+            "[[phase]]\nworkload = { type = \"create-table\", index = \"none\" }\n[[phase]]\nworkload = { type = \"insert-seq\", num = 2 }\n[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"update-rand\", num = 1 }\n",
+            "[[phase]]\nworkload = { type = \"create-table\", index = \"unique\" }\n[[phase]]\nworkload = { type = \"insert-seq\", num = 2 }\n[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"update-rand\", num = 1, sessions = 3 }\n",
+            "[[phase]]\nworkload = { type = \"create-table\", index = \"unique\" }\n[[phase]]\nworkload = { type = \"insert-seq\", num = 2 }\n[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"update-rand\", num = 1, value_size = \"0 B\" }\n",
+            "[[phase]]\nworkload = { type = \"create-table\", index = \"unique\" }\n[[phase]]\nworkload = { type = \"insert-seq\", num = 2 }\n[[phase]]\nworkload = { type = \"update-rand\", num = 1 }\n[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"trx-noop\", num = 1 }\n",
+            "[[phase]]\nworkload = { type = \"create-table\", index = \"unique\" }\n[[phase]]\nworkload = { type = \"insert-seq\", num = 18446744073709551615 }\n[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"update-rand\", num = 1 }\n",
+        ];
+        for raw in invalid {
+            assert!(resolve(raw).is_err(), "{raw}");
+        }
+        assert!(
+            parse(
+                "[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"update-rand\", num = 0 }"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1527,6 +1736,7 @@ mod tests {
             ("stmt-noop.toml", "stmt-noop"),
             ("insert-seq.toml", "insert-seq"),
             ("insert-rand.toml", "insert-rand"),
+            ("update-rand.toml", "update-rand"),
             ("table-ddl.toml", "table-ddl"),
             ("lookup-seq.toml", "lookup-seq"),
             ("lookup-rand.toml", "lookup-rand"),
@@ -1576,6 +1786,33 @@ mod tests {
                 };
                 assert_eq!(measurement.warmup_runs, 0);
                 assert_eq!(measurement.measured_runs.get(), 1);
+            }
+            if file == "update-rand.toml" {
+                assert_eq!(loaded.plan.phases.len(), 3);
+                let ResolvedWorkload::CreateTable(create) = loaded.plan.phases[0].workload() else {
+                    panic!("update template must create its table")
+                };
+                assert_eq!(create.shape.index, IndexMode::Unique);
+                let ResolvedWorkload::InsertSeq(insert) = loaded.plan.phases[1].workload() else {
+                    panic!("update template must load sequential rows")
+                };
+                assert_eq!(insert.num, 1_000);
+                let Phase::Benchmark {
+                    measurement,
+                    workload: ResolvedWorkload::UpdateRand(update),
+                    ..
+                } = &loaded.plan.phases[2]
+                else {
+                    panic!("update template must end in update-rand")
+                };
+                assert_eq!(measurement.warmup_runs, 1);
+                assert_eq!(measurement.measured_runs.get(), 3);
+                assert_eq!(update.num, 1_000);
+                assert_eq!(update.seed, 42);
+                assert!(update.change_key);
+                assert_eq!((update.threads, update.sessions), (2, 4));
+                assert_eq!(update.value_size_bytes, 128);
+                assert_eq!(update.batch_size, 100);
             }
         }
         let mut actual = fs::read_dir(&templates)
