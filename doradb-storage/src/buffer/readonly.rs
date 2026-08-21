@@ -166,7 +166,7 @@ impl ReadonlyBufferPool {
     async fn send_read_async(
         &self,
         req: ReadSubmission,
-    ) -> StdResult<(), flume::SendError<ReadSubmission>> {
+    ) -> StdResult<(), Box<flume::SendError<ReadSubmission>>> {
         self.fs.send_table_read_async(req).await
     }
 
@@ -591,7 +591,7 @@ impl QuiescentGuard<ReadonlyBufferPool> {
                         reservation,
                     );
                     if let Err(err) = self.send_read_async(req).await {
-                        err.into_inner().fail(CompletionErrorBridge::capture(
+                        (*err).into_inner().fail(CompletionErrorBridge::capture(
                             Report::new(IoError::from(IoErrorKind::BrokenPipe))
                                 .attach(format!(
                                     "send readonly pool read request: key={key:?}, request channel closed"

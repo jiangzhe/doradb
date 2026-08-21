@@ -1684,8 +1684,10 @@ pub(crate) fn var_len_for_insert(schema: &TableColumnLayout, cols: &[Val]) -> us
 fn le_u64_words(bytes: &[u8]) -> Vec<u64> {
     debug_assert!(bytes.len().is_multiple_of(mem::size_of::<u64>()));
     bytes
-        .chunks_exact(mem::size_of::<u64>())
-        .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+        .as_chunks::<{ mem::size_of::<u64>() }>()
+        .0
+        .iter()
+        .map(|word| u64::from_le_bytes(*word))
         .collect()
 }
 

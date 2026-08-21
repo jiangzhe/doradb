@@ -1751,8 +1751,8 @@ impl FileSystem {
     pub(crate) async fn send_table_read_async(
         &self,
         req: ReadSubmission,
-    ) -> StdResult<(), SendError<ReadSubmission>> {
-        self.table_reads.send_async(req).await
+    ) -> StdResult<(), Box<SendError<ReadSubmission>>> {
+        self.table_reads.send_async(req).await.map_err(Box::new)
     }
 
     /// Returns a shared reference to the background-write ingress client.
