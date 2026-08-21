@@ -118,8 +118,9 @@ let _matching_rows = trx
 trx.rollback().await?;
 ```
 
-## Design 
+## Design
 
+- [Public API](./docs/public-api.md)
 - [Storage Architecture](./docs/architecture.md)
 - [Transaction System](./docs/transaction-system.md)
 - [Lock System](./docs/lock-system.md)
