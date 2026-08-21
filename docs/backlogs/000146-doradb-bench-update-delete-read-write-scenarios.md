@@ -28,6 +28,11 @@ doradb-bench documents and supports representative update/delete/overwrite and m
 
 ## Notes (Optional)
 
+- Task `docs/tasks/000275-add-random-index-update-benchmark-workload.md`
+  implemented the deterministic unique/non-unique index-update slice. Delete,
+  overwrite/upsert, mixed read/write, and read-while-writing workloads remain
+  open under this backlog.
+
 
 ## Close Reason (Added When Closed)
 
