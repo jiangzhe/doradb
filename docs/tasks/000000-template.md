@@ -34,6 +34,16 @@ Describe the exact goal of this task.
 
 List things that are relevant but we do not implement in this task.
 
+## Rejected Alternatives
+
+Retain no more than four rejected alternatives, and only when they are important,
+large, and materially change the implementation strategy, architecture,
+subsystem boundaries, public contract, data model, correctness approach,
+rollout, or long-term direction. Include the rejection rationale. Do not copy
+every proposal from the design rounds or elevate small changes, local tactics,
+tuning choices, or implementation details into alternatives. Delete this
+section when no rejected alternative qualifies.
+
 ## Plan
 
 Describe implementation plan, including important changes on files, structs, traits, functions, etc.
