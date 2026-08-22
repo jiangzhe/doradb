@@ -78,7 +78,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub(crate) use admission::TableAdmissionRequest;
 use stmt::{PrivateStmtState, Statement, StmtState};
-pub use stream_stmt::IndexScanMvccStream;
+pub use stream_stmt::{IndexScanMvccStream, TableScanMvccStream};
 /// Minimum snapshot timestamp assigned by the transaction system.
 pub(crate) const MIN_SNAPSHOT_TS: TrxID = TrxID::new(1);
 /// Exclusive upper bound for snapshot timestamps.

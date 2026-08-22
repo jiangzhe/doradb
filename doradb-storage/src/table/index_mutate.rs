@@ -5,8 +5,8 @@
 //! effect context used to resolve and mutate each candidate sequentially.
 
 use super::{
-    ColdLatestRow, LazyRow, LazyRowSource, RowIdMove, UserTableAccessor, WriteIndexKeySet,
-    read_latest_cold_row,
+    ColdLatestRow, LazyRow, LazyRowBuffer, LazyRowSource, RowIdMove, UserTableAccessor,
+    WriteIndexKeySet, read_latest_cold_row,
 };
 use crate::buffer::guard::PageSharedGuard;
 use crate::error::{
@@ -24,9 +24,7 @@ use crate::trx::TrxRuntime;
 use crate::trx::row::{BoundIndexCandidate, LockRowForWrite, RowWriteAccess};
 use crate::trx::stmt::StmtEffects;
 use crate::trx::undo::{OwnedRowUndo, RowUndoKind};
-use crate::value::Val;
 use error_stack::{Report, ResultExt};
-use std::mem;
 use std::sync::Arc;
 
 /// Whether candidate processing finished or must restart row-location resolution.
@@ -68,7 +66,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
     pub(super) async fn mutate_index_candidate<F>(
         &mut self,
         candidate: BoundIndexCandidate<'_>,
-        value_buffer: &mut Vec<Val>,
+        row_buffer: &mut LazyRowBuffer,
         outcome: &mut TableMutationOutcome,
         mutate_row: &mut F,
     ) -> Result<()>
@@ -85,21 +83,13 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                 RowLocation::NotFound => CandidateProgress::Done,
                 RowLocation::RowPage(page_id) => {
                     self.mutate_hot_index_candidate(
-                        &candidate,
-                        page_id,
-                        value_buffer,
-                        outcome,
-                        mutate_row,
+                        &candidate, page_id, row_buffer, outcome, mutate_row,
                     )
                     .await?
                 }
                 RowLocation::LwcBlock(location) => {
                     self.mutate_cold_index_candidate(
-                        &candidate,
-                        location,
-                        value_buffer,
-                        outcome,
-                        mutate_row,
+                        &candidate, location, row_buffer, outcome, mutate_row,
                     )
                     .await?
                 }
@@ -116,7 +106,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
         &mut self,
         candidate: &BoundIndexCandidate<'_>,
         page_id: PageID,
-        value_buffer: &mut Vec<Val>,
+        row_buffer: &mut LazyRowBuffer,
         outcome: &mut TableMutationOutcome,
         mutate_row: &mut F,
     ) -> Result<CandidateProgress>
@@ -176,7 +166,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                 candidate,
                 &page_guard,
                 access,
-                value_buffer,
+                row_buffer,
                 outcome,
                 mutate_row,
             )
@@ -204,7 +194,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
         &mut self,
         candidate: &BoundIndexCandidate<'_>,
         location: LwcRowLocation,
-        value_buffer: &mut Vec<Val>,
+        row_buffer: &mut LazyRowBuffer,
         outcome: &mut TableMutationOutcome,
         mutate_row: &mut F,
     ) -> Result<CandidateProgress>
@@ -305,21 +295,16 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
             file_kind,
             block_id,
         };
-        let mut lazy_row = LazyRow::new(
-            source,
-            mem::take(value_buffer),
-            accessor.metadata().col.col_count(),
-        );
+        let mut lazy_row = LazyRow::new(source, row_buffer, accessor.metadata().col.col_count());
         match mutate_row(&mut lazy_row)? {
             RowMutation::Skip => {
-                *value_buffer = lazy_row.into_reusable_buffer();
+                lazy_row.reset();
                 self.cancel_owned_cold_row(candidate.row_id);
                 drop(persisted);
             }
             RowMutation::Delete => {
                 outcome.delete_count += 1;
-                let (index_keys, reusable) = lazy_row.into_index_keys(accessor).disclose()?;
-                *value_buffer = reusable;
+                let index_keys = lazy_row.into_index_keys(accessor).disclose()?;
                 drop(persisted);
                 accessor
                     .finish_owned_cold_delete_effects(
@@ -340,18 +325,17 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                 let defer = candidate.unique
                     && self.unique_driver_key_changed(&mut lazy_row, candidate, &update)?;
                 if update.is_empty() {
-                    *value_buffer = lazy_row.into_reusable_buffer();
+                    lazy_row.reset();
                     self.cancel_owned_cold_row(candidate.row_id);
                     drop(persisted);
                 } else if defer {
-                    *value_buffer = lazy_row.into_reusable_buffer();
+                    lazy_row.reset();
                     drop(persisted);
                     // TODO: evaluate if caching entire cold row is better than rescan.
                     self.effects
                         .defer_index_update(accessor.table_id(), candidate.row_id, update);
                 } else {
-                    let (old_row, reusable) = lazy_row.into_full_row().disclose()?;
-                    *value_buffer = reusable;
+                    let old_row = lazy_row.into_full_row().disclose()?;
                     drop(persisted);
                     accessor
                         .update_owned_cold_row(
@@ -376,7 +360,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
         candidate: &BoundIndexCandidate<'_>,
         page_guard: &PageSharedGuard<RowPage>,
         access: RowWriteAccess<'_>,
-        value_buffer: &mut Vec<Val>,
+        row_buffer: &mut LazyRowBuffer,
         outcome: &mut TableMutationOutcome,
         mutate_row: &mut F,
     ) -> Result<Option<WriteIndexKeySet<'op>>>
@@ -388,23 +372,17 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
             access,
             column_layout: accessor.metadata().col.as_ref(),
         };
-        let mut lazy_row = LazyRow::new(
-            source,
-            mem::take(value_buffer),
-            accessor.metadata().col.col_count(),
-        );
+        let mut lazy_row = LazyRow::new(source, row_buffer, accessor.metadata().col.col_count());
         match mutate_row(&mut lazy_row)? {
             RowMutation::Skip => {
-                let (access, reusable) = lazy_row.into_hot_write_reusable_buffer();
-                *value_buffer = reusable;
+                let access = lazy_row.into_hot_write_access();
                 self.cancel_owned_hot_row(access);
                 Ok(None)
             }
             RowMutation::Delete => {
                 outcome.delete_count += 1;
-                let (access, index_keys, reusable) =
+                let (access, index_keys) =
                     lazy_row.into_hot_write_index_keys(accessor).disclose()?;
-                *value_buffer = reusable;
                 let result = HotRowMutator::new(
                     accessor.table_id(),
                     accessor.metadata(),
@@ -426,8 +404,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                     .disclose()?;
                 let defer = candidate.unique
                     && self.unique_driver_key_changed(&mut lazy_row, candidate, &update)?;
-                let (access, reusable) = lazy_row.into_hot_write_reusable_buffer();
-                *value_buffer = reusable;
+                let access = lazy_row.into_hot_write_access();
                 if update.is_empty() {
                     self.cancel_owned_hot_row(access);
                     return Ok(None);

@@ -118,6 +118,17 @@ impl ScanMvcc {
     }
 }
 
+/// Decision returned by a programmable MVCC table-scan callback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanRowDecision {
+    /// Materialize and return the current row projection.
+    Include,
+    /// Ignore the current row and continue scanning.
+    Skip,
+    /// End the scan successfully without returning the current row.
+    Stop,
+}
+
 /// Physical row-read result.
 pub(crate) enum ReadRow {
     Ok(Vec<Val>),

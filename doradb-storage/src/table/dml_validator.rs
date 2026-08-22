@@ -18,7 +18,7 @@ pub(crate) enum DmlValidationError {
     /// An index reference or key does not match table index metadata.
     #[error("invalid DML index key")]
     IndexKey,
-    /// A secondary-index read set is invalid.
+    /// A projection read set is invalid.
     #[error("invalid DML read set")]
     ReadSet,
     /// A primary-key reference does not match table metadata.
@@ -148,7 +148,7 @@ impl<'m> DmlValidator<'m> {
         R: RangeBounds<&'r [Val]> + ?Sized,
     {
         self.validate_index_range(index_no, range)?;
-        self.validate_read_set(read_set)?;
+        self.validate_projection(read_set)?;
         Ok(())
     }
 
@@ -189,8 +189,9 @@ impl<'m> DmlValidator<'m> {
         }
     }
 
+    /// Validates a projection read set against table column metadata.
     #[inline]
-    fn validate_read_set(&self, read_set: &[usize]) -> DmlValidationResult<()> {
+    pub(crate) fn validate_projection(&self, read_set: &[usize]) -> DmlValidationResult<()> {
         if read_set.is_empty() {
             return Err(
                 Report::new(DmlValidationError::ReadSet).attach("read set must not be empty")

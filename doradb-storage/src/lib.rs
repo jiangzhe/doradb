@@ -51,8 +51,8 @@ pub use engine::Engine;
 pub use error::{Error, ErrorKind, OperationError, Result};
 pub use lock::TableLockMode;
 pub use row::ops::{
-    DeleteMvcc, RowMutation, ScanMvcc, SelectKey, SelectMvcc, TableMutationOutcome, UpdateCol,
-    UpdateMvcc, UpsertMvcc,
+    DeleteMvcc, RowMutation, ScanMvcc, ScanRowDecision, SelectKey, SelectMvcc,
+    TableMutationOutcome, UpdateCol, UpdateMvcc, UpsertMvcc,
 };
 pub use session::{
     CatalogRedoMaintenanceOutcome, RedoTruncationBlockerInfo, RedoTruncationOutcome, Session,
@@ -66,5 +66,5 @@ pub use table::{
     FrozenPageBatchInfo, LazyRow, MemIndexCleanupDelay, MemIndexCleanupOutcome,
     MemIndexCleanupStats, SecondaryMemIndexCleanupIndexStats,
 };
-pub use trx::{IndexScanMvccStream, Transaction};
+pub use trx::{IndexScanMvccStream, TableScanMvccStream, Transaction};
 pub use value::{MemVar, Val, ValKind, ValType};

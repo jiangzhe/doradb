@@ -26,7 +26,7 @@ use crate::index::{
     SecondaryIndex, UniqueInsertAttempt, UniqueSecondaryIndex,
 };
 use crate::log::redo::{RowRedo, RowRedoKind};
-use crate::lwc::LwcBlock;
+use crate::lwc::{LwcBlock, PersistedLwcBlock};
 use crate::map::{FastHashMap, FastHashSet};
 use crate::poison::PoisonAwareListener;
 use crate::row::ops::{
@@ -41,7 +41,8 @@ use crate::table::{
     read_physical_index_keys_for_delete, row_len, unique_key_from_full_row,
 };
 use crate::trx::row::{
-    BoundIndexCandidate, FindOldVersion, ReadLatestRow, RowReadAccess, RowWriteAccess,
+    BoundIndexCandidate, FindOldVersion, MainBranchMvcc, ReadLatestRow, RowReadAccess,
+    RowWriteAccess,
 };
 use crate::trx::stmt::StmtEffects;
 use crate::trx::undo::{IndexBranch, OwnedRowUndo, RowUndoKind};
@@ -78,7 +79,7 @@ enum LazyRowSource<'row> {
 
 impl LazyRowSource<'_> {
     #[inline]
-    fn load_latest(&self, column_no: usize) -> DataIntegrityResult<Val> {
+    fn load_uncached(&self, column_no: usize) -> DataIntegrityResult<Val> {
         match self {
             LazyRowSource::Cold {
                 block,
@@ -103,132 +104,231 @@ impl LazyRowSource<'_> {
     }
 }
 
-/// Lazy accessor for one latest modifiable row in a table mutation callback.
-///
-/// The accessor hides whether the row is stored in a persisted column block or
-/// an in-memory row page. Requested values are cached for the callback
-/// invocation. Cold values are decoded only after the persisted image is
-/// confirmed to remain the current logical row. Hot values come from the latest
-/// physical page image after row ownership validation; they are not
-/// reconstructed from MVCC undo for an older snapshot. Index-driven mutation
-/// retains definitive row ownership for the callback, while full-table
-/// mutation retains its existing table-exclusive traversal protocol.
-/// References returned by [`LazyRow::val`] remain tied to the mutable accessor
-/// borrow.
-pub struct LazyRow<'row> {
-    source: LazyRowSource<'row>,
+/// Reusable value and readiness storage for lazy callback rows.
+pub(crate) struct LazyRowBuffer {
     values: Vec<Val>,
     ready: Vec<bool>,
     ready_columns: Vec<usize>,
 }
 
-impl<'row> LazyRow<'row> {
+impl LazyRowBuffer {
+    /// Creates an empty reusable buffer for one table layout.
     #[inline]
-    fn new(source: LazyRowSource<'row>, mut values: Vec<Val>, column_count: usize) -> Self {
-        if values.len() != column_count {
-            values = vec![Val::default(); column_count];
-        }
+    pub(crate) fn new(column_count: usize) -> Self {
         Self {
-            source,
-            values,
+            values: vec![Val::default(); column_count],
             ready: vec![false; column_count],
             ready_columns: Vec::new(),
         }
     }
 
+    /// Establishes a clean buffer before any values for the next row are loaded.
+    ///
+    /// Post-row resets eagerly release cached payloads, but some exit paths may
+    /// bypass them. Repeating the reset here is the correctness boundary that
+    /// prevents cached values from one row from being observed by the next row.
+    #[inline]
+    fn prepare(&mut self, column_count: usize) {
+        if self.values.len() != column_count {
+            *self = Self::new(column_count);
+        } else {
+            self.reset_ready();
+        }
+    }
+
+    #[inline]
+    fn cache_value(&mut self, column_no: usize, value: Val) {
+        if !self.ready[column_no] {
+            self.ready[column_no] = true;
+            self.ready_columns.push(column_no);
+        }
+        self.values[column_no] = value;
+    }
+
+    /// Eagerly releases cached row payloads while retaining scratch capacity.
+    ///
+    /// [`LazyRowBuffer::prepare`] repeats this work before the next row so this
+    /// cleanup is an allocation-retention optimization rather than a correctness
+    /// requirement for every callback exit path.
+    #[inline]
+    fn reset_ready(&mut self) {
+        for column_no in self.ready_columns.drain(..) {
+            self.values[column_no] = Val::default();
+            self.ready[column_no] = false;
+        }
+    }
+}
+
+/// Lazy accessor for one row supplied to a table callback.
+///
+/// The accessor hides whether the row is stored in a persisted column block or
+/// an in-memory row page. The operation supplying the accessor defines whether
+/// values are the latest modifiable image or a snapshot-visible MVCC image.
+/// Requested values are cached for the callback invocation. Cold values are
+/// decoded on demand. Untouched hot values are loaded from the guarded latest
+/// physical image, while an MVCC table scan seeds applicable undo before-images
+/// into the same cache before invoking the callback. Mutation operations retain
+/// definitive latest-row ownership for their callback.
+/// References returned by [`LazyRow::val`] remain tied to the mutable accessor
+/// borrow.
+pub struct LazyRow<'row> {
+    source: LazyRowSource<'row>,
+    buffer: &'row mut LazyRowBuffer,
+}
+
+impl<'row> LazyRow<'row> {
+    #[inline]
+    fn new(
+        source: LazyRowSource<'row>,
+        buffer: &'row mut LazyRowBuffer,
+        column_count: usize,
+    ) -> Self {
+        buffer.prepare(column_count);
+        Self::new_prepared(source, buffer, column_count)
+    }
+
+    #[inline]
+    fn new_prepared(
+        source: LazyRowSource<'row>,
+        buffer: &'row mut LazyRowBuffer,
+        column_count: usize,
+    ) -> Self {
+        debug_assert_eq!(buffer.values.len(), column_count);
+        debug_assert_eq!(buffer.ready.len(), column_count);
+        Self { source, buffer }
+    }
+
     /// Returns the number of columns in this row.
     #[inline]
     pub fn column_count(&self) -> usize {
-        self.values.len()
+        self.buffer.values.len()
     }
 
-    /// Returns one latest modifiable column value, loading and caching it on demand.
+    /// Returns one column value from this callback row, loading and caching it on demand.
     #[inline]
     pub fn val(&mut self, column_no: usize) -> Result<&Val> {
-        if column_no >= self.values.len() {
+        if column_no >= self.buffer.values.len() {
             return Err(Report::new(OperationError::InvalidDmlInput)
                 .attach(format!(
                     "lazy row column out of range: column_no={column_no}, column_count={}",
-                    self.values.len()
+                    self.buffer.values.len()
                 ))
                 .disclose());
         }
         self.val_inner(column_no).disclose()
     }
 
-    /// Returns one valid latest modifiable column value without crossing the
-    /// public error boundary.
+    /// Returns one valid callback-row column value without crossing the public
+    /// error boundary.
     #[inline]
     pub(crate) fn val_inner(&mut self, column_no: usize) -> DataIntegrityResult<&Val> {
         assert!(
-            column_no < self.values.len(),
+            column_no < self.buffer.values.len(),
             "internal lazy-row column must be in range: column_no={column_no}, column_count={}",
-            self.values.len()
+            self.buffer.values.len()
         );
-        if !self.ready[column_no] {
-            self.values[column_no] = self.source.load_latest(column_no)?;
-            self.ready[column_no] = true;
-            self.ready_columns.push(column_no);
+        if !self.buffer.ready[column_no] {
+            let value = self.source.load_uncached(column_no)?;
+            self.buffer.cache_value(column_no, value);
         }
-        Ok(&self.values[column_no])
+        Ok(&self.buffer.values[column_no])
+    }
+
+    /// Materializes the requested projection from this callback row.
+    #[inline]
+    pub(crate) fn project(&mut self, read_set: &[usize]) -> Result<Vec<Val>> {
+        read_set
+            .iter()
+            .map(|&column_no| self.val(column_no).cloned())
+            .collect()
+    }
+
+    /// Eagerly clears cached values and returns the scratch buffer to its owner.
+    ///
+    /// The next row also calls [`LazyRowBuffer::prepare`] defensively before
+    /// loading values, so callers use this to release cached payloads promptly.
+    #[inline]
+    pub(crate) fn reset(self) {
+        self.buffer.reset_ready();
     }
 
     #[inline]
-    fn into_reusable_buffer(mut self) -> Vec<Val> {
-        for column_no in self.ready_columns {
-            self.values[column_no] = Val::default();
-        }
-        self.values
-    }
-
-    #[inline]
-    fn into_hot_write_reusable_buffer(mut self) -> (RowWriteAccess<'row>, Vec<Val>) {
-        for column_no in self.ready_columns {
-            self.values[column_no] = Val::default();
-        }
-        let LazyRowSource::HotWrite { access, .. } = self.source else {
+    fn into_hot_write_access(self) -> RowWriteAccess<'row> {
+        let LazyRow { source, buffer } = self;
+        buffer.reset_ready();
+        let LazyRowSource::HotWrite { access, .. } = source else {
             unreachable!("hot mutation callback must retain row write access")
         };
-        (access, self.values)
+        access
     }
 
     #[inline]
     fn into_hot_write_index_keys<'op>(
         mut self,
         accessor: &UserTableAccessor<'op>,
-    ) -> DataIntegrityResult<(RowWriteAccess<'row>, WriteIndexKeySet<'op>, Vec<Val>)> {
+    ) -> DataIntegrityResult<(RowWriteAccess<'row>, WriteIndexKeySet<'op>)> {
         let metadata = accessor.metadata();
         for &column_no in metadata.idx.index_columns() {
             let _ = self.val_inner(column_no)?;
         }
-        let keys = WriteIndexKeySet::from_full_row(accessor, &self.values);
-        let (access, values) = self.into_hot_write_reusable_buffer();
-        Ok((access, keys, values))
+        let keys = WriteIndexKeySet::from_full_row(accessor, &self.buffer.values);
+        let access = self.into_hot_write_access();
+        Ok((access, keys))
     }
 
     #[inline]
-    fn into_full_row(mut self) -> DataIntegrityResult<(Vec<Val>, Vec<Val>)> {
-        for column_no in 0..self.values.len() {
+    fn into_full_row(mut self) -> DataIntegrityResult<Vec<Val>> {
+        for column_no in 0..self.buffer.values.len() {
             let _ = self.val_inner(column_no)?;
         }
-        let column_count = self.values.len();
-        Ok((
-            mem::take(&mut self.values),
-            vec![Val::default(); column_count],
-        ))
+        let column_count = self.buffer.values.len();
+        let values = mem::replace(&mut self.buffer.values, vec![Val::default(); column_count]);
+        self.buffer.ready.fill(false);
+        self.buffer.ready_columns.clear();
+        Ok(values)
     }
 
     #[inline]
     fn into_index_keys<'op>(
         mut self,
         accessor: &UserTableAccessor<'op>,
-    ) -> DataIntegrityResult<(WriteIndexKeySet<'op>, Vec<Val>)> {
+    ) -> DataIntegrityResult<WriteIndexKeySet<'op>> {
         let metadata = accessor.metadata();
         for &column_no in metadata.idx.index_columns() {
             let _ = self.val_inner(column_no)?;
         }
-        let keys = WriteIndexKeySet::from_full_row(accessor, &self.values);
-        Ok((keys, self.into_reusable_buffer()))
+        let keys = WriteIndexKeySet::from_full_row(accessor, &self.buffer.values);
+        self.reset();
+        Ok(keys)
+    }
+}
+
+/// Owned physical work captured from one table-root observation.
+pub(crate) struct TableScanWorklist {
+    /// Captured persisted column block-index root.
+    pub(crate) column_root: BlockID,
+    /// Captured boundary between persisted and hot rows.
+    pub(crate) pivot_row_id: RowID,
+    /// Persisted leaf entries ordered by starting row ID.
+    pub(crate) cold_entries: Vec<ColumnLeafEntry>,
+    /// Original hot row-page descriptors ordered by starting row ID.
+    pub(crate) hot_pages: Vec<RowPageDescriptor>,
+}
+
+/// One loaded persisted page and its MVCC scan metadata.
+pub(crate) struct TableScanColdPage {
+    persisted: PersistedLwcBlock,
+    row_ids: Vec<RowID>,
+    durable_deleted: FastHashSet<RowID>,
+    file_kind: FileKind,
+    block_id: BlockID,
+}
+
+impl TableScanColdPage {
+    /// Returns the number of logical row IDs carried by this page.
+    #[inline]
+    pub(crate) fn row_count(&self) -> usize {
+        self.row_ids.len()
     }
 }
 
@@ -336,7 +436,7 @@ impl ScanBoundaryTracker {
 struct TableMutationState {
     tracker: ScanBoundaryTracker,
     column_count: usize,
-    value_buffer: Vec<Val>,
+    row_buffer: LazyRowBuffer,
     outcome: TableMutationOutcome,
 }
 
@@ -3294,6 +3394,234 @@ impl<'op> UserTableAccessor<'op> {
         .await
     }
 
+    /// Captures the cold-block and hot-page worklists from one table root.
+    pub(crate) async fn table_scan_mvcc_worklist(
+        &self,
+        rt: TrxRuntime<'_>,
+    ) -> RuntimeResult<TableScanWorklist> {
+        let root_snapshot = self.root_snapshot(rt.ctx());
+        let column_root = root_snapshot.column_block_index_root();
+        let pivot_row_id = root_snapshot.pivot_row_id();
+        let cold_entries = if column_root == SUPER_BLOCK_ID || pivot_row_id == RowID::new(0) {
+            Vec::new()
+        } else {
+            let storage = self.column_storage();
+            let column_index = ColumnBlockIndex::new(
+                column_root,
+                pivot_row_id,
+                storage.file().file_kind(),
+                storage.file().sparse_file(),
+                storage.disk_pool(),
+                rt.pool_guards().disk_guard(),
+            );
+            column_index.collect_leaf_entries().await.attach_with(|| {
+                format!(
+                    "operation=table_scan_mvcc_stream, phase=capture_cold_entries, table_id={}",
+                    self.table_id()
+                )
+            })?
+        };
+        let (_, hot_pages) = self
+            .mem()
+            .snapshot_original_row_pages_from(rt.pool_guards(), pivot_row_id)
+            .await
+            .attach_with(|| {
+                format!(
+                    "operation=table_scan_mvcc_stream, phase=capture_hot_pages, table_id={}",
+                    self.table_id()
+                )
+            })?;
+        Ok(TableScanWorklist {
+            column_root,
+            pivot_row_id,
+            cold_entries,
+            hot_pages,
+        })
+    }
+
+    /// Loads one captured persisted scan entry and validates its row metadata.
+    pub(crate) async fn load_table_scan_cold_page(
+        &self,
+        rt: TrxRuntime<'_>,
+        column_root: BlockID,
+        pivot_row_id: RowID,
+        entry: &ColumnLeafEntry,
+    ) -> RuntimeResult<TableScanColdPage> {
+        let storage = self.column_storage();
+        let file_kind = storage.file().file_kind();
+        let disk_guard = rt.pool_guards().disk_guard();
+        let column_index = ColumnBlockIndex::new(
+            column_root,
+            pivot_row_id,
+            file_kind,
+            storage.file().sparse_file(),
+            storage.disk_pool(),
+            disk_guard,
+        );
+        let (delete_deltas, row_ids) = column_index
+            .load_delete_deltas_and_row_ids(entry)
+            .await
+            .attach_with(|| {
+                format!(
+                    "operation=table_scan_mvcc_stream, phase=load_cold_row_metadata, table_id={}, block_id={}",
+                    self.table_id(),
+                    entry.block_id()
+                )
+            })?;
+        let persisted = storage
+            .load_lwc_block(disk_guard, entry.block_id())
+            .await
+            .attach_with(|| {
+                format!(
+                    "operation=table_scan_mvcc_stream, phase=load_cold_block, table_id={}, block_id={}",
+                    self.table_id(),
+                    entry.block_id()
+                )
+            })?;
+        validate_cold_scan_entry(file_kind, entry, persisted.block(), &row_ids)
+            .change_context(RuntimeError::TableAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=table_scan_mvcc_stream, phase=validate_cold_block, table_id={}, block_id={}",
+                    self.table_id(),
+                    entry.block_id()
+                )
+            })?;
+        let durable_deleted = persisted_delete_set_for_scan(file_kind, entry, delete_deltas)
+            .change_context(RuntimeError::TableAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=table_scan_mvcc_stream, phase=validate_cold_deletes, table_id={}, block_id={}",
+                    self.table_id(),
+                    entry.block_id()
+                )
+            })?;
+        Ok(TableScanColdPage {
+            persisted,
+            row_ids,
+            durable_deleted,
+            file_kind,
+            block_id: entry.block_id(),
+        })
+    }
+
+    /// Creates a lazy callback row when one persisted row is snapshot-visible.
+    #[inline]
+    pub(crate) fn table_scan_cold_row<'row>(
+        &'row self,
+        rt: TrxRuntime<'_>,
+        page: &'row TableScanColdPage,
+        row_idx: usize,
+        buffer: &'row mut LazyRowBuffer,
+    ) -> Option<LazyRow<'row>> {
+        let row_id = page.row_ids[row_idx];
+        let durable_deleted =
+            !page.durable_deleted.is_empty() && page.durable_deleted.contains(&row_id);
+        if !cold_row_visible_mvcc(
+            self.lwc_deletion_buffer(),
+            rt.sts(),
+            rt.status().as_ref(),
+            row_id,
+            durable_deleted,
+        ) {
+            return None;
+        }
+        let source = LazyRowSource::Cold {
+            block: page.persisted.block(),
+            column_layout: self.metadata().col.as_ref(),
+            row_idx,
+            file_kind: page.file_kind,
+            block_id: page.block_id,
+        };
+        Some(LazyRow::new(
+            source,
+            buffer,
+            self.metadata().col.col_count(),
+        ))
+    }
+
+    /// Reopens and validates one captured hot row page for bounded processing.
+    pub(crate) async fn load_table_scan_hot_page(
+        &self,
+        rt: TrxRuntime<'_>,
+        descriptor: RowPageDescriptor,
+    ) -> RuntimeResult<PageSharedGuard<RowPage>> {
+        let page_guard = self
+            .mem()
+            .get_row_page_shared(rt.pool_guards(), descriptor.page_id)
+            .await
+            .attach_with(|| {
+                format!(
+                    "operation=table_scan_mvcc_stream, phase=load_hot_page, table_id={}, page_id={}",
+                    self.table_id(),
+                    descriptor.page_id
+                )
+            })?
+            .ok_or_else(|| {
+                Report::new(InternalError::CapturedRowPageUnavailable)
+                    .attach(format!(
+                        "captured page is missing: table_id={}, page_id={}, start_row_id={}, end_row_id={}",
+                        self.table_id(),
+                        descriptor.page_id,
+                        descriptor.start_row_id,
+                        descriptor.end_row_id
+                    ))
+                    .change_context(RuntimeError::TableAccess)
+            })?;
+        let page = page_guard.page();
+        let row_end = page
+            .header
+            .start_row_id
+            .checked_add(page.header.row_count() as u64);
+        if page.header.start_row_id != descriptor.start_row_id
+            || row_end.is_none_or(|row_end| row_end > descriptor.end_row_id)
+        {
+            return Err(Report::new(InternalError::CapturedRowPageUnavailable)
+                .attach(format!(
+                    "captured page identity changed: table_id={}, page_id={}, expected_start={}, expected_end={}, actual_start={}, actual_rows={}",
+                    self.table_id(),
+                    descriptor.page_id,
+                    descriptor.start_row_id,
+                    descriptor.end_row_id,
+                    page.header.start_row_id,
+                    page.header.row_count()
+                ))
+                .change_context(RuntimeError::TableAccess));
+        }
+        Ok(page_guard)
+    }
+
+    /// Creates a lazy callback row for one visible hot row version.
+    #[inline]
+    pub(crate) fn table_scan_hot_row<'row>(
+        &'row self,
+        ctx: &TrxContext,
+        access: RowReadAccess<'row>,
+        buffer: &'row mut LazyRowBuffer,
+    ) -> Option<LazyRow<'row>> {
+        let column_count = self.metadata().col.col_count();
+        // Prepare before MVCC resolution because undo before-images are seeded
+        // into the buffer before `LazyRow` itself can be constructed.
+        buffer.prepare(column_count);
+        match access.resolve_main_branch_mvcc(ctx, |undo_cols| {
+            for undo_col in undo_cols {
+                buffer.cache_value(undo_col.idx, undo_col.val.clone());
+            }
+        }) {
+            MainBranchMvcc::Latest | MainBranchMvcc::Historical => {
+                let source = LazyRowSource::Hot {
+                    access,
+                    column_layout: self.metadata().col.as_ref(),
+                };
+                Some(LazyRow::new_prepared(source, buffer, column_count))
+            }
+            MainBranchMvcc::NotFound => {
+                buffer.reset_ready();
+                None
+            }
+        }
+    }
+
     /// Scan cold and hot table rows visible to the transaction snapshot.
     pub(crate) async fn table_scan_mvcc<F>(
         &self,
@@ -3361,7 +3689,7 @@ impl<'op> UserTableAccessor<'op> {
         )
         .disclose()?;
         let column_count = self.metadata().col.col_count();
-        let mut value_buffer = vec![Val::default(); column_count];
+        let mut row_buffer = LazyRowBuffer::new(column_count);
         let mut outcome = TableMutationOutcome::default();
         let mut mutator = IndexMutator::new(self, rt, effects, &root_snapshot, validate_updates);
 
@@ -3371,7 +3699,7 @@ impl<'op> UserTableAccessor<'op> {
                 mutator
                     .mutate_index_candidate(
                         candidate,
-                        &mut value_buffer,
+                        &mut row_buffer,
                         &mut outcome,
                         &mut mutate_row,
                     )
@@ -3409,7 +3737,7 @@ impl<'op> UserTableAccessor<'op> {
         let mut state = TableMutationState {
             tracker: ScanBoundaryTracker::new(upper_bound, original_pages),
             column_count,
-            value_buffer: vec![Val::default(); column_count],
+            row_buffer: LazyRowBuffer::new(column_count),
             outcome: TableMutationOutcome::default(),
         };
 
@@ -3536,20 +3864,15 @@ impl<'op> UserTableAccessor<'op> {
                         file_kind,
                         block_id: entry.block_id(),
                     };
-                    let mut lazy_row = LazyRow::new(
-                        source,
-                        mem::take(&mut state.value_buffer),
-                        state.column_count,
-                    );
+                    let mut lazy_row =
+                        LazyRow::new(source, &mut state.row_buffer, state.column_count);
                     match mutate_row(&mut lazy_row)? {
                         RowMutation::Skip => {
-                            state.value_buffer = lazy_row.into_reusable_buffer();
+                            lazy_row.reset();
                         }
                         RowMutation::Delete => {
                             state.outcome.delete_count += 1;
-                            let (index_keys, reusable) =
-                                lazy_row.into_index_keys(self).disclose()?;
-                            state.value_buffer = reusable;
+                            let index_keys = lazy_row.into_index_keys(self).disclose()?;
                             pending.push(PendingColdMutation::Delete { row_id, index_keys });
                         }
                         RowMutation::Update(update) => {
@@ -3557,10 +3880,9 @@ impl<'op> UserTableAccessor<'op> {
                             self.validate_table_mutation_update(validator, &update)
                                 .disclose()?;
                             if update.is_empty() {
-                                state.value_buffer = lazy_row.into_reusable_buffer();
+                                lazy_row.reset();
                             } else {
-                                let (old_row, reusable) = lazy_row.into_full_row().disclose()?;
-                                state.value_buffer = reusable;
+                                let old_row = lazy_row.into_full_row().disclose()?;
                                 pending.push(PendingColdMutation::Update {
                                     row_id,
                                     old_row,
@@ -3690,19 +4012,14 @@ impl<'op> UserTableAccessor<'op> {
                     access,
                     column_layout: self.metadata().col.as_ref(),
                 };
-                let mut lazy_row = LazyRow::new(
-                    source,
-                    mem::take(&mut state.value_buffer),
-                    state.column_count,
-                );
+                let mut lazy_row = LazyRow::new(source, &mut state.row_buffer, state.column_count);
                 match mutate_row(&mut lazy_row)? {
                     RowMutation::Skip => {
-                        state.value_buffer = lazy_row.into_reusable_buffer();
+                        lazy_row.reset();
                     }
                     RowMutation::Delete => {
                         state.outcome.delete_count += 1;
-                        let (index_keys, reusable) = lazy_row.into_index_keys(self).disclose()?;
-                        state.value_buffer = reusable;
+                        let index_keys = lazy_row.into_index_keys(self).disclose()?;
                         self.delete_known_hot_row(
                             rt,
                             effects,
@@ -3718,7 +4035,7 @@ impl<'op> UserTableAccessor<'op> {
                         state.outcome.update_count += 1;
                         self.validate_table_mutation_update(validator, &update)
                             .disclose()?;
-                        state.value_buffer = lazy_row.into_reusable_buffer();
+                        lazy_row.reset();
                         if update.is_empty() {
                             continue;
                         }
@@ -4791,19 +5108,6 @@ fn validate_cold_scan_entry(
             )),
         );
     }
-    if row_ids.windows(2).any(|window| window[0] >= window[1])
-        || row_ids
-            .iter()
-            .any(|row_id| *row_id < entry.start_row_id || *row_id >= entry.end_row_id())
-    {
-        return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-            "file={file_kind}, block=lwc_block, block_id={}, invalid persisted row id set: start_row_id={}, end_row_id={}, row_ids={}",
-            entry.block_id(),
-            entry.start_row_id,
-            entry.end_row_id(),
-            row_ids.len()
-        )));
-    }
     Ok(())
 }
 
@@ -4886,7 +5190,7 @@ fn read_latest_cold_row(
 #[cfg(test)]
 mod tests {
     use super::{
-        ColdLatestRow, InsertedRow, ScanBoundaryTracker, cold_row_visible_mvcc,
+        ColdLatestRow, InsertedRow, LazyRowBuffer, ScanBoundaryTracker, cold_row_visible_mvcc,
         read_latest_cold_row,
     };
     use crate::buffer::BufferPool;
@@ -4911,8 +5215,8 @@ mod tests {
     use crate::lock::{LockMode, LockResource};
     use crate::row::RowPage;
     use crate::row::ops::{
-        DeleteMvcc, RowMutation, ScanMvcc, SelectKey, SelectMvcc, TableMutationOutcome, UpdateCol,
-        UpdateMvcc, UpsertMvcc,
+        DeleteMvcc, RowMutation, ScanMvcc, ScanRowDecision, SelectKey, SelectMvcc,
+        TableMutationOutcome, UpdateCol, UpdateMvcc, UpsertMvcc,
     };
     use crate::session::Session;
     use crate::session::tests::{
@@ -5131,6 +5435,47 @@ mod tests {
             rows.push(row);
         }
         rows
+    }
+
+    #[test]
+    fn test_lazy_row_buffer_reset_reuses_all_storage() {
+        let mut buffer = LazyRowBuffer::new(3);
+        buffer.cache_value(0, Val::from("zero"));
+        buffer.cache_value(2, Val::from(2i32));
+        let values_ptr = buffer.values.as_ptr();
+        let values_capacity = buffer.values.capacity();
+        let ready_capacity = buffer.ready.capacity();
+        let ready_columns_ptr = buffer.ready_columns.as_ptr();
+        let ready_columns_capacity = buffer.ready_columns.capacity();
+
+        buffer.reset_ready();
+
+        assert!(buffer.values.iter().all(|value| value == &Val::default()));
+        assert!(buffer.ready.iter().all(|ready| !ready));
+        assert!(buffer.ready_columns.is_empty());
+        assert_eq!(buffer.values.as_ptr(), values_ptr);
+        assert_eq!(buffer.values.capacity(), values_capacity);
+        assert_eq!(buffer.ready.capacity(), ready_capacity);
+        assert_eq!(buffer.ready_columns.as_ptr(), ready_columns_ptr);
+        assert_eq!(buffer.ready_columns.capacity(), ready_columns_capacity);
+    }
+
+    #[test]
+    fn test_lazy_row_buffer_prepare_clears_stale_values_without_reallocation() {
+        let mut buffer = LazyRowBuffer::new(3);
+        buffer.cache_value(0, Val::from("stale"));
+        buffer.cache_value(2, Val::from(2i32));
+        let values_ptr = buffer.values.as_ptr();
+        let ready_columns_ptr = buffer.ready_columns.as_ptr();
+
+        // Simulate an exit path that did not perform eager post-row cleanup.
+        buffer.prepare(3);
+
+        assert!(buffer.values.iter().all(|value| value == &Val::default()));
+        assert!(buffer.ready.iter().all(|ready| !ready));
+        assert!(buffer.ready_columns.is_empty());
+        assert_eq!(buffer.values.as_ptr(), values_ptr);
+        assert_eq!(buffer.ready_columns.as_ptr(), ready_columns_ptr);
     }
 
     #[test]
@@ -9102,6 +9447,336 @@ mod tests {
                 vec![0, 1, 2, 3, 4, 100, 101, 102]
             );
             trx.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_table_scan_mvcc_stream_filters_cold_and_hot_rows_lazily() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_stream_scan").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 5, "cold").await;
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+            assert_checkpoint_published(&mut session, table_id).await;
+            insert_rows(table_id, &mut session, 100, 3, "hot").await;
+
+            let mut trx = session.begin_trx().unwrap();
+            let mut callbacks = 0;
+            let mut stream = trx
+                .table_scan_mvcc_stream(table_id, &[0], |row| {
+                    callbacks += 1;
+                    let name = row.val(1)?.clone();
+                    assert_eq!(row.val(1)?, &name, "repeated lazy reads must be stable");
+                    let id = row.val(0)?.as_i32().unwrap();
+                    Ok(
+                        if (name == Val::from("cold") && id % 2 == 0)
+                            || (name == Val::from("hot") && id == 101)
+                        {
+                            ScanRowDecision::Include
+                        } else {
+                            ScanRowDecision::Skip
+                        },
+                    )
+                })
+                .await
+                .unwrap();
+            let mut ids = Vec::new();
+            while let Some(vals) = stream.next().await.unwrap() {
+                assert_eq!(vals.len(), 1, "filter-only column must stay projected out");
+                ids.push(vals[0].as_i32().unwrap());
+            }
+            assert_eq!(ids, vec![0, 2, 4, 101]);
+            assert_eq!(stream.next().await.unwrap(), None);
+            drop(stream);
+            assert_eq!(callbacks, 8);
+            trx.noop().await.unwrap();
+            trx.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_table_scan_mvcc_stream_validates_projection_unless_disabled() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = evictable_test_engine(
+                &temp_dir,
+                64u64 * 1024 * 1024,
+                "redo_stream_scan_projection_validation",
+            )
+            .await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 1, "hot").await;
+
+            let mut trx = session.begin_trx().unwrap();
+            let mut callbacks = 0;
+            for read_set in [&[][..], &[0, 0][..], &[1, 0][..], &[2][..]] {
+                let err = match trx
+                    .table_scan_mvcc_stream(table_id, read_set, |_| {
+                        callbacks += 1;
+                        Ok(ScanRowDecision::Include)
+                    })
+                    .await
+                {
+                    Ok(_) => panic!("invalid projection should fail stream construction"),
+                    Err(err) => err,
+                };
+                assert_eq!(err.operation_error(), Some(OperationError::InvalidDmlInput));
+            }
+            assert_eq!(callbacks, 0);
+
+            trx.disable_dml_validation(true);
+            let mut stream = trx
+                .table_scan_mvcc_stream(table_id, &[], |_| Ok(ScanRowDecision::Include))
+                .await
+                .unwrap();
+            assert_eq!(stream.next().await.unwrap(), Some(Vec::new()));
+            assert_eq!(stream.next().await.unwrap(), None);
+            drop(stream);
+            trx.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_table_scan_mvcc_stream_reconstructs_repeated_hot_updates() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_stream_history").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut writer_session = engine.new_session().unwrap();
+            expect_insert_committed(
+                table_id,
+                &mut writer_session,
+                vec![Val::from(1i32), Val::from("old")],
+            )
+            .await;
+
+            let mut reader_session = engine.new_session().unwrap();
+            let mut reader = reader_session.begin_trx().unwrap();
+            for value in ["middle", "new"] {
+                expect_update_committed(
+                    table_id,
+                    &mut writer_session,
+                    &single_key(1i32),
+                    vec![UpdateCol {
+                        idx: 1,
+                        val: Val::from(value),
+                    }],
+                )
+                .await;
+            }
+
+            let mut stream = reader
+                .table_scan_mvcc_stream(table_id, &[0, 1], |row| {
+                    assert_eq!(row.val(1)?, &Val::from("old"));
+                    Ok(ScanRowDecision::Include)
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                stream.next().await.unwrap(),
+                Some(vec![Val::from(1i32), Val::from("old")])
+            );
+            assert_eq!(stream.next().await.unwrap(), None);
+            drop(stream);
+            reader.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_table_scan_mvcc_stream_clears_reused_lazy_row_buffer() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = evictable_test_engine(
+                &temp_dir,
+                64u64 * 1024 * 1024,
+                "redo_stream_reused_lazy_row_buffer",
+            )
+            .await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut writer_session = engine.new_session().unwrap();
+            expect_insert_committed(
+                table_id,
+                &mut writer_session,
+                vec![Val::from(0i32), Val::from("zero-old")],
+            )
+            .await;
+            expect_insert_committed(
+                table_id,
+                &mut writer_session,
+                vec![Val::from(1i32), Val::from("one-old")],
+            )
+            .await;
+
+            let mut reader_session = engine.new_session().unwrap();
+            let mut reader = reader_session.begin_trx().unwrap();
+            expect_update_committed(
+                table_id,
+                &mut writer_session,
+                &single_key(0i32),
+                vec![UpdateCol {
+                    idx: 1,
+                    val: Val::from("zero-new"),
+                }],
+            )
+            .await;
+
+            let mut stream = reader
+                .table_scan_mvcc_stream(table_id, &[0, 1], |row| {
+                    let _ = row.val(1)?;
+                    Ok(ScanRowDecision::Include)
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                stream.next().await.unwrap(),
+                Some(vec![Val::from(0i32), Val::from("zero-old")])
+            );
+            assert_eq!(
+                stream.next().await.unwrap(),
+                Some(vec![Val::from(1i32), Val::from("one-old")])
+            );
+            assert_eq!(stream.next().await.unwrap(), None);
+            drop(stream);
+            reader.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_table_scan_mvcc_stream_releases_hot_guard_between_rows() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_stream_hot_guard")
+                    .await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut writer_session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut writer_session, 0, 2, "old").await;
+
+            let mut reader_session = engine.new_session().unwrap();
+            let mut reader = reader_session.begin_trx().unwrap();
+            let mut stream = reader
+                .table_scan_mvcc_stream(table_id, &[0, 1], |_| Ok(ScanRowDecision::Include))
+                .await
+                .unwrap();
+            assert_eq!(
+                stream.next().await.unwrap(),
+                Some(vec![Val::from(0i32), Val::from("old")])
+            );
+
+            expect_update_committed(
+                table_id,
+                &mut writer_session,
+                &single_key(1i32),
+                vec![UpdateCol {
+                    idx: 1,
+                    val: Val::from("new"),
+                }],
+            )
+            .await;
+
+            assert_eq!(
+                stream.next().await.unwrap(),
+                Some(vec![Val::from(1i32), Val::from("old")])
+            );
+            assert_eq!(stream.next().await.unwrap(), None);
+            drop(stream);
+            reader.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_table_scan_mvcc_stream_uses_captured_hot_pages_after_checkpoint() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = evictable_test_engine(
+                &temp_dir,
+                64u64 * 1024 * 1024,
+                "redo_stream_checkpoint_overlap",
+            )
+            .await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut checkpoint_session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut checkpoint_session, 0, 5, "hot").await;
+
+            let mut reader_session = engine.new_session().unwrap();
+            let mut reader = reader_session.begin_trx().unwrap();
+            let mut stream = reader
+                .table_scan_mvcc_stream(table_id, &[0], |_| Ok(ScanRowDecision::Include))
+                .await
+                .unwrap();
+
+            assert_freeze_created(
+                checkpoint_session
+                    .freeze_table(table_id, usize::MAX)
+                    .await
+                    .unwrap(),
+            );
+            assert_checkpoint_published(&mut checkpoint_session, table_id).await;
+
+            let mut ids = Vec::new();
+            while let Some(vals) = stream.next().await.unwrap() {
+                ids.push(vals[0].as_i32().unwrap());
+            }
+            assert_eq!(ids, vec![0, 1, 2, 3, 4]);
+            drop(stream);
+            reader.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_table_scan_mvcc_stream_stop_and_error_are_terminal() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_stream_terminal").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 3, "hot").await;
+
+            let mut trx = session.begin_trx().unwrap();
+            let mut callbacks = 0;
+            let mut stream = trx
+                .table_scan_mvcc_stream(table_id, &[0], |_| {
+                    callbacks += 1;
+                    Ok(if callbacks == 1 {
+                        ScanRowDecision::Include
+                    } else {
+                        ScanRowDecision::Stop
+                    })
+                })
+                .await
+                .unwrap();
+            assert_eq!(stream.next().await.unwrap(), Some(vec![Val::from(0i32)]));
+            assert_eq!(stream.next().await.unwrap(), None);
+            assert_eq!(stream.next().await.unwrap(), None);
+            drop(stream);
+            assert_eq!(callbacks, 2);
+
+            let mut stream = trx
+                .table_scan_mvcc_stream(table_id, &[0], |row| {
+                    let _ = row.val(usize::MAX)?;
+                    Ok(ScanRowDecision::Include)
+                })
+                .await
+                .unwrap();
+            let err = stream.next().await.unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::InvalidDmlInput));
+            assert_eq!(stream.next().await.unwrap(), None);
+            drop(stream);
+            trx.noop().await.unwrap();
+
+            let stream = trx
+                .table_scan_mvcc_stream(table_id, &[0], |_| Ok(ScanRowDecision::Include))
+                .await
+                .unwrap();
+            drop(stream);
+            trx.noop().await.unwrap();
+            trx.rollback().await.unwrap();
         });
     }
 
