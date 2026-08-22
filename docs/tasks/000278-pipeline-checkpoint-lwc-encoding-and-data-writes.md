@@ -1,7 +1,7 @@
 ---
 id: 000278
 title: Pipeline Checkpoint LWC Encoding and Data Writes
-status: proposal
+status: implemented
 created: 2026-08-22
 github_issue: 1003
 ---
@@ -10,68 +10,48 @@ github_issue: 1003
 
 ## Summary
 
-Pipeline user-table checkpoint LWC encoding into table-file data writes so CPU
-serialization and shared-storage IO overlap instead of running as two complete,
-sequential phases. Replace the current encode queue plus accumulated block
-vector plus `apply_lwc_blocks` write-future vector with one logical-order list
-whose blocks move monotonically from `Encoding` to `Writing` to `Written`.
+User-table checkpoint previously completed all LWC CPU encoding before it
+allocated and submitted any table-file data writes. That serialized two major
+phases, retained every encoded 64 KiB buffer, and left a persistent-IO tail
+after the parallel CPU work introduced by task 000277.
 
-The checkpoint keeps only the existing CPU-stage bound: blocks waiting to
-reach shared IO are limited by the configured ThreadPool worker count. Once an
-encode completes in logical order, the mandatory runner allocates its CoW
-block and awaits acceptance into the already-bounded shared storage ingress.
-The shared channel, storage scheduler, and backend IO depth provide the actual
-write backpressure across all concurrent engine IO; checkpoint does not add a
-second local write-depth estimate. After production finishes, one traversal
-waits for every accepted data write before column-index construction.
+The shipped implementation replaces the encode queue, accumulated block
+vector, and later write-future vector with one logical-order checkpoint
+pipeline. Each block moves monotonically from `Encoding` to `Writing` to
+`Written`. CPU encoding now overlaps shared-storage data writes while CoW
+allocation, write acceptance, and final column-index entries remain ordered by
+RowID. Shared storage ingress and backend IO depth provide the only write
+backpressure boundary.
 
-Pass the known checkpoint pivot into LWC production and finalize the last
-block's logical shape before CPU encoding. This removes the current
-post-encoding fingerprint mutation that can make a dense final LWC block
-disagree with its column-index entry when fully deleted pages trail the last
+The final block shape is also bound to the known checkpoint pivot before CPU
+encoding. This keeps the fingerprint embedded in the checksummed LWC header
+identical to its column-index entry when fully deleted pages trail the last
 visible row.
 
 ## Context
 
-Task 000277 introduced an engine-owned fixed ThreadPool and made user-table
-checkpoint its first consumer. Page access, visibility analysis, row copying,
-and secondary-index sidecar collection remain on the single mandatory runner;
-an owned `LwcBuilder` is submitted for CPU-only serialization, compression,
-and checksum generation. `CheckpointLwcEncodeQueue` bounds pending encodes by
-the worker count and consumes them in logical RowID order.
+Task 000277 introduced the engine-owned fixed `ThreadPool` and made LWC
+serialization its first consumer. Page access, visibility analysis, row
+copying, and secondary-index sidecar collection stayed on the mandatory
+runner, while complete owned builders were encoded on CPU workers in logical
+order.
 
-The current phase boundary still prevents end-to-end overlap. Successful
-encode completions accumulate as `Vec<LwcBlockPersist>` until
-`Table::build_lwc_blocks` returns. `MutableTableFile::apply_lwc_blocks` then
-allocates every block ID, creates a vector of write futures, awaits
-`try_join_all`, and only afterward builds the `ColumnBlockIndex`. A large
-checkpoint therefore retains every encoded 64 KiB buffer and does not begin
-data writes while CPU production is active.
+The remaining phase boundary accumulated all encoded blocks before
+`MutableTableFile::apply_lwc_blocks` allocated CoW blocks and awaited a vector
+of writes. Two-million-row profiles showed effective CPU scaling but a large
+apply/write/publication tail. Early LWC writes were already safe because they
+target unpublished CoW allocations; visibility still depends on the later
+meta/super-block publication and fsync.
 
-Task 000277's resolved two-million-row measurements showed effective CPU
-scaling but a substantial persistent-IO tail. The four-worker encode and scan
-cluster ended near 181 ms in one profile, followed by roughly 380 ms of apply,
-write, and publication work. File IO depth one was slower than depths 8 through
-64. Early data-block writes are already safe: they are unpublished CoW blocks,
-and visibility still depends on the later meta/super-block root swap and
-publication fsync. A failed mutable fork may leave unreachable written blocks,
-which is existing checkpoint failure behavior.
+The table-write path already had the correct global pressure boundary:
+bounded shared ingress, one storage scheduler, and backend IO depth shared by
+all table, cache, and pool IO. A checkpoint-local write quota would duplicate
+that control and ignore competing consumers.
 
-The table-write path already provides the correct global pressure boundary.
-`IOClient<BackgroundWriteRequest>` uses a bounded ingress channel, the shared
-storage worker stages and submits work under its configured backend depth, and
-other table, cache, and pool IO can compete for the same worker. A second
-checkpoint-local write limit would duplicate that capacity control while
-ignoring concurrent consumers. Awaiting ingress acceptance naturally stops the
-mandatory producer and, because the CPU-stage window cannot advance, stops
-additional encode submission as well.
-
-The current call path also adjusts the final `ColumnBlockEntryShape` after its
-buffer has been built. `set_end_row_id(new_pivot_row_id)` recomputes the index
-fingerprint after the previous fingerprint is embedded in the checksummed LWC
-header. If visible rows form a dense last block but later selected pages are
-fully deleted, extending the exclusive end changes the logical shape to sparse
-and can leave the two fingerprints inconsistent.
+Review also found a correctness edge in the old final-shape adjustment.
+`set_end_row_id` recomputed the index fingerprint after the earlier fingerprint
+had been embedded in the LWC buffer. Dense visible rows followed by fully
+deleted selected pages could therefore produce mismatched durable metadata.
 
 Issue Labels:
 
@@ -81,412 +61,223 @@ Issue Labels:
 
 Source Backlogs:
 
-- `docs/backlogs/000187-pipeline-checkpoint-lwc-encoding-and-data-writes.md`
+- `docs/backlogs/closed/000187-pipeline-checkpoint-lwc-encoding-and-data-writes.md`
 
-This task has no parent RFC. It remains one bounded user-table checkpoint and
-table-file write-path change with no persisted-format or recovery migration.
+This task has no parent RFC. It remained a bounded checkpoint and internal
+table-file IO orchestration change with no durable-format migration.
 
 ## Goals
 
-- Overlap CPU LWC encoding with accepted table-file data writes during one
-  user-table checkpoint.
-- Represent every produced block once in one logical-order state list with
-  monotonic `Encoding -> Writing -> Written` transitions.
-- Preserve logical encode consumption, CoW allocation, write submission, and
-  column-index entry order while allowing CPU and physical IO completion order
-  to vary.
-- Bound CPU-stage occupancy by ThreadPool worker count and propagate shared IO
-  backpressure without a checkpoint-local write-depth setting.
-- Keep ThreadPool jobs CPU-only and retain no page guard, borrowed vector view,
-  latch, logical lock, mutable-root borrow, or IO owner across a CPU wait.
-- Define shared-storage ingress acceptance as the write ownership boundary and
-  keep every accepted write independently completable after the mutable root
-  borrow is released.
-- Stop forward production on an observed failure, then drain every accepted
-  encode and write while preserving Fatal-over-Runtime precedence.
+- Overlap LWC CPU encoding with accepted table-file data writes.
+- Represent every produced block once in a logical-order state list.
+- Preserve logical allocation, submission, and index-entry order while
+  allowing CPU and backend completion order to vary.
+- Bound CPU-stage occupancy by the `ThreadPool` worker count and propagate
+  actual shared-IO ingress pressure without a local write-depth estimate.
+- Keep CPU tasks limited to owned serialization, compression, checksum, and
+  fingerprint work.
+- Transfer buffer, file, and readonly-cache write-lease ownership at shared
+  ingress acceptance.
+- Stop new production after an observed error, drain every accepted encode and
+  write, and preserve Fatal-over-Runtime cleanup precedence.
 - Build the column index and update mutable-root data metadata only after all
   LWC data writes succeed.
-- Finalize the last LWC block shape against the known checkpoint pivot before
-  encoding so the LWC header and index entry carry the same fingerprint.
-- Add phase diagnostics and fresh-root benchmark evidence that distinguish CPU
-  production, write submission/drain, index rebuild, and publication fsync.
+- Finalize the last LWC shape against the checkpoint pivot before encoding.
+- Retain the existing atomic CoW publication boundary and add phase diagnostics.
 
 ## Non-Goals
 
-- A checkpoint-local write window, IO quota, semaphore, or new configuration
-  field; shared storage owns global admission and backend depth.
-- A generic staged-pipeline framework or a new engine execution subsystem.
+- A checkpoint-local write semaphore, quota, configuration field, or inferred
+  backend-depth window.
+- A reusable staged-pipeline framework or another execution subsystem.
 - Pipelining column-index construction, deletion checkpoint, secondary-index
-  sidecars, allocation-map rebuilding, meta/super-block writes, or root
-  publication with LWC data writes.
-- Moving page loading, visibility analysis, sidecar collection, IO, waiting,
-  mutex acquisition, or latch acquisition into ThreadPool workers.
-- Changing LWC bytes, checksums, column-index formats, table roots, replay
-  bounds, recovery rules, MVCC behavior, or checkpoint public APIs.
-- Parallel or out-of-logical-order CoW block allocation and write submission.
+  sidecars, allocation-map rebuilding, or root publication.
+- IO, waiting, page loading, visibility analysis, or lock acquisition inside
+  `ThreadPool` workers.
+- Parallel or out-of-order CoW allocation and write submission.
 - Cancellation of accepted CPU or IO work.
-- A public checkpoint timing/statistics API or a CI performance threshold.
-- Catalog, deletion-only, recovery, CREATE INDEX, or other ThreadPool consumers.
+- Changes to public checkpoint APIs, durable bytes, recovery rules, MVCC
+  semantics, configuration schema, or benchmark-result schema.
+- Catalog, recovery, deletion-only, or other new `ThreadPool` consumers.
 
 ## Rejected Alternatives
 
-### Separate encode, write, and ordered-entry collections
-
-Maintaining a pending-encode deque, an in-flight-write collection, and a third
-ordered entry vector duplicates the identity and lifecycle of every block.
-One logical-order list can retain the final index entry in the same slot and be
-consumed directly after all writes finish. Per-slot state handles asynchronous
-completion without another authoritative queue.
-
 ### Checkpoint-local write depth
 
-Sizing a local write window from `FileSystemConfig::io_depth` double-counts a
-global backend limit and cannot account for concurrent reads, pool IO, catalog
-work, or other background writes. The bounded shared ingress and backend
-scheduler are the authoritative pressure boundary. Awaiting their acceptance
-provides direct feedback while retaining the checkpoint's CPU-stage bound.
+A local window derived from file IO depth would double-count a global backend
+limit and could not account for concurrent reads or writes from other storage
+consumers. Awaiting shared ingress acceptance gives the checkpoint direct
+feedback from the actual contention point.
 
-### Generic ordered CPU-to-IO pipeline
+### Separate encode, write, and entry collections
 
-A reusable stage framework would require generalized job ownership, error
-carriers, shutdown contracts, and capacity policy before a second consumer has
-proved those abstractions. This task keeps the coordinator checkpoint-private;
-future consumers require separate evidence and design.
+Multiple collections would duplicate each block's identity and lifecycle. One
+ordered state list retains the shape, completion, and final entry in the same
+slot and directly supplies column-index input after successful drain.
+
+### Generic CPU-to-IO pipeline
+
+No second consumer justified generalized job ownership, error transport,
+shutdown, or capacity policy. The coordinator remains checkpoint-private.
 
 ## Plan
 
-### One logical-order block-state list
+### Ordered state and capacity model
 
-Replace `PendingLwcEncode`, `CheckpointLwcEncodeQueue`, its output vector, and
-the later write-future vector with a checkpoint-private coordinator in
-`doradb-storage/src/table/persistence.rs`. Its semantic core is:
+`CheckpointLwcPipeline` owns the mutable table-file handle, `ThreadPool` guard,
+table identity, and one `Vec<Option<LwcBlockState>>`. The list is authoritative
+and ordered by RowID:
 
-```rust
-enum LwcBlockState {
-    Encoding {
-        shape: ColumnBlockEntryShape,
-        completion: Arc<Completion<InternalResult<DirectBuf>>>,
-    },
-    Writing {
-        entry: ColumnBlockEntryInput,
-        completion: Arc<Completion<()>>,
-    },
-    Written {
-        entry: ColumnBlockEntryInput,
-    },
-}
+- slots before `next_to_write` are `Writing` or `Written` and have crossed
+  shared ingress;
+- slots at and after `next_to_write` are `Encoding`;
+- `blocks.len() - next_to_write` is the exact CPU-stage occupancy;
+- occupancy never exceeds the configured CPU worker count; and
+- `None` is only a transient ownership device while one state crosses an await,
+  never a semantic pipeline state.
 
-struct CheckpointLwcPipeline<'a> {
-    mutable_file: &'a mut MutableTableFile,
-    thread_pool: QuiescentGuard<ThreadPool>,
-    table_id: TableID,
-    blocks: Vec<LwcBlockState>,
-    next_to_write: usize,
-    encode_limit: usize,
-    first_error: Option<RuntimeOrFatalError>,
-    // phase timing and test-only high-water observations as needed
-}
-```
+At each safe page boundary, the mandatory runner advances consecutive ready
+encodes without waiting for an unready head. When CPU capacity is full, it
+waits for the logical head and submits that block through shared ingress before
+admitting another builder. A ready encode does not release CPU capacity;
+accepted write ownership does.
 
-The list remains in logical RowID order. The range before `next_to_write`
-contains blocks already accepted by shared IO (`Writing`, or `Written` during
-the final traversal). The suffix beginning at `next_to_write` contains
-accepted CPU work not yet handed to shared IO. No semantic `Discarded` or
-placeholder terminal variant is needed. If moving a state across an await
-requires temporary storage, use an implementation-only `Option<LwcBlockState>`
-or an equivalent ownership pattern; absence must not become a persistent
-pipeline state.
+Later CPU jobs may complete first, but allocation and ingress acceptance wait
+for `blocks[next_to_write]`. Backend writes may complete in any order because
+their completions no longer borrow the mutable root.
 
-The CPU-stage occupancy is `blocks.len() - next_to_write` and must never exceed
-`encode_limit`, which is the already-validated ThreadPool worker count. An
-encode completion does not release this capacity. Capacity is released only
-after the corresponding write request is accepted and `next_to_write`
-advances. Consequently a full or contended shared IO ingress propagates
-backpressure through encoded buffers to CPU submission and page production.
+### Write acceptance boundary
 
-### Produce builders and advance ready CPU work
+The direct-write path now separates submission from terminal waiting.
+`submit_direct_write_with_lease` prepares the owned request, awaits bounded
+shared ingress, and returns its completion. Existing composed write helpers
+submit and then await, preserving behavior for unrelated callers.
 
-Refactor `Table::build_lwc_blocks` into an operation whose name reflects both
-production and writes, such as `build_and_write_lwc_blocks`. It receives the
-mutable table-file fork, `new_pivot_row_id`, ThreadPool guard, and the existing
-prepared-page and sidecar inputs.
+`MutableTableFile::submit_lwc_block` validates logical order, allocates the CoW
+block, attaches its ID to the immutable entry shape, starts the readonly-cache
+write barrier, and transfers the buffer, file owner, and write lease to shared
+storage. Only successful ingress acceptance advances the pipeline.
 
-Page loading, vector-view creation, visible-row callbacks, block-split retry,
-and `LwcBuilder::append_view` remain unchanged. When a builder becomes full:
+### Success and failure drain
 
-1. After the page guard and borrowed vector view leave scope, ask the pipeline
-   to advance every consecutive ready CPU result. This does not wait for an
-   unready CPU job, but submitting a ready result may await shared-storage
-   ingress and deliberately propagate its backpressure.
-2. If `blocks.len() - next_to_write == encode_limit`, await the logical head CPU
-   completion and advance it through shared-storage acceptance before
-   admitting another builder.
-3. Append one `Encoding` state with its final logical shape and submit the
-   owned `LwcBuilder::build` job immediately.
-4. Run another ready-only pass so already-completed predecessors reach storage
-   without waiting for the next CPU-capacity boundary.
+After successful page production, the pipeline awaits and submits every
+remaining encode before observing data-write completions. It then traverses
+the accepted prefix in logical order, changing successful `Writing` states to
+`Written`. This traversal does not serialize physical IO because every write
+has already reached shared storage.
 
-At each subsequent safe page boundary, run the same ready-only advance. A
-later CPU job may finish first, but write submission waits for
-`blocks[next_to_write]`, preserving logical allocation and submission order.
-The later completion remains safely stored in its completion cell.
+On an observed producer, encode, allocation, barrier, or submission failure,
+new production stops. Remaining encode completions are consumed and successful
+buffers are dropped rather than written. Every accepted write is still
+observed. Cleanup errors merge through `RuntimeOrFatalError::merge_cleanup`,
+so Fatal reasons outrank Runtime failures while earlier same-domain failures
+remain primary.
 
-At production end, await and submit every remaining `Encoding` state in order.
-A final traversal then owns only `Writing` or `Written` states on the success
-path.
+Only an all-`Written` list becomes ordered `ColumnBlockEntryInput`. The
+post-drain `finish_lwc_blocks` builds the `ColumnBlockIndex` and then updates
+the mutable root's index pointer, pivot, and heap replay floor.
 
-### Finalize the last logical shape before encoding
+### Final shape and publication
 
-Pass `new_pivot_row_id` into LWC production. Hold the last nonempty builder
-until the prepared-page scan finishes, as today, but construct its
-`ColumnBlockEntryShape` with `end_row_id = new_pivot_row_id` before submitting
-the CPU job. This includes fully deleted trailing pages in the logical span
-used to classify dense versus sparse shape and calculate the fingerprint.
+LWC production receives `new_pivot_row_id`. The last nonempty builder uses that
+exclusive end before its fingerprint is calculated and passed to
+`LwcBuilder::build`. The mutable post-encoding `set_end_row_id` API was removed.
+All-deleted selections still write no LWC and advance checkpoint metadata
+through the existing metadata-only path.
 
-Remove the later `last.shape.set_end_row_id(new_pivot_row_id)` mutation from
-`TableCheckpointer::run`. `ColumnBlockEntryShape::set_end_row_id` has no other
-production caller and should be removed so an encoded shape cannot be mutated
-without rebuilding its buffer. When all selected pages are fully deleted,
-produce no LWC block and retain the existing `apply_checkpoint_metadata` path
-for pivot and heap-replay-floor advancement.
+Data writes remain unpublished until the normal meta-block write, ping-pong
+super-block write, publication fsync, and active-root swap. Failed forks may
+leave unreachable CoW blocks, matching existing failure behavior, but cannot
+expose a partial LWC/index pair.
 
-### Split write submission from completion waiting
-
-Refactor the internal write path in `doradb-storage/src/file/mod.rs` and
-`doradb-storage/src/file/cow_file.rs` so an owned direct write can be accepted
-without immediately awaiting completion. Add a narrow helper equivalent to:
-
-```rust
-async fn submit_direct_write_with_lease(...)
-    -> CompletionResult<Arc<Completion<()>>>;
-```
-
-It prepares `WriteSubmission`, asynchronously sends it through the bounded
-`IOClient<BackgroundWriteRequest>`, and returns the completion only after
-ingress acceptance. On a closed channel, preserve the current captured IO
-report and release the request-owned buffer and readonly write lease. Rebuild
-the existing `write_direct_with_lease` and `CowFile::write_block_with_lease`
-helpers by submitting and then awaiting the returned completion so unrelated
-callers retain current behavior.
-
-Add a `MutableTableFile` LWC submission method that:
-
-1. validates logical start/end order against the preceding accepted block;
-2. allocates the next CoW block ID on the mandatory runner;
-3. attaches it to `ColumnBlockEntryShape`, producing
-   `ColumnBlockEntryInput`;
-4. starts the readonly-cache write barrier;
-5. moves the buffer, file owner, and lease into shared-storage submission; and
-6. returns the entry plus completion only after ingress acceptance.
-
-The pipeline replaces its logical-head `Encoding` state with `Writing` and
-increments `next_to_write` only after this method succeeds. The in-flight
-completion owns no mutable-root borrow. Physical backend completion order may
-vary freely.
-
-Do not add a local write count or wait for a write completion during normal
-production. If shared IO is full, the awaited send is the authoritative
-backpressure point. Accepted write buffers are bounded by the shared ingress,
-storage-worker staging, and backend depth; completed IO releases its buffer
-even while the small `Writing` entry and completion remain in the checkpoint
-list.
-
-### Finish success and drain every error path
-
-Give the pipeline one finish operation that combines producer outcome with
-accepted-work draining.
-
-On success:
-
-1. await every remaining CPU result in logical order and submit its write;
-2. traverse `blocks` once in logical order;
-3. await every `Writing` completion, replace successful states with `Written`,
-   and continue after any error so every accepted write is observed;
-4. if all writes succeeded, consume `Written` states directly into an ordered
-   `Vec<ColumnBlockEntryInput>`; and
-5. return those entries for column-index construction.
-
-Awaiting the final traversal in logical order does not serialize physical IO:
-all writes have already crossed storage ingress and may finish in any order.
-Precompleted completion cells return immediately.
-
-On the first observed producer, encode, allocation, write-barrier, or ingress
-submission failure, stop page production and do not submit later successful
-encodes as new writes. Consume every remaining `Encoding` completion and drop
-successful buffers, then traverse every `Writing` completion. An IO-completion
-failure is normally discovered during this final traversal; it prevents index
-construction and publication but does not stop the traversal from draining
-later accepted writes.
-
-Merge errors with `RuntimeOrFatalError::merge_cleanup`: Fatal outranks Runtime,
-and an earlier same-domain operation failure remains primary. The existing
-post-transition `TableCheckpointer::resolve` boundary converts ordinary
-failures to `CheckpointWrite`, poisons storage, and preserves an already-Fatal
-ThreadPool reason. A failed mutable fork may retain unpublished allocations or
-unreachable written blocks, but the active root and column-index root remain
-unchanged.
-
-Document the wait contract locally:
-
-- ThreadPool workers produce encode completions.
-- The shared storage worker produces ingress capacity and write completions.
-- Completion cells and bounded-channel acceptance are authoritative results.
-- Poison stops new forward work but does not cancel accepted work.
-- Mandatory-runtime shutdown drains the accepted checkpoint before ThreadPool
-  and storage worker teardown.
-- The accepted mandatory checkpoint remains the sole drain and cleanup owner.
-
-### Build the column index only after data-write success
-
-Split `MutableTableFile::apply_lwc_blocks` into the per-block submission method
-and a post-drain finalizer such as `finish_lwc_blocks`. The finalizer receives
-the already ordered `ColumnBlockEntryInput` vector, constructs
-`ColumnBlockIndex`, calls `batch_insert`, and only then updates
-`column_block_index_root`, `pivot_row_id`, and `heap_redo_start_ts` on the
-mutable root.
-
-No column-index CoW write may begin until every LWC data write completion is
-successful. Deletion checkpoint, secondary-index sidecar application,
-two-root reachability rebuilding, publication admission, meta/super-block
-writes, fsync, root swap, runtime route update, and system-transaction enqueue
-remain in their existing order after this finalizer.
-
-### Phase diagnostics
-
-Add structured internal debug diagnostics without changing public checkpoint
-outcomes or statistics APIs. Record at least:
-
-- block count and CPU-stage capacity;
-- peak CPU-stage occupancy;
-- pipeline start through final CPU completion;
-- final CPU completion through acceptance of the final LWC data write;
-- final-write-acceptance through complete data-write drain;
-- column-index rebuild duration; and
-- exact root-publication fsync duration in `CowFile::publish_prepared_root`,
-  tagged with file identity.
-
-Keep timings diagnostic rather than correctness inputs. Tests synchronize on
-completion, submission, and publication predicates rather than elapsed time.
-
-### Deterministic validation and benchmark
-
-Use completion cells and existing storage-backend test hooks to control CPU
-and write progress. Add only narrow `#[cfg(test)]` pipeline hooks or constructors
-where direct completion injection cannot exercise the production state path.
-Do not add production locks, sleeps, or widened APIs for testing.
-
-Re-run the task-000277 deterministic workload: insert 2,100,000 128-byte rows,
-freeze the 2,000,320-row prefix, and checkpoint without retry waits. Use a new
-storage root for every sample. On the branch, compare the cross-product of
-ThreadPool workers `{1, 2, 4}` and shared file IO depths `{1, 8, 64}` with at
-least five samples per cell. Record median, minimum/maximum, sample CV, phase
-timings, and storage-backend counters. Also run at least five alternating
-fresh-root pairs between `origin/main` and the branch at workers four and IO
-depth 64. Record results during task resolution; do not add a noisy CI
-threshold. If persistent-filesystem variance masks the phase overlap, add a
-tmpfs control without replacing the persistent comparison.
-
-### Documentation
-
-Update `docs/architecture.md`, `docs/checkpoint.md`,
-`docs/data-checkpoint.md`, and `docs/table-file.md` to describe the one-list
-CPU-to-shared-IO pipeline, logical submission order, global backpressure,
-accepted-work draining, post-write index construction, and unchanged atomic
-publication boundary. Update `docs/benchmark-tool.md` only if commands or
-diagnostic interpretation need durable clarification; no benchmark schema
-change is planned.
+Internal debug diagnostics record block count, CPU capacity and peak occupancy,
+production and write-acceptance/drain intervals, column-index rebuild time,
+and exact root-publication fsync time tagged by file identity.
 
 ## Implementation Notes
 
+The shipped pipeline overlaps CPU encoding and LWC data writes without adding
+checkpoint-local IO policy, preserves the existing durability boundary, and
+fixes the final-shape fingerprint mismatch.
+
+Implementation review clarified that the readonly write lease belongs to the
+accepted storage request, not the checkpoint coordinator. It invalidates a
+possibly reused `(file_id, block_id)` cache mapping and keeps that key
+write-blocked through backend completion. Brand-new table-file and catalog
+mechanical paths continue to use the explicitly disabled barrier where no
+relevant user-table cache-reuse hazard exists.
+
+The final implementation deliberately differs from the source backlog's early
+suggestion of a separately sized write window. Repository research showed the
+shared bounded channel and backend scheduler already own global admission, so
+the checkpoint retains only its CPU-stage worker bound.
+
+Five alternating fresh-root pairs compared commit `dfbe66d` with its
+pre-pipeline parent `d4ef404`. Each run inserted 2,100,000 deterministic
+128-byte rows, froze exactly 2,000,320 rows across 4,465 pages, used four CPU
+workers and file IO depth 64, and completed without checkpoint retry.
+
+| Filesystem | Baseline median | Pipeline median | Median change | Baseline/pipeline sample CV |
+| --- | ---: | ---: | ---: | ---: |
+| persistent Btrfs | 567.4 ms | 478.1 ms | 15.7% faster | 18.43% / 7.07% |
+| tmpfs control | 237.7 ms | 152.4 ms | 35.9% faster | 6.90% / 3.76% |
+
+The pipeline won four of five persistent pairs; one unusually fast baseline
+sample exposed the known Btrfs variance. It won all five tmpfs pairs by
+32.0-39.2%. Every run submitted 4,476 backend operations, including 4,472
+background writes and four table reads. On Btrfs, mean backend
+submit-and-wait call count fell from 7,846 to 4,319 while preserving the same
+operation count, consistent with greater batching and overlap.
+
+Final verification completed with:
+
+- mandatory branch-diff style audit: six Rust files passed against
+  `origin/main`, including formatting and strict workspace Clippy;
+- workspace tests: 1,766 passed across four binaries;
+- alternate `libaio` storage tests: 1,683 passed;
+- alternate-backend strict Clippy: passed; and
+- focused coverage across the five changed implementation files: 92.78%
+  deduplicated, with every file between 87.53% and 95.71%.
+
 ## Impacts
 
-- `doradb-storage/src/table/persistence.rs`
-  - replace `CheckpointLwcEncodeQueue` and accumulated `Vec<LwcBlockPersist>`
-    with `CheckpointLwcPipeline` and `LwcBlockState`;
-  - integrate mutable-file submission into LWC production;
-  - pass `new_pivot_row_id` before final encode;
-  - preserve sidecar collection and no-guard-across-wait rules; and
-  - add pipeline timing and focused state/error tests.
-- `doradb-storage/src/file/table_file.rs`
-  - replace monolithic `apply_lwc_blocks` and `try_join_all` with ordered
-    per-block submission plus post-drain column-index finalization;
-  - retain CoW allocation, readonly-cache barrier, index, and root-update
-    invariants; and
-  - add file-layer submission/finalization tests.
-- `doradb-storage/src/file/mod.rs` and
-  `doradb-storage/src/file/cow_file.rs`
-  - split owned write acceptance from completion waiting while preserving
-    existing composed write helpers and error context;
-  - expose no public API; and
-  - emit exact publication-fsync timing.
-- `doradb-storage/src/index/column_block_index.rs`
-  - remove `ColumnBlockEntryShape::set_end_row_id` and retain immutable
-    construction-time fingerprint semantics.
-- Checkpoint and table-file design documents gain pipeline and shared-pressure
-  details. Task 000277 and backlog 000187 remain historical/source context.
-- No public configuration, durable format, recovery input, dependency,
-  feature, or unsafe-code baseline changes are expected.
-- Checkpoint may retain one small `Writing`/`Written` state per produced LWC
-  block until final index construction. Encoded buffers awaiting shared IO
-  remain CPU-window bounded; accepted write buffers are globally bounded by
-  the existing shared IO subsystem.
+- User-table checkpoint now pipelines owned LWC CPU work into shared-storage
+  data writes and retains only worker-bounded pre-ingress buffers.
+- Internal direct-write APIs can return an accepted write completion while
+  preserving the existing submit-and-wait helpers.
+- Table-file LWC handling is split into ordered per-block submission and
+  post-drain column-index finalization.
+- Readonly-cache write barriers still cover reused user-table LWC and index
+  blocks through backend completion.
+- Column-entry shapes are immutable after construction; final pivot binding
+  occurs before encoding.
+- Checkpoint and CoW publication expose additional debug phase diagnostics.
+- Architecture, checkpoint, data-checkpoint, and table-file documentation now
+  describe shared-ingress backpressure and post-write index construction.
+- No public API, configuration, dependency, schema, durable format, recovery
+  input, feature, or unsafe-code baseline changed.
 
 ## Test Cases
 
-- Prove one list retains logical sequence and permits only
-  `Encoding -> Writing -> Written` on the success path.
-- Complete CPU jobs out of order and verify CoW block allocation, write
-  ingress acceptance, and final index entries remain in logical RowID order.
-- Verify CPU-stage occupancy never exceeds ThreadPool worker count and does not
-  release capacity until shared IO accepts the corresponding write.
-- Fill or block shared background-write ingress while concurrent storage work
-  exists; verify the checkpoint stops advancing `next_to_write`, stops
-  accepting builders at the CPU bound, and resumes from actual shared
-  capacity without a local write limit.
-- Delay an early encode while later encodes complete, and delay data-write
-  completion while subsequent CPU work runs, proving CPU/write overlap through
-  semantic events rather than sleeps.
-- Submit writes whose physical completions arrive out of order; verify the
-  final logical traversal drains all completions and produces ordered entries.
-- Hold one accepted LWC write incomplete and prove no column-index write,
-  mutable-root data update, meta/super-block write, fsync, or active-root swap
-  occurs before it completes successfully.
-- Inject a producer/page-access error with accepted encodes and writes; verify
-  all accepted work drains, successful later encodes are dropped rather than
-  written, and the primary error is preserved.
-- Inject an inner encode error, an encode completion Fatal, block allocation
-  exhaustion, readonly write-barrier failure, closed ingress submission, and
-  backend IO completion failure at each meaningful state boundary.
-- Combine an earlier Runtime producer/submission failure with a later accepted
-  ThreadPool Fatal; verify Fatal outranks Runtime while both diagnostics remain
-  attached and every completion is consumed.
-- Verify write-completion failure drains subsequent accepted writes, skips
-  `finish_lwc_blocks`, leaves the active root unchanged, and reaches the
-  existing post-transition `CheckpointWrite` poison policy.
-- Build a dense final visible block followed by fully deleted selected pages;
-  verify the LWC header and column-index entry fingerprints match, persisted
-  point/range reads succeed, and restart recovery accepts the block.
-- Cover all-selected-pages-deleted behavior: no LWC block is written, while
-  pivot and heap replay floor advance through checkpoint metadata as before.
-- Compare worker counts and shared IO depths for identical LWC bytes,
-  checksums, RowID shapes, pivot, heap replay floor, column-index routes, and
-  secondary-index sidecar results.
-- Preserve readonly-cache write-barrier invalidation for LWC and column-index
-  CoW blocks, including reused physical block IDs.
-- Preserve heartbeat, delayed, cancellation, transition, deletion checkpoint,
-  secondary-index, root-reclamation, recovery, shutdown, and poison tests.
-- Run `rtk cargo nextest run --workspace`.
-- Run
-  `rtk cargo nextest run -p doradb-storage --no-default-features --features libaio`
-  because the change affects backend-neutral table-file IO orchestration.
-- Run the mandatory branch-diff style audit, formatting, and strict Clippy
-  validation.
-- Run and record the specified fresh-root two-million-row benchmark matrix and
-  `origin/main` comparison without turning performance variance into a CI gate.
+- Out-of-order CPU completions preserve logical allocation, write acceptance,
+  and final entry order.
+- Out-of-order write completions drain into ordered `Written` entries.
+- Inner encode failures drain later accepted CPU work without new writes.
+- Fatal encode cleanup outranks an earlier Runtime producer failure while all
+  completions are consumed.
+- A failed accepted write drains later writes and prevents index finalization.
+- CPU occupancy remains bounded until shared ingress accepts the logical head.
+- A dense final visible page followed by a fully deleted page produces matching
+  LWC and column-index fingerprints.
+- An all-deleted selected page advances pivot/replay metadata without creating
+  a column-index root.
+- LWC and column-index writes preserve readonly-cache invalidation when physical
+  block IDs are reused.
+- Existing checkpoint transition, cancellation, deletion, sidecar, recovery,
+  shutdown, poison, and root-reclamation suites pass on both IO backends.
 
 ## Open Questions
 
-None for implementation. A checkpoint-specific IO quota or broader storage
-QoS policy should be considered only if later concurrent-workload evidence
-shows that shared scheduler admission is insufficient; that would be a
-separate task rather than an implicit limit in this pipeline.
+None. A checkpoint-specific IO quota or broader storage QoS policy should be
+considered only if future concurrent-workload evidence shows shared scheduler
+admission is insufficient; that would require a separate task.

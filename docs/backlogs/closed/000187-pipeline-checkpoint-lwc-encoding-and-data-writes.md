@@ -29,3 +29,11 @@ Checkpoint encoding and LWC data writes overlap under deterministic delayed enco
 ## Notes (Optional)
 
 A first implementation should pipeline only LWC data writes. Column-index construction, deletion checkpoint, secondary-index sidecars, allocation-map rebuilding, and root publication should remain after the data-write drain unless separate evidence justifies more overlap. No durable-format change is expected.
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000278-pipeline-checkpoint-lwc-encoding-and-data-writes.md
+- Closed By: backlog close
+- Reference: User decision
+- Closed At: 2026-08-22
