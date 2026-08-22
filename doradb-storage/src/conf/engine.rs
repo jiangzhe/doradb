@@ -11,25 +11,58 @@ use super::consts::{
 };
 use super::{EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
 
+/// Immutable sizing for the engine-owned CPU thread pool.
+///
+/// The default is two fixed operating-system workers. Pool tasks are finite,
+/// synchronous CPU computations submitted only by storage-internal owners.
+/// Sizing is validated once during engine startup; a running engine cannot be
+/// resized.
+#[derive(Clone, Debug)]
+pub struct ThreadPoolConfig {
+    /// Number of fixed operating-system threads executing CPU tasks.
+    pub worker_threads: usize,
+}
+
+impl Default for ThreadPoolConfig {
+    #[inline]
+    fn default() -> Self {
+        Self { worker_threads: 2 }
+    }
+}
+
+impl ThreadPoolConfig {
+    /// Set the fixed number of CPU worker threads.
+    #[inline]
+    pub fn worker_threads(mut self, worker_threads: usize) -> Self {
+        self.worker_threads = worker_threads;
+        self
+    }
+
+    /// Validate immutable pool sizing.
+    #[inline]
+    pub(crate) fn validate(&self) -> ConfigResult<()> {
+        if self.worker_threads == 0 {
+            return Err(Report::new(ConfigError::InvalidThreadPoolWorkerThreads)
+                .attach("thread_pool.worker_threads=0"));
+        }
+        Ok(())
+    }
+}
+
 /// Immutable sizing for the engine-owned mandatory runtime.
 ///
-/// The default is two fixed operating-system runner threads and four accepted
-/// caller-operation permits. One runner provides concurrency only when tasks
-/// reach cooperative await or yield points; multiple runners allow overlap but
-/// do not provide a fairness or queue-latency guarantee.
+/// The runtime has one fixed operating-system runner and four accepted
+/// caller-operation permits by default. Several accepted tasks can make
+/// cooperative progress when they reach await or yield points.
 ///
 /// `concurrency_limit` does not count caller-side preparation futures or
 /// engine-internal transaction cleanup. Internal cleanup bypasses caller quota
 /// so correctness obligations are not lost, while shutdown still waits for
 /// both classes. Raising the caller limit may retain more locks, memory, and
-/// publication work without raising executor throughput. Raising the runner
-/// count may increase storage and metadata contention and cannot repair
-/// blocking task code. Sizing is validated once during engine startup; a
-/// running engine cannot be resized.
+/// publication work without raising executor throughput. Sizing is validated
+/// once during engine startup; a running engine cannot be resized.
 #[derive(Clone, Debug)]
 pub struct MandatoryRuntimeConfig {
-    /// Number of fixed operating-system threads driving the shared executor.
-    pub worker_threads: usize,
     /// Maximum accepted caller obligations, excluding internal cleanup.
     pub concurrency_limit: usize,
 }
@@ -38,20 +71,12 @@ impl Default for MandatoryRuntimeConfig {
     #[inline]
     fn default() -> Self {
         Self {
-            worker_threads: 2,
             concurrency_limit: 4,
         }
     }
 }
 
 impl MandatoryRuntimeConfig {
-    /// Set the fixed number of mandatory-runtime runner threads.
-    #[inline]
-    pub fn worker_threads(mut self, worker_threads: usize) -> Self {
-        self.worker_threads = worker_threads;
-        self
-    }
-
     /// Set accepted caller capacity without limiting internal cleanup.
     #[inline]
     pub fn concurrency_limit(mut self, concurrency_limit: usize) -> Self {
@@ -62,10 +87,6 @@ impl MandatoryRuntimeConfig {
     /// Validate immutable runtime sizing.
     #[inline]
     pub(crate) fn validate(&self) -> ConfigResult<()> {
-        if self.worker_threads == 0 {
-            return Err(Report::new(ConfigError::InvalidMandatoryWorkerThreads)
-                .attach("mandatory_runtime.worker_threads=0"));
-        }
         if self.concurrency_limit == 0 {
             return Err(Report::new(ConfigError::InvalidMandatoryConcurrencyLimit)
                 .attach("mandatory_runtime.concurrency_limit=0"));
@@ -81,6 +102,8 @@ pub struct EngineConfig {
     pub storage_root: PathBuf,
     /// Transaction-system configuration.
     pub trx: TrxSysConfig,
+    /// Engine-owned CPU thread-pool configuration.
+    pub thread_pool: ThreadPoolConfig,
     /// Engine-owned mandatory runtime configuration.
     pub mandatory_runtime: MandatoryRuntimeConfig,
     /// Metadata buffer-pool size.
@@ -99,6 +122,7 @@ impl Default for EngineConfig {
         EngineConfig {
             storage_root: PathBuf::from("."),
             trx: TrxSysConfig::default(),
+            thread_pool: ThreadPoolConfig::default(),
             mandatory_runtime: MandatoryRuntimeConfig::default(),
             meta_buffer: Byte::from_u64(DEFAULT_ENGINE_META_BUFFER as u64),
             index_buffer: EvictableBufferPoolConfig::default()
@@ -123,6 +147,7 @@ impl EngineConfig {
     /// configuration-domain report for storage-internal callers.
     #[inline]
     pub(crate) fn validate_inner(mut self) -> ConfigResult<Self> {
+        self.thread_pool.validate()?;
         self.mandatory_runtime.validate()?;
         self.trx.validate()?;
         self.index_buffer = self
@@ -161,6 +186,13 @@ impl EngineConfig {
     #[inline]
     pub fn trx(mut self, trx: TrxSysConfig) -> Self {
         self.trx = trx;
+        self
+    }
+
+    /// Set the engine-owned CPU thread-pool configuration.
+    #[inline]
+    pub fn thread_pool(mut self, thread_pool: ThreadPoolConfig) -> Self {
+        self.thread_pool = thread_pool;
         self
     }
 
@@ -220,16 +252,15 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn mandatory_runtime_rejects_zero_sizes() {
-        let error = MandatoryRuntimeConfig::default()
+    fn runtime_configs_reject_zero_sizes() {
+        let error = ThreadPoolConfig::default()
             .worker_threads(0)
             .validate()
             .unwrap_err();
         assert_eq!(
             error.current_context(),
-            &ConfigError::InvalidMandatoryWorkerThreads
+            &ConfigError::InvalidThreadPoolWorkerThreads
         );
-
         let error = MandatoryRuntimeConfig::default()
             .concurrency_limit(0)
             .validate()
@@ -266,12 +297,12 @@ mod tests {
         let root = temp.path().join("invalid");
         let config = EngineConfig::default()
             .storage_root(&root)
-            .mandatory_runtime(MandatoryRuntimeConfig::default().worker_threads(0));
+            .thread_pool(ThreadPoolConfig::default().worker_threads(0));
 
         let typed_error = config.clone().validate_inner().unwrap_err();
         assert_eq!(
             typed_error.current_context(),
-            &ConfigError::InvalidMandatoryWorkerThreads
+            &ConfigError::InvalidThreadPoolWorkerThreads
         );
 
         let error = config.validate().unwrap_err();

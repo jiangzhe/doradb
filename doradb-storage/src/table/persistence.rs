@@ -6,10 +6,11 @@ use super::lifecycle::{CheckpointPublishLease, TableCheckpointRootMutationScope,
 use crate::buffer::guard::PageGuard;
 use crate::buffer::{PoolGuard, PoolGuards};
 use crate::catalog::{IndexSpec, SilentWatermarkObject, TableColumnLayout, TableMetadata};
+use crate::completion::Completion;
 use crate::error::{
     CompletionErrorBridge, CompletionResult, DataIntegrityError, DataIntegrityResult, FatalError,
-    InternalError, LifecycleError, MultiDomainResultExt, RuntimeError, RuntimeOrFatalError,
-    RuntimeOrFatalResult, RuntimeOrFatalResultExt, RuntimeResult,
+    InternalError, InternalResult, LifecycleError, MultiDomainResultExt, RuntimeError,
+    RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeOrFatalResultExt, RuntimeResult,
 };
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::file::table_file::{ActiveRoot, LwcBlockPersist, MutableTableFile};
@@ -21,10 +22,13 @@ use crate::index::disk_tree::{
 use crate::index::{
     ColumnBlockEntryShape, ColumnBlockIndex, ColumnDeleteDeltaPatch, ColumnLeafEntry,
 };
+use crate::io::DirectBuf;
 use crate::lwc::LwcBuilder;
 use crate::obs;
+use crate::quiescent::QuiescentGuard;
 use crate::row::RowPage;
 use crate::runtime::mandatory::PreparedExecution;
+use crate::runtime::thread_pool::ThreadPool;
 use crate::session::{
     MaintenanceExecution, PreparedMaintenanceExecution, PreparedMaintenanceScope, SessionRuntime,
     SessionRuntimeAccess,
@@ -40,7 +44,8 @@ use crate::value::{Val, ValKind, ValType};
 use error_stack::{Report, ResultExt};
 use event_listener::EventListener;
 use futures::future::select_all;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
+use std::mem::replace;
 use std::result::Result as StdResult;
 use std::sync::Arc;
 
@@ -111,6 +116,114 @@ pub(crate) enum CheckpointRetryObservation {
     Ready,
     /// The predicate remains blocked and can wait without retaining table state.
     Wait(DetachedCheckpointRetryWait),
+}
+
+struct PendingLwcEncode {
+    shape: ColumnBlockEntryShape,
+    completion: Arc<Completion<InternalResult<DirectBuf>>>,
+}
+
+struct CheckpointLwcEncodeQueue {
+    thread_pool: QuiescentGuard<ThreadPool>,
+    max_in_flight: usize,
+    table_id: TableID,
+    pending: VecDeque<PendingLwcEncode>,
+    output: Vec<LwcBlockPersist>,
+}
+
+impl CheckpointLwcEncodeQueue {
+    #[inline]
+    fn new(thread_pool: QuiescentGuard<ThreadPool>, table_id: TableID) -> Self {
+        let max_in_flight = thread_pool.worker_threads();
+        Self {
+            thread_pool,
+            max_in_flight,
+            table_id,
+            pending: VecDeque::with_capacity(max_in_flight),
+            output: Vec::new(),
+        }
+    }
+
+    async fn submit(
+        &mut self,
+        builder: LwcBuilder,
+        shape: ColumnBlockEntryShape,
+    ) -> RuntimeOrFatalResult<()> {
+        if self.pending.len() == self.max_in_flight {
+            self.consume_oldest().await?;
+        }
+        let row_shape_fingerprint = shape.row_shape_fingerprint();
+        let completion = self
+            .thread_pool
+            .submit(move || builder.build(row_shape_fingerprint));
+        self.pending
+            .push_back(PendingLwcEncode { shape, completion });
+        Ok(())
+    }
+
+    async fn consume_oldest(&mut self) -> RuntimeOrFatalResult<()> {
+        let pending = self
+            .pending
+            .pop_front()
+            .expect("checkpoint LWC encode queue consumes only a known pending task");
+        let start_row_id = pending.shape.start_row_id();
+        let end_row_id = pending.shape.end_row_id();
+        let encoded = pending
+            .completion
+            .wait_take_result()
+            .await
+            .map_err(|bridge| {
+                bridge
+                    .into_runtime_or_fatal(RuntimeError::CheckpointExecution)
+                    .attach_with(|| {
+                        format!(
+                            "operation=build_lwc_blocks, phase=await_encode, table_id={}, start_row_id={start_row_id}, end_row_id={end_row_id}",
+                            self.table_id
+                        )
+                    })
+            })?
+            .map_err(|report| {
+                RuntimeOrFatalError::from(
+                    report
+                        .change_context(RuntimeError::CheckpointExecution)
+                        .attach(format!(
+                            "operation=build_lwc_blocks, phase=encode_block, table_id={}, start_row_id={start_row_id}, end_row_id={end_row_id}",
+                            self.table_id
+                        )),
+                )
+            })?;
+        self.output.push(LwcBlockPersist {
+            shape: pending.shape,
+            buf: encoded,
+        });
+        Ok(())
+    }
+
+    async fn drain(&mut self) -> RuntimeOrFatalResult<()> {
+        let mut first_error: Option<RuntimeOrFatalError> = None;
+        while !self.pending.is_empty() {
+            if let Err(error) = self.consume_oldest().await {
+                first_error = Some(match first_error {
+                    Some(primary) => primary.merge_cleanup(error),
+                    None => error,
+                });
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    async fn finish(
+        mut self,
+        production: RuntimeOrFatalResult<()>,
+    ) -> RuntimeOrFatalResult<Vec<LwcBlockPersist>> {
+        let drain = self.drain().await;
+        match (production, drain) {
+            (Ok(()), Ok(())) => Ok(self.output),
+            (Err(primary), Ok(())) => Err(primary),
+            (Ok(()), Err(drain)) => Err(drain),
+            (Err(primary), Err(drain)) => Err(primary.merge_cleanup(drain)),
+        }
+    }
 }
 
 /// Notification state detached from all table-owned runtime and proof objects.
@@ -357,6 +470,7 @@ where
             .build_lwc_blocks(
                 metadata,
                 pool_guards,
+                session.engine().thread_pool.clone(),
                 self.attempt
                     .batch()
                     .map(|batch| batch.prepared.as_slice())
@@ -366,7 +480,7 @@ where
                 &session.engine().maintenance_test,
             )
             .await
-            .change_context(RuntimeError::CheckpointExecution)
+            .change_runtime_context(RuntimeError::CheckpointExecution)
             .attach_with(|| {
                 format!("operation=checkpoint_table, phase=build_lwc_blocks, table_id={table_id}")
             })?;
@@ -1955,10 +2069,11 @@ impl Table {
         &self,
         metadata: &TableMetadata,
         guards: &PoolGuards,
+        thread_pool: QuiescentGuard<ThreadPool>,
         prepared_pages: &[Option<PreparedTransitionPage>],
         mut collect_visible_row: Option<C>,
         #[cfg(test)] maintenance_test: &MaintenanceTestController,
-    ) -> RuntimeResult<Vec<LwcBlockPersist>>
+    ) -> RuntimeOrFatalResult<Vec<LwcBlockPersist>>
     where
         C: FnMut(&RowPage, usize, RowID),
     {
@@ -1967,82 +2082,30 @@ impl Table {
 
         #[cfg(test)]
         table_test_hooks::maybe_force_lwc_build_error(maintenance_test)?;
-        let mut lwc_blocks = Vec::new();
-        if !prepared_pages.is_empty() {
-            let mut builder = LwcBuilder::new(metadata.col.as_ref());
+        let mut queue = CheckpointLwcEncodeQueue::new(thread_pool, self.table_id());
+        let production: RuntimeOrFatalResult<()> = async {
+            let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
             let mut current_start = RowID::new(0);
             let mut current_end = RowID::new(0);
             for prepared in prepared_pages {
                 let Some(prepared) = prepared.as_ref() else {
-                    return Err(Report::new(InternalError::LwcBuilderMisuse)
-                        .attach("transitioned page has no prepared visibility plan")
-                        .change_context(RuntimeError::CheckpointExecution)
-                        .attach(format!(
-                            "operation=build_lwc_blocks, table_id={}",
-                            self.table_id()
-                        )));
-                };
-                let page_guard = self
-                    .mem
-                    .must_get_row_page_shared(guards, prepared.page_id)
-                    .await?;
-                let page = page_guard.page();
-                assert_eq!(page.header.start_row_id, prepared.start_row_id);
-                let view = page
-                    .vector_view_with_del_bitmap(metadata.col.as_ref(), prepared.del_bitmap.clone())
-                    .change_context(RuntimeError::CheckpointExecution)
-                    .attach_with(|| {
-                        format!(
-                            "operation=build_lwc_blocks, phase=build_vector_view, table_id={}, page_id={}",
-                            self.table_id(), prepared.page_id
-                        )
-                    })?;
-                if view.rows_non_deleted() == 0 {
-                    continue;
-                }
-                if let Some(collect_visible_row) = collect_visible_row.as_mut() {
-                    for (start_idx, end_idx) in view.range_non_deleted() {
-                        for row_idx in start_idx..end_idx {
-                            collect_visible_row(page, row_idx, page.row_id(row_idx));
-                        }
-                    }
-                }
-                if builder.is_empty() {
-                    current_start = prepared.start_row_id;
-                    current_end = prepared.end_row_id;
-                }
-                if !builder.append_view(view, prepared.start_row_id) {
-                    if builder.is_empty() {
-                        return Err(Report::new(InternalError::LwcBuilderMisuse)
-                            .attach(format!(
-                                "single row page does not fit in LWC block: page_id={}",
-                                prepared.page_id
-                            ))
+                    return Err(RuntimeOrFatalError::from(
+                        Report::new(InternalError::LwcBuilderMisuse)
+                            .attach("transitioned page has no prepared visibility plan")
                             .change_context(RuntimeError::CheckpointExecution)
                             .attach(format!(
-                                "operation=build_lwc_blocks, phase=append_page, table_id={}",
+                                "operation=build_lwc_blocks, table_id={}",
                                 self.table_id()
-                            )));
-                    }
-                    let shape = ColumnBlockEntryShape::new(
-                        current_start,
-                        current_end,
-                        builder.row_ids().to_vec(),
-                        Vec::new(),
-                    );
-                    let buf = builder
-                        .build(shape.row_shape_fingerprint())
-                        .change_context(RuntimeError::CheckpointExecution)
-                        .attach_with(|| {
-                            format!(
-                                "operation=build_lwc_blocks, phase=encode_block, table_id={}, start_row_id={current_start}, end_row_id={current_end}",
-                                self.table_id()
-                            )
-                        })?;
-                    lwc_blocks.push(LwcBlockPersist { shape, buf });
-                    builder = LwcBuilder::new(metadata.col.as_ref());
-                    current_start = prepared.start_row_id;
-                    current_end = prepared.end_row_id;
+                            )),
+                    ));
+                };
+                let appended = {
+                    let page_guard = self
+                        .mem
+                        .must_get_row_page_shared(guards, prepared.page_id)
+                        .await?;
+                    let page = page_guard.page();
+                    assert_eq!(page.header.start_row_id, prepared.start_row_id);
                     let view = page
                         .vector_view_with_del_bitmap(
                             metadata.col.as_ref(),
@@ -2051,21 +2114,94 @@ impl Table {
                         .change_context(RuntimeError::CheckpointExecution)
                         .attach_with(|| {
                             format!(
-                                "operation=build_lwc_blocks, phase=rebuild_vector_view, table_id={}, page_id={}",
+                                "operation=build_lwc_blocks, phase=build_vector_view, table_id={}, page_id={}",
                                 self.table_id(), prepared.page_id
                             )
                         })?;
-                    if !builder.append_view(view, prepared.start_row_id) {
-                        return Err(Report::new(InternalError::LwcBuilderMisuse)
-                            .attach(format!(
-                                "single row page does not fit in LWC block: page_id={}",
-                                prepared.page_id
-                            ))
+                    if view.rows_non_deleted() == 0 {
+                        None
+                    } else {
+                        if let Some(collect_visible_row) = collect_visible_row.as_mut() {
+                            for (start_idx, end_idx) in view.range_non_deleted() {
+                                for row_idx in start_idx..end_idx {
+                                    collect_visible_row(page, row_idx, page.row_id(row_idx));
+                                }
+                            }
+                        }
+                        if builder.is_empty() {
+                            current_start = prepared.start_row_id;
+                            current_end = prepared.end_row_id;
+                        }
+                        Some(builder.append_view(view, prepared.start_row_id))
+                    }
+                };
+                let Some(appended) = appended else {
+                    continue;
+                };
+                if !appended {
+                    if builder.is_empty() {
+                        return Err(RuntimeOrFatalError::from(
+                            Report::new(InternalError::LwcBuilderMisuse)
+                                .attach(format!(
+                                    "single row page does not fit in LWC block: page_id={}",
+                                    prepared.page_id
+                                ))
+                                .change_context(RuntimeError::CheckpointExecution)
+                                .attach(format!(
+                                    "operation=build_lwc_blocks, phase=append_page, table_id={}",
+                                    self.table_id()
+                                )),
+                        ));
+                    }
+                    let shape = ColumnBlockEntryShape::new(
+                        current_start,
+                        current_end,
+                        builder.row_ids().to_vec(),
+                        Vec::new(),
+                    );
+                    let completed_builder = replace(
+                        &mut builder,
+                        LwcBuilder::new(Arc::clone(&metadata.col)),
+                    );
+                    // No page guard or borrowed vector view survives this
+                    // capacity wait and accepted-task submission boundary.
+                    queue.submit(completed_builder, shape).await?;
+                    current_start = prepared.start_row_id;
+                    current_end = prepared.end_row_id;
+                    let rebuilt_appended = {
+                        let page_guard = self
+                            .mem
+                            .must_get_row_page_shared(guards, prepared.page_id)
+                            .await?;
+                        let page = page_guard.page();
+                        assert_eq!(page.header.start_row_id, prepared.start_row_id);
+                        let view = page
+                            .vector_view_with_del_bitmap(
+                                metadata.col.as_ref(),
+                                prepared.del_bitmap.clone(),
+                            )
                             .change_context(RuntimeError::CheckpointExecution)
-                            .attach(format!(
-                                "operation=build_lwc_blocks, phase=append_page, table_id={}",
-                                self.table_id()
-                            )));
+                            .attach_with(|| {
+                                format!(
+                                    "operation=build_lwc_blocks, phase=rebuild_vector_view, table_id={}, page_id={}",
+                                    self.table_id(), prepared.page_id
+                                )
+                            })?;
+                        builder.append_view(view, prepared.start_row_id)
+                    };
+                    if !rebuilt_appended {
+                        return Err(RuntimeOrFatalError::from(
+                            Report::new(InternalError::LwcBuilderMisuse)
+                                .attach(format!(
+                                    "single row page does not fit in LWC block: page_id={}",
+                                    prepared.page_id
+                                ))
+                                .change_context(RuntimeError::CheckpointExecution)
+                                .attach(format!(
+                                    "operation=build_lwc_blocks, phase=append_page, table_id={}",
+                                    self.table_id()
+                                )),
+                        ));
                     }
                 } else {
                     current_end = prepared.end_row_id;
@@ -2078,19 +2214,12 @@ impl Table {
                     builder.row_ids().to_vec(),
                     Vec::new(),
                 );
-                let buf = builder
-                    .build(shape.row_shape_fingerprint())
-                    .change_context(RuntimeError::CheckpointExecution)
-                    .attach_with(|| {
-                        format!(
-                            "operation=build_lwc_blocks, phase=encode_final_block, table_id={}, start_row_id={current_start}, end_row_id={current_end}",
-                            self.table_id()
-                        )
-                    })?;
-                lwc_blocks.push(LwcBlockPersist { shape, buf });
+                queue.submit(builder, shape).await?;
             }
+            Ok(())
         }
-        Ok(lwc_blocks)
+        .await;
+        queue.finish(production).await
     }
 
     /// Execute one checkpoint with caller-prepared workflow/root authority.
@@ -2204,12 +2333,13 @@ mod tests {
         ColumnAttributes, ColumnSpec, CurrentTableState, ResolvedVisibleTableMetadata, TableCache,
         TableSpec,
     };
-    use crate::completion::Completion;
+    use crate::completion::{Completion, CompletionTake};
     use crate::conf::TrxSysConfig;
     use crate::engine::Engine;
     use crate::error::{
         Error, FatalError, LifecycleError, ResourceError, RuntimeError, RuntimeOrFatalError,
     };
+    use crate::file::cow_file::COW_FILE_PAGE_SIZE;
     use crate::file::cow_file::tests::old_root_drop_count;
     use crate::index::RowLocation;
     use crate::io::install_storage_backend_test_hook;
@@ -2902,6 +3032,22 @@ mod tests {
         );
     }
 
+    fn test_pending_lwc_encode(
+        start_row_id: u64,
+        completion: Arc<Completion<InternalResult<DirectBuf>>>,
+    ) -> PendingLwcEncode {
+        let start_row_id = RowID::new(start_row_id);
+        PendingLwcEncode {
+            shape: ColumnBlockEntryShape::new(
+                start_row_id,
+                start_row_id + 10,
+                vec![start_row_id],
+                Vec::new(),
+            ),
+            completion,
+        }
+    }
+
     #[test]
     fn test_maintenance_wait_stacks_shutdown_under_checkpoint_runtime() {
         smol::block_on(async {
@@ -3215,6 +3361,7 @@ mod tests {
                 .build_lwc_blocks(
                     &metadata,
                     &guards,
+                    engine.inner().thread_pool.clone(),
                     &[Some(prepared)],
                     None::<fn(&RowPage, usize, RowID)>,
                     &engine.inner().maintenance_test,
@@ -3224,8 +3371,11 @@ mod tests {
                 Ok(_) => panic!("oversized first row page should fail LWC block build"),
                 Err(err) => err,
             };
+            let RuntimeOrFatalError::Runtime(runtime) = &err else {
+                panic!("oversized first row page must remain a Runtime error")
+            };
             assert_eq!(
-                err.downcast_ref::<InternalError>().copied(),
+                runtime.downcast_ref::<InternalError>().copied(),
                 Some(InternalError::LwcBuilderMisuse)
             );
             let report = format!("{err:?}");
@@ -3234,6 +3384,122 @@ mod tests {
                 "{report}"
             );
             assert!(report.contains(&format!("page_id={page_id}")), "{report}");
+        });
+    }
+
+    #[test]
+    fn checkpoint_lwc_encode_queue_preserves_fifo_completion_order() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "lwc-encode-fifo").await;
+            let mut queue =
+                CheckpointLwcEncodeQueue::new(engine.inner().thread_pool.clone(), TableID::new(17));
+            let first = Arc::new(Completion::new());
+            let second = Arc::new(Completion::new());
+            queue.pending.push_back(PendingLwcEncode {
+                shape: ColumnBlockEntryShape::new(
+                    RowID::new(10),
+                    RowID::new(20),
+                    vec![RowID::new(10)],
+                    Vec::new(),
+                ),
+                completion: Arc::clone(&first),
+            });
+            queue.pending.push_back(PendingLwcEncode {
+                shape: ColumnBlockEntryShape::new(
+                    RowID::new(20),
+                    RowID::new(30),
+                    vec![RowID::new(20)],
+                    Vec::new(),
+                ),
+                completion: Arc::clone(&second),
+            });
+
+            second.complete(Ok(Ok(DirectBuf::zeroed(COW_FILE_PAGE_SIZE))));
+            first.complete(Ok(Ok(DirectBuf::zeroed(COW_FILE_PAGE_SIZE))));
+            let output = queue.finish(Ok(())).await.unwrap();
+            assert_eq!(output.len(), 2);
+            assert_eq!(output[0].shape.start_row_id(), RowID::new(10));
+            assert_eq!(output[1].shape.start_row_id(), RowID::new(20));
+            assert!(matches!(first.try_take_result(), CompletionTake::Consumed));
+            assert!(matches!(second.try_take_result(), CompletionTake::Consumed));
+        });
+    }
+
+    #[test]
+    fn checkpoint_lwc_encode_queue_drains_after_inner_encode_error() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "lwc-encode-inner-error").await;
+            let mut queue =
+                CheckpointLwcEncodeQueue::new(engine.inner().thread_pool.clone(), TableID::new(18));
+            let failed = Arc::new(Completion::new());
+            let later = Arc::new(Completion::new());
+            queue
+                .pending
+                .push_back(test_pending_lwc_encode(10, Arc::clone(&failed)));
+            queue
+                .pending
+                .push_back(test_pending_lwc_encode(20, Arc::clone(&later)));
+            failed.complete(Ok(Err(
+                Report::new(InternalError::LwcBuilderMisuse).attach("first encode failure")
+            )));
+            later.complete(Ok(Ok(DirectBuf::zeroed(COW_FILE_PAGE_SIZE))));
+
+            let error = match queue.finish(Ok(())).await {
+                Ok(_) => panic!("inner LWC encode failure must fail queue finish"),
+                Err(error) => error,
+            };
+            let RuntimeOrFatalError::Runtime(report) = error else {
+                panic!("inner LWC encode failure must remain Runtime")
+            };
+            assert_eq!(report.current_context(), &RuntimeError::CheckpointExecution);
+            assert_eq!(
+                report.downcast_ref::<InternalError>().copied(),
+                Some(InternalError::LwcBuilderMisuse)
+            );
+            assert!(matches!(later.try_take_result(), CompletionTake::Consumed));
+        });
+    }
+
+    #[test]
+    fn checkpoint_lwc_encode_queue_fatal_drain_outranks_producer_error() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "lwc-encode-fatal-drain").await;
+            let mut queue =
+                CheckpointLwcEncodeQueue::new(engine.inner().thread_pool.clone(), TableID::new(19));
+            let first = Arc::new(Completion::new());
+            let fatal = Arc::new(Completion::new());
+            queue
+                .pending
+                .push_back(test_pending_lwc_encode(10, Arc::clone(&first)));
+            queue
+                .pending
+                .push_back(test_pending_lwc_encode(20, Arc::clone(&fatal)));
+            first.complete(Ok(Err(
+                Report::new(InternalError::LwcBuilderMisuse).attach("first encode failure")
+            )));
+            fatal.complete(Err(CompletionErrorBridge::capture(
+                Report::new(FatalError::ThreadPoolTaskPanic).attach("fatal encode failure"),
+            )));
+            let production = Err(RuntimeOrFatalError::from(
+                Report::new(RuntimeError::CheckpointExecution).attach("producer page failure"),
+            ));
+
+            let error = match queue.finish(production).await {
+                Ok(_) => panic!("fatal LWC encode failure must fail queue finish"),
+                Err(error) => error,
+            };
+            let RuntimeOrFatalError::Fatal(report) = error else {
+                panic!("fatal encode drain must outrank Runtime producer failure")
+            };
+            assert_eq!(report.current_context(), &FatalError::ThreadPoolTaskPanic);
+            let diagnostic = format!("{report:?}");
+            assert!(diagnostic.contains("producer page failure"), "{diagnostic}");
+            assert!(diagnostic.contains("first encode failure"), "{diagnostic}");
+            assert!(matches!(first.try_take_result(), CompletionTake::Consumed));
+            assert!(matches!(fatal.try_take_result(), CompletionTake::Consumed));
         });
     }
 

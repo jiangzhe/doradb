@@ -121,6 +121,13 @@ impl EnginePoisoner {
     /// Returns the first fatal engine poison error, if runtime admission has been poisoned.
     #[inline]
     pub(crate) fn poison_error(&self) -> Option<Report<FatalError>> {
+        self.shared_poison_error()
+            .map(SharedFatalError::into_report)
+    }
+
+    /// Returns the cached shared fatal error without reconstructing its report.
+    #[inline]
+    pub(crate) fn shared_poison_error(&self) -> Option<SharedFatalError> {
         #[cfg(test)]
         self.health_checks.fetch_add(1, Ordering::Relaxed);
         if !self.poisoned.load(Ordering::Acquire) {
@@ -132,7 +139,7 @@ impl EnginePoisoner {
             .as_ref()
             .cloned()
             .expect("engine poison flag must have a stored fatal error");
-        Some(error.into_report())
+        Some(error)
     }
 
     /// Returns `Err` once a fatal engine failure poisoned runtime admission.

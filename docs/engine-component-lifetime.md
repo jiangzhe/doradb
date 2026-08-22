@@ -121,12 +121,16 @@ can poison the engine without depending on `TransactionSystem`; components
 that publish or inspect fatal state retain their own direct poisoner
 dependency.
 
-`MandatoryRuntime` is registered immediately after the poisoner. Catalog,
-transaction, recovery, and future operation adapters can therefore retain its
-direct `QuiescentGuard` without owning the engine owner shell.
-Its build shelves only the runtime guard and configured runner count. The later
-`MandatoryRuntimeWorkers` build starts the fixed runners and registers their
-join-handle owner at the required shutdown position.
+`ThreadPool` and `ThreadPoolWorkers` are registered immediately after the
+poisoner. The core owns the only job sender and a direct poisoner guard; its
+adjacent worker owner starts the configured fixed workers. `MandatoryRuntime`
+is registered next. Catalog, transaction, recovery, and operation adapters can
+therefore retain its direct `QuiescentGuard` without owning the engine owner
+shell. Its build shelves the runtime guard. The later
+`MandatoryRuntimeWorkers` build starts the one fixed runner and registers its
+join-handle owner at the required shutdown position. Reverse teardown stops
+mandatory execution before the CPU-pool owner enqueues FIFO stop messages and
+joins the drained workers.
 
 Registration order is the dependency order. Reverse registration order is both:
 
@@ -167,11 +171,16 @@ The storage-runtime worker components include:
   - closes group-commit admission and joins redo before mandatory cleanup
     admission closes.
 - `MandatoryRuntimeWorkers`
-  - closes and drains internal cleanup admission, then stops and joins every
+  - closes and drains internal cleanup admission, then stops and joins the
     executor runner.
 - `TransactionPurgeWorkers`
   - stops purge only after mandatory cleanup can no longer update transaction
     GC state.
+- `ThreadPoolWorkers`
+  - enqueues one FIFO stop message per CPU worker after mandatory execution
+    has stopped;
+  - drains every finite task accepted before those messages; and
+  - joins every CPU worker before propagating the first join payload.
 
 The last three registrations intentionally produce reverse shutdown
 `TransactionRedoWorkers -> MandatoryRuntimeWorkers ->
@@ -181,11 +190,36 @@ the later redo build makes the initial redo header durable before engine
 bootstrap returns. Registration order, rather than thread-start order, defines
 the teardown dependency.
 
+## CPU Thread Pool
+
+`ThreadPoolConfig::worker_threads` is nonzero, defaults to two, and is fixed
+for the engine lifetime. Submission uses `EnginePoisoner`'s atomic healthy
+check followed by one synchronous nonblocking send to an unbounded `flume`
+channel and returns the existing `Completion<T>`. The sender needs no external
+submission mutex. Dropping that observer does not cancel accepted computation.
+Pool jobs are crate-private, finite synchronous CPU work and must not perform
+IO, waits, sleeps, latch or logical-lock acquisition, or submit async futures.
+
+Each task body is unwind-supervised. A panic publishes
+`ThreadPoolTaskPanic` through `EnginePoisoner` before completing the task with
+the same shared Fatal bridge; the worker then continues its receive loop. An
+unexpected unavailable ingress similarly publishes `ThreadPoolUnavailable`
+and returns an already-failed completion. Once submission observes poison, it
+returns the cached shared Fatal without enqueueing. Poison may race the fast
+check, so bounded extra finite work can be accepted and is drained normally.
+
+The pool has no shutdown counter of its own. Each production job is nested
+under an already-accounted foreground or mandatory owner, and that owner must
+drain its task handles before terminal publication. Worker-owner shutdown is a
+defensive final drain: after mandatory execution stops, it sends one private
+FIFO stop message per worker, attempts every join, and only then propagates a
+captured join panic. These control messages bypass the poison health gate.
+
 ## Mandatory Runtime
 
-The engine owns one `async_executor::Executor` driven by a fixed number of
-named, joined OS threads (two by default). Caller operations acquire one of
-four bounded permits by default only after preparation is complete. Their
+The engine owns one `async_executor::Executor` driven by exactly one named,
+joined OS thread. Caller operations acquire one of four bounded permits by
+default only after preparation is complete. Their
 synchronous consuming `accept` call is the ownership handoff from
 caller-cancellable `Voluntary` state to runtime-owned `Mandatory` state; there
 is no await between a ready permit and detached spawn.
@@ -196,22 +230,19 @@ submitted synchronously without a lossy channel. Independent transactions can
 therefore clean up concurrently, while each transaction's rollback remains
 sequential.
 
-`MandatoryRuntimeConfig::worker_threads` controls OS runners, not the accepted
-caller count. `concurrency_limit` bounds accepted caller obligations, not
+`MandatoryRuntimeConfig::concurrency_limit` bounds accepted caller obligations, not
 caller-side preparation futures or internal cleanup. Increasing caller
 capacity can retain more logical locks, memory, and publication work without
-increasing runner throughput. Increasing runners can increase storage and
-metadata contention and cannot make blocking code cooperative. Configuration
-is validated once during startup, rejects zero sizes, and cannot resize a
-running engine.
+increasing runner throughput. Configuration is validated once during startup,
+rejects zero, and cannot resize a running engine.
 
-One runner provides concurrency only when accepted work reaches an await or
-explicit yield that returns scheduler control. Multiple runners allow true
-overlap, but neither configuration promises executor ordering, a queue-latency
-bound, or a general fairness SLA. Internal admission is non-lossy and separate
-from caller backpressure; it intentionally does not create a bounded cleanup
-backlog because correctness obligations cannot be rejected after ownership is
-claimed.
+Accepted work makes cooperative progress only when it reaches an await or
+explicit yield that returns scheduler control. CPU parallelism belongs to
+`ThreadPool`; mandatory admission promises neither executor ordering, a
+queue-latency bound, nor a general fairness SLA. Internal admission is
+non-lossy and separate from caller backpressure; it intentionally does not
+create a bounded cleanup backlog because correctness obligations cannot be
+rejected after ownership is claimed.
 
 Mandatory results reuse the common completion cell through a move-once take
 path. The single observer owns no task, permit, engine reference, session
@@ -387,7 +418,7 @@ The complete reverse-order shutdown audit is:
 | Reverse order | Component | Shutdown authority and panic caveat |
 | ---: | --- | --- |
 | 1 | `TransactionRedoWorkers` | Closes group commit, queues the shutdown marker, joins the log thread, releases the active log file, then exposes a captured join payload. Arbitrary redo-body unwind is not repaired. |
-| 2 | `MandatoryRuntimeWorkers` | Closes caller/internal admission, records caller-drain validation, drains internal work, signals stop, joins every runner, validates the executor, then exposes the first invariant or join payload. Accepted task bodies retain their domain supervision. |
+| 2 | `MandatoryRuntimeWorkers` | Closes caller/internal admission, records caller-drain validation, drains internal work, signals stop, joins the fixed runner, validates the executor, then exposes the first invariant or join payload. Accepted task bodies retain their domain supervision. |
 | 3 | `TransactionPurgeWorkers` | Sends `Purge::Stop`, joins the dispatcher and every executor, and retains an explicit transaction-system guard so degraded leakage pins the dependency closure. Arbitrary mid-purge unwind remains unsupported. |
 | 4 | `TransactionSystem` | Passive hook. Redo, mandatory-runtime, and purge worker owners hold active shutdown authority; transaction state is terminal after a worker panic. |
 | 5 | `Catalog` | Passive hook. Purge stops before owner release, and foreground catalog users were drained before component dispatch. |
@@ -400,8 +431,10 @@ The complete reverse-order shutdown audit is:
 | 12 | `DiskPool` | Passive hook. The shared evictor stops earlier in reverse order. |
 | 13 | `FileSystem` | Passive hook. `FileSystemWorkers` owns active I/O shutdown and retains this dependency. |
 | 14 | `MandatoryRuntime` | Passive hook. `MandatoryRuntimeWorkers` owns admission drain, stop, and joins. |
-| 15 | `EnginePoisoner` | Passive hook. It remains available through components that may report fatal state. |
-| 16 | `StorageRootLease` | Takes and drops the lock file last, so root ownership brackets subordinate storage activity even after a contained earlier panic. |
+| 15 | `ThreadPoolWorkers` | Enqueues one FIFO stop per CPU worker, drains earlier accepted jobs, attempts every worker join, then exposes the first join payload. |
+| 16 | `ThreadPool` | Passive hook. Its adjacent worker owner owns stop signalling and joins. |
+| 17 | `EnginePoisoner` | Passive hook. It remains available through components that may report fatal state. |
+| 18 | `StorageRootLease` | Takes and drops the lock file last, so root ownership brackets subordinate storage activity even after a contained earlier panic. |
 
 Any new production component, dependency edge, or panic-capable shutdown
 operation must update this inventory and its adjacent `Panic safety:` comment.
@@ -489,7 +522,7 @@ The owned-handle inventory follows those authorities:
 - terminal and cleanup paths reuse existing authority, upgrade the exact weak
   state without new foreground admission, and validate both operation key and
   transaction id directly on that state.
-- redo, mandatory-runtime, purge, file, and eviction workers are owned and
+- redo, mandatory-runtime, CPU-pool, purge, file, and eviction workers are owned and
   joined by their registered component owners.
 
 A surviving public handle retains only a weak state reference and its small

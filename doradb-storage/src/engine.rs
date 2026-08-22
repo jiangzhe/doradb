@@ -28,6 +28,7 @@ use crate::quiescent::QuiescentGuard;
 use crate::root::{StorageRootLease, StorageRootLeaseAttempt};
 use crate::runtime::block_on;
 use crate::runtime::mandatory::{MandatoryRuntime, MandatoryRuntimeWorkers};
+use crate::runtime::thread_pool::{ThreadPool, ThreadPoolWorkers};
 use crate::session::{Session, SessionAdmission, SessionCleanupRequest, SessionRegistry};
 #[cfg(test)]
 use crate::table::tests::MaintenanceTestController;
@@ -279,182 +280,7 @@ impl Engine {
     #[inline]
     pub async fn bootstrap(config: EngineConfig) -> Result<Self> {
         obs::info!("event=engine_lifecycle component=engine action=build_start result=ok");
-        let result = async {
-            let config = config.validate_inner().disclose()?;
-            let resolved = config
-                .resolve_storage_paths()
-                .disclose()?
-                .prepare_storage_root()
-                .disclose()?;
-            let lock_path = resolved.lock_path();
-            let lease = match StorageRootLease::try_acquire(&resolved).disclose()? {
-                StorageRootLeaseAttempt::Acquired(lease) => lease,
-                StorageRootLeaseAttempt::Contended {
-                    diagnostic,
-                    diagnostic_status,
-                } => {
-                    let report = Report::new(LifecycleError::StorageRootInUse).attach(format!(
-                        "operation=acquire_storage_root, storage_root={}, lock_path={}, owner_diagnostic={diagnostic_status}",
-                        resolved.storage_root_path().display(),
-                        lock_path.display()
-                    ));
-                    let report = if let Some(diagnostic) = diagnostic {
-                        report.attach(format!(
-                            "owner_pid={}, owner_acquired_unix_ms={}",
-                            diagnostic.pid, diagnostic.acquired_unix_ms
-                        ))
-                    } else {
-                        report
-                    };
-                    return Err(report.disclose());
-                }
-            };
-            let mut builder = RegistryBuilder::new();
-            // Root ownership is registered first so every failure and reverse
-            // shutdown path releases it only after all subordinate components stop.
-            builder
-                .build::<StorageRootLease>(lease)
-                .await
-                .unwrap_or_else(|never| match never {});
-            resolved.cleanup_stale_marker_temps().disclose()?;
-            let marker_was_present = resolved.validate_marker_if_present().disclose()?;
-            // Startup prefers a small, durable-safety-focused preflight over trying
-            // to exhaust every possible path conflict up front. It is acceptable for
-            // later setup steps to fail, but those failures must not clobber durable
-            // files or persist `storage-layout.toml` before the engine is fully built.
-            resolved.ensure_directories().disclose()?;
-
-            let file = config.file.data_dir(resolved.data_dir_path());
-            let readonly_buffer_size = file.readonly_buffer_size;
-            let file = file.validate().disclose()?;
-            let trx_cfg = config.trx.log_dir(resolved.log_dir_path());
-            let catalog_cfg = CatalogConfig::new(trx_cfg.recovery_disable_dml_validation);
-            let trx_cfg = ValidatedTrxSysConfig::try_new(trx_cfg).disclose()?;
-            // Components are registered in one fixed dependency order. Reverse
-            // registration order then defines both explicit shutdown order and the
-            // final owner drop order.
-            builder
-                .build::<EnginePoisoner>(())
-                .await
-                .unwrap_or_else(|never| match never {});
-            builder
-                .build::<MandatoryRuntime>(config.mandatory_runtime.clone())
-                .await
-                .disclose()?;
-            builder.build::<FileSystem>(file).await.disclose()?;
-            builder
-                .build::<DiskPool>(DiskPoolConfig::new(readonly_buffer_size))
-                .await
-                .disclose()?;
-            builder
-                .build::<MetaPool>(MetaPoolConfig::new(config.meta_buffer.as_u64() as usize))
-                .await
-                .disclose()?;
-            builder
-                .build::<IndexPool>(
-                    config
-                        .index_buffer
-                        .swap_file(resolved.index_swap_file_path()),
-                )
-                .await
-                .disclose()?;
-            builder
-                .build::<MemPool>(
-                    config
-                        .data_buffer
-                        .swap_file(resolved.data_swap_file_path()),
-                )
-                .await
-                .disclose()?;
-            builder.build::<FileSystemWorkers>(()).await.disclose()?;
-            builder
-                .build::<SharedPoolEvictorWorkers>(())
-                .await
-                .disclose()?;
-            builder
-                .build::<LockManager>(())
-                .await
-                .unwrap_or_else(|never| match never {});
-            // Catalog owns user-table runtimes, and those runtimes retain buffer-pool
-            // guards for row/index/readonly access. Register catalog after the pools it
-            // can pin so reverse shutdown/drop order releases table guards before pool
-            // owners are torn down.
-            builder.build::<Catalog>(catalog_cfg).await.disclose()?;
-            builder
-                .build::<TransactionSystem>(trx_cfg)
-                .await
-                .disclose()?;
-            builder
-                .build::<TransactionPurgeWorkers>(())
-                .await
-                .disclose()?;
-            builder
-                .build::<MandatoryRuntimeWorkers>(())
-                .await
-                .disclose()?;
-            builder
-                .build::<TransactionRedoWorkers>(())
-                .await
-                .disclose()?;
-
-            if marker_was_present {
-                if !resolved.validate_marker_if_present().disclose()? {
-                    return Err(Report::new(ConfigError::StorageLayoutMismatch)
-                        .attach(format!(
-                            "operation=revalidate_storage_layout_marker, phase=post_component_build, marker_path={}, reason=initially_present_marker_disappeared",
-                            resolved.marker_path().display()
-                        ))
-                        .disclose());
-                }
-            } else {
-                resolved.persist_marker().disclose()?;
-            }
-            let registry = builder.finish();
-            let poisoner = registry.dependency::<EnginePoisoner>();
-            let mandatory_runtime = registry.dependency::<MandatoryRuntime>();
-            let catalog = registry.dependency::<Catalog>();
-            let trx_sys = registry.dependency::<TransactionSystem>();
-            let meta_pool = registry.dependency::<MetaPool>();
-            let index_pool = registry.dependency::<IndexPool>();
-            let mem_pool = registry.dependency::<MemPool>();
-            let table_fs = registry.dependency::<FileSystem>();
-            let disk_pool = registry.dependency::<DiskPool>();
-            let lock_manager = registry.dependency::<LockManager>();
-            let session_registry = Arc::new(SessionRegistry::new());
-            let lifecycle = Arc::new(EngineLifecycle::new());
-            let core = Arc::new(EngineCore {
-                poisoner,
-                mandatory_runtime,
-                catalog,
-                trx_sys,
-                pools: EnginePools::new(
-                    meta_pool.clone_inner(),
-                    index_pool.clone_inner(),
-                    mem_pool.clone_inner(),
-                    disk_pool.clone_inner(),
-                ),
-                table_fs,
-                lock_manager,
-                session_registry: Arc::downgrade(&session_registry),
-                #[cfg(test)]
-                table_ddl_test: TableDdlTestController::default(),
-                #[cfg(test)]
-                index_ddl_test: IndexDdlTestController::default(),
-                #[cfg(test)]
-                maintenance_test: MaintenanceTestController::default(),
-            });
-            let engine_inner = EngineInner {
-                core,
-                session_registry,
-                lifecycle,
-                next_session_id: AtomicU64::new(FIRST_SESSION_ID.as_u64()),
-            };
-            Ok(Engine {
-                inner: Arc::new(engine_inner),
-                components: Some(registry),
-            })
-        }
-        .await;
+        let result = bootstrap_engine(config).await;
         result
             .inspect(|_| {
                 obs::info!("event=engine_lifecycle component=engine action=build_finish result=ok");
@@ -695,6 +521,8 @@ impl Drop for Engine {
 pub(crate) struct EngineCore {
     /// Engine-level fatal runtime poison state.
     pub(crate) poisoner: QuiescentGuard<EnginePoisoner>,
+    /// Engine-owned executor for finite synchronous CPU computations.
+    pub(crate) thread_pool: QuiescentGuard<ThreadPool>,
     /// Engine-owned scheduler for accepted caller and internal obligations.
     pub(crate) mandatory_runtime: QuiescentGuard<MandatoryRuntime>,
     /// Shared catalog handle.
@@ -795,6 +623,185 @@ impl Deref for EngineInner {
     fn deref(&self) -> &Self::Target {
         &self.core
     }
+}
+
+async fn bootstrap_engine(config: EngineConfig) -> Result<Engine> {
+    let config = config.validate_inner().disclose()?;
+    let resolved = config
+        .resolve_storage_paths()
+        .disclose()?
+        .prepare_storage_root()
+        .disclose()?;
+    let lock_path = resolved.lock_path();
+    let lease = match StorageRootLease::try_acquire(&resolved).disclose()? {
+        StorageRootLeaseAttempt::Acquired(lease) => lease,
+        StorageRootLeaseAttempt::Contended {
+            diagnostic,
+            diagnostic_status,
+        } => {
+            let report = Report::new(LifecycleError::StorageRootInUse).attach(format!(
+                        "operation=acquire_storage_root, storage_root={}, lock_path={}, owner_diagnostic={diagnostic_status}",
+                        resolved.storage_root_path().display(),
+                        lock_path.display()
+                    ));
+            let report = if let Some(diagnostic) = diagnostic {
+                report.attach(format!(
+                    "owner_pid={}, owner_acquired_unix_ms={}",
+                    diagnostic.pid, diagnostic.acquired_unix_ms
+                ))
+            } else {
+                report
+            };
+            return Err(report.disclose());
+        }
+    };
+    let mut builder = RegistryBuilder::new();
+    // Root ownership is registered first so every failure and reverse
+    // shutdown path releases it only after all subordinate components stop.
+    builder
+        .build::<StorageRootLease>(lease)
+        .await
+        .unwrap_or_else(|never| match never {});
+    resolved.cleanup_stale_marker_temps().disclose()?;
+    let marker_was_present = resolved.validate_marker_if_present().disclose()?;
+    // Startup prefers a small, durable-safety-focused preflight over trying
+    // to exhaust every possible path conflict up front. It is acceptable for
+    // later setup steps to fail, but those failures must not clobber durable
+    // files or persist `storage-layout.toml` before the engine is fully built.
+    resolved.ensure_directories().disclose()?;
+
+    let file = config.file.data_dir(resolved.data_dir_path());
+    let readonly_buffer_size = file.readonly_buffer_size;
+    let file = file.validate().disclose()?;
+    let trx_cfg = config.trx.log_dir(resolved.log_dir_path());
+    let catalog_cfg = CatalogConfig::new(trx_cfg.recovery_disable_dml_validation);
+    let trx_cfg = ValidatedTrxSysConfig::try_new(trx_cfg).disclose()?;
+    // Components are registered in one fixed dependency order. Reverse
+    // registration order then defines both explicit shutdown order and the
+    // final owner drop order.
+    builder
+        .build::<EnginePoisoner>(())
+        .await
+        .unwrap_or_else(|never| match never {});
+    builder
+        .build::<ThreadPool>(config.thread_pool.clone())
+        .await
+        .disclose()?;
+    builder.build::<ThreadPoolWorkers>(()).await.disclose()?;
+    builder
+        .build::<MandatoryRuntime>(config.mandatory_runtime.clone())
+        .await
+        .disclose()?;
+    builder.build::<FileSystem>(file).await.disclose()?;
+    builder
+        .build::<DiskPool>(DiskPoolConfig::new(readonly_buffer_size))
+        .await
+        .disclose()?;
+    builder
+        .build::<MetaPool>(MetaPoolConfig::new(config.meta_buffer.as_u64() as usize))
+        .await
+        .disclose()?;
+    builder
+        .build::<IndexPool>(
+            config
+                .index_buffer
+                .swap_file(resolved.index_swap_file_path()),
+        )
+        .await
+        .disclose()?;
+    builder
+        .build::<MemPool>(config.data_buffer.swap_file(resolved.data_swap_file_path()))
+        .await
+        .disclose()?;
+    builder.build::<FileSystemWorkers>(()).await.disclose()?;
+    builder
+        .build::<SharedPoolEvictorWorkers>(())
+        .await
+        .disclose()?;
+    builder
+        .build::<LockManager>(())
+        .await
+        .unwrap_or_else(|never| match never {});
+    // Catalog owns user-table runtimes, and those runtimes retain buffer-pool
+    // guards for row/index/readonly access. Register catalog after the pools it
+    // can pin so reverse shutdown/drop order releases table guards before pool
+    // owners are torn down.
+    builder.build::<Catalog>(catalog_cfg).await.disclose()?;
+    builder
+        .build::<TransactionSystem>(trx_cfg)
+        .await
+        .disclose()?;
+    builder
+        .build::<TransactionPurgeWorkers>(())
+        .await
+        .disclose()?;
+    builder
+        .build::<MandatoryRuntimeWorkers>(())
+        .await
+        .disclose()?;
+    builder
+        .build::<TransactionRedoWorkers>(())
+        .await
+        .disclose()?;
+
+    if marker_was_present {
+        if !resolved.validate_marker_if_present().disclose()? {
+            return Err(Report::new(ConfigError::StorageLayoutMismatch)
+                        .attach(format!(
+                            "operation=revalidate_storage_layout_marker, phase=post_component_build, marker_path={}, reason=initially_present_marker_disappeared",
+                            resolved.marker_path().display()
+                        ))
+                        .disclose());
+        }
+    } else {
+        resolved.persist_marker().disclose()?;
+    }
+    let registry = builder.finish();
+    let poisoner = registry.dependency::<EnginePoisoner>();
+    let thread_pool = registry.dependency::<ThreadPool>();
+    let mandatory_runtime = registry.dependency::<MandatoryRuntime>();
+    let catalog = registry.dependency::<Catalog>();
+    let trx_sys = registry.dependency::<TransactionSystem>();
+    let meta_pool = registry.dependency::<MetaPool>();
+    let index_pool = registry.dependency::<IndexPool>();
+    let mem_pool = registry.dependency::<MemPool>();
+    let table_fs = registry.dependency::<FileSystem>();
+    let disk_pool = registry.dependency::<DiskPool>();
+    let lock_manager = registry.dependency::<LockManager>();
+    let session_registry = Arc::new(SessionRegistry::new());
+    let lifecycle = Arc::new(EngineLifecycle::new());
+    let core = Arc::new(EngineCore {
+        poisoner,
+        thread_pool,
+        mandatory_runtime,
+        catalog,
+        trx_sys,
+        pools: EnginePools::new(
+            meta_pool.clone_inner(),
+            index_pool.clone_inner(),
+            mem_pool.clone_inner(),
+            disk_pool.clone_inner(),
+        ),
+        table_fs,
+        lock_manager,
+        session_registry: Arc::downgrade(&session_registry),
+        #[cfg(test)]
+        table_ddl_test: TableDdlTestController::default(),
+        #[cfg(test)]
+        index_ddl_test: IndexDdlTestController::default(),
+        #[cfg(test)]
+        maintenance_test: MaintenanceTestController::default(),
+    });
+    let engine_inner = EngineInner {
+        core,
+        session_registry,
+        lifecycle,
+        next_session_id: AtomicU64::new(FIRST_SESSION_ID.as_u64()),
+    };
+    Ok(Engine {
+        inner: Arc::new(engine_inner),
+        components: Some(registry),
+    })
 }
 
 #[cfg(test)]
@@ -989,10 +996,8 @@ mod tests {
                 "Mandatory-Runtime-1",
                 "phase=start_mandatory_runtime_runner",
             ),
-            (
-                "Mandatory-Runtime-2",
-                "phase=start_mandatory_runtime_runner",
-            ),
+            ("ThreadPoolWorker-1", "phase=start_thread_pool_worker"),
+            ("ThreadPoolWorker-2", "phase=start_thread_pool_worker"),
         ] {
             let root = TempDir::new().unwrap();
             let (event_tx, event_rx) = mpsc::channel();
@@ -1044,10 +1049,10 @@ mod tests {
                     "redo started after mandatory worker startup failed: started={started:?}"
                 );
             }
-            if worker == "Mandatory-Runtime-2" {
+            if worker == "ThreadPoolWorker-2" {
                 assert!(
-                    started.iter().any(|name| name == "Mandatory-Runtime-1"),
-                    "first mandatory runner did not start: started={started:?}"
+                    started.iter().any(|name| name == "ThreadPoolWorker-1"),
+                    "first CPU worker did not start: started={started:?}"
                 );
             }
         }
@@ -1681,18 +1686,19 @@ mod tests {
         };
         let redo_finished = finish_position("Log-Thread");
         let mandatory_1_finished = finish_position("Mandatory-Runtime-1");
-        let mandatory_2_finished = finish_position("Mandatory-Runtime-2");
         let purge_dispatcher_finished = finish_position("Purge-Dispatcher");
         let purge_executor_finished = finish_position("Purge-Executor-1");
         let evictor_finished = finish_position("Shared-Pool-Evictor");
         let io_finished = finish_position("IO-Thread");
+        let thread_pool_1_finished = finish_position("ThreadPoolWorker-1");
+        let thread_pool_2_finished = finish_position("ThreadPoolWorker-2");
         assert!(redo_finished < mandatory_1_finished);
-        assert!(redo_finished < mandatory_2_finished);
         assert!(mandatory_1_finished < purge_dispatcher_finished);
-        assert!(mandatory_2_finished < purge_dispatcher_finished);
         assert!(purge_dispatcher_finished < evictor_finished);
         assert!(purge_executor_finished < evictor_finished);
         assert!(evictor_finished < io_finished);
+        assert!(io_finished < thread_pool_1_finished);
+        assert!(io_finished < thread_pool_2_finished);
         drop(events);
         drop(observer);
 

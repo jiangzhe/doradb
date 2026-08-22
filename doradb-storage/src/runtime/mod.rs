@@ -4,6 +4,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 pub(crate) mod mandatory;
+pub(crate) mod thread_pool;
 
 /// Logical work items completed between cooperative executor yields.
 pub(crate) const POLL_BUDGET: usize = 128;

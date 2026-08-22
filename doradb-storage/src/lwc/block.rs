@@ -601,7 +601,7 @@ mod tests {
             InsertRow::Ok(_)
         ));
         let buf = {
-            let mut builder = LwcBuilder::new(metadata.col.as_ref());
+            let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
             let view = page.vector_view(metadata.col.as_ref());
             assert!(builder.append_view(view, page.header.start_row_id));
             let fingerprint = row_shape_fingerprint_for(builder.row_ids());

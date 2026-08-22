@@ -84,7 +84,10 @@ One checkpoint attempt follows these conceptual phases:
 3. Use the purge-published GC horizon as the exclusive cutoff for both frozen
    row images and cold-row delete selection, then allocate `checkpoint_ts`.
 4. Convert a ready frozen-page prefix into LWC blocks and collect matching
-   secondary-index entries from the same visible rows.
+   secondary-index entries from the same visible rows. Owned LWC encoding and
+   checksum work runs on the engine CPU thread pool behind a bounded ordered
+   checkpoint-local FIFO; page access and sidecar collection remain on the
+   mandatory runtime.
 5. Merge eligible cold-row deletes into persistent delete metadata and collect
    matching secondary-index deletes.
 6. Apply all accumulated secondary-index companion work to the same mutable

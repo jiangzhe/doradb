@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EngineConfigOverlay {
+    /// CPU thread-pool sizing overrides.
+    pub thread_pool: ThreadPoolOverlay,
     /// Mandatory runtime sizing overrides.
     pub mandatory_runtime: MandatoryRuntimeOverlay,
     /// Transaction-system overrides.
@@ -26,6 +28,7 @@ impl EngineConfigOverlay {
     /// Apply every set leaf from `other`, retaining unaffected sibling leaves.
     #[inline]
     pub fn merge(&mut self, other: Self) {
+        self.thread_pool.merge(other.thread_pool);
         self.mandatory_runtime.merge(other.mandatory_runtime);
         self.transaction.merge(other.transaction);
         replace(&mut self.meta_buffer_size, other.meta_buffer_size);
@@ -35,12 +38,25 @@ impl EngineConfigOverlay {
     }
 }
 
+/// Strict CPU thread-pool overlay.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ThreadPoolOverlay {
+    /// Fixed CPU worker-thread count.
+    pub worker_threads: Option<usize>,
+}
+
+impl ThreadPoolOverlay {
+    #[inline]
+    fn merge(&mut self, other: Self) {
+        replace(&mut self.worker_threads, other.worker_threads);
+    }
+}
+
 /// Strict mandatory-runtime overlay.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MandatoryRuntimeOverlay {
-    /// Fixed runner thread count.
-    pub worker_threads: Option<usize>,
     /// Accepted caller-operation concurrency limit.
     pub concurrency_limit: Option<usize>,
 }
@@ -48,7 +64,6 @@ pub struct MandatoryRuntimeOverlay {
 impl MandatoryRuntimeOverlay {
     #[inline]
     fn merge(&mut self, other: Self) {
-        replace(&mut self.worker_threads, other.worker_threads);
         replace(&mut self.concurrency_limit, other.concurrency_limit);
     }
 }
@@ -188,6 +203,8 @@ impl LogSyncValue {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolvedEngineConfig {
+    /// CPU thread-pool sizing.
+    pub thread_pool: ResolvedThreadPoolConfig,
     /// Transaction-system settings.
     pub transaction: ResolvedTransactionConfig,
     /// Mandatory runtime sizing.
@@ -206,6 +223,9 @@ impl ResolvedEngineConfig {
     #[inline]
     fn from_config(config: &EngineConfig) -> Self {
         Self {
+            thread_pool: ResolvedThreadPoolConfig {
+                worker_threads: config.thread_pool.worker_threads,
+            },
             transaction: ResolvedTransactionConfig {
                 log_write_io_depth: config.trx.log_write_io_depth,
                 recovery_io_depth: config.trx.recovery_io_depth,
@@ -220,7 +240,6 @@ impl ResolvedEngineConfig {
                 recovery_disable_dml_validation: config.trx.recovery_disable_dml_validation,
             },
             mandatory_runtime: ResolvedMandatoryRuntimeConfig {
-                worker_threads: config.mandatory_runtime.worker_threads,
                 concurrency_limit: config.mandatory_runtime.concurrency_limit,
             },
             meta_buffer_bytes: config.meta_buffer.as_u64(),
@@ -235,6 +254,14 @@ impl ResolvedEngineConfig {
             },
         }
     }
+}
+
+/// Serializable normalized CPU thread-pool configuration.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedThreadPoolConfig {
+    /// Fixed CPU worker-thread count.
+    pub worker_threads: usize,
 }
 
 /// Serializable normalized transaction configuration.
@@ -269,8 +296,6 @@ pub struct ResolvedTransactionConfig {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolvedMandatoryRuntimeConfig {
-    /// Fixed runtime runner-thread count.
-    pub worker_threads: usize,
     /// Accepted caller-operation concurrency limit.
     pub concurrency_limit: usize,
 }
@@ -320,10 +345,11 @@ pub fn resolve_engine_config(
     overlay: &EngineConfigOverlay,
 ) -> Result<(EngineConfig, ResolvedEngineConfig)> {
     let default = EngineConfig::default();
-    let mut mandatory = default.mandatory_runtime;
-    if let Some(value) = overlay.mandatory_runtime.worker_threads {
-        mandatory = mandatory.worker_threads(value);
+    let mut thread_pool = default.thread_pool;
+    if let Some(value) = overlay.thread_pool.worker_threads {
+        thread_pool = thread_pool.worker_threads(value);
     }
+    let mut mandatory = default.mandatory_runtime;
     if let Some(value) = overlay.mandatory_runtime.concurrency_limit {
         mandatory = mandatory.concurrency_limit(value);
     }
@@ -394,6 +420,7 @@ pub fn resolve_engine_config(
 
     let config = EngineConfig::default()
         .storage_root(storage_root)
+        .thread_pool(thread_pool)
         .mandatory_runtime(mandatory)
         .trx(transaction)
         .meta_buffer(
@@ -531,6 +558,32 @@ mod tests {
         assert!(toml::from_str::<EngineConfigOverlay>("[index_buffer]\ntarget_free = 4").is_err());
         assert!(toml::from_str::<EngineConfigOverlay>("meta_buffer_bytes = 4096").is_err());
         assert!(toml::from_str::<EngineConfigOverlay>("meta_buffer_size = 4096").is_err());
+        assert!(toml::from_str::<EngineConfigOverlay>("[thread_pool]\nunknown = 1").is_err());
+        assert!(
+            toml::from_str::<EngineConfigOverlay>("[mandatory_runtime]\nworker_threads = 2")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn thread_pool_and_mandatory_runtime_merge_and_round_trip() {
+        let temp = TempDir::new().unwrap();
+        let mut base: EngineConfigOverlay = toml::from_str(
+            "[thread_pool]\nworker_threads = 1\n[mandatory_runtime]\nconcurrency_limit = 3\n",
+        )
+        .unwrap();
+        let local: EngineConfigOverlay =
+            toml::from_str("[thread_pool]\nworker_threads = 4\n").unwrap();
+        base.merge(local);
+
+        let (config, resolved) = resolve_engine_config(temp.path(), &base).unwrap();
+        assert_eq!(config.thread_pool.worker_threads, 4);
+        assert_eq!(config.mandatory_runtime.concurrency_limit, 3);
+        assert_eq!(resolved.thread_pool.worker_threads, 4);
+        assert_eq!(resolved.mandatory_runtime.concurrency_limit, 3);
+        let encoded = toml::to_string(&resolved).unwrap();
+        let decoded: ResolvedEngineConfig = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded, resolved);
     }
 
     #[test]
