@@ -1,7 +1,7 @@
 ---
 id: 000277
 title: Introduce ThreadPool and Parallelize Checkpoint LWC Encoding
-status: proposal
+status: implemented
 created: 2026-08-21
 github_issue: 1000
 ---
@@ -10,62 +10,41 @@ github_issue: 1000
 
 ## Summary
 
-Add a crate-private, engine-owned `ThreadPool` for short, finite,
-synchronous CPU-bound computations. The pool uses `flume` only for its
-unbounded job ingress and returns the existing `Arc<Completion<T>>` as each
-task handle. Accepted tasks are not cancelled when their completion observer
-is dropped. A task panic or unexpected loss of pool ingress poisons the engine
-and publishes a typed Fatal failure through the same completion.
+The engine now owns a fixed-size, crate-private `ThreadPool` for short,
+finite, synchronous CPU computations. It accepts jobs through an unbounded
+`flume` channel, returns the existing `Arc<Completion<T>>`, and lets accepted
+jobs finish even when their observer is dropped. Task panic and unexpected
+ingress loss publish typed Fatal errors and poison the engine.
 
-Use the pool first to parallelize user-table checkpoint LWC serialization,
-compression, and checksum generation. Checkpoint owns a private FIFO of
-submitted encodes, limits its in-flight work to the configured pool size, and
-consumes completions in logical block order. Page access, visibility analysis,
-secondary-index sidecar collection, table-file IO, and root publication remain
-on the asynchronous mandatory runtime.
+User-table checkpoint is the first consumer. Once the mandatory runner has
+copied a complete LWC block into an owned `LwcBuilder`, serialization,
+compression, and checksum generation run on the CPU pool. A checkpoint-local
+FIFO bounds pending encodes to the worker count, consumes results in logical
+block order, and drains all accepted jobs before checkpoint termination.
 
-As part of the scheduling boundary, make `MandatoryRuntime` permanently
-single-runner. Remove its `worker_threads` configuration while retaining its
-bounded caller `concurrency_limit`. True CPU parallelism belongs to
-`ThreadPool`; the mandatory runner remains responsible for cooperative async
-orchestration and accepted-work ownership.
+`MandatoryRuntime` is now permanently single-runner. Its caller concurrency
+limit and internal cleanup admission remain independent, so accepted async
+obligations still make cooperative progress while true CPU parallelism is
+isolated in `ThreadPool`.
 
 ## Context
 
-The engine currently runs accepted DDL, maintenance, and transaction cleanup
-on `MandatoryRuntime`, an `async_executor::Executor` driven by two configurable
-OS threads by default. One accepted task can execute a long synchronous region
-between await or yield points. Increasing mandatory runner count permits more
-such regions to overlap, but does not isolate CPU consumption from the async
-scheduler or provide algorithm-level parallelism.
+Before this task, two configurable mandatory-runtime threads drove accepted
+DDL, maintenance, and transaction-cleanup futures. Long synchronous regions
+could occupy those async runners, and increasing the runner count neither
+isolated CPU consumption nor exposed algorithm-level parallelism.
 
-The 2026-08-21 checkpoint analysis used the public `doradb-bench` maintenance
-workload with 2,100,000 inserted 128-byte rows and a 2,000,000-row freeze
-budget. The actual frozen prefix contained 2,000,320 rows across 4,465 row
-pages. Five fresh-root release runs completed in 505.1-922.2 ms, with a
-604.6 ms median, approximately 3.31 million rows/second at the median, and no
-checkpoint retry waits.
+The motivating checkpoint workload inserted 2,100,000 deterministic 128-byte
+rows, froze a 2,000,320-row prefix across 4,465 row pages, and checkpointed it
+without retry waits. The pre-change median was approximately 604.6 ms across
+five fresh roots. Profiling concentrated CPU time in `Table::build_lwc_blocks`,
+`LwcBuilder::build`, and whole-block checksum hashing.
 
-The accompanying process profile found the checkpoint CPU path concentrated
-in `Table::build_lwc_blocks`, `LwcBuilder::build`, and block checksum hashing.
-Inclusive profile shares were approximately 57.1%, 49.2%, and 33.8%
-respectively. The profile also showed the checkpoint computation concentrated
-on a mandatory-runtime runner. Percentages include overlapping frames and
-normal process teardown, but the call stacks identify owned LWC encoding and
-checksumming as the dominant safe parallelization boundary.
-
-`Table::build_lwc_blocks` cannot move wholesale to synchronous workers. It
-awaits row-page residency and acquires page guards before constructing borrowed
-vector views. Those operations may perform IO or wait on engine-managed state.
-Once `LwcBuilder` has copied a block's visible values into owned buffers,
-however, its final encode and checksum step requires no IO, page guard, logical
-lock, or wait. This task uses that narrow ownership boundary.
-
-The active engine lifetime design already identifies a separate CPU pool as
-future work requiring workload evidence. The pool must fit the existing
-component registry, reverse shutdown, engine poison, and accepted-service
-completion contracts rather than reintroducing the retired thread-pool async
-IO fallback.
+Page residency, visibility analysis, borrowed vector views, and sidecar
+collection cannot move to synchronous workers because they may await IO or
+retain engine guards. Final encoding can move safely after the builder owns
+all input and no page guard, view, latch, logical lock, or IO request owner
+crosses the submission boundary.
 
 Issue Labels:
 
@@ -73,501 +52,249 @@ Issue Labels:
 - priority:medium
 - codex
 
-Related Backlogs, not source inputs:
+This task has no parent RFC and no source backlog. Related follow-ups that were
+not source inputs remain:
 
 - `docs/backlogs/000104-stream-parallel-create-index-cold-build.md`
 - `docs/backlogs/000137-runtime-agnostic-blocking-work-abstraction.md`
-
-The first backlog may use `ThreadPool` in a separately designed task. The
-second concerns blocking filesystem operations and remains deliberately
-separate because this task's jobs prohibit IO and waiting.
-
-Relevant repository references:
-
-- `docs/architecture.md`
-- `docs/checkpoint.md`
-- `docs/data-checkpoint.md`
-- `docs/engine-component-lifetime.md`
-- `docs/shutdown-and-poison.md`
-- `docs/process/coding-guidance.md`
-- `docs/process/unit-test.md`
-- `docs/benchmark-tool.md`
-- `doradb-storage/src/component.rs`
-- `doradb-storage/src/engine.rs`
-- `doradb-storage/src/runtime/mandatory.rs`
-- `doradb-storage/src/completion.rs`
-- `doradb-storage/src/table/persistence.rs`
-- `doradb-storage/src/lwc/mod.rs`
-- `doradb-bench/src/engine_config.rs`
-
-Approved design constraints are:
-
-- configure only the CPU pool's worker count;
-- run only finite synchronous computation in pool tasks;
-- do not support task cancellation;
-- do not add a generic semaphore or generic bounded task queue;
-- use `flume` for async-to-worker job ingress and the existing `Completion`
-  for result observation;
-- poison the engine on task panic;
-- keep concurrency limiting and output ordering private to checkpoint; and
-- remove mandatory-runtime worker-count configuration and fix it to one
-  runner without editing historical RFC or completed task documents.
+- `docs/backlogs/000187-pipeline-checkpoint-lwc-encoding-and-data-writes.md`
 
 ## Goals
 
-- Add a crate-private `ThreadPool` component with a nonzero, immutable,
-  configurable fixed worker count and a default of two workers.
-- Use an unbounded `flume` channel for synchronous, nonblocking job acceptance.
-- Return `Arc<Completion<T>>` directly from infallible task submission.
-- Continue accepted task execution when the completion observer is dropped.
-- Convert task-body unwind to `FatalError::ThreadPoolTaskPanic`, poison the
-  engine before publishing completion, and keep the worker alive.
-- Convert unexpected closed or unavailable pool ingress to
-  `FatalError::ThreadPoolUnavailable`, poison the engine, and return an already
-  failed completion rather than panicking or adding a submit result.
-- Encode partial-startup rollback and reverse shutdown so every started worker
-  is signalled and joined without cancelling accepted jobs.
-- Make `LwcBuilder` movable into a `'static` CPU task without moving page
-  guards, borrowed vector views, locks, or IO capabilities.
-- Add a checkpoint-private FIFO that bounds in-flight LWC encode jobs to the
-  pool worker count, consumes results in submission order, and drains all
-  accepted work before the checkpoint attempt reaches terminal state.
-- Preserve LWC bytes, block shapes, RowID ordering, secondary-index companion
-  state, checkpoint outcomes, publication semantics, and persisted formats.
-- Remove `MandatoryRuntimeConfig::worker_threads` and drive
-  `MandatoryRuntime` with exactly one fixed runner while preserving caller and
-  internal admission semantics.
-- Extend `doradb-bench` configuration and normalized output for
-  `ThreadPoolConfig`, and remove mandatory worker count from that strict
-  schema.
-- Re-run the 2-million-row checkpoint comparison and produce a post-change
-  flamegraph demonstrating multi-worker LWC encoding.
+- Provide a configurable fixed CPU pool with two workers by default and reject
+  a zero worker count before storage-root mutation.
+- Keep submission synchronous and infallible at the API boundary while
+  returning a typed completion for success or Fatal failure.
+- Preserve accepted work after observer detachment and keep workers alive
+  after task-body panic.
+- Make partial startup and reverse shutdown join every started worker without
+  cancelling accepted jobs.
+- Parallelize only owned LWC encoding and checksum work while preserving
+  checkpoint ordering, sidecars, publication, and durable bytes.
+- Bound pending checkpoint encodes to the configured worker count and drain
+  every accepted completion on success and error paths.
+- Fix `MandatoryRuntime` to one runner while retaining caller capacity,
+  internal cleanup, statistics, and shutdown ownership.
+- Add strict benchmark configuration and normalized output for ThreadPool
+  sizing and remove mandatory worker-count configuration.
+- Demonstrate multi-worker CPU scaling with the 2-million-row checkpoint
+  workload and a post-change process profile.
 
 ## Non-Goals
 
-- Public or caller-supplied task spawning.
-- A generic semaphore, generic task group, generic bounded task queue, or
-  reusable checkpoint queue abstraction.
-- Task cancellation, forced shutdown, deadlines, preemption, or resumable
-  tasks.
-- Blocking filesystem work, storage IO, async futures, lock acquisition,
-  latch acquisition, channel waits, sleeps, or other blocking work inside a
-  production pool task.
-- Priority lanes, work stealing, affinity, NUMA policy, adaptive sizing,
-  runtime resizing, or fairness guarantees.
-- Thread-pool statistics or new `Session` statistics APIs.
-- Separate ThreadPool task accounting in engine shutdown blockers or
-  `try_shutdown` diagnostics.
-- CREATE INDEX, catalog checkpoint, deletion checkpoint, recovery, rollback,
-  purge, MemIndex cleanup, or other maintenance migration.
-- Parallel page loading, visibility analysis, secondary-index sidecar
-  collection, table-file allocation, storage writes, or root publication.
-- LWC format, compression algorithm, checksum algorithm, table-root, redo,
-  MVCC, recovery, or durable metadata changes.
-- A hard performance threshold in CI.
-- Editing RFC-0026 or any other historical RFC or completed task document.
-- Closing either related backlog as part of this task.
+- Public or caller-provided task spawning.
+- Generic task groups, semaphores, bounded queues, cancellation, deadlines,
+  preemption, work stealing, affinity, NUMA policy, or runtime resizing.
+- IO, async futures, channel waits, sleeps, locks, or latches inside a pool
+  task; the worker receive loop is the only blocking executor operation.
+- ThreadPool statistics or additional engine shutdown blockers.
+- Moving CREATE INDEX, catalog or deletion checkpoint, recovery, purge,
+  rollback, or MemIndex cleanup onto the pool.
+- Parallel page access, visibility analysis, sidecar collection, storage
+  writes, index construction, or root publication.
+- LWC format, compression, checksum, table-root, redo, MVCC, recovery, or
+  public checkpoint behavior changes.
+- A CI performance threshold or edits to historical RFC-0026.
 
 ## Rejected Alternatives
 
 ### Reuse MandatoryRuntime for CPU parallelism
 
-Adding mandatory runners or spawning child futures on the existing executor
-would leave synchronous encoding on async scheduling threads. It would neither
-isolate CPU resources nor establish a contract that excludes IO and waiting.
-It also couples accepted-operation concurrency to computation parallelism.
-The approved design instead fixes mandatory orchestration to one runner and
-puts true CPU parallelism behind a separate component.
+More mandatory runners would keep synchronous encoding on async scheduling
+threads and couple accepted-operation capacity to CPU parallelism. The shipped
+design separates one cooperative orchestration runner from a dedicated CPU
+executor.
 
 ### Add a checkpoint-specific worker pool
 
-A checkpoint-only worker pool could encode LWC blocks with fewer engine-level
-interfaces, but it would duplicate configuration, startup rollback, poison,
-completion, and shutdown behavior when another proven CPU-heavy consumer is
-added. The approved task introduces one small generic CPU executor while
-keeping only the concurrency and ordering policy checkpoint-specific.
+A private checkpoint pool would duplicate configuration, startup rollback,
+poison, completion, and shutdown behavior. The engine-level executor remains
+small and generic, while checkpoint alone owns concurrency limiting and output
+ordering.
 
 ## Plan
 
-### Configuration and public builder surface
+### Configuration and runtime boundary
 
-1. Add `ThreadPoolConfig` in `doradb-storage/src/conf/engine.rs` with:
-   - public `worker_threads: usize`;
-   - `Default` value `2`;
-   - a consuming `worker_threads(...)` builder;
-   - validation that rejects zero with
-     `ConfigError::InvalidThreadPoolWorkerThreads`.
-2. Add `EngineConfig::thread_pool` and a consuming `thread_pool(...)` builder.
-   Validate the pool config before any filesystem mutation during engine
-   bootstrap.
-3. Export `ThreadPoolConfig` through `conf/mod.rs` and the crate root beside
-   `MandatoryRuntimeConfig`.
-4. Remove `worker_threads` and its builder from `MandatoryRuntimeConfig`.
-   Retain only `concurrency_limit`, defaulting to four, and validate only that
-   value.
-5. Remove `ConfigError::InvalidMandatoryWorkerThreads`. Unknown benchmark TOML
-   containing the removed mandatory leaf must fail strict deserialization.
+`ThreadPoolConfig` is part of `EngineConfig`, defaults to two workers, and is
+validated before filesystem mutation. It is publicly constructible for engine
+configuration, but the pool and submission API remain crate-private.
 
-### ThreadPool core and workers
+`MandatoryRuntimeConfig` retains only `concurrency_limit`, defaulting to four.
+`MandatoryRuntimeWorkers` always starts one `Mandatory-Runtime-1` runner.
+Several accepted futures may remain live and make progress when they await or
+yield, while synchronous CPU work belongs to ThreadPool.
 
-6. Add `doradb-storage/src/runtime/thread_pool.rs` and register it from
-   `runtime/mod.rs`.
-7. Implement a `ThreadPool` core component that owns:
-   - its configured worker count;
-   - the direct `flume::Sender<ThreadPoolMessage>`; and
-   - a direct `QuiescentGuard<EnginePoisoner>` for the atomic health fast path,
-     cached poison retrieval, and enqueue-failure poison.
-8. Use `flume::unbounded` for the job channel. Submission reads the poisoner's
-   atomic flag and locks only when poison is already published, then performs
-   the nonblocking send directly without an external submission mutex. Poison
-   may race the fast check and admit bounded extra finite work.
-9. Type-erase jobs behind a private `ThreadPoolJob` interface. A generic job
-   owns its `FnOnce() -> T` and one producer-side `Arc<Completion<T>>`. Its
-   execute method must move the completion outside the unwind-caught task-body
-   closure before invoking the `FnOnce`, so a task panic cannot destroy the
-   only producer handle before Fatal completion is published.
-10. Implement the crate-private submission surface as:
+### ThreadPool execution and failure model
 
-    ```rust
-    fn submit<T, F>(&self, task: F) -> Arc<Completion<T>>
-    where
-        T: Send + 'static,
-        F: FnOnce() -> T + Send + 'static;
-    ```
+`ThreadPool` owns the configured worker count, a direct unbounded sender, and a
+guard to `EnginePoisoner`. `ThreadPoolWorkers` separately owns startup state
+and join handles. Workers are named `ThreadPoolWorker-1` through
+`ThreadPoolWorker-N`.
 
-    A successful synchronous flume send is task acceptance. Normal execution
-    publishes `Ok(output)` to the completion. The task owns the producer Arc,
-    so dropping the returned Arc only detaches observation and never cancels
-    execution.
-11. If the fast check observes poison, complete the returned handle with the
-    poisoner's cached shared Fatal without sending. If `send` reports
-    disconnection, create and publish `FatalError::ThreadPoolUnavailable`,
-    poison through the core's poisoner, complete the returned handle with the
-    same shared Fatal bridge, and return it. `submit` itself remains infallible.
-12. Add `ThreadPoolWorkers` as the separate join-handle owner. `ThreadPool`
-    supplies a pending startup provision containing the receiver, poisoner,
-    core guard, and fixed worker count.
-13. Start `ThreadPoolWorker-1` through `ThreadPoolWorker-N` with the repository's named
-    thread helper. Each worker blocks only in the executor's `recv` loop; this
-    idle receive is not a user task.
-14. Wrap each task body, not the complete job owner, in
-    `catch_unwind(AssertUnwindSafe(...))`. On unwind:
-    - format only pool-owned facts: worker name and panic-payload description;
-    - create `FatalError::ThreadPoolTaskPanic`;
-    - poison the engine before waking the completion;
-    - publish the shared Fatal bridge through `Completion`; and
-    - continue the worker receive loop.
-15. Keep task-specific identifiers out of `ThreadPool`. The caller that pairs
-    a completion with its logical input owns and attaches table, RowID, or
-    operation context when it consumes the completion.
-16. Make pending worker startup failure-atomic. If any named spawn fails,
-    enqueue one private FIFO stop message per worker already started, join all
-    of them, preserve the spawn failure as the primary report, and let registry
-    rollback release the passive core.
-17. Register components in this relative order:
+Submission checks the poisoner's atomic healthy path, then sends directly
+without an external mutex. A racing poison may therefore admit bounded extra
+finite work. Once poison is observed, submission reuses the cached shared
+Fatal; disconnected ingress publishes `ThreadPoolUnavailable` and returns an
+already-failed completion.
 
-    ```text
-    StorageRootLease
-    -> EnginePoisoner
-    -> ThreadPool
-    -> ThreadPoolWorkers
-    -> MandatoryRuntime
-    -> existing storage components and worker owners
-    ```
+Each type-erased job owns its `FnOnce() -> T` and producer completion. The task
+body alone is caught with `catch_unwind`. Panic publishes
+`ThreadPoolTaskPanic`, poisons before waking observers, releases job input once,
+and returns the worker to its receive loop.
 
-    Reverse teardown therefore drains and stops mandatory execution before
-    ThreadPool stop signalling. `ThreadPoolWorkers::shutdown` enqueues one
-    private FIFO stop message per worker, lets receivers finish every earlier
-    accepted finite job, joins all workers, and propagates the first join panic
-    only after every join was attempted. `ThreadPool::shutdown` remains
-    passive.
-18. Add the pool guard to `EngineCore`. Do not expose the pool through public
-    `Engine`, `Session`, or transaction APIs.
+Partial startup sends one FIFO stop for every worker already created and joins
+all of them while preserving the spawn report. Reverse component shutdown
+drains mandatory work first, sends one FIFO stop per CPU worker, and attempts
+every join before propagating the first join panic.
 
-### Fatal completion behavior
+### Checkpoint encoding flow
 
-19. Add `FatalError::ThreadPoolTaskPanic` and
-    `FatalError::ThreadPoolUnavailable`.
-20. Reuse `SharedFatalError::into_completion_bridge` and the existing
-    `Completion<T>` failure channel. Do not add a new task-handle wrapper,
-    result channel, error bridge, or panic-resume path.
-21. Update `completion.rs` module documentation only as needed to include CPU
-    task completion among its supported engine flows. The completion state
-    machine and exclusive-take behavior remain unchanged.
-22. Use the poisoner's existing atomic flag as the submission fast check and
-    its mutex-protected shared report as the cached failure. Once poison is
-    observed, reject new pool submission with that cached Fatal. Submission
-    racing poison may over-commit bounded extra finite work; already submitted
-    computations drain normally.
+`LwcBuilder` owns `Arc<TableColumnLayout>` and consumes itself during final
+encoding, making the submitted input `Send + 'static`. Page loading,
+visibility filtering, row copying, block-boundary selection, and
+secondary-index sidecar mutation remain on the mandatory runner.
 
-### Fixed single-runner MandatoryRuntime
+`CheckpointLwcEncodeQueue` stores ordered shape/completion pairs and permits at
+most one pending encode per configured worker. At capacity it consumes the
+oldest result before submitting more work. Successful buffers are paired with
+their retained shapes in FIFO order, independent of worker completion order.
 
-23. Remove configured runner count from `MandatoryRuntime::new`, pending worker
-    startup, component shelf provisions, and worker construction.
-24. Start exactly one runner named `Mandatory-Runtime-1`. Retain the existing
-    executor, caller admission, separate internal admission, supervision,
-    statistics, stop event, and completion-observer behavior.
-25. Keep `concurrency_limit` independent from the single runner. Several
-    accepted tasks may remain live and make cooperative progress when they
-    await IO, a completion, or an explicit yield.
-26. Remove production and test branches that expect
-    `Mandatory-Runtime-2`. Tests that prove async overlap must use two futures
-    yielding on the one executor runner; true simultaneous CPU execution is
-    tested on `ThreadPool` instead.
+Producer and drain results are resolved together. Any page, builder,
+submission-completion, or encode failure stops new production but awaits every
+already accepted task. Cleanup errors are merged without replacing an earlier
+Fatal. Queue waits occur only after borrowed page views and guards leave scope.
 
-### Owned LWC encoding input
+### Benchmark and compatibility surface
 
-27. Change `LwcBuilder` from borrowing `&TableColumnLayout` to owning
-    `Arc<TableColumnLayout>`. Update its constructor and all catalog, table,
-    LWC, and test call sites to clone the metadata-owned Arc.
-28. Make final LWC encoding consume the builder, or otherwise expose an
-    explicitly consuming method, so the complete owned scan buffer and column
-    statistics move into one `'static` task and cannot be reused after
-    submission.
-29. Add a compile-time test assertion that the submitted builder/input and its
-    result are `Send + 'static`.
-30. Keep catalog LWC construction synchronous in this task. Its constructor
-    adjustments are ownership-only.
+Strict benchmark TOML accepts `[engine.thread_pool].worker_threads` and reports
+the normalized value. Mandatory runtime output retains only
+`concurrency_limit`; legacy explicit mandatory `worker_threads` is rejected as
+an unknown field rather than silently ignored.
 
-### Checkpoint-private encode queue
-
-31. Add private `CheckpointLwcEncodeQueue` and `PendingLwcEncode` types in
-    `table/persistence.rs`. They are not exported from the table or runtime
-    modules.
-32. Construct one queue per checkpoint LWC build with:
-    - a borrowed or cloned engine `ThreadPool` guard;
-    - `max_in_flight = thread_pool.worker_threads()`;
-    - the caller-owned `table_id`;
-    - a FIFO `VecDeque` of shape/completion pairs; and
-    - an ordered `Vec<LwcBlockPersist>` output.
-33. Store `ColumnBlockEntryShape` beside
-    `Arc<Completion<InternalResult<DirectBuf>>>`. The worker owns only the
-    `LwcBuilder` and row-shape fingerprint; it does not receive table or RowID
-    diagnostic metadata.
-34. Before submitting while the queue length equals its limit, await and
-    exclusively take the oldest completion. Convert a completion failure to
-    `RuntimeOrFatalError` without replacing Fatal. Convert an inner
-    `InternalResult` error to `RuntimeError::CheckpointExecution`. At this
-    caller boundary, attach table ID and shape start/end RowIDs.
-35. Pair each successful buffer with its retained shape and append it to output
-    in FIFO order. Worker completion order must not affect persistent block
-    ordering.
-36. On the final builder, drain every remaining completion in the same FIFO
-    order and return the ordered vector.
-37. Structure production and drain results so every ordinary page-access,
-    builder, submission-completion, or encode error stops new submission but
-    still awaits all previously submitted completions. Merge later drain
-    failures without replacing an earlier Fatal or losing the primary source.
-    Do not rely on async Drop.
-38. A pool task panic poisons immediately in the worker. When checkpoint
-    consumes that Fatal completion it stops producing, drains the remaining
-    accepted pure computations, and propagates Fatal through
-    `TableCheckpointer::resolve`. The existing irreversible-checkpoint policy
-    must preserve, not replace, an already-Fatal thread-pool reason.
-
-### Checkpoint build-loop integration
-
-39. Change `Table::build_lwc_blocks` to return
-    `RuntimeOrFatalResult<Vec<LwcBlockPersist>>` and provide access to the
-    engine ThreadPool through the accepted session runtime.
-40. Keep these operations on the mandatory runner:
-    - `must_get_row_page_shared(...).await`;
-    - page/vector-view validation;
-    - deletion-bitmap interpretation;
-    - `LwcBuilder::append_view` and block-boundary selection;
-    - visible-row callbacks and secondary-index sidecar mutation; and
-    - all later mutable-file, IO, index, and publication work.
-41. When an appended view overflows the current builder:
-    - retain the completed builder and its shape;
-    - leave the attempted view rolled back;
-    - exit the lexical scope that owns the borrowed view and page guard;
-    - make room in and submit to `CheckpointLwcEncodeQueue`; and
-    - reacquire the same page and rebuild its view before appending it to the
-      fresh builder.
-42. Invoke the visible-row sidecar callback exactly once for each accepted row,
-    even when the page view must be rebuilt after an LWC split.
-43. Never await queue capacity or completion while retaining a page guard,
-    vector view, latch, logical lock newly acquired by the build loop, or an IO
-    request owner.
-44. Preserve the existing final-block end-RowID adjustment, block-index input,
-    write parallelism, sidecar ordering, checkpoint workflow state, and fatal
-    boundary.
-
-### Shutdown ownership
-
-45. Add no ThreadPool active counter, permit, engine-shutdown blocker, or
-    statistics surface. The production ownership rule is that every submitted
-    CPU task is nested under an already shutdown-accounted foreground or
-    mandatory operation, and that operation explicitly drains its local task
-    handles before terminal publication.
-46. Make checkpoint satisfy that rule on every normal and typed-error path.
-    Dropping an arbitrary low-level completion remains valid and does not
-    cancel the task, but no production checkpoint path detaches its submitted
-    queue.
-47. Retain defensive worker-owner drain on component teardown for a terminal
-    unrelated unwind. After mandatory drain, enqueue one private FIFO stop per
-    worker without consulting poison. The finite-task contract bounds the
-    join; shutdown does not cancel or abandon an accepted job.
-48. Document the completion wait under the existing accepted-service wait
-    family: worker execution is the progress producer, `Completion` is the
-    authoritative result, unrelated poison does not abandon an accepted task,
-    shutdown drains the outer mandatory owner, and the job plus checkpoint
-    queue own cleanup. The successful flume send is acceptance.
-
-### Benchmark schema, documentation, and evidence
-
-49. Add strict `[engine.thread_pool] worker_threads = ...` overlay parsing,
-    fieldwise merge, storage-config application, and normalized result output
-    in `doradb-bench/src/engine_config.rs`.
-50. Remove `worker_threads` from `MandatoryRuntimeOverlay` and
-    `ResolvedMandatoryRuntimeConfig`; retain only `concurrency_limit`. Because
-    benchmark TOML uses `deny_unknown_fields`, legacy explicit mandatory worker
-    counts are rejected rather than silently ignored.
-51. Update benchmark parser, merge, normalization, result round-trip, and
-    unknown-field tests for both schema changes.
-52. Update active documentation and component-order comments, including:
-    - `docs/architecture.md`;
-    - `docs/data-checkpoint.md` and checkpoint documentation as needed;
-    - `docs/engine-component-lifetime.md`;
-    - `docs/shutdown-and-poison.md` production wait classification;
-    - `docs/benchmark-tool.md`; and
-    - corresponding Rust API/module documentation.
-53. Do not edit `docs/rfcs/0026-engine-owned-mandatory-background-runtime.md`
-    or completed task documents that historically record the two-runner
-    implementation and validation.
-54. Run release checkpoint measurements using the established 2-million-row
-    shape:
-    - create one index-free table;
-    - insert 2,100,000 sequential rows with 128-byte values, four benchmark
-      threads, sixteen sessions, and batch size 100;
-    - freeze with `max_rows = 2,000,000` and verify the actual frozen row and
-      page counts;
-    - run one measured checkpoint per fresh root; and
-    - repeat five fresh roots for ThreadPool sizes 1, 2, and 4.
-55. Keep all other engine and workload settings identical. Report raw timings,
-    median, min/max, coefficient of variation, rows/second, attempt count, and
-    retry-wait count for each pool size. At least one multi-worker setting must
-    show a lower median than the one-worker setting before the performance goal
-    is considered demonstrated; this is implementation evidence, not a CI
-    threshold.
-56. Capture a post-change Samply profile and interactive flamegraph for the
-    2-million-row, multi-worker run. Confirm LWC encode/checksum stacks appear
-    on multiple `ThreadPoolWorker-*` workers and are no longer executed on
-    `Mandatory-Runtime-1`.
+The component registry and active architecture documents record ThreadPool
+core/worker ownership, direct poison behavior, accepted-work drain, and reverse
+teardown order. `Engine::bootstrap` delegates construction to the module-level
+`bootstrap_engine` helper so lifecycle logging remains separate from the
+component build program.
 
 ## Implementation Notes
 
+Implemented the engine-owned CPU pool, fixed single-runner mandatory runtime,
+and ordered checkpoint encoding queue without changing persisted formats or
+checkpoint publication semantics.
+
+The final submission design intentionally differs from an early serialized
+proposal: `ThreadPool` holds a direct sender and does not use a weak sender or
+submission mutex. `EnginePoisoner` supplies the atomic fast check and cached
+shared Fatal. This permits small racing over-commit after poison in exchange
+for an uncontended healthy submission path.
+
+The join-panic capture helper was retained as defensive ownership protection.
+Although production task bodies are caught, worker output destruction, panic
+payload destruction, thread-wrapper code, and test observers can still unwind
+outside that boundary. Startup and shutdown therefore attempt every join
+before suppressing or propagating the first payload.
+
+The initial persistent Btrfs comparison across five fresh roots produced:
+
+| Workers | Median | Min-Max | Sample CV |
+| ---: | ---: | ---: | ---: |
+| 1 | 579.3 ms | 474.5-943.8 ms | 30.91% |
+| 2 | 573.5 ms | 358.2-708.4 ms | 23.45% |
+| 4 | 599.4 ms | 293.6-831.0 ms | 41.93% |
+
+Two workers improved the median by 0.99%, satisfying the planned comparison,
+but storage variance masked CPU scaling. Eight alternating one/four-worker
+pairs with root deletion and `sync` made four workers faster in seven pairs:
+the medians were 444.7 ms and 272.4 ms respectively, a 38.8% reduction.
+
+The tmpfs control isolated CPU/memory behavior. Median checkpoint time fell
+from 410.9 ms with one worker to 257.4 ms with two and 208.4 ms with four,
+improvements of 37.4% and 49.3%. Sample CV fell to 1.45% at four workers.
+
+Linux `perf` data and SVG flamegraphs were used instead of the planned Samply
+artifact. The main encode/scan cluster ended near 384.7, 258.8, and 181.2 ms
+for one, two, and four workers. In the four-worker profile, pool workers
+accounted for 49.35% of CPU samples and participated evenly; BLAKE3 hashing was
+the largest named self-time hotspot at 25.54%. Temporary profile artifacts
+were not added to the repository, so the durable measurements are recorded
+here.
+
+The apparent four-worker IO regression was not stable. Controlled four-worker
+runs with reclaimed roots had a 262.1 ms median, 234.9-291.6 ms range, and
+6.47% CV. Btrfs full-transaction commit counters did not advance during those
+checkpoints. Retaining ten roots without intervening reclaim increased the
+average from 317.8 ms for the first five to 595.5 ms for the last five. The
+remaining evidence points to cumulative Btrfs or sparse virtual-disk backing
+allocation and flush behavior, not ThreadPool imbalance.
+
+Review identified a valuable next step: overlap ordered encode completion with
+a bounded data-write window. It also preserved a pre-existing final-block edge
+where extending a dense block shape after encoding can change the index
+fingerprint already embedded in the LWC buffer. Both are captured with design
+and acceptance context in backlog 000187.
+
+Final verification completed with:
+
+- mandatory branch-diff style audit: 17 Rust files passed, including workspace
+  formatting and clippy with warnings denied;
+- `cargo nextest run`: 1,763 tests passed across four binaries; and
+- alternate libaio storage suite: 1,680 tests passed.
+
 ## Impacts
 
-- `doradb-storage/src/conf/engine.rs`, `conf/mod.rs`, and `lib.rs` gain
-  `ThreadPoolConfig`; mandatory runtime loses its worker-count builder and
-  validation surface.
-- `doradb-storage/src/runtime/thread_pool.rs` becomes the CPU executor,
-  completion publisher, panic supervisor, and worker owner implementation.
-- `doradb-storage/src/runtime/mandatory.rs` becomes fixed to one OS runner but
-  retains multiple accepted async tasks, admission accounting, and cooperative
-  scheduling.
-- `doradb-storage/src/component.rs` and `engine.rs` gain two registered
-  component entries and an `EngineCore` ThreadPool capability. Reverse teardown
-  changes accordingly.
-- `doradb-storage/src/error.rs` gains one configuration error and two Fatal
-  classifications while removing the mandatory-worker configuration error.
-- `doradb-storage/src/completion.rs` is reused unchanged apart from possible
-  documentation synchronization.
-- `doradb-storage/src/lwc/mod.rs` changes builder layout ownership from a borrow
-  to an Arc and makes final encoding transferable.
-- `doradb-storage/src/table/persistence.rs` gains checkpoint-local task
-  orchestration and a Fatal-capable LWC build result.
-- `doradb-bench/src/engine_config.rs`, benchmark docs, and result schema gain
-  CPU-pool sizing and lose mandatory runner sizing.
-- Existing explicit Rust or benchmark configuration of mandatory
-  `worker_threads` is a deliberate breaking change. Backward compatibility is
-  not provided.
-- Engine bootstrap creates two additional CPU workers by default and one fewer
-  mandatory runner, for a net default increase of one OS thread.
-- Checkpoint may hold up to one owned builder/completion per configured pool
-  worker in addition to its existing ordered encoded-block output. It does not
-  retain additional row-page guards while waiting.
-- Durable formats, recovery inputs, redo ordering, public checkpoint outcomes,
-  MVCC, transaction semantics, and public spawning APIs do not change.
-- No new dependency, unsafe block, raw-pointer lifetime, or unsafe baseline
-  change is expected; `flume` and `Completion` are already production
-  dependencies.
+- Public engine configuration gains `ThreadPoolConfig`; mandatory runtime
+  worker-count builders and validation are removed.
+- Existing Rust or strict benchmark TOML that explicitly configures mandatory
+  `worker_threads` must migrate to ThreadPool sizing or remove the field.
+- Engine bootstrap creates two CPU workers by default and removes one of the
+  former two mandatory runners, a net increase of one OS thread.
+- ThreadPool task panic and unavailable ingress add two Fatal classifications;
+  zero ThreadPool size adds one configuration classification.
+- Checkpoint retains up to one builder/completion per worker plus its ordered
+  encoded output, without retaining extra row-page guards during waits.
+- Catalog LWC construction remains synchronous; its builder changes are
+  ownership-only.
+- Durable files, LWC bytes, recovery inputs, redo ordering, MVCC, transaction
+  semantics, and public spawning APIs do not change.
+- No dependency or unsafe-code baseline changes were introduced.
 
 ## Test Cases
 
-1. `ThreadPoolConfig::default()` resolves to two workers; zero is rejected as
-   `InvalidThreadPoolWorkerThreads` before storage-root mutation.
-2. `MandatoryRuntimeConfig` exposes only `concurrency_limit`, defaults it to
-   four, rejects zero, and always starts exactly `Mandatory-Runtime-1`.
-3. Strict benchmark config merges and round-trips ThreadPool worker count and
-   mandatory concurrency, while removed mandatory `worker_threads` and unknown
-   ThreadPool fields are rejected.
-4. Successful submission runs on a named ThreadPool worker and moves a
-   non-Clone result exactly once through `Completion::wait_take_result`.
-5. Dropping the returned completion immediately after accepted submission does
-   not cancel the task; deterministic test control proves its body reaches
-   completion exactly once.
-6. A task panic poisons with `ThreadPoolTaskPanic`, completes an attached
-   observer with the same Fatal classification, poisons when the observer is
-   detached, releases owned input exactly once, and does not terminate the
-   worker. An already queued normal task still completes.
-7. Observed poison returns the cached Fatal without running the task. A
-   disconnected worker ingress returns an already completed Fatal handle,
-   publishes `ThreadPoolUnavailable`, and never panics or returns a Runtime
-   submission error.
-8. Inject failure at every `ThreadPoolWorker-N` spawn point. Every earlier worker is
-   stopped and joined before bootstrap returns the named `BackgroundSpawn`
-   report, and no later component starts.
-9. Explicit and failed-bootstrap shutdown enqueue private FIFO worker stops
-   after mandatory workers, join every ThreadPool worker even when one join
-   reports a panic, and preserve the first payload only after all joins are
-   attempted.
-10. The fixed mandatory runner polls multiple accepted tasks cooperatively when
-    one awaits `Completion`, preserves internal cleanup progress under caller
-    saturation, and retains admission/statistics/observer behavior.
-11. The checkpoint queue never has more pending handles than the configured
-    pool worker count. Deterministic test-only gates prove the call-site bound
-    without sleeps.
-12. Jobs completing out of order still produce `LwcBlockPersist` entries in
-    original RowID range order.
-13. Inner encode error, Fatal task completion, and producer-side page-access
-    error each stop new submission, drain every previously accepted task, and
-    retain the correct primary/secondary error relationship.
-14. A checkpoint split that must wait for the oldest task drops its current
-    page view and guard first. A synchronized competing page user proves no
-    guard is retained across the completion wait.
-15. Pool sizes 1, 2, and 4 produce byte-identical valid LWC blocks, checksums,
-    shapes, pivot, heap replay floor, and column block-index routes from the
-    same prepared inputs.
-16. Index-free and secondary-index checkpoints preserve visible-row selection,
-    call the sidecar exactly once per accepted row across splits, and publish
-    matching DiskTree companion state.
-17. Injected LWC task panic after irreversible page transition returns Fatal,
-    keeps `ThreadPoolTaskPanic` as the typed reason, poisons the engine, drains
-    other submitted encodes, and preserves workflow/publication ownership.
-18. Heartbeat and empty-page checkpoints submit no CPU task and retain their
-    existing metadata-only or silent-watermark behavior.
-19. Existing freeze/checkpoint delay, retry, cancellation, deletion,
-    publication, recovery, DDL, transaction-cleanup, shutdown, and poison tests
-    remain passing with the fixed mandatory runner.
-20. Run `rtk cargo fmt --all -- --check`.
-21. Run `rtk cargo clippy --workspace --all-targets -- -D warnings`.
-22. Run `rtk cargo build --workspace`.
-23. Run `rtk cargo nextest run --workspace`.
-24. Run
-    `rtk cargo nextest run -p doradb-storage --no-default-features --features libaio`.
-25. Run the mandatory branch-diff style audit required by the resolution
-    workflow.
-26. Run five fresh-root 2-million-row checkpoint measurements for pool sizes
-    1, 2, and 4, record the complete comparison, and verify at least one
-    multi-worker median improves on one worker.
-27. Validate the Samply profile and generated SVG flamegraph and retain their
-    inspection commands and artifact paths in implementation notes at task
-    resolution.
+- Validate ThreadPool and mandatory-runtime defaults, zero rejection, strict
+  benchmark merging, normalization, and legacy-field rejection.
+- Prove named workers execute CPU tasks in parallel and move non-Clone output
+  exactly once through exclusive completion consumption.
+- Prove observer detachment does not cancel accepted success or panic work and
+  owned task input is released exactly once.
+- Verify task panic publishes cached `ThreadPoolTaskPanic`, poisons before
+  completion, and leaves the worker able to process queued work.
+- Verify observed poison skips execution and unavailable ingress publishes an
+  already-completed `ThreadPoolUnavailable` handle.
+- Inject every worker spawn failure and verify earlier workers stop and join
+  before bootstrap returns; verify shutdown attempts every join before panic
+  propagation.
+- Prove the fixed mandatory runner supports cooperative caller overlap and
+  internal cleanup progress under saturated caller admission.
+- Verify the checkpoint queue bound, FIFO output under out-of-order completion,
+  and complete draining after producer, encode, or Fatal failure.
+- Prove checkpoint capacity waits retain no page view or guard and preserve
+  sidecar callbacks exactly once across block splits.
+- Compare one, two, and four workers for identical LWC bytes, checksums, row
+  shapes, pivot, replay floor, and column-index routes.
+- Preserve heartbeat, empty-page, delay, retry, cancellation, deletion,
+  recovery, shutdown, poison, DDL, and transaction-cleanup behavior.
+- Run standard and libaio nextest suites plus the mandatory style gate.
 
 ## Open Questions
 
-None. Generic task limiting, CREATE INDEX adoption, blocking work, additional
-consumers, pool observability, and scheduler policy require separately scoped
-evidence and design.
+- Backlog
+  `docs/backlogs/000187-pipeline-checkpoint-lwc-encoding-and-data-writes.md`
+  covers encode/write pipelining, bounded write depth, phase timing, and the
+  final dense-block fingerprint edge.
+- Backlog `docs/backlogs/000104-stream-parallel-create-index-cold-build.md` may
+  adopt ThreadPool for separately designed CREATE INDEX work.
+- Backlog
+  `docs/backlogs/000137-runtime-agnostic-blocking-work-abstraction.md` remains
+  the scope for blocking work and future runtime-agnostic execution.

@@ -16,7 +16,7 @@ use std::mem::take;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::JoinHandle;
+use std::thread::{JoinHandle, current};
 
 trait ThreadPoolJob: Send {
     fn execute(self: Box<Self>, worker: &str, poisoner: &EnginePoisoner);
@@ -53,17 +53,6 @@ where
             }
         }
     }
-}
-
-#[inline]
-fn poison_thread_pool_failure(
-    poisoner: &EnginePoisoner,
-    report: Report<FatalError>,
-) -> SharedFatalError {
-    obs::error!(
-        "event=engine_poison component=thread_pool action=poison result=error error={report:?}"
-    );
-    poisoner.poison(report)
 }
 
 /// Engine-owned executor for finite synchronous CPU computations.
@@ -218,18 +207,6 @@ impl PendingThreadPoolWorkerStartup {
     }
 }
 
-#[inline]
-fn run_worker(receiver: &flume::Receiver<ThreadPoolMessage>, poisoner: &EnginePoisoner) {
-    let current = std::thread::current();
-    let worker = current.name().unwrap_or("unknown");
-    while let Ok(message) = receiver.recv() {
-        match message {
-            ThreadPoolMessage::Execute(job) => job.execute(worker, poisoner),
-            ThreadPoolMessage::Stop => break,
-        }
-    }
-}
-
 struct PendingThreadPoolWorkers {
     pool: QuiescentGuard<ThreadPool>,
     handles: Vec<JoinHandle<()>>,
@@ -323,6 +300,29 @@ impl ThreadPoolWorkersOwned {
         // Every worker received a FIFO stop and was joined before propagation.
         panics.resume();
     }
+}
+
+#[inline]
+fn run_worker(receiver: &flume::Receiver<ThreadPoolMessage>, poisoner: &EnginePoisoner) {
+    let current = current();
+    let worker = current.name().unwrap_or("unknown");
+    while let Ok(message) = receiver.recv() {
+        match message {
+            ThreadPoolMessage::Execute(job) => job.execute(worker, poisoner),
+            ThreadPoolMessage::Stop => break,
+        }
+    }
+}
+
+#[inline]
+fn poison_thread_pool_failure(
+    poisoner: &EnginePoisoner,
+    report: Report<FatalError>,
+) -> SharedFatalError {
+    obs::error!(
+        "event=engine_poison component=thread_pool action=poison result=error error={report:?}"
+    );
+    poisoner.poison(report)
 }
 
 fn capture_join_panic(panics: &mut FirstPanic, handle: JoinHandle<()>, event: &'static str) {

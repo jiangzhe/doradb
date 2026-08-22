@@ -6,7 +6,7 @@ Overlap checkpoint LWC CPU encoding with bounded table-file data writes so persi
 
 ## Reference
 
-Task 000277 implementation and the 2026-08-22 two-million-row checkpoint profile in target/task-000277-profile-20260822/README.md. Follow-up review traced the current build_lwc_blocks to apply_lwc_blocks phase boundary, CoW allocation and publication rules, storage queue behavior, and column-index ordering constraints.
+Task 000277 implementation and its resolved 2026-08-22 two-million-row checkpoint measurements in `docs/tasks/000277-introduce-thread-pool-and-parallelize-checkpoint-lwc-encoding.md`. Follow-up review traced the current build_lwc_blocks to apply_lwc_blocks phase boundary, CoW allocation and publication rules, storage queue behavior, and column-index ordering constraints.
 
 ## Deferred From (Optional)
 
@@ -29,4 +29,3 @@ Checkpoint encoding and LWC data writes overlap under deterministic delayed enco
 ## Notes (Optional)
 
 A first implementation should pipeline only LWC data writes. Column-index construction, deletion checkpoint, secondary-index sidecars, allocation-map rebuilding, and root publication should remain after the data-write drain unless separate evidence justifies more overlap. No durable-format change is expected.
-
