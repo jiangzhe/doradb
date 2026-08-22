@@ -996,8 +996,8 @@ mod tests {
                 "Mandatory-Runtime-1",
                 "phase=start_mandatory_runtime_runner",
             ),
-            ("Thread-Pool-1", "phase=start_thread_pool_worker"),
-            ("Thread-Pool-2", "phase=start_thread_pool_worker"),
+            ("ThreadPoolWorker-1", "phase=start_thread_pool_worker"),
+            ("ThreadPoolWorker-2", "phase=start_thread_pool_worker"),
         ] {
             let root = TempDir::new().unwrap();
             let (event_tx, event_rx) = mpsc::channel();
@@ -1049,9 +1049,9 @@ mod tests {
                     "redo started after mandatory worker startup failed: started={started:?}"
                 );
             }
-            if worker == "Thread-Pool-2" {
+            if worker == "ThreadPoolWorker-2" {
                 assert!(
-                    started.iter().any(|name| name == "Thread-Pool-1"),
+                    started.iter().any(|name| name == "ThreadPoolWorker-1"),
                     "first CPU worker did not start: started={started:?}"
                 );
             }
@@ -1690,8 +1690,8 @@ mod tests {
         let purge_executor_finished = finish_position("Purge-Executor-1");
         let evictor_finished = finish_position("Shared-Pool-Evictor");
         let io_finished = finish_position("IO-Thread");
-        let thread_pool_1_finished = finish_position("Thread-Pool-1");
-        let thread_pool_2_finished = finish_position("Thread-Pool-2");
+        let thread_pool_1_finished = finish_position("ThreadPoolWorker-1");
+        let thread_pool_2_finished = finish_position("ThreadPoolWorker-2");
         assert!(redo_finished < mandatory_1_finished);
         assert!(mandatory_1_finished < purge_dispatcher_finished);
         assert!(purge_dispatcher_finished < evictor_finished);

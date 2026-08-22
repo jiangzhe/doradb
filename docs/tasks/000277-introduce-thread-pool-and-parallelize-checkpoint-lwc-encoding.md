@@ -247,7 +247,7 @@ keeping only the concurrency and ordering policy checkpoint-specific.
 12. Add `ThreadPoolWorkers` as the separate join-handle owner. `ThreadPool`
     supplies a pending startup provision containing the receiver, poisoner,
     core guard, and fixed worker count.
-13. Start `Thread-Pool-1` through `Thread-Pool-N` with the repository's named
+13. Start `ThreadPoolWorker-1` through `ThreadPoolWorker-N` with the repository's named
     thread helper. Each worker blocks only in the executor's `recv` loop; this
     idle receive is not a user task.
 14. Wrap each task body, not the complete job owner, in
@@ -452,7 +452,7 @@ keeping only the concurrency and ordering policy checkpoint-specific.
     threshold.
 56. Capture a post-change Samply profile and interactive flamegraph for the
     2-million-row, multi-worker run. Confirm LWC encode/checksum stacks appear
-    on multiple `Thread-Pool-*` workers and are no longer executed on
+    on multiple `ThreadPoolWorker-*` workers and are no longer executed on
     `Mandatory-Runtime-1`.
 
 ## Implementation Notes
@@ -516,7 +516,7 @@ keeping only the concurrency and ordering policy checkpoint-specific.
    disconnected worker ingress returns an already completed Fatal handle,
    publishes `ThreadPoolUnavailable`, and never panics or returns a Runtime
    submission error.
-8. Inject failure at every `Thread-Pool-N` spawn point. Every earlier worker is
+8. Inject failure at every `ThreadPoolWorker-N` spawn point. Every earlier worker is
    stopped and joined before bootstrap returns the named `BackgroundSpawn`
    report, and no later component starts.
 9. Explicit and failed-bootstrap shutdown enqueue private FIFO worker stops

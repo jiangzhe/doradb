@@ -207,7 +207,7 @@ impl PendingThreadPoolWorkerStartup {
         for worker_idx in 0..self.worker_threads {
             let receiver = self.receiver.clone();
             let poisoner = self.poisoner.clone();
-            let worker_name = format!("Thread-Pool-Worker-{}", worker_idx + 1);
+            let worker_name = format!("ThreadPoolWorker-{}", worker_idx + 1);
             let handle = thread::spawn_named(worker_name, move || {
                 run_worker(&receiver, &poisoner);
             })
@@ -372,7 +372,7 @@ mod tests {
         runtime::block_on(async {
             let (_registry, pool) = test_pool(1).await;
             let completion = pool.submit(|| {
-                assert_eq!(std::thread::current().name(), Some("Thread-Pool-1"));
+                assert_eq!(std::thread::current().name(), Some("ThreadPoolWorker-1"));
                 NonCloneOutput(Box::new(17))
             });
             let output = completion.wait_take_result().await.unwrap();
@@ -538,7 +538,7 @@ mod tests {
     fn partial_startup_failure_stops_and_joins_started_workers() {
         runtime::block_on(async {
             let (event_tx, event_rx) = mpsc::channel();
-            let _failure = fail_spawn_named_with_observer("Thread-Pool-2", move |event| {
+            let _failure = fail_spawn_named_with_observer("ThreadPoolWorker-2", move |event| {
                 event_tx.send(event).unwrap();
             });
             let mut builder = RegistryBuilder::new();
@@ -550,9 +550,9 @@ mod tests {
             let error = builder.build::<ThreadPoolWorkers>(()).await.unwrap_err();
             assert_eq!(error.current_context(), &RuntimeError::BackgroundSpawn);
             let events: Vec<_> = event_rx.try_iter().collect();
-            assert!(events.contains(&SpawnTestEvent::Started("Thread-Pool-1".to_owned())));
-            assert!(events.contains(&SpawnTestEvent::Finished("Thread-Pool-1".to_owned())));
-            assert!(!events.contains(&SpawnTestEvent::Started("Thread-Pool-3".to_owned())));
+            assert!(events.contains(&SpawnTestEvent::Started("ThreadPoolWorker-1".to_owned())));
+            assert!(events.contains(&SpawnTestEvent::Finished("ThreadPoolWorker-1".to_owned())));
+            assert!(!events.contains(&SpawnTestEvent::Started("ThreadPoolWorker-3".to_owned())));
         });
     }
 
@@ -563,10 +563,10 @@ mod tests {
         let observer = observe_spawn_named(move |event| {
             observed_events.lock().push(event.clone());
             match event {
-                SpawnTestEvent::Finished(name) if name == "Thread-Pool-1" => {
+                SpawnTestEvent::Finished(name) if name == "ThreadPoolWorker-1" => {
                     panic::panic_any("first CPU worker panic");
                 }
-                SpawnTestEvent::Finished(name) if name == "Thread-Pool-2" => {
+                SpawnTestEvent::Finished(name) if name == "ThreadPoolWorker-2" => {
                     panic::panic_any("second CPU worker panic");
                 }
                 _ => {}
@@ -577,8 +577,8 @@ mod tests {
         let outcome = registry.shutdown_all();
         assert!(outcome.is_degraded());
         let events = events.lock();
-        assert!(events.contains(&SpawnTestEvent::Finished("Thread-Pool-1".to_owned())));
-        assert!(events.contains(&SpawnTestEvent::Finished("Thread-Pool-2".to_owned())));
+        assert!(events.contains(&SpawnTestEvent::Finished("ThreadPoolWorker-1".to_owned())));
+        assert!(events.contains(&SpawnTestEvent::Finished("ThreadPoolWorker-2".to_owned())));
         drop(events);
         drop(observer);
 
