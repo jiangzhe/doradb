@@ -6,21 +6,22 @@ use super::lifecycle::{CheckpointPublishLease, TableCheckpointRootMutationScope,
 use crate::buffer::guard::PageGuard;
 use crate::buffer::{PoolGuard, PoolGuards};
 use crate::catalog::{IndexSpec, SilentWatermarkObject, TableColumnLayout, TableMetadata};
-use crate::completion::Completion;
+use crate::completion::{Completion, CompletionTake};
 use crate::error::{
     CompletionErrorBridge, CompletionResult, DataIntegrityError, DataIntegrityResult, FatalError,
     InternalError, InternalResult, LifecycleError, MultiDomainResultExt, RuntimeError,
     RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeOrFatalResultExt, RuntimeResult,
 };
 use crate::file::cow_file::SUPER_BLOCK_ID;
-use crate::file::table_file::{ActiveRoot, LwcBlockPersist, MutableTableFile};
+use crate::file::table_file::{ActiveRoot, MutableTableFile};
 use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
 use crate::index::BTreeKeyEncoder;
 use crate::index::disk_tree::{
     NonUniqueDiskTreeEncodedExact, UniqueDiskTreeEncodedDelete, UniqueDiskTreeEncodedPut,
 };
 use crate::index::{
-    ColumnBlockEntryShape, ColumnBlockIndex, ColumnDeleteDeltaPatch, ColumnLeafEntry,
+    ColumnBlockEntryInput, ColumnBlockEntryShape, ColumnBlockIndex, ColumnDeleteDeltaPatch,
+    ColumnLeafEntry,
 };
 use crate::io::DirectBuf;
 use crate::lwc::LwcBuilder;
@@ -44,10 +45,11 @@ use crate::value::{Val, ValKind, ValType};
 use error_stack::{Report, ResultExt};
 use event_listener::EventListener;
 use futures::future::select_all;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 use std::mem::replace;
 use std::result::Result as StdResult;
 use std::sync::Arc;
+use std::time::Instant;
 
 #[cfg(test)]
 pub(crate) use tests::test_hooks;
@@ -118,29 +120,83 @@ pub(crate) enum CheckpointRetryObservation {
     Wait(DetachedCheckpointRetryWait),
 }
 
-struct PendingLwcEncode {
-    shape: ColumnBlockEntryShape,
-    completion: Arc<Completion<InternalResult<DirectBuf>>>,
+/// Monotonic lifecycle of one logical LWC block in checkpoint RowID order.
+enum LwcBlockState {
+    Encoding {
+        shape: ColumnBlockEntryShape,
+        completion: Arc<Completion<InternalResult<DirectBuf>>>,
+    },
+    Writing {
+        entry: ColumnBlockEntryInput,
+        completion: Arc<Completion<()>>,
+    },
+    Written {
+        entry: ColumnBlockEntryInput,
+    },
 }
 
-struct CheckpointLwcEncodeQueue {
+// Groups the owned write coordinator inputs that must remain stable throughout
+// one LWC production pass.
+struct CheckpointLwcProduction<'file, 'pages> {
+    mutable_file: &'file mut MutableTableFile,
     thread_pool: QuiescentGuard<ThreadPool>,
-    max_in_flight: usize,
-    table_id: TableID,
-    pending: VecDeque<PendingLwcEncode>,
-    output: Vec<LwcBlockPersist>,
+    new_pivot_row_id: RowID,
+    prepared_pages: &'pages [Option<PreparedTransitionPage>],
 }
 
-impl CheckpointLwcEncodeQueue {
+/// Coordinates ordered CPU encoding into globally backpressured data writes.
+///
+/// `blocks` is the single authoritative logical-order list. Entries before
+/// `next_to_write` have crossed shared-storage ingress and are `Writing` or
+/// `Written`; entries at and after it are `Encoding`. Therefore
+/// `blocks.len() - next_to_write` is exactly the CPU-stage occupancy and stays
+/// bounded by `encode_limit`.
+///
+/// Each slot is optional only to move an owned state across an await. A `None`
+/// slot is transient inside one state transition and is restored on success or
+/// removed on failure; it is never a semantic pipeline state.
+struct CheckpointLwcPipeline<'a> {
+    mutable_file: &'a mut MutableTableFile,
+    thread_pool: QuiescentGuard<ThreadPool>,
+    table_id: TableID,
+    blocks: Vec<Option<LwcBlockState>>,
+    next_to_write: usize,
+    encode_limit: usize,
+    last_accepted_end_row_id: RowID,
+    first_error: Option<RuntimeOrFatalError>,
+    started_at: Instant,
+    final_cpu_completion_at: Option<Instant>,
+    final_write_acceptance_at: Option<Instant>,
+    produced_blocks: usize,
+    peak_cpu_occupancy: usize,
+}
+
+impl<'a> CheckpointLwcPipeline<'a> {
     #[inline]
-    fn new(thread_pool: QuiescentGuard<ThreadPool>, table_id: TableID) -> Self {
-        let max_in_flight = thread_pool.worker_threads();
+    fn new(
+        mutable_file: &'a mut MutableTableFile,
+        thread_pool: QuiescentGuard<ThreadPool>,
+        table_id: TableID,
+    ) -> Self {
+        let encode_limit = thread_pool.worker_threads();
+        assert!(
+            encode_limit > 0,
+            "checkpoint LWC pipeline requires at least one ThreadPool worker"
+        );
         Self {
+            last_accepted_end_row_id: mutable_file.root().pivot_row_id,
+            mutable_file,
             thread_pool,
-            max_in_flight,
             table_id,
-            pending: VecDeque::with_capacity(max_in_flight),
-            output: Vec::new(),
+            blocks: Vec::with_capacity(encode_limit),
+            next_to_write: 0,
+            encode_limit,
+            first_error: None,
+            started_at: Instant::now(),
+            final_cpu_completion_at: None,
+            final_write_acceptance_at: None,
+            produced_blocks: 0,
+            peak_cpu_occupancy: 0,
         }
     }
 
@@ -149,35 +205,116 @@ impl CheckpointLwcEncodeQueue {
         builder: LwcBuilder,
         shape: ColumnBlockEntryShape,
     ) -> RuntimeOrFatalResult<()> {
-        if self.pending.len() == self.max_in_flight {
-            self.consume_oldest().await?;
+        // First hand every consecutively ready logical predecessor to shared
+        // storage. Acceptance, rather than CPU completion, releases capacity.
+        self.advance_ready().await?;
+        if self.cpu_occupancy() == self.encode_limit {
+            // A full CPU stage cannot admit another builder until its logical
+            // head completes and shared ingress accepts the resulting write.
+            let advanced = self.advance_next_encode(true).await?;
+            assert!(
+                advanced,
+                "full checkpoint CPU stage must have a logical encoding head"
+            );
         }
         let row_shape_fingerprint = shape.row_shape_fingerprint();
         let completion = self
             .thread_pool
             .submit(move || builder.build(row_shape_fingerprint));
-        self.pending
-            .push_back(PendingLwcEncode { shape, completion });
+        self.blocks
+            .push(Some(LwcBlockState::Encoding { shape, completion }));
+        self.produced_blocks += 1;
+        self.peak_cpu_occupancy = self.peak_cpu_occupancy.max(self.cpu_occupancy());
+        assert!(
+            self.cpu_occupancy() <= self.encode_limit,
+            "checkpoint CPU-stage occupancy exceeded ThreadPool worker bound"
+        );
+        // A predecessor may have completed while this job was submitted. Push
+        // ready work toward IO without waiting for another capacity boundary.
+        self.advance_ready().await
+    }
+
+    #[inline]
+    fn cpu_occupancy(&self) -> usize {
+        self.blocks.len() - self.next_to_write
+    }
+
+    async fn advance_ready(&mut self) -> RuntimeOrFatalResult<()> {
+        while self.advance_next_encode(false).await? {}
         Ok(())
     }
 
-    async fn consume_oldest(&mut self) -> RuntimeOrFatalResult<()> {
-        let pending = self
-            .pending
-            .pop_front()
-            .expect("checkpoint LWC encode queue consumes only a known pending task");
-        let start_row_id = pending.shape.start_row_id();
-        let end_row_id = pending.shape.end_row_id();
-        let encoded = pending
-            .completion
-            .wait_take_result()
-            .await
+    async fn advance_next_encode(&mut self, wait: bool) -> RuntimeOrFatalResult<bool> {
+        let Some(state) = self.blocks.get(self.next_to_write) else {
+            return Ok(false);
+        };
+        let Some(LwcBlockState::Encoding { shape, completion }) = state.as_ref() else {
+            panic!("checkpoint pipeline CPU suffix contains a non-Encoding state")
+        };
+        let start_row_id = shape.start_row_id();
+        let end_row_id = shape.end_row_id();
+        let result = if wait {
+            completion.wait_take_result().await
+        } else {
+            match completion.try_take_result() {
+                CompletionTake::Pending => return Ok(false),
+                CompletionTake::Ready(result) => result,
+                CompletionTake::Consumed => {
+                    panic!("checkpoint LWC encode completion consumed more than once")
+                }
+            }
+        };
+        self.final_cpu_completion_at = Some(Instant::now());
+        // Take the owned Encoding state only after its completion is ready.
+        // The temporary empty slot lets the encoded buffer cross the async
+        // ingress boundary without duplicating the block in another queue.
+        let state = self.blocks[self.next_to_write]
+            .take()
+            .expect("checkpoint pipeline logical head must remain present");
+        let LwcBlockState::Encoding { shape, .. } = state else {
+            unreachable!("checkpoint pipeline logical head changed while awaiting encode")
+        };
+        let encoded = match self.resolve_encode(start_row_id, end_row_id, result) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                self.remove_empty_logical_head();
+                return Err(error);
+            }
+        };
+        let submission = self
+            .mutable_file
+            .submit_lwc_block(shape, encoded, self.last_accepted_end_row_id)
+            .await;
+        let (entry, completion) = match submission {
+            Ok(submission) => submission,
+            Err(error) => {
+                self.remove_empty_logical_head();
+                return Err(error);
+            }
+        };
+        // Ingress acceptance is the write ownership and CPU-capacity
+        // linearization point. Allocation and submission remain in logical
+        // order even though backend completions may arrive in any order.
+        self.last_accepted_end_row_id = entry.end_row_id();
+        self.blocks[self.next_to_write] = Some(LwcBlockState::Writing { entry, completion });
+        self.next_to_write += 1;
+        self.final_write_acceptance_at = Some(Instant::now());
+        Ok(true)
+    }
+
+    fn resolve_encode(
+        &self,
+        start_row_id: RowID,
+        end_row_id: RowID,
+        result: CompletionResult<InternalResult<DirectBuf>>,
+    ) -> RuntimeOrFatalResult<DirectBuf> {
+        result
             .map_err(|bridge| {
                 bridge
                     .into_runtime_or_fatal(RuntimeError::CheckpointExecution)
                     .attach_with(|| {
                         format!(
-                            "operation=build_lwc_blocks, phase=await_encode, table_id={}, start_row_id={start_row_id}, end_row_id={end_row_id}",
+                            "operation=build_and_write_lwc_blocks, phase=await_encode, table_id={}, start_row_id={start_row_id}, end_row_id={end_row_id}",
                             self.table_id
                         )
                     })
@@ -187,42 +324,174 @@ impl CheckpointLwcEncodeQueue {
                     report
                         .change_context(RuntimeError::CheckpointExecution)
                         .attach(format!(
-                            "operation=build_lwc_blocks, phase=encode_block, table_id={}, start_row_id={start_row_id}, end_row_id={end_row_id}",
+                            "operation=build_and_write_lwc_blocks, phase=encode_block, table_id={}, start_row_id={start_row_id}, end_row_id={end_row_id}",
                             self.table_id
                         )),
                 )
-            })?;
-        self.output.push(LwcBlockPersist {
-            shape: pending.shape,
-            buf: encoded,
-        });
-        Ok(())
+            })
     }
 
-    async fn drain(&mut self) -> RuntimeOrFatalResult<()> {
-        let mut first_error: Option<RuntimeOrFatalError> = None;
-        while !self.pending.is_empty() {
-            if let Err(error) = self.consume_oldest().await {
-                first_error = Some(match first_error {
-                    Some(primary) => primary.merge_cleanup(error),
-                    None => error,
-                });
+    #[inline]
+    fn remove_empty_logical_head(&mut self) {
+        let removed = self.blocks.remove(self.next_to_write);
+        assert!(
+            removed.is_none(),
+            "checkpoint pipeline may remove only its transient empty head"
+        );
+    }
+
+    #[inline]
+    fn record_error(&mut self, error: RuntimeOrFatalError) {
+        self.first_error = Some(match self.first_error.take() {
+            Some(primary) => primary.merge_cleanup(error),
+            None => error,
+        });
+    }
+
+    async fn drain_encodes_without_writes(&mut self) {
+        // Forward production has failed. Observe every accepted CPU task, but
+        // drop successful buffers instead of creating additional writes.
+        while self.next_to_write < self.blocks.len() {
+            let state = self.blocks[self.next_to_write]
+                .take()
+                .expect("checkpoint pipeline encode drain requires a present state");
+            let LwcBlockState::Encoding { shape, completion } = state else {
+                panic!("checkpoint pipeline encode drain found a non-Encoding state")
+            };
+            let start_row_id = shape.start_row_id();
+            let end_row_id = shape.end_row_id();
+            let result = completion.wait_take_result().await;
+            self.final_cpu_completion_at = Some(Instant::now());
+            if let Err(error) = self.resolve_encode(start_row_id, end_row_id, result) {
+                self.record_error(error);
+            }
+            self.remove_empty_logical_head();
+        }
+    }
+
+    async fn drain_writes(&mut self) {
+        // Waiting in logical order does not serialize physical IO: every state
+        // in this prefix has already crossed shared-storage ingress.
+        let mut index = 0;
+        while index < self.next_to_write {
+            let Some(state) = self.blocks[index].as_ref() else {
+                panic!("checkpoint pipeline write drain found an empty state")
+            };
+            let completion = match state {
+                LwcBlockState::Writing { completion, .. } => Arc::clone(completion),
+                LwcBlockState::Written { .. } => {
+                    index += 1;
+                    continue;
+                }
+                LwcBlockState::Encoding { .. } => {
+                    panic!("checkpoint pipeline accepted prefix contains an Encoding state")
+                }
+            };
+            let result = completion.wait_take_result().await;
+            let state = self.blocks[index]
+                .take()
+                .expect("checkpoint pipeline write state must remain present");
+            let LwcBlockState::Writing { entry, .. } = state else {
+                unreachable!("checkpoint pipeline write state changed while awaiting completion")
+            };
+            match result {
+                Ok(()) => {
+                    self.blocks[index] = Some(LwcBlockState::Written { entry });
+                    index += 1;
+                }
+                Err(bridge) => {
+                    self.record_error(
+                        bridge
+                            .into_runtime_or_fatal(RuntimeError::FileRootAccess)
+                            .attach_with(|| {
+                                format!(
+                                    "operation=build_and_write_lwc_blocks, phase=drain_data_write, table_id={}, start_row_id={}",
+                                    self.table_id,
+                                    entry.start_row_id()
+                                )
+                            }),
+                    );
+                    let removed = self.blocks.remove(index);
+                    assert!(removed.is_none());
+                    self.next_to_write -= 1;
+                }
             }
         }
-        first_error.map_or(Ok(()), Err)
     }
 
+    /// Finish owns all accepted CPU and IO work after checkpoint admission.
+    ///
+    /// ThreadPool workers produce encode completions; the shared storage worker
+    /// produces ingress capacity and write completions. Completion cells and
+    /// bounded-channel acceptance are authoritative. Poison stops forward work
+    /// but does not cancel accepted work. Mandatory shutdown drains this owner
+    /// before ThreadPool and storage teardown, and this accepted checkpoint is
+    /// the sole cancellation and cleanup owner.
     async fn finish(
         mut self,
         production: RuntimeOrFatalResult<()>,
-    ) -> RuntimeOrFatalResult<Vec<LwcBlockPersist>> {
-        let drain = self.drain().await;
-        match (production, drain) {
-            (Ok(()), Ok(())) => Ok(self.output),
-            (Err(primary), Ok(())) => Err(primary),
-            (Ok(()), Err(drain)) => Err(drain),
-            (Err(primary), Err(drain)) => Err(primary.merge_cleanup(drain)),
+    ) -> RuntimeOrFatalResult<Vec<ColumnBlockEntryInput>> {
+        if let Err(error) = production {
+            self.record_error(error);
         }
+        if self.first_error.is_none() {
+            // Success path: submit every remaining encode before observing any
+            // data-write completion, maximizing CPU/write overlap.
+            while self.next_to_write < self.blocks.len() {
+                if let Err(error) = self.advance_next_encode(true).await {
+                    self.record_error(error);
+                    break;
+                }
+            }
+        }
+        if self.first_error.is_some() {
+            self.drain_encodes_without_writes().await;
+        }
+        // Both paths must observe every write accepted before the error or end
+        // of production. Only an all-success Written list becomes index input.
+        self.drain_writes().await;
+        let result = if self.first_error.is_some() {
+            "error"
+        } else {
+            "ok"
+        };
+        self.log_diagnostics(result);
+        if let Some(error) = self.first_error {
+            return Err(error);
+        }
+        Ok(self
+            .blocks
+            .into_iter()
+            .map(|state| match state {
+                Some(LwcBlockState::Written { entry }) => entry,
+                _ => panic!("successful checkpoint pipeline has a non-Written terminal state"),
+            })
+            .collect())
+    }
+
+    fn log_diagnostics(&self, result: &str) {
+        let production_nanos = self.final_cpu_completion_at.map_or(0, |finished| {
+            finished.duration_since(self.started_at).as_nanos()
+        });
+        let cpu_to_accept_nanos = self
+            .final_cpu_completion_at
+            .zip(self.final_write_acceptance_at)
+            .and_then(|(cpu, accepted)| accepted.checked_duration_since(cpu))
+            .map_or(0, |duration| duration.as_nanos());
+        let write_drain_nanos = self
+            .final_write_acceptance_at
+            .map_or(0, |accepted| accepted.elapsed().as_nanos());
+        obs::debug!(
+            "event=checkpoint_lwc_pipeline component=table action=finish result={} table_id={} block_count={} cpu_stage_capacity={} peak_cpu_occupancy={} production_nanos={} final_cpu_to_final_write_acceptance_nanos={} data_write_drain_nanos={}",
+            result,
+            self.table_id,
+            self.produced_blocks,
+            self.encode_limit,
+            self.peak_cpu_occupancy,
+            production_nanos,
+            cpu_to_accept_nanos,
+            write_drain_nanos,
+        );
     }
 }
 
@@ -466,15 +735,20 @@ where
                 secondary_sidecar.add_data_row(col_layout, page, row_idx, row_id)
             })
         };
-        let mut lwc_blocks = table
-            .build_lwc_blocks(
+        let lwc_entries = table
+            .build_and_write_lwc_blocks(
                 metadata,
                 pool_guards,
-                session.engine().thread_pool.clone(),
-                self.attempt
-                    .batch()
-                    .map(|batch| batch.prepared.as_slice())
-                    .unwrap_or_default(),
+                CheckpointLwcProduction {
+                    mutable_file: &mut mutable_file,
+                    thread_pool: session.engine().thread_pool.clone(),
+                    new_pivot_row_id,
+                    prepared_pages: self
+                        .attempt
+                        .batch()
+                        .map(|batch| batch.prepared.as_slice())
+                        .unwrap_or_default(),
+                },
                 collect_visible_row,
                 #[cfg(test)]
                 &session.engine().maintenance_test,
@@ -482,23 +756,19 @@ where
             .await
             .change_runtime_context(RuntimeError::CheckpointExecution)
             .attach_with(|| {
-                format!("operation=checkpoint_table, phase=build_lwc_blocks, table_id={table_id}")
+                format!(
+                    "operation=checkpoint_table, phase=build_and_write_lwc_blocks, table_id={table_id}"
+                )
             })?;
         // A heartbeat checkpoint still advances the heap replay floor: its
         // transaction STS comes from the global timestamp sequence.
         let heap_redo_start_ts = next_heap_redo_start_ts.unwrap_or(checkpoint_ts);
 
-        if let Some(last) = lwc_blocks.last_mut()
-            && last.shape.end_row_id() < new_pivot_row_id
-        {
-            last.shape.set_end_row_id(new_pivot_row_id);
-        }
-
         // Step 5: apply checkpoint changes to the already-checked mutable root.
-        if !lwc_blocks.is_empty() {
+        if !lwc_entries.is_empty() {
             mutable_file
-                .apply_lwc_blocks(
-                    lwc_blocks,
+                .finish_lwc_blocks(
+                    lwc_entries,
                     heap_redo_start_ts,
                     checkpoint_ts,
                     disk_pool,
@@ -508,7 +778,7 @@ where
                 .change_runtime_context(RuntimeError::CheckpointExecution)
                 .attach_with(|| {
                     format!(
-                        "operation=checkpoint_table, phase=apply_lwc_blocks, table_id={table_id}"
+                        "operation=checkpoint_table, phase=finish_lwc_blocks, table_id={table_id}"
                     )
                 })?;
         } else {
@@ -2065,15 +2335,14 @@ impl Table {
         Ok(heap_redo_start_ts)
     }
 
-    async fn build_lwc_blocks<C>(
+    async fn build_and_write_lwc_blocks<C>(
         &self,
         metadata: &TableMetadata,
         guards: &PoolGuards,
-        thread_pool: QuiescentGuard<ThreadPool>,
-        prepared_pages: &[Option<PreparedTransitionPage>],
+        production: CheckpointLwcProduction<'_, '_>,
         mut collect_visible_row: Option<C>,
         #[cfg(test)] maintenance_test: &MaintenanceTestController,
-    ) -> RuntimeOrFatalResult<Vec<LwcBlockPersist>>
+    ) -> RuntimeOrFatalResult<Vec<ColumnBlockEntryInput>>
     where
         C: FnMut(&RowPage, usize, RowID),
     {
@@ -2082,7 +2351,13 @@ impl Table {
 
         #[cfg(test)]
         table_test_hooks::maybe_force_lwc_build_error(maintenance_test)?;
-        let mut queue = CheckpointLwcEncodeQueue::new(thread_pool, self.table_id());
+        let CheckpointLwcProduction {
+            mutable_file,
+            thread_pool,
+            new_pivot_row_id,
+            prepared_pages,
+        } = production;
+        let mut pipeline = CheckpointLwcPipeline::new(mutable_file, thread_pool, self.table_id());
         let production: RuntimeOrFatalResult<()> = async {
             let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
             let mut current_start = RowID::new(0);
@@ -2094,7 +2369,7 @@ impl Table {
                             .attach("transitioned page has no prepared visibility plan")
                             .change_context(RuntimeError::CheckpointExecution)
                             .attach(format!(
-                                "operation=build_lwc_blocks, table_id={}",
+                                "operation=build_and_write_lwc_blocks, table_id={}",
                                 self.table_id()
                             )),
                     ));
@@ -2114,7 +2389,7 @@ impl Table {
                         .change_context(RuntimeError::CheckpointExecution)
                         .attach_with(|| {
                             format!(
-                                "operation=build_lwc_blocks, phase=build_vector_view, table_id={}, page_id={}",
+                                "operation=build_and_write_lwc_blocks, phase=build_vector_view, table_id={}, page_id={}",
                                 self.table_id(), prepared.page_id
                             )
                         })?;
@@ -2135,6 +2410,9 @@ impl Table {
                         Some(builder.append_view(view, prepared.start_row_id))
                     }
                 };
+                // Page guards and borrowed vector views are gone before any
+                // CPU-completion or shared-ingress await.
+                pipeline.advance_ready().await?;
                 let Some(appended) = appended else {
                     continue;
                 };
@@ -2148,7 +2426,7 @@ impl Table {
                                 ))
                                 .change_context(RuntimeError::CheckpointExecution)
                                 .attach(format!(
-                                    "operation=build_lwc_blocks, phase=append_page, table_id={}",
+                                    "operation=build_and_write_lwc_blocks, phase=append_page, table_id={}",
                                     self.table_id()
                                 )),
                         ));
@@ -2165,7 +2443,7 @@ impl Table {
                     );
                     // No page guard or borrowed vector view survives this
                     // capacity wait and accepted-task submission boundary.
-                    queue.submit(completed_builder, shape).await?;
+                    pipeline.submit(completed_builder, shape).await?;
                     current_start = prepared.start_row_id;
                     current_end = prepared.end_row_id;
                     let rebuilt_appended = {
@@ -2183,7 +2461,7 @@ impl Table {
                             .change_context(RuntimeError::CheckpointExecution)
                             .attach_with(|| {
                                 format!(
-                                    "operation=build_lwc_blocks, phase=rebuild_vector_view, table_id={}, page_id={}",
+                                    "operation=build_and_write_lwc_blocks, phase=rebuild_vector_view, table_id={}, page_id={}",
                                     self.table_id(), prepared.page_id
                                 )
                             })?;
@@ -2198,7 +2476,7 @@ impl Table {
                                 ))
                                 .change_context(RuntimeError::CheckpointExecution)
                                 .attach(format!(
-                                    "operation=build_lwc_blocks, phase=append_page, table_id={}",
+                                    "operation=build_and_write_lwc_blocks, phase=append_page, table_id={}",
                                     self.table_id()
                                 )),
                         ));
@@ -2206,20 +2484,21 @@ impl Table {
                 } else {
                     current_end = prepared.end_row_id;
                 }
+                pipeline.advance_ready().await?;
             }
             if !builder.is_empty() {
                 let shape = ColumnBlockEntryShape::new(
                     current_start,
-                    current_end,
+                    new_pivot_row_id,
                     builder.row_ids().to_vec(),
                     Vec::new(),
                 );
-                queue.submit(builder, shape).await?;
+                pipeline.submit(builder, shape).await?;
             }
             Ok(())
         }
         .await;
-        queue.finish(production).await
+        pipeline.finish(production).await
     }
 
     /// Execute one checkpoint with caller-prepared workflow/root authority.
@@ -2325,6 +2604,7 @@ where
 mod tests {
 
     use super::*;
+    use crate::bitmap::Bitmap;
     use crate::buffer::BufferPool;
     use crate::buffer::guard::PageSharedGuard;
     use crate::buffer::page::VersionedPageID;
@@ -2337,7 +2617,8 @@ mod tests {
     use crate::conf::TrxSysConfig;
     use crate::engine::Engine;
     use crate::error::{
-        Error, FatalError, LifecycleError, ResourceError, RuntimeError, RuntimeOrFatalError,
+        Error, FatalError, IoError, LifecycleError, ResourceError, RuntimeError,
+        RuntimeOrFatalError,
     };
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
     use crate::file::cow_file::tests::old_root_drop_count;
@@ -2395,6 +2676,7 @@ mod tests {
     use smol::future::yield_now;
     use std::cmp::Ordering;
     use std::future::{Future, poll_fn};
+    use std::io::ErrorKind as IoErrorKind;
     use std::pin::Pin;
     use std::ptr::from_ref;
     use std::sync::Arc;
@@ -3032,12 +3314,12 @@ mod tests {
         );
     }
 
-    fn test_pending_lwc_encode(
+    fn test_lwc_encoding_state(
         start_row_id: u64,
         completion: Arc<Completion<InternalResult<DirectBuf>>>,
-    ) -> PendingLwcEncode {
+    ) -> LwcBlockState {
         let start_row_id = RowID::new(start_row_id);
-        PendingLwcEncode {
+        LwcBlockState::Encoding {
             shape: ColumnBlockEntryShape::new(
                 start_row_id,
                 start_row_id + 10,
@@ -3046,6 +3328,38 @@ mod tests {
             ),
             completion,
         }
+    }
+
+    fn test_lwc_entry(start_row_id: u64, block_id: u64) -> ColumnBlockEntryInput {
+        let start_row_id = RowID::new(start_row_id);
+        ColumnBlockEntryShape::new(
+            start_row_id,
+            start_row_id + 10,
+            vec![start_row_id],
+            Vec::new(),
+        )
+        .with_block_id(BlockID::new(block_id))
+    }
+
+    fn test_mutable_table_file(
+        engine: &Engine,
+        table: &Arc<Table>,
+        guards: &PoolGuards,
+    ) -> MutableTableFile {
+        MutableTableFile::fork(
+            table.file(),
+            engine.inner().table_fs.background_writes(),
+            table.disk_pool().clone(),
+            guards.disk_guard().clone(),
+        )
+    }
+
+    async fn test_lwc_pipeline_file(engine: &Engine) -> (TableID, MutableTableFile) {
+        let table_id = create_table2_for_test(engine).await;
+        let table = table_for_internal_assertion(engine, table_id);
+        let session = engine.new_session().unwrap();
+        let guards = session.pool_guards();
+        (table_id, test_mutable_table_file(engine, &table, &guards))
     }
 
     #[test]
@@ -3319,7 +3633,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_lwc_blocks_rejects_oversized_first_page() {
+    fn test_build_and_write_lwc_blocks_rejects_oversized_first_page() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "oversized-first-lwc-page").await;
@@ -3355,14 +3669,20 @@ mod tests {
                 overlay_markers: Vec::new(),
             };
             let page_id = prepared.page_id;
+            let new_pivot_row_id = prepared.end_row_id;
             drop(page_guard);
+            let mut mutable_file = test_mutable_table_file(&engine, &table, &guards);
 
             let err = match table
-                .build_lwc_blocks(
+                .build_and_write_lwc_blocks(
                     &metadata,
                     &guards,
-                    engine.inner().thread_pool.clone(),
-                    &[Some(prepared)],
+                    CheckpointLwcProduction {
+                        mutable_file: &mut mutable_file,
+                        thread_pool: engine.inner().thread_pool.clone(),
+                        new_pivot_row_id,
+                        prepared_pages: &[Some(prepared)],
+                    },
                     None::<fn(&RowPage, usize, RowID)>,
                     &engine.inner().maintenance_test,
                 )
@@ -3388,15 +3708,138 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_lwc_encode_queue_preserves_fifo_completion_order() {
+    fn checkpoint_lwc_pipeline_finalizes_trailing_deleted_span_before_encoding() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "lwc-final-shape").await;
+            let mut session = engine.new_session().unwrap();
+            let table_id = session
+                .create_table(
+                    TableSpec::new(vec![ColumnSpec::new(
+                        "value",
+                        ValKind::U32,
+                        ColumnAttributes::empty(),
+                    )]),
+                    vec![],
+                )
+                .await
+                .unwrap();
+            let table = table_for_internal_assertion(&engine, table_id);
+            let metadata = table.metadata();
+            let guards = session.pool_guards();
+
+            let first = {
+                let page_guard = table.mem.try_get_insert_page(&guards, 1).await.unwrap();
+                let page = page_guard.page();
+                let max_row_count = usize::from(page.header.max_row_count);
+                for value in 0..max_row_count {
+                    assert!(
+                        page.insert(metadata.col.as_ref(), &[Val::from(value as u32)])
+                            .is_ok()
+                    );
+                }
+                PreparedTransitionPage {
+                    page_id: page_guard.page_id(),
+                    start_row_id: page.header.start_row_id,
+                    end_row_id: page.header.start_row_id + max_row_count as u64,
+                    cutoff_ts: TrxID::new(1),
+                    observed_version: 0,
+                    required_cutoff_ts: None,
+                    del_bitmap: page.del_bitmap(max_row_count),
+                    overlay_markers: Vec::new(),
+                }
+            };
+            let second = {
+                let page_guard = table.mem.try_get_insert_page(&guards, 1).await.unwrap();
+                let page = page_guard.page();
+                assert!(
+                    page.insert(metadata.col.as_ref(), &[Val::from(999u32)])
+                        .is_ok()
+                );
+                let mut del_bitmap = page.del_bitmap(page.header.row_count());
+                assert!(del_bitmap.bitmap_set(0));
+                PreparedTransitionPage {
+                    page_id: page_guard.page_id(),
+                    start_row_id: page.header.start_row_id,
+                    end_row_id: page.header.start_row_id + u64::from(page.header.max_row_count),
+                    cutoff_ts: TrxID::new(1),
+                    observed_version: 0,
+                    required_cutoff_ts: None,
+                    del_bitmap,
+                    overlay_markers: Vec::new(),
+                }
+            };
+            assert_eq!(first.end_row_id, second.start_row_id);
+            let new_pivot_row_id = second.end_row_id;
+            let mut mutable_file = test_mutable_table_file(&engine, &table, &guards);
+            let entries = table
+                .build_and_write_lwc_blocks(
+                    &metadata,
+                    &guards,
+                    CheckpointLwcProduction {
+                        mutable_file: &mut mutable_file,
+                        thread_pool: engine.inner().thread_pool.clone(),
+                        new_pivot_row_id,
+                        prepared_pages: &[Some(first.clone()), Some(second)],
+                    },
+                    None::<fn(&RowPage, usize, RowID)>,
+                    &engine.inner().maintenance_test,
+                )
+                .await
+                .unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].end_row_id(), new_pivot_row_id);
+            mutable_file
+                .finish_lwc_blocks(
+                    entries,
+                    TrxID::new(2),
+                    TrxID::new(2),
+                    table.disk_pool(),
+                    guards.disk_guard(),
+                )
+                .await
+                .unwrap();
+
+            let root = mutable_file.root();
+            let index = ColumnBlockIndex::new(
+                root.column_block_index_root,
+                root.pivot_row_id,
+                table.file().file_kind(),
+                table.file().sparse_file(),
+                table.disk_pool(),
+                guards.disk_guard(),
+            );
+            let entry = index
+                .locate_block(first.start_row_id)
+                .await
+                .unwrap()
+                .expect("final LWC entry should be indexed");
+            let persisted = table
+                .storage
+                .load_lwc_block(guards.disk_guard(), entry.block_id())
+                .await
+                .unwrap();
+            assert_eq!(
+                persisted.block().row_shape_fingerprint(),
+                entry.row_shape_fingerprint()
+            );
+        });
+    }
+
+    #[test]
+    fn checkpoint_lwc_pipeline_preserves_logical_write_order() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "lwc-encode-fifo").await;
-            let mut queue =
-                CheckpointLwcEncodeQueue::new(engine.inner().thread_pool.clone(), TableID::new(17));
+            let (table_id, mut mutable_file) = test_lwc_pipeline_file(&engine).await;
+            let mut pipeline = CheckpointLwcPipeline::new(
+                &mut mutable_file,
+                engine.inner().thread_pool.clone(),
+                table_id,
+            );
             let first = Arc::new(Completion::new());
             let second = Arc::new(Completion::new());
-            queue.pending.push_back(PendingLwcEncode {
+            pipeline.blocks.push(Some(LwcBlockState::Encoding {
                 shape: ColumnBlockEntryShape::new(
                     RowID::new(10),
                     RowID::new(20),
@@ -3404,8 +3847,8 @@ mod tests {
                     Vec::new(),
                 ),
                 completion: Arc::clone(&first),
-            });
-            queue.pending.push_back(PendingLwcEncode {
+            }));
+            pipeline.blocks.push(Some(LwcBlockState::Encoding {
                 shape: ColumnBlockEntryShape::new(
                     RowID::new(20),
                     RowID::new(30),
@@ -3413,40 +3856,118 @@ mod tests {
                     Vec::new(),
                 ),
                 completion: Arc::clone(&second),
-            });
+            }));
 
             second.complete(Ok(Ok(DirectBuf::zeroed(COW_FILE_PAGE_SIZE))));
             first.complete(Ok(Ok(DirectBuf::zeroed(COW_FILE_PAGE_SIZE))));
-            let output = queue.finish(Ok(())).await.unwrap();
+            let output = pipeline.finish(Ok(())).await.unwrap();
             assert_eq!(output.len(), 2);
-            assert_eq!(output[0].shape.start_row_id(), RowID::new(10));
-            assert_eq!(output[1].shape.start_row_id(), RowID::new(20));
+            assert_eq!(output[0].start_row_id(), RowID::new(10));
+            assert_eq!(output[1].start_row_id(), RowID::new(20));
             assert!(matches!(first.try_take_result(), CompletionTake::Consumed));
             assert!(matches!(second.try_take_result(), CompletionTake::Consumed));
         });
     }
 
     #[test]
-    fn checkpoint_lwc_encode_queue_drains_after_inner_encode_error() {
+    fn checkpoint_lwc_pipeline_drains_out_of_order_writes_into_ordered_entries() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "lwc-write-order").await;
+            let (table_id, mut mutable_file) = test_lwc_pipeline_file(&engine).await;
+            let mut pipeline = CheckpointLwcPipeline::new(
+                &mut mutable_file,
+                engine.inner().thread_pool.clone(),
+                table_id,
+            );
+            let first = Arc::new(Completion::new());
+            let second = Arc::new(Completion::new());
+            pipeline.blocks.push(Some(LwcBlockState::Writing {
+                entry: test_lwc_entry(10, 1),
+                completion: Arc::clone(&first),
+            }));
+            pipeline.blocks.push(Some(LwcBlockState::Writing {
+                entry: test_lwc_entry(20, 2),
+                completion: Arc::clone(&second),
+            }));
+            pipeline.next_to_write = 2;
+
+            second.complete(Ok(()));
+            first.complete(Ok(()));
+            let entries = pipeline.finish(Ok(())).await.unwrap();
+            assert_eq!(entries[0].start_row_id(), RowID::new(10));
+            assert_eq!(entries[1].start_row_id(), RowID::new(20));
+            assert!(matches!(first.try_take_result(), CompletionTake::Consumed));
+            assert!(matches!(second.try_take_result(), CompletionTake::Consumed));
+        });
+    }
+
+    #[test]
+    fn checkpoint_lwc_pipeline_write_failure_drains_later_accepted_write() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "lwc-write-error-drain").await;
+            let (table_id, mut mutable_file) = test_lwc_pipeline_file(&engine).await;
+            let mut pipeline = CheckpointLwcPipeline::new(
+                &mut mutable_file,
+                engine.inner().thread_pool.clone(),
+                table_id,
+            );
+            let failed = Arc::new(Completion::new());
+            let later = Arc::new(Completion::new());
+            pipeline.blocks.push(Some(LwcBlockState::Writing {
+                entry: test_lwc_entry(10, 1),
+                completion: Arc::clone(&failed),
+            }));
+            pipeline.blocks.push(Some(LwcBlockState::Writing {
+                entry: test_lwc_entry(20, 2),
+                completion: Arc::clone(&later),
+            }));
+            pipeline.next_to_write = 2;
+            failed.complete(Err(CompletionErrorBridge::capture(
+                Report::new(IoError::from(IoErrorKind::Other))
+                    .attach("first accepted LWC write failed"),
+            )));
+            later.complete(Ok(()));
+
+            let error = pipeline.finish(Ok(())).await.unwrap_err();
+            let RuntimeOrFatalError::Runtime(report) = error else {
+                panic!("backend write failure must remain Runtime")
+            };
+            assert_eq!(report.current_context(), &RuntimeError::FileRootAccess);
+            assert_eq!(
+                report.downcast_ref::<IoError>().copied(),
+                Some(IoError::from(IoErrorKind::Other))
+            );
+            assert!(matches!(later.try_take_result(), CompletionTake::Consumed));
+        });
+    }
+
+    #[test]
+    fn checkpoint_lwc_pipeline_drains_after_inner_encode_error() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "lwc-encode-inner-error").await;
-            let mut queue =
-                CheckpointLwcEncodeQueue::new(engine.inner().thread_pool.clone(), TableID::new(18));
+            let (table_id, mut mutable_file) = test_lwc_pipeline_file(&engine).await;
+            let mut pipeline = CheckpointLwcPipeline::new(
+                &mut mutable_file,
+                engine.inner().thread_pool.clone(),
+                table_id,
+            );
             let failed = Arc::new(Completion::new());
             let later = Arc::new(Completion::new());
-            queue
-                .pending
-                .push_back(test_pending_lwc_encode(10, Arc::clone(&failed)));
-            queue
-                .pending
-                .push_back(test_pending_lwc_encode(20, Arc::clone(&later)));
+            pipeline
+                .blocks
+                .push(Some(test_lwc_encoding_state(10, Arc::clone(&failed))));
+            pipeline
+                .blocks
+                .push(Some(test_lwc_encoding_state(20, Arc::clone(&later))));
             failed.complete(Ok(Err(
                 Report::new(InternalError::LwcBuilderMisuse).attach("first encode failure")
             )));
             later.complete(Ok(Ok(DirectBuf::zeroed(COW_FILE_PAGE_SIZE))));
 
-            let error = match queue.finish(Ok(())).await {
+            let error = match pipeline.finish(Ok(())).await {
                 Ok(_) => panic!("inner LWC encode failure must fail queue finish"),
                 Err(error) => error,
             };
@@ -3463,20 +3984,24 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_lwc_encode_queue_fatal_drain_outranks_producer_error() {
+    fn checkpoint_lwc_pipeline_fatal_drain_outranks_producer_error() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "lwc-encode-fatal-drain").await;
-            let mut queue =
-                CheckpointLwcEncodeQueue::new(engine.inner().thread_pool.clone(), TableID::new(19));
+            let (table_id, mut mutable_file) = test_lwc_pipeline_file(&engine).await;
+            let mut pipeline = CheckpointLwcPipeline::new(
+                &mut mutable_file,
+                engine.inner().thread_pool.clone(),
+                table_id,
+            );
             let first = Arc::new(Completion::new());
             let fatal = Arc::new(Completion::new());
-            queue
-                .pending
-                .push_back(test_pending_lwc_encode(10, Arc::clone(&first)));
-            queue
-                .pending
-                .push_back(test_pending_lwc_encode(20, Arc::clone(&fatal)));
+            pipeline
+                .blocks
+                .push(Some(test_lwc_encoding_state(10, Arc::clone(&first))));
+            pipeline
+                .blocks
+                .push(Some(test_lwc_encoding_state(20, Arc::clone(&fatal))));
             first.complete(Ok(Err(
                 Report::new(InternalError::LwcBuilderMisuse).attach("first encode failure")
             )));
@@ -3487,7 +4012,7 @@ mod tests {
                 Report::new(RuntimeError::CheckpointExecution).attach("producer page failure"),
             ));
 
-            let error = match queue.finish(production).await {
+            let error = match pipeline.finish(production).await {
                 Ok(_) => panic!("fatal LWC encode failure must fail queue finish"),
                 Err(error) => error,
             };

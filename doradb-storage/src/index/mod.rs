@@ -31,8 +31,8 @@ pub(crate) use column_block_index::{
     ColumnBlockNodeHeader, validate_persisted_column_block_index_page,
 };
 pub(crate) use column_block_index::{
-    ColumnBlockEntryShape, ColumnBlockIndex, ColumnDeleteDeltaPatch, ColumnLeafEntry,
-    ResolvedColumnRow,
+    ColumnBlockEntryInput, ColumnBlockEntryShape, ColumnBlockIndex, ColumnDeleteDeltaPatch,
+    ColumnLeafEntry, ResolvedColumnRow,
 };
 #[cfg(test)]
 pub(crate) use column_deletion_blob::{

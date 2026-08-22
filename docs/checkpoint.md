@@ -85,18 +85,24 @@ One checkpoint attempt follows these conceptual phases:
    row images and cold-row delete selection, then allocate `checkpoint_ts`.
 4. Convert a ready frozen-page prefix into LWC blocks and collect matching
    secondary-index entries from the same visible rows. Owned LWC encoding and
-   checksum work runs on the engine CPU thread pool behind a bounded ordered
-   checkpoint-local FIFO; page access and sidecar collection remain on the
-   mandatory runtime.
-5. Merge eligible cold-row deletes into persistent delete metadata and collect
+   checksum work runs on the engine CPU thread pool. One checkpoint-local
+   logical-order list moves each block from encoding to accepted shared-storage
+   write to written, so CPU work overlaps CoW data writes. Page access,
+   logical CoW allocation, write submission, and sidecar collection remain on
+   the mandatory runtime.
+5. Drain every accepted LWC data write, then build the `ColumnBlockIndex` and
+   update the mutable root's pivot and heap replay floor. Shared storage
+   ingress and backend depth, rather than a checkpoint-local write limit,
+   provide write backpressure.
+6. Merge eligible cold-row deletes into persistent delete metadata and collect
    matching secondary-index deletes.
-6. Apply all accumulated secondary-index companion work to the same mutable
+7. Apply all accumulated secondary-index companion work to the same mutable
    table-file fork.
-7. Rebuild the mutable root's allocation map from blocks reachable through the
+8. Rebuild the mutable root's allocation map from blocks reachable through the
    protected active root and the root about to be published.
-8. Publish either the changed user-table root or, when only replay bounds
+9. Publish either the changed user-table root or, when only replay bounds
    advanced, a catalog-backed silent watermark.
-9. Submit the data-checkpoint marker and any retired row-page batch through the
+10. Submit the data-checkpoint marker and any retired row-page batch through the
    ordered system-transaction path.
 
 The detailed row-page preparation and LWC conversion rules are defined in
@@ -119,7 +125,10 @@ If an attempt fails before publication admission, its mutable fork can be
 discarded without exposing partial state. Once transition or publication has
 crossed its irreversible boundary, an unexpected build, root publication, or
 system-commit failure poisons storage rather than reopening a partially
-published workflow.
+published workflow. LWC data blocks written before a failure remain
+unpublished CoW allocations. The checkpoint stops new production after the
+failure but drains every accepted CPU task and data write, with Fatal failures
+taking precedence over Runtime cleanup failures.
 
 ### Delay, Cancellation, and Retry
 

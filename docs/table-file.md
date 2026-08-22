@@ -262,6 +262,20 @@ walk row undo chains again. Prepared plans and mutation versions remain
 volatile; the durable LWC, block-index, delete metadata, secondary roots,
 allocation reachability, replay bounds, and atomic root format are unchanged.
 
+Checkpoint allocates LWC CoW blocks and submits their data writes in logical
+RowID order as the corresponding CPU encodes become available. Shared storage
+ingress acceptance transfers the buffer, file owner, and readonly-cache write
+lease to the IO subsystem; completion no longer borrows the mutable root.
+Physical completion order is unrestricted. The checkpoint drains all accepted
+data writes before it starts any `ColumnBlockIndex` CoW write, and only a
+successful index rebuild updates the mutable root's column-index pointer,
+pivot, and heap replay floor.
+
+These early data writes remain invisible because root publication is
+unchanged: the new meta block, super-block slot, and final publication fsync
+still precede the active-root swap. A failed fork may leave unreachable CoW
+blocks, but cannot expose a partially built LWC/index pair.
+
 ### 7.2 Deletion Checkpoint Publication
 
 Deletion checkpoint publishes:

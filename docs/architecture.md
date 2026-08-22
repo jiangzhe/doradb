@@ -150,9 +150,12 @@ User-table checkpoint is the first consumer. Page residency, visibility
 analysis, borrowed vector views, secondary-index collection, table-file IO,
 and publication stay on the mandatory runtime. Once an `LwcBuilder` owns a
 complete block input, checkpoint submits serialization, compression, and
-checksum generation to the CPU pool. A checkpoint-private FIFO bounds pending
-jobs to the worker count, consumes them in logical block order, and drains all
-accepted jobs before the checkpoint operation reaches a terminal state.
+checksum generation to the CPU pool. A checkpoint-private logical-order state
+list bounds blocks that have not reached shared IO to the worker count. Ready
+encodes become CoW data-write submissions in RowID order while later encoding
+continues; shared storage ingress and backend depth provide global write
+backpressure. The checkpoint drains every accepted encode and write before it
+builds the column index or reaches a terminal state.
 
 ## Mandatory Background Runtime
 

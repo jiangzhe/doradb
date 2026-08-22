@@ -148,11 +148,26 @@ same prepared bitmap is reused rather than walking undo state again.
 Page loading, vector-view construction, visibility filtering, and row copying
 remain on the single mandatory-runtime runner. After a builder owns one
 complete block input, checkpoint submits only LWC serialization, compression,
-and checksum generation to the engine CPU thread pool. A checkpoint-local FIFO
-keeps at most one pending encode per configured worker and consumes results in
-logical RowID order. Capacity and final-drain waits retain no page guard,
-borrowed vector view, latch, logical lock, or IO request owner. Every accepted
-encode is drained even when later page access or an earlier encode fails.
+and checksum generation to the engine CPU thread pool. One checkpoint-local
+state list retains blocks in logical RowID order and moves each block
+monotonically from `Encoding` to `Writing` to `Written`. The number of blocks
+that have not crossed shared-storage ingress is bounded by the configured CPU
+worker count. An encode frees that capacity only when its CoW data write is
+accepted, so the shared bounded ingress and backend IO depth propagate global
+backpressure without a second checkpoint-local write limit.
+
+CPU completions may arrive out of order and physical writes may finish out of
+order, but CoW block allocation and write acceptance follow logical RowID
+order. After production ends, checkpoint drains all accepted writes before
+constructing the `ColumnBlockIndex`. Capacity, ingress, and final-drain waits
+retain no page guard, borrowed vector view, latch, logical lock, mutable-root
+borrow, or IO request owner. On failure, forward production stops while every
+accepted encode and write is still observed.
+
+The known checkpoint pivot is part of the final builder's logical shape before
+encoding. Fully deleted trailing pages therefore extend the final block's
+exclusive RowID span before its fingerprint is embedded in the checksummed LWC
+header, keeping that fingerprint identical to the later block-index entry.
 
 For every row accepted into an LWC block, checkpoint sends the identical
 visible value and RowID to the secondary-index sidecar. This produces companion
