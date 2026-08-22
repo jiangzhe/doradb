@@ -337,6 +337,41 @@ trx.table_scan_mvcc(table_id, &[0, 1], |vals| {
 The callback cannot be async. Effects outside Doradb performed by a callback
 are not reversible if later application code rolls back the transaction.
 
+Use `table_scan_mvcc_stream` for incremental full-table consumption with a
+programmable filter. The callback receives a snapshot-visible `LazyRow`, so it
+can inspect a column omitted from the output projection:
+
+```rust,ignore
+let mut stream = trx
+    .table_scan_mvcc_stream(table_id, &[0, 2], |row| {
+        if row.val(1)? == &Val::from("active") {
+            Ok(ScanRowDecision::Include)
+        } else {
+            Ok(ScanRowDecision::Skip)
+        }
+    })
+    .await?;
+
+while let Some(vals) = stream.next().await? {
+    consume(vals); // columns 0 and 2 only
+}
+drop(stream);
+```
+
+`Include` materializes the supplied read set and returns at most one row from
+the current `next` call. `Skip` continues internally without materializing the
+projection. `Stop` excludes the current row and closes the stream successfully.
+Exhaustion, `Stop`, callback or storage error, early drop, and constructor
+cancellation all release the stream's operation checkout. After a terminal
+result, later `next` calls return `Ok(None)` without invoking the callback.
+
+The stream exclusively borrows its transaction until it is dropped. The
+callback is synchronous and cannot retain the lazy row or a value borrowed from
+it. For a hot row, callback code runs while that row's read guard is held; keep
+the callback finite and do not wait for external work that may require a
+conflicting write. No hot row-page or row guard remains held while the caller
+consumes a returned projection.
+
 ### Unique lookup
 
 `table_lookup_unique_mvcc` requires a unique index and returns `SelectMvcc`:

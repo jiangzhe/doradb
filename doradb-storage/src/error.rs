@@ -357,6 +357,8 @@ pub(crate) enum InternalError {
     ReadonlyWriteBlocked,
     #[error("row page scan start is not a page boundary")]
     RowPageScanStartInvalid,
+    #[error("captured row page is unavailable")]
+    CapturedRowPageUnavailable,
     #[error("lwc builder misuse")]
     LwcBuilderMisuse,
     #[error("secondary index out of bounds")]

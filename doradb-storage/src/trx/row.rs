@@ -38,6 +38,17 @@ pub(crate) enum ReadLatestRow {
     WriteConflict,
 }
 
+/// Visibility outcome from the keyless main-branch MVCC traversal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MainBranchMvcc {
+    /// The latest physical page image is visible.
+    Latest,
+    /// An older image reconstructed from visited update before-images is visible.
+    Historical,
+    /// No row version is visible to the reader.
+    NotFound,
+}
+
 /// Read row with latest or visible version.
 pub(crate) struct RowReadAccess<'a> {
     page: &'a RowPage,
@@ -189,6 +200,9 @@ impl<'a> RowReadAccess<'a> {
         read_set: &[usize],
         key: Option<(usize, &[Val])>,
     ) -> ReadRow {
+        if key.is_none() {
+            return self.read_row_mvcc_keyless(ctx, metadata, read_set);
+        }
         match &self.state {
             RowReadState::RowVer(undo) => match &**undo {
                 None => self.read_row_latest(metadata, read_set, key),
@@ -363,6 +377,106 @@ impl<'a> RowReadAccess<'a> {
                 // no mvcc support for recovery mode.
                 unreachable!("no mvcc support for recovery mode")
             }
+        }
+    }
+
+    /// Resolves a keyless MVCC read by following only the row's main undo branch.
+    ///
+    /// Every update before-image visited on the path to the selected version is
+    /// supplied to `undo_update` in newest-to-oldest order. A collector may
+    /// therefore overwrite repeated columns to retain the oldest applicable
+    /// logical value.
+    #[inline]
+    pub(crate) fn resolve_main_branch_mvcc<F>(
+        &self,
+        ctx: &TrxContext,
+        mut undo_update: F,
+    ) -> MainBranchMvcc
+    where
+        F: FnMut(&[UndoCol]),
+    {
+        let latest = || {
+            if self.row().is_deleted() {
+                MainBranchMvcc::NotFound
+            } else {
+                MainBranchMvcc::Latest
+            }
+        };
+        let undo = match &self.state {
+            RowReadState::Recover(_) => {
+                unreachable!("no mvcc support for recovery mode")
+            }
+            RowReadState::RowVer(undo) => undo,
+        };
+        let Some(undo_head) = &**undo else {
+            return latest();
+        };
+        let ts = undo_head.ts();
+        if trx_is_committed(ts) {
+            if ctx.sts() > ts {
+                return latest();
+            }
+        } else if ctx.trx_id() == ts {
+            return latest();
+        }
+
+        let mut deleted = self.row().is_deleted();
+        let mut next = &undo_head.next;
+        loop {
+            let entry = next.main.entry.as_ref();
+            match &entry.kind {
+                RowUndoKind::Lock => (),
+                RowUndoKind::Insert => {
+                    debug_assert!(!deleted);
+                    deleted = true;
+                }
+                RowUndoKind::Update(undo_vals) => {
+                    debug_assert!(!deleted);
+                    undo_update(undo_vals);
+                }
+                RowUndoKind::Delete => {
+                    deleted = false;
+                }
+            }
+            match entry.next.as_ref() {
+                None => {
+                    return if deleted {
+                        MainBranchMvcc::NotFound
+                    } else {
+                        MainBranchMvcc::Historical
+                    };
+                }
+                Some(older) => {
+                    if ctx.sts() > older.main.status.ts() {
+                        return if deleted {
+                            MainBranchMvcc::NotFound
+                        } else {
+                            MainBranchMvcc::Historical
+                        };
+                    }
+                    next = older;
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn read_row_mvcc_keyless(
+        &self,
+        ctx: &TrxContext,
+        metadata: &TableMetadata,
+        read_set: &[usize],
+    ) -> ReadRow {
+        let mut ver = RowVersion {
+            deleted: false,
+            read_set: read_set.iter().copied().collect(),
+            key_tracker: None,
+            undo_vals: BTreeMap::new(),
+        };
+        match self.resolve_main_branch_mvcc(ctx, |undo_vals| ver.undo_update(undo_vals)) {
+            MainBranchMvcc::Latest => self.read_row_latest(metadata, read_set, None),
+            MainBranchMvcc::Historical => ver.get_visible_vals(metadata, self.row(), None),
+            MainBranchMvcc::NotFound => ReadRow::NotFound,
         }
     }
 
