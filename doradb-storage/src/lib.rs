@@ -45,7 +45,7 @@ pub use catalog::{
 };
 pub use conf::{
     DEFAULT_COW_FILE_MAX_SIZE, EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, LogSync,
-    MandatoryRuntimeConfig, TrxSysConfig,
+    MandatoryRuntimeConfig, ThreadPoolConfig, TrxSysConfig,
 };
 pub use engine::Engine;
 pub use error::{Error, ErrorKind, OperationError, Result};

@@ -647,7 +647,7 @@ impl<T> Drop for CompletionObserver<T> {
 
 /// One engine-owned asynchronous scheduler for non-cancellable obligations.
 pub(crate) struct MandatoryRuntime {
-    /// Shared executor driven by every fixed mandatory-runtime runner.
+    /// Shared executor driven by the fixed mandatory-runtime runner.
     executor: async_executor::Executor<'static>,
     /// Bounded admission for caller-prepared operations.
     ///
@@ -668,7 +668,7 @@ pub(crate) struct MandatoryRuntime {
     transaction_cleanup_counters: Arc<MandatoryTaskCounters>,
     /// One-way stop state shared by all executor runners.
     stopping: AtomicBool,
-    /// Wakeup used to stop every runner after both admissions drain.
+    /// Wakeup used to stop the runner after both admissions drain.
     stop_event: Event,
     /// Engine-level fatal state used by mandatory panic supervision.
     poisoner: QuiescentGuard<EnginePoisoner>,
@@ -766,14 +766,10 @@ impl Component for MandatoryRuntime {
         mut shelf: ShelfScope<'_, Self>,
     ) -> ConfigResult<()> {
         config.validate()?;
-        let worker_threads = config.worker_threads;
         let poisoner = registry.dependency::<EnginePoisoner>();
         registry.register::<Self>(Self::new(&config, poisoner));
         let runtime = registry.dependency::<Self>();
-        shelf.put::<MandatoryRuntimeWorkers>(PendingMandatoryRuntimeWorkerStartup::new(
-            runtime,
-            worker_threads,
-        ));
+        shelf.put::<MandatoryRuntimeWorkers>(PendingMandatoryRuntimeWorkerStartup::new(runtime));
         Ok(())
     }
 
@@ -796,31 +792,24 @@ impl Supplier<MandatoryRuntimeWorkers> for MandatoryRuntime {
 /// Deferred mandatory-runtime runner startup supplied by the runtime core.
 pub(crate) struct PendingMandatoryRuntimeWorkerStartup {
     runtime: QuiescentGuard<MandatoryRuntime>,
-    worker_threads: usize,
 }
 
 impl PendingMandatoryRuntimeWorkerStartup {
     #[inline]
-    fn new(runtime: QuiescentGuard<MandatoryRuntime>, worker_threads: usize) -> Self {
-        Self {
-            runtime,
-            worker_threads,
-        }
+    fn new(runtime: QuiescentGuard<MandatoryRuntime>) -> Self {
+        Self { runtime }
     }
 
-    /// Start every configured runner and retain rollback ownership until done.
+    /// Start the fixed runner and retain rollback ownership until done.
     #[inline]
     fn start(self) -> RuntimeResult<MandatoryRuntimeWorkersOwned> {
         let mut pending = PendingMandatoryRuntimeWorkers::new(self.runtime);
-        for runner in 0..self.worker_threads {
-            let runner_runtime = pending.runtime.clone();
-            let handle =
-                thread::spawn_named(format!("Mandatory-Runtime-{}", runner + 1), move || {
-                    runtime::block_on(runner_runtime.run())
-                })
-                .attach("phase=start_mandatory_runtime_runner")?;
-            pending.handles.push(handle);
-        }
+        let runner_runtime = pending.runtime.clone();
+        let handle = thread::spawn_named("Mandatory-Runtime-1", move || {
+            runtime::block_on(runner_runtime.run());
+        })
+        .attach("phase=start_mandatory_runtime_runner")?;
+        pending.handles.push(handle);
         Ok(pending.into_owned())
     }
 }
@@ -970,7 +959,7 @@ impl MandatoryRuntimeWorkersOwned {
             panics.capture(Box::new(message));
         }
         // Panic safety after caller admission is confirmed drained: both
-        // admissions are closed, internal work is drained, every runner is
+        // admissions are closed, internal work is drained, the runner is
         // signalled and joined, and terminal validation is complete before the
         // first join or executor-invariant payload is resumed.
         panics.resume();
@@ -1550,11 +1539,7 @@ mod tests {
             let mut builder = RegistryBuilder::new();
             builder.build::<EnginePoisoner>(()).await.unwrap();
             builder
-                .build::<MandatoryRuntime>(
-                    MandatoryRuntimeConfig::default()
-                        .worker_threads(1)
-                        .concurrency_limit(1),
-                )
+                .build::<MandatoryRuntime>(MandatoryRuntimeConfig::default().concurrency_limit(1))
                 .await
                 .unwrap();
 
@@ -1609,11 +1594,7 @@ mod tests {
             let mut builder = RegistryBuilder::new();
             builder.build::<EnginePoisoner>(()).await.unwrap();
             builder
-                .build::<MandatoryRuntime>(
-                    MandatoryRuntimeConfig::default()
-                        .worker_threads(1)
-                        .concurrency_limit(1),
-                )
+                .build::<MandatoryRuntime>(MandatoryRuntimeConfig::default().concurrency_limit(1))
                 .await
                 .unwrap();
             builder.build::<MandatoryRuntimeWorkers>(()).await.unwrap();
@@ -1655,30 +1636,20 @@ mod tests {
     }
 
     #[test]
-    fn mandatory_shutdown_joins_every_runner_before_resuming_first_panic() {
+    fn mandatory_shutdown_joins_fixed_runner_before_resuming_panic() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let observed_events = Arc::clone(&events);
         let observer = observe_spawn_named(move |event| {
             observed_events.lock().push(event.clone());
-            match event {
-                SpawnTestEvent::Finished(name) if name == "Mandatory-Runtime-1" => {
-                    panic::panic_any("first mandatory runner panic");
-                }
-                SpawnTestEvent::Finished(name) if name == "Mandatory-Runtime-2" => {
-                    panic::panic_any("second mandatory runner panic");
-                }
-                _ => {}
+            if matches!(event, SpawnTestEvent::Finished(name) if name == "Mandatory-Runtime-1") {
+                panic::panic_any("fixed mandatory runner panic");
             }
         });
         let (registry, mandatory) = runtime::block_on(async {
             let mut builder = RegistryBuilder::new();
             builder.build::<EnginePoisoner>(()).await.unwrap();
             builder
-                .build::<MandatoryRuntime>(
-                    MandatoryRuntimeConfig::default()
-                        .worker_threads(2)
-                        .concurrency_limit(1),
-                )
+                .build::<MandatoryRuntime>(MandatoryRuntimeConfig::default().concurrency_limit(1))
                 .await
                 .unwrap();
             builder.build::<MandatoryRuntimeWorkers>(()).await.unwrap();
@@ -1693,17 +1664,16 @@ mod tests {
         assert!(outcome.is_degraded());
         let events = events.lock();
         assert!(events.contains(&SpawnTestEvent::Finished("Mandatory-Runtime-1".to_owned())));
-        assert!(events.contains(&SpawnTestEvent::Finished("Mandatory-Runtime-2".to_owned())));
         drop(events);
         drop(observer);
 
         let payload = panic::catch_unwind(AssertUnwindSafe(|| {
-            outcome.propagate_or_suppress("mandatory_multi_runner_test");
+            outcome.propagate_or_suppress("mandatory_fixed_runner_test");
         }))
         .unwrap_err();
         assert_eq!(
             payload.downcast_ref::<&'static str>().copied(),
-            Some("first mandatory runner panic")
+            Some("fixed mandatory runner panic")
         );
     }
 
@@ -1713,11 +1683,7 @@ mod tests {
             let mut builder = RegistryBuilder::new();
             builder.build::<EnginePoisoner>(()).await.unwrap();
             builder
-                .build::<MandatoryRuntime>(
-                    MandatoryRuntimeConfig::default()
-                        .worker_threads(1)
-                        .concurrency_limit(1),
-                )
+                .build::<MandatoryRuntime>(MandatoryRuntimeConfig::default().concurrency_limit(1))
                 .await
                 .unwrap();
             builder.build::<MandatoryRuntimeWorkers>(()).await.unwrap();
@@ -1767,11 +1733,7 @@ mod tests {
             let mut builder = RegistryBuilder::new();
             builder.build::<EnginePoisoner>(()).await.unwrap();
             builder
-                .build::<MandatoryRuntime>(
-                    MandatoryRuntimeConfig::default()
-                        .worker_threads(1)
-                        .concurrency_limit(1),
-                )
+                .build::<MandatoryRuntime>(MandatoryRuntimeConfig::default().concurrency_limit(1))
                 .await
                 .unwrap();
             builder.build::<MandatoryRuntimeWorkers>(()).await.unwrap();
@@ -1837,11 +1799,7 @@ mod tests {
             let mut builder = RegistryBuilder::new();
             builder.build::<EnginePoisoner>(()).await.unwrap();
             builder
-                .build::<MandatoryRuntime>(
-                    MandatoryRuntimeConfig::default()
-                        .worker_threads(1)
-                        .concurrency_limit(1),
-                )
+                .build::<MandatoryRuntime>(MandatoryRuntimeConfig::default().concurrency_limit(1))
                 .await
                 .unwrap();
             builder.build::<MandatoryRuntimeWorkers>(()).await.unwrap();
@@ -1918,11 +1876,7 @@ mod tests {
             let mut builder = RegistryBuilder::new();
             builder.build::<EnginePoisoner>(()).await.unwrap();
             builder
-                .build::<MandatoryRuntime>(
-                    MandatoryRuntimeConfig::default()
-                        .worker_threads(2)
-                        .concurrency_limit(2),
-                )
+                .build::<MandatoryRuntime>(MandatoryRuntimeConfig::default().concurrency_limit(2))
                 .await
                 .unwrap();
             builder.build::<MandatoryRuntimeWorkers>(()).await.unwrap();
@@ -1968,11 +1922,7 @@ mod tests {
             let mut builder = RegistryBuilder::new();
             builder.build::<EnginePoisoner>(()).await.unwrap();
             builder
-                .build::<MandatoryRuntime>(
-                    MandatoryRuntimeConfig::default()
-                        .worker_threads(1)
-                        .concurrency_limit(1),
-                )
+                .build::<MandatoryRuntime>(MandatoryRuntimeConfig::default().concurrency_limit(1))
                 .await
                 .unwrap();
             builder.build::<MandatoryRuntimeWorkers>(()).await.unwrap();
@@ -2031,11 +1981,7 @@ mod tests {
             let mut builder = RegistryBuilder::new();
             builder.build::<EnginePoisoner>(()).await.unwrap();
             builder
-                .build::<MandatoryRuntime>(
-                    MandatoryRuntimeConfig::default()
-                        .worker_threads(1)
-                        .concurrency_limit(1),
-                )
+                .build::<MandatoryRuntime>(MandatoryRuntimeConfig::default().concurrency_limit(1))
                 .await
                 .unwrap();
             builder.build::<MandatoryRuntimeWorkers>(()).await.unwrap();

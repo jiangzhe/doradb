@@ -67,10 +67,13 @@ doradb-storage defaults < included [engine] < plan-local [engine]
 ```
 
 The overlay covers public engine builder inputs other than the invocation root
-and internal eviction policy. Its tables are `mandatory_runtime`,
-`transaction`, `index_buffer`, `data_buffer`, and `file`; `meta_buffer_size` is
-an `[engine]` leaf. Byte inputs are strings such as `"512 MiB"`. The canonical
-result records the complete normalized engine configuration.
+and internal eviction policy. Its tables are `thread_pool`,
+`mandatory_runtime`, `transaction`, `index_buffer`, `data_buffer`, and `file`;
+`meta_buffer_size` is an `[engine]` leaf. `[thread_pool]` accepts
+`worker_threads`; `[mandatory_runtime]` accepts only `concurrency_limit`
+because orchestration always uses one runner. Byte inputs are strings such as
+`"512 MiB"`. The canonical result records the complete normalized engine
+configuration.
 
 `[workload_defaults]` accepts `threads`, `sessions`, `value_size`, `batch_size`,
 and `include_stats`. Defaults are one thread, sessions equal to threads,

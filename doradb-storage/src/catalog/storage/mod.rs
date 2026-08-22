@@ -1131,7 +1131,7 @@ fn build_lwc_blocks_from_row_records(
     }
 
     let mut lwc_blocks = Vec::new();
-    let mut builder = LwcBuilder::new(&metadata.col);
+    let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
     let mut builder_start = None;
     let mut builder_end = RowID::new(0);
 
@@ -1177,7 +1177,7 @@ fn build_lwc_blocks_from_row_records(
                 .attach("operation=build_catalog_lwc_blocks, phase=encode_block")?;
             lwc_blocks.push(PendingLwcBlock { shape, buf });
 
-            builder = LwcBuilder::new(&metadata.col);
+            builder = LwcBuilder::new(Arc::clone(&metadata.col));
             builder_start = Some(row.row_id);
             if !builder.append_row_values(row.row_id, &row.vals) {
                 return Err(

@@ -11,7 +11,7 @@ pub use self::consts::{
     DEFAULT_LOG_BLOCK_SIZE, DEFAULT_LOG_DIR, DEFAULT_LOG_FILE_MAX_SIZE, DEFAULT_LOG_FILE_STEM,
     DEFAULT_LOG_SYNC, DEFAULT_LOG_WRITE_IO_DEPTH, DEFAULT_PURGE_THREADS, DEFAULT_RECOVERY_IO_DEPTH,
 };
-pub use self::engine::{EngineConfig, MandatoryRuntimeConfig};
+pub use self::engine::{EngineConfig, MandatoryRuntimeConfig, ThreadPoolConfig};
 pub use self::fs::FileSystemConfig;
 pub(crate) use self::fs::ValidatedFileSystemConfig;
 pub use self::trx::TrxSysConfig;

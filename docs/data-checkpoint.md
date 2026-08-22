@@ -145,6 +145,15 @@ bitmap. Deleted or otherwise cutoff-invisible rows are omitted while explicit
 RowIDs preserve the sparse logical range. If an output block must split, the
 same prepared bitmap is reused rather than walking undo state again.
 
+Page loading, vector-view construction, visibility filtering, and row copying
+remain on the single mandatory-runtime runner. After a builder owns one
+complete block input, checkpoint submits only LWC serialization, compression,
+and checksum generation to the engine CPU thread pool. A checkpoint-local FIFO
+keeps at most one pending encode per configured worker and consumes results in
+logical RowID order. Capacity and final-drain waits retain no page guard,
+borrowed vector view, latch, logical lock, or IO request owner. Every accepted
+encode is drained even when later page access or an earlier encode fails.
+
 For every row accepted into an LWC block, checkpoint sends the identical
 visible value and RowID to the secondary-index sidecar. This produces companion
 `DiskTree` entries from exactly the rows represented by the new cold data.

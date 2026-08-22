@@ -160,8 +160,8 @@ pub(crate) enum ConfigError {
     InvalidLatchFallbackMode,
     #[error("invalid B-tree compact ratio")]
     InvalidBTreeCompactRatio,
-    #[error("invalid mandatory runtime worker thread count")]
-    InvalidMandatoryWorkerThreads,
+    #[error("invalid thread pool worker thread count")]
+    InvalidThreadPoolWorkerThreads,
     #[error("invalid mandatory runtime concurrency limit")]
     InvalidMandatoryConcurrencyLimit,
     #[error("invalid buffer pool configuration")]
@@ -338,6 +338,10 @@ pub(crate) enum FatalError {
     RollbackAccess,
     #[error("mandatory task panicked")]
     MandatoryTaskPanic,
+    #[error("thread pool task panicked")]
+    ThreadPoolTaskPanic,
+    #[error("thread pool is unavailable")]
+    ThreadPoolUnavailable,
 }
 
 /// Fieldless internal-domain errors used beneath typed crate-private owners.

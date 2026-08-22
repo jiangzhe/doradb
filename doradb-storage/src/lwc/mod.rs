@@ -20,6 +20,7 @@ use error_stack::{Report, ResultExt};
 use std::borrow::Cow;
 use std::mem;
 use std::slice::Iter;
+use std::sync::Arc;
 use zerocopy::{Immutable, IntoBytes};
 
 const LWC_BLOCK_HEADER_SIZE: usize = 24;
@@ -861,21 +862,21 @@ struct LwcSnapshot {
 }
 
 /// Builder that accumulates row-page data into one persisted LWC block image.
-pub(crate) struct LwcBuilder<'a> {
-    col_layout: &'a TableColumnLayout,
+pub(crate) struct LwcBuilder {
+    col_layout: Arc<TableColumnLayout>,
     buffer: ScanBuffer,
     row_ids: Vec<RowID>,
     stats: Vec<LwcColumnStats>,
 }
 
-impl<'a> LwcBuilder<'a> {
+impl LwcBuilder {
     /// Creates an empty LWC builder for the provided column layout.
-    pub(crate) fn new(col_layout: &'a TableColumnLayout) -> Self {
+    pub(crate) fn new(col_layout: Arc<TableColumnLayout>) -> Self {
         let scan_set: Vec<_> = (0..col_layout.col_count()).collect();
         let stats = (0..col_layout.col_count())
             .map(|_| LwcColumnStats::new())
             .collect();
-        let buffer = ScanBuffer::new(col_layout, &scan_set);
+        let buffer = ScanBuffer::new(col_layout.as_ref(), &scan_set);
         LwcBuilder {
             col_layout,
             buffer,
@@ -960,13 +961,14 @@ impl<'a> LwcBuilder<'a> {
 
     fn append_row_values_inner(&mut self, row_id: RowID, vals: &[Val]) -> bool {
         self.scan_row_value_stats(vals);
-        self.buffer.append_row_values(self.col_layout, vals);
+        self.buffer
+            .append_row_values(self.col_layout.as_ref(), vals);
         self.row_ids.push(row_id);
         self.estimate_size() <= LWC_BLOCK_PAYLOAD_SIZE
     }
 
     /// Builds a persisted LWC block with the supplied row-shape fingerprint.
-    pub(crate) fn build(&self, row_shape_fingerprint: u128) -> InternalResult<DirectBuf> {
+    pub(crate) fn build(self, row_shape_fingerprint: u128) -> InternalResult<DirectBuf> {
         if self.buffer.is_empty() {
             return Err(Report::new(InternalError::LwcBuilderMisuse)
                 .attach("cannot build an empty LWC block"));
@@ -1272,7 +1274,12 @@ impl<'a> LwcBuilder<'a> {
         let row_count = self.buffer.len();
         let mut total = LWC_BLOCK_HEADER_SIZE;
         total += mem::size_of::<u16>() * self.col_layout.col_count();
-        total += estimate_columns_size(self.col_layout, &self.buffer, &self.stats, row_count);
+        total += estimate_columns_size(
+            self.col_layout.as_ref(),
+            &self.buffer,
+            &self.stats,
+            row_count,
+        );
         total
     }
 }
@@ -2023,7 +2030,7 @@ fn read_i8(input: &[u8]) -> DataIntegrityResult<(i8, &[u8])> {
 mod tests {
     use super::*;
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
-    use crate::error::{DataIntegrityError, DataIntegrityResult, InternalError};
+    use crate::error::{DataIntegrityError, DataIntegrityResult, InternalError, InternalResult};
     use crate::file::{FileKind, test_block_id};
     use crate::id::RowID;
     use crate::index::ColumnBlockEntryShape;
@@ -2048,6 +2055,14 @@ mod tests {
                 .as_ref()
                 .is_err_and(|err| *err.current_context() == DataIntegrityError::InvalidPayload)
         );
+    }
+
+    #[test]
+    fn lwc_encode_task_types_are_send_and_static() {
+        fn assert_send_static<T: Send + 'static>() {}
+
+        assert_send_static::<LwcBuilder>();
+        assert_send_static::<InternalResult<DirectBuf>>();
     }
 
     #[test]
@@ -2449,7 +2464,7 @@ mod tests {
         assert!(matches!(page.delete(RowID::new(105)), Delete::Ok));
         expected_rows.retain(|(row_id, _, _)| *row_id != 102 && *row_id != 105);
 
-        let mut builder = LwcBuilder::new(metadata.col.as_ref());
+        let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
         assert!(builder.is_empty());
         assert!(builder.row_count() == 0);
         let view = page.vector_view(metadata.col.as_ref());
@@ -2526,10 +2541,10 @@ mod tests {
             ));
         }
 
-        let mut page_builder = LwcBuilder::new(metadata.col.as_ref());
+        let mut page_builder = LwcBuilder::new(Arc::clone(&metadata.col));
         let view = page.vector_view(metadata.col.as_ref());
         assert!(page_builder.append_view(view, page.header.start_row_id));
-        let mut direct_builder = LwcBuilder::new(metadata.col.as_ref());
+        let mut direct_builder = LwcBuilder::new(Arc::clone(&metadata.col));
         for (offset, vals) in rows.iter().enumerate() {
             assert!(direct_builder.append_row_values(RowID::new(10 + offset as u64), vals));
         }
@@ -2552,7 +2567,7 @@ mod tests {
             vec![],
         )
         .expect("valid table metadata");
-        let mut builder = LwcBuilder::new(metadata.col.as_ref());
+        let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
         assert!(builder.append_row_values(RowID::new(1), &[Val::from(Vec::from(&b"ok"[..]))]));
 
         let oversized = Val::from(vec![0u8; LWC_BLOCK_PAYLOAD_SIZE]);
@@ -2574,7 +2589,7 @@ mod tests {
             vec![],
         )
         .expect("valid table metadata");
-        let mut builder = LwcBuilder::new(metadata.col.as_ref());
+        let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
 
         for row_no in 0..=u16::MAX {
             assert!(builder.append_row_values(RowID::new(u64::from(row_no)), &[Val::U8(0)]));
@@ -2626,7 +2641,7 @@ mod tests {
         }
         assert!(matches!(page.delete(RowID::new(4)), Delete::Ok));
 
-        let mut builder = LwcBuilder::new(metadata.col.as_ref());
+        let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
         let view = page.vector_view(metadata.col.as_ref());
         assert!(builder.append_view(view, page.header.start_row_id));
 
@@ -2658,7 +2673,7 @@ mod tests {
             ));
         }
 
-        let mut builder = LwcBuilder::new(metadata.col.as_ref());
+        let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
         let view = page.vector_view(metadata.col.as_ref());
         assert!(builder.append_view(view, page.header.start_row_id));
 
@@ -2783,12 +2798,11 @@ mod tests {
             ));
         }
 
-        let mut builder = LwcBuilder::new(metadata.col.as_ref());
+        let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
         let view = page.vector_view(metadata.col.as_ref());
         assert!(builder.append_view(view, page.header.start_row_id));
-        let buf = builder
-            .build(row_shape_fingerprint_for(builder.row_ids(), 10, 13))
-            .unwrap();
+        let fingerprint = row_shape_fingerprint_for(builder.row_ids(), 10, 13);
+        let buf = builder.build(fingerprint).unwrap();
 
         let lwc_block = LwcBlock::try_from_persisted_bytes(
             buf.as_bytes(),

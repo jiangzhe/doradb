@@ -3037,11 +3037,7 @@ pub(crate) mod tests {
                     temp_dir.path().to_path_buf(),
                     "index_ddl_cleanup_progress",
                 )
-                .mandatory_runtime(
-                    MandatoryRuntimeConfig::default()
-                        .worker_threads(1)
-                        .concurrency_limit(1),
-                ),
+                .mandatory_runtime(MandatoryRuntimeConfig::default().concurrency_limit(1)),
             )
             .await
             .unwrap();

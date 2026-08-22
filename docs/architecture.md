@@ -135,10 +135,30 @@ This system employs a unique persistence and recovery model (No-Steal / No-Force
 See [Transaction System](./transaction-system.md). Table-level metadata and
 data coordination is described in [Lock System](./lock-system.md).
 
+## CPU Thread Pool
+
+The engine owns a fixed-size `ThreadPool` for short, finite, synchronous CPU
+computations. It defaults to two named workers and accepts jobs through an
+unbounded ingress channel. The pool has no public spawning API, cancellation,
+IO, waiting, or lock-acquisition contract. A task panic poisons the engine,
+completes that task with the same typed Fatal reason, and leaves the worker
+available to drain other accepted jobs. Submission checks the engine
+poisoner's atomic healthy path before sending directly; a racing poison may
+admit bounded extra work, while an observed poison returns the cached Fatal.
+
+User-table checkpoint is the first consumer. Page residency, visibility
+analysis, borrowed vector views, secondary-index collection, table-file IO,
+and publication stay on the mandatory runtime. Once an `LwcBuilder` owns a
+complete block input, checkpoint submits serialization, compression, and
+checksum generation to the CPU pool. A checkpoint-private FIFO bounds pending
+jobs to the worker count, consumes them in logical block order, and drains all
+accepted jobs before the checkpoint operation reaches a terminal state.
+
 ## Mandatory Background Runtime
 
-The engine owns one fixed-thread asynchronous executor for obligations that
-must reach a supervised terminal outcome after acceptance. Effectful session
+The engine owns one single-runner asynchronous executor for obligations that
+must reach a supervised terminal outcome after acceptance. True CPU
+parallelism belongs to the separate thread pool. Effectful session
 maintenance uses this runtime beside table and index DDL: table freeze and
 checkpoint, catalog checkpoint, redo truncation, combined catalog/redo
 maintenance, and secondary `MemIndex` cleanup all prepare their complete
@@ -153,7 +173,9 @@ rollback are independent accounted tasks, so different transactions may
 progress concurrently. Rollback within one transaction remains sequential,
 and fatal residual undo ownership is retained before poison is published.
 
-Caller operation admission and engine-internal cleanup admission have separate
+Several accepted tasks can still make cooperative progress when they await IO,
+a completion, or an explicit yield. Caller operation admission and
+engine-internal cleanup admission have separate
 RAII counters. Shutdown closes caller admission first, lets redo submit its
 final cleanup, drains the runtime, and stops purge last. See
 [Engine Component Lifetime](./engine-component-lifetime.md) for the exact

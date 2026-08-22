@@ -1,11 +1,11 @@
 //! One-shot completion cells for asynchronous engine flows.
 //!
-//! `Completion<T>` stores a `CompletionResult<T>` so IO, redo, commit, and
-//! mandatory-runtime paths can move detailed domain reports across thread
-//! boundaries without promoting them to the public `Error` type too early. A
-//! completion failure stores one cloneable bridge. Fanout clones only its inner
-//! `Arc`; final error owners reconstruct independent reports with their own
-//! context after leaving the state lock.
+//! `Completion<T>` stores a `CompletionResult<T>` so IO, redo, commit,
+//! CPU-task, and mandatory-runtime paths can move detailed domain reports
+//! across thread boundaries without promoting them to the public `Error` type
+//! too early. A completion failure stores one cloneable bridge. Fanout clones
+//! only its inner `Arc`; final error owners reconstruct independent reports
+//! with their own context after leaving the state lock.
 
 use crate::error::CompletionResult;
 use event_listener::{Event, listener};
