@@ -139,6 +139,15 @@ impl StreamStmtState {
             .admit_user_table(table_id, TableAdmissionRequest::TableRead)
             .await
             .disclose()?;
+        if !self.dml_validation_disabled {
+            DmlValidator::new(layout.metadata())
+                .validate_projection(read_set)
+                .change_context(OperationError::InvalidDmlInput)
+                .attach_with(|| {
+                    format!("operation={TABLE_SCAN_STREAM_OPERATION}, table_id={table_id}")
+                })
+                .disclose()?;
+        }
         let worklist = {
             let rt = self.runtime();
             table

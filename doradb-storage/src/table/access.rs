@@ -204,7 +204,7 @@ impl<'row> LazyRow<'row> {
         self.buffer.values.len()
     }
 
-    /// Returns one latest modifiable column value, loading and caching it on demand.
+    /// Returns one column value from this callback row, loading and caching it on demand.
     #[inline]
     pub fn val(&mut self, column_no: usize) -> Result<&Val> {
         if column_no >= self.buffer.values.len() {
@@ -218,8 +218,8 @@ impl<'row> LazyRow<'row> {
         self.val_inner(column_no).disclose()
     }
 
-    /// Returns one valid latest modifiable column value without crossing the
-    /// public error boundary.
+    /// Returns one valid callback-row column value without crossing the public
+    /// error boundary.
     #[inline]
     pub(crate) fn val_inner(&mut self, column_no: usize) -> DataIntegrityResult<&Val> {
         assert!(
@@ -9493,6 +9493,49 @@ mod tests {
             drop(stream);
             assert_eq!(callbacks, 8);
             trx.noop().await.unwrap();
+            trx.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_table_scan_mvcc_stream_validates_projection_unless_disabled() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = evictable_test_engine(
+                &temp_dir,
+                64u64 * 1024 * 1024,
+                "redo_stream_scan_projection_validation",
+            )
+            .await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 1, "hot").await;
+
+            let mut trx = session.begin_trx().unwrap();
+            let mut callbacks = 0;
+            for read_set in [&[][..], &[0, 0][..], &[1, 0][..], &[2][..]] {
+                let err = match trx
+                    .table_scan_mvcc_stream(table_id, read_set, |_| {
+                        callbacks += 1;
+                        Ok(ScanRowDecision::Include)
+                    })
+                    .await
+                {
+                    Ok(_) => panic!("invalid projection should fail stream construction"),
+                    Err(err) => err,
+                };
+                assert_eq!(err.operation_error(), Some(OperationError::InvalidDmlInput));
+            }
+            assert_eq!(callbacks, 0);
+
+            trx.disable_dml_validation(true);
+            let mut stream = trx
+                .table_scan_mvcc_stream(table_id, &[], |_| Ok(ScanRowDecision::Include))
+                .await
+                .unwrap();
+            assert_eq!(stream.next().await.unwrap(), Some(Vec::new()));
+            assert_eq!(stream.next().await.unwrap(), None);
+            drop(stream);
             trx.rollback().await.unwrap();
         });
     }
