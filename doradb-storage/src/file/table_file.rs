@@ -1,6 +1,7 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::{PoolGuard, ReadonlyBufferPool};
 use crate::catalog::table::TableMetadata;
+use crate::completion::Completion;
 use crate::error::{
     CompletionErrorBridge, CompletionResult, DataIntegrityError, DataIntegrityResult, IoResult,
     MultiDomainResultExt, ResourceError, ResourceResult, RuntimeError, RuntimeOrFatalResult,
@@ -25,15 +26,16 @@ use crate::file::super_block::{
 };
 use crate::file::{FileKind, SparseFile};
 use crate::id::{BlockID, FileID, RowID, TableID, TrxID};
-use crate::index::{ColumnBlockEntryShape, ColumnBlockIndex};
+use crate::index::{ColumnBlockEntryInput, ColumnBlockEntryShape, ColumnBlockIndex};
 use crate::io::{DirectBuf, IOBuf, IOClient};
+use crate::obs;
 use crate::quiescent::QuiescentGuard;
 use crate::serde::{Deser, Ser};
 use crate::trx::MIN_SNAPSHOT_TS;
 use error_stack::{Report, ResultExt};
-use futures::future::try_join_all;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Magic bytes stored at the beginning of every user table-file super block.
 pub(crate) const TABLE_FILE_MAGIC_WORD: [u8; 8] = [b'D', b'O', b'R', b'A', 0, 0, 0, 0];
@@ -454,65 +456,71 @@ impl MutableTableFile {
         }
     }
 
-    /// Persist provided LWC blocks and update mutable root/index metadata.
-    pub(crate) async fn apply_lwc_blocks(
+    /// Allocate and submit one logically ordered LWC data-block write.
+    ///
+    /// Shared-storage ingress acceptance transfers ownership of the buffer,
+    /// backing file, and readonly-cache write lease. The returned completion
+    /// can therefore be observed after this mutable-root borrow ends.
+    pub(crate) async fn submit_lwc_block(
         &mut self,
-        lwc_blocks: Vec<LwcBlockPersist>,
+        shape: ColumnBlockEntryShape,
+        buf: DirectBuf,
+        previous_end_row_id: RowID,
+    ) -> RuntimeOrFatalResult<(ColumnBlockEntryInput, Arc<Completion<()>>)> {
+        let file_id = self.file.sparse_file().file_id();
+        let start_row_id = shape.start_row_id();
+        assert!(
+            start_row_id >= previous_end_row_id,
+            "column block-index invariant violated: LWC block start row regressed: start_row_id={start_row_id}, last_end={previous_end_row_id}, file_id={file_id}"
+        );
+        let block_id = self.allocate_block().attach_with(|| {
+            format!("operation=submit_lwc_block, phase=allocate_block, file_id={file_id}")
+        })?;
+        let entry = shape.with_block_id(block_id);
+        let write_lease = self
+            .write_barrier
+            .as_cow_write_barrier()
+            .begin_write(file_id, block_id)
+            .change_context(RuntimeError::FileRootAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=submit_lwc_block, phase=begin_block_write, file_id={file_id}, block_id={block_id}"
+                )
+            })?;
+        let completion = self
+            .file
+            .file()
+            .submit_block_write_with_lease(
+                &self.background_writes,
+                block_id,
+                buf,
+                write_lease,
+            )
+            .await
+            .map_err(|bridge| bridge.into_runtime_or_fatal(RuntimeError::FileRootAccess))
+            .attach_with(|| {
+                format!(
+                    "operation=submit_lwc_block, phase=accept_data_write, file_id={file_id}, block_id={block_id}"
+                )
+            })?;
+        Ok((entry, completion))
+    }
+
+    /// Rebuild the column index after all submitted LWC data writes succeed.
+    pub(crate) async fn finish_lwc_blocks(
+        &mut self,
+        new_entries: Vec<ColumnBlockEntryInput>,
         heap_redo_start_ts: TrxID,
         ts: TrxID,
         disk_pool: &QuiescentGuard<ReadonlyBufferPool>,
         disk_guard: &PoolGuard,
     ) -> RuntimeOrFatalResult<()> {
+        let started_at = Instant::now();
         let table_file = Arc::clone(&self.file);
-        let background_writes = self.background_writes.clone();
-        let mut max_row_id = self.root().pivot_row_id;
-        let mut writes = Vec::with_capacity(lwc_blocks.len());
-        let mut new_entries = Vec::with_capacity(lwc_blocks.len());
-        let mut last_end = self.root().pivot_row_id;
-
-        for block in lwc_blocks {
-            let start_row_id = block.shape.start_row_id();
-            let end_row_id = block.shape.end_row_id();
-            assert!(
-                start_row_id >= last_end,
-                "column block-index invariant violated: LWC block start row regressed: start_row_id={start_row_id}, last_end={last_end}, file_id={}",
-                self.file.sparse_file().file_id()
-            );
-            let block_id = self.allocate_block().attach_with(|| {
-                format!(
-                    "operation=apply_lwc_blocks, phase=allocate_block, file_id={}",
-                    self.file.sparse_file().file_id()
-                )
-            })?;
-            max_row_id = max_row_id.max(end_row_id);
-            last_end = end_row_id;
-            new_entries.push(block.shape.with_block_id(block_id));
-            let write_lease = self
-                .write_barrier
-                .as_cow_write_barrier()
-                .begin_write(self.file.sparse_file().file_id(), block_id)
-                .change_context(RuntimeError::FileRootAccess)
-                .attach_with(|| {
-                    format!(
-                        "operation=apply_lwc_blocks, phase=begin_block_write, file_id={}, block_id={block_id}",
-                        self.file.sparse_file().file_id()
-                    )
-                })?;
-            let background_writes = background_writes.clone();
-            let file = Arc::clone(&table_file);
-            writes.push(async move {
-                file.file()
-                    .write_block_with_lease(&background_writes, block_id, block.buf, write_lease)
-                    .await
-            });
-        }
-
-        try_join_all(writes)
-            .await
-            .map_err(|report| report.into_runtime_or_fatal(RuntimeError::FileRootAccess))
-            .attach("persist table LWC blocks")?;
-
         let root = self.root();
+        let max_row_id = new_entries
+            .last()
+            .map_or(root.pivot_row_id, ColumnBlockEntryInput::end_row_id);
         let column_index = ColumnBlockIndex::new(
             root.column_block_index_root,
             root.pivot_row_id,
@@ -527,7 +535,7 @@ impl MutableTableFile {
             .change_runtime_context(RuntimeError::FileRootAccess)
             .attach_with(|| {
                 format!(
-                    "operation=apply_lwc_blocks, phase=rebuild_column_index, file_id={}",
+                    "operation=finish_lwc_blocks, phase=rebuild_column_index, file_id={}",
                     self.file.sparse_file().file_id()
                 )
             })?;
@@ -535,6 +543,12 @@ impl MutableTableFile {
         root.column_block_index_root = new_root;
         root.pivot_row_id = max_row_id;
         root.heap_redo_start_ts = heap_redo_start_ts;
+        obs::debug!(
+            "event=checkpoint_lwc_pipeline component=table_file action=rebuild_column_index result=ok file_id={} block_count={} duration_nanos={}",
+            self.file.sparse_file().file_id(),
+            new_entries.len(),
+            started_at.elapsed().as_nanos(),
+        );
         Ok(())
     }
 
@@ -609,14 +623,6 @@ impl MutableTableWriteBarrier {
             MutableTableWriteBarrier::Disabled => CowWriteBarrier::Disabled,
         }
     }
-}
-
-/// One LWC block payload that should be persisted into table-file blocks.
-pub(crate) struct LwcBlockPersist {
-    /// Phase-1 logical index-entry shape for this block before block-id assignment.
-    pub shape: ColumnBlockEntryShape,
-    /// Serialized LWC block bytes.
-    pub buf: DirectBuf,
 }
 
 /// Guard object of swapped table-file roots.
@@ -843,6 +849,11 @@ mod tests {
     use std::io::{Seek, SeekFrom, Write};
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
+    struct TestLwcBlock {
+        shape: ColumnBlockEntryShape,
+        buf: DirectBuf,
+    }
+
     fn panic_message(panic: Box<dyn Any + Send>) -> String {
         panic
             .downcast_ref::<String>()
@@ -881,17 +892,51 @@ mod tests {
 
     async fn persist_lwc_blocks_for_test(
         mut mutable_file: MutableTableFile,
-        lwc_blocks: Vec<LwcBlockPersist>,
+        lwc_blocks: Vec<TestLwcBlock>,
         heap_redo_start_ts: TrxID,
         ts: TrxID,
         disk_pool: &QuiescentGuard<ReadonlyBufferPool>,
     ) -> Result<(Arc<TableFile>, Option<OldRoot>)> {
         let disk_guard = disk_pool.create_base_guard();
-        mutable_file
-            .apply_lwc_blocks(lwc_blocks, heap_redo_start_ts, ts, disk_pool, &disk_guard)
-            .await
-            .disclose()?;
+        apply_lwc_blocks_for_test(
+            &mut mutable_file,
+            lwc_blocks,
+            heap_redo_start_ts,
+            ts,
+            disk_pool,
+            &disk_guard,
+        )
+        .await?;
         mutable_file.commit(ts, false).await.disclose()
+    }
+
+    async fn apply_lwc_blocks_for_test(
+        mutable_file: &mut MutableTableFile,
+        lwc_blocks: Vec<TestLwcBlock>,
+        heap_redo_start_ts: TrxID,
+        ts: TrxID,
+        disk_pool: &QuiescentGuard<ReadonlyBufferPool>,
+        disk_guard: &PoolGuard,
+    ) -> Result<()> {
+        let mut previous_end_row_id = mutable_file.root().pivot_row_id;
+        let mut entries = Vec::with_capacity(lwc_blocks.len());
+        for block in lwc_blocks {
+            let (entry, completion) = mutable_file
+                .submit_lwc_block(block.shape, block.buf, previous_end_row_id)
+                .await
+                .disclose()?;
+            previous_end_row_id = entry.end_row_id();
+            completion
+                .wait_result()
+                .await
+                .map_err(|bridge| bridge.into_runtime_or_fatal(RuntimeError::FileRootAccess))
+                .disclose()?;
+            entries.push(entry);
+        }
+        mutable_file
+            .finish_lwc_blocks(entries, heap_redo_start_ts, ts, disk_pool, disk_guard)
+            .await
+            .disclose()
     }
 
     fn build_test_metadata() -> Arc<TableMetadata> {
@@ -1227,7 +1272,7 @@ mod tests {
             }
 
             let lwc_blocks = vec![
-                LwcBlockPersist {
+                TestLwcBlock {
                     shape: ColumnBlockEntryShape::new(
                         RowID::new(0),
                         RowID::new(10),
@@ -1236,7 +1281,7 @@ mod tests {
                     ),
                     buf: page_buf(b"reuse-lwc-1"),
                 },
-                LwcBlockPersist {
+                TestLwcBlock {
                     shape: ColumnBlockEntryShape::new(
                         RowID::new(10),
                         RowID::new(20),
@@ -1252,16 +1297,16 @@ mod tests {
                 disk_pool.global_pool().clone(),
                 disk_pool.create_base_guard(),
             );
-            mutable
-                .apply_lwc_blocks(
-                    lwc_blocks,
-                    TrxID::new(7),
-                    TrxID::new(2),
-                    disk_pool.global_pool(),
-                    &disk_pool_guard,
-                )
-                .await
-                .unwrap();
+            apply_lwc_blocks_for_test(
+                &mut mutable,
+                lwc_blocks,
+                TrxID::new(7),
+                TrxID::new(2),
+                disk_pool.global_pool(),
+                &disk_pool_guard,
+            )
+            .await
+            .unwrap();
 
             let invalidated_blocks = cached_blocks
                 .into_iter()
@@ -1449,7 +1494,7 @@ mod tests {
             drop(old_root);
 
             let lwc_blocks = vec![
-                LwcBlockPersist {
+                TestLwcBlock {
                     shape: ColumnBlockEntryShape::new(
                         RowID::new(0),
                         RowID::new(10),
@@ -1458,7 +1503,7 @@ mod tests {
                     ),
                     buf: page_buf(b"lwc-page-1"),
                 },
-                LwcBlockPersist {
+                TestLwcBlock {
                     shape: ColumnBlockEntryShape::new(
                         RowID::new(10),
                         RowID::new(20),
@@ -1543,7 +1588,7 @@ mod tests {
             drop(old_root);
 
             let lwc_blocks = vec![
-                LwcBlockPersist {
+                TestLwcBlock {
                     shape: ColumnBlockEntryShape::new(
                         RowID::new(0),
                         RowID::new(10),
@@ -1552,7 +1597,7 @@ mod tests {
                     ),
                     buf: page_buf(b"lwc-overlap-1"),
                 },
-                LwcBlockPersist {
+                TestLwcBlock {
                     shape: ColumnBlockEntryShape::new(
                         RowID::new(5),
                         RowID::new(15),

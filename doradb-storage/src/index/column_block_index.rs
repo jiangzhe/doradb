@@ -496,14 +496,6 @@ impl ColumnBlockEntryShape {
         self.row_shape_fingerprint
     }
 
-    /// Updates the exclusive upper row-id bound and recomputes the row-shape fingerprint.
-    pub(crate) fn set_end_row_id(&mut self, end_row_id: RowID) {
-        validate_row_ids(&self.row_ids, self.start_row_id, end_row_id);
-        self.end_row_id = end_row_id;
-        self.row_shape_fingerprint =
-            row_shape_fingerprint_for_row_ids(self.start_row_id, self.end_row_id, &self.row_ids);
-    }
-
     /// Attaches the backing LWC block id, producing a complete leaf-entry input.
     #[inline]
     pub(crate) fn with_block_id(self, block_id: impl Into<BlockID>) -> ColumnBlockEntryInput {
@@ -537,6 +529,12 @@ impl ColumnBlockEntryInput {
     #[inline]
     pub(crate) fn start_row_id(&self) -> RowID {
         self.start_row_id
+    }
+
+    /// Returns the exclusive upper row-id bound of this completed entry input.
+    #[inline]
+    pub(crate) fn end_row_id(&self) -> RowID {
+        self.end_row_id
     }
 }
 

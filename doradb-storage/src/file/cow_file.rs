@@ -1,6 +1,7 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::page::PAGE_SIZE;
 use crate::buffer::{PoolGuard, ReadonlyBufferPool, ReadonlyWriteLease, begin_write_barrier};
+use crate::completion::Completion;
 use crate::error::{
     CompletionResult, DataIntegrityError, DataIntegrityResult, InternalResult, IoError, IoResult,
     ResourceError, ResourceResult, RuntimeError, RuntimeResult,
@@ -9,7 +10,8 @@ use crate::file::block_integrity::max_payload_len;
 use crate::file::fs::BackgroundWriteRequest;
 use crate::file::super_block::{SUPER_BLOCK_SIZE, SuperBlock};
 use crate::file::{
-    BlockKey, FileKind, SparseFile, fsync_direct, write_direct, write_direct_with_lease,
+    BlockKey, FileKind, SparseFile, fsync_direct, submit_direct_write_with_lease, write_direct,
+    write_direct_with_lease,
 };
 use crate::id::{BlockID, FileID, TrxID};
 use crate::io::{DirectBuf, IOClient};
@@ -26,6 +28,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::ptr::{NonNull, null_mut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::time::Instant;
 
 /// Shared page size of CoW table files and multi-table files.
 pub(crate) const COW_FILE_PAGE_SIZE: usize = PAGE_SIZE;
@@ -540,6 +543,31 @@ impl<M> CowFile<M> {
         .await
     }
 
+    /// Submit one block write and return after shared-storage ingress accepts it.
+    ///
+    /// The completion owns terminal observation independently of the mutable
+    /// CoW writer that initiated the submission.
+    #[inline]
+    pub(crate) async fn submit_block_write_with_lease(
+        &self,
+        background_writes: &IOClient<BackgroundWriteRequest>,
+        block_id: BlockID,
+        buf: DirectBuf,
+        write_lease: Option<ReadonlyWriteLease>,
+    ) -> CompletionResult<Arc<Completion<()>>> {
+        debug_assert!(buf.capacity() == COW_FILE_PAGE_SIZE);
+        let offset = usize::from(block_id) * COW_FILE_PAGE_SIZE;
+        submit_direct_write_with_lease(
+            self.block_key(offset),
+            Arc::clone(&self.file),
+            offset,
+            buf,
+            background_writes,
+            write_lease,
+        )
+        .await
+    }
+
     #[inline]
     fn block_key(&self, offset: usize) -> BlockKey {
         BlockKey::new(
@@ -884,6 +912,7 @@ impl<M> CowFile<M> {
                 ))
             })?;
 
+        let fsync_started_at = Instant::now();
         fsync_direct(Arc::clone(&self.file), background_writes)
             .await
             .map_err(|bridge| {
@@ -893,6 +922,11 @@ impl<M> CowFile<M> {
                         "operation=publish_file_root, file_id={file_id}, phase=fsync"
                     ))
             })?;
+        obs::debug!(
+            "event=cow_root_publish component=cow_file action=fsync result=ok file_id={} duration_nanos={}",
+            file_id,
+            fsync_started_at.elapsed().as_nanos(),
+        );
         Ok(self.swap_active_root(new_root.root))
     }
 

@@ -763,6 +763,26 @@ pub(crate) async fn write_direct_with_lease(
     background_writes: &IOClient<BackgroundWriteRequest>,
     write_lease: Option<ReadonlyWriteLease>,
 ) -> CompletionResult<()> {
+    let completion =
+        submit_direct_write_with_lease(key, file, offset, buf, background_writes, write_lease)
+            .await?;
+    completion.wait_result().await
+}
+
+/// Submit one owned direct write and return after shared-storage ingress accepts it.
+///
+/// The returned completion independently owns the accepted write's terminal
+/// result. On ingress failure, dropping the rejected request releases its
+/// buffer, file owner, and optional readonly-cache write lease.
+#[inline]
+pub(crate) async fn submit_direct_write_with_lease(
+    key: BlockKey,
+    file: Arc<SparseFile>,
+    offset: usize,
+    buf: DirectBuf,
+    background_writes: &IOClient<BackgroundWriteRequest>,
+    write_lease: Option<ReadonlyWriteLease>,
+) -> CompletionResult<Arc<Completion<()>>> {
     let (submission, completion) = WriteSubmission::prepare(key, file, offset, buf, write_lease);
     if let Err(err) = background_writes
         .send_async(BackgroundWriteRequest::Table(submission))
@@ -778,7 +798,7 @@ pub(crate) async fn write_direct_with_lease(
                 )),
         ));
     }
-    completion.wait_result().await
+    Ok(completion)
 }
 
 /// Flush one sparse file with a backend-submitted fsync request.
