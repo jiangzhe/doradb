@@ -36,8 +36,8 @@ use crate::row::ops::{
 use crate::row::{Row, RowPage, RowRead, estimate_max_row_count};
 use crate::table::{
     ColumnDeletionBuffer, ColumnStorage, DeleteMarker, DeletionClaim, DeletionError, DmlValidator,
-    MemTable, RowPageDescriptor, Table, TableRootSnapshot, TableRuntimeLayout, UpdateUniqueMvcc,
-    index_key_is_changed, index_key_replace, read_latest_index_key,
+    MemTable, RowPageDescriptor, Table, TableRootSnapshot, TableRuntimeLayout, TableScanRootView,
+    UpdateUniqueMvcc, index_key_is_changed, index_key_replace, read_latest_index_key,
     read_physical_index_keys_for_delete, row_len, unique_key_from_full_row,
 };
 use crate::trx::row::{
@@ -47,8 +47,8 @@ use crate::trx::row::{
 use crate::trx::stmt::StmtEffects;
 use crate::trx::undo::{IndexBranch, OwnedRowUndo, RowUndoKind};
 use crate::trx::{
-    MIN_SNAPSHOT_TS, PrepareListenerResult, SharedTrxStatus, TrxContext, TrxRuntime,
-    trx_is_committed,
+    MIN_SNAPSHOT_TS, MvccReadView, MvccVisibility, PrepareListenerResult, SharedTrxStatus,
+    TrxContext, TrxRuntime, trx_is_committed,
 };
 use crate::value::Val;
 use error_stack::{Report, ResultExt};
@@ -313,6 +313,32 @@ pub(crate) struct TableScanWorklist {
     pub(crate) cold_entries: Vec<ColumnLeafEntry>,
     /// Original hot row-page descriptors ordered by starting row ID.
     pub(crate) hot_pages: Vec<RowPageDescriptor>,
+}
+
+/// Physical capabilities required while planning and loading a table scan.
+#[derive(Clone, Copy)]
+pub(crate) struct TableScanRuntime<'runtime> {
+    pool_guards: &'runtime PoolGuards,
+}
+
+impl<'runtime> TableScanRuntime<'runtime> {
+    /// Create a scan runtime from the session pool guards retained by an operation.
+    #[inline]
+    pub(crate) fn new(pool_guards: &'runtime PoolGuards) -> Self {
+        Self { pool_guards }
+    }
+
+    /// Restrict a transaction runtime to table-scan physical capabilities.
+    #[inline]
+    pub(crate) fn from_transaction(rt: TrxRuntime<'runtime>) -> Self {
+        Self::new(rt.pool_guards())
+    }
+
+    /// Returns the retained session pool guards.
+    #[inline]
+    fn pool_guards(self) -> &'runtime PoolGuards {
+        self.pool_guards
+    }
 }
 
 /// One loaded persisted page and its MVCC scan metadata.
@@ -879,8 +905,9 @@ impl<'op> UserTableAccessor<'op> {
             .secondary_index_roots[index_no]
     }
 
+    /// Captures the full proof-branded root used by transaction scan planning.
     #[inline]
-    fn root_snapshot<'ctx>(&self, ctx: &'ctx TrxContext) -> TableRootSnapshot<'ctx> {
+    pub(crate) fn root_snapshot<'ctx>(&self, ctx: &'ctx TrxContext) -> TableRootSnapshot<'ctx> {
         let proof = ctx.read_proof();
         self.storage.with_active_root(&proof, |root| {
             self.assert_foreground_root_layout_compatible(root);
@@ -1216,8 +1243,7 @@ impl<'op> UserTableAccessor<'op> {
                 }) => {
                     if !cold_row_visible_mvcc(
                         self.lwc_deletion_buffer(),
-                        rt.sts(),
-                        rt.status().as_ref(),
+                        rt.ctx(),
                         row_id,
                         durable_deleted,
                     ) {
@@ -1278,8 +1304,7 @@ impl<'op> UserTableAccessor<'op> {
                 }) => {
                     if !cold_row_visible_mvcc(
                         self.lwc_deletion_buffer(),
-                        rt.sts(),
-                        rt.status().as_ref(),
+                        rt.ctx(),
                         candidate.row_id,
                         durable_deleted,
                     ) {
@@ -3291,11 +3316,11 @@ impl<'op> UserTableAccessor<'op> {
     /// Captures the cold-block and hot-page worklists from one table root.
     pub(crate) async fn table_scan_mvcc_worklist(
         &self,
-        rt: TrxRuntime<'_>,
+        runtime: TableScanRuntime<'_>,
+        root: &impl TableScanRootView,
     ) -> RuntimeResult<TableScanWorklist> {
-        let root_snapshot = self.root_snapshot(rt.ctx());
-        let column_root = root_snapshot.column_block_index_root();
-        let pivot_row_id = root_snapshot.pivot_row_id();
+        let column_root = root.column_block_index_root();
+        let pivot_row_id = root.pivot_row_id();
         let cold_entries = if column_root == SUPER_BLOCK_ID || pivot_row_id == RowID::new(0) {
             Vec::new()
         } else {
@@ -3306,7 +3331,7 @@ impl<'op> UserTableAccessor<'op> {
                 storage.file().file_kind(),
                 storage.file().sparse_file(),
                 storage.disk_pool(),
-                rt.pool_guards().disk_guard(),
+                runtime.pool_guards().disk_guard(),
             );
             column_index.collect_leaf_entries().await.attach_with(|| {
                 format!(
@@ -3317,7 +3342,7 @@ impl<'op> UserTableAccessor<'op> {
         };
         let (_, hot_pages) = self
             .mem()
-            .snapshot_original_row_pages_from(rt.pool_guards(), pivot_row_id)
+            .snapshot_original_row_pages_from(runtime.pool_guards(), pivot_row_id)
             .await
             .attach_with(|| {
                 format!(
@@ -3336,14 +3361,14 @@ impl<'op> UserTableAccessor<'op> {
     /// Loads one captured persisted scan entry and validates its row metadata.
     pub(crate) async fn load_table_scan_cold_page(
         &self,
-        rt: TrxRuntime<'_>,
+        runtime: TableScanRuntime<'_>,
         column_root: BlockID,
         pivot_row_id: RowID,
         entry: &ColumnLeafEntry,
     ) -> RuntimeResult<TableScanColdPage> {
         let storage = self.column_storage();
         let file_kind = storage.file().file_kind();
-        let disk_guard = rt.pool_guards().disk_guard();
+        let disk_guard = runtime.pool_guards().disk_guard();
         let column_index = ColumnBlockIndex::new(
             column_root,
             pivot_row_id,
@@ -3403,7 +3428,7 @@ impl<'op> UserTableAccessor<'op> {
     #[inline]
     pub(crate) fn table_scan_cold_row<'row>(
         &'row self,
-        rt: TrxRuntime<'_>,
+        read_view: &MvccReadView,
         page: &'row TableScanColdPage,
         row_idx: usize,
         buffer: &'row mut LazyRowBuffer,
@@ -3413,8 +3438,7 @@ impl<'op> UserTableAccessor<'op> {
             !page.durable_deleted.is_empty() && page.durable_deleted.contains(&row_id);
         if !cold_row_visible_mvcc(
             self.lwc_deletion_buffer(),
-            rt.sts(),
-            rt.status().as_ref(),
+            read_view,
             row_id,
             durable_deleted,
         ) {
@@ -3437,12 +3461,12 @@ impl<'op> UserTableAccessor<'op> {
     /// Reopens and validates one captured hot row page for bounded processing.
     pub(crate) async fn load_table_scan_hot_page(
         &self,
-        rt: TrxRuntime<'_>,
+        runtime: TableScanRuntime<'_>,
         descriptor: RowPageDescriptor,
     ) -> RuntimeResult<PageSharedGuard<RowPage>> {
         let page_guard = self
             .mem()
-            .get_row_page_shared(rt.pool_guards(), descriptor.page_id)
+            .get_row_page_shared(runtime.pool_guards(), descriptor.page_id)
             .await
             .attach_with(|| {
                 format!(
@@ -3489,7 +3513,7 @@ impl<'op> UserTableAccessor<'op> {
     #[inline]
     pub(crate) fn table_scan_hot_row<'row>(
         &'row self,
-        ctx: &TrxContext,
+        read_view: &MvccReadView,
         access: RowReadAccess<'row>,
         buffer: &'row mut LazyRowBuffer,
     ) -> Option<LazyRow<'row>> {
@@ -3497,7 +3521,7 @@ impl<'op> UserTableAccessor<'op> {
         // Prepare before MVCC resolution because undo before-images are seeded
         // into the buffer before `LazyRow` itself can be constructed.
         buffer.prepare(column_count);
-        match access.resolve_main_branch_mvcc(ctx, |undo_cols| {
+        match access.resolve_main_branch_mvcc(read_view, |undo_cols| {
             for undo_col in undo_cols {
                 buffer.cache_value(undo_col.idx, undo_col.val.clone());
             }
@@ -4972,11 +4996,11 @@ fn validate_cold_scan_entry(
 #[inline]
 fn cold_row_visible_mvcc(
     deletion_buffer: &ColumnDeletionBuffer,
-    reader_sts: TrxID,
-    reader_status: &SharedTrxStatus,
+    visibility: &impl MvccVisibility,
     row_id: RowID,
     durable_deleted: bool,
 ) -> bool {
+    let reader_sts = visibility.sts();
     // The CDB marker is the newest MVCC authority: among other things, a
     // committed marker newer than the reader snapshot is the undo fact that
     // keeps a durably deleted cold image visible. Durable membership becomes
@@ -4988,7 +5012,7 @@ fn cold_row_visible_mvcc(
             if trx_is_committed(ts) {
                 ts > reader_sts
             } else {
-                !addr_eq(status.as_ref(), reader_status)
+                !visibility.owns_status(status.as_ref())
             }
         }
         None => !durable_deleted,
@@ -5093,7 +5117,7 @@ mod tests {
         transition_delete, transition_insert_update,
     };
     use crate::trx::ver_map::RowPageState;
-    use crate::trx::{MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID, Transaction};
+    use crate::trx::{MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID, MvccReadView, Transaction};
     use crate::value::{Val, ValKind};
     use error_stack::Report;
     use futures::FutureExt;
@@ -7805,52 +7829,50 @@ mod tests {
     fn test_cold_row_visibility_prefers_cdb_marker_to_durable_delete() {
         let deletion_buffer = ColumnDeletionBuffer::new();
         let reader_status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 1));
-        let reader_sts = TrxID::new(20);
-
-        assert!(!cold_row_visible_mvcc(
-            &deletion_buffer,
-            reader_sts,
-            reader_status.as_ref(),
-            RowID::new(1),
-            true,
-        ));
+        let read_view =
+            MvccReadView::with_own_status_for_test(TrxID::new(20), Arc::clone(&reader_status));
+        let ownerless = MvccReadView::ownerless(TrxID::new(20));
+        let visible = |view, row_id, durable_deleted| {
+            cold_row_visible_mvcc(&deletion_buffer, view, RowID::new(row_id), durable_deleted)
+        };
 
         deletion_buffer
-            .put_committed(RowID::new(2), TrxID::new(30))
+            .put_committed(RowID::new(3), TrxID::new(10))
             .unwrap();
-        assert!(cold_row_visible_mvcc(
-            &deletion_buffer,
-            reader_sts,
-            reader_status.as_ref(),
-            RowID::new(2),
-            true,
-        ));
-
+        deletion_buffer
+            .put_committed(RowID::new(4), TrxID::new(30))
+            .unwrap();
         deletion_buffer
             .put_ref(
-                RowID::new(3),
+                RowID::new(5),
                 Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 2)),
                 MAX_SNAPSHOT_TS,
             )
             .unwrap();
-        assert!(cold_row_visible_mvcc(
-            &deletion_buffer,
-            reader_sts,
-            reader_status.as_ref(),
-            RowID::new(3),
-            true,
-        ));
-
         deletion_buffer
-            .put_ref(RowID::new(4), Arc::clone(&reader_status), MAX_SNAPSHOT_TS)
+            .put_ref(RowID::new(6), Arc::clone(&reader_status), MAX_SNAPSHOT_TS)
             .unwrap();
-        assert!(!cold_row_visible_mvcc(
-            &deletion_buffer,
-            reader_sts,
-            reader_status.as_ref(),
-            RowID::new(4),
-            true,
-        ));
+        deletion_buffer
+            .put_ref(
+                RowID::new(7),
+                Arc::new(shared_trx_status(TrxID::new(30))),
+                MAX_SNAPSHOT_TS,
+            )
+            .unwrap();
+
+        let cases = [
+            (&read_view, 1, false, true),
+            (&read_view, 2, true, false),
+            (&read_view, 3, false, false),
+            (&read_view, 4, true, true),
+            (&read_view, 5, true, true),
+            (&read_view, 6, false, false),
+            (&ownerless, 6, false, true),
+            (&read_view, 7, true, true),
+        ];
+        for (view, row_id, durable_deleted, expected) in cases {
+            assert_eq!(visible(view, row_id, durable_deleted), expected);
+        }
     }
 
     #[test]

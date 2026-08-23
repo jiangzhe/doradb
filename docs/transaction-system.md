@@ -170,6 +170,14 @@ then copy a single secondary `DiskTree` root id or build an owned
 load, and file-internal root reads remain explicit unchecked exceptions outside
 this runtime transaction contract.
 
+Full-table scan planning accepts that proof-branded root through a crate-private
+scan-root view. Registered read snapshots use a separate lifetime-free
+`OwnedTableScanRoot` projection because their root fields must be stored beside
+the active-STS owner. That stored projection is not usable directly: only a
+view borrowed from the exact future snapshot checkout can expose its scan
+fields. Transaction, index, mutation, and maintenance paths continue to use
+the lifetime-branded full `TableRootSnapshot`.
+
 MemIndex cleanup is the separate registered-reader case. Its
 `PrivateSnapshot` directly brands the captured `TableRootSnapshot` lifetime;
 it cannot mint `TrxReadProof`, and the captured root cannot outlive the active

@@ -736,6 +736,81 @@ pub(crate) struct TrxReadProof<'ctx> {
     _ctx: PhantomData<&'ctx TrxContext>,
 }
 
+/// Reader identity required by shared MVCC visibility algorithms.
+pub(crate) trait MvccVisibility {
+    /// Returns the reader's snapshot timestamp.
+    fn sts(&self) -> TrxID;
+
+    /// Returns whether an active shared status belongs to this reader.
+    fn owns_status(&self, status: &SharedTrxStatus) -> bool;
+
+    /// Returns whether an active row undo head belongs to this reader.
+    #[inline]
+    fn owns_undo_head(&self, undo_head: &RowUndoHead) -> bool {
+        match &undo_head.next.main.status {
+            UndoStatus::Ref(status) => self.owns_status(status.as_ref()),
+            UndoStatus::Committed(_) => false,
+        }
+    }
+}
+
+/// Immutable identity used by full-table MVCC scans.
+pub(crate) struct MvccReadView {
+    sts: TrxID,
+    own_status: Option<Arc<SharedTrxStatus>>,
+}
+
+impl MvccReadView {
+    /// Capture one transaction-backed scan identity.
+    #[inline]
+    pub(crate) fn from_transaction(ctx: &TrxContext) -> Self {
+        Self {
+            sts: ctx.sts(),
+            own_status: Some(Arc::clone(ctx.status())),
+        }
+    }
+
+    /// Create an ownerless scan identity at one registered snapshot timestamp.
+    #[inline]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Phase 2 will construct ownerless registered-snapshot read views"
+        )
+    )]
+    pub(crate) fn ownerless(sts: TrxID) -> Self {
+        Self {
+            sts,
+            own_status: None,
+        }
+    }
+
+    /// Create a status-owning scan view for focused visibility tests.
+    #[inline]
+    #[cfg(test)]
+    pub(crate) fn with_own_status_for_test(sts: TrxID, own_status: Arc<SharedTrxStatus>) -> Self {
+        Self {
+            sts,
+            own_status: Some(own_status),
+        }
+    }
+}
+
+impl MvccVisibility for MvccReadView {
+    #[inline]
+    fn sts(&self) -> TrxID {
+        self.sts
+    }
+
+    #[inline]
+    fn owns_status(&self, status: &SharedTrxStatus) -> bool {
+        self.own_status
+            .as_ref()
+            .is_some_and(|own| addr_eq(own.as_ref(), status))
+    }
+}
+
 /// Immutable transaction identity and MVCC status.
 pub(crate) struct TrxContext {
     status: Arc<SharedTrxStatus>,
@@ -777,10 +852,7 @@ impl TrxContext {
     /// Returns whether the row undo head belongs to this transaction.
     #[inline]
     pub(crate) fn is_same_trx(&self, undo_head: &RowUndoHead) -> bool {
-        match &undo_head.next.main.status {
-            UndoStatus::Ref(arc) => addr_eq(self.status.as_ref(), arc.as_ref()),
-            _ => false,
-        }
+        MvccVisibility::owns_undo_head(self, undo_head)
     }
 
     /// Returns this transaction's current status timestamp.
@@ -811,6 +883,18 @@ impl TrxContext {
     #[inline]
     pub(crate) fn mark_preparing(&self) {
         self.status.mark_preparing();
+    }
+}
+
+impl MvccVisibility for TrxContext {
+    #[inline]
+    fn sts(&self) -> TrxID {
+        self.sts
+    }
+
+    #[inline]
+    fn owns_status(&self, status: &SharedTrxStatus) -> bool {
+        addr_eq(self.status.as_ref(), status)
     }
 }
 
@@ -4644,6 +4728,31 @@ pub(crate) mod tests {
         );
         wait_for_session_idle(&engine.inner().session_registry, session_id).await;
         engine.shutdown();
+    }
+
+    #[test]
+    fn mvcc_visibility_preserves_optional_pointer_exact_ownership() {
+        let own_status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 10));
+        let same_timestamp = Arc::new(shared_trx_status(own_status.ts()));
+        let ctx = TrxContext {
+            status: Arc::clone(&own_status),
+            sts: TrxID::new(9),
+            gc_no: 0,
+        };
+
+        assert_eq!(MvccVisibility::sts(&ctx), TrxID::new(9));
+        assert!(MvccVisibility::owns_status(&ctx, own_status.as_ref()));
+        assert!(!MvccVisibility::owns_status(&ctx, same_timestamp.as_ref()));
+
+        let transaction = MvccReadView::from_transaction(&ctx);
+        assert_eq!(transaction.sts(), TrxID::new(9));
+        assert!(transaction.owns_status(own_status.as_ref()));
+        assert!(!transaction.owns_status(same_timestamp.as_ref()));
+
+        let ownerless = MvccReadView::ownerless(TrxID::new(9));
+        assert_eq!(ownerless.sts(), TrxID::new(9));
+        assert!(!ownerless.owns_status(own_status.as_ref()));
+        assert!(!ownerless.owns_status(same_timestamp.as_ref()));
     }
 
     #[test]

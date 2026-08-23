@@ -11,6 +11,7 @@ mod page_transition;
 mod persistence;
 mod recover;
 mod rollback;
+mod scan_root;
 mod storage;
 pub use access::LazyRow;
 pub(crate) use access::*;
@@ -31,6 +32,11 @@ pub(crate) use lifecycle::{TableDropDrain, TableLifecycle};
 pub(crate) use mem_table::{MemTable, NoTrxUpsertChange, RowPageDescriptor};
 pub use persistence::*;
 pub(crate) use rollback::IndexRollback;
+#[expect(
+    unused_imports,
+    reason = "Phase 2 will store and check out the opaque scan-root types"
+)]
+pub(crate) use scan_root::{CheckedOutTableScanRoot, OwnedTableScanRoot, TableScanRootView};
 pub(crate) use storage::ColumnStorage;
 #[cfg(test)]
 pub(crate) use tests::{test_hooks, test_user_table_id};

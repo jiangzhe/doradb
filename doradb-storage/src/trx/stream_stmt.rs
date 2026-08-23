@@ -12,11 +12,11 @@ use crate::row::RowPage;
 use crate::row::ops::{ScanRowDecision, SelectMvcc};
 use crate::table::{
     DmlValidator, LazyRow, LazyRowBuffer, RowPageDescriptor, Table, TableRuntimeLayout,
-    TableScanColdPage, TableScanWorklist,
+    TableScanColdPage, TableScanRuntime, TableScanWorklist,
 };
 use crate::trx::row::BoundIndexCandidate;
 use crate::trx::{
-    SessionOperationCheckout, StmtNo, TableAdmissionRequest, Transaction, TrxRuntime,
+    MvccReadView, SessionOperationCheckout, StmtNo, TableAdmissionRequest, Transaction, TrxRuntime,
 };
 use crate::value::Val;
 use error_stack::ResultExt;
@@ -149,18 +149,22 @@ impl StreamStmtState {
                 })
                 .disclose()?;
         }
-        let worklist = {
+        let (read_view, worklist) = {
             let rt = self.runtime();
-            table
-                .accessor_with_layout(&layout)
-                .table_scan_mvcc_worklist(rt)
+            let read_view = MvccReadView::from_transaction(rt.ctx());
+            let accessor = table.accessor_with_layout(&layout);
+            let root = accessor.root_snapshot(rt.ctx());
+            let worklist = accessor
+                .table_scan_mvcc_worklist(TableScanRuntime::from_transaction(rt), &root)
                 .await
                 .attach_with(|| {
                     format!("operation={TABLE_SCAN_STREAM_OPERATION}, table_id={table_id}")
                 })
-                .disclose()?
+                .disclose()?;
+            (read_view, worklist)
         };
         Ok(TableScanMvccStream::new(TableScanMvccStreamState::new(
+            read_view,
             scan_row,
             table,
             layout,
@@ -341,6 +345,7 @@ enum TableScanAdvance {
 }
 
 struct TableScanMvccStreamState<F> {
+    read_view: MvccReadView,
     scan_row: F,
     table: Arc<Table>,
     layout: Arc<TableRuntimeLayout>,
@@ -356,6 +361,7 @@ struct TableScanMvccStreamState<F> {
 impl<F> TableScanMvccStreamState<F> {
     #[inline]
     fn new(
+        read_view: MvccReadView,
         scan_row: F,
         table: Arc<Table>,
         layout: Arc<TableRuntimeLayout>,
@@ -378,6 +384,7 @@ impl<F> TableScanMvccStreamState<F> {
         );
         pages.extend(hot_pages.into_iter().map(TableScanPageState::HotPending));
         Self {
+            read_view,
             scan_row,
             table,
             layout,
@@ -405,19 +412,19 @@ impl<F> TableScanMvccStreamState<F> {
         let Some(load) = self.pending_front_load() else {
             return Ok(None);
         };
-        let rt = self.stmt_state.runtime();
+        let runtime = TableScanRuntime::from_transaction(self.stmt_state.runtime());
         let accessor = self.table.accessor_with_layout(&self.layout);
         let loaded = match load {
             TableScanPageLoad::Cold(entry) => {
                 let page = accessor
-                    .load_table_scan_cold_page(rt, self.column_root, self.pivot_row_id, &entry)
+                    .load_table_scan_cold_page(runtime, self.column_root, self.pivot_row_id, &entry)
                     .await
                     .disclose()?;
                 TableScanPageState::Cold { page, next_row: 0 }
             }
             TableScanPageLoad::Hot(descriptor) => {
                 let page_guard = accessor
-                    .load_table_scan_hot_page(rt, descriptor)
+                    .load_table_scan_hot_page(runtime, descriptor)
                     .await
                     .disclose()?;
                 TableScanPageState::Hot {
@@ -483,10 +490,12 @@ where
                 while *next_row < page.row_count() {
                     let row_idx = *next_row;
                     *next_row += 1;
-                    let rt = self.stmt_state.runtime();
-                    let Some(lazy_row) =
-                        accessor.table_scan_cold_row(rt, page, row_idx, &mut self.row_buffer)
-                    else {
+                    let Some(lazy_row) = accessor.table_scan_cold_row(
+                        &self.read_view,
+                        page,
+                        row_idx,
+                        &mut self.row_buffer,
+                    ) else {
                         continue;
                     };
                     match Self::apply_row(&mut self.scan_row, &self.read_set, lazy_row)? {
@@ -508,11 +517,9 @@ where
                     let row_idx = *next_row;
                     *next_row += 1;
                     let access = page_guard.read_row(row_idx);
-                    let Some(lazy_row) = accessor.table_scan_hot_row(
-                        self.stmt_state.runtime().ctx(),
-                        access,
-                        &mut self.row_buffer,
-                    ) else {
+                    let Some(lazy_row) =
+                        accessor.table_scan_hot_row(&self.read_view, access, &mut self.row_buffer)
+                    else {
                         continue;
                     };
                     match Self::apply_row(&mut self.scan_row, &self.read_set, lazy_row)? {

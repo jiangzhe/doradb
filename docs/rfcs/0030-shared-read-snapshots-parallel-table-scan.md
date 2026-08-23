@@ -1591,9 +1591,9 @@ not preselect Arrow crate versions or public Arrow schema mapping. [U1] [U3]
 - The stable entry needs snapshot-specific construction, ready, draining,
   checkout-count, first-failure control, terminal-claim, and notification
   plumbing in addition to the existing transaction checkout state machine.
-- Phase 1 must add and seal a second private root representation for
-  registry-owned snapshots while keeping the existing lifetime-branded
-  transaction and maintenance representation unchanged.
+- Phase 1 must add a second private root representation with checkout-borrowed
+  usable access for registry-owned snapshots while keeping the existing
+  lifetime-branded transaction and maintenance representation unchanged.
 - Calling `ReadSnapshot::close` on one clone invalidates all clones and dormant
   plans; callers must coordinate that group-wide terminal action with workers.
 - A build future that already owns the exclusive checkout remains a real
