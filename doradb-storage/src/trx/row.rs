@@ -16,7 +16,8 @@ use crate::trx::undo::{
 };
 use crate::trx::ver_map::{RowPageState, RowVersionMap, RowVersionReadGuard, RowVersionWriteGuard};
 use crate::trx::{
-    PrepareListenerResult, SharedTrxStatus, StmtNo, TrxContext, TrxRuntime, trx_is_committed,
+    MvccVisibility, PrepareListenerResult, SharedTrxStatus, StmtNo, TrxContext, TrxRuntime,
+    trx_is_committed,
 };
 use crate::value::Val;
 use error_stack::Report;
@@ -389,12 +390,13 @@ impl<'a> RowReadAccess<'a> {
     #[inline]
     pub(crate) fn resolve_main_branch_mvcc<F>(
         &self,
-        ctx: &TrxContext,
+        visibility: &impl MvccVisibility,
         mut undo_update: F,
     ) -> MainBranchMvcc
     where
         F: FnMut(&[UndoCol]),
     {
+        let reader_sts = visibility.sts();
         let latest = || {
             if self.row().is_deleted() {
                 MainBranchMvcc::NotFound
@@ -413,10 +415,10 @@ impl<'a> RowReadAccess<'a> {
         };
         let ts = undo_head.ts();
         if trx_is_committed(ts) {
-            if ctx.sts() > ts {
+            if reader_sts > ts {
                 return latest();
             }
-        } else if ctx.trx_id() == ts {
+        } else if visibility.owns_undo_head(undo_head) {
             return latest();
         }
 
@@ -447,7 +449,7 @@ impl<'a> RowReadAccess<'a> {
                     };
                 }
                 Some(older) => {
-                    if ctx.sts() > older.main.status.ts() {
+                    if reader_sts > older.main.status.ts() {
                         return if deleted {
                             MainBranchMvcc::NotFound
                         } else {
@@ -1592,8 +1594,10 @@ pub(crate) mod tests {
         ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec,
     };
     use crate::trx::tests::{commit_shared_trx_status, shared_trx_status};
-    use crate::trx::undo::RowUndoHead;
-    use crate::trx::{MIN_ACTIVE_TRX_ID, NON_FOREGROUND_STMT_NO, ver_map::RowVersionMap};
+    use crate::trx::undo::{MainBranch, NextRowUndo, RowUndoHead, UndoStatus};
+    use crate::trx::{
+        MIN_ACTIVE_TRX_ID, MvccReadView, NON_FOREGROUND_STMT_NO, ver_map::RowVersionMap,
+    };
     use crate::value::ValKind;
     use std::collections::BTreeMap;
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -1735,6 +1739,154 @@ pub(crate) mod tests {
         assert_eq!(access.read_latest(&trx_ctx), ReadLatestRow::WriteConflict);
         commit_shared_trx_status(&status, TrxID::new(10));
         assert_eq!(access.read_latest(&trx_ctx), ReadLatestRow::NotFound);
+    }
+
+    #[test]
+    fn test_scan_read_view_resolves_active_main_branch_kinds() {
+        #[derive(Clone, Copy)]
+        enum CaseKind {
+            Lock,
+            Insert,
+            Update,
+            Delete,
+        }
+
+        let cases = [
+            (CaseKind::Lock, false, MainBranchMvcc::Historical, vec![]),
+            (CaseKind::Insert, false, MainBranchMvcc::NotFound, vec![]),
+            (
+                CaseKind::Update,
+                false,
+                MainBranchMvcc::Historical,
+                vec![(0, Val::from(9i32))],
+            ),
+            (CaseKind::Delete, true, MainBranchMvcc::Historical, vec![]),
+        ];
+
+        for (kind, latest_deleted, historical, expected_undo) in cases {
+            let metadata = sparse_metadata();
+            let page = row_page(&metadata);
+            if latest_deleted {
+                assert!(page.set_deleted(0, true));
+            }
+            let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+            let owner = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 10));
+            let undo_kind = match kind {
+                CaseKind::Lock => RowUndoKind::Lock,
+                CaseKind::Insert => RowUndoKind::Insert,
+                CaseKind::Update => RowUndoKind::Update(vec![UndoCol {
+                    idx: 0,
+                    val: Val::from(9i32),
+                    var_offset: None,
+                }]),
+                CaseKind::Delete => RowUndoKind::Delete,
+            };
+            let undo = OwnedRowUndo::new(
+                NON_FOREGROUND_STMT_NO,
+                TableID::new(1),
+                None,
+                RowID::new(100),
+                undo_kind,
+            );
+            *row_ver.write_latch(0) =
+                Some(Box::new(RowUndoHead::new(Arc::clone(&owner), undo.leak())));
+            let own_ctx = TrxContext {
+                status: Arc::clone(&owner),
+                sts: TrxID::new(20),
+                gc_no: 0,
+            };
+            let foreign_ctx = test_trx_context(TrxID::new(20));
+            let own = MvccReadView::from_transaction(&own_ctx);
+            let foreign = MvccReadView::from_transaction(&foreign_ctx);
+            let ownerless = MvccReadView::ownerless(TrxID::new(20));
+
+            let mut own_undo = Vec::new();
+            let own_result =
+                test_row_read_access(&page, &row_ver, 0).resolve_main_branch_mvcc(&own, |cols| {
+                    own_undo.extend(cols.iter().map(|col| (col.idx, col.val.clone())));
+                });
+            assert_eq!(
+                own_result,
+                if latest_deleted {
+                    MainBranchMvcc::NotFound
+                } else {
+                    MainBranchMvcc::Latest
+                }
+            );
+            assert!(own_undo.is_empty());
+
+            for read_view in [&foreign, &ownerless] {
+                let mut actual_undo = Vec::new();
+                let result = test_row_read_access(&page, &row_ver, 0).resolve_main_branch_mvcc(
+                    read_view,
+                    |cols| {
+                        actual_undo.extend(cols.iter().map(|col| (col.idx, col.val.clone())));
+                    },
+                );
+                assert_eq!(result, historical);
+                assert_eq!(actual_undo, expected_undo);
+            }
+        }
+    }
+
+    #[test]
+    fn test_ownerless_scan_replays_repeated_sparse_updates_like_foreign_reader() {
+        let metadata = sparse_metadata();
+        let page = row_page(&metadata);
+        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+        let older = OwnedRowUndo::new(
+            NON_FOREGROUND_STMT_NO,
+            TableID::new(1),
+            None,
+            RowID::new(100),
+            RowUndoKind::Update(vec![UndoCol {
+                idx: 0,
+                val: Val::from(7i32),
+                var_offset: None,
+            }]),
+        );
+        let mut newer = OwnedRowUndo::new(
+            NON_FOREGROUND_STMT_NO,
+            TableID::new(1),
+            None,
+            RowID::new(100),
+            RowUndoKind::Update(vec![UndoCol {
+                idx: 0,
+                val: Val::from(8i32),
+                var_offset: None,
+            }]),
+        );
+        newer.next = Some(NextRowUndo::new(MainBranch {
+            entry: older.leak(),
+            status: UndoStatus::Committed(TrxID::new(30)),
+        }));
+        *row_ver.write_latch(0) = Some(Box::new(RowUndoHead::new(
+            Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 10)),
+            newer.leak(),
+        )));
+        let foreign = MvccReadView::from_transaction(&test_trx_context(TrxID::new(20)));
+        let ownerless = MvccReadView::ownerless(TrxID::new(20));
+
+        let reconstruct = |read_view: &MvccReadView| {
+            let mut value = Val::from(10i32);
+            let result = test_row_read_access(&page, &row_ver, 0).resolve_main_branch_mvcc(
+                read_view,
+                |cols| {
+                    for col in cols {
+                        if col.idx == 0 {
+                            value = col.val.clone();
+                        }
+                    }
+                },
+            );
+            (result, value)
+        };
+
+        assert_eq!(
+            reconstruct(&foreign),
+            (MainBranchMvcc::Historical, Val::from(7i32))
+        );
+        assert_eq!(reconstruct(&ownerless), reconstruct(&foreign));
     }
 
     #[test]

@@ -108,6 +108,14 @@ paths mint `TrxReadProof<'ctx>` from `TrxContext` and use the runtime table
 layer's proof-gated `with_active_root(...)` helper to bind one root observation
 before copying a secondary `DiskTree` root id or building a `TableRootSnapshot`.
 
+The full-table scan adapter can also consume a scan-only root view. Transaction
+scans obtain that view from the existing lifetime-branded
+`TableRootSnapshot`. A future registered read snapshot instead stores an
+`OwnedTableScanRoot` beside its active-STS registration and exposes scan fields
+only through a view borrowed from the exact checkout that pins that owner. The
+owned projection alone provides no root access and does not replace the full
+root snapshot used by index, mutation, or maintenance paths.
+
 Checkpoint, recovery/bootstrap, catalog load, file-internal publication, and
 test-only helpers remain explicit unchecked boundaries until the later sealing
 phase.
