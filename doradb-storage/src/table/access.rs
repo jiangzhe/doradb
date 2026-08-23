@@ -5111,10 +5111,10 @@ mod tests {
     use crate::trx::sys::tests::fatal_rollback_retention_count;
     use crate::trx::tests::{
         commit_preparing_shared_trx_status, lock_hot_row_then_wait_and_error,
-        prepare_event_is_installed, prepare_shared_trx_status, prepare_transaction,
-        rollback_preparing_shared_trx_status, rollback_production_prepared_for_test,
-        shared_trx_status, transaction_redo_kind_counts, transaction_status_for_test,
-        transition_delete, transition_insert_update,
+        observe_table_scan_worklist, prepare_event_is_installed, prepare_shared_trx_status,
+        prepare_transaction, rollback_preparing_shared_trx_status,
+        rollback_production_prepared_for_test, shared_trx_status, transaction_redo_kind_counts,
+        transaction_status_for_test, transition_delete, transition_insert_update,
     };
     use crate::trx::ver_map::RowPageState;
     use crate::trx::{MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID, MvccReadView, Transaction};
@@ -9282,6 +9282,73 @@ mod tests {
             assert_eq!(callbacks, 0);
             first.rollback().await.unwrap();
             second.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_table_scan_mvcc_worklist_captures_root_and_physical_work() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "scan_worklist_capture")
+                    .await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 5, "cold").await;
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+            assert_checkpoint_published(&mut session, table_id).await;
+            insert_rows(table_id, &mut session, 100, 3, "hot").await;
+
+            let table = table_for_internal_assertion(&engine, table_id);
+            let (expected_column_root, expected_pivot) = {
+                let root = table.file().active_root_unchecked();
+                (root.column_block_index_root, root.pivot_row_id)
+            };
+            let guards = session.pool_guards();
+            let expected_cold_entries = column_block_index_snapshot(&engine, table_id)
+                .index(guards.disk_guard())
+                .collect_leaf_entries()
+                .await
+                .unwrap();
+            let (_, expected_hot_pages) = table
+                .mem
+                .snapshot_original_row_pages_from(&guards, expected_pivot)
+                .await
+                .unwrap();
+            drop(guards);
+
+            let mut trx = session.begin_trx().unwrap();
+            let worklist = observe_table_scan_worklist(&mut trx, &table).await.unwrap();
+            assert_eq!(worklist.column_root, expected_column_root);
+            assert_eq!(worklist.pivot_row_id, expected_pivot);
+            assert_eq!(worklist.cold_entries, expected_cold_entries);
+            assert_eq!(worklist.hot_pages, expected_hot_pages);
+            assert!(!worklist.cold_entries.is_empty());
+            assert!(!worklist.hot_pages.is_empty());
+            trx.noop().await.unwrap();
+            trx.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_table_scan_mvcc_stream_empty_exhaustion_releases_checkout() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "empty_stream_scan").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let mut stream = trx
+                .table_scan_mvcc_stream(table_id, &[0], |_| Ok(ScanRowDecision::Include))
+                .await
+                .unwrap();
+
+            assert_eq!(stream.next().await.unwrap(), None);
+            assert_eq!(stream.next().await.unwrap(), None);
+            drop(stream);
+            trx.noop().await.unwrap();
+            trx.rollback().await.unwrap();
         });
     }
 

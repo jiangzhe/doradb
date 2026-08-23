@@ -1229,10 +1229,11 @@ not preselect Arrow crate versions or public Arrow schema mapping. [U1] [U3]
 
 - **Phase 1: Transaction-neutral scan read view and owned root binding**
   - Scope: Introduce immutable table-scan MVCC identity with optional own
-    status, scan root/runtime adapters for the existing transaction proof and
-    the registered snapshot's distinct borrowed view, the private
-    `OwnedTableRootSnapshot` field projection and checkout-borrowed root-view
-    seam, and adapters for the existing transaction table stream.
+    status, the shared crate-private `MvccVisibility` contract, scan
+    root/runtime adapters for the existing transaction proof and the registered
+    snapshot's distinct borrowed view, the private owned scan-root projection
+    and checkout-borrowed root-view seam, and adapt the existing transaction
+    table stream as the production consumer.
   - Goals: Remove transaction-only assumptions from cold CDB visibility, hot
     main-undo traversal, captured-root access, and scan page loading without
     duplicating algorithms; provide the lifetime-free stored artifact needed by
@@ -1241,25 +1242,27 @@ not preselect Arrow crate versions or public Arrow schema mapping. [U1] [U3]
   - Non-goals: No public snapshot API, partitions, Arrow, index-runtime
     generalization, transaction lifecycle change, lifetime erasure, or change
     to existing `TableRootSnapshot<'ctx>` transaction/maintenance semantics.
-  - Phase-local Choices: Keep the abstraction table-scan-specific unless an
-    immediately impacted read path proves a wider runtime is necessary;
-    represent own status as `Option`, not a synthetic transaction status;
-    expose root fields only through the private borrowed view that Phase 2 will
-    construct from its exact checkout.
-  - Verification: Run the existing transaction table-stream suite through the
-    new adapters, add cold-only, hot-only, mixed, error, exhaustion, and drop
-    parity coverage, and add private invariant tests proving that an owned root
-    cannot expose fields without its checkout-borrowed view. The existing
-    sequential stream is this phase's production consumer; no dormant public
-    API or synthetic stream is introduced.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase-local Choices: Keep physical runtime and root authority
+    table-scan-specific while sharing the narrow visibility contract with
+    existing transaction readers; represent own status as `Option`, not a
+    synthetic transaction status; use ordinary crate-private traits and static
+    dispatch; expose root fields only through the private borrowed view that
+    Phase 2 will construct from its exact checkout.
+  - Verification: Exercise the existing transaction table stream through all
+    new boundaries; cover cold-only, hot-only, mixed, empty, error, exhaustion,
+    drop, and transaction-reuse behavior; directly verify captured worklists;
+    and prove that the owned root cannot expose fields without its
+    checkout-borrowed view. No dormant public API or synthetic stream is
+    introduced.
+  - Task Doc: `docs/tasks/000281-transaction-neutral-scan-read-view-owned-root-binding.md`
+  - Task Issue: `#1011`
+  - Phase Status: done
+  - Implementation Summary: Introduced transaction-neutral MVCC visibility, scan-only physical runtime, and checkout-bound owned roots; adapted the transaction table stream without changing results or terminal behavior. [Task Resolve Sync: docs/tasks/000281-transaction-neutral-scan-read-view-owned-root-binding.md @ 2026-08-23]
 
 - **Phase 2: Shared snapshot preparation and deterministic planning**
-  - Prerequisites: Phase 1 read view, private owned root projection, and
-    checkout-borrowed root-view seam are available.
+  - Prerequisites: Phase 1 `MvccReadView`, `MvccVisibility`, private owned and
+    checked-out scan roots, `TableScanRuntime`, shared root view, and worklist
+    capture are available.
   - Scope: Add the `ReadSnapshot` session-operation kind; builder and snapshot
     facades; registry-owned build, ready, draining, and terminal states; weak
     facade liveness; the exclusive build checkout; active STS ownership before

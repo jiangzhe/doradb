@@ -3620,7 +3620,7 @@ pub(crate) mod tests {
             session_has_public_trx_cache, session_registry_len, wait_for_session_idle,
         },
     };
-    use crate::table::{MemTable, Table, test_user_table_id};
+    use crate::table::{MemTable, Table, TableScanRuntime, TableScanWorklist, test_user_table_id};
     use crate::trx::stmt::tests as stmt_tests;
     use crate::trx::sys::tests::{
         TerminalRollbackTestHookGuard, fatal_rollback_retention_count,
@@ -3997,6 +3997,25 @@ pub(crate) mod tests {
                 visible: snapshot.root_is_visible_to(rt.sts()),
                 sts: rt.sts(),
             })
+        })
+        .await
+    }
+
+    /// Capture one table-scan worklist through a transaction-branded root.
+    pub(crate) async fn observe_table_scan_worklist(
+        trx: &mut Transaction,
+        table: &Table,
+    ) -> Result<TableScanWorklist> {
+        trx.exec(async |stmt| {
+            let rt = stmt.runtime();
+            let layout = table.layout_snapshot();
+            let accessor = table.accessor_with_layout(&layout);
+            let root = accessor.root_snapshot(rt.ctx());
+            let worklist = accessor
+                .table_scan_mvcc_worklist(TableScanRuntime::from_transaction(rt), &root)
+                .await
+                .disclose()?;
+            Ok(worklist)
         })
         .await
     }
