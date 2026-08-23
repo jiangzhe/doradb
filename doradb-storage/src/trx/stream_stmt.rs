@@ -1,5 +1,5 @@
 use crate::buffer::EvictableBufferPool;
-use crate::buffer::guard::PageGuard;
+use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::error::{
     DiscloseResultExt, OperationError, OperationOrFatalResult, Result, RuntimeResult,
 };
@@ -8,6 +8,7 @@ use crate::index::{
     BTreeKeyEncoder, ColumnLeafEntry, IndexBatchStream, IndexLookupCandidate,
     OwnedIndexCandidateStream,
 };
+use crate::row::RowPage;
 use crate::row::ops::{ScanRowDecision, SelectMvcc};
 use crate::table::{
     DmlValidator, LazyRow, LazyRowBuffer, RowPageDescriptor, Table, TableRuntimeLayout,
@@ -307,6 +308,38 @@ impl Drop for IndexScanMvccStream<'_> {
     }
 }
 
+enum TableScanPageState {
+    ColdPending(ColumnLeafEntry),
+    Cold {
+        page: TableScanColdPage,
+        next_row: usize,
+    },
+    HotPending(RowPageDescriptor),
+    Hot {
+        page_guard: PageSharedGuard<RowPage>,
+        next_row: usize,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum TableScanPageLoad {
+    Cold(ColumnLeafEntry),
+    Hot(RowPageDescriptor),
+}
+
+enum TableScanRowAdvance {
+    Include(Vec<Val>),
+    Skip,
+    Stop,
+}
+
+enum TableScanAdvance {
+    Include(Vec<Val>),
+    Continue,
+    Stop,
+    End,
+}
+
 struct TableScanMvccStreamState<F> {
     scan_row: F,
     table: Arc<Table>,
@@ -314,13 +347,7 @@ struct TableScanMvccStreamState<F> {
     read_set: Vec<usize>,
     column_root: BlockID,
     pivot_row_id: RowID,
-    cold_entries: Vec<ColumnLeafEntry>,
-    next_cold_entry: usize,
-    cold_page: Option<TableScanColdPage>,
-    cold_row_idx: usize,
-    hot_pages: Vec<RowPageDescriptor>,
-    hot_page_idx: usize,
-    hot_row_idx: usize,
+    pages: VecDeque<TableScanPageState>,
     row_buffer: LazyRowBuffer,
     // Keep checkout last so callback, page, and worklist state drops first.
     stmt_state: StreamStmtState,
@@ -343,6 +370,13 @@ impl<F> TableScanMvccStreamState<F> {
             hot_pages,
         } = worklist;
         let column_count = layout.metadata().col.col_count();
+        let mut pages = VecDeque::with_capacity(cold_entries.len() + hot_pages.len());
+        pages.extend(
+            cold_entries
+                .into_iter()
+                .map(TableScanPageState::ColdPending),
+        );
+        pages.extend(hot_pages.into_iter().map(TableScanPageState::HotPending));
         Self {
             scan_row,
             table,
@@ -350,20 +384,169 @@ impl<F> TableScanMvccStreamState<F> {
             read_set,
             column_root,
             pivot_row_id,
-            cold_entries,
-            next_cold_entry: 0,
-            cold_page: None,
-            cold_row_idx: 0,
-            hot_pages,
-            hot_page_idx: 0,
-            hot_row_idx: 0,
+            pages,
             row_buffer: LazyRowBuffer::new(column_count),
             stmt_state,
         }
     }
+
+    #[inline]
+    fn pending_front_load(&self) -> Option<TableScanPageLoad> {
+        match self.pages.front() {
+            Some(TableScanPageState::ColdPending(entry)) => Some(TableScanPageLoad::Cold(*entry)),
+            Some(TableScanPageState::HotPending(descriptor)) => {
+                Some(TableScanPageLoad::Hot(*descriptor))
+            }
+            Some(TableScanPageState::Cold { .. } | TableScanPageState::Hot { .. }) | None => None,
+        }
+    }
+
+    async fn load_pending_front(&self) -> Result<Option<TableScanPageState>> {
+        let Some(load) = self.pending_front_load() else {
+            return Ok(None);
+        };
+        let rt = self.stmt_state.runtime();
+        let accessor = self.table.accessor_with_layout(&self.layout);
+        let loaded = match load {
+            TableScanPageLoad::Cold(entry) => {
+                let page = accessor
+                    .load_table_scan_cold_page(rt, self.column_root, self.pivot_row_id, &entry)
+                    .await
+                    .disclose()?;
+                TableScanPageState::Cold { page, next_row: 0 }
+            }
+            TableScanPageLoad::Hot(descriptor) => {
+                let page_guard = accessor
+                    .load_table_scan_hot_page(rt, descriptor)
+                    .await
+                    .disclose()?;
+                TableScanPageState::Hot {
+                    page_guard,
+                    next_row: 0,
+                }
+            }
+        };
+        Ok(Some(loaded))
+    }
+
+    #[inline]
+    fn install_loaded_front(&mut self, loaded: TableScanPageState) {
+        let matches_pending = matches!(
+            (&loaded, self.pages.front()),
+            (
+                TableScanPageState::Cold { .. },
+                Some(TableScanPageState::ColdPending(_))
+            ) | (
+                TableScanPageState::Hot { .. },
+                Some(TableScanPageState::HotPending(_))
+            )
+        );
+        if !matches_pending {
+            unreachable!("loaded scan page must replace its matching pending queue front");
+        }
+        self.pages.pop_front();
+        self.pages.push_front(loaded);
+    }
+}
+
+impl<F> TableScanMvccStreamState<F>
+where
+    F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<ScanRowDecision>,
+{
+    #[inline]
+    fn apply_row(
+        scan_row: &mut F,
+        read_set: &[usize],
+        mut lazy_row: LazyRow<'_>,
+    ) -> Result<TableScanRowAdvance> {
+        match scan_row(&mut lazy_row)? {
+            ScanRowDecision::Include => {
+                let vals = lazy_row.project(read_set)?;
+                lazy_row.reset();
+                Ok(TableScanRowAdvance::Include(vals))
+            }
+            ScanRowDecision::Skip => {
+                lazy_row.reset();
+                Ok(TableScanRowAdvance::Skip)
+            }
+            ScanRowDecision::Stop => {
+                lazy_row.reset();
+                Ok(TableScanRowAdvance::Stop)
+            }
+        }
+    }
+
+    fn advance_loaded_front(&mut self) -> Result<TableScanAdvance> {
+        let accessor = self.table.accessor_with_layout(&self.layout);
+        let advance = match self.pages.front_mut() {
+            Some(TableScanPageState::Cold { page, next_row }) => {
+                while *next_row < page.row_count() {
+                    let row_idx = *next_row;
+                    *next_row += 1;
+                    let rt = self.stmt_state.runtime();
+                    let Some(lazy_row) =
+                        accessor.table_scan_cold_row(rt, page, row_idx, &mut self.row_buffer)
+                    else {
+                        continue;
+                    };
+                    match Self::apply_row(&mut self.scan_row, &self.read_set, lazy_row)? {
+                        TableScanRowAdvance::Include(vals) => {
+                            return Ok(TableScanAdvance::Include(vals));
+                        }
+                        TableScanRowAdvance::Skip => {}
+                        TableScanRowAdvance::Stop => return Ok(TableScanAdvance::Stop),
+                    }
+                }
+                TableScanAdvance::Continue
+            }
+            Some(TableScanPageState::Hot {
+                page_guard,
+                next_row,
+            }) => {
+                let row_count = page_guard.page().header.row_count();
+                while *next_row < row_count {
+                    let row_idx = *next_row;
+                    *next_row += 1;
+                    let access = page_guard.read_row(row_idx);
+                    let Some(lazy_row) = accessor.table_scan_hot_row(
+                        self.stmt_state.runtime().ctx(),
+                        access,
+                        &mut self.row_buffer,
+                    ) else {
+                        continue;
+                    };
+                    match Self::apply_row(&mut self.scan_row, &self.read_set, lazy_row)? {
+                        TableScanRowAdvance::Include(vals) => {
+                            return Ok(TableScanAdvance::Include(vals));
+                        }
+                        TableScanRowAdvance::Skip => {}
+                        TableScanRowAdvance::Stop => return Ok(TableScanAdvance::Stop),
+                    }
+                }
+                TableScanAdvance::Continue
+            }
+            Some(TableScanPageState::ColdPending(_) | TableScanPageState::HotPending(_)) => {
+                unreachable!("pending scan pages are loaded before row processing")
+            }
+            None => TableScanAdvance::End,
+        };
+        if matches!(advance, TableScanAdvance::Continue) {
+            match self.pages.pop_front() {
+                Some(TableScanPageState::Cold { .. } | TableScanPageState::Hot { .. }) => {}
+                _ => unreachable!("only an exhausted loaded page can continue the scan"),
+            }
+        }
+        Ok(advance)
+    }
 }
 
 /// Public caller-driven programmable MVCC full-table scan stream.
+///
+/// The stream retains a shared guard for its current hot page across returned
+/// rows until that page is exhausted or the stream closes. Ordinary row
+/// updates remain compatible, but work requiring the same page latch
+/// exclusively may wait. A caller paused mid-page must not wait for external
+/// work that requires that exclusive latch.
 pub struct TableScanMvccStream<'trx, F> {
     state: Option<TableScanMvccStreamState<F>>,
     _trx: PhantomData<&'trx mut Transaction>,
@@ -395,143 +578,30 @@ where
 
     async fn next_inner(&mut self) -> Result<Option<Vec<Val>>> {
         loop {
-            let load_cold = {
-                let state = self
-                    .state
-                    .as_ref()
-                    .expect("stream state is present while scanning");
-                if state.cold_page.is_none() && state.next_cold_entry < state.cold_entries.len() {
-                    Some(state.cold_entries[state.next_cold_entry])
-                } else {
-                    None
-                }
-            };
-            if let Some(entry) = load_cold {
-                let page = {
-                    let state = self
-                        .state
-                        .as_ref()
-                        .expect("stream state is present while loading a cold page");
-                    let rt = state.stmt_state.runtime();
-                    state
-                        .table
-                        .accessor_with_layout(&state.layout)
-                        .load_table_scan_cold_page(
-                            rt,
-                            state.column_root,
-                            state.pivot_row_id,
-                            &entry,
-                        )
-                        .await
-                        .disclose()?
-                };
-                let state = self
-                    .state
-                    .as_mut()
-                    .expect("stream state is present after loading a cold page");
-                state.cold_page = Some(page);
-                state.cold_row_idx = 0;
-                state.next_cold_entry += 1;
-            }
-
-            let has_cold_page = self
+            let loaded = self
                 .state
                 .as_ref()
-                .expect("stream state is present while scanning")
-                .cold_page
-                .is_some();
-            if has_cold_page {
-                let state = self
-                    .state
+                .expect("stream state is present while loading the queue front")
+                .load_pending_front()
+                .await?;
+            if let Some(loaded) = loaded {
+                self.state
                     .as_mut()
-                    .expect("stream state is present while scanning a cold page");
-                let accessor = state.table.accessor_with_layout(&state.layout);
-                let page = state
-                    .cold_page
-                    .as_ref()
-                    .expect("loaded cold page is present");
-                while state.cold_row_idx < page.row_count() {
-                    let row_idx = state.cold_row_idx;
-                    state.cold_row_idx += 1;
-                    let rt = state.stmt_state.runtime();
-                    let Some(mut lazy_row) =
-                        accessor.table_scan_cold_row(rt, page, row_idx, &mut state.row_buffer)
-                    else {
-                        continue;
-                    };
-                    match (state.scan_row)(&mut lazy_row)? {
-                        ScanRowDecision::Include => {
-                            let vals = lazy_row.project(&state.read_set)?;
-                            lazy_row.reset();
-                            return Ok(Some(vals));
-                        }
-                        ScanRowDecision::Skip => lazy_row.reset(),
-                        ScanRowDecision::Stop => {
-                            lazy_row.reset();
-                            return Ok(None);
-                        }
-                    }
-                }
-                state.cold_page.take();
-                state.cold_row_idx = 0;
+                    .expect("stream state is present after loading the queue front")
+                    .install_loaded_front(loaded);
                 continue;
             }
 
-            let descriptor = {
-                let state = self
-                    .state
-                    .as_ref()
-                    .expect("stream state is present while selecting a hot page");
-                state.hot_pages.get(state.hot_page_idx).copied()
-            };
-            let Some(descriptor) = descriptor else {
-                return Ok(None);
-            };
-            let page_guard = {
-                let state = self
-                    .state
-                    .as_ref()
-                    .expect("stream state is present while loading a hot page");
-                let rt = state.stmt_state.runtime();
-                state
-                    .table
-                    .accessor_with_layout(&state.layout)
-                    .load_table_scan_hot_page(rt, descriptor)
-                    .await
-                    .disclose()?
-            };
-            let row_count = page_guard.page().header.row_count();
-            let state = self
+            let advance = self
                 .state
                 .as_mut()
-                .expect("stream state is present while scanning a hot page");
-            let accessor = state.table.accessor_with_layout(&state.layout);
-            while state.hot_row_idx < row_count {
-                let row_idx = state.hot_row_idx;
-                state.hot_row_idx += 1;
-                let access = page_guard.read_row(row_idx);
-                let Some(mut lazy_row) = accessor.table_scan_hot_row(
-                    state.stmt_state.runtime().ctx(),
-                    access,
-                    &mut state.row_buffer,
-                ) else {
-                    continue;
-                };
-                match (state.scan_row)(&mut lazy_row)? {
-                    ScanRowDecision::Include => {
-                        let vals = lazy_row.project(&state.read_set)?;
-                        lazy_row.reset();
-                        return Ok(Some(vals));
-                    }
-                    ScanRowDecision::Skip => lazy_row.reset(),
-                    ScanRowDecision::Stop => {
-                        lazy_row.reset();
-                        return Ok(None);
-                    }
-                }
+                .expect("stream state is present while advancing the queue front")
+                .advance_loaded_front()?;
+            match advance {
+                TableScanAdvance::Include(vals) => return Ok(Some(vals)),
+                TableScanAdvance::Continue => {}
+                TableScanAdvance::Stop | TableScanAdvance::End => return Ok(None),
             }
-            state.hot_page_idx += 1;
-            state.hot_row_idx = 0;
         }
     }
 

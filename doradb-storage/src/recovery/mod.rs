@@ -1279,7 +1279,9 @@ mod tests {
     use crate::log::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind};
     use crate::recovery::{RecoveryResources, RowRecoveryMap, TableReplayBounds};
     use crate::row::RowRead;
-    use crate::row::ops::{DeleteMvcc, RowMutation, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
+    use crate::row::ops::{
+        DeleteMvcc, RowMutation, ScanRowDecision, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc,
+    };
     use crate::serde::Ser;
     use crate::session::tests::{SessionTestExt, assert_checkpoint_published};
     use crate::table::tests::{
@@ -2864,13 +2866,18 @@ mod tests {
             let mut rows = 0usize;
             {
                 let layout = table.layout_snapshot();
+                let pivot_row_id = table.file().active_root_unchecked().pivot_row_id;
                 table
                     .accessor_with_layout(&layout)
-                    .mem_scan_uncommitted(&session.pool_guards(), |_metadata, row| {
-                        assert!(row.row_id().as_usize() <= DML_SIZE);
-                        rows += if row.is_deleted() { 0 } else { 1 };
-                        true
-                    })
+                    .mem_scan_uncommitted_from(
+                        &session.pool_guards(),
+                        pivot_row_id,
+                        |_metadata, row| {
+                            assert!(row.row_id().as_usize() <= DML_SIZE);
+                            rows += if row.is_deleted() { 0 } else { 1 };
+                            true
+                        },
+                    )
                     .await
                     .unwrap();
             }
@@ -3632,16 +3639,18 @@ mod tests {
                     .unwrap();
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
+            let mut stream = trx
+                .table_scan_mvcc_stream(table_id, &[0, 1], |_| Ok(ScanRowDecision::Include))
+                .await
+                .unwrap();
             let mut rows = Vec::new();
-            trx.table_scan_mvcc(table_id, &[0, 1], |row| {
+            while let Some(row) = stream.next().await.unwrap() {
                 rows.push((
                     row[0].as_u32().unwrap(),
                     row[1].as_str().unwrap().to_owned(),
                 ));
-                true
-            })
-            .await
-            .unwrap();
+            }
+            drop(stream);
             rows.sort_unstable();
             assert_eq!(
                 rows,

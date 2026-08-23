@@ -1971,6 +1971,7 @@ pub(crate) mod tests {
     use crate::lock::tests::{LockDebugEntryState, TestLockOwner, debug_snapshot};
     use crate::lock::{LockMode, LockOwner, LockResource, TableLockMode};
     use crate::log::redo::DDLRedo;
+    use crate::row::ops::ScanRowDecision;
     use crate::session::tests::{
         SessionTestExt, active_operation_count, active_operation_snapshot, remove_session_for_test,
     };
@@ -4838,10 +4839,11 @@ pub(crate) mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut reader_session = engine.new_session().unwrap();
             let mut reader_trx = reader_session.begin_trx().unwrap();
-            reader_trx
-                .table_scan_mvcc(table_id, &[0], |_| true)
+            let reader_stream = reader_trx
+                .table_scan_mvcc_stream(table_id, &[0], |_| Ok(ScanRowDecision::Include))
                 .await
                 .unwrap();
+            drop(reader_stream);
 
             let mut drop_session = engine.new_session().unwrap();
             let mut drop_fut = Box::pin(drop_session.drop_table(table_id));

@@ -687,7 +687,8 @@ mod tests {
     use crate::error::{DiscloseResultExt, OperationError};
     use crate::index::{IndexInsert, RowLocation};
     use crate::row::ops::{
-        DeleteMvcc, RowMutation, SelectMvcc, TableMutationOutcome, UpdateCol, UpdateMvcc,
+        DeleteMvcc, RowMutation, ScanRowDecision, SelectMvcc, TableMutationOutcome, UpdateCol,
+        UpdateMvcc,
     };
     use crate::session::tests::{
         SessionTestExt, assert_checkpoint_published, wait_for_session_idle,
@@ -1267,14 +1268,15 @@ mod tests {
             writer.commit().await.unwrap();
 
             let mut reader = session.begin_trx().unwrap();
-            let mut rows = Vec::new();
-            reader
-                .table_scan_mvcc(table_id, &[0, 1], |vals| {
-                    rows.push((vals[0].as_i32().unwrap(), vals[1].as_i32().unwrap()));
-                    true
-                })
+            let mut stream = reader
+                .table_scan_mvcc_stream(table_id, &[0, 1], |_| Ok(ScanRowDecision::Include))
                 .await
                 .unwrap();
+            let mut rows = Vec::new();
+            while let Some(vals) = stream.next().await.unwrap() {
+                rows.push((vals[0].as_i32().unwrap(), vals[1].as_i32().unwrap()));
+            }
+            drop(stream);
             rows.sort_unstable();
             assert_eq!(rows, vec![(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)]);
             reader.commit().await.unwrap();

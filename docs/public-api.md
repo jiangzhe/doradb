@@ -67,8 +67,8 @@ Engine::bootstrap
 - Direct transaction methods are statement boundaries. Each successful method
   merges its effects into the transaction; an ordinary method error rolls back
   that method's effects before returning.
-- `IndexScanMvccStream` holds an exclusive borrow of its transaction until the
-  stream is exhausted, fails, or is dropped.
+- `IndexScanMvccStream` and `TableScanMvccStream` hold an exclusive borrow of
+  their transaction until the stream is exhausted, fails, or is dropped.
 
 DDL, effectful maintenance, session-lock mutation, and a new transaction
 require an idle session. Read-only diagnostics and progress waits use observer
@@ -286,9 +286,9 @@ can await and observe the result.
 Dropping an in-flight direct-operation future after it has checked out the
 transaction transfers the whole transaction to cleanup; the stale transaction
 handle will no longer be reusable. Avoid cancellation by timeout or `select`
-when later reuse of that transaction is required. Dropping an
-`IndexScanMvccStream` merely closes the stream and releases its exclusive
-transaction borrow.
+when later reuse of that transaction is required. Dropping an index or table
+scan stream merely closes the stream and releases its exclusive transaction
+borrow.
 
 ### DML validation
 
@@ -301,9 +301,8 @@ DML validation is enabled by default. Depending on the operation, it checks:
 - in-range, strictly increasing sparse update columns.
 
 Input rejected by these checks returns `OperationError::InvalidDmlInput`
-without poisoning the engine. Callers must always supply valid column numbers;
-full-table scan projections are consumed directly by the row readers rather
-than by the index-read validator.
+without poisoning the engine. Full-table scan projections are validated before
+the stream is constructed.
 
 `Transaction::disable_dml_validation(true)` disables these caller-input checks
 for subsequent direct and streaming operations in that transaction. Use it
@@ -316,30 +315,15 @@ invariants are never disabled.
 ## Reading data
 
 Read sets are projections expressed as zero-based column numbers. Index-read
-projections must be non-empty, in range, and strictly increasing. Full-table
-scan projections must contain valid column numbers. Returned `Vec<Val>` values
-follow read-set order.
+and full-table scan projections must be non-empty, in range, and strictly
+increasing. Returned `Vec<Val>` values follow read-set order.
 
 ### Full-table scan
 
-`table_scan_mvcc` invokes a synchronous callback for each visible projection.
-Return `true` to continue or `false` to stop successfully.
-
-```rust,ignore
-let mut rows = Vec::new();
-trx.table_scan_mvcc(table_id, &[0, 1], |vals| {
-    rows.push(vals);
-    true
-})
-.await?;
-```
-
-The callback cannot be async. Effects outside Doradb performed by a callback
-are not reversible if later application code rolls back the transaction.
-
-Use `table_scan_mvcc_stream` for incremental full-table consumption with a
-programmable filter. The callback receives a snapshot-visible `LazyRow`, so it
-can inspect a column omitted from the output projection:
+`table_scan_mvcc_stream` is the full-table MVCC scan API. It supports
+incremental consumption and a programmable filter. The callback receives a
+snapshot-visible `LazyRow`, so it can inspect a column omitted from the output
+projection:
 
 ```rust,ignore
 let mut stream = trx
@@ -361,16 +345,21 @@ drop(stream);
 `Include` materializes the supplied read set and returns at most one row from
 the current `next` call. `Skip` continues internally without materializing the
 projection. `Stop` excludes the current row and closes the stream successfully.
-Exhaustion, `Stop`, callback or storage error, early drop, and constructor
-cancellation all release the stream's operation checkout. After a terminal
-result, later `next` calls return `Ok(None)` without invoking the callback.
+Exhaustion, `Stop`, callback or storage error, and early drop release the
+stream's operation checkout. Cancelling a pending stream constructor also
+returns its checkout and leaves the transaction reusable; transaction claims
+already accepted during admission remain until commit or rollback. After a
+terminal result, later `next` calls return `Ok(None)` without invoking the
+callback.
 
 The stream exclusively borrows its transaction until it is dropped. The
 callback is synchronous and cannot retain the lazy row or a value borrowed from
-it. For a hot row, callback code runs while that row's read guard is held; keep
-the callback finite and do not wait for external work that may require a
-conflicting write. No hot row-page or row guard remains held while the caller
-consumes a returned projection.
+it. Row-level access ends before `next` returns, but the stream retains one
+shared guard for its current hot page across included projections. Ordinary
+row updates use compatible shared page access. An operation requiring that
+page latch exclusively, such as eviction or physical deallocation, may wait
+until the stream advances or closes. A caller paused mid-page must not wait for
+external work that requires the same page's exclusive latch.
 
 ### Unique lookup
 
@@ -717,11 +706,11 @@ Most application-facing types are re-exported from the crate root:
 
 | Area | Primary types |
 | --- | --- |
-| Lifecycle | `Engine`, `Session`, `Transaction`, `IndexScanMvccStream` |
+| Lifecycle | `Engine`, `Session`, `Transaction`, `IndexScanMvccStream`, `TableScanMvccStream` |
 | Configuration | `EngineConfig`, `TrxSysConfig`, `MandatoryRuntimeConfig`, `FileSystemConfig`, `EvictableBufferPoolConfig`, `LogSync`, `DEFAULT_COW_FILE_MAX_SIZE` |
 | Schema | `TableSpec`, `ColumnSpec`, `ColumnAttributes`, `IndexSpec`, `IndexKey`, `IndexOrder`, `IndexAttributes`, `IndexNo` |
 | Values | `Val`, `ValKind`, `ValType`, `MemVar` |
-| Reads | `SelectKey`, `SelectMvcc`, `ScanMvcc`, `LazyRow` |
+| Reads | `SelectKey`, `SelectMvcc`, `ScanMvcc`, `LazyRow`, `ScanRowDecision` |
 | Writes | `UpdateCol`, `UpdateMvcc`, `UpsertMvcc`, `DeleteMvcc`, `RowMutation`, `TableMutationOutcome` |
 | Locks | `TableLockMode` |
 | Maintenance | `FreezeOutcome`, `FrozenPageBatchInfo`, `CheckpointOutcome`, `CheckpointDelayReason`, `CheckpointCancelReason`, `CatalogCheckpointOutcome`, `RedoTruncationOutcome`, `RedoTruncationBlockerInfo`, `CatalogRedoMaintenanceOutcome`, `MemIndexCleanupOutcome`, `MemIndexCleanupStats`, `MemIndexCleanupDelay`, `SecondaryMemIndexCleanupIndexStats` |

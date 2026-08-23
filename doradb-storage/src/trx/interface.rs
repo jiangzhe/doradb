@@ -20,21 +20,6 @@ impl Transaction {
         self.exec(async |_| Ok(())).await
     }
 
-    /// Scans visible rows in a user table and invokes `row_action` for each projection.
-    #[inline]
-    pub async fn table_scan_mvcc<F>(
-        &mut self,
-        table_id: TableID,
-        read_set: &[usize],
-        row_action: F,
-    ) -> Result<()>
-    where
-        F: FnMut(Vec<Val>) -> bool,
-    {
-        self.exec(async move |stmt| stmt.table_scan_mvcc(table_id, read_set, row_action).await)
-            .await
-    }
-
     /// Looks up one visible row by a unique secondary-index key.
     #[inline]
     pub async fn table_lookup_unique_mvcc(
@@ -239,7 +224,7 @@ impl Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::OperationError;
+    use crate::error::{ErrorKind, OperationError};
     use crate::lock::{LockMode, LockResource};
     use crate::row::ops::SelectMvcc;
     use crate::table::tests::{create_table2_for_test, lightweight_test_engine};
@@ -383,6 +368,38 @@ mod tests {
             assert_eq!(stream.next().await.unwrap(), Some(row(1, "one")));
             assert_eq!(stream.next().await.unwrap(), None);
             drop(stream);
+            trx.noop().await.unwrap();
+            trx.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_table_scan_mvcc_stream_missing_table_preserves_typed_context() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "table_stream_missing_context").await;
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let table_id = TableID::new(91_225);
+
+            let err = match trx
+                .table_scan_mvcc_stream(table_id, &[0], |_| Ok(ScanRowDecision::Include))
+                .await
+            {
+                Ok(_) => panic!("missing table must fail stream construction"),
+                Err(err) => err,
+            };
+            assert_eq!(err.kind(), ErrorKind::Operation);
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::TableNotFound)
+            );
+            let rendered = format!("{err:?}");
+            assert_eq!(
+                rendered.matches("operation=table_scan_mvcc_stream").count(),
+                1
+            );
+            assert_eq!(rendered.matches(&format!("table_id={table_id}")).count(), 1);
             trx.noop().await.unwrap();
             trx.rollback().await.unwrap();
         });

@@ -6,7 +6,7 @@ Design and implement a shared current-state hot row scan path for secondary-inde
 
 ## Reference
 
-Discovered while reviewing full table scan MVCC task docs/tasks/000156-full-table-scan-mvcc.md. CREATE INDEX currently uses a renamed hot-only mem_scan_uncommitted helper after building cold DiskTree rows, while recovery rebuilds hot secondary MemIndex state from recovered row-page IDs.
+Discovered while reviewing full table scan MVCC task docs/tasks/000156-full-table-scan-mvcc.md. CREATE INDEX currently uses the explicit-boundary hot-only `mem_scan_uncommitted_from` path after building cold DiskTree rows, while recovery rebuilds hot secondary MemIndex state from recovered row-page IDs.
 
 ## Deferred From (Optional)
 
@@ -15,7 +15,7 @@ docs/tasks/000156-full-table-scan-mvcc.md
 ## Deferral Context (Optional)
 
 - Defer Reason: Task 000156 is scoped to foreground full-table MVCC scan correctness and the user-table mem_scan_uncommitted rename. Unifying index-build and recovery scan architecture affects recovery, CREATE INDEX, batching, duplicate handling, and performance validation, so it is intentionally deferred.
-- Findings: CREATE INDEX should remain a current-state DDL builder: it builds cold DiskTree rows from a captured active root and uses hot-only row-store scanning while DDL locks and the table metadata-change lease exclude DML and checkpoint root movement. Recovery also rebuilds only hot secondary MemIndex state because checkpointed cold DiskTree roots are already loaded from table files. The current recovery path uses row-page IDs collected during redo replay rather than a shared hot row scan, which is acceptable for this task but worth revisiting for consistency and future parallelism.
+- Findings: CREATE INDEX should remain a current-state DDL builder: it builds cold DiskTree rows from a captured active root and uses `mem_scan_uncommitted_from` with that root's explicit pivot while DDL locks and the table metadata-change lease exclude DML and checkpoint root movement. Recovery also rebuilds only hot secondary MemIndex state because checkpointed cold DiskTree roots are already loaded from table files. The current recovery path uses row-page IDs collected during redo replay rather than a shared hot row scan, which is acceptable for this task but worth revisiting for consistency and future parallelism.
 - Direction Hint: Prefer a current-state hot-row abstraction, not table_scan_mvcc. Keep cold DiskTree scanning/building separate from hot MemIndex population unless a broader index-build framework is designed. Consider collecting page work from the current mem-table pivot and processing pages in bounded batches or parallel workers, with deterministic unique duplicate reporting and safe recovery row-page refresh sequencing.
 
 ## Scope Hint

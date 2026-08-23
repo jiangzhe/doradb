@@ -4817,7 +4817,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mem_scan_uncommitted() {
+    fn test_mem_scan_uncommitted_from_current_pivot() {
         smol::block_on(async {
             const SIZE: i32 = 10000;
 
@@ -4838,17 +4838,22 @@ mod tests {
             }
             {
                 let mut res_len = 0usize;
-                let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
-                table_for_internal_assertion(&engine, table_id)
+                let table = table_for_internal_assertion(&engine, table_id);
+                let layout = table.layout_snapshot();
+                let pivot_row_id = table.file().active_root_unchecked().pivot_row_id;
+                table
                     .accessor_with_layout(&layout)
-                    .mem_scan_uncommitted(&session.pool_guards(), |_metadata, _row| {
-                        res_len += 1;
-                        true
-                    })
+                    .mem_scan_uncommitted_from(
+                        &session.pool_guards(),
+                        pivot_row_id,
+                        |_metadata, _row| {
+                            res_len += 1;
+                            true
+                        },
+                    )
                     .await
                     .unwrap();
-                println!("res.len()={}", res_len);
-                assert!(res_len == SIZE as usize);
+                assert_eq!(res_len, SIZE as usize);
             }
         });
     }

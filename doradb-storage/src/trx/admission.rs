@@ -266,11 +266,12 @@ mod tests {
     use crate::catalog::{IndexAttributes, IndexKey, IndexSpec};
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
-    use crate::error::{Error, LifecycleError, OperationError};
+    use crate::error::{Error, OperationError, Result};
     use crate::lock::LockOwner;
     use crate::lock::tests::{LockDebugEntryState, debug_snapshot};
-    use crate::session::tests::wait_for_session_idle;
+    use crate::row::ops::ScanRowDecision;
     use crate::table::TableTerminal;
+    use crate::trx::Transaction;
     use crate::value::Val;
     use std::cell::Cell;
     use std::future::{Future, pending};
@@ -333,6 +334,14 @@ mod tests {
         err.report().downcast_ref::<OperationError>().copied()
     }
 
+    async fn touch_table_read(trx: &mut Transaction, table_id: TableID) -> Result<()> {
+        let stream = trx
+            .table_scan_mvcc_stream(table_id, &[0], |_| Ok(ScanRowDecision::Include))
+            .await?;
+        drop(stream);
+        Ok(())
+    }
+
     async fn observe_metadata_x_waiter<F>(
         engine: &Engine,
         resource: LockResource,
@@ -382,7 +391,7 @@ mod tests {
             let trx_owner = LockOwner::transaction(session_id, trx.trx_id());
             let metadata = LockResource::TableMetadata(table_id);
 
-            trx.table_scan_mvcc(table_id, &[0], |_| true).await.unwrap();
+            touch_table_read(&mut trx, table_id).await.unwrap();
 
             {
                 let checkout = trx.checkout().unwrap();
@@ -422,10 +431,7 @@ mod tests {
             let owner = LockOwner::transaction(session_id, trx.trx_id());
 
             let before = session.logical_lock_stats().unwrap();
-            let first = trx
-                .table_scan_mvcc(table_id, &[0], |_| true)
-                .await
-                .unwrap_err();
+            let first = touch_table_read(&mut trx, table_id).await.unwrap_err();
             assert_eq!(operation_error(&first), Some(OperationError::TableNotFound));
             let after_first = session.logical_lock_stats().unwrap();
             assert_eq!(
@@ -445,10 +451,7 @@ mod tests {
             }
             assert!(owner_has_grant(&engine, owner, metadata, LockMode::Shared));
 
-            let retry = trx
-                .table_scan_mvcc(table_id, &[0], |_| true)
-                .await
-                .unwrap_err();
+            let retry = touch_table_read(&mut trx, table_id).await.unwrap_err();
             assert_eq!(operation_error(&retry), Some(OperationError::TableNotFound));
             let after_retry = session.logical_lock_stats().unwrap();
             assert_eq!(
@@ -500,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_first_touch_releases_accepted_claim_through_terminal_cleanup() {
+    fn cancelled_stream_constructor_returns_checkout_and_retains_claim_until_rollback() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("admission_cancel_first_touch").await;
             let table_id = table2(&engine).await;
@@ -509,10 +512,12 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let metadata = LockResource::TableMetadata(table_id);
             pause_after_transaction_metadata_grant();
-            let mut exec = Box::pin(trx.table_scan_mvcc(table_id, &[0], |_| true));
+            let mut constructor = Box::pin(
+                trx.table_scan_mvcc_stream(table_id, &[0], |_| Ok(ScanRowDecision::Include)),
+            );
 
             assert!(matches!(
-                futures::poll!(exec.as_mut()),
+                futures::poll!(constructor.as_mut()),
                 std::task::Poll::Pending
             ));
             let physical = debug_snapshot(engine.inner().core.lock_manager())
@@ -534,14 +539,19 @@ mod tests {
                 "accepted manager state must not expose an exact claim number"
             );
 
-            drop(exec);
+            drop(constructor);
 
-            let err = trx.noop().await.unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<LifecycleError>().copied(),
-                Some(LifecycleError::TransactionDiscarded)
+            trx.noop().await.unwrap();
+            assert!(
+                owner_has_grant(
+                    &engine,
+                    LockOwner::transaction(session_id, trx.trx_id()),
+                    metadata,
+                    LockMode::Shared,
+                ),
+                "constructor cancellation must retain the accepted transaction claim"
             );
-            wait_for_session_idle(&engine.inner().session_registry, session_id).await;
+            trx.rollback().await.unwrap();
             assert_no_table_locks(&engine, table_id);
             engine.shutdown();
         });
@@ -651,10 +661,7 @@ mod tests {
                     .await
                     .unwrap();
 
-                old_trx
-                    .table_scan_mvcc(table_id, &[0], |_| true)
-                    .await
-                    .unwrap();
+                touch_table_read(&mut old_trx, table_id).await.unwrap();
                 let surviving = old_trx
                     .table_lookup_unique_mvcc(table_id, 0, &[Val::from(7i32)], &[0])
                     .await
@@ -751,10 +758,7 @@ mod tests {
             let metadata = LockResource::TableMetadata(table_id);
             let mut bound_session = engine.new_session().unwrap();
             let mut bound_trx = bound_session.begin_trx().unwrap();
-            bound_trx
-                .table_scan_mvcc(table_id, &[0], |_| true)
-                .await
-                .unwrap();
+            touch_table_read(&mut bound_trx, table_id).await.unwrap();
 
             let mut ddl_session = engine.new_session().unwrap();
             let table = engine
@@ -831,10 +835,7 @@ mod tests {
             let bound_session_id = bound_session.id();
             let mut bound_trx = bound_session.begin_trx().unwrap();
             let bound_owner = LockOwner::transaction(bound_session_id, bound_trx.trx_id());
-            bound_trx
-                .table_scan_mvcc(table_id, &[0], |_| true)
-                .await
-                .unwrap();
+            touch_table_read(&mut bound_trx, table_id).await.unwrap();
             let before_current_cts = engine
                 .inner()
                 .core
@@ -914,10 +915,7 @@ mod tests {
             let bound_session_id = bound_session.id();
             let mut bound_trx = bound_session.begin_trx().unwrap();
             let bound_owner = LockOwner::transaction(bound_session_id, bound_trx.trx_id());
-            bound_trx
-                .table_scan_mvcc(table_id, &[0], |_| true)
-                .await
-                .unwrap();
+            touch_table_read(&mut bound_trx, table_id).await.unwrap();
             let before_current_cts = engine
                 .inner()
                 .core
@@ -1099,10 +1097,7 @@ mod tests {
                 Some(ResolvedVisibleTableMetadata::Live(_))
             ));
 
-            let err = old_trx
-                .table_scan_mvcc(table_id, &[0], |_| true)
-                .await
-                .unwrap_err();
+            let err = touch_table_read(&mut old_trx, table_id).await.unwrap_err();
             assert_eq!(operation_error(&err), Some(OperationError::SchemaChanged));
             {
                 let checkout = old_trx.checkout().unwrap();

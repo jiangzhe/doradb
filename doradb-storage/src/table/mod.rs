@@ -1185,7 +1185,9 @@ pub(crate) mod tests {
     use crate::lock::{LockFamily, LockMode, LockOwner, LockResource};
     use crate::quiescent::QuiescentGuard;
     use crate::row::RowPage;
-    use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
+    use crate::row::ops::{
+        DeleteMvcc, ScanRowDecision, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc,
+    };
     use crate::session::{Session, tests::SessionTestExt};
     use crate::table::hot::{
         DeleteInternal, HotRowMutator, InsertRowIntoPage, RowInserter, UpdateRowInplace,
@@ -2644,13 +2646,11 @@ pub(crate) mod tests {
 
     /// Scans table i32s for tests.
     pub(crate) async fn scan_table_i32s(trx: &mut Transaction, table_id: TableID) -> Vec<i32> {
-        let mut rows = Vec::new();
-        trx.table_scan_mvcc(table_id, &[0], |vals| {
-            rows.push(vals[0].as_i32().unwrap());
-            true
-        })
-        .await
-        .unwrap();
+        let rows = scan_table_rows(trx, table_id, &[0]).await;
+        let mut rows = rows
+            .into_iter()
+            .map(|vals| vals[0].as_i32().unwrap())
+            .collect::<Vec<_>>();
         rows.sort_unstable();
         rows
     }
@@ -2660,16 +2660,16 @@ pub(crate) mod tests {
         trx: &mut Transaction,
         table_id: TableID,
     ) -> Vec<(i32, String)> {
-        let mut rows = Vec::new();
-        trx.table_scan_mvcc(table_id, &[0, 1], |vals| {
-            rows.push((
-                vals[0].as_i32().unwrap(),
-                vals[1].as_str().unwrap().to_string(),
-            ));
-            true
-        })
-        .await
-        .unwrap();
+        let rows = scan_table_rows(trx, table_id, &[0, 1]).await;
+        let mut rows = rows
+            .into_iter()
+            .map(|vals| {
+                (
+                    vals[0].as_i32().unwrap(),
+                    vals[1].as_str().unwrap().to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
         rows.sort_unstable();
         rows
     }
@@ -3176,6 +3176,23 @@ pub(crate) mod tests {
             .wait_for_gc_horizon_after(max_delete_cts)
             .await
             .unwrap();
+    }
+
+    async fn scan_table_rows(
+        trx: &mut Transaction,
+        table_id: TableID,
+        read_set: &[usize],
+    ) -> Vec<Vec<Val>> {
+        let mut stream = trx
+            .table_scan_mvcc_stream(table_id, read_set, |_| Ok(ScanRowDecision::Include))
+            .await
+            .unwrap();
+        let mut rows = Vec::new();
+        while let Some(vals) = stream.next().await.unwrap() {
+            rows.push(vals);
+        }
+        drop(stream);
+        rows
     }
 
     fn assert_invalid_dml_input(err: Error) {
