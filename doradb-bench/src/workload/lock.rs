@@ -368,10 +368,10 @@ async fn run_specialized_lifecycle(
             let table_id = stable_table(&spec.table_ids, plan)?;
             let mut trx = session.begin_trx()?;
             let scan_result = async {
-                let stream = trx
+                let mut stream = trx
                     .table_scan_mvcc_stream(table_id, &[0], |_| Ok(ScanRowDecision::Include))
                     .await?;
-                drop(stream);
+                while stream.next().await?.is_some() {}
                 Ok::<(), BenchError>(())
             }
             .await;

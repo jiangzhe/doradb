@@ -2957,11 +2957,13 @@ impl Drop for SessionState {
     #[inline]
     fn drop(&mut self) {
         let table_cache = self.table_cache.get_mut();
-        for (_, entry) in table_cache.drain() {
-            if let (Some(page_id), Some(table)) = (entry.active_insert_page, entry.table.upgrade())
-            {
-                table.mem.cache_insert_page_version(page_id);
-            }
+        for (table_id, entry) in table_cache.drain() {
+            let Some(page_id) = entry.active_insert_page else {
+                continue;
+            };
+            self.core
+                .catalog()
+                .return_session_insert_page(table_id, &entry.table, page_id);
         }
         if let Some(mut authority) = self.lifecycle.get_mut().lock_authority.take() {
             authority.close_session(self.core.lock_manager());

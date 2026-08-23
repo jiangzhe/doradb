@@ -278,6 +278,16 @@ mod tests {
     use std::pin::Pin;
     use tempfile::TempDir;
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct LiveTableObservation {
+        effective_cts: TrxID,
+        history_count: Option<usize>,
+        runtime_identity: *const Table,
+        layout_generation: u64,
+        root_ts: TrxID,
+        terminal: TableTerminal,
+    }
+
     thread_local! {
         static PAUSE_AFTER_TRANSACTION_METADATA_GRANT: Cell<bool> = const { Cell::new(false) };
     }
@@ -332,6 +342,24 @@ mod tests {
 
     fn operation_error(err: &Error) -> Option<OperationError> {
         err.report().downcast_ref::<OperationError>().copied()
+    }
+
+    fn observe_live_table(engine: &Engine, table_id: TableID) -> LiveTableObservation {
+        let catalog = engine.inner().core.catalog();
+        let current = catalog
+            .resolve_user_table_current(table_id)
+            .expect("test table should have current metadata");
+        let table = current
+            .live_table()
+            .expect("test table should have a live runtime");
+        LiveTableObservation {
+            effective_cts: current.effective_cts(),
+            history_count: catalog.user_table_history_version_count(table_id),
+            runtime_identity: Arc::as_ptr(table),
+            layout_generation: table.layout_snapshot().generation(),
+            root_ts: table.file().active_root_unchecked().root_ts,
+            terminal: table.lifecycle.inspect_terminal(),
+        }
     }
 
     async fn touch_table_read(trx: &mut Transaction, table_id: TableID) -> Result<()> {
@@ -905,31 +933,22 @@ mod tests {
             let (_temp_dir, engine) = test_engine("admission_drop_table_waits_for_binding").await;
             let table_id = table2(&engine).await;
             let metadata_resource = LockResource::TableMetadata(table_id);
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table_now(table_id)
-                .unwrap();
+            let table_runtime = {
+                let table = engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .get_table_now(table_id)
+                    .unwrap();
+                Arc::downgrade(&table)
+            };
             let mut bound_session = engine.new_session().unwrap();
             let bound_session_id = bound_session.id();
             let mut bound_trx = bound_session.begin_trx().unwrap();
             let bound_owner = LockOwner::transaction(bound_session_id, bound_trx.trx_id());
             touch_table_read(&mut bound_trx, table_id).await.unwrap();
-            let before_current_cts = engine
-                .inner()
-                .core
-                .catalog()
-                .resolve_user_table_current(table_id)
-                .unwrap()
-                .effective_cts();
-            let before_history_count = engine
-                .inner()
-                .core
-                .catalog()
-                .user_table_history_version_count(table_id);
-            let before_generation = table.layout_snapshot().generation();
-            let before_root_ts = table.file().active_root_unchecked().root_ts;
+            assert_eq!(table_runtime.strong_count(), 2);
+            let before = observe_live_table(&engine, table_id);
 
             let mut ddl_session = engine.new_session().unwrap();
             let mut drop_table = Box::pin(ddl_session.drop_table(table_id));
@@ -940,33 +959,10 @@ mod tests {
                 metadata_resource,
                 LockMode::Shared
             ));
-            let waiting_current = engine
-                .inner()
-                .core
-                .catalog()
-                .resolve_user_table_current(table_id)
-                .unwrap();
-            assert_eq!(waiting_current.effective_cts(), before_current_cts);
-            assert!(
-                waiting_current
-                    .live_table()
-                    .is_some_and(|current| Arc::ptr_eq(current, &table))
-            );
-            assert_eq!(
-                engine
-                    .inner()
-                    .core
-                    .catalog()
-                    .user_table_history_version_count(table_id),
-                before_history_count
-            );
-            assert_eq!(table.layout_snapshot().generation(), before_generation);
-            assert_eq!(table.file().active_root_unchecked().root_ts, before_root_ts);
-            assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Live);
+            assert_eq!(observe_live_table(&engine, table_id), before);
 
-            drop(waiting_current);
-            drop(table);
             bound_trx.rollback().await.unwrap();
+            assert_eq!(table_runtime.strong_count(), 1);
             drop_table.await.unwrap();
             assert!(!matches!(
                 engine
