@@ -1,4 +1,4 @@
 interface:
   display_name: "RFC Create"
   short_description: "Design evidence-gated RFC programs"
-  default_prompt: "Use $rfc-create to research an architectural program, compare no more than four major strategic alternatives, and formalize an approved RFC."
+  default_prompt: "Use $rfc-create to research an architectural program, compare first-principles, long-term-evolution, and original-requirement-fit proposals, and formalize an approved RFC."
