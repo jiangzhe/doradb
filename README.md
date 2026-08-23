@@ -90,19 +90,21 @@ table metadata; the setting applies to subsequent direct and streaming
 operations in that transaction. Call `disable_dml_validation(false)` to enable
 validation again.
 
-Scan rows, read one unique-key row, and scan matching rows through a secondary index.
+Stream rows, read one unique-key row, and scan matching rows through a secondary index.
 
 ```rust
-use doradb_storage::{SelectKey, Val};
+use doradb_storage::{ScanRowDecision, SelectKey, Val};
 
 let mut trx = session.begin_trx()?;
 let mut rows = Vec::new();
 
-trx.table_scan_mvcc(table_id, &[0, 1], |vals| {
-        rows.push(vals);
-        true
-    })
+let mut stream = trx
+    .table_scan_mvcc_stream(table_id, &[0, 1], |_| Ok(ScanRowDecision::Include))
     .await?;
+while let Some(vals) = stream.next().await? {
+    rows.push(vals);
+}
+drop(stream);
 
 let id_key = SelectKey::new(0, vec![Val::from(1i32)]);
 let _row = trx

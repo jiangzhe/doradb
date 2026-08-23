@@ -662,35 +662,6 @@ impl<'stmt> Statement<'stmt> {
         admit_user_table(self.inner, self.attachment, table_id, request, operation).await
     }
 
-    /// Scans the catalog-owned user table's row store by table id.
-    ///
-    /// The table runtime is resolved and strongly pinned only for this statement
-    /// method. The public caller supplies the stable [`TableID`], not a table
-    /// runtime handle.
-    #[inline]
-    pub(super) async fn table_scan_mvcc<F>(
-        mut self,
-        table_id: TableID,
-        read_set: &[usize],
-        row_action: F,
-    ) -> Result<()>
-    where
-        F: FnMut(Vec<Val>) -> bool,
-    {
-        const OPERATION: &str = "table_scan_mvcc";
-        let (table, layout) = self
-            .admit_user_table(table_id, TableAdmissionRequest::TableRead, OPERATION)
-            .await
-            .disclose()?;
-        let rt = self.runtime();
-        table
-            .accessor_with_layout(&layout)
-            .table_scan_mvcc(rt, read_set, row_action)
-            .await
-            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
-            .disclose()
-    }
-
     /// Sequentially mutate callback-selected rows using latest modification reads.
     ///
     /// A cold persisted image is exposed only while it remains the current
@@ -1477,7 +1448,7 @@ pub(crate) mod tests {
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{
-        DiscloseError, DiscloseResultExt, ErrorKind, FatalError, InternalError, LifecycleError,
+        DiscloseError, DiscloseResultExt, FatalError, InternalError, LifecycleError,
         OperationError, ResourceError,
     };
     use crate::id::TrxID;
@@ -2156,31 +2127,6 @@ pub(crate) mod tests {
             );
             trx.rollback().await;
             engine.shutdown();
-        });
-    }
-
-    #[test]
-    fn test_table_scan_mvcc_missing_table_preserves_typed_context() {
-        smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("redo_table_scan_missing_context").await;
-            let mut session = engine.new_session().unwrap();
-            let mut trx = session.begin_trx().unwrap();
-            let table_id = TableID::new(91_225);
-
-            let err = trx
-                .table_scan_mvcc(table_id, &[0], |_| true)
-                .await
-                .unwrap_err();
-
-            assert_eq!(err.kind(), ErrorKind::Operation);
-            assert_eq!(
-                err.report().downcast_ref::<OperationError>().copied(),
-                Some(OperationError::TableNotFound)
-            );
-            let rendered = format!("{err:?}");
-            assert_eq!(rendered.matches("operation=table_scan_mvcc").count(), 1);
-            assert_eq!(rendered.matches(&format!("table_id={table_id}")).count(), 1);
-            trx.rollback().await.unwrap();
         });
     }
 

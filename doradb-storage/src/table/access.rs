@@ -1474,96 +1474,6 @@ impl<'op> UserTableAccessor<'op> {
             })
     }
 
-    async fn scan_cold_lwc_mvcc<F>(
-        &self,
-        guards: &PoolGuards,
-        rt: TrxRuntime<'_>,
-        read_set: &[usize],
-        root_snapshot: &TableRootSnapshot<'_>,
-        row_action: &mut F,
-    ) -> RuntimeResult<bool>
-    where
-        F: FnMut(Vec<Val>) -> bool,
-    {
-        let column_root = root_snapshot.column_block_index_root();
-        let pivot_row_id = root_snapshot.pivot_row_id();
-        if column_root == SUPER_BLOCK_ID || pivot_row_id == RowID::new(0) {
-            return Ok(true);
-        }
-
-        let storage = self.column_storage();
-        let deletion_buffer = self.lwc_deletion_buffer();
-        let column_layout = self.metadata().col.as_ref();
-        let reader_sts = rt.sts();
-        let reader_status = rt.status();
-        let file_kind = storage.file().file_kind();
-        let disk_guard = guards.disk_guard();
-        let column_index = ColumnBlockIndex::new(
-            column_root,
-            pivot_row_id,
-            file_kind,
-            storage.file().sparse_file(),
-            storage.disk_pool(),
-            disk_guard,
-        );
-        for entry in column_index.collect_leaf_entries().await? {
-            let (delete_deltas, row_ids) =
-                column_index.load_delete_deltas_and_row_ids(&entry).await?;
-            let persisted = storage.load_lwc_block(disk_guard, entry.block_id()).await?;
-            let block = persisted.block();
-            validate_cold_scan_entry(file_kind, &entry, block, &row_ids)
-                .change_context(RuntimeError::TableAccess)
-                .attach_with(|| {
-                    format!(
-                        "operation=scan_cold_lwc_mvcc, table_id={}, block_id={}",
-                        self.table_id(),
-                        entry.block_id()
-                    )
-                })?;
-            let durable_deleted = persisted_delete_set_for_scan(file_kind, &entry, delete_deltas)
-                .change_context(RuntimeError::TableAccess)
-                .attach_with(|| {
-                    format!(
-                        "operation=scan_cold_lwc_mvcc, table_id={}, block_id={}",
-                        self.table_id(),
-                        entry.block_id()
-                    )
-                })?;
-            let has_durable_deletes = !durable_deleted.is_empty();
-            for (row_idx, row_id) in row_ids.into_iter().enumerate() {
-                if !cold_row_visible_mvcc(
-                    deletion_buffer,
-                    reader_sts,
-                    reader_status.as_ref(),
-                    row_id,
-                    has_durable_deletes && durable_deleted.contains(&row_id),
-                ) {
-                    continue;
-                }
-                let vals = block
-                    .decode_row_values(column_layout, row_idx, read_set)
-                    .attach_with(|| {
-                        format!(
-                            "file={file_kind}, block=lwc_block, block_id={}",
-                            entry.block_id()
-                        )
-                    })
-                    .change_context(RuntimeError::TableAccess)
-                    .attach_with(|| {
-                        format!(
-                            "operation=scan_cold_lwc_mvcc, table_id={}, block_id={}, row_idx={row_idx}",
-                            self.table_id(),
-                            entry.block_id()
-                        )
-                    })?;
-                if !row_action(vals) {
-                    return Ok(false);
-                }
-            }
-        }
-        Ok(true)
-    }
-
     #[inline]
     async fn read_lwc_index_keys(
         &self,
@@ -3344,35 +3254,19 @@ impl<'op> UserTableAccessor<'op> {
         }
     }
 
-    /// Scans raw latest row versions from in-memory row-store pages only.
+    /// Scans raw latest row versions from an explicit captured hot-row boundary.
     ///
-    /// This helper is for current-state internal users that already account
-    /// for the cold/hot split elsewhere. For example, CREATE INDEX builds the
-    /// cold DiskTree from a captured active root, then uses this helper to
-    /// collect the current hot rows for the new MemIndex while DDL locks and
-    /// the table metadata-change lease prevent DML and checkpoint root
-    /// movement.
+    /// This path is for current-state internal users that already account for
+    /// the cold/hot split elsewhere. CREATE INDEX builds the cold DiskTree from
+    /// a captured active root, then uses this path to collect current hot rows
+    /// for the new MemIndex while DDL locks and the table metadata-change lease
+    /// prevent DML and checkpoint root movement. Its row-page scan remains
+    /// bound to the same pivot as the captured column-block root.
     ///
     /// It includes rows marked deleted and intentionally does not visit
     /// persisted column-store rows. Foreground logical reads must use
-    /// `table_scan_mvcc`, which binds cold and hot phases to one root snapshot.
-    #[cfg(test)]
-    pub(crate) async fn mem_scan_uncommitted<F>(
-        &self,
-        guards: &PoolGuards,
-        row_action: F,
-    ) -> RuntimeResult<()>
-    where
-        F: for<'m, 'p> FnMut(&'m TableColumnLayout, Row<'p>) -> bool,
-    {
-        self.mem_scan_uncommitted_from(guards, self.mem().pivot_row_id(), row_action)
-            .await
-    }
-
-    /// Scans raw latest row versions from an explicit captured hot-row boundary.
-    ///
-    /// CREATE INDEX uses this form so its row-page scan is bound to the same
-    /// pivot as its captured column-block root.
+    /// `table_scan_mvcc_stream`, which binds cold and hot phases to one root
+    /// snapshot.
     pub(crate) async fn mem_scan_uncommitted_from<F>(
         &self,
         guards: &PoolGuards,
@@ -3620,42 +3514,6 @@ impl<'op> UserTableAccessor<'op> {
                 None
             }
         }
-    }
-
-    /// Scan cold and hot table rows visible to the transaction snapshot.
-    pub(crate) async fn table_scan_mvcc<F>(
-        &self,
-        rt: TrxRuntime<'_>,
-        read_set: &[usize],
-        mut row_action: F,
-    ) -> RuntimeResult<()>
-    where
-        F: FnMut(Vec<Val>) -> bool,
-    {
-        let guards = rt.pool_guards();
-        let root_snapshot = self.root_snapshot(rt.ctx());
-        if !self
-            .scan_cold_lwc_mvcc(guards, rt, read_set, &root_snapshot, &mut row_action)
-            .await?
-        {
-            return Ok(());
-        }
-        let metadata = self.metadata();
-        self.mem_scan_from(guards, root_snapshot.pivot_row_id(), |page_guard| {
-            for row_access in page_guard.read_all_rows() {
-                match row_access.read_row_mvcc(rt.ctx(), metadata, read_set, None) {
-                    ReadRow::InvalidIndex => unreachable!(),
-                    ReadRow::NotFound => (),
-                    ReadRow::Ok(vals) => {
-                        if !row_action(vals) {
-                            return false;
-                        }
-                    }
-                }
-            }
-            true
-        })
-        .await
     }
 
     /// Mutate latest rows selected by one secondary-index logical-key range.
@@ -6142,7 +6000,7 @@ mod tests {
     }
 
     #[test]
-    fn test_table_scan_mvcc_preserves_cold_data_integrity_context() {
+    fn test_table_scan_mvcc_stream_preserves_cold_data_integrity_context() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine =
@@ -6174,13 +6032,18 @@ mod tests {
             );
 
             let mut trx = session.begin_trx().unwrap();
-            let err = trx
-                .table_scan_mvcc(table_id, &[0, 1], |_| true)
+            let mut stream = trx
+                .table_scan_mvcc_stream(table_id, &[0, 1], |_| Ok(ScanRowDecision::Include))
                 .await
-                .unwrap_err();
+                .unwrap();
+            let err = stream.next().await.unwrap_err();
+            assert_eq!(stream.next().await.unwrap(), None);
 
             let rendered = format!("{err:?}");
-            assert_eq!(rendered.matches("operation=table_scan_mvcc").count(), 1);
+            assert_eq!(
+                rendered.matches("operation=table_scan_mvcc_stream").count(),
+                1
+            );
             assert_eq!(rendered.matches(&format!("table_id={table_id}")).count(), 1);
             assert_table_data_integrity(
                 err,
@@ -6188,6 +6051,7 @@ mod tests {
                 block_id,
                 DataIntegrityError::ChecksumMismatch,
             );
+            drop(stream);
             trx.rollback().await.unwrap();
         });
     }
@@ -7789,7 +7653,7 @@ mod tests {
     }
 
     #[test]
-    fn test_table_scan_mvcc() {
+    fn test_table_scan_mvcc_stream_visibility() {
         smol::block_on(async {
             const SIZE: i32 = 100;
 
@@ -7813,15 +7677,8 @@ mod tests {
             let mut session2 = engine.new_session().unwrap();
             {
                 let mut trx = session2.begin_trx().unwrap();
-                let mut res_len = 0usize;
-                trx.table_scan_mvcc(table_id, &[0], |_| {
-                    res_len += 1;
-                    true
-                })
-                .await
-                .unwrap();
-                println!("res.len()={}", res_len);
-                assert!(res_len == SIZE as usize);
+                let rows = scan_table_i32s(&mut trx, table_id).await;
+                assert_eq!(rows.len(), SIZE as usize);
                 trx.commit().await.unwrap();
             }
             // insert 100 rows but not commit.
@@ -7837,15 +7694,8 @@ mod tests {
             // we should see only 100 rows
             {
                 let mut trx = session2.begin_trx().unwrap();
-                let mut res_len = 0usize;
-                trx.table_scan_mvcc(table_id, &[0], |_| {
-                    res_len += 1;
-                    true
-                })
-                .await
-                .unwrap();
-                println!("res.len()={}", res_len);
-                assert!(res_len == SIZE as usize);
+                let rows = scan_table_i32s(&mut trx, table_id).await;
+                assert_eq!(rows.len(), SIZE as usize);
                 trx.commit().await.unwrap();
             }
             // commit the pending transaction.
@@ -7853,15 +7703,8 @@ mod tests {
             // now we should see 200 rows.
             {
                 let mut trx = session2.begin_trx().unwrap();
-                let mut res_len = 0usize;
-                trx.table_scan_mvcc(table_id, &[0], |_| {
-                    res_len += 1;
-                    true
-                })
-                .await
-                .unwrap();
-                println!("res.len()={}", res_len);
-                assert!(res_len == (SIZE * 2) as usize);
+                let rows = scan_table_i32s(&mut trx, table_id).await;
+                assert_eq!(rows.len(), (SIZE * 2) as usize);
                 trx.commit().await.unwrap();
             }
         });
@@ -9647,7 +9490,7 @@ mod tests {
     }
 
     #[test]
-    fn test_table_scan_mvcc_stream_releases_hot_guard_between_rows() {
+    fn test_table_scan_mvcc_stream_retains_hot_guard_and_allows_updates() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine =
@@ -9656,6 +9499,17 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut writer_session = engine.new_session().unwrap();
             insert_rows(table_id, &mut writer_session, 0, 2, "old").await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let layout = table.layout_snapshot();
+            let accessor = table.accessor_with_layout(&layout);
+            let scan_guards = writer_session.pool_guards();
+            let (_, pages) = accessor
+                .mem()
+                .snapshot_original_row_pages_from(&scan_guards, accessor.mem().pivot_row_id())
+                .await
+                .unwrap();
+            assert_eq!(pages.len(), 1);
+            let page_id = pages[0].page_id;
 
             let mut reader_session = engine.new_session().unwrap();
             let mut reader = reader_session.begin_trx().unwrap();
@@ -9667,6 +9521,15 @@ mod tests {
                 stream.next().await.unwrap(),
                 Some(vec![Val::from(0i32), Val::from("old")])
             );
+
+            let exclusive_guards = writer_session.pool_guards();
+            let mut exclusive = Box::pin(
+                accessor
+                    .mem()
+                    .must_get_row_page_exclusive(&exclusive_guards, page_id),
+            );
+            assert!(futures::poll!(exclusive.as_mut()).is_pending());
+            drop(exclusive);
 
             expect_update_committed(
                 table_id,
@@ -9683,7 +9546,16 @@ mod tests {
                 stream.next().await.unwrap(),
                 Some(vec![Val::from(1i32), Val::from("old")])
             );
+
+            let exclusive_guards = writer_session.pool_guards();
+            let mut exclusive = Box::pin(
+                accessor
+                    .mem()
+                    .must_get_row_page_exclusive(&exclusive_guards, page_id),
+            );
+            assert!(futures::poll!(exclusive.as_mut()).is_pending());
             assert_eq!(stream.next().await.unwrap(), None);
+            drop(exclusive.await.unwrap());
             drop(stream);
             reader.commit().await.unwrap();
         });
@@ -9792,7 +9664,11 @@ mod tests {
 
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
-            trx.table_scan_mvcc(table_id, &[0], |_| true).await.unwrap();
+            let stream = trx
+                .table_scan_mvcc_stream(table_id, &[0], |_| Ok(ScanRowDecision::Include))
+                .await
+                .unwrap();
+            drop(stream);
             trx.rollback().await.unwrap();
             table.mark_dropped_lifecycle();
         });
@@ -9950,7 +9826,7 @@ mod tests {
     }
 
     #[test]
-    fn test_table_scan_mvcc_early_stop_before_hot_phase() {
+    fn test_table_scan_mvcc_stream_stops_before_hot_phase() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine =
@@ -9963,14 +9839,25 @@ mod tests {
             insert_rows(table_id, &mut session, 100, 2, "hot").await;
 
             let mut trx = session.begin_trx().unwrap();
+            let mut callbacks = 0usize;
+            let mut stream = trx
+                .table_scan_mvcc_stream(table_id, &[0], |_| {
+                    callbacks += 1;
+                    Ok(if callbacks <= 3 {
+                        ScanRowDecision::Include
+                    } else {
+                        ScanRowDecision::Stop
+                    })
+                })
+                .await
+                .unwrap();
             let mut rows = Vec::new();
-            trx.table_scan_mvcc(table_id, &[0], |vals| {
+            while let Some(vals) = stream.next().await.unwrap() {
                 rows.push(vals[0].as_i32().unwrap());
-                rows.len() < 3
-            })
-            .await
-            .unwrap();
+            }
             assert_eq!(rows, vec![0, 1, 2]);
+            drop(stream);
+            assert_eq!(callbacks, 4);
             trx.commit().await.unwrap();
         });
     }

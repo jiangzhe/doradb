@@ -11,7 +11,7 @@ use crate::workload::util::{
 };
 use crate::workload::{RunCancellation, SessionPlan};
 use doradb_storage::id::TableID;
-use doradb_storage::{Engine, Session, TableLockMode};
+use doradb_storage::{Engine, ScanRowDecision, Session, TableLockMode};
 use smol::channel;
 use smol::future::or;
 use std::sync::{Arc, Mutex};
@@ -367,11 +367,17 @@ async fn run_specialized_lifecycle(
         LockTableScenario::FirstTouch => {
             let table_id = stable_table(&spec.table_ids, plan)?;
             let mut trx = session.begin_trx()?;
-            let scan = trx.table_scan_mvcc(table_id, &[0], |_| true).await;
-            if let Err(error) = scan {
-                let primary = BenchError::from(error);
+            let scan_result = async {
+                let mut stream = trx
+                    .table_scan_mvcc_stream(table_id, &[0], |_| Ok(ScanRowDecision::Include))
+                    .await?;
+                while stream.next().await?.is_some() {}
+                Ok::<(), BenchError>(())
+            }
+            .await;
+            if let Err(error) = scan_result {
                 let _ = trx.rollback().await;
-                return Err(primary);
+                return Err(error);
             }
             trx.commit().await?;
         }

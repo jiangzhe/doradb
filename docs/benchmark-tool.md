@@ -205,9 +205,10 @@ All serde-facing counts, ranges, widths, and table counts are positive.
 Sequential lookups wrap over the candidate range. Random lookups use seeded
 selection with replacement. Materialized index scans and streams choose seeded
 half-open bounds; omitted `range` spans the full candidate range and an
-oversized range is rejected. Table scans iterate all visible rows. Read
-batching is per declared session. A statement/stream error rolls back best
-effort and preserves the original error.
+oversized range is rejected. Each `table-scan` operation drains the public
+full-table MVCC stream across all visible rows. Read batching is per declared
+session. A statement/stream error rolls back best effort and preserves the
+original error.
 
 `update-rand` requires a committed primary with a unique or non-unique
 secondary index and is allowed only as the final benchmark phase. `num` is an

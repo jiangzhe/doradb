@@ -18,6 +18,7 @@ pub(crate) use storage::*;
 pub(crate) use table::*;
 
 use crate::DiskPool;
+use crate::buffer::page::VersionedPageID;
 use crate::buffer::{
     BufferPool, EvictableBufferPool, FixedBufferPool, PoolGuard, PoolGuards, PoolRole,
     ReadonlyBufferPool,
@@ -45,8 +46,9 @@ use error_stack::{Report, ResultExt};
 use std::collections::BTreeMap;
 use std::collections::hash_map::Entry;
 use std::ops::Deref;
-use std::sync::Arc;
+use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 /// First table id allocated to user-managed tables.
 pub(crate) const USER_TABLE_ID_START: TableID = TableID::new(0);
@@ -495,6 +497,30 @@ impl Catalog {
     pub(crate) fn current_live_user_table(&self, table_id: TableID) -> Option<Arc<Table>> {
         self.resolve_user_table_current(table_id)
             .and_then(|current| current.live_table().map(Arc::clone))
+    }
+
+    /// Returns a session-owned insert-page token to the exact current runtime.
+    ///
+    /// The catalog entry guard prevents DROP from replacing the live runtime
+    /// while the token is returned. Comparing the cached weak identity with the
+    /// borrowed current runtime avoids a transient strong owner racing dropped
+    /// runtime destruction.
+    #[inline]
+    pub(crate) fn return_session_insert_page(
+        &self,
+        table_id: TableID,
+        expected_table: &Weak<Table>,
+        page_id: VersionedPageID,
+    ) {
+        let Some(entry) = self.user_tables.get(&table_id) else {
+            return;
+        };
+        let Some(table) = entry.value().current_live_table_ref() else {
+            return;
+        };
+        if ptr::eq(expected_table.as_ptr(), table) {
+            table.mem.cache_insert_page_version(page_id);
+        }
     }
 
     /// Pins a user-table runtime for checkpoint-retirement purge.

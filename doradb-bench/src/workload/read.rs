@@ -12,7 +12,7 @@ use crate::workload::util::{
 };
 use crate::workload::{RunCancellation, SessionPlan};
 use doradb_storage::id::TableID;
-use doradb_storage::{Engine, SelectKey, SelectMvcc, Session, Val};
+use doradb_storage::{Engine, ScanRowDecision, SelectKey, SelectMvcc, Session, Val};
 
 /// Sequential lookup session executor.
 #[derive(Clone, Copy)]
@@ -603,23 +603,27 @@ async fn table_scans(
         let mut trx = session.begin_trx()?;
         let mut batch = WorkloadCounters::default();
         for _ in 0..count {
-            let mut rows = 0u64;
-            let scan = trx
-                .table_scan_mvcc(table_id, &[0, 1], |_| {
-                    rows += 1;
-                    true
-                })
-                .await
-                .map(|()| rows);
-            match scan {
+            let scan_result = async {
+                let mut stream = trx
+                    .table_scan_mvcc_stream(table_id, &[0, 1], |_| Ok(ScanRowDecision::Include))
+                    .await?;
+                let mut rows = 0u64;
+                while stream.next().await?.is_some() {
+                    rows = rows
+                        .checked_add(1)
+                        .ok_or_else(|| BenchError::message("table scan row count overflow"))?;
+                }
+                Ok::<u64, BenchError>(rows)
+            }
+            .await;
+            match scan_result {
                 Ok(rows) => {
                     batch.operations = checked(batch.operations, 1, "operations")?;
                     batch.rows_returned = checked(batch.rows_returned, rows, "rows returned")?;
                 }
                 Err(error) => {
-                    let primary = BenchError::from(error);
                     let _ = trx.rollback().await;
-                    return Err(primary);
+                    return Err(error);
                 }
             }
         }
