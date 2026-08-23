@@ -51,36 +51,24 @@ major decision and alternative.
 
 ## Round 1: Proposals
 
-Present goal, scope, direction, current-state analysis, one recommended
-direction, and one to four alternatives. Use these lenses to challenge the
-direction; treat them as analysis lenses, not mandatory proposal slots:
+Present goal, scope, direction, current-state analysis, and at least these
+three explicitly labeled proposals:
 
 - `First-Principles Proposal`
 - `Long-Term Evolution Proposal`
 - `Original-Requirement-Fit Proposal`
 
-Include an alternative only when it is important, large, and materially changes
-the architecture, subsystem boundaries, public contract, data model,
-correctness approach, rollout or phase structure, or long-term direction. Do
-not invent alternatives to reach a minimum count. Exclude small changes, local
-tactics, tuning choices, and implementation details; fold them into the chosen
-direction's design details and tradeoffs instead. Omit any lens that does not
-produce a qualifying alternative. If no important, large alternative qualifies,
-report that the proposal gate is incomplete and request user feedback instead
-of drafting the RFC.
-
-For each presented direction, explain its scope, rationale, tradeoffs,
-drawbacks, and alignment or conflict with the original request. State scope
-expansion explicitly and identify a prerequisite or Phase 0 candidate when
-useful.
+For each proposal, explain its scope, rationale, tradeoffs, drawbacks, and
+alignment or conflict with the original request. State scope expansion
+explicitly and identify a prerequisite or Phase 0 candidate when useful.
 
 Recommend the best overall direction for correctness and project evolution.
 Do not default to the original request or use effort tiers as substitutes for
 materially different strategies. Explain why the original direction is weaker
 when the recommendation conflicts with it.
 
-Use the proposal lenses only during proposal rounds. Record the chosen direction
-in `Decision`. Record one to four materially relevant, large rejected
+Use the three required proposals only during proposal rounds. Record the chosen
+direction in `Decision`. Record one to four materially relevant, large rejected
 alternatives in `Alternatives Considered`, and omit minor variants.
 
 Ask for user feedback. Round 1 is incomplete without explicit input.

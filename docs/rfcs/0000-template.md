@@ -48,6 +48,13 @@ For each major decision point, include at least one input reference token (`[D#]
 
 ## Alternatives Considered
 
+Retain no more than four rejected alternatives, and only when they are
+important, large, and materially change the architecture, subsystem boundaries,
+public contract, data model, correctness approach, rollout or phase structure,
+or long-term direction. Include the rejection rationale. Do not copy every
+proposal from the design rounds or elevate small changes, local tactics, tuning
+choices, or implementation details into alternatives.
+
 ### Alternative A: Name
 
 - Summary: ...
