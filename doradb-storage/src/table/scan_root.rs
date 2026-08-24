@@ -40,7 +40,7 @@ impl OwnedTableScanRoot {
             reason = "Phase 2 will capture owned roots during snapshot preparation"
         )
     )]
-    pub(crate) fn from_active_root(root: &ActiveRoot) -> Self {
+    pub(super) fn from_active_root(root: &ActiveRoot) -> Self {
         Self {
             root_ts: root.root_ts,
             effective_ts: root.effective_ts(),
@@ -63,6 +63,18 @@ pub(crate) struct CheckedOutTableScanRoot<'checkout> {
 }
 
 impl CheckedOutTableScanRoot<'_> {
+    /// Borrow one stored root through the checkout that pins its owner.
+    #[inline]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "shared snapshots remain crate-private until Phase 4"
+        )
+    )]
+    pub(crate) fn new(root: &OwnedTableScanRoot) -> CheckedOutTableScanRoot<'_> {
+        CheckedOutTableScanRoot { root }
+    }
     /// Returns the durable timestamp carried by the captured root.
     #[inline]
     #[cfg_attr(

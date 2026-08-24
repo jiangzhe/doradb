@@ -19,7 +19,7 @@ mod admission;
 pub(crate) mod group;
 mod interface;
 pub(crate) mod purge;
-mod readonly;
+mod read_snapshot;
 pub(crate) mod retention;
 pub(crate) mod row;
 pub(crate) mod stmt;
@@ -29,7 +29,16 @@ mod sys_trx;
 pub(crate) mod undo;
 pub(crate) mod ver_map;
 
-pub(crate) use readonly::PrivateSnapshot;
+#[expect(
+    unused_imports,
+    reason = "Phase 3 will consume the crate-private shared snapshot facades"
+)]
+pub(crate) use read_snapshot::{
+    ActiveSnapshotRegistration, CheckedOutSnapshotTable, FrozenReadSnapshotCore, PrivateSnapshot,
+    ReadSnapshot, ReadSnapshotBuildCore, ReadSnapshotBuilder, ReadSnapshotCheckout,
+    ReadSnapshotDrainReason, ReadSnapshotEntry, ReadSnapshotLockOwner, ReadSnapshotPhase,
+    ReadSnapshotReadyPayload, ReadSnapshotTerminalClaim,
+};
 pub(crate) use retention::{
     prepare_catalog_redo_maintenance_operation, prepare_redo_truncation_operation,
 };
@@ -76,7 +85,9 @@ use std::ptr::addr_eq;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-pub(crate) use admission::TableAdmissionRequest;
+pub(crate) use admission::{
+    ResolvedTableReadBinding, TableAdmissionRequest, resolve_table_read_binding,
+};
 use stmt::{PrivateStmtState, Statement, StmtState};
 pub use stream_stmt::{IndexScanMvccStream, TableScanMvccStream};
 /// Minimum snapshot timestamp assigned by the transaction system.
@@ -1174,6 +1185,8 @@ pub(crate) enum SessionOperationKind {
     Maintenance,
     /// Explicit session-lock mutation.
     SessionExplicitLock,
+    /// Shared ownerless read snapshot.
+    ReadSnapshot,
 }
 
 impl SessionOperationKind {
@@ -1185,6 +1198,7 @@ impl SessionOperationKind {
             Self::Ddl => "ddl",
             Self::Maintenance => "maintenance",
             Self::SessionExplicitLock => "session_explicit_lock",
+            Self::ReadSnapshot => "read_snapshot",
         }
     }
 }
@@ -1308,8 +1322,12 @@ impl SessionOperationEntry {
     #[inline]
     pub(crate) fn new(key: SessionOperationKey, kind: SessionOperationKind) -> Arc<Self> {
         assert!(
-            kind != SessionOperationKind::PublicTransaction,
-            "public transaction entry requires an installed transaction payload: key={key}"
+            !matches!(
+                kind,
+                SessionOperationKind::PublicTransaction | SessionOperationKind::ReadSnapshot
+            ),
+            "typed operation requires its matching entry payload: key={key}, kind={}",
+            kind.label()
         );
         Arc::new(Self {
             key,
@@ -1474,7 +1492,8 @@ impl SessionOperationEntry {
             SessionOperationKind::PublicTransaction
             | SessionOperationKind::Ddl
             | SessionOperationKind::Maintenance
-            | SessionOperationKind::SessionExplicitLock => {
+            | SessionOperationKind::SessionExplicitLock
+            | SessionOperationKind::ReadSnapshot => {
                 return Err(session_operation_entry_state_err(
                     self.key, self.kind, &inner,
                 ));
@@ -1528,7 +1547,8 @@ impl SessionOperationEntry {
             SessionOperationKind::PublicTransaction
             | SessionOperationKind::Ddl
             | SessionOperationKind::Maintenance
-            | SessionOperationKind::SessionExplicitLock => {
+            | SessionOperationKind::SessionExplicitLock
+            | SessionOperationKind::ReadSnapshot => {
                 return Err(session_operation_entry_state_err(
                     self.key, self.kind, &inner,
                 ));
@@ -1582,7 +1602,8 @@ impl SessionOperationEntry {
             SessionOperationKind::PublicTransaction
             | SessionOperationKind::Ddl
             | SessionOperationKind::Maintenance
-            | SessionOperationKind::SessionExplicitLock => {
+            | SessionOperationKind::SessionExplicitLock
+            | SessionOperationKind::ReadSnapshot => {
                 return Err(session_operation_entry_state_err(
                     self.key, self.kind, &inner,
                 ));
@@ -1618,7 +1639,9 @@ impl SessionOperationEntry {
                         | SessionOperationState::Mandatory(Some(InternalTrxState::Running))
                 )
             }
-            SessionOperationKind::Maintenance | SessionOperationKind::SessionExplicitLock => false,
+            SessionOperationKind::Maintenance
+            | SessionOperationKind::SessionExplicitLock
+            | SessionOperationKind::ReadSnapshot => false,
         };
         assert!(
             running && inner.trx_inner.is_none(),
@@ -1641,7 +1664,9 @@ impl SessionOperationEntry {
                     SessionOperationState::Voluntary(Some(InternalTrxState::CleanupReady))
                 }
                 SessionOperationKind::Ddl => SessionOperationState::CleanupReady,
-                SessionOperationKind::Maintenance | SessionOperationKind::SessionExplicitLock => {
+                SessionOperationKind::Maintenance
+                | SessionOperationKind::SessionExplicitLock
+                | SessionOperationKind::ReadSnapshot => {
                     panic!(
                         "non-transaction operation cannot return a transaction core: key={}, kind={}",
                         self.key,
@@ -1670,7 +1695,9 @@ impl SessionOperationEntry {
                         inner.state.label()
                     ),
                 },
-                SessionOperationKind::Maintenance | SessionOperationKind::SessionExplicitLock => {
+                SessionOperationKind::Maintenance
+                | SessionOperationKind::SessionExplicitLock
+                | SessionOperationKind::ReadSnapshot => {
                     panic!(
                         "non-transaction operation cannot return a transaction core: key={}, kind={}",
                         self.key,
@@ -1766,7 +1793,8 @@ impl SessionOperationEntry {
                 SessionOperationKind::PublicTransaction
                 | SessionOperationKind::Ddl
                 | SessionOperationKind::Maintenance
-                | SessionOperationKind::SessionExplicitLock,
+                | SessionOperationKind::SessionExplicitLock
+                | SessionOperationKind::ReadSnapshot,
                 SessionOperationState::Voluntary(_)
                 | SessionOperationState::CleanupReady
                 | SessionOperationState::Completing
@@ -1882,7 +1910,9 @@ impl SessionOperationEntry {
                 true
             }
             SessionOperationKind::Ddl => inner.state == SessionOperationState::Completing,
-            SessionOperationKind::Maintenance | SessionOperationKind::SessionExplicitLock => false,
+            SessionOperationKind::Maintenance
+            | SessionOperationKind::SessionExplicitLock
+            | SessionOperationKind::ReadSnapshot => false,
         };
         if inner.trx_id != Some(trx_id) || !completion_owned {
             return None;
@@ -4062,6 +4092,14 @@ pub(crate) mod tests {
                 active_sts.active.len() - active_sts.deleted.len()
             })
             .sum()
+    }
+
+    /// Return whether one exact STS remains registered in the active GC horizon.
+    pub(crate) fn active_sts_contains(trx_sys: &sys::TransactionSystem, sts: TrxID) -> bool {
+        trx_sys.gc_buckets.iter().any(|bucket| {
+            let active_sts = bucket.active_sts_list.lock();
+            active_sts.active.contains(&sts) && !active_sts.deleted.contains(&sts)
+        })
     }
 
     /// Provides test-only access to `transaction_entry`.

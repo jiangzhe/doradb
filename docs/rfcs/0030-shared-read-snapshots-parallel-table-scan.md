@@ -180,7 +180,7 @@ Issue Labels:
   leaf entries, actual persisted row counts, coverage bounds, delete metadata,
   and block identity.
 - [C5] `doradb-storage/src/trx/mod.rs` and
-  `doradb-storage/src/trx/readonly.rs` - define transaction-only read identity,
+  `doradb-storage/src/trx/read_snapshot.rs` - define transaction-only read identity,
   `TrxRuntime`, `TrxReadProof`, active STS registration, and the existing
   maintenance-only `PrivateSnapshot` RAII owner.
 - [C6] `doradb-storage/src/trx/admission.rs` - acquires transaction-lifetime
@@ -202,7 +202,7 @@ Issue Labels:
   return, terminal claims, exact-key resolution, and registry-driven
   abandonment and shutdown cleanup that the snapshot lifecycle extends.
 - [C11] `doradb-storage/src/table/mod.rs`,
-  `doradb-storage/src/trx/readonly.rs`, and
+  `doradb-storage/src/trx/read_snapshot.rs`, and
   `doradb-storage/src/table/gc.rs` - define the lifetime-branded
   `TableRootSnapshot<'read>`, active-STS-owning `PrivateSnapshot`, and the
   existing pattern that keeps the private snapshot outside a temporary root
@@ -270,6 +270,17 @@ Issue Labels:
   freeze with deterministic planning, merge execution lifecycle with actual
   row scanning, publish the API only when the scan path is complete, and retain
   performance proof as an independently testable final phase.
+- [U11] Phase-two task-planning correction and approval: keep the consuming
+  one-shot builder because an optimized query-level physical plan can enumerate
+  the complete table set before snapshot preparation; do not add late or
+  dynamic table registration. Split deterministic planning out of the
+  lifecycle-heavy snapshot task into a new Phase 3, move parallel row streams
+  to Phase 4, and move benchmark proof to Phase 5. Phase 2 instead ends in the
+  complete self-tested
+  `begin_read_snapshot -> acquire_tables -> shared checkout -> close`
+  workflow. This phase split supersedes only U10's freeze-plus-planning
+  grouping; its existing-lock-order, real-workflow, complete-public-feature,
+  and independent-performance-proof decisions remain normative.
 
 ### Source Backlogs
 
@@ -825,7 +836,7 @@ per returned row is at most one atomic load and performs no mutex acquisition,
 event registration, registry lookup, or entry locking. A stream already inside
 storage I/O observes failure after that await; an unpolled stream stops only
 when it is next polled or dropped. This RFC does not attempt preemptive I/O
-cancellation. Phase 4 measures the one-partition healthy path with the signal
+cancellation. Phase 5 measures the one-partition healthy path with the signal
 enabled, and any material regression must be corrected by changing check
 placement before the phase is accepted. A later vectorized implementation can
 amortize the same check per batch or physical unit. [C12] [C13] [U8]
@@ -839,14 +850,15 @@ a paused stream rather than wait on conflicting exclusive page work. [D6] [D8]
 
 Normal exhaustion detaches only that stream. Checkout return atomically
 decrements the entry's active count, but a `Ready` snapshot remains open even
-when that count reaches zero because future multi-table planning and repeatable
-opens are still legal. Once explicit close, final-facade close, session cleanup,
-shutdown, or the first stream error has changed the entry to `Draining`, no new
-checkout is admitted. Each existing stream then exhausts normally, observes
-the shared failure, or is dropped; the last active checkout transfers the
-complete snapshot to terminal cleanup. Thus a normal stream does not
-prematurely close siblings, while a failed stream makes all tables under the
-snapshot fail fast. [D6] [D7] [D13] [C1] [C10] [U2] [U5] [U8]
+when that count reaches zero because future planning for any already-acquired
+table and repeatable opens are still legal. Once explicit close, final-facade
+close, session cleanup, shutdown, or the first stream error has changed the
+entry to `Draining`, no new checkout is admitted. Each existing stream then
+exhausts normally, observes the shared failure, or is dropped; the last active
+checkout transfers the complete snapshot to terminal cleanup. Thus a normal
+stream does not prematurely close siblings, while a failed stream makes all
+tables under the snapshot fail fast. [D6] [D7] [D13] [C1] [C10] [U2] [U5]
+[U8]
 
 ### Coverage and ordering contract
 
@@ -921,7 +933,7 @@ BuildingCheckedOut --error-------------------------> Completing
 Ready { active_checkouts } --close/abandon--------> Draining { active_checkouts }
 Ready { active_checkouts } --first stream error----> Draining { active_checkouts }
 Draining { active_checkouts == 0 } ----------------> Completing
-Completing ----------------------------------------> Terminal | FailedRetained
+Completing ----------------------------------------> Terminal
 ```
 
 `BuildingCheckedOut` is exclusive and means the mutable core resides in the
@@ -980,10 +992,9 @@ operation is never mutated. Once the close request is published, cancellation
 of the close future does not reopen the entry or re-admit work. Terminal close
 uses established cleanup authority rather than new healthy foreground
 admission, so it remains usable after poison or shutdown admission closure
-while the registered session still exists. `close` reports lifecycle or cleanup
-failure, not the primary scan result; the originating partition retains its
-original error and peers report the typed abort. [D7] [D8] [D13] [C10] [U5]
-[U8]
+while the registered session still exists. `close` reports lifecycle failure,
+not the primary scan result; the originating partition retains its original
+error and peers report the typed abort. [D7] [D8] [D13] [C10] [U5] [U8]
 
 Every checkout has an explicit return boundary:
 
@@ -1018,10 +1029,12 @@ its borrowed root views and `read_core` pin before decrementing the final active
 count. Family state is mutated only by the exclusive build checkout before
 freeze and by the sole terminal claim after the active checkout count is zero.
 Cleanup holds no registry guard, session lifecycle lock, or entry mutex while
-dropping resource owners or closing logical locks. An unsafe cleanup failure
-publishes `FailedRetained` and preserves the residual owner rather than falsely
-unblocking teardown. [D2] [D5] [D6] [D7] [D13] [D14] [C7] [C10] [C11]
-[U5] [U6]
+dropping resource owners or closing logical locks. Snapshot cleanup is
+infallible: phase, count, identity, and ownership mismatches are internal
+invariants and use release assertions rather than error conversion or engine
+poison. An unexpectedly dropped terminal claim preserves its complete payload
+before surfacing that invariant. [D2] [D5] [D6] [D7] [D13] [D14] [C7] [C10]
+[C11] [U5] [U6]
 
 While the registry entry is ready or has active checkouts, another effectful
 operation on the originating session reports the existing `ReadSnapshot`
@@ -1259,61 +1272,111 @@ not preselect Arrow crate versions or public Arrow schema mapping. [U1] [U3]
   - Phase Status: done
   - Implementation Summary: Introduced transaction-neutral MVCC visibility, scan-only physical runtime, and checkout-bound owned roots; adapted the transaction table stream without changing results or terminal behavior. [Task Resolve Sync: docs/tasks/000281-transaction-neutral-scan-read-view-owned-root-binding.md @ 2026-08-23]
 
-- **Phase 2: Shared snapshot preparation and deterministic planning**
-  - Prerequisites: Phase 1 `MvccReadView`, `MvccVisibility`, private owned and
-    checked-out scan roots, `TableScanRuntime`, shared root view, and worklist
-    capture are available.
-  - Scope: Add the `ReadSnapshot` session-operation kind; builder and snapshot
-    facades; registry-owned build, ready, draining, and terminal states; weak
-    facade liveness; the exclusive build checkout; active STS ownership before
-    root capture; all-or-nothing acquisition of the complete metadata-S set
-    through existing logical-lock rules; table bindings with
-    `OwnedTableRootSnapshot`; the frozen core containing those bindings and the
-    same registration; exact-checkout-borrowed root access;
-    abandonment-aware lock waits; sticky checked-out build abort; atomic
-    `Ready` publication versus abandonment; group-wide close; and terminal
-    cleanup order. On that complete lifecycle, add planning checkout/return,
-    `TableScanOptions`, a weak value-only `TableScanPlan`, cold/hot unit
-    capture, coverage validation, checked weights, deterministic contiguous
-    partitioning, immutable partition metadata, and plan publication ordered
-    against abandonment.
+- **Phase 2: Shared snapshot preparation**
+  - Prerequisites: Phase 1 `MvccReadView`, `MvccVisibility`, private
+    `OwnedTableScanRoot`, `CheckedOutTableScanRoot<'_>`, and the shared
+    scan-root view are available.
+  - Scope: Add the `ReadSnapshot` session-operation kind; typed snapshot entry;
+    builder and snapshot facades; registry-owned building, ready, draining,
+    completing, and terminal states; resource-free shared facade liveness; the
+    exclusive build checkout; active STS ownership before root capture;
+    all-or-nothing acquisition of the complete metadata-S set through existing
+    logical-lock rules; immutable table, layout, visible-metadata, and
+    `OwnedTableScanRoot` bindings; the frozen core containing those bindings
+    and the same STS registration; counted shared checkout and return;
+    exact-checkout-borrowed table/layout/root access; abandonment-aware lock
+    waits; sticky checked-out build abort; atomic `Ready` publication versus
+    abandonment and shutdown; group-wide close; final-facade close; and
+    registry-authoritative terminal cleanup order.
   - Goals: Complete and test the real
-    `begin_read_snapshot -> acquire_tables -> prepare_table_scan -> close`
-    workflow; keep the stable registry entry as the sole durable owner of STS,
-    locks, bindings, roots, and family authority; make every success, error,
-    cancellation, close, abandonment, poison, and shutdown path leak-free;
-    assign each captured physical unit exactly once; preserve local and
-    concatenated physical order; and publish no snapshot or plan after
-    abandonment wins its corresponding linearization.
-  - Non-goals: No page loading, row output, partition `open`, dynamic
-    scheduling, unit splitting, late table acquisition, or exported incomplete
-    scan API.
-  - Phase-local Choices: Require at least one user table; use the operation
-    scope rather than transaction or session-explicit claims; inherit logical
-    lock acquisition rules without defining a snapshot-specific order; make
-    `ReadSnapshot::close` consuming, group-wide, idempotent, and cancellation
-    safe after its close request; use cold row counts and hot reserved spans as
-    weights; return one empty partition for an empty table; reduce requested
-    parallelism when units are fewer than the target; retain repeatable plan
-    descriptors only while the snapshot remains `Ready`; keep the final new
-    API crate-private or unexported until Phase 3 can open real row streams; and
-    add typed lifecycle and planning diagnostics.
+    `begin_read_snapshot -> acquire_tables -> shared checkout -> close`
+    workflow; keep the stable registry entry as the sole checked-in owner of
+    STS, locks, bindings, roots, and family authority; keep builders and
+    snapshots weak; make every success, error, cancellation, close,
+    abandonment, poison, and shutdown path leak-free; and publish no usable
+    snapshot after abandonment or shutdown wins the final build
+    linearization.
+  - Non-goals: No late or dynamic table registration, mutable frozen table set,
+    `TableScanOptions`, worklist capture, scan units, coverage validation,
+    weighting, partitioning, `TableScanPlan`, planning publication, partition
+    `open`, page loading, row output, or exported incomplete scan API.
+  - Phase-local Choices: Require at least one user table and deduplicate the
+    complete caller-supplied set by first occurrence; use the operation scope
+    rather than transaction or session-explicit claims; inherit logical-lock
+    acquisition rules without defining a snapshot-specific order; retain one
+    immutable table set for the snapshot lifetime; keep `Ready` reusable when
+    its shared-checkout count returns to zero; make `ReadSnapshot::close`
+    consuming, group-wide, idempotent, and cancellation safe after its close
+    request; release strong session runtime before close waits; clean
+    checked-in snapshots synchronously during registry inspection while
+    retained build or shared checkouts remain visible blockers; keep the new
+    API crate-private or unexported until Phase 4 opens real row streams; and
+    add typed snapshot-lifecycle, invalid-table-set, and table-not-acquired
+    diagnostics. [U11]
   - Verification: Exercise the complete preparation workflow rather than a
     registry-only harness. Prove STS-before-root capture and
-    roots-before-STS-release ordering; lock-prefix unwind; exact registry
-    ownership and checkout return; build, planning, close, abandonment, and
-    shutdown races; deterministic complete unit coverage; checked weighting;
-    empty and reduced partition counts; value-only plan ownership; and
-    publication rejection after abandonment. No test-only execution shell is
-    added.
+    roots-before-STS-release ordering; lock-prefix unwind and prompt
+    queued/provisional cancellation on snapshot abort; exact registry ownership
+    and shared-checkout return; immutable multi-table binding under one STS;
+    zero-checkout ready reuse; build, close, final-facade, abandonment, poison,
+    session-close, and shutdown races; and terminal root, STS, scope, authority,
+    and session-publication order. Close listeners must retain no hidden strong
+    runtime while awaiting terminal notification. The shared checkout and
+    borrowed table/root view are production prerequisites for Phase 3, not a
+    test-only execution shell.
+  - Task Doc: `docs/tasks/000282-shared-snapshot-preparation.md`
+  - Task Issue: `#1013`
+  - Phase Status: done
+  - Implementation Summary: Implemented registry-owned multi-table snapshot preparation with weak facades, counted checkouts, exact abort/drain cleanup, and session/shutdown integration; deterministic planning remains Phase 3. [Task Resolve Sync: docs/tasks/000282-shared-snapshot-preparation.md @ 2026-08-24]
+
+- **Phase 3: Deterministic table-scan planning**
+  - Prerequisites: Phase 2 provides a complete, self-tested multi-table
+    snapshot preparation workflow, immutable frozen bindings, counted shared
+    checkout, exact checkout-borrowed table/layout/root access, and the common
+    weak facade-liveness group.
+  - Scope: Add `TableScanOptions`; planning checkout and return policy; a weak,
+    cloneable, value-only `TableScanPlan`; projection validation; cold/hot
+    worklist capture through the exact frozen root; ordered `TableScanUnit`
+    construction; monotonic non-overlapping coverage validation; checked
+    weights and prefix arithmetic; deterministic contiguous partitioning;
+    immutable partition metadata; facade-group participation; and final plan
+    publication ordered against close, abandonment, poison, and shutdown.
+  - Goals: Complete and test the real
+    `begin_read_snapshot -> acquire_tables -> prepare_table_scan -> close`
+    workflow; assign each captured physical unit exactly once; preserve local
+    and concatenated physical order; keep plans free of table, layout, root,
+    STS-registration, lock, stable-entry, and strong runtime ownership; allow
+    concurrent and repeated planning only while the snapshot remains `Ready`;
+    and publish no plan after a terminal edge wins its final linearization.
+  - Non-goals: No page or block loading, MVCC row filtering, row output,
+    partition `open`, execution checkout, dynamic scheduling, unit splitting,
+    user cancellation, execution failure propagation, or exported incomplete
+    scan API.
+  - Phase-local Choices: Require a nonempty, in-range, strictly increasing
+    projection; use cold row counts and hot reserved spans as weights; build
+    checked wide prefix sums; keep every physical unit intact; use
+    deterministic contiguous nonempty ranges; return one empty partition for
+    an empty table; reduce requested parallelism when units are fewer than the
+    target; retain repeatable plan descriptors only while the snapshot remains
+    `Ready`; share the snapshot facade-liveness group with plans; keep the API
+    crate-private or unexported until Phase 4 opens real row streams; and add
+    typed planning-input and arithmetic diagnostics. [U11]
+  - Verification: Prove deterministic complete unit coverage, cold-before-hot
+    and partition-index concatenated order, checked weighting, target counts of
+    one/fewer/equal/greater than units, empty input, skew without unit splitting,
+    value-only plan ownership, repeated identical preparation, concurrent and
+    cancelled planners, close/abandonment/poison/shutdown publication rejection,
+    and stale-plan safety after terminal cleanup. No test-only execution shell
+    or partition `open` is added.
   - Task Doc: `docs/tasks/TBD.md`
   - Task Issue: `#0`
   - Phase Status: `pending`
   - Implementation Summary: `pending`
 
-- **Phase 3: Parallel row-oriented table scan**
-  - Prerequisites: Phase 2 provides a complete, self-tested snapshot
-    preparation workflow and immutable partition descriptors.
+- **Phase 4: Parallel row-oriented table scan**
+  - Prerequisites: Phase 3 provides complete, self-tested deterministic
+    planning and immutable partition descriptors on Phase 2's shared snapshot
+    lifecycle.
   - Scope: Add the combined session-open/snapshot-ready `open` acceptance
     linearization against close, failure, abandonment, and shutdown; shared
     execution checkout and return, `TableScanPartitionStream`,
@@ -1363,8 +1426,8 @@ not preselect Arrow crate versions or public Arrow schema mapping. [U1] [U3]
   - Related Backlogs:
     - `docs/backlogs/000150-implement-futures-stream-for-index-and-public-scan-streams.md`
 
-- **Phase 4: Parallel scan benchmark and performance proof**
-  - Prerequisites: Phase 3 exports the complete row-oriented parallel scan and
+- **Phase 5: Parallel scan benchmark and performance proof**
+  - Prerequisites: Phase 4 exports the complete row-oriented parallel scan and
     proves its correctness and lifecycle behavior with real concurrent drains.
   - Scope: Add a dedicated `doradb-bench` `parallel-table-scan` workload with
     configurable target partitions, a one-partition baseline, checked row and
@@ -1608,8 +1671,8 @@ not preselect Arrow crate versions or public Arrow schema mapping. [U1] [U3]
   period after success.
 - A normal active-checkout count of zero does not imply completion. Callers that
   have opened all intended work must poll close to seal the snapshot; otherwise
-  its STS and metadata locks intentionally remain live for later tables or
-  repeatable opens.
+  its STS and metadata locks intentionally remain live for later plans over the
+  already-acquired tables or for repeatable opens.
 - One partition execution error fails the whole multi-table snapshot, so
   otherwise healthy sibling streams return peer-abort errors and partial
   results require caller policy.
@@ -1621,7 +1684,7 @@ not preselect Arrow crate versions or public Arrow schema mapping. [U1] [U3]
 - Callers must spawn workers, retain the originating error among peer-abort
   results, and merge or discard partial results themselves.
 - Cooperative failure detection adds an atomic load to the common `next()`
-  entry path and additional checks around physical-unit I/O; Phase 4 must show
+  entry path and additional checks around physical-unit I/O; Phase 5 must show
   that this produces no material row-scan regression.
 - The `'static` stream boundary forbids borrowing plan, snapshot, or caller
   storage into an opened partition; each stream must own or clone the pins and

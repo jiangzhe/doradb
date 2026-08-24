@@ -6,7 +6,8 @@ use crate::id::BlockID;
 use crate::index::SecondaryDiskTreeRuntime;
 use crate::lwc::PersistedLwcBlock;
 use crate::quiescent::QuiescentGuard;
-use crate::trx::{PrivateSnapshot, TrxReadProof};
+use crate::table::OwnedTableScanRoot;
+use crate::trx::{ActiveSnapshotRegistration, PrivateSnapshot, TrxReadProof};
 use error_stack::Report;
 use std::sync::Arc;
 
@@ -88,6 +89,22 @@ impl ColumnStorage {
     {
         let root = self.file().active_root_unchecked();
         f(root)
+    }
+
+    /// Capture an owned scan root while one active snapshot registration pins history.
+    #[inline]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "shared snapshots remain crate-private until Phase 4"
+        )
+    )]
+    pub(crate) fn capture_owned_scan_root(
+        &self,
+        _registration: &ActiveSnapshotRegistration,
+    ) -> OwnedTableScanRoot {
+        OwnedTableScanRoot::from_active_root(self.file().active_root_unchecked())
     }
 
     /// Returns the read-only buffer pool used for persisted blocks.
