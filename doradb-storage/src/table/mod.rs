@@ -32,10 +32,6 @@ pub(crate) use lifecycle::{TableDropDrain, TableLifecycle};
 pub(crate) use mem_table::{MemTable, NoTrxUpsertChange, RowPageDescriptor};
 pub use persistence::*;
 pub(crate) use rollback::IndexRollback;
-#[expect(
-    unused_imports,
-    reason = "Phase 2 will store and check out the opaque scan-root types"
-)]
 pub(crate) use scan_root::{CheckedOutTableScanRoot, OwnedTableScanRoot, TableScanRootView};
 pub(crate) use storage::ColumnStorage;
 #[cfg(test)]
@@ -59,7 +55,7 @@ use crate::quiescent::QuiescentGuard;
 use crate::row::ops::{RowUpdateInput, RowUpdateView, SelectKey, UpdateCol};
 use crate::row::{RowPage, RowRead, var_len_for_insert};
 use crate::runtime::yield_now;
-use crate::trx::{PrivateSnapshot, TrxReadProof};
+use crate::trx::{ActiveSnapshotRegistration, PrivateSnapshot, TrxReadProof};
 use crate::value::{PAGE_VAR_LEN_INLINE, Val};
 use error_stack::{Report, ResultExt};
 use parking_lot::Mutex;
@@ -328,6 +324,22 @@ impl Table {
         F: for<'root> FnOnce(&'root ActiveRoot) -> R,
     {
         self.storage.with_private_snapshot_root(snapshot, f)
+    }
+
+    /// Capture an owned scan root under an active snapshot registration.
+    #[inline]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "shared snapshots remain crate-private until Phase 4"
+        )
+    )]
+    pub(crate) fn capture_owned_scan_root(
+        &self,
+        registration: &ActiveSnapshotRegistration,
+    ) -> OwnedTableScanRoot {
+        self.storage.capture_owned_scan_root(registration)
     }
 
     /// Capture an owned table-root snapshot for this table.

@@ -406,6 +406,24 @@ entry. Terminal completion returns the family box through the stable entry,
 and the still-active outer operation reclaims that exact allocation before
 acquiring again or closing.
 
+Shared read-snapshot preparation is another typed operation owner, but it has
+no nested transaction scope. Begin takes the session's boxed
+`FamilyLockAuthority` and creates one `LockScopeState` with
+`LockOwner::operation(snapshot_key)`. The consuming builder acquires exactly one
+metadata-S claim for each deduplicated user table and intentionally acquires no
+table-data claim. All accepted claims remain checked in beside the ready
+snapshot until terminal drain; closing the snapshot scope happens only after
+checkout and registry-owned root pins have dropped and the active STS has been
+deregistered.
+
+A blocked snapshot metadata acquisition registers the exact snapshot-entry
+change listener before checking sticky abort, then races the existing
+poison-aware family acquisition with that abort. If close, abandonment, or
+shutdown wins, dropping the acquisition future synchronously invokes the
+existing `PendingClaimGuard` cancellation. Queued, provisional, and partially
+published token state is therefore removed by the lock layer's unchanged
+token-exact protocol before the snapshot closes its accepted prefix.
+
 ### Wait and cancellation behavior
 
 A fresh attempt reserves one move-only `PendingClaimToken` before manager

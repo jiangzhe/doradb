@@ -154,8 +154,9 @@ For the detailed index design, see [`secondary-index.md`](./secondary-index.md).
 - **CTS (Commit Timestamp)**: Acquired at transaction commit.
 
 Mandatory maintenance may register a `PrivateSnapshot` from the same STS
-sequence. It participates in the active GC watermark but is not a transaction
-and receives no transaction id or status.
+sequence. Shared read snapshots register through the same factored
+`ActiveSnapshotRegistration` owner. Both participate in the active GC watermark
+without receiving a transaction id or status.
 
 ### Transaction Lifecycle
 
@@ -217,12 +218,45 @@ containing a ready `Box<TrxInner>`. A public transaction takes that box, and
 successful terminal processing resets and returns it before publishing the
 idle lifecycle state. DDL and maintenance leave the public cache parked while
 their private transaction owns a separately allocated core.
-An active slot owns exactly one `Arc<SessionOperationEntry>`. This is the
-direct generalization of the former transaction entry, not an outer wrapper:
-immutable key and kind fields sit beside one compact mutex containing operation
-state, optional `TrxID`, an optional checked-in `Box<TrxInner>`, cleanup
-intent, and foreground ownership. The entry contains no whole operation future
-and no strong engine reference.
+An active slot owns one typed `ActiveSessionOperation`. Existing transaction,
+DDL, maintenance, and explicit-lock operations retain their established
+`Arc<SessionOperationEntry>` payload and state machine. A shared read snapshot
+instead owns an `Arc<ReadSnapshotEntry>` with its own building, ready, draining,
+completing, and terminal phases. The wrapper delegates stable identity and
+diagnostics without combining the two payload state spaces. Neither entry
+contains a whole operation future or a strong engine reference.
+
+#### Shared read snapshots
+
+`Session::begin_read_snapshot` reserves the session's one active operation,
+takes its boxed family-lock authority, creates an operation metadata scope, and
+registers one active STS before publishing a checked-in build core. The
+single-owner builder is weak and one-shot. Its consuming acquisition deduplicates
+the complete caller-supplied user-table set in first-occurrence order, retains
+metadata-S for every table, binds STS-visible metadata to the compatible current
+`Table` and `TableRuntimeLayout`, and captures an `OwnedTableScanRoot` under the
+same active registration. Any error or cancellation drains the whole accepted
+prefix; only a complete set can become `Ready`.
+
+The ready entry owns an immutable `Arc<FrozenReadSnapshotCore>` plus the lock
+authority and metadata scope. Snapshot facades form one cloneable group
+containing only weak session reachability, the exact operation key, the copied
+STS, and an atomic closed bit. A facade therefore cannot keep tables, roots,
+locks, registration, or engine/session runtime alive. Internal checkout
+increments the entry count under `SessionState.lifecycle -> ReadSnapshotEntry`,
+then clones only the frozen core and a strong operation-local runtime attachment.
+Its table accessor borrows the table, layout, visible metadata, and usable
+`CheckedOutTableScanRoot` from that exact checkout. Returning to zero while
+`Ready` preserves the snapshot for a later checkout.
+
+Explicit close, final facade-group drop, session close or abandonment, and
+engine shutdown seal the exact entry. Checked-out work receives a sticky abort
+or drains normally; no new checkout is admitted. The last accepted checkout
+makes terminal ownership claimable. The sole terminal claim drops checkout-local
+pins first, then registry-owned bindings and roots, then the ownerless read view
+and active-STS registration, closes the snapshot metadata scope, recovers an
+idle family authority, publishes the typed entry terminal, and finally changes
+the session slot to idle or closed. Weak dormant facades never block this drain.
 
 The reusable public transaction core box is allocated eagerly once per
 session. A ready core has zero identity fields, no lock state, empty

@@ -32,7 +32,6 @@ use crate::runtime::thread_pool::{ThreadPool, ThreadPoolWorkers};
 use crate::session::{Session, SessionAdmission, SessionCleanupRequest, SessionRegistry};
 #[cfg(test)]
 use crate::table::tests::MaintenanceTestController;
-use crate::trx::SessionOperationState;
 use crate::trx::sys::{TransactionPurgeWorkers, TransactionRedoWorkers, TransactionSystem};
 use crate::{DiskPool, IndexPool, MemPool, MetaPool};
 use error_stack::{Report, ResultExt};
@@ -364,8 +363,8 @@ impl Engine {
         let session_blocker = blocker.as_ref().map_or("none", |blocker| blocker.label());
         let operation_state = blocker
             .as_ref()
-            .and_then(|blocker| blocker.operation_state())
-            .map_or("none", SessionOperationState::label);
+            .and_then(|blocker| blocker.operation_state_label())
+            .unwrap_or("none");
         let observer_count = blocker
             .as_ref()
             .map_or(0, |blocker| blocker.observer_count());

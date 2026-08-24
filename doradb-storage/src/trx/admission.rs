@@ -2,6 +2,7 @@ use super::TrxInner;
 use crate::catalog::{
     CurrentTableState, ResolvedLiveMetadata, ResolvedVisibleTableMetadata, is_catalog_table,
 };
+use crate::engine::EngineCore;
 use crate::error::{MultiDomainResultExt, OperationError, OperationOrFatalResult, OperationResult};
 use crate::id::{TableID, TrxID};
 use crate::lock::{LockMode, LockResource};
@@ -100,6 +101,82 @@ impl TransactionTableBinding {
     }
 }
 
+/// Snapshot-visible metadata bound to the compatible current table runtime.
+pub(crate) struct ResolvedTableReadBinding {
+    /// Metadata version visible at the reader STS.
+    pub(crate) visible: ResolvedLiveMetadata,
+    /// Effective timestamp of the authoritative current metadata version.
+    pub(crate) current_effective_cts: TrxID,
+    /// Authoritative current table runtime.
+    pub(crate) table: Arc<Table>,
+    /// Layout compatible with the authoritative current metadata.
+    pub(crate) layout: Arc<TableRuntimeLayout>,
+}
+
+/// Resolve one STS-visible user-table definition against current runtime state.
+///
+/// Callers must already retain metadata-S for `table_id` so the visible/current
+/// compatibility check and returned owners remain stable.
+#[inline]
+pub(crate) fn resolve_table_read_binding(
+    engine: &EngineCore,
+    sts: TrxID,
+    table_id: TableID,
+    operation: &'static str,
+) -> OperationResult<ResolvedTableReadBinding> {
+    let visible = engine
+        .catalog()
+        .resolve_user_table_visible(table_id, sts)
+        .ok_or_else(|| {
+            Report::new(OperationError::TableNotFound)
+                .attach(format!("operation={operation}, table_id={table_id}"))
+        })?;
+    let visible = match visible {
+        ResolvedVisibleTableMetadata::Live(visible) => visible,
+        ResolvedVisibleTableMetadata::Tombstone { effective_cts } => {
+            return Err(Report::new(OperationError::TableNotFound)
+                .attach(format!(
+                    "operation={operation}, table_id={table_id}, tombstone_effective_cts={effective_cts}"
+                )));
+        }
+    };
+    let current = engine
+        .catalog()
+        .resolve_user_table_current(table_id)
+        .ok_or_else(|| {
+            Report::new(OperationError::SchemaChanged)
+                .attach(format!("operation={operation}, table_id={table_id}"))
+        })?;
+    let (bound_current_effective_cts, current_metadata, table) = match current {
+        CurrentTableState::Live {
+            effective_cts,
+            metadata,
+            table,
+        } => (effective_cts, metadata, table),
+        CurrentTableState::Dropped { .. } => {
+            return Err(Report::new(OperationError::SchemaChanged)
+                .attach(format!("operation={operation}, table_id={table_id}")));
+        }
+    };
+    assert_eq!(
+        table.table_id(),
+        table_id,
+        "current catalog runtime has mismatched table id: requested={table_id}, actual={}",
+        table.table_id()
+    );
+    let layout = table.layout_snapshot();
+    assert!(
+        Arc::ptr_eq(layout.metadata_arc(), &current_metadata),
+        "current catalog metadata and runtime layout diverged: table_id={table_id}"
+    );
+    Ok(ResolvedTableReadBinding {
+        visible,
+        current_effective_cts: bound_current_effective_cts,
+        table,
+        layout,
+    })
+}
+
 #[inline]
 fn admit_cached_binding(
     inner: &TrxInner,
@@ -129,58 +206,12 @@ fn resolve_table_binding(
     request: TableAdmissionRequest,
     operation: &'static str,
 ) -> OperationResult<TransactionTableBinding> {
-    let visible = attachment
-        .engine()
-        .catalog()
-        .resolve_user_table_visible(table_id, sts)
-        .ok_or_else(|| {
-            Report::new(OperationError::TableNotFound)
-                .attach(format!("operation={operation}, table_id={table_id}"))
-        })?;
-    let visible = match visible {
-        ResolvedVisibleTableMetadata::Live(visible) => visible,
-        ResolvedVisibleTableMetadata::Tombstone { effective_cts } => {
-            return Err(Report::new(OperationError::TableNotFound)
-                .attach(format!(
-                    "operation={operation}, table_id={table_id}, tombstone_effective_cts={effective_cts}"
-                )));
-        }
-    };
-    let current = attachment
-        .engine()
-        .catalog()
-        .resolve_user_table_current(table_id)
-        .ok_or_else(|| {
-            Report::new(OperationError::SchemaChanged)
-                .attach(format!("operation={operation}, table_id={table_id}"))
-        })?;
-    let (bound_current_effective_cts, current_metadata, table) = match current {
-        CurrentTableState::Live {
-            effective_cts,
-            metadata,
-            table,
-        } => (effective_cts, metadata, table),
-        CurrentTableState::Dropped { .. } => {
-            return Err(Report::new(OperationError::SchemaChanged)
-                .attach(format!("operation={operation}, table_id={table_id}")));
-        }
-    };
-    assert_eq!(
-        table.table_id(),
-        table_id,
-        "current catalog runtime has mismatched table id: requested={table_id}, actual={}",
-        table.table_id()
-    );
-    let layout = table.layout_snapshot();
-    assert!(
-        Arc::ptr_eq(layout.metadata_arc(), &current_metadata),
-        "current catalog metadata and runtime layout diverged: table_id={table_id}"
-    );
+    let binding = resolve_table_read_binding(attachment.engine(), sts, table_id, operation)?;
     let binding = TransactionTableBinding {
-        visible,
-        bound_current_effective_cts,
-        table,
-        layout,
+        visible: binding.visible,
+        bound_current_effective_cts: binding.current_effective_cts,
+        table: binding.table,
+        layout: binding.layout,
     };
     binding.validate(table_id, request, operation)?;
     Ok(binding)

@@ -466,6 +466,7 @@ one row or add a new documented category.
 | Wait family | Progress producer and primary wake | Poison behavior | Shutdown behavior | Cancellation or cleanup owner |
 | --- | --- | --- | --- | --- |
 | Queued logical-lock acquisition | blocker release promotes FIFO prefix and completes success-only waiter | race poison only after entering `Waiting`; return first Fatal and cancel exact pending state | no direct cancellation; graceful session drain waits | `PendingClaimGuard`, then `FreshClaimsGuard` for an acquired prefix |
+| Read-snapshot metadata acquisition | blocker release grants metadata-S, or the exact snapshot entry publishes sticky abort and wakes its listener | the underlying logical-lock wait retains its poison-aware Fatal behavior and cancels exact pending state | close, abandonment, or shutdown requests snapshot abort; a retained checked-out build remains a visible blocker until polled or dropped | pending acquisition guard first, then build checkout and snapshot terminal claim close the accepted prefix |
 | Hot/cold foreign prepare | owner commit or rollback drops the injected prepare notifier | registered and completion-race paths check poison before retry | no direct cancellation; active owner drains | row access/CDB guards plus statement/transaction owner |
 | Row-page transition route | checkpoint publishes a newer route epoch; pivot is authoritative | route-or-poison race; fatal checkpoint guard supplies poison | no direct cancellation; active or mandatory owner drains | foreground row attempt, or vector-owned row undo plus statement/terminal/precommit owner |
 | GC/purge progress and checkpoint retry | monotonic progress, transaction terminal state, or table lifecycle change | poison terminates observation as Fatal | shutdown listener terminates observation | detached listeners and `SessionObserverPin` |
@@ -537,24 +538,27 @@ Blocking shutdown performs these steps:
 5. scan the session registry for the first current blocker, preferring an
    active operation over standalone observers in the same session;
 6. for blocking shutdown, arm that exact session's lifecycle event under its
-   mutex, recheck the blocker, release all registry/state guards, queue at most
-   its exact claimable cleanup hint, wait, and rescan;
+   mutex, recheck the blocker, request abort/drain for an exact read snapshot,
+   release all registry/state guards, perform synchronous checked-in snapshot
+   cleanup or queue at most one transaction cleanup hint, wait, and rescan;
 7. remove idle registry-owned sessions;
 8. shut down registered components in reverse dependency order; and
 9. publish `Shutdown`, release the owner shutdown mutex, and apply the
    aggregate panic policy.
 
 `try_shutdown()` uses the same first-blocker classification but installs no
-listener. It may queue one exact cleanup hint and reports Busy if it finds a
-session blocker, mandatory caller permit, or mandatory internal permit. Its
+listener. It may synchronously clean one checked-in snapshot or queue one exact
+transaction cleanup hint and still reports Busy for the blocker sampled by that
+call. A later call observes the resulting terminal edge. Its
 diagnostic attachment includes `session_blocker`, `operation_state`,
 `observer_count`, `cleanup_queued`, `mandatory_callers`, and
 `mandatory_internal`.
 
 The listener-before-recheck protocol prevents a session transition from being
-lost between inspection and sleep. Cleanup messages carry the exact
-`(SessionOperationKey, TrxID)`, so stale or duplicate work cannot claim a
-replacement operation.
+lost between inspection and sleep. Transaction cleanup messages carry the exact
+`(SessionOperationKey, TrxID)`, while synchronous snapshot cleanup validates the
+exact typed entry and operation key; stale work cannot claim a replacement
+operation.
 
 ### What blocks shutdown
 

@@ -216,6 +216,15 @@ pub(crate) enum LifecycleError {
     ExistingOperation,
     #[error("transaction is discarded")]
     TransactionDiscarded,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "shared snapshots remain crate-private until Phase 4"
+        )
+    )]
+    #[error("read snapshot is unavailable")]
+    ReadSnapshotUnavailable,
 }
 
 /// Recoverable failures of engine-owned internal operations and runtime infrastructure.
@@ -313,6 +322,12 @@ pub enum OperationError {
     /// The requested lock conflicts with another lock family.
     #[error("lock family conflict")]
     LockFamilyConflict,
+    /// The read-snapshot table set is empty.
+    #[error("invalid read snapshot input")]
+    InvalidReadSnapshotInput,
+    /// The requested table was not included in the read snapshot.
+    #[error("table not acquired by read snapshot")]
+    TableNotAcquired,
 }
 
 /// Fieldless fatal-domain errors carried underneath `ErrorKind::Fatal`.

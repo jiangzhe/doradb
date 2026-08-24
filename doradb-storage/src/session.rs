@@ -36,9 +36,12 @@ use crate::table::{
     prepare_freeze_table_operation, prepare_mem_index_cleanup_operation,
 };
 use crate::trx::{
-    PrivateTransaction, RedoRetentionScope, ReleasedTransactionLocks, SessionOperationEntry,
-    SessionOperationKind, SessionOperationState, Transaction, TrxInner,
-    prepare_catalog_redo_maintenance_operation, prepare_redo_truncation_operation,
+    FrozenReadSnapshotCore, PrivateTransaction, ReadSnapshotBuildCore, ReadSnapshotBuilder,
+    ReadSnapshotDrainReason, ReadSnapshotEntry, ReadSnapshotLockOwner, ReadSnapshotPhase,
+    ReadSnapshotReadyPayload, ReadSnapshotTerminalClaim, RedoRetentionScope,
+    ReleasedTransactionLocks, SessionOperationEntry, SessionOperationKind, SessionOperationState,
+    Transaction, TrxInner, prepare_catalog_redo_maintenance_operation,
+    prepare_redo_truncation_operation,
 };
 use error_stack::{Report, ResultExt};
 use event_listener::EventListener;
@@ -49,7 +52,7 @@ use std::cell::Cell;
 use std::future::Future;
 use std::mem::replace;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 /// Summary returned by a redo-log truncation maintenance call.
@@ -646,14 +649,16 @@ pub(crate) trait SessionRuntimeAccess {
 ///
 /// This typed `Arc` wrapper pins the state reached by a public weak handle.
 /// Engine capabilities are reached through the state without a separate core
-/// clone.
+/// clone. Foreground admission establishes durable operation or observer
+/// ownership before yielding this plain strong attachment; the attachment is
+/// not itself an admission guard.
 #[derive(Clone)]
 pub(crate) struct SessionRuntime(Arc<SessionState>);
 
 impl SessionRuntime {
     /// Wrap one registered session state without another allocation.
     #[inline]
-    pub(crate) fn new(state: Arc<SessionState>) -> Self {
+    fn new(state: Arc<SessionState>) -> Self {
         Self(state)
     }
 
@@ -699,9 +704,109 @@ impl SessionRuntime {
         self.core().catalog.clone()
     }
 
+    /// Begin one public transaction while foreground admission remains held.
+    #[inline]
+    fn begin_public_trx(&self) -> LifecycleResult<Transaction> {
+        let state = self.state();
+        let mut lifecycle = state.lifecycle.lock();
+        lifecycle
+            .admit_idle()
+            .attach_with(|| format!("session_id={}", state.id))?;
+        let key = SessionState::next_operation_key(&lifecycle, state.id);
+        let inner = lifecycle.public_trx_cache.take().unwrap_or_else(|| {
+            panic!(
+                "idle session must retain one ready public transaction core: session_id={}",
+                state.id
+            )
+        });
+        let authority = lifecycle.lock_authority.take().unwrap_or_else(|| {
+            panic!(
+                "idle session must retain family lock authority: session_id={}, operation_key={key}",
+                state.id
+            )
+        });
+        let (trx, entry) = self
+            .trx_sys
+            .begin_public_trx(self.downgrade(), key, inner, authority);
+        lifecycle.advance_operation_id();
+        lifecycle.slot = SessionOperationSlot::Active(ActiveSessionOperation::Operation(entry));
+        Ok(trx)
+    }
+
+    /// Seal an exact read snapshot and synchronously resolve checked-in cleanup.
+    #[inline]
+    pub(crate) fn request_read_snapshot_close(
+        &self,
+        key: SessionOperationKey,
+        reason: ReadSnapshotDrainReason,
+    ) {
+        let claim = self.request_read_snapshot_drain(key, reason);
+        if let Some(claim) = claim {
+            claim.cleanup();
+        }
+    }
+
+    /// Seal an exact snapshot and claim checked-in terminal ownership when available.
+    #[inline]
+    fn request_read_snapshot_drain(
+        &self,
+        key: SessionOperationKey,
+        reason: ReadSnapshotDrainReason,
+    ) -> Option<ReadSnapshotTerminalClaim> {
+        let state = self.state();
+        let lifecycle = state.lifecycle.lock();
+        let entry = lifecycle
+            .slot
+            .active_read_snapshot()
+            .filter(|entry| entry.key() == key)
+            .cloned()?;
+        entry.request_drain(reason);
+        let claim = entry.claim_terminal(self.clone());
+        let notify = lifecycle.change_ev.clone();
+        drop(lifecycle);
+        SessionState::notify_operation_change(notify);
+        claim
+    }
+
+    /// Claim a terminal payload only while this exact typed entry remains active.
+    #[inline]
+    pub(crate) fn claim_read_snapshot_terminal(
+        &self,
+        entry: &Arc<ReadSnapshotEntry>,
+    ) -> Option<ReadSnapshotTerminalClaim> {
+        let state = self.state();
+        let lifecycle = state.lifecycle.lock();
+        let exact = lifecycle
+            .slot
+            .active_read_snapshot()
+            .is_some_and(|active| Arc::ptr_eq(active, entry));
+        let claim = exact.then(|| entry.claim_terminal(self.clone())).flatten();
+        let notify = lifecycle.change_ev.clone();
+        drop(lifecycle);
+        if claim.is_some() {
+            SessionState::notify_operation_change(notify);
+        }
+        claim
+    }
+
+    /// Resolve terminal cleanup exposed by a returned counted checkout.
+    #[inline]
+    pub(crate) fn return_read_snapshot_checkout(&self, entry: &Arc<ReadSnapshotEntry>) {
+        let claim = self.claim_read_snapshot_terminal(entry);
+        if let Some(claim) = claim {
+            claim.cleanup();
+        } else {
+            let state = self.state();
+            let lifecycle = state.lifecycle.lock();
+            let notify = lifecycle.change_ev.clone();
+            drop(lifecycle);
+            SessionState::notify_operation_change(notify);
+        }
+    }
+
     /// Remove this state only when the registry still owns this exact Arc.
     #[inline]
-    fn remove_if_requested(&self, remove_from_registry: bool) {
+    pub(crate) fn remove_if_requested(&self, remove_from_registry: bool) {
         if !remove_from_registry {
             return;
         }
@@ -922,12 +1027,59 @@ impl Session {
             .disclose()?;
         let trx = admitted
             .runtime()
-            .state()
-            .begin_public_trx(admitted.runtime())
+            .begin_public_trx()
             .attach("operation=begin_transaction")
             .disclose()?;
         drop(admitted);
         Ok(trx)
+    }
+
+    /// Begin one crate-private shared read snapshot.
+    #[inline]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "shared snapshots remain crate-private until Phase 4"
+        )
+    )]
+    pub(crate) fn begin_read_snapshot(&mut self) -> Result<ReadSnapshotBuilder> {
+        if self.closed.get() {
+            return Err(Report::new(LifecycleError::SessionUnavailable)
+                .attach(format!("session_id={}", self.id))
+                .disclose());
+        }
+        let admitted = self
+            .session
+            .upgrade()
+            .attach_with(|| format!("session_id={}", self.id))
+            .disclose()?
+            .ok_or_else(|| {
+                Report::new(LifecycleError::SessionUnavailable)
+                    .attach(format!("session_id={}, reason=session_missing", self.id))
+            })
+            .disclose()?;
+        admitted
+            .runtime()
+            .poisoner
+            .ensure_healthy()
+            .attach_with(|| format!("session_id={}, phase=check_engine_health", self.id))
+            .disclose()?;
+        let (entry, sts) = admitted
+            .runtime()
+            .state()
+            .reserve_read_snapshot()
+            .attach_with(|| format!("session_id={}", self.id))
+            .disclose()?;
+        assert_eq!(
+            entry.sts(),
+            sts,
+            "reserved snapshot entry returned mismatched STS: key={}",
+            entry.key()
+        );
+        let builder = ReadSnapshotBuilder::new(self.session.clone(), entry.key(), sts);
+        drop(admitted);
+        Ok(builder)
     }
 
     /// Close this session when no caller-owned foreground operation is active.
@@ -960,9 +1112,22 @@ impl Session {
                 .disclose()?;
             admitted.into_runtime()
         };
+        let mut initial_runtime = Some(runtime);
         loop {
-            let (decision, remove_from_registry) = runtime.state().request_close();
-            runtime.remove_if_requested(remove_from_registry);
+            let decision = {
+                let Some(runtime) = initial_runtime
+                    .take()
+                    .or_else(|| self.session.upgrade_for_terminal())
+                else {
+                    break;
+                };
+                let (decision, remove_from_registry) = runtime.state().request_close();
+                runtime.remove_if_requested(remove_from_registry);
+                // A lifecycle listener owns its wake registration without the
+                // runtime. End strong reachability before a possible wait so
+                // terminal session removal cannot leave a hidden shutdown owner.
+                decision
+            };
             match decision {
                 SessionCloseDecision::Closed => break,
                 SessionCloseDecision::Wait(listener) => listener.await,
@@ -2137,7 +2302,9 @@ pub(crate) enum SessionShutdownBlocker {
     /// One stable effectful operation remains active.
     Operation {
         /// Current operation ownership class.
-        state: SessionOperationState,
+        state: Option<SessionOperationState>,
+        /// Typed read-snapshot phase when the active entry is a snapshot.
+        snapshot_phase: Option<ReadSnapshotPhase>,
         /// Exact claimable transaction cleanup hint, when one exists.
         ///
         /// The tuple locates the stable outer operation entry first and
@@ -2165,10 +2332,32 @@ impl SessionShutdownBlocker {
 
     /// Returns the active operation state, if this is an operation blocker.
     #[inline]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "only shutdown diagnostics and tests inspect typed states"
+        )
+    )]
     pub(crate) const fn operation_state(&self) -> Option<SessionOperationState> {
         match self {
-            Self::Operation { state, .. } => Some(*state),
+            Self::Operation { state, .. } => *state,
             Self::Observer { .. } => None,
+        }
+    }
+
+    /// Returns the current active-operation state label.
+    #[inline]
+    pub(crate) const fn operation_state_label(&self) -> Option<&'static str> {
+        match self {
+            Self::Operation {
+                state: Some(state), ..
+            } => Some(state.label()),
+            Self::Operation {
+                snapshot_phase: Some(phase),
+                ..
+            } => Some(phase.label()),
+            Self::Operation { .. } | Self::Observer { .. } => None,
         }
     }
 
@@ -2275,25 +2464,6 @@ impl SessionRegistry {
         let session = self.session_state(key.session_id())?;
         let entry = session.resolve_operation(key)?;
         Some((entry, session))
-    }
-
-    /// Close one registry-owned session directly for lifecycle tests.
-    #[cfg(test)]
-    pub(crate) async fn close(&self, id: SessionID) -> LifecycleResult<()> {
-        loop {
-            let Some(state) = self.session_state(id) else {
-                return Ok(());
-            };
-            let (decision, remove_from_registry) = state.request_close();
-            if remove_from_registry {
-                self.remove_exact(&SessionRuntime::new(Arc::clone(&state)));
-            }
-            match decision {
-                SessionCloseDecision::Closed => return Ok(()),
-                SessionCloseDecision::Wait(listener) => listener.await,
-                SessionCloseDecision::Rejected(err) => return Err(err),
-            }
-        }
     }
 
     /// Returns the first active session operation without installing a listener.
@@ -2459,10 +2629,9 @@ impl SessionState {
     fn active_operation_err(
         &self,
         disposition: SessionDisposition,
-        entry: &SessionOperationEntry,
+        entry: &ActiveSessionOperation,
     ) -> Report<LifecycleError> {
-        let snapshot = entry.inspect();
-        let error = if snapshot.kind == SessionOperationKind::PublicTransaction {
+        let error = if entry.kind() == SessionOperationKind::PublicTransaction {
             LifecycleError::ExistingTransaction
         } else {
             LifecycleError::ExistingOperation
@@ -2470,11 +2639,11 @@ impl SessionState {
         Report::new(error).attach(format!(
             "operation_key={}, kind={}, state={}, disposition={}, trx_id={}",
             entry.key(),
-            snapshot.kind.label(),
-            snapshot.state.label(),
+            entry.kind().label(),
+            entry.state_label(),
             disposition.label(),
-            snapshot
-                .trx_id
+            entry
+                .trx_id()
                 .map_or_else(|| "none".to_owned(), |trx_id| trx_id.to_string())
         ))
     }
@@ -2528,39 +2697,181 @@ impl SessionState {
             )
         });
         lifecycle.advance_operation_id();
-        lifecycle.slot = SessionOperationSlot::Active(Arc::clone(&entry));
+        lifecycle.slot =
+            SessionOperationSlot::Active(ActiveSessionOperation::Operation(Arc::clone(&entry)));
         Ok((entry, authority))
     }
 
     #[inline]
-    fn begin_public_trx(
-        self: &Arc<Self>,
-        runtime: &SessionRuntime,
-    ) -> LifecycleResult<Transaction> {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "shared snapshots remain crate-private until Phase 4"
+        )
+    )]
+    fn reserve_read_snapshot(&self) -> LifecycleResult<(Arc<ReadSnapshotEntry>, TrxID)> {
         let mut lifecycle = self.lifecycle.lock();
         lifecycle
             .admit_idle()
             .attach_with(|| format!("session_id={}", self.id))?;
         let key = Self::next_operation_key(&lifecycle, self.id);
-        let inner = lifecycle.public_trx_cache.take().unwrap_or_else(|| {
-            panic!(
-                "idle session must retain one ready public transaction core: session_id={}",
-                self.id
-            )
-        });
         let authority = lifecycle.lock_authority.take().unwrap_or_else(|| {
             panic!(
                 "idle session must retain family lock authority: session_id={}, operation_key={key}",
                 self.id
             )
         });
-        let (trx, entry) =
-            runtime
-                .trx_sys
-                .begin_public_trx(runtime.downgrade(), key, inner, authority);
+        let registration = self.core.trx_sys.register_active_snapshot();
+        let sts = registration.sts();
+        let locks = ReadSnapshotLockOwner::new(authority, key);
+        let core = ReadSnapshotBuildCore::new(registration, locks);
+        let entry = ReadSnapshotEntry::new(key, sts, core);
         lifecycle.advance_operation_id();
-        lifecycle.slot = SessionOperationSlot::Active(entry);
-        Ok(trx)
+        lifecycle.slot =
+            SessionOperationSlot::Active(ActiveSessionOperation::ReadSnapshot(Arc::clone(&entry)));
+        Ok((entry, sts))
+    }
+
+    /// Exclusively check out the exact building snapshot core.
+    #[inline]
+    pub(crate) fn checkout_read_snapshot_build(
+        &self,
+        key: SessionOperationKey,
+    ) -> LifecycleResult<(Arc<ReadSnapshotEntry>, ReadSnapshotBuildCore)> {
+        let lifecycle = self.lifecycle.lock();
+        if lifecycle.disposition != SessionDisposition::Open || self.admission.shutdown_started() {
+            return Err(
+                Report::new(LifecycleError::ReadSnapshotUnavailable).attach(format!(
+                    "operation_key={key}, disposition={}, shutdown_started={}",
+                    lifecycle.disposition.label(),
+                    self.admission.shutdown_started()
+                )),
+            );
+        }
+        let entry = lifecycle
+            .slot
+            .active_read_snapshot()
+            .filter(|entry| entry.key() == key)
+            .cloned()
+            .ok_or_else(|| {
+                Report::new(LifecycleError::ReadSnapshotUnavailable)
+                    .attach(format!("operation_key={key}, reason=identity_mismatch"))
+            })?;
+        let core = entry.take_build()?;
+        Ok((entry, core))
+    }
+
+    /// Atomically publish a complete frozen snapshot when lifecycle admission still holds.
+    #[inline]
+    pub(crate) fn publish_read_snapshot_ready(
+        &self,
+        entry: &Arc<ReadSnapshotEntry>,
+        payload: ReadSnapshotReadyPayload,
+    ) -> bool {
+        let lifecycle = self.lifecycle.lock();
+        let exact = lifecycle
+            .slot
+            .active_read_snapshot()
+            .is_some_and(|active| Arc::ptr_eq(active, entry));
+        let healthy = self.core.poisoner.ensure_healthy().is_ok();
+        let admit_ready = exact
+            && lifecycle.disposition == SessionDisposition::Open
+            && !self.admission.shutdown_started()
+            && healthy;
+        let published = entry.publish_ready(payload, admit_ready);
+        let notify = lifecycle.change_ev.clone();
+        drop(lifecycle);
+        Self::notify_operation_change(notify);
+        published
+    }
+
+    /// Count and clone the frozen core from one exact open ready snapshot.
+    #[inline]
+    pub(crate) fn checkout_read_snapshot_ready(
+        &self,
+        key: SessionOperationKey,
+        facade_closed: &AtomicBool,
+    ) -> LifecycleResult<(Arc<ReadSnapshotEntry>, Arc<FrozenReadSnapshotCore>)> {
+        let lifecycle = self.lifecycle.lock();
+        if lifecycle.disposition != SessionDisposition::Open
+            || self.admission.shutdown_started()
+            || facade_closed.load(Ordering::Acquire)
+        {
+            return Err(
+                Report::new(LifecycleError::ReadSnapshotUnavailable).attach(format!(
+                    "operation_key={key}, disposition={}, shutdown_started={}, facade_closed={}",
+                    lifecycle.disposition.label(),
+                    self.admission.shutdown_started(),
+                    facade_closed.load(Ordering::Acquire)
+                )),
+            );
+        }
+        let entry = lifecycle
+            .slot
+            .active_read_snapshot()
+            .filter(|entry| entry.key() == key)
+            .cloned()
+            .ok_or_else(|| {
+                Report::new(LifecycleError::ReadSnapshotUnavailable)
+                    .attach(format!("operation_key={key}, reason=identity_mismatch"))
+            })?;
+        let read_core = entry.checkout_ready()?;
+        if facade_closed.load(Ordering::Acquire) {
+            // Close marked the facade after the first check but before this
+            // lifecycle-serialized acceptance edge. Destroy the local pin
+            // before returning the counted checkout to the entry.
+            drop(read_core);
+            entry.return_checkout();
+            return Err(
+                Report::new(LifecycleError::ReadSnapshotUnavailable).attach(format!(
+                    "operation_key={key}, reason=facade_closed_during_checkout"
+                )),
+            );
+        }
+        Ok((entry, read_core))
+    }
+
+    /// Arm the session lifecycle listener while the exact snapshot remains active.
+    #[inline]
+    pub(crate) fn read_snapshot_terminal_listener(
+        &self,
+        key: SessionOperationKey,
+    ) -> Option<EventListener> {
+        let mut lifecycle = self.lifecycle.lock();
+        lifecycle
+            .slot
+            .active_read_snapshot()
+            .filter(|entry| entry.key() == key)?;
+        Some(lifecycle.change_listener())
+    }
+
+    /// Publish terminal after resource cleanup and restore or close family authority.
+    #[inline]
+    pub(crate) fn finish_read_snapshot_terminal(
+        &self,
+        entry: &Arc<ReadSnapshotEntry>,
+        authority: Box<FamilyLockAuthority>,
+    ) -> bool {
+        let mut lifecycle = self.lifecycle.lock();
+        let exact = lifecycle
+            .slot
+            .active_read_snapshot()
+            .is_some_and(|active| Arc::ptr_eq(active, entry));
+        assert!(
+            exact,
+            "snapshot terminal claim lost exact active slot: key={}",
+            entry.key()
+        );
+        entry.publish_terminal();
+        let terminal = lifecycle.finalize_terminal(authority);
+        let notify = lifecycle.change_ev.clone();
+        drop(lifecycle);
+        if let Some(mut authority) = terminal.close_authority {
+            authority.close_session(self.core.lock_manager());
+        }
+        Self::notify_operation_change(notify);
+        terminal.remove_from_registry
     }
 
     /// Recycle a cached public core or directly drop an ephemeral private core.
@@ -2584,7 +2895,7 @@ impl SessionState {
     }
 
     #[inline]
-    fn request_close(&self) -> (SessionCloseDecision, bool) {
+    fn request_close(self: &Arc<Self>) -> (SessionCloseDecision, bool) {
         let mut lifecycle = self.lifecycle.lock();
         if lifecycle.disposition == SessionDisposition::Abandoned {
             return (
@@ -2598,7 +2909,22 @@ impl SessionState {
                 return (SessionCloseDecision::Closed, lifecycle.observer_count == 0);
             }
             SessionOperationSlot::Active(entry) => {
-                let snapshot = entry.inspect();
+                if let Some(snapshot_entry) = entry.read_snapshot().cloned() {
+                    lifecycle.disposition = SessionDisposition::CloseRequested;
+                    snapshot_entry.request_drain(ReadSnapshotDrainReason::SessionClose);
+                    let listener = lifecycle.change_listener();
+                    let claim =
+                        snapshot_entry.claim_terminal(SessionRuntime::new(Arc::clone(self)));
+                    drop(lifecycle);
+                    if let Some(claim) = claim {
+                        claim.cleanup();
+                    }
+                    return (SessionCloseDecision::Wait(listener), false);
+                }
+                let operation_entry = entry.operation_entry().unwrap_or_else(|| {
+                    panic!("active operation lost typed entry: key={}", entry.key())
+                });
+                let snapshot = operation_entry.inspect();
                 match snapshot.state {
                     SessionOperationState::Terminal => {}
                     SessionOperationState::CleanupReady
@@ -2642,10 +2968,14 @@ impl SessionState {
     }
 
     #[inline]
-    fn abandon(&self) -> bool {
+    fn abandon(self: &Arc<Self>) -> bool {
         let mut lifecycle = self.lifecycle.lock();
         if lifecycle.disposition == SessionDisposition::Open {
             lifecycle.disposition = SessionDisposition::Abandoned;
+        }
+        let snapshot_entry = lifecycle.slot.active_read_snapshot().cloned();
+        if let Some(entry) = &snapshot_entry {
+            entry.request_drain(ReadSnapshotDrainReason::SessionAbandoned);
         }
         let close_authority = match lifecycle.slot {
             SessionOperationSlot::Closed => false,
@@ -2666,9 +2996,14 @@ impl SessionState {
                 )
             })
         });
+        let claim = snapshot_entry
+            .and_then(|entry| entry.claim_terminal(SessionRuntime::new(Arc::clone(self))));
         drop(lifecycle);
         if let Some(mut authority) = authority {
             authority.close_session(self.core.lock_manager());
+        }
+        if let Some(claim) = claim {
+            claim.cleanup();
         }
         Self::notify_operation_change(notify);
         remove_from_registry
@@ -2867,7 +3202,14 @@ impl SessionState {
     fn shutdown_blocker(self: &Arc<Self>) -> Option<SessionShutdownBlocker> {
         let lifecycle = self.lifecycle.lock();
         let mut blocker = lifecycle.shutdown_blocker()?;
+        let snapshot_entry = lifecycle.slot.active_read_snapshot().cloned();
         blocker.capture_runtime(SessionRuntime::new(Arc::clone(self)));
+        let claim = snapshot_entry
+            .and_then(|entry| entry.claim_terminal(SessionRuntime::new(Arc::clone(self))));
+        drop(lifecycle);
+        if let Some(claim) = claim {
+            claim.cleanup_during_registry_scan();
+        }
         Some(blocker)
     }
 
@@ -2879,7 +3221,14 @@ impl SessionState {
         let mut blocker = lifecycle
             .shutdown_blocker()
             .expect("session blocker cannot change while lifecycle lock is held");
+        let snapshot_entry = lifecycle.slot.active_read_snapshot().cloned();
         blocker.capture_runtime(SessionRuntime::new(Arc::clone(self)));
+        let claim = snapshot_entry
+            .and_then(|entry| entry.claim_terminal(SessionRuntime::new(Arc::clone(self))));
+        drop(lifecycle);
+        if let Some(claim) = claim {
+            claim.cleanup_during_registry_scan();
+        }
         Some(SessionShutdownWait { listener, blocker })
     }
 
@@ -2993,8 +3342,7 @@ impl SessionLifecycle {
         match &self.slot {
             SessionOperationSlot::Idle => Ok(()),
             SessionOperationSlot::Active(entry) => {
-                let snapshot = entry.inspect();
-                let error = if snapshot.kind == SessionOperationKind::PublicTransaction {
+                let error = if entry.kind() == SessionOperationKind::PublicTransaction {
                     LifecycleError::ExistingTransaction
                 } else {
                     LifecycleError::ExistingOperation
@@ -3002,11 +3350,11 @@ impl SessionLifecycle {
                 Err(Report::new(error).attach(format!(
                     "operation_key={}, kind={}, state={}, disposition={}, trx_id={}",
                     entry.key(),
-                    snapshot.kind.label(),
-                    snapshot.state.label(),
+                    entry.kind().label(),
+                    entry.state_label(),
                     self.disposition.label(),
-                    snapshot
-                        .trx_id
+                    entry
+                        .trx_id()
                         .map_or_else(|| "none".to_owned(), |trx_id| trx_id.to_string())
                 )))
             }
@@ -3033,10 +3381,27 @@ impl SessionLifecycle {
 
     #[inline]
     fn shutdown_blocker(&self) -> Option<SessionShutdownBlocker> {
-        if let Some(entry) = self.slot.active_entry() {
+        if let Some(operation) = self.slot.active_operation() {
+            if let Some(entry) = operation.read_snapshot() {
+                let phase = entry.phase();
+                entry.request_drain(ReadSnapshotDrainReason::EngineShutdown);
+                return Some(SessionShutdownBlocker::Operation {
+                    state: None,
+                    snapshot_phase: Some(phase),
+                    cleanup: None,
+                    runtime: None,
+                });
+            }
+            let entry = operation.operation_entry().unwrap_or_else(|| {
+                panic!(
+                    "typed active operation is missing its operation entry: key={}",
+                    operation.key()
+                )
+            });
             let state = entry.inspect().state;
             return Some(SessionShutdownBlocker::Operation {
-                state,
+                state: Some(state),
+                snapshot_phase: None,
                 cleanup: entry
                     .cleanup_candidate()
                     .map(|trx_id| (entry.key(), trx_id)),
@@ -3113,21 +3478,96 @@ impl SessionDisposition {
     }
 }
 
+/// Typed pointer-stable entry stored in one active session slot.
+enum ActiveSessionOperation {
+    Operation(Arc<SessionOperationEntry>),
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "shared snapshots remain crate-private until Phase 4"
+        )
+    )]
+    ReadSnapshot(Arc<ReadSnapshotEntry>),
+}
+
+impl ActiveSessionOperation {
+    #[inline]
+    fn key(&self) -> SessionOperationKey {
+        match self {
+            Self::Operation(entry) => entry.key(),
+            Self::ReadSnapshot(entry) => entry.key(),
+        }
+    }
+
+    #[inline]
+    fn kind(&self) -> SessionOperationKind {
+        match self {
+            Self::Operation(entry) => entry.kind(),
+            Self::ReadSnapshot(_) => SessionOperationKind::ReadSnapshot,
+        }
+    }
+
+    #[inline]
+    fn state_label(&self) -> &'static str {
+        match self {
+            Self::Operation(entry) => entry.inspect().state.label(),
+            Self::ReadSnapshot(entry) => entry.phase().label(),
+        }
+    }
+
+    #[inline]
+    fn trx_id(&self) -> Option<TrxID> {
+        match self {
+            Self::Operation(entry) => entry.inspect().trx_id,
+            Self::ReadSnapshot(_) => None,
+        }
+    }
+
+    #[inline]
+    fn operation_entry(&self) -> Option<&Arc<SessionOperationEntry>> {
+        match self {
+            Self::Operation(entry) => Some(entry),
+            Self::ReadSnapshot(_) => None,
+        }
+    }
+
+    #[inline]
+    fn read_snapshot(&self) -> Option<&Arc<ReadSnapshotEntry>> {
+        match self {
+            Self::ReadSnapshot(entry) => Some(entry),
+            Self::Operation(_) => None,
+        }
+    }
+}
+
 /// Registry-visible ownership slot for one session's effectful operation.
 enum SessionOperationSlot {
     Idle,
     /// Exact active entry, stable until its terminal lifecycle publication.
-    Active(Arc<SessionOperationEntry>),
+    Active(ActiveSessionOperation),
     Closed,
 }
 
 impl SessionOperationSlot {
     #[inline]
-    fn active_entry(&self) -> Option<&Arc<SessionOperationEntry>> {
+    fn active_operation(&self) -> Option<&ActiveSessionOperation> {
         match self {
             Self::Active(entry) => Some(entry),
             Self::Idle | Self::Closed => None,
         }
+    }
+
+    #[inline]
+    fn active_entry(&self) -> Option<&Arc<SessionOperationEntry>> {
+        self.active_operation()
+            .and_then(ActiveSessionOperation::operation_entry)
+    }
+
+    #[inline]
+    fn active_read_snapshot(&self) -> Option<&Arc<ReadSnapshotEntry>> {
+        self.active_operation()
+            .and_then(ActiveSessionOperation::read_snapshot)
     }
 
     #[inline]
@@ -3602,10 +4042,10 @@ pub(crate) mod tests {
     /// Wait asynchronously until one exact session no longer owns an operation.
     pub(crate) async fn wait_for_session_idle(registry: &SessionRegistry, session_id: SessionID) {
         loop {
-            let Some(state) = registry.session_state(session_id) else {
-                return;
-            };
             let listener = {
+                let Some(state) = registry.session_state(session_id) else {
+                    return;
+                };
                 let mut lifecycle = state.lifecycle.lock();
                 match lifecycle.slot {
                     SessionOperationSlot::Active(_) => lifecycle.change_listener(),
@@ -3769,7 +4209,7 @@ pub(crate) mod tests {
         {
             let mut lifecycle = state.lifecycle.lock();
             lifecycle.next_operation_id = 2;
-            lifecycle.slot = SessionOperationSlot::Active(entry);
+            lifecycle.slot = SessionOperationSlot::Active(ActiveSessionOperation::Operation(entry));
         }
         let runtime = SessionRuntime::new(Arc::clone(&state));
         registry.insert(Arc::clone(&state));
@@ -4026,7 +4466,11 @@ pub(crate) mod tests {
             .expect("test session must remain registered");
         let lifecycle = state.lifecycle.lock();
         match &lifecycle.slot {
-            SessionOperationSlot::Active(entry) => Arc::clone(entry),
+            SessionOperationSlot::Active(entry) => Arc::clone(
+                entry
+                    .operation_entry()
+                    .expect("test helper requires an existing operation entry"),
+            ),
             SessionOperationSlot::Idle | SessionOperationSlot::Closed => {
                 panic!("test session must have an active operation")
             }
@@ -4040,7 +4484,10 @@ pub(crate) mod tests {
         }
         Ok(matches!(
             &lifecycle.slot,
-            SessionOperationSlot::Active(entry) if entry.inspect().trx_id.is_some()
+            SessionOperationSlot::Active(entry)
+                if entry
+                    .operation_entry()
+                    .is_some_and(|entry| entry.inspect().trx_id.is_some())
         ))
     }
 
@@ -4671,7 +5118,9 @@ pub(crate) mod tests {
             {
                 let mut lifecycle = state.lifecycle.lock();
                 lifecycle.disposition = SessionDisposition::Abandoned;
-                lifecycle.slot = SessionOperationSlot::Active(Arc::clone(&entry));
+                lifecycle.slot = SessionOperationSlot::Active(ActiveSessionOperation::Operation(
+                    Arc::clone(&entry),
+                ));
             }
 
             let blocker = state
@@ -4706,7 +5155,9 @@ pub(crate) mod tests {
             {
                 let mut lifecycle = state.lifecycle.lock();
                 lifecycle.disposition = SessionDisposition::Abandoned;
-                lifecycle.slot = SessionOperationSlot::Active(Arc::clone(&entry));
+                lifecycle.slot = SessionOperationSlot::Active(ActiveSessionOperation::Operation(
+                    Arc::clone(&entry),
+                ));
             }
 
             let blocker = state
@@ -4736,7 +5187,8 @@ pub(crate) mod tests {
                 key,
                 Box::new(trx_inner(trx_id, MIN_SNAPSHOT_TS, 0, session_id)),
             );
-            state.lifecycle.lock().slot = SessionOperationSlot::Active(Arc::clone(&entry));
+            state.lifecycle.lock().slot =
+                SessionOperationSlot::Active(ActiveSessionOperation::Operation(Arc::clone(&entry)));
 
             let shutdown_wait = state
                 .shutdown_wait()
@@ -4766,7 +5218,8 @@ pub(crate) mod tests {
                 key,
                 Box::new(trx_inner(trx_id, MIN_SNAPSHOT_TS, 0, session_id)),
             );
-            state.lifecycle.lock().slot = SessionOperationSlot::Active(entry);
+            state.lifecycle.lock().slot =
+                SessionOperationSlot::Active(ActiveSessionOperation::Operation(entry));
 
             let first = state
                 .shutdown_wait()
@@ -4803,7 +5256,8 @@ pub(crate) mod tests {
                 {
                     let mut lifecycle = state.lifecycle.lock();
                     lifecycle.disposition = SessionDisposition::Abandoned;
-                    lifecycle.slot = SessionOperationSlot::Active(entry);
+                    lifecycle.slot =
+                        SessionOperationSlot::Active(ActiveSessionOperation::Operation(entry));
                 }
                 expected_cleanup.push((key, trx_id));
                 states.push(Arc::clone(&state));
@@ -4892,7 +5346,8 @@ pub(crate) mod tests {
                 {
                     let mut lifecycle = state.lifecycle.lock();
                     lifecycle.disposition = SessionDisposition::Abandoned;
-                    lifecycle.slot = SessionOperationSlot::Active(entry);
+                    lifecycle.slot =
+                        SessionOperationSlot::Active(ActiveSessionOperation::Operation(entry));
                 }
                 states.push(Arc::clone(&state));
                 registry.insert(state);
@@ -5243,7 +5698,11 @@ pub(crate) mod tests {
                 let SessionOperationSlot::Active(active) = &lifecycle.slot else {
                     panic!("private transaction terminal must preserve the outer operation")
                 };
-                assert!(Arc::ptr_eq(active, &entry));
+                assert!(
+                    active
+                        .operation_entry()
+                        .is_some_and(|active| Arc::ptr_eq(active, &entry))
+                );
                 assert_eq!(lifecycle.next_operation_id, 2);
                 assert_eq!(
                     lifecycle
@@ -6830,12 +7289,7 @@ pub(crate) mod tests {
                 .unwrap();
             let session = engine.new_session().unwrap();
 
-            engine
-                .inner()
-                .session_registry
-                .close(session.id())
-                .await
-                .unwrap();
+            remove_session_for_test(&engine.inner().session_registry, session.id());
 
             for err in [
                 session.list_table_ids().unwrap_err(),
