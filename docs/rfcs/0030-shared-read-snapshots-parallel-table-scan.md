@@ -1307,9 +1307,12 @@ not preselect Arrow crate versions or public Arrow schema mapping. [U1] [U3]
     immutable table set for the snapshot lifetime; keep `Ready` reusable when
     its shared-checkout count returns to zero; make `ReadSnapshot::close`
     consuming, group-wide, idempotent, and cancellation safe after its close
-    request; keep the new API crate-private or unexported until Phase 4 opens
-    real row streams; and add typed snapshot-lifecycle, invalid-table-set, and
-    table-not-acquired diagnostics. [U11]
+    request; release strong session runtime before close waits; clean
+    checked-in snapshots synchronously during registry inspection while
+    retained build or shared checkouts remain visible blockers; keep the new
+    API crate-private or unexported until Phase 4 opens real row streams; and
+    add typed snapshot-lifecycle, invalid-table-set, and table-not-acquired
+    diagnostics. [U11]
   - Verification: Exercise the complete preparation workflow rather than a
     registry-only harness. Prove STS-before-root capture and
     roots-before-STS-release ordering; lock-prefix unwind and prompt
@@ -1317,13 +1320,14 @@ not preselect Arrow crate versions or public Arrow schema mapping. [U1] [U3]
     and shared-checkout return; immutable multi-table binding under one STS;
     zero-checkout ready reuse; build, close, final-facade, abandonment, poison,
     session-close, and shutdown races; and terminal root, STS, scope, authority,
-    and session-publication order. The shared checkout and borrowed table/root
-    view are production prerequisites for Phase 3, not a test-only execution
-    shell.
+    and session-publication order. Close listeners must retain no hidden strong
+    runtime while awaiting terminal notification. The shared checkout and
+    borrowed table/root view are production prerequisites for Phase 3, not a
+    test-only execution shell.
   - Task Doc: `docs/tasks/000282-shared-snapshot-preparation.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Issue: `#1013`
+  - Phase Status: done
+  - Implementation Summary: Implemented registry-owned multi-table snapshot preparation with weak facades, counted checkouts, exact abort/drain cleanup, and session/shutdown integration; deterministic planning remains Phase 3. [Task Resolve Sync: docs/tasks/000282-shared-snapshot-preparation.md @ 2026-08-24]
 
 - **Phase 3: Deterministic table-scan planning**
   - Prerequisites: Phase 2 provides a complete, self-tested multi-table
