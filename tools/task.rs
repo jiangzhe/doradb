@@ -24,6 +24,7 @@ Subcommands:\n\
   next-task-id          Print the next task id from docs/tasks/next-id\n\
   create-task-doc       Create a docs/tasks task document from template with validated id and slug\n\
   purge-worktrees       List purge-safe task worktrees and optionally remove them\n\
+  find-parent-rfc       Read the explicit Parent RFC block without modifying files\n\
   resolve-task-next-id  Refresh docs/tasks/next-id during task resolve\n\
   resolve-task-rfc      Sync task resolve outcome into parent RFC Implementation Phases\n"
 }
@@ -58,6 +59,10 @@ fn resolve_task_backlogs_usage() -> &'static str {
 
 fn resolve_task_rfc_usage() -> &'static str {
     "Usage: tools/task.rs resolve-task-rfc --task <docs/tasks/<id>-<slug>.md> [--date <YYYY-MM-DD>] [--summary <text> | --summary-file <path>] [--rfc <docs/rfcs/<id>-<slug>.md>]"
+}
+
+fn find_parent_rfc_usage() -> &'static str {
+    "Usage: tools/task.rs find-parent-rfc --task <docs/tasks/<id>-<slug>.md>"
 }
 
 fn resolve_task_next_id_usage() -> &'static str {
@@ -166,10 +171,56 @@ fn run() -> Result<(), String> {
         "next-task-id" => run_next_task_id(args),
         "create-task-doc" => run_create_task_doc(args),
         "purge-worktrees" => run_purge_worktrees(args),
+        "find-parent-rfc" => run_find_parent_rfc(args),
         "resolve-task-next-id" => run_resolve_task_next_id(args),
         "resolve-task-rfc" => run_resolve_task_rfc(args),
         _ => Err(format!("unknown subcommand: {subcommand}\n{}", usage())),
     }
+}
+
+fn run_find_parent_rfc(mut args: impl Iterator<Item = String>) -> Result<(), String> {
+    let mut task_path: Option<PathBuf> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--task" => {
+                let Some(v) = args.next() else {
+                    return Err(format!(
+                        "missing value for --task\n{}",
+                        find_parent_rfc_usage()
+                    ));
+                };
+                task_path = Some(PathBuf::from(v));
+            }
+            "-h" | "--help" => {
+                println!("{}", find_parent_rfc_usage());
+                return Ok(());
+            }
+            _ => {
+                return Err(format!("unknown arg: {arg}\n{}", find_parent_rfc_usage()));
+            }
+        }
+    }
+
+    let task_path = task_path
+        .ok_or_else(|| format!("missing required arg: --task\n{}", find_parent_rfc_usage()))?;
+    validate_task_doc_path(&task_path)?;
+    let task_text = fs::read_to_string(&task_path)
+        .map_err(|e| format!("failed to read {}: {e}", normalize_path(&task_path)))?;
+    let parent_rfc = extract_parent_rfc_ref(&task_text)?;
+    if let Some(parent_rfc) = parent_rfc.as_deref() {
+        validate_rfc_doc_path(Path::new(parent_rfc))?;
+    }
+    println!(
+        "{{\"task\":\"{}\",\"has_parent_rfc\":{},\"rfc_doc\":{}}}",
+        json_escape(&normalize_path(&task_path)),
+        if parent_rfc.is_some() {
+            "true"
+        } else {
+            "false"
+        },
+        json_nullable(&parent_rfc),
+    );
+    Ok(())
 }
 
 fn run_next_task_id(mut args: impl Iterator<Item = String>) -> Result<(), String> {
@@ -1965,6 +2016,61 @@ fn extract_doc_refs_by_prefix(text: &str, prefix: &str) -> Vec<String> {
     refs
 }
 
+fn normalize_metadata_line(line: &str) -> &str {
+    let trimmed = line.trim();
+    trimmed
+        .strip_prefix('`')
+        .and_then(|line| line.strip_suffix('`'))
+        .unwrap_or(trimmed)
+}
+
+fn extract_parent_rfc_ref(text: &str) -> Result<Option<String>, String> {
+    let mut lines = text.lines();
+    let Some(_) = lines.find(|line| normalize_metadata_line(line) == "Parent RFC:") else {
+        return Ok(None);
+    };
+
+    let mut block = String::new();
+    let mut saw_item = false;
+    for line in lines {
+        let trimmed = normalize_metadata_line(line);
+        if trimmed.is_empty() {
+            if saw_item {
+                break;
+            }
+            continue;
+        }
+        if !trimmed.starts_with('-') {
+            break;
+        }
+        saw_item = true;
+        block.push_str(trimmed);
+        block.push('\n');
+    }
+
+    let refs = extract_doc_refs_by_prefix(&block, "docs/rfcs/")
+        .into_iter()
+        .filter(|ref_path| {
+            let name = Path::new(ref_path)
+                .file_name()
+                .map(|x| x.to_string_lossy().to_string())
+                .unwrap_or_default();
+            parse_strict_four_digit_rfc_name(&name).is_some_and(|id| id != 0)
+        })
+        .collect::<Vec<_>>();
+    match refs.as_slice() {
+        [] if saw_item => {
+            Err("Parent RFC block contains no valid RFC document reference".to_string())
+        }
+        [] => Err("Parent RFC block is empty".to_string()),
+        [parent] => Ok(Some(parent.clone())),
+        _ => Err(format!(
+            "multiple RFC references found in Parent RFC block: {}",
+            refs.join(", ")
+        )),
+    }
+}
+
 fn extract_markdown_section(content: &str, section: &str) -> Option<String> {
     let header = format!("## {section}");
     let lines: Vec<&str> = content.lines().collect();
@@ -2582,6 +2688,48 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn extract_parent_rfc_ref_reads_only_explicit_parent_block() {
+        let input = "\
+Related RFC: docs/rfcs/0001-related.md\n\
+\n\
+Parent RFC:\n\
+\n\
+- `docs/rfcs/0030-parent.md` (Phase 3)\n\
+\n\
+Other RFC:\n\
+\n\
+- docs/rfcs/0031-other.md\n";
+        assert_eq!(
+            extract_parent_rfc_ref(input).unwrap().as_deref(),
+            Some("docs/rfcs/0030-parent.md")
+        );
+    }
+
+    #[test]
+    fn extract_parent_rfc_ref_accepts_backticked_metadata() {
+        let input = "`Parent RFC:`\n`- docs/rfcs/0030-parent.md`\n";
+        assert_eq!(
+            extract_parent_rfc_ref(input).unwrap().as_deref(),
+            Some("docs/rfcs/0030-parent.md")
+        );
+    }
+
+    #[test]
+    fn extract_parent_rfc_ref_returns_none_without_explicit_block() {
+        assert_eq!(
+            extract_parent_rfc_ref("Related RFC: docs/rfcs/0030-related.md\n").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_parent_rfc_ref_rejects_multiple_parents() {
+        let input = "Parent RFC:\n- docs/rfcs/0030-first.md\n- docs/rfcs/0031-second.md\n";
+        let err = extract_parent_rfc_ref(input).unwrap_err();
+        assert!(err.contains("multiple RFC references"));
+    }
 
     #[test]
     fn parse_worktree_list_porcelain_extracts_paths_branches_and_flags() {

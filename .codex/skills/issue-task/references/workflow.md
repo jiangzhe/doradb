@@ -43,13 +43,15 @@ is unioned from both sources.
 
 - Treat an explicit `Parent RFC:` block as the only parent source.
 - Resolve it with
-  `tools/task.rs resolve-task-rfc --task <task-document>`.
+  `tools/task.rs find-parent-rfc --task <task-document>`.
 - Require the command to return at most one RFC document.
 - Validate the RFC path and require its `github_issue` metadata.
 - Pass that issue number with `--parent` in the task creation command.
 - Omit `--parent` for standalone tasks.
 - Do not add a textual parent reference or run a follow-up linking command.
 - Keep the hierarchy flat: RFC epic to task issue.
+- Never use `resolve-task-rfc` during issue creation; it is a mutating
+  task-completion synchronization command.
 
 ## CLI Rules
 
