@@ -29,12 +29,16 @@ tools/issue.rs validate-doc-path \
    create another issue; report or read the linked issue instead.
 5. Resolve the task's explicit `Parent RFC:` block deterministically:
 ```bash
-tools/task.rs resolve-task-rfc \
+tools/task.rs find-parent-rfc \
   --task docs/tasks/000047-example.md
 ```
    For one resolved RFC, validate that RFC and require its `github_issue`
    value. Fail on ambiguous parent references or missing RFC issue metadata.
    Omit `--parent` when the command reports no parent RFC.
+
+Do not use `resolve-task-rfc` here. That command synchronizes a completed
+task's implementation outcome into its parent RFC and belongs only to task
+resolution workflows.
 6. Create the issue with assignee `@me`:
 ```bash
 tools/issue.rs create-issue-from-doc \
