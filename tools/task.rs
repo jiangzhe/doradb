@@ -2016,16 +2016,24 @@ fn extract_doc_refs_by_prefix(text: &str, prefix: &str) -> Vec<String> {
     refs
 }
 
+fn normalize_metadata_line(line: &str) -> &str {
+    let trimmed = line.trim();
+    trimmed
+        .strip_prefix('`')
+        .and_then(|line| line.strip_suffix('`'))
+        .unwrap_or(trimmed)
+}
+
 fn extract_parent_rfc_ref(text: &str) -> Result<Option<String>, String> {
     let mut lines = text.lines();
-    let Some(_) = lines.find(|line| line.trim() == "Parent RFC:") else {
+    let Some(_) = lines.find(|line| normalize_metadata_line(line) == "Parent RFC:") else {
         return Ok(None);
     };
 
     let mut block = String::new();
     let mut saw_item = false;
     for line in lines {
-        let trimmed = line.trim();
+        let trimmed = normalize_metadata_line(line);
         if trimmed.is_empty() {
             if saw_item {
                 break;
@@ -2693,6 +2701,15 @@ Parent RFC:\n\
 Other RFC:\n\
 \n\
 - docs/rfcs/0031-other.md\n";
+        assert_eq!(
+            extract_parent_rfc_ref(input).unwrap().as_deref(),
+            Some("docs/rfcs/0030-parent.md")
+        );
+    }
+
+    #[test]
+    fn extract_parent_rfc_ref_accepts_backticked_metadata() {
+        let input = "`Parent RFC:`\n`- docs/rfcs/0030-parent.md`\n";
         assert_eq!(
             extract_parent_rfc_ref(input).unwrap().as_deref(),
             Some("docs/rfcs/0030-parent.md")
