@@ -93,13 +93,6 @@ impl ColumnStorage {
 
     /// Capture an owned scan root while one active snapshot registration pins history.
     #[inline]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "shared snapshots remain crate-private until Phase 4"
-        )
-    )]
     pub(crate) fn capture_owned_scan_root(
         &self,
         _registration: &ActiveSnapshotRegistration,

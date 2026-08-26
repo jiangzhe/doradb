@@ -361,6 +361,84 @@ page latch exclusively, such as eviction or physical deallocation, may wait
 until the stream advances or closes. A caller paused mid-page must not wait for
 external work that requires the same page's exclusive latch.
 
+### Shared-snapshot partition scans
+
+Use a shared read snapshot when several tables or independently scheduled scan
+partitions must observe one ownerless MVCC timestamp. The one-shot builder
+acquires the complete table set before the snapshot becomes shareable:
+
+```rust,ignore
+let snapshot = session
+    .begin_read_snapshot()?
+    .acquire_tables([customer_table, order_table])
+    .await?;
+
+let mut plan = snapshot
+    .prepare_table_scan(
+        order_table,
+        TableScanOptions {
+            projection: vec![0, 2],
+        },
+    )
+    .await?;
+if let Some(repartitioned) =
+    plan.repartition(NonZeroUsize::new(worker_count).unwrap())?
+{
+    plan = repartitioned;
+}
+
+let mut tasks = Vec::with_capacity(plan.partition_count());
+for partition_idx in 0..plan.partition_count() {
+    let mut stream = plan.open(partition_idx)?;
+    tasks.push(smol::spawn(async move {
+        let mut rows = Vec::new();
+        while let Some(row) = stream.next().await? {
+            rows.push(row);
+        }
+        Ok::<_, doradb_storage::Error>(rows)
+    }));
+}
+drop(plan);
+let (results, close) =
+    futures::join!(futures::future::join_all(tasks), snapshot.close());
+close?;
+consume_partition_results(results)?;
+```
+
+`ReadSnapshot` covers every acquired table with one `sts()`. Planning validates
+a nonempty, in-range, strictly increasing projection. Initial and explicit
+repartitioning preserve physical cold-before-hot order and split only between
+captured blocks/pages. Concatenating fully drained partition results in
+partition-index order reproduces sequential physical scan order; concurrently
+delivered rows have no global ordering guarantee.
+
+`TableScanPlan::open` is synchronous, repeatable for a current generation, and
+returns a fully owned `TableScanPartitionStream: Send + 'static`. Each
+`next()` future is `Send`, so callers may move complete drains into executor
+tasks. Opening the same partition twice intentionally returns the same logical
+rows twice. An out-of-range index returns
+`OperationError::InvalidTableScanInput`; a changed repartition permanently
+stales older plan clones, and the first successful open prevents later
+repartitioning of that plan family.
+
+Normal stream exhaustion releases only that stream's execution checkout. A
+ready snapshot with zero active streams remains reusable for later plans and
+repeatable opens while retaining its STS and metadata locks. Poll
+`ReadSnapshot::close` after every intended open to seal new admission and wait
+for accepted streams to return their checkouts. Explicit close is group-wide;
+final-facade drop, session close/abandonment, shutdown, or first execution
+failure also seals the snapshot. An already opened stream owns no facade or
+plan borrow and can finish after those public values are dropped.
+
+The first partition execution error is returned unchanged and fails the whole
+multi-table snapshot. Sibling streams return
+`OperationError::SnapshotScanAborted` when they next reach a physical-unit
+boundary. A peer can still return rows remaining in its currently loaded
+block/page, but it never starts another unit after observing failure. Partial
+results are therefore a caller policy. Each stream retains at most one unit;
+pausing mid-hot-page also retains that page's shared guard and can delay work
+requiring its exclusive latch.
+
 ### Unique lookup
 
 `table_lookup_unique_mvcc` requires a unique index and returns `SelectMvcc`:
@@ -659,8 +737,10 @@ match trx.table_insert_mvcc(table_id, row).await {
 
 Other common `OperationError` values include `TableNotFound`, `TableDropping`,
 `SchemaChanged`, `IndexNotFound`, `WriteConflict`, `InvalidDmlInput`, and the
-explicit-lock errors. Because the enum is non-exhaustive, downstream matches
-must include a fallback.
+explicit-lock errors. Shared snapshots additionally use
+`InvalidReadSnapshotInput`, `TableNotAcquired`, `InvalidTableScanInput`,
+`StaleTableScanPlan`, `TableScanAlreadyOpened`, and `SnapshotScanAborted`.
+Because the enum is non-exhaustive, downstream matches must include a fallback.
 
 `Error::report` borrows the underlying `error_stack::Report<ErrorKind>`, and
 `into_report` consumes the error. The report retains lower typed frames and
@@ -706,11 +786,11 @@ Most application-facing types are re-exported from the crate root:
 
 | Area | Primary types |
 | --- | --- |
-| Lifecycle | `Engine`, `Session`, `Transaction`, `IndexScanMvccStream`, `TableScanMvccStream` |
-| Configuration | `EngineConfig`, `TrxSysConfig`, `MandatoryRuntimeConfig`, `FileSystemConfig`, `EvictableBufferPoolConfig`, `LogSync`, `DEFAULT_COW_FILE_MAX_SIZE` |
+| Lifecycle | `Engine`, `Session`, `Transaction`, `ReadSnapshotBuilder`, `ReadSnapshot`, `IndexScanMvccStream`, `TableScanMvccStream`, `TableScanPartitionStream` |
+| Configuration | `EngineConfig`, `TableScanConfig`, `TrxSysConfig`, `MandatoryRuntimeConfig`, `FileSystemConfig`, `EvictableBufferPoolConfig`, `LogSync`, `DEFAULT_COW_FILE_MAX_SIZE` |
 | Schema | `TableSpec`, `ColumnSpec`, `ColumnAttributes`, `IndexSpec`, `IndexKey`, `IndexOrder`, `IndexAttributes`, `IndexNo` |
 | Values | `Val`, `ValKind`, `ValType`, `MemVar` |
-| Reads | `SelectKey`, `SelectMvcc`, `ScanMvcc`, `LazyRow`, `ScanRowDecision` |
+| Reads | `SelectKey`, `SelectMvcc`, `ScanMvcc`, `LazyRow`, `ScanRowDecision`, `TableScanOptions`, `TableScanPlan` |
 | Writes | `UpdateCol`, `UpdateMvcc`, `UpsertMvcc`, `DeleteMvcc`, `RowMutation`, `TableMutationOutcome` |
 | Locks | `TableLockMode` |
 | Maintenance | `FreezeOutcome`, `FrozenPageBatchInfo`, `CheckpointOutcome`, `CheckpointDelayReason`, `CheckpointCancelReason`, `CatalogCheckpointOutcome`, `RedoTruncationOutcome`, `RedoTruncationBlockerInfo`, `CatalogRedoMaintenanceOutcome`, `MemIndexCleanupOutcome`, `MemIndexCleanupStats`, `MemIndexCleanupDelay`, `SecondaryMemIndexCleanupIndexStats` |

@@ -376,9 +376,7 @@ impl TableScanPlan {
 }
 
 impl TableScanPartitionStream {
-    pub fn next(
-        &mut self,
-    ) -> impl Future<Output = Result<Option<Vec<Val>>>> + Send + '_;
+    pub async fn next(&mut self) -> Result<Option<Vec<Val>>>;
 }
 ```
 
@@ -560,8 +558,7 @@ listener/select and lock-guard factoring is a Phase 2 choice. [D5] [D7] [C6]
 After each grant, acquisition resolves the table's STS-visible metadata and
 current live runtime/layout with the same compatibility rules as transaction
 table admission. It then captures the scan-relevant fields from one active-root
-observation: root/effective timestamps for diagnostics, the
-`column_block_index_root`, and `pivot_row_id`. The resulting
+observation: the `column_block_index_root` and `pivot_row_id`. The resulting
 `SnapshotTableBinding` owns the table and layout `Arc`s plus a private
 `OwnedTableRootSnapshot` defined below. It never stores
 `TableRootSnapshot<'_>`. [D3] [D4] [D12] [D14] [C2] [C6] [C11] [U6]
@@ -614,8 +611,6 @@ the long-lived registered snapshot path:
 
 ```rust,ignore
 struct OwnedTableRootSnapshot {
-    root_ts: TrxID,
-    effective_ts: TrxID,
     pivot_row_id: RowID,
     column_block_index_root: BlockID,
     // no proof lifetime and no directly usable root accessors
@@ -856,11 +851,13 @@ cloning a mutable callback for partitions and avoids defining whether `Stop`
 terminates one partition or a whole distributed scan. The existing
 transaction stream remains the programmable row API. [C1] [U3]
 
-The stream preserves the current custom async `next()` call shape while making
-the returned future's `Send` bound explicit. It does not implement
-`futures::Stream` in this RFC. Standardizing index and table stream polling
-remains the larger coordinated change in [B1]; the future Arrow adapter may
-either consume `next()` initially or resolve [B1] first. [C1] [B1] [U3] [U7]
+The stream preserves the current custom `async fn next()` call shape. The
+returned future's `Send` auto trait is inferred from the implementation and
+protected by compile-time assertions plus the executor spawn test. It does not
+implement `futures::Stream` in this RFC. Standardizing index and table stream
+polling remains the larger coordinated change in [B1]; the future Arrow adapter
+may either consume `next()` initially or resolve [B1] first. [C1] [B1] [U3]
+[U7]
 
 How the implementation arranges references, guards, and owned temporaries
 inside one `next()` future across await points is private. The observable rule
@@ -883,16 +880,18 @@ that observes the published failure detaches and returns typed
 context. No new plan or stream can publish after the failed drain transition.
 [D7] [D13] [C10] [C13] [U8]
 
-Cooperative failure checks occur at public `next()` entry, before starting a
-new physical-unit load, and after an awaited load completes. The common path
-per returned row is at most one atomic load and performs no mutex acquisition,
-event registration, registry lookup, or entry locking. A stream already inside
-storage I/O observes failure after that await; an unpolled stream stops only
-when it is next polled or dropped. This RFC does not attempt preemptive I/O
-cancellation. Phase 5 measures the one-partition healthy path with the signal
-enabled, and any material regression must be corrected by changing check
-placement before the phase is accepted. A later vectorized implementation can
-amortize the same check per batch or physical unit. [C12] [C13] [U8]
+Cooperative failure checks occur before starting a physical-unit load, after an
+awaited load completes, and when advancing beyond an exhausted loaded unit.
+There is no failure check at public `next()` entry while a unit remains loaded
+and therefore no failure atomic load per returned, invisible, or skipped row.
+A peer may return the remainder of the block/page it already owns when failure
+publishes, but it never begins another unit after observing failure. A stream
+already inside storage I/O observes failure after that await; an unpolled
+stream stops only when it is next polled or dropped. This RFC does not attempt
+preemptive I/O cancellation. Phase 5 measures the one-partition healthy path
+with these unit-boundary checks and confirms that the returned-row path contains
+no failure check. A later vectorized implementation may retain the same
+physical-unit boundary. [C12] [C13] [U8]
 
 A stream retains its current hot-page shared guard across yielded rows until
 that page is exhausted or the stream closes, matching the existing amortized
@@ -1187,9 +1186,11 @@ not preselect Arrow crate versions or public Arrow schema mapping. [U1] [U3]
     that boundary creates the sole terminal claim. [D7] [D13] [C10] [U5] [U8]
 15. The first partition execution error wins the snapshot-wide failure record,
     requests `Draining`, and returns its original error. Every sibling stream
-    checks the shared atomic signal without healthy-path locking, detaches on
-    observation, and returns the typed peer-failure result; no later planning
-    or execution checkout can publish. [D7] [C10] [C13] [U8]
+    checks the shared atomic signal only before/after unit load and after an
+    exhausted unit, without healthy returned-row locking. It may return the
+    remainder of one already loaded unit, then detaches on observation and
+    returns the typed peer-failure result; it never starts a later unit and no
+    later planning or execution checkout can publish. [D7] [C10] [C13] [U8]
 16. Every storage-entering path owns a counted checkout, no close or failure
     request admits a new checkout, and no snapshot resource is released while
     an active checkout can read it. [D6] [D7] [D13] [C10] [U5] [U8]
@@ -1460,8 +1461,8 @@ not preselect Arrow crate versions or public Arrow schema mapping. [U1] [U3]
     concurrently and migrate between worker threads; preserve current integrity
     checks and MVCC results; make a retained terminal stream resource-free;
     stop every table's streams after the first execution failure; bound each
-    stream to one loaded unit and one reusable row buffer; perform at most one
-    atomic failure check on the common returned-row path and no registry lookup,
+    stream to one loaded unit and one reusable row buffer; perform zero atomic
+    failure checks on the common returned-row path and no registry lookup,
     mutex, event registration, or entry lock there; return checkout only after
     local pins are gone; prove dormant plans are not executor ownership and only
     an `open` that wins before abandonment can produce a drainable stream; and
@@ -1475,11 +1476,12 @@ not preselect Arrow crate versions or public Arrow schema mapping. [U1] [U3]
     checkout, seal the family only after checkout succeeds, retain repeatable
     opens for the current generation, retain a current hot-page shared guard
     across rows as the existing stream does; use first-error-wins snapshot-wide
-    failure with typed peer-abort results; check failure at `next()` entry and
-    unit I/O boundaries; require no `Sync` bound; leave internal reference
-    placement across await points private subject to the `Send` future
-    contract; keep repeatable opens legal only while the snapshot remains
-    `Ready`.
+    failure with typed peer-abort results; check failure before and after unit
+    load and after exhausting a loaded unit, allowing peers to return that
+    unit's remainder but never begin another; require no `Sync` bound; leave
+    internal reference placement across await points private subject to the
+    `Send` future contract; keep repeatable opens legal only while the snapshot
+    remains `Ready`.
   - Verification: Compare complete partition unions and concatenated physical
     order with the existing transaction stream for empty, cold-only, hot-only,
     and mixed tables; cover MVCC insert, update, delete, undo, and CDB cases;
@@ -1505,8 +1507,9 @@ not preselect Arrow crate versions or public Arrow schema mapping. [U1] [U3]
     mode, and documented cold, hot, and mixed performance runs.
   - Goals: Preserve the existing benchmark counter equations, prove the
     benchmark consumes every partition exactly once, show no material
-    one-partition healthy-path regression from cooperative failure checks, and
-    report scaling over sufficiently large cold, hot, and mixed fixtures.
+    one-partition healthy-path regression from unit-boundary cooperative
+    failure checks, confirm that no per-row failure check exists, and report
+    scaling over sufficiently large cold, hot, and mixed fixtures.
   - Non-goals: No CI wall-clock speedup assertion, auto-tuning, query scheduler,
     or replacement of the existing `table-scan` benchmark identity.
   - Phase-local Choices: Count one complete all-partition drain as one logical
@@ -1625,10 +1628,11 @@ not preselect Arrow crate versions or public Arrow schema mapping. [U1] [U3]
     from at least two tables are active. Prove the first publisher records its
     context, returns its original error, moves the exact snapshot toward failed
     drain, and rejects new planning/open admission. Prove peers observe the
-    atomic signal at `next()` entry or the defined unit-I/O boundaries, return
-    typed `OperationError::SnapshotScanAborted`, and detach without scanning a
-    later unit. Race two original errors and prove only the first failure record
-    wins while each directly failing stream may return its own error. Retain all
+    atomic signal before/after unit load or after an exhausted unit, may return
+    the exact remainder of an already loaded unit, return typed
+    `OperationError::SnapshotScanAborted`, and detach without loading a later
+    unit. Race two original errors and prove only the first failure record wins
+    while each directly failing stream may return its own error. Retain all
     terminal stream objects and snapshot facades; after the final active
     checkout returns, verify STS deregistration and metadata-X lock progress do
     not depend on dropping those values. [C13] [U8]
@@ -1674,10 +1678,11 @@ not preselect Arrow crate versions or public Arrow schema mapping. [U1] [U3]
 25. Benchmark target parallelism 1 through available worker capacity over
     sufficiently large cold, hot, and mixed data. Record rows, actual
     partitions, elapsed scan throughput, and relevant I/O/buffer statistics;
-    compare the one-partition healthy path with and without cooperative failure
-    checks to reject a material regression, and report the exact check
-    placement. Performance results inform later weight or vectorization work
-    but remain a review/benchmark gate rather than a CI timing assertion.
+    assess the one-partition healthy path with unit-boundary cooperative failure
+    checks, confirm no per-row failure check exists, reject a material
+    regression, and report the exact check placement. Performance results
+    inform later weight or vectorization work but remain a review/benchmark
+    gate rather than a CI timing assertion.
 
 ## Consequences
 
@@ -1757,9 +1762,11 @@ not preselect Arrow crate versions or public Arrow schema mapping. [U1] [U3]
   the final OLAP output format.
 - Callers must spawn workers, retain the originating error among peer-abort
   results, and merge or discard partial results themselves.
-- Cooperative failure detection adds an atomic load to the common `next()`
-  entry path and additional checks around physical-unit I/O; Phase 5 must show
-  that this produces no material row-scan regression.
+- Cooperative failure detection adds atomic loads at physical-unit load and
+  advance boundaries. It adds no load to the common returned-row path, but a
+  failed peer may return the remainder of its already loaded unit and a paused
+  stream can delay failed-drain cleanup; Phase 5 must show that the boundary
+  checks produce no material one-partition regression.
 - The `'static` stream boundary forbids borrowing plan, snapshot, or caller
   storage into an opened partition; each stream must own or clone the pins and
   values needed by its task.

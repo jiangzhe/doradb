@@ -1,19 +1,12 @@
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "shared snapshots remain crate-private until Phase 4 exposes row streams"
-    )
-)]
-
 use super::{
     MvccReadView, MvccVisibility, ResolvedTableReadBinding, resolve_table_read_binding,
     sys::TransactionSystem,
 };
+use crate::buffer::PoolGuards;
 use crate::catalog::{ResolvedLiveMetadata, is_catalog_table};
 use crate::error::{
-    LifecycleError, LifecycleOrFatalResult, LifecycleResult, MultiDomainResultExt, OperationError,
-    OperationResult, QuadResult, Result,
+    DiscloseError, DiscloseResultExt, LifecycleError, LifecycleOrFatalResult, LifecycleResult,
+    MultiDomainResultExt, OperationError, OperationResult, QuadResult, Result,
 };
 use crate::id::{BlockID, RowID, SessionOperationKey, TableID, TrxID};
 use crate::lock::{FamilyLockAuthority, LockMode, LockOwner, LockResource, LockScopeState};
@@ -22,8 +15,8 @@ use crate::quiescent::QuiescentGuard;
 use crate::session::{SessionRuntime, WeakSessionRef};
 use crate::table::{
     CheckedOutTableScanRoot, CompiledTableScanPlan, DmlValidator, OwnedTableScanRoot, Table,
-    TableRuntimeLayout, TableScanRuntime, TableScanUnit, compile_table_scan_plan,
-    repartition_table_scan_offsets,
+    TableRuntimeLayout, TableScanPartitionStream, TableScanRuntime, TableScanUnit,
+    compile_table_scan_plan, repartition_table_scan_offsets,
 };
 use error_stack::{Report, ResultExt};
 use event_listener::{Event, EventListener};
@@ -105,6 +98,7 @@ pub(crate) enum ReadSnapshotDrainReason {
     SessionClose,
     SessionAbandoned,
     EngineShutdown,
+    ExecutionFailed,
 }
 
 /// Registry-visible phase of one typed read-snapshot entry.
@@ -138,7 +132,6 @@ impl ReadSnapshotPhase {
 /// One table binding frozen into a shared read snapshot.
 struct SnapshotTableBinding {
     visible: ResolvedLiveMetadata,
-    current_effective_cts: TrxID,
     table: Arc<Table>,
     layout: Arc<TableRuntimeLayout>,
     root: OwnedTableScanRoot,
@@ -211,6 +204,7 @@ impl ReadSnapshotBuildCore {
             read_core: Arc::new(FrozenReadSnapshotCore {
                 bindings,
                 read_view,
+                execution: SnapshotExecutionControl::new(),
                 active_sts,
             }),
             locks,
@@ -236,8 +230,63 @@ impl ReadSnapshotBuildCore {
 pub(crate) struct FrozenReadSnapshotCore {
     bindings: FastHashMap<TableID, SnapshotTableBinding>,
     read_view: MvccReadView,
+    execution: SnapshotExecutionControl,
     // Keep registration last so bindings and owned roots drop first.
     active_sts: ActiveSnapshotRegistration,
+}
+
+/// First execution error context shared by every stream in one snapshot.
+#[derive(Clone, Copy)]
+pub(crate) struct SnapshotExecutionFailure {
+    /// Table whose partition produced the first error.
+    pub(crate) table_id: TableID,
+    /// Zero-based partition that produced the first error.
+    pub(crate) partition_idx: usize,
+}
+
+struct SnapshotExecutionControl {
+    failed: AtomicBool,
+    first_failure: Mutex<Option<SnapshotExecutionFailure>>,
+}
+
+impl SnapshotExecutionControl {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            failed: AtomicBool::new(false),
+            first_failure: Mutex::new(None),
+        }
+    }
+
+    #[inline]
+    fn is_healthy(&self) -> bool {
+        !self.failed.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    fn failure(&self) -> Option<SnapshotExecutionFailure> {
+        if self.is_healthy() {
+            return None;
+        }
+        Some(self.first_failure.lock().unwrap_or_else(|| {
+            panic!("failed snapshot execution control is missing first-failure context")
+        }))
+    }
+
+    #[inline]
+    fn publish_first_failure(&self, failure: SnapshotExecutionFailure) -> bool {
+        let mut first_failure = self.first_failure.lock();
+        if self.failed.load(Ordering::Acquire) {
+            return false;
+        }
+        assert!(
+            first_failure.is_none(),
+            "healthy snapshot execution control already contains failure context"
+        );
+        *first_failure = Some(failure);
+        self.failed.store(true, Ordering::Release);
+        true
+    }
 }
 
 /// Checked-in ready payload; lock mutation remains registry-authoritative.
@@ -365,6 +414,18 @@ impl ReadSnapshotEntry {
     #[inline]
     pub(crate) fn phase(&self) -> ReadSnapshotPhase {
         self.inner.lock().state.phase()
+    }
+
+    /// Return whether the exact ready snapshot still accepts execution work.
+    #[inline]
+    pub(crate) fn execution_healthy(&self) -> bool {
+        let inner = self.inner.lock();
+        match &inner.state {
+            ReadSnapshotEntryState::Ready { payload, .. } => {
+                payload.read_core.execution.is_healthy()
+            }
+            _ => false,
+        }
     }
 
     /// Register the exact abort listener before rechecking sticky build abort.
@@ -542,6 +603,14 @@ impl ReadSnapshotEntry {
                 )),
             );
         };
+        if !payload.read_core.execution.is_healthy() {
+            return Err(
+                Report::new(LifecycleError::ReadSnapshotUnavailable).attach(format!(
+                    "operation_key={}, reason=execution_failed",
+                    self.key
+                )),
+            );
+        }
         *active_checkouts = active_checkouts
             .checked_add(1)
             .unwrap_or_else(|| panic!("read snapshot checkout count overflow: key={}", self.key));
@@ -703,8 +772,8 @@ impl Drop for ReadSnapshotTerminalClaim {
     }
 }
 
-/// Weak, one-shot owner for snapshot preparation.
-pub(crate) struct ReadSnapshotBuilder {
+/// Weak, one-shot owner for preparing a shared read snapshot.
+pub struct ReadSnapshotBuilder {
     session: WeakSessionRef,
     key: SessionOperationKey,
     sts: TrxID,
@@ -725,12 +794,19 @@ impl ReadSnapshotBuilder {
 
     /// Return the registered snapshot timestamp.
     #[inline]
-    pub(crate) const fn sts(&self) -> TrxID {
+    pub const fn sts(&self) -> TrxID {
         self.sts
     }
 
-    /// Acquire and freeze the complete user-table set.
-    pub(crate) async fn acquire_tables<I>(self, input_table_ids: I) -> QuadResult<ReadSnapshot>
+    /// Acquire and freeze the complete user-table set for this snapshot.
+    pub async fn acquire_tables<I>(self, input_table_ids: I) -> Result<ReadSnapshot>
+    where
+        I: IntoIterator<Item = TableID>,
+    {
+        self.acquire_tables_inner(input_table_ids).await.disclose()
+    }
+
+    async fn acquire_tables_inner<I>(self, input_table_ids: I) -> QuadResult<ReadSnapshot>
     where
         I: IntoIterator<Item = TableID>,
     {
@@ -876,7 +952,7 @@ impl ReadSnapshotBuildCheckout {
         }
         let ResolvedTableReadBinding {
             visible,
-            current_effective_cts,
+            current_effective_cts: _,
             table,
             layout,
         } = resolve_table_read_binding(
@@ -891,7 +967,6 @@ impl ReadSnapshotBuildCheckout {
             table_id,
             SnapshotTableBinding {
                 visible,
-                current_effective_cts,
                 table,
                 layout,
                 root,
@@ -929,51 +1004,37 @@ impl Drop for ReadSnapshotBuildCheckout {
     }
 }
 
-/// Cloneable weak facade over one registry-owned read snapshot.
+/// Cloneable weak facade over one registry-owned shared read snapshot.
 #[derive(Clone)]
-pub(crate) struct ReadSnapshot {
+pub struct ReadSnapshot {
     group: Arc<ReadSnapshotFacadeGroup>,
 }
 
 impl ReadSnapshot {
     /// Return the registered snapshot timestamp.
     #[inline]
-    pub(crate) fn sts(&self) -> TrxID {
+    pub fn sts(&self) -> TrxID {
         self.group.sts
     }
 
     /// Count and pin one immutable snapshot checkout.
     #[inline]
     pub(crate) fn checkout(&self) -> LifecycleOrFatalResult<ReadSnapshotCheckout> {
-        if self.group.closed.load(Ordering::Acquire) {
-            return Err(read_snapshot_unavailable(self.group.key, "facade_closed").into());
-        }
-        let admitted = self
-            .group
-            .session
-            .upgrade()
-            .attach_with(|| format!("operation_key={}", self.group.key))?
-            .ok_or_else(|| read_snapshot_unavailable(self.group.key, "session_missing"))?;
-        admitted
-            .runtime()
-            .poisoner
-            .ensure_healthy()
-            .attach_with(|| format!("operation_key={}, phase=checkout", self.group.key))?;
-        let (entry, read_core) = admitted
-            .runtime()
-            .state()
-            .checkout_read_snapshot_ready(self.group.key, &self.group.closed)
-            .attach_with(|| format!("operation_key={}", self.group.key))?;
-        let runtime = admitted.into_runtime();
-        Ok(ReadSnapshotCheckout {
-            runtime,
-            entry,
-            read_core: Some(read_core),
-        })
+        ReadSnapshotCheckout::open(&self.group)
     }
 
-    /// Capture and publish one deterministic resource-free table-scan plan.
-    pub(crate) async fn prepare_table_scan(
+    /// Prepare one deterministic table-scan plan at this snapshot.
+    pub async fn prepare_table_scan(
+        &self,
+        table_id: TableID,
+        options: TableScanOptions,
+    ) -> Result<TableScanPlan> {
+        self.prepare_table_scan_inner(table_id, options)
+            .await
+            .disclose()
+    }
+
+    async fn prepare_table_scan_inner(
         &self,
         table_id: TableID,
         options: TableScanOptions,
@@ -1035,7 +1096,7 @@ impl ReadSnapshot {
     }
 
     /// Seal the shared facade group and wait for exact terminal cleanup.
-    pub(crate) async fn close(self) -> Result<()> {
+    pub async fn close(self) -> Result<()> {
         self.group
             .request_close(ReadSnapshotDrainReason::ExplicitClose);
         loop {
@@ -1059,10 +1120,10 @@ impl ReadSnapshot {
     }
 }
 
-/// Crate-private projection input for deterministic table-scan planning.
-pub(crate) struct TableScanOptions {
+/// Projection input for deterministic shared-snapshot table-scan planning.
+pub struct TableScanOptions {
     /// Strictly increasing snapshot-visible table column numbers.
-    pub(crate) projection: Vec<usize>,
+    pub projection: Vec<usize>,
 }
 
 struct TableScanPlanShared {
@@ -1080,7 +1141,7 @@ struct TableScanPlanShared {
 
 /// Cloneable immutable table-scan plan for one exact snapshot and generation.
 #[derive(Clone)]
-pub(crate) struct TableScanPlan {
+pub struct TableScanPlan {
     shared: Arc<TableScanPlanShared>,
     partition_offsets: Arc<[usize]>,
     generation: u64,
@@ -1091,6 +1152,7 @@ impl Debug for TableScanPlan {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("TableScanPlan")
             .field("operation_key", &self.shared.operation_key)
+            .field("sts", &self.shared.sts)
             .field("table_id", &self.shared.table_id)
             .field("generation", &self.generation)
             .field("partition_offsets", &self.partition_offsets)
@@ -1135,15 +1197,50 @@ impl TableScanPlan {
 
     /// Return the compact plan layout's logical partition count.
     #[inline]
-    pub(crate) fn partition_count(&self) -> usize {
+    pub fn partition_count(&self) -> usize {
         self.partition_offsets.len() - 1
     }
 
+    /// Open one fully owned current-generation partition stream.
+    pub fn open(&self, partition_idx: usize) -> Result<TableScanPartitionStream> {
+        if partition_idx >= self.partition_count() {
+            return Err(Report::new(OperationError::InvalidTableScanInput)
+                .attach(format!(
+                    "operation=open_table_scan_partition, operation_key={}, table_id={}, generation={}, partition_idx={partition_idx}, partition_count={}",
+                    self.shared.operation_key,
+                    self.shared.table_id,
+                    self.generation,
+                    self.partition_count()
+                ))
+                .disclose());
+        }
+        let start = self.partition_offsets[partition_idx];
+        let end = self.partition_offsets[partition_idx + 1];
+        self.admit_open(|| {
+            let checkout = ReadSnapshotExecutionCheckout::open(&self.shared.liveness)?;
+            let table = checkout.table(self.shared.table_id, partition_idx, self.generation);
+            Ok(TableScanPartitionStream::new(
+                Arc::clone(&self.shared.units),
+                start,
+                end,
+                self.shared.column_root,
+                self.shared.pivot_row_id,
+                Arc::clone(&self.shared.projection),
+                self.shared.table_id,
+                partition_idx,
+                table,
+                checkout,
+            ))
+        })
+        .disclose()
+    }
+
     /// Best-effort repartition at immutable physical-unit boundaries.
-    pub(crate) fn repartition(
-        &self,
-        target_partitions: NonZeroUsize,
-    ) -> OperationResult<Option<Self>> {
+    pub fn repartition(&self, target_partitions: NonZeroUsize) -> Result<Option<Self>> {
+        self.repartition_inner(target_partitions).disclose()
+    }
+
+    fn repartition_inner(&self, target_partitions: NonZeroUsize) -> OperationResult<Option<Self>> {
         let offsets =
             repartition_table_scan_offsets(self.shared.weight_prefix.as_ref(), target_partitions);
 
@@ -1183,11 +1280,10 @@ impl TableScanPlan {
         }))
     }
 
-    /// Run the future execution-checkout acceptance while holding the family gate.
+    /// Run execution-checkout acceptance while holding the family gate.
     ///
-    /// Phase 4 supplies the combined session-open/exact-snapshot-ready checkout
-    /// as `accept`. Only a successful checkout seals the family; repeatable
-    /// acceptance through the current generation remains legal.
+    /// Only a successful checkout seals the family; repeatable acceptance
+    /// through the current generation remains legal.
     #[inline]
     pub(crate) fn admit_open<T>(&self, accept: impl FnOnce() -> QuadResult<T>) -> QuadResult<T> {
         let mut gate = self.shared.gate.inner.lock();
@@ -1263,6 +1359,34 @@ pub(crate) struct ReadSnapshotCheckout {
 }
 
 impl ReadSnapshotCheckout {
+    #[inline]
+    fn open(group: &Arc<ReadSnapshotFacadeGroup>) -> LifecycleOrFatalResult<Self> {
+        if group.closed.load(Ordering::Acquire) {
+            return Err(read_snapshot_unavailable(group.key, "facade_closed").into());
+        }
+        let admitted = group
+            .session
+            .upgrade()
+            .attach_with(|| format!("operation_key={}", group.key))?
+            .ok_or_else(|| read_snapshot_unavailable(group.key, "session_missing"))?;
+        admitted
+            .runtime()
+            .poisoner
+            .ensure_healthy()
+            .attach_with(|| format!("operation_key={}, phase=checkout", group.key))?;
+        let (entry, read_core) = admitted
+            .runtime()
+            .state()
+            .checkout_read_snapshot_ready(group.key, &group.closed)
+            .attach_with(|| format!("operation_key={}", group.key))?;
+        let runtime = admitted.into_runtime();
+        Ok(Self {
+            runtime,
+            entry,
+            read_core: Some(read_core),
+        })
+    }
+
     /// Return a table/layout/root view borrowed from this exact checkout.
     #[inline]
     pub(crate) fn table(&self, table_id: TableID) -> OperationResult<CheckedOutSnapshotTable<'_>> {
@@ -1280,7 +1404,6 @@ impl ReadSnapshotCheckout {
         })?;
         Ok(CheckedOutSnapshotTable {
             visible: &binding.visible,
-            current_effective_cts: binding.current_effective_cts,
             table: &binding.table,
             layout: &binding.layout,
             root: CheckedOutTableScanRoot::new(&binding.root),
@@ -1312,10 +1435,102 @@ impl Drop for ReadSnapshotCheckout {
     }
 }
 
+/// Exact table and layout pins transferred into one partition stream.
+pub(crate) struct ReadSnapshotExecutionTable {
+    /// Snapshot-bound user-table runtime.
+    pub(crate) table: Arc<Table>,
+    /// Snapshot-bound table runtime layout.
+    pub(crate) layout: Arc<TableRuntimeLayout>,
+}
+
+/// Counted owner accepted for one fully owned table-scan execution.
+pub(crate) struct ReadSnapshotExecutionCheckout {
+    checkout: ReadSnapshotCheckout,
+}
+
+impl ReadSnapshotExecutionCheckout {
+    #[inline]
+    fn open(group: &Arc<ReadSnapshotFacadeGroup>) -> LifecycleOrFatalResult<Self> {
+        ReadSnapshotCheckout::open(group).map(|checkout| Self { checkout })
+    }
+
+    #[inline]
+    fn table(
+        &self,
+        table_id: TableID,
+        partition_idx: usize,
+        generation: u64,
+    ) -> ReadSnapshotExecutionTable {
+        let read_core = self.checkout.read_core.as_ref().unwrap_or_else(|| {
+            panic!(
+                "live snapshot execution checkout is missing its read core: key={}",
+                self.checkout.entry.key()
+            )
+        });
+        let binding = read_core.bindings.get(&table_id).unwrap_or_else(|| {
+            panic!(
+                "table scan execution binding invariant violated: operation_key={}, table_id={table_id}, partition_idx={partition_idx}, generation={generation}",
+                self.checkout.entry.key()
+            )
+        });
+        ReadSnapshotExecutionTable {
+            table: Arc::clone(&binding.table),
+            layout: Arc::clone(&binding.layout),
+        }
+    }
+
+    /// Borrow the ownerless MVCC view pinned by this execution checkout.
+    #[inline]
+    pub(crate) fn read_view(&self) -> &MvccReadView {
+        self.checkout.read_view()
+    }
+
+    /// Clone the operation's pool-guard roots for an asynchronous unit load.
+    #[inline]
+    pub(crate) fn pool_guards_owned(&self) -> PoolGuards {
+        self.checkout.runtime.pool_guards().clone()
+    }
+
+    /// Return the first snapshot execution failure, if one was published.
+    #[inline]
+    pub(crate) fn failure(&self) -> Option<SnapshotExecutionFailure> {
+        self.read_core().execution.failure()
+    }
+
+    /// Attempt to publish this partition as the snapshot's first failure.
+    #[inline]
+    pub(crate) fn publish_failure(&self, table_id: TableID, partition_idx: usize) -> bool {
+        self.read_core()
+            .execution
+            .publish_first_failure(SnapshotExecutionFailure {
+                table_id,
+                partition_idx,
+            })
+    }
+
+    /// Seal the exact snapshot after this checkout wins failure publication.
+    #[inline]
+    pub(crate) fn request_failed_drain(&self) {
+        self.checkout.runtime.request_read_snapshot_close(
+            self.checkout.entry.key(),
+            ReadSnapshotDrainReason::ExecutionFailed,
+        );
+    }
+
+    #[inline]
+    fn read_core(&self) -> &FrozenReadSnapshotCore {
+        self.checkout.read_core.as_deref().unwrap_or_else(|| {
+            panic!(
+                "live snapshot execution checkout is missing its read core: key={}",
+                self.checkout.entry.key()
+            )
+        })
+    }
+}
+
 /// Table binding whose references and root view cannot outlive a checkout.
 pub(crate) struct CheckedOutSnapshotTable<'checkout> {
     visible: &'checkout ResolvedLiveMetadata,
-    current_effective_cts: TrxID,
     table: &'checkout Arc<Table>,
     layout: &'checkout Arc<TableRuntimeLayout>,
     root: CheckedOutTableScanRoot<'checkout>,
@@ -1326,12 +1541,6 @@ impl CheckedOutSnapshotTable<'_> {
     #[inline]
     pub(crate) const fn visible_metadata(&self) -> &ResolvedLiveMetadata {
         self.visible
-    }
-
-    /// Return the current metadata identity used for runtime binding.
-    #[inline]
-    pub(crate) const fn current_effective_cts(&self) -> TrxID {
-        self.current_effective_cts
     }
 
     /// Borrow the bound table runtime.
@@ -1369,10 +1578,13 @@ mod tests {
     use crate::catalog::tests::{table2, table3};
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TableScanConfig, TrxSysConfig};
     use crate::engine::Engine;
-    use crate::error::{FatalError, LifecycleOrFatalError, QuadError};
+    use crate::error::{Error, ErrorKind, FatalError, LifecycleOrFatalError, QuadError};
     use crate::id::{BlockID, OperationID, PageID, SessionID};
     use crate::lock::tests::{LockDebugEntryState, debug_snapshot};
     use crate::lock::{FamilyLockAuthority, LockMode, LockOwner, LockResource, LockScopeState};
+    use crate::row::ops::ScanRowDecision;
+    use crate::session::tests::assert_checkpoint_published;
+    use crate::table::tests::assert_freeze_created;
     use crate::table::{RowPageDescriptor, TableScanRootView, TableScanWorklist};
     use crate::trx::tests::{active_sts_contains, active_sts_count, test_engine};
     use crate::trx::{MAX_SNAPSHOT_TS, MvccVisibility};
@@ -1490,25 +1702,35 @@ mod tests {
     assert_not_impl!(ReadSnapshotBuilder: Sync);
     assert_not_impl!(ReadSnapshotBuilder: Clone);
 
-    fn assert_operation(error: QuadError, expected: OperationError) {
+    fn assert_quad_operation(error: QuadError, expected: OperationError) {
         match error {
             QuadError::Operation(report) => assert_eq!(report.current_context(), &expected),
             error => panic!("expected Operation error, got {error:?}"),
         }
     }
 
-    fn assert_lifecycle(error: QuadError, expected: LifecycleError) {
+    fn assert_quad_lifecycle(error: QuadError, expected: LifecycleError) {
         match error {
             QuadError::Lifecycle(report) => assert_eq!(report.current_context(), &expected),
             error => panic!("expected Lifecycle error, got {error:?}"),
         }
     }
 
-    fn assert_fatal(error: QuadError, expected: FatalError) {
-        match error {
-            QuadError::Fatal(report) => assert_eq!(report.current_context(), &expected),
-            error => panic!("expected Fatal error, got {error:?}"),
-        }
+    fn assert_operation(error: Error, expected: OperationError) {
+        assert_eq!(error.operation_error(), Some(expected), "{error:?}");
+    }
+
+    fn assert_lifecycle(error: Error, expected: LifecycleError) {
+        assert_eq!(error.kind(), ErrorKind::Lifecycle, "{error:?}");
+        assert_eq!(
+            error.report().downcast_ref::<LifecycleError>(),
+            Some(&expected)
+        );
+    }
+
+    fn assert_fatal(error: Error, expected: FatalError) {
+        assert_eq!(error.kind(), ErrorKind::Fatal, "{error:?}");
+        assert_eq!(error.report().downcast_ref::<FatalError>(), Some(&expected));
     }
 
     macro_rules! drive_planner_to_capture_hook {
@@ -1535,8 +1757,8 @@ mod tests {
         }
     }
 
-    fn assert_operation_report(error: Report<OperationError>, expected: OperationError) {
-        assert_eq!(error.current_context(), &expected);
+    fn assert_operation_report(error: Error, expected: OperationError) {
+        assert_operation(error, expected);
     }
 
     fn synthetic_hot_plan(snapshot: &ReadSnapshot, table_id: TableID) -> TableScanPlan {
@@ -1562,6 +1784,300 @@ mod tests {
             vec![0],
             compiled,
         )
+    }
+
+    async fn insert_test_rows(engine: &Engine, table_id: TableID, count: i32) {
+        let mut session = engine.new_session().unwrap();
+        let mut trx = session.begin_trx().unwrap();
+        for key in 0..count {
+            trx.table_insert_mvcc(table_id, vec![Val::from(key), Val::from("value")])
+                .await
+                .unwrap();
+        }
+        trx.commit().await.unwrap();
+        session.close().await.unwrap();
+    }
+
+    async fn insert_large_test_rows(engine: &Engine, table_id: TableID, count: i32) {
+        let mut session = engine.new_session().unwrap();
+        let mut trx = session.begin_trx().unwrap();
+        for key in 0..count {
+            trx.table_insert_mvcc(
+                table_id,
+                vec![Val::from(key), Val::from(vec![b'x'; 40 * 1024])],
+            )
+            .await
+            .unwrap();
+        }
+        trx.commit().await.unwrap();
+        session.close().await.unwrap();
+    }
+
+    async fn drain_partition(mut stream: TableScanPartitionStream) -> Result<Vec<Vec<Val>>> {
+        let mut rows = Vec::new();
+        while let Some(row) = stream.next().await? {
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+
+    #[test]
+    fn partition_streams_are_spawnable_ordered_and_repeatable() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("table_scan_partition_spawnable").await;
+            let table_id = table2(&engine).await;
+            insert_large_test_rows(&engine, table_id, 12).await;
+
+            let mut session = engine.new_session().unwrap();
+            let snapshot = session
+                .begin_read_snapshot()
+                .unwrap()
+                .acquire_tables([table_id])
+                .await
+                .unwrap();
+            let plan = snapshot
+                .prepare_table_scan(
+                    table_id,
+                    TableScanOptions {
+                        projection: vec![0],
+                    },
+                )
+                .await
+                .unwrap();
+            let invalid = match plan.open(plan.partition_count()) {
+                Ok(_) => panic!("out-of-range partition must fail before execution checkout"),
+                Err(error) => error,
+            };
+            assert_operation(invalid, OperationError::InvalidTableScanInput);
+            let plan = plan
+                .repartition(NonZeroUsize::new(4).unwrap())
+                .unwrap()
+                .unwrap_or(plan);
+            assert!(plan.partition_count() > 1);
+
+            let mut tasks = Vec::with_capacity(plan.partition_count());
+            for partition_idx in 0..plan.partition_count() {
+                let mut stream = plan.open(partition_idx).unwrap();
+                fn require_send<T: Send>(_: &T) {}
+                let next = stream.next();
+                require_send(&next);
+                drop(next);
+                tasks.push(smol::spawn(drain_partition(stream)));
+            }
+            drop(plan);
+            let (partition_rows, close) =
+                futures::join!(futures::future::join_all(tasks), snapshot.close());
+            close.unwrap();
+            let rows = partition_rows
+                .into_iter()
+                .map(|result| result.unwrap())
+                .collect::<Vec<_>>();
+            let concatenated = rows.into_iter().flatten().collect::<Vec<_>>();
+            let mut trx = session.begin_trx().unwrap();
+            let mut sequential_stream = trx
+                .table_scan_mvcc_stream(table_id, &[0], |_| Ok(ScanRowDecision::Include))
+                .await
+                .unwrap();
+            let mut sequential = Vec::new();
+            while let Some(row) = sequential_stream.next().await.unwrap() {
+                sequential.push(row);
+            }
+            drop(sequential_stream);
+            trx.rollback().await.unwrap();
+            assert_eq!(concatenated, sequential);
+
+            session.close().await.unwrap();
+            engine.shutdown();
+        });
+    }
+
+    #[test]
+    fn partition_stream_scans_mixed_cold_and_hot_units() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("table_scan_partition_mixed").await;
+            let table_id = table2(&engine).await;
+            insert_test_rows(&engine, table_id, 3).await;
+            let mut maintenance = engine.new_session().unwrap();
+            assert_freeze_created(
+                maintenance
+                    .freeze_table(table_id, usize::MAX)
+                    .await
+                    .unwrap(),
+            );
+            assert_checkpoint_published(&mut maintenance, table_id).await;
+            maintenance.close().await.unwrap();
+
+            let mut writer = engine.new_session().unwrap();
+            let mut trx = writer.begin_trx().unwrap();
+            for key in 3..5 {
+                trx.table_insert_mvcc(table_id, vec![Val::from(key), Val::from("hot")])
+                    .await
+                    .unwrap();
+            }
+            trx.commit().await.unwrap();
+            writer.close().await.unwrap();
+
+            let mut session = engine.new_session().unwrap();
+            let snapshot = session
+                .begin_read_snapshot()
+                .unwrap()
+                .acquire_tables([table_id])
+                .await
+                .unwrap();
+            let plan = snapshot
+                .prepare_table_scan(
+                    table_id,
+                    TableScanOptions {
+                        projection: vec![0],
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(
+                plan.shared
+                    .units
+                    .iter()
+                    .any(|unit| matches!(unit, TableScanUnit::Cold(_)))
+            );
+            assert!(
+                plan.shared
+                    .units
+                    .iter()
+                    .any(|unit| matches!(unit, TableScanUnit::Hot(_)))
+            );
+            let streams = (0..plan.partition_count())
+                .map(|partition_idx| plan.open(partition_idx).unwrap())
+                .collect::<Vec<_>>();
+            drop(plan);
+            let (partitions, close) = futures::join!(
+                futures::future::join_all(streams.into_iter().map(drain_partition)),
+                snapshot.close()
+            );
+            close.unwrap();
+            let rows = partitions
+                .into_iter()
+                .flat_map(|result| result.unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                rows,
+                (0..5).map(|key| vec![Val::from(key)]).collect::<Vec<_>>()
+            );
+
+            session.close().await.unwrap();
+            engine.shutdown();
+        });
+    }
+
+    #[test]
+    fn opened_streams_outlive_facades_and_repeat_the_same_partition() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("table_scan_partition_owned").await;
+            let table_id = table2(&engine).await;
+            insert_test_rows(&engine, table_id, 4).await;
+
+            let mut session = engine.new_session().unwrap();
+            let snapshot = session
+                .begin_read_snapshot()
+                .unwrap()
+                .acquire_tables([table_id])
+                .await
+                .unwrap();
+            let sts = snapshot.sts();
+            let plan = snapshot
+                .prepare_table_scan(
+                    table_id,
+                    TableScanOptions {
+                        projection: vec![0],
+                    },
+                )
+                .await
+                .unwrap();
+            let first = plan.open(0).unwrap();
+            let second = plan.open(0).unwrap();
+            let (first, second) = futures::join!(drain_partition(first), drain_partition(second));
+            let expected = first.unwrap();
+            assert_eq!(expected, second.unwrap());
+            assert!(active_sts_contains(&engine.inner().trx_sys, sts));
+
+            let third = plan.open(0).unwrap();
+            drop(plan);
+            drop(snapshot);
+            assert_eq!(drain_partition(third).await.unwrap(), expected);
+            assert!(!active_sts_contains(&engine.inner().trx_sys, sts));
+
+            session.close().await.unwrap();
+            engine.shutdown();
+        });
+    }
+
+    #[test]
+    fn first_execution_error_aborts_peers_only_at_unit_boundary() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("table_scan_partition_failure").await;
+            let table_id = table2(&engine).await;
+            insert_test_rows(&engine, table_id, 5).await;
+
+            let mut session = engine.new_session().unwrap();
+            let snapshot = session
+                .begin_read_snapshot()
+                .unwrap()
+                .acquire_tables([table_id])
+                .await
+                .unwrap();
+            let valid = snapshot
+                .prepare_table_scan(
+                    table_id,
+                    TableScanOptions {
+                        projection: vec![0],
+                    },
+                )
+                .await
+                .unwrap();
+            let mut peer = valid.open(0).unwrap();
+            assert_eq!(peer.next().await.unwrap(), Some(vec![Val::from(0)]));
+
+            let mut origin = valid.open(0).unwrap();
+            let origin_error = origin.inject_execution_error().unwrap_err();
+            assert_eq!(origin_error.kind(), ErrorKind::Runtime);
+            assert_eq!(origin.next().await.unwrap(), None);
+
+            let later_open = match valid.open(0) {
+                Ok(_) => panic!("failed snapshot must reject later execution checkout"),
+                Err(error) => error,
+            };
+            assert_lifecycle(later_open, LifecycleError::ReadSnapshotUnavailable);
+            assert_lifecycle(
+                snapshot
+                    .prepare_table_scan(
+                        table_id,
+                        TableScanOptions {
+                            projection: vec![0],
+                        },
+                    )
+                    .await
+                    .unwrap_err(),
+                LifecycleError::ReadSnapshotUnavailable,
+            );
+
+            let mut remainder = Vec::new();
+            let peer_error = loop {
+                match peer.next().await {
+                    Ok(Some(row)) => remainder.push(row),
+                    Ok(None) => panic!("failed peer must publish its abort at the unit boundary"),
+                    Err(error) => break error,
+                }
+            };
+            assert_eq!(
+                remainder,
+                (1..5).map(|key| vec![Val::from(key)]).collect::<Vec<_>>()
+            );
+            assert_operation(peer_error, OperationError::SnapshotScanAborted);
+            assert_eq!(peer.next().await.unwrap(), None);
+
+            snapshot.close().await.unwrap();
+            session.close().await.unwrap();
+            engine.shutdown();
+        });
     }
 
     #[test]
@@ -1793,7 +2309,7 @@ mod tests {
             let open_error = original
                 .admit_open(|| Ok(()))
                 .expect_err("superseded generation must reject open");
-            assert_operation(open_error, OperationError::StaleTableScanPlan);
+            assert_quad_operation(open_error, OperationError::StaleTableScanPlan);
             drop(current);
             assert_operation_report(
                 original
@@ -1805,7 +2321,7 @@ mod tests {
             let failed_then_repartitioned = synthetic_hot_plan(&snapshot, table_id);
             let failed: QuadResult<()> = failed_then_repartitioned
                 .admit_open(|| Err(Report::new(LifecycleError::ReadSnapshotUnavailable).into()));
-            assert_lifecycle(
+            assert_quad_lifecycle(
                 failed.expect_err("simulated checkout must fail"),
                 LifecycleError::ReadSnapshotUnavailable,
             );
@@ -1875,7 +2391,7 @@ mod tests {
             });
             match (repartition_result, open_result) {
                 (Ok(Some(_)), Err(error)) => {
-                    assert_operation(error, OperationError::StaleTableScanPlan);
+                    assert_quad_operation(error, OperationError::StaleTableScanPlan);
                 }
                 (Err(error), Ok(())) => {
                     assert_operation_report(error, OperationError::TableScanAlreadyOpened);
@@ -2285,7 +2801,6 @@ mod tests {
                 first_table.layout().metadata_arc(),
                 first_table.table().layout_snapshot().metadata_arc()
             ));
-            assert!(first_table.current_effective_cts() < sts);
             let _pivot = first_table.root().pivot_row_id();
             let missing = match checkout.table(TableID::new(u64::MAX)) {
                 Ok(_) => panic!("table outside the frozen set must be rejected"),

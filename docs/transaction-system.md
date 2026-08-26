@@ -290,11 +290,42 @@ lock scope, stable entry, frozen-core checkout, or strong session runtime.
 Changed repartitioning publishes a new immutable generation and immediately
 supersedes every clone of the prior generation; dropping the new plan never
 reactivates an old generation. The family gate rejects stale generations and
-repartitioning after the first successful future partition open. A failed
+repartitioning after the first successful partition open. A failed
 open checkout leaves repartition legal, while successful current-generation
-opens remain repeatable. Phase 4 supplies the real execution checkout under
-the fixed `PlanFamilyGate -> SessionState.lifecycle -> ReadSnapshotEntry` lock
-order.
+opens remain repeatable. Partition execution uses the fixed
+`PlanFamilyGate -> SessionState.lifecycle -> ReadSnapshotEntry` lock order.
+
+`TableScanPlan::open` validates the partition index before admission, holds the
+family gate across exact session/snapshot checkout, and clones only the unit
+slice, projection, and exact table/layout pins needed by the new owned stream.
+`ReadSnapshotExecutionCheckout` retains the ownerless read view, pool guards,
+frozen core, stable entry, and runtime return authority without retaining the
+facade group or plan-family gate. The stream declares this checkout last, so
+its cursor, loaded block/page, table/layout pins, and projection drop before
+the counted checkout returns.
+
+Physical row behavior is centralized in `TableScanCursor<C>`. A
+`TableScanWorklistCursor` consumes the transaction stream's owned cold/hot
+worklist, while `TableScanRangeCursor<Arc<[TableScanUnit]>>` advances one
+partition's immutable range. The shared cursor persists a pending descriptor
+before awaiting its load, retains at most one loaded LWC block or hot-page
+guard, reuses one lazy-row buffer, applies the existing cold/hot MVCC helpers,
+and destroys an exhausted unit before exposing the next boundary. Cancelling a
+pending load therefore cannot omit its descriptor. Transaction scans keep
+their callback and read-your-own-write view; snapshot streams always include
+visible rows and return the requested owned `Vec<Val>` projection.
+
+The frozen core also owns a snapshot-wide first-error execution control: one
+atomic healthy/failed flag and a mutex-protected first table/partition record.
+The first original execution error publishes that record, requests
+`ExecutionFailed` drain through its retained checkout, detaches locally, and
+returns unchanged. Peers perform no failure load while returning rows from an
+already loaded unit. They check only before a unit load, after its await, and
+after exhausting a unit; on observation they detach and return
+`OperationError::SnapshotScanAborted` with the first-failure context. Thus a
+peer may return the remainder of one loaded block/page but cannot start a later
+unit. Entry checkout and final plan publication also reject the failed flag, so
+no work can publish in the interval before the entry reaches `Draining`.
 
 The reusable public transaction core box is allocated eagerly once per
 session. A ready core has zero identity fields, no lock state, empty

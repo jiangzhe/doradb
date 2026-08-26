@@ -1034,16 +1034,9 @@ impl Session {
         Ok(trx)
     }
 
-    /// Begin one crate-private shared read snapshot.
+    /// Begin one shared read snapshot at a newly registered timestamp.
     #[inline]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "shared snapshots remain crate-private until Phase 4"
-        )
-    )]
-    pub(crate) fn begin_read_snapshot(&mut self) -> Result<ReadSnapshotBuilder> {
+    pub fn begin_read_snapshot(&mut self) -> Result<ReadSnapshotBuilder> {
         if self.closed.get() {
             return Err(Report::new(LifecycleError::SessionUnavailable)
                 .attach(format!("session_id={}", self.id))
@@ -2703,13 +2696,6 @@ impl SessionState {
     }
 
     #[inline]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "shared snapshots remain crate-private until Phase 4"
-        )
-    )]
     fn reserve_read_snapshot(&self) -> LifecycleResult<(Arc<ReadSnapshotEntry>, TrxID)> {
         let mut lifecycle = self.lifecycle.lock();
         lifecycle
@@ -2882,6 +2868,14 @@ impl SessionState {
                     entry.key(),
                     self.admission.shutdown_started(),
                     facade_closed.load(Ordering::Acquire)
+                ))
+                .into());
+        }
+        if !entry.execution_healthy() {
+            return Err(Report::new(LifecycleError::ReadSnapshotUnavailable)
+                .attach(format!(
+                    "operation_key={}, reason=execution_failed_during_plan_publication",
+                    entry.key()
                 ))
                 .into());
         }
@@ -3537,13 +3531,6 @@ impl SessionDisposition {
 /// Typed pointer-stable entry stored in one active session slot.
 enum ActiveSessionOperation {
     Operation(Arc<SessionOperationEntry>),
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "shared snapshots remain crate-private until Phase 4"
-        )
-    )]
     ReadSnapshot(Arc<ReadSnapshotEntry>),
 }
 
