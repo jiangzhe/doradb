@@ -1437,10 +1437,7 @@ not preselect Arrow crate versions or public Arrow schema mapping. [U1] [U3]
   - Task Doc: `docs/tasks/000283-deterministic-table-scan-planning.md`
   - Task Issue: `#1015`
   - Phase Status: done
-  - Implementation Summary: Implemented validated 16/32 startup sizing,
-    deterministic resource-free unit compilation, bounded normalized prefixes,
-    shared-budget compact offsets, best-effort superseding repartition,
-    future-open family admission, and final snapshot-lifecycle publication.
+  - Implementation Summary: Phase 3 shipped deterministic resource-free table-scan planning with validated 16/32 startup sizing, shared greedy packing, immutable superseding generations, future-open admission, and final lifecycle publication. [Task Resolve Sync: docs/tasks/000283-deterministic-table-scan-planning.md @ 2026-08-26]
 
 - **Phase 4: Parallel row-oriented table scan**
   - Prerequisites: Phase 3 provides complete, self-tested deterministic
