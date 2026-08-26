@@ -15,20 +15,28 @@ use crate::error::{
     LifecycleError, LifecycleOrFatalResult, LifecycleResult, MultiDomainResultExt, OperationError,
     OperationResult, QuadResult, Result,
 };
-use crate::id::{SessionOperationKey, TableID, TrxID};
+use crate::id::{BlockID, RowID, SessionOperationKey, TableID, TrxID};
 use crate::lock::{FamilyLockAuthority, LockMode, LockOwner, LockResource, LockScopeState};
 use crate::map::{FastHashMap, FastHashSet};
 use crate::quiescent::QuiescentGuard;
 use crate::session::{SessionRuntime, WeakSessionRef};
-use crate::table::{CheckedOutTableScanRoot, OwnedTableScanRoot, Table, TableRuntimeLayout};
+use crate::table::{
+    CheckedOutTableScanRoot, CompiledTableScanPlan, DmlValidator, OwnedTableScanRoot, Table,
+    TableRuntimeLayout, TableScanRuntime, TableScanUnit, compile_table_scan_plan,
+    repartition_table_scan_offsets,
+};
 use error_stack::{Report, ResultExt};
 use event_listener::{Event, EventListener};
 use futures::future::{Either, select};
 use parking_lot::Mutex;
 use std::cell::Cell;
+use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::mem::replace;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+pub(crate) use tests::TableScanPlanTestController;
 
 /// One RAII registration in the transaction system's active GC horizon.
 ///
@@ -964,6 +972,68 @@ impl ReadSnapshot {
         })
     }
 
+    /// Capture and publish one deterministic resource-free table-scan plan.
+    pub(crate) async fn prepare_table_scan(
+        &self,
+        table_id: TableID,
+        options: TableScanOptions,
+    ) -> QuadResult<TableScanPlan> {
+        let checkout = self.checkout()?;
+        let operation_key = checkout.entry.key();
+        let config = checkout.runtime.core().table_scan_config();
+        let worklist = {
+            let table = checkout.table(table_id)?;
+            DmlValidator::new(table.visible_metadata().metadata())
+                .validate_projection(&options.projection)
+                .change_context(OperationError::InvalidTableScanInput)
+                .attach_with(|| {
+                    format!(
+                        "operation=prepare_table_scan, operation_key={operation_key}, table_id={table_id}"
+                    )
+                })?;
+            table
+                .table()
+                .accessor_with_layout(table.layout())
+                .table_scan_mvcc_worklist(
+                    TableScanRuntime::new(checkout.runtime.pool_guards()),
+                    table.root(),
+                )
+                .await
+                .attach_with(|| {
+                    format!(
+                        "operation=prepare_table_scan, operation_key={operation_key}, table_id={table_id}"
+                    )
+                })?
+        };
+        #[cfg(test)]
+        checkout
+            .runtime
+            .core()
+            .table_scan_plan_test
+            .after_worklist_capture()
+            .await;
+        let compiled = compile_table_scan_plan(worklist, config);
+        let plan = TableScanPlan::new(
+            Arc::clone(&self.group),
+            operation_key,
+            self.sts(),
+            table_id,
+            options.projection,
+            compiled,
+        );
+        checkout
+            .runtime
+            .state()
+            .admit_read_snapshot_plan_publication(&checkout.entry, &self.group.closed)
+            .attach_with(|| {
+                format!(
+                    "operation=prepare_table_scan, operation_key={operation_key}, table_id={table_id}, phase=publish_plan"
+                )
+            })?;
+        drop(checkout);
+        Ok(plan)
+    }
+
     /// Seal the shared facade group and wait for exact terminal cleanup.
     pub(crate) async fn close(self) -> Result<()> {
         self.group
@@ -987,6 +1057,178 @@ impl ReadSnapshot {
             listener.await;
         }
     }
+}
+
+/// Crate-private projection input for deterministic table-scan planning.
+pub(crate) struct TableScanOptions {
+    /// Strictly increasing snapshot-visible table column numbers.
+    pub(crate) projection: Vec<usize>,
+}
+
+struct TableScanPlanShared {
+    liveness: Arc<ReadSnapshotFacadeGroup>,
+    gate: PlanFamilyGate,
+    operation_key: SessionOperationKey,
+    sts: TrxID,
+    table_id: TableID,
+    column_root: BlockID,
+    pivot_row_id: RowID,
+    projection: Arc<[usize]>,
+    units: Arc<[TableScanUnit]>,
+    weight_prefix: Arc<[u64]>,
+}
+
+/// Cloneable immutable table-scan plan for one exact snapshot and generation.
+#[derive(Clone)]
+pub(crate) struct TableScanPlan {
+    shared: Arc<TableScanPlanShared>,
+    partition_offsets: Arc<[usize]>,
+    generation: u64,
+}
+
+impl Debug for TableScanPlan {
+    #[inline]
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        f.debug_struct("TableScanPlan")
+            .field("operation_key", &self.shared.operation_key)
+            .field("table_id", &self.shared.table_id)
+            .field("generation", &self.generation)
+            .field("partition_offsets", &self.partition_offsets)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TableScanPlan {
+    #[inline]
+    fn new(
+        liveness: Arc<ReadSnapshotFacadeGroup>,
+        operation_key: SessionOperationKey,
+        sts: TrxID,
+        table_id: TableID,
+        projection: Vec<usize>,
+        compiled: CompiledTableScanPlan,
+    ) -> Self {
+        let CompiledTableScanPlan {
+            column_root,
+            pivot_row_id,
+            units,
+            weight_prefix,
+            partition_offsets,
+        } = compiled;
+        Self {
+            shared: Arc::new(TableScanPlanShared {
+                liveness,
+                gate: PlanFamilyGate::new(),
+                operation_key,
+                sts,
+                table_id,
+                column_root,
+                pivot_row_id,
+                projection: Arc::from(projection),
+                units: Arc::from(units),
+                weight_prefix: Arc::from(weight_prefix),
+            }),
+            partition_offsets: Arc::from(partition_offsets),
+            generation: 0,
+        }
+    }
+
+    /// Return the compact plan layout's logical partition count.
+    #[inline]
+    pub(crate) fn partition_count(&self) -> usize {
+        self.partition_offsets.len() - 1
+    }
+
+    /// Best-effort repartition at immutable physical-unit boundaries.
+    pub(crate) fn repartition(
+        &self,
+        target_partitions: NonZeroUsize,
+    ) -> OperationResult<Option<Self>> {
+        let offsets =
+            repartition_table_scan_offsets(self.shared.weight_prefix.as_ref(), target_partitions);
+
+        let mut gate = self.shared.gate.inner.lock();
+        if self.generation != gate.current_generation {
+            return Err(Report::new(OperationError::StaleTableScanPlan)
+                .attach(format!(
+                    "operation=repartition_table_scan, operation_key={}, table_id={}, receiver_generation={}, current_generation={}, target_partitions={target_partitions}",
+                    self.shared.operation_key,
+                    self.shared.table_id,
+                    self.generation,
+                    gate.current_generation
+                )));
+        }
+        if gate.opened {
+            return Err(Report::new(OperationError::TableScanAlreadyOpened)
+                .attach(format!(
+                    "operation=repartition_table_scan, operation_key={}, table_id={}, generation={}, target_partitions={target_partitions}",
+                    self.shared.operation_key, self.shared.table_id, self.generation
+                )));
+        }
+        if offsets.as_slice() == self.partition_offsets.as_ref() {
+            return Ok(None);
+        }
+        let Some(generation) = gate.current_generation.checked_add(1) else {
+            panic!(
+                "table scan invariant violated: operation=repartition_table_scan, phase=increment_generation, operation_key={}, table_id={}, generation={}",
+                self.shared.operation_key, self.shared.table_id, gate.current_generation
+            )
+        };
+        gate.current_generation = generation;
+        drop(gate);
+        Ok(Some(Self {
+            shared: Arc::clone(&self.shared),
+            partition_offsets: Arc::from(offsets),
+            generation,
+        }))
+    }
+
+    /// Run the future execution-checkout acceptance while holding the family gate.
+    ///
+    /// Phase 4 supplies the combined session-open/exact-snapshot-ready checkout
+    /// as `accept`. Only a successful checkout seals the family; repeatable
+    /// acceptance through the current generation remains legal.
+    #[inline]
+    pub(crate) fn admit_open<T>(&self, accept: impl FnOnce() -> QuadResult<T>) -> QuadResult<T> {
+        let mut gate = self.shared.gate.inner.lock();
+        if self.generation != gate.current_generation {
+            return Err(Report::new(OperationError::StaleTableScanPlan)
+                .attach(format!(
+                    "operation=open_table_scan_partition, operation_key={}, table_id={}, receiver_generation={}, current_generation={}",
+                    self.shared.operation_key,
+                    self.shared.table_id,
+                    self.generation,
+                    gate.current_generation
+                ))
+                .into());
+        }
+        let result = accept();
+        if result.is_ok() {
+            gate.opened = true;
+        }
+        result
+    }
+}
+
+struct PlanFamilyGate {
+    inner: Mutex<PlanFamilyState>,
+}
+
+impl PlanFamilyGate {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(PlanFamilyState {
+                current_generation: 0,
+                opened: false,
+            }),
+        }
+    }
+}
+
+struct PlanFamilyState {
+    current_generation: u64,
+    opened: bool,
 }
 
 struct ReadSnapshotFacadeGroup {
@@ -1125,15 +1367,21 @@ mod tests {
     use super::*;
     use crate::catalog::CATALOG_TABLE_ID_START;
     use crate::catalog::tests::{table2, table3};
-    use crate::error::{LifecycleOrFatalError, QuadError};
-    use crate::id::{OperationID, SessionID};
+    use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TableScanConfig, TrxSysConfig};
+    use crate::engine::Engine;
+    use crate::error::{FatalError, LifecycleOrFatalError, QuadError};
+    use crate::id::{BlockID, OperationID, PageID, SessionID};
     use crate::lock::tests::{LockDebugEntryState, debug_snapshot};
     use crate::lock::{FamilyLockAuthority, LockMode, LockOwner, LockResource, LockScopeState};
-    use crate::table::TableScanRootView;
+    use crate::table::{RowPageDescriptor, TableScanRootView, TableScanWorklist};
     use crate::trx::tests::{active_sts_contains, active_sts_count, test_engine};
     use crate::trx::{MAX_SNAPSHOT_TS, MvccVisibility};
+    use crate::value::Val;
     use std::iter::empty;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::Barrier;
+    use std::thread::scope;
+    use tempfile::TempDir;
 
     const _: fn() = || {
         fn assert_send<T: Send>() {}
@@ -1146,7 +1394,84 @@ mod tests {
         assert_clone::<ReadSnapshot>();
         assert_send::<ReadSnapshotCheckout>();
         assert_sync::<ReadSnapshotCheckout>();
+        assert_send::<TableScanPlan>();
+        assert_sync::<TableScanPlan>();
+        assert_clone::<TableScanPlan>();
     };
+
+    /// Per-engine semantic pause after worklist capture and before plan publication.
+    #[derive(Default)]
+    pub(crate) struct TableScanPlanTestController {
+        after_capture: Mutex<Option<Arc<TableScanPlanTestHook>>>,
+    }
+
+    impl TableScanPlanTestController {
+        /// Arm a one-shot pause after physical worklist capture.
+        #[inline]
+        fn arm_after_worklist_capture(&self) -> Arc<TableScanPlanTestHook> {
+            let hook = Arc::new(TableScanPlanTestHook::new());
+            let previous = self.after_capture.lock().replace(Arc::clone(&hook));
+            assert!(
+                previous.is_none(),
+                "table-scan planning test hook already armed"
+            );
+            hook
+        }
+
+        #[inline]
+        pub(super) async fn after_worklist_capture(&self) {
+            let Some(hook) = self.after_capture.lock().take() else {
+                return;
+            };
+            hook.pause().await;
+        }
+    }
+
+    /// One semantic planning pause controlled without sleeps or elapsed-time progress.
+    struct TableScanPlanTestHook {
+        reached: AtomicBool,
+        released: AtomicBool,
+        reached_event: Event,
+        release_event: Event,
+    }
+
+    impl TableScanPlanTestHook {
+        #[inline]
+        fn new() -> Self {
+            Self {
+                reached: AtomicBool::new(false),
+                released: AtomicBool::new(false),
+                reached_event: Event::new(),
+                release_event: Event::new(),
+            }
+        }
+
+        #[inline]
+        async fn pause(&self) {
+            self.reached.store(true, Ordering::Release);
+            self.reached_event.notify(usize::MAX);
+            loop {
+                let listener = self.release_event.listen();
+                if self.released.load(Ordering::Acquire) {
+                    return;
+                }
+                listener.await;
+            }
+        }
+
+        /// Return whether planning reached the armed capture boundary.
+        #[inline]
+        fn reached(&self) -> bool {
+            self.reached.load(Ordering::Acquire)
+        }
+
+        /// Release planning from the armed capture boundary.
+        #[inline]
+        fn release(&self) {
+            self.released.store(true, Ordering::Release);
+            self.release_event.notify(usize::MAX);
+        }
+    }
 
     macro_rules! assert_not_impl {
         ($ty:ty: $trait:path) => {
@@ -1179,6 +1504,28 @@ mod tests {
         }
     }
 
+    fn assert_fatal(error: QuadError, expected: FatalError) {
+        match error {
+            QuadError::Fatal(report) => assert_eq!(report.current_context(), &expected),
+            error => panic!("expected Fatal error, got {error:?}"),
+        }
+    }
+
+    macro_rules! drive_planner_to_capture_hook {
+        ($future:expr, $hook:expr) => {{
+            for _ in 0..64 {
+                assert!(
+                    matches!(futures::poll!($future.as_mut()), std::task::Poll::Pending),
+                    "planning completed before the armed capture hook"
+                );
+                if $hook.reached() {
+                    break;
+                }
+            }
+            assert!($hook.reached(), "planning did not reach the capture hook");
+        }};
+    }
+
     fn assert_lifecycle_or_fatal_lifecycle(error: LifecycleOrFatalError, expected: LifecycleError) {
         match error {
             LifecycleOrFatalError::Lifecycle(report) => {
@@ -1186,6 +1533,636 @@ mod tests {
             }
             error => panic!("expected Lifecycle error, got {error:?}"),
         }
+    }
+
+    fn assert_operation_report(error: Report<OperationError>, expected: OperationError) {
+        assert_eq!(error.current_context(), &expected);
+    }
+
+    fn synthetic_hot_plan(snapshot: &ReadSnapshot, table_id: TableID) -> TableScanPlan {
+        let pivot_row_id = RowID::new(100);
+        let worklist = TableScanWorklist {
+            column_root: BlockID::new(7),
+            pivot_row_id,
+            cold_entries: Vec::new(),
+            hot_pages: (0..4)
+                .map(|idx| RowPageDescriptor {
+                    page_id: PageID::new(idx + 1),
+                    start_row_id: RowID::new(100 + idx * 2),
+                    end_row_id: RowID::new(101 + idx * 2),
+                })
+                .collect(),
+        };
+        let compiled = compile_table_scan_plan(worklist, TableScanConfig::default());
+        TableScanPlan::new(
+            Arc::clone(&snapshot.group),
+            snapshot.group.key,
+            snapshot.sts(),
+            table_id,
+            vec![0],
+            compiled,
+        )
+    }
+
+    #[test]
+    fn table_scan_plan_preparation_validates_projection_and_identity() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("table_scan_plan_projection").await;
+            let table_id = table2(&engine).await;
+            let outside = table3(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let snapshot = session
+                .begin_read_snapshot()
+                .unwrap()
+                .acquire_tables([table_id])
+                .await
+                .unwrap();
+
+            for projection in [vec![], vec![2], vec![0, 0], vec![1, 0]] {
+                let error = snapshot
+                    .prepare_table_scan(table_id, TableScanOptions { projection })
+                    .await
+                    .unwrap_err();
+                assert_operation(error, OperationError::InvalidTableScanInput);
+            }
+            let error = snapshot
+                .prepare_table_scan(
+                    outside,
+                    TableScanOptions {
+                        projection: vec![0],
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert_operation(error, OperationError::TableNotAcquired);
+
+            let plan = snapshot
+                .prepare_table_scan(
+                    table_id,
+                    TableScanOptions {
+                        projection: vec![0, 1],
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(plan.partition_count(), 1);
+            assert_eq!(plan.partition_offsets.as_ref(), [0, 0]);
+            assert_eq!(plan.generation, 0);
+            assert_eq!(plan.shared.operation_key, snapshot.group.key);
+            assert_eq!(plan.shared.sts, snapshot.sts());
+            assert_eq!(plan.shared.table_id, table_id);
+            assert_eq!(plan.shared.projection.as_ref(), [0, 1]);
+            assert!(plan.shared.units.is_empty());
+            assert_eq!(plan.shared.weight_prefix.as_ref(), [0]);
+            assert_eq!(plan.shared.column_root, BlockID::new(0));
+            assert_eq!(plan.shared.pivot_row_id, RowID::new(0));
+            assert!(Arc::ptr_eq(&plan.shared.liveness, &snapshot.group));
+
+            drop(plan);
+            snapshot.close().await.unwrap();
+            session.close().await.unwrap();
+            engine.shutdown();
+        });
+    }
+
+    #[test]
+    fn custom_engine_scan_config_drives_real_snapshot_initial_partitions() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let scan_config = TableScanConfig::default()
+                .lwc_blocks_per_partition(3)
+                .row_pages_per_partition(1);
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(temp_dir.path())
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(
+                        TrxSysConfig::default()
+                            .purge_threads(1)
+                            .log_file_stem("custom_table_scan_config"),
+                    )
+                    .table_scan(scan_config),
+            )
+            .await
+            .unwrap();
+            assert_eq!(engine.inner().table_scan_config(), scan_config);
+            let table_id = table2(&engine).await;
+            for row_no in 0..2 {
+                let mut insert_session = engine.new_session().unwrap();
+                let mut trx = insert_session.begin_trx().unwrap();
+                trx.table_insert_mvcc(
+                    table_id,
+                    vec![
+                        Val::from(row_no),
+                        Val::from(vec![b'a' + row_no as u8; 40 * 1024]),
+                    ],
+                )
+                .await
+                .unwrap();
+                trx.commit().await.unwrap();
+                insert_session.close().await.unwrap();
+            }
+
+            let mut session = engine.new_session().unwrap();
+            let snapshot = session
+                .begin_read_snapshot()
+                .unwrap()
+                .acquire_tables([table_id])
+                .await
+                .unwrap();
+            let plan = snapshot
+                .prepare_table_scan(
+                    table_id,
+                    TableScanOptions {
+                        projection: vec![0],
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(plan.shared.units.len(), 2);
+            assert!(
+                plan.shared
+                    .units
+                    .iter()
+                    .all(|unit| matches!(unit, TableScanUnit::Hot(_)))
+            );
+            assert_eq!(plan.shared.weight_prefix.as_ref(), [0, 3, 6]);
+            assert_eq!(plan.partition_offsets.as_ref(), [0, 1, 2]);
+
+            drop(plan);
+            snapshot.close().await.unwrap();
+            session.close().await.unwrap();
+            engine.shutdown();
+        });
+    }
+
+    #[test]
+    fn repeated_and_concurrent_preparation_is_deterministic_with_independent_gates() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("table_scan_plan_repeatable_prepare").await;
+            let table_id = table2(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let snapshot = session
+                .begin_read_snapshot()
+                .unwrap()
+                .acquire_tables([table_id])
+                .await
+                .unwrap();
+            let concurrent = snapshot.clone();
+            let (first, second) = futures::join!(
+                snapshot.prepare_table_scan(
+                    table_id,
+                    TableScanOptions {
+                        projection: vec![0, 1],
+                    },
+                ),
+                concurrent.prepare_table_scan(
+                    table_id,
+                    TableScanOptions {
+                        projection: vec![0, 1],
+                    },
+                )
+            );
+            let first = first.unwrap();
+            let second = second.unwrap();
+            assert_eq!(first.shared.operation_key, second.shared.operation_key);
+            assert_eq!(first.shared.column_root, second.shared.column_root);
+            assert_eq!(first.shared.pivot_row_id, second.shared.pivot_row_id);
+            assert_eq!(first.shared.projection, second.shared.projection);
+            assert_eq!(first.shared.units, second.shared.units);
+            assert_eq!(first.shared.weight_prefix, second.shared.weight_prefix);
+            assert_eq!(first.partition_offsets, second.partition_offsets);
+            assert_eq!(first.generation, 0);
+            assert_eq!(second.generation, 0);
+            assert!(!Arc::ptr_eq(&first.shared, &second.shared));
+
+            drop(first);
+            drop(second);
+            drop(concurrent);
+            snapshot.close().await.unwrap();
+            session.close().await.unwrap();
+            engine.shutdown();
+        });
+    }
+
+    #[test]
+    fn table_scan_repartition_supersedes_generations_and_open_seals_family() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("table_scan_plan_generation").await;
+            let table_id = table2(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let snapshot = session
+                .begin_read_snapshot()
+                .unwrap()
+                .acquire_tables([table_id])
+                .await
+                .unwrap();
+
+            let original = synthetic_hot_plan(&snapshot, table_id);
+            let clone = original.clone();
+            assert_eq!(original.partition_offsets.as_ref(), [0, 4]);
+            assert!(
+                original
+                    .repartition(NonZeroUsize::new(1).unwrap())
+                    .unwrap()
+                    .is_none()
+            );
+            let current = original
+                .repartition(NonZeroUsize::new(2).unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(current.generation, 1);
+            assert_eq!(current.partition_offsets.as_ref(), [0, 2, 4]);
+            assert!(Arc::ptr_eq(&original.shared, &current.shared));
+            assert_operation_report(
+                original
+                    .repartition(NonZeroUsize::new(3).unwrap())
+                    .unwrap_err(),
+                OperationError::StaleTableScanPlan,
+            );
+            assert_operation_report(
+                clone
+                    .repartition(NonZeroUsize::new(3).unwrap())
+                    .unwrap_err(),
+                OperationError::StaleTableScanPlan,
+            );
+            let open_error = original
+                .admit_open(|| Ok(()))
+                .expect_err("superseded generation must reject open");
+            assert_operation(open_error, OperationError::StaleTableScanPlan);
+            drop(current);
+            assert_operation_report(
+                original
+                    .repartition(NonZeroUsize::new(4).unwrap())
+                    .unwrap_err(),
+                OperationError::StaleTableScanPlan,
+            );
+
+            let failed_then_repartitioned = synthetic_hot_plan(&snapshot, table_id);
+            let failed: QuadResult<()> = failed_then_repartitioned
+                .admit_open(|| Err(Report::new(LifecycleError::ReadSnapshotUnavailable).into()));
+            assert_lifecycle(
+                failed.expect_err("simulated checkout must fail"),
+                LifecycleError::ReadSnapshotUnavailable,
+            );
+            assert!(
+                failed_then_repartitioned
+                    .repartition(NonZeroUsize::new(2).unwrap())
+                    .unwrap()
+                    .is_some()
+            );
+
+            let opened = synthetic_hot_plan(&snapshot, table_id);
+            opened.admit_open(|| Ok(())).unwrap();
+            opened.admit_open(|| Ok(())).unwrap();
+            assert_operation_report(
+                opened
+                    .repartition(NonZeroUsize::new(2).unwrap())
+                    .unwrap_err(),
+                OperationError::TableScanAlreadyOpened,
+            );
+
+            let mut overflow = synthetic_hot_plan(&snapshot, table_id);
+            overflow.generation = u64::MAX;
+            overflow.shared.gate.inner.lock().current_generation = u64::MAX;
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                overflow.repartition(NonZeroUsize::new(2).unwrap())
+            }));
+            assert!(result.is_err(), "generation wrap must panic");
+
+            drop(overflow);
+            drop(opened);
+            drop(failed_then_repartitioned);
+            drop(clone);
+            drop(original);
+            snapshot.close().await.unwrap();
+            session.close().await.unwrap();
+            engine.shutdown();
+        });
+    }
+
+    #[test]
+    fn table_scan_repartition_and_open_have_one_gate_winner() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("table_scan_plan_gate_race").await;
+            let table_id = table2(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let snapshot = session
+                .begin_read_snapshot()
+                .unwrap()
+                .acquire_tables([table_id])
+                .await
+                .unwrap();
+            let plan = synthetic_hot_plan(&snapshot, table_id);
+            let repartition_plan = plan.clone();
+            let open_plan = plan.clone();
+            let barrier = Barrier::new(3);
+            let (repartition_result, open_result) = scope(|scope| {
+                let repartition = scope.spawn(|| {
+                    barrier.wait();
+                    repartition_plan.repartition(NonZeroUsize::new(2).unwrap())
+                });
+                let open = scope.spawn(|| {
+                    barrier.wait();
+                    open_plan.admit_open(|| Ok(()))
+                });
+                barrier.wait();
+                (repartition.join().unwrap(), open.join().unwrap())
+            });
+            match (repartition_result, open_result) {
+                (Ok(Some(_)), Err(error)) => {
+                    assert_operation(error, OperationError::StaleTableScanPlan);
+                }
+                (Err(error), Ok(())) => {
+                    assert_operation_report(error, OperationError::TableScanAlreadyOpened);
+                }
+                _ => panic!("unexpected table-scan gate race outcome"),
+            }
+
+            drop(plan);
+            snapshot.close().await.unwrap();
+            session.close().await.unwrap();
+            engine.shutdown();
+        });
+    }
+
+    #[test]
+    fn table_scan_plan_liveness_is_resource_free_after_explicit_close() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("table_scan_plan_resource_free").await;
+            let table_id = table2(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let snapshot = session
+                .begin_read_snapshot()
+                .unwrap()
+                .acquire_tables([table_id])
+                .await
+                .unwrap();
+            let sts = snapshot.sts();
+            let plan = snapshot
+                .prepare_table_scan(
+                    table_id,
+                    TableScanOptions {
+                        projection: vec![0],
+                    },
+                )
+                .await
+                .unwrap();
+            snapshot.clone().close().await.unwrap();
+            assert!(!active_sts_contains(&engine.inner().trx_sys, sts));
+            assert_eq!(plan.partition_count(), 1);
+            assert!(
+                plan.repartition(NonZeroUsize::new(8).unwrap())
+                    .unwrap()
+                    .is_none()
+            );
+            drop(snapshot);
+            drop(plan);
+
+            let snapshot = session
+                .begin_read_snapshot()
+                .unwrap()
+                .acquire_tables([table_id])
+                .await
+                .unwrap();
+            let sts = snapshot.sts();
+            let plan = snapshot
+                .prepare_table_scan(
+                    table_id,
+                    TableScanOptions {
+                        projection: vec![0],
+                    },
+                )
+                .await
+                .unwrap();
+            drop(snapshot);
+            assert!(active_sts_contains(&engine.inner().trx_sys, sts));
+            drop(plan);
+            assert!(!active_sts_contains(&engine.inner().trx_sys, sts));
+
+            session.close().await.unwrap();
+            engine.shutdown();
+        });
+    }
+
+    #[test]
+    fn cancelled_table_scan_planning_returns_counted_checkout() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("table_scan_plan_cancel").await;
+            let table_id = table2(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let snapshot = session
+                .begin_read_snapshot()
+                .unwrap()
+                .acquire_tables([table_id])
+                .await
+                .unwrap();
+            let hook = engine
+                .inner()
+                .table_scan_plan_test
+                .arm_after_worklist_capture();
+            let mut planning = Box::pin(snapshot.prepare_table_scan(
+                table_id,
+                TableScanOptions {
+                    projection: vec![0],
+                },
+            ));
+            drive_planner_to_capture_hook!(planning, hook);
+            drop(planning);
+
+            let checkout = snapshot.checkout().unwrap();
+            assert_eq!(checkout.entry.phase(), ReadSnapshotPhase::Ready);
+            drop(checkout);
+            hook.release();
+            snapshot.close().await.unwrap();
+            session.close().await.unwrap();
+            engine.shutdown();
+        });
+    }
+
+    #[test]
+    fn explicit_snapshot_close_wins_against_final_plan_publication() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("table_scan_plan_explicit_close_race").await;
+            let table_id = table2(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let snapshot = session
+                .begin_read_snapshot()
+                .unwrap()
+                .acquire_tables([table_id])
+                .await
+                .unwrap();
+            let sts = snapshot.sts();
+            let hook = engine
+                .inner()
+                .table_scan_plan_test
+                .arm_after_worklist_capture();
+            let mut planning = Box::pin(snapshot.prepare_table_scan(
+                table_id,
+                TableScanOptions {
+                    projection: vec![0],
+                },
+            ));
+            drive_planner_to_capture_hook!(planning, hook);
+
+            let mut close = Box::pin(snapshot.clone().close());
+            assert!(matches!(
+                futures::poll!(close.as_mut()),
+                std::task::Poll::Pending
+            ));
+            hook.release();
+            assert_lifecycle(
+                planning.await.unwrap_err(),
+                LifecycleError::ReadSnapshotUnavailable,
+            );
+            close.await.unwrap();
+            assert!(!active_sts_contains(&engine.inner().trx_sys, sts));
+
+            drop(snapshot);
+            session.close().await.unwrap();
+            engine.shutdown();
+        });
+    }
+
+    #[test]
+    fn session_close_and_abandonment_win_against_plan_publication() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("table_scan_plan_session_close_race").await;
+            let table_id = table2(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let snapshot = session
+                .begin_read_snapshot()
+                .unwrap()
+                .acquire_tables([table_id])
+                .await
+                .unwrap();
+            let hook = engine
+                .inner()
+                .table_scan_plan_test
+                .arm_after_worklist_capture();
+            let mut planning = Box::pin(snapshot.prepare_table_scan(
+                table_id,
+                TableScanOptions {
+                    projection: vec![0],
+                },
+            ));
+            drive_planner_to_capture_hook!(planning, hook);
+            let mut close = Box::pin(session.close());
+            assert!(matches!(
+                futures::poll!(close.as_mut()),
+                std::task::Poll::Pending
+            ));
+            hook.release();
+            assert_lifecycle(
+                planning.await.unwrap_err(),
+                LifecycleError::ReadSnapshotUnavailable,
+            );
+            close.await.unwrap();
+            drop(snapshot);
+            engine.shutdown();
+        });
+
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("table_scan_plan_abandon_race").await;
+            let table_id = table2(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let snapshot = session
+                .begin_read_snapshot()
+                .unwrap()
+                .acquire_tables([table_id])
+                .await
+                .unwrap();
+            let hook = engine
+                .inner()
+                .table_scan_plan_test
+                .arm_after_worklist_capture();
+            let mut planning = Box::pin(snapshot.prepare_table_scan(
+                table_id,
+                TableScanOptions {
+                    projection: vec![0],
+                },
+            ));
+            drive_planner_to_capture_hook!(planning, hook);
+            drop(session);
+            hook.release();
+            assert_lifecycle(
+                planning.await.unwrap_err(),
+                LifecycleError::ReadSnapshotUnavailable,
+            );
+            drop(snapshot);
+            engine.shutdown();
+        });
+    }
+
+    #[test]
+    fn poison_and_shutdown_win_against_final_plan_publication() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("table_scan_plan_poison_race").await;
+            let table_id = table2(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let snapshot = session
+                .begin_read_snapshot()
+                .unwrap()
+                .acquire_tables([table_id])
+                .await
+                .unwrap();
+            let hook = engine
+                .inner()
+                .table_scan_plan_test
+                .arm_after_worklist_capture();
+            let mut planning = Box::pin(snapshot.prepare_table_scan(
+                table_id,
+                TableScanOptions {
+                    projection: vec![0],
+                },
+            ));
+            drive_planner_to_capture_hook!(planning, hook);
+            engine
+                .inner()
+                .poisoner
+                .poison(Report::new(FatalError::RedoWrite).attach("test planning poison"));
+            hook.release();
+            assert_fatal(planning.await.unwrap_err(), FatalError::RedoWrite);
+            snapshot.close().await.unwrap();
+            drop(session);
+            engine.shutdown();
+        });
+
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("table_scan_plan_shutdown_race").await;
+            let table_id = table2(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let snapshot = session
+                .begin_read_snapshot()
+                .unwrap()
+                .acquire_tables([table_id])
+                .await
+                .unwrap();
+            let hook = engine
+                .inner()
+                .table_scan_plan_test
+                .arm_after_worklist_capture();
+            let mut planning = Box::pin(snapshot.prepare_table_scan(
+                table_id,
+                TableScanOptions {
+                    projection: vec![0],
+                },
+            ));
+            drive_planner_to_capture_hook!(planning, hook);
+            assert!(engine.try_shutdown().is_err());
+            hook.release();
+            assert_lifecycle(
+                planning.await.unwrap_err(),
+                LifecycleError::ReadSnapshotUnavailable,
+            );
+            engine.try_shutdown().unwrap();
+            drop(snapshot);
+            drop(session);
+        });
     }
 
     #[test]

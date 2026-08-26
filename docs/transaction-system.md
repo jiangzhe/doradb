@@ -258,6 +258,44 @@ and active-STS registration, closes the snapshot metadata scope, recovers an
 idle family authority, publishes the typed entry terminal, and finally changes
 the session slot to idle or closed. Weak dormant facades never block this drain.
 
+Table-scan planning takes one counted ready checkout, validates a nonempty
+strictly increasing projection against the snapshot-visible metadata, and
+captures ordered cold block-index entries plus original hot-page descriptors
+through the exact checkout-borrowed root. The borrowed table and root view are
+destroyed before the checkout can return. A final
+`SessionState.lifecycle -> ReadSnapshotEntry` check orders publication against
+explicit close, session close or abandonment, poison, and shutdown. Every
+success, failure, cancellation, and lost-publication path returns the counted
+checkout.
+
+Cold block-index decoding validates positive, monotonic, non-overlapping
+entries, while root publication pairs that index with its end pivot. Hot
+worklist capture requires the captured pivot to be an exact page boundary and
+constructs positive ordered descriptors from it. The deterministic table-domain
+planner consumes those guarantees without revalidating physical coverage.
+Immutable startup configuration cross-normalizes physical work: with
+configured cold count `C` and hot count `H`, one cold LWC block weighs `H`, one
+hot row page weighs `C`, and the initial shared partition budget is `C * H`.
+Defaults are `C = 16` and `H = 32`, so the weights are 32 and 16 and the budget
+is 512. One checked cumulative `u64` prefix supports both greedy initial
+packing and later best-effort repartitioning. A partial cold group may share
+its remaining budget with following hot pages; no physical unit is split.
+Compact offsets contain `p + 1` unit indexes for `p` partitions, with `[0, 0]`
+representing the single empty partition.
+
+A published `TableScanPlan` owns only copied units, projection, normalized
+prefix and offsets, exact scalar identity, a plan-family gate, and the common
+facade-liveness token. It owns no table, layout, usable root, STS registration,
+lock scope, stable entry, frozen-core checkout, or strong session runtime.
+Changed repartitioning publishes a new immutable generation and immediately
+supersedes every clone of the prior generation; dropping the new plan never
+reactivates an old generation. The family gate rejects stale generations and
+repartitioning after the first successful future partition open. A failed
+open checkout leaves repartition legal, while successful current-generation
+opens remain repeatable. Phase 4 supplies the real execution checkout under
+the fixed `PlanFamilyGate -> SessionState.lifecycle -> ReadSnapshotEntry` lock
+order.
+
 The reusable public transaction core box is allocated eagerly once per
 session. A ready core has zero identity fields, no lock state, empty
 zero-capacity effect containers, and one uniquely owned zero-valued

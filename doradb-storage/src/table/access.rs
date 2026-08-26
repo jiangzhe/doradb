@@ -3333,23 +3333,16 @@ impl<'op> UserTableAccessor<'op> {
                 storage.disk_pool(),
                 runtime.pool_guards().disk_guard(),
             );
-            column_index.collect_leaf_entries().await.attach_with(|| {
-                format!(
-                    "operation=table_scan_mvcc_stream, phase=capture_cold_entries, table_id={}",
-                    self.table_id()
-                )
-            })?
+            column_index
+                .collect_leaf_entries()
+                .await
+                .attach("operation=capture_table_scan_worklist, phase=capture_cold_entries")?
         };
         let (_, hot_pages) = self
             .mem()
             .snapshot_original_row_pages_from(runtime.pool_guards(), pivot_row_id)
             .await
-            .attach_with(|| {
-                format!(
-                    "operation=table_scan_mvcc_stream, phase=capture_hot_pages, table_id={}",
-                    self.table_id()
-                )
-            })?;
+            .attach("operation=capture_table_scan_worklist, phase=capture_hot_pages")?;
         Ok(TableScanWorklist {
             column_root,
             pivot_row_id,

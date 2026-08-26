@@ -11,6 +11,7 @@ mod page_transition;
 mod persistence;
 mod recover;
 mod rollback;
+mod scan_plan;
 mod scan_root;
 mod storage;
 pub use access::LazyRow;
@@ -32,6 +33,9 @@ pub(crate) use lifecycle::{TableDropDrain, TableLifecycle};
 pub(crate) use mem_table::{MemTable, NoTrxUpsertChange, RowPageDescriptor};
 pub use persistence::*;
 pub(crate) use rollback::IndexRollback;
+pub(crate) use scan_plan::{
+    CompiledTableScanPlan, TableScanUnit, compile_table_scan_plan, repartition_table_scan_offsets,
+};
 pub(crate) use scan_root::{CheckedOutTableScanRoot, OwnedTableScanRoot, TableScanRootView};
 pub(crate) use storage::ColumnStorage;
 #[cfg(test)]

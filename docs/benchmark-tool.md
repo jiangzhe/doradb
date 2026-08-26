@@ -68,12 +68,16 @@ doradb-storage defaults < included [engine] < plan-local [engine]
 
 The overlay covers public engine builder inputs other than the invocation root
 and internal eviction policy. Its tables are `thread_pool`,
-`mandatory_runtime`, `transaction`, `index_buffer`, `data_buffer`, and `file`;
-`meta_buffer_size` is an `[engine]` leaf. `[thread_pool]` accepts
-`worker_threads`; `[mandatory_runtime]` accepts only `concurrency_limit`
-because orchestration always uses one runner. Byte inputs are strings such as
-`"512 MiB"`. The canonical result records the complete normalized engine
-configuration.
+`mandatory_runtime`, `table_scan`, `transaction`, `index_buffer`,
+`data_buffer`, and `file`; `meta_buffer_size` is an `[engine]` leaf.
+`[thread_pool]` accepts `worker_threads`; `[mandatory_runtime]` accepts only
+`concurrency_limit` because orchestration always uses one runner.
+`[table_scan]` accepts `lwc_blocks_per_partition` and
+`row_pages_per_partition`, whose defaults are 16 and 32 and whose supported
+range is `1..=8192`. Byte inputs are strings such as `"512 MiB"`. The canonical
+result records the complete normalized engine configuration, including both
+effective table-scan counts. Normalized result documents must include the
+`table_scan` table.
 
 `[workload_defaults]` accepts `threads`, `sessions`, `value_size`, `batch_size`,
 and `include_stats`. Defaults are one thread, sessions equal to threads,
