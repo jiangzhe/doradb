@@ -5308,8 +5308,10 @@ mod tests {
             let first_key = first_key.expect("first frozen page should contain a test key");
             let later_key = later_key.expect("later frozen page should contain a test key");
 
+            let setup_cts = setup.last_cts();
             let mut horizon_session = engine.new_session().unwrap();
             let horizon_trx = horizon_session.begin_trx().unwrap();
+            setup.wait_for_gc_horizon_after(setup_cts).await.unwrap();
             let (locked_tx, locked_rx) = flume::bounded(1);
             let (release_tx, release_rx) = flume::bounded(1);
             let mut freeze_session = engine.new_session().unwrap();

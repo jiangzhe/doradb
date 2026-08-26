@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use super::consts::{
     DEFAULT_ENGINE_INDEX_BUFFER, DEFAULT_ENGINE_INDEX_MAX_FILE_SIZE,
     DEFAULT_ENGINE_INDEX_SWAP_FILE, DEFAULT_ENGINE_META_BUFFER,
+    DEFAULT_TABLE_SCAN_LWC_BLOCKS_PER_PARTITION, DEFAULT_TABLE_SCAN_ROW_PAGES_PER_PARTITION,
+    MAX_TABLE_SCAN_UNITS_PER_PARTITION,
 };
 use super::{EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
 
@@ -95,6 +97,57 @@ impl MandatoryRuntimeConfig {
     }
 }
 
+/// Immutable physical-unit sizing for deterministic table-scan planning.
+///
+/// The two counts define equal-cost homogeneous partitions. Planning
+/// cross-normalizes them into one shared budget, allowing a partition to span
+/// the cold/hot storage-tier boundary without splitting a physical unit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TableScanConfig {
+    /// Number of persisted LWC blocks in one homogeneous partition.
+    pub lwc_blocks_per_partition: usize,
+    /// Number of hot row pages in one homogeneous partition.
+    pub row_pages_per_partition: usize,
+}
+
+impl Default for TableScanConfig {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            lwc_blocks_per_partition: DEFAULT_TABLE_SCAN_LWC_BLOCKS_PER_PARTITION,
+            row_pages_per_partition: DEFAULT_TABLE_SCAN_ROW_PAGES_PER_PARTITION,
+        }
+    }
+}
+
+impl TableScanConfig {
+    /// Set the persisted LWC-block count for one homogeneous partition.
+    #[inline]
+    pub fn lwc_blocks_per_partition(mut self, count: usize) -> Self {
+        self.lwc_blocks_per_partition = count;
+        self
+    }
+
+    /// Set the hot row-page count for one homogeneous partition.
+    #[inline]
+    pub fn row_pages_per_partition(mut self, count: usize) -> Self {
+        self.row_pages_per_partition = count;
+        self
+    }
+
+    #[inline]
+    fn validate(&self) -> ConfigResult<()> {
+        validate_table_scan_partition_size(
+            "table_scan.lwc_blocks_per_partition",
+            self.lwc_blocks_per_partition,
+        )?;
+        validate_table_scan_partition_size(
+            "table_scan.row_pages_per_partition",
+            self.row_pages_per_partition,
+        )
+    }
+}
+
 /// Storage-engine configuration.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -106,6 +159,8 @@ pub struct EngineConfig {
     pub thread_pool: ThreadPoolConfig,
     /// Engine-owned mandatory runtime configuration.
     pub mandatory_runtime: MandatoryRuntimeConfig,
+    /// Deterministic table-scan planning configuration.
+    pub table_scan: TableScanConfig,
     /// Metadata buffer-pool size.
     pub meta_buffer: Byte,
     /// User-index buffer-pool configuration.
@@ -124,6 +179,7 @@ impl Default for EngineConfig {
             trx: TrxSysConfig::default(),
             thread_pool: ThreadPoolConfig::default(),
             mandatory_runtime: MandatoryRuntimeConfig::default(),
+            table_scan: TableScanConfig::default(),
             meta_buffer: Byte::from_u64(DEFAULT_ENGINE_META_BUFFER as u64),
             index_buffer: EvictableBufferPoolConfig::default()
                 .swap_file(DEFAULT_ENGINE_INDEX_SWAP_FILE)
@@ -149,6 +205,7 @@ impl EngineConfig {
     pub(crate) fn validate_inner(mut self) -> ConfigResult<Self> {
         self.thread_pool.validate()?;
         self.mandatory_runtime.validate()?;
+        self.table_scan.validate()?;
         self.trx.validate()?;
         self.index_buffer = self
             .index_buffer
@@ -203,6 +260,13 @@ impl EngineConfig {
         self
     }
 
+    /// Set deterministic table-scan physical-unit sizing.
+    #[inline]
+    pub fn table_scan(mut self, table_scan: TableScanConfig) -> Self {
+        self.table_scan = table_scan;
+        self
+    }
+
     /// Set the metadata buffer-pool size.
     #[inline]
     pub fn meta_buffer(mut self, meta_buffer: impl Into<Byte>) -> Self {
@@ -246,10 +310,84 @@ impl EngineConfig {
     }
 }
 
+#[inline]
+fn validate_table_scan_partition_size(field: &'static str, value: usize) -> ConfigResult<()> {
+    if !(1..=MAX_TABLE_SCAN_UNITS_PER_PARTITION).contains(&value) {
+        return Err(
+            Report::new(ConfigError::InvalidTableScanPartitionSize).attach(format!(
+                "config_field={field}, actual={value}, supported=1..={MAX_TABLE_SCAN_UNITS_PER_PARTITION}"
+            )),
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn table_scan_config_defaults_boundaries_and_validation() {
+        assert_eq!(
+            TableScanConfig::default(),
+            TableScanConfig {
+                lwc_blocks_per_partition: 16,
+                row_pages_per_partition: 32,
+            }
+        );
+        for count in [1, MAX_TABLE_SCAN_UNITS_PER_PARTITION] {
+            TableScanConfig::default()
+                .lwc_blocks_per_partition(count)
+                .row_pages_per_partition(count)
+                .validate()
+                .unwrap();
+        }
+        for (field, config) in [
+            (
+                "table_scan.lwc_blocks_per_partition",
+                TableScanConfig::default().lwc_blocks_per_partition(0),
+            ),
+            (
+                "table_scan.lwc_blocks_per_partition",
+                TableScanConfig::default().lwc_blocks_per_partition(8193),
+            ),
+            (
+                "table_scan.row_pages_per_partition",
+                TableScanConfig::default().row_pages_per_partition(0),
+            ),
+            (
+                "table_scan.row_pages_per_partition",
+                TableScanConfig::default().row_pages_per_partition(8193),
+            ),
+        ] {
+            let error = config.validate().unwrap_err();
+            assert_eq!(
+                error.current_context(),
+                &ConfigError::InvalidTableScanPartitionSize
+            );
+            let diagnostic = format!("{error:?}");
+            assert!(diagnostic.contains(field), "{diagnostic}");
+            assert!(diagnostic.contains("supported=1..=8192"), "{diagnostic}");
+        }
+    }
+
+    #[test]
+    fn invalid_table_scan_config_validation_is_filesystem_pure() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("must-not-be-created");
+        let error = EngineConfig::default()
+            .storage_root(&root)
+            .table_scan(TableScanConfig::default().row_pages_per_partition(0))
+            .validate()
+            .unwrap_err();
+        assert_eq!(
+            error.operation_error(),
+            None,
+            "configuration failure must not be disclosed as an operation error"
+        );
+        assert!(!root.exists());
+    }
 
     #[test]
     fn runtime_configs_reject_zero_sizes() {

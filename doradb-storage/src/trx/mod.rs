@@ -29,6 +29,8 @@ mod sys_trx;
 pub(crate) mod undo;
 pub(crate) mod ver_map;
 
+#[cfg(test)]
+pub(crate) use read_snapshot::TableScanPlanTestController;
 #[expect(
     unused_imports,
     reason = "Phase 3 will consume the crate-private shared snapshot facades"
@@ -37,7 +39,7 @@ pub(crate) use read_snapshot::{
     ActiveSnapshotRegistration, CheckedOutSnapshotTable, FrozenReadSnapshotCore, PrivateSnapshot,
     ReadSnapshot, ReadSnapshotBuildCore, ReadSnapshotBuilder, ReadSnapshotCheckout,
     ReadSnapshotDrainReason, ReadSnapshotEntry, ReadSnapshotLockOwner, ReadSnapshotPhase,
-    ReadSnapshotReadyPayload, ReadSnapshotTerminalClaim,
+    ReadSnapshotReadyPayload, ReadSnapshotTerminalClaim, TableScanOptions, TableScanPlan,
 };
 pub(crate) use retention::{
     prepare_catalog_redo_maintenance_operation, prepare_redo_truncation_operation,

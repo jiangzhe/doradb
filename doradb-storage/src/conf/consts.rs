@@ -10,6 +10,13 @@ pub(crate) const DEFAULT_ENGINE_INDEX_SWAP_FILE: &str = "index.swp";
 /// Default on-disk size cap for the user secondary-index swap file.
 pub(crate) const DEFAULT_ENGINE_INDEX_MAX_FILE_SIZE: usize = 2 * 1024 * 1024 * 1024;
 
+/// Default number of persisted LWC blocks that fill a homogeneous scan partition.
+pub const DEFAULT_TABLE_SCAN_LWC_BLOCKS_PER_PARTITION: usize = 16;
+/// Default number of hot row pages that fill a homogeneous scan partition.
+pub const DEFAULT_TABLE_SCAN_ROW_PAGES_PER_PARTITION: usize = 32;
+/// Maximum configured homogeneous physical units per scan partition.
+pub const MAX_TABLE_SCAN_UNITS_PER_PARTITION: usize = 8192;
+
 /// Default async IO depth for the table-file subsystem worker.
 pub(crate) const DEFAULT_TABLE_FILE_IO_DEPTH: usize = 64;
 /// Default relative data directory for durable table and catalog files.

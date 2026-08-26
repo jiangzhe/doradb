@@ -164,6 +164,8 @@ pub(crate) enum ConfigError {
     InvalidThreadPoolWorkerThreads,
     #[error("invalid mandatory runtime concurrency limit")]
     InvalidMandatoryConcurrencyLimit,
+    #[error("invalid table scan partition size")]
+    InvalidTableScanPartitionSize,
     #[error("invalid buffer pool configuration")]
     InvalidBufferPoolConfig,
     #[error("invalid fixed buffer pool size")]
@@ -328,6 +330,15 @@ pub enum OperationError {
     /// The requested table was not included in the read snapshot.
     #[error("table not acquired by read snapshot")]
     TableNotAcquired,
+    /// The table-scan projection is empty, unordered, duplicated, or out of range.
+    #[error("invalid table scan input")]
+    InvalidTableScanInput,
+    /// The table-scan plan generation has been superseded.
+    #[error("stale table scan plan")]
+    StaleTableScanPlan,
+    /// The table-scan plan family has already admitted partition execution.
+    #[error("table scan already opened")]
+    TableScanAlreadyOpened,
 }
 
 /// Fieldless fatal-domain errors carried underneath `ErrorKind::Fatal`.
@@ -2096,6 +2107,11 @@ mod tests {
             OperationError::LockUpgradeWouldBlock,
             OperationError::LockConversionNotSupported,
             OperationError::LockFamilyConflict,
+            OperationError::InvalidReadSnapshotInput,
+            OperationError::TableNotAcquired,
+            OperationError::InvalidTableScanInput,
+            OperationError::StaleTableScanPlan,
+            OperationError::TableScanAlreadyOpened,
         ];
         for operation_error in cases {
             let error = Report::new(operation_error).disclose();

@@ -281,6 +281,15 @@ Issue Labels:
   workflow. This phase split supersedes only U10's freeze-plus-planning
   grouping; its existing-lock-order, real-workflow, complete-public-feature,
   and independent-performance-proof decisions remain normative.
+- [U12] Phase-three task-planning correction and approval: initial planning
+  uses immutable engine-startup counts for homogeneous LWC-block and row-page
+  partitions instead of a caller target or persisted row-count/span weights.
+  Cross-normalized unit weights share one configuration-product budget and may
+  pack across the tier edge. Add best-effort pre-open repartitioning,
+  superseding immutable plan generations, compact partition offsets, and a
+  plan-local gate that seals only after the first successful execution
+  checkout. This revises Phase 3 planning and the Phase 4/5 handoff without
+  changing the frozen snapshot or physical-unit boundaries.
 
 ### Source Backlogs
 
@@ -315,7 +324,16 @@ pub struct ReadSnapshot { /* cloneable weak snapshot facade */ }
 
 pub struct TableScanOptions {
     pub projection: Vec<usize>,
-    pub target_partitions: NonZeroUsize,
+}
+
+pub struct TableScanConfig {
+    pub lwc_blocks_per_partition: usize, // default 16, range 1..=8192
+    pub row_pages_per_partition: usize,  // default 32, range 1..=8192
+}
+
+pub struct EngineConfig {
+    pub table_scan: TableScanConfig,
+    // existing fields
 }
 
 pub struct TableScanPlan { /* weak facade plus value-only partition descriptors */ }
@@ -348,6 +366,11 @@ impl ReadSnapshot {
 impl TableScanPlan {
     pub fn partition_count(&self) -> usize;
 
+    pub fn repartition(
+        &self,
+        target_partitions: NonZeroUsize,
+    ) -> Result<Option<TableScanPlan>>;
+
     pub fn open(&self, partition_idx: usize)
         -> Result<TableScanPartitionStream>;
 }
@@ -367,15 +390,19 @@ let snapshot = session
     .acquire_tables([customer_table, order_table])
     .await?;
 
-let plan = snapshot
+let mut plan = snapshot
     .prepare_table_scan(
         order_table,
         TableScanOptions {
             projection: vec![0, 2],
-            target_partitions: NonZeroUsize::new(8).unwrap(),
         },
     )
     .await?;
+if let Some(repartitioned) =
+    plan.repartition(NonZeroUsize::new(8).unwrap())?
+{
+    plan = repartitioned;
+}
 
 fn spawn_and_drain(
     mut partition: TableScanPartitionStream,
@@ -702,9 +729,9 @@ enum TableScanUnit {
     Hot(RowPageDescriptor),
 }
 
-struct TableScanPartition {
-    start_unit: usize,
-    end_unit: usize,
+struct TableScanPartitionLayout {
+    // p partitions use p + 1 offsets; partition i is offsets[i]..offsets[i + 1].
+    offsets: Arc<[usize]>,
 }
 ```
 
@@ -725,25 +752,51 @@ snapshot operation. [D3] [D6] [D7] [D13] [D14] [C3] [C4] [C10] [C11]
 [C14] [U5] [U6] [U9]
 
 Cold units precede the pivot and hot units start at or above it. Units remain in
-ascending RowID coverage order. The plan validates monotonic, non-overlapping
-coverage while constructing the combined unit vector; block IDs, page IDs,
-RowIDs, and the storage-tier split are not exposed publicly. [D3] [C2] [C3]
+ascending RowID coverage order. Cold block-index decoding validates its entries
+and root publication pairs that index with its end pivot. Hot worklist capture
+requires that pivot to be an exact page boundary and constructs ordered positive
+descriptors from it. The planner consumes those producer guarantees when
+constructing the combined unit vector. Block IDs, page IDs, RowIDs, and the
+storage-tier split are not exposed publicly. [D3] [C2] [C3]
 
-Each cold unit's weight is `max(1, entry.row_count())`. Each hot unit's initial
-weight is `max(1, end_row_id - start_row_id)`, an intentionally approximate
-reserved-row span available without loading the page. Checked wide arithmetic
-builds a prefix weight sum. Deterministic cut points divide the ordered units
-into contiguous, non-empty ranges near equal cumulative weight while leaving
-every physical unit intact. [C3] [C4] [U3]
+Startup configuration supplies `C = lwc_blocks_per_partition` and
+`H = row_pages_per_partition`. One cold LWC unit weighs `H`, one hot row-page
+unit weighs `C`, and the shared initial budget is `C * H`. Startup validation
+bounds both counts to `1..=8192`, making their `u64` conversion and product
+infallible. The defaults therefore give cold weight 32, hot weight 16, and
+budget 512. A bounded cumulative weight prefix is the sole arithmetic
+source for both greedy initial budget packing and explicit repartitioning. A
+partial cold group may use its remaining budget for following hot pages; the
+tier edge is not an automatic cut. [C3] [C4] [U3] [U12]
 
-For a nonempty unit list, actual partition count is
-`min(target_partitions, unit_count)`. An empty table has exactly one empty
-partition. The planner never creates empty interior partitions, splits an LWC
-block or hot page, or changes MVCC row membership to meet the requested count.
-Static skew from a single expensive unit is accepted in this RFC. [C2] [U3]
+Initial packing depends only on ordered unit kinds and startup configuration.
+Explicit `repartition(target_partitions)` derives a ceiling-average normalized
+weight budget from the count hint and reuses the initial greedy offset builder.
+The builder packs consecutive units while they fit, cuts before the first unit
+that would exceed the budget, and retains an overweight indivisible unit as a
+singleton. Unit granularity may produce either more or fewer partitions than
+the hint, so callers inspect `partition_count()`; identical offsets return
+`None`. An empty table always has one empty partition encoded by `[0, 0]`.
+Nonempty layouts have strictly increasing compact offsets beginning at zero
+and ending at the unit count. No path creates an empty interior partition,
+splits a physical unit, or changes MVCC membership. [C2] [U3] [U12]
 
-The plan is immutable and `open(partition_idx)` is repeatable while its session
-and snapshot remain open. After validating the index, each call uses ordinary
+Every changed repartition publishes a new immutable generation and makes all
+clones of the receiver stale. Older generations are never reactivated, even
+if the current plan is dropped. A small plan-family gate validates generation
+and whether any partition open has succeeded. Repartition prepares offsets
+outside the gate, then atomically rejects stale generations, rejects an opened
+family, returns `None` for identical offsets, or installs the next generation.
+The future `open` path holds this gate across combined session/snapshot
+checkout and marks the family opened only after checkout succeeds. Failed open
+leaves repartition legal; successful current-generation opens remain
+repeatable. The fixed lock order is `PlanFamilyGate -> SessionState.lifecycle
+-> ReadSnapshotEntry`. [D7] [C10] [U12]
+
+The plan and each generation layout are immutable, and
+`open(partition_idx)` is repeatable through the current generation while its
+session and snapshot remain open. After validating the generation and index,
+each call uses ordinary
 healthy admission and performs the combined executor-acceptance transition:
 the exact session must still be `Open`, the exact entry must still be `Ready`
 and not failed, and the active execution count is incremented before a fresh
@@ -962,8 +1015,9 @@ session upgrade.
 `ReadSnapshot` clones and plans share a lightweight public-liveness token. The
 token owns only weak session reachability, the exact operation key, and local
 idempotence/completion state. Dropping a `ReadSnapshot` while a plan remains
-does not by itself close the snapshot, so that plan may still open partitions
-while the session is `Open` and the snapshot remains `Ready`. Dropping the
+does not by itself close the snapshot, so a current-generation plan may still
+repartition before its first successful open or open partitions while the
+session is `Open` and the snapshot remains `Ready`. Dropping the
 final snapshot-or-plan token requests close without waiting. A running
 partition stream needs no such token: its execution checkout is the stronger,
 precisely counted proof that registry cleanup must wait. If the last facade is
@@ -1108,8 +1162,13 @@ not preselect Arrow crate versions or public Arrow schema mapping. [U1] [U3]
 9. Cold root and hot lower bound for one plan come from one captured root
    observation while its checkout-borrowed root view is live. [D3] [D4] [D14]
    [C2] [C11]
-10. Partition ranges are contiguous, non-overlapping, and cover the complete
-   physical unit vector. [C2] [C3] [C4]
+10. Compact partition offsets begin at zero, end at the physical unit count,
+   are strictly increasing for nonempty plans, and derive contiguous,
+   non-overlapping ranges covering the complete unit vector. The normalized
+   prefix is bounded `u64` data shared by initial packing and repartitioning.
+   Only the current immutable generation may open or repartition; a changed
+   repartition permanently supersedes older clones, and the first successful
+   open seals the family against later repartition. [C2] [C3] [C4] [U12]
 11. `open` returns a fully owned `TableScanPartitionStream: Send + 'static`
     with no borrow from its plan, snapshot facade, session, caller inputs, or a
     checkout-borrowed root view. Every `next()` future is `Send`, and moving the
@@ -1297,8 +1356,8 @@ not preselect Arrow crate versions or public Arrow schema mapping. [U1] [U3]
     snapshot after abandonment or shutdown wins the final build
     linearization.
   - Non-goals: No late or dynamic table registration, mutable frozen table set,
-    `TableScanOptions`, worklist capture, scan units, coverage validation,
-    weighting, partitioning, `TableScanPlan`, planning publication, partition
+    `TableScanOptions`, worklist capture, scan units, weighting, partitioning,
+    `TableScanPlan`, planning publication, partition
     `open`, page loading, row output, or exported incomplete scan API.
   - Phase-local Choices: Require at least one user table and deduplicate the
     complete caller-supplied set by first occurrence; use the operation scope
@@ -1336,10 +1395,12 @@ not preselect Arrow crate versions or public Arrow schema mapping. [U1] [U3]
     weak facade-liveness group.
   - Scope: Add `TableScanOptions`; planning checkout and return policy; a weak,
     cloneable, value-only `TableScanPlan`; projection validation; cold/hot
-    worklist capture through the exact frozen root; ordered `TableScanUnit`
-    construction; monotonic non-overlapping coverage validation; checked
-    weights and prefix arithmetic; deterministic contiguous partitioning;
-    immutable partition metadata; facade-group participation; and final plan
+    worklist capture through the exact frozen root; consumption of
+    producer-validated ordered descriptors; ordered `TableScanUnit`
+    construction; checked normalized weights and prefix arithmetic;
+    shared-budget initial packing;
+    compact offsets; best-effort repartitioning; superseding plan generations;
+    the future-open family gate; facade-group participation; and final plan
     publication ordered against close, abandonment, poison, and shutdown.
   - Goals: Complete and test the real
     `begin_read_snapshot -> acquire_tables -> prepare_table_scan -> close`
@@ -1347,37 +1408,43 @@ not preselect Arrow crate versions or public Arrow schema mapping. [U1] [U3]
     and concatenated physical order; keep plans free of table, layout, root,
     STS-registration, lock, stable-entry, and strong runtime ownership; allow
     concurrent and repeated planning only while the snapshot remains `Ready`;
-    and publish no plan after a terminal edge wins its final linearization.
+    publish no plan after a terminal edge wins its final linearization; and
+    leave Phase 4 an exact current-generation gate that seals only after
+    successful execution checkout.
   - Non-goals: No page or block loading, MVCC row filtering, row output,
     partition `open`, execution checkout, dynamic scheduling, unit splitting,
     user cancellation, execution failure propagation, or exported incomplete
     scan API.
   - Phase-local Choices: Require a nonempty, in-range, strictly increasing
-    projection; use cold row counts and hot reserved spans as weights; build
-    checked wide prefix sums; keep every physical unit intact; use
-    deterministic contiguous nonempty ranges; return one empty partition for
-    an empty table; reduce requested parallelism when units are fewer than the
-    target; retain repeatable plan descriptors only while the snapshot remains
-    `Ready`; share the snapshot facade-liveness group with plans; keep the API
-    crate-private or unexported until Phase 4 opens real row streams; and add
-    typed planning-input and arithmetic diagnostics. [U11]
+    projection; cross-normalize immutable configured LWC-block and row-page
+    counts into positive weights and one shared initial budget; build one
+    bounded `u64` prefix; keep every physical unit intact; permit initial
+    packing across the tier edge; use compact offsets; return one empty
+    partition for an empty table; expose best-effort repartition only before a
+    successful open; supersede old generations on changed repartition; share
+    the snapshot facade-liveness group with plans; keep the API crate-private
+    until Phase 4 opens real row streams; retain typed planning-input, stale,
+    and already-opened diagnostics; and treat impossible prefix and generation
+    states as release-checked invariants. [U11] [U12]
   - Verification: Prove deterministic complete unit coverage, cold-before-hot
-    and partition-index concatenated order, checked weighting, target counts of
-    one/fewer/equal/greater than units, empty input, skew without unit splitting,
-    value-only plan ownership, repeated identical preparation, concurrent and
-    cancelled planners, close/abandonment/poison/shutdown publication rejection,
-    and stale-plan safety after terminal cleanup. No test-only execution shell
-    or partition `open` is added.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+    and partition-index concatenated order, bounded weighting, initial and
+    explicit repartition offsets, empty input, skew without unit splitting,
+    value-only plan ownership, superseded clones, generation/open gate races,
+    repeated identical preparation, concurrent and cancelled planners,
+    close/abandonment/poison/shutdown publication rejection, and stale-plan
+    safety after terminal cleanup. The production future-open gate is tested
+    directly without adding a partition stream.
+  - Task Doc: `docs/tasks/000283-deterministic-table-scan-planning.md`
+  - Task Issue: `#1015`
+  - Phase Status: done
+  - Implementation Summary: Phase 3 shipped deterministic resource-free table-scan planning with validated 16/32 startup sizing, shared greedy packing, immutable superseding generations, future-open admission, and final lifecycle publication. [Task Resolve Sync: docs/tasks/000283-deterministic-table-scan-planning.md @ 2026-08-26]
 
 - **Phase 4: Parallel row-oriented table scan**
   - Prerequisites: Phase 3 provides complete, self-tested deterministic
-    planning and immutable partition descriptors on Phase 2's shared snapshot
-    lifecycle.
-  - Scope: Add the combined session-open/snapshot-ready `open` acceptance
+    planning, immutable current-generation partition descriptors, and the
+    pre-open plan-family gate on Phase 2's shared snapshot lifecycle.
+  - Scope: Add the current-generation check and combined
+    session-open/snapshot-ready `open` acceptance
     linearization against close, failure, abandonment, and shutdown; shared
     execution checkout and return, `TableScanPartitionStream`,
     one-unit-at-a-time cold/hot loading, MVCC filtering, direct projection into
@@ -1404,12 +1471,15 @@ not preselect Arrow crate versions or public Arrow schema mapping. [U1] [U3]
     decoding, public user-cancellation API, preemptive in-flight I/O
     interruption, engine-owned query coordinator, global ordering, or benchmark
     speedup threshold.
-  - Phase-local Choices: Retain a current hot-page shared guard across rows as
-    the existing stream does; use first-error-wins snapshot-wide failure with
-    typed peer-abort results; check failure at `next()` entry and unit I/O
-    boundaries; require no `Sync` bound; leave internal reference placement
-    across await points private subject to the `Send` future contract; keep
-    repeatable opens legal only while the snapshot remains `Ready`.
+  - Phase-local Choices: Hold the plan-family gate before session lifecycle
+    checkout, seal the family only after checkout succeeds, retain repeatable
+    opens for the current generation, retain a current hot-page shared guard
+    across rows as the existing stream does; use first-error-wins snapshot-wide
+    failure with typed peer-abort results; check failure at `next()` entry and
+    unit I/O boundaries; require no `Sync` bound; leave internal reference
+    placement across await points private subject to the `Send` future
+    contract; keep repeatable opens legal only while the snapshot remains
+    `Ready`.
   - Verification: Compare complete partition unions and concatenated physical
     order with the existing transaction stream for empty, cold-only, hot-only,
     and mixed tables; cover MVCC insert, update, delete, undo, and CDB cases;
@@ -1440,8 +1510,9 @@ not preselect Arrow crate versions or public Arrow schema mapping. [U1] [U3]
   - Non-goals: No CI wall-clock speedup assertion, auto-tuning, query scheduler,
     or replacement of the existing `table-scan` benchmark identity.
   - Phase-local Choices: Count one complete all-partition drain as one logical
-    scan operation; aggregate returned rows with checked arithmetic; report
-    actual as well as target partition count.
+    scan operation; call best-effort `repartition` with configured target
+    parallelism before opening; aggregate returned rows with checked
+    arithmetic; report actual as well as target partition count.
   - Verification: Run the small smoke mode in deterministic validation and
     assert row, operation, and partition counters against the one-partition
     baseline. Record large-fixture measurements separately; variable wall-clock
@@ -1491,8 +1562,10 @@ not preselect Arrow crate versions or public Arrow schema mapping. [U1] [U3]
 9. Race plan capture and partition draining with real freeze/checkpoint
    publication to prove the captured cold root/pivot and original hot-page
    descriptors have no omissions or duplicates.
-10. Exercise target counts of one, fewer than units, equal to units, greater than
-   units, and empty-table input; assert deterministic ranges and checked weight
+10. Exercise initial configured packing and repartition targets of one, fewer
+   than units, equal to units, greater than units, and empty-table input; assert
+   compact greedy offsets, actual counts above and below the hint, overweight
+   singleton handling, superseding generations, and bounded normalized weight
    behavior.
 11. Open the same partition twice and prove repeatable identical execution while
    a normal one-open-per-partition run remains duplicate free.
@@ -1630,8 +1703,9 @@ not preselect Arrow crate versions or public Arrow schema mapping. [U1] [U3]
   limiting new correctness surface.
 - Worker threads share immutable state and never mutate the session lock
   family.
-- Plans are deterministic, independently reopenable, and suitable for later
-  adapters that expect partition-index execution.
+- Plans are deterministic; current-generation partitions are independently
+  reopenable, and compact layouts are suitable for later adapters that expect
+  partition-index execution.
 - The stream type, each `next()` future, and the whole drain task have explicit
   compile-checked spawnability boundaries, so a non-`Send` value retained across
   an await cannot silently defeat parallel execution.

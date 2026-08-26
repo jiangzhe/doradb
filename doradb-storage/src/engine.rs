@@ -14,7 +14,7 @@ use crate::component::{
     ComponentRegistry, ComponentShutdownOutcome, DiskPoolConfig, EnginePools, MetaPoolConfig,
     RegistryBuilder,
 };
-use crate::conf::{EngineConfig, ValidatedTrxSysConfig};
+use crate::conf::{EngineConfig, TableScanConfig, ValidatedTrxSysConfig};
 use crate::error::{
     ConfigError, DiscloseError, DiscloseResultExt, LifecycleError, LifecycleOrFatalError,
     LifecycleOrFatalResult, LifecycleResult, Result,
@@ -32,6 +32,8 @@ use crate::runtime::thread_pool::{ThreadPool, ThreadPoolWorkers};
 use crate::session::{Session, SessionAdmission, SessionCleanupRequest, SessionRegistry};
 #[cfg(test)]
 use crate::table::tests::MaintenanceTestController;
+#[cfg(test)]
+use crate::trx::TableScanPlanTestController;
 use crate::trx::sys::{TransactionPurgeWorkers, TransactionRedoWorkers, TransactionSystem};
 use crate::{DiskPool, IndexPool, MemPool, MetaPool};
 use error_stack::{Report, ResultExt};
@@ -518,6 +520,8 @@ impl Drop for Engine {
 /// session becomes closed and idle. It must never be used for operation
 /// resolution.
 pub(crate) struct EngineCore {
+    /// Immutable deterministic table-scan planning configuration.
+    table_scan_config: TableScanConfig,
     /// Engine-level fatal runtime poison state.
     pub(crate) poisoner: QuiescentGuard<EnginePoisoner>,
     /// Engine-owned executor for finite synchronous CPU computations.
@@ -545,9 +549,18 @@ pub(crate) struct EngineCore {
     /// Per-engine maintenance fault and phase controller.
     #[cfg(test)]
     pub(crate) maintenance_test: MaintenanceTestController,
+    /// Per-engine deterministic table-scan planning phase controller.
+    #[cfg(test)]
+    pub(crate) table_scan_plan_test: TableScanPlanTestController,
 }
 
 impl EngineCore {
+    /// Return immutable deterministic table-scan planning configuration.
+    #[inline]
+    pub(crate) const fn table_scan_config(&self) -> TableScanConfig {
+        self.table_scan_config
+    }
+
     /// Return the shared catalog handle.
     #[inline]
     pub(crate) fn catalog(&self) -> &Catalog {
@@ -626,6 +639,7 @@ impl Deref for EngineInner {
 
 async fn bootstrap_engine(config: EngineConfig) -> Result<Engine> {
     let config = config.validate_inner().disclose()?;
+    let table_scan_config = config.table_scan;
     let resolved = config
         .resolve_storage_paths()
         .disclose()?
@@ -770,6 +784,7 @@ async fn bootstrap_engine(config: EngineConfig) -> Result<Engine> {
     let session_registry = Arc::new(SessionRegistry::new());
     let lifecycle = Arc::new(EngineLifecycle::new());
     let core = Arc::new(EngineCore {
+        table_scan_config,
         poisoner,
         thread_pool,
         mandatory_runtime,
@@ -790,6 +805,8 @@ async fn bootstrap_engine(config: EngineConfig) -> Result<Engine> {
         index_ddl_test: IndexDdlTestController::default(),
         #[cfg(test)]
         maintenance_test: MaintenanceTestController::default(),
+        #[cfg(test)]
+        table_scan_plan_test: TableScanPlanTestController::default(),
     });
     let engine_inner = EngineInner {
         core,

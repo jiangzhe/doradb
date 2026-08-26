@@ -2832,6 +2832,62 @@ impl SessionState {
         Ok((entry, read_core))
     }
 
+    /// Admit a completed plan at the final edge before it escapes to the caller.
+    ///
+    /// Planning retains a counted checkout, but close, abandonment, shutdown,
+    /// or poison may arrive after worklist capture starts. Holding the session
+    /// lifecycle lock stabilizes the active entry, session disposition, and
+    /// snapshot phase while this method decides whether publication won.
+    #[inline]
+    pub(crate) fn admit_read_snapshot_plan_publication(
+        &self,
+        entry: &Arc<ReadSnapshotEntry>,
+        facade_closed: &AtomicBool,
+    ) -> LifecycleOrFatalResult<()> {
+        let lifecycle = self.lifecycle.lock();
+        // Pointer identity rejects a stale checkout even if another snapshot
+        // could otherwise present matching scalar identity.
+        let exact = lifecycle
+            .slot
+            .active_read_snapshot()
+            .is_some_and(|active| Arc::ptr_eq(active, entry));
+        let disposition_open = lifecycle.disposition == SessionDisposition::Open;
+        let phase = entry.phase();
+        let ready = phase == ReadSnapshotPhase::Ready;
+        let shutdown_started = self.admission.shutdown_started();
+        let closed = facade_closed.load(Ordering::Acquire);
+        if !exact || !disposition_open || !ready || shutdown_started || closed {
+            return Err(Report::new(LifecycleError::ReadSnapshotUnavailable)
+                .attach(format!(
+                    "operation_key={}, exact_entry={exact}, disposition={}, snapshot_phase={}, shutdown_started={shutdown_started}, facade_closed={closed}",
+                    entry.key(),
+                    lifecycle.disposition.label(),
+                    phase.label()
+                ))
+                .into());
+        }
+        // Preserve poison as a fatal result instead of collapsing it into
+        // snapshot lifecycle unavailability.
+        self.core
+            .poisoner
+            .ensure_healthy()
+            .attach_with(|| format!("operation_key={}, phase=publish_plan", entry.key()))?;
+        // Shutdown and facade close publish through atomics outside the session
+        // lifecycle lock. Recheck them after the poison edge; the lock already
+        // keeps the exact entry, disposition, and snapshot phase stable.
+        if self.admission.shutdown_started() || facade_closed.load(Ordering::Acquire) {
+            return Err(Report::new(LifecycleError::ReadSnapshotUnavailable)
+                .attach(format!(
+                    "operation_key={}, reason=terminal_edge_during_plan_publication, shutdown_started={}, facade_closed={}",
+                    entry.key(),
+                    self.admission.shutdown_started(),
+                    facade_closed.load(Ordering::Acquire)
+                ))
+                .into());
+        }
+        Ok(())
+    }
+
     /// Arm the session lifecycle listener while the exact snapshot remains active.
     #[inline]
     pub(crate) fn read_snapshot_terminal_listener(

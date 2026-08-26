@@ -10,8 +10,10 @@ pub use self::consts::{
     DEFAULT_CATALOG_CHECKPOINT_SCAN_IO_DEPTH, DEFAULT_COW_FILE_MAX_SIZE, DEFAULT_GC_BUCKETS,
     DEFAULT_LOG_BLOCK_SIZE, DEFAULT_LOG_DIR, DEFAULT_LOG_FILE_MAX_SIZE, DEFAULT_LOG_FILE_STEM,
     DEFAULT_LOG_SYNC, DEFAULT_LOG_WRITE_IO_DEPTH, DEFAULT_PURGE_THREADS, DEFAULT_RECOVERY_IO_DEPTH,
+    DEFAULT_TABLE_SCAN_LWC_BLOCKS_PER_PARTITION, DEFAULT_TABLE_SCAN_ROW_PAGES_PER_PARTITION,
+    MAX_TABLE_SCAN_UNITS_PER_PARTITION,
 };
-pub use self::engine::{EngineConfig, MandatoryRuntimeConfig, ThreadPoolConfig};
+pub use self::engine::{EngineConfig, MandatoryRuntimeConfig, TableScanConfig, ThreadPoolConfig};
 pub use self::fs::FileSystemConfig;
 pub(crate) use self::fs::ValidatedFileSystemConfig;
 pub use self::trx::TrxSysConfig;

@@ -12,6 +12,8 @@ pub struct EngineConfigOverlay {
     pub thread_pool: ThreadPoolOverlay,
     /// Mandatory runtime sizing overrides.
     pub mandatory_runtime: MandatoryRuntimeOverlay,
+    /// Deterministic table-scan planning overrides.
+    pub table_scan: TableScanConfigOverlay,
     /// Transaction-system overrides.
     pub transaction: TransactionConfigOverlay,
     /// Metadata buffer-pool size.
@@ -30,11 +32,36 @@ impl EngineConfigOverlay {
     pub fn merge(&mut self, other: Self) {
         self.thread_pool.merge(other.thread_pool);
         self.mandatory_runtime.merge(other.mandatory_runtime);
+        self.table_scan.merge(other.table_scan);
         self.transaction.merge(other.transaction);
         replace(&mut self.meta_buffer_size, other.meta_buffer_size);
         self.index_buffer.merge(other.index_buffer);
         self.data_buffer.merge(other.data_buffer);
         self.file.merge(other.file);
+    }
+}
+
+/// Strict deterministic table-scan planning overlay.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TableScanConfigOverlay {
+    /// Persisted LWC blocks per homogeneous partition.
+    pub lwc_blocks_per_partition: Option<usize>,
+    /// Hot row pages per homogeneous partition.
+    pub row_pages_per_partition: Option<usize>,
+}
+
+impl TableScanConfigOverlay {
+    #[inline]
+    fn merge(&mut self, other: Self) {
+        replace(
+            &mut self.lwc_blocks_per_partition,
+            other.lwc_blocks_per_partition,
+        );
+        replace(
+            &mut self.row_pages_per_partition,
+            other.row_pages_per_partition,
+        );
     }
 }
 
@@ -209,6 +236,8 @@ pub struct ResolvedEngineConfig {
     pub transaction: ResolvedTransactionConfig,
     /// Mandatory runtime sizing.
     pub mandatory_runtime: ResolvedMandatoryRuntimeConfig,
+    /// Deterministic table-scan planning settings.
+    pub table_scan: ResolvedTableScanConfig,
     /// Metadata buffer-pool bytes.
     pub meta_buffer_bytes: u64,
     /// User-index buffer-pool settings.
@@ -242,6 +271,10 @@ impl ResolvedEngineConfig {
             mandatory_runtime: ResolvedMandatoryRuntimeConfig {
                 concurrency_limit: config.mandatory_runtime.concurrency_limit,
             },
+            table_scan: ResolvedTableScanConfig {
+                lwc_blocks_per_partition: config.table_scan.lwc_blocks_per_partition,
+                row_pages_per_partition: config.table_scan.row_pages_per_partition,
+            },
             meta_buffer_bytes: config.meta_buffer.as_u64(),
             index_buffer: ResolvedEvictableBufferPoolConfig::from_config(&config.index_buffer),
             data_buffer: ResolvedEvictableBufferPoolConfig::from_config(&config.data_buffer),
@@ -254,6 +287,16 @@ impl ResolvedEngineConfig {
             },
         }
     }
+}
+
+/// Serializable normalized deterministic table-scan planning configuration.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedTableScanConfig {
+    /// Persisted LWC blocks per homogeneous partition.
+    pub lwc_blocks_per_partition: usize,
+    /// Hot row pages per homogeneous partition.
+    pub row_pages_per_partition: usize,
 }
 
 /// Serializable normalized CPU thread-pool configuration.
@@ -353,6 +396,13 @@ pub fn resolve_engine_config(
     if let Some(value) = overlay.mandatory_runtime.concurrency_limit {
         mandatory = mandatory.concurrency_limit(value);
     }
+    let mut table_scan = default.table_scan;
+    if let Some(value) = overlay.table_scan.lwc_blocks_per_partition {
+        table_scan = table_scan.lwc_blocks_per_partition(value);
+    }
+    if let Some(value) = overlay.table_scan.row_pages_per_partition {
+        table_scan = table_scan.row_pages_per_partition(value);
+    }
 
     let mut transaction = default.trx.clone();
     if let Some(value) = overlay.transaction.log_write_io_depth {
@@ -422,6 +472,7 @@ pub fn resolve_engine_config(
         .storage_root(storage_root)
         .thread_pool(thread_pool)
         .mandatory_runtime(mandatory)
+        .table_scan(table_scan)
         .trx(transaction)
         .meta_buffer(
             overlay
@@ -559,6 +610,7 @@ mod tests {
         assert!(toml::from_str::<EngineConfigOverlay>("meta_buffer_bytes = 4096").is_err());
         assert!(toml::from_str::<EngineConfigOverlay>("meta_buffer_size = 4096").is_err());
         assert!(toml::from_str::<EngineConfigOverlay>("[thread_pool]\nunknown = 1").is_err());
+        assert!(toml::from_str::<EngineConfigOverlay>("[table_scan]\nunknown = 1").is_err());
         assert!(
             toml::from_str::<EngineConfigOverlay>("[mandatory_runtime]\nworker_threads = 2")
                 .is_err()
@@ -584,6 +636,51 @@ mod tests {
         let encoded = toml::to_string(&resolved).unwrap();
         let decoded: ResolvedEngineConfig = toml::from_str(&encoded).unwrap();
         assert_eq!(decoded, resolved);
+    }
+
+    #[test]
+    fn table_scan_overlay_merges_resolves_round_trips_and_is_required() {
+        let temp = TempDir::new().unwrap();
+        let mut base: EngineConfigOverlay = toml::from_str(
+            "[table_scan]\nlwc_blocks_per_partition = 7\nrow_pages_per_partition = 15\n",
+        )
+        .unwrap();
+        let local: EngineConfigOverlay =
+            toml::from_str("[table_scan]\nrow_pages_per_partition = 21\n").unwrap();
+        base.merge(local);
+        let (config, resolved) = resolve_engine_config(temp.path(), &base).unwrap();
+        assert_eq!(config.table_scan.lwc_blocks_per_partition, 7);
+        assert_eq!(config.table_scan.row_pages_per_partition, 21);
+        assert_eq!(
+            resolved.table_scan,
+            ResolvedTableScanConfig {
+                lwc_blocks_per_partition: 7,
+                row_pages_per_partition: 21,
+            }
+        );
+        let encoded = toml::to_string(&resolved).unwrap();
+        assert!(encoded.contains("[table_scan]"));
+        assert_eq!(
+            toml::from_str::<ResolvedEngineConfig>(&encoded).unwrap(),
+            resolved
+        );
+
+        let mut skipping_scan = false;
+        let without_scan = encoded
+            .lines()
+            .filter(|line| {
+                if *line == "[table_scan]" {
+                    skipping_scan = true;
+                    return false;
+                }
+                if skipping_scan && line.starts_with('[') {
+                    skipping_scan = false;
+                }
+                !skipping_scan
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(toml::from_str::<ResolvedEngineConfig>(&without_scan).is_err());
     }
 
     #[test]
