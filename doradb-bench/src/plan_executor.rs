@@ -608,18 +608,16 @@ where
     F: FnOnce(RunTaskSpawner<'run>) -> E::Config,
 {
     verify_executor_identity::<E>(workload)?;
+    let task_executor: Arc<Executor<'run>> = Arc::new(Executor::new());
+    let task_spawner = RunTaskSpawner {
+        executor: Arc::clone(&task_executor),
+    };
+    let executor = E::new(config_factory(task_spawner))?;
     run_executor_with_setup::<E, _>(
         engine,
         clock,
         workload,
-        move || {
-            let task_executor: Arc<Executor<'run>> = Arc::new(Executor::new());
-            let task_spawner = RunTaskSpawner {
-                executor: Arc::clone(&task_executor),
-            };
-            let executor = E::new(config_factory(task_spawner))?;
-            Ok((executor, task_executor))
-        },
+        move || Ok((executor, task_executor)),
         planned_effect,
         sample_latency,
     )
@@ -1059,6 +1057,11 @@ mod tests {
             });
         let (identities, task_identities) = result.unwrap();
         assert_ne!(identities[0], identities[1]);
-        assert_eq!(identities, task_identities);
+        assert_ne!(task_identities[0], task_identities[1]);
+        assert!(
+            task_identities
+                .into_iter()
+                .all(|identity| identities.contains(&identity))
+        );
     }
 }

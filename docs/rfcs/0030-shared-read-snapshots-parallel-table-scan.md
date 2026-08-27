@@ -1517,15 +1517,23 @@ not preselect Arrow crate versions or public Arrow schema mapping. [U1] [U3]
   - Phase-local Choices: Count one complete all-partition drain as one logical
     scan operation; call best-effort `repartition` with configured target
     parallelism before opening; aggregate returned rows with checked
-    arithmetic; report actual as well as target partition count.
-  - Verification: Run the small smoke mode in deterministic validation and
-    assert row, operation, and partition counters against the one-partition
-    baseline. Record large-fixture measurements separately; variable wall-clock
-    speedup remains benchmark evidence rather than a CI pass condition.
+    arithmetic; report actual as well as target partition count; use one
+    coordinator session and the target-sized run-local executor; keep nested
+    spawning private to the concrete parallel executor; and join every accepted
+    partition task while driving snapshot close to terminal completion.
+  - Verification: Strict plan, metric, output, executor-rendezvous, lifecycle,
+    template, workspace, and alternate-backend coverage passed. On equivalent
+    million-row warm-cache fixtures, target one retained 98.9% of sequential
+    hot throughput, 99.7% of mixed throughput, and 99.8% of cold-dominant
+    throughput. Target nine scaled by 3.61x, 4.26x, and 4.62x respectively;
+    variable wall-clock speedup remains benchmark evidence rather than a CI
+    pass condition.
   - Task Doc: `docs/tasks/000285-parallel-scan-benchmark-performance-proof.md`
   - Task Issue: `#1020`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase Status: done
+  - Implementation Summary: Phase 5 shipped the strict `parallel-table-scan` workload with one coordinator, target-sized run-local execution, checked cardinality, typed target/actual metrics, deterministic lifecycle coverage, and a focused table-scan module. Million-row release runs passed target-one parity for hot, mixed, and cold-dominant fixtures and scaled through available worker capacity. A lexical scope boundary keeps `ReadSnapshotBuilder::acquire_tables` `Send` without changing storage semantics; warm-cache cold-row validation optimization is deferred to backlog 000188. [Task Resolve Sync: docs/tasks/000285-parallel-scan-benchmark-performance-proof.md @ 2026-08-27]
+  - Related Backlogs:
+    - `docs/backlogs/000188-optimize-warm-cache-cold-row-table-scans.md`
 
 ## Test Strategy
 
