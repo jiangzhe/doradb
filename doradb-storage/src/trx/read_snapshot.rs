@@ -830,32 +830,39 @@ impl ReadSnapshotBuilder {
                 .into());
         }
 
-        let admitted = self
-            .session
-            .upgrade()
-            .attach_with(|| format!("operation_key={}", self.key))?
-            .ok_or_else(|| {
-                Report::new(LifecycleError::ReadSnapshotUnavailable).attach(format!(
-                    "operation_key={}, reason=session_missing",
-                    self.key
-                ))
-            })?;
-        admitted
-            .runtime()
-            .poisoner
-            .ensure_healthy()
-            .attach_with(|| format!("operation_key={}, phase=build_checkout", self.key))?;
-        let (entry, core) = admitted
-            .runtime()
-            .state()
-            .checkout_read_snapshot_build(self.key)
-            .attach_with(|| format!("operation_key={}", self.key))?;
-        let runtime = admitted.into_runtime();
-        self.armed.set(false);
-        let mut checkout = ReadSnapshotBuildCheckout {
-            runtime: runtime.clone(),
-            entry,
-            core: Some(core),
+        // End the non-Send admitted wrapper's storage scope before the first
+        // await. Although `into_runtime` consumes the value and releases
+        // admission, keeping its binding in this async scope would make the
+        // generated future conservatively retain a non-Send coroutine field.
+        let (runtime, mut checkout) = {
+            let admitted = self
+                .session
+                .upgrade()
+                .attach_with(|| format!("operation_key={}", self.key))?
+                .ok_or_else(|| {
+                    Report::new(LifecycleError::ReadSnapshotUnavailable).attach(format!(
+                        "operation_key={}, reason=session_missing",
+                        self.key
+                    ))
+                })?;
+            admitted
+                .runtime()
+                .poisoner
+                .ensure_healthy()
+                .attach_with(|| format!("operation_key={}, phase=build_checkout", self.key))?;
+            let (entry, core) = admitted
+                .runtime()
+                .state()
+                .checkout_read_snapshot_build(self.key)
+                .attach_with(|| format!("operation_key={}", self.key))?;
+            let runtime = admitted.into_runtime();
+            self.armed.set(false);
+            let checkout = ReadSnapshotBuildCheckout {
+                runtime: runtime.clone(),
+                entry,
+                core: Some(core),
+            };
+            (runtime, checkout)
         };
 
         for table_id in table_ids {
@@ -1609,6 +1616,12 @@ mod tests {
         assert_send::<TableScanPlan>();
         assert_sync::<TableScanPlan>();
         assert_clone::<TableScanPlan>();
+    };
+
+    const _: fn(ReadSnapshotBuilder, TableID) = |builder, table_id| {
+        fn assert_send<T: Send>(_: T) {}
+
+        assert_send(builder.acquire_tables([table_id]));
     };
 
     /// Per-engine semantic pause after worklist capture and before plan publication.

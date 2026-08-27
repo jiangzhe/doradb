@@ -1081,6 +1081,9 @@ impl Session {
         if self.closed.get() {
             return Ok(());
         }
+        // End the non-Send admitted wrapper's storage scope before the close
+        // loop can await. `into_runtime` releases foreground admission while
+        // retaining the runtime pin that owns asynchronous close progress.
         let runtime = {
             let admitted = self
                 .session

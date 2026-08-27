@@ -146,6 +146,8 @@ pub enum WorkloadSpec {
     LookupRand(SeededReadSpec),
     /// Execute complete table scans.
     TableScan(OptionalReadSpec),
+    /// Execute caller-scheduled shared-snapshot table scans.
+    ParallelTableScan(ParallelTableScanSpec),
     /// Execute materialized secondary-index range scans.
     IndexScan(IndexScanSpec),
     /// Execute public secondary-index streams.
@@ -306,6 +308,18 @@ pub struct OptionalReadSpec {
     pub sessions: Option<NonZeroUsize>,
     /// Optional operations-per-transaction override.
     pub batch_size: Option<NonZeroU64>,
+    /// Optional engine-diagnostic override.
+    pub include_stats: Option<bool>,
+}
+
+/// Strict shared-snapshot parallel table-scan controls.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParallelTableScanSpec {
+    /// Optional positive scan count; defaults to one.
+    pub num: Option<NonZeroU64>,
+    /// Required positive best-effort partition target and executor size.
+    pub target_partitions: NonZeroUsize,
     /// Optional engine-diagnostic override.
     pub include_stats: Option<bool>,
 }
@@ -664,6 +678,20 @@ pub struct ReadConfig {
     pub include_stats: bool,
 }
 
+/// Resolved shared-snapshot parallel table-scan configuration.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParallelTableScanConfig {
+    /// Aggregate complete-scan operation count.
+    pub num: u64,
+    /// Best-effort partition target and executor thread count.
+    pub target_partitions: usize,
+    /// Candidate loaded logical-key range.
+    pub loaded_range: KeyRange,
+    /// Whether engine diagnostics are captured around the run.
+    pub include_stats: bool,
+}
+
 /// Resolved public index-stream configuration.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -738,6 +766,8 @@ pub enum ResolvedWorkload {
     LookupRand(ReadConfig),
     /// Full table-scan workload.
     TableScan(ReadConfig),
+    /// Shared-snapshot parallel table-scan workload.
+    ParallelTableScan(ParallelTableScanConfig),
     /// Materialized index-range-scan workload.
     IndexScan(ReadConfig),
     /// Public index-range-stream workload.
@@ -766,6 +796,7 @@ impl ResolvedWorkload {
             Self::LookupSeq(_) => "lookup-seq",
             Self::LookupRand(_) => "lookup-rand",
             Self::TableScan(_) => "table-scan",
+            Self::ParallelTableScan(_) => "parallel-table-scan",
             Self::IndexScan(_) => "index-scan",
             Self::IndexStream(_) => "index-stream",
             Self::IndexDdl(_) => "index-ddl",
@@ -791,7 +822,7 @@ impl ResolvedWorkload {
                 index: IndexRequirement::Exact(IndexMode::Unique),
                 load: LoadRequirement::Committed,
             },
-            Self::TableScan(_) => FixtureRequirement::Primary {
+            Self::TableScan(_) | Self::ParallelTableScan(_) => FixtureRequirement::Primary {
                 index: IndexRequirement::Any,
                 load: LoadRequirement::Committed,
             },
@@ -822,6 +853,7 @@ impl ResolvedWorkload {
             | Self::LookupSeq(_)
             | Self::LookupRand(_)
             | Self::TableScan(_)
+            | Self::ParallelTableScan(_)
             | Self::IndexScan(_)
             | Self::IndexStream(_)
             | Self::UpdateRand(_)
@@ -848,6 +880,7 @@ impl ResolvedWorkload {
             | Self::LookupRand(config)
             | Self::TableScan(config)
             | Self::IndexScan(config) => (config.threads, config.sessions),
+            Self::ParallelTableScan(config) => (config.target_partitions, 1),
             Self::IndexStream(config) => (config.threads, config.sessions),
             Self::LockTable(config) => (config.threads, config.sessions),
             Self::FreezeTable(_) | Self::CheckpointTable(_) => (1, 1),
@@ -866,6 +899,7 @@ impl ResolvedWorkload {
             | Self::LookupRand(config)
             | Self::TableScan(config)
             | Self::IndexScan(config) => config.include_stats,
+            Self::ParallelTableScan(config) => config.include_stats,
             Self::IndexStream(config) => config.include_stats,
             Self::LockTable(config) => config.include_stats,
             Self::FreezeTable(config) => config.include_stats,
@@ -884,6 +918,7 @@ impl ResolvedWorkload {
             Self::TableDdl(_) => LatencyUnit::TableCreateDropCycle,
             Self::LookupSeq(_) | Self::LookupRand(_) => LatencyUnit::LookupBatchTransaction,
             Self::TableScan(_) => LatencyUnit::TableScanBatchTransaction,
+            Self::ParallelTableScan(_) => LatencyUnit::ParallelTableScanLifecycle,
             Self::IndexScan(_) => LatencyUnit::IndexScanBatchTransaction,
             Self::IndexStream(_) => LatencyUnit::IndexStreamTransaction,
             Self::IndexDdl(_) => LatencyUnit::IndexCreateDropCycle,
@@ -922,6 +957,7 @@ impl ResolvedWorkload {
             | Self::IndexScan(config) => {
                 aggregate_batch_count(config.num, config.sessions, config.batch_size)
             }
+            Self::ParallelTableScan(config) => Ok(config.num),
             Self::IndexStream(config) => Ok(config.num),
             Self::LockTable(config)
                 if config.scenario == LockTableScenario::Basic && !config.unlock =>
@@ -1155,6 +1191,17 @@ fn resolve_workload(
                 loaded_range,
                 None,
             )?))
+        }
+        WorkloadSpec::ParallelTableScan(spec) => {
+            let loaded_range = fixture.loaded_range()?;
+            no_effect(ResolvedWorkload::ParallelTableScan(
+                ParallelTableScanConfig {
+                    num: spec.num.unwrap_or(NonZeroU64::MIN).get(),
+                    target_partitions: spec.target_partitions.get(),
+                    loaded_range,
+                    include_stats: spec.include_stats.unwrap_or(defaults.include_stats),
+                },
+            ))
         }
         WorkloadSpec::IndexScan(spec) => {
             let loaded_range = fixture.loaded_range()?;
@@ -1527,13 +1574,16 @@ mod tests {
             "lookup-seq",
             "lookup-rand",
             "table-scan",
+            "parallel-table-scan",
             "index-scan",
             "index-stream",
             "index-ddl",
             "lock-table",
             "update-rand",
         ] {
-            let controls = if matches!(workload, "lock-table" | "update-rand") {
+            let controls = if workload == "parallel-table-scan" {
+                "target_partitions = 2"
+            } else if matches!(workload, "lock-table" | "update-rand") {
                 "num = 1"
             } else if matches!(workload, "table-scan" | "index-stream" | "index-ddl") {
                 ""
@@ -1547,6 +1597,57 @@ mod tests {
         }
         assert!(parse("[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"lock-table\", num = 1, rand = true }").is_err());
         assert!(parse("[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"update-rand\", num = 1, range = 1 }").is_err());
+    }
+
+    #[test]
+    fn parallel_table_scan_schema_and_resolution_are_strict() {
+        for invalid in [
+            "[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"parallel-table-scan\" }\n",
+            "[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"parallel-table-scan\", target_partitions = 0 }\n",
+            "[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"parallel-table-scan\", target_partitions = 2, threads = 2 }\n",
+            "[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"parallel-table-scan\", target_partitions = 2, sessions = 1 }\n",
+            "[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"parallel-table-scan\", target_partitions = 2, batch_size = 1 }\n",
+        ] {
+            assert!(parse(invalid).is_err(), "{invalid}");
+        }
+
+        let phases = resolve(
+            "[[phase]]\nworkload = { type = \"create-table\", index = \"none\" }\n\
+             [[phase]]\nworkload = { type = \"insert-seq\", num = 8 }\n\
+             [[phase]]\nkind = \"benchmark\"\nwarmup_runs = 1\nmeasured_runs = 2\n\
+             workload = { type = \"parallel-table-scan\", num = 3, target_partitions = 4, include_stats = true }\n",
+        )
+        .unwrap();
+        let workload = phases[2].workload();
+        let ResolvedWorkload::ParallelTableScan(config) = workload else {
+            panic!("final workload must resolve as parallel-table-scan")
+        };
+        assert_eq!(config.num, 3);
+        assert_eq!(config.target_partitions, 4);
+        assert_eq!(config.loaded_range, KeyRange { start: 0, len: 8 });
+        assert!(config.include_stats);
+        assert_eq!(workload.identity(), "parallel-table-scan");
+        assert_eq!(workload.replay_policy(), ReplayPolicy::Safe);
+        assert_eq!(workload.worker_counts(), (4, 1));
+        assert_eq!(
+            workload.latency_unit(),
+            LatencyUnit::ParallelTableScanLifecycle
+        );
+        assert_eq!(workload.expected_samples().unwrap(), 3);
+
+        let defaulted = resolve(
+            "[[phase]]\nworkload = { type = \"create-table\", index = \"none\" }\n\
+             [[phase]]\nworkload = { type = \"insert-seq\", num = 1 }\n\
+             [[phase]]\nkind = \"benchmark\"\n\
+             workload = { type = \"parallel-table-scan\", target_partitions = 2 }\n",
+        )
+        .unwrap();
+        let ResolvedWorkload::ParallelTableScan(config) = defaulted[2].workload() else {
+            panic!("defaulted workload must resolve as parallel-table-scan")
+        };
+        assert_eq!(config.num, 1);
+        assert_eq!(config.target_partitions, 2);
+        assert!(!config.include_stats);
     }
 
     #[test]
@@ -1799,6 +1900,7 @@ mod tests {
             ("lookup-seq.toml", "lookup-seq"),
             ("lookup-rand.toml", "lookup-rand"),
             ("table-scan.toml", "table-scan"),
+            ("parallel-table-scan.toml", "parallel-table-scan"),
             ("index-scan.toml", "index-scan"),
             ("index-stream.toml", "index-stream"),
             ("index-ddl.toml", "index-ddl"),

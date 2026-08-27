@@ -9,6 +9,7 @@ mod lock;
 mod maintenance;
 mod noop;
 mod read;
+mod table_scan;
 mod update;
 mod util;
 
@@ -19,7 +20,9 @@ pub(crate) use maintenance::{CheckpointTableExecutor, FreezeTableExecutor};
 pub(crate) use noop::{StmtNoopExecutor, TrxNoopExecutor};
 pub(crate) use read::{
     IndexScanExecutor, IndexStreamExecutor, LookupRandExecutor, LookupSeqExecutor,
-    TableScanExecutor,
+};
+pub(crate) use table_scan::{
+    ParallelTableScanExecutor, ParallelTableScanExecutorConfig, TableScanExecutor,
 };
 pub(crate) use update::UpdateRandExecutor;
 pub(crate) use util::build_session_plans;
