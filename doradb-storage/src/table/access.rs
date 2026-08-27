@@ -3375,8 +3375,7 @@ impl<'op> UserTableAccessor<'op> {
             .await
             .attach_with(|| {
                 format!(
-                    "operation=table_scan_mvcc_stream, phase=load_cold_row_metadata, table_id={}, block_id={}",
-                    self.table_id(),
+                    "operation=load_table_scan_cold_page, phase=load_row_metadata, block_id={}",
                     entry.block_id()
                 )
             })?;
@@ -3385,8 +3384,7 @@ impl<'op> UserTableAccessor<'op> {
             .await
             .attach_with(|| {
                 format!(
-                    "operation=table_scan_mvcc_stream, phase=load_cold_block, table_id={}, block_id={}",
-                    self.table_id(),
+                    "operation=load_table_scan_cold_page, phase=load_block, block_id={}",
                     entry.block_id()
                 )
             })?;
@@ -3394,8 +3392,7 @@ impl<'op> UserTableAccessor<'op> {
             .change_context(RuntimeError::TableAccess)
             .attach_with(|| {
                 format!(
-                    "operation=table_scan_mvcc_stream, phase=validate_cold_block, table_id={}, block_id={}",
-                    self.table_id(),
+                    "operation=load_table_scan_cold_page, phase=validate_block, block_id={}",
                     entry.block_id()
                 )
             })?;
@@ -3403,8 +3400,7 @@ impl<'op> UserTableAccessor<'op> {
             .change_context(RuntimeError::TableAccess)
             .attach_with(|| {
                 format!(
-                    "operation=table_scan_mvcc_stream, phase=validate_cold_deletes, table_id={}, block_id={}",
-                    self.table_id(),
+                    "operation=load_table_scan_cold_page, phase=validate_deletes, block_id={}",
                     entry.block_id()
                 )
             })?;
@@ -3463,8 +3459,7 @@ impl<'op> UserTableAccessor<'op> {
             .await
             .attach_with(|| {
                 format!(
-                    "operation=table_scan_mvcc_stream, phase=load_hot_page, table_id={}, page_id={}",
-                    self.table_id(),
+                    "operation=load_table_scan_hot_page, page_id={}",
                     descriptor.page_id
                 )
             })?

@@ -218,13 +218,6 @@ pub(crate) enum LifecycleError {
     ExistingOperation,
     #[error("transaction is discarded")]
     TransactionDiscarded,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "shared snapshots remain crate-private until Phase 4"
-        )
-    )]
     #[error("read snapshot is unavailable")]
     ReadSnapshotUnavailable,
 }
@@ -339,6 +332,9 @@ pub enum OperationError {
     /// The table-scan plan family has already admitted partition execution.
     #[error("table scan already opened")]
     TableScanAlreadyOpened,
+    /// A peer partition failed while this shared snapshot scan was executing.
+    #[error("snapshot scan aborted")]
+    SnapshotScanAborted,
 }
 
 /// Fieldless fatal-domain errors carried underneath `ErrorKind::Fatal`.
@@ -2112,6 +2108,7 @@ mod tests {
             OperationError::InvalidTableScanInput,
             OperationError::StaleTableScanPlan,
             OperationError::TableScanAlreadyOpened,
+            OperationError::SnapshotScanAborted,
         ];
         for operation_error in cases {
             let error = Report::new(operation_error).disclose();

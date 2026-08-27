@@ -8,9 +8,11 @@ mod layout;
 mod lifecycle;
 mod mem_table;
 mod page_transition;
+mod partition_stream;
 mod persistence;
 mod recover;
 mod rollback;
+mod scan_cursor;
 mod scan_plan;
 mod scan_root;
 mod storage;
@@ -31,8 +33,12 @@ pub use lifecycle::CheckpointCancelReason;
 pub(crate) use lifecycle::TableTerminal;
 pub(crate) use lifecycle::{TableDropDrain, TableLifecycle};
 pub(crate) use mem_table::{MemTable, NoTrxUpsertChange, RowPageDescriptor};
+pub use partition_stream::TableScanPartitionStream;
 pub use persistence::*;
 pub(crate) use rollback::IndexRollback;
+pub(crate) use scan_cursor::{
+    TableScanCursor, TableScanCursorAdvance, TableScanRangeCursor, TableScanWorklistCursor,
+};
 pub(crate) use scan_plan::{
     CompiledTableScanPlan, TableScanUnit, compile_table_scan_plan, repartition_table_scan_offsets,
 };
@@ -332,13 +338,6 @@ impl Table {
 
     /// Capture an owned scan root under an active snapshot registration.
     #[inline]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "shared snapshots remain crate-private until Phase 4"
-        )
-    )]
     pub(crate) fn capture_owned_scan_root(
         &self,
         registration: &ActiveSnapshotRegistration,

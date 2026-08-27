@@ -19,7 +19,7 @@ mod admission;
 pub(crate) mod group;
 mod interface;
 pub(crate) mod purge;
-mod read_snapshot;
+pub(crate) mod read_snapshot;
 pub(crate) mod retention;
 pub(crate) mod row;
 pub(crate) mod stmt;
@@ -29,18 +29,15 @@ mod sys_trx;
 pub(crate) mod undo;
 pub(crate) mod ver_map;
 
+pub use crate::table::TableScanPartitionStream;
 #[cfg(test)]
 pub(crate) use read_snapshot::TableScanPlanTestController;
-#[expect(
-    unused_imports,
-    reason = "Phase 3 will consume the crate-private shared snapshot facades"
-)]
 pub(crate) use read_snapshot::{
-    ActiveSnapshotRegistration, CheckedOutSnapshotTable, FrozenReadSnapshotCore, PrivateSnapshot,
-    ReadSnapshot, ReadSnapshotBuildCore, ReadSnapshotBuilder, ReadSnapshotCheckout,
+    ActiveSnapshotRegistration, FrozenReadSnapshotCore, PrivateSnapshot, ReadSnapshotBuildCore,
     ReadSnapshotDrainReason, ReadSnapshotEntry, ReadSnapshotLockOwner, ReadSnapshotPhase,
-    ReadSnapshotReadyPayload, ReadSnapshotTerminalClaim, TableScanOptions, TableScanPlan,
+    ReadSnapshotReadyPayload, ReadSnapshotTerminalClaim,
 };
+pub use read_snapshot::{ReadSnapshot, ReadSnapshotBuilder, TableScanOptions, TableScanPlan};
 pub(crate) use retention::{
     prepare_catalog_redo_maintenance_operation, prepare_redo_truncation_operation,
 };
@@ -785,13 +782,6 @@ impl MvccReadView {
 
     /// Create an ownerless scan identity at one registered snapshot timestamp.
     #[inline]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Phase 2 will construct ownerless registered-snapshot read views"
-        )
-    )]
     pub(crate) fn ownerless(sts: TrxID) -> Self {
         Self {
             sts,
