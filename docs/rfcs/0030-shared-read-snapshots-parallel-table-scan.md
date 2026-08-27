@@ -1491,10 +1491,10 @@ not preselect Arrow crate versions or public Arrow schema mapping. [U1] [U3]
     abandonment/open ordering, and shutdown behavior; and compile-check the
     stream, each `next()` future, and the complete spawned drain boundary. The
     phase is accepted only with actual row streams, not synthetic units.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000284-parallel-row-oriented-table-scan.md`
+  - Task Issue: `#1018`
+  - Phase Status: done
+  - Implementation Summary: Phase 4 shipped public spawnable partition streams with a shared bounded cursor, unit-boundary peer abort, and exact checkout cleanup. [Task Resolve Sync: docs/tasks/000284-parallel-row-oriented-table-scan.md @ 2026-08-27]
   - Related Backlogs:
     - `docs/backlogs/000150-implement-futures-stream-for-index-and-public-scan-streams.md`
 
