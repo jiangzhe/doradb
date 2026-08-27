@@ -97,6 +97,8 @@ pub enum LatencyUnit {
     LookupBatchTransaction,
     /// One table-scan batch transaction from begin through successful commit.
     TableScanBatchTransaction,
+    /// One shared-snapshot parallel scan from begin through drains and close.
+    ParallelTableScanLifecycle,
     /// One materialized index-scan batch transaction.
     IndexScanBatchTransaction,
     /// One public index stream from begin through exhaustion and commit.
@@ -126,6 +128,7 @@ impl fmt::Display for LatencyUnit {
             Self::TableCreateDropCycle => "table-create-drop-cycle",
             Self::LookupBatchTransaction => "lookup-batch-transaction",
             Self::TableScanBatchTransaction => "table-scan-batch-transaction",
+            Self::ParallelTableScanLifecycle => "parallel-table-scan-lifecycle",
             Self::IndexScanBatchTransaction => "index-scan-batch-transaction",
             Self::IndexStreamTransaction => "index-stream-transaction",
             Self::IndexCreateDropCycle => "index-create-drop-cycle",
@@ -144,6 +147,13 @@ impl fmt::Display for LatencyUnit {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum WorkloadMetrics {
+    /// Requested and realized shared-snapshot table-scan partition counts.
+    ParallelTableScan {
+        /// Best-effort partition target and executor thread count.
+        target_partitions: usize,
+        /// Stable positive physical partition count produced by planning.
+        actual_partitions: usize,
+    },
     /// Verified canonical frozen-page batch summary.
     FreezeTable {
         /// Approximate non-deleted rows selected by the frozen batch.
@@ -620,6 +630,10 @@ mod tests {
     #[test]
     fn workload_metrics_round_trip_strictly() {
         let cases = [
+            WorkloadMetrics::ParallelTableScan {
+                target_partitions: 4,
+                actual_partitions: 3,
+            },
             WorkloadMetrics::FreezeTable {
                 approximate_rows: 4,
                 page_count: 2,

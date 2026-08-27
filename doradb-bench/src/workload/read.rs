@@ -12,7 +12,7 @@ use crate::workload::util::{
 };
 use crate::workload::{RunCancellation, SessionPlan};
 use doradb_storage::id::TableID;
-use doradb_storage::{Engine, ScanRowDecision, SelectKey, SelectMvcc, Session, Val};
+use doradb_storage::{Engine, SelectKey, SelectMvcc, Session, Val};
 
 /// Sequential lookup session executor.
 #[derive(Clone, Copy)]
@@ -90,67 +90,6 @@ impl SessionExecutor for LookupRandExecutor {
     fn new(config: Self::Config) -> Result<Self> {
         Ok(Self {
             state: build_read_state(config, Self::IDENTITY, ReadOperationType::LookupRand)?,
-        })
-    }
-
-    fn threads(&self) -> usize {
-        self.state.config.threads
-    }
-
-    fn session_plans(&self) -> Result<Vec<SessionPlan>> {
-        operation_plans(self.state.config.num, self.state.config.sessions)
-    }
-
-    async fn execute(
-        &self,
-        _engine: &Engine,
-        session: &mut Session,
-        plan: &SessionPlan,
-        clock: &MeasurementClock,
-        sample_latency: bool,
-        cancellation: &RunCancellation,
-    ) -> Result<Self::Outcome> {
-        execute_read_session(
-            &self.state,
-            session,
-            plan,
-            sample_latency.then_some(clock),
-            cancellation,
-        )
-        .await
-    }
-
-    fn verify_outcome(
-        &self,
-        planned_effect: &FixturePlanEffect,
-        outcome: &Self::Outcome,
-        expected_samples: u64,
-    ) -> Result<FixtureRuntimeEffect> {
-        verify_read_outcome(
-            Self::IDENTITY,
-            &self.state,
-            planned_effect,
-            outcome,
-            expected_samples,
-        )
-    }
-}
-
-/// Full table-scan session executor.
-#[derive(Clone, Copy)]
-pub(crate) struct TableScanExecutor {
-    state: ReadExecutorState,
-}
-
-impl SessionExecutor for TableScanExecutor {
-    type Config = SessionExecutorConfig<ReadConfig>;
-    type Outcome = ReadSessionOutcome;
-
-    const IDENTITY: &'static str = "table-scan";
-
-    fn new(config: Self::Config) -> Result<Self> {
-        Ok(Self {
-            state: build_read_state(config, Self::IDENTITY, ReadOperationType::TableScan)?,
         })
     }
 
@@ -376,8 +315,6 @@ enum ReadOperationType {
     LookupSeq,
     /// Seeded random unique-index lookups.
     LookupRand,
-    /// Complete table scans.
-    TableScan,
     /// Materialized secondary-index range scans.
     IndexScan,
     /// Public secondary-index range streams.
@@ -478,7 +415,7 @@ fn verify_read_outcome(
                 )));
             }
         }
-        ReadOperationType::TableScan | ReadOperationType::IndexStream => {
+        ReadOperationType::IndexStream => {
             verify_read_shape(identity, counters, state.config.num, false)?;
         }
         ReadOperationType::IndexScan => {
@@ -508,17 +445,6 @@ async fn run_read_operations(
                 spec.batch_size,
                 spec.table_id,
                 &keys,
-                clock,
-                cancellation,
-            )
-            .await
-        }
-        ReadOperationType::TableScan => {
-            table_scans(
-                session,
-                spec.batch_size,
-                spec.table_id,
-                plan.number,
                 clock,
                 cancellation,
             )
@@ -579,58 +505,6 @@ async fn lookup_keys(
         trx.commit().await?;
         result.counters.merge(batch_counters)?;
         record_latency(&mut result.latency, clock, started)?;
-    }
-    Ok(result)
-}
-
-async fn table_scans(
-    session: &mut Session,
-    batch_size: u64,
-    table_id: TableID,
-    iterations: u64,
-    clock: Option<&MeasurementClock>,
-    cancellation: Option<&RunCancellation>,
-) -> Result<ReadOperationResult> {
-    let mut result = empty_result()?;
-    let batch_size = effective_batch_size(batch_size, iterations)? as u64;
-    let mut remaining = iterations;
-    while remaining != 0 {
-        if cancellation.is_some_and(RunCancellation::is_cancelled) {
-            break;
-        }
-        let count = remaining.min(batch_size);
-        let started = clock.map(MeasurementClock::raw);
-        let mut trx = session.begin_trx()?;
-        let mut batch = WorkloadCounters::default();
-        for _ in 0..count {
-            let scan_result = async {
-                let mut stream = trx
-                    .table_scan_mvcc_stream(table_id, &[0, 1], |_| Ok(ScanRowDecision::Include))
-                    .await?;
-                let mut rows = 0u64;
-                while stream.next().await?.is_some() {
-                    rows = rows
-                        .checked_add(1)
-                        .ok_or_else(|| BenchError::message("table scan row count overflow"))?;
-                }
-                Ok::<u64, BenchError>(rows)
-            }
-            .await;
-            match scan_result {
-                Ok(rows) => {
-                    batch.operations = checked(batch.operations, 1, "operations")?;
-                    batch.rows_returned = checked(batch.rows_returned, rows, "rows returned")?;
-                }
-                Err(error) => {
-                    let _ = trx.rollback().await;
-                    return Err(error);
-                }
-            }
-        }
-        trx.commit().await?;
-        result.counters.merge(batch)?;
-        record_latency(&mut result.latency, clock, started)?;
-        remaining -= count;
     }
     Ok(result)
 }

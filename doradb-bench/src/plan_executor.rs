@@ -15,8 +15,9 @@ use crate::plan_output::{
 use crate::workload::{
     CheckpointTableExecutor, CreateTableExecutor, FreezeTableExecutor, IndexDdlExecutor,
     IndexScanExecutor, IndexStreamExecutor, InsertRandExecutor, InsertSeqExecutor,
-    LockTableExecutor, LookupRandExecutor, LookupSeqExecutor, RunCancellation, SessionPlan,
-    StmtNoopExecutor, TableDdlExecutor, TableScanExecutor, TrxNoopExecutor, UpdateRandExecutor,
+    LockTableExecutor, LookupRandExecutor, LookupSeqExecutor, ParallelTableScanExecutor,
+    ParallelTableScanExecutorConfig, RunCancellation, SessionPlan, StmtNoopExecutor,
+    TableDdlExecutor, TableScanExecutor, TrxNoopExecutor, UpdateRandExecutor,
 };
 use doradb_storage::{Engine, Session};
 use easy_parallel::Parallel;
@@ -48,6 +49,23 @@ impl<C> SessionExecutorConfig<C> {
     }
 }
 
+/// Scoped submission handle for owned tasks on the run's driven executor.
+#[derive(Clone)]
+pub(crate) struct RunTaskSpawner<'tasks> {
+    executor: Arc<Executor<'tasks>>,
+}
+
+impl RunTaskSpawner<'_> {
+    /// Submit one owned task without changing runtimes or detaching it.
+    pub(crate) fn spawn<F, T>(&self, future: F) -> smol::Task<T>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.executor.spawn(future)
+    }
+}
+
 /// Common measurement projection produced by every typed session outcome.
 pub(crate) struct SessionMeasurement {
     /// Successful logical workload counters.
@@ -73,8 +91,8 @@ pub(crate) trait SessionOutcome: Send + Sized + 'static {
     fn into_measurement(self) -> SessionMeasurement;
 }
 
-/// Static workload implementation used by the generic public-session runner.
-pub(crate) trait SessionExecutor: Clone + Send + Sync + Sized + 'static {
+/// Workload implementation used by the generic public-session runner.
+pub(crate) trait SessionExecutor: Clone + Send + Sync + Sized {
     /// Constructor input, which related workloads may share.
     type Config;
     /// Typed session result, which related workloads may share.
@@ -468,6 +486,22 @@ async fn dispatch_workload(
             )
             .await
         }
+        ResolvedWorkload::ParallelTableScan(config) => {
+            run_executor_with::<ParallelTableScanExecutor<'_>, _>(
+                engine,
+                clock,
+                workload,
+                move |spawner| {
+                    ParallelTableScanExecutorConfig::new(
+                        SessionExecutorConfig::new(*config, binding, execution_ordinal),
+                        spawner,
+                    )
+                },
+                planned_effect,
+                sample_latency,
+            )
+            .await
+        }
         ResolvedWorkload::IndexScan(config) => {
             run_executor::<IndexScanExecutor>(
                 engine,
@@ -548,6 +582,54 @@ async fn run_executor<E>(
 where
     E: SessionExecutor,
 {
+    verify_executor_identity::<E>(workload)?;
+    let executor = E::new(config)?;
+    run_executor_with_setup::<E, _>(
+        engine,
+        clock,
+        workload,
+        move || Ok((executor, Arc::new(Executor::new()))),
+        planned_effect,
+        sample_latency,
+    )
+    .await
+}
+
+async fn run_executor_with<'run, E, F>(
+    engine: &'run Engine,
+    clock: &MeasurementClock,
+    workload: &ResolvedWorkload,
+    config_factory: F,
+    planned_effect: &FixturePlanEffect,
+    sample_latency: bool,
+) -> Result<RunOutcome>
+where
+    E: SessionExecutor + 'run,
+    F: FnOnce(RunTaskSpawner<'run>) -> E::Config,
+{
+    verify_executor_identity::<E>(workload)?;
+    run_executor_with_setup::<E, _>(
+        engine,
+        clock,
+        workload,
+        move || {
+            let task_executor: Arc<Executor<'run>> = Arc::new(Executor::new());
+            let task_spawner = RunTaskSpawner {
+                executor: Arc::clone(&task_executor),
+            };
+            let executor = E::new(config_factory(task_spawner))?;
+            Ok((executor, task_executor))
+        },
+        planned_effect,
+        sample_latency,
+    )
+    .await
+}
+
+fn verify_executor_identity<E>(workload: &ResolvedWorkload) -> Result<()>
+where
+    E: SessionExecutor,
+{
     if E::IDENTITY != workload.identity() {
         return Err(BenchError::message(format!(
             "executor identity {} does not match resolved workload {}",
@@ -555,7 +637,21 @@ where
             workload.identity()
         )));
     }
-    let executor = E::new(config)?;
+    Ok(())
+}
+
+async fn run_executor_with_setup<'run, E, F>(
+    engine: &'run Engine,
+    clock: &MeasurementClock,
+    workload: &ResolvedWorkload,
+    setup: F,
+    planned_effect: &FixturePlanEffect,
+    sample_latency: bool,
+) -> Result<RunOutcome>
+where
+    E: SessionExecutor + 'run,
+    F: FnOnce() -> Result<(E, Arc<Executor<'run>>)>,
+{
     let expected_samples = if sample_latency {
         workload.expected_samples()?
     } else {
@@ -572,10 +668,17 @@ where
     };
 
     let started = clock.now();
-    let run_result = run_session_workers(engine, clock, &executor, sample_latency).await;
+    let run_result = match setup() {
+        Ok((executor, task_executor)) => {
+            run_session_workers(engine, clock, &executor, task_executor, sample_latency)
+                .await
+                .map(|outcome| (executor, outcome))
+        }
+        Err(error) => Err(error),
+    };
     let stopped = clock.now();
     let elapsed_result = clock.wall_delta_nanos(started, stopped);
-    let outcome = match run_result {
+    let (executor, outcome) = match run_result {
         Ok(result) => result,
         Err(error) => {
             if let Some((mut session, _)) = stats_state {
@@ -620,18 +723,18 @@ async fn close_stats_session<T>(mut session: Session, result: Result<T>) -> Resu
     }
 }
 
-async fn run_session_workers<E>(
-    engine: &Engine,
+async fn run_session_workers<'run, E>(
+    engine: &'run Engine,
     clock: &MeasurementClock,
     executor: &E,
+    task_executor: Arc<Executor<'run>>,
     sample_latency: bool,
 ) -> Result<E::Outcome>
 where
-    E: SessionExecutor,
+    E: SessionExecutor + 'run,
 {
     let plans = executor.session_plans()?;
     let cancellation = Arc::new(RunCancellation::new());
-    let task_executor = Executor::new();
     let tasks = plans
         .into_iter()
         .map(|plan| {
@@ -678,7 +781,12 @@ where
             })
         })
         .collect();
-    let outcome = drive_session_tasks(&task_executor, executor.threads(), tasks, cancellation)?;
+    let outcome = drive_session_tasks(
+        task_executor.as_ref(),
+        executor.threads(),
+        tasks,
+        cancellation,
+    )?;
     executor.finish_run(engine).await?;
     Ok(outcome)
 }
@@ -747,6 +855,9 @@ fn prepare_plan_root(storage_root: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::io::ErrorKind;
+    use std::sync::{Condvar, Mutex as StdMutex, mpsc};
+    use std::thread::{self, ThreadId};
+    use std::time::Duration;
 
     struct WriteFailure;
 
@@ -843,6 +954,7 @@ mod tests {
                 LookupSeqExecutor::IDENTITY,
                 LookupRandExecutor::IDENTITY,
                 TableScanExecutor::IDENTITY,
+                ParallelTableScanExecutor::IDENTITY,
                 IndexScanExecutor::IDENTITY,
                 IndexStreamExecutor::IDENTITY,
                 IndexDdlExecutor::IDENTITY,
@@ -861,6 +973,7 @@ mod tests {
                 "lookup-seq",
                 "lookup-rand",
                 "table-scan",
+                "parallel-table-scan",
                 "index-scan",
                 "index-stream",
                 "index-ddl",
@@ -869,5 +982,83 @@ mod tests {
                 "checkpoint-table",
             ]
         );
+    }
+
+    #[test]
+    fn run_spawner_uses_distinct_driven_executor_workers() {
+        struct Rendezvous {
+            arrived: usize,
+            released: bool,
+        }
+
+        let executor = Arc::new(Executor::new());
+        let spawner = RunTaskSpawner {
+            executor: Arc::clone(&executor),
+        };
+        let rendezvous = Arc::new((
+            StdMutex::new(Rendezvous {
+                arrived: 0,
+                released: false,
+            }),
+            Condvar::new(),
+        ));
+        let (identity_sender, identity_receiver) = mpsc::channel();
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let rendezvous = Arc::clone(&rendezvous);
+            let identity_sender = identity_sender.clone();
+            tasks.push(spawner.spawn(async move {
+                let identity = thread::current().id();
+                let (state, ready) = &*rendezvous;
+                let mut state = state.lock().unwrap();
+                state.arrived += 1;
+                identity_sender.send(identity).unwrap();
+                if state.arrived == 2 {
+                    state.released = true;
+                    ready.notify_all();
+                }
+                while !state.released {
+                    state = ready.wait(state).unwrap();
+                }
+                identity
+            }));
+        }
+        drop(identity_sender);
+
+        let (signal, shutdown) = channel::unbounded::<()>();
+        let shutdown_receiver = shutdown.clone();
+        let worker_executor = Arc::clone(&executor);
+        let release_on_timeout = Arc::clone(&rendezvous);
+        let (_workers, result) = Parallel::new()
+            .each(0..2, move |_| {
+                let _ = smol::block_on(worker_executor.run(shutdown_receiver.recv()));
+            })
+            .finish(move || {
+                let _signal = signal;
+                let identities = (|| {
+                    let first = identity_receiver
+                        .recv_timeout(Duration::from_secs(5))
+                        .map_err(|error| error.to_string())?;
+                    let second = identity_receiver
+                        .recv_timeout(Duration::from_secs(5))
+                        .map_err(|error| error.to_string())?;
+                    Ok::<[ThreadId; 2], String>([first, second])
+                })();
+                if identities.is_err() {
+                    let (state, ready) = &*release_on_timeout;
+                    let mut state = state.lock().unwrap();
+                    state.released = true;
+                    ready.notify_all();
+                }
+                let task_identities = smol::block_on(async move {
+                    let first = tasks.remove(0).await;
+                    let second = tasks.remove(0).await;
+                    [first, second]
+                });
+                identities.map(|identities| (identities, task_identities))
+            });
+        let (identities, task_identities) = result.unwrap();
+        assert_ne!(identities[0], identities[1]);
+        assert_eq!(identities, task_identities);
     }
 }

@@ -305,6 +305,53 @@ mod tests {
     }
 
     #[test]
+    fn parallel_table_scan_matches_target_one_cardinality_and_reports_actual_partitions() {
+        let temp = TempDir::new().unwrap();
+        let execute = |name: &str, target_partitions: usize| {
+            let phases = format!(
+                "\n[[phase]]\nworkload = {{ type = \"create-table\", index = \"none\" }}\n\
+                 [[phase]]\nworkload = {{ type = \"insert-seq\", num = 8, value_size = \"32 KiB\", batch_size = 8 }}\n\
+                 [[phase]]\nkind = \"benchmark\"\nwarmup_runs = 1\nmeasured_runs = 2\n\
+                 workload = {{ type = \"parallel-table-scan\", num = 2, target_partitions = {target_partitions} }}\n"
+            );
+            execute_plan(&temp, name, &phases).1
+        };
+
+        let target_one = execute("parallel-scan-one", 1);
+        let target_many = execute("parallel-scan-many", 16);
+        for (report, target) in [(&target_one, 1), (&target_many, 16)] {
+            assert_eq!(report.measured_runs.len(), 2);
+            for run in &report.measured_runs {
+                assert_eq!(run.counters.operations, 2);
+                assert_eq!(run.counters.rows_returned, 16);
+                assert_eq!(run.latency.unit, LatencyUnit::ParallelTableScanLifecycle);
+                assert_eq!(run.latency.sample_count, 2);
+                let Some(WorkloadMetrics::ParallelTableScan {
+                    target_partitions,
+                    actual_partitions,
+                }) = run.workload_metrics
+                else {
+                    panic!("parallel scan must retain partition metrics")
+                };
+                assert_eq!(target_partitions, target);
+                assert!(actual_partitions > 0);
+                if target == 1 {
+                    assert_eq!(actual_partitions, 1);
+                } else {
+                    assert!(actual_partitions < target);
+                }
+            }
+            assert_eq!(report.aggregate.counters.operations, 4);
+            assert_eq!(report.aggregate.counters.rows_returned, 32);
+            assert_eq!(report.aggregate.latency.sample_count, 4);
+        }
+        assert_eq!(
+            target_one.aggregate.counters.rows_returned,
+            target_many.aggregate.counters.rows_returned
+        );
+    }
+
+    #[test]
     fn random_index_updates_replay_unique_keys_and_non_unique_payloads() {
         let temp = TempDir::new().unwrap();
         let unique = "\n[[phase]]\nworkload = { type = \"create-table\", index = \"unique\" }\n\
@@ -362,6 +409,40 @@ mod tests {
         }
         assert_update_counters(report.aggregate.counters);
         assert_eq!(report.aggregate.latency.sample_count, 36);
+    }
+
+    #[test]
+    fn checked_in_parallel_scan_template_executes_end_to_end() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("parallel-scan-template-root");
+        let template = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("templates")
+            .join("parallel-table-scan.toml");
+        let stdout = assert_success(run_bench(&root, &["--plan", template.to_str().unwrap()]));
+        let report: InvocationReport =
+            toml::from_str(&fs::read_to_string(root.join("benchmark-result.toml")).unwrap())
+                .unwrap();
+        assert!(stdout.contains("workload: parallel-table-scan\n"));
+        assert!(stdout.contains("target_partitions: 4\n"));
+        assert!(stdout.contains("rows_returned: 60000\n"));
+        assert!(stdout.contains("rows_per_second: "));
+        assert_eq!(report.measured_runs.len(), 3);
+        for run in &report.measured_runs {
+            assert_eq!(run.counters.operations, 2);
+            assert_eq!(run.counters.rows_returned, 20_000);
+            assert_eq!(run.latency.unit, LatencyUnit::ParallelTableScanLifecycle);
+            assert_eq!(run.latency.sample_count, 2);
+            assert!(matches!(
+                run.workload_metrics,
+                Some(WorkloadMetrics::ParallelTableScan {
+                    target_partitions: 4,
+                    actual_partitions: 1..
+                })
+            ));
+        }
+        assert_eq!(report.aggregate.counters.operations, 6);
+        assert_eq!(report.aggregate.counters.rows_returned, 60_000);
+        assert_eq!(report.aggregate.latency.sample_count, 6);
     }
 
     #[test]

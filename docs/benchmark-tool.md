@@ -199,6 +199,7 @@ All serde-facing counts, ranges, widths, and table counts are positive.
 | `lookup-seq` | required `num`; optional `batch_size` | committed unique primary | safe |
 | `lookup-rand` | lookup controls plus optional `seed` | committed unique primary | safe |
 | `table-scan` | optional `num`, `batch_size` | any committed primary | safe |
+| `parallel-table-scan` | optional `num`; required `target_partitions` | any committed primary | safe |
 | `index-scan` | required `num`; optional `range`, `seed`, `batch_size` | committed secondary index | safe |
 | `index-stream` | optional `num`, `range`, `seed` | committed secondary index | safe |
 | `index-ddl` | optional `num` | index-free primary, load optional | single run |
@@ -213,6 +214,24 @@ oversized range is rejected. Each `table-scan` operation drains the public
 full-table MVCC stream across all visible rows. Read batching is per declared
 session. A statement/stream error rolls back best effort and preserves the
 original error.
+
+`parallel-table-scan` is the deliberate exception to the common independent
+session topology. It rejects `threads`, `sessions`, `batch_size`, `value_size`,
+`seed`, and other unrelated controls. `num` defaults to one,
+`target_partitions` is required and positive, and only `include_stats` inherits
+from workload defaults. One coordinator session executes all `num` scans
+sequentially while the run-local executor uses `target_partitions` worker
+threads.
+
+Each operation begins a public shared read snapshot, acquires the primary
+table, prepares projection `[0, 1]`, best-effort repartitions before the first
+open, and opens every resulting partition exactly once. Every owned partition
+stream is submitted to that run's local executor. The coordinator joins every
+drain while polling snapshot close concurrently, so target one remains
+progress-safe without a global Smol executor. `target_partitions` is a planning
+hint: physical pages and blocks are indivisible, so the typed per-run metrics
+retain both the requested target and the positive actual partition count.
+Actual count must remain stable across all scans in one run.
 
 `update-rand` requires a committed primary with a unique or non-unique
 secondary index and is allowed only as the final benchmark phase. `num` is an
@@ -296,6 +315,7 @@ leaked.
 | `table-ddl` | `table-create-drop-cycle` | `num` |
 | lookups | `lookup-batch-transaction` | sum of per-session batch ceilings |
 | `table-scan` | `table-scan-batch-transaction` | sum of per-session batch ceilings |
+| `parallel-table-scan` | `parallel-table-scan-lifecycle` | `num` |
 | `index-scan` | `index-scan-batch-transaction` | sum of per-session batch ceilings |
 | `index-stream` | `index-stream-transaction` | `num` |
 | `index-ddl` | `index-create-drop-cycle` | `num` |
@@ -310,6 +330,10 @@ successful commit. Stream samples include begin, full exhaustion, drop, and
 commit. Retained session-lock samples finish only after successful session
 close; retained transaction-lock samples finish after the releasing commit.
 Specialized samples include all coordination and participant cleanup.
+Each parallel-table-scan sample starts immediately before
+`begin_read_snapshot` and ends only after every partition task has joined and
+`ReadSnapshot::close` has completed. Warm-ups execute the identical lifecycle
+but discard samples and diagnostics.
 For random updates, the exact sample equation is
 `sum(ceil(session_budget / batch_size))`; a zero-budget session contributes
 zero. The equation uses planned key widths, not matched rows.
@@ -322,6 +346,10 @@ Counter equations are verified before phase state advances:
 - Lookups: `operations = found + not_found`; `rows_returned = found`.
 - Table scan and index stream: `operations = num`; outcome classifications are
   zero and `rows_returned` is actual cardinality.
+- Parallel table scan: `operations = num` and
+  `rows_returned = num * fixture.inserted_rows`; all write and outcome
+  classification counters are zero. Every multiplication and aggregation is
+  checked.
 - Index scan: `operations = found + not_found`; returned rows are actual.
 - DDL: `operations = 2 * num`.
 - Locks: `operations = num`; unrelated counters are zero.
@@ -345,6 +373,87 @@ orchestration may account for the remaining total interval. Prepare metrics
 are retained on their phase result, measured metrics on their run result, and
 warm-up metrics are discarded.
 
+## Parallel scan release proof
+
+Task 000285 was measured on 2026-08-27 from revision
+`cc5b9b62019c6853729f8fdcd7443320bbcd5c42` plus the task's working-tree
+changes. The build used the Cargo `release` profile and the default `io_uring`
+backend. The host was Linux
+`7.0.14-orbstack-00380-ga7e0a2dc9535` on AArch64 with 10 online Apple virtual
+CPU cores at 2.0 GHz, 9 CPUs available to the process, 11 GiB RAM, and a
+`/dev/vdb1` Btrfs filesystem mounted with `ssd`, `nodatacow`, and `noatime`.
+
+Every configuration used a fresh root and an equivalent plan copy. The fixture
+had 1,000,000 sequential rows with a 128-byte payload, inserted with four
+workers, four sessions, and batches of 100. The engine used the normalized
+default scan packing of 16 LWC blocks and 32 row pages per initial partition;
+redo log sync was disabled consistently for fixture construction. Each
+benchmark operation scanned projection `[0, 1]` once. Each configuration ran
+one warm-up and five measured runs with internal statistics enabled. The
+sequential comparison used one worker, one session, and batch size one.
+Parallel targets covered 1, 2, 4, 8, and the effective worker capacity of 9.
+
+The hot fixture was not frozen. The mixed fixture checkpointed a freeze request
+of 500,000 rows; its public freeze metrics reported 500,416 persisted-tier rows
+across 1,117 frozen pages and a 499,584-row hot suffix across 1,116 row pages.
+The cold-dominant fixture checkpointed a 900,000-row request: freeze metrics
+reported 900,032 persisted-tier rows across 2,009 frozen pages and a
+99,968-row hot suffix across 224 row pages. For these full, undeleted pages,
+checkpoint produced one 64 KiB LWC block per frozen page. “Cold-dominant”
+describes physical placement only. These runs did not restart or evict the
+cache, and therefore make no cold-cache or pure-cold claim.
+
+The resulting physical-unit count was materially larger than the original
+smoke-sized fixture and exceeded the host's 64 MiB LLC. The hot sequential
+fresh root had 2,234 row pages; the five hot parallel roots each had 2,233.
+Every mixed root had 1,117 LWC blocks plus 1,116 hot row pages, while every
+cold-dominant root had 2,009 LWC blocks plus 224 hot row pages. Thus every
+parallel run scanned exactly 2,233 physical units (139.56 MiB at 64 KiB per
+unit); the sequential hot run scanned 2,234 units (139.62 MiB). The persisted
+column index occupied one additional page for mixed and three for
+cold-dominant, but those index pages are planning/metadata reads rather than
+partition scan units.
+
+The table reports the median complete-run envelope and derived median row
+throughput. Scaling is relative to the same shape's parallel target-one median.
+
+| Shape | Workload / target | Actual partitions | Scan units | Rows | Median elapsed (ns) | Median rows/s | Scaling |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| hot | sequential | - | 2,234 | 1,000,000 | 73,934,261 | 13,525,529 | - |
+| hot | 1 | 1 | 2,233 | 1,000,000 | 74,756,460 | 13,376,770 | 1.00x |
+| hot | 2 | 3 | 2,233 | 1,000,000 | 38,271,993 | 26,128,767 | 1.95x |
+| hot | 4 | 5 | 2,233 | 1,000,000 | 23,510,406 | 42,534,357 | 3.18x |
+| hot | 8 | 9 | 2,233 | 1,000,000 | 20,745,034 | 48,204,308 | 3.60x |
+| hot | 9 | 10 | 2,233 | 1,000,000 | 20,683,215 | 48,348,383 | 3.61x |
+| mixed | sequential | - | 2,233 | 1,000,000 | 176,644,288 | 5,661,094 | - |
+| mixed | 1 | 1 | 2,233 | 1,000,000 | 177,120,749 | 5,645,866 | 1.00x |
+| mixed | 2 | 3 | 2,233 | 1,000,000 | 105,668,344 | 9,463,572 | 1.68x |
+| mixed | 4 | 5 | 2,233 | 1,000,000 | 55,450,235 | 18,034,189 | 3.19x |
+| mixed | 8 | 9 | 2,233 | 1,000,000 | 41,674,485 | 23,995,497 | 4.25x |
+| mixed | 9 | 10 | 2,233 | 1,000,000 | 41,626,943 | 24,022,903 | 4.26x |
+| cold-dominant | sequential | - | 2,233 | 1,000,000 | 263,145,795 | 3,800,175 | - |
+| cold-dominant | 1 | 1 | 2,233 | 1,000,000 | 263,723,341 | 3,791,852 | 1.00x |
+| cold-dominant | 2 | 3 | 2,233 | 1,000,000 | 143,720,412 | 6,957,954 | 1.83x |
+| cold-dominant | 4 | 5 | 2,233 | 1,000,000 | 75,035,914 | 13,326,952 | 3.51x |
+| cold-dominant | 8 | 9 | 2,233 | 1,000,000 | 59,400,082 | 16,834,994 | 4.44x |
+| cold-dominant | 9 | 10 | 2,233 | 1,000,000 | 57,082,987 | 17,518,354 | 4.62x |
+
+Parallel target one retained 98.9% of sequential median throughput for hot,
+99.7% for mixed, and 99.8% for cold-dominant, so all shapes passed the 90%
+manual gate. The first target-nine measured run also confirmed the intended
+physical tiers through buffer metrics: hot recorded 2,233 memory-cache hits;
+mixed recorded 1,116 memory-cache and 2,235 disk-cache hits; cold-dominant
+recorded 224 memory-cache and 4,021 disk-cache hits. Mixed retained 1,118 disk
+frames (1,117 LWC plus one index page), and cold-dominant retained 2,012 (2,009
+LWC plus three index pages). All three recorded zero disk-cache
+misses, completed reads, and backend submissions after warm-up, consistent with
+the explicitly warm-cache proof. Target nine produced the best median for all
+three shapes; no minimum scaling threshold applies.
+Source inspection after the proof confirmed that
+`TableScanPartitionStream::next` checks peer failure only before and after a
+physical-unit load and after exhaustion. The returned-row branch still returns
+directly without a peer-failure load.
+
 ## Results and failure behavior
 
 After atomically installing the result, a successful invocation prints the
@@ -353,6 +462,11 @@ nanoseconds, throughput, latency unit, mean, p95, p99, and the absolute detailed
 result path to stdout.
 For a final `checkpoint-table`, the summary additionally prints the four
 checkpoint attempt/wait fields from its single measured run.
+For a final `parallel-table-scan`, it additionally prints target and actual
+partitions, aggregate returned rows, and aggregate rows per second. Zero
+elapsed time reports zero rows per second, matching operation-throughput
+handling. Canonical TOML retains target and actual partitions on every
+measured run.
 
 Success installs only:
 
@@ -368,17 +482,20 @@ boundaries. All declared tasks and auxiliary lock participants drain, active
 transactions roll back where required, sessions close, the engine shuts down,
 later phases are skipped, and no result artifact or success summary is emitted.
 The root remains available for diagnosis and user-managed deletion.
+For parallel table scan specifically, already accepted partition tasks are
+always collected and snapshot close is driven to terminal completion before
+the coordinator returns the first partition, orchestration, or close failure.
 
 ## Templates
 
 `doradb-bench/templates/` contains one complete directly executable plan for
-each of the fourteen workloads:
+each of the fifteen workloads:
 
 ```text
 trx-noop.toml        stmt-noop.toml       insert-seq.toml
 insert-rand.toml     table-ddl.toml       lookup-seq.toml
 update-rand.toml     lookup-rand.toml     table-scan.toml
-index-scan.toml
+parallel-table-scan.toml                  index-scan.toml
 index-stream.toml    index-ddl.toml       lock-table.toml
 checkpoint-table.toml
 ```

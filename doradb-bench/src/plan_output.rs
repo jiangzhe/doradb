@@ -1,7 +1,7 @@
 use crate::error::{BenchError, Result};
 use crate::measurement::{
     BenchmarkAggregate, InternalMetric, MeasuredRunResult, WorkloadCounters, WorkloadMetrics,
-    u128_decimal,
+    operations_per_second, u128_decimal,
 };
 use crate::plan::Plan;
 use serde::{Deserialize, Serialize};
@@ -123,6 +123,39 @@ pub(crate) fn render_stdout_summary(
              checkpoint_retry_wait_elapsed_nanos: {retry_wait_elapsed_nanos}"
         ));
     }
+    if workload.identity() == "parallel-table-scan" {
+        let metrics = report
+            .measured_runs
+            .first()
+            .and_then(|run| run.workload_metrics)
+            .ok_or_else(|| BenchError::message("parallel scan report has no workload metrics"))?;
+        let WorkloadMetrics::ParallelTableScan {
+            target_partitions,
+            actual_partitions,
+        } = metrics
+        else {
+            return Err(BenchError::message(
+                "parallel scan report has incompatible workload metrics",
+            ));
+        };
+        if report
+            .measured_runs
+            .iter()
+            .any(|run| run.workload_metrics != Some(metrics))
+        {
+            return Err(BenchError::message(
+                "parallel scan report has inconsistent per-run partition metrics",
+            ));
+        }
+        summary.push_str(&format!(
+            "\ntarget_partitions: {target_partitions}\n\
+             actual_partitions: {actual_partitions}\n\
+             rows_returned: {}\n\
+             rows_per_second: {:.3}",
+            aggregate.counters.rows_returned,
+            operations_per_second(aggregate.counters.rows_returned, aggregate.elapsed_nanos)
+        ));
+    }
     summary.push_str(&format!("\ndetailed_result: {}", detailed_result.display()));
     Ok(summary)
 }
@@ -168,11 +201,11 @@ fn artifact_error(path: &Path, err: IoError) -> BenchError {
 mod tests {
     use super::*;
     use crate::engine_config::{EngineConfigOverlay, resolve_engine_config};
-    use crate::fixture::FixturePlanEffect;
+    use crate::fixture::{FixturePlanEffect, KeyRange};
     use crate::measurement::{LatencySummary, LatencyUnit, WorkloadMetrics};
     use crate::plan::{
-        CheckpointTableConfig, CountConfig, MeasurementSpec, Phase, ResolvedWorkload,
-        ResolvedWorkloadDefaults,
+        CheckpointTableConfig, CountConfig, MeasurementSpec, ParallelTableScanConfig, Phase,
+        ResolvedWorkload, ResolvedWorkloadDefaults,
     };
     use std::num::NonZeroU32;
     use tempfile::TempDir;
@@ -328,5 +361,43 @@ mod tests {
         assert!(summary.contains("checkpoint_attempt_elapsed_nanos: 7\n"));
         assert!(summary.contains("checkpoint_retry_wait_count: 2\n"));
         assert!(summary.contains("checkpoint_retry_wait_elapsed_nanos: 2\n"));
+    }
+
+    #[test]
+    fn parallel_scan_stdout_summary_includes_partition_and_row_throughput() {
+        let temp = TempDir::new().unwrap();
+        let mut report = report(temp.path());
+        let Phase::Benchmark { workload, .. } = &mut report.plan.phases[0] else {
+            unreachable!()
+        };
+        *workload = ResolvedWorkload::ParallelTableScan(ParallelTableScanConfig {
+            num: 1,
+            target_partitions: 4,
+            loaded_range: KeyRange { start: 0, len: 8 },
+            include_stats: false,
+        });
+        report.aggregate.counters.rows_returned = 8;
+        report.aggregate.latency.unit = LatencyUnit::ParallelTableScanLifecycle;
+        report.measured_runs.push(MeasuredRunResult {
+            run_index: 1,
+            elapsed_nanos: 10,
+            counters: report.aggregate.counters,
+            operations_per_second: report.aggregate.operations_per_second,
+            latency: report.aggregate.latency.clone(),
+            workload_metrics: Some(WorkloadMetrics::ParallelTableScan {
+                target_partitions: 4,
+                actual_partitions: 3,
+            }),
+            internal_metrics: Vec::new(),
+        });
+        let summary = render_stdout_summary(&report, Path::new("result.toml")).unwrap();
+        assert!(summary.contains("target_partitions: 4\n"));
+        assert!(summary.contains("actual_partitions: 3\n"));
+        assert!(summary.contains("rows_returned: 8\n"));
+        assert!(summary.contains("rows_per_second: 800000000.000\n"));
+
+        report.aggregate.elapsed_nanos = 0;
+        let summary = render_stdout_summary(&report, Path::new("result.toml")).unwrap();
+        assert!(summary.contains("rows_per_second: 0.000\n"));
     }
 }

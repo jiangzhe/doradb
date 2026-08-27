@@ -193,9 +193,8 @@ Issue Labels:
 - [C8] `doradb-storage/src/value.rs` and
   `doradb-storage/src/buffer/guard.rs` - define owned `Val` and shared page
   guards as cross-thread-capable values.
-- [C9] `doradb-bench/src/workload/read.rs` - contains the current sequential
-  table-scan consumer and counter equations that provide a reference for the
-  parallel proof workload.
+- [C9] `doradb-bench/src/workload/table_scan.rs` - colocates the sequential and
+  parallel table-scan consumers and their shared checked counter seams.
 - [C10] `doradb-storage/src/trx/mod.rs` and
   `doradb-storage/src/session.rs` - implement the weak public `Transaction`
   facade, registry-owned `SessionOperationEntry`, operation-local checkout and
@@ -1504,7 +1503,10 @@ not preselect Arrow crate versions or public Arrow schema mapping. [U1] [U3]
   - Scope: Add a dedicated `doradb-bench` `parallel-table-scan` workload with
     configurable target partitions, a one-partition baseline, checked row and
     operation counters, actual-partition reporting, a small correctness smoke
-    mode, and documented cold, hot, and mixed performance runs.
+    mode, and documented hot, mixed, and cold-dominant performance runs. Move
+    the existing sequential scan consumer from the catch-all read module into
+    the same focused workload module without changing its identity or
+    transaction lifecycle.
   - Goals: Preserve the existing benchmark counter equations, prove the
     benchmark consumes every partition exactly once, show no material
     one-partition healthy-path regression from unit-boundary cooperative
@@ -1520,8 +1522,8 @@ not preselect Arrow crate versions or public Arrow schema mapping. [U1] [U3]
     assert row, operation, and partition counters against the one-partition
     baseline. Record large-fixture measurements separately; variable wall-clock
     speedup remains benchmark evidence rather than a CI pass condition.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
+  - Task Doc: `docs/tasks/000285-parallel-scan-benchmark-performance-proof.md`
+  - Task Issue: `#1020`
   - Phase Status: `pending`
   - Implementation Summary: `pending`
 

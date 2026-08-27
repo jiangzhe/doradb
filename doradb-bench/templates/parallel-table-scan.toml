@@ -1,0 +1,14 @@
+name = "caller-scheduled parallel table scans"
+engine_defaults = "engine-defaults.toml"
+
+[[phase]]
+workload = { type = "create-table", index = "none" }
+
+[[phase]]
+workload = { type = "insert-seq", num = 10000, batch_size = 100 }
+
+[[phase]]
+kind = "benchmark"
+warmup_runs = 1
+measured_runs = 3
+workload = { type = "parallel-table-scan", num = 2, target_partitions = 4 }
