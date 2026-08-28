@@ -3377,7 +3377,7 @@ pub(crate) mod tests {
             let readonly_probe = readonly_pool.clone();
             let readonly_task = smol::spawn(async move {
                 let g = readonly_pool
-                    .read_block(
+                    .read_raw_block(
                         reopened.file_kind(),
                         reopened.sparse_file(),
                         &readonly_guard,

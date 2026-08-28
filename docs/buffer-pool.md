@@ -23,9 +23,10 @@ All pool implementations share these core ideas:
 
 ### VersionedPageID and Recovery
 
-`VersionedPageID { page_id, generation }` is a runtime identity used when row-page
-undo or purge logic needs to refer back to a mutable page safely after
-deallocation and reuse become possible.
+`VersionedPageID { page_id, generation }` is a runtime residency identity. Row-page
+undo and purge use it to refer back to mutable pages safely after deallocation,
+and the global readonly mapping uses it to distinguish one admitted immutable
+block residency from later reuse of the same frame slot.
 
 The important rule is that `generation` is not durable metadata:
 
@@ -118,6 +119,12 @@ Readonly key is physical identity:
 
 This preserves cache hits across root swaps when physical blocks are unchanged.
 
+The global mapping value is `VersionedPageID`, not a bare frame id. A lookup is
+accepted only when the guarded frame is initialized, still carries the expected
+physical key, and has the mapped generation. Stale readers conditionally remove
+only the exact copied mapping, so they cannot erase a newer generation published
+for the same key or frame slot.
+
 ### CoW Block Write Barrier
 
 User-table CoW writes install a readonly-cache write barrier for the physical
@@ -133,16 +140,37 @@ pool does not poison storage or consult the transaction system; checkpoint,
 DDL, and tests own rollback, retry, or fatal handling policy at their
 respective call sites.
 
-This is intentionally not a generation-key design. Catalog `catalog.mtb`
-publication may mechanically use the shared CoW allocator, but normal
-foreground user-table readonly-cache correctness is the driver for the barrier.
+The physical cache key intentionally has no durable generation component; the
+versioned mapping value is runtime-only. Catalog `catalog.mtb` publication may
+mechanically use the shared CoW allocator, but normal foreground user-table
+readonly-cache correctness is the driver for the barrier.
 
 ### Miss/Load and Error Flow
 
 1. miss -> reserve free frame -> read table file page into frame memory
 2. validate the persisted block envelope/checksum for the expected page kind
-3. publish mapping and frame metadata
+3. bump the frame generation and publish the versioned mapping and frame metadata
 4. return guards from global frame arena
+
+Validated data mappings are published only after their page-role validator
+succeeds. A matching warm-cache generation is therefore the exact immutable
+residency already admitted by that validator and is returned without repeating
+checksum or structural validation. Initial load, invalidation, eviction/reload,
+frame reuse, and CoW replacement all create a new generation and require fresh
+validation before publication.
+
+This contract relies on one persisted page role per immutable residency
+generation. It does not continuously scrub resident memory and does not promise
+to re-prove a different page kind for a generation that was admitted under the
+well-formed page-role invariant.
+
+The crate-internal `read_raw_block` entrypoint skips admission validation. Its
+documented production use is Cow super/meta root parsing; persisted data pages
+must use `read_validated_block`. Raw loads are classified separately from
+validated inflight loads, and a same-key raw/validated overlap is rejected as
+an internal protocol error. Cow root loading invalidates both the super mapping
+and selected meta mapping after caller-side parsing, on success and validation
+failure, so those raw mappings remain transient.
 
 Readonly-specific accessors return `Result` for recoverable miss/load errors.  
 The generic `BufferPool` trait boundary still has deferred error policy and uses explicit `todo!()` for unresolved mapping decisions.

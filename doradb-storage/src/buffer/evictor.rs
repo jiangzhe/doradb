@@ -1313,7 +1313,7 @@ mod tests {
         for i in 0..fixture.block_count {
             let block_id = fixture.base_block_id + i as u64;
             let g = pool
-                .read_block(
+                .read_raw_block(
                     FileKind::TableFile,
                     fixture.file.sparse_file(),
                     &pool_guard,
