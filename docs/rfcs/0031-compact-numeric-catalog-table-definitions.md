@@ -65,9 +65,10 @@ different domains. Catalog row redo and catalog rollback/purge use it to name a
 static catalog-table index ordinal. User-table lookup, rollback, and purge use
 the same shape to name a user runtime position that this RFC makes reusable.
 Giving both domains one generation-qualified replacement would incorrectly
-assign user `IndexID` semantics to catalog indexes and would change persisted
-catalog row-redo bytes during the pre-cutover foundation phase. [C8], [C9],
-[C13], [U12]
+assign user `IndexID` semantics to catalog indexes. Phase 1 instead gives
+catalog indexes a fixed `u16` ordinal and intentionally changes catalog keyed
+row redo in place; prior catalog-key bytes are not migrated or decoded. [C8],
+[C9], [C13], [U12]
 
 Final physical index placement also cannot be compiler-owned. The current
 CREATE INDEX path acquires its DDL/table/catalog exclusion before
@@ -371,11 +372,13 @@ Issue Labels:
   unproven ID to become available after the catalog replay floor passes it;
   persist retired slot generations for create-then-drop proof; and add the
   failed-CREATE/restart/second-CREATE/checkpoint test sequence.
-- [U12] Round 2 index-reference review on 2026-08-28: classify static catalog
-  index ordinals separately from reusable user index generations; preserve
-  catalog row-redo serialization in Phase 1; expose stable `IndexID` to normal
-  user APIs; and avoid repeated resolution by carrying `IndexRef` through one
-  admitted operation and offering an opaque cached resolved handle.
+- [U12] Round 2 index-reference review on 2026-08-28, updated during Task
+  000288 implementation: classify static catalog index ordinals separately
+  from reusable user index generations; serialize catalog keyed row redo
+  directly with its native `u16` ordinal without a compatibility adapter or
+  version bump; expose stable `IndexID` to normal user APIs; and avoid repeated
+  resolution by carrying `IndexRef` through one admitted operation and
+  offering an opaque cached resolved handle.
 - [U13] Round 2 compiler/finalization review on 2026-08-28: make compiler
   output a slot-free proposal containing stable IDs and physical semantics;
   revalidate the storage epoch, descriptor revision, and effective next index
@@ -715,7 +718,7 @@ pub struct ColumnOrdinal(u16);         // physical row-layout position
 pub struct IndexID(u32);               // stable user-table identity
 pub struct IndexIDWatermark(u64);      // validated 0..=ID_DOMAIN_END
 pub(crate) struct IndexSlot(u16);      // sparse user runtime/root position
-pub(crate) struct CatalogIndexNo(usize); // static catalog runtime ordinal
+pub(crate) struct CatalogIndexNo(u16); // static catalog runtime ordinal
 
 pub(crate) struct IndexRef {
     pub(crate) id: IndexID,
@@ -795,7 +798,7 @@ pub(crate) struct ResolvedUserIndexKey {
 
 /// Static catalog-table selector used by catalog execution and row redo.
 pub(crate) struct CatalogSelectKey {
-    pub(crate) index_no: CatalogIndexNo,
+    pub(crate) index: CatalogIndexNo,
     pub(crate) vals: Vec<Val>,
 }
 
@@ -817,12 +820,12 @@ be constructed with `IndexRef` and a user entry cannot be constructed with
 reference domain only from `table_id`. [C8], [U12]
 
 `RowRedoKind::DeleteByPrimaryKey` and `UpdateByPrimaryKey` remain catalog-only
-and serialize `CatalogSelectKey` as the existing checked `u32` catalog ordinal
-followed by `Vec<Val>`. Phase 1 uses an explicit legacy serializer/deserializer
-adapter and golden-byte tests, so introducing the domain types does not change
-catalog row-redo bytes. The Phase 3 redo version bump is required by user index
-DDL markers; it does not require a new encoding for these catalog row-redo
-variants. [C8], [C9], [U9], [U12]
+and serialize `CatalogSelectKey` directly as a `u16` catalog ordinal followed
+by `Vec<Val>`. Phase 1 intentionally adopts this encoding under redo version 5
+without a fallback decoder or migration; golden-byte and boundary tests define
+the new payload. The Phase 3 redo version bump remains required by user index
+DDL markers and retains this Phase 1 catalog-key encoding. [C8], [C9], [U9],
+[U12]
 
 Normal public user APIs accept stable `IndexID`. `TableRuntimeLayout` builds a
 direct `IndexID -> IndexSlot` resolution structure with its validated active
@@ -1498,7 +1501,7 @@ scope. The preferred future direction is a compact base plus immutable delta
 segments with periodic streaming compaction, described under Future Work.
 [U19]
 
-### One Unsupported Format Cutover
+### Final Unsupported Format Cutover
 
 The implementation bumps every affected format version together:
 `CATALOG_MTB_VERSION` from 5 to 6, `TABLE_META_BLOCK_VERSION` from 7 to 8, and
@@ -1513,12 +1516,13 @@ The implementation bumps every affected format version together:
 - persisted ColumnID/ordinal and IndexID/slot mappings;
 - persisted active/retired generation tags for every allocated index slot;
 - generation-qualified user index DDL redo, while catalog row-redo select keys
-  retain their existing payload encoding;
+  retain their Phase 1 native-`u16` payload encoding;
 - empty-but-available descriptor and binding tables.
 
 Opening any older catalog, user table, or redo file returns the existing typed
 unsupported/invalid-version error. The engine does not translate old rows,
-roots, or redo, and tests must create fresh storage. There is no sequence of
+roots, or redo, and tests must create fresh storage. Apart from Phase 1's
+explicit in-place catalog-key redo adjustment, there is no sequence of
 intermediate durable formats between implementation phases. [U9]
 
 ### Test Strategy
@@ -1533,9 +1537,9 @@ Each item has one owning phase or names an earlier base gate and a later
 feature extension explicitly. No phase completion depends on functionality
 deferred to a later phase.
 
-1. Phase 1 golden bytes proving catalog
-   `DeleteByPrimaryKey`/`UpdateByPrimaryKey` redo remains unchanged through the
-   `CatalogSelectKey` legacy adapter, plus catalog rollback and purge tests that
+1. Phase 1 golden bytes and boundary round trips proving catalog
+   `DeleteByPrimaryKey`/`UpdateByPrimaryKey` redo uses the native-`u16`
+   `CatalogSelectKey` encoding, plus catalog rollback and purge tests that
    retain static `CatalogIndexNo` semantics.
 2. Phase 2 user-domain type and admission tests proving normal APIs accept
    `IndexID`, resolve it once per logical operation or stream, and carry the
@@ -1738,37 +1742,39 @@ deferred to a later phase.
 ## Implementation Phases
 
 Each phase below maps to one task and leaves a buildable, testable repository
-with a valid runtime and durable state. The format cutover remains one large
-phase because no intermediate durable format is supported. Replay-visible
-CREATE reservation is part of that cutover rather than later slot reuse: the
-new ID/slot format is not independently safe if a failed marker can alias a
-second CREATE after restart. [U20]
+with a valid runtime and durable state. Apart from Phase 1's accepted in-place
+catalog-key redo adjustment, the coordinated format cutover remains one large
+phase. Replay-visible CREATE reservation is part of that cutover rather than
+later slot reuse: the new ID/slot format is not independently safe if a failed
+marker can alias a second CREATE after restart. [U20]
 
 - **Phase 1: Catalog/User Index Reference Separation**
   - Scope: Introduce `IndexID`, `IndexSlot`, `IndexRef`, and `CatalogIndexNo`;
     replace ambiguous `SelectKey` use with domain-specific
     `CatalogSelectKey`, `UserIndexKey`, and `ResolvedUserIndexKey`; split
     catalog and user undo/purge payloads by type; and generation-qualify all
-    transaction-owned user index undo and purge entries. Preserve catalog
-    `DeleteByPrimaryKey`/`UpdateByPrimaryKey` bytes through the explicit legacy
-    `CatalogSelectKey` serializer/deserializer and golden tests. Until Phase 2,
-    narrow private adapters may compile the current user `index_no` into equal
-    ID and slot values; no persisted format changes.
+    transaction-owned user index undo and purge entries. Encode catalog
+    `DeleteByPrimaryKey`/`UpdateByPrimaryKey` keys directly as native-`u16`
+    `CatalogSelectKey` payloads without migration or a version bump. Until
+    Phase 2, narrow private adapters compile the current user `index_no` into
+    equal ID and slot values.
   - Goals: Remove the catalog-static/user-generation type conflation and make
     transactional user index work carry exact generation identity without
-    changing current public behavior or durable bytes.
+    changing current public behavior; establish the compact catalog-key redo
+    representation used by following phases.
   - Validation: Own test 1 and the catalog/user undo-purge type boundary from
-    test 15, plus focused rollback and purge coverage for both domains.
+    test 15, plus focused rollback, purge, row-branch, and redo coverage for
+    both domains.
   - Non-goals: Public stable-ID admission, an ID-to-slot runtime map, runtime
     retirement changes, catalog schema changes, or slot reuse.
   - Phase-local Choices: Exact internal module placement, private tagged-enum
     versus separate-structure organization for catalog/user undo, and the
     checked transitional adapter shape. No public or durable bare slot identity
     may be introduced.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000288-catalog-user-index-reference-separation.md`
+  - Task Issue: `#1029`
+  - Phase Status: done
+  - Implementation Summary: Implemented typed catalog/user references across redo and retained transaction state. [Task Resolve Sync: docs/tasks/000288-catalog-user-index-reference-separation.md @ 2026-08-28]
 
 - **Phase 2: Resolve-Once Runtime Layout And Generation Ownership**
   - Prerequisites: Phase 1 provides distinct catalog/user key domains and
@@ -1803,8 +1809,9 @@ second CREATE after restart. [U20]
 
 - **Phase 3: Atomic Numeric Format Cutover And Replay-Safe Allocation**
   - Prerequisites: Phases 1 and 2 have separated reference domains, removed
-    unqualified delayed user references, preserved catalog row-redo encoding,
-    and established persisted-to-runtime index-generation compilation.
+    unqualified delayed user references, established native catalog row-redo
+    encoding, and established persisted-to-runtime index-generation
+    compilation.
   - Scope: Introduce `ColumnID`, `ColumnOrdinal`, `ColumnIDWatermark`, and
     `IndexIDWatermark`; define bounded `0..=2^32` allocation/exhaustion and
     typed errors; install all six final catalog tables/slots; replace table,
@@ -2138,8 +2145,9 @@ second CREATE after restart. [U20]
   DDL. All effects stay in the same private transaction and are classified as
   one DDL redo group.
 - **Catalog/root format mismatch:** a partial implementation could create an
-  intermediate format. Phase 3 owns every affected bump and tests explicit old
-  version rejection plus fresh bootstrap/restart.
+  unintended intermediate format. Phase 1's catalog-key redo adjustment is the
+  only accepted in-place exception; Phase 3 owns every affected bump and tests
+  explicit old-version rejection plus fresh bootstrap/restart.
 - **Oversized opaque input:** descriptors and keys could exhaust row/log
   capacity. Both are validated against existing `VarByte` and catalog-row
   encoding before mandatory acceptance.
