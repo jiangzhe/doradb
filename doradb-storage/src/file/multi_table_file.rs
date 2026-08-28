@@ -1118,6 +1118,7 @@ mod tests {
                 .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
                 .await;
             assert!(res.is_err());
+            assert_eq!(global.allocated(), 0);
         });
     }
 
@@ -1163,6 +1164,7 @@ mod tests {
                 active_meta_block_id,
                 DataIntegrityError::InvalidVersion,
             );
+            assert_eq!(global.allocated(), 0);
         });
     }
 
@@ -1197,6 +1199,7 @@ mod tests {
                 active_meta_block_id,
                 DataIntegrityError::ChecksumMismatch,
             );
+            assert_eq!(global.allocated(), 0);
         });
     }
 
@@ -1258,6 +1261,7 @@ mod tests {
                 older_snapshot.catalog_replay_start_ts
             );
             assert_eq!(snapshot.meta, older_snapshot.meta);
+            assert_eq!(global.allocated(), 0);
         });
     }
 
@@ -1343,6 +1347,7 @@ mod tests {
                 active_meta_block_id,
                 DataIntegrityError::InvalidRootInvariant,
             );
+            assert_eq!(global.allocated(), 0);
         });
     }
 

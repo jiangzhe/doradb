@@ -1171,7 +1171,7 @@ mod tests {
                 .unwrap();
             let key = BlockKey::new(FileID::from(table_id), block_id);
             let cached = disk_pool
-                .read_block(&disk_pool_guard, block_id)
+                .read_raw_block(&disk_pool_guard, block_id)
                 .await
                 .unwrap();
             drop(cached);
@@ -1217,7 +1217,7 @@ mod tests {
                 .unwrap();
             let key = BlockKey::new(FileID::from(table_id), meta_block_id);
             let cached = disk_pool
-                .read_block(&disk_pool_guard, meta_block_id)
+                .read_raw_block(&disk_pool_guard, meta_block_id)
                 .await
                 .unwrap();
             drop(cached);
@@ -1260,7 +1260,7 @@ mod tests {
             let cached_blocks = first_unallocated_blocks(&before_root, 8);
             for block_id in &cached_blocks {
                 let cached = disk_pool
-                    .read_block(&disk_pool_guard, *block_id)
+                    .read_raw_block(&disk_pool_guard, *block_id)
                     .await
                     .unwrap();
                 drop(cached);

@@ -375,6 +375,8 @@ pub(crate) enum InternalError {
     BufferPageAlreadyAllocated,
     #[error("readonly write barrier encountered an in-flight load")]
     ReadonlyWriteInflight,
+    #[error("readonly in-flight load class conflict")]
+    ReadonlyLoadClassConflict,
     #[error("readonly block is blocked by a write barrier")]
     ReadonlyWriteBlocked,
     #[error("row page scan start is not a page boundary")]

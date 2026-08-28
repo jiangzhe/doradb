@@ -762,12 +762,11 @@ impl<M> CowFile<M> {
     /// in-memory [`ActiveRoot`].
     ///
     /// This is the intended runtime use of
-    /// `QuiescentGuard<ReadonlyBufferPool>::read_block()`.
+    /// `QuiescentGuard<ReadonlyBufferPool>::read_raw_block()`.
     /// The raw block reads here are acceptable because super/meta-block
     /// validation happens immediately through `pick_super_block`,
-    /// `parse_meta_block`, and `validate_root`. New callers should prefer
-    /// `read_validated_block()` unless they have an equivalent caller-owned
-    /// validation path and have reviewed the raw-read inflight semantics.
+    /// `parse_meta_block`, and `validate_root`, then each transient mapping is
+    /// removed. Persisted data pages use `read_validated_block()`.
     #[inline]
     pub(crate) async fn load_active_root_from_pool(
         &self,
@@ -778,7 +777,7 @@ impl<M> CowFile<M> {
         let file_id = self.file.file_id();
         let _ = disk_pool.invalidate_block(disk_guard, file_id, SUPER_BLOCK_ID);
         let super_block_guard = disk_pool
-            .read_block(file_kind, &self.file, disk_guard, SUPER_BLOCK_ID)
+            .read_raw_block(file_kind, &self.file, disk_guard, SUPER_BLOCK_ID)
             .await
             .change_context(RuntimeError::FileRootAccess)
             .attach_with(|| {
@@ -795,13 +794,15 @@ impl<M> CowFile<M> {
             format!(
                 "operation=load_file_root, file_kind={file_kind}, file_id={file_id}, phase=validate_super_block, block_id={SUPER_BLOCK_ID}"
             )
-        })?;
+        });
         drop(super_block_guard);
+        let _ = disk_pool.invalidate_block(disk_guard, file_id, SUPER_BLOCK_ID);
+        let super_block = super_block?;
 
         let meta_block_id = super_block.body.meta_block_id;
         let _ = disk_pool.invalidate_block(disk_guard, file_id, meta_block_id);
         let meta_block_guard = disk_pool
-            .read_block(file_kind, &self.file, disk_guard, meta_block_id)
+            .read_raw_block(file_kind, &self.file, disk_guard, meta_block_id)
             .await
             .change_context(RuntimeError::FileRootAccess)
             .attach_with(|| {
@@ -815,7 +816,10 @@ impl<M> CowFile<M> {
                 format!(
                     "operation=load_file_root, file_kind={file_kind}, file_id={file_id}, phase=parse_meta_block, block_id={meta_block_id}"
                 )
-            })?;
+            });
+        drop(meta_block_guard);
+        let _ = disk_pool.invalidate_block(disk_guard, file_id, meta_block_id);
+        let parsed_meta = parsed_meta?;
         (self.codec.validate_root)(meta_block_id, &parsed_meta)
             .change_context(RuntimeError::FileRootAccess)
             .attach_with(|| {
@@ -823,7 +827,6 @@ impl<M> CowFile<M> {
                     "operation=load_file_root, file_kind={file_kind}, file_id={file_id}, phase=validate_root, block_id={meta_block_id}"
                 )
             })?;
-        drop(meta_block_guard);
 
         Ok(ActiveRoot::from_parts(
             super_block.header.slot_no,
