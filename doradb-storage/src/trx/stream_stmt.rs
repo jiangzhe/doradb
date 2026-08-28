@@ -152,7 +152,7 @@ impl StreamStmtState {
             let accessor = table.accessor_with_layout(&layout);
             let root = accessor.root_snapshot(rt.ctx());
             let worklist = accessor
-                .table_scan_mvcc_worklist(TableScanRuntime::from_transaction(rt), &root)
+                .table_scan_mvcc_worklist(TableScanRuntime::from_transaction(rt), &root, &read_view)
                 .await
                 .attach_with(|| {
                     format!("operation={TABLE_SCAN_STREAM_OPERATION}, table_id={table_id}")
@@ -332,14 +332,14 @@ impl<F> TableScanMvccStreamState<F> {
         stmt_state: StreamStmtState,
     ) -> Self {
         let column_count = layout.metadata().col.col_count();
-        let (column_root, pivot_row_id, units) = TableScanWorklistCursor::from_worklist(worklist);
+        let (_, _, units) = TableScanWorklistCursor::from_worklist(worklist);
         Self {
             read_view,
             scan_row,
             table,
             layout,
             read_set,
-            cursor: TableScanCursor::new(units, column_root, pivot_row_id, column_count),
+            cursor: TableScanCursor::new(units, column_count),
             stmt_state,
         }
     }

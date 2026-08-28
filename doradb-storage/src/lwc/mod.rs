@@ -337,7 +337,6 @@ impl<'a> LwcData<'a> {
 
     /// Returns the length of Lwc Data.
     #[inline]
-    #[cfg_attr(not(test), expect(dead_code, reason = "reserved len"))]
     pub(crate) fn len(&self) -> usize {
         match self {
             LwcData::Primitive(p) => match p {
@@ -399,6 +398,184 @@ impl<'a> LwcData<'a> {
         match self {
             LwcData::Primitive(p) => p.value(idx),
             LwcData::Bytes(b) => b.value(idx).map(Val::VarByte),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PreparedLwcMin {
+    Signed(i64),
+    Unsigned(u64),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PreparedLwcEncoding {
+    FlatPrimitive {
+        data_start: usize,
+        unit_len: usize,
+    },
+    FlatVarByte {
+        offsets_start: usize,
+        data_start: usize,
+    },
+    ForBitpacking {
+        data_start: usize,
+        n_bits: usize,
+        min: PreparedLwcMin,
+    },
+}
+
+/// Owned scalar metadata for one validated LWC value payload.
+///
+/// The representation stores offsets rather than references so a scan page can
+/// cache it beside, rather than inside, its readonly-buffer guard.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PreparedLwcData {
+    kind: ValKind,
+    len: usize,
+    input_len: usize,
+    encoding: PreparedLwcEncoding,
+}
+
+impl PreparedLwcData {
+    /// Validate one encoded value payload and retain only owned decoder state.
+    pub(crate) fn from_bytes(kind: ValKind, input: &[u8]) -> DataIntegrityResult<Self> {
+        // Keep the general reader as the single codec/type/length validator.
+        let parsed = LwcData::from_bytes(kind, input)?;
+        let len = parsed.len();
+        let code = input[0];
+        let encoding = match LwcCode::decode(code)? {
+            LwcCode::Flat => {
+                let data_start = mem::size_of::<u8>() + mem::size_of::<u64>();
+                if kind == ValKind::VarByte {
+                    let offsets_len = len
+                        .checked_add(1)
+                        .and_then(|count| count.checked_mul(mem::size_of::<u32>()))
+                        .ok_or_else(|| {
+                            Report::new(DataIntegrityError::InvalidPayload)
+                                .attach("LWC varbyte offset table length overflows usize")
+                        })?;
+                    let values_start = data_start + offsets_len;
+                    validate_prepared_varbyte_offsets(
+                        &input[data_start..values_start],
+                        input.len() - values_start,
+                    )?;
+                    PreparedLwcEncoding::FlatVarByte {
+                        offsets_start: data_start,
+                        data_start: values_start,
+                    }
+                } else {
+                    PreparedLwcEncoding::FlatPrimitive {
+                        data_start,
+                        unit_len: kind.inline_len(),
+                    }
+                }
+            }
+            LwcCode::ForBitpacking => {
+                let n_bits = input[1] as usize;
+                let min_start = mem::size_of::<u8>() + mem::size_of::<u8>() + mem::size_of::<u64>();
+                let unit_len = kind.inline_len();
+                let min_bytes = &input[min_start..min_start + unit_len];
+                let min = match kind {
+                    ValKind::I8 => PreparedLwcMin::Signed(i64::from(min_bytes[0] as i8)),
+                    ValKind::U8 => PreparedLwcMin::Unsigned(u64::from(min_bytes[0])),
+                    ValKind::I16 => PreparedLwcMin::Signed(i64::from(i16::from_le_bytes(
+                        min_bytes.try_into().unwrap(),
+                    ))),
+                    ValKind::U16 => PreparedLwcMin::Unsigned(u64::from(u16::from_le_bytes(
+                        min_bytes.try_into().unwrap(),
+                    ))),
+                    ValKind::I32 => PreparedLwcMin::Signed(i64::from(i32::from_le_bytes(
+                        min_bytes.try_into().unwrap(),
+                    ))),
+                    ValKind::U32 => PreparedLwcMin::Unsigned(u64::from(u32::from_le_bytes(
+                        min_bytes.try_into().unwrap(),
+                    ))),
+                    ValKind::I64 => {
+                        PreparedLwcMin::Signed(i64::from_le_bytes(min_bytes.try_into().unwrap()))
+                    }
+                    ValKind::U64 => {
+                        PreparedLwcMin::Unsigned(u64::from_le_bytes(min_bytes.try_into().unwrap()))
+                    }
+                    ValKind::F32 | ValKind::F64 | ValKind::VarByte => {
+                        unreachable!("general LWC validation rejects this FOR value kind")
+                    }
+                };
+                PreparedLwcEncoding::ForBitpacking {
+                    data_start: min_start + unit_len,
+                    n_bits,
+                    min,
+                }
+            }
+        };
+        Ok(PreparedLwcData {
+            kind,
+            len,
+            input_len: input.len(),
+            encoding,
+        })
+    }
+
+    /// Returns the number of logical values represented by the payload.
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Decode one value by borrowing the same immutable bytes used to prepare.
+    pub(crate) fn value(&self, input: &[u8], idx: usize) -> Option<Val> {
+        debug_assert_eq!(input.len(), self.input_len);
+        if idx >= self.len {
+            return None;
+        }
+        match self.encoding {
+            PreparedLwcEncoding::FlatPrimitive {
+                data_start,
+                unit_len,
+            } => Some(decode_prepared_flat(
+                self.kind,
+                &input[data_start + idx * unit_len..data_start + (idx + 1) * unit_len],
+            )),
+            PreparedLwcEncoding::FlatVarByte {
+                offsets_start,
+                data_start,
+            } => {
+                let offset = |ordinal: usize| {
+                    let start = offsets_start + ordinal * mem::size_of::<u32>();
+                    u32::from_le_bytes(
+                        input[start..start + mem::size_of::<u32>()]
+                            .try_into()
+                            .unwrap(),
+                    ) as usize
+                };
+                let start = offset(idx);
+                let end = offset(idx + 1);
+                Some(Val::VarByte(MemVar::from(
+                    &input[data_start + start..data_start + end],
+                )))
+            }
+            PreparedLwcEncoding::ForBitpacking {
+                data_start,
+                n_bits,
+                min,
+            } => {
+                let data = &input[data_start..];
+                let delta = match n_bits {
+                    1 | 2 | 4 => {
+                        let bit_idx = idx * n_bits;
+                        u64::from((data[bit_idx / 8] >> (bit_idx % 8)) & ((1 << n_bits) - 1))
+                    }
+                    8 => u64::from(data[idx]),
+                    16 => u64::from(u16::from_le_bytes(
+                        data[idx * 2..idx * 2 + 2].try_into().unwrap(),
+                    )),
+                    32 => u64::from(u32::from_le_bytes(
+                        data[idx * 4..idx * 4 + 4].try_into().unwrap(),
+                    )),
+                    _ => unreachable!("general LWC validation rejects unsupported bit widths"),
+                };
+                Some(decode_prepared_for(self.kind, min, delta))
+            }
         }
     }
 }
@@ -1608,6 +1785,77 @@ impl_lwc_flat!(FlatU64, u64, [u8; 8], FlatU64Iter);
 impl_lwc_flat!(FlatF32, f32, [u8; 4], FlatF32Iter);
 impl_lwc_flat!(FlatF64, f64, [u8; 8], FlatF64Iter);
 
+fn validate_prepared_varbyte_offsets(
+    offset_bytes: &[u8],
+    data_len: usize,
+) -> DataIntegrityResult<()> {
+    let mut previous = None;
+    for bytes in offset_bytes.as_chunks::<{ mem::size_of::<u32>() }>().0 {
+        let offset = u32::from_le_bytes(*bytes) as usize;
+        if previous.is_none() && offset != 0
+            || previous.is_some_and(|previous| offset < previous)
+            || offset > data_len
+        {
+            return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                "invalid LWC varbyte offset: previous={previous:?}, current={offset}, data_len={data_len}"
+            )));
+        }
+        previous = Some(offset);
+    }
+    if previous != Some(data_len) {
+        return Err(
+            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                "LWC varbyte final offset {previous:?} does not match data length {data_len}"
+            )),
+        );
+    }
+    Ok(())
+}
+
+#[inline]
+fn decode_prepared_flat(kind: ValKind, bytes: &[u8]) -> Val {
+    match kind {
+        ValKind::I8 => Val::I8(bytes[0] as i8),
+        ValKind::U8 => Val::U8(bytes[0]),
+        ValKind::I16 => Val::I16(i16::from_le_bytes(bytes.try_into().unwrap())),
+        ValKind::U16 => Val::U16(u16::from_le_bytes(bytes.try_into().unwrap())),
+        ValKind::I32 => Val::I32(i32::from_le_bytes(bytes.try_into().unwrap())),
+        ValKind::U32 => Val::U32(u32::from_le_bytes(bytes.try_into().unwrap())),
+        ValKind::F32 => Val::from(f32::from_le_bytes(bytes.try_into().unwrap())),
+        ValKind::I64 => Val::I64(i64::from_le_bytes(bytes.try_into().unwrap())),
+        ValKind::U64 => Val::U64(u64::from_le_bytes(bytes.try_into().unwrap())),
+        ValKind::F64 => Val::from(f64::from_le_bytes(bytes.try_into().unwrap())),
+        ValKind::VarByte => unreachable!("varbyte uses its offset-aware prepared decoder"),
+    }
+}
+
+#[inline]
+fn decode_prepared_for(kind: ValKind, min: PreparedLwcMin, delta: u64) -> Val {
+    match (kind, min) {
+        (ValKind::I8, PreparedLwcMin::Signed(min)) => {
+            Val::I8((min as i8).wrapping_add(delta as i8))
+        }
+        (ValKind::U8, PreparedLwcMin::Unsigned(min)) => {
+            Val::U8((min as u8).wrapping_add(delta as u8))
+        }
+        (ValKind::I16, PreparedLwcMin::Signed(min)) => {
+            Val::I16((min as i16).wrapping_add(delta as i16))
+        }
+        (ValKind::U16, PreparedLwcMin::Unsigned(min)) => {
+            Val::U16((min as u16).wrapping_add(delta as u16))
+        }
+        (ValKind::I32, PreparedLwcMin::Signed(min)) => {
+            Val::I32((min as i32).wrapping_add(delta as i32))
+        }
+        (ValKind::U32, PreparedLwcMin::Unsigned(min)) => {
+            Val::U32((min as u32).wrapping_add(delta as u32))
+        }
+        (ValKind::I64, PreparedLwcMin::Signed(min)) => Val::I64(min.wrapping_add(delta as i64)),
+        (ValKind::U64, PreparedLwcMin::Unsigned(min)) => Val::U64(min.wrapping_add(delta)),
+        _ => unreachable!("general LWC validation binds FOR minima to integer value kinds"),
+    }
+}
+
 #[inline]
 fn persisted_lwc_layout<T>(
     result: layout::LayoutResult<T>,
@@ -2055,6 +2303,55 @@ mod tests {
                 .as_ref()
                 .is_err_and(|err| *err.current_context() == DataIntegrityError::InvalidPayload)
         );
+    }
+
+    fn assert_prepared_matches(kind: ValKind, serializer: LwcPrimitiveSer<'_>) {
+        let mut bytes = vec![0u8; serializer.ser_len()];
+        serializer.ser(&mut bytes[..], 0);
+        let ordinary = LwcData::from_bytes(kind, &bytes).unwrap();
+        let prepared = PreparedLwcData::from_bytes(kind, &bytes).unwrap();
+        assert_eq!(prepared.len(), ordinary.len());
+        for idx in 0..ordinary.len() {
+            assert_eq!(prepared.value(&bytes, idx), ordinary.value(idx));
+        }
+        assert_eq!(prepared.value(&bytes, ordinary.len()), None);
+    }
+
+    #[test]
+    fn prepared_lwc_data_matches_supported_codecs_and_value_kinds() {
+        let i8s = [-8i8, -7, -4, -1];
+        let u8s = [1u8, 2, 4, 7];
+        let i16s = [-300i16, -299, -250, -200];
+        let u16s = [300u16, 301, 350, 400];
+        let i32s = [-70_000i32, -69_999, -60_000, -50_000];
+        let u32s = [70_000u32, 70_001, 80_000, 90_000];
+        let i64s = [-5_000_000_000i64, -4_999_999_999, -4_000_000_000];
+        let u64s = [5_000_000_000u64, 5_000_000_001, 6_000_000_000];
+        let f32s = [1.25f32, -2.5, 9.75];
+        let f64s = [1.25f64, -2.5, 9.75];
+        assert_prepared_matches(ValKind::I8, LwcPrimitiveSer::new_i8(&i8s));
+        assert_prepared_matches(ValKind::U8, LwcPrimitiveSer::new_u8(&u8s));
+        assert_prepared_matches(ValKind::I16, LwcPrimitiveSer::new_i16(&i16s));
+        assert_prepared_matches(ValKind::U16, LwcPrimitiveSer::new_u16(&u16s));
+        assert_prepared_matches(ValKind::I32, LwcPrimitiveSer::new_i32(&i32s));
+        assert_prepared_matches(ValKind::U32, LwcPrimitiveSer::new_u32(&u32s));
+        assert_prepared_matches(ValKind::I64, LwcPrimitiveSer::new_i64(&i64s));
+        assert_prepared_matches(ValKind::U64, LwcPrimitiveSer::new_u64(&u64s));
+        assert_prepared_matches(ValKind::F32, LwcPrimitiveSer::new_f32(&f32s));
+        assert_prepared_matches(ValKind::F64, LwcPrimitiveSer::new_f64(&f64s));
+        assert_prepared_matches(
+            ValKind::VarByte,
+            LwcPrimitiveSer::new_bytes_owned(vec![0, 1, 3, 6], b"abcdef".to_vec()).unwrap(),
+        );
+    }
+
+    #[test]
+    fn prepared_lwc_data_rejects_malformed_varbyte_offsets() {
+        let serializer = LwcPrimitiveSer::new_bytes_owned(vec![0, 1, 3], b"abc".to_vec()).unwrap();
+        let mut bytes = vec![0u8; serializer.ser_len()];
+        serializer.ser(&mut bytes[..], 0);
+        bytes[9..13].copy_from_slice(&1u32.to_le_bytes());
+        assert_invalid_payload(PreparedLwcData::from_bytes(ValKind::VarByte, &bytes));
     }
 
     #[test]

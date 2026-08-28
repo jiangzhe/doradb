@@ -33,3 +33,11 @@ Starting from the post-task-000286 medians of 71.43 ms hot and 128.55 ms cold, t
 ## Notes (Optional)
 
 Task 000286 resolved the checksum portion of the original backlog evidence; this item remains open for column-index metadata and LWC decoding work. Related but distinct: docs/backlogs/000111-optimize-cold-row-visibility-filtering-mvcc-scans.md addresses per-row deletion-buffer visibility checks, which remained a small part of the post-task-000286 profile.
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000287-vectorize-cold-row-scan-metadata-and-lwc-decoding.md
+- Closed By: backlog close
+- Reference: User decision
+- Closed At: 2026-08-28

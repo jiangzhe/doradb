@@ -10,12 +10,13 @@ use crate::file::cow_file::COW_FILE_PAGE_SIZE;
 use crate::file::{FileKind, SparseFile};
 use crate::id::BlockID;
 use crate::layout;
-use crate::lwc::{LwcData, LwcNullBitmap};
+use crate::lwc::{LwcData, LwcNullBitmap, PreparedLwcData};
 use crate::quiescent::QuiescentGuard;
 use crate::serde::{Ser, Serde};
 use crate::value::{Val, ValKind};
 use error_stack::{Report, ResultExt};
 use std::mem;
+use std::ops::Range;
 use std::sync::Arc;
 use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -355,6 +356,159 @@ impl PersistedLwcBlock {
         // `read_validated_block` with `validate_persisted_lwc_block`, and the
         // fixed payload range has the exact size and alignment asserted above.
         unsafe { LwcBlock::from_bytes_unchecked(payload) }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PreparedLwcColumn {
+    null_bitmap: Option<Range<usize>>,
+    values: Range<usize>,
+    data: PreparedLwcData,
+}
+
+/// Lazy owned decoder cache for one loaded immutable LWC block.
+pub(crate) struct PreparedLwcBlock {
+    column_ranges: Box<[Range<usize>]>,
+    columns: Box<[Option<PreparedLwcColumn>]>,
+}
+
+impl PreparedLwcBlock {
+    /// Parse and validate the column-offset plane once for a loaded block.
+    pub(crate) fn new(
+        block: &LwcBlock,
+        col_layout: &TableColumnLayout,
+    ) -> DataIntegrityResult<Self> {
+        let block_col_count = block.header.col_count() as usize;
+        if block_col_count != col_layout.col_count() {
+            return Err(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                    "LWC column count mismatch: block_columns={block_col_count}, layout_columns={}",
+                    col_layout.col_count()
+                )),
+            );
+        }
+        let offsets = block.col_offsets()?;
+        let mut column_ranges = Vec::with_capacity(block_col_count);
+        for col_idx in 0..block_col_count {
+            let (start, end) = offsets.get(col_idx).ok_or_else(|| {
+                Report::new(DataIntegrityError::InvalidPayload)
+                    .attach(format!("LWC column index {col_idx} is out of range"))
+            })?;
+            column_ranges.push(start..end);
+        }
+        let columns = vec![None; block_col_count].into_boxed_slice();
+        Ok(PreparedLwcBlock {
+            column_ranges: column_ranges.into_boxed_slice(),
+            columns,
+        })
+    }
+
+    /// Decode one value, preparing its column metadata at most once.
+    pub(crate) fn decode_value(
+        &mut self,
+        block: &LwcBlock,
+        col_layout: &TableColumnLayout,
+        row_idx: usize,
+        col_idx: usize,
+    ) -> DataIntegrityResult<Val> {
+        if row_idx >= block.row_count() {
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!("LWC row index {row_idx} is out of range")));
+        }
+        if col_idx >= self.columns.len() {
+            return Err(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                    "LWC column metadata mismatch: col_idx={col_idx}, col_count={}",
+                    self.columns.len()
+                )),
+            );
+        }
+        if self.columns[col_idx].is_none() {
+            let column = self.prepare_column(block, col_layout, col_idx)?;
+            self.columns[col_idx] = Some(column);
+        }
+        let column = self.columns[col_idx]
+            .as_ref()
+            .expect("prepared LWC column is present after successful initialization");
+        if column.null_bitmap.as_ref().is_some_and(|range| {
+            let byte = block.body[range.start + row_idx / 8];
+            byte & (1 << (row_idx % 8)) != 0
+        }) {
+            return Ok(Val::Null);
+        }
+        column
+            .data
+            .value(&block.body[column.values.clone()], row_idx)
+            .ok_or_else(|| {
+                Report::new(DataIntegrityError::InvalidPayload)
+                    .attach(format!("LWC row index {row_idx} is out of range"))
+            })
+    }
+
+    fn prepare_column(
+        &self,
+        block: &LwcBlock,
+        col_layout: &TableColumnLayout,
+        col_idx: usize,
+    ) -> DataIntegrityResult<PreparedLwcColumn> {
+        let range = self.column_ranges.get(col_idx).cloned().ok_or_else(|| {
+            Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!("LWC column index {col_idx} is out of range"))
+        })?;
+        let (null_bitmap, values) =
+            if col_layout.nullable(col_idx) {
+                if range.len() < mem::size_of::<u16>() {
+                    return Err(Report::new(DataIntegrityError::InvalidPayload)
+                        .attach("expected LWC little-endian u16"));
+                }
+                let bitmap_len = u16::from_le_bytes(
+                    block.body[range.start..range.start + mem::size_of::<u16>()]
+                        .try_into()
+                        .unwrap(),
+                ) as usize;
+                let bitmap_start = range.start + mem::size_of::<u16>();
+                let bitmap_end = bitmap_start.checked_add(bitmap_len).ok_or_else(|| {
+                    Report::new(DataIntegrityError::InvalidPayload)
+                        .attach("LWC null bitmap range overflows usize")
+                })?;
+                if bitmap_end > range.end {
+                    return Err(Report::new(DataIntegrityError::InvalidPayload)
+                        .attach("LWC null bitmap payload is shorter than declared length"));
+                }
+                let required = block.row_count().div_ceil(8);
+                if bitmap_len < required {
+                    return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                    "LWC null bitmap length {bitmap_len} is shorter than required {required}"
+                )));
+                }
+                (Some(bitmap_start..bitmap_end), bitmap_end..range.end)
+            } else {
+                (None, range)
+            };
+        let data =
+            PreparedLwcData::from_bytes(col_layout.val_kind(col_idx), &block.body[values.clone()])?;
+        if data.len() != block.row_count() {
+            return Err(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                    "LWC column value count mismatch: column={col_idx}, values={}, rows={}",
+                    data.len(),
+                    block.row_count()
+                )),
+            );
+        }
+        Ok(PreparedLwcColumn {
+            null_bitmap,
+            values,
+            data,
+        })
+    }
+
+    #[cfg(test)]
+    fn prepared_column_count(&self) -> usize {
+        self.columns
+            .iter()
+            .filter(|column| column.is_some())
+            .count()
     }
 }
 
@@ -813,6 +967,42 @@ mod tests {
                 .unwrap(),
             vec![Val::U8(10), Val::I16(20)]
         );
+    }
+
+    #[test]
+    fn test_prepared_lwc_block_lazily_reuses_touched_columns() {
+        let (metadata, buf) = build_valid_persisted_lwc_block();
+        let page =
+            LwcBlock::try_from_persisted_bytes(buf.data(), FileKind::TableFile, test_block_id(8))
+                .unwrap();
+        let mut prepared = PreparedLwcBlock::new(page, metadata.col.as_ref()).unwrap();
+        assert_eq!(prepared.prepared_column_count(), 0);
+
+        for row_idx in 0..page.row_count() {
+            assert_eq!(
+                prepared
+                    .decode_value(page, metadata.col.as_ref(), row_idx, 0)
+                    .unwrap(),
+                page.decode_value(metadata.col.as_ref(), row_idx, 0)
+                    .unwrap()
+            );
+        }
+        assert_eq!(prepared.prepared_column_count(), 1);
+        assert_eq!(
+            prepared
+                .decode_value(page, metadata.col.as_ref(), 1, 0)
+                .unwrap(),
+            Val::U8(11)
+        );
+        assert_eq!(prepared.prepared_column_count(), 1);
+
+        assert_eq!(
+            prepared
+                .decode_value(page, metadata.col.as_ref(), 1, 1)
+                .unwrap(),
+            Val::Null
+        );
+        assert_eq!(prepared.prepared_column_count(), 2);
     }
 
     #[test]

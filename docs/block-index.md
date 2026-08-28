@@ -115,6 +115,32 @@ Scans use the same split:
 This allows the engine to scan across mixed hot/cold table state without
 pretending both tiers have the same physical structure.
 
+Cold full-scan planning compiles each leaf entry while its owning index page is
+already resident. The scan descriptor retains the LWC block id, coverage and
+row-shape binding, row count, and persisted delete plan; execution does not
+reopen the leaf. Row identity is represented only as either allocation-free
+dense span metadata or the persisted sorted sparse `u32` deltas. These forms
+translate temporary row-id metadata to LWC ordinals without expanding a dense
+`Vec<RowID>`.
+
+For the scan's fixed MVCC read view, the table deletion buffer is traversed
+once and its matching markers are immediately classified and sorted. Persisted
+deletes are normalized to an ordinal mask first. Deletion-buffer overrides are
+then applied as newer authority: an old committed or reader-owned active
+marker forces the ordinal hidden, while a newer committed, foreign-active, or
+ownerless-active marker forces it visible even if the persisted base contains
+a delete. Ordinary cold-row advancement therefore checks one ordinal bit and
+does not reconstruct a row id, probe a delete hash set, or query the deletion
+buffer.
+
+Inline deletes are finalized during planning. An external deletion blob stays
+lazy so early callback stop does not read metadata for an unreached block. Its
+descriptor retains the validated blob reference, domain, declared count,
+already translated deletion-buffer overrides, and a sparse identity resolver
+only when a row-id-delta payload still needs it. Loading that block validates
+the blob, converts its values to ordinals, applies the saved overrides, and
+builds the final mask without consulting the column-index leaf.
+
 ### 5.3 Concurrent Boundary Movement
 
 Checkpoint can move the hot/cold boundary while readers are active.

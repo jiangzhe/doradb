@@ -4033,8 +4033,9 @@ pub(crate) mod tests {
             let layout = table.layout_snapshot();
             let accessor = table.accessor_with_layout(&layout);
             let root = accessor.root_snapshot(rt.ctx());
+            let read_view = MvccReadView::from_transaction(rt.ctx());
             let worklist = accessor
-                .table_scan_mvcc_worklist(TableScanRuntime::from_transaction(rt), &root)
+                .table_scan_mvcc_worklist(TableScanRuntime::from_transaction(rt), &root, &read_view)
                 .await
                 .disclose()?;
             Ok(worklist)

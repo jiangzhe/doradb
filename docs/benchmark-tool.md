@@ -454,6 +454,62 @@ Source inspection after the proof confirmed that
 physical-unit load and after exhaustion. The returned-row branch still returns
 directly without a peer-failure load.
 
+## Cold scan vectorization release proof
+
+Task 000287 was measured on 2026-08-28 against exact `origin/main` revision
+`b58f2192486a1677b9d88aef5c7ef579c281eb94`; the candidate was the Task 000287
+working tree based on that same revision. Baseline and candidate were separate
+release builds and used separate fresh roots on the same host described above.
+The four plans retained the one-million-row, 128-byte fixture, projection
+`[0, 1]`, four fixture workers/sessions, batch size 100, disabled redo sync,
+one unmeasured warm-up, internal statistics, and 20 measured runs. Sequential
+plans used one scan worker/session. Parallel plans requested the host's target
+capacity of nine and produced ten physical partitions. Cold-dominant plans
+froze and checkpointed 900,000 requested rows, producing 2,009 LWC blocks,
+224 hot pages, and three column-index pages.
+
+Both source trees ran:
+
+```bash
+rtk cargo build --release -p doradb-bench
+target/release/doradb-bench --root <fresh-root> --plan <shape-plan>.toml
+```
+
+The shape plans differed only by the presence of the 900,000-row freeze and
+checkpoint and by final `table-scan` versus `parallel-table-scan` target nine.
+The table reports complete-run medians plus IQR and median absolute deviation;
+positive hot change is regression and positive cold change is improvement.
+
+| Shape | Baseline median (ms) | Candidate median (ms) | Candidate IQR (ms) | Candidate MAD (ms) | Change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| hot sequential | 75.367 | 75.224 | 2.770 | 0.549 | 0.19% faster |
+| hot target-nine | 19.419 | 20.383 | 4.881 | 2.249 | 4.97% slower |
+| cold-dominant sequential | 131.084 | 80.601 | 0.443 | 0.221 | 38.51% faster |
+| cold-dominant target-nine | 37.258 | 21.404 | 2.883 | 1.309 | 42.55% faster |
+
+Every measured cold candidate run returned exactly 1,000,000 rows and recorded
+2,012 readonly-cache hits: three planning index pages plus 2,009 LWC pages.
+Every run also recorded zero readonly misses, completed reads, and backend
+submissions. The corresponding baseline cold sequential runs recorded 4,021
+hits, confirming that the 2,009 execution-time leaf reopens were removed rather
+than hidden by changed I/O.
+
+CPU-clock attribution used a profiler-paused cold sequential plan and:
+
+```bash
+perf record -F 999 -g -p <paused-pid> -o <profile.data> -- sleep 4
+perf report --stdio --no-children --call-graph none -i <profile.data>
+```
+
+The baseline captured 3,576 samples and attributed 10.54% directly to
+`ValidatedColumnBlockNode::leaf_prefix_plane`; the candidate captured 2,122
+samples and had no leaf-prefix or execution leaf-entry symbol above the 0.1%
+report threshold. Baseline per-row LWC parser helpers such as
+`for_bitpacking_lwc_payload` remained visible, while candidate samples moved to
+`PreparedLwcBlock::decode_value` and `PreparedLwcData::value`, confirming that
+codec preparation was amortized and ordinary value decoding remained. Raw
+latency samples are retained in Task 000287's implementation notes.
+
 ## Results and failure behavior
 
 After atomically installing the result, a successful invocation prints the

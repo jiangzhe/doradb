@@ -1,15 +1,15 @@
 use super::{
-    LazyRow, LazyRowBuffer, RowPageDescriptor, Table, TableRuntimeLayout, TableScanColdPage,
-    TableScanRuntime, TableScanUnit, TableScanWorklist,
+    ColdBlockScanDescriptor, LazyRow, LazyRowBuffer, RowPageDescriptor, Table, TableRuntimeLayout,
+    TableScanColdPage, TableScanRuntime, TableScanUnit, TableScanWorklist,
 };
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::error::{Result, RuntimeResult};
 use crate::id::{BlockID, RowID};
-use crate::index::ColumnLeafEntry;
 use crate::row::RowPage;
 use crate::row::ops::ScanRowDecision;
 use crate::trx::MvccReadView;
 use crate::value::Val;
+use std::sync::Arc;
 use std::vec::IntoIter;
 
 /// Source-agnostic ordered physical-unit advancement for a table scan.
@@ -20,7 +20,7 @@ pub(crate) trait TableScanUnitCursor {
 
 /// Owned transaction worklist adapter that yields cold units before hot units.
 pub(crate) struct TableScanWorklistCursor {
-    cold_entries: IntoIter<ColumnLeafEntry>,
+    cold_entries: IntoIter<Arc<ColdBlockScanDescriptor>>,
     hot_pages: IntoIter<RowPageDescriptor>,
 }
 
@@ -91,7 +91,7 @@ where
         if self.next == self.end {
             return None;
         }
-        let unit = self.units.as_ref()[self.next];
+        let unit = self.units.as_ref()[self.next].clone();
         self.next += 1;
         Some(unit)
     }
@@ -125,8 +125,6 @@ pub(crate) enum TableScanCursorAdvance {
 /// Shared bounded physical cursor for cold and hot MVCC table-scan rows.
 pub(crate) struct TableScanCursor<C> {
     units: C,
-    column_root: BlockID,
-    pivot_row_id: RowID,
     current: TableScanUnitState,
     row_buffer: LazyRowBuffer,
 }
@@ -137,16 +135,9 @@ where
 {
     /// Create a cursor over one captured root and ordered unit source.
     #[inline]
-    pub(crate) fn new(
-        units: C,
-        column_root: BlockID,
-        pivot_row_id: RowID,
-        column_count: usize,
-    ) -> Self {
+    pub(crate) fn new(units: C, column_count: usize) -> Self {
         Self {
             units,
-            column_root,
-            pivot_row_id,
             current: TableScanUnitState::Idle,
             row_buffer: LazyRowBuffer::new(column_count),
         }
@@ -160,20 +151,20 @@ where
         layout: &TableRuntimeLayout,
     ) -> RuntimeResult<()> {
         let unit = match &self.current {
-            TableScanUnitState::Pending(unit) => *unit,
+            TableScanUnitState::Pending(unit) => unit.clone(),
             _ => panic!("table scan cursor load requires a persistent pending descriptor"),
         };
         let accessor = table.accessor_with_layout(layout);
-        let loaded = match unit {
-            TableScanUnit::Cold(entry) => TableScanUnitState::Cold {
+        let loaded = match &unit {
+            TableScanUnit::Cold(descriptor) => TableScanUnitState::Cold {
                 page: accessor
-                    .load_table_scan_cold_page(runtime, self.column_root, self.pivot_row_id, &entry)
+                    .load_table_scan_cold_page(runtime, descriptor)
                     .await?,
                 next_row: 0,
             },
             TableScanUnit::Hot(descriptor) => TableScanUnitState::Hot {
                 page_guard: accessor
-                    .load_table_scan_hot_page(runtime, descriptor)
+                    .load_table_scan_hot_page(runtime, *descriptor)
                     .await?,
                 next_row: 0,
             },
@@ -181,7 +172,7 @@ where
         assert!(
             matches!(
                 &self.current,
-                TableScanUnitState::Pending(pending) if *pending == unit
+                TableScanUnitState::Pending(pending) if pending == &unit
             ),
             "table scan cursor pending descriptor changed while its load completed"
         );
@@ -218,12 +209,9 @@ where
                     while *next_row < page.row_count() {
                         let row_idx = *next_row;
                         *next_row += 1;
-                        let Some(lazy_row) = accessor.table_scan_cold_row(
-                            read_view,
-                            page,
-                            row_idx,
-                            &mut self.row_buffer,
-                        ) else {
+                        let Some(lazy_row) =
+                            accessor.table_scan_cold_row(page, row_idx, &mut self.row_buffer)
+                        else {
                             continue;
                         };
                         if let Some(advance) = apply_row(scan_row, projection, lazy_row)? {
