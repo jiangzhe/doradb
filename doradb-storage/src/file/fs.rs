@@ -4,7 +4,6 @@ use crate::buffer::{
     EvictReadSubmission, EvictSubmission, EvictableBufferPool, EvictablePoolStateMachine,
     PoolGuard, PoolRequest, PoolRole, ReadSubmission, ReadonlyBufferPool,
 };
-use crate::catalog::is_user_table;
 use crate::catalog::table::TableMetadata;
 use crate::component::{Component, ComponentRegistry, ShelfScope, Supplier};
 use crate::conf::ValidatedFileSystemConfig;
@@ -1892,7 +1891,7 @@ impl FileSystem {
     /// Delete one deterministic user-table file.
     #[inline]
     pub(crate) fn delete_user_table_file(&self, table_id: TableID) -> IoResult<()> {
-        debug_assert!(is_user_table(table_id));
+        debug_assert!(table_id.is_user());
         match fs::remove_file(self.data_dir.join(user_table_file_name(table_id))) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == IoErrorKind::NotFound => Ok(()),
@@ -1954,7 +1953,7 @@ impl FileSystem {
             let Some(table_id) = parse_user_table_file_name(&entry.file_name()) else {
                 continue;
             };
-            if !is_user_table(table_id) {
+            if !table_id.is_user() {
                 continue;
             }
             if recovered_user_table_ids.contains(&table_id)
@@ -2136,7 +2135,7 @@ fn path_to_string(path: &Path, field: &str) -> String {
 
 #[inline]
 fn user_table_file_name(table_id: TableID) -> String {
-    debug_assert!(is_user_table(table_id));
+    debug_assert!(table_id.is_user());
     format!("{table_id:016x}.tbl")
 }
 
@@ -2148,7 +2147,7 @@ fn parse_user_table_file_name(file_name: &OsStr) -> Option<TableID> {
         return None;
     }
     let table_id = TableID::from_str_radix(table_id_hex, 16).ok()?;
-    is_user_table(table_id).then_some(table_id)
+    table_id.is_user().then_some(table_id)
 }
 
 #[cfg(test)]

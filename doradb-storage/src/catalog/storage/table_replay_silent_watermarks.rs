@@ -236,9 +236,10 @@ fn val_u64(vals: &[Val], idx: usize, name: &'static str) -> DataIntegrityResult<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::catalog_key_from_active_ordinal;
     use crate::catalog::tests::open_catalog_test_engine;
     use crate::log::redo::{DDLRedo, RowRedoKind};
-    use crate::row::ops::{SelectKey, UpdateCol};
+    use crate::row::ops::UpdateCol;
     use crate::session::tests::SessionTestExt;
     use tempfile::TempDir;
 
@@ -305,7 +306,7 @@ mod tests {
             assert!(matches!(
                 &update_redo.kind,
                 RowRedoKind::UpdateByPrimaryKey(key, cols)
-                    if key == &SelectKey::new(0, vec![Val::from(table_id)])
+                    if key == &catalog_key_from_active_ordinal(0, vec![Val::from(table_id)])
                         && cols == &vec![UpdateCol {
                             idx: COL_NO_TABLE_REPLAY_SILENT_WATERMARKS_DELETION_CUTOFF_TS,
                             val: Val::from(13u64),

@@ -1,5 +1,5 @@
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
-use crate::catalog::TableMetadata;
+use crate::catalog::{CatalogSelectKey, TableMetadata, catalog_key_from_active_ordinal};
 use crate::error::{FatalResult, OperationError, OperationOrFatalResult};
 use crate::id::{RowID, TableID};
 use crate::log::redo::{RowRedo, RowRedoKind};
@@ -11,7 +11,7 @@ use crate::row::{RowPage, RowRead, var_len_for_insert};
 use crate::trx::TrxRuntime;
 use crate::trx::row::{BoundIndexCandidate, LockRowForWrite, LockUndo, RowWriteAccess};
 use crate::trx::stmt::StmtEffects;
-use crate::trx::undo::{IndexBranch, IndexBranchTarget, RowUndoKind};
+use crate::trx::undo::{IndexBranch, IndexBranchDomain, IndexBranchTarget, RowUndoKind};
 use crate::trx::ver_map::RowPageState;
 use crate::value::Val;
 use error_stack::Report;
@@ -122,18 +122,7 @@ impl<'m, 'r> RowInserter<'m, 'r> {
         debug_assert!(new_row_id == row_id);
         effects.update_last_row_undo(undo_kind);
         for branch in index_branches {
-            match branch.target {
-                IndexBranchTarget::Hot { cts, entry } => {
-                    access.link_for_unique_index(branch.key, cts, entry, branch.undo_vals);
-                }
-                IndexBranchTarget::ColdTerminal { delete_cts } => {
-                    access.link_for_unique_index_cold_terminal(
-                        branch.key,
-                        delete_cts,
-                        branch.undo_vals,
-                    );
-                }
-            }
+            access.link_index_branch(branch);
         }
         drop(access);
 
@@ -367,7 +356,10 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
         log_by_key: bool,
     ) -> OperationOrFatalResult<DeleteInternal> {
         let redo_kind = if log_by_key {
-            RowRedoKind::DeleteByPrimaryKey(SelectKey::new(index_no, key_vals.to_vec()))
+            RowRedoKind::DeleteByPrimaryKey(catalog_key_from_active_ordinal(
+                index_no,
+                key_vals.to_vec(),
+            ))
         } else {
             RowRedoKind::Delete(Some(self.page_guard.page_id()))
         };
@@ -468,7 +460,8 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
         update: RowUpdateInput,
         log_by_key: bool,
     ) -> OperationOrFatalResult<UpdateRowInplace> {
-        let redo_key = log_by_key.then(|| SelectKey::new(index_no, key_vals.to_vec()));
+        let redo_key =
+            log_by_key.then(|| catalog_key_from_active_ordinal(index_no, key_vals.to_vec()));
         self.update_known_row_inner(effects, update, Some((index_no, key_vals)), redo_key)
             .await
     }
@@ -501,7 +494,7 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
         effects: &mut StmtEffects,
         update: RowUpdateInput,
         lookup_key: Option<(usize, &[Val])>,
-        redo_key: Option<SelectKey>,
+        redo_key: Option<CatalogSelectKey>,
     ) -> OperationOrFatalResult<UpdateRowInplace> {
         let page_guard = self.page_guard;
         let row_id = self.row_id;
@@ -541,7 +534,7 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
         &self,
         effects: &mut StmtEffects,
         update: RowUpdateInput,
-        redo_key: Option<SelectKey>,
+        redo_key: Option<CatalogSelectKey>,
         mut access: RowWriteAccess<'g>,
     ) -> UpdateRowInplace {
         let row_id = self.row_id;
@@ -609,7 +602,7 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
 
     /// Prepare a replacement row and runtime branches for a hot-row move update.
     #[inline]
-    pub(super) fn prepare_move_update(
+    pub(super) fn prepare_move_update<D: IndexBranchDomain>(
         &self,
         old_row: Vec<Val>,
         update: RowUpdateInput,
@@ -671,9 +664,9 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
                         .iter()
                         .map(|key| new_row[key.col_no as usize].clone())
                         .collect();
-                    IndexBranch {
-                        key: SelectKey::new(index_no, vals),
-                        target: IndexBranchTarget::Hot {
+                    D::branch(
+                        SelectKey::new(index_no, vals),
+                        IndexBranchTarget::Hot {
                             cts: undo_head.ts(),
                             entry: old_entry.clone(),
                         },
@@ -681,8 +674,8 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
                         // unique index. Multiple unique indexes are rare, and this
                         // moved-row path is cold, so keep the simpler Vec ownership
                         // until profiling justifies sharing it with Arc<[UpdateCol]>.
-                        undo_vals: undo_vals.clone(),
-                    }
+                        undo_vals.clone(),
+                    )
                 })
                 .collect::<Vec<_>>()
         };

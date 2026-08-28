@@ -287,11 +287,11 @@ impl<'a> RowReadAccess<'a> {
                             // owner to an older owner that may have a different
                             // RowID. Apply the delta from the current row image
                             // to that older owner before checking its target.
-                            ver.undo_update(&ib.undo_vals);
+                            ver.undo_update(ib.undo_vals());
                             // Index branch only contains non-deleted version.
                             // So delete flag is not used.
                             debug_assert!(!ver.deleted);
-                            match &ib.target {
+                            match ib.target() {
                                 IndexBranchTarget::Hot {
                                     cts,
                                     entry: hot_entry,
@@ -539,9 +539,9 @@ impl<'a> RowReadAccess<'a> {
                         if let Some(ib) =
                             next.indexes.iter().find(|ib| candidate.matches_branch(ib))
                         {
-                            ver.undo_update(&ib.undo_vals);
+                            ver.undo_update(ib.undo_vals());
                             debug_assert!(!ver.deleted);
-                            match &ib.target {
+                            match ib.target() {
                                 IndexBranchTarget::Hot {
                                     cts,
                                     entry: hot_entry,
@@ -909,7 +909,8 @@ impl<'a> BoundIndexCandidate<'a> {
 
     #[inline]
     fn matches_branch(&self, branch: &IndexBranch) -> bool {
-        self.unique && branch.key.index_no == self.index_no && self.matches_key(&branch.key.vals)
+        let (index_no, key_vals) = branch.key_parts();
+        self.unique && index_no == self.index_no && self.matches_key(key_vals)
     }
 }
 
@@ -1370,7 +1371,7 @@ impl<'a> RowWriteAccess<'a> {
 
     /// Link this row's unique-key branch to an older hot owner.
     #[inline]
-    pub(crate) fn link_for_unique_index(
+    pub(crate) fn link_catalog_for_unique_index(
         &mut self,
         key: SelectKey,
         cts: TrxID,
@@ -1382,16 +1383,33 @@ impl<'a> RowWriteAccess<'a> {
         // mapping can still reach snapshots where `entry` was the visible
         // same-key owner.
         let undo_head = self.guard.as_mut().expect("undo head");
-        undo_head.next.indexes.push(IndexBranch {
+        undo_head.next.indexes.push(IndexBranch::catalog(
             key,
-            target: IndexBranchTarget::Hot { cts, entry },
+            IndexBranchTarget::Hot { cts, entry },
             undo_vals,
-        })
+        ));
+    }
+
+    /// Link this row's unique user-index branch to an older hot owner.
+    #[inline]
+    pub(crate) fn link_user_for_unique_index(
+        &mut self,
+        key: SelectKey,
+        cts: TrxID,
+        entry: RowUndoRef,
+        undo_vals: Vec<UpdateCol>,
+    ) {
+        let undo_head = self.guard.as_mut().expect("undo head");
+        undo_head.next.indexes.push(IndexBranch::user(
+            key,
+            IndexBranchTarget::Hot { cts, entry },
+            undo_vals,
+        ));
     }
 
     /// Link this row's unique-key branch to an older cold terminal image.
     #[inline]
-    pub(crate) fn link_for_unique_index_cold_terminal(
+    pub(crate) fn link_user_for_unique_index_cold_terminal(
         &mut self,
         key: SelectKey,
         delete_cts: Option<TrxID>,
@@ -1402,11 +1420,18 @@ impl<'a> RowWriteAccess<'a> {
         // no RowUndoRef continuation because cold rows do not have row-page
         // undo chains after checkpoint.
         let undo_head = self.guard.as_mut().expect("undo head");
-        undo_head.next.indexes.push(IndexBranch {
+        undo_head.next.indexes.push(IndexBranch::user(
             key,
-            target: IndexBranchTarget::ColdTerminal { delete_cts },
+            IndexBranchTarget::ColdTerminal { delete_cts },
             undo_vals,
-        })
+        ));
+    }
+
+    /// Attach one already-qualified branch prepared by shared hot-row code.
+    #[inline]
+    pub(crate) fn link_index_branch(&mut self, branch: IndexBranch) {
+        let undo_head = self.guard.as_mut().expect("undo head");
+        undo_head.next.indexes.push(branch);
     }
 
     /// Purge undo chain according to minimum active STS.
@@ -1452,7 +1477,6 @@ impl<'a> RowWriteAccess<'a> {
                     while idx > 0 {
                         idx -= 1;
                         if next.indexes[idx]
-                            .target
                             .purge_cts()
                             .is_some_and(|cts| cts < min_active_sts)
                         {

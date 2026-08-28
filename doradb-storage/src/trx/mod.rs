@@ -46,7 +46,7 @@ pub(crate) use sys_trx::{RetiredRowPageBatch, SysTrxPayload};
 
 use crate::buffer::PoolGuards;
 use crate::buffer::page::VersionedPageID;
-use crate::catalog::{CatalogTable, TableCache, is_catalog_table};
+use crate::catalog::{CatalogTable, TableCache};
 use crate::completion::Completion;
 use crate::engine::EngineCore;
 use crate::error::{
@@ -1120,11 +1120,7 @@ impl TrxEffects {
     #[inline]
     fn debug_assert_redo_invariants(&self) {
         debug_assert!(
-            !self
-                .redo
-                .dml
-                .keys()
-                .any(|table_id| is_catalog_table(*table_id))
+            !self.redo.dml.keys().any(|table_id| table_id.is_catalog())
                 || is_catalog_metadata_ddl(self.redo.ddl.as_deref()),
             "catalog table DML must be logged by a catalog metadata DDL transaction"
         );
@@ -3616,7 +3612,7 @@ pub(crate) mod tests {
     use crate::buffer::test_frame_kind;
     use crate::catalog::storage::tables::TABLE_ID_TABLES;
     use crate::catalog::tests as catalog_tests;
-    use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
+    use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata, user_key_from_active_slot};
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{InternalError, OperationError};
@@ -5393,10 +5389,10 @@ pub(crate) mod tests {
                     RowID::new(22),
                     RowUndoKind::Delete,
                 ));
-                inner.index_undo_mut().push(IndexUndo {
+                inner.index_undo_mut().push_user(IndexUndo {
                     table_id: TableID::new(11),
                     row_id: RowID::new(22),
-                    kind: IndexUndoKind::DeferDelete(SelectKey::new(0, vec![]), true),
+                    kind: IndexUndoKind::DeferDelete(user_key_from_active_slot(0, vec![]), true),
                 });
             })
             .unwrap();
@@ -5433,10 +5429,10 @@ pub(crate) mod tests {
             let (_temp_dir, engine) = test_engine("redo_trx_precommit_index_undo").await;
             let (_session, mut trx) = begin_production_test_transaction(&engine);
             with_transaction_inner_mut(&mut trx, "test_precommit_index_undo", |inner| {
-                inner.index_undo_mut().push(IndexUndo {
+                inner.index_undo_mut().push_user(IndexUndo {
                     table_id: TableID::new(11),
                     row_id: RowID::new(22),
-                    kind: IndexUndoKind::DeferDelete(SelectKey::new(0, vec![]), true),
+                    kind: IndexUndoKind::DeferDelete(user_key_from_active_slot(0, vec![]), true),
                 });
             })
             .unwrap();
@@ -5453,8 +5449,11 @@ pub(crate) mod tests {
             let committed = precommit.commit();
             let index_gc = committed.index_gc().unwrap();
             assert_eq!(index_gc.len(), 1);
-            assert_eq!(index_gc[0].table_id, TableID::new(11));
-            assert_eq!(index_gc[0].row_id, RowID::new(22));
+            let IndexPurgeEntry::User(index_gc) = &index_gc[0] else {
+                panic!("user transaction must produce user index purge work");
+            };
+            assert_eq!(index_gc.table_id, TableID::new(11));
+            assert_eq!(index_gc.row_id, RowID::new(22));
             finish_production_committed_for_test(&engine, committed);
         });
     }
@@ -5723,10 +5722,10 @@ pub(crate) mod tests {
                     RowID::new(23),
                     RowUndoKind::Delete,
                 ));
-                effects.push_delete_index_undo(
+                effects.push_user_delete_index_undo(
                     TableID::new(12),
                     RowID::new(23),
-                    SelectKey::new(0, vec![]),
+                    user_key_from_active_slot(0, vec![]),
                     true,
                 );
                 effects.insert_row_redo(
@@ -7145,10 +7144,10 @@ pub(crate) mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             with_transaction_inner_mut(&mut trx, "test_index_undo_predicate", |inner| {
-                inner.index_undo_mut().push(IndexUndo {
+                inner.index_undo_mut().push_user(IndexUndo {
                     table_id: TableID::new(47),
                     row_id: RowID::new(1),
-                    kind: IndexUndoKind::DeferDelete(SelectKey::new(0, vec![]), true),
+                    kind: IndexUndoKind::DeferDelete(user_key_from_active_slot(0, vec![]), true),
                 });
             })
             .unwrap();

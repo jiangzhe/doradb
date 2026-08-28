@@ -1,8 +1,8 @@
 use super::{RowRecord, validate_catalog_row};
-use crate::catalog::table::TableMetadata;
+use crate::catalog::{CatalogSelectKey, table::TableMetadata};
 use crate::error::{DataIntegrityError, DataIntegrityResult};
 use crate::index::{BTreeKey, BTreeKeyEncoder};
-use crate::row::ops::{SelectKey, UpdateCol};
+use crate::row::ops::UpdateCol;
 use crate::value::{Val, ValType};
 use error_stack::Report;
 use std::collections::{BTreeMap, btree_map::Entry};
@@ -135,14 +135,14 @@ impl CatalogFoldedRows {
     pub(super) fn fold_update(
         &mut self,
         metadata: &TableMetadata,
-        key: &SelectKey,
+        key: &CatalogSelectKey,
         update: &[UpdateCol],
     ) -> DataIntegrityResult<()> {
         let merge_key = self.key_builder.key_from_select_key(key, "update")?;
         let Some(entry) = self.rows.get_mut(&merge_key) else {
             return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                 "catalog checkpoint update-by-primary-key target missing: index_no={}, key_vals={:?}",
-                key.index_no, key.vals
+                key.index.as_usize(), key.vals
             )));
         };
         match entry {
@@ -177,13 +177,13 @@ impl CatalogFoldedRows {
         Ok(())
     }
 
-    pub(super) fn fold_delete(&mut self, key: &SelectKey) -> DataIntegrityResult<()> {
+    pub(super) fn fold_delete(&mut self, key: &CatalogSelectKey) -> DataIntegrityResult<()> {
         let merge_key = self.key_builder.key_from_select_key(key, "delete")?;
         match self.rows.entry(merge_key) {
             Entry::Vacant(_) => {
                 return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                     "catalog checkpoint delete-by-primary-key target missing: index_no={}, key_vals={:?}",
-                    key.index_no, key.vals
+                    key.index.as_usize(), key.vals
                 )));
             }
             Entry::Occupied(mut entry) => match entry.get() {
@@ -282,7 +282,7 @@ impl CatalogMergeKeyBuilder {
     #[inline]
     fn key_from_select_key(
         &self,
-        key: &SelectKey,
+        key: &CatalogSelectKey,
         operation: &'static str,
     ) -> DataIntegrityResult<BTreeKey> {
         self.validate_select_key(key, operation)?;
@@ -306,13 +306,13 @@ impl CatalogMergeKeyBuilder {
     #[inline]
     fn validate_select_key(
         &self,
-        key: &SelectKey,
+        key: &CatalogSelectKey,
         operation: &'static str,
     ) -> DataIntegrityResult<()> {
-        if key.index_no != self.index_no {
+        if key.index.as_usize() != self.index_no {
             return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                 "catalog checkpoint {operation} key is not primary key: index_no={}, primary_key_index_no={}",
-                key.index_no, self.index_no
+                key.index.as_usize(), self.index_no
             )));
         }
         if key.vals.len() != self.col_idxs.len() {
@@ -331,7 +331,7 @@ impl CatalogMergeKeyBuilder {
             return Err(
                 Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                     "catalog checkpoint {operation} key type mismatch: index_no={}",
-                    key.index_no
+                    key.index.as_usize()
                 )),
             );
         }
@@ -380,7 +380,7 @@ fn catalog_val_type_match(ty: ValType, val: &Val) -> bool {
 fn apply_catalog_update_by_primary_key(
     metadata: &TableMetadata,
     key_builder: &CatalogMergeKeyBuilder,
-    key: &SelectKey,
+    key: &CatalogSelectKey,
     row: &mut [Val],
     update: &[UpdateCol],
 ) -> DataIntegrityResult<()> {
@@ -432,7 +432,7 @@ fn apply_catalog_update_by_primary_key(
     if !key_builder.row_matches_key(row, &key.vals) {
         return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
             "catalog checkpoint update-by-primary-key changed stable key: index_no={}, key_vals={:?}",
-            key.index_no, key.vals
+            key.index.as_usize(), key.vals
         )));
     }
     Ok(())
@@ -444,6 +444,7 @@ mod tests {
     use super::super::tables::catalog_definition_of_tables;
     use super::*;
     use crate::catalog::USER_TABLE_ID_START;
+    use crate::catalog::catalog_key_from_active_ordinal;
     use crate::error::DataIntegrityError;
     use crate::id::{RowID, TableID};
     use crate::value::ValKind;
@@ -495,7 +496,10 @@ mod tests {
             .key_from_row(&catalog_table_vals(tables_table_id, 0))
             .unwrap();
         let tables_select_key = tables_key_builder
-            .key_from_select_key(&SelectKey::new(0, vec![Val::from(tables_table_id)]), "test")
+            .key_from_select_key(
+                &catalog_key_from_active_ordinal(0, vec![Val::from(tables_table_id)]),
+                "test",
+            )
             .unwrap();
         assert_eq!(tables_key, tables_select_key);
 
@@ -507,7 +511,10 @@ mod tests {
         let columns_key = columns_key_builder.key_from_row(&columns_vals).unwrap();
         let columns_select_key = columns_key_builder
             .key_from_select_key(
-                &SelectKey::new(0, vec![Val::from(columns_table_id), Val::from(columns_no)]),
+                &catalog_key_from_active_ordinal(
+                    0,
+                    vec![Val::from(columns_table_id), Val::from(columns_no)],
+                ),
                 "test",
             )
             .unwrap();
@@ -519,8 +526,8 @@ mod tests {
         let metadata = &catalog_definition_of_tables().metadata;
         let base_table_id = USER_TABLE_ID_START + 1;
         let new_table_id = USER_TABLE_ID_START + 2;
-        let base_key = SelectKey::new(0, vec![Val::from(base_table_id)]);
-        let new_key = SelectKey::new(0, vec![Val::from(new_table_id)]);
+        let base_key = catalog_key_from_active_ordinal(0, vec![Val::from(base_table_id)]);
+        let new_key = catalog_key_from_active_ordinal(0, vec![Val::from(new_table_id)]);
 
         let mut folded = folded_tables_with_base(Vec::new());
         folded
@@ -599,8 +606,8 @@ mod tests {
         let metadata = &catalog_definition_of_tables().metadata;
         let base_table_id = USER_TABLE_ID_START + 31;
         let new_table_id = USER_TABLE_ID_START + 32;
-        let base_key = SelectKey::new(0, vec![Val::from(base_table_id)]);
-        let new_key = SelectKey::new(0, vec![Val::from(new_table_id)]);
+        let base_key = catalog_key_from_active_ordinal(0, vec![Val::from(base_table_id)]);
+        let new_key = catalog_key_from_active_ordinal(0, vec![Val::from(new_table_id)]);
 
         let mut folded = folded_tables_with_base(vec![(base_table_id, 0)]);
         folded
@@ -632,8 +639,8 @@ mod tests {
         let metadata = &catalog_definition_of_tables().metadata;
         let base_table_id = USER_TABLE_ID_START + 11;
         let new_table_id = USER_TABLE_ID_START + 12;
-        let base_key = SelectKey::new(0, vec![Val::from(base_table_id)]);
-        let new_key = SelectKey::new(0, vec![Val::from(new_table_id)]);
+        let base_key = catalog_key_from_active_ordinal(0, vec![Val::from(base_table_id)]);
+        let new_key = catalog_key_from_active_ordinal(0, vec![Val::from(new_table_id)]);
 
         let mut folded = folded_tables_with_base(vec![(base_table_id, 0)]);
         assert!(

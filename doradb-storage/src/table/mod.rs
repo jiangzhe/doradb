@@ -4,6 +4,7 @@ mod deletion_buffer;
 mod dml_validator;
 mod gc;
 mod hot;
+mod index_mutate;
 mod layout;
 mod lifecycle;
 mod mem_table;
@@ -72,6 +73,42 @@ use parking_lot::Mutex;
 use std::marker::PhantomData;
 use std::mem::take;
 use std::sync::Arc;
+
+/// Logical table kind encoded in a [`TableID`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TableKind {
+    /// User-managed table.
+    User,
+    /// Built-in catalog table.
+    Catalog,
+}
+
+impl TableID {
+    /// First table identifier reserved for built-in catalog tables.
+    pub(crate) const CATALOG_START: Self = Self::new(1u64 << 63);
+
+    /// Returns the logical kind encoded in this table identifier.
+    #[inline]
+    pub(crate) const fn kind(self) -> TableKind {
+        if self.as_u64() < Self::CATALOG_START.as_u64() {
+            TableKind::User
+        } else {
+            TableKind::Catalog
+        }
+    }
+
+    /// Returns whether this identifier belongs to a user-managed table.
+    #[inline]
+    pub(crate) const fn is_user(self) -> bool {
+        matches!(self.kind(), TableKind::User)
+    }
+
+    /// Returns whether this identifier belongs to a built-in catalog table.
+    #[inline]
+    pub(crate) const fn is_catalog(self) -> bool {
+        matches!(self.kind(), TableKind::Catalog)
+    }
+}
 
 /// Copied replay floor fields from one user-table active root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1214,7 +1251,7 @@ pub(crate) mod tests {
         DeleteInternal, HotRowMutator, InsertRowIntoPage, RowInserter, UpdateRowInplace,
     };
     use crate::table::{
-        DeleteMarker, DmlValidationError, FreezeOutcome, FrozenPageBatchInfo, Table,
+        DeleteMarker, DmlValidationError, FreezeOutcome, FrozenPageBatchInfo, Table, TableKind,
         TableRuntimeLayout,
     };
     use crate::trx::stmt::StmtEffects;
@@ -3354,5 +3391,23 @@ pub(crate) mod tests {
             assert_invalid_dml_input(err);
             trx.rollback().await.unwrap();
         });
+    }
+
+    #[test]
+    fn test_table_id_kind() {
+        let last_user = TableID::new(TableID::CATALOG_START.as_u64() - 1);
+
+        assert_eq!(TableID::new(0).kind(), TableKind::User);
+        assert!(TableID::new(0).is_user());
+        assert!(!TableID::new(0).is_catalog());
+        assert_eq!(last_user.kind(), TableKind::User);
+        assert!(last_user.is_user());
+        assert!(!last_user.is_catalog());
+        assert_eq!(TableID::CATALOG_START.kind(), TableKind::Catalog);
+        assert!(!TableID::CATALOG_START.is_user());
+        assert!(TableID::CATALOG_START.is_catalog());
+        assert_eq!(TableID::new(u64::MAX).kind(), TableKind::Catalog);
+        assert!(!TableID::new(u64::MAX).is_user());
+        assert!(TableID::new(u64::MAX).is_catalog());
     }
 }

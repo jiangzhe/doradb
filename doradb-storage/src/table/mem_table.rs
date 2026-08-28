@@ -1,5 +1,5 @@
 use super::{
-    DmlValidator, UpdateUniqueMvcc,
+    DmlValidator, TableKind, UpdateUniqueMvcc,
     hot::{DeleteInternal, HotRowMutator, InsertRowIntoPage, RowInserter, UpdateRowInplace},
     index_key_is_changed, index_key_replace, read_latest_index_key,
     read_physical_index_keys_for_delete, row_len, unique_key_from_full_row,
@@ -10,7 +10,10 @@ use crate::buffer::page::VersionedPageID;
 use crate::buffer::{
     BufferPool, PoolGuard, PoolGuards, PoolRole, RowPoolRole, get_page_versioned_shared,
 };
-use crate::catalog::{IndexSpec, PrimaryKeyMatchError, TableColumnLayout, TableMetadata};
+use crate::catalog::{
+    CatalogSelectKey, IndexSpec, PrimaryKeyMatchError, TableColumnLayout, TableMetadata,
+    catalog_key_from_active_ordinal, user_key_from_active_slot,
+};
 use crate::error::{
     DataIntegrityError, InternalError, InternalResult, MultiDomainResultExt, OperationError,
     OperationOrRuntimeError, OperationOrRuntimeResult, QuadResult, RecoveryDuplicateKey,
@@ -34,7 +37,10 @@ use crate::row::ops::{
 use crate::row::{Row, RowPage, RowRead, estimate_max_row_count, var_len_for_insert};
 use crate::trx::row::FindOldVersion;
 use crate::trx::stmt::StmtEffects;
-use crate::trx::undo::{IndexBranch, OwnedRowUndo, RowUndoKind, RowUndoRollbackAttempt};
+use crate::trx::undo::{
+    CatalogIndexBranchDomain, IndexBranch, OwnedRowUndo, RowUndoKind, RowUndoRollbackAttempt,
+    UserIndexBranchDomain,
+};
 use crate::trx::ver_map::RowPageState;
 use crate::trx::{MIN_SNAPSHOT_TS, RetiredRowPageBatch, TrxRuntime};
 use crate::value::Val;
@@ -58,7 +64,7 @@ pub(crate) enum NoTrxUpsertChange {
     /// An existing logical row was updated with its stable runtime row identity.
     Updated {
         row_id: RowID,
-        key: SelectKey,
+        key: CatalogSelectKey,
         cols: Vec<UpdateCol>,
     },
 }
@@ -895,7 +901,20 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         merge_old_deleted: bool,
     ) {
         self.debug_assert_table_write_lock_held(rt);
-        effects.push_insert_unique_index_undo(self.table_id(), row_id, key, merge_old_deleted);
+        match self.table_id().kind() {
+            TableKind::Catalog => effects.push_catalog_insert_unique_index_undo(
+                self.table_id(),
+                row_id,
+                catalog_key_from_active_ordinal(key.index_no, key.vals),
+                merge_old_deleted,
+            ),
+            TableKind::User => effects.push_user_insert_unique_index_undo(
+                self.table_id(),
+                row_id,
+                user_key_from_active_slot(key.index_no, key.vals),
+                merge_old_deleted,
+            ),
+        }
     }
 
     #[inline]
@@ -908,7 +927,22 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         merge_old_deleted: bool,
     ) {
         self.debug_assert_table_write_lock_held(rt);
-        effects.push_insert_non_unique_index_undo(self.table_id(), row_id, key, merge_old_deleted);
+        match self.table_id().kind() {
+            TableKind::Catalog => {
+                effects.push_catalog_insert_non_unique_index_undo(
+                    self.table_id(),
+                    row_id,
+                    catalog_key_from_active_ordinal(key.index_no, key.vals),
+                    merge_old_deleted,
+                );
+            }
+            TableKind::User => effects.push_user_insert_non_unique_index_undo(
+                self.table_id(),
+                row_id,
+                user_key_from_active_slot(key.index_no, key.vals),
+                merge_old_deleted,
+            ),
+        }
     }
 
     #[inline]
@@ -921,7 +955,20 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         unique: bool,
     ) {
         self.debug_assert_table_write_lock_held(rt);
-        effects.push_delete_index_undo(self.table_id(), row_id, key, unique);
+        match self.table_id().kind() {
+            TableKind::Catalog => effects.push_catalog_delete_index_undo(
+                self.table_id(),
+                row_id,
+                catalog_key_from_active_ordinal(key.index_no, key.vals),
+                unique,
+            ),
+            TableKind::User => effects.push_user_delete_index_undo(
+                self.table_id(),
+                row_id,
+                user_key_from_active_slot(key.index_no, key.vals),
+                unique,
+            ),
+        }
     }
 
     #[inline]
@@ -935,13 +982,22 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         old_deleted: bool,
     ) {
         self.debug_assert_table_write_lock_held(rt);
-        effects.push_update_unique_index_undo(
-            self.table_id(),
-            old_row_id,
-            new_row_id,
-            key,
-            old_deleted,
-        );
+        match self.table_id().kind() {
+            TableKind::Catalog => effects.push_catalog_update_unique_index_undo(
+                self.table_id(),
+                old_row_id,
+                new_row_id,
+                catalog_key_from_active_ordinal(key.index_no, key.vals),
+                old_deleted,
+            ),
+            TableKind::User => effects.push_user_update_unique_index_undo(
+                self.table_id(),
+                old_row_id,
+                new_row_id,
+                user_key_from_active_slot(key.index_no, key.vals),
+                old_deleted,
+            ),
+        }
     }
 
     #[inline]
@@ -1164,12 +1220,20 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             FindOldVersion::Found(old_row, cts, old_entry) => {
                 let mut new_access = new_guard.write_row_by_id(new_id);
                 let undo_vals = new_access.row().calc_delta(metadata.col.as_ref(), &old_row);
-                new_access.link_for_unique_index(
-                    SelectKey::new(index_no, key_vals.to_vec()),
-                    cts,
-                    old_entry,
-                    undo_vals,
-                );
+                match self.table_id().kind() {
+                    TableKind::Catalog => new_access.link_catalog_for_unique_index(
+                        SelectKey::new(index_no, key_vals.to_vec()),
+                        cts,
+                        old_entry,
+                        undo_vals,
+                    ),
+                    TableKind::User => new_access.link_user_for_unique_index(
+                        SelectKey::new(index_no, key_vals.to_vec()),
+                        cts,
+                        old_entry,
+                        undo_vals,
+                    ),
+                }
                 Ok(LinkForUniqueIndex::Linked)
             }
         }
@@ -1748,7 +1812,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             .await?;
         on_change(NoTrxUpsertChange::Updated {
             row_id,
-            key,
+            key: catalog_key_from_active_ordinal(key.index_no, key.vals),
             cols: update,
         });
         Ok(())
@@ -2332,8 +2396,15 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         old_id: RowID,
         old_guard: PageSharedGuard<RowPage>,
     ) -> RuntimeResult<(RowID, FastHashMap<usize, Val>, PageSharedGuard<RowPage>)> {
-        let prepared = HotRowMutator::new(self.table_id(), self.metadata(), rt, &old_guard, old_id)
-            .prepare_move_update(old_row, update);
+        let mutator = HotRowMutator::new(self.table_id(), self.metadata(), rt, &old_guard, old_id);
+        let prepared = match self.table_id().kind() {
+            TableKind::Catalog => {
+                mutator.prepare_move_update::<CatalogIndexBranchDomain>(old_row, update)
+            }
+            TableKind::User => {
+                mutator.prepare_move_update::<UserIndexBranchDomain>(old_row, update)
+            }
+        };
         // Release the old row page before awaiting replacement-row insertion.
         drop(old_guard);
         let (new_row_id, new_guard) = self
@@ -3299,6 +3370,7 @@ mod tests {
     use crate::buffer::page::VersionedPageID;
     use crate::buffer::{BufferPool, EvictableBufferPool};
     use crate::buffer::{PoolGuards, PoolRole};
+    use crate::catalog::catalog_key_from_active_ordinal;
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
     };
@@ -3729,7 +3801,10 @@ mod tests {
             match updated.unwrap() {
                 NoTrxUpsertChange::Updated { row_id, key, cols } => {
                     assert_eq!(row_id, insert_row_id);
-                    assert_eq!(key, single_key(1i32));
+                    assert_eq!(
+                        key,
+                        catalog_key_from_active_ordinal(0, vec![Val::from(1i32)])
+                    );
                     assert_eq!(
                         cols,
                         vec![UpdateCol {

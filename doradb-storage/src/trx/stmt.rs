@@ -1,7 +1,7 @@
 use crate::buffer::PoolGuards;
 use crate::id::{RowID, TableID, TrxID};
 
-use crate::catalog::{CatalogTable, TableCache};
+use crate::catalog::{CatalogSelectKey, CatalogTable, ResolvedUserIndexKey, TableCache};
 use crate::error::{
     DiscloseResultExt, FatalError, FatalResult, MultiDomainResultExt, OperationError,
     OperationOrFatalError, OperationOrFatalResult, OperationOrRuntimeError,
@@ -12,8 +12,8 @@ use crate::lock::{LockMode, LockResource};
 use crate::log::redo::{RedoLogs, RowRedo};
 use crate::obs;
 use crate::row::ops::{
-    DeleteMvcc, RowMutation, ScanMvcc, SelectKey, SelectMvcc, TableMutationOutcome, UpdateCol,
-    UpdateMvcc, UpsertMvcc,
+    DeleteMvcc, RowMutation, ScanMvcc, SelectMvcc, TableMutationOutcome, UpdateCol, UpdateMvcc,
+    UpsertMvcc,
 };
 use crate::session::TrxAttachment;
 use crate::table::{DmlValidator, LazyRow, Table, TableRuntimeLayout};
@@ -221,14 +221,14 @@ impl StmtEffects {
 
     /// Push an inserted unique-index claim into statement rollback state.
     #[inline]
-    pub(crate) fn push_insert_unique_index_undo(
+    pub(crate) fn push_catalog_insert_unique_index_undo(
         &mut self,
         table_id: TableID,
         row_id: RowID,
-        key: SelectKey,
+        key: CatalogSelectKey,
         merge_old_deleted: bool,
     ) {
-        self.push_index_undo(IndexUndo {
+        self.index_undo.push_catalog(IndexUndo {
             table_id,
             row_id,
             kind: IndexUndoKind::InsertUnique(key, merge_old_deleted),
@@ -237,14 +237,14 @@ impl StmtEffects {
 
     /// Push an inserted non-unique-index claim into statement rollback state.
     #[inline]
-    pub(crate) fn push_insert_non_unique_index_undo(
+    pub(crate) fn push_catalog_insert_non_unique_index_undo(
         &mut self,
         table_id: TableID,
         row_id: RowID,
-        key: SelectKey,
+        key: CatalogSelectKey,
         merge_old_deleted: bool,
     ) {
-        self.push_index_undo(IndexUndo {
+        self.index_undo.push_catalog(IndexUndo {
             table_id,
             row_id,
             kind: IndexUndoKind::InsertNonUnique(key, merge_old_deleted),
@@ -253,14 +253,14 @@ impl StmtEffects {
 
     /// Push a deferred index delete into statement rollback and GC state.
     #[inline]
-    pub(crate) fn push_delete_index_undo(
+    pub(crate) fn push_catalog_delete_index_undo(
         &mut self,
         table_id: TableID,
         row_id: RowID,
-        key: SelectKey,
+        key: CatalogSelectKey,
         unique: bool,
     ) {
-        self.push_index_undo(IndexUndo {
+        self.index_undo.push_catalog(IndexUndo {
             table_id,
             row_id,
             kind: IndexUndoKind::DeferDelete(key, unique),
@@ -269,15 +269,80 @@ impl StmtEffects {
 
     /// Push a unique-index update into statement rollback state.
     #[inline]
-    pub(crate) fn push_update_unique_index_undo(
+    pub(crate) fn push_catalog_update_unique_index_undo(
         &mut self,
         table_id: TableID,
         old_row_id: RowID,
         new_row_id: RowID,
-        key: SelectKey,
+        key: CatalogSelectKey,
         old_deleted: bool,
     ) {
-        self.push_index_undo(IndexUndo {
+        self.index_undo.push_catalog(IndexUndo {
+            table_id,
+            row_id: new_row_id,
+            kind: IndexUndoKind::UpdateUnique(key, old_row_id, old_deleted),
+        });
+    }
+
+    /// Push an inserted generation-qualified unique user-index claim.
+    #[inline]
+    pub(crate) fn push_user_insert_unique_index_undo(
+        &mut self,
+        table_id: TableID,
+        row_id: RowID,
+        key: ResolvedUserIndexKey,
+        merge_old_deleted: bool,
+    ) {
+        self.index_undo.push_user(IndexUndo {
+            table_id,
+            row_id,
+            kind: IndexUndoKind::InsertUnique(key, merge_old_deleted),
+        });
+    }
+
+    /// Push an inserted generation-qualified non-unique user-index claim.
+    #[inline]
+    pub(crate) fn push_user_insert_non_unique_index_undo(
+        &mut self,
+        table_id: TableID,
+        row_id: RowID,
+        key: ResolvedUserIndexKey,
+        merge_old_deleted: bool,
+    ) {
+        self.index_undo.push_user(IndexUndo {
+            table_id,
+            row_id,
+            kind: IndexUndoKind::InsertNonUnique(key, merge_old_deleted),
+        });
+    }
+
+    /// Push a generation-qualified deferred user-index delete.
+    #[inline]
+    pub(crate) fn push_user_delete_index_undo(
+        &mut self,
+        table_id: TableID,
+        row_id: RowID,
+        key: ResolvedUserIndexKey,
+        unique: bool,
+    ) {
+        self.index_undo.push_user(IndexUndo {
+            table_id,
+            row_id,
+            kind: IndexUndoKind::DeferDelete(key, unique),
+        });
+    }
+
+    /// Push a generation-qualified unique user-index update.
+    #[inline]
+    pub(crate) fn push_user_update_unique_index_undo(
+        &mut self,
+        table_id: TableID,
+        old_row_id: RowID,
+        new_row_id: RowID,
+        key: ResolvedUserIndexKey,
+        old_deleted: bool,
+    ) {
+        self.index_undo.push_user(IndexUndo {
             table_id,
             row_id: new_row_id,
             kind: IndexUndoKind::UpdateUnique(key, old_row_id, old_deleted),
@@ -288,11 +353,6 @@ impl StmtEffects {
     #[inline]
     pub(crate) fn insert_row_redo(&mut self, table_id: TableID, entry: RowRedo) {
         self.redo.insert_dml(table_id, entry);
-    }
-
-    #[inline]
-    fn push_index_undo(&mut self, index_undo: IndexUndo) {
-        self.index_undo.push(index_undo);
     }
 
     /// Moves successful statement effects into the active transaction effects.
@@ -1445,6 +1505,7 @@ pub(crate) mod tests {
     use crate::buffer::guard::PageSharedGuard;
     use crate::catalog::storage::tables::TABLE_ID_TABLES;
     use crate::catalog::storage::tests::begin_catalog_test_trx;
+    use crate::catalog::user_key_from_active_slot;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{
@@ -1456,6 +1517,7 @@ pub(crate) mod tests {
     use crate::lock::tests::debug_snapshot;
     use crate::log::redo::RowRedoKind;
     use crate::row::RowPage;
+    use crate::row::ops::SelectKey;
     use crate::session::{SessionState, tests as session_tests};
     use crate::table::MemTable;
     use crate::table::tests::{
@@ -1846,10 +1908,10 @@ pub(crate) mod tests {
             RowID::new(1),
             RowUndoKind::Delete,
         ));
-        trx_effects.index_undo_mut().push(IndexUndo {
+        trx_effects.index_undo_mut().push_user(IndexUndo {
             table_id: TableID::new(41),
             row_id: RowID::new(1),
-            kind: IndexUndoKind::DeferDelete(SelectKey::new(0, vec![]), true),
+            kind: IndexUndoKind::DeferDelete(user_key_from_active_slot(0, vec![]), true),
         });
 
         let mut effects = empty_stmt_effects();
@@ -1860,10 +1922,10 @@ pub(crate) mod tests {
             RowID::new(2),
             RowUndoKind::Insert,
         ));
-        effects.push_delete_index_undo(
+        effects.push_user_delete_index_undo(
             TableID::new(42),
             RowID::new(2),
-            SelectKey::new(0, vec![]),
+            user_key_from_active_slot(0, vec![]),
             true,
         );
         effects.insert_row_redo(
@@ -1902,7 +1964,12 @@ pub(crate) mod tests {
             let table_id = TableID::new(99_999_998);
             let row_id = RowID::new(23);
             let mut effects = empty_stmt_effects();
-            effects.push_delete_index_undo(table_id, row_id, SelectKey::new(0, vec![]), true);
+            effects.push_user_delete_index_undo(
+                table_id,
+                row_id,
+                user_key_from_active_slot(0, vec![]),
+                true,
+            );
             effects.push_row_undo(OwnedRowUndo::new(
                 NON_FOREGROUND_STMT_NO,
                 table_id,
@@ -2166,10 +2233,10 @@ pub(crate) mod tests {
                         RowID::new(24),
                         RowUndoKind::Delete,
                     ));
-                    effects.push_delete_index_undo(
+                    effects.push_user_delete_index_undo(
                         TableID::new(12),
                         RowID::new(23),
-                        SelectKey::new(0, vec![]),
+                        user_key_from_active_slot(0, vec![]),
                         true,
                     );
                     Err(Report::new(OperationError::InvalidDmlInput).disclose())

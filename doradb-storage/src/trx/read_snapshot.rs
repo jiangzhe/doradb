@@ -3,7 +3,7 @@ use super::{
     sys::TransactionSystem,
 };
 use crate::buffer::PoolGuards;
-use crate::catalog::{ResolvedLiveMetadata, is_catalog_table};
+use crate::catalog::ResolvedLiveMetadata;
 use crate::error::{
     DiscloseError, DiscloseResultExt, LifecycleError, LifecycleOrFatalResult, LifecycleResult,
     MultiDomainResultExt, OperationError, OperationResult, QuadResult, Result,
@@ -822,7 +822,7 @@ impl ReadSnapshotBuilder {
                 .attach(format!("operation_key={}", self.key))
                 .into());
         }
-        if let Some(table_id) = table_ids.iter().copied().find(|id| is_catalog_table(*id)) {
+        if let Some(table_id) = table_ids.iter().copied().find(|id| id.is_catalog()) {
             return Err(Report::new(OperationError::TableNotFound)
                 .attach(format!(
                     "operation=acquire_read_snapshot, table_id={table_id}"

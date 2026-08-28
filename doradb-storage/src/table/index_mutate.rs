@@ -4,7 +4,7 @@
 //! retains the statement-scoped table, transaction, root, validation, and
 //! effect context used to resolve and mutate each candidate sequentially.
 
-use super::{
+use super::access::{
     ColdLatestRow, LazyRow, LazyRowBuffer, LazyRowSource, RowIdMove, UserTableAccessor,
     WriteIndexKeySet, read_latest_cold_row,
 };
@@ -150,7 +150,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                 drop(locked);
                 drop(page_guard);
                 accessor
-                    .table
+                    .table()
                     .wait_transition_route_or_poison(&self.rt.engine().poisoner, candidate.row_id)
                     .await
                     .disclose()?;
@@ -496,7 +496,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                     // re-resolves the row instead of assuming its location.
                     drop(page_guard);
                     accessor
-                        .table
+                        .table()
                         .wait_transition_route_or_poison(&self.rt.engine().poisoner, row_id)
                         .await
                         .disclose()?;

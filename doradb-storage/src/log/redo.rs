@@ -1,6 +1,7 @@
+use crate::catalog::CatalogSelectKey;
 use crate::error::DataIntegrityError;
 use crate::id::{PageID, RowID, TableID, TrxID};
-use crate::row::ops::{SelectKey, UpdateCol};
+use crate::row::ops::UpdateCol;
 use crate::serde::{Deser, DeserResult, MinBytesHint, Ser, Serde, min_bytes_hint};
 use crate::value::Val;
 use error_stack::Report;
@@ -43,9 +44,9 @@ pub(crate) enum RowRedoKind {
     Delete(Option<PageID>),
     Update(PageID, Vec<UpdateCol>),
     /// This is special kind for catalog update/delete.
-    DeleteByPrimaryKey(SelectKey),
+    DeleteByPrimaryKey(CatalogSelectKey),
     /// Catalog update selected by the table primary key instead of runtime row id.
-    UpdateByPrimaryKey(SelectKey, Vec<UpdateCol>),
+    UpdateByPrimaryKey(CatalogSelectKey, Vec<UpdateCol>),
 }
 
 impl RowRedoKind {
@@ -157,20 +158,20 @@ impl Deser for RowRedoKind {
                 ensure_deser_remaining(
                     input,
                     idx,
-                    mem::size_of::<u32>() + mem::size_of::<u64>(),
+                    mem::size_of::<u16>() + mem::size_of::<u64>(),
                     "row redo delete-by-primary-key",
                 )?;
-                let (idx, key) = SelectKey::deser(input, idx)?;
+                let (idx, key) = CatalogSelectKey::deser(input, idx)?;
                 Ok((idx, RowRedoKind::DeleteByPrimaryKey(key)))
             }
             RowRedoCode::UpdateByPrimaryKey => {
                 ensure_deser_remaining(
                     input,
                     idx,
-                    mem::size_of::<u32>() + mem::size_of::<u64>(),
+                    mem::size_of::<u16>() + mem::size_of::<u64>(),
                     "row redo update-by-primary-key",
                 )?;
-                let (idx, key) = SelectKey::deser(input, idx)?;
+                let (idx, key) = CatalogSelectKey::deser(input, idx)?;
                 ensure_deser_remaining(
                     input,
                     idx,
@@ -765,7 +766,70 @@ fn merge_update_cols(vals: &mut Vec<UpdateCol>, upd_cols: Vec<UpdateCol>) {
 mod tests {
     use super::*;
     use crate::buffer::test_page_id;
+    use crate::catalog::catalog_key_from_active_ordinal;
     use crate::error::DataIntegrityError;
+
+    #[test]
+    fn test_catalog_keyed_row_redo_golden_bytes() {
+        let key = catalog_key_from_active_ordinal(1, vec![Val::U64(11)]);
+        let delete = RowRedo {
+            row_id: RowID::new(7),
+            kind: RowRedoKind::DeleteByPrimaryKey(key.clone()),
+        };
+        let delete_expected = [
+            7, 0, 0, 0, 0, 0, 0, 0, // row id
+            4, // delete-by-primary-key code
+            1, 0, // u16 catalog ordinal
+            1, 0, 0, 0, 0, 0, 0, 0, // key value count
+            9, 0, 0, 0, // U64 value kind
+            11, 0, 0, 0, 0, 0, 0, 0, // key value
+        ];
+        let mut delete_buf = vec![0; delete.ser_len()];
+        assert_eq!(delete.ser(&mut delete_buf[..], 0), delete_buf.len());
+        assert_eq!(delete_buf.as_slice(), delete_expected);
+
+        let update = RowRedo {
+            row_id: RowID::new(7),
+            kind: RowRedoKind::UpdateByPrimaryKey(
+                key,
+                vec![UpdateCol {
+                    idx: 2,
+                    val: Val::U32(13),
+                }],
+            ),
+        };
+        let update_expected = [
+            7, 0, 0, 0, 0, 0, 0, 0, // row id
+            5, // update-by-primary-key code
+            1, 0, // u16 catalog ordinal
+            1, 0, 0, 0, 0, 0, 0, 0, // key value count
+            9, 0, 0, 0, // U64 value kind
+            11, 0, 0, 0, 0, 0, 0, 0, // key value
+            1, 0, 0, 0, 0, 0, 0, 0, // update column count
+            2, 0, 0, 0, // column index
+            6, 0, 0, 0, // U32 value kind
+            13, 0, 0, 0, // new value
+        ];
+        let mut update_buf = vec![0; update.ser_len()];
+        assert_eq!(update.ser(&mut update_buf[..], 0), update_buf.len());
+        assert_eq!(update_buf.as_slice(), update_expected);
+    }
+
+    #[test]
+    fn test_catalog_keyed_row_redo_ordinal_bounds() {
+        for index_no in [0, usize::from(u16::MAX)] {
+            let expected = catalog_key_from_active_ordinal(index_no, vec![]);
+            let kind = RowRedoKind::DeleteByPrimaryKey(expected.clone());
+            let mut buf = vec![0; kind.ser_len()];
+            assert_eq!(kind.ser(&mut buf[..], 0), buf.len());
+            let (end, decoded) = RowRedoKind::deser(&buf[..], 0).unwrap();
+            assert_eq!(end, buf.len());
+            let RowRedoKind::DeleteByPrimaryKey(decoded) = decoded else {
+                panic!("catalog delete redo must round trip as the same variant");
+            };
+            assert_eq!(decoded, expected);
+        }
+    }
 
     #[test]
     fn test_redo_log_insert_update_delete() {
@@ -948,7 +1012,7 @@ mod tests {
 
     #[test]
     fn test_row_redo_variants_round_trip_and_reject_truncation() {
-        let key = SelectKey::new(0, vec![Val::U64(7)]);
+        let key = catalog_key_from_active_ordinal(0, vec![Val::U64(7)]);
         let cases = [
             RowRedo {
                 row_id: RowID::new(1),
@@ -1214,7 +1278,7 @@ mod tests {
 
     #[test]
     fn test_row_redo_kind_update_by_primary_key_serde() {
-        let key = SelectKey::new(0, vec![Val::U64(7)]);
+        let key = catalog_key_from_active_ordinal(0, vec![Val::U64(7)]);
         let kind = RowRedoKind::UpdateByPrimaryKey(
             key.clone(),
             vec![
@@ -1256,7 +1320,7 @@ mod tests {
 
     #[test]
     fn test_table_dml_update_by_primary_key_merge() {
-        let key = SelectKey::new(0, vec![Val::U64(1)]);
+        let key = catalog_key_from_active_ordinal(0, vec![Val::U64(1)]);
         let mut table = TableDML::default();
         table.insert(RowRedo {
             row_id: RowID::new(10),
