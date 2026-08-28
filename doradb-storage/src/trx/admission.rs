@@ -1,7 +1,5 @@
 use super::TrxInner;
-use crate::catalog::{
-    CurrentTableState, ResolvedLiveMetadata, ResolvedVisibleTableMetadata, is_catalog_table,
-};
+use crate::catalog::{CurrentTableState, ResolvedLiveMetadata, ResolvedVisibleTableMetadata};
 use crate::engine::EngineCore;
 use crate::error::{MultiDomainResultExt, OperationError, OperationOrFatalResult, OperationResult};
 use crate::id::{TableID, TrxID};
@@ -246,7 +244,7 @@ pub(super) async fn admit_user_table(
     request: TableAdmissionRequest,
     operation: &'static str,
 ) -> OperationOrFatalResult<(Arc<Table>, Arc<TableRuntimeLayout>)> {
-    if is_catalog_table(table_id) {
+    if table_id.is_catalog() {
         return Err(Report::new(OperationError::TableNotFound)
             .attach(format!("operation={operation}, table_id={table_id}"))
             .into());

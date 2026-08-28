@@ -3869,9 +3869,7 @@ pub(crate) mod tests {
     use crate::buffer::{PoolRole, test_pool_guards_share_keepalive_root};
     use crate::catalog::storage::tables::TABLE_ID_TABLES;
     use crate::catalog::tests::{table1, table2, wait_for_dropped_table_floor};
-    use crate::catalog::{
-        CatalogTable, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, is_catalog_table,
-    };
+    use crate::catalog::{CatalogTable, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey};
     use crate::conf::{EngineConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{
@@ -5074,7 +5072,7 @@ pub(crate) mod tests {
                         .table_cache
                         .lock()
                         .keys()
-                        .all(|table_id| !is_catalog_table(*table_id))
+                        .all(|table_id| !table_id.is_catalog())
                 );
             }
 
@@ -5092,7 +5090,7 @@ pub(crate) mod tests {
                     .table_cache
                     .lock()
                     .keys()
-                    .all(|table_id| !is_catalog_table(*table_id))
+                    .all(|table_id| !table_id.is_catalog())
             );
         });
     }

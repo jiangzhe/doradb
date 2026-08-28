@@ -21,7 +21,6 @@ use crate::buffer::BufferPool;
 use crate::buffer::guard::PageGuard;
 use crate::catalog::{
     CatalogTable, IndexDdlKind, IndexDdlRootProof, TableColumnLayout, classify_index_ddl_root,
-    is_catalog_table, is_user_table,
 };
 use crate::error::{
     DataIntegrityError, DataIntegrityResult, IoResult, RuntimeError, RuntimeResult,
@@ -322,7 +321,7 @@ impl<'a> RecoveryCoordinator<'a> {
             .await?;
         let checkpointed_user_table_ids = checkpointed_tables
             .iter()
-            .filter(|table| is_user_table(table.table_id))
+            .filter(|table| table.table_id.is_user())
             .map(|table| table.table_id)
             .collect::<FastHashSet<_>>();
         self.resources
@@ -334,7 +333,7 @@ impl<'a> RecoveryCoordinator<'a> {
             .change_context(RuntimeError::Recovery)?;
 
         for table in checkpointed_tables {
-            if !is_user_table(table.table_id) {
+            if !table.table_id.is_user() {
                 continue;
             }
             // Checkpoint bootstrap can see table-file metadata that already includes
@@ -899,7 +898,7 @@ impl<'a> RecoveryCoordinator<'a> {
 
         // Record recovered pages so we can recover indexes and refresh undo map at end.
         // Note: we do not need to recover catalog tables because they are specially handled.
-        if self.resources.catalog.is_user_table(table_id) {
+        if table_id.is_user() {
             self.recovered_tables
                 .entry(table_id)
                 .or_default()
@@ -992,7 +991,7 @@ impl<'a> RecoveryCoordinator<'a> {
         cts: TrxID,
     ) -> RuntimeResult<()> {
         for (table_id, table_dml) in dml {
-            if is_catalog_table(table_id) {
+            if table_id.is_catalog() {
                 if !self.should_replay_catalog(cts) {
                     continue;
                 }
@@ -1082,7 +1081,7 @@ impl<'a> RecoveryCoordinator<'a> {
                     table
                         .delete_primary_key_no_trx(
                             &self.resources.pool_guards,
-                            key.index_no,
+                            key.index.as_usize(),
                             &key.vals,
                             self.recovery_disable_dml_validation,
                         )
@@ -1092,7 +1091,7 @@ impl<'a> RecoveryCoordinator<'a> {
                     table
                         .update_primary_key_no_trx(
                             &self.resources.pool_guards,
-                            key.index_no,
+                            key.index.as_usize(),
                             &key.vals,
                             cols,
                             self.recovery_disable_dml_validation,
@@ -1258,7 +1257,7 @@ mod tests {
     use crate::catalog::{
         ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexAttributes, IndexColumnObject,
         IndexKey, IndexObject, IndexOrder, IndexSpec, TableMetadata, TableObject, TableSpec,
-        USER_TABLE_ID_START,
+        USER_TABLE_ID_START, catalog_key_from_active_ordinal,
     };
     use crate::component::EnginePools;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
@@ -1990,12 +1989,15 @@ mod tests {
         let cases = [
             (
                 "DeleteByPrimaryKey",
-                RowRedoKind::DeleteByPrimaryKey(SelectKey::new(0, vec![Val::from(42u64)])),
+                RowRedoKind::DeleteByPrimaryKey(catalog_key_from_active_ordinal(
+                    0,
+                    vec![Val::from(42u64)],
+                )),
             ),
             (
                 "UpdateByPrimaryKey",
                 RowRedoKind::UpdateByPrimaryKey(
-                    SelectKey::new(0, vec![Val::from(42u64)]),
+                    catalog_key_from_active_ordinal(0, vec![Val::from(42u64)]),
                     vec![UpdateCol {
                         idx: 1,
                         val: Val::from(7u64),

@@ -1,13 +1,13 @@
-#[path = "index_mutate.rs"]
-mod index_mutate;
-
-use super::hot::{
-    DeleteInternal, HotRowMutator, InsertRowIntoPage, RowInserter, UpdateRowInplace,
-    read_hot_row_mvcc,
+use super::{
+    hot::{
+        DeleteInternal, HotRowMutator, InsertRowIntoPage, RowInserter, UpdateRowInplace,
+        read_hot_row_mvcc,
+    },
+    index_mutate::IndexMutator,
 };
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::buffer::{EvictableBufferPool, PoolGuards};
-use crate::catalog::{TableColumnLayout, TableMetadata};
+use crate::catalog::{ResolvedUserIndexKey, TableColumnLayout, TableMetadata};
 use crate::error::{
     DataIntegrityError, DataIntegrityResult, DiscloseError, DiscloseResultExt, InternalError,
     MultiDomainResultExt, OperationError, OperationOrFatalResult, OperationOrRuntimeError,
@@ -47,21 +47,20 @@ use crate::trx::row::{
     RowWriteAccess,
 };
 use crate::trx::stmt::StmtEffects;
-use crate::trx::undo::{IndexBranch, OwnedRowUndo, RowUndoKind};
+use crate::trx::undo::{IndexBranch, OwnedRowUndo, RowUndoKind, UserIndexBranchDomain};
 use crate::trx::{
     MIN_SNAPSHOT_TS, MvccReadView, MvccVisibility, PrepareListenerResult, SharedTrxStatus,
     TrxContext, TrxRuntime, trx_is_committed,
 };
 use crate::value::Val;
 use error_stack::{Report, ResultExt};
-use index_mutate::IndexMutator;
 use std::marker::PhantomData;
 use std::mem;
 use std::ops::RangeBounds;
 use std::ptr::addr_eq;
 use std::sync::Arc;
 
-enum LazyRowSource<'row> {
+pub(super) enum LazyRowSource<'row> {
     Cold {
         block: &'row LwcBlock,
         column_layout: &'row TableColumnLayout,
@@ -200,7 +199,7 @@ pub struct LazyRow<'row> {
 
 impl<'row> LazyRow<'row> {
     #[inline]
-    fn new(
+    pub(super) fn new(
         source: LazyRowSource<'row>,
         buffer: &'row mut LazyRowBuffer,
         column_count: usize,
@@ -275,7 +274,7 @@ impl<'row> LazyRow<'row> {
     }
 
     #[inline]
-    fn into_hot_write_access(self) -> RowWriteAccess<'row> {
+    pub(super) fn into_hot_write_access(self) -> RowWriteAccess<'row> {
         let LazyRow { source, buffer } = self;
         buffer.reset_ready();
         let LazyRowSource::HotWrite { access, .. } = source else {
@@ -285,7 +284,7 @@ impl<'row> LazyRow<'row> {
     }
 
     #[inline]
-    fn into_hot_write_index_keys<'op>(
+    pub(super) fn into_hot_write_index_keys<'op>(
         mut self,
         accessor: &UserTableAccessor<'op>,
     ) -> DataIntegrityResult<(RowWriteAccess<'row>, WriteIndexKeySet<'op>)> {
@@ -299,7 +298,7 @@ impl<'row> LazyRow<'row> {
     }
 
     #[inline]
-    fn into_full_row(mut self) -> DataIntegrityResult<Vec<Val>> {
+    pub(super) fn into_full_row(mut self) -> DataIntegrityResult<Vec<Val>> {
         for column_no in 0..self.buffer.values.len() {
             let _ = self.val_inner(column_no)?;
         }
@@ -311,7 +310,7 @@ impl<'row> LazyRow<'row> {
     }
 
     #[inline]
-    fn into_index_keys<'op>(
+    pub(super) fn into_index_keys<'op>(
         mut self,
         accessor: &UserTableAccessor<'op>,
     ) -> DataIntegrityResult<WriteIndexKeySet<'op>> {
@@ -489,13 +488,13 @@ pub(super) struct RowIdMove {
 
 impl RowIdMove {
     #[inline]
-    const fn new(old: RowID, new: RowID) -> Self {
+    pub(super) const fn new(old: RowID, new: RowID) -> Self {
         Self { old, new }
     }
 }
 
 #[derive(Clone, Copy)]
-struct InsertedRow {
+pub(super) struct InsertedRow {
     page_id: PageID,
     row_id: RowID,
 }
@@ -641,14 +640,14 @@ impl<'op> WriteIndexKey<'op> {
 /// Private constructors preserve active stable-index order. The accessor
 /// lifetime remains attached from construction through either new-side claims
 /// or old-row ownership proof construction.
-struct WriteIndexKeySet<'op> {
+pub(super) struct WriteIndexKeySet<'op> {
     keys: Vec<SelectKey>,
     _layout: PhantomData<&'op TableRuntimeLayout>,
 }
 
 impl<'op> WriteIndexKeySet<'op> {
     #[inline]
-    fn from_full_row(accessor: &UserTableAccessor<'op>, row: &[Val]) -> Self {
+    pub(super) fn from_full_row(accessor: &UserTableAccessor<'op>, row: &[Val]) -> Self {
         Self {
             keys: accessor.metadata().idx.keys_for_insert(row),
             _layout: PhantomData,
@@ -769,7 +768,7 @@ enum OwnedRowMutationOwnership {
 /// `MemRequired` and `Persisted` differ in whether an absent MemIndex copy is an
 /// invariant violation or a successful no-op. Keeping the fields private and
 /// exposing only consuming iteration prevents rebinding or partial reuse.
-struct OwnedRowIndexSetProof<'op, 'snapshot, 'ctx> {
+pub(super) struct OwnedRowIndexSetProof<'op, 'snapshot, 'ctx> {
     /// Current owned row whose old index membership was reconstructed.
     row_id: RowID,
     /// Pivot copied from the root against which storage mode was classified.
@@ -833,7 +832,7 @@ pub(super) enum ColdRowUpdateRead {
     Preparing(PoisonAwareListener),
 }
 
-enum ColdLatestRow {
+pub(super) enum ColdLatestRow {
     Readable,
     NotFound,
     WriteConflict,
@@ -879,17 +878,22 @@ impl<'op> UserTableAccessor<'op> {
     }
 
     #[inline]
+    pub(super) fn table(&self) -> &Table {
+        self.table
+    }
+
+    #[inline]
     fn user_sec_idx(&self) -> &[Option<Arc<SecondaryIndex<EvictableBufferPool>>>] {
         self.layout().secondary_indexes()
     }
 
     #[inline]
-    fn mem(&self) -> &MemTable<EvictableBufferPool, EvictableBufferPool> {
+    pub(super) fn mem(&self) -> &MemTable<EvictableBufferPool, EvictableBufferPool> {
         &self.table.mem
     }
 
     #[inline]
-    fn metadata(&self) -> &TableMetadata {
+    pub(super) fn metadata(&self) -> &TableMetadata {
         self.layout().metadata()
     }
 
@@ -1111,7 +1115,7 @@ impl<'op> UserTableAccessor<'op> {
     }
 
     #[inline]
-    fn owned_row_page_index_set_proof<'snapshot, 'ctx>(
+    pub(super) fn owned_row_page_index_set_proof<'snapshot, 'ctx>(
         &self,
         row_id: RowID,
         keys: WriteIndexKeySet<'op>,
@@ -1238,7 +1242,7 @@ impl<'op> UserTableAccessor<'op> {
     }
 
     #[inline]
-    async fn resolve_row_location(
+    pub(super) async fn resolve_row_location(
         &self,
         guards: &PoolGuards,
         row_id: RowID,
@@ -1253,16 +1257,16 @@ impl<'op> UserTableAccessor<'op> {
     }
 
     #[inline]
-    fn column_storage(&self) -> &ColumnStorage {
+    pub(super) fn column_storage(&self) -> &ColumnStorage {
         self.storage
     }
 
     #[inline]
-    fn lwc_deletion_buffer(&self) -> &ColumnDeletionBuffer {
+    pub(super) fn lwc_deletion_buffer(&self) -> &ColumnDeletionBuffer {
         self.storage.deletion_buffer()
     }
     #[inline]
-    fn table_id(&self) -> TableID {
+    pub(super) fn table_id(&self) -> TableID {
         self.mem().table_id()
     }
 
@@ -1282,8 +1286,21 @@ impl<'op> UserTableAccessor<'op> {
     }
 
     #[inline]
-    fn debug_assert_table_write_lock_held(&self, rt: TrxRuntime<'_>) {
+    pub(super) fn debug_assert_table_write_lock_held(&self, rt: TrxRuntime<'_>) {
         rt.debug_assert_table_write_lock_held(self.table_id());
+    }
+
+    #[inline]
+    fn retained_user_key(&self, key: SelectKey) -> ResolvedUserIndexKey {
+        let index_no = key.index_no;
+        self.layout()
+            .resolve_active_user_key(index_no, key.vals)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "retained user index key must reference the accessor's active layout: table_id={}, index_no={index_no}, error={err:?}",
+                    self.table_id()
+                )
+            })
     }
 
     #[inline]
@@ -1296,7 +1313,12 @@ impl<'op> UserTableAccessor<'op> {
         merge_old_deleted: bool,
     ) {
         self.debug_assert_table_write_lock_held(rt);
-        effects.push_insert_unique_index_undo(self.table_id(), row_id, key, merge_old_deleted);
+        effects.push_user_insert_unique_index_undo(
+            self.table_id(),
+            row_id,
+            self.retained_user_key(key),
+            merge_old_deleted,
+        );
     }
 
     #[inline]
@@ -1309,7 +1331,12 @@ impl<'op> UserTableAccessor<'op> {
         merge_old_deleted: bool,
     ) {
         self.debug_assert_table_write_lock_held(rt);
-        effects.push_insert_non_unique_index_undo(self.table_id(), row_id, key, merge_old_deleted);
+        effects.push_user_insert_non_unique_index_undo(
+            self.table_id(),
+            row_id,
+            self.retained_user_key(key),
+            merge_old_deleted,
+        );
     }
 
     #[inline]
@@ -1322,7 +1349,12 @@ impl<'op> UserTableAccessor<'op> {
         unique: bool,
     ) {
         self.debug_assert_table_write_lock_held(rt);
-        effects.push_delete_index_undo(self.table_id(), row_id, key, unique);
+        effects.push_user_delete_index_undo(
+            self.table_id(),
+            row_id,
+            self.retained_user_key(key),
+            unique,
+        );
     }
 
     #[inline]
@@ -1336,11 +1368,11 @@ impl<'op> UserTableAccessor<'op> {
         old_deleted: bool,
     ) {
         self.debug_assert_table_write_lock_held(rt);
-        effects.push_update_unique_index_undo(
+        effects.push_user_update_unique_index_undo(
             self.table_id(),
             old_row_id,
             new_row_id,
-            key,
+            self.retained_user_key(key),
             old_deleted,
         );
     }
@@ -1580,7 +1612,7 @@ impl<'op> UserTableAccessor<'op> {
     }
 
     #[inline]
-    async fn read_lwc_full_row(
+    pub(super) async fn read_lwc_full_row(
         &self,
         guards: &PoolGuards,
         block_id: BlockID,
@@ -1907,7 +1939,7 @@ impl<'op> UserTableAccessor<'op> {
     }
 
     #[inline]
-    async fn move_update_for_space(
+    pub(super) async fn move_update_for_space(
         &self,
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
@@ -1917,7 +1949,7 @@ impl<'op> UserTableAccessor<'op> {
         old_guard: PageSharedGuard<RowPage>,
     ) -> RuntimeOrFatalResult<(RowID, FastHashMap<usize, Val>, PageSharedGuard<RowPage>)> {
         let prepared = HotRowMutator::new(self.table_id(), self.metadata(), rt, &old_guard, old_id)
-            .prepare_move_update(old_row, update);
+            .prepare_move_update::<UserIndexBranchDomain>(old_row, update);
         // Release the old row page before awaiting replacement-row insertion.
         drop(old_guard);
         let (new_row_id, new_guard) = self
@@ -1950,7 +1982,7 @@ impl<'op> UserTableAccessor<'op> {
     }
 
     #[inline]
-    async fn update_indexes_only_key_change(
+    pub(super) async fn update_indexes_only_key_change(
         &self,
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
@@ -1993,7 +2025,7 @@ impl<'op> UserTableAccessor<'op> {
     }
 
     #[inline]
-    async fn update_indexes_only_row_id_change(
+    pub(super) async fn update_indexes_only_row_id_change(
         &self,
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
@@ -2029,7 +2061,7 @@ impl<'op> UserTableAccessor<'op> {
     }
 
     #[inline]
-    async fn update_indexes_may_both_change(
+    pub(super) async fn update_indexes_may_both_change(
         &self,
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
@@ -2346,7 +2378,7 @@ impl<'op> UserTableAccessor<'op> {
         // The new hot row owns the key now. The terminal branch preserves the
         // old cold image for snapshots that still need to see it. The branch is
         // runtime-only; recovery restores only the latest committed mapping.
-        new_access.link_for_unique_index_cold_terminal(
+        new_access.link_user_for_unique_index_cold_terminal(
             SelectKey::new(index_no, key_vals.to_vec()),
             delete_cts,
             undo_vals,
@@ -2423,7 +2455,7 @@ impl<'op> UserTableAccessor<'op> {
                 // row latch is enough, because row lock is already acquired.
                 let mut new_access = target.guard.write_row_by_id(target.row_id);
                 let undo_vals = new_access.row().calc_delta(metadata.col.as_ref(), &old_row);
-                new_access.link_for_unique_index(
+                new_access.link_user_for_unique_index(
                     SelectKey::new(index_no, key_vals.to_vec()),
                     cts,
                     old_entry,
@@ -2705,7 +2737,7 @@ impl<'op> UserTableAccessor<'op> {
     }
 
     #[inline]
-    async fn defer_delete_owned_row_index_set(
+    pub(super) async fn defer_delete_owned_row_index_set(
         &self,
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
@@ -4067,7 +4099,7 @@ impl<'op> UserTableAccessor<'op> {
     }
 
     #[inline]
-    fn validate_table_mutation_update(
+    pub(super) fn validate_table_mutation_update(
         &self,
         validator: Option<&DmlValidator<'_>>,
         update: &[UpdateCol],
@@ -4115,7 +4147,7 @@ impl<'op> UserTableAccessor<'op> {
 
     /// Convert a provisional cold-row lock into definitive delete effects.
     #[inline]
-    async fn finish_owned_cold_delete_effects(
+    pub(super) async fn finish_owned_cold_delete_effects(
         &self,
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
@@ -4139,7 +4171,7 @@ impl<'op> UserTableAccessor<'op> {
     }
 
     #[inline]
-    async fn update_owned_cold_row(
+    pub(super) async fn update_owned_cold_row(
         &self,
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
@@ -5241,7 +5273,7 @@ fn cold_row_visible_mvcc(
 /// also identifies an already consumed cold image; its replacement, if any, is
 /// scanned in hot storage. A foreign active marker remains a write conflict.
 #[inline]
-fn read_latest_cold_row(
+pub(super) fn read_latest_cold_row(
     deletion_buffer: &ColumnDeletionBuffer,
     reader_status: &SharedTrxStatus,
     row_id: RowID,

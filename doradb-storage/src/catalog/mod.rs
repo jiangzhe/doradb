@@ -1,6 +1,7 @@
 mod checkpoint;
 mod history;
 pub(crate) mod index;
+mod index_ref;
 pub(crate) mod spec;
 pub(crate) mod storage;
 pub(crate) mod table;
@@ -9,6 +10,7 @@ pub use checkpoint::CatalogCheckpointOutcome;
 pub(crate) use checkpoint::*;
 pub(crate) use history::*;
 pub(crate) use index::*;
+pub(crate) use index_ref::*;
 pub(crate) use spec::ActiveIndexSpec;
 pub use spec::{
     ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexNo, IndexOrder, IndexSpec,
@@ -34,7 +36,6 @@ use crate::index::BlockIndex;
 use crate::map::{FastDashMap, FastHashMap, FastHashSet};
 use crate::poison::EnginePoisoner;
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
-use crate::row::ops::SelectKey;
 use crate::table::{
     LiveTableRedoReplayFloor, MemTable, Table, TableRedoReplayFloor, TableRuntimeLayout,
 };
@@ -54,7 +55,7 @@ use std::sync::{Arc, Weak};
 pub(crate) const USER_TABLE_ID_START: TableID = TableID::new(0);
 
 /// First table id reserved for built-in catalog tables.
-pub(crate) const CATALOG_TABLE_ID_START: TableID = TableID::new(1u64 << 63);
+pub(crate) const CATALOG_TABLE_ID_START: TableID = TableID::CATALOG_START;
 
 /// Exclusive upper bound of the user table-id range.
 pub(crate) const USER_TABLE_ID_LIMIT: TableID = CATALOG_TABLE_ID_START;
@@ -210,12 +211,6 @@ impl Catalog {
         self.storage
             .prepare_checkpoint_batch(batch, self.curr_next_table_id(), disk_guard)
             .await
-    }
-
-    /// Returns whether a table is user table.
-    #[inline]
-    pub(crate) fn is_user_table(&self, table_id: TableID) -> bool {
-        is_user_table(table_id)
     }
 
     /// Reload one user table runtime from catalog metadata and table file.
@@ -470,7 +465,7 @@ impl Catalog {
         table_id: TableID,
         sts: TrxID,
     ) -> Option<ResolvedVisibleTableMetadata> {
-        if is_catalog_table(table_id) {
+        if table_id.is_catalog() {
             return None;
         }
         self.user_tables
@@ -484,7 +479,7 @@ impl Catalog {
         &self,
         table_id: TableID,
     ) -> Option<CurrentTableState> {
-        if is_catalog_table(table_id) {
+        if table_id.is_catalog() {
             return None;
         }
         self.user_tables
@@ -530,7 +525,7 @@ impl Catalog {
     /// absent entry no longer has a runtime that can safely service the batch.
     #[inline]
     pub(crate) fn pin_user_table_for_purge(&self, table_id: TableID) -> Option<Arc<Table>> {
-        if is_catalog_table(table_id) {
+        if table_id.is_catalog() {
             return None;
         }
         self.user_tables
@@ -1000,7 +995,7 @@ impl UserTableCacheEntry {
     #[inline]
     pub(crate) async fn rollback_index_entry(
         &mut self,
-        entry: &IndexUndo,
+        entry: &IndexUndo<ResolvedUserIndexKey>,
         guards: &PoolGuards,
         ts: TrxID,
     ) -> RuntimeResult<()> {
@@ -1018,7 +1013,7 @@ impl UserTableCacheEntry {
     pub(crate) async fn delete_index(
         &mut self,
         guards: &PoolGuards,
-        key: &SelectKey,
+        key: &ResolvedUserIndexKey,
         row_id: RowID,
         unique: bool,
         min_active_sts: TrxID,
@@ -1031,7 +1026,7 @@ impl UserTableCacheEntry {
             .accessor_with_layout(layout.as_ref())
             .delete_index(
                 guards,
-                key.index_no,
+                key.index.slot().as_usize(),
                 &key.vals,
                 row_id,
                 unique,
@@ -1078,7 +1073,7 @@ impl<'a> TableCache<'a> {
     /// positive/negative lookup result.
     #[inline]
     pub(crate) fn get_catalog_table(&mut self, table_id: TableID) -> Option<&CatalogTable> {
-        if !is_catalog_table(table_id) {
+        if !table_id.is_catalog() {
             return None;
         }
         match self.catalog_tables.entry(table_id) {
@@ -1107,7 +1102,7 @@ impl<'a> TableCache<'a> {
         &mut self,
         table_id: TableID,
     ) -> Option<&mut UserTableCacheEntry> {
-        if is_catalog_table(table_id) {
+        if table_id.is_catalog() {
             return None;
         }
         match self.user_tables.entry(table_id) {
@@ -1173,18 +1168,6 @@ impl<'a> TableCache<'a> {
     }
 }
 
-/// Return whether a table id belongs to user-managed catalog space.
-#[inline]
-pub(crate) const fn is_user_table(table_id: TableID) -> bool {
-    table_id.as_u64() < USER_TABLE_ID_LIMIT.as_u64()
-}
-
-/// Return whether a table id belongs to built-in catalog table space.
-#[inline]
-pub(crate) const fn is_catalog_table(table_id: TableID) -> bool {
-    table_id.as_u64() >= CATALOG_TABLE_ID_START.as_u64()
-}
-
 /// Build a built-in catalog table id from its dense root slot.
 #[inline]
 pub(crate) const fn catalog_table_id_from_slot(slot: usize) -> TableID {
@@ -1194,7 +1177,7 @@ pub(crate) const fn catalog_table_id_from_slot(slot: usize) -> TableID {
 /// Return the dense root slot for a built-in catalog table id.
 #[inline]
 pub(crate) const fn catalog_table_slot(table_id: TableID) -> Option<usize> {
-    if is_catalog_table(table_id) {
+    if table_id.is_catalog() {
         Some((table_id.as_u64() - CATALOG_TABLE_ID_START.as_u64()) as usize)
     } else {
         None
@@ -1609,12 +1592,12 @@ pub(crate) mod tests {
     #[test]
     fn test_catalog_table_id_boundary_predicates() {
         let last_user = TableID::new(USER_TABLE_ID_LIMIT.as_u64() - 1);
-        assert!(is_user_table(USER_TABLE_ID_START));
-        assert!(!is_catalog_table(USER_TABLE_ID_START));
-        assert!(is_user_table(last_user));
-        assert!(!is_catalog_table(last_user));
-        assert!(!is_user_table(CATALOG_TABLE_ID_START));
-        assert!(is_catalog_table(CATALOG_TABLE_ID_START));
+        assert!(USER_TABLE_ID_START.is_user());
+        assert!(!USER_TABLE_ID_START.is_catalog());
+        assert!(last_user.is_user());
+        assert!(!last_user.is_catalog());
+        assert!(!CATALOG_TABLE_ID_START.is_user());
+        assert!(CATALOG_TABLE_ID_START.is_catalog());
         assert_eq!(catalog_table_id_from_slot(0), CATALOG_TABLE_ID_START);
         assert_eq!(catalog_table_slot(CATALOG_TABLE_ID_START), Some(0));
         assert_eq!(catalog_table_slot(catalog_table_id_from_slot(4)), Some(4));

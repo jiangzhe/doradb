@@ -1,6 +1,6 @@
 use crate::buffer::PoolGuards;
 use crate::catalog::spec::{ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexNo, IndexSpec};
-use crate::catalog::{Catalog, catalog_table_id_from_slot, is_user_table};
+use crate::catalog::{Catalog, catalog_table_id_from_slot};
 use crate::component::EnginePools;
 use crate::engine::EngineCore;
 use crate::error::{
@@ -1771,7 +1771,7 @@ pub(crate) fn reject_non_user_table_id(
     table_id: TableID,
     operation: &'static str,
 ) -> OperationResult<()> {
-    if is_user_table(table_id) {
+    if table_id.is_user() {
         return Ok(());
     }
     Err(Report::new(OperationError::TableNotFound).attach(format!(

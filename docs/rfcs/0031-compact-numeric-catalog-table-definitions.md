@@ -4,6 +4,7 @@ title: Compact Numeric Catalog and Extensible Table Definitions
 status: proposal
 tags: [storage, catalog, metadata, ddl, checkpoint, recovery]
 created: 2026-08-28
+github_issue: 1028
 ---
 
 # RFC-0031: Compact Numeric Catalog and Extensible Table Definitions

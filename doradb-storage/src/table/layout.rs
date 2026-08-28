@@ -1,7 +1,8 @@
 use crate::buffer::EvictableBufferPool;
-use crate::catalog::TableMetadata;
+use crate::catalog::{ResolvedUserIndexKey, TableMetadata, user_key_from_active_slot};
 use crate::error::{InternalError, RuntimeError, RuntimeResult};
 use crate::index::SecondaryIndex;
+use crate::value::Val;
 use error_stack::Report;
 use std::sync::Arc;
 
@@ -135,6 +136,17 @@ impl TableRuntimeLayout {
                     .change_context(RuntimeError::IndexAccess)
                     .attach("operation=resolve_secondary_index_runtime")
             })
+    }
+
+    /// Qualifies a validated active positional key for retained user state.
+    #[inline]
+    pub(crate) fn resolve_active_user_key(
+        &self,
+        index_no: usize,
+        vals: Vec<Val>,
+    ) -> RuntimeResult<ResolvedUserIndexKey> {
+        self.secondary_index(index_no)?;
+        Ok(user_key_from_active_slot(index_no, vals))
     }
 
     /// Iterates active secondary-index runtimes by stable index number.

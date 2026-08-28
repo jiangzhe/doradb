@@ -1,8 +1,6 @@
 use crate::buffer::PoolGuards;
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
-use crate::catalog::{
-    Catalog, DroppedTableFileCleanup, DroppedTableRuntime, TableCache, is_catalog_table,
-};
+use crate::catalog::{Catalog, DroppedTableFileCleanup, DroppedTableRuntime, TableCache};
 use crate::error::{FatalError, FatalResult, RuntimeError, RuntimeResult};
 use crate::file::table_file::OldRoot;
 use crate::id::{TableID, TrxID};
@@ -14,7 +12,7 @@ use crate::runtime;
 use crate::table::Table;
 use crate::thread;
 use crate::trx::sys::TransactionSystem;
-use crate::trx::undo::{OwnedRowUndo, RowUndoKind};
+use crate::trx::undo::{IndexPurgeEntry, OwnedRowUndo, RowUndoKind};
 use crate::trx::{CommittedTrx, MAX_SNAPSHOT_TS, RetiredRowPageBatch};
 use crossbeam_utils::CachePadded;
 use error_stack::Report;
@@ -419,7 +417,7 @@ impl TransactionSystem {
             if let Some(row_undo) = trx.row_undo() {
                 purge_row_count += row_undo.len();
                 for undo in &**row_undo {
-                    if is_catalog_table(undo.table_id) {
+                    if undo.table_id.is_catalog() {
                         let Some(table) = table_cache.get_catalog_table(undo.table_id) else {
                             continue;
                         };
@@ -458,33 +456,34 @@ impl TransactionSystem {
         for trx in &trx_list {
             if let Some(index_gc) = trx.index_gc() {
                 for ip in index_gc {
-                    if is_catalog_table(ip.table_id) {
-                        let Some(table) = table_cache.get_catalog_table(ip.table_id) else {
-                            continue;
-                        };
-                        if table
-                            .delete_index(
-                                guards,
-                                ip.key.index_no,
-                                &ip.key.vals,
-                                ip.row_id,
-                                ip.unique,
-                                min_active_sts,
-                            )
-                            .await?
-                        {
-                            purge_index_count += 1;
+                    let deleted = match ip {
+                        IndexPurgeEntry::Catalog(ip) => {
+                            let Some(table) = table_cache.get_catalog_table(ip.table_id) else {
+                                continue;
+                            };
+                            table
+                                .delete_index(
+                                    guards,
+                                    ip.key.index.as_usize(),
+                                    &ip.key.vals,
+                                    ip.row_id,
+                                    ip.unique,
+                                    min_active_sts,
+                                )
+                                .await?
                         }
-                    } else {
-                        let Some(table) = table_cache.get_user_entry_mut(ip.table_id).await else {
-                            continue;
-                        };
-                        if table
-                            .delete_index(guards, &ip.key, ip.row_id, ip.unique, min_active_sts)
-                            .await?
-                        {
-                            purge_index_count += 1;
+                        IndexPurgeEntry::User(ip) => {
+                            let Some(table) = table_cache.get_user_entry_mut(ip.table_id).await
+                            else {
+                                continue;
+                            };
+                            table
+                                .delete_index(guards, &ip.key, ip.row_id, ip.unique, min_active_sts)
+                                .await?
                         }
+                    };
+                    if deleted {
+                        purge_index_count += 1;
                     }
                 }
             }

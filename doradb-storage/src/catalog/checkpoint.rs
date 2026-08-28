@@ -1,9 +1,6 @@
 use crate::buffer::PoolGuard;
 use crate::catalog::storage::tables::TABLE_ID_TABLES;
-use crate::catalog::{
-    Catalog, IndexDdlKind, IndexDdlRootProof, classify_index_ddl_root, is_catalog_table,
-    is_user_table,
-};
+use crate::catalog::{Catalog, IndexDdlKind, IndexDdlRootProof, classify_index_ddl_root};
 use crate::error::{
     CompletionErrorBridge, CompletionResult, DataIntegrityError, DataIntegrityResult, FatalError,
     IoError, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
@@ -605,7 +602,7 @@ impl Catalog {
                     // checkpoint; user-table row data remains owned by table
                     // files and is not part of catalog storage state.
                     for (table_id, table_dml) in redo.dml {
-                        if !is_catalog_table(table_id) {
+                        if !table_id.is_catalog() {
                             continue;
                         }
                         for row_redo in table_dml.rows.into_values() {
@@ -638,7 +635,7 @@ impl Catalog {
     ) -> DataIntegrityResult<CatalogCheckpointTxnAction> {
         match ddl {
             DDLRedo::CreateTable(_) => Ok(CatalogCheckpointTxnAction::Include),
-            DDLRedo::DropTable(table_id) if is_user_table(*table_id) => {
+            DDLRedo::DropTable(table_id) if table_id.is_user() => {
                 if drop_table_has_catalog_table_delete(*table_id, dml)? {
                     return Ok(CatalogCheckpointTxnAction::Include);
                 }
@@ -721,11 +718,11 @@ fn drop_table_has_catalog_table_delete(
         let RowRedoKind::DeleteByPrimaryKey(key) = &row.kind else {
             continue;
         };
-        if key.index_no != 0 {
+        if key.index.as_usize() != 0 {
             return Err(
                 Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                     "malformed drop-table redo: table_id={table_id}, index_no={}, expected_index_no=0",
-                    key.index_no
+                    key.index.as_usize()
                 )),
             );
         }
@@ -754,16 +751,16 @@ fn drop_table_has_catalog_table_delete(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::{CatalogSelectKey, catalog_key_from_active_ordinal};
     use crate::id::RowID;
     use crate::log::redo::RowRedo;
     use crate::recovery::stream::RedoSegmentCtsRange;
-    use crate::row::ops::SelectKey;
     use crate::value::Val;
     use smol::Timer;
     use smol::future::or;
     use std::time::Duration;
 
-    fn catalog_tables_delete_dml(key: SelectKey) -> BTreeMap<TableID, TableDML> {
+    fn catalog_tables_delete_dml(key: CatalogSelectKey) -> BTreeMap<TableID, TableDML> {
         catalog_tables_dml(RowRedoKind::DeleteByPrimaryKey(key))
     }
 
@@ -787,7 +784,10 @@ mod tests {
     #[test]
     fn test_drop_table_has_catalog_table_delete_matches_table_key() {
         let table_id = TableID::new(42);
-        let dml = catalog_tables_delete_dml(SelectKey::new(0, vec![Val::from(table_id.as_u64())]));
+        let dml = catalog_tables_delete_dml(catalog_key_from_active_ordinal(
+            0,
+            vec![Val::from(table_id.as_u64())],
+        ));
 
         assert!(drop_table_has_catalog_table_delete(table_id, &dml).unwrap());
     }
@@ -803,7 +803,7 @@ mod tests {
     #[test]
     fn test_drop_table_has_catalog_table_delete_different_table_is_false() {
         let table_id = TableID::new(42);
-        let dml = catalog_tables_delete_dml(SelectKey::new(
+        let dml = catalog_tables_delete_dml(catalog_key_from_active_ordinal(
             0,
             vec![Val::from(TableID::new(43).as_u64())],
         ));
@@ -814,7 +814,10 @@ mod tests {
     #[test]
     fn test_drop_table_has_catalog_table_delete_rejects_wrong_index_no() {
         let table_id = TableID::new(42);
-        let dml = catalog_tables_delete_dml(SelectKey::new(1, vec![Val::from(table_id.as_u64())]));
+        let dml = catalog_tables_delete_dml(catalog_key_from_active_ordinal(
+            1,
+            vec![Val::from(table_id.as_u64())],
+        ));
         let err = drop_table_has_catalog_table_delete(table_id, &dml).unwrap_err();
 
         assert_malformed_drop_table_redo(err, "index_no=1");
@@ -823,7 +826,7 @@ mod tests {
     #[test]
     fn test_drop_table_has_catalog_table_delete_rejects_value_count_mismatch() {
         let table_id = TableID::new(42);
-        let dml = catalog_tables_delete_dml(SelectKey::new(
+        let dml = catalog_tables_delete_dml(catalog_key_from_active_ordinal(
             0,
             vec![Val::from(table_id.as_u64()), Val::from(1u64)],
         ));
@@ -835,7 +838,8 @@ mod tests {
     #[test]
     fn test_drop_table_has_catalog_table_delete_rejects_value_type_mismatch() {
         let table_id = TableID::new(42);
-        let dml = catalog_tables_delete_dml(SelectKey::new(0, vec![Val::from(42u32)]));
+        let dml =
+            catalog_tables_delete_dml(catalog_key_from_active_ordinal(0, vec![Val::from(42u32)]));
         let err = drop_table_has_catalog_table_delete(table_id, &dml).unwrap_err();
 
         assert_malformed_drop_table_redo(err, "key value is not u64");

@@ -1282,6 +1282,7 @@ pub(crate) mod tests {
     use crate::catalog::{
         CatalogCheckpointBatch, CatalogCheckpointScanStopReason, ColumnAttributes, ColumnSpec,
     };
+    use crate::catalog::{CatalogSelectKey, catalog_key_from_active_ordinal};
     use crate::error::{
         DataIntegrityError, DiscloseResultExt, Result, RuntimeError, RuntimeOrFatalError,
     };
@@ -1291,7 +1292,7 @@ pub(crate) mod tests {
     use crate::id::{BlockID, PageID};
     use crate::index::{ColumnBlockIndex, ColumnDeleteDeltaPatch};
     use crate::log::redo::{DDLRedo, RowRedoKind};
-    use crate::row::ops::{SelectKey, UpdateCol};
+    use crate::row::ops::UpdateCol;
     use crate::session::tests::begin_test_mandatory_private_trx;
     use crate::session::{MandatoryOperationGuard, Session};
     use crate::trx::PrivateTransaction;
@@ -1577,7 +1578,7 @@ pub(crate) mod tests {
 
     async fn assert_checkpoint_rejects_delete_key(
         engine_name: &str,
-        key: SelectKey,
+        key: CatalogSelectKey,
         expected_message: &str,
     ) {
         let temp_dir = TempDir::new().unwrap();
@@ -1789,7 +1790,7 @@ pub(crate) mod tests {
         smol::block_on(async {
             assert_checkpoint_rejects_delete_key(
                 "catalog-delete-key-non-primary",
-                SelectKey::new(1, vec![Val::from(USER_TABLE_ID_START)]),
+                catalog_key_from_active_ordinal(1, vec![Val::from(USER_TABLE_ID_START)]),
                 "catalog checkpoint delete key is not primary key",
             )
             .await;
@@ -1801,7 +1802,7 @@ pub(crate) mod tests {
         smol::block_on(async {
             assert_checkpoint_rejects_delete_key(
                     "catalog-delete-key-value-count",
-                    SelectKey::new(
+                    catalog_key_from_active_ordinal(
                         0,
                         vec![Val::from(USER_TABLE_ID_START), Val::from(0u16)],
                     ),
@@ -2151,7 +2152,7 @@ pub(crate) mod tests {
                     },
                     CatalogRedoEntry {
                         table_id: TABLE_ID_TABLES,
-                        kind: RowRedoKind::DeleteByPrimaryKey(SelectKey::new(
+                        kind: RowRedoKind::DeleteByPrimaryKey(catalog_key_from_active_ordinal(
                             0,
                             vec![Val::from(table_id)],
                         )),
@@ -2207,7 +2208,7 @@ pub(crate) mod tests {
                     CatalogRedoEntry {
                         table_id: TABLE_ID_TABLES,
                         kind: RowRedoKind::UpdateByPrimaryKey(
-                            SelectKey::new(0, vec![Val::from(table_id)]),
+                            catalog_key_from_active_ordinal(0, vec![Val::from(table_id)]),
                             vec![UpdateCol {
                                 idx: 1,
                                 val: Val::from(7u16),
@@ -2259,7 +2260,7 @@ pub(crate) mod tests {
                     CatalogRedoEntry {
                         table_id: TABLE_ID_TABLES,
                         kind: RowRedoKind::UpdateByPrimaryKey(
-                            SelectKey::new(0, vec![Val::from(table_id)]),
+                            catalog_key_from_active_ordinal(0, vec![Val::from(table_id)]),
                             vec![UpdateCol {
                                 idx: 0,
                                 val: Val::from(table_id),
@@ -2315,7 +2316,7 @@ pub(crate) mod tests {
                 vec![CatalogRedoEntry {
                     table_id: TABLE_ID_TABLES,
                     kind: RowRedoKind::UpdateByPrimaryKey(
-                        SelectKey::new(0, vec![Val::from(table_id)]),
+                        catalog_key_from_active_ordinal(0, vec![Val::from(table_id)]),
                         vec![UpdateCol {
                             idx: 1,
                             val: Val::from(9u16),
@@ -2411,7 +2412,10 @@ pub(crate) mod tests {
             let table_id = USER_TABLE_ID_START + 42;
             let table_ops = vec![
                 RowRedoKind::Insert(PageID::new(0), vec![Val::from(table_id), Val::from(0u16)]),
-                RowRedoKind::DeleteByPrimaryKey(SelectKey::new(0, vec![Val::from(table_id)])),
+                RowRedoKind::DeleteByPrimaryKey(catalog_key_from_active_ordinal(
+                    0,
+                    vec![Val::from(table_id)],
+                )),
             ];
             let mut mutable =
                 MutableMultiTableFile::fork(&storage.mtb, storage.table_fs.background_writes());
@@ -2462,7 +2466,10 @@ pub(crate) mod tests {
             let table_id = USER_TABLE_ID_START + 4242;
             let table_ops = vec![
                 RowRedoKind::Insert(PageID::new(0), vec![Val::from(table_id), Val::from(0u16)]),
-                RowRedoKind::DeleteByPrimaryKey(SelectKey::new(0, vec![Val::from(table_id)])),
+                RowRedoKind::DeleteByPrimaryKey(catalog_key_from_active_ordinal(
+                    0,
+                    vec![Val::from(table_id)],
+                )),
             ];
             let mut mutable =
                 MutableMultiTableFile::fork(&storage.mtb, storage.table_fs.background_writes());
