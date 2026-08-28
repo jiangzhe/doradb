@@ -1049,6 +1049,7 @@ impl ReadSnapshot {
         let checkout = self.checkout()?;
         let operation_key = checkout.entry.key();
         let config = checkout.runtime.core().table_scan_config();
+        let read_view = MvccReadView::ownerless(self.sts());
         let worklist = {
             let table = checkout.table(table_id)?;
             DmlValidator::new(table.visible_metadata().metadata())
@@ -1065,6 +1066,7 @@ impl ReadSnapshot {
                 .table_scan_mvcc_worklist(
                     TableScanRuntime::new(checkout.runtime.pool_guards()),
                     table.root(),
+                    &read_view,
                 )
                 .await
                 .attach_with(|| {
@@ -1161,6 +1163,8 @@ impl Debug for TableScanPlan {
             .field("operation_key", &self.shared.operation_key)
             .field("sts", &self.shared.sts)
             .field("table_id", &self.shared.table_id)
+            .field("column_root", &self.shared.column_root)
+            .field("pivot_row_id", &self.shared.pivot_row_id)
             .field("generation", &self.generation)
             .field("partition_offsets", &self.partition_offsets)
             .finish_non_exhaustive()
@@ -1230,8 +1234,6 @@ impl TableScanPlan {
                 Arc::clone(&self.shared.units),
                 start,
                 end,
-                self.shared.column_root,
-                self.shared.pivot_row_id,
                 Arc::clone(&self.shared.projection),
                 self.shared.table_id,
                 partition_idx,

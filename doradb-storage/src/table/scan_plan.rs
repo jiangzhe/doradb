@@ -1,14 +1,14 @@
-use super::{RowPageDescriptor, TableScanWorklist};
+use super::{ColdBlockScanDescriptor, RowPageDescriptor, TableScanWorklist};
 use crate::conf::TableScanConfig;
 use crate::id::{BlockID, RowID};
-use crate::index::ColumnLeafEntry;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 /// One immutable storage-level unit in captured table-scan order.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TableScanUnit {
     /// One persisted LWC block-index entry.
-    Cold(ColumnLeafEntry),
+    Cold(Arc<ColdBlockScanDescriptor>),
     /// One original hot row page and its captured RowID reservation.
     Hot(RowPageDescriptor),
 }

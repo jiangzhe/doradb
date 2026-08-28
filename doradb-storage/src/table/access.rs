@@ -20,13 +20,14 @@ use crate::file::table_file::ActiveRoot;
 use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{
-    BorrowedIndexMutationStream, ColumnBlockIndex, ColumnLeafEntry, CurrentIndexReadHandle,
-    IndexBatchStream, IndexCompareExchange, IndexInsert, IndexMask, KeyRange, LwcRowLocation,
+    BorrowedIndexMutationStream, ColumnBlockIndex, ColumnBlockScanEntry, ColumnLeafEntry,
+    ColumnScanDeletePlan, CurrentIndexReadHandle, DeferredColumnScanDeletes, IndexBatchStream,
+    IndexCompareExchange, IndexInsert, IndexMask, KeyRange, LwcRowLocation,
     NonUniqueSecondaryIndex, OwnedCurrentIndexReadHandle, OwnedIndexCandidateStream, RowLocation,
     SecondaryIndex, UniqueInsertAttempt, UniqueSecondaryIndex,
 };
 use crate::log::redo::{RowRedo, RowRedoKind};
-use crate::lwc::{LwcBlock, PersistedLwcBlock};
+use crate::lwc::{LwcBlock, PersistedLwcBlock, PreparedLwcBlock};
 use crate::map::{FastHashMap, FastHashSet};
 use crate::poison::PoisonAwareListener;
 use crate::row::ops::{
@@ -35,10 +36,11 @@ use crate::row::ops::{
 };
 use crate::row::{Row, RowPage, RowRead, estimate_max_row_count};
 use crate::table::{
-    ColumnDeletionBuffer, ColumnStorage, DeleteMarker, DeletionClaim, DeletionError, DmlValidator,
-    MemTable, RowPageDescriptor, Table, TableRootSnapshot, TableRuntimeLayout, TableScanRootView,
-    UpdateUniqueMvcc, index_key_is_changed, index_key_replace, read_latest_index_key,
-    read_physical_index_keys_for_delete, row_len, unique_key_from_full_row,
+    ColdVisibilityOverride, ColumnDeletionBuffer, ColumnStorage, DeleteMarker, DeletionClaim,
+    DeletionError, DmlValidator, MemTable, RowPageDescriptor, Table, TableRootSnapshot,
+    TableRuntimeLayout, TableScanRootView, UpdateUniqueMvcc, index_key_is_changed,
+    index_key_replace, read_latest_index_key, read_physical_index_keys_for_delete, row_len,
+    unique_key_from_full_row,
 };
 use crate::trx::row::{
     BoundIndexCandidate, FindOldVersion, MainBranchMvcc, ReadLatestRow, RowReadAccess,
@@ -67,6 +69,14 @@ enum LazyRowSource<'row> {
         file_kind: FileKind,
         block_id: BlockID,
     },
+    PreparedCold {
+        block: &'row LwcBlock,
+        prepared: &'row mut PreparedLwcBlock,
+        column_layout: &'row TableColumnLayout,
+        row_idx: usize,
+        file_kind: FileKind,
+        block_id: BlockID,
+    },
     Hot {
         access: RowReadAccess<'row>,
         column_layout: &'row TableColumnLayout,
@@ -79,7 +89,7 @@ enum LazyRowSource<'row> {
 
 impl LazyRowSource<'_> {
     #[inline]
-    fn load_uncached(&self, column_no: usize) -> DataIntegrityResult<Val> {
+    fn load_uncached(&mut self, column_no: usize) -> DataIntegrityResult<Val> {
         match self {
             LazyRowSource::Cold {
                 block,
@@ -89,6 +99,18 @@ impl LazyRowSource<'_> {
                 block_id,
             } => Ok(block
                 .decode_value(column_layout, *row_idx, column_no)
+                .attach_with(|| {
+                    format!("file={file_kind}, block=lwc_block, block_id={block_id}")
+                })?),
+            LazyRowSource::PreparedCold {
+                block,
+                prepared,
+                column_layout,
+                row_idx,
+                file_kind,
+                block_id,
+            } => Ok(prepared
+                .decode_value(block, column_layout, *row_idx, column_no)
                 .attach_with(|| {
                     format!("file={file_kind}, block=lwc_block, block_id={block_id}")
                 })?),
@@ -309,10 +331,111 @@ pub(crate) struct TableScanWorklist {
     pub(crate) column_root: BlockID,
     /// Captured boundary between persisted and hot rows.
     pub(crate) pivot_row_id: RowID,
-    /// Persisted leaf entries ordered by starting row ID.
-    pub(crate) cold_entries: Vec<ColumnLeafEntry>,
+    /// Scan-ready persisted block descriptors ordered by starting row ID.
+    pub(crate) cold_entries: Vec<Arc<ColdBlockScanDescriptor>>,
     /// Original hot row-page descriptors ordered by starting row ID.
     pub(crate) hot_pages: Vec<RowPageDescriptor>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OrdinalVisibilityOverride {
+    ordinal: u32,
+    force_visible: bool,
+}
+
+/// Final ordinal visibility state for one persisted LWC block.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ColdDeleteMask {
+    /// The block has no invisible ordinals and needs no bitmap allocation.
+    AllVisible,
+    /// Set bits identify invisible LWC ordinals.
+    Bitmap(Box<[u64]>),
+}
+
+impl ColdDeleteMask {
+    fn compile(
+        row_count: u16,
+        deleted_ordinals: &[u32],
+        overrides: &[OrdinalVisibilityOverride],
+    ) -> DataIntegrityResult<Self> {
+        if deleted_ordinals.is_empty() && overrides.iter().all(|entry| entry.force_visible) {
+            return Ok(ColdDeleteMask::AllVisible);
+        }
+        let row_count = usize::from(row_count);
+        let mut words = vec![0u64; row_count.div_ceil(u64::BITS as usize)];
+        for &ordinal in deleted_ordinals {
+            let ordinal = ordinal as usize;
+            if ordinal >= row_count {
+                return Err(
+                    Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                        "cold scan delete ordinal {ordinal} exceeds row count {row_count}"
+                    )),
+                );
+            }
+            words[ordinal / u64::BITS as usize] |= 1 << (ordinal % u64::BITS as usize);
+        }
+        // The CDB is newer authority and must be applied after the durable base.
+        for entry in overrides {
+            let ordinal = entry.ordinal as usize;
+            if ordinal >= row_count {
+                return Err(
+                    Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                        "cold scan visibility ordinal {ordinal} exceeds row count {row_count}"
+                    )),
+                );
+            }
+            let bit = 1 << (ordinal % u64::BITS as usize);
+            if entry.force_visible {
+                words[ordinal / u64::BITS as usize] &= !bit;
+            } else {
+                words[ordinal / u64::BITS as usize] |= bit;
+            }
+        }
+        if words.iter().all(|word| *word == 0) {
+            Ok(ColdDeleteMask::AllVisible)
+        } else {
+            Ok(ColdDeleteMask::Bitmap(words.into_boxed_slice()))
+        }
+    }
+
+    #[inline]
+    fn is_deleted(&self, ordinal: usize) -> bool {
+        match self {
+            ColdDeleteMask::AllVisible => false,
+            ColdDeleteMask::Bitmap(words) => {
+                words[ordinal / u64::BITS as usize] & (1 << (ordinal % u64::BITS as usize)) != 0
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ColdDescriptorDeletes {
+    Ready(ColdDeleteMask),
+    Deferred {
+        deletes: DeferredColumnScanDeletes,
+        overrides: Box<[OrdinalVisibilityOverride]>,
+    },
+}
+
+/// Immutable scan execution metadata for one persisted LWC block.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ColdBlockScanDescriptor {
+    block_id: BlockID,
+    start_row_id: RowID,
+    end_row_id: RowID,
+    row_count: u16,
+    row_id_span: u32,
+    row_shape_fingerprint: u128,
+    deletes: ColdDescriptorDeletes,
+}
+
+impl ColdBlockScanDescriptor {
+    /// Returns the logical row count bound by the column index.
+    #[inline]
+    pub(crate) fn row_count(&self) -> usize {
+        usize::from(self.row_count)
+    }
 }
 
 /// Physical capabilities required while planning and loading a table scan.
@@ -344,8 +467,8 @@ impl<'runtime> TableScanRuntime<'runtime> {
 /// One loaded persisted page and its MVCC scan metadata.
 pub(crate) struct TableScanColdPage {
     persisted: PersistedLwcBlock,
-    row_ids: Vec<RowID>,
-    durable_deleted: FastHashSet<RowID>,
+    prepared: PreparedLwcBlock,
+    delete_mask: ColdDeleteMask,
     file_kind: FileKind,
     block_id: BlockID,
 }
@@ -354,7 +477,7 @@ impl TableScanColdPage {
     /// Returns the number of logical row IDs carried by this page.
     #[inline]
     pub(crate) fn row_count(&self) -> usize {
-        self.row_ids.len()
+        self.persisted.block().row_count()
     }
 }
 
@@ -3318,10 +3441,11 @@ impl<'op> UserTableAccessor<'op> {
         &self,
         runtime: TableScanRuntime<'_>,
         root: &impl TableScanRootView,
+        read_view: &MvccReadView,
     ) -> RuntimeResult<TableScanWorklist> {
         let column_root = root.column_block_index_root();
         let pivot_row_id = root.pivot_row_id();
-        let cold_entries = if column_root == SUPER_BLOCK_ID || pivot_row_id == RowID::new(0) {
+        let scan_entries = if column_root == SUPER_BLOCK_ID || pivot_row_id == RowID::new(0) {
             Vec::new()
         } else {
             let storage = self.column_storage();
@@ -3334,10 +3458,20 @@ impl<'op> UserTableAccessor<'op> {
                 runtime.pool_guards().disk_guard(),
             );
             column_index
-                .collect_leaf_entries()
+                .collect_scan_entries()
                 .await
                 .attach("operation=capture_table_scan_worklist, phase=capture_cold_entries")?
         };
+        let visibility_overrides = match (scan_entries.first(), scan_entries.last()) {
+            (Some(first), Some(last)) => self
+                .lwc_deletion_buffer()
+                .collect_cold_visibility_overrides(read_view, first.start_row_id, last.end_row_id),
+            (None, None) => Vec::new(),
+            _ => unreachable!("cold scan entry bounds must be both present or both absent"),
+        };
+        let cold_entries = compile_cold_scan_descriptors(scan_entries, &visibility_overrides)
+            .change_context(RuntimeError::TableAccess)
+            .attach("operation=capture_table_scan_worklist, phase=compile_cold_entries")?;
         let (_, hot_pages) = self
             .mem()
             .snapshot_original_row_pages_from(runtime.pool_guards(), pivot_row_id)
@@ -3355,61 +3489,69 @@ impl<'op> UserTableAccessor<'op> {
     pub(crate) async fn load_table_scan_cold_page(
         &self,
         runtime: TableScanRuntime<'_>,
-        column_root: BlockID,
-        pivot_row_id: RowID,
-        entry: &ColumnLeafEntry,
+        descriptor: &ColdBlockScanDescriptor,
     ) -> RuntimeResult<TableScanColdPage> {
         let storage = self.column_storage();
         let file_kind = storage.file().file_kind();
         let disk_guard = runtime.pool_guards().disk_guard();
-        let column_index = ColumnBlockIndex::new(
-            column_root,
-            pivot_row_id,
-            file_kind,
-            storage.file().sparse_file(),
-            storage.disk_pool(),
-            disk_guard,
-        );
-        let (delete_deltas, row_ids) = column_index
-            .load_delete_deltas_and_row_ids(entry)
-            .await
-            .attach_with(|| {
-                format!(
-                    "operation=load_table_scan_cold_page, phase=load_row_metadata, block_id={}",
-                    entry.block_id()
-                )
-            })?;
+        let delete_mask = match &descriptor.deletes {
+            ColdDescriptorDeletes::Ready(mask) => mask.clone(),
+            ColdDescriptorDeletes::Deferred { deletes, overrides } => {
+                let ordinals = deletes
+                    .load_ordinals(
+                        file_kind,
+                        storage.file().sparse_file(),
+                        storage.disk_pool(),
+                        disk_guard,
+                    )
+                    .await
+                    .attach_with(|| {
+                        format!(
+                            "operation=load_table_scan_cold_page, phase=load_delete_blob, block_id={}",
+                            descriptor.block_id
+                        )
+                    })?;
+                ColdDeleteMask::compile(descriptor.row_count, &ordinals, overrides)
+                    .change_context(RuntimeError::TableAccess)
+                    .attach_with(|| {
+                        format!(
+                            "operation=load_table_scan_cold_page, phase=finalize_delete_mask, block_id={}",
+                            descriptor.block_id
+                        )
+                    })?
+            }
+        };
         let persisted = storage
-            .load_lwc_block(disk_guard, entry.block_id())
+            .load_lwc_block(disk_guard, descriptor.block_id)
             .await
             .attach_with(|| {
                 format!(
                     "operation=load_table_scan_cold_page, phase=load_block, block_id={}",
-                    entry.block_id()
+                    descriptor.block_id
                 )
             })?;
-        validate_cold_scan_entry(file_kind, entry, persisted.block(), &row_ids)
+        validate_cold_scan_descriptor(file_kind, descriptor, persisted.block())
             .change_context(RuntimeError::TableAccess)
             .attach_with(|| {
                 format!(
                     "operation=load_table_scan_cold_page, phase=validate_block, block_id={}",
-                    entry.block_id()
+                    descriptor.block_id
                 )
             })?;
-        let durable_deleted = persisted_delete_set_for_scan(file_kind, entry, delete_deltas)
+        let prepared = PreparedLwcBlock::new(persisted.block(), self.metadata().col.as_ref())
             .change_context(RuntimeError::TableAccess)
             .attach_with(|| {
                 format!(
-                    "operation=load_table_scan_cold_page, phase=validate_deletes, block_id={}",
-                    entry.block_id()
+                    "operation=load_table_scan_cold_page, phase=prepare_block, block_id={}",
+                    descriptor.block_id
                 )
             })?;
         Ok(TableScanColdPage {
             persisted,
-            row_ids,
-            durable_deleted,
+            prepared,
+            delete_mask,
             file_kind,
-            block_id: entry.block_id(),
+            block_id: descriptor.block_id,
         })
     }
 
@@ -3417,24 +3559,16 @@ impl<'op> UserTableAccessor<'op> {
     #[inline]
     pub(crate) fn table_scan_cold_row<'row>(
         &'row self,
-        read_view: &MvccReadView,
-        page: &'row TableScanColdPage,
+        page: &'row mut TableScanColdPage,
         row_idx: usize,
         buffer: &'row mut LazyRowBuffer,
     ) -> Option<LazyRow<'row>> {
-        let row_id = page.row_ids[row_idx];
-        let durable_deleted =
-            !page.durable_deleted.is_empty() && page.durable_deleted.contains(&row_id);
-        if !cold_row_visible_mvcc(
-            self.lwc_deletion_buffer(),
-            read_view,
-            row_id,
-            durable_deleted,
-        ) {
+        if page.delete_mask.is_deleted(row_idx) {
             return None;
         }
-        let source = LazyRowSource::Cold {
+        let source = LazyRowSource::PreparedCold {
             block: page.persisted.block(),
+            prepared: &mut page.prepared,
             column_layout: self.metadata().col.as_ref(),
             row_idx,
             file_kind: page.file_kind,
@@ -4955,6 +5089,99 @@ fn persisted_delete_set_for_scan(
     Ok(deleted)
 }
 
+fn compile_cold_scan_descriptors(
+    entries: Vec<ColumnBlockScanEntry>,
+    visibility_overrides: &[ColdVisibilityOverride],
+) -> DataIntegrityResult<Vec<Arc<ColdBlockScanDescriptor>>> {
+    let mut descriptors = Vec::with_capacity(entries.len());
+    let mut next_override = 0usize;
+    for entry in entries {
+        while next_override < visibility_overrides.len()
+            && visibility_overrides[next_override].row_id < entry.start_row_id
+        {
+            next_override += 1;
+        }
+        let mut ordinal_overrides = Vec::new();
+        while next_override < visibility_overrides.len()
+            && visibility_overrides[next_override].row_id < entry.end_row_id
+        {
+            let visibility = visibility_overrides[next_override];
+            let delta = visibility
+                .row_id
+                .checked_sub(entry.start_row_id)
+                .and_then(|delta| u32::try_from(delta).ok())
+                .ok_or_else(|| {
+                    Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                        "cold scan visibility delta is not representable: row_id={}, start_row_id={}",
+                        visibility.row_id, entry.start_row_id
+                    ))
+                })?;
+            if let Some(ordinal) = entry.identity.ordinal_for_delta(delta) {
+                ordinal_overrides.push(OrdinalVisibilityOverride {
+                    ordinal,
+                    force_visible: visibility.force_visible,
+                });
+            }
+            next_override += 1;
+        }
+        let deletes = match entry.deletes {
+            ColumnScanDeletePlan::InlineOrdinals(ordinals) => ColdDescriptorDeletes::Ready(
+                ColdDeleteMask::compile(entry.row_count, &ordinals, &ordinal_overrides)?,
+            ),
+            ColumnScanDeletePlan::External(deletes) => ColdDescriptorDeletes::Deferred {
+                deletes,
+                overrides: ordinal_overrides.into_boxed_slice(),
+            },
+        };
+        descriptors.push(Arc::new(ColdBlockScanDescriptor {
+            block_id: entry.block_id,
+            start_row_id: entry.start_row_id,
+            end_row_id: entry.end_row_id,
+            row_count: entry.row_count,
+            row_id_span: entry.row_id_span,
+            row_shape_fingerprint: entry.row_shape_fingerprint,
+            deletes,
+        }));
+    }
+    Ok(descriptors)
+}
+
+fn validate_cold_scan_descriptor(
+    file_kind: FileKind,
+    descriptor: &ColdBlockScanDescriptor,
+    block: &LwcBlock,
+) -> DataIntegrityResult<()> {
+    let coverage_span = descriptor
+        .end_row_id
+        .checked_sub(descriptor.start_row_id)
+        .and_then(|span| u32::try_from(span).ok());
+    if coverage_span != Some(descriptor.row_id_span) {
+        return Err(
+            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                "file={file_kind}, block=lwc_block, block_id={}, cold scan coverage mismatch",
+                descriptor.block_id
+            )),
+        );
+    }
+    if block.row_count() != descriptor.row_count() {
+        return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+            "file={file_kind}, block=lwc_block, block_id={}, LWC row count mismatch: descriptor_rows={}, block_rows={}",
+            descriptor.block_id,
+            descriptor.row_count(),
+            block.row_count()
+        )));
+    }
+    if block.row_shape_fingerprint() != descriptor.row_shape_fingerprint {
+        return Err(
+            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                "file={file_kind}, block=lwc_block, block_id={}, row shape fingerprint mismatch",
+                descriptor.block_id
+            )),
+        );
+    }
+    Ok(())
+}
+
 fn validate_cold_scan_entry(
     file_kind: FileKind,
     entry: &ColumnLeafEntry,
@@ -5060,8 +5287,8 @@ fn read_latest_cold_row(
 #[cfg(test)]
 mod tests {
     use super::{
-        ColdLatestRow, InsertedRow, LazyRowBuffer, ScanBoundaryTracker, cold_row_visible_mvcc,
-        read_latest_cold_row,
+        ColdDeleteMask, ColdLatestRow, InsertedRow, LazyRowBuffer, OrdinalVisibilityOverride,
+        ScanBoundaryTracker, cold_row_visible_mvcc, read_latest_cold_row,
     };
     use crate::buffer::BufferPool;
     use crate::buffer::frame::FrameKind;
@@ -7748,6 +7975,43 @@ mod tests {
     }
 
     #[test]
+    fn test_cold_delete_mask_applies_cdb_overrides_after_persisted_deletes() {
+        let mask = ColdDeleteMask::compile(
+            5,
+            &[1, 3],
+            &[
+                OrdinalVisibilityOverride {
+                    ordinal: 1,
+                    force_visible: true,
+                },
+                OrdinalVisibilityOverride {
+                    ordinal: 2,
+                    force_visible: false,
+                },
+            ],
+        )
+        .unwrap();
+        assert!(!mask.is_deleted(0));
+        assert!(!mask.is_deleted(1));
+        assert!(mask.is_deleted(2));
+        assert!(mask.is_deleted(3));
+        assert!(!mask.is_deleted(4));
+
+        assert_eq!(
+            ColdDeleteMask::compile(
+                2,
+                &[],
+                &[OrdinalVisibilityOverride {
+                    ordinal: 1,
+                    force_visible: true,
+                }]
+            )
+            .unwrap(),
+            ColdDeleteMask::AllVisible
+        );
+    }
+
+    #[test]
     fn test_read_latest_cold_row_checks_delete_ownership() {
         let deletion_buffer = ColumnDeletionBuffer::new();
         let reader_status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 1));
@@ -9309,12 +9573,59 @@ mod tests {
             let worklist = observe_table_scan_worklist(&mut trx, &table).await.unwrap();
             assert_eq!(worklist.column_root, expected_column_root);
             assert_eq!(worklist.pivot_row_id, expected_pivot);
-            assert_eq!(worklist.cold_entries, expected_cold_entries);
+            assert_eq!(worklist.cold_entries.len(), expected_cold_entries.len());
+            for (descriptor, entry) in worklist.cold_entries.iter().zip(&expected_cold_entries) {
+                assert_eq!(descriptor.block_id, entry.block_id());
+                assert_eq!(descriptor.start_row_id, entry.start_row_id);
+                assert_eq!(descriptor.end_row_id, entry.end_row_id());
+                assert_eq!(descriptor.row_count(), usize::from(entry.row_count()));
+                assert_eq!(
+                    descriptor.row_shape_fingerprint,
+                    entry.row_shape_fingerprint()
+                );
+            }
             assert_eq!(worklist.hot_pages, expected_hot_pages);
             assert!(!worklist.cold_entries.is_empty());
             assert!(!worklist.hot_pages.is_empty());
             trx.noop().await.unwrap();
             trx.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_warm_cold_scan_reads_each_index_and_lwc_page_once() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "cold_scan_page_reads").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 5, "cold").await;
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+            assert_checkpoint_published(&mut session, table_id).await;
+
+            let mut warmup = session.begin_trx().unwrap();
+            assert_eq!(scan_table_i32s(&mut warmup, table_id).await.len(), 5);
+            warmup.commit().await.unwrap();
+
+            let table = table_for_internal_assertion(&engine, table_id);
+            let cdb_before = table.deletion_buffer().scan_diagnostics();
+            let before = session.buffer_pool_stats().unwrap().disk.counters;
+            let mut measured = session.begin_trx().unwrap();
+            assert_eq!(scan_table_i32s(&mut measured, table_id).await.len(), 5);
+            measured.commit().await.unwrap();
+            let delta = session
+                .buffer_pool_stats()
+                .unwrap()
+                .disk
+                .counters
+                .delta_since(before);
+            assert_eq!(delta.cache_hits, 2, "one index leaf plus one LWC block");
+            assert_eq!(delta.cache_misses, 0);
+            assert_eq!(delta.completed_reads, 0);
+            let cdb_after = table.deletion_buffer().scan_diagnostics();
+            assert_eq!(cdb_after.0 - cdb_before.0, 1, "one bounded CDB pass");
+            assert_eq!(cdb_after.1 - cdb_before.1, 0, "no per-row CDB gets");
         });
     }
 

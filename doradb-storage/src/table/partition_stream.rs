@@ -1,7 +1,7 @@
 #[cfg(test)]
 use crate::error::RuntimeError;
 use crate::error::{DiscloseError, DiscloseResultExt, Error, OperationError, Result};
-use crate::id::{BlockID, RowID, TableID};
+use crate::id::TableID;
 use crate::row::ops::{ScanRowDecision, ScanRowDecision::Include};
 use crate::table::{
     LazyRow, Table, TableRuntimeLayout, TableScanCursor, TableScanCursorAdvance,
@@ -92,8 +92,6 @@ impl TableScanPartitionStream {
         units: Arc<[TableScanUnit]>,
         start: usize,
         end: usize,
-        column_root: BlockID,
-        pivot_row_id: RowID,
         projection: Arc<[usize]>,
         table_id: TableID,
         partition_idx: usize,
@@ -105,8 +103,6 @@ impl TableScanPartitionStream {
             state: Some(TableScanPartitionStreamState {
                 cursor: TableScanCursor::new(
                     TableScanRangeCursor::new(units, start, end),
-                    column_root,
-                    pivot_row_id,
                     column_count,
                 ),
                 table: table.table,

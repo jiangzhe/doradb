@@ -14,9 +14,11 @@
 use crate::id::{RowID, TrxID};
 use crate::map::FastDashMap;
 use crate::poison::PoisonAwareListener;
-use crate::trx::{PrepareListenerResult, SharedTrxStatus, trx_is_committed};
+use crate::trx::{MvccVisibility, PrepareListenerResult, SharedTrxStatus, trx_is_committed};
 use dashmap::mapref::entry::Entry;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Result of attempting to claim or seed a cold-row delete marker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +66,15 @@ pub(crate) enum DeleteMarker {
     Committed(TrxID),
 }
 
+/// One immediately classified cold-row visibility override for a fixed reader.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ColdVisibilityOverride {
+    /// Cold row id whose in-memory marker supersedes persisted delete state.
+    pub(crate) row_id: RowID,
+    /// Whether the cold image must be visible after applying the persisted base.
+    pub(crate) force_visible: bool,
+}
+
 /// Concurrent table-level map from cold row id to delete marker.
 ///
 /// Column-store rows are immutable, so foreground modifications use this buffer
@@ -73,6 +84,10 @@ pub(crate) enum DeleteMarker {
 /// checkpoint, and recovery replay.
 pub(crate) struct ColumnDeletionBuffer {
     entries: FastDashMap<RowID, DeleteMarker>,
+    #[cfg(test)]
+    scan_passes: AtomicUsize,
+    #[cfg(test)]
+    point_gets: AtomicUsize,
 }
 
 impl ColumnDeletionBuffer {
@@ -81,6 +96,10 @@ impl ColumnDeletionBuffer {
     pub(crate) fn new() -> Self {
         ColumnDeletionBuffer {
             entries: FastDashMap::default(),
+            #[cfg(test)]
+            scan_passes: AtomicUsize::new(0),
+            #[cfg(test)]
+            point_gets: AtomicUsize::new(0),
         }
     }
 
@@ -310,7 +329,62 @@ impl ColumnDeletionBuffer {
     /// their own transaction snapshot.
     #[inline]
     pub(crate) fn get(&self, row_id: RowID) -> Option<DeleteMarker> {
+        #[cfg(test)]
+        self.point_gets.fetch_add(1, Ordering::Relaxed);
         self.entries.get(&row_id).map(|entry| entry.value().clone())
+    }
+
+    /// Classifies markers inside one captured cold coverage and sorts by row id.
+    ///
+    /// Classification is equivalent to later per-row lookup for a fixed STS:
+    /// a marker inserted after the STS is foreign-active or newer-committed and
+    /// therefore visible either way; rollback removes a foreign-active marker
+    /// without changing visibility; Ref compaction preserves its timestamp;
+    /// GC retains old-reader overrides; root publication installs required
+    /// transition markers first; and a transaction-owned stream keeps its
+    /// operation borrow until scanning ends.
+    pub(crate) fn collect_cold_visibility_overrides(
+        &self,
+        visibility: &impl MvccVisibility,
+        start_row_id: RowID,
+        end_row_id: RowID,
+    ) -> Vec<ColdVisibilityOverride> {
+        #[cfg(test)]
+        self.scan_passes.fetch_add(1, Ordering::Relaxed);
+        let reader_sts = visibility.sts();
+        let mut overrides = Vec::new();
+        for entry in &self.entries {
+            let row_id = *entry.key();
+            if row_id < start_row_id || row_id >= end_row_id {
+                continue;
+            }
+            let force_visible = match entry.value() {
+                DeleteMarker::Committed(ts) => *ts > reader_sts,
+                DeleteMarker::Ref(status) => {
+                    let ts = status.ts();
+                    if trx_is_committed(ts) {
+                        ts > reader_sts
+                    } else {
+                        !visibility.owns_status(status.as_ref())
+                    }
+                }
+            };
+            overrides.push(ColdVisibilityOverride {
+                row_id,
+                force_visible,
+            });
+        }
+        overrides.sort_unstable_by_key(|entry| entry.row_id);
+        overrides
+    }
+
+    /// Returns deterministic cold-scan map-pass and point-get counters.
+    #[cfg(test)]
+    pub(crate) fn scan_diagnostics(&self) -> (usize, usize) {
+        (
+            self.scan_passes.load(Ordering::Relaxed),
+            self.point_gets.load(Ordering::Relaxed),
+        )
     }
 
     /// Returns `None` when no marker exists, otherwise whether the marker is
@@ -435,7 +509,7 @@ mod tests {
         prepare_event_is_installed, prepare_shared_trx_status,
         rollback_preparing_shared_trx_status, shared_trx_status,
     };
-    use crate::trx::{MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID};
+    use crate::trx::{MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID, MvccReadView};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
@@ -514,6 +588,66 @@ mod tests {
         assert_eq!(
             buffer.put_ref(RowID::new(2), status, TrxID::new(29)),
             Err(DeletionError::WriteConflict)
+        );
+    }
+
+    #[test]
+    fn test_collect_cold_visibility_overrides_classifies_and_sorts_once() {
+        let buffer = ColumnDeletionBuffer::new();
+        let own = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 1));
+        let foreign = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 2));
+        buffer.put_committed(RowID::new(6), TrxID::new(30)).unwrap();
+        buffer.put_committed(RowID::new(1), TrxID::new(10)).unwrap();
+        buffer
+            .put_ref(
+                RowID::new(4),
+                Arc::new(shared_trx_status(TrxID::new(30))),
+                MAX_SNAPSHOT_TS,
+            )
+            .unwrap();
+        buffer
+            .put_ref(RowID::new(5), Arc::clone(&own), MAX_SNAPSHOT_TS)
+            .unwrap();
+        buffer
+            .put_ref(RowID::new(3), foreign, MAX_SNAPSHOT_TS)
+            .unwrap();
+        buffer
+            .put_ref(
+                RowID::new(2),
+                Arc::new(shared_trx_status(TrxID::new(10))),
+                MAX_SNAPSHOT_TS,
+            )
+            .unwrap();
+
+        let view = MvccReadView::with_own_status_for_test(TrxID::new(20), own);
+        assert_eq!(
+            buffer.collect_cold_visibility_overrides(&view, RowID::new(1), RowID::new(7)),
+            [
+                ColdVisibilityOverride {
+                    row_id: RowID::new(1),
+                    force_visible: false,
+                },
+                ColdVisibilityOverride {
+                    row_id: RowID::new(2),
+                    force_visible: false,
+                },
+                ColdVisibilityOverride {
+                    row_id: RowID::new(3),
+                    force_visible: true,
+                },
+                ColdVisibilityOverride {
+                    row_id: RowID::new(4),
+                    force_visible: true,
+                },
+                ColdVisibilityOverride {
+                    row_id: RowID::new(5),
+                    force_visible: false,
+                },
+                ColdVisibilityOverride {
+                    row_id: RowID::new(6),
+                    force_visible: true,
+                },
+            ]
         );
     }
 

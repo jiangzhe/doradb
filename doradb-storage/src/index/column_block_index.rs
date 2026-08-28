@@ -611,6 +611,155 @@ impl ColumnLeafEntry {
     }
 }
 
+/// Minimal ordinal resolver retained while compiling a cold table scan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ScanRowIdentity {
+    /// Every row-id delta in the persisted coverage is present.
+    Dense { row_id_span: u32 },
+    /// Strictly ordered present row-id deltas for a sparse persisted block.
+    SparseDeltas(Arc<[u32]>),
+}
+
+impl ScanRowIdentity {
+    /// Translate a row-id delta to its zero-based LWC ordinal.
+    #[inline]
+    pub(crate) fn ordinal_for_delta(&self, delta: u32) -> Option<u32> {
+        match self {
+            ScanRowIdentity::Dense { row_id_span } => (delta < *row_id_span).then_some(delta),
+            ScanRowIdentity::SparseDeltas(deltas) => deltas
+                .binary_search(&delta)
+                .ok()
+                .and_then(|idx| u32::try_from(idx).ok()),
+        }
+    }
+}
+
+impl From<LogicalRowSet> for ScanRowIdentity {
+    #[inline]
+    fn from(row_set: LogicalRowSet) -> Self {
+        match row_set {
+            LogicalRowSet::Dense { row_id_span } => ScanRowIdentity::Dense { row_id_span },
+            LogicalRowSet::DeltaList { deltas, .. } => {
+                ScanRowIdentity::SparseDeltas(Arc::from(deltas))
+            }
+        }
+    }
+}
+
+/// Lazy external persisted-delete payload retained by a cold scan descriptor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DeferredColumnScanDeletes {
+    domain: ColumnDeleteDomain,
+    del_count: u16,
+    blob_ref: BlobRef,
+    codec_version: u8,
+    row_count: u16,
+    identity: Option<ScanRowIdentity>,
+}
+
+impl DeferredColumnScanDeletes {
+    /// Load, validate, and normalize the external payload to LWC ordinals.
+    pub(crate) async fn load_ordinals(
+        &self,
+        file_kind: FileKind,
+        file: &Arc<SparseFile>,
+        disk_pool: &QuiescentGuard<ReadonlyBufferPool>,
+        disk_pool_guard: &PoolGuard,
+    ) -> RuntimeResult<Vec<u32>> {
+        let reader = ColumnDeletionBlobReader::new(file_kind, file, disk_pool, disk_pool_guard);
+        let (header, payload) = reader.read_framed_blob(self.blob_ref).await?;
+        if header.blob_kind() != COLUMN_AUX_BLOB_KIND_DELETE_DELTAS
+            || header.codec_kind() != COLUMN_AUX_BLOB_CODEC_U32_DELTA_LIST
+            || header.codec_version() != self.codec_version
+        {
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!(
+                    "file={file_kind}, block=column_deletion_blob, block_id={}, deletion metadata does not match scan descriptor",
+                    self.blob_ref.start_block_id
+                ))
+                .change_context(RuntimeError::IndexAccess)
+                .attach("operation=load_column_scan_delete_ordinals"));
+        }
+        let values = decode_u32_bytes_strict(&payload, self.del_count)
+            .attach_with(|| {
+                format!(
+                    "file={file_kind}, block=column_deletion_blob, block_id={}",
+                    self.blob_ref.start_block_id
+                )
+            })
+            .change_context(RuntimeError::IndexAccess)
+            .attach("operation=load_column_scan_delete_ordinals")?;
+        match self.domain {
+            ColumnDeleteDomain::Ordinal => {
+                if values
+                    .iter()
+                    .any(|ordinal| *ordinal >= u32::from(self.row_count))
+                {
+                    return Err(invalid_node_payload()
+                        .attach(format!(
+                            "file={file_kind}, block=column_deletion_blob, block_id={}",
+                            self.blob_ref.start_block_id
+                        ))
+                        .change_context(RuntimeError::IndexAccess)
+                        .attach("operation=load_column_scan_delete_ordinals"));
+                }
+                Ok(values)
+            }
+            ColumnDeleteDomain::RowIdDelta => {
+                let identity = self.identity.as_ref().ok_or_else(|| {
+                    invalid_node_payload()
+                        .change_context(RuntimeError::IndexAccess)
+                        .attach("operation=load_column_scan_delete_ordinals")
+                })?;
+                values
+                    .into_iter()
+                    .map(|delta| {
+                        identity.ordinal_for_delta(delta).ok_or_else(|| {
+                            invalid_node_payload()
+                                .attach(format!(
+                                    "file={file_kind}, block=column_deletion_blob, block_id={}",
+                                    self.blob_ref.start_block_id
+                                ))
+                                .change_context(RuntimeError::IndexAccess)
+                                .attach("operation=load_column_scan_delete_ordinals")
+                        })
+                    })
+                    .collect()
+            }
+        }
+    }
+}
+
+/// Persisted delete state already compiled as ordinals or deferred to a blob read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ColumnScanDeletePlan {
+    /// Inline delete ordinals, empty when the block has no persisted deletes.
+    InlineOrdinals(Vec<u32>),
+    /// External delete metadata that remains lazy until the block is reached.
+    External(DeferredColumnScanDeletes),
+}
+
+/// Scan-ready metadata decoded while its owning column-index leaf is resident.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ColumnBlockScanEntry {
+    /// Inclusive lower row-id coverage bound.
+    pub(crate) start_row_id: RowID,
+    /// Exclusive upper row-id coverage bound.
+    pub(crate) end_row_id: RowID,
+    /// Persisted LWC block id.
+    pub(crate) block_id: BlockID,
+    /// Number of logical rows stored in the LWC block.
+    pub(crate) row_count: u16,
+    /// Persisted row-id coverage width.
+    pub(crate) row_id_span: u32,
+    /// Canonical binding between column-index identity and LWC contents.
+    pub(crate) row_shape_fingerprint: u128,
+    /// Minimal resolver used only while row-id based metadata needs ordinals.
+    pub(crate) identity: ScanRowIdentity,
+    /// Persisted visibility base for the block.
+    pub(crate) deletes: ColumnScanDeletePlan,
+}
+
 /// Runtime row resolution result for one persisted columnar row lookup.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ResolvedColumnRow {
@@ -1896,6 +2045,67 @@ impl<'a> ColumnBlockIndex<'a> {
         Ok(entries)
     }
 
+    /// Collects scan-ready cold-block metadata in ascending row-id order.
+    ///
+    /// Each leaf prefix plane and entry payload is decoded while its owning
+    /// node is already resident. External delete blobs intentionally remain
+    /// unread until execution reaches their block.
+    pub(crate) async fn collect_scan_entries(&self) -> RuntimeResult<Vec<ColumnBlockScanEntry>> {
+        if self.root_block_id == SUPER_BLOCK_ID {
+            return Ok(Vec::new());
+        }
+        let mut stack = vec![self.root_block_id];
+        let mut entries = Vec::new();
+        let mut last_end = None;
+        while let Some(block_id) = stack.pop() {
+            let node = self.read_node(block_id).await?;
+            if node.is_leaf() {
+                let prefixes = self
+                    .node_result(block_id, node.leaf_prefix_plane())
+                    .change_context(RuntimeError::IndexAccess)
+                    .attach("operation=collect_column_scan_entries")?;
+                for idx in 0..prefixes.count() {
+                    let view = self
+                        .node_result(block_id, node.leaf_entry_view_with_prefixes(&prefixes, idx))
+                        .change_context(RuntimeError::IndexAccess)
+                        .attach("operation=collect_column_scan_entries")?;
+                    let entry = self
+                        .node_result(block_id, build_scan_entry(&view))
+                        .change_context(RuntimeError::IndexAccess)
+                        .attach("operation=collect_column_scan_entries")?;
+                    if let Some(prev_end) = last_end
+                        && entry.start_row_id < prev_end
+                    {
+                        return Err(invalid_node_payload()
+                            .attach(format!(
+                                "file={}, block=column_block_index, block_id={block_id}",
+                                self.file_kind()
+                            ))
+                            .change_context(RuntimeError::IndexAccess)
+                            .attach("operation=collect_column_scan_entries"));
+                    }
+                    last_end = Some(entry.end_row_id);
+                    entries.push(entry);
+                }
+                continue;
+            }
+            for entry in node.branch_entries().iter().rev() {
+                let child_block_id = entry.block_id();
+                if child_block_id == SUPER_BLOCK_ID {
+                    return Err(invalid_node_payload()
+                        .attach(format!(
+                            "file={}, block=column_block_index, block_id={block_id}",
+                            self.file_kind()
+                        ))
+                        .change_context(RuntimeError::IndexAccess)
+                        .attach("operation=collect_column_scan_entries"));
+                }
+                stack.push(child_block_id);
+            }
+        }
+        Ok(entries)
+    }
+
     /// Collect all blocks reachable from this column block-index root.
     ///
     /// The traversal validates every visited index node, leaf payload metadata,
@@ -2840,6 +3050,57 @@ fn build_leaf_entry(
     })
 }
 
+fn build_scan_entry(view: &LeafEntryView<'_>) -> DataIntegrityResult<ColumnBlockScanEntry> {
+    let row_set = decode_logical_row_set(view)?;
+    let row_count = u16::try_from(row_set.row_count()).map_err(|_| invalid_node_payload())?;
+    let delete_set = decode_logical_delete_set_base(view, &row_set)?;
+    let deletes = match delete_set {
+        LogicalDeleteSet::None { .. } => ColumnScanDeletePlan::InlineOrdinals(Vec::new()),
+        LogicalDeleteSet::Inline { row_id_deltas, .. } => {
+            let ordinals = row_id_deltas
+                .into_iter()
+                .map(|delta| {
+                    row_set
+                        .ordinal_for_delta(delta)
+                        .ok_or_else(invalid_node_payload)
+                })
+                .collect::<DataIntegrityResult<Vec<_>>>()?;
+            ColumnScanDeletePlan::InlineOrdinals(ordinals)
+        }
+        LogicalDeleteSet::External {
+            domain,
+            del_count,
+            blob_ref,
+            ..
+        } => {
+            let codec_version = view.delete_header.ok_or_else(invalid_node_payload)?.version;
+            let identity = (domain == ColumnDeleteDomain::RowIdDelta)
+                .then(|| ScanRowIdentity::from(row_set.clone()));
+            ColumnScanDeletePlan::External(DeferredColumnScanDeletes {
+                domain,
+                del_count,
+                blob_ref,
+                codec_version,
+                row_count,
+                identity,
+            })
+        }
+    };
+    Ok(ColumnBlockScanEntry {
+        start_row_id: view.start_row_id,
+        end_row_id: view
+            .entry_header
+            .end_row_id(view.start_row_id)
+            .map_err(|_| invalid_node_payload())?,
+        block_id: view.entry_header.block_id(),
+        row_count,
+        row_id_span: view.entry_header.row_id_span(),
+        row_shape_fingerprint: view.entry_header.row_shape_fingerprint(),
+        identity: ScanRowIdentity::from(row_set),
+        deletes,
+    })
+}
+
 fn build_resolved_row(
     leaf_block_id: BlockID,
     view: &LeafEntryView<'_>,
@@ -3660,6 +3921,20 @@ mod tests {
     }
 
     #[test]
+    fn scan_row_identity_translates_dense_and_sparse_ordinals() {
+        let dense = ScanRowIdentity::Dense { row_id_span: 4 };
+        assert_eq!(dense.ordinal_for_delta(0), Some(0));
+        assert_eq!(dense.ordinal_for_delta(3), Some(3));
+        assert_eq!(dense.ordinal_for_delta(4), None);
+
+        let sparse = ScanRowIdentity::SparseDeltas(Arc::from([1u32, 4, 9]));
+        assert_eq!(sparse.ordinal_for_delta(1), Some(0));
+        assert_eq!(sparse.ordinal_for_delta(4), Some(1));
+        assert_eq!(sparse.ordinal_for_delta(9), Some(2));
+        assert_eq!(sparse.ordinal_for_delta(2), None);
+    }
+
+    #[test]
     fn test_column_index_layout_adaptation_preserves_layout_source() {
         let err = match persisted_column_index_layout(
             layout::try_ref_from_bytes::<ColumnBlockNodeHeader>(&[0u8; 1]),
@@ -4001,6 +4276,20 @@ mod tests {
                     &test_row_ids([12, 15, 18])
                 )
             );
+            let scan_entries = index.collect_scan_entries().await.unwrap();
+            assert_eq!(scan_entries.len(), 2);
+            assert!(matches!(
+                scan_entries[0].identity,
+                ScanRowIdentity::Dense { row_id_span: 4 }
+            ));
+            assert_eq!(
+                scan_entries[1].identity,
+                ScanRowIdentity::SparseDeltas(Arc::from([2u32, 5, 8]))
+            );
+            assert!(matches!(
+                &scan_entries[0].deletes,
+                ColumnScanDeletePlan::InlineOrdinals(ordinals) if ordinals.is_empty()
+            ));
         });
     }
 
@@ -4287,6 +4576,23 @@ mod tests {
             assert!(reachable.contains(&root));
             assert!(reachable.contains(&entry.block_id()));
             assert!(reachable.contains(&blob_ref.start_block_id));
+
+            let scan_entries = index.collect_scan_entries().await.unwrap();
+            let ColumnScanDeletePlan::External(deferred) = &scan_entries[0].deletes else {
+                panic!("large scan delete set should remain deferred")
+            };
+            assert_eq!(
+                deferred
+                    .load_ordinals(
+                        disk_pool.file_kind(),
+                        disk_pool.sparse_file(),
+                        disk_pool.global_pool(),
+                        &disk_pool_guard,
+                    )
+                    .await
+                    .unwrap(),
+                (0..80).collect::<Vec<u32>>()
+            );
         });
     }
 
