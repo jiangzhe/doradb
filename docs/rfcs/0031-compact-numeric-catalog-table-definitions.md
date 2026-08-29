@@ -1938,13 +1938,16 @@ marker can alias a second CREATE after restart. [U20]
     extensions remain Phase 5 tests.
   - Non-goals: Column identity persistence, allocator watermarks, on-disk
     changes, provisional CREATE reservations, or slot reuse.
-  - Phase-local Choices: Direct ID-to-slot map representation, opaque handle
-    method names, slot-indexed `Option` versus unique map retirement ownership,
-    and checked `usize` conversions for immediate non-escaping helpers.
+  - Phase-local Choices: Use a `FastHashMap` ID-to-slot map, slot-indexed
+    optional runtime entries, one sealed shared API normalized through opaque
+    `TableIndexSelector`, a slot-keyed unique retirement registry, unified
+    catalog/user retained `IndexRef` carriers under the catalog equal-ID/slot
+    invariant, and checked `usize` conversions only for immediate non-escaping
+    helpers.
   - Task Doc: `docs/tasks/000289-resolve-once-runtime-layout-generation-ownership.md`
   - Task Issue: `#1031`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase Status: done
+  - Implementation Summary: Implemented stable-ID APIs, resolve-once admission, exact runtime ownership, and replay-safe root proof. [Task Resolve Sync: docs/tasks/000289-resolve-once-runtime-layout-generation-ownership.md @ 2026-08-29]
 
 - **Phase 3: Atomic Numeric Format Cutover And Replay-Safe Allocation**
   - Prerequisites: Phases 1 and 2 have separated public/durable reference

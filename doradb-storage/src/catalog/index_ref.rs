@@ -1,6 +1,7 @@
 use crate::error::{OperationError, OperationResult};
 use crate::id::TableID;
 use crate::row::ops::SelectKey;
+use crate::sealed::Sealed;
 use crate::table::TableRuntimeLayout;
 use crate::value::Val;
 use error_stack::Report;
@@ -173,9 +174,42 @@ impl fmt::Display for IndexRef {
     }
 }
 
+/// Sealed public argument accepted by table-index-driven transaction APIs.
+///
+/// Callers use [`TableIndex`] for normal ID resolution,
+/// or [`ResolvedTableIndex`] for direct exact-generation revalidation.
+pub trait TableIndexArgument: Sealed + Copy {
+    /// Converts this argument into its unified table-index selector.
+    fn into_selector(self) -> TableIndexSelector;
+}
+
 /// Table-qualified stable identity of one user index.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct TableIndex(pub TableID, pub IndexID);
+pub struct TableIndex(
+    /// Table owning the index.
+    pub TableID,
+    /// Stable table-local index identity.
+    pub IndexID,
+);
+
+impl Sealed for TableIndex {}
+
+impl TableIndexArgument for TableIndex {
+    #[inline]
+    fn into_selector(self) -> TableIndexSelector {
+        let TableIndex(table_id, index_id) = self;
+        TableIndexSelector {
+            table_id,
+            selection: TableIndexSelection::ID(index_id),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+enum TableIndexSelection {
+    ID(IndexID),
+    Resolved(IndexRef),
+}
 
 /// Unified opaque selector produced by table-index argument conversion.
 ///
@@ -185,12 +219,6 @@ pub struct TableIndex(pub TableID, pub IndexID);
 pub struct TableIndexSelector {
     table_id: TableID,
     selection: TableIndexSelection,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-enum TableIndexSelection {
-    ID(IndexID),
-    Resolved(IndexRef),
 }
 
 impl TableIndexSelector {
@@ -267,29 +295,7 @@ impl ResolvedTableIndex {
     }
 }
 
-/// Sealed public argument accepted by table-index-driven transaction APIs.
-///
-/// Callers use [`TableIndex`] for normal ID resolution,
-/// or [`ResolvedTableIndex`] for direct exact-generation revalidation.
-pub trait TableIndexArgument: crate::sealed::Sealed + Copy {
-    /// Converts this argument into its unified table-index selector.
-    fn into_selector(self) -> TableIndexSelector;
-}
-
-impl crate::sealed::Sealed for TableIndex {}
-
-impl TableIndexArgument for TableIndex {
-    #[inline]
-    fn into_selector(self) -> TableIndexSelector {
-        let TableIndex(table_id, index_id) = self;
-        TableIndexSelector {
-            table_id,
-            selection: TableIndexSelection::ID(index_id),
-        }
-    }
-}
-
-impl crate::sealed::Sealed for ResolvedTableIndex {}
+impl Sealed for ResolvedTableIndex {}
 
 impl TableIndexArgument for ResolvedTableIndex {
     #[inline]
