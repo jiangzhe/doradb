@@ -2783,8 +2783,7 @@ pub(crate) mod tests {
             let key = single_key(0i32);
             let selected = trx
                 .table_lookup_unique_mvcc(
-                    table_id,
-                    key.index_slot.transitional_id(),
+                    crate::TableIndex(table_id, key.index_slot.transitional_id()),
                     &key.vals,
                     &[0, 1],
                 )
@@ -2793,8 +2792,7 @@ pub(crate) mod tests {
             assert!(selected.is_found());
             let repeated = trx
                 .table_lookup_unique_mvcc(
-                    table_id,
-                    key.index_slot.transitional_id(),
+                    crate::TableIndex(table_id, key.index_slot.transitional_id()),
                     &key.vals,
                     &[0, 1],
                 )
@@ -3361,8 +3359,7 @@ pub(crate) mod tests {
             let key = single_key(0i32);
             let selected = read_trx
                 .table_lookup_unique_mvcc(
-                    table_id,
-                    key.index_slot.transitional_id(),
+                    crate::TableIndex(table_id, key.index_slot.transitional_id()),
                     &key.vals,
                     &[0, 1],
                 )
@@ -4796,8 +4793,7 @@ pub(crate) mod tests {
             let key = single_key(11);
             let err = trx
                 .table_lookup_unique_mvcc(
-                    table_id,
-                    key.index_slot.transitional_id(),
+                    crate::TableIndex(table_id, key.index_slot.transitional_id()),
                     &key.vals,
                     &[0, 1],
                 )

@@ -1,5 +1,5 @@
 use crate::buffer::EvictableBufferPool;
-use crate::catalog::{IndexID, IndexRef};
+use crate::catalog::{IndexRef, TableIndexSelector};
 use crate::error::{
     DiscloseResultExt, OperationError, OperationOrFatalResult, Result, RuntimeResult,
 };
@@ -21,9 +21,7 @@ use std::marker::PhantomData;
 use std::ops::RangeBounds;
 use std::sync::Arc;
 
-use super::admission::{
-    AdmittedUserIndex, AdmittedUserTable, UserIndexSelector, admit_user_index, admit_user_table,
-};
+use super::admission::{AdmittedUserIndex, AdmittedUserTable, admit_user_index, admit_user_table};
 
 pub(super) const INDEX_SCAN_STREAM_OPERATION: &str = "table_index_scan_mvcc";
 pub(super) const TABLE_SCAN_STREAM_OPERATION: &str = "table_scan_mvcc_stream";
@@ -75,35 +73,31 @@ impl StreamStmtState {
     #[inline]
     async fn admit_user_index(
         &mut self,
-        table_id: TableID,
-        selector: UserIndexSelector,
+        selector: TableIndexSelector,
     ) -> OperationOrFatalResult<AdmittedUserIndex> {
         let operation = self.operation;
         let Self { checkout, .. } = self;
         let (inner, attachment) = checkout.inner_and_attachment_mut();
-        admit_user_index(inner, attachment, table_id, selector, false, operation).await
+        admit_user_index(inner, attachment, selector, false, operation).await
     }
 
     /// Creates a validated MVCC secondary-index row stream for a user table.
     #[inline]
     pub(super) async fn table_index_scan_mvcc_stream<'trx, 'r, R>(
         mut self,
-        table_id: TableID,
-        index_id: IndexID,
+        selector: TableIndexSelector,
         range: R,
         read_set: &[usize],
     ) -> Result<IndexScanMvccStream<'trx>>
     where
         R: RangeBounds<&'r [Val]>,
     {
+        let table_id = selector.table_id();
         let AdmittedUserIndex {
             table,
             layout,
             index,
-        } = self
-            .admit_user_index(table_id, UserIndexSelector::ID(index_id))
-            .await
-            .disclose()?;
+        } = self.admit_user_index(selector).await.disclose()?;
         if !self.dml_validation_disabled {
             DmlValidator::new(layout.metadata())
                 .validate_index_scan(index.slot(), &range, read_set)

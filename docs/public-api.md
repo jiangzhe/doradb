@@ -190,9 +190,12 @@ specifications. Use `UK` when a public user table needs uniqueness.
 
 Initial index identities are allocated from zero in the order supplied to
 `create_table`. `Session::create_index` returns a stable table-local `IndexID`.
-Transaction methods accept that identity directly, and `IndexID::new` is used
-only when an initial identity is known from table construction. Dropping an
-index does not renumber the remaining indexes.
+Index-driven transaction methods accept `TableIndex(table_id, index_id)`, and
+`IndexID::new` is used only when an initial identity is known from table
+construction. Dropping an index does not renumber the remaining indexes.
+The sealed `TableIndexArgument::into_selector` conversion normalizes a
+`TableIndex` or `ResolvedTableIndex` into an opaque `TableIndexSelector`; its
+public accessors expose only the stable table and index identities.
 
 ## Values and identifiers
 
@@ -446,7 +449,7 @@ requiring its exclusive latch.
 ```rust,ignore
 let key = [Val::from(42i32)];
 match trx
-    .table_lookup_unique_mvcc(table_id, IndexID::new(0), &key, &[0, 1])
+    .table_lookup_unique_mvcc(TableIndex(table_id, IndexID::new(0)), &key, &[0, 1])
     .await?
 {
     SelectMvcc::Found(vals) => consume(vals),
@@ -457,12 +460,12 @@ match trx
 Prefer matching the enum when absence is expected. `unwrap_found` panics for
 `NotFound`.
 
-For repeated point operations, `resolve_user_index(table_id, index_id)` returns
-an opaque non-pinning `ResolvedUserIndex`. The token is `Copy` and the
-`_resolved` lookup, upsert, update, and delete methods take it by value and
-revalidate its exact generation directly without an ID-map lookup. Tokens may
-cross transaction boundaries; a dropped or replaced generation returns
-`SchemaChanged` during admission.
+For repeated operations, `resolve_table_index(TableIndex(table_id, index_id))`
+returns an opaque non-pinning `ResolvedTableIndex`. The token is `Copy` and can
+be passed to the same lookup, scan, stream, mutation, upsert, update, and delete
+methods in place of `TableIndex`. Admission revalidates its exact generation
+directly without an ID-map lookup. Tokens may cross transaction boundaries; a
+dropped or replaced generation returns `SchemaChanged` during admission.
 
 ### Exact and range index reads
 
@@ -479,8 +482,7 @@ let lower = [Val::from("a")];
 let upper = [Val::from("z")];
 let rows = trx
     .table_index_scan_mvcc(
-        table_id,
-        name_index_id,
+        TableIndex(table_id, name_index_id),
         &lower[..]..=&upper[..],
         &[0, 1],
     )
@@ -498,8 +500,7 @@ Use `table_index_scan_mvcc_stream` when rows should be consumed incrementally:
 let key = [Val::from("alice")];
 let mut stream = trx
     .table_index_scan_mvcc_stream(
-        table_id,
-        name_index_id,
+        TableIndex(table_id, name_index_id),
         &key[..]..=&key[..],
         &[0, 1],
     )
@@ -545,7 +546,7 @@ These methods select one logical row through a unique index:
 
 | Method | Input | Result |
 | --- | --- | --- |
-| `table_upsert_unique_mvcc` | Unique `IndexID` and a complete replacement row. | `UpsertMvcc::Inserted(RowID)` or `Updated(RowID)`. |
+| `table_upsert_unique_mvcc` | Unique `TableIndex` or `ResolvedTableIndex` and a complete replacement row. | `UpsertMvcc::Inserted(RowID)` or `Updated(RowID)`. |
 | `table_update_unique_mvcc` | Unique key and strictly ordered sparse `UpdateCol` values. | `UpdateMvcc::Updated(RowID)` or `NotFound`. |
 | `table_delete_unique_mvcc` | Unique key. | `DeleteMvcc::Deleted` or `NotFound`. |
 
@@ -553,8 +554,7 @@ These methods select one logical row through a unique index:
 let key = [Val::from(1i32)];
 let outcome = trx
     .table_update_unique_mvcc(
-        table_id,
-        id_index_id,
+        TableIndex(table_id, id_index_id),
         &key,
         vec![UpdateCol {
             idx: 1,
@@ -795,7 +795,7 @@ Most application-facing types are re-exported from the crate root:
 | --- | --- |
 | Lifecycle | `Engine`, `Session`, `Transaction`, `ReadSnapshotBuilder`, `ReadSnapshot`, `IndexScanMvccStream`, `TableScanMvccStream`, `TableScanPartitionStream` |
 | Configuration | `EngineConfig`, `TableScanConfig`, `TrxSysConfig`, `MandatoryRuntimeConfig`, `FileSystemConfig`, `EvictableBufferPoolConfig`, `LogSync`, `DEFAULT_COW_FILE_MAX_SIZE` |
-| Schema | `TableSpec`, `ColumnSpec`, `ColumnAttributes`, `IndexSpec`, `IndexKeySpec`, `IndexOrder`, `IndexAttributes`, `IndexID`, `ResolvedUserIndex` |
+| Schema | `TableSpec`, `ColumnSpec`, `ColumnAttributes`, `IndexSpec`, `IndexKeySpec`, `IndexOrder`, `IndexAttributes`, `IndexID`, `TableIndex`, `ResolvedTableIndex`, `TableIndexSelector`, `TableIndexArgument` |
 | Values | `Val`, `ValKind`, `ValType`, `MemVar` |
 | Reads | `SelectMvcc`, `ScanMvcc`, `LazyRow`, `ScanRowDecision`, `TableScanOptions`, `TableScanPlan` |
 | Writes | `UpdateCol`, `UpdateMvcc`, `UpsertMvcc`, `DeleteMvcc`, `RowMutation`, `TableMutationOutcome` |

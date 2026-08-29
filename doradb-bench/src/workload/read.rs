@@ -12,7 +12,7 @@ use crate::workload::util::{
 };
 use crate::workload::{RunCancellation, SessionPlan};
 use doradb_storage::id::TableID;
-use doradb_storage::{Engine, IndexID, SelectMvcc, Session, Val};
+use doradb_storage::{Engine, IndexID, SelectMvcc, Session, TableIndex, Val};
 
 /// Sequential lookup session executor.
 #[derive(Clone, Copy)]
@@ -480,7 +480,7 @@ async fn lookup_keys(
         for key in batch {
             let key_vals = [Val::from(*key)];
             let lookup = trx
-                .table_lookup_unique_mvcc(table_id, IndexID::new(0), &key_vals, &[0, 1])
+                .table_lookup_unique_mvcc(TableIndex(table_id, IndexID::new(0)), &key_vals, &[0, 1])
                 .await;
             match lookup {
                 Ok(SelectMvcc::Found(_)) => {
@@ -542,8 +542,7 @@ async fn index_scans(
             let upper = [Val::from(range.end()?)];
             let scan = trx
                 .table_index_scan_mvcc(
-                    spec.table_id,
-                    IndexID::new(0),
+                    TableIndex(spec.table_id, IndexID::new(0)),
                     &lower[..]..&upper[..],
                     &[0, 1],
                 )
@@ -601,8 +600,7 @@ async fn index_streams(
         let scan_result = async {
             let mut stream = trx
                 .table_index_scan_mvcc_stream(
-                    spec.table_id,
-                    IndexID::new(0),
+                    TableIndex(spec.table_id, IndexID::new(0)),
                     &lower[..]..&upper[..],
                     &[0, 1],
                 )

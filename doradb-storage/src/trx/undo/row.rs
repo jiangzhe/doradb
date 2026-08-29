@@ -1,15 +1,14 @@
 use crate::buffer::PoolGuards;
 use crate::buffer::page::VersionedPageID;
-use crate::catalog::{CatalogSelectKey, IndexRef, IndexSlot, ResolvedUserIndexKey, TableCache};
+use crate::catalog::{ResolvedIndexKey, TableCache};
 use crate::error::RuntimeOrFatalResult as Result;
 use crate::id::{RowID, TableID, TrxID};
 use crate::poison::EnginePoisoner;
-use crate::row::ops::{SelectKey, UndoCol, UpdateCol};
+use crate::row::ops::{UndoCol, UpdateCol};
 use crate::runtime::{POLL_BUDGET, yield_now};
 use crate::trx::{
     MIN_SNAPSHOT_TS, PrepareListenerResult, SharedTrxStatus, StmtNo, trx_is_committed,
 };
-use crate::value::Val;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
@@ -406,15 +405,13 @@ impl NextRowUndo {
         }
     }
 
-    /// Returns next index branch.
-    #[cfg_attr(not(test), expect(dead_code, reason = "legacy catalog row MVCC tests"))]
+    /// Returns the first index branch accepted by the caller's exact-reference matcher.
     #[inline]
-    pub(crate) fn index_branch(&self, key: Option<(IndexSlot, &[Val])>) -> Option<&IndexBranch> {
-        key.and_then(|(index_slot, key_vals)| {
-            self.indexes
-                .iter()
-                .find(|branch| branch.matches(index_slot, key_vals))
-        })
+    pub(crate) fn index_branch(
+        &self,
+        mut matches: impl FnMut(&IndexBranch) -> bool,
+    ) -> Option<&IndexBranch> {
+        self.indexes.iter().find(|branch| matches(branch))
     }
 }
 
@@ -553,97 +550,34 @@ impl UndoStatus {
 ///   └───────────┘   └─────►│rowid=200,k=3,v=4├──►│k=1,v=2├───────────────┘          
 ///                          └─────────────────┘   └───────┘                          
 /// ```
-pub(crate) struct IndexBranchPayload<K> {
+pub(crate) struct IndexBranch {
     /// Unique index key that requires this alternate version branch.
-    pub(crate) key: K,
+    pub(crate) key: ResolvedIndexKey,
     /// Hot or cold owner reached by this branch.
     pub(crate) target: IndexBranchTarget,
     /// Before-image values used to reconstruct a cold terminal owner.
     pub(crate) undo_vals: Vec<UpdateCol>,
 }
 
-/// Domain-tagged transaction-owned unique-index MVCC branch.
-pub(crate) enum IndexBranch {
-    /// Branch on a fixed catalog index ordinal.
-    Catalog(IndexBranchPayload<CatalogSelectKey>),
-    /// Branch on a generation-qualified user index reference.
-    User(IndexBranchPayload<ResolvedUserIndexKey>),
-}
-
 impl IndexBranch {
-    /// Creates a catalog branch from one metadata-proven active ordinal.
+    /// Creates a branch from one exact runtime index reference.
     #[inline]
-    pub(crate) fn catalog(
-        key: SelectKey,
+    pub(crate) fn new(
+        key: ResolvedIndexKey,
         target: IndexBranchTarget,
         undo_vals: Vec<UpdateCol>,
     ) -> Self {
-        Self::Catalog(IndexBranchPayload {
+        Self {
             key,
             target,
             undo_vals,
-        })
-    }
-
-    /// Creates a user branch from one admitted exact index reference.
-    #[inline]
-    pub(crate) fn user(
-        key: ResolvedUserIndexKey,
-        target: IndexBranchTarget,
-        undo_vals: Vec<UpdateCol>,
-    ) -> Self {
-        Self::User(IndexBranchPayload {
-            key,
-            target,
-            undo_vals,
-        })
-    }
-
-    /// Returns whether this branch matches a transient execution slot and key.
-    #[cfg_attr(not(test), expect(dead_code, reason = "legacy catalog row MVCC tests"))]
-    #[inline]
-    pub(crate) fn matches(&self, index_slot: IndexSlot, key_vals: &[Val]) -> bool {
-        match self {
-            Self::Catalog(branch) => {
-                branch.key.index_slot == index_slot && branch.key.vals == key_vals
-            }
-            Self::User(branch) => {
-                branch.key.index.slot() == index_slot && branch.key.vals == key_vals
-            }
-        }
-    }
-
-    /// Returns the exact user-index reference and logical values for matching.
-    #[inline]
-    pub(crate) fn user_key_parts(&self) -> Option<(IndexRef, &[Val])> {
-        match self {
-            Self::Catalog(_) => None,
-            Self::User(branch) => Some((branch.key.index, &branch.key.vals)),
-        }
-    }
-
-    /// Returns this branch's target.
-    #[inline]
-    pub(crate) fn target(&self) -> &IndexBranchTarget {
-        match self {
-            Self::Catalog(branch) => &branch.target,
-            Self::User(branch) => &branch.target,
-        }
-    }
-
-    /// Returns the row before-images carried by this branch.
-    #[inline]
-    pub(crate) fn undo_vals(&self) -> &[UpdateCol] {
-        match self {
-            Self::Catalog(branch) => &branch.undo_vals,
-            Self::User(branch) => &branch.undo_vals,
         }
     }
 
     /// Returns the timestamp controlling whether this branch can be purged.
     #[inline]
     pub(crate) fn purge_cts(&self) -> Option<TrxID> {
-        self.target().purge_cts()
+        self.target.purge_cts()
     }
 }
 

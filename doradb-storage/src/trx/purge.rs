@@ -1,6 +1,8 @@
 use crate::buffer::PoolGuards;
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
-use crate::catalog::{Catalog, DroppedTableFileCleanup, DroppedTableRuntime, TableCache};
+use crate::catalog::{
+    Catalog, DroppedTableFileCleanup, DroppedTableRuntime, TableCache, catalog_index_slot,
+};
 use crate::error::{FatalError, FatalResult, RuntimeError, RuntimeResult};
 use crate::file::table_file::OldRoot;
 use crate::id::{TableID, TrxID};
@@ -12,7 +14,7 @@ use crate::runtime;
 use crate::table::Table;
 use crate::thread;
 use crate::trx::sys::TransactionSystem;
-use crate::trx::undo::{IndexPurgeEntry, OwnedRowUndo, RowUndoKind};
+use crate::trx::undo::{OwnedRowUndo, RowUndoKind};
 use crate::trx::{CommittedTrx, MAX_SNAPSHOT_TS, RetiredRowPageBatch};
 use crossbeam_utils::CachePadded;
 use error_stack::Report;
@@ -456,31 +458,27 @@ impl TransactionSystem {
         for trx in &trx_list {
             if let Some(index_gc) = trx.index_gc() {
                 for ip in index_gc {
-                    let deleted = match ip {
-                        IndexPurgeEntry::Catalog(ip) => {
-                            let Some(table) = table_cache.get_catalog_table(ip.table_id) else {
-                                continue;
-                            };
-                            table
-                                .delete_index(
-                                    guards,
-                                    ip.key.index_slot,
-                                    &ip.key.vals,
-                                    ip.row_id,
-                                    ip.unique,
-                                    min_active_sts,
-                                )
-                                .await?
-                        }
-                        IndexPurgeEntry::User(ip) => {
-                            let Some(table) = table_cache.get_user_entry_mut(ip.table_id).await
-                            else {
-                                continue;
-                            };
-                            table
-                                .delete_index(guards, &ip.key, ip.row_id, ip.unique, min_active_sts)
-                                .await?
-                        }
+                    let deleted = if ip.table_id.is_catalog() {
+                        let Some(table) = table_cache.get_catalog_table(ip.table_id) else {
+                            continue;
+                        };
+                        table
+                            .delete_index(
+                                guards,
+                                catalog_index_slot(ip.key.index),
+                                &ip.key.vals,
+                                ip.row_id,
+                                ip.unique,
+                                min_active_sts,
+                            )
+                            .await?
+                    } else {
+                        let Some(table) = table_cache.get_user_entry_mut(ip.table_id).await else {
+                            continue;
+                        };
+                        table
+                            .delete_index(guards, &ip.key, ip.row_id, ip.unique, min_active_sts)
+                            .await?
                     };
                     if deleted {
                         purge_index_count += 1;
@@ -3448,7 +3446,10 @@ mod tests {
                 let mut trx = session.begin_trx().unwrap();
                 let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(i as i32)]);
                 let res = trx
-                    .table_delete_unique_mvcc(table_id, key.index_slot.transitional_id(), &key.vals)
+                    .table_delete_unique_mvcc(
+                        crate::TableIndex(table_id, key.index_slot.transitional_id()),
+                        &key.vals,
+                    )
                     .await;
                 assert!(res.is_ok());
                 purge_target = trx.commit().await.unwrap();
@@ -3523,7 +3524,10 @@ mod tests {
                 let mut trx = session.begin_trx().unwrap();
                 let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(i as i32)]);
                 let res = trx
-                    .table_delete_unique_mvcc(table_id, key.index_slot.transitional_id(), &key.vals)
+                    .table_delete_unique_mvcc(
+                        crate::TableIndex(table_id, key.index_slot.transitional_id()),
+                        &key.vals,
+                    )
                     .await;
                 assert!(res.is_ok());
                 purge_target = trx.commit().await.unwrap();

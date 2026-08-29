@@ -1,6 +1,6 @@
 use doradb_storage::{
     ColumnAttributes, ColumnSpec, Engine, EngineConfig, IndexAttributes, IndexID, IndexKeySpec,
-    IndexSpec, ScanRowDecision, TableSpec, UpdateCol, Val, ValKind,
+    IndexSpec, ScanRowDecision, TableIndex, TableSpec, UpdateCol, Val, ValKind,
 };
 use futures::executor;
 use std::error::Error;
@@ -54,8 +54,7 @@ async fn run() -> ExampleResult<()> {
     // Update one row by its unique id key.
     let updated = write_trx
         .table_update_unique_mvcc(
-            table_id,
-            id_index,
+            TableIndex(table_id, id_index),
             &id_one,
             vec![UpdateCol {
                 idx: 1,
@@ -68,7 +67,7 @@ async fn run() -> ExampleResult<()> {
     let id_two = [Val::from(2i32)];
     // Delete one row by its unique id key.
     let deleted = write_trx
-        .table_delete_unique_mvcc(table_id, id_index, &id_two)
+        .table_delete_unique_mvcc(TableIndex(table_id, id_index), &id_two)
         .await?;
     assert!(deleted.is_deleted());
     write_trx.commit().await?;
@@ -88,7 +87,7 @@ async fn run() -> ExampleResult<()> {
 
     // Lookup one row through the unique id index.
     let found = read_trx
-        .table_lookup_unique_mvcc(table_id, id_index, &id_one, &[0, 1])
+        .table_lookup_unique_mvcc(TableIndex(table_id, id_index), &id_one, &[0, 1])
         .await?
         .unwrap_found();
     assert_eq!(row_pair(found), (1, String::from("ada")));
@@ -97,7 +96,7 @@ async fn run() -> ExampleResult<()> {
     let name_key = [Val::from("ada")];
     // Scan rows that match one secondary-index key.
     let mut matching_rows = read_trx
-        .table_index_lookup_mvcc(table_id, name_index, &name_key, &[0, 1])
+        .table_index_lookup_mvcc(TableIndex(table_id, name_index), &name_key, &[0, 1])
         .await?
         .unwrap_rows()
         .into_iter()
@@ -108,7 +107,11 @@ async fn run() -> ExampleResult<()> {
 
     // Stream the same secondary-index match one row at a time.
     let mut stream = read_trx
-        .table_index_scan_mvcc_stream(table_id, name_index, &name_key[..]..=&name_key[..], &[0, 1])
+        .table_index_scan_mvcc_stream(
+            TableIndex(table_id, name_index),
+            &name_key[..]..=&name_key[..],
+            &[0, 1],
+        )
         .await?;
     let mut streamed_rows = Vec::new();
     while let Some(vals) = stream.next().await? {

@@ -2,8 +2,8 @@ use crate::buffer::PoolGuards;
 use crate::id::{RowID, TableID, TrxID};
 
 use crate::catalog::{
-    CatalogIndexNo, CatalogSelectKey, CatalogTable, IndexID, IndexRef, ResolvedUserIndex,
-    ResolvedUserIndexKey, TableCache,
+    CatalogIndexNo, CatalogTable, IndexRef, ResolvedIndexKey, ResolvedTableIndex, TableCache,
+    TableIndex, TableIndexArgument, TableIndexSelector,
 };
 use crate::error::{
     DiscloseResultExt, FatalError, FatalResult, MultiDomainResultExt, OperationError,
@@ -33,9 +33,7 @@ use error_stack::ResultExt;
 use std::mem;
 use std::ops::RangeBounds;
 
-use super::admission::{
-    AdmittedUserIndex, AdmittedUserTable, UserIndexSelector, admit_user_index, admit_user_table,
-};
+use super::admission::{AdmittedUserIndex, AdmittedUserTable, admit_user_index, admit_user_table};
 
 /// Cached unique-driver update whose provisional row lock remains installed.
 struct DeferredIndexUpdate {
@@ -229,14 +227,14 @@ impl StmtEffects {
 
     /// Push an inserted unique-index claim into statement rollback state.
     #[inline]
-    pub(crate) fn push_catalog_insert_unique_index_undo(
+    pub(crate) fn push_insert_unique_index_undo(
         &mut self,
         table_id: TableID,
         row_id: RowID,
-        key: CatalogSelectKey,
+        key: ResolvedIndexKey,
         merge_old_deleted: bool,
     ) {
-        self.index_undo.push_catalog(IndexUndo {
+        self.index_undo.push(IndexUndo {
             table_id,
             row_id,
             kind: IndexUndoKind::InsertUnique(key, merge_old_deleted),
@@ -245,14 +243,14 @@ impl StmtEffects {
 
     /// Push an inserted non-unique-index claim into statement rollback state.
     #[inline]
-    pub(crate) fn push_catalog_insert_non_unique_index_undo(
+    pub(crate) fn push_insert_non_unique_index_undo(
         &mut self,
         table_id: TableID,
         row_id: RowID,
-        key: CatalogSelectKey,
+        key: ResolvedIndexKey,
         merge_old_deleted: bool,
     ) {
-        self.index_undo.push_catalog(IndexUndo {
+        self.index_undo.push(IndexUndo {
             table_id,
             row_id,
             kind: IndexUndoKind::InsertNonUnique(key, merge_old_deleted),
@@ -261,14 +259,14 @@ impl StmtEffects {
 
     /// Push a deferred index delete into statement rollback and GC state.
     #[inline]
-    pub(crate) fn push_catalog_delete_index_undo(
+    pub(crate) fn push_delete_index_undo(
         &mut self,
         table_id: TableID,
         row_id: RowID,
-        key: CatalogSelectKey,
+        key: ResolvedIndexKey,
         unique: bool,
     ) {
-        self.index_undo.push_catalog(IndexUndo {
+        self.index_undo.push(IndexUndo {
             table_id,
             row_id,
             kind: IndexUndoKind::DeferDelete(key, unique),
@@ -277,80 +275,15 @@ impl StmtEffects {
 
     /// Push a unique-index update into statement rollback state.
     #[inline]
-    pub(crate) fn push_catalog_update_unique_index_undo(
+    pub(crate) fn push_update_unique_index_undo(
         &mut self,
         table_id: TableID,
         old_row_id: RowID,
         new_row_id: RowID,
-        key: CatalogSelectKey,
+        key: ResolvedIndexKey,
         old_deleted: bool,
     ) {
-        self.index_undo.push_catalog(IndexUndo {
-            table_id,
-            row_id: new_row_id,
-            kind: IndexUndoKind::UpdateUnique(key, old_row_id, old_deleted),
-        });
-    }
-
-    /// Push an inserted generation-qualified unique user-index claim.
-    #[inline]
-    pub(crate) fn push_user_insert_unique_index_undo(
-        &mut self,
-        table_id: TableID,
-        row_id: RowID,
-        key: ResolvedUserIndexKey,
-        merge_old_deleted: bool,
-    ) {
-        self.index_undo.push_user(IndexUndo {
-            table_id,
-            row_id,
-            kind: IndexUndoKind::InsertUnique(key, merge_old_deleted),
-        });
-    }
-
-    /// Push an inserted generation-qualified non-unique user-index claim.
-    #[inline]
-    pub(crate) fn push_user_insert_non_unique_index_undo(
-        &mut self,
-        table_id: TableID,
-        row_id: RowID,
-        key: ResolvedUserIndexKey,
-        merge_old_deleted: bool,
-    ) {
-        self.index_undo.push_user(IndexUndo {
-            table_id,
-            row_id,
-            kind: IndexUndoKind::InsertNonUnique(key, merge_old_deleted),
-        });
-    }
-
-    /// Push a generation-qualified deferred user-index delete.
-    #[inline]
-    pub(crate) fn push_user_delete_index_undo(
-        &mut self,
-        table_id: TableID,
-        row_id: RowID,
-        key: ResolvedUserIndexKey,
-        unique: bool,
-    ) {
-        self.index_undo.push_user(IndexUndo {
-            table_id,
-            row_id,
-            kind: IndexUndoKind::DeferDelete(key, unique),
-        });
-    }
-
-    /// Push a generation-qualified unique user-index update.
-    #[inline]
-    pub(crate) fn push_user_update_unique_index_undo(
-        &mut self,
-        table_id: TableID,
-        old_row_id: RowID,
-        new_row_id: RowID,
-        key: ResolvedUserIndexKey,
-        old_deleted: bool,
-    ) {
-        self.index_undo.push_user(IndexUndo {
+        self.index_undo.push(IndexUndo {
             table_id,
             row_id: new_row_id,
             kind: IndexUndoKind::UpdateUnique(key, old_row_id, old_deleted),
@@ -734,20 +667,11 @@ impl<'stmt> Statement<'stmt> {
     #[inline]
     async fn admit_user_index(
         &mut self,
-        table_id: TableID,
-        selector: UserIndexSelector,
+        selector: TableIndexSelector,
         write: bool,
         operation: &'static str,
     ) -> OperationOrFatalResult<AdmittedUserIndex> {
-        admit_user_index(
-            self.inner,
-            self.attachment,
-            table_id,
-            selector,
-            write,
-            operation,
-        )
-        .await
+        admit_user_index(self.inner, self.attachment, selector, write, operation).await
     }
 
     /// Sequentially mutate callback-selected rows using latest modification reads.
@@ -804,8 +728,7 @@ impl<'stmt> Statement<'stmt> {
     #[inline]
     pub(super) async fn table_index_mutate_mvcc<'r, R, F>(
         mut self,
-        table_id: TableID,
-        selector: UserIndexSelector,
+        selector: TableIndexSelector,
         range: R,
         mutate_row: F,
     ) -> Result<TableMutationOutcome>
@@ -814,13 +737,14 @@ impl<'stmt> Statement<'stmt> {
         F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<RowMutation>,
     {
         const OPERATION: &str = "table_index_mutate_mvcc";
+        let table_id = selector.table_id();
         self.effects.assert_no_deferred_index_updates();
         let AdmittedUserIndex {
             table,
             layout,
             index,
         } = self
-            .admit_user_index(table_id, selector, true, OPERATION)
+            .admit_user_index(selector, true, OPERATION)
             .await
             .disclose()?;
         if !self.dml_validation_disabled {
@@ -850,21 +774,20 @@ impl<'stmt> Statement<'stmt> {
         result
     }
 
-    /// Looks up one unique-key row in a catalog-owned user table by table id.
-    ///
-    /// Strong table-runtime access is internal and operation-local.
+    /// Resolves one stable [`TableIndex`] into a reusable non-pinning
+    /// [`ResolvedTableIndex`] token.
     #[inline]
-    pub(super) async fn resolve_user_index(
+    pub(super) async fn resolve_table_index(
         mut self,
-        table_id: TableID,
-        index_id: IndexID,
-    ) -> Result<ResolvedUserIndex> {
-        const OPERATION: &str = "resolve_user_index";
+        index: TableIndex,
+    ) -> Result<ResolvedTableIndex> {
+        const OPERATION: &str = "resolve_table_index";
+        let table_id = index.0;
         let admitted = self
-            .admit_user_index(table_id, UserIndexSelector::ID(index_id), false, OPERATION)
+            .admit_user_index(index.into_selector(), false, OPERATION)
             .await
             .disclose()?;
-        Ok(ResolvedUserIndex::from_admitted(table_id, admitted.index))
+        Ok(ResolvedTableIndex::from_admitted(table_id, admitted.index))
     }
 
     /// Looks up one unique-key row in a catalog-owned user table by table id.
@@ -873,18 +796,18 @@ impl<'stmt> Statement<'stmt> {
     #[inline]
     pub(super) async fn table_lookup_unique_mvcc(
         mut self,
-        table_id: TableID,
-        selector: UserIndexSelector,
+        selector: TableIndexSelector,
         key_vals: &[Val],
         user_read_set: &[usize],
     ) -> Result<SelectMvcc> {
         const OPERATION: &str = "table_lookup_unique_mvcc";
+        let table_id = selector.table_id();
         let AdmittedUserIndex {
             table,
             layout,
             index,
         } = self
-            .admit_user_index(table_id, selector, false, OPERATION)
+            .admit_user_index(selector, false, OPERATION)
             .await
             .disclose()?;
         let rt = self.runtime();
@@ -902,18 +825,18 @@ impl<'stmt> Statement<'stmt> {
     #[inline]
     pub(super) async fn table_index_lookup_mvcc(
         mut self,
-        table_id: TableID,
-        selector: UserIndexSelector,
+        selector: TableIndexSelector,
         key_vals: &[Val],
         user_read_set: &[usize],
     ) -> Result<ScanMvcc> {
         const OPERATION: &str = "table_index_lookup_mvcc";
+        let table_id = selector.table_id();
         let AdmittedUserIndex {
             table,
             layout,
             index,
         } = self
-            .admit_user_index(table_id, selector, false, OPERATION)
+            .admit_user_index(selector, false, OPERATION)
             .await
             .disclose()?;
         let rt = self.runtime();
@@ -931,8 +854,7 @@ impl<'stmt> Statement<'stmt> {
     #[inline]
     pub(super) async fn table_index_scan_mvcc<'r, R>(
         mut self,
-        table_id: TableID,
-        selector: UserIndexSelector,
+        selector: TableIndexSelector,
         range: R,
         read_set: &[usize],
     ) -> Result<ScanMvcc>
@@ -940,12 +862,13 @@ impl<'stmt> Statement<'stmt> {
         R: RangeBounds<&'r [Val]>,
     {
         const OPERATION: &str = "table_index_scan_mvcc";
+        let table_id = selector.table_id();
         let AdmittedUserIndex {
             table,
             layout,
             index,
         } = self
-            .admit_user_index(table_id, selector, false, OPERATION)
+            .admit_user_index(selector, false, OPERATION)
             .await
             .disclose()?;
         if !self.dml_validation_disabled {
@@ -1050,17 +973,17 @@ impl<'stmt> Statement<'stmt> {
     #[inline]
     pub(super) async fn table_upsert_unique_mvcc(
         mut self,
-        table_id: TableID,
-        selector: UserIndexSelector,
+        selector: TableIndexSelector,
         cols: Vec<Val>,
     ) -> Result<UpsertMvcc> {
         const OPERATION: &str = "table_upsert_unique_mvcc";
+        let table_id = selector.table_id();
         let AdmittedUserIndex {
             table,
             layout,
             index,
         } = self
-            .admit_user_index(table_id, selector, true, OPERATION)
+            .admit_user_index(selector, true, OPERATION)
             .await
             .disclose()?;
         if !self.dml_validation_disabled {
@@ -1095,18 +1018,18 @@ impl<'stmt> Statement<'stmt> {
     #[inline]
     pub(super) async fn table_update_unique_mvcc(
         mut self,
-        table_id: TableID,
-        selector: UserIndexSelector,
+        selector: TableIndexSelector,
         key_vals: &[Val],
         update: Vec<UpdateCol>,
     ) -> Result<UpdateMvcc> {
         const OPERATION: &str = "table_update_unique_mvcc";
+        let table_id = selector.table_id();
         let AdmittedUserIndex {
             table,
             layout,
             index,
         } = self
-            .admit_user_index(table_id, selector, true, OPERATION)
+            .admit_user_index(selector, true, OPERATION)
             .await
             .disclose()?;
         if !self.dml_validation_disabled {
@@ -1141,17 +1064,17 @@ impl<'stmt> Statement<'stmt> {
     #[inline]
     pub(super) async fn table_delete_unique_mvcc(
         mut self,
-        table_id: TableID,
-        selector: UserIndexSelector,
+        selector: TableIndexSelector,
         key_vals: &[Val],
     ) -> Result<DeleteMvcc> {
         const OPERATION: &str = "table_delete_unique_mvcc";
+        let table_id = selector.table_id();
         let AdmittedUserIndex {
             table,
             layout,
             index,
         } = self
-            .admit_user_index(table_id, selector, true, OPERATION)
+            .admit_user_index(selector, true, OPERATION)
             .await
             .disclose()?;
         if !self.dml_validation_disabled {
@@ -1945,7 +1868,7 @@ pub(crate) mod tests {
             RowID::new(1),
             RowUndoKind::Delete,
         ));
-        trx_effects.index_undo_mut().push_user(IndexUndo {
+        trx_effects.index_undo_mut().push(IndexUndo {
             table_id: TableID::new(41),
             row_id: RowID::new(1),
             kind: IndexUndoKind::DeferDelete(
@@ -1962,7 +1885,7 @@ pub(crate) mod tests {
             RowID::new(2),
             RowUndoKind::Insert,
         ));
-        effects.push_user_delete_index_undo(
+        effects.push_delete_index_undo(
             TableID::new(42),
             RowID::new(2),
             user_key_from_active_slot(IndexSlot::new(0), vec![]),
@@ -2004,7 +1927,7 @@ pub(crate) mod tests {
             let table_id = TableID::new(99_999_998);
             let row_id = RowID::new(23);
             let mut effects = empty_stmt_effects();
-            effects.push_user_delete_index_undo(
+            effects.push_delete_index_undo(
                 table_id,
                 row_id,
                 user_key_from_active_slot(IndexSlot::new(0), vec![]),
@@ -2273,7 +2196,7 @@ pub(crate) mod tests {
                         RowID::new(24),
                         RowUndoKind::Delete,
                     ));
-                    effects.push_user_delete_index_undo(
+                    effects.push_delete_index_undo(
                         TableID::new(12),
                         RowID::new(23),
                         user_key_from_active_slot(IndexSlot::new(0), vec![]),

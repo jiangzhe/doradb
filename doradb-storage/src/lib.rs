@@ -29,6 +29,7 @@ mod recovery;
 mod root;
 mod row;
 mod runtime;
+mod sealed;
 mod serde;
 mod session;
 pub mod stats;
@@ -41,7 +42,8 @@ pub(crate) use component::{DiskPool, IndexPool, MemPool, MetaPool};
 
 pub use catalog::{
     CatalogCheckpointOutcome, ColumnAttributes, ColumnSpec, IndexAttributes, IndexID, IndexKeySpec,
-    IndexOrder, IndexSpec, ResolvedUserIndex, TableSpec,
+    IndexOrder, IndexSpec, ResolvedTableIndex, TableIndex, TableIndexArgument, TableIndexSelector,
+    TableSpec,
 };
 pub use conf::{
     DEFAULT_COW_FILE_MAX_SIZE, DEFAULT_TABLE_SCAN_LWC_BLOCKS_PER_PARTITION,

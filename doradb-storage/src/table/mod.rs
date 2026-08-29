@@ -2366,8 +2366,11 @@ pub(crate) mod tests {
         table_id: TableID,
         key: &SelectKey,
     ) -> Result<DeleteMvcc> {
-        trx.table_delete_unique_mvcc(table_id, key.index_slot.transitional_id(), &key.vals)
-            .await
+        trx.table_delete_unique_mvcc(
+            crate::TableIndex(table_id, key.index_slot.transitional_id()),
+            &key.vals,
+        )
+        .await
     }
 
     /// Provides test-only access to `trx_update_row_by_id`.
@@ -2378,8 +2381,7 @@ pub(crate) mod tests {
         update: Vec<UpdateCol>,
     ) -> Result<UpdateMvcc> {
         trx.table_update_unique_mvcc(
-            table_id,
-            key.index_slot.transitional_id(),
+            crate::TableIndex(table_id, key.index_slot.transitional_id()),
             &key.vals,
             update,
         )
@@ -2501,8 +2503,7 @@ pub(crate) mod tests {
         user_read_set: &[usize],
     ) -> Result<SelectMvcc> {
         trx.table_lookup_unique_mvcc(
-            table_id,
-            key.index_slot.transitional_id(),
+            crate::TableIndex(table_id, key.index_slot.transitional_id()),
             &key.vals,
             user_read_set,
         )
@@ -3473,8 +3474,7 @@ pub(crate) mod tests {
             let mut trx = session.begin_trx().unwrap();
             let err = trx
                 .table_upsert_unique_mvcc(
-                    table_id,
-                    crate::IndexID::new(1),
+                    crate::TableIndex(table_id, crate::IndexID::new(1)),
                     vec![Val::from(2i32), Val::from("new")],
                 )
                 .await
@@ -3486,8 +3486,7 @@ pub(crate) mod tests {
             let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(1i32)]);
             let err = trx
                 .table_update_unique_mvcc(
-                    table_id,
-                    key.index_slot.transitional_id(),
+                    crate::TableIndex(table_id, key.index_slot.transitional_id()),
                     &key.vals,
                     vec![
                         UpdateCol {
@@ -3508,7 +3507,10 @@ pub(crate) mod tests {
             let mut trx = session.begin_trx().unwrap();
             let key = SelectKey::new(IndexSlot::new(1), vec![Val::from("old")]);
             let err = trx
-                .table_delete_unique_mvcc(table_id, key.index_slot.transitional_id(), &key.vals)
+                .table_delete_unique_mvcc(
+                    crate::TableIndex(table_id, key.index_slot.transitional_id()),
+                    &key.vals,
+                )
                 .await
                 .unwrap_err();
             assert_invalid_dml_input(err);

@@ -7114,7 +7114,10 @@ mod tests {
             let mut writer = writer_session.begin_trx().unwrap();
             let writer_status = transaction_status_for_test(&writer);
             let deleted = writer
-                .table_delete_unique_mvcc(table_id, key.index_slot.transitional_id(), &key.vals)
+                .table_delete_unique_mvcc(
+                    crate::TableIndex(table_id, key.index_slot.transitional_id()),
+                    &key.vals,
+                )
                 .await
                 .unwrap();
             assert_eq!(deleted, DeleteMvcc::Deleted);

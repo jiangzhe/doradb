@@ -11,8 +11,8 @@ use crate::buffer::{
     BufferPool, PoolGuard, PoolGuards, PoolRole, RowPoolRole, get_page_versioned_shared,
 };
 use crate::catalog::{
-    CatalogSelectKey, IndexSlot, IndexSpec, PrimaryKeyMatchError, TableColumnLayout, TableMetadata,
-    user_key_from_active_slot,
+    CatalogSelectKey, IndexSlot, IndexSpec, PrimaryKeyMatchError, ResolvedIndexKey,
+    TableColumnLayout, TableMetadata, resolve_catalog_key, user_key_from_active_slot,
 };
 use crate::error::{
     DataIntegrityError, InternalError, InternalResult, MultiDomainResultExt, OperationError,
@@ -897,6 +897,15 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         rt.debug_assert_table_write_lock_held(self.table_id());
     }
 
+    /// Qualifies one metadata-proven active slot for retained transaction state.
+    #[inline]
+    fn resolved_index_key(&self, key: SelectKey) -> ResolvedIndexKey {
+        match self.table_id().kind() {
+            TableKind::Catalog => resolve_catalog_key(key),
+            TableKind::User => user_key_from_active_slot(key.index_slot, key.vals),
+        }
+    }
+
     #[inline]
     fn push_insert_unique_index_undo(
         &self,
@@ -907,20 +916,12 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         merge_old_deleted: bool,
     ) {
         self.debug_assert_table_write_lock_held(rt);
-        match self.table_id().kind() {
-            TableKind::Catalog => effects.push_catalog_insert_unique_index_undo(
-                self.table_id(),
-                row_id,
-                key,
-                merge_old_deleted,
-            ),
-            TableKind::User => effects.push_user_insert_unique_index_undo(
-                self.table_id(),
-                row_id,
-                user_key_from_active_slot(key.index_slot, key.vals),
-                merge_old_deleted,
-            ),
-        }
+        effects.push_insert_unique_index_undo(
+            self.table_id(),
+            row_id,
+            self.resolved_index_key(key),
+            merge_old_deleted,
+        );
     }
 
     #[inline]
@@ -933,22 +934,12 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         merge_old_deleted: bool,
     ) {
         self.debug_assert_table_write_lock_held(rt);
-        match self.table_id().kind() {
-            TableKind::Catalog => {
-                effects.push_catalog_insert_non_unique_index_undo(
-                    self.table_id(),
-                    row_id,
-                    key,
-                    merge_old_deleted,
-                );
-            }
-            TableKind::User => effects.push_user_insert_non_unique_index_undo(
-                self.table_id(),
-                row_id,
-                user_key_from_active_slot(key.index_slot, key.vals),
-                merge_old_deleted,
-            ),
-        }
+        effects.push_insert_non_unique_index_undo(
+            self.table_id(),
+            row_id,
+            self.resolved_index_key(key),
+            merge_old_deleted,
+        );
     }
 
     #[inline]
@@ -961,17 +952,12 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         unique: bool,
     ) {
         self.debug_assert_table_write_lock_held(rt);
-        match self.table_id().kind() {
-            TableKind::Catalog => {
-                effects.push_catalog_delete_index_undo(self.table_id(), row_id, key, unique)
-            }
-            TableKind::User => effects.push_user_delete_index_undo(
-                self.table_id(),
-                row_id,
-                user_key_from_active_slot(key.index_slot, key.vals),
-                unique,
-            ),
-        }
+        effects.push_delete_index_undo(
+            self.table_id(),
+            row_id,
+            self.resolved_index_key(key),
+            unique,
+        );
     }
 
     #[inline]
@@ -985,22 +971,13 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         old_deleted: bool,
     ) {
         self.debug_assert_table_write_lock_held(rt);
-        match self.table_id().kind() {
-            TableKind::Catalog => effects.push_catalog_update_unique_index_undo(
-                self.table_id(),
-                old_row_id,
-                new_row_id,
-                key,
-                old_deleted,
-            ),
-            TableKind::User => effects.push_user_update_unique_index_undo(
-                self.table_id(),
-                old_row_id,
-                new_row_id,
-                user_key_from_active_slot(key.index_slot, key.vals),
-                old_deleted,
-            ),
-        }
+        effects.push_update_unique_index_undo(
+            self.table_id(),
+            old_row_id,
+            new_row_id,
+            self.resolved_index_key(key),
+            old_deleted,
+        );
     }
 
     #[inline]
@@ -1223,20 +1200,12 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             FindOldVersion::Found(old_row, cts, old_entry) => {
                 let mut new_access = new_guard.write_row_by_id(new_id);
                 let undo_vals = new_access.row().calc_delta(metadata.col.as_ref(), &old_row);
-                match self.table_id().kind() {
-                    TableKind::Catalog => new_access.link_catalog_for_unique_index(
-                        SelectKey::new(index_slot, key_vals.to_vec()),
-                        cts,
-                        old_entry,
-                        undo_vals,
-                    ),
-                    TableKind::User => new_access.link_user_for_unique_index(
-                        user_key_from_active_slot(index_slot, key_vals.to_vec()),
-                        cts,
-                        old_entry,
-                        undo_vals,
-                    ),
-                }
+                new_access.link_for_unique_index(
+                    self.resolved_index_key(SelectKey::new(index_slot, key_vals.to_vec())),
+                    cts,
+                    old_entry,
+                    undo_vals,
+                );
                 Ok(LinkForUniqueIndex::Linked)
             }
         }
@@ -2404,20 +2373,9 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         old_guard: PageSharedGuard<RowPage>,
     ) -> RuntimeResult<(RowID, FastHashMap<usize, Val>, PageSharedGuard<RowPage>)> {
         let mutator = HotRowMutator::new(self.table_id(), self.metadata(), rt, &old_guard, old_id);
-        let prepared = match self.table_id().kind() {
-            TableKind::Catalog => {
-                mutator.prepare_move_update(old_row, update, IndexBranch::catalog)
-            }
-            TableKind::User => {
-                mutator.prepare_move_update(old_row, update, |key, target, undo_vals| {
-                    IndexBranch::user(
-                        user_key_from_active_slot(key.index_slot, key.vals),
-                        target,
-                        undo_vals,
-                    )
-                })
-            }
-        };
+        let prepared = mutator.prepare_move_update(old_row, update, |key, target, undo_vals| {
+            IndexBranch::new(self.resolved_index_key(key), target, undo_vals)
+        });
         // Release the old row page before awaiting replacement-row insertion.
         drop(old_guard);
         let (new_row_id, new_guard) = self

@@ -59,7 +59,7 @@ doradb-storage/src/trx/read_snapshot.rs,ReadSnapshot::prepare_table_scan,1
 doradb-storage/src/trx/read_snapshot.rs,ReadSnapshotBuilder::acquire_tables,1
 doradb-storage/src/trx/read_snapshot.rs,TableScanPlan::open,2
 doradb-storage/src/trx/read_snapshot.rs,TableScanPlan::repartition,1
-doradb-storage/src/trx/stmt.rs,Statement::resolve_user_index,1
+doradb-storage/src/trx/stmt.rs,Statement::resolve_table_index,1
 doradb-storage/src/trx/stmt.rs,Statement::table_delete_unique_mvcc,4
 doradb-storage/src/trx/stmt.rs,Statement::table_index_lookup_mvcc,2
 doradb-storage/src/trx/stmt.rs,Statement::table_index_mutate_mvcc,3

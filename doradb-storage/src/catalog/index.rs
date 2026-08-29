@@ -2437,8 +2437,7 @@ pub(crate) mod tests {
         let mut trx = session.begin_trx().unwrap();
         let result = trx
             .table_update_unique_mvcc(
-                table_id,
-                key.index_slot.transitional_id(),
+                crate::TableIndex(table_id, key.index_slot.transitional_id()),
                 &key.vals,
                 update,
             )

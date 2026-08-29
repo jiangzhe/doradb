@@ -75,11 +75,13 @@ The current public and internal `SelectKey { index_no, vals }` also spans two
 different domains. Catalog row redo and catalog rollback/purge use it to name a
 static catalog-table index ordinal. User-table lookup, rollback, and purge use
 the same shape to name a user runtime position that this RFC makes reusable.
-Giving both domains one generation-qualified replacement would incorrectly
-assign user `IndexID` semantics to catalog indexes. Phase 1 instead gives
-catalog indexes a fixed `u16` ordinal and intentionally changes catalog keyed
-row redo in place; prior catalog-key bytes are not migrated or decoded. [C8],
-[C9], [C13], [U12]
+A shared durable selector would incorrectly assign user-generation semantics
+to catalog indexes. Catalog redo therefore keeps a fixed `u16` ordinal and its
+Phase 1 keyed-row encoding; prior catalog-key bytes are not migrated or decoded.
+Transient transaction-retained state may still use one private `IndexRef`
+shape: the catalog module synthesizes `IndexID == IndexSlot`, while user
+references retain their independently stable generation. [C8], [C9], [C13],
+[U12]
 
 Final physical index placement also cannot be compiler-owned. The current
 CREATE INDEX path acquires its DDL/table/catalog exclusion before
@@ -864,14 +866,11 @@ reference that can outlive its validating operation is generation-qualified.
 Representative key and handle types are: [C8], [C13], [U12]
 
 ```rust
-/// Stable public selector for one user-index point operation.
-pub struct UserIndexKey {
-    pub index_id: IndexID,
-    pub vals: Vec<Val>,
-}
+/// Table-qualified stable identity accepted by index-driven public APIs.
+pub struct TableIndex(pub TableID, pub IndexID);
 
-/// Compiled under one admitted and validated user-table layout.
-pub(crate) struct ResolvedUserIndexKey {
+/// Exact runtime key retained by catalog and user transaction state.
+pub(crate) struct ResolvedIndexKey {
     pub(crate) index: IndexRef,
     pub(crate) vals: Vec<Val>,
 }
@@ -886,26 +885,39 @@ pub(crate) struct SelectKey {
 pub(crate) type CatalogSelectKey = SelectKey;
 
 /// Public fast-path token; fields remain private and cannot expose a raw slot.
-pub struct ResolvedUserIndex {
+pub struct ResolvedTableIndex {
     table_id: TableID,
     index: IndexRef,
 }
+
+/// Opaque table-qualified admission selector; fields remain private.
+pub struct TableIndexSelector {
+    table_id: TableID,
+    selection: TableIndexSelection,
+}
+
+/// Sealed argument implemented by TableIndex and ResolvedTableIndex.
+pub trait TableIndexArgument: Sealed + Copy {
+    fn into_selector(self) -> TableIndexSelector;
+}
 ```
 
-`UserIndexKey` is representative of point operations. User range and mutation
-APIs accept `IndexID` separately from their range or row values rather than
-forcing every operation into that structure. The ambiguous public `SelectKey`
-is removed from user APIs. Internally, one
+Index-driven user APIs accept either `TableIndex` for normal stable-ID
+resolution or `ResolvedTableIndex` for direct exact-reference validation under
+the sealed `TableIndexArgument` bound. Both normalize into the same opaque
+`TableIndexSelector`, which keeps table qualification attached while exposing
+no physical slot. The ambiguous public `SelectKey` is removed from user APIs.
+Internally, one
 crate-private `SelectKey` represents an immediate physical-slot lookup, and
 catalog code names that same shape through the `CatalogSelectKey` semantic
 alias. `CatalogIndexNo` is likewise a semantic alias for the common physical
 `IndexSlot`. The alias avoids duplicate key and serde implementations; the
-retained-state boundary separates catalog work from generation-qualified user
-work. Catalog and user index undo may use separate structures or a private
-tagged enum: catalog state retains `CatalogSelectKey`, while user state retains
-`IndexRef` and cannot be constructed from an unqualified slot. Catalog purge
-and rollback therefore no longer discover the reference domain only from
-`table_id`. [C8], [U12]
+durable boundary separates catalog slot encoding from generation-qualified user
+identity. Transaction-retained branches, undo, and purge instead use one
+`ResolvedIndexKey`: catalog-owned conversion synthesizes an equal-valued ID and
+slot, while user construction requires an admitted exact reference. Rollback
+and purge use the retained `table_id` to select the table runtime and never
+reconstruct identity from it. [C8], [U12]
 
 `RowRedoKind::DeleteByPrimaryKey` and `UpdateByPrimaryKey` remain catalog-only
 and serialize `CatalogSelectKey` directly as a `u16` catalog index slot followed
@@ -915,18 +927,20 @@ the new payload. The Phase 3 redo version bump remains required by user index
 DDL markers and retains this Phase 1 catalog-key encoding. [C8], [C9], [U9],
 [U12]
 
-Normal public user APIs accept stable `IndexID`. `TableRuntimeLayout` builds a
+Normal public user APIs accept table-qualified stable `TableIndex` arguments.
+`TableRuntimeLayout` builds a
 direct `IndexID -> IndexSlot` resolution structure with its validated active
 slot generations. Transaction admission already captures and caches that
 layout under metadata S; it resolves the ID once at the operation boundary and
-carries `IndexRef` or `ResolvedUserIndexKey` through the complete synchronous
+carries `IndexRef` or `ResolvedIndexKey` through the complete synchronous
 lookup, scan stream, mutation traversal, undo creation, and purge handoff. A
 row callback, B-tree step, or row in a stream never repeats the ID lookup.
 Inserts, which maintain every active index, iterate validated active slots
 directly. [C10], [C13], [U12]
 
-Callers performing repeated point operations may resolve once to an opaque,
-`Copy` `ResolvedUserIndex` and pass that token by value to fast-path APIs. The
+Callers performing repeated operations may resolve once to an opaque,
+`Copy` `ResolvedTableIndex` and pass that token by value to the same lookup,
+scan, stream, mutation, upsert, update, and delete methods. The
 token does not serialize or pin an `Arc<TableRuntimeLayout>`. On each later
 admission, storage checks its `table_id` and directly verifies
 `layout[index.slot].id == index.id`; this is one array access and generation
@@ -936,14 +950,14 @@ Storage issues a token only for an admitted active index; a provisional CREATE
 marker never escapes through this API. The raw `IndexSlot` remains
 crate-private. [D8], [C13], [U11], [U12]
 
-Deferred catalog work retains the physical-slot key under its
-`CatalogSelectKey` alias. Deferred user undo, purge,
-retired-runtime, maintenance, cleanup, and checkpoint-sidecar work that can
-cross a metadata publication retains `IndexRef`. Before acting on a current
-user runtime slot, the consumer verifies the captured ID. Stale best-effort
-purge or cleanup becomes a no-op; invariant-sensitive paths return an error or
-use a captured old runtime, but none may mutate a newer generation. [D8], [D9],
-[C8], [C10], [C16], [U12], [U17]
+Deferred transaction branches, undo, and purge retain `IndexRef` for both table
+kinds. Catalog construction and consumption enforce `IndexID == IndexSlot`;
+deferred user maintenance, cleanup, checkpoint-sidecar, and retired-runtime
+work retains the admitted exact generation. Before acting on a current user
+runtime slot, the consumer verifies the captured ID. Stale best-effort purge or
+cleanup becomes a no-op; invariant-sensitive paths return an error or use a
+captured old runtime, but none may mutate a newer generation. [D8], [D9], [C8],
+[C10], [C16], [U12], [U17]
 
 ### Index Identity, Provisional Reservations, And Slot Reuse
 
@@ -1460,9 +1474,9 @@ DoraDB guarantees physical integrity: [D3], [C1]-[C8], [C10], [C13]-[C16],
   are complete, with no provisional reservation remaining;
 - root proof is attempted only for catalog-replay-visible markers and matches
   exact ID plus slot;
-- a retained catalog index key contains the `CatalogIndexNo` physical-slot
-  alias, a retained user index reference contains exact `IndexID` plus
-  `IndexSlot`, and neither carrier accepts the other's representation;
+- every retained index key contains `IndexRef`; catalog references have equal
+  numeric ID and fixed slot values, while user references contain the exact
+  admitted `IndexID` plus `IndexSlot` generation;
 - a deferred user `IndexRef` never acts on a different ID in the same slot;
 - compiler proposals contain stable IDs and physical semantics but no user
   `IndexSlot` or storage-stamped descriptor epoch/fingerprint;
@@ -1898,10 +1912,12 @@ marker can alias a second CREATE after restart. [U20]
   - Prerequisites: Phase 1 provides distinct catalog/user key domains and
     exact-generation transactional user references while all physical index
     positions remain non-reusable.
-  - Scope: Make normal public user APIs accept stable `IndexID`; add validated
+  - Scope: Make normal public user APIs accept stable `TableIndex`; add validated
     direct `IndexID -> IndexSlot` resolution to admitted layouts; carry
     `IndexRef` through synchronous execution; expose the opaque
-    `ResolvedUserIndex` fast path; keep low-level user index arrays slot-based;
+    `ResolvedTableIndex` fast path through the sealed `TableIndexArgument`
+    bound, opaque `TableIndexSelector`, and shared method names; keep low-level
+    user index arrays slot-based;
     make physical-position metadata helpers such as `TableIndexLayout` accept
     `IndexSlot` and convert to `usize` only at direct array/root boundaries;
     and generation-qualify every remaining retired-runtime, maintenance,
@@ -1909,8 +1925,11 @@ marker can alias a second CREATE after restart. [U20]
     carry exact `IndexRef` plus its captured runtime, enforce unique retirement
     ownership by slot, keep retirement state out of foreground execution, and
     change root-proof interfaces to accept ID plus slot only after the caller
-    has checked the catalog replay floor. Transitional layouts still compile
-    current persisted `index_no` into equal ID/slot pairs.
+    has checked the catalog replay floor. Normalize transaction-retained catalog
+    and user keys onto `ResolvedIndexKey`; catalog conversion enforces an
+    internal equal-ID/equal-slot invariant without changing catalog serde.
+    Transitional layouts still compile current persisted `index_no` into equal
+    ID/slot pairs.
   - Goals: Establish resolve-once performance and one-runtime-generation-per-
     slot ownership before persisted generations or reuse are enabled.
   - Validation: Own tests 2 and the pre-reuse portion of test 3; the runtime-
@@ -1928,10 +1947,10 @@ marker can alias a second CREATE after restart. [U20]
   - Implementation Summary: `pending`
 
 - **Phase 3: Atomic Numeric Format Cutover And Replay-Safe Allocation**
-  - Prerequisites: Phases 1 and 2 have separated reference domains, removed
-    unqualified delayed user references, established native catalog row-redo
-    encoding, and established persisted-to-runtime index-generation
-    compilation.
+  - Prerequisites: Phases 1 and 2 have separated public/durable reference
+    domains, normalized transient retained keys, removed unqualified delayed
+    user references, established native catalog row-redo encoding, and
+    established persisted-to-runtime index-generation compilation.
   - Scope: Introduce `ColumnID`, `ColumnOrdinal`, `ColumnIDWatermark`, and
     `IndexIDWatermark`; define bounded `0..=2^32` allocation/exhaustion and
     typed errors; install all six final catalog tables/slots; replace table,
@@ -2223,12 +2242,11 @@ marker can alias a second CREATE after restart. [U20]
   lock from normal index operations would compromise the direct-layout design.
   Only DDL, checkpoint, and cleanup touch that state, and instrumentation tests
   require zero retirement-state access for foreground lookup, scan, and DML.
-- **Reference-domain confusion:** applying `IndexRef` uniformly would alter
-  catalog redo and give static catalog indexes false user generations.
-  `IndexID` remains distinct from physical `IndexSlot`; `CatalogIndexNo` is a
-  semantic slot alias used by the `CatalogSelectKey = SelectKey` name; the
-  shared physical-slot key owns catalog serde, while catalog/user undo and
-  purge payloads are split before slot reuse is enabled.
+- **Reference-domain confusion:** applying `IndexRef` at durable or public
+  boundaries would alter catalog redo and expose false catalog generations.
+  `CatalogSelectKey` continues to own catalog serde, while only transient
+  retained state shares `ResolvedIndexKey`; catalog-owned conversion and
+  consumers enforce equal numeric ID and slot values.
 - **Index resolution regression:** resolving stable IDs inside row callbacks or
   tree traversal would add avoidable hot-path work. Admission resolves at most
   once per logical operation, streams retain the result, inserts iterate active

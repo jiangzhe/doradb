@@ -3573,8 +3573,7 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let rows = trx
                 .table_index_lookup_mvcc(
-                    table.table_id(),
-                    name_key.index_slot.transitional_id(),
+                    crate::TableIndex(table.table_id(), name_key.index_slot.transitional_id()),
                     &name_key.vals,
                     &[0, 1],
                 )
@@ -3705,8 +3704,7 @@ mod tests {
             );
             let cold_rows = trx
                 .table_index_lookup_mvcc(
-                    table_id,
-                    crate::IndexID::new(1),
+                    crate::TableIndex(table_id, crate::IndexID::new(1)),
                     &[Val::from("cold")],
                     &[0],
                 )
@@ -3717,8 +3715,7 @@ mod tests {
             for deleted_id in [0u32, 10] {
                 let deleted = trx
                     .table_lookup_unique_mvcc(
-                        table_id,
-                        crate::IndexID::new(0),
+                        crate::TableIndex(table_id, crate::IndexID::new(0)),
                         &[Val::from(deleted_id)],
                         &[0],
                     )

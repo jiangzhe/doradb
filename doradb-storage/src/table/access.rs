@@ -4,7 +4,7 @@ use super::{
 };
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::buffer::{EvictableBufferPool, PoolGuards};
-use crate::catalog::{IndexRef, IndexSlot, ResolvedUserIndexKey, TableColumnLayout, TableMetadata};
+use crate::catalog::{IndexRef, IndexSlot, ResolvedIndexKey, TableColumnLayout, TableMetadata};
 use crate::error::{
     DataIntegrityError, DataIntegrityResult, DiscloseError, DiscloseResultExt, InternalError,
     MultiDomainResultExt, OperationError, OperationOrFatalResult, OperationOrRuntimeError,
@@ -1322,7 +1322,7 @@ impl<'op> UserTableAccessor<'op> {
     }
 
     #[inline]
-    fn retained_user_key(&self, index: IndexRef, vals: Vec<Val>) -> ResolvedUserIndexKey {
+    fn retained_user_key(&self, index: IndexRef, vals: Vec<Val>) -> ResolvedIndexKey {
         self.layout()
             .resolve_active_user_key(index, vals)
             .unwrap_or_else(|err| {
@@ -1344,7 +1344,7 @@ impl<'op> UserTableAccessor<'op> {
         merge_old_deleted: bool,
     ) {
         self.debug_assert_table_write_lock_held(rt);
-        effects.push_user_insert_unique_index_undo(
+        effects.push_insert_unique_index_undo(
             self.table_id(),
             row_id,
             self.retained_user_key(index, vals),
@@ -1363,7 +1363,7 @@ impl<'op> UserTableAccessor<'op> {
         merge_old_deleted: bool,
     ) {
         self.debug_assert_table_write_lock_held(rt);
-        effects.push_user_insert_non_unique_index_undo(
+        effects.push_insert_non_unique_index_undo(
             self.table_id(),
             row_id,
             self.retained_user_key(index, vals),
@@ -1382,7 +1382,7 @@ impl<'op> UserTableAccessor<'op> {
         unique: bool,
     ) {
         self.debug_assert_table_write_lock_held(rt);
-        effects.push_user_delete_index_undo(
+        effects.push_delete_index_undo(
             self.table_id(),
             row_id,
             self.retained_user_key(index, vals),
@@ -1397,11 +1397,11 @@ impl<'op> UserTableAccessor<'op> {
         effects: &mut StmtEffects,
         old_row_id: RowID,
         new_row_id: RowID,
-        key: ResolvedUserIndexKey,
+        key: ResolvedIndexKey,
         old_deleted: bool,
     ) {
         self.debug_assert_table_write_lock_held(rt);
-        effects.push_user_update_unique_index_undo(
+        effects.push_update_unique_index_undo(
             self.table_id(),
             old_row_id,
             new_row_id,
@@ -1937,7 +1937,7 @@ impl<'op> UserTableAccessor<'op> {
             .prepare_move_update(old_row, update, |key, target, undo_vals| {
                 let key = WriteIndexKey::new(self.layout(), key);
                 let (index, vals) = key.into_parts();
-                IndexBranch::user(self.retained_user_key(index, vals), target, undo_vals)
+                IndexBranch::new(self.retained_user_key(index, vals), target, undo_vals)
             });
         // Release the old row page before awaiting replacement-row insertion.
         drop(old_guard);
@@ -2385,7 +2385,7 @@ impl<'op> UserTableAccessor<'op> {
         // The new hot row owns the key now. The terminal branch preserves the
         // old cold image for snapshots that still need to see it. The branch is
         // runtime-only; recovery restores only the latest committed mapping.
-        new_access.link_user_for_unique_index_cold_terminal(
+        new_access.link_for_unique_index_cold_terminal(
             self.retained_user_key(index_ref, key_vals.to_vec()),
             delete_cts,
             undo_vals,
@@ -2465,7 +2465,7 @@ impl<'op> UserTableAccessor<'op> {
                 // row latch is enough, because row lock is already acquired.
                 let mut new_access = target.guard.write_row_by_id(target.row_id);
                 let undo_vals = new_access.row().calc_delta(metadata.col.as_ref(), &old_row);
-                new_access.link_user_for_unique_index(
+                new_access.link_for_unique_index(
                     self.retained_user_key(index_ref, key_vals.to_vec()),
                     cts,
                     old_entry,
@@ -5575,10 +5575,14 @@ mod tests {
     ) -> Vec<Vec<Val>> {
         let key_vals = [Val::from(key)];
         let read_set = [0usize, 1];
-        trx.table_index_lookup_mvcc(table_id, crate::IndexID::new(1), &key_vals, &read_set)
-            .await
-            .unwrap()
-            .unwrap_rows()
+        trx.table_index_lookup_mvcc(
+            crate::TableIndex(table_id, crate::IndexID::new(1)),
+            &key_vals,
+            &read_set,
+        )
+        .await
+        .unwrap()
+        .unwrap_rows()
     }
 
     async fn secondary_index_stream_rows(
@@ -5590,8 +5594,7 @@ mod tests {
         let read_set = [0usize, 1];
         let mut stream = trx
             .table_index_scan_mvcc_stream(
-                table_id,
-                crate::IndexID::new(1),
+                crate::TableIndex(table_id, crate::IndexID::new(1)),
                 &key_vals[..]..=&key_vals[..],
                 &read_set,
             )
@@ -5846,8 +5849,7 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let inserted = trx
                 .table_upsert_unique_mvcc(
-                    table_id,
-                    crate::IndexID::new(0),
+                    crate::TableIndex(table_id, crate::IndexID::new(0)),
                     vec![Val::from(1i32), Val::from("hello")],
                 )
                 .await
@@ -5861,8 +5863,7 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let updated = trx
                 .table_upsert_unique_mvcc(
-                    table_id,
-                    crate::IndexID::new(0),
+                    crate::TableIndex(table_id, crate::IndexID::new(0)),
                     vec![Val::from(1i32), Val::from("world")],
                 )
                 .await
@@ -5943,8 +5944,7 @@ mod tests {
             let mut writer = session.begin_trx().unwrap();
             let updated = writer
                 .table_upsert_unique_mvcc(
-                    table_id,
-                    crate::IndexID::new(0),
+                    crate::TableIndex(table_id, crate::IndexID::new(0)),
                     vec![
                         Val::from(0i32),
                         Val::from("name0"),
@@ -6052,8 +6052,7 @@ mod tests {
             let mut trx1 = session.begin_trx().unwrap();
             assert!(matches!(
                 trx1.table_upsert_unique_mvcc(
-                    table_id,
-                    crate::IndexID::new(0),
+                    crate::TableIndex(table_id, crate::IndexID::new(0)),
                     vec![Val::from(1i32), Val::from("held")],
                 )
                 .await
@@ -6065,8 +6064,7 @@ mod tests {
             let mut trx2 = session2.begin_trx().unwrap();
             let err = trx2
                 .table_upsert_unique_mvcc(
-                    table_id,
-                    crate::IndexID::new(0),
+                    crate::TableIndex(table_id, crate::IndexID::new(0)),
                     vec![Val::from(1i32), Val::from("conflict")],
                 )
                 .await
@@ -6081,8 +6079,7 @@ mod tests {
             let mut trx1 = session.begin_trx().unwrap();
             assert!(matches!(
                 trx1.table_upsert_unique_mvcc(
-                    table_id,
-                    crate::IndexID::new(0),
+                    crate::TableIndex(table_id, crate::IndexID::new(0)),
                     vec![Val::from(2i32), Val::from("first")],
                 )
                 .await
@@ -6093,8 +6090,7 @@ mod tests {
             let mut trx2 = session2.begin_trx().unwrap();
             let err = trx2
                 .table_upsert_unique_mvcc(
-                    table_id,
-                    crate::IndexID::new(0),
+                    crate::TableIndex(table_id, crate::IndexID::new(0)),
                     vec![Val::from(2i32), Val::from("second")],
                 )
                 .await
@@ -8330,8 +8326,7 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let rows = trx
                 .table_index_lookup_mvcc(
-                    table_id,
-                    non_unique_key.index_slot.transitional_id(),
+                    crate::TableIndex(table_id, non_unique_key.index_slot.transitional_id()),
                     &non_unique_key.vals,
                     &[0, 1],
                 )
@@ -8839,8 +8834,7 @@ mod tests {
                 let key = single_key(id);
                 assert_eq!(
                     trx.table_delete_unique_mvcc(
-                        table_id,
-                        key.index_slot.transitional_id(),
+                        crate::TableIndex(table_id, key.index_slot.transitional_id()),
                         &key.vals
                     )
                     .await
@@ -9071,8 +9065,7 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let rows = trx
                 .table_index_lookup_mvcc(
-                    table_id,
-                    crate::IndexID::new(1),
+                    crate::TableIndex(table_id, crate::IndexID::new(1)),
                     &[Val::from("shared")],
                     &[0],
                 )
@@ -9112,8 +9105,7 @@ mod tests {
             assert_eq!(outcome.delete_count, 2);
             let rows = trx
                 .table_index_lookup_mvcc(
-                    table_id,
-                    crate::IndexID::new(1),
+                    crate::TableIndex(table_id, crate::IndexID::new(1)),
                     &[Val::from("shared")],
                     &[0],
                 )
@@ -9134,8 +9126,7 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let rows = trx
                 .table_index_lookup_mvcc(
-                    table_id,
-                    crate::IndexID::new(1),
+                    crate::TableIndex(table_id, crate::IndexID::new(1)),
                     &[Val::from("shared")],
                     &[0],
                 )
@@ -9180,8 +9171,7 @@ mod tests {
             assert!(matches!(deleted, Ok(DeleteMvcc::Deleted)));
             let rows = trx
                 .table_index_lookup_mvcc(
-                    table_id,
-                    crate::IndexID::new(1),
+                    crate::TableIndex(table_id, crate::IndexID::new(1)),
                     &[Val::from("shared")],
                     &[0],
                 )
@@ -9204,8 +9194,7 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let rows = trx
                 .table_index_lookup_mvcc(
-                    table_id,
-                    crate::IndexID::new(1),
+                    crate::TableIndex(table_id, crate::IndexID::new(1)),
                     &[Val::from("shared")],
                     &[0],
                 )
@@ -9234,8 +9223,7 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let rows = trx
                 .table_index_lookup_mvcc(
-                    table_id,
-                    crate::IndexID::new(1),
+                    crate::TableIndex(table_id, crate::IndexID::new(1)),
                     &[Val::from("shared")],
                     &[0],
                 )
@@ -11305,7 +11293,11 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let rows = trx
-                .table_index_lookup_mvcc(table_id, crate::IndexID::new(1), &key_vals, &read_set)
+                .table_index_lookup_mvcc(
+                    crate::TableIndex(table_id, crate::IndexID::new(1)),
+                    &key_vals,
+                    &read_set,
+                )
                 .await
                 .unwrap()
                 .unwrap_rows();
@@ -11315,8 +11307,7 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let mut stream = trx
                 .table_index_scan_mvcc_stream(
-                    table_id,
-                    crate::IndexID::new(1),
+                    crate::TableIndex(table_id, crate::IndexID::new(1)),
                     &key_vals[..]..=&key_vals[..],
                     &read_set,
                 )
@@ -11358,8 +11349,7 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let err = match trx
                 .table_index_scan_mvcc_stream(
-                    table_id,
-                    crate::IndexID::new(1),
+                    crate::TableIndex(table_id, crate::IndexID::new(1)),
                     &key_vals[..]..=&key_vals[..],
                     &[],
                 )
@@ -11377,8 +11367,7 @@ mod tests {
             trx.noop().await.unwrap();
             let mut stream = trx
                 .table_index_scan_mvcc_stream(
-                    table_id,
-                    crate::IndexID::new(1),
+                    crate::TableIndex(table_id, crate::IndexID::new(1)),
                     &key_vals[..]..=&key_vals[..],
                     &[],
                 )
@@ -11391,8 +11380,7 @@ mod tests {
 
             let err = match trx
                 .table_index_scan_mvcc_stream(
-                    table_id,
-                    crate::IndexID::new(1),
+                    crate::TableIndex(table_id, crate::IndexID::new(1)),
                     &key_vals[..]..=&key_vals[..],
                     &[],
                 )
@@ -11410,8 +11398,7 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let err = match trx
                 .table_index_scan_mvcc_stream(
-                    table_id,
-                    crate::IndexID::new(1),
+                    crate::TableIndex(table_id, crate::IndexID::new(1)),
                     &key_vals[..]..=&key_vals[..],
                     &[],
                 )
@@ -11464,8 +11451,7 @@ mod tests {
                 let key = SelectKey::new(IndexSlot::new(1), vec![Val::from(1i32)]);
                 let res = trx
                     .table_index_lookup_mvcc(
-                        table_id,
-                        key.index_slot.transitional_id(),
+                        crate::TableIndex(table_id, key.index_slot.transitional_id()),
                         &key.vals,
                         user_read_set,
                     )
@@ -11477,8 +11463,7 @@ mod tests {
                 let key_vals = [Val::from(1i32)];
                 let rows = trx
                     .table_index_scan_mvcc(
-                        table_id,
-                        crate::IndexID::new(1),
+                        crate::TableIndex(table_id, crate::IndexID::new(1)),
                         &key_vals[..]..=&key_vals[..],
                         user_read_set,
                     )
@@ -11491,8 +11476,7 @@ mod tests {
                 let mut trx = session.begin_trx().unwrap();
                 let mut stream = trx
                     .table_index_scan_mvcc_stream(
-                        table_id,
-                        crate::IndexID::new(1),
+                        crate::TableIndex(table_id, crate::IndexID::new(1)),
                         &key_vals[..]..=&key_vals[..],
                         user_read_set,
                     )
@@ -11512,8 +11496,7 @@ mod tests {
                 let upper = [Val::from(4i32)];
                 let mut stream = trx
                     .table_index_scan_mvcc_stream(
-                        table_id,
-                        crate::IndexID::new(0),
+                        crate::TableIndex(table_id, crate::IndexID::new(0)),
                         &lower[..]..&upper[..],
                         user_read_set,
                     )
@@ -11535,8 +11518,7 @@ mod tests {
                 let mut trx = session.begin_trx().unwrap();
                 let rows = trx
                     .table_index_scan_mvcc(
-                        table_id,
-                        crate::IndexID::new(0),
+                        crate::TableIndex(table_id, crate::IndexID::new(0)),
                         &lower[..]..&upper[..],
                         user_read_set,
                     )
@@ -11549,8 +11531,7 @@ mod tests {
                 let mut trx = session.begin_trx().unwrap();
                 let mut stream = trx
                     .table_index_scan_mvcc_stream(
-                        table_id,
-                        crate::IndexID::new(1),
+                        crate::TableIndex(table_id, crate::IndexID::new(1)),
                         ..,
                         user_read_set,
                     )
@@ -11565,7 +11546,11 @@ mod tests {
 
                 let mut trx = session.begin_trx().unwrap();
                 let err = match trx
-                    .table_index_scan_mvcc_stream(table_id, crate::IndexID::new(1), .., &[])
+                    .table_index_scan_mvcc_stream(
+                        crate::TableIndex(table_id, crate::IndexID::new(1)),
+                        ..,
+                        &[],
+                    )
                     .await
                 {
                     Ok(_) => panic!("empty read set should fail stream construction"),
@@ -11581,8 +11566,7 @@ mod tests {
                 let invalid_key_vals = [Val::from(1i32), Val::from(2i32)];
                 let err = match trx
                     .table_index_scan_mvcc_stream(
-                        table_id,
-                        crate::IndexID::new(1),
+                        crate::TableIndex(table_id, crate::IndexID::new(1)),
                         &invalid_key_vals[..]..=&invalid_key_vals[..],
                         user_read_set,
                     )
@@ -11611,8 +11595,7 @@ mod tests {
                 let key = SelectKey::new(IndexSlot::new(1), vec![Val::from(0i32)]);
                 let res = trx
                     .table_index_lookup_mvcc(
-                        table_id,
-                        key.index_slot.transitional_id(),
+                        crate::TableIndex(table_id, key.index_slot.transitional_id()),
                         &key.vals,
                         user_read_set,
                     )
@@ -11625,8 +11608,7 @@ mod tests {
                 let upper = [Val::from(5i32)];
                 let mut stream = trx
                     .table_index_scan_mvcc_stream(
-                        table_id,
-                        crate::IndexID::new(1),
+                        crate::TableIndex(table_id, crate::IndexID::new(1)),
                         &lower[..]..&upper[..],
                         user_read_set,
                     )
@@ -11649,8 +11631,7 @@ mod tests {
                 let mut trx = session.begin_trx().unwrap();
                 let rows = trx
                     .table_index_scan_mvcc(
-                        table_id,
-                        crate::IndexID::new(1),
+                        crate::TableIndex(table_id, crate::IndexID::new(1)),
                         &lower[..]..&upper[..],
                         user_read_set,
                     )
@@ -11676,8 +11657,7 @@ mod tests {
                 let key = SelectKey::new(IndexSlot::new(1), vec![Val::from(0i32)]);
                 let res = trx
                     .table_index_lookup_mvcc(
-                        table_id,
-                        key.index_slot.transitional_id(),
+                        crate::TableIndex(table_id, key.index_slot.transitional_id()),
                         &key.vals,
                         user_read_set,
                     )

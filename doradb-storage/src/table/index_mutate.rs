@@ -800,16 +800,17 @@ mod tests {
         let mut writer_session = engine.new_session().unwrap();
         let mut writer = writer_session.begin_trx().unwrap();
         let writer_status = transaction_status_for_test(&writer);
-        let mut mutation =
-            Box::pin(
-                writer.table_index_mutate_mvcc(table_id, crate::IndexID::new(0), .., |row| {
-                    assert_eq!(row.val(0)?.as_i32(), Some(1));
-                    Ok(RowMutation::Update(vec![UpdateCol {
-                        idx: 0,
-                        val: Val::from(101i32),
-                    }]))
-                }),
-            );
+        let mut mutation = Box::pin(writer.table_index_mutate_mvcc(
+            crate::TableIndex(table_id, crate::IndexID::new(0)),
+            ..,
+            |row| {
+                assert_eq!(row.val(0)?.as_i32(), Some(1));
+                Ok(RowMutation::Update(vec![UpdateCol {
+                    idx: 0,
+                    val: Val::from(101i32),
+                }]))
+            },
+        ));
         poll_until_deferred_application_pauses(mutation.as_mut()).await;
 
         assert_checkpoint_published(&mut maintenance_session, table_id).await;
@@ -862,23 +863,27 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let mut callbacks = 0usize;
             let outcome = trx
-                .table_index_mutate_mvcc(table_id, crate::IndexID::new(0), .., |row| {
-                    callbacks += 1;
-                    Ok(match row.val(0)?.as_i32().unwrap() {
-                        0 => RowMutation::Update(vec![UpdateCol {
-                            idx: 1,
-                            val: Val::from("cold-updated"),
-                        }]),
-                        1 | 12 => RowMutation::Delete,
-                        2 => RowMutation::Skip,
-                        10 => RowMutation::Update(vec![UpdateCol {
-                            idx: 1,
-                            val: Val::from("hot-updated"),
-                        }]),
-                        11 => RowMutation::Update(Vec::new()),
-                        _ => unreachable!(),
-                    })
-                })
+                .table_index_mutate_mvcc(
+                    crate::TableIndex(table_id, crate::IndexID::new(0)),
+                    ..,
+                    |row| {
+                        callbacks += 1;
+                        Ok(match row.val(0)?.as_i32().unwrap() {
+                            0 => RowMutation::Update(vec![UpdateCol {
+                                idx: 1,
+                                val: Val::from("cold-updated"),
+                            }]),
+                            1 | 12 => RowMutation::Delete,
+                            2 => RowMutation::Skip,
+                            10 => RowMutation::Update(vec![UpdateCol {
+                                idx: 1,
+                                val: Val::from("hot-updated"),
+                            }]),
+                            11 => RowMutation::Update(Vec::new()),
+                            _ => unreachable!(),
+                        })
+                    },
+                )
                 .await
                 .unwrap();
             assert_eq!(callbacks, 6);
@@ -903,7 +908,11 @@ mod tests {
             );
             let deleted_hot_key = [Val::from(12i32)];
             let deleted_hot_row = reader
-                .table_lookup_unique_mvcc(table_id, crate::IndexID::new(0), &deleted_hot_key, &[0])
+                .table_lookup_unique_mvcc(
+                    crate::TableIndex(table_id, crate::IndexID::new(0)),
+                    &deleted_hot_key,
+                    &[0],
+                )
                 .await
                 .unwrap();
             assert!(matches!(deleted_hot_row, SelectMvcc::NotFound));
@@ -959,8 +968,7 @@ mod tests {
             let mut writer = session.begin_trx().unwrap();
             let outcome = writer
                 .table_index_mutate_mvcc(
-                    table_id,
-                    crate::IndexID::new(0),
+                    crate::TableIndex(table_id, crate::IndexID::new(0)),
                     &range_key[..]..=&range_key[..],
                     |_| {
                         callbacks += 1;
@@ -988,14 +996,18 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let mut callbacks = Vec::new();
             let outcome = trx
-                .table_index_mutate_mvcc(table_id, crate::IndexID::new(0), .., |row| {
-                    let id = row.val(0)?.as_i32().unwrap();
-                    callbacks.push(id);
-                    Ok(RowMutation::Update(vec![UpdateCol {
-                        idx: 0,
-                        val: Val::from(id + 100),
-                    }]))
-                })
+                .table_index_mutate_mvcc(
+                    crate::TableIndex(table_id, crate::IndexID::new(0)),
+                    ..,
+                    |row| {
+                        let id = row.val(0)?.as_i32().unwrap();
+                        callbacks.push(id);
+                        Ok(RowMutation::Update(vec![UpdateCol {
+                            idx: 0,
+                            val: Val::from(id + 100),
+                        }]))
+                    },
+                )
                 .await
                 .unwrap();
             assert_eq!(callbacks, vec![0, 1, 2]);
@@ -1039,13 +1051,17 @@ mod tests {
 
             let mut writer = session.begin_trx().unwrap();
             let outcome = writer
-                .table_index_mutate_mvcc(table_id, crate::IndexID::new(0), .., |row| {
-                    assert_eq!(row.val(0)?.as_str(), Some("old"));
-                    Ok(RowMutation::Update(vec![UpdateCol {
-                        idx: 0,
-                        val: Val::from("new-variable-length-key"),
-                    }]))
-                })
+                .table_index_mutate_mvcc(
+                    crate::TableIndex(table_id, crate::IndexID::new(0)),
+                    ..,
+                    |row| {
+                        assert_eq!(row.val(0)?.as_str(), Some("old"));
+                        Ok(RowMutation::Update(vec![UpdateCol {
+                            idx: 0,
+                            val: Val::from("new-variable-length-key"),
+                        }]))
+                    },
+                )
                 .await
                 .unwrap();
             assert_eq!(outcome.update_count, 1);
@@ -1055,11 +1071,19 @@ mod tests {
             let new_key = [Val::from("new-variable-length-key")];
             let mut reader = session.begin_trx().unwrap();
             let old_row = reader
-                .table_lookup_unique_mvcc(table_id, crate::IndexID::new(0), &old_key, &[0])
+                .table_lookup_unique_mvcc(
+                    crate::TableIndex(table_id, crate::IndexID::new(0)),
+                    &old_key,
+                    &[0],
+                )
                 .await
                 .unwrap();
             let new_row = reader
-                .table_lookup_unique_mvcc(table_id, crate::IndexID::new(0), &new_key, &[0])
+                .table_lookup_unique_mvcc(
+                    crate::TableIndex(table_id, crate::IndexID::new(0)),
+                    &new_key,
+                    &[0],
+                )
                 .await
                 .unwrap();
             assert!(old_row.not_found());
@@ -1083,14 +1107,18 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let mut callbacks = Vec::new();
             let result = trx
-                .table_index_mutate_mvcc(table_id, crate::IndexID::new(0), .., |row| {
-                    let id = row.val(0)?.as_i32().unwrap();
-                    callbacks.push(id);
-                    Ok(RowMutation::Update(vec![UpdateCol {
-                        idx: 0,
-                        val: Val::from(if id == 0 { 2 } else { id + 100 }),
-                    }]))
-                })
+                .table_index_mutate_mvcc(
+                    crate::TableIndex(table_id, crate::IndexID::new(0)),
+                    ..,
+                    |row| {
+                        let id = row.val(0)?.as_i32().unwrap();
+                        callbacks.push(id);
+                        Ok(RowMutation::Update(vec![UpdateCol {
+                            idx: 0,
+                            val: Val::from(if id == 0 { 2 } else { id + 100 }),
+                        }]))
+                    },
+                )
                 .await;
             assert_eq!(callbacks, vec![0, 1, 2]);
             assert_eq!(
@@ -1130,14 +1158,18 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let mut callbacks = Vec::new();
             let outcome = trx
-                .table_index_mutate_mvcc(table_id, crate::IndexID::new(0), .., |row| {
-                    let id = row.val(0)?.as_i32().unwrap();
-                    callbacks.push(id);
-                    Ok(RowMutation::Update(vec![UpdateCol {
-                        idx: 0,
-                        val: Val::from(id + 100),
-                    }]))
-                })
+                .table_index_mutate_mvcc(
+                    crate::TableIndex(table_id, crate::IndexID::new(0)),
+                    ..,
+                    |row| {
+                        let id = row.val(0)?.as_i32().unwrap();
+                        callbacks.push(id);
+                        Ok(RowMutation::Update(vec![UpdateCol {
+                            idx: 0,
+                            val: Val::from(id + 100),
+                        }]))
+                    },
+                )
                 .await
                 .unwrap();
             assert_eq!(callbacks, vec![0, 1, 2, 10, 11, 12]);
@@ -1181,8 +1213,7 @@ mod tests {
             let session_id = session.id();
             let mut writer = session.begin_trx().unwrap();
             let mut mutation = Box::pin(writer.table_index_mutate_mvcc(
-                table_id,
-                crate::IndexID::new(0),
+                crate::TableIndex(table_id, crate::IndexID::new(0)),
                 ..,
                 |_| {
                     Ok(RowMutation::Update(vec![UpdateCol {
@@ -1218,8 +1249,7 @@ mod tests {
             let mut writer_session = engine.new_session().unwrap();
             let mut writer = writer_session.begin_trx().unwrap();
             let mut mutation = Box::pin(writer.table_index_mutate_mvcc(
-                table_id,
-                crate::IndexID::new(0),
+                crate::TableIndex(table_id, crate::IndexID::new(0)),
                 ..,
                 |_| {
                     Ok(RowMutation::Update(vec![UpdateCol {
@@ -1279,8 +1309,7 @@ mod tests {
             let mut writer = session.begin_trx().unwrap();
             let outcome = writer
                 .table_index_mutate_mvcc(
-                    table_id,
-                    crate::IndexID::new(1),
+                    crate::TableIndex(table_id, crate::IndexID::new(1)),
                     &lower[..]..=&upper[..],
                     |row| {
                         callbacks += 1;
@@ -1344,13 +1373,17 @@ mod tests {
             let mut owner_session = engine.new_session().unwrap();
             let mut owner = owner_session.begin_trx().unwrap();
             let outcome = owner
-                .table_index_mutate_mvcc(table_id, crate::IndexID::new(0), .., |row| {
-                    Ok(match row.val(0)?.as_i32().unwrap() {
-                        0 => RowMutation::Skip,
-                        10 => RowMutation::Update(Vec::new()),
-                        _ => unreachable!(),
-                    })
-                })
+                .table_index_mutate_mvcc(
+                    crate::TableIndex(table_id, crate::IndexID::new(0)),
+                    ..,
+                    |row| {
+                        Ok(match row.val(0)?.as_i32().unwrap() {
+                            0 => RowMutation::Skip,
+                            10 => RowMutation::Update(Vec::new()),
+                            _ => unreachable!(),
+                        })
+                    },
+                )
                 .await
                 .unwrap();
             assert_eq!(
@@ -1399,11 +1432,15 @@ mod tests {
 
             let mut callbacks = 0usize;
             let outcome = trx
-                .table_index_mutate_mvcc(table_id, crate::IndexID::new(0), .., |row| {
-                    callbacks += 1;
-                    assert_eq!(row.val(0)?.as_i32(), Some(7));
-                    Ok(RowMutation::Skip)
-                })
+                .table_index_mutate_mvcc(
+                    crate::TableIndex(table_id, crate::IndexID::new(0)),
+                    ..,
+                    |row| {
+                        callbacks += 1;
+                        assert_eq!(row.val(0)?.as_i32(), Some(7));
+                        Ok(RowMutation::Skip)
+                    },
+                )
                 .await
                 .unwrap();
             assert_eq!(callbacks, 1);
@@ -1411,11 +1448,15 @@ mod tests {
 
             let mut later_callbacks = 0usize;
             let outcome = trx
-                .table_index_mutate_mvcc(table_id, crate::IndexID::new(0), .., |row| {
-                    later_callbacks += 1;
-                    assert_eq!(row.val(0)?.as_i32(), Some(7));
-                    Ok(RowMutation::Skip)
-                })
+                .table_index_mutate_mvcc(
+                    crate::TableIndex(table_id, crate::IndexID::new(0)),
+                    ..,
+                    |row| {
+                        later_callbacks += 1;
+                        assert_eq!(row.val(0)?.as_i32(), Some(7));
+                        Ok(RowMutation::Skip)
+                    },
+                )
                 .await
                 .unwrap();
             assert_eq!(later_callbacks, 1);
@@ -1448,8 +1489,7 @@ mod tests {
             let mut competitor = competitor_session.begin_trx().unwrap();
             let result = competitor
                 .table_index_mutate_mvcc(
-                    table_id,
-                    crate::IndexID::new(0),
+                    crate::TableIndex(table_id, crate::IndexID::new(0)),
                     &key[..]..=&key[..],
                     |_| {
                         callbacks += 1;
@@ -1504,8 +1544,7 @@ mod tests {
             let mut competitor = competitor_session.begin_trx().unwrap();
             let result = competitor
                 .table_index_mutate_mvcc(
-                    table_id,
-                    crate::IndexID::new(0),
+                    crate::TableIndex(table_id, crate::IndexID::new(0)),
                     &old_key[..]..=&old_key[..],
                     |_| {
                         callbacks += 1;
@@ -1555,8 +1594,7 @@ mod tests {
             let mutate = async {
                 competitor
                     .table_index_mutate_mvcc(
-                        table_id,
-                        crate::IndexID::new(0),
+                        crate::TableIndex(table_id, crate::IndexID::new(0)),
                         &key[..]..=&key[..],
                         |_| {
                             callbacks.fetch_add(1, Ordering::SeqCst);

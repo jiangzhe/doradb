@@ -13,7 +13,7 @@ use crate::workload::util::{
 };
 use crate::workload::{RunCancellation, SessionPlan};
 use doradb_storage::id::TableID;
-use doradb_storage::{Engine, IndexID, RowMutation, Session, UpdateCol, Val};
+use doradb_storage::{Engine, IndexID, RowMutation, Session, TableIndex, UpdateCol, Val};
 
 const SPLITMIX_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
 const UPDATE_RANGE_SALT: u64 = 0xd743_8f29_51ce_6a0b;
@@ -378,8 +378,7 @@ async fn run_update_operations(
         let mut callback_error = None;
         let mutation_result = trx
             .table_index_mutate_mvcc(
-                spec.table_id,
-                IndexID::new(0),
+                TableIndex(spec.table_id, IndexID::new(0)),
                 &lower[..]..&upper[..],
                 |row| {
                     if callback_error.is_some() {

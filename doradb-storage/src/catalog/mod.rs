@@ -11,7 +11,9 @@ pub(crate) use checkpoint::*;
 pub(crate) use history::*;
 pub(crate) use index::*;
 pub(crate) use index_ref::*;
-pub use index_ref::{IndexID, ResolvedUserIndex};
+pub use index_ref::{
+    IndexID, ResolvedTableIndex, TableIndex, TableIndexArgument, TableIndexSelector,
+};
 pub(crate) use spec::ActiveIndexSpec;
 pub use spec::{
     ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexOrder, IndexSpec, TableSpec,
@@ -994,7 +996,7 @@ impl UserTableCacheEntry {
     #[inline]
     pub(crate) async fn rollback_index_entry(
         &mut self,
-        entry: &IndexUndo<ResolvedUserIndexKey>,
+        entry: &IndexUndo,
         guards: &PoolGuards,
         ts: TrxID,
     ) -> RuntimeResult<()> {
@@ -1012,7 +1014,7 @@ impl UserTableCacheEntry {
     pub(crate) async fn delete_index(
         &mut self,
         guards: &PoolGuards,
-        key: &ResolvedUserIndexKey,
+        key: &ResolvedIndexKey,
         row_id: RowID,
         unique: bool,
         min_active_sts: TrxID,

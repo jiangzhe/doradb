@@ -16,7 +16,7 @@ resulting generation-qualified `IndexRef` through synchronous execution and
 all state that can survive an await or metadata publication. Keep runtime
 arrays and table-root vectors addressed by crate-private `IndexSlot`.
 
-Add an opaque, non-pinning `ResolvedUserIndex` fast-path token whose later use
+Add an opaque, non-pinning `ResolvedTableIndex` fast-path token whose later use
 performs one direct slot/generation comparison instead of another ID-map
 lookup. Replace duplicate-permitting retired-runtime storage with unique
 ownership by slot, while keeping retirement state completely outside
@@ -43,6 +43,9 @@ user `IndexRef` domains, with `CatalogIndexNo` naming the fixed catalog use of
 the shared physical slot type. It also generation-qualified transaction-owned
 user undo, purge, and row-branch state. Its transitional adapter still derives
 equal ID and slot values from the current non-reusable positional metadata.
+This phase normalizes transaction-retained catalog and user state onto the same
+private `IndexRef` shape: catalog construction enforces `IndexID == IndexSlot`,
+while user references retain generation-aware identity.
 Public DML continues to accept `usize`, public DDL exposes a positional index
 number, and public `SelectKey` still exposes an ordinal.
 
@@ -79,15 +82,17 @@ record any implementation deviation that changes a following-phase assumption.
    index-number alias and `SelectKey` identity from normal user APIs.
 2. Add one validated direct `IndexID -> IndexSlot` resolution structure to
    each immutable `TableRuntimeLayout`.
-3. Resolve a normal public `IndexID` exactly once per logical operation or
-   caller-driven stream and carry the resulting `IndexRef` through the complete
-   synchronous path.
+3. Resolve the `IndexID` in a normal public `TableIndex` exactly once per
+   logical operation or caller-driven stream and carry the resulting
+   `IndexRef` through the complete synchronous path.
 4. Keep low-level secondary-index arrays, DiskTree-root vectors, and immediate
    root/vector helpers slot-based without exposing `IndexSlot` publicly.
 5. Let insert and other all-index work iterate validated active `IndexRef`
    entries directly with no ID lookup.
-6. Add a public opaque `ResolvedUserIndex` token that stores no layout/runtime
-   owner and validates later use by direct exact-generation slot access.
+6. Add a public opaque `ResolvedTableIndex` token that stores no layout/runtime
+   owner and validates later use by direct exact-generation slot access. Let
+   the sealed argument trait normalize both public input forms into one opaque
+   `TableIndexSelector` carrying the table-qualified admission request.
 7. Generation-qualify every user-index reference retained by streams,
    candidates, runtime branches, maintenance, cleanup, checkpoint sidecars,
    retirement, and root-proof classification.
@@ -112,11 +117,10 @@ record any implementation deviation that changes a following-phase assumption.
    persisting a free list.
 6. Adding a `Destroying` allocator state or the scheduled control-plane retry
    needed to make a released runtime eventually reusable. Phase 5 owns both.
-7. Exposing a raw slot, serializing `ResolvedUserIndex`, or letting the token
+7. Exposing a raw slot, serializing `ResolvedTableIndex`, or letting the token
    retain an `Arc<TableRuntimeLayout>` or runtime object.
-8. Adding resolved-handle variants for range scan, scan streams, or
-   index-driven mutation; those operations already resolve once for their
-   complete traversal.
+8. Adding separate resolved-handle method names; `TableIndexArgument` lets the
+   ordinary index-driven APIs accept both unresolved and resolved targets.
 9. Replacing all immediate, non-escaping positional helpers in one mechanical
    rewrite. Checked slot-to-`usize` conversion remains valid at the array/root
    access boundary.
@@ -156,11 +160,17 @@ carrier and narrows to `IndexSlot`/`usize` only for immediate execution.
      needed to compile validated layout entries. Keep one crate-private
      physical-slot `SelectKey { index_slot: IndexSlot, vals }` and define
      `CatalogSelectKey = SelectKey` as its semantic catalog name. The shared
-     key owns the existing catalog `u16` serde encoding; retained user keys
-     carry `IndexRef` instead of an unqualified slot.
-   - Add public `ResolvedUserIndex { table_id, index }` with private fields.
-     It may expose `table_id()` and `index_id()` but no slot accessor.
-   - Re-export `IndexID` and `ResolvedUserIndex` from the crate root. Stop
+     key owns the existing catalog `u16` serde encoding. Transaction-retained
+     keys use `ResolvedIndexKey = IndexKey<IndexRef>` for both table kinds;
+     catalog-owned conversion gives each fixed slot a synthetic equal-valued
+     ID without changing public APIs or durable bytes.
+   - Add public `TableIndex(pub TableID, pub IndexID)`, opaque
+     `ResolvedTableIndex { table_id, index }`, and opaque table-qualified
+     `TableIndexSelector`. The opaque types may expose `table_id()` and
+     `index_id()` but no slot accessor.
+   - Re-export `IndexID`, `TableIndex`, `ResolvedTableIndex`,
+     `TableIndexSelector`, and the sealed `TableIndexArgument` trait from the
+     crate root. Stop
      publicly exporting the positional index-number alias and `SelectKey`.
      Remove the positional alias entirely: represent in-memory persisted slots
      with `IndexSlot`, while catalog rows and serde continue encoding the same
@@ -223,24 +233,25 @@ carrier and narrows to `IndexSlot`/`usize` only for immediate execution.
      after an admitted claim even when later resolution or validation fails.
 
 4. Public normal and fast-path APIs.
-   - Change all normal transaction index arguments from `usize` to `IndexID`:
+   - Change all normal transaction index arguments from `usize` to
+     `TableIndex(TableID, IndexID)`:
      unique lookup, equality lookup, range scan, index-driven mutation, unique
      upsert/update/delete, and caller-driven index scan stream.
    - Change `Session::create_index` to return `Result<IndexID>` and
      `Session::drop_index` to accept `IndexID`. No public user-index method
      accepts or returns `IndexSlot` or a positional index number.
-   - Add `Transaction::resolve_user_index(table_id, index_id) ->
-     Result<ResolvedUserIndex>`. Issue a token only after normal indexed read
+   - Add `Transaction::resolve_table_index(TableIndex) ->
+     Result<ResolvedTableIndex>`. Issue a token only after normal indexed read
      admission succeeds; the token has no lifetime parameter and may be reused
      by later transactions, which must revalidate it.
-   - Add point-operation fast paths taking the `Copy` `ResolvedUserIndex` by
-     value and no separate table ID: `table_lookup_unique_mvcc_resolved`,
-     `table_index_lookup_mvcc_resolved`, `table_upsert_unique_mvcc_resolved`,
-     `table_update_unique_mvcc_resolved`, and
-     `table_delete_unique_mvcc_resolved`.
-   - Route normal and resolved variants into the same post-admission operation
-     implementation so validation, locking, MVCC, undo, and error behavior do
-     not fork.
+   - Seal `TableIndexArgument` through the shared private `sealed` module,
+     implement it only for `TableIndex` and `ResolvedTableIndex`, and give it
+     one `into_selector()` conversion returning `TableIndexSelector`. Lookup,
+     scan, stream, mutation, upsert, update, and delete keep one public method
+     name.
+   - Route unresolved and resolved arguments into the same post-admission
+     operation implementation so validation, locking, MVCC, undo, and error
+     behavior do not fork.
 
 5. Resolve-once synchronous execution.
    - Change indexed statement, validation, and table-access entry points to
@@ -410,9 +421,9 @@ carrier and narrows to `IndexSlot`/`usize` only for immediate execution.
    count.
 5. Insert and batch insert perform zero ID-map lookups, iterate exact active
    references directly, and create generation-qualified undo for every index.
-6. `resolve_user_index` performs one normal resolution. Repeated resolved
-   lookup/update/delete/upsert calls perform zero ID-map lookups and exactly one
-   direct slot/generation validation per admission.
+6. `resolve_table_index` performs one normal resolution. Repeated resolved
+   lookup/scan/stream/mutation/update/delete/upsert calls perform zero ID-map
+   lookups and exactly one direct slot/generation validation per admission.
 7. A resolved token for a synthetic old ID whose slot contains a different ID
    returns `SchemaChanged` before key encoding, root access, or MemIndex access.
    An empty current slot is rejected at the same boundary.
@@ -421,10 +432,10 @@ carrier and narrows to `IndexSlot`/`usize` only for immediate execution.
    index, undo, and redo effects.
 9. Caller-driven stream state and every `BoundIndexCandidate` retain the
    admitted `IndexRef`; repeated `next()` calls do not consult the ID map.
-10. Unique runtime branches match complete user `IndexRef` plus logical key,
-    while catalog branches use the `CatalogSelectKey` semantic alias whose
-    `index_slot: IndexSlot` names a fixed physical slot. The shared immediate
-    `SelectKey` never substitutes for the `IndexRef` in retained user state.
+10. Unique runtime branches match complete `IndexRef` plus logical key for both
+    table kinds. Catalog references enforce equal ID and fixed slot values;
+    user references preserve the admitted generation. The shared immediate
+    `SelectKey` never substitutes for `IndexRef` in retained state.
 11. Checkpoint data and deletion sidecars retain exact references, apply roots
     through their captured slots, and fail closed on a synthetic generation
     mismatch without changing the mutable root.

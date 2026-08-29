@@ -1,6 +1,6 @@
 use crate::buffer::EvictableBufferPool;
 use crate::catalog::{
-    IndexID, IndexRef, IndexSlot, ResolvedUserIndexKey, TableMetadata, user_key_from_index_ref,
+    IndexID, IndexRef, IndexSlot, ResolvedIndexKey, TableMetadata, user_key_from_index_ref,
 };
 use crate::error::{InternalError, RuntimeError, RuntimeResult};
 use crate::index::SecondaryIndex;
@@ -335,7 +335,7 @@ impl TableRuntimeLayout {
         &self,
         index: IndexRef,
         vals: Vec<Val>,
-    ) -> RuntimeResult<ResolvedUserIndexKey> {
+    ) -> RuntimeResult<ResolvedIndexKey> {
         self.secondary_index(index)?;
         Ok(user_key_from_index_ref(index, vals))
     }

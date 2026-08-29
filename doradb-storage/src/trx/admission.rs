@@ -1,6 +1,7 @@
 use super::TrxInner;
 use crate::catalog::{
-    CurrentTableState, IndexID, IndexRef, ResolvedLiveMetadata, ResolvedVisibleTableMetadata,
+    CurrentTableState, IndexRef, ResolvedLiveMetadata, ResolvedVisibleTableMetadata,
+    TableIndexSelector,
 };
 use crate::engine::EngineCore;
 use crate::error::{MultiDomainResultExt, OperationError, OperationOrFatalResult, OperationResult};
@@ -15,14 +16,14 @@ use std::sync::Arc;
 #[derive(Clone, Copy)]
 pub(super) enum TableAdmissionRequest {
     TableRead,
-    IndexRead { selector: UserIndexSelector },
+    IndexRead { selector: TableIndexSelector },
     TableWrite,
-    IndexWrite { selector: UserIndexSelector },
+    IndexWrite { selector: TableIndexSelector },
 }
 
 impl TableAdmissionRequest {
     #[inline]
-    fn selector(self) -> Option<UserIndexSelector> {
+    fn selector(self) -> Option<TableIndexSelector> {
         match self {
             Self::TableRead | Self::TableWrite => None,
             Self::IndexRead { selector } | Self::IndexWrite { selector } => Some(selector),
@@ -32,47 +33,6 @@ impl TableAdmissionRequest {
     #[inline]
     fn is_write(self) -> bool {
         matches!(self, Self::TableWrite | Self::IndexWrite { .. })
-    }
-}
-
-/// Private selector used by normal and opaque-token index admission.
-#[derive(Clone, Copy)]
-pub(super) enum UserIndexSelector {
-    ID(IndexID),
-    Resolved(IndexRef),
-}
-
-impl UserIndexSelector {
-    #[inline]
-    fn index_id(self) -> IndexID {
-        match self {
-            Self::ID(index_id) => index_id,
-            Self::Resolved(index) => index.id(),
-        }
-    }
-
-    #[inline]
-    fn resolve(
-        self,
-        layout: &TableRuntimeLayout,
-        table_id: TableID,
-        operation: &'static str,
-    ) -> OperationResult<IndexRef> {
-        match self {
-            Self::ID(index_id) => layout.resolve_index_id(index_id).ok_or_else(|| {
-                Report::new(OperationError::SchemaChanged).attach(format!(
-                    "operation={operation}, table_id={table_id}, index_id={index_id}"
-                ))
-            }),
-            Self::Resolved(index) => {
-                if !layout.validate_index_ref(index) {
-                    return Err(Report::new(OperationError::SchemaChanged).attach(format!(
-                        "operation={operation}, table_id={table_id}, index={index}"
-                    )));
-                }
-                Ok(index)
-            }
-        }
     }
 }
 
@@ -125,7 +85,7 @@ impl TransactionTableBinding {
                 .idx
                 .index_spec(visible_index_slot)
                 .expect("visible index presence was established above");
-            let index = selector.resolve(&self.layout, table_id, operation)?;
+            let index = selector.resolve(&self.layout, operation)?;
             let current_spec = self
                 .layout
                 .metadata()
@@ -358,11 +318,11 @@ pub(super) async fn admit_user_table(
 pub(super) async fn admit_user_index(
     inner: &mut TrxInner,
     attachment: &TrxAttachment,
-    table_id: TableID,
-    selector: UserIndexSelector,
+    selector: TableIndexSelector,
     write: bool,
     operation: &'static str,
 ) -> OperationOrFatalResult<AdmittedUserIndex> {
+    let table_id = selector.table_id();
     let request = if write {
         TableAdmissionRequest::IndexWrite { selector }
     } else {
@@ -382,7 +342,9 @@ pub(super) async fn admit_user_index(
 mod tests {
     use super::*;
     use crate::catalog::tests::table2;
-    use crate::catalog::{IndexAttributes, IndexKeySpec, IndexSlot, IndexSpec};
+    use crate::catalog::{
+        IndexAttributes, IndexID, IndexKeySpec, IndexSlot, IndexSpec, TableIndex,
+    };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{Error, OperationError, Result};
@@ -535,7 +497,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
             let token = trx
-                .resolve_user_index(table_id, IndexID::new(0))
+                .resolve_table_index(TableIndex(table_id, IndexID::new(0)))
                 .await
                 .unwrap();
 
@@ -575,7 +537,7 @@ mod tests {
 
             TableRuntimeLayout::reset_index_access_counters();
             let err = trx
-                .table_lookup_unique_mvcc_resolved(token, &[Val::from(1i32)], &[0])
+                .table_lookup_unique_mvcc(token, &[Val::from(1i32)], &[0])
                 .await
                 .unwrap_err();
             assert_eq!(err.operation_error(), Some(OperationError::SchemaChanged));
@@ -684,7 +646,7 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
 
             let err = trx
-                .table_lookup_unique_mvcc(table_id, crate::IndexID::new(99), &[], &[0])
+                .table_lookup_unique_mvcc(TableIndex(table_id, IndexID::new(99)), &[], &[0])
                 .await
                 .unwrap_err();
             assert_eq!(operation_error(&err), Some(OperationError::IndexNotFound));
@@ -874,8 +836,7 @@ mod tests {
                 touch_table_read(&mut old_trx, table_id).await.unwrap();
                 let surviving = old_trx
                     .table_lookup_unique_mvcc(
-                        table_id,
-                        crate::IndexID::new(0),
+                        TableIndex(table_id, IndexID::new(0)),
                         &[Val::from(7i32)],
                         &[0],
                     )
@@ -885,8 +846,7 @@ mod tests {
 
                 let new_index_err = old_trx
                     .table_index_lookup_mvcc(
-                        table_id,
-                        new_index_id,
+                        TableIndex(table_id, new_index_id),
                         &[Val::from(&b"new"[..])],
                         &[0],
                     )
@@ -928,8 +888,7 @@ mod tests {
                 if attributes.contains(IndexAttributes::UK) {
                     let fresh_result = fresh_trx
                         .table_lookup_unique_mvcc(
-                            table_id,
-                            new_index_id,
+                            TableIndex(table_id, new_index_id),
                             &[Val::from(&b"new"[..])],
                             &[0],
                         )
@@ -942,8 +901,7 @@ mod tests {
                 } else {
                     let fresh_result = fresh_trx
                         .table_index_lookup_mvcc(
-                            table_id,
-                            new_index_id,
+                            TableIndex(table_id, new_index_id),
                             &[Val::from(&b"new"[..])],
                             &[0],
                         )
@@ -1226,8 +1184,7 @@ mod tests {
 
             let err = old_trx
                 .table_lookup_unique_mvcc(
-                    table_id,
-                    crate::IndexID::new(0),
+                    TableIndex(table_id, IndexID::new(0)),
                     &[Val::from(1i32)],
                     &[0],
                 )

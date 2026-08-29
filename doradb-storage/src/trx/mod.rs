@@ -4719,8 +4719,7 @@ pub(crate) mod tests {
         let mut verify = session.begin_trx().unwrap();
         let select = verify
             .table_lookup_unique_mvcc(
-                table_id,
-                crate::IndexID::new(0),
+                crate::TableIndex(table_id, crate::IndexID::new(0)),
                 &[Val::from(value)],
                 &[0, 1],
             )
@@ -5415,7 +5414,7 @@ pub(crate) mod tests {
                     RowID::new(22),
                     RowUndoKind::Delete,
                 ));
-                inner.index_undo_mut().push_user(IndexUndo {
+                inner.index_undo_mut().push(IndexUndo {
                     table_id: TableID::new(11),
                     row_id: RowID::new(22),
                     kind: IndexUndoKind::DeferDelete(
@@ -5458,7 +5457,7 @@ pub(crate) mod tests {
             let (_temp_dir, engine) = test_engine("redo_trx_precommit_index_undo").await;
             let (_session, mut trx) = begin_production_test_transaction(&engine);
             with_transaction_inner_mut(&mut trx, "test_precommit_index_undo", |inner| {
-                inner.index_undo_mut().push_user(IndexUndo {
+                inner.index_undo_mut().push(IndexUndo {
                     table_id: TableID::new(11),
                     row_id: RowID::new(22),
                     kind: IndexUndoKind::DeferDelete(
@@ -5481,9 +5480,7 @@ pub(crate) mod tests {
             let committed = precommit.commit();
             let index_gc = committed.index_gc().unwrap();
             assert_eq!(index_gc.len(), 1);
-            let IndexPurgeEntry::User(index_gc) = &index_gc[0] else {
-                panic!("user transaction must produce user index purge work");
-            };
+            let index_gc = &index_gc[0];
             assert_eq!(index_gc.table_id, TableID::new(11));
             assert_eq!(index_gc.row_id, RowID::new(22));
             finish_production_committed_for_test(&engine, committed);
@@ -5754,7 +5751,7 @@ pub(crate) mod tests {
                     RowID::new(23),
                     RowUndoKind::Delete,
                 ));
-                effects.push_user_delete_index_undo(
+                effects.push_delete_index_undo(
                     TableID::new(12),
                     RowID::new(23),
                     user_key_from_active_slot(IndexSlot::new(0), vec![]),
@@ -7176,7 +7173,7 @@ pub(crate) mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             with_transaction_inner_mut(&mut trx, "test_index_undo_predicate", |inner| {
-                inner.index_undo_mut().push_user(IndexUndo {
+                inner.index_undo_mut().push(IndexUndo {
                     table_id: TableID::new(47),
                     row_id: RowID::new(1),
                     kind: IndexUndoKind::DeferDelete(

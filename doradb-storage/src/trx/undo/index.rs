@@ -1,19 +1,13 @@
 use crate::buffer::PoolGuards;
-use crate::catalog::{CatalogSelectKey, ResolvedUserIndexKey, TableCache};
+use crate::catalog::{ResolvedIndexKey, TableCache};
 use crate::error::RuntimeResult as Result;
 use crate::id::{RowID, TableID, TrxID};
 use crate::runtime::{POLL_BUDGET, yield_now};
 use crate::table::IndexRollback;
 
-/// Domain-tagged index undo entry stored in one effect-ordered log.
-enum IndexUndoEntry {
-    Catalog(IndexUndo<CatalogSelectKey>),
-    User(IndexUndo<ResolvedUserIndexKey>),
-}
-
 /// Buffer of index undo entries accumulated for rollback and GC handoff.
 #[derive(Default)]
-pub(crate) struct IndexUndoLogs(Vec<IndexUndoEntry>);
+pub(crate) struct IndexUndoLogs(Vec<IndexUndo>);
 
 impl IndexUndoLogs {
     /// Create an empty index undo buffer.
@@ -35,26 +29,10 @@ impl IndexUndoLogs {
         self.0.len()
     }
 
-    /// Add one fixed-ordinal catalog index undo at the end of the buffer.
+    /// Adds one resolved index undo at the end of the effect-ordered buffer.
     #[inline]
-    pub(crate) fn push_catalog(&mut self, value: IndexUndo<CatalogSelectKey>) {
-        assert!(
-            value.table_id.is_catalog(),
-            "catalog index undo requires a catalog table: table_id={}",
-            value.table_id
-        );
-        self.0.push(IndexUndoEntry::Catalog(value));
-    }
-
-    /// Add one generation-qualified user index undo at the end of the buffer.
-    #[inline]
-    pub(crate) fn push_user(&mut self, value: IndexUndo<ResolvedUserIndexKey>) {
-        assert!(
-            value.table_id.is_user(),
-            "user index undo requires a user table: table_id={}",
-            value.table_id
-        );
-        self.0.push(IndexUndoEntry::User(value));
+    pub(crate) fn push(&mut self, value: IndexUndo) {
+        self.0.push(value);
     }
 
     /// Rollback all index changes.
@@ -85,15 +63,12 @@ impl IndexUndoLogs {
                     use super::tests::maybe_pause_index_rollback;
                     maybe_pause_index_rollback().await;
                 }
-                match entry {
-                    IndexUndoEntry::Catalog(entry) => {
-                        let table = table_cache.must_get_catalog_table(entry.table_id);
-                        table.rollback_index_entry(entry, guards, ts).await?;
-                    }
-                    IndexUndoEntry::User(entry) => {
-                        let table = table_cache.must_get_user_entry_mut(entry.table_id).await;
-                        table.rollback_index_entry(entry, guards, ts).await?;
-                    }
+                if entry.table_id.is_catalog() {
+                    let table = table_cache.must_get_catalog_table(entry.table_id);
+                    table.rollback_index_entry(entry, guards, ts).await?;
+                } else {
+                    let table = table_cache.must_get_user_entry_mut(entry.table_id).await;
+                    table.rollback_index_entry(entry, guards, ts).await?;
                 }
             }
             self.0.pop();
@@ -120,51 +95,45 @@ impl IndexUndoLogs {
     /// So here we should only keep potential index deletions.
     #[inline]
     pub(in crate::trx) fn commit_for_gc(&mut self) -> Vec<IndexPurgeEntry> {
-        self.0
-            .drain(..)
-            .filter_map(|entry| match entry {
-                IndexUndoEntry::Catalog(entry) => entry.into_purge().map(IndexPurgeEntry::Catalog),
-                IndexUndoEntry::User(entry) => entry.into_purge().map(IndexPurgeEntry::User),
-            })
-            .collect()
+        self.0.drain(..).filter_map(IndexUndo::into_purge).collect()
     }
 }
 
 /// Kinds of index changes that can be rolled back.
-pub(crate) enum IndexUndoKind<K> {
+pub(crate) enum IndexUndoKind {
     /// Insert unique key, merge flag(if overwrite delete flag)
-    InsertUnique(K, bool),
+    InsertUnique(ResolvedIndexKey, bool),
     /// Insert non-unique key, merge flag(if overwrite delete flag).
-    InsertNonUnique(K, bool),
+    InsertNonUnique(ResolvedIndexKey, bool),
     /// Update unique key, old row id, delete flag of old row.
-    UpdateUnique(K, RowID, bool),
+    UpdateUnique(ResolvedIndexKey, RowID, bool),
     /// Delete is not included in index undo,
     /// because transaction thread does not perform index deletion,
     /// in order to support MVCC.
     /// The actual deletion is performed solely by purge workers.
     /// This is what GC entry means.
     /// Second parameter indicates whether the index is unique.
-    DeferDelete(K, bool),
+    DeferDelete(ResolvedIndexKey, bool),
 }
 
 /// One reversible index change recorded for rollback.
-pub(crate) struct IndexUndo<K> {
+pub(crate) struct IndexUndo {
     /// Table whose index entry was changed.
     pub(crate) table_id: TableID,
     /// Row version referenced by the new index entry.
     pub(crate) row_id: RowID,
     /// Reversible index operation and rollback payload.
-    pub(crate) kind: IndexUndoKind<K>,
+    pub(crate) kind: IndexUndoKind,
 }
 
-impl<K> IndexUndo<K> {
+impl IndexUndo {
     #[inline]
-    fn into_purge(self) -> Option<IndexPurge<K>> {
+    fn into_purge(self) -> Option<IndexPurgeEntry> {
         match self.kind {
             IndexUndoKind::InsertUnique(..)
             | IndexUndoKind::InsertNonUnique(..)
             | IndexUndoKind::UpdateUnique(..) => None,
-            IndexUndoKind::DeferDelete(key, unique) => Some(IndexPurge {
+            IndexUndoKind::DeferDelete(key, unique) => Some(IndexPurgeEntry {
                 table_id: self.table_id,
                 row_id: self.row_id,
                 key,
@@ -174,17 +143,11 @@ impl<K> IndexUndo<K> {
     }
 }
 
-/// Domain-tagged index entry scheduled for deferred GC-time deletion.
-pub(in crate::trx) enum IndexPurgeEntry {
-    Catalog(IndexPurge<CatalogSelectKey>),
-    User(IndexPurge<ResolvedUserIndexKey>),
-}
-
-/// Deferred deletion payload in one index-reference domain.
-pub(in crate::trx) struct IndexPurge<K> {
+/// Index entry scheduled for deferred GC-time deletion.
+pub(in crate::trx) struct IndexPurgeEntry {
     pub(in crate::trx) table_id: TableID,
     pub(in crate::trx) row_id: RowID,
-    pub(in crate::trx) key: K,
+    pub(in crate::trx) key: ResolvedIndexKey,
     pub(in crate::trx) unique: bool,
 }
 
@@ -192,11 +155,11 @@ pub(in crate::trx) struct IndexPurge<K> {
 mod tests {
     use super::*;
     use crate::catalog::{
-        CATALOG_TABLE_ID_START, IndexSlot, catalog_key_from_active_ordinal,
+        CATALOG_TABLE_ID_START, IndexSlot, catalog_key_from_active_ordinal, resolve_catalog_key,
         user_key_from_active_slot,
     };
 
-    fn create_test_key(index_slot: IndexSlot) -> ResolvedUserIndexKey {
+    fn create_test_key(index_slot: IndexSlot) -> ResolvedIndexKey {
         user_key_from_active_slot(index_slot, vec![])
     }
 
@@ -211,19 +174,19 @@ mod tests {
         assert!(log2.is_empty());
 
         // Add entries to log1
-        log1.push_user(IndexUndo {
+        log1.push(IndexUndo {
             table_id: TableID::new(1),
             row_id: RowID::new(1),
             kind: IndexUndoKind::InsertUnique(create_test_key(IndexSlot::new(1)), false),
         });
 
         // Add entries to log2
-        log2.push_user(IndexUndo {
+        log2.push(IndexUndo {
             table_id: TableID::new(2),
             row_id: RowID::new(2),
             kind: IndexUndoKind::DeferDelete(create_test_key(IndexSlot::new(2)), true),
         });
-        log2.push_user(IndexUndo {
+        log2.push(IndexUndo {
             table_id: TableID::new(3),
             row_id: RowID::new(3),
             kind: IndexUndoKind::UpdateUnique(
@@ -240,16 +203,12 @@ mod tests {
         assert!(log2.is_empty());
 
         // Verify order is preserved
-        let IndexUndoEntry::User(first) = &log1.0[0] else {
-            panic!("First entry should be user undo");
-        };
+        let first = &log1.0[0];
         match &first.kind {
             IndexUndoKind::InsertUnique(..) => (),
             _ => panic!("First entry should be InsertUnique"),
         }
-        let IndexUndoEntry::User(second) = &log1.0[1] else {
-            panic!("Second entry should be user undo");
-        };
+        let second = &log1.0[1];
         match &second.kind {
             IndexUndoKind::DeferDelete(..) => (),
             _ => panic!("Second entry should be DeferDelete"),
@@ -257,22 +216,23 @@ mod tests {
     }
 
     #[test]
-    fn test_index_undo_and_purge_preserve_typed_reference_domains() {
+    fn test_index_undo_and_purge_preserve_resolved_references() {
         let mut logs = IndexUndoLogs::empty();
-        logs.push_catalog(IndexUndo {
+        logs.push(IndexUndo {
             table_id: CATALOG_TABLE_ID_START,
             row_id: RowID::new(7),
-            kind: IndexUndoKind::DeferDelete(catalog_key_from_active_ordinal(3, vec![]), true),
+            kind: IndexUndoKind::DeferDelete(
+                resolve_catalog_key(catalog_key_from_active_ordinal(3, vec![])),
+                true,
+            ),
         });
-        logs.push_user(IndexUndo {
+        logs.push(IndexUndo {
             table_id: TableID::new(9),
             row_id: RowID::new(11),
             kind: IndexUndoKind::DeferDelete(create_test_key(IndexSlot::new(5)), false),
         });
 
-        let IndexUndoEntry::User(user) = &logs.0[1] else {
-            panic!("second retained entry must be user-qualified");
-        };
+        let user = &logs.0[1];
         let IndexUndoKind::DeferDelete(key, false) = &user.kind else {
             panic!("user retained entry must preserve deferred-delete payload");
         };
@@ -280,10 +240,9 @@ mod tests {
         assert_eq!(key.index.slot().get(), 5);
 
         let purge = logs.commit_for_gc();
-        assert!(
-            matches!(&purge[0], IndexPurgeEntry::Catalog(entry) if entry.key.index_slot.get() == 3)
-        );
-        assert!(matches!(&purge[1], IndexPurgeEntry::User(entry)
-            if entry.key.index.id().get() == 5 && entry.key.index.slot().get() == 5));
+        assert_eq!(purge[0].key.index.id().get(), 3);
+        assert_eq!(purge[0].key.index.slot().get(), 3);
+        assert_eq!(purge[1].key.index.id().get(), 5);
+        assert_eq!(purge[1].key.index.slot().get(), 5);
     }
 }
