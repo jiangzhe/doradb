@@ -876,7 +876,7 @@ mod tests {
     use super::*;
     use crate::catalog::table::TableMetadata;
     use crate::catalog::{
-        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, USER_TABLE_ID_START,
+        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexSpec, USER_TABLE_ID_START,
     };
     use crate::compression::BitPackable;
     use crate::error::{DiscloseResultExt, MultiDomainResultExt, RuntimeError};
@@ -911,7 +911,10 @@ mod tests {
                     ValKind::U32,
                     ColumnAttributes::empty(),
                 )],
-                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+                vec![IndexSpec::new(
+                    vec![IndexKeySpec::new(0)],
+                    IndexAttributes::PK,
+                )],
             )
             .expect("valid table metadata"),
         )

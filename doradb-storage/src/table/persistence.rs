@@ -5,7 +5,9 @@ use super::checkpoint_workflow::{
 use super::lifecycle::{CheckpointPublishLease, TableCheckpointRootMutationScope, TableTerminal};
 use crate::buffer::guard::PageGuard;
 use crate::buffer::{PoolGuard, PoolGuards};
-use crate::catalog::{IndexSpec, SilentWatermarkObject, TableColumnLayout, TableMetadata};
+use crate::catalog::{
+    IndexRef, IndexSlot, IndexSpec, SilentWatermarkObject, TableColumnLayout, TableMetadata,
+};
 use crate::completion::{Completion, CompletionTake};
 use crate::error::{
     CompletionErrorBridge, CompletionResult, DataIntegrityError, DataIntegrityResult, FatalError,
@@ -616,7 +618,7 @@ where
             disk_guard.clone(),
         );
         let pivot_row_id = mutable_file.root().pivot_row_id;
-        let mut secondary_sidecar = SecondaryCheckpointSidecar::new(metadata);
+        let mut secondary_sidecar = SecondaryCheckpointSidecar::new(&layout);
 
         // Step 2: derive replay and data cutoffs from the explicit batch. The
         // purge-published horizon is the exclusive cutoff for both frozen row
@@ -1193,7 +1195,7 @@ impl SecondaryIndexSidecar {
 }
 
 struct ActiveSecondaryIndexSidecar {
-    index_no: usize,
+    index: IndexRef,
     key_cols: Box<[usize]>,
     sidecar: SecondaryIndexSidecar,
 }
@@ -1203,38 +1205,43 @@ struct SecondaryCheckpointSidecar {
 }
 
 impl SecondaryCheckpointSidecar {
-    fn new(metadata: &TableMetadata) -> Self {
+    fn new(layout: &TableRuntimeLayout) -> Self {
+        let metadata = layout.metadata();
         // Active-index iteration and every sidecar shape come from the same
         // validated immutable metadata snapshot, so construction cannot fail.
-        let indexes = metadata
-            .idx
-            .active_indexes()
-            .map(|(index_no, index_spec)| ActiveSecondaryIndexSidecar {
-                index_no,
-                key_cols: index_spec
-                    .cols
-                    .iter()
-                    .map(|index_key| index_key.col_no as usize)
-                    .collect(),
-                sidecar: SecondaryIndexSidecar::new(metadata, index_spec),
+        let indexes = layout
+            .active_secondary_indexes()
+            .map(|(index, _)| {
+                let index_spec = metadata
+                    .idx
+                    .index_spec(index.slot())
+                    .expect("active layout entry has a validated metadata specification");
+                ActiveSecondaryIndexSidecar {
+                    index,
+                    key_cols: index_spec
+                        .cols
+                        .iter()
+                        .map(|index_key| index_key.col_no as usize)
+                        .collect(),
+                    sidecar: SecondaryIndexSidecar::new(metadata, index_spec),
+                }
             })
             .collect();
         let sidecar = Self { indexes };
-        sidecar.assert_matches_metadata(metadata);
+        sidecar.assert_matches_layout(layout);
         sidecar
     }
 
     #[inline]
-    fn assert_matches_metadata(&self, metadata: &TableMetadata) {
-        let expected = metadata
-            .idx
-            .active_indexes()
-            .map(|(index_no, _)| index_no)
+    fn assert_matches_layout(&self, layout: &TableRuntimeLayout) {
+        let expected = layout
+            .active_secondary_indexes()
+            .map(|(index, _)| index)
             .collect::<Vec<_>>();
         let actual = self
             .indexes
             .iter()
-            .map(|active| active.index_no)
+            .map(|active| active.index)
             .collect::<Vec<_>>();
         assert_eq!(
             actual, expected,
@@ -1269,7 +1276,7 @@ impl SecondaryCheckpointSidecar {
     fn add_deleted_key_at(
         &mut self,
         sidecar_pos: usize,
-        index_no: usize,
+        index: IndexRef,
         row_id: RowID,
         key: Vec<Val>,
     ) {
@@ -1280,12 +1287,12 @@ impl SecondaryCheckpointSidecar {
             .get_mut(sidecar_pos)
             .unwrap_or_else(|| {
                 panic!(
-                    "secondary checkpoint sidecar position missing: sidecar_pos={sidecar_pos}, index_no={index_no}, row_id={row_id}"
+                    "secondary checkpoint sidecar position missing: sidecar_pos={sidecar_pos}, index={index}, row_id={row_id}"
                 )
             });
         assert_eq!(
-            active.index_no, index_no,
-            "secondary checkpoint sidecar identity changed: sidecar_pos={sidecar_pos}, row_id={row_id}"
+            active.index, index,
+            "secondary checkpoint sidecar identity changed: sidecar_pos={sidecar_pos}, index={index}, row_id={row_id}"
         );
         active.sidecar.add_delete(key, row_id);
     }
@@ -1475,13 +1482,16 @@ impl Table {
                 })?;
         }
 
-        for (index_no, index_slot) in layout.secondary_indexes().iter().enumerate() {
-            let root_block_id = root.secondary_index_roots[index_no];
-            let Some(index) = index_slot.as_ref() else {
+        for (index_slot, index) in layout.secondary_indexes().iter().enumerate() {
+            let index_slot = IndexSlot::try_from(index_slot).unwrap_or_else(|_| {
+                panic!("validated runtime index slot exceeds u16: index_slot={index_slot}")
+            });
+            let root_block_id = root.secondary_index_roots[index_slot.as_usize()];
+            let Some(index) = index.as_ref() else {
                 if root_block_id != SUPER_BLOCK_ID {
                     return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
                         .attach(format!(
-                            "inactive secondary index slot has root: index_no={index_no}, root={root_block_id}"
+                            "inactive secondary index slot has root: index_slot={index_slot}, root={root_block_id}"
                         ))
                         .change_context(RuntimeError::CheckpointExecution)
                         .attach(format!(
@@ -1494,15 +1504,15 @@ impl Table {
             if root_block_id == SUPER_BLOCK_ID {
                 continue;
             }
-            let runtime = index.disk_runtime();
+            let runtime = index.runtime().disk_runtime();
             runtime
                 .collect_reachable_blocks(root_block_id, disk_guard, &mut root_reachable)
                 .await
                 .change_context(RuntimeError::CheckpointExecution)
                 .attach_with(|| {
                     format!(
-                        "operation=collect_root_reachable_blocks, phase=walk_secondary_index, table_id={}, index_no={index_no}, root_block_id={root_block_id}",
-                        self.table_id()
+                        "operation=collect_root_reachable_blocks, phase=walk_secondary_index, table_id={}, index={}, root_block_id={root_block_id}",
+                        self.table_id(), index.index_ref()
                     )
                 })?;
         }
@@ -1766,7 +1776,7 @@ impl Table {
         #[cfg(test)] maintenance_test: &MaintenanceTestController,
     ) -> RuntimeOrFatalResult<()> {
         let metadata = layout.metadata();
-        sidecar.assert_matches_metadata(metadata);
+        sidecar.assert_matches_layout(layout);
         if sidecar.is_empty() {
             return Ok(());
         }
@@ -1792,12 +1802,12 @@ impl Table {
         }
 
         for active in &mut sidecar.indexes {
-            let index_no = active.index_no;
+            let index = active.index;
             // The sidecar is built directly from this immutable metadata
             // snapshot, so each recorded active index must still exist.
             assert!(
-                metadata.idx.index_spec(index_no).is_some(),
-                "secondary checkpoint sidecar index missing from metadata: table_id={}, index_no={index_no}",
+                metadata.idx.index_spec(index.slot()).is_some(),
+                "secondary checkpoint sidecar index missing from metadata: table_id={}, index={index}",
                 self.table_id()
             );
             let index_sidecar = &mut active.sidecar;
@@ -1805,8 +1815,17 @@ impl Table {
             if !index_sidecar.has_work() {
                 continue;
             }
-            let old_root = mutable_file.secondary_index_root(index_no);
-            let runtime = layout.secondary_index(index_no)?.disk_runtime();
+            let old_root = mutable_file.secondary_index_root(index.slot());
+            if !layout.validate_index_ref(index) {
+                return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+                    .attach(format!(
+                        "secondary checkpoint sidecar generation mismatch: table_id={}, index={index}",
+                        self.table_id()
+                    ))
+                    .change_context(RuntimeError::CheckpointExecution)
+                    .into());
+            }
+            let runtime = layout.secondary_index(index)?.disk_runtime();
             let new_root = match index_sidecar {
                 SecondaryIndexSidecar::Unique { puts, deletes, .. } => {
                     // Use one writer per affected index so same-run puts and
@@ -1857,7 +1876,7 @@ impl Table {
             if new_root != old_root {
                 // The root update stays private to mutable_file until the
                 // final table-file commit publishes every checkpoint change.
-                mutable_file.set_secondary_index_root(index_no, new_root);
+                mutable_file.set_secondary_index_root(index.slot(), new_root);
             }
         }
         Ok(())
@@ -1989,7 +2008,7 @@ impl Table {
                     )));
             }
             for sidecar_pos in 0..secondary_sidecar.indexes.len() {
-                let (index_no, key) = {
+                let (index, key) = {
                     let active = &secondary_sidecar.indexes[sidecar_pos];
                     let key = block
                         .decode_row_values(metadata.col.as_ref(), row_idx, active.key_cols.as_ref())
@@ -2000,9 +2019,9 @@ impl Table {
                                 self.table_id()
                             )
                         })?;
-                    (active.index_no, key)
+                    (active.index, key)
                 };
-                secondary_sidecar.add_deleted_key_at(sidecar_pos, index_no, row_id, key);
+                secondary_sidecar.add_deleted_key_at(sidecar_pos, index, row_id, key);
             }
         }
         Ok(())
@@ -2610,8 +2629,8 @@ mod tests {
     use crate::buffer::page::VersionedPageID;
     use crate::catalog::tests::wait_for_dropped_table_floor;
     use crate::catalog::{
-        ColumnAttributes, ColumnSpec, CurrentTableState, ResolvedVisibleTableMetadata, TableCache,
-        TableSpec,
+        ColumnAttributes, ColumnSpec, CurrentTableState, IndexSlot, ResolvedVisibleTableMetadata,
+        TableCache, TableSpec,
     };
     use crate::completion::{Completion, CompletionTake};
     use crate::conf::TrxSysConfig;
@@ -2899,7 +2918,7 @@ mod tests {
 
     async fn hot_page_id_for_key(table: &Table, session: &mut Session, key: &SelectKey) -> PageID {
         let guards = session.pool_guards();
-        let index = bound_unique_index(table, &guards, key.index_no);
+        let index = bound_unique_index(table, &guards, key.index_slot);
         let (row_id, _) = index
             .lookup(&key.vals, session.last_cts())
             .await
@@ -2918,7 +2937,7 @@ mod tests {
         key: &SelectKey,
     ) -> (RowID, VersionedPageID) {
         let guards = session.pool_guards();
-        let (row_id, _) = bound_unique_index(table, &guards, key.index_no)
+        let (row_id, _) = bound_unique_index(table, &guards, key.index_slot)
             .lookup(&key.vals, session.last_cts())
             .await
             .unwrap()
@@ -3612,7 +3631,7 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let table = table_for_internal_assertion(&engine, table_id);
-            let observed = observe_table_root_snapshot(&mut trx, &table, 0)
+            let observed = observe_table_root_snapshot(&mut trx, &table, IndexSlot::new(0))
                 .await
                 .unwrap();
             let active_root = table.file().active_root_unchecked();
@@ -4430,7 +4449,7 @@ mod tests {
             let reader = session.begin_trx().unwrap();
             let table = table_for_internal_assertion(&engine, table_id);
             let pool_guards = session.pool_guards();
-            let index = bound_unique_index(&table, &pool_guards, key.index_no);
+            let index = bound_unique_index(&table, &pool_guards, key.index_slot);
             let (row_id, _) = index
                 .lookup(&key.vals, reader.sts())
                 .await
@@ -5628,7 +5647,7 @@ mod tests {
                 .take()
                 .expect("reader hook should install an active transaction");
             let table = table_for_internal_assertion(&engine, table_id);
-            let observed = observe_table_root_snapshot(&mut reader, &table, 0)
+            let observed = observe_table_root_snapshot(&mut reader, &table, IndexSlot::new(0))
                 .await
                 .unwrap();
             assert!(observed.root_ts < observed.sts);
@@ -7095,7 +7114,7 @@ mod tests {
             let mut writer = writer_session.begin_trx().unwrap();
             let writer_status = transaction_status_for_test(&writer);
             let deleted = writer
-                .table_delete_unique_mvcc(table_id, key.index_no, &key.vals)
+                .table_delete_unique_mvcc(table_id, key.index_slot.transitional_id(), &key.vals)
                 .await
                 .unwrap();
             assert_eq!(deleted, DeleteMvcc::Deleted);
@@ -7324,7 +7343,7 @@ mod tests {
 
             let new_key = single_key(101);
             assert!(
-                bound_unique_index(&table, &writer_session.pool_guards(), new_key.index_no,)
+                bound_unique_index(&table, &writer_session.pool_guards(), new_key.index_slot,)
                     .lookup(&new_key.vals, writer_status.ts())
                     .await
                     .unwrap()
@@ -7897,7 +7916,7 @@ mod tests {
 
             let mut read_trx = session.begin_trx().unwrap();
             {
-                let key = SelectKey::new(0, vec![Val::from(1)]);
+                let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(1)]);
                 let res = trx_select_row_mvcc_by_id(&mut read_trx, table_id, &key, &[0, 1]).await;
                 assert!(matches!(res, Ok(SelectMvcc::Found(_))));
             }
@@ -7914,7 +7933,7 @@ mod tests {
             assert_checkpoint_published(&mut checkpoint_session, table_id).await;
 
             {
-                let key = SelectKey::new(0, vec![Val::from(10_000i32)]);
+                let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(10_000i32)]);
                 let res = trx_select_row_mvcc_by_id(&mut read_trx, table_id, &key, &[0, 1]).await;
                 assert!(matches!(res, Ok(SelectMvcc::NotFound)));
             }
@@ -9029,9 +9048,18 @@ mod tests {
             let ResolvedVisibleTableMetadata::Live(retained_live) = &retained_visible else {
                 panic!("pre-drop metadata should remain logically live");
             };
-            assert!(retained_live.metadata().idx.index_spec(0).is_some());
+            assert!(
+                retained_live
+                    .metadata()
+                    .idx
+                    .index_spec(IndexSlot::new(0))
+                    .is_some()
+            );
 
-            session.drop_index(table_id, 0).await.unwrap();
+            session
+                .drop_index(table_id, crate::IndexID::new(0))
+                .await
+                .unwrap();
             let table = table_for_internal_assertion(&engine, table_id);
             let after_drop_root = table.file().active_root_unchecked().clone();
             let CurrentTableState::Live { metadata, .. } = engine
@@ -9043,7 +9071,7 @@ mod tests {
             else {
                 panic!("DROP INDEX must leave the table live");
             };
-            assert!(metadata.idx.index_spec(0).is_none());
+            assert!(metadata.idx.index_spec(IndexSlot::new(0)).is_none());
             assert_eq!(after_drop_root.secondary_index_roots[0], SUPER_BLOCK_ID);
             assert!(
                 after_drop_root
@@ -9059,7 +9087,13 @@ mod tests {
                     .user_table_history_version_count(table_id),
                 Some(1)
             );
-            assert!(retained_live.metadata().idx.index_spec(0).is_some());
+            assert!(
+                retained_live
+                    .metadata()
+                    .idx
+                    .index_spec(IndexSlot::new(0))
+                    .is_some()
+            );
             assert!(
                 !table.has_retired_secondary_indexes(),
                 "logical metadata and an untouched old transaction must not retain removed runtime"
@@ -9086,7 +9120,13 @@ mod tests {
                     .user_table_history_version_count(table_id),
                 Some(0)
             );
-            assert!(retained_live.metadata().idx.index_spec(0).is_some());
+            assert!(
+                retained_live
+                    .metadata()
+                    .idx
+                    .index_spec(IndexSlot::new(0))
+                    .is_some()
+            );
             assert_checkpoint_published(&mut session, table_id).await;
             let after_reclaim = table.file().active_root_unchecked().clone();
             assert!(

@@ -438,11 +438,11 @@ async fn run_index_ddl_operations(
             break;
         }
         let started = clock.map(MeasurementClock::raw);
-        let index_no = session
+        let index_id = session
             .create_index(table_id, benchmark_non_unique_index_spec())
             .await?;
         result.operations = checked(result.operations, 1)?;
-        session.drop_index(table_id, index_no).await?;
+        session.drop_index(table_id, index_id).await?;
         complete_cycle(&mut result, clock, started)?;
     }
     Ok(result)

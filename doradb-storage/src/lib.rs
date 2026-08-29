@@ -40,8 +40,8 @@ mod value;
 pub(crate) use component::{DiskPool, IndexPool, MemPool, MetaPool};
 
 pub use catalog::{
-    CatalogCheckpointOutcome, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexNo,
-    IndexOrder, IndexSpec, TableSpec,
+    CatalogCheckpointOutcome, ColumnAttributes, ColumnSpec, IndexAttributes, IndexID, IndexKeySpec,
+    IndexOrder, IndexSpec, ResolvedUserIndex, TableSpec,
 };
 pub use conf::{
     DEFAULT_COW_FILE_MAX_SIZE, DEFAULT_TABLE_SCAN_LWC_BLOCKS_PER_PARTITION,
@@ -53,8 +53,8 @@ pub use engine::Engine;
 pub use error::{Error, ErrorKind, OperationError, Result};
 pub use lock::TableLockMode;
 pub use row::ops::{
-    DeleteMvcc, RowMutation, ScanMvcc, ScanRowDecision, SelectKey, SelectMvcc,
-    TableMutationOutcome, UpdateCol, UpdateMvcc, UpsertMvcc,
+    DeleteMvcc, RowMutation, ScanMvcc, ScanRowDecision, SelectMvcc, TableMutationOutcome,
+    UpdateCol, UpdateMvcc, UpsertMvcc,
 };
 pub use session::{
     CatalogRedoMaintenanceOutcome, RedoTruncationBlockerInfo, RedoTruncationOutcome, Session,

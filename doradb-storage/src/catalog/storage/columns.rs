@@ -1,10 +1,11 @@
 use crate::buffer::PoolGuards;
-use crate::catalog::CatalogTable;
 use crate::catalog::storage::CatalogDefinition;
 use crate::catalog::storage::object::ColumnObject;
 use crate::catalog::table::{TableColumnLayout, TableMetadata};
+use crate::catalog::{CatalogIndexNo, CatalogTable};
 use crate::catalog::{
-    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, catalog_table_id_from_slot,
+    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexSpec,
+    catalog_table_id_from_slot,
 };
 use crate::error::{MultiDomainResultExt, RuntimeError, RuntimeOrFatalResult, RuntimeResult};
 use crate::id::TableID;
@@ -29,7 +30,7 @@ const COL_NO_COLUMNS_COLUMN_TYPE: usize = 3;
 const COL_NAME_COLUMNS_COLUMN_TYPE: &str = "column_type";
 const COL_NO_COLUMNS_COLUMN_ATTRIBUTES: usize = 4;
 const COL_NAME_COLUMNS_COLUMN_ATTRIBUTES: &str = "column_attributes";
-const PK_NO_COLUMNS: usize = 0;
+const PK_NO_COLUMNS: CatalogIndexNo = CatalogIndexNo::new(0);
 
 /// Runtime accessor for `catalog.columns`.
 pub(crate) struct Columns<'a> {
@@ -172,7 +173,7 @@ pub(super) fn catalog_definition_of_columns() -> &'static CatalogDefinition {
                 vec![
                     // primary key pk_columns (table_id, column_no)
                     IndexSpec::new(
-                        vec![IndexKey::new(0), IndexKey::new(1)],
+                        vec![IndexKeySpec::new(0), IndexKeySpec::new(1)],
                         IndexAttributes::PK,
                     ),
                 ],

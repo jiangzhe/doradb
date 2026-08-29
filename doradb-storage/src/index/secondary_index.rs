@@ -15,7 +15,7 @@ use super::index_stream::{
 use super::non_unique_index::{GuardedNonUniqueMemIndex, IndexMask, NonUniqueMemIndex};
 use super::unique_index::{GuardedUniqueMemIndex, UniqueMemIndex};
 use crate::buffer::{BufferPool, PoolGuard, PoolGuards, ReadonlyBufferPool};
-use crate::catalog::{IndexSpec, TableMetadata};
+use crate::catalog::{IndexSlot, IndexSpec, TableMetadata};
 use crate::error::{InternalError, RuntimeError, RuntimeResult, SecondaryIndexBinding};
 use crate::file::table_file::TableFile;
 use crate::id::{BlockID, RowID, TrxID};
@@ -136,7 +136,7 @@ impl<P: BufferPool> InMemorySecondaryIndex<P> {
 /// must pass a root id captured from a proof-gated table snapshot. Already
 /// opened readers keep their root snapshot.
 pub(crate) struct SecondaryDiskTreeRuntime {
-    index_no: usize,
+    index_slot: IndexSlot,
     kind: SecondaryDiskTreeRuntimeKind,
 }
 
@@ -144,15 +144,15 @@ impl SecondaryDiskTreeRuntime {
     /// Create a cold-layer runtime for one table secondary index.
     #[inline]
     pub(crate) fn new(
-        index_no: usize,
+        index_slot: IndexSlot,
         metadata: Arc<TableMetadata>,
         table_file: Arc<TableFile>,
         disk_pool: QuiescentGuard<ReadonlyBufferPool>,
     ) -> RuntimeResult<Self> {
-        let index_spec = metadata.idx.index_spec(index_no).ok_or_else(|| {
+        let index_spec = metadata.idx.index_spec(index_slot).ok_or_else(|| {
             Report::new(InternalError::SecondaryIndexOutOfBounds)
                 .attach(format!(
-                    "index_no={index_no}, index_slot_count={}",
+                    "index_slot={index_slot}, index_slot_count={}",
                     metadata.idx.index_slot_count()
                 ))
                 .change_context(RuntimeError::IndexAccess)
@@ -177,14 +177,14 @@ impl SecondaryDiskTreeRuntime {
                 disk_pool,
             ))
         };
-        let runtime = Self { index_no, kind };
+        let runtime = Self { index_slot, kind };
         Ok(runtime)
     }
 
-    /// Return the table index number represented by this context.
+    /// Return the physical table-index slot represented by this context.
     #[inline]
-    pub(crate) fn index_no(&self) -> usize {
-        self.index_no
+    pub(crate) fn index_slot(&self) -> IndexSlot {
+        self.index_slot
     }
 
     /// Returns a borrowed key encoder for operation-local use.
@@ -331,10 +331,10 @@ impl<P: BufferPool> SecondaryIndex<P> {
         matches!(self, Self::Unique { .. })
     }
 
-    /// Return the table index number from the cold runtime.
+    /// Return the physical table-index slot from the cold runtime.
     #[inline]
-    pub(crate) fn index_no(&self) -> usize {
-        self.disk_runtime().index_no()
+    pub(crate) fn index_slot(&self) -> IndexSlot {
+        self.disk_runtime().index_slot()
     }
 
     /// Return the cold DiskTree runtime used by this composite.
@@ -1032,7 +1032,9 @@ mod tests {
         FixedBufferPool, PoolGuard, PoolGuards, PoolRole, global_readonly_pool_scope,
         table_readonly_pool,
     };
-    use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
+    use crate::catalog::{
+        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexSlot, IndexSpec,
+    };
     use crate::file::build_test_fs;
     use crate::file::cow_file::SUPER_BLOCK_ID;
     use crate::file::table_file::{MutableTableFile, TableFile};
@@ -1059,7 +1061,7 @@ mod tests {
     macro_rules! unique_runtime {
         ($metadata:ident, $disk_pool:ident) => {
             UniqueDiskTreeRuntime::new(
-                &$metadata.idx.index_specs()[0],
+                &$metadata.idx.index_specs()[IndexSlot::new(0)],
                 $metadata.as_ref(),
                 $disk_pool.file_kind(),
                 Arc::clone($disk_pool.sparse_file()),
@@ -1071,7 +1073,7 @@ mod tests {
     macro_rules! non_unique_runtime {
         ($metadata:ident, $disk_pool:ident) => {
             NonUniqueDiskTreeRuntime::new(
-                &$metadata.idx.index_specs()[1],
+                &$metadata.idx.index_specs()[IndexSlot::new(1)],
                 $metadata.as_ref(),
                 $disk_pool.file_kind(),
                 Arc::clone($disk_pool.sparse_file()),
@@ -1093,8 +1095,8 @@ mod tests {
                     ColumnAttributes::empty(),
                 )],
                 vec![
-                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK),
-                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::empty()),
+                    IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK),
+                    IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::empty()),
                 ],
             )
             .expect("valid table metadata"),
@@ -1105,7 +1107,7 @@ mod tests {
         pool: &QuiescentBox<FixedBufferPool>,
         pool_guard: &PoolGuard,
     ) -> UniqueMemIndex<FixedBufferPool> {
-        let index_spec = IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK);
+        let index_spec = IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK);
         UniqueMemIndex::new(
             pool.guard(),
             pool_guard,
@@ -1121,7 +1123,7 @@ mod tests {
         pool: &QuiescentBox<FixedBufferPool>,
         pool_guard: &PoolGuard,
     ) -> NonUniqueMemIndex<FixedBufferPool> {
-        let index_spec = IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::empty());
+        let index_spec = IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::empty());
         NonUniqueMemIndex::new(
             pool.guard(),
             pool_guard,
@@ -1188,11 +1190,11 @@ mod tests {
 
     async fn publish_secondary_root(
         mut mutable: MutableTableFile,
-        index_no: usize,
+        index_slot: IndexSlot,
         root: BlockID,
         ts: TrxID,
     ) -> Arc<TableFile> {
-        mutable.set_secondary_index_root(index_no, root);
+        mutable.set_secondary_index_root(index_slot, root);
         let (table, old_root) = mutable
             .commit(ts, false)
             .await
@@ -1249,7 +1251,8 @@ mod tests {
             let encoded_puts = encode_unique_puts(&puts);
             writer.batch_put_encoded(&unique_put_refs(&encoded_puts));
             let root = writer.finish().await.unwrap();
-            let table = publish_secondary_root(mutable, 0, root, TrxID::new(2)).await;
+            let table =
+                publish_secondary_root(mutable, IndexSlot::new(0), root, TrxID::new(2)).await;
 
             let index_pool = QuiescentBox::new(
                 FixedBufferPool::with_capacity(PoolRole::Index, 64 * 1024 * 1024).unwrap(),
@@ -1264,7 +1267,7 @@ mod tests {
                     .is_ok()
             );
             let runtime = SecondaryDiskTreeRuntime::new(
-                0,
+                IndexSlot::new(0),
                 Arc::clone(&metadata),
                 Arc::clone(&table),
                 disk_pool.global_pool().clone(),
@@ -1278,7 +1281,7 @@ mod tests {
             let bound = index.bind_unique_unchecked(&pool_guards, root).unwrap();
 
             assert_eq!(table.active_root_unchecked().secondary_index_roots[0], root);
-            assert_eq!(index.disk_runtime().index_no(), 0);
+            assert_eq!(index.disk_runtime().index_slot(), IndexSlot::new(0));
             assert!(
                 index
                     .unique_mem()
@@ -1566,9 +1569,10 @@ mod tests {
                 writer.batch_put_encoded(&unique_put_refs(&encoded_puts));
                 writer.finish().await.unwrap()
             };
-            let table = publish_secondary_root(mutable, 0, root_a, TrxID::new(2)).await;
+            let table =
+                publish_secondary_root(mutable, IndexSlot::new(0), root_a, TrxID::new(2)).await;
             let runtime = SecondaryDiskTreeRuntime::new(
-                0,
+                IndexSlot::new(0),
                 Arc::clone(&metadata),
                 Arc::clone(&table),
                 disk_pool.global_pool().clone(),
@@ -1597,7 +1601,8 @@ mod tests {
                 writer.finish().await.unwrap()
             };
             assert_ne!(root_a, root_b);
-            let table_after_b = publish_secondary_root(mutable, 0, root_b, TrxID::new(3)).await;
+            let table_after_b =
+                publish_secondary_root(mutable, IndexSlot::new(0), root_b, TrxID::new(3)).await;
             assert_eq!(
                 table_after_b.active_root_unchecked().secondary_index_roots[0],
                 root_b
@@ -1661,7 +1666,8 @@ mod tests {
                 .batch_insert_encoded(&non_unique_exact_refs(&encoded_entries))
                 .unwrap();
             let root = writer.finish().await.unwrap();
-            let table = publish_secondary_root(mutable, 1, root, TrxID::new(2)).await;
+            let table =
+                publish_secondary_root(mutable, IndexSlot::new(1), root, TrxID::new(2)).await;
 
             let index_pool = QuiescentBox::new(
                 FixedBufferPool::with_capacity(PoolRole::Index, 64 * 1024 * 1024).unwrap(),
@@ -1676,7 +1682,7 @@ mod tests {
                     .is_ok()
             );
             let runtime = SecondaryDiskTreeRuntime::new(
-                1,
+                IndexSlot::new(1),
                 Arc::clone(&metadata),
                 Arc::clone(&table),
                 disk_pool.global_pool().clone(),
@@ -1690,7 +1696,7 @@ mod tests {
             let bound = index.bind_non_unique_unchecked(&pool_guards, root).unwrap();
 
             assert_eq!(table.active_root_unchecked().secondary_index_roots[1], root);
-            assert_eq!(index.disk_runtime().index_no(), 1);
+            assert_eq!(index.disk_runtime().index_slot(), IndexSlot::new(1));
             assert!(
                 index
                     .non_unique_mem()
@@ -1891,7 +1897,8 @@ mod tests {
                 let encoded_puts = encode_unique_puts(&puts);
                 writer.batch_put_encoded(&unique_put_refs(&encoded_puts));
                 let root = writer.finish().await.unwrap();
-                let table = publish_secondary_root(mutable, 0, root, TrxID::new(2)).await;
+                let table =
+                    publish_secondary_root(mutable, IndexSlot::new(0), root, TrxID::new(2)).await;
 
                 let index_pool = QuiescentBox::new(
                     FixedBufferPool::with_capacity(PoolRole::Index, 64 * 1024 * 1024).unwrap(),
@@ -1906,7 +1913,7 @@ mod tests {
                         .is_ok()
                 );
                 let runtime = SecondaryDiskTreeRuntime::new(
-                    0,
+                    IndexSlot::new(0),
                     Arc::clone(&metadata),
                     Arc::clone(&table),
                     disk_pool.global_pool().clone(),
@@ -1994,7 +2001,8 @@ mod tests {
                     .batch_insert_encoded(&non_unique_exact_refs(&encoded_entries))
                     .unwrap();
                 let root = writer.finish().await.unwrap();
-                let table = publish_secondary_root(mutable, 1, root, TrxID::new(2)).await;
+                let table =
+                    publish_secondary_root(mutable, IndexSlot::new(1), root, TrxID::new(2)).await;
 
                 let index_pool = QuiescentBox::new(
                     FixedBufferPool::with_capacity(PoolRole::Index, 64 * 1024 * 1024).unwrap(),
@@ -2009,7 +2017,7 @@ mod tests {
                         .is_ok()
                 );
                 let runtime = SecondaryDiskTreeRuntime::new(
-                    1,
+                    IndexSlot::new(1),
                     Arc::clone(&metadata),
                     Arc::clone(&table),
                     disk_pool.global_pool().clone(),
@@ -2087,7 +2095,7 @@ mod tests {
                     .unwrap()
             );
             let runtime = SecondaryDiskTreeRuntime::new(
-                0,
+                IndexSlot::new(0),
                 Arc::clone(&metadata),
                 Arc::clone(&table),
                 disk_pool.global_pool().clone(),
@@ -2095,11 +2103,11 @@ mod tests {
             .unwrap();
             let composite = SecondaryIndex::Unique { mem, disk: runtime };
             assert!(composite.is_unique());
-            assert_eq!(composite.index_no(), 0);
+            assert_eq!(composite.index_slot(), IndexSlot::new(0));
 
             let mem = non_unique_mem_index(&index_pool, &index_guard).await;
             let runtime = SecondaryDiskTreeRuntime::new(
-                1,
+                IndexSlot::new(1),
                 Arc::clone(&metadata),
                 Arc::clone(&table),
                 disk_pool.global_pool().clone(),
@@ -2107,7 +2115,7 @@ mod tests {
             .unwrap();
             let composite = SecondaryIndex::NonUnique { mem, disk: runtime };
             assert!(!composite.is_unique());
-            assert_eq!(composite.index_no(), 1);
+            assert_eq!(composite.index_slot(), IndexSlot::new(1));
         });
     }
 }

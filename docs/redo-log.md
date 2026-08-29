@@ -337,9 +337,9 @@ RowRedo :=
 - `2 Delete`: `Option<PageID>` using the generic one-byte presence tag.
 - `3 Update`: `PageID + Vec<UpdateCol>`, where
   `UpdateCol = u32 col_idx + Val`.
-- `4 DeleteByPrimaryKey`: `SelectKey`, where
-  `SelectKey = u32 index_no + Vec<Val>`.
-- `5 UpdateByPrimaryKey`: `SelectKey + Vec<UpdateCol>`.
+- `4 DeleteByPrimaryKey`: `CatalogSelectKey`, where
+  `CatalogSelectKey = u16 index_slot + Vec<Val>`.
+- `5 UpdateByPrimaryKey`: `CatalogSelectKey + Vec<UpdateCol>`.
 
 `DeleteByPrimaryKey` and `UpdateByPrimaryKey` are logical catalog-table redo.
 Catalog recovery locates rows by primary key instead of physical row id.

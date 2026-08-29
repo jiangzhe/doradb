@@ -3783,7 +3783,7 @@ mod tests {
     use super::*;
     use crate::buffer::{global_readonly_pool_scope, table_readonly_pool};
     use crate::catalog::{
-        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
+        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexSpec, TableMetadata,
     };
     // Tests below inspect the existing ColumnBlockIndex public orchestration
     // boundary over persisted DataIntegrity, buffer/file IO, and rewrite Internal.
@@ -3813,7 +3813,10 @@ mod tests {
                     ValKind::U64,
                     ColumnAttributes::empty(),
                 )],
-                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+                vec![IndexSpec::new(
+                    vec![IndexKeySpec::new(0)],
+                    IndexAttributes::PK,
+                )],
             )
             .expect("valid table metadata"),
         )

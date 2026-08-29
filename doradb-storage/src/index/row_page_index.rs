@@ -1834,7 +1834,7 @@ mod tests {
     use crate::buffer::test_page_id;
     use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard, PoolRole};
     use crate::catalog::{
-        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
+        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexSpec, TableMetadata,
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
@@ -2019,7 +2019,7 @@ mod tests {
     }
 
     fn first_i32_unique_index() -> IndexSpec {
-        IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)
+        IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK)
     }
 
     fn make_test_metadata() -> Arc<TableMetadata> {

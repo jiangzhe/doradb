@@ -1,9 +1,6 @@
 use crate::buffer::PoolGuards;
 use crate::buffer::page::VersionedPageID;
-use crate::catalog::{
-    CatalogSelectKey, ResolvedUserIndexKey, TableCache, catalog_key_from_active_ordinal,
-    user_key_from_active_slot,
-};
+use crate::catalog::{CatalogSelectKey, IndexRef, IndexSlot, ResolvedUserIndexKey, TableCache};
 use crate::error::RuntimeOrFatalResult as Result;
 use crate::id::{RowID, TableID, TrxID};
 use crate::poison::EnginePoisoner;
@@ -410,12 +407,13 @@ impl NextRowUndo {
     }
 
     /// Returns next index branch.
+    #[cfg_attr(not(test), expect(dead_code, reason = "legacy catalog row MVCC tests"))]
     #[inline]
-    pub(crate) fn index_branch(&self, key: Option<(usize, &[Val])>) -> Option<&IndexBranch> {
-        key.and_then(|(index_no, key_vals)| {
+    pub(crate) fn index_branch(&self, key: Option<(IndexSlot, &[Val])>) -> Option<&IndexBranch> {
+        key.and_then(|(index_slot, key_vals)| {
             self.indexes
                 .iter()
-                .find(|branch| branch.matches(index_no, key_vals))
+                .find(|branch| branch.matches(index_slot, key_vals))
         })
     }
 }
@@ -581,45 +579,46 @@ impl IndexBranch {
         undo_vals: Vec<UpdateCol>,
     ) -> Self {
         Self::Catalog(IndexBranchPayload {
-            key: catalog_key_from_active_ordinal(key.index_no, key.vals),
+            key,
             target,
             undo_vals,
         })
     }
 
-    /// Creates a user branch from one layout-proven active slot.
+    /// Creates a user branch from one admitted exact index reference.
     #[inline]
     pub(crate) fn user(
-        key: SelectKey,
+        key: ResolvedUserIndexKey,
         target: IndexBranchTarget,
         undo_vals: Vec<UpdateCol>,
     ) -> Self {
         Self::User(IndexBranchPayload {
-            key: user_key_from_active_slot(key.index_no, key.vals),
+            key,
             target,
             undo_vals,
         })
     }
 
     /// Returns whether this branch matches a transient execution slot and key.
+    #[cfg_attr(not(test), expect(dead_code, reason = "legacy catalog row MVCC tests"))]
     #[inline]
-    pub(crate) fn matches(&self, index_no: usize, key_vals: &[Val]) -> bool {
+    pub(crate) fn matches(&self, index_slot: IndexSlot, key_vals: &[Val]) -> bool {
         match self {
             Self::Catalog(branch) => {
-                branch.key.index.as_usize() == index_no && branch.key.vals == key_vals
+                branch.key.index_slot == index_slot && branch.key.vals == key_vals
             }
             Self::User(branch) => {
-                branch.key.index.slot().as_usize() == index_no && branch.key.vals == key_vals
+                branch.key.index.slot() == index_slot && branch.key.vals == key_vals
             }
         }
     }
 
-    /// Returns the transient execution slot and logical values for matching.
+    /// Returns the exact user-index reference and logical values for matching.
     #[inline]
-    pub(crate) fn key_parts(&self) -> (usize, &[Val]) {
+    pub(crate) fn user_key_parts(&self) -> Option<(IndexRef, &[Val])> {
         match self {
-            Self::Catalog(branch) => (branch.key.index.as_usize(), &branch.key.vals),
-            Self::User(branch) => (branch.key.index.slot().as_usize(), &branch.key.vals),
+            Self::Catalog(_) => None,
+            Self::User(branch) => Some((branch.key.index, &branch.key.vals)),
         }
     }
 
@@ -645,32 +644,6 @@ impl IndexBranch {
     #[inline]
     pub(crate) fn purge_cts(&self) -> Option<TrxID> {
         self.target().purge_cts()
-    }
-}
-
-/// Qualifies a shared positional key before it enters retained row-undo state.
-pub(crate) trait IndexBranchDomain {
-    /// Builds one branch in the selected index-reference domain.
-    fn branch(key: SelectKey, target: IndexBranchTarget, undo_vals: Vec<UpdateCol>) -> IndexBranch;
-}
-
-/// Compile-time selector used by shared hot-row code to qualify catalog branches.
-pub(crate) struct CatalogIndexBranchDomain;
-
-impl IndexBranchDomain for CatalogIndexBranchDomain {
-    #[inline]
-    fn branch(key: SelectKey, target: IndexBranchTarget, undo_vals: Vec<UpdateCol>) -> IndexBranch {
-        IndexBranch::catalog(key, target, undo_vals)
-    }
-}
-
-/// Compile-time selector used by shared hot-row code to qualify user branches.
-pub(crate) struct UserIndexBranchDomain;
-
-impl IndexBranchDomain for UserIndexBranchDomain {
-    #[inline]
-    fn branch(key: SelectKey, target: IndexBranchTarget, undo_vals: Vec<UpdateCol>) -> IndexBranch {
-        IndexBranch::user(key, target, undo_vals)
     }
 }
 

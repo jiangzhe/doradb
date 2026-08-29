@@ -1,6 +1,6 @@
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::buffer::page::VersionedPageID;
-use crate::catalog::{TableColumnLayout, TableMetadata};
+use crate::catalog::{IndexRef, IndexSlot, ResolvedUserIndexKey, TableColumnLayout, TableMetadata};
 use crate::error::{OperationError, OperationResult};
 use crate::id::{RowID, TableID, TrxID};
 use crate::index::{BTreeKey, BTreeKeyEncoder, IndexLookupCandidate};
@@ -146,15 +146,15 @@ impl<'a> RowReadAccess<'a> {
         &self,
         metadata: &TableMetadata,
         read_set: &[usize],
-        key: Option<(usize, &[Val])>,
+        key: Option<(IndexSlot, &[Val])>,
     ) -> ReadRow {
         let row = self.row();
         // latest version in row page.
         if row.is_deleted() {
             return ReadRow::NotFound;
         }
-        if let Some((index_no, key_vals)) = key {
-            let Some(index_spec) = metadata.idx.index_spec(index_no) else {
+        if let Some((index_slot, key_vals)) = key {
+            let Some(index_spec) = metadata.idx.index_spec(index_slot) else {
                 return ReadRow::InvalidIndex;
             };
             if row.is_key_different(metadata.col.as_ref(), index_spec, key_vals) {
@@ -177,7 +177,7 @@ impl<'a> RowReadAccess<'a> {
         if row.is_deleted() {
             return ReadRow::NotFound;
         }
-        let Some(index_spec) = metadata.idx.index_spec(candidate.index_no) else {
+        let Some(index_spec) = metadata.idx.index_spec(candidate.index.slot()) else {
             return ReadRow::InvalidIndex;
         };
         let key_vals = index_spec
@@ -193,13 +193,14 @@ impl<'a> RowReadAccess<'a> {
     }
 
     /// Reads the row version visible to the transaction context.
+    #[cfg_attr(not(test), expect(dead_code, reason = "legacy catalog row MVCC tests"))]
     #[inline]
     pub(crate) fn read_row_mvcc(
         &self,
         ctx: &TrxContext,
         metadata: &TableMetadata,
         read_set: &[usize],
-        key: Option<(usize, &[Val])>,
+        key: Option<(IndexSlot, &[Val])>,
     ) -> ReadRow {
         if key.is_none() {
             return self.read_row_mvcc_keyless(ctx, metadata, read_set);
@@ -234,12 +235,12 @@ impl<'a> RowReadAccess<'a> {
                     // visible version is reconstructed.
                     let mut next = &undo_head.next;
                     let read_set: BTreeSet<usize> = read_set.iter().copied().collect();
-                    let key_tracker = if let Some((index_no, key_vals)) = key {
+                    let key_tracker = if let Some((index_slot, key_vals)) = key {
                         // Index lookups may route through a latest row whose
                         // current key no longer matches the lookup key. Track
                         // enough key columns to validate older reconstructed
                         // versions, even when the user read set omitted them.
-                        let Some(index_spec) = metadata.idx.index_spec(index_no) else {
+                        let Some(index_spec) = metadata.idx.index_spec(index_slot) else {
                             return ReadRow::InvalidIndex;
                         };
                         if index_spec.cols.len() != key_vals.len() {
@@ -264,7 +265,7 @@ impl<'a> RowReadAccess<'a> {
                                     self.row().val(metadata.col.as_ref(), key.col_no as usize)
                                 })
                                 .collect();
-                            Some(SelectKey { index_no, vals })
+                            Some(SelectKey { index_slot, vals })
                         };
                         Some(IndexKeyTracker {
                             user_key_idx_map,
@@ -462,6 +463,7 @@ impl<'a> RowReadAccess<'a> {
         }
     }
 
+    #[cfg_attr(not(test), expect(dead_code, reason = "legacy catalog row MVCC tests"))]
     #[inline]
     fn read_row_mvcc_keyless(
         &self,
@@ -506,7 +508,7 @@ impl<'a> RowReadAccess<'a> {
                         return self.read_row_latest_index_candidate(metadata, read_set, candidate);
                     }
 
-                    let Some(index_spec) = metadata.idx.index_spec(candidate.index_no) else {
+                    let Some(index_spec) = metadata.idx.index_spec(candidate.index.slot()) else {
                         return ReadRow::InvalidIndex;
                     };
                     let mut next = &undo_head.next;
@@ -518,7 +520,7 @@ impl<'a> RowReadAccess<'a> {
                         .map(|(key_pos, key)| (key.col_no as usize, key_pos))
                         .collect();
                     let undo_key = SelectKey {
-                        index_no: candidate.index_no,
+                        index_slot: candidate.index.slot(),
                         vals: index_spec
                             .cols
                             .iter()
@@ -640,7 +642,7 @@ impl<'a> RowReadAccess<'a> {
     pub(crate) fn find_old_version_for_unique_key(
         &self,
         metadata: &TableMetadata,
-        index_no: usize,
+        index_slot: IndexSlot,
         key_vals: &[Val],
         ctx: &TrxContext,
     ) -> OperationResult<FindOldVersion> {
@@ -648,7 +650,7 @@ impl<'a> RowReadAccess<'a> {
             RowReadState::Recover(_) => unreachable!(),
             RowReadState::RowVer(undo) => undo,
         };
-        let Some(index_spec) = metadata.idx.index_spec(index_no) else {
+        let Some(index_spec) = metadata.idx.index_spec(index_slot) else {
             return Ok(FindOldVersion::None);
         };
 
@@ -725,7 +727,7 @@ impl<'a> RowReadAccess<'a> {
                         }
                     }
                     // Here we check if current version matches input key
-                    if !deleted && metadata.idx.match_key(index_no, key_vals, &vals) {
+                    if !deleted && metadata.idx.match_key(index_slot, key_vals, &vals) {
                         return Ok(FindOldVersion::Found(vals, cts, entry));
                     }
                     // We only need to go through main branch, because Index
@@ -758,10 +760,10 @@ impl<'a> RowReadAccess<'a> {
     pub(crate) fn any_version_matches_key(
         &self,
         metadata: &TableMetadata,
-        index_no: usize,
+        index_slot: IndexSlot,
         key_vals: &[Val],
     ) -> bool {
-        let Some(index_spec) = metadata.idx.index_spec(index_no) else {
+        let Some(index_spec) = metadata.idx.index_spec(index_slot) else {
             return false;
         };
         // Check page data first.
@@ -784,7 +786,7 @@ impl<'a> RowReadAccess<'a> {
                         .iter()
                         .map(|key| row.val(metadata.col.as_ref(), key.col_no as usize))
                         .collect();
-                    let mvcc_key = SelectKey::new(index_no, vals);
+                    let mvcc_key = SelectKey::new(index_slot, vals);
                     let mapping: FastHashMap<usize, usize> = index_spec
                         .cols
                         .iter()
@@ -815,7 +817,7 @@ impl<'a> RowReadAccess<'a> {
                         }
                         // Here we check if current version matches input key
                         if !ver.deleted
-                            && ver.mvcc_key.index_no == index_no
+                            && ver.mvcc_key.index_slot == index_slot
                             && ver.mvcc_key.vals.as_slice() == key_vals
                         {
                             return true;
@@ -862,8 +864,8 @@ impl<'a> RowReadState<'a> {
 /// The lookup candidate is consumed from its scanner, while the key encoder
 /// remains borrowed from the operation-owned index handle.
 pub(crate) struct BoundIndexCandidate<'a> {
-    /// Admitted secondary-index slot.
-    pub(crate) index_no: usize,
+    /// Exact admitted secondary-index generation.
+    pub(crate) index: IndexRef,
     /// Whether the admitted index is unique.
     pub(crate) unique: bool,
     /// Encoded candidate identity emitted by the index scan.
@@ -878,7 +880,7 @@ impl<'a> BoundIndexCandidate<'a> {
     /// Consumes one lookup candidate and binds it to admitted index metadata.
     #[inline]
     pub(crate) fn new(
-        index_no: usize,
+        index: IndexRef,
         unique: bool,
         encoder: &'a BTreeKeyEncoder,
         candidate: IndexLookupCandidate,
@@ -888,7 +890,7 @@ impl<'a> BoundIndexCandidate<'a> {
             row_id,
         } = candidate;
         Self {
-            index_no,
+            index,
             unique,
             encoded_key,
             row_id,
@@ -909,8 +911,10 @@ impl<'a> BoundIndexCandidate<'a> {
 
     #[inline]
     fn matches_branch(&self, branch: &IndexBranch) -> bool {
-        let (index_no, key_vals) = branch.key_parts();
-        self.unique && index_no == self.index_no && self.matches_key(key_vals)
+        let Some((index, key_vals)) = branch.user_key_parts() else {
+            return false;
+        };
+        self.unique && index == self.index && self.matches_key(key_vals)
     }
 }
 
@@ -1014,15 +1018,16 @@ impl RowVersion {
         }
     }
 
+    #[cfg_attr(not(test), expect(dead_code, reason = "legacy catalog row MVCC tests"))]
     #[inline]
     fn get_visible_vals(
         mut self,
         metadata: &TableMetadata,
         row: Row<'_>,
-        search_key: Option<(usize, &[Val])>,
+        search_key: Option<(IndexSlot, &[Val])>,
     ) -> ReadRow {
-        if let Some((index_no, key_vals)) = search_key {
-            let Some(index_spec) = metadata.idx.index_spec(index_no) else {
+        if let Some((index_slot, key_vals)) = search_key {
+            let Some(index_spec) = metadata.idx.index_spec(index_slot) else {
                 return ReadRow::InvalidIndex;
             };
             if index_spec.cols.len() != key_vals.len() {
@@ -1070,7 +1075,7 @@ impl RowVersion {
         row: Row<'_>,
         candidate: &BoundIndexCandidate<'_>,
     ) -> ReadRow {
-        let Some(index_spec) = metadata.idx.index_spec(candidate.index_no) else {
+        let Some(index_spec) = metadata.idx.index_spec(candidate.index.slot()) else {
             return ReadRow::InvalidIndex;
         };
         let matches_candidate = if let Some(undo_key) = self
@@ -1394,7 +1399,7 @@ impl<'a> RowWriteAccess<'a> {
     #[inline]
     pub(crate) fn link_user_for_unique_index(
         &mut self,
-        key: SelectKey,
+        key: ResolvedUserIndexKey,
         cts: TrxID,
         entry: RowUndoRef,
         undo_vals: Vec<UpdateCol>,
@@ -1411,7 +1416,7 @@ impl<'a> RowWriteAccess<'a> {
     #[inline]
     pub(crate) fn link_user_for_unique_index_cold_terminal(
         &mut self,
-        key: SelectKey,
+        key: ResolvedUserIndexKey,
         delete_cts: Option<TrxID>,
         undo_vals: Vec<UpdateCol>,
     ) {
@@ -1615,7 +1620,8 @@ pub(crate) enum FindOldVersion {
 pub(crate) mod tests {
     use super::*;
     use crate::catalog::{
-        ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec,
+        ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexSlot,
+        IndexSpec,
     };
     use crate::trx::tests::{commit_shared_trx_status, shared_trx_status};
     use crate::trx::undo::{MainBranch, NextRowUndo, RowUndoHead, UndoStatus};
@@ -1639,16 +1645,16 @@ pub(crate) mod tests {
     }
 
     fn sparse_metadata() -> TableMetadata {
-        TableMetadata::try_new_with_next_index_no(
+        TableMetadata::try_new_with_next_index_slot(
             vec![
                 ColumnSpec::new("c0", ValKind::I32, ColumnAttributes::empty()),
                 ColumnSpec::new("c1", ValKind::I32, ColumnAttributes::empty()),
             ],
             vec![ActiveIndexSpec::new(
-                0,
-                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                IndexSlot::new(0),
+                IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::PK),
             )],
-            2,
+            IndexSlot::new(2),
         )
         .unwrap()
     }
@@ -2177,9 +2183,9 @@ pub(crate) mod tests {
         let page = row_page(&metadata);
         let rec_map = RowRecoveryMap::new(TrxID::new(0));
         let access = test_recovery_row_read_access(&page, &rec_map, 0);
-        let key = SelectKey::new(1, vec![Val::from(10i32)]);
+        let key = SelectKey::new(IndexSlot::new(1), vec![Val::from(10i32)]);
 
-        let res = access.read_row_latest(&metadata, &[0], Some((key.index_no, &key.vals)));
+        let res = access.read_row_latest(&metadata, &[0], Some((key.index_slot, &key.vals)));
 
         assert!(matches!(res, ReadRow::InvalidIndex));
     }
@@ -2206,9 +2212,10 @@ pub(crate) mod tests {
         )));
         let access = test_row_read_access(&page, &row_ver, 0);
         let trx_ctx = test_trx_context(TrxID::new(1));
-        let key = SelectKey::new(1, vec![Val::from(10i32)]);
+        let key = SelectKey::new(IndexSlot::new(1), vec![Val::from(10i32)]);
 
-        let res = access.read_row_mvcc(&trx_ctx, &metadata, &[0], Some((key.index_no, &key.vals)));
+        let res =
+            access.read_row_mvcc(&trx_ctx, &metadata, &[0], Some((key.index_slot, &key.vals)));
 
         assert!(matches!(res, ReadRow::InvalidIndex));
     }
@@ -2219,9 +2226,9 @@ pub(crate) mod tests {
         let page = row_page(&metadata);
         let rec_map = RowRecoveryMap::new(TrxID::new(0));
         let access = test_recovery_row_read_access(&page, &rec_map, 0);
-        let key = SelectKey::new(1, vec![Val::from(10i32)]);
+        let key = SelectKey::new(IndexSlot::new(1), vec![Val::from(10i32)]);
 
-        assert!(!access.any_version_matches_key(&metadata, key.index_no, &key.vals));
+        assert!(!access.any_version_matches_key(&metadata, key.index_slot, &key.vals));
     }
 
     #[test]
@@ -2230,9 +2237,9 @@ pub(crate) mod tests {
         let page = row_page(&metadata);
         let rec_map = RowRecoveryMap::new(TrxID::new(0));
         let access = test_recovery_row_read_access(&page, &rec_map, 0);
-        let key = SelectKey::new(0, vec![Val::from(10i32)]);
+        let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(10i32)]);
 
-        assert!(access.any_version_matches_key(&metadata, key.index_no, &key.vals));
+        assert!(access.any_version_matches_key(&metadata, key.index_slot, &key.vals));
     }
 
     #[test]
@@ -2245,9 +2252,9 @@ pub(crate) mod tests {
             key_tracker: None,
             undo_vals: BTreeMap::new(),
         };
-        let key = SelectKey::new(1, vec![Val::from(10i32)]);
+        let key = SelectKey::new(IndexSlot::new(1), vec![Val::from(10i32)]);
 
-        let res = ver.get_visible_vals(&metadata, page.row(0), Some((key.index_no, &key.vals)));
+        let res = ver.get_visible_vals(&metadata, page.row(0), Some((key.index_slot, &key.vals)));
 
         assert!(matches!(res, ReadRow::InvalidIndex));
     }
@@ -2258,11 +2265,11 @@ pub(crate) mod tests {
         let page = row_page(&metadata);
         let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
         let access = test_row_read_access(&page, &row_ver, 0);
-        let key = SelectKey::new(1, vec![Val::from(10i32)]);
+        let key = SelectKey::new(IndexSlot::new(1), vec![Val::from(10i32)]);
         let trx_ctx = test_trx_context(TrxID::new(1));
 
         let res =
-            access.find_old_version_for_unique_key(&metadata, key.index_no, &key.vals, &trx_ctx);
+            access.find_old_version_for_unique_key(&metadata, key.index_slot, &key.vals, &trx_ctx);
 
         assert!(matches!(res, Ok(FindOldVersion::None)));
     }

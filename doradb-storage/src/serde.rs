@@ -1,5 +1,6 @@
 use crate::catalog::{
-    ActiveIndexSpec, ColumnAttributes, IndexAttributes, IndexKey, IndexOrder, IndexSpec,
+    ActiveIndexSpec, ColumnAttributes, IndexAttributes, IndexKeySpec, IndexOrder, IndexSlot,
+    IndexSpec,
 };
 use crate::compression::bitpacking::*;
 use crate::error::{DataIntegrityError, DataIntegrityResult};
@@ -790,7 +791,7 @@ impl Deser for IndexOrder {
     }
 }
 
-impl Ser<'_> for IndexKey {
+impl Ser<'_> for IndexKeySpec {
     #[inline]
     fn ser_len(&self) -> usize {
         mem::size_of::<u16>() + mem::size_of::<u8>()
@@ -803,7 +804,7 @@ impl Ser<'_> for IndexKey {
     }
 }
 
-impl Deser for IndexKey {
+impl Deser for IndexKeySpec {
     const MIN_BYTES_HINT: MinBytesHint =
         min_bytes_hint(mem::size_of::<u16>() + mem::size_of::<u8>());
 
@@ -811,7 +812,7 @@ impl Deser for IndexKey {
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let (idx, col_no) = input.deser_u16(start_idx)?;
         let (idx, order) = IndexOrder::deser(input, idx)?;
-        Ok((idx, IndexKey { col_no, order }))
+        Ok((idx, IndexKeySpec { col_no, order }))
     }
 }
 
@@ -878,7 +879,7 @@ impl Deser for IndexSpec {
 
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
-        let (idx, cols) = <Vec<IndexKey>>::deser(input, start_idx)?;
+        let (idx, cols) = <Vec<IndexKeySpec>>::deser(input, start_idx)?;
         let (idx, attributes) = IndexAttributes::deser(input, idx)?;
         Ok((idx, IndexSpec { cols, attributes }))
     }
@@ -892,7 +893,7 @@ impl Ser<'_> for ActiveIndexSpec {
 
     #[inline]
     fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
-        let idx = out.ser_u16(start_idx, self.index_no);
+        let idx = out.ser_u16(start_idx, self.index_slot.get());
         self.spec.ser(out, idx)
     }
 }
@@ -903,9 +904,15 @@ impl Deser for ActiveIndexSpec {
 
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
-        let (idx, index_no) = input.deser_u16(start_idx)?;
+        let (idx, index_slot) = input.deser_u16(start_idx)?;
         let (idx, spec) = IndexSpec::deser(input, idx)?;
-        Ok((idx, ActiveIndexSpec { index_no, spec }))
+        Ok((
+            idx,
+            ActiveIndexSpec {
+                index_slot: IndexSlot::from(index_slot),
+                spec,
+            },
+        ))
     }
 }
 
@@ -1377,8 +1384,8 @@ mod tests {
     #[test]
     fn test_index_spec_serde() {
         let cols = vec![
-            IndexKey::new(0),
-            IndexKey {
+            IndexKeySpec::new(0),
+            IndexKeySpec {
                 col_no: 1,
                 order: IndexOrder::Desc,
             },

@@ -464,7 +464,7 @@ impl TransactionSystem {
                             table
                                 .delete_index(
                                     guards,
-                                    ip.key.index.as_usize(),
+                                    ip.key.index_slot,
                                     &ip.key.vals,
                                     ip.row_id,
                                     ip.unique,
@@ -1449,6 +1449,7 @@ mod tests {
     use super::*;
     use crate::buffer::page::VersionedPageID;
     use crate::buffer::{BufferPool, PoolGuards, PoolRole};
+    use crate::catalog::IndexSlot;
     use crate::catalog::tests::table1;
     use crate::conf::{DEFAULT_GC_BUCKETS, EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
@@ -2476,7 +2477,7 @@ mod tests {
             drop(session);
             let pool_guards = full_pool_guards(&engine);
             let key = vec![Val::from(1001i32)];
-            let Some((row_id, _)) = bound_unique_index(&table, &pool_guards, 0)
+            let Some((row_id, _)) = bound_unique_index(&table, &pool_guards, IndexSlot::new(0))
                 .lookup(&key, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap()
@@ -2568,7 +2569,7 @@ mod tests {
             drop(session);
             let pool_guards = full_pool_guards(&engine);
             let key = vec![Val::from(1002i32)];
-            let Some((row_id, _)) = bound_unique_index(&table, &pool_guards, 0)
+            let Some((row_id, _)) = bound_unique_index(&table, &pool_guards, IndexSlot::new(0))
                 .lookup(&key, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap()
@@ -2664,7 +2665,7 @@ mod tests {
             drop(session);
             let pool_guards = full_pool_guards(&engine);
             let key = vec![Val::from(1003i32)];
-            let Some((row_id, _)) = bound_unique_index(&table, &pool_guards, 0)
+            let Some((row_id, _)) = bound_unique_index(&table, &pool_guards, IndexSlot::new(0))
                 .lookup(&key, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap()
@@ -2779,7 +2780,7 @@ mod tests {
             drop(session);
             let pool_guards = full_pool_guards(&engine);
             let key = vec![Val::from(1004i32)];
-            let Some((row_id, _)) = bound_unique_index(&table, &pool_guards, 0)
+            let Some((row_id, _)) = bound_unique_index(&table, &pool_guards, IndexSlot::new(0))
                 .lookup(&key, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap()
@@ -3445,9 +3446,9 @@ mod tests {
             // delete
             for i in 0..PURGE_SIZE {
                 let mut trx = session.begin_trx().unwrap();
-                let key = SelectKey::new(0, vec![Val::from(i as i32)]);
+                let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(i as i32)]);
                 let res = trx
-                    .table_delete_unique_mvcc(table_id, key.index_no, &key.vals)
+                    .table_delete_unique_mvcc(table_id, key.index_slot.transitional_id(), &key.vals)
                     .await;
                 assert!(res.is_ok());
                 purge_target = trx.commit().await.unwrap();
@@ -3520,9 +3521,9 @@ mod tests {
             // delete
             for i in 0..PURGE_SIZE {
                 let mut trx = session.begin_trx().unwrap();
-                let key = SelectKey::new(0, vec![Val::from(i as i32)]);
+                let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(i as i32)]);
                 let res = trx
-                    .table_delete_unique_mvcc(table_id, key.index_no, &key.vals)
+                    .table_delete_unique_mvcc(table_id, key.index_slot.transitional_id(), &key.vals)
                     .await;
                 assert!(res.is_ok());
                 purge_target = trx.commit().await.unwrap();

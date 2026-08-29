@@ -46,14 +46,14 @@ pub(crate) use sys_trx::{RetiredRowPageBatch, SysTrxPayload};
 
 use crate::buffer::PoolGuards;
 use crate::buffer::page::VersionedPageID;
-use crate::catalog::{CatalogTable, TableCache};
+use crate::catalog::{CatalogIndexNo, CatalogTable, TableCache};
 use crate::completion::Completion;
 use crate::engine::EngineCore;
 use crate::error::{
     CompletionErrorBridge, DiscloseError, DiscloseResultExt, Error, FatalError, FatalResult,
     LifecycleError, LifecycleOrFatalError, LifecycleOrFatalResult, LifecycleResult,
-    MultiDomainResultExt, OperationOrFatalResult, ResourceError, Result, RuntimeError,
-    RuntimeOrFatalError, RuntimeOrFatalResult, SharedFatalError,
+    MultiDomainResultExt, OperationOrFatalResult, OperationResult, ResourceError, Result,
+    RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, SharedFatalError,
 };
 use crate::id::{RowID, SessionID, SessionOperationKey, TableID, TrxID};
 use crate::lock::{
@@ -84,9 +84,7 @@ use std::ptr::addr_eq;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-pub(crate) use admission::{
-    ResolvedTableReadBinding, TableAdmissionRequest, resolve_table_read_binding,
-};
+pub(crate) use admission::{ResolvedTableReadBinding, resolve_table_read_binding};
 use stmt::{PrivateStmtState, Statement, StmtState};
 pub use stream_stmt::{IndexScanMvccStream, TableScanMvccStream};
 /// Minimum snapshot timestamp assigned by the transaction system.
@@ -471,11 +469,11 @@ impl PrivateTransaction {
     pub(crate) async fn catalog_delete_primary_key_mvcc(
         &mut self,
         table: &CatalogTable,
-        index_no: usize,
+        index_slot: CatalogIndexNo,
         key_vals: Vec<Val>,
     ) -> RuntimeOrFatalResult<DeleteMvcc> {
         self.exec(async move |stmt| {
-            stmt.catalog_delete_primary_key_mvcc(table, index_no, &key_vals, true)
+            stmt.catalog_delete_primary_key_mvcc(table, index_slot, &key_vals, true)
                 .await
         })
         .await
@@ -486,11 +484,11 @@ impl PrivateTransaction {
     pub(crate) async fn catalog_delete_primary_key_batch_mvcc(
         &mut self,
         table: &CatalogTable,
-        index_no: usize,
+        index_slot: CatalogIndexNo,
         keys: Vec<Vec<Val>>,
     ) -> RuntimeOrFatalResult<usize> {
         self.exec(async move |stmt| {
-            stmt.catalog_delete_primary_key_batch_mvcc(table, index_no, keys)
+            stmt.catalog_delete_primary_key_batch_mvcc(table, index_slot, keys)
                 .await
         })
         .await
@@ -501,12 +499,12 @@ impl PrivateTransaction {
     pub(crate) async fn catalog_replace_primary_key_mvcc(
         &mut self,
         table: &CatalogTable,
-        index_no: usize,
+        index_slot: CatalogIndexNo,
         key_vals: Vec<Val>,
         cols: Vec<Val>,
     ) -> RuntimeOrFatalResult<DeleteMvcc> {
         self.exec(async move |stmt| {
-            stmt.catalog_replace_primary_key_mvcc(table, index_no, &key_vals, cols)
+            stmt.catalog_replace_primary_key_mvcc(table, index_slot, &key_vals, cols)
                 .await
         })
         .await
@@ -2529,6 +2527,27 @@ pub(crate) struct TrxInner {
 }
 
 impl TrxInner {
+    #[inline]
+    fn admit_cached_binding(
+        &self,
+        table_id: TableID,
+        metadata_resource: LockResource,
+        request: admission::TableAdmissionRequest,
+        operation: &'static str,
+    ) -> OperationResult<Option<admission::AdmittedOperationParts>> {
+        let Some(binding) = self.table_bindings.get(&table_id) else {
+            return Ok(None);
+        };
+        assert!(
+            self.checked_lock_state()
+                .covers(metadata_resource, LockMode::Shared),
+            "transaction table binding requires cached metadata S: table_id={table_id}"
+        );
+        let index = binding.validate(table_id, request, operation)?;
+        let (table, layout) = binding.operation_parts();
+        Ok(Some((table, layout, index)))
+    }
+
     /// Create one reusable zero-valued core for a session's public cache.
     #[inline]
     pub(crate) fn public_cached() -> Self {
@@ -3612,7 +3631,9 @@ pub(crate) mod tests {
     use crate::buffer::test_frame_kind;
     use crate::catalog::storage::tables::TABLE_ID_TABLES;
     use crate::catalog::tests as catalog_tests;
-    use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata, user_key_from_active_slot};
+    use crate::catalog::{
+        ColumnAttributes, ColumnSpec, IndexSlot, TableMetadata, user_key_from_active_slot,
+    };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{InternalError, OperationError};
@@ -3999,7 +4020,7 @@ pub(crate) mod tests {
     pub(crate) async fn observe_table_root_snapshot(
         trx: &mut Transaction,
         table: &Table,
-        index_no: usize,
+        index_slot: IndexSlot,
     ) -> Result<RootSnapshotObservation> {
         trx.exec(async |stmt| {
             let rt = stmt.runtime();
@@ -4011,7 +4032,7 @@ pub(crate) mod tests {
                 pivot_row_id: snapshot.pivot_row_id(),
                 column_block_index_root: snapshot.column_block_index_root(),
                 deletion_cutoff_ts: snapshot.deletion_cutoff_ts(),
-                secondary_index_root: snapshot.secondary_index_root(index_no),
+                secondary_index_root: snapshot.secondary_index_root(index_slot),
                 visible: snapshot.root_is_visible_to(rt.sts()),
                 sts: rt.sts(),
             })
@@ -4697,7 +4718,12 @@ pub(crate) mod tests {
 
         let mut verify = session.begin_trx().unwrap();
         let select = verify
-            .table_lookup_unique_mvcc(table_id, 0, &[Val::from(value)], &[0, 1])
+            .table_lookup_unique_mvcc(
+                table_id,
+                crate::IndexID::new(0),
+                &[Val::from(value)],
+                &[0, 1],
+            )
             .await
             .unwrap();
         assert!(
@@ -5392,7 +5418,10 @@ pub(crate) mod tests {
                 inner.index_undo_mut().push_user(IndexUndo {
                     table_id: TableID::new(11),
                     row_id: RowID::new(22),
-                    kind: IndexUndoKind::DeferDelete(user_key_from_active_slot(0, vec![]), true),
+                    kind: IndexUndoKind::DeferDelete(
+                        user_key_from_active_slot(IndexSlot::new(0), vec![]),
+                        true,
+                    ),
                 });
             })
             .unwrap();
@@ -5432,7 +5461,10 @@ pub(crate) mod tests {
                 inner.index_undo_mut().push_user(IndexUndo {
                     table_id: TableID::new(11),
                     row_id: RowID::new(22),
-                    kind: IndexUndoKind::DeferDelete(user_key_from_active_slot(0, vec![]), true),
+                    kind: IndexUndoKind::DeferDelete(
+                        user_key_from_active_slot(IndexSlot::new(0), vec![]),
+                        true,
+                    ),
                 });
             })
             .unwrap();
@@ -5725,7 +5757,7 @@ pub(crate) mod tests {
                 effects.push_user_delete_index_undo(
                     TableID::new(12),
                     RowID::new(23),
-                    user_key_from_active_slot(0, vec![]),
+                    user_key_from_active_slot(IndexSlot::new(0), vec![]),
                     true,
                 );
                 effects.insert_row_redo(
@@ -7147,7 +7179,10 @@ pub(crate) mod tests {
                 inner.index_undo_mut().push_user(IndexUndo {
                     table_id: TableID::new(47),
                     row_id: RowID::new(1),
-                    kind: IndexUndoKind::DeferDelete(user_key_from_active_slot(0, vec![]), true),
+                    kind: IndexUndoKind::DeferDelete(
+                        user_key_from_active_slot(IndexSlot::new(0), vec![]),
+                        true,
+                    ),
                 });
             })
             .unwrap();

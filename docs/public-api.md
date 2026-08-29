@@ -151,7 +151,7 @@ indexes:
 
 ```rust,ignore
 use doradb_storage::{
-    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec,
+    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexSpec,
     TableSpec, ValKind,
 };
 
@@ -161,8 +161,8 @@ let table_spec = TableSpec::new(vec![
 ]);
 
 let index_specs = vec![
-    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK),
-    IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+    IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK),
+    IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty()),
 ];
 
 let table_id = session.create_table(table_spec, index_specs).await?;
@@ -172,12 +172,12 @@ Column numbers are zero-based and follow `TableSpec::columns`. The caller
 controls nullability with `ColumnAttributes::NULLABLE`; index membership is
 declared with `IndexSpec`, not by setting `ColumnAttributes::INDEX`.
 
-An `IndexSpec` contains one or more `IndexKey` values in logical key order.
-`IndexKey::new(column_no)` creates an ascending key. Construct the public
+An `IndexSpec` contains one or more `IndexKeySpec` values in logical key order.
+`IndexKeySpec::new(column_no)` creates an ascending key. Construct the public
 fields directly to request `IndexOrder::Desc`:
 
 ```rust,ignore
-let descending_name = IndexKey {
+let descending_name = IndexKeySpec {
     col_no: 1,
     order: IndexOrder::Desc,
 };
@@ -188,10 +188,10 @@ non-unique index. `IndexAttributes::PK` exists in catalog metadata, but public
 user-table `create_table` and `create_index` currently reject primary-key
 specifications. Use `UK` when a public user table needs uniqueness.
 
-Initial index numbers are allocated from zero in the order supplied to
-`create_table`. `Session::create_index` returns a stable table-local `IndexNo`
-(`u16`). Transaction methods accept the same number as `usize`, so dynamically
-created indexes are normally passed as `usize::from(index_no)`. Dropping an
+Initial index identities are allocated from zero in the order supplied to
+`create_table`. `Session::create_index` returns a stable table-local `IndexID`.
+Transaction methods accept that identity directly, and `IndexID::new` is used
+only when an initial identity is known from table construction. Dropping an
 index does not renumber the remaining indexes.
 
 ## Values and identifiers
@@ -244,7 +244,7 @@ The effectful DDL methods require an idle mutable session:
 | Method | Effect |
 | --- | --- |
 | `create_table` | Validate metadata, create the table, and return its `TableID`. |
-| `create_index` | Build and publish a secondary index, returning its stable `IndexNo`. |
+| `create_index` | Build and publish a secondary index, returning its stable `IndexID`. |
 | `drop_index` | Logically remove an active secondary index. |
 | `drop_table` | Logically remove a user table and schedule safe physical reclamation. |
 
@@ -444,9 +444,9 @@ requiring its exclusive latch.
 `table_lookup_unique_mvcc` requires a unique index and returns `SelectMvcc`:
 
 ```rust,ignore
-let key = SelectKey::new(0, vec![Val::from(42i32)]);
+let key = [Val::from(42i32)];
 match trx
-    .table_lookup_unique_mvcc(table_id, key.index_no, &key.vals, &[0, 1])
+    .table_lookup_unique_mvcc(table_id, IndexID::new(0), &key, &[0, 1])
     .await?
 {
     SelectMvcc::Found(vals) => consume(vals),
@@ -456,6 +456,13 @@ match trx
 
 Prefer matching the enum when absence is expected. `unwrap_found` panics for
 `NotFound`.
+
+For repeated point operations, `resolve_user_index(table_id, index_id)` returns
+an opaque non-pinning `ResolvedUserIndex`. The token is `Copy` and the
+`_resolved` lookup, upsert, update, and delete methods take it by value and
+revalidate its exact generation directly without an ID-map lookup. Tokens may
+cross transaction boundaries; a dropped or replaced generation returns
+`SchemaChanged` during admission.
 
 ### Exact and range index reads
 
@@ -473,7 +480,7 @@ let upper = [Val::from("z")];
 let rows = trx
     .table_index_scan_mvcc(
         table_id,
-        name_index_no,
+        name_index_id,
         &lower[..]..=&upper[..],
         &[0, 1],
     )
@@ -492,7 +499,7 @@ let key = [Val::from("alice")];
 let mut stream = trx
     .table_index_scan_mvcc_stream(
         table_id,
-        name_index_no,
+        name_index_id,
         &key[..]..=&key[..],
         &[0, 1],
     )
@@ -538,17 +545,17 @@ These methods select one logical row through a unique index:
 
 | Method | Input | Result |
 | --- | --- | --- |
-| `table_upsert_unique_mvcc` | Unique index number and a complete replacement row. | `UpsertMvcc::Inserted(RowID)` or `Updated(RowID)`. |
+| `table_upsert_unique_mvcc` | Unique `IndexID` and a complete replacement row. | `UpsertMvcc::Inserted(RowID)` or `Updated(RowID)`. |
 | `table_update_unique_mvcc` | Unique key and strictly ordered sparse `UpdateCol` values. | `UpdateMvcc::Updated(RowID)` or `NotFound`. |
 | `table_delete_unique_mvcc` | Unique key. | `DeleteMvcc::Deleted` or `NotFound`. |
 
 ```rust,ignore
-let key = SelectKey::new(id_index_no, vec![Val::from(1i32)]);
+let key = [Val::from(1i32)];
 let outcome = trx
     .table_update_unique_mvcc(
         table_id,
-        key.index_no,
-        &key.vals,
+        id_index_id,
+        &key,
         vec![UpdateCol {
             idx: 1,
             val: Val::from("ada"),
@@ -788,9 +795,9 @@ Most application-facing types are re-exported from the crate root:
 | --- | --- |
 | Lifecycle | `Engine`, `Session`, `Transaction`, `ReadSnapshotBuilder`, `ReadSnapshot`, `IndexScanMvccStream`, `TableScanMvccStream`, `TableScanPartitionStream` |
 | Configuration | `EngineConfig`, `TableScanConfig`, `TrxSysConfig`, `MandatoryRuntimeConfig`, `FileSystemConfig`, `EvictableBufferPoolConfig`, `LogSync`, `DEFAULT_COW_FILE_MAX_SIZE` |
-| Schema | `TableSpec`, `ColumnSpec`, `ColumnAttributes`, `IndexSpec`, `IndexKey`, `IndexOrder`, `IndexAttributes`, `IndexNo` |
+| Schema | `TableSpec`, `ColumnSpec`, `ColumnAttributes`, `IndexSpec`, `IndexKeySpec`, `IndexOrder`, `IndexAttributes`, `IndexID`, `ResolvedUserIndex` |
 | Values | `Val`, `ValKind`, `ValType`, `MemVar` |
-| Reads | `SelectKey`, `SelectMvcc`, `ScanMvcc`, `LazyRow`, `ScanRowDecision`, `TableScanOptions`, `TableScanPlan` |
+| Reads | `SelectMvcc`, `ScanMvcc`, `LazyRow`, `ScanRowDecision`, `TableScanOptions`, `TableScanPlan` |
 | Writes | `UpdateCol`, `UpdateMvcc`, `UpsertMvcc`, `DeleteMvcc`, `RowMutation`, `TableMutationOutcome` |
 | Locks | `TableLockMode` |
 | Maintenance | `FreezeOutcome`, `FrozenPageBatchInfo`, `CheckpointOutcome`, `CheckpointDelayReason`, `CheckpointCancelReason`, `CatalogCheckpointOutcome`, `RedoTruncationOutcome`, `RedoTruncationBlockerInfo`, `CatalogRedoMaintenanceOutcome`, `MemIndexCleanupOutcome`, `MemIndexCleanupStats`, `MemIndexCleanupDelay`, `SecondaryMemIndexCleanupIndexStats` |

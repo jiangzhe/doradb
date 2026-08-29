@@ -2270,7 +2270,7 @@ fn branch_entries_from_node(node: &BTreeNode) -> DataIntegrityResult<Vec<BranchE
 mod tests {
     use super::*;
     use crate::buffer::{global_readonly_pool_scope, table_readonly_pool};
-    use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey};
+    use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexSlot};
     use crate::error::{CompletionErrorBridge, CompletionResult, DataIntegrityError, IoError};
     use crate::file::block_integrity::checksum_offset;
     use crate::file::build_test_fs;
@@ -2291,7 +2291,7 @@ mod tests {
     macro_rules! unique_runtime {
         ($metadata:ident, $disk_pool:ident) => {
             UniqueDiskTreeRuntime::new(
-                &$metadata.idx.index_specs()[0],
+                &$metadata.idx.index_specs()[IndexSlot::new(0)],
                 $metadata.as_ref(),
                 $disk_pool.file_kind(),
                 Arc::clone($disk_pool.sparse_file()),
@@ -2303,7 +2303,7 @@ mod tests {
     macro_rules! non_unique_runtime {
         ($metadata:ident, $disk_pool:ident) => {
             NonUniqueDiskTreeRuntime::new(
-                &$metadata.idx.index_specs()[1],
+                &$metadata.idx.index_specs()[IndexSlot::new(1)],
                 $metadata.as_ref(),
                 $disk_pool.file_kind(),
                 Arc::clone($disk_pool.sparse_file()),
@@ -2554,8 +2554,8 @@ mod tests {
                     ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::empty()),
                 ],
                 vec![
-                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK),
-                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::empty()),
+                    IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK),
+                    IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::empty()),
                 ],
             )
             .expect("valid table metadata"),
@@ -2570,7 +2570,10 @@ mod tests {
                     ValKind::VarByte,
                     ColumnAttributes::empty(),
                 )],
-                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
+                vec![IndexSpec::new(
+                    vec![IndexKeySpec::new(0)],
+                    IndexAttributes::UK,
+                )],
             )
             .expect("valid table metadata"),
         )

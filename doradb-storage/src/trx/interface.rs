@@ -1,3 +1,4 @@
+use crate::catalog::{IndexID, ResolvedUserIndex};
 use crate::error::{DiscloseResultExt, MultiDomainResultExt, Result};
 use crate::id::{RowID, TableID};
 use crate::row::ops::{
@@ -9,6 +10,7 @@ use crate::trx::{IndexScanMvccStream, TableScanMvccStream, Transaction};
 use crate::value::Val;
 use std::ops::RangeBounds;
 
+use super::admission::UserIndexSelector;
 use super::stream_stmt::{
     INDEX_SCAN_STREAM_OPERATION, StreamStmtState, TABLE_SCAN_STREAM_OPERATION,
 };
@@ -25,13 +27,18 @@ impl Transaction {
     pub async fn table_lookup_unique_mvcc(
         &mut self,
         table_id: TableID,
-        index_no: usize,
+        index_id: IndexID,
         key_vals: &[Val],
         user_read_set: &[usize],
     ) -> Result<SelectMvcc> {
         self.exec(async move |stmt| {
-            stmt.table_lookup_unique_mvcc(table_id, index_no, key_vals, user_read_set)
-                .await
+            stmt.table_lookup_unique_mvcc(
+                table_id,
+                UserIndexSelector::ID(index_id),
+                key_vals,
+                user_read_set,
+            )
+            .await
         })
         .await
     }
@@ -41,13 +48,18 @@ impl Transaction {
     pub async fn table_index_lookup_mvcc(
         &mut self,
         table_id: TableID,
-        index_no: usize,
+        index_id: IndexID,
         key_vals: &[Val],
         user_read_set: &[usize],
     ) -> Result<ScanMvcc> {
         self.exec(async move |stmt| {
-            stmt.table_index_lookup_mvcc(table_id, index_no, key_vals, user_read_set)
-                .await
+            stmt.table_index_lookup_mvcc(
+                table_id,
+                UserIndexSelector::ID(index_id),
+                key_vals,
+                user_read_set,
+            )
+            .await
         })
         .await
     }
@@ -57,7 +69,7 @@ impl Transaction {
     pub async fn table_index_scan_mvcc<'r, R>(
         &mut self,
         table_id: TableID,
-        index_no: usize,
+        index_id: IndexID,
         range: R,
         read_set: &[usize],
     ) -> Result<ScanMvcc>
@@ -65,7 +77,7 @@ impl Transaction {
         R: RangeBounds<&'r [Val]>,
     {
         self.exec(async move |stmt| {
-            stmt.table_index_scan_mvcc(table_id, index_no, range, read_set)
+            stmt.table_index_scan_mvcc(table_id, UserIndexSelector::ID(index_id), range, read_set)
                 .await
         })
         .await
@@ -90,7 +102,7 @@ impl Transaction {
     pub async fn table_index_mutate_mvcc<'r, R, F>(
         &mut self,
         table_id: TableID,
-        index_no: usize,
+        index_id: IndexID,
         range: R,
         mutate_row: F,
     ) -> Result<TableMutationOutcome>
@@ -99,8 +111,13 @@ impl Transaction {
         F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<RowMutation>,
     {
         self.exec(async move |stmt| {
-            stmt.table_index_mutate_mvcc(table_id, index_no, range, mutate_row)
-                .await
+            stmt.table_index_mutate_mvcc(
+                table_id,
+                UserIndexSelector::ID(index_id),
+                range,
+                mutate_row,
+            )
+            .await
         })
         .await
     }
@@ -128,11 +145,11 @@ impl Transaction {
     pub async fn table_upsert_unique_mvcc(
         &mut self,
         table_id: TableID,
-        unique_index_no: usize,
+        index_id: IndexID,
         cols: Vec<Val>,
     ) -> Result<UpsertMvcc> {
         self.exec(async move |stmt| {
-            stmt.table_upsert_unique_mvcc(table_id, unique_index_no, cols)
+            stmt.table_upsert_unique_mvcc(table_id, UserIndexSelector::ID(index_id), cols)
                 .await
         })
         .await
@@ -143,13 +160,18 @@ impl Transaction {
     pub async fn table_update_unique_mvcc(
         &mut self,
         table_id: TableID,
-        index_no: usize,
+        index_id: IndexID,
         key_vals: &[Val],
         update: Vec<UpdateCol>,
     ) -> Result<UpdateMvcc> {
         self.exec(async move |stmt| {
-            stmt.table_update_unique_mvcc(table_id, index_no, key_vals, update)
-                .await
+            stmt.table_update_unique_mvcc(
+                table_id,
+                UserIndexSelector::ID(index_id),
+                key_vals,
+                update,
+            )
+            .await
         })
         .await
     }
@@ -159,11 +181,11 @@ impl Transaction {
     pub async fn table_delete_unique_mvcc(
         &mut self,
         table_id: TableID,
-        index_no: usize,
+        index_id: IndexID,
         key_vals: &[Val],
     ) -> Result<DeleteMvcc> {
         self.exec(async move |stmt| {
-            stmt.table_delete_unique_mvcc(table_id, index_no, key_vals)
+            stmt.table_delete_unique_mvcc(table_id, UserIndexSelector::ID(index_id), key_vals)
                 .await
         })
         .await
@@ -174,7 +196,7 @@ impl Transaction {
     pub async fn table_index_scan_mvcc_stream<'trx, 'r, R>(
         &'trx mut self,
         table_id: TableID,
-        index_no: usize,
+        index_id: IndexID,
         range: R,
         read_set: &[usize],
     ) -> Result<IndexScanMvccStream<'trx>>
@@ -191,7 +213,101 @@ impl Transaction {
             dml_validation_disabled,
             INDEX_SCAN_STREAM_OPERATION,
         )
-        .table_index_scan_mvcc_stream(table_id, index_no, range, read_set)
+        .table_index_scan_mvcc_stream(table_id, index_id, range, read_set)
+        .await
+    }
+
+    /// Resolves one stable user-index identity into a reusable non-pinning token.
+    #[inline]
+    pub async fn resolve_user_index(
+        &mut self,
+        table_id: TableID,
+        index_id: IndexID,
+    ) -> Result<ResolvedUserIndex> {
+        self.exec(async move |stmt| stmt.resolve_user_index(table_id, index_id).await)
+            .await
+    }
+
+    /// Looks up one visible row using a directly revalidated resolved index.
+    #[inline]
+    pub async fn table_lookup_unique_mvcc_resolved(
+        &mut self,
+        index: ResolvedUserIndex,
+        key_vals: &[Val],
+        user_read_set: &[usize],
+    ) -> Result<SelectMvcc> {
+        let table_id = index.table_id();
+        let selector = UserIndexSelector::Resolved(index.index_ref());
+        self.exec(async move |stmt| {
+            stmt.table_lookup_unique_mvcc(table_id, selector, key_vals, user_read_set)
+                .await
+        })
+        .await
+    }
+
+    /// Looks up visible rows using a directly revalidated resolved index.
+    #[inline]
+    pub async fn table_index_lookup_mvcc_resolved(
+        &mut self,
+        index: ResolvedUserIndex,
+        key_vals: &[Val],
+        user_read_set: &[usize],
+    ) -> Result<ScanMvcc> {
+        let table_id = index.table_id();
+        let selector = UserIndexSelector::Resolved(index.index_ref());
+        self.exec(async move |stmt| {
+            stmt.table_index_lookup_mvcc(table_id, selector, key_vals, user_read_set)
+                .await
+        })
+        .await
+    }
+
+    /// Upserts one row using a directly revalidated resolved unique index.
+    #[inline]
+    pub async fn table_upsert_unique_mvcc_resolved(
+        &mut self,
+        index: ResolvedUserIndex,
+        cols: Vec<Val>,
+    ) -> Result<UpsertMvcc> {
+        let table_id = index.table_id();
+        let selector = UserIndexSelector::Resolved(index.index_ref());
+        self.exec(async move |stmt| {
+            stmt.table_upsert_unique_mvcc(table_id, selector, cols)
+                .await
+        })
+        .await
+    }
+
+    /// Updates one row using a directly revalidated resolved unique index.
+    #[inline]
+    pub async fn table_update_unique_mvcc_resolved(
+        &mut self,
+        index: ResolvedUserIndex,
+        key_vals: &[Val],
+        update: Vec<UpdateCol>,
+    ) -> Result<UpdateMvcc> {
+        let table_id = index.table_id();
+        let selector = UserIndexSelector::Resolved(index.index_ref());
+        self.exec(async move |stmt| {
+            stmt.table_update_unique_mvcc(table_id, selector, key_vals, update)
+                .await
+        })
+        .await
+    }
+
+    /// Deletes one row using a directly revalidated resolved unique index.
+    #[inline]
+    pub async fn table_delete_unique_mvcc_resolved(
+        &mut self,
+        index: ResolvedUserIndex,
+        key_vals: &[Val],
+    ) -> Result<DeleteMvcc> {
+        let table_id = index.table_id();
+        let selector = UserIndexSelector::Resolved(index.index_ref());
+        self.exec(async move |stmt| {
+            stmt.table_delete_unique_mvcc(table_id, selector, key_vals)
+                .await
+        })
         .await
     }
 
@@ -224,10 +340,12 @@ impl Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::{IndexAttributes, IndexKeySpec, IndexSpec};
     use crate::error::{ErrorKind, OperationError};
     use crate::lock::{LockMode, LockResource};
     use crate::row::ops::SelectMvcc;
     use crate::table::tests::{create_table2_for_test, lightweight_test_engine};
+    use crate::table::{Table, TableRuntimeLayout};
     use tempfile::TempDir;
 
     fn row(id: i32, name: &str) -> Vec<Val> {
@@ -253,7 +371,12 @@ mod tests {
             assert!(row_ids.windows(2).all(|pair| pair[0] < pair[1]));
             for (id, name) in [(1, "one"), (2, "two"), (3, "three")] {
                 let selected = trx
-                    .table_lookup_unique_mvcc(table_id, 0, &[Val::from(id)], &[0, 1])
+                    .table_lookup_unique_mvcc(
+                        table_id,
+                        crate::IndexID::new(0),
+                        &[Val::from(id)],
+                        &[0, 1],
+                    )
                     .await
                     .unwrap();
                 assert_eq!(selected, SelectMvcc::Found(row(id, name)));
@@ -288,9 +411,14 @@ mod tests {
                 );
             }
             assert_eq!(
-                trx.table_lookup_unique_mvcc(table_id, 0, &[Val::from(1)], &[0, 1])
-                    .await
-                    .unwrap(),
+                trx.table_lookup_unique_mvcc(
+                    table_id,
+                    crate::IndexID::new(0),
+                    &[Val::from(1)],
+                    &[0, 1]
+                )
+                .await
+                .unwrap(),
                 SelectMvcc::NotFound
             );
             trx.rollback().await.unwrap();
@@ -313,9 +441,14 @@ mod tests {
             assert_eq!(err.operation_error(), Some(OperationError::DuplicateKey));
             assert!(format!("{:?}", err.report()).contains("batch_index=1"));
             assert_eq!(
-                trx.table_lookup_unique_mvcc(table_id, 0, &[Val::from(1)], &[0, 1])
-                    .await
-                    .unwrap(),
+                trx.table_lookup_unique_mvcc(
+                    table_id,
+                    crate::IndexID::new(0),
+                    &[Val::from(1)],
+                    &[0, 1]
+                )
+                .await
+                .unwrap(),
                 SelectMvcc::NotFound
             );
             assert!(
@@ -362,7 +495,7 @@ mod tests {
                 "empty batch must not allocate a row id",
             );
             let mut stream = trx
-                .table_index_scan_mvcc_stream(table_id, 0, .., &[0, 1])
+                .table_index_scan_mvcc_stream(table_id, crate::IndexID::new(0), .., &[0, 1])
                 .await
                 .unwrap();
             assert_eq!(stream.next().await.unwrap(), Some(row(1, "one")));
@@ -370,6 +503,196 @@ mod tests {
             drop(stream);
             trx.noop().await.unwrap();
             trx.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn resolved_user_index_uses_direct_generation_validation() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "resolved_user_index").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+
+            TableRuntimeLayout::reset_index_access_counters();
+            Table::reset_retirement_registry_access_count();
+            let mut insert = session.begin_trx().unwrap();
+            insert
+                .table_insert_mvcc(table_id, row(1, "one"))
+                .await
+                .unwrap();
+            insert.commit().await.unwrap();
+            let (map, direct, iterations) = TableRuntimeLayout::index_access_counters();
+            assert_eq!(map, 0);
+            assert_eq!(direct, 0);
+            assert!(iterations >= 1);
+
+            let non_unique_id = session
+                .create_index(
+                    table_id,
+                    IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(non_unique_id, IndexID::new(1));
+            Table::reset_retirement_registry_access_count();
+
+            TableRuntimeLayout::reset_index_access_counters();
+            let mut normal_point = session.begin_trx().unwrap();
+            assert_eq!(
+                normal_point
+                    .table_lookup_unique_mvcc(table_id, IndexID::new(0), &[Val::from(1)], &[0, 1],)
+                    .await
+                    .unwrap(),
+                SelectMvcc::Found(row(1, "one"))
+            );
+            normal_point.rollback().await.unwrap();
+            assert_eq!(TableRuntimeLayout::index_access_counters().0, 1);
+
+            TableRuntimeLayout::reset_index_access_counters();
+            let mut normal_equality = session.begin_trx().unwrap();
+            assert!(
+                normal_equality
+                    .table_index_lookup_mvcc(table_id, non_unique_id, &[Val::from("one")], &[0, 1],)
+                    .await
+                    .unwrap()
+                    .has_rows()
+            );
+            normal_equality.rollback().await.unwrap();
+            assert_eq!(TableRuntimeLayout::index_access_counters().0, 1);
+
+            TableRuntimeLayout::reset_index_access_counters();
+            let mut normal_range = session.begin_trx().unwrap();
+            assert!(
+                normal_range
+                    .table_index_scan_mvcc(table_id, non_unique_id, .., &[0, 1])
+                    .await
+                    .unwrap()
+                    .has_rows()
+            );
+            normal_range.rollback().await.unwrap();
+            assert_eq!(TableRuntimeLayout::index_access_counters().0, 1);
+
+            TableRuntimeLayout::reset_index_access_counters();
+            let mut normal_stream = session.begin_trx().unwrap();
+            let mut stream = normal_stream
+                .table_index_scan_mvcc_stream(table_id, non_unique_id, .., &[0, 1])
+                .await
+                .unwrap();
+            assert_eq!(stream.next().await.unwrap(), Some(row(1, "one")));
+            assert_eq!(stream.next().await.unwrap(), None);
+            drop(stream);
+            normal_stream.rollback().await.unwrap();
+            assert_eq!(TableRuntimeLayout::index_access_counters().0, 1);
+
+            TableRuntimeLayout::reset_index_access_counters();
+            let mut normal_mutation = session.begin_trx().unwrap();
+            assert_eq!(
+                normal_mutation
+                    .table_index_mutate_mvcc(table_id, non_unique_id, .., |_| {
+                        Ok(RowMutation::Skip)
+                    })
+                    .await
+                    .unwrap(),
+                TableMutationOutcome::default()
+            );
+            normal_mutation.rollback().await.unwrap();
+            assert_eq!(TableRuntimeLayout::index_access_counters().0, 1);
+
+            TableRuntimeLayout::reset_index_access_counters();
+            let mut resolver = session.begin_trx().unwrap();
+            let resolved = resolver
+                .resolve_user_index(table_id, IndexID::new(0))
+                .await
+                .unwrap();
+            resolver.rollback().await.unwrap();
+            assert_eq!(resolved.table_id(), table_id);
+            assert_eq!(resolved.index_id(), IndexID::new(0));
+            assert_eq!(TableRuntimeLayout::index_access_counters(), (1, 0, 0));
+
+            TableRuntimeLayout::reset_index_access_counters();
+            let mut equality_resolver = session.begin_trx().unwrap();
+            let resolved_non_unique = equality_resolver
+                .resolve_user_index(table_id, non_unique_id)
+                .await
+                .unwrap();
+            equality_resolver.rollback().await.unwrap();
+            assert_eq!(TableRuntimeLayout::index_access_counters(), (1, 0, 0));
+
+            TableRuntimeLayout::reset_index_access_counters();
+            let mut read = session.begin_trx().unwrap();
+            assert_eq!(
+                read.table_lookup_unique_mvcc_resolved(resolved, &[Val::from(1)], &[0, 1],)
+                    .await
+                    .unwrap(),
+                SelectMvcc::Found(row(1, "one"))
+            );
+            read.rollback().await.unwrap();
+            assert_eq!(TableRuntimeLayout::index_access_counters(), (0, 1, 0));
+
+            TableRuntimeLayout::reset_index_access_counters();
+            let mut equality = session.begin_trx().unwrap();
+            assert!(
+                equality
+                    .table_index_lookup_mvcc_resolved(
+                        resolved_non_unique,
+                        &[Val::from("one")],
+                        &[0, 1],
+                    )
+                    .await
+                    .unwrap()
+                    .has_rows()
+            );
+            equality.rollback().await.unwrap();
+            assert_eq!(TableRuntimeLayout::index_access_counters(), (0, 1, 0));
+
+            TableRuntimeLayout::reset_index_access_counters();
+            let mut write = session.begin_trx().unwrap();
+            assert!(
+                write
+                    .table_update_unique_mvcc_resolved(
+                        resolved,
+                        &[Val::from(1)],
+                        vec![UpdateCol {
+                            idx: 1,
+                            val: Val::from("updated"),
+                        }],
+                    )
+                    .await
+                    .unwrap()
+                    .is_updated()
+            );
+            write.rollback().await.unwrap();
+            assert_eq!(TableRuntimeLayout::index_access_counters(), (0, 1, 0));
+
+            TableRuntimeLayout::reset_index_access_counters();
+            let mut delete = session.begin_trx().unwrap();
+            assert!(
+                delete
+                    .table_delete_unique_mvcc_resolved(resolved, &[Val::from(1)])
+                    .await
+                    .unwrap()
+                    .is_deleted()
+            );
+            delete.rollback().await.unwrap();
+            let (map, direct, _) = TableRuntimeLayout::index_access_counters();
+            assert_eq!(map, 0);
+            assert_eq!(direct, 1);
+
+            TableRuntimeLayout::reset_index_access_counters();
+            let mut upsert = session.begin_trx().unwrap();
+            assert!(
+                upsert
+                    .table_upsert_unique_mvcc_resolved(resolved, row(1, "upserted"))
+                    .await
+                    .unwrap()
+                    .is_updated()
+            );
+            upsert.rollback().await.unwrap();
+            let (map, direct, _) = TableRuntimeLayout::index_access_counters();
+            assert_eq!(map, 0);
+            assert_eq!(direct, 1);
+            assert_eq!(Table::retirement_registry_access_count(), 0);
         });
     }
 

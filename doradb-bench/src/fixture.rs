@@ -1,7 +1,7 @@
 use crate::error::{BenchError, Result};
 use doradb_storage::id::{TableID, TrxID};
 use doradb_storage::{
-    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableSpec, ValKind,
+    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexSpec, TableSpec, ValKind,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -630,14 +630,17 @@ pub(crate) fn benchmark_table_spec() -> TableSpec {
 pub(crate) fn benchmark_index_specs(index: IndexMode) -> Vec<IndexSpec> {
     match index {
         IndexMode::None => Vec::new(),
-        IndexMode::Unique => vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
+        IndexMode::Unique => vec![IndexSpec::new(
+            vec![IndexKeySpec::new(0)],
+            IndexAttributes::UK,
+        )],
         IndexMode::NonUnique => vec![benchmark_non_unique_index_spec()],
     }
 }
 
 /// Build the standard non-unique logical-key index.
 pub(crate) fn benchmark_non_unique_index_spec() -> IndexSpec {
-    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::empty())
+    IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::empty())
 }
 
 fn validate_index(actual: IndexMode, requirement: IndexRequirement) -> Result<()> {

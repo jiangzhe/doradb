@@ -1,5 +1,7 @@
 use super::TrxInner;
-use crate::catalog::{CurrentTableState, ResolvedLiveMetadata, ResolvedVisibleTableMetadata};
+use crate::catalog::{
+    CurrentTableState, IndexID, IndexRef, ResolvedLiveMetadata, ResolvedVisibleTableMetadata,
+};
 use crate::engine::EngineCore;
 use crate::error::{MultiDomainResultExt, OperationError, OperationOrFatalResult, OperationResult};
 use crate::id::{TableID, TrxID};
@@ -11,19 +13,19 @@ use std::sync::Arc;
 
 /// Schema contract requested by one foreground user-table operation.
 #[derive(Clone, Copy)]
-pub(crate) enum TableAdmissionRequest {
+pub(super) enum TableAdmissionRequest {
     TableRead,
-    IndexRead { index_no: usize },
+    IndexRead { selector: UserIndexSelector },
     TableWrite,
-    IndexWrite { index_no: usize },
+    IndexWrite { selector: UserIndexSelector },
 }
 
 impl TableAdmissionRequest {
     #[inline]
-    fn index_no(self) -> Option<usize> {
+    fn selector(self) -> Option<UserIndexSelector> {
         match self {
             Self::TableRead | Self::TableWrite => None,
-            Self::IndexRead { index_no } | Self::IndexWrite { index_no } => Some(index_no),
+            Self::IndexRead { selector } | Self::IndexWrite { selector } => Some(selector),
         }
     }
 
@@ -32,6 +34,62 @@ impl TableAdmissionRequest {
         matches!(self, Self::TableWrite | Self::IndexWrite { .. })
     }
 }
+
+/// Private selector used by normal and opaque-token index admission.
+#[derive(Clone, Copy)]
+pub(super) enum UserIndexSelector {
+    ID(IndexID),
+    Resolved(IndexRef),
+}
+
+impl UserIndexSelector {
+    #[inline]
+    fn index_id(self) -> IndexID {
+        match self {
+            Self::ID(index_id) => index_id,
+            Self::Resolved(index) => index.id(),
+        }
+    }
+
+    #[inline]
+    fn resolve(
+        self,
+        layout: &TableRuntimeLayout,
+        table_id: TableID,
+        operation: &'static str,
+    ) -> OperationResult<IndexRef> {
+        match self {
+            Self::ID(index_id) => layout.resolve_index_id(index_id).ok_or_else(|| {
+                Report::new(OperationError::SchemaChanged).attach(format!(
+                    "operation={operation}, table_id={table_id}, index_id={index_id}"
+                ))
+            }),
+            Self::Resolved(index) => {
+                if !layout.validate_index_ref(index) {
+                    return Err(Report::new(OperationError::SchemaChanged).attach(format!(
+                        "operation={operation}, table_id={table_id}, index={index}"
+                    )));
+                }
+                Ok(index)
+            }
+        }
+    }
+}
+
+/// Successfully admitted table operation with its pinned layout.
+pub(super) struct AdmittedUserTable {
+    pub(super) table: Arc<Table>,
+    pub(super) layout: Arc<TableRuntimeLayout>,
+}
+
+/// Successfully admitted indexed operation with its exact active generation.
+pub(super) struct AdmittedUserIndex {
+    pub(super) table: Arc<Table>,
+    pub(super) layout: Arc<TableRuntimeLayout>,
+    pub(super) index: IndexRef,
+}
+
+pub(super) type AdmittedOperationParts = (Arc<Table>, Arc<TableRuntimeLayout>, Option<IndexRef>);
 
 /// Positive transaction-lifetime binding between visible schema and current runtime.
 pub(super) struct TransactionTableBinding {
@@ -43,44 +101,50 @@ pub(super) struct TransactionTableBinding {
 
 impl TransactionTableBinding {
     #[inline]
-    fn validate(
+    pub(super) fn validate(
         &self,
         table_id: TableID,
         request: TableAdmissionRequest,
         operation: &'static str,
-    ) -> OperationResult<()> {
-        if let Some(index_no) = request.index_no() {
+    ) -> OperationResult<Option<IndexRef>> {
+        let mut admitted_index = None;
+        if let Some(selector) = request.selector() {
+            let index_id = selector.index_id();
+            let visible_index_slot = index_id
+                .transitional_slot()
+                .ok()
+                .filter(|slot| self.visible.metadata().idx.index_spec(*slot).is_some())
+                .ok_or_else(|| {
+                    Report::new(OperationError::IndexNotFound).attach(format!(
+                        "operation={operation}, table_id={table_id}, index_id={index_id}"
+                    ))
+                })?;
             let visible_spec = self
                 .visible
                 .metadata()
                 .idx
-                .index_spec(index_no)
+                .index_spec(visible_index_slot)
+                .expect("visible index presence was established above");
+            let index = selector.resolve(&self.layout, table_id, operation)?;
+            let current_spec = self
+                .layout
+                .metadata()
+                .idx
+                .index_spec(index.slot())
                 .ok_or_else(|| {
-                    Report::new(OperationError::IndexNotFound).attach(format!(
-                        "operation={operation}, table_id={table_id}, index_no={index_no}"
+                    Report::new(OperationError::SchemaChanged).attach(format!(
+                        "operation={operation}, table_id={table_id}, index={index}"
                     ))
                 })?;
-            let current_spec =
-                self.layout
-                    .metadata()
-                    .idx
-                    .index_spec(index_no)
-                    .ok_or_else(|| {
-                        Report::new(OperationError::SchemaChanged).attach(format!(
-                            "operation={operation}, table_id={table_id}, index_no={index_no}"
-                        ))
-                    })?;
             assert_eq!(
                 visible_spec, current_spec,
-                "stable index specification changed across metadata versions: table_id={table_id}, index_no={index_no}"
+                "stable index specification changed across metadata versions: table_id={table_id}, index={index}"
             );
             assert!(
-                self.layout
-                    .secondary_indexes()
-                    .get(index_no)
-                    .is_some_and(Option::is_some),
-                "active current index is missing its runtime: table_id={table_id}, index_no={index_no}"
+                self.layout.index_entry(index).is_ok(),
+                "active current index is missing its runtime: table_id={table_id}, index={index}"
             );
+            admitted_index = Some(index);
         }
 
         if request.is_write() && self.visible.effective_cts() != self.bound_current_effective_cts {
@@ -90,11 +154,11 @@ impl TransactionTableBinding {
                 self.bound_current_effective_cts
             )));
         }
-        Ok(())
+        Ok(admitted_index)
     }
 
     #[inline]
-    fn operation_parts(&self) -> (Arc<Table>, Arc<TableRuntimeLayout>) {
+    pub(super) fn operation_parts(&self) -> (Arc<Table>, Arc<TableRuntimeLayout>) {
         (Arc::clone(&self.table), Arc::clone(&self.layout))
     }
 }
@@ -176,34 +240,13 @@ pub(crate) fn resolve_table_read_binding(
 }
 
 #[inline]
-fn admit_cached_binding(
-    inner: &TrxInner,
-    table_id: TableID,
-    metadata_resource: LockResource,
-    request: TableAdmissionRequest,
-    operation: &'static str,
-) -> OperationResult<Option<(Arc<Table>, Arc<TableRuntimeLayout>)>> {
-    let Some(binding) = inner.table_bindings.get(&table_id) else {
-        return Ok(None);
-    };
-    assert!(
-        inner
-            .checked_lock_state()
-            .covers(metadata_resource, LockMode::Shared),
-        "transaction table binding requires cached metadata S: table_id={table_id}"
-    );
-    binding.validate(table_id, request, operation)?;
-    Ok(Some(binding.operation_parts()))
-}
-
-#[inline]
 fn resolve_table_binding(
     attachment: &TrxAttachment,
     sts: TrxID,
     table_id: TableID,
     request: TableAdmissionRequest,
     operation: &'static str,
-) -> OperationResult<TransactionTableBinding> {
+) -> OperationResult<(TransactionTableBinding, Option<IndexRef>)> {
     let binding = resolve_table_read_binding(attachment.engine(), sts, table_id, operation)?;
     let binding = TransactionTableBinding {
         visible: binding.visible,
@@ -211,8 +254,8 @@ fn resolve_table_binding(
         table: binding.table,
         layout: binding.layout,
     };
-    binding.validate(table_id, request, operation)?;
-    Ok(binding)
+    let index = binding.validate(table_id, request, operation)?;
+    Ok((binding, index))
 }
 
 #[inline]
@@ -221,7 +264,8 @@ fn install_table_binding(
     attachment: &TrxAttachment,
     table_id: TableID,
     binding: TransactionTableBinding,
-) -> (Arc<Table>, Arc<TableRuntimeLayout>) {
+    index: Option<IndexRef>,
+) -> AdmittedOperationParts {
     let (table, layout) = binding.operation_parts();
     let previous = inner.table_bindings.insert(table_id, binding);
     assert!(
@@ -229,7 +273,7 @@ fn install_table_binding(
         "binding miss installation replaced an existing binding: table_id={table_id}"
     );
     attachment.cache_user_table(&table);
-    (table, layout)
+    (table, layout, index)
 }
 
 /// Admit one foreground user-table operation through a binding hit or locked miss.
@@ -237,13 +281,13 @@ fn install_table_binding(
 /// A successful first touch binds snapshot-visible metadata to the current
 /// runtime and keeps that contract stable under transaction-owned metadata S.
 /// Later operations reuse the binding and validate only their requested shape.
-pub(super) async fn admit_user_table(
+async fn admit_user_operation(
     inner: &mut TrxInner,
     attachment: &TrxAttachment,
     table_id: TableID,
     request: TableAdmissionRequest,
     operation: &'static str,
-) -> OperationOrFatalResult<(Arc<Table>, Arc<TableRuntimeLayout>)> {
+) -> OperationOrFatalResult<AdmittedOperationParts> {
     if table_id.is_catalog() {
         return Err(Report::new(OperationError::TableNotFound)
             .attach(format!("operation={operation}, table_id={table_id}"))
@@ -259,7 +303,7 @@ pub(super) async fn admit_user_table(
     // The transaction metadata lock already protects a cached binding, so the
     // operation can validate and reuse it without another lock acquisition.
     if let Some(parts) =
-        admit_cached_binding(inner, table_id, metadata_resource, request, operation)?
+        inner.admit_cached_binding(table_id, metadata_resource, request, operation)?
     {
         return Ok(parts);
     }
@@ -284,22 +328,68 @@ pub(super) async fn admit_user_table(
     #[cfg(test)]
     tests::maybe_pause_after_transaction_metadata_grant().await;
 
-    let binding = resolve_table_binding(attachment, inner.sts(), table_id, request, operation)?;
-    Ok(install_table_binding(inner, attachment, table_id, binding))
+    let (binding, index) =
+        resolve_table_binding(attachment, inner.sts(), table_id, request, operation)?;
+    Ok(install_table_binding(
+        inner, attachment, table_id, binding, index,
+    ))
+}
+
+/// Admits one table-only operation.
+pub(super) async fn admit_user_table(
+    inner: &mut TrxInner,
+    attachment: &TrxAttachment,
+    table_id: TableID,
+    write: bool,
+    operation: &'static str,
+) -> OperationOrFatalResult<AdmittedUserTable> {
+    let request = if write {
+        TableAdmissionRequest::TableWrite
+    } else {
+        TableAdmissionRequest::TableRead
+    };
+    let (table, layout, index) =
+        admit_user_operation(inner, attachment, table_id, request, operation).await?;
+    assert!(index.is_none(), "table-only admission resolved an index");
+    Ok(AdmittedUserTable { table, layout })
+}
+
+/// Admits one indexed operation and returns its exact current generation.
+pub(super) async fn admit_user_index(
+    inner: &mut TrxInner,
+    attachment: &TrxAttachment,
+    table_id: TableID,
+    selector: UserIndexSelector,
+    write: bool,
+    operation: &'static str,
+) -> OperationOrFatalResult<AdmittedUserIndex> {
+    let request = if write {
+        TableAdmissionRequest::IndexWrite { selector }
+    } else {
+        TableAdmissionRequest::IndexRead { selector }
+    };
+    let (table, layout, index) =
+        admit_user_operation(inner, attachment, table_id, request, operation).await?;
+    let index = index.expect("indexed admission must return one exact reference");
+    Ok(AdmittedUserIndex {
+        table,
+        layout,
+        index,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::catalog::tests::table2;
-    use crate::catalog::{IndexAttributes, IndexKey, IndexSpec};
+    use crate::catalog::{IndexAttributes, IndexKeySpec, IndexSlot, IndexSpec};
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{Error, OperationError, Result};
     use crate::lock::LockOwner;
     use crate::lock::tests::{LockDebugEntryState, debug_snapshot};
     use crate::row::ops::ScanRowDecision;
-    use crate::table::TableTerminal;
+    use crate::table::{RuntimeIndexEntry, TableTerminal};
     use crate::trx::Transaction;
     use crate::value::Val;
     use std::cell::Cell;
@@ -438,6 +528,63 @@ mod tests {
     }
 
     #[test]
+    fn stale_resolved_token_rejects_replacement_generation_before_execution() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("stale_resolved_generation").await;
+            let table_id = table2(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let token = trx
+                .resolve_user_index(table_id, IndexID::new(0))
+                .await
+                .unwrap();
+
+            let current = {
+                let checkout = trx.checkout().unwrap();
+                Arc::clone(
+                    &checkout
+                        .inner()
+                        .table_bindings
+                        .get(&table_id)
+                        .unwrap()
+                        .layout,
+                )
+            };
+            let slot = IndexSlot::new(0);
+            let replacement_ref = IndexRef::new(IndexID::new(100), slot);
+            let runtime = Arc::clone(
+                current.secondary_indexes()[0]
+                    .as_ref()
+                    .unwrap()
+                    .runtime_arc(),
+            );
+            let replacement = Arc::new(TableRuntimeLayout::from_entries(
+                current.generation() + 1,
+                Arc::clone(current.metadata_arc()),
+                vec![Some(RuntimeIndexEntry::new(replacement_ref, runtime))].into_boxed_slice(),
+            ));
+            {
+                let mut checkout = trx.checkout().unwrap();
+                checkout
+                    .inner_mut()
+                    .table_bindings
+                    .get_mut(&table_id)
+                    .unwrap()
+                    .layout = replacement;
+            }
+
+            TableRuntimeLayout::reset_index_access_counters();
+            let err = trx
+                .table_lookup_unique_mvcc_resolved(token, &[Val::from(1i32)], &[0])
+                .await
+                .unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::SchemaChanged));
+            assert_eq!(TableRuntimeLayout::index_access_counters(), (0, 1, 0));
+            trx.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
     fn first_read_installs_binding_under_transaction_metadata_lock() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("admission_first_read_binding").await;
@@ -537,7 +684,7 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
 
             let err = trx
-                .table_lookup_unique_mvcc(table_id, 99, &[], &[0])
+                .table_lookup_unique_mvcc(table_id, crate::IndexID::new(99), &[], &[0])
                 .await
                 .unwrap_err();
             assert_eq!(operation_error(&err), Some(OperationError::IndexNotFound));
@@ -634,7 +781,10 @@ mod tests {
 
                 let mut ddl_session = engine.new_session().unwrap();
                 ddl_session
-                    .create_index(table_id, IndexSpec::new(vec![IndexKey::new(1)], attributes))
+                    .create_index(
+                        table_id,
+                        IndexSpec::new(vec![IndexKeySpec::new(1)], attributes),
+                    )
                     .await
                     .unwrap();
 
@@ -713,14 +863,22 @@ mod tests {
                 let trx_owner = LockOwner::transaction(old_session_id, old_trx.trx_id());
 
                 let mut ddl_session = engine.new_session().unwrap();
-                let new_index_no = ddl_session
-                    .create_index(table_id, IndexSpec::new(vec![IndexKey::new(1)], attributes))
+                let new_index_id = ddl_session
+                    .create_index(
+                        table_id,
+                        IndexSpec::new(vec![IndexKeySpec::new(1)], attributes),
+                    )
                     .await
                     .unwrap();
 
                 touch_table_read(&mut old_trx, table_id).await.unwrap();
                 let surviving = old_trx
-                    .table_lookup_unique_mvcc(table_id, 0, &[Val::from(7i32)], &[0])
+                    .table_lookup_unique_mvcc(
+                        table_id,
+                        crate::IndexID::new(0),
+                        &[Val::from(7i32)],
+                        &[0],
+                    )
                     .await
                     .unwrap();
                 assert!(matches!(surviving, crate::row::ops::SelectMvcc::NotFound));
@@ -728,7 +886,7 @@ mod tests {
                 let new_index_err = old_trx
                     .table_index_lookup_mvcc(
                         table_id,
-                        usize::from(new_index_no),
+                        new_index_id,
                         &[Val::from(&b"new"[..])],
                         &[0],
                     )
@@ -771,7 +929,7 @@ mod tests {
                     let fresh_result = fresh_trx
                         .table_lookup_unique_mvcc(
                             table_id,
-                            usize::from(new_index_no),
+                            new_index_id,
                             &[Val::from(&b"new"[..])],
                             &[0],
                         )
@@ -785,7 +943,7 @@ mod tests {
                     let fresh_result = fresh_trx
                         .table_index_lookup_mvcc(
                             table_id,
-                            usize::from(new_index_no),
+                            new_index_id,
                             &[Val::from(&b"new"[..])],
                             &[0],
                         )
@@ -835,7 +993,7 @@ mod tests {
                 .effective_cts();
             let mut create = Box::pin(ddl_session.create_index(
                 table_id,
-                IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty()),
             ));
             observe_metadata_x_waiter(&engine, metadata, create.as_mut()).await;
             assert_eq!(
@@ -858,7 +1016,7 @@ mod tests {
             );
 
             bound_trx.commit().await.unwrap();
-            assert_eq!(create.await.unwrap(), 1);
+            assert_eq!(create.await.unwrap(), crate::IndexID::new(1));
             assert_no_table_locks(&engine, table_id);
 
             drop(ddl_session);
@@ -874,10 +1032,10 @@ mod tests {
             let table_id = table2(&engine).await;
             let metadata_resource = LockResource::TableMetadata(table_id);
             let mut ddl_session = engine.new_session().unwrap();
-            let index_no = ddl_session
+            let index_id = ddl_session
                 .create_index(
                     table_id,
-                    IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                    IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty()),
                 )
                 .await
                 .unwrap();
@@ -903,7 +1061,7 @@ mod tests {
             let before_layout = table.layout_snapshot();
             let before_root = table.file().active_root_unchecked().clone();
 
-            let mut drop_index = Box::pin(ddl_session.drop_index(table_id, index_no));
+            let mut drop_index = Box::pin(ddl_session.drop_index(table_id, index_id));
             observe_metadata_x_waiter(&engine, metadata_resource, drop_index.as_mut()).await;
             assert!(owner_has_grant(
                 &engine,
@@ -923,12 +1081,13 @@ mod tests {
                     .live_table()
                     .is_some_and(|current| Arc::ptr_eq(current, &table))
             );
-            assert!(before_layout.secondary_indexes()[usize::from(index_no)].is_some());
+            let index_slot = usize::try_from(index_id.as_u32()).unwrap();
+            assert!(before_layout.secondary_indexes()[index_slot].is_some());
             assert_eq!(
                 table.layout_snapshot().generation(),
                 before_layout.generation()
             );
-            assert!(table.layout_snapshot().secondary_indexes()[usize::from(index_no)].is_some());
+            assert!(table.layout_snapshot().secondary_indexes()[index_slot].is_some());
             assert_eq!(
                 table.file().active_root_unchecked().root_ts,
                 before_root.root_ts
@@ -946,8 +1105,13 @@ mod tests {
             let CurrentTableState::Live { metadata, .. } = current else {
                 panic!("DROP INDEX must keep the table live");
             };
-            assert!(metadata.idx.index_spec(usize::from(index_no)).is_none());
-            assert!(table.layout_snapshot().secondary_indexes()[usize::from(index_no)].is_none());
+            assert!(
+                metadata
+                    .idx
+                    .index_spec(IndexSlot::try_from(index_slot).unwrap())
+                    .is_none()
+            );
+            assert!(table.layout_snapshot().secondary_indexes()[index_slot].is_none());
             assert_no_table_locks(&engine, table_id);
 
             drop(ddl_session);
@@ -1029,7 +1193,10 @@ mod tests {
             let old_owner = LockOwner::transaction(old_session_id, old_trx.trx_id());
 
             let mut ddl_session = engine.new_session().unwrap();
-            ddl_session.drop_index(table_id, 0).await.unwrap();
+            ddl_session
+                .drop_index(table_id, crate::IndexID::new(0))
+                .await
+                .unwrap();
             let visible = engine
                 .inner()
                 .core
@@ -1039,7 +1206,13 @@ mod tests {
             let ResolvedVisibleTableMetadata::Live(visible) = visible else {
                 panic!("untouched transaction should retain logical predecessor metadata");
             };
-            assert!(visible.metadata().idx.index_spec(0).is_some());
+            assert!(
+                visible
+                    .metadata()
+                    .idx
+                    .index_spec(IndexSlot::new(0))
+                    .is_some()
+            );
             let CurrentTableState::Live { metadata, .. } = engine
                 .inner()
                 .core
@@ -1049,10 +1222,15 @@ mod tests {
             else {
                 panic!("DROP INDEX must keep the table live");
             };
-            assert!(metadata.idx.index_spec(0).is_none());
+            assert!(metadata.idx.index_spec(IndexSlot::new(0)).is_none());
 
             let err = old_trx
-                .table_lookup_unique_mvcc(table_id, 0, &[Val::from(1i32)], &[0])
+                .table_lookup_unique_mvcc(
+                    table_id,
+                    crate::IndexID::new(0),
+                    &[Val::from(1i32)],
+                    &[0],
+                )
                 .await
                 .unwrap_err();
             assert_eq!(operation_error(&err), Some(OperationError::SchemaChanged));

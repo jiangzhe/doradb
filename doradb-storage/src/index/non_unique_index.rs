@@ -336,7 +336,7 @@ impl<P: BufferPool> GuardedNonUniqueMemIndex<'_, '_, P> {
 mod tests {
     use super::*;
     use crate::buffer::{FixedBufferPool, PoolRole};
-    use crate::catalog::{IndexAttributes, IndexKey};
+    use crate::catalog::{IndexAttributes, IndexKeySpec};
     use crate::index::btree::BTreeKeyEncoder;
     use crate::index::mem_index::MemIndexEntry;
     use crate::index::util::tests::drain_row_ids;
@@ -352,7 +352,7 @@ mod tests {
     ) -> NonUniqueMemIndex<FixedBufferPool> {
         let index_spec = IndexSpec::new(
             (0..types.len())
-                .map(|col_no| IndexKey::new(col_no as u16))
+                .map(|col_no| IndexKeySpec::new(col_no as u16))
                 .collect(),
             IndexAttributes::empty(),
         );

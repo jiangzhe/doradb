@@ -192,11 +192,12 @@ pub(in crate::trx) struct IndexPurge<K> {
 mod tests {
     use super::*;
     use crate::catalog::{
-        CATALOG_TABLE_ID_START, catalog_key_from_active_ordinal, user_key_from_active_slot,
+        CATALOG_TABLE_ID_START, IndexSlot, catalog_key_from_active_ordinal,
+        user_key_from_active_slot,
     };
 
-    fn create_test_key(index_no: usize) -> ResolvedUserIndexKey {
-        user_key_from_active_slot(index_no, vec![])
+    fn create_test_key(index_slot: IndexSlot) -> ResolvedUserIndexKey {
+        user_key_from_active_slot(index_slot, vec![])
     }
 
     #[test]
@@ -213,19 +214,23 @@ mod tests {
         log1.push_user(IndexUndo {
             table_id: TableID::new(1),
             row_id: RowID::new(1),
-            kind: IndexUndoKind::InsertUnique(create_test_key(1), false),
+            kind: IndexUndoKind::InsertUnique(create_test_key(IndexSlot::new(1)), false),
         });
 
         // Add entries to log2
         log2.push_user(IndexUndo {
             table_id: TableID::new(2),
             row_id: RowID::new(2),
-            kind: IndexUndoKind::DeferDelete(create_test_key(2), true),
+            kind: IndexUndoKind::DeferDelete(create_test_key(IndexSlot::new(2)), true),
         });
         log2.push_user(IndexUndo {
             table_id: TableID::new(3),
             row_id: RowID::new(3),
-            kind: IndexUndoKind::UpdateUnique(create_test_key(3), RowID::new(4), false),
+            kind: IndexUndoKind::UpdateUnique(
+                create_test_key(IndexSlot::new(3)),
+                RowID::new(4),
+                false,
+            ),
         });
 
         // Merge and verify
@@ -262,7 +267,7 @@ mod tests {
         logs.push_user(IndexUndo {
             table_id: TableID::new(9),
             row_id: RowID::new(11),
-            kind: IndexUndoKind::DeferDelete(create_test_key(5), false),
+            kind: IndexUndoKind::DeferDelete(create_test_key(IndexSlot::new(5)), false),
         });
 
         let IndexUndoEntry::User(user) = &logs.0[1] else {
@@ -275,7 +280,9 @@ mod tests {
         assert_eq!(key.index.slot().get(), 5);
 
         let purge = logs.commit_for_gc();
-        assert!(matches!(&purge[0], IndexPurgeEntry::Catalog(entry) if entry.key.index.get() == 3));
+        assert!(
+            matches!(&purge[0], IndexPurgeEntry::Catalog(entry) if entry.key.index_slot.get() == 3)
+        );
         assert!(matches!(&purge[1], IndexPurgeEntry::User(entry)
             if entry.key.index.id().get() == 5 && entry.key.index.slot().get() == 5));
     }

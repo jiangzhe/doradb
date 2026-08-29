@@ -1,6 +1,6 @@
 use crate::buffer::PoolGuards;
-use crate::catalog::spec::{ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexNo, IndexSpec};
-use crate::catalog::{Catalog, catalog_table_id_from_slot};
+use crate::catalog::spec::{ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexSpec};
+use crate::catalog::{Catalog, IndexSlot, catalog_table_id_from_slot};
 use crate::component::EnginePools;
 use crate::engine::EngineCore;
 use crate::error::{
@@ -416,25 +416,25 @@ pub(crate) struct IndexSpecs {
 impl IndexSpecs {
     #[inline]
     fn try_from_active(
-        next_index_no: IndexNo,
+        next_index_slot: IndexSlot,
         active_index_specs: Vec<ActiveIndexSpec>,
         col_count: usize,
     ) -> OperationResult<Self> {
-        let mut slots = vec![None; next_index_no as usize];
+        let mut slots = vec![None; next_index_slot.as_usize()];
         let mut active_count = 0usize;
         for active_index_spec in active_index_specs {
-            let index_no = active_index_spec.index_no as usize;
-            if index_no >= next_index_no as usize {
+            let index_slot = active_index_spec.index_slot;
+            if index_slot >= next_index_slot {
                 return Err(Report::new(OperationError::InvalidMetadata).attach(format!(
-                    "index_no {index_no} must be less than next_index_no {next_index_no}"
+                    "index_slot {index_slot} must be less than next_index_slot {next_index_slot}"
                 )));
             }
-            if slots[index_no].is_some() {
+            if slots[index_slot.as_usize()].is_some() {
                 return Err(Report::new(OperationError::InvalidMetadata)
-                    .attach(format!("duplicate index_no {index_no}")));
+                    .attach(format!("duplicate index_slot {index_slot}")));
             }
-            validate_index_spec(index_no, &active_index_spec.spec, col_count)?;
-            slots[index_no] = Some(active_index_spec.spec);
+            validate_index_spec(index_slot, &active_index_spec.spec, col_count)?;
+            slots[index_slot.as_usize()] = Some(active_index_spec.spec);
             active_count += 1;
         }
         Ok(Self {
@@ -443,7 +443,7 @@ impl IndexSpecs {
         })
     }
 
-    /// Returns the sparse slot count, equal to table metadata `next_index_no`.
+    /// Returns the sparse slot count, equal to table metadata `next_index_slot`.
     #[inline]
     pub(crate) fn len(&self) -> usize {
         self.slots.len()
@@ -457,11 +457,11 @@ impl IndexSpecs {
 
     /// Returns active secondary indexes with their stable slot numbers.
     #[inline]
-    pub(crate) fn active_indexes(&self) -> impl Iterator<Item = (usize, &IndexSpec)> {
-        self.slots
-            .iter()
-            .enumerate()
-            .filter_map(|(index_no, spec)| spec.as_ref().map(|spec| (index_no, spec)))
+    pub(crate) fn active_indexes(&self) -> impl Iterator<Item = (IndexSlot, &IndexSpec)> {
+        self.slots.iter().enumerate().filter_map(|(slot_no, spec)| {
+            spec.as_ref()
+                .map(|spec| (IndexSlot::try_from(slot_no).unwrap(), spec))
+        })
     }
 
     /// Returns active secondary-index specs only.
@@ -472,19 +472,21 @@ impl IndexSpecs {
 
     /// Returns one active secondary-index spec by stable slot number.
     #[inline]
-    pub(crate) fn get(&self, index_no: usize) -> Option<&IndexSpec> {
-        self.slots.get(index_no).and_then(Option::as_ref)
+    pub(crate) fn get(&self, index_slot: IndexSlot) -> Option<&IndexSpec> {
+        self.slots
+            .get(index_slot.as_usize())
+            .and_then(Option::as_ref)
     }
 }
 
-impl Index<usize> for IndexSpecs {
+impl Index<IndexSlot> for IndexSpecs {
     type Output = IndexSpec;
 
     #[inline]
-    fn index(&self, index: usize) -> &Self::Output {
-        self.get(index).unwrap_or_else(|| {
+    fn index(&self, index_slot: IndexSlot) -> &Self::Output {
+        self.get(index_slot).unwrap_or_else(|| {
             panic!(
-                "active index spec missing: index_no={index}, slot_count={}",
+                "active index spec missing: index_slot={index_slot}, slot_count={}",
                 self.len()
             )
         })
@@ -672,9 +674,9 @@ impl TableColumnLayout {
 /// Immutable sparse secondary-index layout for one table metadata envelope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableIndexLayout {
-    // next table-local index number to allocate.
-    next_index_no: IndexNo,
-    // secondary index slots keyed by stable table-local index number.
+    // Next physical table-local index slot to allocate.
+    next_index_slot: IndexSlot,
+    // Secondary index specs keyed by physical table-local slot.
     index_specs: IndexSpecs,
     // columns that are included in any index.
     index_cols: FastHashSet<usize>,
@@ -685,10 +687,10 @@ impl TableIndexLayout {
     fn try_create(
         column_layout: &TableColumnLayout,
         index_specs: Vec<ActiveIndexSpec>,
-        next_index_no: IndexNo,
+        next_index_slot: IndexSlot,
     ) -> OperationResult<Self> {
         let index_specs =
-            IndexSpecs::try_from_active(next_index_no, index_specs, column_layout.col_count())?;
+            IndexSpecs::try_from_active(next_index_slot, index_specs, column_layout.col_count())?;
         validate_primary_key_contract(column_layout, &index_specs)?;
         let mut index_cols = FastHashSet::default();
         for index_spec in index_specs.values() {
@@ -697,66 +699,63 @@ impl TableIndexLayout {
             }
         }
         Ok(Self {
-            next_index_no,
+            next_index_slot,
             index_specs,
             index_cols,
         })
     }
 
-    /// Returns the next table-local index number to allocate.
+    /// Returns the next physical table-local index slot to allocate.
     #[inline]
-    pub(crate) fn next_index_no(&self) -> IndexNo {
-        self.next_index_no
+    pub(crate) fn next_index_slot(&self) -> IndexSlot {
+        self.next_index_slot
     }
 
-    /// Allocates the next table-local index number and returns an index layout with
+    /// Allocates the next physical table-local slot and returns an index layout with
     /// the new active index appended in the corresponding sparse slot.
     #[inline]
     fn try_with_created_index(
         &self,
         column_layout: &TableColumnLayout,
         index_spec: IndexSpec,
-    ) -> OperationResult<(IndexNo, Self)> {
-        let index_no = self.next_index_no;
-        validate_index_spec(index_no as usize, &index_spec, column_layout.col_count())?;
-        let next_index_no = index_no.checked_add(1).ok_or_else(|| {
-            Report::new(OperationError::InvalidMetadata).attach("next_index_no overflow")
+    ) -> OperationResult<(IndexSlot, Self)> {
+        let index_slot = self.next_index_slot;
+        validate_index_spec(index_slot, &index_spec, column_layout.col_count())?;
+        let next_index_slot = index_slot.checked_next().ok_or_else(|| {
+            Report::new(OperationError::InvalidMetadata).attach("next_index_slot overflow")
         })?;
         let mut index_specs = self
             .active_indexes()
-            .map(|(index_no, spec)| ActiveIndexSpec::new(index_no as IndexNo, spec.clone()))
+            .map(|(slot, spec)| ActiveIndexSpec::new(slot, spec.clone()))
             .collect::<Vec<_>>();
-        index_specs.push(ActiveIndexSpec::new(index_no, index_spec));
-        let index_layout = Self::try_create(column_layout, index_specs, next_index_no)?;
-        Ok((index_no, index_layout))
+        index_specs.push(ActiveIndexSpec::new(index_slot, index_spec));
+        let index_layout = Self::try_create(column_layout, index_specs, next_index_slot)?;
+        Ok((index_slot, index_layout))
     }
 
     /// Returns an index layout with one active index slot made inactive.
     #[inline]
-    fn without_index(&self, column_layout: &TableColumnLayout, index_no: IndexNo) -> Self {
-        let index_no_usize = usize::from(index_no);
+    fn without_index(&self, column_layout: &TableColumnLayout, index_slot: IndexSlot) -> Self {
         assert!(
-            index_no_usize < self.index_slot_count(),
-            "drop-index metadata invariant violated: index_no={index_no}, next_index_no={}",
-            self.next_index_no
+            index_slot < self.next_index_slot,
+            "drop-index metadata invariant violated: index_slot={index_slot}, next_index_slot={}",
+            self.next_index_slot
         );
         assert!(
-            self.index_spec(index_no_usize).is_some(),
-            "drop-index metadata invariant violated: inactive index_no={index_no}, next_index_no={}",
-            self.next_index_no
+            self.index_spec(index_slot).is_some(),
+            "drop-index metadata invariant violated: inactive index_slot={index_slot}, next_index_slot={}",
+            self.next_index_slot
         );
 
         let index_specs = self
             .active_indexes()
-            .filter(|(active_index_no, _)| *active_index_no != index_no_usize)
-            .map(|(active_index_no, spec)| {
-                ActiveIndexSpec::new(active_index_no as IndexNo, spec.clone())
-            })
+            .filter(|(active_slot, _)| *active_slot != index_slot)
+            .map(|(active_slot, spec)| ActiveIndexSpec::new(active_slot, spec.clone()))
             .collect::<Vec<_>>();
-        Self::try_create(column_layout, index_specs, self.next_index_no).unwrap_or_else(|err| {
+        Self::try_create(column_layout, index_specs, self.next_index_slot).unwrap_or_else(|err| {
             panic!(
-                "drop-index metadata rebuild invariant violated: index_no={index_no}, next_index_no={}, error={err:?}",
-                self.next_index_no
+                "drop-index metadata rebuild invariant violated: index_slot={index_slot}, next_index_slot={}, error={err:?}",
+                self.next_index_slot
             )
         })
     }
@@ -764,7 +763,7 @@ impl TableIndexLayout {
     /// Returns the sparse secondary-index slot count.
     #[inline]
     pub(crate) fn index_slot_count(&self) -> usize {
-        self.next_index_no as usize
+        self.next_index_slot.as_usize()
     }
 
     /// Returns the active secondary-index count.
@@ -775,30 +774,30 @@ impl TableIndexLayout {
 
     /// Returns active secondary indexes with their stable slot numbers.
     #[inline]
-    pub(crate) fn active_indexes(&self) -> impl Iterator<Item = (usize, &IndexSpec)> {
+    pub(crate) fn active_indexes(&self) -> impl Iterator<Item = (IndexSlot, &IndexSpec)> {
         self.index_specs.active_indexes()
     }
 
-    /// Returns one active secondary-index spec by stable index number.
+    /// Returns one active secondary-index spec by physical slot.
     #[inline]
-    pub(crate) fn index_spec(&self, index_no: usize) -> Option<&IndexSpec> {
-        self.index_specs.get(index_no)
+    pub(crate) fn index_spec(&self, slot: IndexSlot) -> Option<&IndexSpec> {
+        self.index_specs.get(slot)
     }
 
-    /// Requires one active secondary-index spec by stable index number.
+    /// Requires one active secondary-index spec by physical slot.
     #[inline]
-    pub(crate) fn require_index_spec(&self, index_no: usize) -> InternalResult<&IndexSpec> {
-        self.index_spec(index_no).ok_or_else(|| {
+    pub(crate) fn require_index_spec(&self, slot: IndexSlot) -> InternalResult<&IndexSpec> {
+        self.index_spec(slot).ok_or_else(|| {
             Report::new(InternalError::SecondaryIndexOutOfBounds).attach(format!(
-                "index_no={index_no}, index_slot_count={}",
+                "index_slot={slot}, index_slot_count={}",
                 self.index_slot_count()
             ))
         })
     }
 
-    /// Returns the primary-key index number and spec when this table has one.
+    /// Returns the primary-key index slot and spec when this table has one.
     #[inline]
-    pub(crate) fn primary_key_index(&self) -> Option<(usize, &IndexSpec)> {
+    pub(crate) fn primary_key_index(&self) -> Option<(IndexSlot, &IndexSpec)> {
         self.active_indexes()
             .find(|(_, index_spec)| index_spec.primary_key())
     }
@@ -820,10 +819,10 @@ impl TableIndexLayout {
     pub(crate) fn index_type_match(
         &self,
         column_layout: &TableColumnLayout,
-        index_no: usize,
+        slot: IndexSlot,
         vals: &[Val],
     ) -> bool {
-        let Some(index) = self.index_spec(index_no) else {
+        let Some(index) = self.index_spec(slot) else {
             return false;
         };
         if index.cols.len() != vals.len() {
@@ -840,13 +839,16 @@ impl TableIndexLayout {
     #[inline]
     pub(crate) fn keys_for_insert(&self, row: &[Val]) -> Vec<SelectKey> {
         self.active_indexes()
-            .map(|(index_no, is)| {
+            .map(|(slot, is)| {
                 let vals: Vec<Val> = is
                     .cols
                     .iter()
                     .map(|k| row[k.col_no as usize].clone())
                     .collect();
-                SelectKey { index_no, vals }
+                SelectKey {
+                    index_slot: slot,
+                    vals,
+                }
             })
             .collect()
     }
@@ -859,21 +861,24 @@ impl TableIndexLayout {
         row: Row<'_>,
     ) -> Vec<SelectKey> {
         self.active_indexes()
-            .map(|(index_no, is)| {
+            .map(|(slot, is)| {
                 let vals: Vec<Val> = is
                     .cols
                     .iter()
                     .map(|k| row.val(column_layout, k.col_no as usize))
                     .collect();
-                SelectKey { index_no, vals }
+                SelectKey {
+                    index_slot: slot,
+                    vals,
+                }
             })
             .collect()
     }
 
     /// Returns whether key matches given row.
     #[inline]
-    pub(crate) fn match_key(&self, index_no: usize, key_vals: &[Val], row: &[Val]) -> bool {
-        let Some(keys) = self.index_spec(index_no).map(|spec| &spec.cols) else {
+    pub(crate) fn match_key(&self, slot: IndexSlot, key_vals: &[Val], row: &[Val]) -> bool {
+        let Some(keys) = self.index_spec(slot).map(|spec| &spec.cols) else {
             return false;
         };
         if keys.len() != key_vals.len() {
@@ -888,16 +893,16 @@ impl TableIndexLayout {
 /// Borrowed primary-key metadata view with enough context to validate keys.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PrimaryKeySpec<'a> {
-    index_no: usize,
+    index_slot: IndexSlot,
     index_spec: &'a IndexSpec,
     column_layout: &'a TableColumnLayout,
 }
 
 impl<'a> PrimaryKeySpec<'a> {
-    /// Returns the stable table-local primary-key index number.
+    /// Returns the physical primary-key index slot.
     #[inline]
-    pub(crate) fn index_no(&self) -> usize {
-        self.index_no
+    pub(crate) fn index_slot(&self) -> IndexSlot {
+        self.index_slot
     }
 
     /// Returns the primary-key index specification.
@@ -911,13 +916,13 @@ impl<'a> PrimaryKeySpec<'a> {
     #[inline]
     pub(crate) fn validate_key(
         &self,
-        index_no: usize,
+        index_slot: IndexSlot,
         key_vals: &[Val],
     ) -> StdResult<(), PrimaryKeyMatchError> {
-        if index_no != self.index_no {
-            return Err(PrimaryKeyMatchError::IndexNo {
-                actual: index_no,
-                expected: self.index_no,
+        if index_slot != self.index_slot {
+            return Err(PrimaryKeyMatchError::IndexSlot {
+                actual: index_slot,
+                expected: self.index_slot,
             });
         }
         if key_vals.len() != self.index_spec.cols.len() {
@@ -936,7 +941,7 @@ impl<'a> PrimaryKeySpec<'a> {
                     .col_type_match(usize::from(index_key.col_no), val)
             })
         {
-            return Err(PrimaryKeyMatchError::Type { index_no });
+            return Err(PrimaryKeyMatchError::Type { index_slot });
         }
         Ok(())
     }
@@ -945,9 +950,17 @@ impl<'a> PrimaryKeySpec<'a> {
 /// Why an input [`SelectKey`] does not match a primary-key specification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PrimaryKeyMatchError {
-    IndexNo { actual: usize, expected: usize },
-    ValueCount { actual: usize, expected: usize },
-    Type { index_no: usize },
+    IndexSlot {
+        actual: IndexSlot,
+        expected: IndexSlot,
+    },
+    ValueCount {
+        actual: usize,
+        expected: usize,
+    },
+    Type {
+        index_slot: IndexSlot,
+    },
 }
 
 /// Table metadata including column layout and index layout.
@@ -967,34 +980,38 @@ impl TableMetadata {
         column_specs: Vec<ColumnSpec>,
         index_specs: Vec<IndexSpec>,
     ) -> OperationResult<Self> {
-        let next_index_no = IndexNo::try_from(index_specs.len()).map_err(|_| {
+        let next_index_slot = IndexSlot::try_from(index_specs.len()).map_err(|_| {
             Report::new(OperationError::InvalidMetadata)
-                .attach("next_index_no overflow while deriving table metadata")
+                .attach("next_index_slot overflow while deriving table metadata")
         })?;
         let col_count = column_specs.len();
         let active_index_specs = index_specs
             .into_iter()
             .enumerate()
-            .map(|(index_no, spec)| {
+            .map(|(slot_no, spec)| {
+                let index_slot = IndexSlot::try_from(slot_no).map_err(|_| {
+                    Report::new(OperationError::InvalidMetadata)
+                        .attach("index_slot overflow while deriving table metadata")
+                })?;
                 if col_count > 0 {
-                    validate_index_spec(index_no, &spec, col_count)?;
+                    validate_index_spec(index_slot, &spec, col_count)?;
                 }
-                Ok(ActiveIndexSpec::new(index_no as IndexNo, spec))
+                Ok(ActiveIndexSpec::new(index_slot, spec))
             })
             .collect::<OperationResult<Vec<_>>>()?;
-        Self::try_new_with_next_index_no(column_specs, active_index_specs, next_index_no)
+        Self::try_new_with_next_index_slot(column_specs, active_index_specs, next_index_slot)
     }
 
-    /// Try to create metadata with an explicit durable next index number.
+    /// Try to create metadata with an explicit next physical index slot.
     #[inline]
-    pub(crate) fn try_new_with_next_index_no(
+    pub(crate) fn try_new_with_next_index_slot(
         column_specs: Vec<ColumnSpec>,
         index_specs: Vec<ActiveIndexSpec>,
-        next_index_no: IndexNo,
+        next_index_slot: IndexSlot,
     ) -> OperationResult<Self> {
         let column_layout = Arc::new(TableColumnLayout::try_new(column_specs)?);
         let index_layout =
-            TableIndexLayout::try_create(&column_layout, index_specs, next_index_no)?;
+            TableIndexLayout::try_create(&column_layout, index_specs, next_index_slot)?;
         Ok(Self {
             col: column_layout,
             idx: index_layout,
@@ -1006,12 +1023,12 @@ impl TableMetadata {
     pub(crate) fn from_persisted_parts(
         column_specs: Vec<ColumnSpec>,
         index_specs: Vec<ActiveIndexSpec>,
-        next_index_no: IndexNo,
+        next_index_slot: IndexSlot,
     ) -> Self {
-        Self::try_new_with_next_index_no(column_specs, index_specs, next_index_no).unwrap_or_else(
+        Self::try_new_with_next_index_slot(column_specs, index_specs, next_index_slot).unwrap_or_else(
             |err| {
                 panic!(
-                    "persisted table metadata invariant violated: next_index_no={next_index_no}, error={err:?}"
+                    "persisted table metadata invariant violated: next_index_slot={next_index_slot}, error={err:?}"
                 )
             },
         )
@@ -1022,8 +1039,8 @@ impl TableMetadata {
     pub(crate) fn primary_key(&self) -> Option<PrimaryKeySpec<'_>> {
         self.idx
             .primary_key_index()
-            .map(|(index_no, index_spec)| PrimaryKeySpec {
-                index_no,
+            .map(|(index_slot, index_spec)| PrimaryKeySpec {
+                index_slot,
                 index_spec,
                 column_layout: self.col.as_ref(),
             })
@@ -1035,38 +1052,38 @@ impl TableMetadata {
         col_types: Vec<ValType>,
         col_attrs: Vec<ColumnAttributes>,
         index_specs: Vec<ActiveIndexSpec>,
-        next_index_no: IndexNo,
+        next_index_slot: IndexSlot,
     ) -> OperationResult<Self> {
         let column_layout = Arc::new(TableColumnLayout::try_create(
             col_names, col_types, col_attrs,
         )?);
         let index_layout =
-            TableIndexLayout::try_create(&column_layout, index_specs, next_index_no)?;
+            TableIndexLayout::try_create(&column_layout, index_specs, next_index_slot)?;
         Ok(Self {
             col: column_layout,
             idx: index_layout,
         })
     }
 
-    /// Allocates the next table-local index number and returns metadata with
+    /// Allocates the next physical table-local slot and returns metadata with
     /// the new active index appended in the corresponding sparse slot.
     #[inline]
     pub(crate) fn try_with_created_index(
         &self,
         index_spec: IndexSpec,
-    ) -> OperationResult<(IndexNo, Self)> {
-        let (index_no, index_layout) = self.idx.try_with_created_index(&self.col, index_spec)?;
+    ) -> OperationResult<(IndexSlot, Self)> {
+        let (index_slot, index_layout) = self.idx.try_with_created_index(&self.col, index_spec)?;
         let metadata = Self {
             col: Arc::clone(&self.col),
             idx: index_layout,
         };
-        Ok((index_no, metadata))
+        Ok((index_slot, metadata))
     }
 
     /// Returns metadata with one active index slot made inactive.
     #[inline]
-    pub(crate) fn without_index(&self, index_no: IndexNo) -> Self {
-        let index_layout = self.idx.without_index(&self.col, index_no);
+    pub(crate) fn without_index(&self, index_slot: IndexSlot) -> Self {
+        let index_layout = self.idx.without_index(&self.col, index_slot);
         Self {
             col: Arc::clone(&self.col),
             idx: index_layout,
@@ -1080,7 +1097,7 @@ impl TableMetadata {
             col_names: self.col.col_names(),
             col_types: self.col.col_types(),
             col_attrs: self.col.col_attrs(),
-            next_index_no: self.idx.next_index_no(),
+            next_index_slot: self.idx.next_index_slot(),
             index_specs: self.idx.index_specs(),
         }
     }
@@ -1094,12 +1111,12 @@ impl From<TableBriefMetadata> for TableMetadata {
             value.col_types,
             value.col_attrs,
             value.index_specs,
-            value.next_index_no,
+            value.next_index_slot,
         )
         .unwrap_or_else(|err| {
             panic!(
-                "persisted table-file metadata invariant violated: next_index_no={}, error={err:?}",
-                value.next_index_no
+                "persisted table-file metadata invariant violated: next_index_slot={}, error={err:?}",
+                value.next_index_slot
             )
         })
     }
@@ -1115,8 +1132,8 @@ pub(crate) struct TableBriefMetadataSerView<'a> {
     pub(crate) col_types: &'a [ValType],
     /// Column attributes in physical column order.
     pub(crate) col_attrs: &'a [ColumnAttributes],
-    /// Next table-local secondary-index number.
-    pub(crate) next_index_no: IndexNo,
+    /// Next physical table-local secondary-index slot.
+    pub(crate) next_index_slot: IndexSlot,
     /// Active sparse secondary-index specs.
     pub(crate) index_specs: &'a IndexSpecs,
 }
@@ -1127,12 +1144,12 @@ impl<'a> Ser<'a> for TableBriefMetadataSerView<'a> {
         self.col_names.ser_len()
             + self.col_types.ser_len()
             + self.col_attrs.ser_len()
-            + mem::size_of::<IndexNo>()
+            + mem::size_of::<u16>()
             + mem::size_of::<u64>()
             + self
                 .index_specs
                 .active_indexes()
-                .map(|(_, index_spec)| mem::size_of::<IndexNo>() + index_spec.ser_len())
+                .map(|(_, index_spec)| mem::size_of::<u16>() + index_spec.ser_len())
                 .sum::<usize>()
     }
 
@@ -1141,10 +1158,10 @@ impl<'a> Ser<'a> for TableBriefMetadataSerView<'a> {
         let idx = self.col_names.ser(out, start_idx);
         let idx = self.col_types.ser(out, idx);
         let idx = self.col_attrs.ser(out, idx);
-        let mut idx = out.ser_u16(idx, self.next_index_no);
+        let mut idx = out.ser_u16(idx, self.next_index_slot.get());
         idx = out.ser_u64(idx, self.index_specs.active_count() as u64);
-        for (index_no, index_spec) in self.index_specs.active_indexes() {
-            idx = out.ser_u16(idx, index_no as IndexNo);
+        for (index_slot, index_spec) in self.index_specs.active_indexes() {
+            idx = out.ser_u16(idx, index_slot.get());
             idx = index_spec.ser(out, idx);
         }
         idx
@@ -1161,8 +1178,8 @@ pub(crate) struct TableBriefMetadata {
     pub(crate) col_types: Vec<ValType>,
     /// Column attributes in physical column order.
     pub(crate) col_attrs: Vec<ColumnAttributes>,
-    /// Next table-local secondary-index number.
-    pub(crate) next_index_no: IndexNo,
+    /// Next physical table-local secondary-index slot.
+    pub(crate) next_index_slot: IndexSlot,
     /// Active sparse secondary-index specs.
     pub(crate) index_specs: Vec<ActiveIndexSpec>,
 }
@@ -1170,14 +1187,14 @@ pub(crate) struct TableBriefMetadata {
 impl Deser for TableBriefMetadata {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(
         mem::size_of::<u64>() * 4 // four vector length prefixes
-            + mem::size_of::<u16>(), // next_index_no
+            + mem::size_of::<u16>(), // next_index_slot
     );
 
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let (idx, col_names) = <Vec<SemiStr>>::deser(input, start_idx)?;
         let (idx, col_types) = <Vec<ValType>>::deser(input, idx)?;
         let (idx, col_attrs) = <Vec<ColumnAttributes>>::deser(input, idx)?;
-        let (idx, next_index_no) = input.deser_u16(idx)?;
+        let (idx, next_index_slot) = input.deser_u16(idx)?;
         let (idx, index_specs) = <Vec<ActiveIndexSpec>>::deser(input, idx)?;
         Ok((
             idx,
@@ -1185,7 +1202,7 @@ impl Deser for TableBriefMetadata {
                 col_names,
                 col_types,
                 col_attrs,
-                next_index_no,
+                next_index_slot: IndexSlot::from(next_index_slot),
                 index_specs,
             },
         ))
@@ -1903,16 +1920,20 @@ fn poison_error_source(
 }
 
 #[inline]
-fn validate_index_spec(index_no: usize, spec: &IndexSpec, col_count: usize) -> OperationResult<()> {
+fn validate_index_spec(
+    index_slot: IndexSlot,
+    spec: &IndexSpec,
+    col_count: usize,
+) -> OperationResult<()> {
     if spec.cols.is_empty() {
         return Err(Report::new(OperationError::InvalidMetadata)
-            .attach(format!("index_no {index_no} has no key columns")));
+            .attach(format!("index_slot {index_slot} has no key columns")));
     }
     for key in &spec.cols {
         let col_no = key.col_no as usize;
         if col_no >= col_count {
             return Err(Report::new(OperationError::InvalidMetadata).attach(format!(
-                "index_no {index_no} references column {col_no} outside column count {col_count}"
+                "index_slot {index_slot} references column {col_no} outside column count {col_count}"
             )));
         }
     }
@@ -1924,25 +1945,25 @@ fn validate_primary_key_contract(
     column_layout: &TableColumnLayout,
     index_specs: &IndexSpecs,
 ) -> OperationResult<()> {
-    let mut primary_key_index_no = None;
-    for (index_no, index_spec) in index_specs.active_indexes() {
+    let mut primary_key_index_slot = None;
+    for (index_slot, index_spec) in index_specs.active_indexes() {
         if !index_spec.primary_key() {
             continue;
         }
-        if let Some(existing_index_no) = primary_key_index_no {
+        if let Some(existing_index_slot) = primary_key_index_slot {
             return Err(Report::new(OperationError::InvalidMetadata).attach(format!(
-                "multiple primary keys: index_no {existing_index_no} and index_no {index_no}"
+                "multiple primary keys: index_slot {existing_index_slot} and index_slot {index_slot}"
             )));
         }
         for key in &index_spec.cols {
             let col_no = usize::from(key.col_no);
             if column_layout.nullable(col_no) {
                 return Err(Report::new(OperationError::InvalidMetadata).attach(format!(
-                    "primary key index_no {index_no} references nullable column {col_no}"
+                    "primary key index_slot {index_slot} references nullable column {col_no}"
                 )));
             }
         }
-        primary_key_index_no = Some(index_no);
+        primary_key_index_slot = Some(index_slot);
     }
     Ok(())
 }
@@ -1959,7 +1980,7 @@ pub(crate) mod tests {
     };
     use crate::catalog::{
         CatalogCheckpointScanStopReason, ColumnAttributes, ColumnSpec, CurrentTableState,
-        IndexAttributes, IndexKey, IndexSpec, TableMetadata, TableSpec,
+        IndexAttributes, IndexKeySpec, IndexSpec, TableMetadata, TableSpec,
     };
     use crate::engine::Engine;
     use crate::error::{
@@ -2293,7 +2314,10 @@ pub(crate) mod tests {
                 ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
                 ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
             ],
-            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+            vec![IndexSpec::new(
+                vec![IndexKeySpec::new(0)],
+                IndexAttributes::PK,
+            )],
         )
         .expect("valid table metadata");
 
@@ -2308,38 +2332,38 @@ pub(crate) mod tests {
         assert_eq!(metadata.col.col_names, brief.col_names);
         assert_eq!(metadata.col.col_types, brief.col_types);
         assert_eq!(metadata.col.col_attrs, brief.col_attrs);
-        assert_eq!(metadata.idx.next_index_no(), brief.next_index_no);
+        assert_eq!(metadata.idx.next_index_slot(), brief.next_index_slot);
         assert_eq!(
             metadata
                 .idx
                 .active_indexes()
-                .map(|(index_no, spec)| ActiveIndexSpec::new(index_no as IndexNo, spec.clone()))
+                .map(|(index_slot, spec)| ActiveIndexSpec::new(index_slot, spec.clone()))
                 .collect::<Vec<_>>(),
             brief.index_specs
         );
     }
 
     #[test]
-    fn test_table_metadata_dense_indexes_derive_next_index_no() {
+    fn test_table_metadata_dense_indexes_derive_next_index_slot() {
         let metadata = TableMetadata::try_new(
             vec![
                 ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
                 ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::empty()),
             ],
             vec![
-                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
-                IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::PK),
+                IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty()),
             ],
         )
         .expect("valid table metadata");
-        assert_eq!(metadata.idx.next_index_no(), 2);
+        assert_eq!(metadata.idx.next_index_slot(), IndexSlot::new(2));
         assert_eq!(metadata.idx.index_slot_count(), 2);
         assert_eq!(metadata.idx.active_index_count(), 2);
         let primary_key = metadata
             .primary_key()
             .expect("metadata should expose primary key index");
-        assert_eq!(primary_key.index_no(), 0);
-        assert_eq!(primary_key.spec().cols, vec![IndexKey::new(0)]);
+        assert_eq!(primary_key.index_slot(), IndexSlot::new(0));
+        assert_eq!(primary_key.spec().cols, vec![IndexKeySpec::new(0)]);
     }
 
     #[test]
@@ -2350,41 +2374,49 @@ pub(crate) mod tests {
                 ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
             ],
             vec![
-                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
-                IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::UK),
+                IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::PK),
+                IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::UK),
             ],
         )
         .expect("valid table metadata");
         let primary_key = metadata.primary_key().unwrap();
 
-        assert!(primary_key.validate_key(0, &[Val::from(42u32)]).is_ok());
+        assert!(
+            primary_key
+                .validate_key(IndexSlot::new(0), &[Val::from(42u32)])
+                .is_ok()
+        );
         assert_eq!(
-            primary_key.validate_key(1, &[Val::from(42u32)]),
-            Err(PrimaryKeyMatchError::IndexNo {
-                actual: 1,
-                expected: 0
+            primary_key.validate_key(IndexSlot::new(1), &[Val::from(42u32)]),
+            Err(PrimaryKeyMatchError::IndexSlot {
+                actual: IndexSlot::new(1),
+                expected: IndexSlot::new(0)
             })
         );
         assert_eq!(
-            primary_key.validate_key(0, &[Val::from(42u32), Val::from(99u64)]),
+            primary_key.validate_key(IndexSlot::new(0), &[Val::from(42u32), Val::from(99u64)]),
             Err(PrimaryKeyMatchError::ValueCount {
                 actual: 2,
                 expected: 1
             })
         );
         assert_eq!(
-            primary_key.validate_key(0, &[Val::from(42u64)]),
-            Err(PrimaryKeyMatchError::Type { index_no: 0 })
+            primary_key.validate_key(IndexSlot::new(0), &[Val::from(42u64)]),
+            Err(PrimaryKeyMatchError::Type {
+                index_slot: IndexSlot::new(0)
+            })
         );
         assert_eq!(
-            primary_key.validate_key(0, &[Val::Null]),
-            Err(PrimaryKeyMatchError::Type { index_no: 0 })
+            primary_key.validate_key(IndexSlot::new(0), &[Val::Null]),
+            Err(PrimaryKeyMatchError::Type {
+                index_slot: IndexSlot::new(0)
+            })
         );
-        assert!(
-            metadata
-                .idx
-                .index_type_match(metadata.col.as_ref(), 1, &[Val::Null])
-        );
+        assert!(metadata.idx.index_type_match(
+            metadata.col.as_ref(),
+            IndexSlot::new(1),
+            &[Val::Null]
+        ));
     }
 
     #[test]
@@ -2407,10 +2439,13 @@ pub(crate) mod tests {
         assert_eq!(metadata.col.null_offset(0), 0);
         assert_eq!(metadata.col.null_offset(1), 0);
 
-        let (index_no, created) = metadata
-            .try_with_created_index(IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK))
+        let (index_slot, created) = metadata
+            .try_with_created_index(IndexSpec::new(
+                vec![IndexKeySpec::new(0)],
+                IndexAttributes::UK,
+            ))
             .unwrap();
-        let dropped = created.without_index(index_no);
+        let dropped = created.without_index(index_slot);
 
         assert!(Arc::ptr_eq(&metadata.col, &created.col));
         assert!(Arc::ptr_eq(&metadata.col, &dropped.col));
@@ -2419,8 +2454,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_table_metadata_sparse_active_indexes_preserve_index_no() {
-        let metadata = TableMetadata::try_new_with_next_index_no(
+    fn test_table_metadata_sparse_active_indexes_preserve_index_slot() {
+        let metadata = TableMetadata::try_new_with_next_index_slot(
             vec![
                 ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
                 ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::empty()),
@@ -2428,26 +2463,26 @@ pub(crate) mod tests {
             ],
             vec![
                 ActiveIndexSpec::new(
-                    0,
-                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                    IndexSlot::new(0),
+                    IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::PK),
                 ),
                 ActiveIndexSpec::new(
-                    2,
-                    IndexSpec::new(vec![IndexKey::new(2)], IndexAttributes::empty()),
+                    IndexSlot::new(2),
+                    IndexSpec::new(vec![IndexKeySpec::new(2)], IndexAttributes::empty()),
                 ),
             ],
-            3,
+            IndexSlot::new(3),
         )
         .unwrap();
 
-        assert_eq!(metadata.idx.next_index_no(), 3);
+        assert_eq!(metadata.idx.next_index_slot(), IndexSlot::new(3));
         assert_eq!(metadata.idx.index_slot_count(), 3);
-        assert!(metadata.idx.index_spec(1).is_none());
+        assert!(metadata.idx.index_spec(IndexSlot::new(1)).is_none());
         assert_eq!(
             metadata
                 .idx
                 .active_indexes()
-                .map(|(index_no, _)| index_no)
+                .map(|(index_slot, _)| index_slot.get())
                 .collect::<Vec<_>>(),
             vec![0, 2]
         );
@@ -2455,8 +2490,8 @@ pub(crate) mod tests {
             metadata
                 .idx
                 .keys_for_insert(&[Val::from(11u32), Val::from(22u64), Val::from(33u32)]);
-        assert_eq!(keys[0].index_no, 0);
-        assert_eq!(keys[1].index_no, 2);
+        assert_eq!(keys[0].index_slot, IndexSlot::new(0));
+        assert_eq!(keys[1].index_slot, IndexSlot::new(2));
     }
 
     #[test]
@@ -2467,30 +2502,30 @@ pub(crate) mod tests {
             ColumnAttributes::empty(),
         )];
         assert!(
-            TableMetadata::try_new_with_next_index_no(
+            TableMetadata::try_new_with_next_index_slot(
                 columns.clone(),
                 vec![ActiveIndexSpec::new(
-                    1,
-                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                    IndexSlot::new(1),
+                    IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::PK),
                 )],
-                1,
+                IndexSlot::new(1),
             )
             .is_err()
         );
         assert!(
-            TableMetadata::try_new_with_next_index_no(
+            TableMetadata::try_new_with_next_index_slot(
                 columns.clone(),
                 vec![
                     ActiveIndexSpec::new(
-                        0,
-                        IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                        IndexSlot::new(0),
+                        IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::PK),
                     ),
                     ActiveIndexSpec::new(
-                        0,
-                        IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::empty()),
+                        IndexSlot::new(0),
+                        IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::empty()),
                     ),
                 ],
-                1,
+                IndexSlot::new(1),
             )
             .is_err()
         );
@@ -2506,8 +2541,8 @@ pub(crate) mod tests {
         let err = TableMetadata::try_new(
             columns,
             vec![
-                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
-                IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::PK),
+                IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::PK),
+                IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::PK),
             ],
         )
         .unwrap_err();
@@ -2522,19 +2557,19 @@ pub(crate) mod tests {
             ColumnSpec::new("c1", ValKind::U32, ColumnAttributes::empty()),
         ];
 
-        let err = TableMetadata::try_new_with_next_index_no(
+        let err = TableMetadata::try_new_with_next_index_slot(
             columns,
             vec![
                 ActiveIndexSpec::new(
-                    0,
-                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                    IndexSlot::new(0),
+                    IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::PK),
                 ),
                 ActiveIndexSpec::new(
-                    2,
-                    IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::PK),
+                    IndexSlot::new(2),
+                    IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::PK),
                 ),
             ],
-            3,
+            IndexSlot::new(3),
         )
         .unwrap_err();
 
@@ -2549,13 +2584,16 @@ pub(crate) mod tests {
                 ValKind::U32,
                 ColumnAttributes::NULLABLE,
             )],
-            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+            vec![IndexSpec::new(
+                vec![IndexKeySpec::new(0)],
+                IndexAttributes::PK,
+            )],
         )
         .unwrap_err();
 
         assert_invalid_metadata(
             err.disclose(),
-            "primary key index_no 0 references nullable column 0",
+            "primary key index_slot 0 references nullable column 0",
         );
     }
 
@@ -2572,33 +2610,36 @@ pub(crate) mod tests {
             vec![IndexSpec::new(vec![], IndexAttributes::PK)],
         )
         .unwrap_err();
-        assert_invalid_metadata(err.disclose(), "index_no 0 has no key columns");
+        assert_invalid_metadata(err.disclose(), "index_slot 0 has no key columns");
 
-        let err = TableMetadata::try_new_with_next_index_no(
+        let err = TableMetadata::try_new_with_next_index_slot(
             columns.clone(),
             vec![ActiveIndexSpec::new(
-                1,
+                IndexSlot::new(1),
                 IndexSpec::new(vec![], IndexAttributes::PK),
             )],
-            2,
+            IndexSlot::new(2),
         )
         .unwrap_err();
-        assert_invalid_metadata(err.disclose(), "index_no 1 has no key columns");
+        assert_invalid_metadata(err.disclose(), "index_slot 1 has no key columns");
 
         let err = TableMetadata::try_new(
             columns,
-            vec![IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::PK)],
+            vec![IndexSpec::new(
+                vec![IndexKeySpec::new(1)],
+                IndexAttributes::PK,
+            )],
         )
         .unwrap_err();
         assert_invalid_metadata(
             err.disclose(),
-            "index_no 0 references column 1 outside column count 1",
+            "index_slot 0 references column 1 outside column count 1",
         );
     }
 
     #[test]
     fn test_table_metadata_create_index_allocates_sparse_next_slot() {
-        let metadata = TableMetadata::try_new_with_next_index_no(
+        let metadata = TableMetadata::try_new_with_next_index_slot(
             vec![
                 ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
                 ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::empty()),
@@ -2606,32 +2647,35 @@ pub(crate) mod tests {
             ],
             vec![
                 ActiveIndexSpec::new(
-                    0,
-                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                    IndexSlot::new(0),
+                    IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::PK),
                 ),
                 ActiveIndexSpec::new(
-                    2,
-                    IndexSpec::new(vec![IndexKey::new(2)], IndexAttributes::empty()),
+                    IndexSlot::new(2),
+                    IndexSpec::new(vec![IndexKeySpec::new(2)], IndexAttributes::empty()),
                 ),
             ],
-            3,
+            IndexSlot::new(3),
         )
         .unwrap();
 
-        let (index_no, metadata) = metadata
-            .try_with_created_index(IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::UK))
+        let (index_slot, metadata) = metadata
+            .try_with_created_index(IndexSpec::new(
+                vec![IndexKeySpec::new(1)],
+                IndexAttributes::UK,
+            ))
             .unwrap();
 
-        assert_eq!(index_no, 3);
-        assert_eq!(metadata.idx.next_index_no(), 4);
+        assert_eq!(index_slot, IndexSlot::new(3));
+        assert_eq!(metadata.idx.next_index_slot(), IndexSlot::new(4));
         assert_eq!(metadata.idx.index_slot_count(), 4);
-        assert!(metadata.idx.index_spec(1).is_none());
-        assert!(metadata.idx.index_spec(3).unwrap().unique());
+        assert!(metadata.idx.index_spec(IndexSlot::new(1)).is_none());
+        assert!(metadata.idx.index_spec(IndexSlot::new(3)).unwrap().unique());
         assert_eq!(
             metadata
                 .idx
                 .active_indexes()
-                .map(|(index_no, _)| index_no)
+                .map(|(index_slot, _)| index_slot.get())
                 .collect::<Vec<_>>(),
             vec![0, 2, 3]
         );
@@ -2656,30 +2700,31 @@ pub(crate) mod tests {
         );
         assert!(
             metadata
-                .try_with_created_index(
-                    IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::UK,)
-                )
+                .try_with_created_index(IndexSpec::new(
+                    vec![IndexKeySpec::new(1)],
+                    IndexAttributes::UK,
+                ))
                 .is_err()
         );
     }
 
     #[test]
     fn test_table_metadata_create_index_rejects_next_index_overflow() {
-        let metadata = TableMetadata::try_new_with_next_index_no(
+        let metadata = TableMetadata::try_new_with_next_index_slot(
             vec![ColumnSpec::new(
                 "c0",
                 ValKind::U32,
                 ColumnAttributes::empty(),
             )],
             vec![],
-            IndexNo::MAX,
+            IndexSlot::MAX,
         )
         .unwrap();
 
         assert!(
             metadata
                 .try_with_created_index(IndexSpec::new(
-                    vec![IndexKey::new(0)],
+                    vec![IndexKeySpec::new(0)],
                     IndexAttributes::empty(),
                 ))
                 .is_err()
@@ -2688,7 +2733,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_table_metadata_drop_index_preserves_sparse_allocation() {
-        let metadata = TableMetadata::try_new_with_next_index_no(
+        let metadata = TableMetadata::try_new_with_next_index_slot(
             vec![
                 ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
                 ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::empty()),
@@ -2696,27 +2741,27 @@ pub(crate) mod tests {
             ],
             vec![
                 ActiveIndexSpec::new(
-                    0,
-                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                    IndexSlot::new(0),
+                    IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::PK),
                 ),
                 ActiveIndexSpec::new(
-                    2,
-                    IndexSpec::new(vec![IndexKey::new(2)], IndexAttributes::empty()),
+                    IndexSlot::new(2),
+                    IndexSpec::new(vec![IndexKeySpec::new(2)], IndexAttributes::empty()),
                 ),
             ],
-            4,
+            IndexSlot::new(4),
         )
         .unwrap();
 
-        let dropped = metadata.without_index(2);
+        let dropped = metadata.without_index(IndexSlot::new(2));
 
-        assert_eq!(dropped.idx.next_index_no(), 4);
+        assert_eq!(dropped.idx.next_index_slot(), IndexSlot::new(4));
         assert_eq!(dropped.idx.index_slot_count(), 4);
         assert_eq!(dropped.idx.active_index_count(), 1);
-        assert!(dropped.idx.index_spec(0).is_some());
-        assert!(dropped.idx.index_spec(1).is_none());
-        assert!(dropped.idx.index_spec(2).is_none());
-        assert!(dropped.idx.index_spec(3).is_none());
+        assert!(dropped.idx.index_spec(IndexSlot::new(0)).is_some());
+        assert!(dropped.idx.index_spec(IndexSlot::new(1)).is_none());
+        assert!(dropped.idx.index_spec(IndexSlot::new(2)).is_none());
+        assert!(dropped.idx.index_spec(IndexSlot::new(3)).is_none());
         assert_eq!(
             dropped.idx.index_cols,
             [0].into_iter().collect::<FastHashSet<_>>()
@@ -2737,12 +2782,22 @@ pub(crate) mod tests {
             let trx_owner = trx_tests::lock_owner(&trx).unwrap();
             let key = single_key(0i32);
             let selected = trx
-                .table_lookup_unique_mvcc(table_id, key.index_no, &key.vals, &[0, 1])
+                .table_lookup_unique_mvcc(
+                    table_id,
+                    key.index_slot.transitional_id(),
+                    &key.vals,
+                    &[0, 1],
+                )
                 .await
                 .unwrap();
             assert!(selected.is_found());
             let repeated = trx
-                .table_lookup_unique_mvcc(table_id, key.index_no, &key.vals, &[0, 1])
+                .table_lookup_unique_mvcc(
+                    table_id,
+                    key.index_slot.transitional_id(),
+                    &key.vals,
+                    &[0, 1],
+                )
                 .await
                 .unwrap();
             assert!(repeated.is_found());
@@ -2964,7 +3019,10 @@ pub(crate) mod tests {
                         ValKind::I32,
                         ColumnAttributes::empty(),
                     )]),
-                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+                    vec![IndexSpec::new(
+                        vec![IndexKeySpec::new(0)],
+                        IndexAttributes::PK,
+                    )],
                 )
                 .await
                 .unwrap_err();
@@ -3302,7 +3360,12 @@ pub(crate) mod tests {
             let mut read_trx = session.begin_trx().unwrap();
             let key = single_key(0i32);
             let selected = read_trx
-                .table_lookup_unique_mvcc(table_id, key.index_no, &key.vals, &[0, 1])
+                .table_lookup_unique_mvcc(
+                    table_id,
+                    key.index_slot.transitional_id(),
+                    &key.vals,
+                    &[0, 1],
+                )
                 .await
                 .unwrap();
             assert!(selected.is_found());
@@ -4732,7 +4795,12 @@ pub(crate) mod tests {
             let mut trx = session.begin_trx().unwrap();
             let key = single_key(11);
             let err = trx
-                .table_lookup_unique_mvcc(table_id, key.index_no, &key.vals, &[0, 1])
+                .table_lookup_unique_mvcc(
+                    table_id,
+                    key.index_slot.transitional_id(),
+                    &key.vals,
+                    &[0, 1],
+                )
                 .await
                 .unwrap_err();
             assert_eq!(

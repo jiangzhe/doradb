@@ -48,9 +48,9 @@ impl ColumnStorage {
         }
         let mut secondary_indexes = Vec::with_capacity(metadata.idx.index_slot_count());
         secondary_indexes.resize_with(metadata.idx.index_slot_count(), || None);
-        for (index_no, _) in metadata.idx.active_indexes() {
-            secondary_indexes[index_no] = Some(SecondaryDiskTreeRuntime::new(
-                index_no,
+        for (index_slot, _) in metadata.idx.active_indexes() {
+            secondary_indexes[index_slot.as_usize()] = Some(SecondaryDiskTreeRuntime::new(
+                index_slot,
                 Arc::clone(&metadata),
                 Arc::clone(&file),
                 disk_pool.clone(),

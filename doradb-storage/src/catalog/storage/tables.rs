@@ -1,10 +1,11 @@
 use crate::buffer::PoolGuards;
-use crate::catalog::CatalogTable;
 use crate::catalog::storage::CatalogDefinition;
 use crate::catalog::storage::object::TableObject;
 use crate::catalog::table::{TableColumnLayout, TableMetadata};
+use crate::catalog::{CatalogIndexNo, CatalogTable};
 use crate::catalog::{
-    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, catalog_table_id_from_slot,
+    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexSlot, IndexSpec,
+    catalog_table_id_from_slot,
 };
 use crate::error::{MultiDomainResultExt, RuntimeError, RuntimeOrFatalResult, RuntimeResult};
 use crate::id::TableID;
@@ -23,7 +24,7 @@ const COL_NO_TABLES_TABLE_ID: usize = 0;
 const COL_NAME_TABLES_TABLE_ID: &str = "table_id";
 const COL_NO_TABLES_NEXT_INDEX_NO: usize = 1;
 const COL_NAME_TABLES_NEXT_INDEX_NO: &str = "next_index_no";
-const PK_NO_TABLES: usize = 0;
+const PK_NO_TABLES: CatalogIndexNo = CatalogIndexNo::new(0);
 
 /// Runtime accessor for `catalog.tables`.
 pub(crate) struct Tables<'a> {
@@ -77,7 +78,10 @@ impl Tables<'_> {
         trx: &mut PrivateTransaction,
         obj: &TableObject,
     ) -> RuntimeOrFatalResult<()> {
-        let cols = vec![Val::from(obj.table_id), Val::from(obj.next_index_no)];
+        let cols = vec![
+            Val::from(obj.table_id),
+            Val::from(obj.next_index_slot.get()),
+        ];
         trx.catalog_insert_mvcc(self.table, cols)
             .await
             .map(|_| ())
@@ -104,7 +108,10 @@ impl Tables<'_> {
         obj: &TableObject,
     ) -> RuntimeOrFatalResult<bool> {
         let key_vals = vec![Val::from(obj.table_id)];
-        let cols = vec![Val::from(obj.table_id), Val::from(obj.next_index_no)];
+        let cols = vec![
+            Val::from(obj.table_id),
+            Val::from(obj.next_index_slot.get()),
+        ];
         let res = trx
             .catalog_replace_primary_key_mvcc(self.table, PK_NO_TABLES, key_vals, cols)
             .await
@@ -141,7 +148,7 @@ pub(crate) fn catalog_definition_of_tables() -> &'static CatalogDefinition {
                 ],
                 vec![
                     // primary key (table_id)
-                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                    IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::PK),
                 ],
             )
             .expect("valid table metadata"),
@@ -156,13 +163,13 @@ fn row_to_table_object(col_layout: &TableColumnLayout, row: Row<'_>) -> TableObj
             .as_u64()
             .unwrap(),
     );
-    let next_index_no = row
+    let next_index_slot = row
         .val(col_layout, COL_NO_TABLES_NEXT_INDEX_NO)
         .as_u16()
         .unwrap();
     TableObject {
         table_id,
-        next_index_no,
+        next_index_slot: IndexSlot::from(next_index_slot),
     }
 }
 
@@ -186,11 +193,11 @@ mod tests {
 
             let table100 = TableObject {
                 table_id: TableID::new(100),
-                next_index_no: 0,
+                next_index_slot: IndexSlot::new(0),
             };
             let table101 = TableObject {
                 table_id: TableID::new(101),
-                next_index_no: 0,
+                next_index_slot: IndexSlot::new(0),
             };
             let mut trx = begin_catalog_test_trx(&session);
             engine

@@ -28,7 +28,7 @@ pub use gc::{
     MemIndexCleanupDelay, MemIndexCleanupOutcome, MemIndexCleanupStats,
     SecondaryMemIndexCleanupIndexStats,
 };
-pub(crate) use layout::{RetiredSecondaryIndex, TableRuntimeLayout};
+pub(crate) use layout::{RetiredSecondaryIndex, RuntimeIndexEntry, TableRuntimeLayout};
 pub use lifecycle::CheckpointCancelReason;
 #[cfg(test)]
 pub(crate) use lifecycle::TableTerminal;
@@ -50,7 +50,7 @@ pub(crate) use tests::{test_hooks, test_user_table_id};
 
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards, PoolRole, ReadonlyBufferPool};
-use crate::catalog::{IndexSpec, TableMetadata};
+use crate::catalog::{IndexSlot, IndexSpec, TableMetadata};
 use crate::error::{
     DataIntegrityError, DataIntegrityResult, OperationResult, RuntimeError, RuntimeResult,
 };
@@ -73,6 +73,11 @@ use parking_lot::Mutex;
 use std::marker::PhantomData;
 use std::mem::take;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[cfg(test)]
+static RETIREMENT_REGISTRY_ACCESSES: AtomicUsize = AtomicUsize::new(0);
 
 /// Logical table kind encoded in a [`TableID`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -136,6 +141,12 @@ pub(crate) struct LiveTableRedoReplayFloor {
     pub(crate) floor: TableRedoReplayFloor,
 }
 
+/// Unique ownership of retired user-index runtimes keyed by physical slot.
+#[derive(Default)]
+struct RetiredSecondaryIndexRegistry {
+    by_slot: FastHashMap<IndexSlot, RetiredSecondaryIndex>,
+}
+
 /// Runtime handle for a user table, combining in-memory and persisted storage.
 pub(crate) struct Table {
     /// Hot row-store and in-memory index runtime.
@@ -143,7 +154,7 @@ pub(crate) struct Table {
     /// Persisted column-store runtime and table file binding.
     pub(crate) storage: ColumnStorage,
     layout: Mutex<Arc<TableRuntimeLayout>>,
-    retired_secondary_indexes: Mutex<Vec<RetiredSecondaryIndex>>,
+    retired_secondary_indexes: Mutex<RetiredSecondaryIndexRegistry>,
     /// Runtime lifecycle gates for foreground, checkpoint, and drop operations.
     pub(crate) lifecycle: TableLifecycle,
     /// Canonical volatile freeze-to-checkpoint workflow state.
@@ -151,6 +162,24 @@ pub(crate) struct Table {
 }
 
 impl Table {
+    #[cfg(test)]
+    #[inline]
+    fn record_retirement_registry_access() {
+        RETIREMENT_REGISTRY_ACCESSES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Resets the narrow test-only retirement-registry access counter.
+    #[cfg(test)]
+    pub(crate) fn reset_retirement_registry_access_count() {
+        RETIREMENT_REGISTRY_ACCESSES.store(0, Ordering::Relaxed);
+    }
+
+    /// Returns the narrow test-only retirement-registry access counter.
+    #[cfg(test)]
+    pub(crate) fn retirement_registry_access_count() -> usize {
+        RETIREMENT_REGISTRY_ACCESSES.load(Ordering::Relaxed)
+    }
+
     /// Create a new table.
     #[inline]
     pub(crate) async fn new(
@@ -207,7 +236,7 @@ impl Table {
             mem,
             storage,
             layout: Mutex::new(Arc::new(layout)),
-            retired_secondary_indexes: Mutex::new(Vec::new()),
+            retired_secondary_indexes: Mutex::new(RetiredSecondaryIndexRegistry::default()),
             lifecycle: TableLifecycle::new(),
             checkpoint_workflow: TableCheckpointWorkflow::new(),
         })
@@ -282,12 +311,12 @@ impl Table {
         } = self;
         checkpoint_workflow.assert_closed();
         let index_pool_guard = guards.index_guard();
-        for retired in retired_secondary_indexes.into_inner() {
-            let _retired_identity = (retired.index_no, retired.retired_generation);
-            let index = Arc::try_unwrap(retired.index).unwrap_or_else(|index| {
+        for retired in retired_secondary_indexes.into_inner().by_slot.into_values() {
+            let retired_index = retired.index;
+            let _retired_identity = (retired_index, retired.retired_generation);
+            let index = Arc::try_unwrap(retired.runtime).unwrap_or_else(|index| {
                 panic!(
-                    "retired secondary index still referenced during runtime destroy: index_no={}, strong_count={}",
-                    index.index_no(),
+                    "retired secondary index still referenced during runtime destroy: index={retired_index}, strong_count={}",
                     Arc::strong_count(&index)
                 )
             });
@@ -301,19 +330,19 @@ impl Table {
             )
         });
         let indexes = layout.into_secondary_indexes();
-        for index in indexes.iter().flatten() {
+        for entry in indexes.iter().flatten() {
             assert_eq!(
-                Arc::strong_count(index),
+                Arc::strong_count(entry.runtime_arc()),
                 1,
-                "secondary index still referenced during runtime destroy: index_no={}",
-                index.index_no()
+                "secondary index still referenced during runtime destroy: index={}",
+                entry.index_ref()
             );
         }
-        for index in indexes.into_iter().flatten() {
-            let index = Arc::try_unwrap(index).unwrap_or_else(|index| {
+        for entry in indexes.into_iter().flatten() {
+            let index_ref = entry.index_ref();
+            let index = Arc::try_unwrap(entry.into_runtime()).unwrap_or_else(|index| {
                 panic!(
-                    "secondary index still referenced during runtime destroy: index_no={}, strong_count={}",
-                    index.index_no(),
+                    "secondary index still referenced during runtime destroy: index={index_ref}, strong_count={}",
                     Arc::strong_count(&index)
                 )
             });
@@ -416,7 +445,9 @@ impl Table {
         )
     )]
     pub(crate) fn has_retired_secondary_indexes(&self) -> bool {
-        !self.retired_secondary_indexes.lock().is_empty()
+        #[cfg(test)]
+        Self::record_retirement_registry_access();
+        !self.retired_secondary_indexes.lock().by_slot.is_empty()
     }
 
     /// Replaces the layout only when the exact prepared snapshot remains current.
@@ -429,7 +460,39 @@ impl Table {
         &self,
         expected_layout: &Arc<TableRuntimeLayout>,
         new_layout: Arc<TableRuntimeLayout>,
-    ) -> Option<Vec<RetiredSecondaryIndex>> {
+    ) -> Option<()> {
+        let mut retired = Vec::new();
+        for (slot, old_entry) in expected_layout.secondary_indexes().iter().enumerate() {
+            let Some(old_entry) = old_entry else {
+                continue;
+            };
+            let unchanged = new_layout
+                .secondary_indexes()
+                .get(slot)
+                .and_then(Option::as_ref)
+                .is_some_and(|new_entry| {
+                    new_entry.index_ref() == old_entry.index_ref()
+                        && Arc::ptr_eq(new_entry.runtime_arc(), old_entry.runtime_arc())
+                });
+            if !unchanged {
+                if new_layout
+                    .secondary_indexes()
+                    .get(slot)
+                    .and_then(Option::as_ref)
+                    .is_some()
+                {
+                    // Phase 2 keeps physical slots append-only and cannot
+                    // publish another generation while the old runtime retires.
+                    return None;
+                }
+                retired.push(RetiredSecondaryIndex {
+                    index: old_entry.index_ref(),
+                    retired_generation: expected_layout.generation(),
+                    runtime: Arc::clone(old_entry.runtime_arc()),
+                });
+            }
+        }
+
         let mut guard = self.layout.lock();
         if !Arc::ptr_eq(&guard, expected_layout)
             || new_layout.generation() <= expected_layout.generation()
@@ -437,35 +500,33 @@ impl Table {
         {
             return None;
         }
-
-        let mut retired = Vec::new();
-        for (index_no, old_index) in expected_layout.secondary_indexes().iter().enumerate() {
-            let Some(old_index) = old_index else {
-                continue;
-            };
-            let unchanged = new_layout
+        // Code needing both locks always takes layout before retirement.
+        #[cfg(test)]
+        Self::record_retirement_registry_access();
+        let mut registry = self.retired_secondary_indexes.lock();
+        if retired
+            .iter()
+            .any(|retired| registry.by_slot.contains_key(&retired.index.slot()))
+            || new_layout
                 .secondary_indexes()
-                .get(index_no)
-                .and_then(Option::as_ref)
-                .is_some_and(|new_index| Arc::ptr_eq(old_index, new_index));
-            if !unchanged {
-                retired.push(RetiredSecondaryIndex {
-                    index_no,
-                    retired_generation: expected_layout.generation(),
-                    index: Arc::clone(old_index),
-                });
-            }
+                .iter()
+                .flatten()
+                .any(|entry| registry.by_slot.contains_key(&entry.index_ref().slot()))
+        {
+            return None;
         }
+        registry.by_slot.reserve(retired.len());
         *guard = new_layout;
-        Some(retired)
-    }
-
-    /// Enqueues retirement records prepared before a coordinated layout swap.
-    #[inline]
-    pub(crate) fn queue_retired_secondary_indexes(&self, retired: Vec<RetiredSecondaryIndex>) {
-        if !retired.is_empty() {
-            self.retired_secondary_indexes.lock().extend(retired);
+        for retired in retired {
+            let index = retired.index;
+            let slot = index.slot();
+            let previous = registry.by_slot.insert(slot, retired);
+            assert!(
+                previous.is_none(),
+                "retirement registry vacancy was validated before layout publication: index={index}"
+            );
         }
+        Some(())
     }
 
     /// Destroys retired secondary-index runtimes whose old layout snapshots drained.
@@ -475,33 +536,46 @@ impl Table {
     ) -> RuntimeResult<usize> {
         let mut ready = Vec::new();
         {
-            let mut queued = self.retired_secondary_indexes.lock();
-            let mut pending = Vec::with_capacity(queued.len());
-            for retired in queued.drain(..) {
-                if Arc::strong_count(&retired.index) > 1 {
-                    pending.push(retired);
-                } else {
+            #[cfg(test)]
+            Self::record_retirement_registry_access();
+            let mut registry = self.retired_secondary_indexes.lock();
+            let ready_slots = registry
+                .by_slot
+                .iter()
+                .filter_map(|(slot, retired)| {
+                    (Arc::strong_count(&retired.runtime) == 1).then_some(*slot)
+                })
+                .collect::<Vec<_>>();
+            ready.reserve(ready_slots.len());
+            for slot in ready_slots {
+                if let Some(retired) = registry.by_slot.remove(&slot) {
                     ready.push(retired);
                 }
             }
-            *queued = pending;
         }
 
         let index_pool_guard = guards.index_guard();
         let mut cleaned = 0usize;
         while let Some(retired) = ready.pop() {
-            let index_no = retired.index_no;
+            let index_ref = retired.index;
             let retired_generation = retired.retired_generation;
-            let index = match Arc::try_unwrap(retired.index) {
+            let index = match Arc::try_unwrap(retired.runtime) {
                 Ok(index) => index,
                 Err(index) => {
-                    self.retired_secondary_indexes
-                        .lock()
-                        .push(RetiredSecondaryIndex {
-                            index_no,
+                    #[cfg(test)]
+                    Self::record_retirement_registry_access();
+                    let previous = self.retired_secondary_indexes.lock().by_slot.insert(
+                        index_ref.slot(),
+                        RetiredSecondaryIndex {
+                            index: index_ref,
                             retired_generation,
-                            index,
-                        });
+                            runtime: index,
+                        },
+                    );
+                    assert!(
+                        previous.is_none(),
+                        "ready retirement slot became occupied: index={index_ref}"
+                    );
                     continue;
                 }
             };
@@ -509,10 +583,21 @@ impl Table {
                 // The failing index has been consumed by destroy. Keep the
                 // remaining ready entries queued so a later maintenance pass
                 // can continue after the caller handles the error.
-                self.retired_secondary_indexes.lock().extend(ready);
+                #[cfg(test)]
+                Self::record_retirement_registry_access();
+                let mut registry = self.retired_secondary_indexes.lock();
+                for pending in ready {
+                    let index = pending.index;
+                    let slot = index.slot();
+                    let previous = registry.by_slot.insert(slot, pending);
+                    assert!(
+                        previous.is_none(),
+                        "ready retirement slot became occupied: index={index}"
+                    );
+                }
                 return Err(err);
             }
-            let _destroyed_identity = (index_no, retired_generation);
+            let _destroyed_identity = (index_ref, retired_generation);
             cleaned += 1;
             yield_now().await;
         }
@@ -928,8 +1013,8 @@ impl<'read> TableRootSnapshot<'read> {
 
     /// Returns the captured DiskTree root for one secondary index.
     #[inline]
-    pub(crate) fn secondary_index_root(&self, index_no: usize) -> BlockID {
-        self.secondary_index_roots[index_no]
+    pub(crate) fn secondary_index_root(&self, index_slot: IndexSlot) -> BlockID {
+        self.secondary_index_roots[index_slot.as_usize()]
     }
 
     /// Returns whether the captured root was observable before the supplied
@@ -954,20 +1039,20 @@ impl SecondaryIndexScopedBuilder {
     }
 
     #[inline]
-    fn push(&mut self, index_no: usize, index: SecondaryIndex<EvictableBufferPool>) {
-        debug_assert!(self.staged[index_no].is_none());
-        self.staged[index_no] = Some(index);
+    fn push(&mut self, index_slot: IndexSlot, index: SecondaryIndex<EvictableBufferPool>) {
+        debug_assert!(self.staged[index_slot.as_usize()].is_none());
+        self.staged[index_slot.as_usize()] = Some(index);
     }
 
     #[inline]
     async fn rollback(&mut self, pool_guard: &PoolGuard) {
         for index in take(&mut self.staged).into_iter().rev().flatten() {
-            let index_no = index.index_no();
+            let index_slot = index.index_slot();
             // Keep the original construction error as the function result,
             // but observe this terminal best-effort cleanup report first.
             if let Err(report) = index.destroy(pool_guard).await {
                 let report = report.attach(format!(
-                    "operation=rollback_secondary_index_build, index_no={index_no}"
+                    "operation=rollback_secondary_index_build, index_slot={index_slot}"
                 ));
                 obs::error!(
                     "event=secondary_index_cleanup component=table action=destroy_staged result=error error={report:?}"
@@ -1003,9 +1088,9 @@ pub(crate) async fn build_dual_tree_secondary_indexes(
     index_ts: TrxID,
 ) -> RuntimeResult<Box<[Option<Arc<SecondaryIndex<EvictableBufferPool>>>]>> {
     let mut builder = SecondaryIndexScopedBuilder::new(metadata.idx.index_slot_count());
-    for (index_no, index_spec) in metadata.idx.active_indexes() {
+    for (index_slot, index_spec) in metadata.idx.active_indexes() {
         let runtime = match SecondaryDiskTreeRuntime::new(
-            index_no,
+            index_slot,
             Arc::clone(&metadata),
             Arc::clone(&file),
             disk_pool.clone(),
@@ -1052,7 +1137,7 @@ pub(crate) async fn build_dual_tree_secondary_indexes(
             };
             SecondaryIndex::NonUnique { mem, disk: runtime }
         };
-        builder.push(index_no, index);
+        builder.push(index_slot, index);
     }
     Ok(builder.publish())
 }
@@ -1123,16 +1208,27 @@ fn index_key_replace(
     key: &SelectKey,
     updates: &FastHashMap<usize, Val>,
 ) -> SelectKey {
-    let vals: Vec<Val> = index_spec
+    SelectKey::new(
+        key.index_slot,
+        index_key_vals_replace(index_spec, &key.vals, updates),
+    )
+}
+
+#[inline]
+fn index_key_vals_replace(
+    index_spec: &IndexSpec,
+    vals: &[Val],
+    updates: &FastHashMap<usize, Val>,
+) -> Vec<Val> {
+    index_spec
         .cols
         .iter()
-        .zip(&key.vals)
+        .zip(vals)
         .map(|(ik, val)| {
             let col_no = ik.col_no as usize;
             updates.get(&col_no).cloned().unwrap_or_else(|| val.clone())
         })
-        .collect();
-    SelectKey::new(key.index_no, vals)
+        .collect()
 }
 
 /// Read an index key from the current physical row image.
@@ -1143,15 +1239,15 @@ fn index_key_replace(
 #[inline]
 fn read_latest_index_key(
     metadata: &TableMetadata,
-    index_no: usize,
+    index_slot: IndexSlot,
     page_guard: &PageSharedGuard<RowPage>,
     row_id: RowID,
 ) -> SelectKey {
     let index_spec = metadata
         .idx
-        .index_spec(index_no)
+        .index_spec(index_slot)
         .expect("active index spec must exist for latest key read");
-    let mut new_key = SelectKey::null(index_no, index_spec.cols.len());
+    let mut new_key = SelectKey::null(index_slot, index_spec.cols.len());
     for (pos, key) in index_spec.cols.iter().enumerate() {
         let access = page_guard.read_row_by_id(row_id);
         let val = access.row().val(metadata.col.as_ref(), key.col_no as usize);
@@ -1180,7 +1276,7 @@ fn read_physical_index_keys_for_delete(
 #[inline]
 fn unique_key_from_full_row(
     metadata: &TableMetadata,
-    unique_index_no: usize,
+    unique_index_slot: IndexSlot,
     cols: &[Val],
     operation: &'static str,
 ) -> SelectKey {
@@ -1192,22 +1288,22 @@ fn unique_key_from_full_row(
     );
     let index_spec = metadata
         .idx
-        .index_spec(unique_index_no)
+        .index_spec(unique_index_slot)
         .unwrap_or_else(|| {
             panic!(
-                "unique-key construction requires an active index: operation={operation}, index_no={unique_index_no}"
+                "unique-key construction requires an active index: operation={operation}, index_slot={unique_index_slot}"
             )
         });
     assert!(
         index_spec.unique(),
-        "unique-key construction requires a unique index: operation={operation}, index_no={unique_index_no}"
+        "unique-key construction requires a unique index: operation={operation}, index_slot={unique_index_slot}"
     );
     let vals = index_spec
         .cols
         .iter()
         .map(|key| cols[key.col_no as usize].clone())
         .collect();
-    SelectKey::new(unique_index_no, vals)
+    SelectKey::new(unique_index_slot, vals)
 }
 
 #[cfg(test)]
@@ -1218,8 +1314,8 @@ pub(crate) mod tests {
     use crate::buffer::{PoolGuard, PoolGuards, ReadonlyBufferPool};
     use crate::catalog::tests::table2;
     use crate::catalog::{
-        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableSpec,
-        USER_TABLE_ID_START,
+        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexRef, IndexSlot,
+        IndexSpec, TableSpec, USER_TABLE_ID_START,
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
@@ -2062,7 +2158,7 @@ pub(crate) mod tests {
     pub(crate) struct BoundUniqueIndex<'a> {
         layout: Arc<TableRuntimeLayout>,
         guards: &'a PoolGuards,
-        index_no: usize,
+        index_slot: IndexSlot,
         root: BlockID,
     }
 
@@ -2074,7 +2170,7 @@ pub(crate) mod tests {
             key: &[Val],
             ts: TrxID,
         ) -> RuntimeResult<Option<(RowID, bool)>> {
-            let index = self.layout.secondary_index(self.index_no)?;
+            let index = self.layout.secondary_index(self.index_slot)?;
             index
                 .bind_unique_unchecked(self.guards, self.root)?
                 .lookup(key, ts)
@@ -2091,7 +2187,7 @@ pub(crate) mod tests {
             merge_if_match_deleted: bool,
             ts: TrxID,
         ) -> RuntimeResult<IndexInsert> {
-            let index = self.layout.secondary_index(self.index_no)?;
+            let index = self.layout.secondary_index(self.index_slot)?;
             index
                 .unique_mem()?
                 .bind(self.guards.index_guard())
@@ -2108,7 +2204,7 @@ pub(crate) mod tests {
             row_id: RowID,
             ts: TrxID,
         ) -> RuntimeResult<bool> {
-            let index = self.layout.secondary_index(self.index_no)?;
+            let index = self.layout.secondary_index(self.index_slot)?;
             index
                 .unique_mem()?
                 .bind(self.guards.index_guard())
@@ -2117,15 +2213,15 @@ pub(crate) mod tests {
         }
     }
 
-    /// Test fixture for bound non unique index no.
-    pub(crate) struct BoundNonUniqueIndexNo<'a> {
+    /// Test fixture for a bound non-unique index.
+    pub(crate) struct BoundNonUniqueIndex<'a> {
         layout: Arc<TableRuntimeLayout>,
         guards: &'a PoolGuards,
-        index_no: usize,
+        index_slot: IndexSlot,
         root: BlockID,
     }
 
-    impl BoundNonUniqueIndexNo<'_> {
+    impl BoundNonUniqueIndex<'_> {
         /// Looks up an entry through the test fixture.
         #[inline]
         pub(crate) async fn lookup(
@@ -2134,7 +2230,7 @@ pub(crate) mod tests {
             res: &mut Vec<RowID>,
             ts: TrxID,
         ) -> RuntimeResult<()> {
-            let index = self.layout.secondary_index(self.index_no)?;
+            let index = self.layout.secondary_index(self.index_slot)?;
             let range = index.key_encoder().encode_non_unique_equal_range(key);
             let bound = index.bind_non_unique_unchecked(self.guards, self.root)?;
             let mut stream = bound.equal_scan_candidates(&range, ts)?;
@@ -2152,7 +2248,7 @@ pub(crate) mod tests {
             row_id: RowID,
             ts: TrxID,
         ) -> RuntimeResult<Option<bool>> {
-            let index = self.layout.secondary_index(self.index_no)?;
+            let index = self.layout.secondary_index(self.index_slot)?;
             index
                 .bind_non_unique_unchecked(self.guards, self.root)?
                 .lookup_unique(key, row_id, ts)
@@ -2169,7 +2265,7 @@ pub(crate) mod tests {
             merge_if_match_deleted: bool,
             ts: TrxID,
         ) -> RuntimeResult<IndexInsert> {
-            let index = self.layout.secondary_index(self.index_no)?;
+            let index = self.layout.secondary_index(self.index_slot)?;
             index
                 .bind_non_unique_unchecked(self.guards, self.root)?
                 .insert_mem_if_not_exists(key, row_id, merge_if_match_deleted, ts)
@@ -2185,7 +2281,7 @@ pub(crate) mod tests {
             row_id: RowID,
             ts: TrxID,
         ) -> RuntimeResult<IndexMask> {
-            let index = self.layout.secondary_index(self.index_no)?;
+            let index = self.layout.secondary_index(self.index_slot)?;
             index
                 .bind_non_unique_unchecked(self.guards, self.root)?
                 .mask_mem_if_present(key, row_id, ts)
@@ -2270,7 +2366,7 @@ pub(crate) mod tests {
         table_id: TableID,
         key: &SelectKey,
     ) -> Result<DeleteMvcc> {
-        trx.table_delete_unique_mvcc(table_id, key.index_no, &key.vals)
+        trx.table_delete_unique_mvcc(table_id, key.index_slot.transitional_id(), &key.vals)
             .await
     }
 
@@ -2281,8 +2377,13 @@ pub(crate) mod tests {
         key: &SelectKey,
         update: Vec<UpdateCol>,
     ) -> Result<UpdateMvcc> {
-        trx.table_update_unique_mvcc(table_id, key.index_no, &key.vals, update)
-            .await
+        trx.table_update_unique_mvcc(
+            table_id,
+            key.index_slot.transitional_id(),
+            &key.vals,
+            update,
+        )
+        .await
     }
 
     /// Run the raw transition-page insert and update primitives for one test operation.
@@ -2314,7 +2415,7 @@ pub(crate) mod tests {
             HotRowMutator::new(table.mem.table_id(), metadata, rt, page_guard, row_id,)
                 .update_inplace(
                     effects,
-                    key.index_no,
+                    key.index_slot,
                     &key.vals,
                     crate::row::ops::RowUpdateInput::Sparse(update),
                     false,
@@ -2339,7 +2440,7 @@ pub(crate) mod tests {
         let metadata = layout.metadata();
         Ok(matches!(
             HotRowMutator::new(table.mem.table_id(), metadata, rt, page_guard, row_id,)
-                .delete(effects, key.index_no, &key.vals, false)
+                .delete(effects, key.index_slot, &key.vals, false,)
                 .await
                 .disclose()?,
             DeleteInternal::RetryInTransition
@@ -2369,7 +2470,7 @@ pub(crate) mod tests {
                 &page_guard,
                 row_id,
             )
-            .lock_for_write(effects, Some((key.index_no, &key.vals)))
+            .lock_for_write(effects, Some((key.index_slot, &key.vals)))
             .await
             .disclose()?
             {
@@ -2399,8 +2500,13 @@ pub(crate) mod tests {
         key: &SelectKey,
         user_read_set: &[usize],
     ) -> Result<SelectMvcc> {
-        trx.table_lookup_unique_mvcc(table_id, key.index_no, &key.vals, user_read_set)
-            .await
+        trx.table_lookup_unique_mvcc(
+            table_id,
+            key.index_slot.transitional_id(),
+            &key.vals,
+            user_read_set,
+        )
+        .await
     }
 
     /// Provides test-only access to `evictable_test_engine`.
@@ -2458,8 +2564,8 @@ pub(crate) mod tests {
                     ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
                 ]),
                 vec![
-                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK),
-                    IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                    IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK),
+                    IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty()),
                 ],
             )
             .await
@@ -2478,7 +2584,10 @@ pub(crate) mod tests {
                     ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
                     ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::NULLABLE),
                 ]),
-                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
+                vec![IndexSpec::new(
+                    vec![IndexKeySpec::new(0)],
+                    IndexAttributes::UK,
+                )],
             )
             .await
             .unwrap();
@@ -2697,7 +2806,7 @@ pub(crate) mod tests {
     /// Provides test-only access to `single_key`.
     pub(crate) fn single_key<V: Into<Val>>(value: V) -> SelectKey {
         SelectKey {
-            index_no: 0,
+            index_slot: IndexSlot::new(0),
             vals: vec![value.into()],
         }
     }
@@ -2740,8 +2849,8 @@ pub(crate) mod tests {
                 ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
             ]),
             vec![
-                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK),
-                IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK),
+                IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty()),
             ],
         )
     }
@@ -2896,7 +3005,7 @@ pub(crate) mod tests {
     /// Provides test-only access to `name_key`.
     pub(crate) fn name_key(value: &str) -> SelectKey {
         SelectKey {
-            index_no: 1,
+            index_slot: IndexSlot::new(1),
             vals: vec![Val::from(value)],
         }
     }
@@ -2910,37 +3019,45 @@ pub(crate) mod tests {
     }
 
     /// Returns secondary root for tests.
-    pub(crate) fn active_secondary_root(table: &Table, index_no: usize) -> BlockID {
-        table.file().active_root_unchecked().secondary_index_roots[index_no]
+    pub(crate) fn active_secondary_root(table: &Table, index_slot: IndexSlot) -> BlockID {
+        table.file().active_root_unchecked().secondary_index_roots[index_slot.as_usize()]
+    }
+
+    /// Returns the exact active index reference for one test-visible slot.
+    pub(crate) fn active_index_ref(layout: &TableRuntimeLayout, index_slot: IndexSlot) -> IndexRef {
+        layout
+            .index_entry_at_slot(index_slot)
+            .expect("test index slot must be active")
+            .index_ref()
     }
 
     /// Provides test-only access to `bound_unique_index`.
     pub(crate) fn bound_unique_index<'a>(
         table: &Table,
         guards: &'a PoolGuards,
-        index_no: usize,
+        index_slot: IndexSlot,
     ) -> BoundUniqueIndex<'a> {
         let layout = table.layout_snapshot();
         BoundUniqueIndex {
             layout,
             guards,
-            index_no,
-            root: active_secondary_root(table, index_no),
+            index_slot,
+            root: active_secondary_root(table, index_slot),
         }
     }
 
-    /// Provides test-only access to `bound_non_unique_index_no`.
-    pub(crate) fn bound_non_unique_index_no<'a>(
+    /// Provides test-only access to `bound_non_unique_index`.
+    pub(crate) fn bound_non_unique_index<'a>(
         table: &Table,
         guards: &'a PoolGuards,
-        index_no: usize,
-    ) -> BoundNonUniqueIndexNo<'a> {
+        index_slot: IndexSlot,
+    ) -> BoundNonUniqueIndex<'a> {
         let layout = table.layout_snapshot();
-        BoundNonUniqueIndexNo {
+        BoundNonUniqueIndex {
             layout,
             guards,
-            index_no,
-            root: active_secondary_root(table, index_no),
+            index_slot,
+            root: active_secondary_root(table, index_slot),
         }
     }
 
@@ -2951,7 +3068,7 @@ pub(crate) mod tests {
         key: &SelectKey,
         sts: TrxID,
     ) -> RowID {
-        let index = bound_unique_index(table, guards, key.index_no);
+        let index = bound_unique_index(table, guards, key.index_slot);
         let Some((row_id, _)) = index
             .lookup(&key.vals, sts)
             .await
@@ -2972,10 +3089,11 @@ pub(crate) mod tests {
         guards: &PoolGuards,
         key: &SelectKey,
     ) -> Option<RowID> {
-        let root = active_secondary_root(table, key.index_no);
+        let index_slot = key.index_slot;
+        let root = active_secondary_root(table, index_slot);
         let layout = table.layout_snapshot();
         let tree = layout
-            .secondary_index(key.index_no)
+            .secondary_index(index_slot)
             .unwrap()
             .disk_runtime()
             .open_unique_at(root, guards.disk_guard())
@@ -2989,9 +3107,10 @@ pub(crate) mod tests {
         guards: &PoolGuards,
         key: &SelectKey,
     ) -> Vec<RowID> {
-        let root = active_secondary_root(table, key.index_no);
+        let index_slot = key.index_slot;
+        let root = active_secondary_root(table, index_slot);
         let layout = table.layout_snapshot();
-        let index = layout.secondary_index(key.index_no).unwrap();
+        let index = layout.secondary_index(index_slot).unwrap();
         let range = index.key_encoder().encode_non_unique_equal_range(&key.vals);
         let tree = index
             .disk_runtime()
@@ -3014,7 +3133,7 @@ pub(crate) mod tests {
         expected_row_id: RowID,
         expected_deleted: bool,
     ) {
-        let index = bound_unique_index(table, guards, key.index_no);
+        let index = bound_unique_index(table, guards, key.index_slot);
         let Some((row_id, deleted)) = index
             .lookup(&key.vals, sts)
             .await
@@ -3353,18 +3472,22 @@ pub(crate) mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let err = trx
-                .table_upsert_unique_mvcc(table_id, 1, vec![Val::from(2i32), Val::from("new")])
+                .table_upsert_unique_mvcc(
+                    table_id,
+                    crate::IndexID::new(1),
+                    vec![Val::from(2i32), Val::from("new")],
+                )
                 .await
                 .unwrap_err();
             assert_invalid_dml_input(err);
             trx.rollback().await.unwrap();
 
             let mut trx = session.begin_trx().unwrap();
-            let key = SelectKey::new(0, vec![Val::from(1i32)]);
+            let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(1i32)]);
             let err = trx
                 .table_update_unique_mvcc(
                     table_id,
-                    key.index_no,
+                    key.index_slot.transitional_id(),
                     &key.vals,
                     vec![
                         UpdateCol {
@@ -3383,9 +3506,9 @@ pub(crate) mod tests {
             trx.rollback().await.unwrap();
 
             let mut trx = session.begin_trx().unwrap();
-            let key = SelectKey::new(1, vec![Val::from("old")]);
+            let key = SelectKey::new(IndexSlot::new(1), vec![Val::from("old")]);
             let err = trx
-                .table_delete_unique_mvcc(table_id, key.index_no, &key.vals)
+                .table_delete_unique_mvcc(table_id, key.index_slot.transitional_id(), &key.vals)
                 .await
                 .unwrap_err();
             assert_invalid_dml_input(err);

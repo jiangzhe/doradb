@@ -24,7 +24,7 @@ Create a table with a schema and indexes, then drop it from an idle session.
 
 ```rust
 use doradb_storage::{
-    ColumnAttributes, ColumnSpec, Engine, EngineConfig, IndexAttributes, IndexKey, IndexSpec,
+    ColumnAttributes, ColumnSpec, Engine, EngineConfig, IndexAttributes, IndexKeySpec, IndexSpec,
     TableSpec, ValKind,
 };
 
@@ -41,8 +41,8 @@ let table_id = session
             ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
         ]),
         vec![
-            IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK),
-            IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+            IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK),
+            IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty()),
         ],
     )
     .await?;
@@ -55,19 +55,20 @@ engine.shutdown()?;
 Insert, update, and delete rows through direct transaction methods.
 
 ```rust
-use doradb_storage::{SelectKey, UpdateCol, Val};
+use doradb_storage::{IndexID, UpdateCol, Val};
 
 let mut trx = session.begin_trx()?;
 
 trx.table_insert_mvcc(table_id, vec![Val::from(1i32), Val::from("alice")])
     .await?;
 
-let key = SelectKey::new(0, vec![Val::from(1i32)]);
+let id_index = IndexID::new(0);
+let key = [Val::from(1i32)];
 let updated = trx
     .table_update_unique_mvcc(
         table_id,
-        key.index_no,
-        &key.vals,
+        id_index,
+        &key,
         vec![UpdateCol {
             idx: 1,
             val: Val::from("ada"),
@@ -77,7 +78,7 @@ let updated = trx
 assert!(updated.is_updated());
 
 let deleted = trx
-    .table_delete_unique_mvcc(table_id, key.index_no, &key.vals)
+    .table_delete_unique_mvcc(table_id, id_index, &key)
     .await?;
 assert!(deleted.is_deleted());
 
@@ -93,7 +94,7 @@ validation again.
 Stream rows, read one unique-key row, and scan matching rows through a secondary index.
 
 ```rust
-use doradb_storage::{ScanRowDecision, SelectKey, Val};
+use doradb_storage::{IndexID, ScanRowDecision, Val};
 
 let mut trx = session.begin_trx()?;
 let mut rows = Vec::new();
@@ -106,14 +107,14 @@ while let Some(vals) = stream.next().await? {
 }
 drop(stream);
 
-let id_key = SelectKey::new(0, vec![Val::from(1i32)]);
+let id_key = [Val::from(1i32)];
 let _row = trx
-    .table_lookup_unique_mvcc(table_id, id_key.index_no, &id_key.vals, &[0, 1])
+    .table_lookup_unique_mvcc(table_id, IndexID::new(0), &id_key, &[0, 1])
     .await?;
 
-let name_key = SelectKey::new(1, vec![Val::from("ada")]);
+let name_key = [Val::from("ada")];
 let _matching_rows = trx
-    .table_index_lookup_mvcc(table_id, name_key.index_no, &name_key.vals, &[0, 1])
+    .table_index_lookup_mvcc(table_id, IndexID::new(1), &name_key, &[0, 1])
     .await?
     .unwrap_rows();
 
