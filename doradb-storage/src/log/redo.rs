@@ -1,4 +1,4 @@
-use crate::catalog::CatalogSelectKey;
+use crate::catalog::{CatalogSelectKey, IndexSlot};
 use crate::error::DataIntegrityError;
 use crate::id::{PageID, RowID, TableID, TrxID};
 use crate::row::ops::UpdateCol;
@@ -266,11 +266,11 @@ pub(crate) enum DDLRedo {
     DropTable(TableID),
     CreateIndex {
         table_id: TableID,
-        index_no: u16,
+        index_slot: IndexSlot,
     },
     DropIndex {
         table_id: TableID,
-        index_no: u16,
+        index_slot: IndexSlot,
     },
     CreateRowPage {
         table_id: TableID,
@@ -337,13 +337,19 @@ impl Ser<'_> for DDLRedo {
             DDLRedo::DropTable(table_id) => {
                 idx = out.ser_u64(idx, table_id.as_u64());
             }
-            DDLRedo::CreateIndex { table_id, index_no } => {
+            DDLRedo::CreateIndex {
+                table_id,
+                index_slot,
+            } => {
                 idx = out.ser_u64(idx, table_id.as_u64());
-                idx = out.ser_u16(idx, *index_no);
+                idx = out.ser_u16(idx, index_slot.get());
             }
-            DDLRedo::DropIndex { table_id, index_no } => {
+            DDLRedo::DropIndex {
+                table_id,
+                index_slot,
+            } => {
                 idx = out.ser_u64(idx, table_id.as_u64());
-                idx = out.ser_u16(idx, *index_no);
+                idx = out.ser_u16(idx, index_slot.get());
             }
             DDLRedo::CreateRowPage {
                 table_id,
@@ -395,13 +401,25 @@ impl Deser for DDLRedo {
             }
             DDLRedoCode::CreateIndex => {
                 let (idx, table_id) = TableID::deser(input, idx)?;
-                let (idx, index_no) = input.deser_u16(idx)?;
-                Ok((idx, DDLRedo::CreateIndex { table_id, index_no }))
+                let (idx, index_slot) = input.deser_u16(idx)?;
+                Ok((
+                    idx,
+                    DDLRedo::CreateIndex {
+                        table_id,
+                        index_slot: IndexSlot::from(index_slot),
+                    },
+                ))
             }
             DDLRedoCode::DropIndex => {
                 let (idx, table_id) = TableID::deser(input, idx)?;
-                let (idx, index_no) = input.deser_u16(idx)?;
-                Ok((idx, DDLRedo::DropIndex { table_id, index_no }))
+                let (idx, index_slot) = input.deser_u16(idx)?;
+                Ok((
+                    idx,
+                    DDLRedo::DropIndex {
+                        table_id,
+                        index_slot: IndexSlot::from(index_slot),
+                    },
+                ))
             }
             DDLRedoCode::CreateRowPage => {
                 let (idx, table_id) = TableID::deser(input, idx)?;
@@ -779,7 +797,7 @@ mod tests {
         let delete_expected = [
             7, 0, 0, 0, 0, 0, 0, 0, // row id
             4, // delete-by-primary-key code
-            1, 0, // u16 catalog ordinal
+            1, 0, // u16 catalog index slot
             1, 0, 0, 0, 0, 0, 0, 0, // key value count
             9, 0, 0, 0, // U64 value kind
             11, 0, 0, 0, 0, 0, 0, 0, // key value
@@ -801,7 +819,7 @@ mod tests {
         let update_expected = [
             7, 0, 0, 0, 0, 0, 0, 0, // row id
             5, // update-by-primary-key code
-            1, 0, // u16 catalog ordinal
+            1, 0, // u16 catalog index slot
             1, 0, 0, 0, 0, 0, 0, 0, // key value count
             9, 0, 0, 0, // U64 value kind
             11, 0, 0, 0, 0, 0, 0, 0, // key value
@@ -816,9 +834,9 @@ mod tests {
     }
 
     #[test]
-    fn test_catalog_keyed_row_redo_ordinal_bounds() {
-        for index_no in [0, usize::from(u16::MAX)] {
-            let expected = catalog_key_from_active_ordinal(index_no, vec![]);
+    fn test_catalog_keyed_row_redo_slot_bounds() {
+        for index_slot in [IndexSlot::new(0), IndexSlot::MAX] {
+            let expected = CatalogSelectKey::new(index_slot, vec![]);
             let kind = RowRedoKind::DeleteByPrimaryKey(expected.clone());
             let mut buf = vec![0; kind.ser_len()];
             assert_eq!(kind.ser(&mut buf[..], 0), buf.len());
@@ -1440,7 +1458,7 @@ mod tests {
         // 测试用例3：CreateIndex
         let create_index = DDLRedo::CreateIndex {
             table_id: TableID::new(11),
-            index_no: 1,
+            index_slot: IndexSlot::new(1),
         };
         let mut buf = vec![0; create_index.ser_len()];
         create_index.ser(&mut buf[..], 0);
@@ -1451,9 +1469,12 @@ mod tests {
         // 验证反序列化结果
         let (_, deserialized) = DDLRedo::deser(&buf[..], 0).unwrap();
         match deserialized {
-            DDLRedo::CreateIndex { table_id, index_no } => {
+            DDLRedo::CreateIndex {
+                table_id,
+                index_slot,
+            } => {
                 assert_eq!(table_id, TableID::new(11));
-                assert_eq!(index_no, 1);
+                assert_eq!(index_slot, IndexSlot::new(1));
             }
             _ => panic!("Expected CreateIndex"),
         }
@@ -1461,7 +1482,7 @@ mod tests {
         // 测试用例4：DropIndex
         let drop_index = DDLRedo::DropIndex {
             table_id: TableID::new(22),
-            index_no: 2,
+            index_slot: IndexSlot::new(2),
         };
         let mut buf = vec![0; drop_index.ser_len()];
         drop_index.ser(&mut buf[..], 0);
@@ -1472,9 +1493,12 @@ mod tests {
         // 验证反序列化结果
         let (_, deserialized) = DDLRedo::deser(&buf[..], 0).unwrap();
         match deserialized {
-            DDLRedo::DropIndex { table_id, index_no } => {
+            DDLRedo::DropIndex {
+                table_id,
+                index_slot,
+            } => {
                 assert_eq!(table_id, TableID::new(22));
-                assert_eq!(index_no, 2);
+                assert_eq!(index_slot, IndexSlot::new(2));
             }
             _ => panic!("Expected DropIndex"),
         }

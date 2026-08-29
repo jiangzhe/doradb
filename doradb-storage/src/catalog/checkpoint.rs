@@ -1,6 +1,9 @@
 use crate::buffer::PoolGuard;
 use crate::catalog::storage::tables::TABLE_ID_TABLES;
-use crate::catalog::{Catalog, IndexDdlKind, IndexDdlRootProof, classify_index_ddl_root};
+use crate::catalog::{
+    Catalog, IndexDdlKind, IndexDdlRootProof, IndexSlot, ReplayVisibleIndexDdl,
+    classify_index_ddl_root,
+};
 use crate::error::{
     CompletionErrorBridge, CompletionResult, DataIntegrityError, DataIntegrityResult, FatalError,
     IoError, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
@@ -583,7 +586,7 @@ impl Catalog {
             // checkpoint before advancing the safe cursor. The decision covers
             // both table DDL ordering rules and index DDL root-proof rules.
             match self
-                .catalog_checkpoint_txn_action(ddl, &redo.dml, header.cts)
+                .catalog_checkpoint_txn_action(ddl, &redo.dml, header.cts, replay_start_ts)
                 .change_context(RuntimeError::CatalogAccess)
                 .attach_with(|| {
                     format!(
@@ -632,6 +635,7 @@ impl Catalog {
         ddl: &DDLRedo,
         dml: &BTreeMap<TableID, TableDML>,
         cts: TrxID,
+        catalog_replay_start_ts: TrxID,
     ) -> DataIntegrityResult<CatalogCheckpointTxnAction> {
         match ddl {
             DDLRedo::CreateTable(_) => Ok(CatalogCheckpointTxnAction::Include),
@@ -654,18 +658,25 @@ impl Catalog {
                 Ok(CatalogCheckpointTxnAction::Skip)
             }
             DDLRedo::TableReplaySilentWatermark { .. } => Ok(CatalogCheckpointTxnAction::Include),
-            DDLRedo::CreateIndex { table_id, index_no } => self
-                .catalog_checkpoint_index_ddl_action(
-                    IndexDdlKind::Create,
-                    *table_id,
-                    *index_no,
-                    cts,
-                ),
-            DDLRedo::DropIndex { table_id, index_no } => self.catalog_checkpoint_index_ddl_action(
+            DDLRedo::CreateIndex {
+                table_id,
+                index_slot,
+            } => self.catalog_checkpoint_index_ddl_action(
+                IndexDdlKind::Create,
+                *table_id,
+                *index_slot,
+                cts,
+                catalog_replay_start_ts,
+            ),
+            DDLRedo::DropIndex {
+                table_id,
+                index_slot,
+            } => self.catalog_checkpoint_index_ddl_action(
                 IndexDdlKind::Drop,
                 *table_id,
-                *index_no,
+                *index_slot,
                 cts,
+                catalog_replay_start_ts,
             ),
         }
     }
@@ -674,8 +685,9 @@ impl Catalog {
         &self,
         kind: IndexDdlKind,
         table_id: TableID,
-        index_no: u16,
+        index_slot: IndexSlot,
         cts: TrxID,
+        catalog_replay_start_ts: TrxID,
     ) -> DataIntegrityResult<CatalogCheckpointTxnAction> {
         let table_entry = self.user_tables.get(&table_id);
         let active_root = table_entry
@@ -687,7 +699,9 @@ impl Catalog {
         // folded into the checkpoint; provisional index DDL advances the safe
         // point but leaves catalog row redo for recovery to skip/replay from
         // the still-authoritative root.
-        let proof = classify_index_ddl_root(kind, table_id, index_no, cts, active_root)?;
+        let ddl =
+            ReplayVisibleIndexDdl::from_replay_visible(index_slot, cts, catalog_replay_start_ts);
+        let proof = classify_index_ddl_root(kind, table_id, ddl, active_root)?;
         drop(table_entry);
         match (kind, proof) {
             (
@@ -718,11 +732,12 @@ fn drop_table_has_catalog_table_delete(
         let RowRedoKind::DeleteByPrimaryKey(key) = &row.kind else {
             continue;
         };
-        if key.index.as_usize() != 0 {
+        let expected_index_slot = IndexSlot::new(0);
+        if key.index_slot != expected_index_slot {
             return Err(
                 Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-                    "malformed drop-table redo: table_id={table_id}, index_no={}, expected_index_no=0",
-                    key.index.as_usize()
+                    "malformed drop-table redo: table_id={table_id}, index_slot={}, expected_index_slot={expected_index_slot}",
+                    key.index_slot
                 )),
             );
         }
@@ -812,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn test_drop_table_has_catalog_table_delete_rejects_wrong_index_no() {
+    fn test_drop_table_has_catalog_table_delete_rejects_wrong_index_slot() {
         let table_id = TableID::new(42);
         let dml = catalog_tables_delete_dml(catalog_key_from_active_ordinal(
             1,
@@ -820,7 +835,7 @@ mod tests {
         ));
         let err = drop_table_has_catalog_table_delete(table_id, &dml).unwrap_err();
 
-        assert_malformed_drop_table_redo(err, "index_no=1");
+        assert_malformed_drop_table_redo(err, "index_slot=1");
     }
 
     #[test]

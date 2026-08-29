@@ -1,5 +1,5 @@
 use super::{CatalogStorage, ColumnObject, IndexColumnObject, IndexObject, TableObject};
-use crate::catalog::{IndexNo, TableMetadata};
+use crate::catalog::{IndexSlot, TableMetadata};
 use crate::error::{MultiDomainResultExt, RuntimeOrFatalError, RuntimeOrFatalResult};
 use crate::id::TableID;
 use crate::log::redo::DDLRedo;
@@ -17,7 +17,7 @@ impl CatalogStorage {
 
         let table = TableObject {
             table_id,
-            next_index_no: metadata.idx.next_index_no(),
+            next_index_slot: metadata.idx.next_index_slot(),
         };
         let columns = metadata
             .col
@@ -39,23 +39,23 @@ impl CatalogStorage {
         let indexes = metadata
             .idx
             .active_indexes()
-            .map(|(index_no, index_spec)| IndexObject {
+            .map(|(index_slot, index_spec)| IndexObject {
                 table_id,
-                index_no: index_no as IndexNo,
+                index_slot,
                 index_attributes: index_spec.attributes,
             })
             .collect::<Vec<_>>();
         let index_columns = metadata
             .idx
             .active_indexes()
-            .flat_map(|(index_no, index_spec)| {
+            .flat_map(|(index_slot, index_spec)| {
                 index_spec
                     .cols
                     .iter()
                     .enumerate()
                     .map(move |(index_column_no, index_key)| IndexColumnObject {
                         table_id,
-                        index_no: index_no as IndexNo,
+                        index_slot,
                         index_column_no: index_column_no as u16,
                         column_no: index_key.col_no,
                         index_order: index_key.order,
@@ -133,27 +133,27 @@ impl CatalogStorage {
         &self,
         trx: &mut PrivateTransaction,
         table_id: TableID,
-        index_no: IndexNo,
+        index_slot: IndexSlot,
         new_metadata: &TableMetadata,
     ) -> RuntimeOrFatalResult<()> {
         validate_catalog_engine_health(trx, "stage_create_index")?;
 
-        let expected_next_index_no = index_no.checked_add(1).unwrap_or_else(|| {
+        let expected_next_index_slot = index_slot.checked_next().unwrap_or_else(|| {
             panic!(
-                "create-index prepared metadata overflow: table_id={table_id}, index_no={index_no}"
+                "create-index prepared metadata overflow: table_id={table_id}, index_slot={index_slot}"
             )
         });
         assert_eq!(
-            new_metadata.idx.next_index_no(),
-            expected_next_index_no,
-            "create-index prepared metadata mismatch: table_id={table_id}, index_no={index_no}"
+            new_metadata.idx.next_index_slot(),
+            expected_next_index_slot,
+            "create-index prepared metadata mismatch: table_id={table_id}, index_slot={index_slot}"
         );
         let index_spec = new_metadata
             .idx
-            .index_spec(usize::from(index_no))
+            .index_spec(index_slot)
             .unwrap_or_else(|| {
                 panic!(
-                    "create-index prepared metadata has inactive index: table_id={table_id}, index_no={index_no}"
+                    "create-index prepared metadata has inactive index: table_id={table_id}, index_slot={index_slot}"
                 )
             });
 
@@ -163,7 +163,7 @@ impl CatalogStorage {
                 trx,
                 &TableObject {
                     table_id,
-                    next_index_no: new_metadata.idx.next_index_no(),
+                    next_index_slot: new_metadata.idx.next_index_slot(),
                 },
             )
             .await?;
@@ -176,7 +176,7 @@ impl CatalogStorage {
                 trx,
                 &IndexObject {
                     table_id,
-                    index_no,
+                    index_slot,
                     index_attributes: index_spec.attributes,
                 },
             )
@@ -188,7 +188,7 @@ impl CatalogStorage {
                 .enumerate()
                 .map(|(index_column_no, index_key)| IndexColumnObject {
                     table_id,
-                    index_no,
+                    index_slot,
                     index_column_no: index_column_no as u16,
                     column_no: index_key.col_no,
                     index_order: index_key.order,
@@ -199,7 +199,10 @@ impl CatalogStorage {
                 .await?;
         }
 
-        trx.install_ddl_redo(DDLRedo::CreateIndex { table_id, index_no });
+        trx.install_ddl_redo(DDLRedo::CreateIndex {
+            table_id,
+            index_slot,
+        });
         Ok(())
     }
 
@@ -208,42 +211,48 @@ impl CatalogStorage {
         &self,
         trx: &mut PrivateTransaction,
         table_id: TableID,
-        index_no: IndexNo,
+        index_slot: IndexSlot,
         old_metadata: &TableMetadata,
     ) -> RuntimeOrFatalResult<()> {
         validate_catalog_engine_health(trx, "stage_drop_index")?;
 
         assert!(
-            old_metadata.idx.next_index_no() > index_no,
-            "drop-index prepared metadata mismatch: table_id={table_id}, index_no={index_no}, next_index_no={}",
-            old_metadata.idx.next_index_no()
+            old_metadata.idx.next_index_slot() > index_slot,
+            "drop-index prepared metadata mismatch: table_id={table_id}, index_slot={index_slot}, next_index_slot={}",
+            old_metadata.idx.next_index_slot()
         );
         let index_spec = old_metadata
             .idx
-            .index_spec(usize::from(index_no))
+            .index_spec(index_slot)
             .unwrap_or_else(|| {
                 panic!(
-                    "drop-index prepared metadata has inactive index: table_id={table_id}, index_no={index_no}"
+                    "drop-index prepared metadata has inactive index: table_id={table_id}, index_slot={index_slot}"
                 )
             });
 
         let deleted_columns = self
             .index_columns()
-            .delete_by_index(trx, table_id, index_no)
+            .delete_by_index(trx, table_id, index_slot)
             .await?;
         assert_eq!(
             deleted_columns,
             index_spec.cols.len(),
-            "drop-index catalog invariant violated: index-column delete count mismatch, table_id={table_id}, index_no={index_no}"
+            "drop-index catalog invariant violated: index-column delete count mismatch, table_id={table_id}, index_slot={index_slot}"
         );
 
-        let index_deleted = self.indexes().delete_by_id(trx, table_id, index_no).await?;
+        let index_deleted = self
+            .indexes()
+            .delete_by_id(trx, table_id, index_slot)
+            .await?;
         assert!(
             index_deleted,
-            "drop-index catalog invariant violated: validated index row is missing, table_id={table_id}, index_no={index_no}"
+            "drop-index catalog invariant violated: validated index row is missing, table_id={table_id}, index_slot={index_slot}"
         );
 
-        trx.install_ddl_redo(DDLRedo::DropIndex { table_id, index_no });
+        trx.install_ddl_redo(DDLRedo::DropIndex {
+            table_id,
+            index_slot,
+        });
         Ok(())
     }
 }

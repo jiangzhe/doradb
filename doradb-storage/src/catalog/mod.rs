@@ -11,10 +11,12 @@ pub(crate) use checkpoint::*;
 pub(crate) use history::*;
 pub(crate) use index::*;
 pub(crate) use index_ref::*;
+pub use index_ref::{
+    IndexID, ResolvedTableIndex, TableIndex, TableIndexArgument, TableIndexSelector,
+};
 pub(crate) use spec::ActiveIndexSpec;
 pub use spec::{
-    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexNo, IndexOrder, IndexSpec,
-    TableSpec,
+    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexOrder, IndexSpec, TableSpec,
 };
 pub(crate) use storage::*;
 pub(crate) use table::*;
@@ -373,12 +375,12 @@ impl Catalog {
             .indexes()
             .list_uncommitted_by_table_id(guards, table_id)
             .await?;
-        indexes.sort_by_key(|index| index.index_no);
+        indexes.sort_by_key(|index| index.index_slot);
         for pair in indexes.windows(2) {
             assert!(
-                pair[0].index_no < pair[1].index_no,
-                "catalog reconstruction invariant violated: duplicate index number, table_id={table_id}, index_no={}",
-                pair[0].index_no
+                pair[0].index_slot < pair[1].index_slot,
+                "catalog reconstruction invariant violated: duplicate index slot, table_id={table_id}, index_slot={}",
+                pair[0].index_slot
             );
         }
 
@@ -387,11 +389,12 @@ impl Catalog {
             .index_columns()
             .list_uncommitted_by_table_id(guards, table_id)
             .await?;
-        index_columns.sort_by_key(|ic| (ic.index_no, ic.index_column_no));
-        let mut index_columns_by_index_no: BTreeMap<u16, Vec<IndexColumnObject>> = BTreeMap::new();
+        index_columns.sort_by_key(|ic| (ic.index_slot, ic.index_column_no));
+        let mut index_columns_by_index_slot: BTreeMap<IndexSlot, Vec<IndexColumnObject>> =
+            BTreeMap::new();
         for index_column in index_columns {
-            index_columns_by_index_no
-                .entry(index_column.index_no)
+            index_columns_by_index_slot
+                .entry(index_column.index_slot)
                 .or_default()
                 .push(index_column);
         }
@@ -399,12 +402,12 @@ impl Catalog {
         let mut index_specs = vec![];
         for index in indexes {
             let mut index_cols = vec![];
-            let persisted_index_columns = index_columns_by_index_no
-                .remove(&index.index_no)
+            let persisted_index_columns = index_columns_by_index_slot
+                .remove(&index.index_slot)
                 .unwrap_or_else(|| {
                     panic!(
-                        "catalog reconstruction invariant violated: index has no key columns, table_id={table_id}, index_no={}",
-                        index.index_no
+                        "catalog reconstruction invariant violated: index has no key columns, table_id={table_id}, index_slot={}",
+                        index.index_slot
                     )
                 });
             for (expected_index_column_no, index_column) in
@@ -413,36 +416,36 @@ impl Catalog {
                 assert_eq!(
                     usize::from(index_column.index_column_no),
                     expected_index_column_no,
-                    "catalog reconstruction invariant violated: non-contiguous index-column number, table_id={table_id}, index_no={}, expected_index_column_no={expected_index_column_no}, actual_index_column_no={}",
-                    index.index_no,
+                    "catalog reconstruction invariant violated: non-contiguous index-column number, table_id={table_id}, index_slot={}, expected_index_column_no={expected_index_column_no}, actual_index_column_no={}",
+                    index.index_slot,
                     index_column.index_column_no
                 );
-                let ik = IndexKey {
+                let ik = IndexKeySpec {
                     col_no: index_column.column_no,
                     order: index_column.index_order,
                 };
                 index_cols.push(ik);
             }
             index_specs.push(ActiveIndexSpec::new(
-                index.index_no,
+                index.index_slot,
                 IndexSpec::new(index_cols, index.index_attributes),
             ));
         }
-        if !index_columns_by_index_no.is_empty() {
-            let index_numbers = index_columns_by_index_no
+        if !index_columns_by_index_slot.is_empty() {
+            let index_slots = index_columns_by_index_slot
                 .keys()
                 .copied()
                 .collect::<Vec<_>>();
-            let count: usize = index_columns_by_index_no
+            let count: usize = index_columns_by_index_slot
                 .values()
                 .map(|index_columns| index_columns.len())
                 .sum();
             panic!(
-                "catalog reconstruction invariant violated: orphaned index-column rows, table_id={table_id}, index_numbers={index_numbers:?}, count={count}"
+                "catalog reconstruction invariant violated: orphaned index-column rows, table_id={table_id}, index_slots={index_slots:?}, count={count}"
             );
         }
         let metadata =
-            TableMetadata::from_persisted_parts(column_specs, index_specs, table.next_index_no);
+            TableMetadata::from_persisted_parts(column_specs, index_specs, table.next_index_slot);
         Ok((table, metadata))
     }
 
@@ -690,7 +693,7 @@ impl Catalog {
     ) -> Option<Arc<TableRuntimeLayout>> {
         new_layout.assert_valid();
         let new_layout = Arc::new(new_layout);
-        let retired = match self.user_tables.entry(table_id) {
+        match self.user_tables.entry(table_id) {
             Occupied(mut entry) => {
                 let expected_metadata = expected_old_layout.metadata_arc();
                 if !entry.get_mut().prepare_publish_live(
@@ -700,18 +703,16 @@ impl Catalog {
                 ) {
                     return None;
                 }
-                let retired = expected_table
+                expected_table
                     .try_replace_runtime_layout(expected_old_layout, Arc::clone(&new_layout))?;
                 #[cfg(test)]
                 test_hook.0.reach_publication_interval(test_hook.1);
                 entry
                     .get_mut()
                     .commit_publish_live(effective_cts, Arc::clone(new_layout.metadata_arc()));
-                retired
             }
             Vacant(_) => return None,
-        };
-        expected_table.queue_retired_secondary_indexes(retired);
+        }
         Some(new_layout)
     }
 
@@ -968,7 +969,7 @@ impl DroppedTableFileCleanup {
 /// entry to lazily pin one user-table layout snapshot for repeated same-table
 /// index operations. A purge cycle may cache a layout before a later DROP INDEX
 /// publishes a new inactive slot; that is safe only because RFC 0018 keeps
-/// `index_no` stable and non-reused. If the cached/current layout sees the slot
+/// the index slot stable and non-reused. If the cached/current layout sees the slot
 /// inactive, index purge is a no-op; if it still sees the old slot active, it
 /// can only touch the old runtime/root identity for that same stable slot.
 pub(crate) struct UserTableCacheEntry {
@@ -995,7 +996,7 @@ impl UserTableCacheEntry {
     #[inline]
     pub(crate) async fn rollback_index_entry(
         &mut self,
-        entry: &IndexUndo<ResolvedUserIndexKey>,
+        entry: &IndexUndo,
         guards: &PoolGuards,
         ts: TrxID,
     ) -> RuntimeResult<()> {
@@ -1013,7 +1014,7 @@ impl UserTableCacheEntry {
     pub(crate) async fn delete_index(
         &mut self,
         guards: &PoolGuards,
-        key: &ResolvedUserIndexKey,
+        key: &ResolvedIndexKey,
         row_id: RowID,
         unique: bool,
         min_active_sts: TrxID,
@@ -1024,14 +1025,7 @@ impl UserTableCacheEntry {
             .get_or_insert_with(|| table.layout_snapshot());
         table
             .accessor_with_layout(layout.as_ref())
-            .delete_index(
-                guards,
-                key.index.slot().as_usize(),
-                &key.vals,
-                row_id,
-                unique,
-                min_active_sts,
-            )
+            .delete_index(guards, key.index, &key.vals, row_id, unique, min_active_sts)
             .await
     }
 }
@@ -1206,12 +1200,12 @@ fn index_ddl_metadata_reconcilable(
     // can replay later index-DDL catalog rows to make catalog metadata catch up.
     // The opposite direction is unrecoverable here because replay cannot make a
     // table root that has already been opened acquire missing allocation state.
-    if file.idx.next_index_no() < catalog.idx.next_index_no() {
+    if file.idx.next_index_slot() < catalog.idx.next_index_slot() {
         return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
             .attach(format!(
-                "index-DDL reconciliation found catalog allocation ahead of table root: table_id={table_id}, catalog_next_index_no={}, file_next_index_no={}",
-                catalog.idx.next_index_no(),
-                file.idx.next_index_no()
+                "index-DDL reconciliation found catalog allocation ahead of table root: table_id={table_id}, catalog_next_index_slot={}, file_next_index_slot={}",
+                catalog.idx.next_index_slot(),
+                file.idx.next_index_slot()
             )));
     }
     if catalog.col != file.col {
@@ -1222,9 +1216,12 @@ fn index_ddl_metadata_reconcilable(
         .idx
         .index_slot_count()
         .max(file.idx.index_slot_count());
-    for index_no in 0..max_slots {
-        let catalog_spec = catalog.idx.index_spec(index_no);
-        let file_spec = file.idx.index_spec(index_no);
+    for index_slot in 0..max_slots {
+        let index_slot = IndexSlot::try_from(index_slot).unwrap_or_else(|_| {
+            panic!("validated metadata index slot exceeds u16: index_slot={index_slot}")
+        });
+        let catalog_spec = catalog.idx.index_spec(index_slot);
+        let file_spec = file.idx.index_spec(index_slot);
         if let (Some(catalog_spec), Some(file_spec)) = (catalog_spec, file_spec)
             && catalog_spec != file_spec
         {
@@ -1238,7 +1235,7 @@ fn index_ddl_metadata_reconcilable(
 pub(crate) mod tests {
     use super::*;
     use crate::catalog::CatalogCheckpointScanStopReason;
-    use crate::catalog::{ColumnAttributes, IndexAttributes, IndexKey, IndexSpec, TableSpec};
+    use crate::catalog::{ColumnAttributes, IndexAttributes, IndexKeySpec, IndexSpec, TableSpec};
     use crate::conf::{EngineConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{CompletionErrorBridge, DataIntegrityError, Error};
@@ -1403,7 +1400,10 @@ pub(crate) mod tests {
                         column_attributes: ColumnAttributes::empty(),
                     }],
                 },
-                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
+                vec![IndexSpec::new(
+                    vec![IndexKeySpec::new(0)],
+                    IndexAttributes::UK,
+                )],
             )
             .await
             .unwrap();
@@ -1432,7 +1432,10 @@ pub(crate) mod tests {
                         },
                     ],
                 },
-                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
+                vec![IndexSpec::new(
+                    vec![IndexKeySpec::new(0)],
+                    IndexAttributes::UK,
+                )],
             )
             .await
             .unwrap();
@@ -1455,7 +1458,10 @@ pub(crate) mod tests {
                         column_attributes: ColumnAttributes::empty(),
                     }],
                 },
-                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
+                vec![IndexSpec::new(
+                    vec![IndexKeySpec::new(0)],
+                    IndexAttributes::UK,
+                )],
             )
             .await
             .unwrap();
@@ -1489,12 +1495,12 @@ pub(crate) mod tests {
                 },
                 vec![
                     IndexSpec::new(
-                        vec![IndexKey::new(0)],
+                        vec![IndexKeySpec::new(0)],
                         // unique index.
                         IndexAttributes::UK,
                     ),
                     IndexSpec::new(
-                        vec![IndexKey::new(1)],
+                        vec![IndexKeySpec::new(1)],
                         // non-unique index.
                         IndexAttributes::empty(),
                     ),
@@ -1631,12 +1637,18 @@ pub(crate) mod tests {
                 ValKind::I32,
                 ColumnAttributes::empty(),
             )],
-            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
+            vec![IndexSpec::new(
+                vec![IndexKeySpec::new(0)],
+                IndexAttributes::UK,
+            )],
         )
         .expect("valid table metadata");
         let file_metadata = TableMetadata::try_new(
             vec![ColumnSpec::new("id", ValKind::I32, ColumnAttributes::INDEX)],
-            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
+            vec![IndexSpec::new(
+                vec![IndexKeySpec::new(0)],
+                IndexAttributes::UK,
+            )],
         )
         .expect("valid table metadata");
         assert_eq!(catalog_metadata.col.col_names, file_metadata.col.col_names);
@@ -1656,8 +1668,9 @@ pub(crate) mod tests {
                 ColumnSpec::new("value", ValKind::I32, ColumnAttributes::empty()),
             ]
         };
-        let primary_index = || IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK);
-        let secondary_index = || IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty());
+        let primary_index = || IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK);
+        let secondary_index =
+            || IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty());
 
         let catalog_metadata =
             TableMetadata::try_new(columns(), vec![primary_index()]).expect("valid table metadata");
@@ -1665,7 +1678,7 @@ pub(crate) mod tests {
             TableMetadata::try_new(columns(), vec![primary_index(), secondary_index()])
                 .expect("valid table metadata");
 
-        assert!(file_metadata.idx.next_index_no() > catalog_metadata.idx.next_index_no());
+        assert!(file_metadata.idx.next_index_slot() > catalog_metadata.idx.next_index_slot());
         assert!(
             index_ddl_metadata_reconcilable(TableID::new(42), &catalog_metadata, &file_metadata)
                 .unwrap()
@@ -1680,8 +1693,9 @@ pub(crate) mod tests {
                 ColumnSpec::new("value", ValKind::I32, ColumnAttributes::empty()),
             ]
         };
-        let primary_index = || IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK);
-        let secondary_index = || IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty());
+        let primary_index = || IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK);
+        let secondary_index =
+            || IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty());
 
         let catalog_metadata =
             TableMetadata::try_new(columns(), vec![primary_index(), secondary_index()])
@@ -1689,7 +1703,7 @@ pub(crate) mod tests {
         let file_metadata =
             TableMetadata::try_new(columns(), vec![primary_index()]).expect("valid table metadata");
 
-        assert!(catalog_metadata.idx.next_index_no() > file_metadata.idx.next_index_no());
+        assert!(catalog_metadata.idx.next_index_slot() > file_metadata.idx.next_index_slot());
         let err =
             index_ddl_metadata_reconcilable(TableID::new(42), &catalog_metadata, &file_metadata)
                 .unwrap_err();
@@ -1699,8 +1713,8 @@ pub(crate) mod tests {
         );
         let report = format!("{err:?}");
         assert!(report.contains("table_id=42"), "{report}");
-        assert!(report.contains("catalog_next_index_no=2"), "{report}");
-        assert!(report.contains("file_next_index_no=1"), "{report}");
+        assert!(report.contains("catalog_next_index_slot=2"), "{report}");
+        assert!(report.contains("file_next_index_slot=1"), "{report}");
     }
 
     #[test]
@@ -1738,9 +1752,9 @@ pub(crate) mod tests {
                 ColumnSpec::new("k2", ValKind::I32, ColumnAttributes::empty()),
             ]);
             let index_specs = vec![
-                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK),
+                IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK),
                 IndexSpec::new(
-                    vec![IndexKey::new(1), IndexKey::new(2)],
+                    vec![IndexKeySpec::new(1), IndexKeySpec::new(2)],
                     IndexAttributes::empty(),
                 ),
             ];
@@ -1765,7 +1779,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_next_index_no_persists_across_restart_and_catalog_checkpoint() {
+    fn test_next_index_slot_persists_across_restart_and_catalog_checkpoint() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
@@ -1782,8 +1796,8 @@ pub(crate) mod tests {
                         ],
                     },
                     vec![
-                        IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK),
-                        IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                        IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK),
+                        IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty()),
                     ],
                 )
                 .await
@@ -1795,13 +1809,13 @@ pub(crate) mod tests {
                 .get_table(table_id)
                 .await
                 .unwrap();
-            assert_eq!(table.metadata().idx.next_index_no(), 2);
+            assert_eq!(table.metadata().idx.next_index_slot(), IndexSlot::new(2));
             assert_eq!(
                 table
                     .metadata()
                     .idx
                     .active_indexes()
-                    .map(|(index_no, _)| index_no)
+                    .map(|(index_slot, _)| index_slot.get())
                     .collect::<Vec<_>>(),
                 vec![0, 1]
             );
@@ -1825,7 +1839,7 @@ pub(crate) mod tests {
                 .get_table(table_id)
                 .await
                 .unwrap();
-            assert_eq!(table.metadata().idx.next_index_no(), 2);
+            assert_eq!(table.metadata().idx.next_index_slot(), IndexSlot::new(2));
             assert_eq!(
                 table
                     .file()
@@ -1854,9 +1868,9 @@ pub(crate) mod tests {
             assert_eq!(
                 indexes
                     .iter()
-                    .map(|index| index.index_no)
+                    .map(|index| index.index_slot)
                     .collect::<Vec<_>>(),
-                vec![0, 1]
+                vec![IndexSlot::new(0), IndexSlot::new(1)]
             );
             drop(table);
             engine
@@ -1875,7 +1889,7 @@ pub(crate) mod tests {
                 .get_table(table_id)
                 .await
                 .unwrap();
-            assert_eq!(table.metadata().idx.next_index_no(), 2);
+            assert_eq!(table.metadata().idx.next_index_slot(), IndexSlot::new(2));
             assert_eq!(table.metadata().idx.active_index_count(), 2);
             assert_eq!(
                 table

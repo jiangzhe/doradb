@@ -2,7 +2,7 @@ use crate::buffer::page::VersionedPageID;
 use crate::buffer::{BufferPool, PoolGuards};
 use crate::catalog::{
     Catalog, CatalogCheckpointOutcome, CatalogCheckpointScope, CreateIndexPlan, DropIndexPlan,
-    DropTablePlan, IndexDdlGateScope, IndexNo, IndexSpec, PreparedCreateIndex, PreparedCreateTable,
+    DropTablePlan, IndexDdlGateScope, IndexID, IndexSpec, PreparedCreateIndex, PreparedCreateTable,
     PreparedDropIndex, PreparedDropTable, TableSpec, ValidatedCreateTable,
     create_index_catalog_write_targets, create_table_catalog_write_targets,
     drop_index_catalog_write_targets, drop_table_catalog_write_targets,
@@ -1174,7 +1174,7 @@ impl Session {
         &mut self,
         table_id: TableID,
         index_spec: IndexSpec,
-    ) -> Result<IndexNo> {
+    ) -> Result<IndexID> {
         reject_user_table_primary_key_index(&index_spec, "create_index").disclose()?;
         reject_non_user_table_id(table_id, "create_index").disclose()?;
         let operation = self
@@ -1225,7 +1225,7 @@ impl Session {
 
     /// Logically drop an active secondary index from an existing user table.
     #[inline]
-    pub async fn drop_index(&mut self, table_id: TableID, index_no: IndexNo) -> Result<()> {
+    pub async fn drop_index(&mut self, table_id: TableID, index_id: IndexID) -> Result<()> {
         reject_non_user_table_id(table_id, "drop_index").disclose()?;
         let operation = self
             .pin_operation(SessionOperationKind::Ddl)
@@ -1251,7 +1251,7 @@ impl Session {
             .await
             .attach("operation=drop_index")
             .disclose()?;
-        let plan = DropIndexPlan::new(table_id, table, index_no).disclose()?;
+        let plan = DropIndexPlan::new(table_id, table, index_id).disclose()?;
         let observer = mandatory_runtime
             .submit(PreparedDropIndex::new(gates, scope, plan))
             .await
@@ -1264,7 +1264,7 @@ impl Session {
             .map_err(|error| error.into_quad(RuntimeError::IndexAccess))
             .attach_with(|| {
                 format!(
-                    "operation=drop_index, phase=wait_mandatory_completion, table_id={table_id}, index_no={index_no}"
+                    "operation=drop_index, phase=wait_mandatory_completion, table_id={table_id}, index_id={index_id}"
                 )
             })
             .disclose()
@@ -3869,7 +3869,9 @@ pub(crate) mod tests {
     use crate::buffer::{PoolRole, test_pool_guards_share_keepalive_root};
     use crate::catalog::storage::tables::TABLE_ID_TABLES;
     use crate::catalog::tests::{table1, table2, wait_for_dropped_table_floor};
-    use crate::catalog::{CatalogTable, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey};
+    use crate::catalog::{
+        CatalogTable, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec,
+    };
     use crate::conf::{EngineConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{
@@ -4462,7 +4464,10 @@ pub(crate) mod tests {
                     ValKind::I32,
                     ColumnAttributes::empty(),
                 )]),
-                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
+                vec![IndexSpec::new(
+                    vec![IndexKeySpec::new(0)],
+                    IndexAttributes::UK,
+                )],
             )
             .await
             .unwrap()
@@ -4693,11 +4698,11 @@ pub(crate) mod tests {
                 session
                     .create_index(
                         table_id,
-                        IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::empty(),),
+                        IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::empty(),),
                     )
                     .await
             );
-            assert_rejected!(session.drop_index(table_id, 0).await);
+            assert_rejected!(session.drop_index(table_id, crate::IndexID::new(0)).await);
             assert_rejected!(session.drop_table(table_id).await);
             assert_rejected!(session.checkpoint_catalog().await);
             assert_rejected!(session.checkpoint_catalog_and_truncate_redo_log().await);

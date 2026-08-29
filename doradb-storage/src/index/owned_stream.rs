@@ -14,6 +14,7 @@ use super::index_stream::{
 use super::secondary_index::{SecondaryIndex, SecondaryIndexCandidateStream};
 use crate::buffer::guard::PageSharedGuard;
 use crate::buffer::{BufferPool, PoolGuard};
+use crate::catalog::IndexRef;
 use crate::error::RuntimeResult;
 use crate::id::BlockID;
 use crate::index::btree::{BTreeNode, BTreeNodeCursorState};
@@ -263,6 +264,7 @@ enum OwnedIndexCandidateStreamKind<P: BufferPool + 'static> {
 /// public `IndexScanMvccStream<'trx>` lifetime; do not retain or poll this
 /// crate-private cursor after releasing that enclosing operation state.
 pub(crate) struct OwnedIndexCandidateStream<P: BufferPool + 'static> {
+    index_ref: IndexRef,
     inner: OwnedIndexCandidateStreamKind<P>,
 }
 
@@ -271,6 +273,7 @@ impl<P: BufferPool + 'static> OwnedIndexCandidateStream<P> {
     #[inline]
     pub(crate) fn new(handle: OwnedCurrentIndexReadHandle<P>, range: KeyRange) -> Self {
         let OwnedCurrentIndexReadHandle {
+            index_ref,
             index,
             index_pool_guard,
             disk_pool_guard,
@@ -303,7 +306,13 @@ impl<P: BufferPool + 'static> OwnedIndexCandidateStream<P> {
                 ))
             }
         };
-        Self { inner }
+        Self { index_ref, inner }
+    }
+
+    /// Returns the exact user-index generation retained by this stream.
+    #[inline]
+    pub(crate) fn index_ref(&self) -> IndexRef {
+        self.index_ref
     }
 }
 

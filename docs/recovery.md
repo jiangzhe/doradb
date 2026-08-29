@@ -183,6 +183,11 @@ only while the necessary index DDL remains replayable and the root timestamp
 proves the table-file state is new enough. Any mismatch left after replay is a
 root-integrity failure.
 
+The root-proof classifier receives a replay-floor-qualified exact index
+identity. The existing redo `u16` is checked and expanded to an equal
+transitional `IndexID`/slot pair only after the DDL is known to be replay
+visible; recovery does not infer a generation from an unqualified bare slot.
+
 ## Secondary-Index Reconstruction
 
 Recovery needs no `index_rec_cts` because index state is divided by storage

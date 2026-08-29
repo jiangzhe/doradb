@@ -1,4 +1,4 @@
-use crate::catalog::TableColumnLayout;
+use crate::catalog::{IndexSlot, TableColumnLayout};
 use crate::id::RowID;
 use crate::row::{Row, RowMut};
 use crate::serde::{Deser, DeserResult, MinBytesHint, Ser, Serde, min_bytes_hint};
@@ -8,25 +8,25 @@ use std::{mem, slice, vec};
 
 /// Logical lookup key for one table index.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SelectKey {
-    /// Index ordinal in table metadata.
-    pub index_no: usize,
+pub(crate) struct SelectKey {
+    /// Physical table-local index slot.
+    pub(crate) index_slot: IndexSlot,
     /// Serialized key column values in index order.
-    pub vals: Vec<Val>,
+    pub(crate) vals: Vec<Val>,
 }
 
 impl SelectKey {
-    /// Creates a lookup key from an index ordinal and key values.
+    /// Creates a lookup key from a physical slot and key values.
     #[inline]
-    pub fn new(index_no: usize, vals: Vec<Val>) -> Self {
-        SelectKey { index_no, vals }
+    pub(crate) fn new(index_slot: IndexSlot, vals: Vec<Val>) -> Self {
+        SelectKey { index_slot, vals }
     }
 
     /// Creates a lookup key with all key values set to null.
     #[inline]
-    pub fn null(index_no: usize, val_count: usize) -> Self {
+    pub(crate) fn null(index_slot: IndexSlot, val_count: usize) -> Self {
         SelectKey {
-            index_no,
+            index_slot,
             vals: vec![Val::Null; val_count],
         }
     }
@@ -35,25 +35,25 @@ impl SelectKey {
 impl Ser<'_> for SelectKey {
     #[inline]
     fn ser_len(&self) -> usize {
-        mem::size_of::<u32>() + self.vals.ser_len()
+        mem::size_of::<u16>() + self.vals.ser_len()
     }
 
     #[inline]
     fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
-        let idx = out.ser_u32(start_idx, self.index_no as u32);
+        let idx = out.ser_u16(start_idx, self.index_slot.get());
         self.vals.ser(out, idx)
     }
 }
 
 impl Deser for SelectKey {
     const MIN_BYTES_HINT: MinBytesHint =
-        min_bytes_hint(mem::size_of::<u32>() + mem::size_of::<u64>());
+        min_bytes_hint(mem::size_of::<u16>() + mem::size_of::<u64>());
 
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
-        let (idx, index_no) = input.deser_u32(start_idx)?;
+        let (idx, index_slot) = input.deser_u16(start_idx)?;
         let (idx, vals) = <Vec<Val>>::deser(input, idx)?;
-        Ok((idx, SelectKey::new(index_no as usize, vals)))
+        Ok((idx, SelectKey::new(IndexSlot::from(index_slot), vals)))
     }
 }
 

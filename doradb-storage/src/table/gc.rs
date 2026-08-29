@@ -1,6 +1,6 @@
 use super::{Table, TableRootSnapshot, TableRuntimeLayout};
 use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuard, PoolGuards};
-use crate::catalog::TableMetadata;
+use crate::catalog::{IndexID, IndexRef, IndexSlot, TableMetadata};
 use crate::error::{
     CompletionErrorBridge, CompletionResult, DataIntegrityError, RuntimeError, RuntimeOrFatalError,
     RuntimeOrFatalResult, RuntimeResult,
@@ -53,8 +53,8 @@ pub struct MemIndexCleanupDelay {
 /// Cleanup result for one secondary MemIndex.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecondaryMemIndexCleanupIndexStats {
-    /// Table-local secondary-index number.
-    pub index_no: usize,
+    /// Stable table-local secondary-index identity.
+    pub index_id: IndexID,
     /// Whether the scanned index is unique.
     pub unique: bool,
     /// Number of MemIndex entries processed as cleanup candidates.
@@ -71,9 +71,9 @@ pub struct SecondaryMemIndexCleanupIndexStats {
 
 impl SecondaryMemIndexCleanupIndexStats {
     #[inline]
-    fn new(index_no: usize, unique: bool) -> Self {
+    fn new(index_id: IndexID, unique: bool) -> Self {
         Self {
-            index_no,
+            index_id,
             unique,
             scanned: 0,
             removed: 0,
@@ -147,13 +147,13 @@ impl MemIndexCleanupSnapshot<'_> {
     }
 
     #[inline]
-    fn secondary_index_root(&self, index_no: usize) -> BlockID {
-        self.root.secondary_index_root(index_no)
+    fn secondary_index_root(&self, index_slot: IndexSlot) -> BlockID {
+        self.root.secondary_index_root(index_slot)
     }
 
     #[inline]
-    fn root_index_is_active(&self, index_no: usize) -> bool {
-        self.root_metadata.idx.index_spec(index_no).is_some()
+    fn root_index_is_active(&self, index_slot: IndexSlot) -> bool {
+        self.root_metadata.idx.index_spec(index_slot).is_some()
     }
 
     #[inline]
@@ -387,19 +387,19 @@ impl Table {
             indexes: Vec::with_capacity(metadata.idx.active_index_count()),
         };
 
-        for (_, index) in layout.active_secondary_indexes() {
-            let index_no = index.index_no();
-            if !snapshot.root_index_is_active(index_no) {
+        for (index_ref, index) in layout.active_secondary_indexes() {
+            let index_slot = index_ref.slot();
+            if !snapshot.root_index_is_active(index_slot) || !layout.validate_index_ref(index_ref) {
                 continue;
             }
-            let secondary_root = snapshot.secondary_index_root(index_no);
+            let secondary_root = snapshot.secondary_index_root(index_slot);
             let mut index_stats =
-                SecondaryMemIndexCleanupIndexStats::new(index_no, index.is_unique());
+                SecondaryMemIndexCleanupIndexStats::new(index_ref.id(), index.is_unique());
             match index {
                 SecondaryIndex::Unique { .. } => {
                     self.cleanup_unique_secondary_mem_index(
                         &cleanup_context,
-                        index_no,
+                        index_ref,
                         index,
                         secondary_root,
                         &mut index_stats,
@@ -409,7 +409,7 @@ impl Table {
                 SecondaryIndex::NonUnique { .. } => {
                     self.cleanup_non_unique_secondary_mem_index(
                         &cleanup_context,
-                        index_no,
+                        index_ref,
                         index,
                         secondary_root,
                         &mut index_stats,
@@ -427,7 +427,7 @@ impl Table {
     async fn cleanup_unique_secondary_mem_index(
         &self,
         cleanup_context: &MemIndexCleanupContext<'_, '_>,
-        index_no: usize,
+        index_ref: IndexRef,
         index: &SecondaryIndex<EvictableBufferPool>,
         secondary_root: BlockID,
         stats: &mut SecondaryMemIndexCleanupIndexStats,
@@ -455,7 +455,7 @@ impl Table {
                     if self
                         .cleanup_unique_delete_overlay_is_obsolete(
                             cleanup_context,
-                            index_no,
+                            index_ref,
                             mem,
                             &entry,
                         )
@@ -500,7 +500,7 @@ impl Table {
     async fn cleanup_non_unique_secondary_mem_index(
         &self,
         cleanup_context: &MemIndexCleanupContext<'_, '_>,
-        index_no: usize,
+        index_ref: IndexRef,
         index: &SecondaryIndex<EvictableBufferPool>,
         secondary_root: BlockID,
         stats: &mut SecondaryMemIndexCleanupIndexStats,
@@ -527,7 +527,7 @@ impl Table {
                     if self
                         .cleanup_non_unique_delete_overlay_is_obsolete(
                             cleanup_context,
-                            index_no,
+                            index_ref,
                             mem,
                             &entry,
                         )
@@ -593,12 +593,12 @@ impl Table {
     async fn cleanup_unique_delete_overlay_is_obsolete(
         &self,
         cleanup_context: &MemIndexCleanupContext<'_, '_>,
-        index_no: usize,
+        index_ref: IndexRef,
         index: &UniqueMemIndex<EvictableBufferPool>,
         entry: &MemIndexEntry,
     ) -> RuntimeResult<bool> {
         match self
-            .cleanup_delete_overlay_proof(cleanup_context, index_no, entry.row_id)
+            .cleanup_delete_overlay_proof(cleanup_context, index_ref, entry.row_id)
             .await?
         {
             DeleteOverlayProof::NotProven => Ok(false),
@@ -613,12 +613,12 @@ impl Table {
     async fn cleanup_non_unique_delete_overlay_is_obsolete(
         &self,
         cleanup_context: &MemIndexCleanupContext<'_, '_>,
-        index_no: usize,
+        index_ref: IndexRef,
         index: &NonUniqueMemIndex<EvictableBufferPool>,
         entry: &MemIndexEntry,
     ) -> RuntimeResult<bool> {
         match self
-            .cleanup_delete_overlay_proof(cleanup_context, index_no, entry.row_id)
+            .cleanup_delete_overlay_proof(cleanup_context, index_ref, entry.row_id)
             .await?
         {
             DeleteOverlayProof::NotProven => Ok(false),
@@ -633,7 +633,7 @@ impl Table {
     async fn cleanup_delete_overlay_proof(
         &self,
         cleanup_context: &MemIndexCleanupContext<'_, '_>,
-        index_no: usize,
+        index_ref: IndexRef,
         row_id: RowID,
     ) -> RuntimeResult<DeleteOverlayProof> {
         let snapshot = cleanup_context.snapshot;
@@ -672,7 +672,7 @@ impl Table {
             return Ok(DeleteOverlayProof::Obsolete);
         }
         let values = self
-            .cleanup_read_cold_index_values(cleanup_context, index_no, row)
+            .cleanup_read_cold_index_values(cleanup_context, index_ref, row)
             .await?;
         Ok(DeleteOverlayProof::ColdRowValues(values))
     }
@@ -681,13 +681,25 @@ impl Table {
     async fn cleanup_read_cold_index_values(
         &self,
         cleanup_context: &MemIndexCleanupContext<'_, '_>,
-        index_no: usize,
+        index_ref: IndexRef,
         row: ResolvedColumnRow,
     ) -> RuntimeResult<Vec<Val>> {
+        if !cleanup_context
+            .snapshot
+            .layout()
+            .validate_index_ref(index_ref)
+        {
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!(
+                    "cleanup index generation mismatch: table_id={}, index={index_ref}",
+                    self.table_id()
+                ))
+                .change_context(RuntimeError::TableAccess));
+        }
         let metadata = cleanup_context.metadata;
-        let index_spec = metadata.idx.index_spec(index_no).unwrap_or_else(|| {
+        let index_spec = metadata.idx.index_spec(index_ref.slot()).unwrap_or_else(|| {
             panic!(
-                "active cleanup index must exist in captured metadata: table_id={}, index_no={index_no}",
+                "active cleanup index must exist in captured metadata: table_id={}, index={index_ref}",
                 self.table_id()
             )
         });
@@ -711,7 +723,7 @@ impl Table {
                 ))
                 .change_context(RuntimeError::TableAccess)
                 .attach(format!(
-                    "operation=cleanup_secondary_mem_indexes, table_id={}, index_no={index_no}",
+                    "operation=cleanup_secondary_mem_indexes, table_id={}, index={index_ref}",
                     self.table_id()
                 )));
         }
@@ -721,7 +733,7 @@ impl Table {
             .change_context(RuntimeError::TableAccess)
             .attach_with(|| {
                 format!(
-                    "operation=cleanup_secondary_mem_indexes, table_id={}, index_no={index_no}",
+                    "operation=cleanup_secondary_mem_indexes, table_id={}, index={index_ref}",
                     self.table_id()
                 )
             })
@@ -775,8 +787,8 @@ async fn compare_delete_non_unique_cleanup_entry<P: BufferPool>(
 
 #[cfg(test)]
 mod tests {
-    use crate::catalog::IndexNo;
     use crate::catalog::tests::wait_for_dropped_table_floor;
+    use crate::catalog::{IndexID, IndexSlot};
     use crate::engine::Engine;
     use crate::error::{DataIntegrityError, FatalError, LifecycleError};
     use crate::id::{RowID, TrxID};
@@ -949,8 +961,8 @@ mod tests {
 
             let table = table_for_internal_assertion(&engine, table_id);
             let pool_guards = session.pool_guards();
-            let old_unique = bound_unique_index(&table, &pool_guards, 0);
-            let old_non_unique = bound_non_unique_index_no(&table, &pool_guards, 1);
+            let old_unique = bound_unique_index(&table, &pool_guards, IndexSlot::new(0));
+            let old_non_unique = bound_non_unique_index(&table, &pool_guards, IndexSlot::new(1));
             let primary_key = single_key(0i32);
             let non_unique_key = name_key("old-root");
             let row_id = old_unique
@@ -1032,7 +1044,7 @@ mod tests {
             assert_eq!(completed.stats.indexes[0].removed, 1);
             assert_eq!(completed.stats.indexes[1].removed, 1);
 
-            let current_unique = bound_unique_index(&table, &pool_guards, 0);
+            let current_unique = bound_unique_index(&table, &pool_guards, IndexSlot::new(0));
             assert_eq!(
                 current_unique
                     .lookup(&primary_key.vals, MAX_SNAPSHOT_TS)
@@ -1040,7 +1052,8 @@ mod tests {
                     .unwrap(),
                 Some((row_id, false))
             );
-            let current_non_unique = bound_non_unique_index_no(&table, &pool_guards, 1);
+            let current_non_unique =
+                bound_non_unique_index(&table, &pool_guards, IndexSlot::new(1));
             let mut current_rows = Vec::new();
             current_non_unique
                 .lookup(&non_unique_key.vals, &mut current_rows, MAX_SNAPSHOT_TS)
@@ -1067,7 +1080,7 @@ mod tests {
             let index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
-                0,
+                IndexSlot::new(0),
             );
             let stats = session
                 .cleanup_secondary_mem_indexes(table_id, true)
@@ -1076,7 +1089,7 @@ mod tests {
                 .stats;
             assert!(!session.in_trx().unwrap());
             assert_eq!(stats.indexes.len(), 1);
-            assert_eq!(stats.indexes[0].index_no, 0);
+            assert_eq!(stats.indexes[0].index_id, IndexID::new(0));
             assert!(stats.indexes[0].unique);
             assert_eq!(stats.indexes[0].scanned, row_count as usize);
             assert_eq!(stats.indexes[0].removed, row_count as usize);
@@ -1140,10 +1153,10 @@ mod tests {
             assert_checkpoint_published(&mut session, table_id).await;
 
             let pool_guards = session.pool_guards();
-            let index = bound_non_unique_index_no(
+            let index = bound_non_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
-                1,
+                IndexSlot::new(1),
             );
             let stats = session
                 .cleanup_secondary_mem_indexes(table_id, true)
@@ -1151,7 +1164,7 @@ mod tests {
                 .unwrap()
                 .stats;
             assert_eq!(stats.indexes.len(), 2);
-            assert_eq!(stats.indexes[1].index_no, 1);
+            assert_eq!(stats.indexes[1].index_id, IndexID::new(1));
             assert!(!stats.indexes[1].unique);
             assert_eq!(stats.indexes[1].scanned, row_count as usize);
             assert_eq!(stats.indexes[1].removed, row_count as usize);
@@ -1222,12 +1235,12 @@ mod tests {
             let unique_index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
-                0,
+                IndexSlot::new(0),
             );
-            let non_unique_index = bound_non_unique_index_no(
+            let non_unique_index = bound_non_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
-                1,
+                IndexSlot::new(1),
             );
             let outcome = session
                 .cleanup_secondary_mem_indexes(table_id, false)
@@ -1292,7 +1305,7 @@ mod tests {
             let index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
-                0,
+                IndexSlot::new(0),
             );
             let row_id = index
                 .lookup(&current_key.vals, MAX_SNAPSHOT_TS)
@@ -1368,7 +1381,7 @@ mod tests {
             let index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
-                0,
+                IndexSlot::new(0),
             );
             assert!(
                 index
@@ -1439,7 +1452,7 @@ mod tests {
             let index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
-                0,
+                IndexSlot::new(0),
             );
             assert!(
                 index
@@ -1511,7 +1524,7 @@ mod tests {
             let index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
-                0,
+                IndexSlot::new(0),
             );
             let _ = index
                 .inject_mem_entry_if_absent(&current_key.vals, row_id, false, MAX_SNAPSHOT_TS)
@@ -1604,7 +1617,7 @@ mod tests {
             let index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
-                0,
+                IndexSlot::new(0),
             );
             assert!(
                 index
@@ -1694,7 +1707,7 @@ mod tests {
                     .unwrap()
                     .block_id()
             };
-            let index = bound_unique_index(&table, &pool_guards, 0);
+            let index = bound_unique_index(&table, &pool_guards, IndexSlot::new(0));
             assert!(
                 index
                     .inject_mem_entry_if_absent(&stale_key.vals, row_id, false, MAX_SNAPSHOT_TS,)
@@ -1753,7 +1766,7 @@ mod tests {
             let row_id = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
-                0,
+                IndexSlot::new(0),
             )
             .lookup(&pk.vals, MAX_SNAPSHOT_TS)
             .await
@@ -1761,10 +1774,10 @@ mod tests {
             .unwrap()
             .0;
             let stale_key = name_key("stale");
-            let index = bound_non_unique_index_no(
+            let index = bound_non_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
-                stale_key.index_no,
+                stale_key.index_slot,
             );
             assert!(
                 index
@@ -1824,10 +1837,10 @@ mod tests {
             .await
             .unwrap();
             let stale_key = name_key("stale");
-            let index = bound_non_unique_index_no(
+            let index = bound_non_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
-                stale_key.index_no,
+                stale_key.index_slot,
             );
             assert!(
                 index
@@ -1891,10 +1904,10 @@ mod tests {
             .await
             .unwrap();
             let current_key = name_key("current");
-            let index = bound_non_unique_index_no(
+            let index = bound_non_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
-                current_key.index_no,
+                current_key.index_slot,
             );
             let _ = index
                 .inject_mem_entry_if_absent(&current_key.vals, row_id, false, MAX_SNAPSHOT_TS)
@@ -1996,10 +2009,10 @@ mod tests {
                 .await,
                 vec![row_id]
             );
-            let index = bound_non_unique_index_no(
+            let index = bound_non_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
-                stale_key.index_no,
+                stale_key.index_slot,
             );
             assert!(
                 index
@@ -2084,7 +2097,7 @@ mod tests {
             let index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
-                key.index_no,
+                key.index_slot,
             );
             let _ = index
                 .inject_mem_entry_if_absent(&key.vals, row_id, false, MAX_SNAPSHOT_TS)
@@ -2107,7 +2120,7 @@ mod tests {
                 .accessor_with_layout(&layout)
                 .delete_index(
                     &pool_guards,
-                    key.index_no,
+                    active_index_ref(&layout, key.index_slot),
                     &key.vals,
                     row_id,
                     true,
@@ -2151,7 +2164,7 @@ mod tests {
             let index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
-                current_key.index_no,
+                current_key.index_slot,
             );
             let _ = index
                 .inject_mem_entry_if_absent(&stale_key.vals, row_id, false, MAX_SNAPSHOT_TS)
@@ -2168,7 +2181,7 @@ mod tests {
                 .accessor_with_layout(&layout)
                 .delete_index(
                     &pool_guards,
-                    stale_key.index_no,
+                    active_index_ref(&layout, stale_key.index_slot),
                     &stale_key.vals,
                     row_id,
                     true,
@@ -2204,7 +2217,7 @@ mod tests {
                 .accessor_with_layout(&layout)
                 .delete_index(
                     &pool_guards,
-                    current_key.index_no,
+                    active_index_ref(&layout, current_key.index_slot),
                     &current_key.vals,
                     row_id,
                     true,
@@ -2254,7 +2267,7 @@ mod tests {
             assert_checkpoint_published(&mut session, table_id).await;
 
             let pool_guards = session.pool_guards();
-            let index = bound_unique_index(&table, &pool_guards, key.index_no);
+            let index = bound_unique_index(&table, &pool_guards, key.index_slot);
             assert!(
                 index
                     .inject_mem_entry_if_absent(&key.vals, row_id, true, MAX_SNAPSHOT_TS)
@@ -2274,7 +2287,7 @@ mod tests {
                 .accessor_with_layout(&layout)
                 .delete_index(
                     &pool_guards,
-                    key.index_no,
+                    active_index_ref(&layout, key.index_slot),
                     &key.vals,
                     row_id,
                     true,
@@ -2292,7 +2305,7 @@ mod tests {
                 .accessor_with_layout(&layout)
                 .delete_index(
                     &pool_guards,
-                    key.index_no,
+                    active_index_ref(&layout, key.index_slot),
                     &key.vals,
                     row_id,
                     true,
@@ -2334,10 +2347,10 @@ mod tests {
             .await;
             reader.commit().await.unwrap();
 
-            let index = bound_non_unique_index_no(
+            let index = bound_non_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
-                current_key.index_no,
+                current_key.index_slot,
             );
             let _ = index
                 .inject_mem_entry_if_absent(&stale_key.vals, row_id, false, MAX_SNAPSHOT_TS)
@@ -2355,7 +2368,7 @@ mod tests {
                 .accessor_with_layout(&layout)
                 .delete_index(
                     &pool_guards,
-                    stale_key.index_no,
+                    active_index_ref(&layout, stale_key.index_slot),
                     &stale_key.vals,
                     row_id,
                     false,
@@ -2392,7 +2405,7 @@ mod tests {
                 .accessor_with_layout(&layout)
                 .delete_index(
                     &pool_guards,
-                    current_key.index_no,
+                    active_index_ref(&layout, current_key.index_slot),
                     &current_key.vals,
                     row_id,
                     false,
@@ -2425,7 +2438,7 @@ mod tests {
             let index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
-                key.index_no,
+                key.index_slot,
             );
             let _ = index
                 .inject_mem_entry_if_absent(&key.vals, RowID::new(row_id), false, MAX_SNAPSHOT_TS)
@@ -2444,7 +2457,7 @@ mod tests {
                 .accessor_with_layout(&layout)
                 .delete_index(
                     &pool_guards,
-                    key.index_no,
+                    active_index_ref(&layout, key.index_slot),
                     &key.vals,
                     RowID::new(row_id),
                     true,
@@ -2492,7 +2505,7 @@ mod tests {
             let index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
-                key.index_no,
+                key.index_slot,
             );
             assert!(matches!(
                 index
@@ -2503,8 +2516,15 @@ mod tests {
                     .unwrap(),
                 Some((actual_row_id, true)) if actual_row_id == row_id
             ));
+            let retained_index = {
+                let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
+                active_index_ref(&layout, key.index_slot)
+            };
 
-            session.drop_index(table_id, 0).await.unwrap();
+            session
+                .drop_index(table_id, crate::IndexID::new(0))
+                .await
+                .unwrap();
 
             let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
 
@@ -2512,7 +2532,7 @@ mod tests {
                 .accessor_with_layout(&layout)
                 .delete_index(
                     &pool_guards,
-                    key.index_no,
+                    retained_index,
                     &key.vals,
                     row_id,
                     true,
@@ -2554,10 +2574,10 @@ mod tests {
                     .unwrap(),
             ) + 1;
             let pool_guards = session.pool_guards();
-            let index = bound_non_unique_index_no(
+            let index = bound_non_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
-                key.index_no,
+                key.index_slot,
             );
             assert!(matches!(
                 index
@@ -2566,9 +2586,13 @@ mod tests {
                     .unwrap(),
                 Some(false)
             ));
+            let retained_index = {
+                let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
+                active_index_ref(&layout, key.index_slot)
+            };
 
             session
-                .drop_index(table_id, key.index_no as IndexNo)
+                .drop_index(table_id, key.index_slot.transitional_id())
                 .await
                 .unwrap();
 
@@ -2578,7 +2602,7 @@ mod tests {
                 .accessor_with_layout(&layout)
                 .delete_index(
                     &pool_guards,
-                    key.index_no,
+                    retained_index,
                     &key.vals,
                     row_id,
                     false,

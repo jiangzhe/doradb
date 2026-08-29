@@ -679,7 +679,7 @@ pub(crate) fn validate_persisted_lwc_block(
 mod tests {
     use super::*;
     use crate::catalog::{
-        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
+        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexSpec, TableMetadata,
     };
     // Test helper inspects the intentional `PersistedLwcBlock::load` public
     // convergence over read/completion and DataIntegrity domains.
@@ -1008,10 +1008,13 @@ mod tests {
     #[test]
     fn test_lwc_block_decode_stable_across_index_only_metadata_changes() {
         let (metadata, buf) = build_valid_persisted_lwc_block();
-        let (index_no, indexed_metadata) = metadata
-            .try_with_created_index(IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK))
+        let (index_slot, indexed_metadata) = metadata
+            .try_with_created_index(IndexSpec::new(
+                vec![IndexKeySpec::new(0)],
+                IndexAttributes::UK,
+            ))
             .unwrap();
-        let dropped_metadata = indexed_metadata.without_index(index_no);
+        let dropped_metadata = indexed_metadata.without_index(index_slot);
         let page =
             LwcBlock::try_from_persisted_bytes(buf.data(), FileKind::TableFile, test_block_id(8))
                 .unwrap();

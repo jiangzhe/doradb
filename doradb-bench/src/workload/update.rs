@@ -13,7 +13,7 @@ use crate::workload::util::{
 };
 use crate::workload::{RunCancellation, SessionPlan};
 use doradb_storage::id::TableID;
-use doradb_storage::{Engine, RowMutation, Session, UpdateCol, Val};
+use doradb_storage::{Engine, IndexID, RowMutation, Session, TableIndex, UpdateCol, Val};
 
 const SPLITMIX_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
 const UPDATE_RANGE_SALT: u64 = 0xd743_8f29_51ce_6a0b;
@@ -377,65 +377,70 @@ async fn run_update_operations(
         let upper = [Val::from(range_end)];
         let mut callback_error = None;
         let mutation_result = trx
-            .table_index_mutate_mvcc(spec.table_id, 0, &lower[..]..&upper[..], |row| {
-                if callback_error.is_some() {
-                    return Ok(RowMutation::Skip);
-                }
-                let Some(key) = row.val(0)?.as_u64() else {
-                    callback_error = Some(BenchError::message(
-                        "update callback logical key is not u64",
-                    ));
-                    return Ok(RowMutation::Skip);
-                };
-                let base_offset = match domain_offset(key, spec.source_domain) {
-                    Ok(offset) => offset,
-                    Err(error) => {
-                        callback_error = Some(error);
+            .table_index_mutate_mvcc(
+                TableIndex(spec.table_id, IndexID::new(0)),
+                &lower[..]..&upper[..],
+                |row| {
+                    if callback_error.is_some() {
                         return Ok(RowMutation::Skip);
                     }
-                };
-                let preferred = generate_update_payload(
-                    base_offset,
-                    spec.seed,
-                    spec.value_size,
-                    payload_variant,
-                );
-                let Some(current_payload) = row.val(1)?.as_bytes() else {
-                    callback_error = Some(BenchError::message(
-                        "update callback payload is not variable bytes",
-                    ));
-                    return Ok(RowMutation::Skip);
-                };
-                let payload = if current_payload == preferred.as_slice() {
-                    generate_update_payload(
-                        base_offset,
-                        spec.seed,
-                        spec.value_size,
-                        !payload_variant,
-                    )
-                } else {
-                    preferred
-                };
-                let mut update = Vec::with_capacity(usize::from(spec.change_key) + 1);
-                if spec.change_key {
-                    let mapped_key = match key_at_domain_offset(spec.target_domain, base_offset) {
-                        Ok(key) => key,
+                    let Some(key) = row.val(0)?.as_u64() else {
+                        callback_error = Some(BenchError::message(
+                            "update callback logical key is not u64",
+                        ));
+                        return Ok(RowMutation::Skip);
+                    };
+                    let base_offset = match domain_offset(key, spec.source_domain) {
+                        Ok(offset) => offset,
                         Err(error) => {
                             callback_error = Some(error);
                             return Ok(RowMutation::Skip);
                         }
                     };
+                    let preferred = generate_update_payload(
+                        base_offset,
+                        spec.seed,
+                        spec.value_size,
+                        payload_variant,
+                    );
+                    let Some(current_payload) = row.val(1)?.as_bytes() else {
+                        callback_error = Some(BenchError::message(
+                            "update callback payload is not variable bytes",
+                        ));
+                        return Ok(RowMutation::Skip);
+                    };
+                    let payload = if current_payload == preferred.as_slice() {
+                        generate_update_payload(
+                            base_offset,
+                            spec.seed,
+                            spec.value_size,
+                            !payload_variant,
+                        )
+                    } else {
+                        preferred
+                    };
+                    let mut update = Vec::with_capacity(usize::from(spec.change_key) + 1);
+                    if spec.change_key {
+                        let mapped_key = match key_at_domain_offset(spec.target_domain, base_offset)
+                        {
+                            Ok(key) => key,
+                            Err(error) => {
+                                callback_error = Some(error);
+                                return Ok(RowMutation::Skip);
+                            }
+                        };
+                        update.push(UpdateCol {
+                            idx: 0,
+                            val: Val::from(mapped_key),
+                        });
+                    }
                     update.push(UpdateCol {
-                        idx: 0,
-                        val: Val::from(mapped_key),
+                        idx: 1,
+                        val: Val::from(payload),
                     });
-                }
-                update.push(UpdateCol {
-                    idx: 1,
-                    val: Val::from(payload),
-                });
-                Ok(RowMutation::Update(update))
-            })
+                    Ok(RowMutation::Update(update))
+                },
+            )
             .await;
         if let Some(error) = callback_error {
             let _ = trx.rollback().await;

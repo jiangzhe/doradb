@@ -1,6 +1,6 @@
 use super::{MemTable, Table, TableRuntimeLayout};
 use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool, PoolGuard, PoolGuards};
-use crate::catalog::{CatalogSelectKey, CatalogTable, ResolvedUserIndexKey};
+use crate::catalog::{CatalogTable, ResolvedIndexKey, catalog_index_slot};
 use crate::error::RuntimeResult;
 use crate::id::{RowID, TrxID};
 use crate::index::IndexCompareExchange;
@@ -15,8 +15,6 @@ use crate::trx::undo::{IndexUndo, IndexUndoKind};
 /// undo entries in reverse order and preserves the exact old index value
 /// recorded in the undo log.
 pub(crate) trait IndexRollback {
-    /// Index-reference domain accepted by this table runtime.
-    type Key;
     /// Row buffer pool type owned by the table runtime.
     type RowPool: BufferPool + 'static;
     /// Secondary-index buffer pool type owned by the table runtime.
@@ -29,7 +27,7 @@ pub(crate) trait IndexRollback {
     async fn unique_mask_as_deleted(
         &self,
         index_pool_guard: &PoolGuard,
-        key: &Self::Key,
+        key: &ResolvedIndexKey,
         row_id: RowID,
         ts: TrxID,
     ) -> RuntimeResult<bool>;
@@ -38,7 +36,7 @@ pub(crate) trait IndexRollback {
     async fn unique_compare_delete(
         &self,
         index_pool_guard: &PoolGuard,
-        key: &Self::Key,
+        key: &ResolvedIndexKey,
         row_id: RowID,
         ignore_del_mask: bool,
         ts: TrxID,
@@ -48,7 +46,7 @@ pub(crate) trait IndexRollback {
     async fn unique_compare_exchange(
         &self,
         index_pool_guard: &PoolGuard,
-        key: &Self::Key,
+        key: &ResolvedIndexKey,
         old_row_id: RowID,
         new_row_id: RowID,
         ts: TrxID,
@@ -58,7 +56,7 @@ pub(crate) trait IndexRollback {
     async fn non_unique_mask_as_deleted(
         &self,
         index_pool_guard: &PoolGuard,
-        key: &Self::Key,
+        key: &ResolvedIndexKey,
         row_id: RowID,
         ts: TrxID,
     ) -> RuntimeResult<bool>;
@@ -67,7 +65,7 @@ pub(crate) trait IndexRollback {
     async fn non_unique_mask_as_active(
         &self,
         index_pool_guard: &PoolGuard,
-        key: &Self::Key,
+        key: &ResolvedIndexKey,
         row_id: RowID,
         ts: TrxID,
     ) -> RuntimeResult<bool>;
@@ -76,7 +74,7 @@ pub(crate) trait IndexRollback {
     async fn non_unique_compare_delete(
         &self,
         index_pool_guard: &PoolGuard,
-        key: &Self::Key,
+        key: &ResolvedIndexKey,
         row_id: RowID,
         ignore_del_mask: bool,
         ts: TrxID,
@@ -85,7 +83,7 @@ pub(crate) trait IndexRollback {
     /// Rolls back one secondary-index undo entry against this table runtime.
     async fn rollback_index_entry(
         &self,
-        entry: &IndexUndo<Self::Key>,
+        entry: &IndexUndo,
         guards: &PoolGuards,
         ts: TrxID,
     ) -> RuntimeResult<()> {
@@ -181,7 +179,6 @@ struct UserTableRollback<'a> {
 }
 
 impl IndexRollback for UserTableRollback<'_> {
-    type Key = ResolvedUserIndexKey;
     type RowPool = EvictableBufferPool;
     type IndexPool = EvictableBufferPool;
 
@@ -194,11 +191,11 @@ impl IndexRollback for UserTableRollback<'_> {
     async fn unique_mask_as_deleted(
         &self,
         index_pool_guard: &PoolGuard,
-        key: &ResolvedUserIndexKey,
+        key: &ResolvedIndexKey,
         row_id: RowID,
         ts: TrxID,
     ) -> RuntimeResult<bool> {
-        let index = self.layout.secondary_index(key.index.slot().as_usize())?;
+        let index = self.layout.secondary_index(key.index)?;
         index
             .unique_mem()?
             .bind(index_pool_guard)
@@ -210,12 +207,12 @@ impl IndexRollback for UserTableRollback<'_> {
     async fn unique_compare_delete(
         &self,
         index_pool_guard: &PoolGuard,
-        key: &ResolvedUserIndexKey,
+        key: &ResolvedIndexKey,
         row_id: RowID,
         ignore_del_mask: bool,
         ts: TrxID,
     ) -> RuntimeResult<bool> {
-        let index = self.layout.secondary_index(key.index.slot().as_usize())?;
+        let index = self.layout.secondary_index(key.index)?;
         index
             .unique_mem()?
             .bind(index_pool_guard)
@@ -227,12 +224,12 @@ impl IndexRollback for UserTableRollback<'_> {
     async fn unique_compare_exchange(
         &self,
         index_pool_guard: &PoolGuard,
-        key: &ResolvedUserIndexKey,
+        key: &ResolvedIndexKey,
         old_row_id: RowID,
         new_row_id: RowID,
         ts: TrxID,
     ) -> RuntimeResult<IndexCompareExchange> {
-        let index = self.layout.secondary_index(key.index.slot().as_usize())?;
+        let index = self.layout.secondary_index(key.index)?;
         index
             .unique_mem()?
             .bind(index_pool_guard)
@@ -244,11 +241,11 @@ impl IndexRollback for UserTableRollback<'_> {
     async fn non_unique_mask_as_deleted(
         &self,
         index_pool_guard: &PoolGuard,
-        key: &ResolvedUserIndexKey,
+        key: &ResolvedIndexKey,
         row_id: RowID,
         ts: TrxID,
     ) -> RuntimeResult<bool> {
-        let index = self.layout.secondary_index(key.index.slot().as_usize())?;
+        let index = self.layout.secondary_index(key.index)?;
         index
             .non_unique_mem()?
             .bind(index_pool_guard)
@@ -260,11 +257,11 @@ impl IndexRollback for UserTableRollback<'_> {
     async fn non_unique_mask_as_active(
         &self,
         index_pool_guard: &PoolGuard,
-        key: &ResolvedUserIndexKey,
+        key: &ResolvedIndexKey,
         row_id: RowID,
         ts: TrxID,
     ) -> RuntimeResult<bool> {
-        let index = self.layout.secondary_index(key.index.slot().as_usize())?;
+        let index = self.layout.secondary_index(key.index)?;
         index
             .non_unique_mem()?
             .bind(index_pool_guard)
@@ -276,12 +273,12 @@ impl IndexRollback for UserTableRollback<'_> {
     async fn non_unique_compare_delete(
         &self,
         index_pool_guard: &PoolGuard,
-        key: &ResolvedUserIndexKey,
+        key: &ResolvedIndexKey,
         row_id: RowID,
         ignore_del_mask: bool,
         ts: TrxID,
     ) -> RuntimeResult<bool> {
-        let index = self.layout.secondary_index(key.index.slot().as_usize())?;
+        let index = self.layout.secondary_index(key.index)?;
         index
             .non_unique_mem()?
             .bind(index_pool_guard)
@@ -296,7 +293,7 @@ impl Table {
     pub(crate) async fn rollback_index_entry_with_layout(
         &self,
         layout: &TableRuntimeLayout,
-        entry: &IndexUndo<ResolvedUserIndexKey>,
+        entry: &IndexUndo,
         guards: &PoolGuards,
         ts: TrxID,
     ) -> RuntimeResult<()> {
@@ -310,7 +307,6 @@ impl Table {
 }
 
 impl IndexRollback for CatalogTable {
-    type Key = CatalogSelectKey;
     type RowPool = FixedBufferPool;
     type IndexPool = FixedBufferPool;
 
@@ -323,12 +319,12 @@ impl IndexRollback for CatalogTable {
     async fn unique_mask_as_deleted(
         &self,
         index_pool_guard: &PoolGuard,
-        key: &CatalogSelectKey,
+        key: &ResolvedIndexKey,
         row_id: RowID,
         ts: TrxID,
     ) -> RuntimeResult<bool> {
         self.mem
-            .require_sec_idx(key.index.as_usize())?
+            .require_sec_idx(catalog_index_slot(key.index))?
             .unique()
             // The undo variant is emitted from this index's immutable kind.
             .expect("unique rollback undo referenced a non-unique catalog index")
@@ -341,13 +337,13 @@ impl IndexRollback for CatalogTable {
     async fn unique_compare_delete(
         &self,
         index_pool_guard: &PoolGuard,
-        key: &CatalogSelectKey,
+        key: &ResolvedIndexKey,
         row_id: RowID,
         ignore_del_mask: bool,
         ts: TrxID,
     ) -> RuntimeResult<bool> {
         self.mem
-            .require_sec_idx(key.index.as_usize())?
+            .require_sec_idx(catalog_index_slot(key.index))?
             .unique()
             // The undo variant is emitted from this index's immutable kind.
             .expect("unique rollback undo referenced a non-unique catalog index")
@@ -360,13 +356,13 @@ impl IndexRollback for CatalogTable {
     async fn unique_compare_exchange(
         &self,
         index_pool_guard: &PoolGuard,
-        key: &CatalogSelectKey,
+        key: &ResolvedIndexKey,
         old_row_id: RowID,
         new_row_id: RowID,
         ts: TrxID,
     ) -> RuntimeResult<IndexCompareExchange> {
         self.mem
-            .require_sec_idx(key.index.as_usize())?
+            .require_sec_idx(catalog_index_slot(key.index))?
             .unique()
             // The undo variant is emitted from this index's immutable kind.
             .expect("unique rollback undo referenced a non-unique catalog index")
@@ -379,12 +375,12 @@ impl IndexRollback for CatalogTable {
     async fn non_unique_mask_as_deleted(
         &self,
         index_pool_guard: &PoolGuard,
-        key: &CatalogSelectKey,
+        key: &ResolvedIndexKey,
         row_id: RowID,
         ts: TrxID,
     ) -> RuntimeResult<bool> {
         self.mem
-            .require_sec_idx(key.index.as_usize())?
+            .require_sec_idx(catalog_index_slot(key.index))?
             .non_unique()
             // The undo variant is emitted from this index's immutable kind.
             .expect("non-unique rollback undo referenced a unique catalog index")
@@ -397,12 +393,12 @@ impl IndexRollback for CatalogTable {
     async fn non_unique_mask_as_active(
         &self,
         index_pool_guard: &PoolGuard,
-        key: &CatalogSelectKey,
+        key: &ResolvedIndexKey,
         row_id: RowID,
         ts: TrxID,
     ) -> RuntimeResult<bool> {
         self.mem
-            .require_sec_idx(key.index.as_usize())?
+            .require_sec_idx(catalog_index_slot(key.index))?
             .non_unique()
             // The undo variant is emitted from this index's immutable kind.
             .expect("non-unique rollback undo referenced a unique catalog index")
@@ -415,13 +411,13 @@ impl IndexRollback for CatalogTable {
     async fn non_unique_compare_delete(
         &self,
         index_pool_guard: &PoolGuard,
-        key: &CatalogSelectKey,
+        key: &ResolvedIndexKey,
         row_id: RowID,
         ignore_del_mask: bool,
         ts: TrxID,
     ) -> RuntimeResult<bool> {
         self.mem
-            .require_sec_idx(key.index.as_usize())?
+            .require_sec_idx(catalog_index_slot(key.index))?
             .non_unique()
             // The undo variant is emitted from this index's immutable kind.
             .expect("non-unique rollback undo referenced a unique catalog index")
@@ -433,6 +429,7 @@ impl IndexRollback for CatalogTable {
 
 #[cfg(test)]
 mod tests {
+    use crate::catalog::IndexSlot;
     use crate::catalog::tests::table4;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
@@ -571,7 +568,7 @@ mod tests {
             let index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
-                key.index_no,
+                key.index_slot,
             );
             assert!(
                 index
@@ -663,7 +660,7 @@ mod tests {
             let old_row_id = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
-                live_key.index_no,
+                live_key.index_slot,
             )
             .lookup(&live_key.vals, reader.sts())
             .await
@@ -682,7 +679,7 @@ mod tests {
             let index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
-                stale_key.index_no,
+                stale_key.index_slot,
             );
             assert!(
                 index
@@ -835,13 +832,13 @@ mod tests {
                 trx.rollback().await.unwrap();
 
                 let mut trx = session.begin_trx().unwrap();
-                let key = SelectKey::new(0, vec![Val::from(5i32)]);
+                let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(5i32)]);
                 let res = trx_select_row_mvcc_by_id(&mut trx, table_id, &key, user_read_set).await;
                 trx.commit().await.unwrap();
                 assert!(matches!(res, Ok(SelectMvcc::NotFound)));
 
                 let mut trx = session.begin_trx().unwrap();
-                let key = SelectKey::new(0, vec![Val::from(1i32)]);
+                let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(1i32)]);
                 let update = vec![UpdateCol {
                     idx: 1,
                     val: Val::from(0i32),
@@ -851,7 +848,7 @@ mod tests {
                 trx.rollback().await.unwrap();
 
                 let mut trx = session.begin_trx().unwrap();
-                let key = SelectKey::new(0, vec![Val::from(1i32)]);
+                let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(1i32)]);
                 let res = trx_select_row_mvcc_by_id(&mut trx, table_id, &key, user_read_set).await;
                 trx.commit().await.unwrap();
                 assert!(matches!(res, Ok(SelectMvcc::Found(_))));
@@ -859,13 +856,13 @@ mod tests {
                 assert!(vals[0] == Val::from(1i32) && vals[1] == Val::from(1i32));
 
                 let mut trx = session.begin_trx().unwrap();
-                let key = SelectKey::new(0, vec![Val::from(0i32)]);
+                let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(0i32)]);
                 let res = trx_delete_row_by_id(&mut trx, table_id, &key).await;
                 assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
                 trx.rollback().await.unwrap();
 
                 let mut trx = session.begin_trx().unwrap();
-                let key = SelectKey::new(0, vec![Val::from(0i32)]);
+                let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(0i32)]);
                 let res = trx_select_row_mvcc_by_id(&mut trx, table_id, &key, user_read_set).await;
                 trx.commit().await.unwrap();
                 assert!(matches!(res, Ok(SelectMvcc::Found(_))));
@@ -873,7 +870,7 @@ mod tests {
                 assert!(vals[0] == Val::from(0i32) && vals[1] == Val::from(0i32));
 
                 let mut trx = session.begin_trx().unwrap();
-                let key = SelectKey::new(0, vec![Val::from(3i32)]);
+                let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(3i32)]);
                 let res = trx_delete_row_by_id(&mut trx, table_id, &key).await;
                 assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
                 let res = trx
@@ -883,7 +880,7 @@ mod tests {
                 trx.rollback().await.unwrap();
 
                 let mut trx = session.begin_trx().unwrap();
-                let key = SelectKey::new(0, vec![Val::from(3i32)]);
+                let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(3i32)]);
                 let res = trx_select_row_mvcc_by_id(&mut trx, table_id, &key, user_read_set).await;
                 _ = trx.commit().await.unwrap();
                 assert!(matches!(res, Ok(SelectMvcc::Found(_))));

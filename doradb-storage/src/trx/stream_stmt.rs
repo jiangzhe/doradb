@@ -1,4 +1,5 @@
 use crate::buffer::EvictableBufferPool;
+use crate::catalog::{IndexRef, TableIndexSelector};
 use crate::error::{
     DiscloseResultExt, OperationError, OperationOrFatalResult, Result, RuntimeResult,
 };
@@ -12,9 +13,7 @@ use crate::table::{
     TableScanRuntime, TableScanWorklist, TableScanWorklistCursor,
 };
 use crate::trx::row::BoundIndexCandidate;
-use crate::trx::{
-    MvccReadView, SessionOperationCheckout, StmtNo, TableAdmissionRequest, Transaction, TrxRuntime,
-};
+use crate::trx::{MvccReadView, SessionOperationCheckout, StmtNo, Transaction, TrxRuntime};
 use crate::value::Val;
 use error_stack::ResultExt;
 use std::collections::VecDeque;
@@ -22,7 +21,7 @@ use std::marker::PhantomData;
 use std::ops::RangeBounds;
 use std::sync::Arc;
 
-use super::admission::admit_user_table;
+use super::admission::{AdmittedUserIndex, AdmittedUserTable, admit_user_index, admit_user_table};
 
 pub(super) const INDEX_SCAN_STREAM_OPERATION: &str = "table_index_scan_mvcc";
 pub(super) const TABLE_SCAN_STREAM_OPERATION: &str = "table_scan_mvcc_stream";
@@ -63,42 +62,54 @@ impl StreamStmtState {
     async fn admit_user_table(
         &mut self,
         table_id: TableID,
-        request: TableAdmissionRequest,
-    ) -> OperationOrFatalResult<(Arc<Table>, Arc<TableRuntimeLayout>)> {
+        write: bool,
+    ) -> OperationOrFatalResult<AdmittedUserTable> {
         let operation = self.operation;
         let Self { checkout, .. } = self;
         let (inner, attachment) = checkout.inner_and_attachment_mut();
-        admit_user_table(inner, attachment, table_id, request, operation).await
+        admit_user_table(inner, attachment, table_id, write, operation).await
+    }
+
+    #[inline]
+    async fn admit_user_index(
+        &mut self,
+        selector: TableIndexSelector,
+    ) -> OperationOrFatalResult<AdmittedUserIndex> {
+        let operation = self.operation;
+        let Self { checkout, .. } = self;
+        let (inner, attachment) = checkout.inner_and_attachment_mut();
+        admit_user_index(inner, attachment, selector, false, operation).await
     }
 
     /// Creates a validated MVCC secondary-index row stream for a user table.
     #[inline]
     pub(super) async fn table_index_scan_mvcc_stream<'trx, 'r, R>(
         mut self,
-        table_id: TableID,
-        index_no: usize,
+        selector: TableIndexSelector,
         range: R,
         read_set: &[usize],
     ) -> Result<IndexScanMvccStream<'trx>>
     where
         R: RangeBounds<&'r [Val]>,
     {
-        let (table, layout) = self
-            .admit_user_table(table_id, TableAdmissionRequest::IndexRead { index_no })
-            .await
-            .disclose()?;
+        let table_id = selector.table_id();
+        let AdmittedUserIndex {
+            table,
+            layout,
+            index,
+        } = self.admit_user_index(selector).await.disclose()?;
         if !self.dml_validation_disabled {
             DmlValidator::new(layout.metadata())
-                .validate_index_scan(index_no, &range, read_set)
+                .validate_index_scan(index.slot(), &range, read_set)
                 .change_context(OperationError::InvalidDmlInput)
                 .attach_with(|| {
                     format!("operation={INDEX_SCAN_STREAM_OPERATION}, table_id={table_id}")
                 })
                 .disclose()?;
         }
-        let index = layout.secondary_index(index_no).disclose()?;
-        let unique = index.is_unique();
-        let encoder = index.key_encoder_arc();
+        let runtime = layout.secondary_index(index).disclose()?;
+        let unique = runtime.is_unique();
+        let encoder = runtime.key_encoder_arc();
         let range = if unique {
             encoder.encode_range(range)
         } else {
@@ -107,13 +118,14 @@ impl StreamStmtState {
         let rt = self.runtime();
         let accessor = table.accessor_with_layout(&layout);
         let candidate_stream = accessor
-            .index_scan_candidates(rt, index_no, range)
+            .index_scan_candidates(rt, index, range)
             .disclose()?;
+        debug_assert_eq!(candidate_stream.index_ref(), index);
         let state = IndexScanMvccStreamState {
             candidate_stream,
             table,
             layout,
-            index_no,
+            index,
             unique,
             encoder,
             read_set: read_set.to_vec(),
@@ -133,10 +145,8 @@ impl StreamStmtState {
     where
         F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<ScanRowDecision>,
     {
-        let (table, layout) = self
-            .admit_user_table(table_id, TableAdmissionRequest::TableRead)
-            .await
-            .disclose()?;
+        let AdmittedUserTable { table, layout } =
+            self.admit_user_table(table_id, false).await.disclose()?;
         if !self.dml_validation_disabled {
             DmlValidator::new(layout.metadata())
                 .validate_projection(read_set)
@@ -176,7 +186,7 @@ struct IndexScanMvccStreamState {
     candidate_stream: OwnedIndexCandidateStream<EvictableBufferPool>,
     table: Arc<Table>,
     layout: Arc<TableRuntimeLayout>,
-    index_no: usize,
+    index: IndexRef,
     unique: bool,
     encoder: Arc<BTreeKeyEncoder>,
     read_set: Vec<usize>,
@@ -275,20 +285,16 @@ impl<'trx> IndexScanMvccStream<'trx> {
         let rt = state.stmt_state.runtime();
         let accessor = state.table.accessor_with_layout(&state.layout);
         let row_id = candidate.row_id;
-        let candidate = BoundIndexCandidate::new(
-            state.index_no,
-            state.unique,
-            state.encoder.as_ref(),
-            candidate,
-        );
+        let candidate =
+            BoundIndexCandidate::new(state.index, state.unique, state.encoder.as_ref(), candidate);
         accessor
             .index_lookup_candidate_row_mvcc(rt, candidate, &state.read_set)
             .await
             .attach_with(|| {
                 format!(
-                    "operation={INDEX_SCAN_STREAM_OPERATION}, table_id={}, index_no={}, row_id={}",
+                    "operation={INDEX_SCAN_STREAM_OPERATION}, table_id={}, index={}, row_id={}",
                     state.table.table_id(),
-                    state.index_no,
+                    state.index,
                     row_id
                 )
             })

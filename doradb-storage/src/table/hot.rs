@@ -1,17 +1,15 @@
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
-use crate::catalog::{CatalogSelectKey, TableMetadata, catalog_key_from_active_ordinal};
+use crate::catalog::{CatalogSelectKey, IndexSlot, TableMetadata, catalog_key_from_active_ordinal};
 use crate::error::{FatalResult, OperationError, OperationOrFatalResult};
 use crate::id::{RowID, TableID};
 use crate::log::redo::{RowRedo, RowRedoKind};
 use crate::map::FastHashMap;
-use crate::row::ops::{
-    ReadRow, RowUpdateInput, SelectKey, SelectMvcc, UndoCol, UpdateCol, UpdateRow,
-};
+use crate::row::ops::{RowUpdateInput, SelectKey, UndoCol, UpdateCol, UpdateRow};
 use crate::row::{RowPage, RowRead, var_len_for_insert};
 use crate::trx::TrxRuntime;
 use crate::trx::row::{BoundIndexCandidate, LockRowForWrite, LockUndo, RowWriteAccess};
 use crate::trx::stmt::StmtEffects;
-use crate::trx::undo::{IndexBranch, IndexBranchDomain, IndexBranchTarget, RowUndoKind};
+use crate::trx::undo::{IndexBranch, IndexBranchTarget, RowUndoKind};
 use crate::trx::ver_map::RowPageState;
 use crate::value::Val;
 use error_stack::Report;
@@ -188,14 +186,14 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
     pub(super) async fn lock_for_write(
         &self,
         effects: &mut StmtEffects,
-        key: Option<(usize, &[Val])>,
+        key: Option<(IndexSlot, &[Val])>,
     ) -> FatalResult<LockRowForWrite<'g>> {
         let page_guard = self.page_guard;
         let row_id = self.row_id;
         let page = page_guard.page();
         let lookup = match key {
-            Some((index_no, key_vals)) => {
-                let Some(index_spec) = self.metadata.idx.index_spec(index_no) else {
+            Some((index_slot, key_vals)) => {
+                let Some(index_spec) = self.metadata.idx.index_spec(index_slot) else {
                     return Ok(LockRowForWrite::InvalidIndex);
                 };
                 Some((index_spec, key_vals))
@@ -262,7 +260,7 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
         if !page.row_id_in_valid_range(row_id) {
             return Ok(LockRowForWrite::InvalidIndex);
         }
-        let Some(index_spec) = self.metadata.idx.index_spec(candidate.index_no) else {
+        let Some(index_spec) = self.metadata.idx.index_spec(candidate.index.slot()) else {
             return Ok(LockRowForWrite::InvalidIndex);
         };
         let ver_map = page_guard.unwrap_vmap();
@@ -351,19 +349,19 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
     pub(super) async fn delete(
         &self,
         effects: &mut StmtEffects,
-        index_no: usize,
+        index_slot: IndexSlot,
         key_vals: &[Val],
         log_by_key: bool,
     ) -> OperationOrFatalResult<DeleteInternal> {
         let redo_kind = if log_by_key {
             RowRedoKind::DeleteByPrimaryKey(catalog_key_from_active_ordinal(
-                index_no,
+                index_slot.as_usize(),
                 key_vals.to_vec(),
             ))
         } else {
             RowRedoKind::Delete(Some(self.page_guard.page_id()))
         };
-        self.delete_inner(effects, Some((index_no, key_vals)), redo_kind)
+        self.delete_inner(effects, Some((index_slot, key_vals)), redo_kind)
             .await
     }
 
@@ -422,7 +420,7 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
     async fn delete_inner(
         &self,
         effects: &mut StmtEffects,
-        lookup_key: Option<(usize, &[Val])>,
+        lookup_key: Option<(IndexSlot, &[Val])>,
         redo_kind: RowRedoKind,
     ) -> OperationOrFatalResult<DeleteInternal> {
         let page_guard = self.page_guard;
@@ -455,14 +453,14 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
     pub(super) async fn update_inplace(
         &self,
         effects: &mut StmtEffects,
-        index_no: usize,
+        index_slot: IndexSlot,
         key_vals: &[Val],
         update: RowUpdateInput,
         log_by_key: bool,
     ) -> OperationOrFatalResult<UpdateRowInplace> {
-        let redo_key =
-            log_by_key.then(|| catalog_key_from_active_ordinal(index_no, key_vals.to_vec()));
-        self.update_known_row_inner(effects, update, Some((index_no, key_vals)), redo_key)
+        let redo_key = log_by_key
+            .then(|| catalog_key_from_active_ordinal(index_slot.as_usize(), key_vals.to_vec()));
+        self.update_known_row_inner(effects, update, Some((index_slot, key_vals)), redo_key)
             .await
     }
 
@@ -493,7 +491,7 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
         &self,
         effects: &mut StmtEffects,
         update: RowUpdateInput,
-        lookup_key: Option<(usize, &[Val])>,
+        lookup_key: Option<(IndexSlot, &[Val])>,
         redo_key: Option<CatalogSelectKey>,
     ) -> OperationOrFatalResult<UpdateRowInplace> {
         let page_guard = self.page_guard;
@@ -602,11 +600,15 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
 
     /// Prepare a replacement row and runtime branches for a hot-row move update.
     #[inline]
-    pub(super) fn prepare_move_update<D: IndexBranchDomain>(
+    pub(super) fn prepare_move_update<F>(
         &self,
         old_row: Vec<Val>,
         update: RowUpdateInput,
-    ) -> PreparedHotMoveUpdate {
+        mut branch: F,
+    ) -> PreparedHotMoveUpdate
+    where
+        F: FnMut(SelectKey, IndexBranchTarget, Vec<UpdateCol>) -> IndexBranch,
+    {
         let old_guard = self.page_guard;
         let old_id = self.row_id;
         // Build the replacement hot row and remember indexed old values. The
@@ -658,14 +660,14 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
                 .idx
                 .active_indexes()
                 .filter(|(_, index)| index.unique())
-                .map(|(index_no, index)| {
+                .map(|(index_slot, index)| {
                     let vals = index
                         .cols
                         .iter()
                         .map(|key| new_row[key.col_no as usize].clone())
                         .collect();
-                    D::branch(
-                        SelectKey::new(index_no, vals),
+                    branch(
+                        SelectKey::new(index_slot, vals),
                         IndexBranchTarget::Hot {
                             cts: undo_head.ts(),
                             entry: old_entry.clone(),
@@ -684,22 +686,5 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
             index_change_cols,
             index_branches,
         }
-    }
-}
-
-/// Read a validated hot row page through MVCC.
-#[inline]
-pub(super) fn read_hot_row_mvcc(
-    rt: TrxRuntime<'_>,
-    metadata: &TableMetadata,
-    page_guard: &PageSharedGuard<RowPage>,
-    row_id: RowID,
-    key: Option<(usize, &[Val])>,
-    read_set: &[usize],
-) -> SelectMvcc {
-    let access = page_guard.read_row_by_id(row_id);
-    match access.read_row_mvcc(rt.ctx(), metadata, read_set, key) {
-        ReadRow::Ok(vals) => SelectMvcc::Found(vals),
-        ReadRow::InvalidIndex | ReadRow::NotFound => SelectMvcc::NotFound,
     }
 }

@@ -601,7 +601,7 @@ fn assert_current_layout_metadata(table: &Arc<Table>, metadata: &Arc<TableMetada
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{IndexAttributes, IndexKey, IndexSpec};
+    use crate::catalog::{IndexAttributes, IndexKeySpec, IndexSpec};
     use crate::engine::Engine;
     use crate::file::cow_file::SUPER_BLOCK_ID;
     use crate::id::TableID;
@@ -742,10 +742,10 @@ mod tests {
             assert!(initial_cts < reader_sts);
 
             let mut ddl_session = engine.new_session().unwrap();
-            let index_no = ddl_session
+            let index_id = ddl_session
                 .create_index(
                     table_id,
-                    IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                    IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty()),
                 )
                 .await
                 .unwrap();
@@ -761,7 +761,7 @@ mod tests {
                 2
             );
 
-            ddl_session.drop_index(table_id, index_no).await.unwrap();
+            ddl_session.drop_index(table_id, index_id).await.unwrap();
             let after_drop_index = catalog.resolve_user_table_current(table_id).unwrap();
             let drop_index_cts = after_drop_index.effective_cts();
             assert!(create_index_cts < drop_index_cts);
@@ -794,7 +794,12 @@ mod tests {
             );
 
             let layout = table.layout_snapshot();
-            let index = Arc::clone(layout.secondary_indexes()[0].as_ref().unwrap());
+            let index = Arc::clone(
+                layout.secondary_indexes()[0]
+                    .as_ref()
+                    .unwrap()
+                    .runtime_arc(),
+            );
             let table_owners = Arc::strong_count(&table);
             let layout_owners = Arc::strong_count(&layout);
             let index_owners = Arc::strong_count(&index);
@@ -963,10 +968,10 @@ mod tests {
             let catalog = engine.inner().core.catalog();
 
             let mut ddl_session = engine.new_session().unwrap();
-            let index_no = ddl_session
+            let index_id = ddl_session
                 .create_index(
                     table_id,
-                    IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                    IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty()),
                 )
                 .await
                 .unwrap();
@@ -980,7 +985,7 @@ mod tests {
             let reader_sts = reader.sts();
             assert!(create_index_cts < reader_sts);
 
-            ddl_session.drop_index(table_id, index_no).await.unwrap();
+            ddl_session.drop_index(table_id, index_id).await.unwrap();
             let drop_index_cts = catalog
                 .resolve_user_table_current(table_id)
                 .unwrap()
@@ -1011,14 +1016,14 @@ mod tests {
                 let engine = lightweight_test_engine(&temp_dir, "metadata_history_recovery").await;
                 let table_id = create_table2_for_test(&engine).await;
                 let mut session = engine.new_session().unwrap();
-                let index_no = session
+                let index_id = session
                     .create_index(
                         table_id,
-                        IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                        IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty()),
                     )
                     .await
                     .unwrap();
-                assert_eq!(usize::from(index_no), 1);
+                assert_eq!(index_id, crate::IndexID::new(1));
                 let visible = engine
                     .inner()
                     .core
@@ -1026,9 +1031,14 @@ mod tests {
                     .resolve_user_table_visible(table_id, MAX_SNAPSHOT_TS)
                     .unwrap();
                 let retained_metadata = Arc::clone(visible.live().unwrap().metadata());
-                assert!(retained_metadata.idx.index_spec(1).is_some());
+                assert!(
+                    retained_metadata
+                        .idx
+                        .index_spec(crate::catalog::IndexSlot::new(1))
+                        .is_some()
+                );
 
-                session.drop_index(table_id, index_no).await.unwrap();
+                session.drop_index(table_id, index_id).await.unwrap();
                 let table = engine
                     .inner()
                     .core
@@ -1061,8 +1071,20 @@ mod tests {
                 current.live_metadata().unwrap(),
                 &retained_pre_crash_metadata
             ));
-            assert!(retained_pre_crash_metadata.idx.index_spec(1).is_some());
-            assert!(current.live_metadata().unwrap().idx.index_spec(1).is_none());
+            assert!(
+                retained_pre_crash_metadata
+                    .idx
+                    .index_spec(crate::catalog::IndexSlot::new(1))
+                    .is_some()
+            );
+            assert!(
+                current
+                    .live_metadata()
+                    .unwrap()
+                    .idx
+                    .index_spec(crate::catalog::IndexSlot::new(1))
+                    .is_none()
+            );
             assert_eq!(current.live_metadata().unwrap().idx.index_slot_count(), 2);
             assert!(table.layout_snapshot().secondary_indexes()[1].is_none());
             assert_eq!(

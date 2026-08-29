@@ -1,10 +1,11 @@
 use crate::buffer::PoolGuards;
-use crate::catalog::CatalogTable;
 use crate::catalog::storage::CatalogDefinition;
 use crate::catalog::storage::object::SilentWatermarkObject;
 use crate::catalog::table::{TableColumnLayout, TableMetadata};
+use crate::catalog::{CatalogIndexNo, CatalogTable};
 use crate::catalog::{
-    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, catalog_table_id_from_slot,
+    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexSpec,
+    catalog_table_id_from_slot,
 };
 use crate::error::{
     DataIntegrityError, DataIntegrityResult, MultiDomainResultExt, RuntimeError,
@@ -29,7 +30,7 @@ const COL_NO_TABLE_REPLAY_SILENT_WATERMARKS_HEAP_REDO_START_TS: usize = 1;
 const COL_NAME_TABLE_REPLAY_SILENT_WATERMARKS_HEAP_REDO_START_TS: &str = "heap_redo_start_ts";
 const COL_NO_TABLE_REPLAY_SILENT_WATERMARKS_DELETION_CUTOFF_TS: usize = 2;
 const COL_NAME_TABLE_REPLAY_SILENT_WATERMARKS_DELETION_CUTOFF_TS: &str = "deletion_cutoff_ts";
-const PK_NO_TABLE_REPLAY_SILENT_WATERMARKS: usize = 0;
+const PK_NO_TABLE_REPLAY_SILENT_WATERMARKS: CatalogIndexNo = CatalogIndexNo::new(0);
 
 /// Runtime accessor for `catalog.table_replay_silent_watermarks`.
 pub(crate) struct TableReplaySilentWatermarks<'a> {
@@ -161,7 +162,10 @@ pub(super) fn catalog_definition_of_table_replay_silent_watermarks() -> &'static
                     column_attributes: ColumnAttributes::empty(),
                 },
             ],
-            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+            vec![IndexSpec::new(
+                vec![IndexKeySpec::new(0)],
+                IndexAttributes::PK,
+            )],
         )
         .expect("valid table metadata"),
     })

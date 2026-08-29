@@ -1,4 +1,4 @@
-use crate::catalog::{IndexSpec, PrimaryKeyMatchError, TableMetadata};
+use crate::catalog::{IndexSlot, IndexSpec, PrimaryKeyMatchError, TableMetadata};
 use crate::row::ops::{RowUpdateView, UpdateCol};
 use crate::value::Val;
 use error_stack::Report;
@@ -108,11 +108,11 @@ impl<'m> DmlValidator<'m> {
     #[inline]
     pub(crate) fn validate_unique_key(
         &self,
-        index_no: usize,
+        index_slot: IndexSlot,
         key_vals: &[Val],
     ) -> DmlValidationResult<&'m IndexSpec> {
-        let index_spec = self.validate_unique_index(index_no)?;
-        self.validate_index_values(index_no, index_spec, key_vals)?;
+        let index_spec = self.validate_unique_index(index_slot)?;
+        self.validate_index_values(index_slot, index_spec, key_vals)?;
         Ok(index_spec)
     }
 
@@ -120,18 +120,18 @@ impl<'m> DmlValidator<'m> {
     #[inline]
     pub(crate) fn validate_unique_index(
         &self,
-        index_no: usize,
+        index_slot: IndexSlot,
     ) -> DmlValidationResult<&'m IndexSpec> {
-        let Some(index_spec) = self.metadata.idx.index_spec(index_no) else {
+        let Some(index_spec) = self.metadata.idx.index_spec(index_slot) else {
             return Err(Report::new(DmlValidationError::IndexKey).attach(format!(
-                "unique index not found: index_no={}, index_slot_count={}",
-                index_no,
+                "unique index not found: index_slot={}, index_slot_count={}",
+                index_slot,
                 self.metadata.idx.index_slot_count()
             )));
         };
         if !index_spec.unique() {
             return Err(Report::new(DmlValidationError::IndexKey)
-                .attach(format!("index is not unique: index_no={index_no}")));
+                .attach(format!("index is not unique: index_slot={index_slot}")));
         }
         Ok(index_spec)
     }
@@ -140,14 +140,14 @@ impl<'m> DmlValidator<'m> {
     #[inline]
     pub(crate) fn validate_index_scan<'r, R>(
         &self,
-        index_no: usize,
+        index_slot: IndexSlot,
         range: &R,
         read_set: &[usize],
     ) -> DmlValidationResult<()>
     where
         R: RangeBounds<&'r [Val]> + ?Sized,
     {
-        self.validate_index_range(index_no, range)?;
+        self.validate_index_range(index_slot, range)?;
         self.validate_projection(read_set)?;
         Ok(())
     }
@@ -156,35 +156,35 @@ impl<'m> DmlValidator<'m> {
     #[inline]
     pub(crate) fn validate_index_range<'r, R>(
         &self,
-        index_no: usize,
+        index_slot: IndexSlot,
         range: &R,
     ) -> DmlValidationResult<()>
     where
         R: RangeBounds<&'r [Val]> + ?Sized,
     {
-        let Some(index_spec) = self.metadata.idx.index_spec(index_no) else {
+        let Some(index_spec) = self.metadata.idx.index_spec(index_slot) else {
             return Err(Report::new(DmlValidationError::IndexKey).attach(format!(
-                "index not found: index_no={}, index_slot_count={}",
-                index_no,
+                "index not found: index_slot={}, index_slot_count={}",
+                index_slot,
                 self.metadata.idx.index_slot_count()
             )));
         };
-        self.validate_index_bound(index_no, index_spec, range.start_bound())?;
-        self.validate_index_bound(index_no, index_spec, range.end_bound())?;
+        self.validate_index_bound(index_slot, index_spec, range.start_bound())?;
+        self.validate_index_bound(index_slot, index_spec, range.end_bound())?;
         Ok(())
     }
 
     #[inline]
     fn validate_index_bound(
         &self,
-        index_no: usize,
+        index_slot: IndexSlot,
         index_spec: &IndexSpec,
         bound: Bound<&&[Val]>,
     ) -> DmlValidationResult<()> {
         match bound {
             Bound::Unbounded => Ok(()),
             Bound::Included(vals) | Bound::Excluded(vals) => {
-                self.validate_index_values(index_no, index_spec, vals)
+                self.validate_index_values(index_slot, index_spec, vals)
             }
         }
     }
@@ -220,17 +220,17 @@ impl<'m> DmlValidator<'m> {
     #[inline]
     pub(crate) fn validate_primary_key(
         &self,
-        index_no: usize,
+        index_slot: IndexSlot,
         key_vals: &[Val],
     ) -> DmlValidationResult<()> {
         let Some(primary_key) = self.metadata.primary_key() else {
             return Err(Report::new(DmlValidationError::PrimaryKey).attach("primary key not found"));
         };
-        match primary_key.validate_key(index_no, key_vals) {
+        match primary_key.validate_key(index_slot, key_vals) {
             Ok(()) => Ok(()),
-            Err(PrimaryKeyMatchError::IndexNo { actual, expected }) => {
+            Err(PrimaryKeyMatchError::IndexSlot { actual, expected }) => {
                 Err(Report::new(DmlValidationError::PrimaryKey).attach(format!(
-                    "key is not primary key: index_no={actual}, primary_key_index_no={expected}"
+                    "key is not primary key: index_slot={actual}, primary_key_index_slot={expected}"
                 )))
             }
             Err(PrimaryKeyMatchError::ValueCount { actual, expected }) => {
@@ -238,9 +238,9 @@ impl<'m> DmlValidator<'m> {
                     "key value count {actual} does not match primary key column count {expected}"
                 )))
             }
-            Err(PrimaryKeyMatchError::Type { index_no }) => {
+            Err(PrimaryKeyMatchError::Type { index_slot }) => {
                 Err(Report::new(DmlValidationError::PrimaryKey)
-                    .attach(format!("key type mismatch: index_no={index_no}")))
+                    .attach(format!("key type mismatch: index_slot={index_slot}")))
             }
         }
     }
@@ -248,13 +248,13 @@ impl<'m> DmlValidator<'m> {
     #[inline]
     fn validate_index_values(
         &self,
-        index_no: usize,
+        index_slot: IndexSlot,
         index_spec: &IndexSpec,
         vals: &[Val],
     ) -> DmlValidationResult<()> {
         if vals.len() != index_spec.cols.len() {
             return Err(Report::new(DmlValidationError::IndexKey).attach(format!(
-                "key value count mismatch: index_no={index_no}, actual={}, expected={}",
+                "key value count mismatch: index_slot={index_slot}, actual={}, expected={}",
                 vals.len(),
                 index_spec.cols.len()
             )));
@@ -263,7 +263,7 @@ impl<'m> DmlValidator<'m> {
             let col_no = usize::from(index_key.col_no);
             if !self.metadata.col.col_type_match(col_no, val) {
                 return Err(Report::new(DmlValidationError::IndexKey).attach(format!(
-                    "key value type mismatch: index_no={index_no}, key_pos={key_pos}, column_no={col_no}, expected={:?}, actual={val:?}",
+                    "key value type mismatch: index_slot={index_slot}, key_pos={key_pos}, column_no={col_no}, expected={:?}, actual={val:?}",
                     self.metadata.col.col_type(col_no)
                 )));
             }

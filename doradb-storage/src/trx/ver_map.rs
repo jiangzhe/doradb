@@ -175,7 +175,7 @@ mod tests {
     use super::*;
     use crate::catalog::TableMetadata;
     use crate::catalog::spec::{
-        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec,
+        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexSpec,
     };
     use crate::value::ValKind;
 
@@ -228,10 +228,13 @@ mod tests {
             Vec::<IndexSpec>::new(),
         )
         .expect("valid table metadata");
-        let (index_no, indexed_metadata) = metadata
-            .try_with_created_index(IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK))
+        let (index_slot, indexed_metadata) = metadata
+            .try_with_created_index(IndexSpec::new(
+                vec![IndexKeySpec::new(0)],
+                IndexAttributes::UK,
+            ))
             .unwrap();
-        assert_eq!(index_no, 0);
+        assert_eq!(index_slot, crate::catalog::IndexSlot::new(0));
         assert!(Arc::ptr_eq(&metadata.col, &indexed_metadata.col));
         assert_ne!(
             metadata.idx.active_index_count(),

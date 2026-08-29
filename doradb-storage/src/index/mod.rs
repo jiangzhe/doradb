@@ -15,6 +15,7 @@ mod unique_index;
 pub(crate) mod util;
 
 use crate::buffer::{BufferPool, PoolGuard, PoolGuards};
+use crate::catalog::IndexRef;
 use crate::error::RuntimeResult;
 use crate::id::BlockID;
 use crate::table::TableRootSnapshot;
@@ -70,6 +71,7 @@ impl<'op> ProvenIndexRoot<'op> {
 
 /// Borrowed executable state for one foreground current-index read.
 pub(crate) struct CurrentIndexReadHandle<'op, 'idx, P: BufferPool + 'static> {
+    index_ref: IndexRef,
     index: &'idx SecondaryIndex<P>,
     guards: &'op PoolGuards,
     root: ProvenIndexRoot<'op>,
@@ -79,12 +81,14 @@ impl<'op, 'idx, P: BufferPool + 'static> CurrentIndexReadHandle<'op, 'idx, P> {
     /// Creates a borrowed handle from one proof-gated current index root.
     #[inline]
     pub(crate) fn new(
+        index_ref: IndexRef,
         index: &'idx SecondaryIndex<P>,
         guards: &'op PoolGuards,
         root: BlockID,
         proof: &TrxReadProof<'op>,
     ) -> Self {
         Self {
+            index_ref,
             index,
             guards,
             root: ProvenIndexRoot::new(root, proof),
@@ -94,16 +98,18 @@ impl<'op, 'idx, P: BufferPool + 'static> CurrentIndexReadHandle<'op, 'idx, P> {
     /// Creates a handle from one proof-bearing table-root snapshot.
     #[inline]
     pub(crate) fn from_snapshot(
+        index_ref: IndexRef,
         index: &'idx SecondaryIndex<P>,
         guards: &'op PoolGuards,
         snapshot: &'op TableRootSnapshot<'_>,
-        index_no: usize,
     ) -> Self {
+        let index_slot = index_ref.slot();
         Self {
+            index_ref,
             index,
             guards,
             root: ProvenIndexRoot {
-                block_id: snapshot.secondary_index_root(index_no),
+                block_id: snapshot.secondary_index_root(index_slot),
                 _proof: PhantomData,
             },
         }
@@ -124,6 +130,7 @@ impl<'op, 'idx, P: BufferPool + 'static> CurrentIndexReadHandle<'op, 'idx, P> {
     /// Binds a unique executable view for the lifetime of this handle borrow.
     #[inline]
     pub(crate) fn bind_unique(&self) -> RuntimeResult<UniqueSecondaryIndex<'_, 'op, P>> {
+        debug_assert_eq!(self.index.index_slot(), self.index_ref.slot());
         self.index
             .bind_unique_unchecked(self.guards, self.root.block_id)
     }
@@ -131,6 +138,7 @@ impl<'op, 'idx, P: BufferPool + 'static> CurrentIndexReadHandle<'op, 'idx, P> {
     /// Binds a non-unique executable view for the lifetime of this handle borrow.
     #[inline]
     pub(crate) fn bind_non_unique(&self) -> RuntimeResult<NonUniqueSecondaryIndex<'_, 'op, P>> {
+        debug_assert_eq!(self.index.index_slot(), self.index_ref.slot());
         self.index
             .bind_non_unique_unchecked(self.guards, self.root.block_id)
     }
@@ -138,6 +146,7 @@ impl<'op, 'idx, P: BufferPool + 'static> CurrentIndexReadHandle<'op, 'idx, P> {
 
 /// Owned executable state retained by one caller-driven index stream.
 pub(crate) struct OwnedCurrentIndexReadHandle<P: BufferPool + 'static> {
+    index_ref: IndexRef,
     index: Arc<SecondaryIndex<P>>,
     index_pool_guard: PoolGuard,
     disk_pool_guard: PoolGuard,
@@ -148,6 +157,7 @@ impl<P: BufferPool + 'static> OwnedCurrentIndexReadHandle<P> {
     /// Creates an owned handle from one proof-gated current index root.
     #[inline]
     pub(crate) fn new(
+        index_ref: IndexRef,
         index: Arc<SecondaryIndex<P>>,
         index_pool_guard: PoolGuard,
         disk_pool_guard: PoolGuard,
@@ -155,6 +165,7 @@ impl<P: BufferPool + 'static> OwnedCurrentIndexReadHandle<P> {
         _proof: &TrxReadProof<'_>,
     ) -> Self {
         Self {
+            index_ref,
             index,
             index_pool_guard,
             disk_pool_guard,

@@ -1,4 +1,4 @@
-use crate::catalog::{ColumnAttributes, IndexAttributes, IndexOrder};
+use crate::catalog::{ColumnAttributes, IndexAttributes, IndexOrder, IndexSlot};
 use crate::id::{TableID, TrxID};
 use crate::value::ValKind;
 use semistr::SemiStr;
@@ -8,8 +8,8 @@ use semistr::SemiStr;
 pub(crate) struct TableObject {
     /// User table identifier.
     pub(crate) table_id: TableID,
-    /// Next index number to assign for the table.
-    pub(crate) next_index_no: u16,
+    /// Next physical index slot to assign for the table.
+    pub(crate) next_index_slot: IndexSlot,
 }
 
 /// One row object in `catalog.columns`.
@@ -32,8 +32,8 @@ pub(crate) struct ColumnObject {
 pub(crate) struct IndexObject {
     /// User table identifier.
     pub(crate) table_id: TableID,
-    /// Index number within the table.
-    pub(crate) index_no: u16,
+    /// Physical index slot within the table.
+    pub(crate) index_slot: IndexSlot,
     /// Index attribute bitset.
     pub(crate) index_attributes: IndexAttributes,
 }
@@ -43,8 +43,8 @@ pub(crate) struct IndexObject {
 pub(crate) struct IndexColumnObject {
     /// User table identifier.
     pub(crate) table_id: TableID,
-    /// Index number within the table.
-    pub(crate) index_no: u16,
+    /// Physical index slot within the table.
+    pub(crate) index_slot: IndexSlot,
     /// Column position in the index.
     pub(crate) index_column_no: u16,
     /// Column position in the table.

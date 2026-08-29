@@ -12,7 +12,7 @@ use crate::workload::util::{
 };
 use crate::workload::{RunCancellation, SessionPlan};
 use doradb_storage::id::TableID;
-use doradb_storage::{Engine, SelectKey, SelectMvcc, Session, Val};
+use doradb_storage::{Engine, IndexID, SelectMvcc, Session, TableIndex, Val};
 
 /// Sequential lookup session executor.
 #[derive(Clone, Copy)]
@@ -478,9 +478,9 @@ async fn lookup_keys(
         let mut trx = session.begin_trx()?;
         let mut batch_counters = WorkloadCounters::default();
         for key in batch {
-            let select_key = SelectKey::new(0, vec![Val::from(*key)]);
+            let key_vals = [Val::from(*key)];
             let lookup = trx
-                .table_lookup_unique_mvcc(table_id, select_key.index_no, &select_key.vals, &[0, 1])
+                .table_lookup_unique_mvcc(TableIndex(table_id, IndexID::new(0)), &key_vals, &[0, 1])
                 .await;
             match lookup {
                 Ok(SelectMvcc::Found(_)) => {
@@ -541,7 +541,11 @@ async fn index_scans(
             let lower = [Val::from(range.start)];
             let upper = [Val::from(range.end()?)];
             let scan = trx
-                .table_index_scan_mvcc(spec.table_id, 0, &lower[..]..&upper[..], &[0, 1])
+                .table_index_scan_mvcc(
+                    TableIndex(spec.table_id, IndexID::new(0)),
+                    &lower[..]..&upper[..],
+                    &[0, 1],
+                )
                 .await;
             match scan {
                 Ok(scan) => {
@@ -595,7 +599,11 @@ async fn index_streams(
         let mut trx = session.begin_trx()?;
         let scan_result = async {
             let mut stream = trx
-                .table_index_scan_mvcc_stream(spec.table_id, 0, &lower[..]..&upper[..], &[0, 1])
+                .table_index_scan_mvcc_stream(
+                    TableIndex(spec.table_id, IndexID::new(0)),
+                    &lower[..]..&upper[..],
+                    &[0, 1],
+                )
                 .await?;
             let mut rows = 0u64;
             while stream.next().await?.is_some() {

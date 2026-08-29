@@ -327,7 +327,7 @@ mod tests {
     use crate::buffer::page::{BufferPage, VersionedPageID};
     use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard, PoolRole};
     use crate::catalog::{
-        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
+        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexSpec, TableMetadata,
     };
     use crate::error::{IoError, RuntimeError, RuntimeResult, Validation};
     use crate::file::test_block_id;
@@ -461,7 +461,10 @@ mod tests {
                     column_type: ValKind::I32,
                     column_attributes: ColumnAttributes::empty(),
                 }],
-                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
+                vec![IndexSpec::new(
+                    vec![IndexKeySpec::new(0)],
+                    IndexAttributes::UK,
+                )],
             )
             .expect("valid table metadata"),
         )

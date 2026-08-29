@@ -129,7 +129,7 @@ impl<'scan, 'ctx, P: BufferPool + 'static> BorrowedIndexMutationStream<'scan, 'c
         snapshot: &'scan TableRootSnapshot<'ctx>,
         range: &'scan KeyRange,
     ) -> RuntimeResult<Self> {
-        let root = snapshot.secondary_index_root(index.index_no());
+        let root = snapshot.secondary_index_root(index.index_slot());
         let (mem_source, disk) = match index {
             SecondaryIndex::Unique { mem, disk } => (
                 MutationMemSource::Unique {

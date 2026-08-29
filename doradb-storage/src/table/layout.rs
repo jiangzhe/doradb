@@ -1,19 +1,97 @@
 use crate::buffer::EvictableBufferPool;
-use crate::catalog::{ResolvedUserIndexKey, TableMetadata, user_key_from_active_slot};
+use crate::catalog::{
+    IndexID, IndexRef, IndexSlot, ResolvedIndexKey, TableMetadata, user_key_from_index_ref,
+};
 use crate::error::{InternalError, RuntimeError, RuntimeResult};
 use crate::index::SecondaryIndex;
+use crate::map::FastHashMap;
 use crate::value::Val;
 use error_stack::Report;
 use std::sync::Arc;
+
+/// One exact active user-index generation and its runtime owner.
+#[derive(Clone)]
+pub(crate) struct RuntimeIndexEntry {
+    index: IndexRef,
+    runtime: Arc<SecondaryIndex<EvictableBufferPool>>,
+}
+
+impl RuntimeIndexEntry {
+    /// Creates one exact runtime entry.
+    #[inline]
+    pub(crate) fn new(index: IndexRef, runtime: Arc<SecondaryIndex<EvictableBufferPool>>) -> Self {
+        Self { index, runtime }
+    }
+
+    /// Returns this entry's generation-qualified identity.
+    #[inline]
+    pub(crate) const fn index_ref(&self) -> IndexRef {
+        self.index
+    }
+
+    /// Returns the owned secondary-index runtime.
+    #[inline]
+    pub(crate) fn runtime(&self) -> &SecondaryIndex<EvictableBufferPool> {
+        &self.runtime
+    }
+
+    /// Returns a shared owner of the secondary-index runtime.
+    #[inline]
+    pub(crate) fn runtime_arc(&self) -> &Arc<SecondaryIndex<EvictableBufferPool>> {
+        &self.runtime
+    }
+
+    /// Consumes this entry and returns its runtime owner.
+    #[inline]
+    pub(crate) fn into_runtime(self) -> Arc<SecondaryIndex<EvictableBufferPool>> {
+        self.runtime
+    }
+}
+
+/// Selector admitted by exact runtime lookup.
+pub(crate) trait LayoutIndexSelector {
+    /// Resolves this selector to an exact active user-index generation.
+    fn resolve(self, layout: &TableRuntimeLayout) -> RuntimeResult<IndexRef>;
+}
+
+impl LayoutIndexSelector for IndexRef {
+    #[inline]
+    fn resolve(self, layout: &TableRuntimeLayout) -> RuntimeResult<IndexRef> {
+        layout.index_entry(self).map(|_| self)
+    }
+}
+
+#[cfg(test)]
+impl LayoutIndexSelector for IndexSlot {
+    #[inline]
+    fn resolve(self, layout: &TableRuntimeLayout) -> RuntimeResult<IndexRef> {
+        layout
+            .index_entry_at_slot(self)
+            .map(RuntimeIndexEntry::index_ref)
+    }
+}
 
 /// Immutable metadata and secondary-index runtime snapshot for a user table.
 pub(crate) struct TableRuntimeLayout {
     generation: u64,
     metadata: Arc<TableMetadata>,
-    secondary_indexes: Box<[Option<Arc<SecondaryIndex<EvictableBufferPool>>>]>,
+    secondary_indexes: Box<[Option<RuntimeIndexEntry>]>,
+    slot_by_id: FastHashMap<IndexID, IndexSlot>,
 }
 
 impl TableRuntimeLayout {
+    /// Resets test-only resolve-once counters.
+    #[cfg(test)]
+    pub(crate) fn reset_index_access_counters() {
+        tests::reset_index_access_counters();
+    }
+
+    /// Returns test-only `(map resolutions, direct validations, active iterations)`.
+    #[cfg(test)]
+    pub(crate) fn index_access_counters() -> (usize, usize, usize) {
+        tests::index_access_counters()
+    }
+
     /// Create a validated user-table runtime layout snapshot.
     #[inline]
     pub(crate) fn new(
@@ -21,10 +99,46 @@ impl TableRuntimeLayout {
         metadata: Arc<TableMetadata>,
         secondary_indexes: Box<[Option<Arc<SecondaryIndex<EvictableBufferPool>>>]>,
     ) -> Self {
+        let entries = secondary_indexes
+            .into_vec()
+            .into_iter()
+            .enumerate()
+            .map(|(slot, runtime)| {
+                runtime.map(|runtime| {
+                    let slot = IndexSlot::try_from(slot).unwrap_or_else(|_| {
+                        panic!(
+                            "table runtime layout slot exceeds persisted u16 domain: slot={slot}"
+                        )
+                    });
+                    RuntimeIndexEntry::new(IndexRef::from_active_slot(slot), runtime)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self::from_entries(generation, metadata, entries)
+    }
+
+    /// Creates a validated layout from exact generation-qualified entries.
+    #[inline]
+    pub(crate) fn from_entries(
+        generation: u64,
+        metadata: Arc<TableMetadata>,
+        secondary_indexes: Box<[Option<RuntimeIndexEntry>]>,
+    ) -> Self {
+        let mut slot_by_id = FastHashMap::default();
+        for entry in secondary_indexes.iter().flatten() {
+            let previous = slot_by_id.insert(entry.index_ref().id(), entry.index_ref().slot());
+            assert!(
+                previous.is_none(),
+                "table runtime layout invariant violated: duplicate active index id, index={}",
+                entry.index_ref()
+            );
+        }
         let layout = Self {
             generation,
             metadata,
             secondary_indexes,
+            slot_by_id,
         };
         layout.assert_valid();
         layout
@@ -41,41 +155,78 @@ impl TableRuntimeLayout {
             self.metadata.idx.index_slot_count()
         );
 
-        for (index_no, _) in self.metadata.idx.active_indexes() {
+        for (index_slot, _) in self.metadata.idx.active_indexes() {
+            let entry = self
+                .secondary_indexes
+                .get(index_slot.as_usize())
+                .and_then(Option::as_ref);
             assert!(
-                self.secondary_indexes
-                    .get(index_no)
-                    .and_then(Option::as_ref)
-                    .is_some(),
-                "table runtime layout invariant violated: active metadata index missing runtime slot, index_no={index_no}"
+                entry.is_some(),
+                "table runtime layout invariant violated: active metadata index missing runtime slot, index_slot={index_slot}"
+            );
+            let entry = entry.expect("active metadata entry was asserted present");
+            assert_eq!(
+                entry.index_ref().slot(),
+                index_slot,
+                "table runtime layout invariant violated: entry reference targets another slot, expected_slot={index_slot}, index={}",
+                entry.index_ref()
+            );
+            assert_eq!(
+                self.slot_by_id.get(&entry.index_ref().id()).copied(),
+                Some(entry.index_ref().slot()),
+                "table runtime layout invariant violated: active entry is missing or disagrees with id map, index={}",
+                entry.index_ref()
             );
         }
 
-        for (index_no, index) in self.secondary_indexes.iter().enumerate() {
-            let Some(index) = index else {
+        for (index_slot, entry) in self.secondary_indexes.iter().enumerate() {
+            let Some(entry) = entry else {
                 continue;
             };
+            let index_slot = IndexSlot::try_from(index_slot).unwrap_or_else(|_| {
+                panic!("validated runtime index slot exceeds u16: index_slot={index_slot}")
+            });
             assert!(
-                self.metadata.idx.index_spec(index_no).is_some(),
-                "table runtime layout invariant violated: runtime slot has no active metadata spec, index_no={index_no}"
+                self.metadata.idx.index_spec(index_slot).is_some(),
+                "table runtime layout invariant violated: runtime slot has no active metadata spec, index={}",
+                entry.index_ref()
             );
             assert_eq!(
-                index.index_no(),
-                index_no,
-                "table runtime layout invariant violated: runtime index number mismatch, slot={index_no}, runtime={}",
-                index.index_no()
+                entry.runtime().index_slot(),
+                index_slot,
+                "table runtime layout invariant violated: runtime index slot mismatch, index={}, runtime_index_slot={}",
+                entry.index_ref(),
+                entry.runtime().index_slot()
             );
             let index_spec = self
                 .metadata
                 .idx
-                .index_spec(index_no)
+                .index_spec(index_slot)
                 .expect("runtime slot was already proven active");
             assert_eq!(
-                index.is_unique(),
+                entry.runtime().is_unique(),
                 index_spec.unique(),
-                "table runtime layout invariant violated: runtime index kind mismatch, index_no={index_no}, runtime_unique={}, metadata_unique={}",
-                index.is_unique(),
+                "table runtime layout invariant violated: runtime index kind mismatch, index={}, runtime_unique={}, metadata_unique={}",
+                entry.index_ref(),
+                entry.runtime().is_unique(),
                 index_spec.unique()
+            );
+        }
+
+        assert_eq!(
+            self.slot_by_id.len(),
+            self.metadata.idx.active_index_count(),
+            "table runtime layout invariant violated: id-map cardinality disagrees with active metadata"
+        );
+        for (id, slot) in &self.slot_by_id {
+            let entry = self
+                .secondary_indexes
+                .get(slot.as_usize())
+                .and_then(Option::as_ref);
+            assert!(
+                entry.is_some_and(|entry| entry.index_ref() == IndexRef::new(*id, *slot)),
+                "table runtime layout invariant violated: id map targets inactive or different entry, index_id={id}, slot={}",
+                slot.get()
             );
         }
     }
@@ -106,69 +257,111 @@ impl TableRuntimeLayout {
 
     /// Returns the sparse secondary-index runtime slots.
     #[inline]
-    pub(crate) fn secondary_indexes(&self) -> &[Option<Arc<SecondaryIndex<EvictableBufferPool>>>] {
+    pub(crate) fn secondary_indexes(&self) -> &[Option<RuntimeIndexEntry>] {
         &self.secondary_indexes
     }
 
     /// Consumes the layout and returns its secondary-index runtime slots.
     #[inline]
-    pub(crate) fn into_secondary_indexes(
-        self,
-    ) -> Box<[Option<Arc<SecondaryIndex<EvictableBufferPool>>>]> {
+    pub(crate) fn into_secondary_indexes(self) -> Box<[Option<RuntimeIndexEntry>]> {
         self.secondary_indexes
     }
 
-    /// Returns one active secondary-index runtime by stable index number.
+    /// Resolves one stable identity through the layout's active ID map.
     #[inline]
-    pub(crate) fn secondary_index(
-        &self,
-        index_no: usize,
-    ) -> RuntimeResult<&SecondaryIndex<EvictableBufferPool>> {
+    pub(crate) fn resolve_index_id(&self, index_id: IndexID) -> Option<IndexRef> {
+        #[cfg(test)]
+        tests::record_map_resolution();
+        self.slot_by_id
+            .get(&index_id)
+            .copied()
+            .map(|slot| IndexRef::new(index_id, slot))
+    }
+
+    /// Validates one exact reference using only direct slot/generation access.
+    #[inline]
+    pub(crate) fn validate_index_ref(&self, index: IndexRef) -> bool {
+        #[cfg(test)]
+        tests::record_direct_validation();
         self.secondary_indexes
-            .get(index_no)
-            .and_then(Option::as_deref)
-            .ok_or_else(|| {
-                Report::new(InternalError::SecondaryIndexOutOfBounds)
-                    .attach(format!(
-                        "index_no={index_no}, index_slot_count={}",
-                        self.index_slot_count()
-                    ))
-                    .change_context(RuntimeError::IndexAccess)
-                    .attach("operation=resolve_secondary_index_runtime")
-            })
+            .get(index.slot().as_usize())
+            .and_then(Option::as_ref)
+            .is_some_and(|entry| entry.index_ref() == index)
+    }
+
+    /// Returns one exact active secondary-index entry.
+    #[inline]
+    pub(crate) fn index_entry(&self, index: IndexRef) -> RuntimeResult<&RuntimeIndexEntry> {
+        self.secondary_indexes
+            .get(index.slot().as_usize())
+            .and_then(Option::as_ref)
+            .filter(|entry| entry.index_ref() == index)
+            .ok_or_else(|| self.index_access_error(index))
+    }
+
+    /// Returns one active secondary-index entry by an already trusted slot.
+    #[inline]
+    pub(crate) fn index_entry_at_slot(&self, slot: IndexSlot) -> RuntimeResult<&RuntimeIndexEntry> {
+        self.secondary_indexes
+            .get(slot.as_usize())
+            .and_then(Option::as_ref)
+            .ok_or_else(|| self.index_access_error(IndexRef::new(slot.transitional_id(), slot)))
+    }
+
+    #[inline]
+    fn index_access_error(&self, index: IndexRef) -> error_stack::Report<RuntimeError> {
+        Report::new(InternalError::SecondaryIndexOutOfBounds)
+            .attach(format!(
+                "index={index}, index_slot_count={}",
+                self.index_slot_count()
+            ))
+            .change_context(RuntimeError::IndexAccess)
+            .attach("operation=resolve_secondary_index_runtime")
+    }
+
+    /// Returns one active secondary-index runtime by exact reference.
+    #[inline]
+    pub(crate) fn secondary_index<I: LayoutIndexSelector>(
+        &self,
+        index: I,
+    ) -> RuntimeResult<&SecondaryIndex<EvictableBufferPool>> {
+        let index = index.resolve(self)?;
+        self.index_entry(index).map(RuntimeIndexEntry::runtime)
     }
 
     /// Qualifies a validated active positional key for retained user state.
     #[inline]
     pub(crate) fn resolve_active_user_key(
         &self,
-        index_no: usize,
+        index: IndexRef,
         vals: Vec<Val>,
-    ) -> RuntimeResult<ResolvedUserIndexKey> {
-        self.secondary_index(index_no)?;
-        Ok(user_key_from_active_slot(index_no, vals))
+    ) -> RuntimeResult<ResolvedIndexKey> {
+        self.secondary_index(index)?;
+        Ok(user_key_from_index_ref(index, vals))
     }
 
-    /// Iterates active secondary-index runtimes by stable index number.
+    /// Iterates exact active references paired with their runtimes.
     #[inline]
     pub(crate) fn active_secondary_indexes(
         &self,
-    ) -> impl Iterator<Item = (usize, &SecondaryIndex<EvictableBufferPool>)> + '_ {
+    ) -> impl Iterator<Item = (IndexRef, &SecondaryIndex<EvictableBufferPool>)> + '_ {
+        #[cfg(test)]
+        tests::record_active_iteration();
         self.secondary_indexes
             .iter()
-            .enumerate()
-            .filter_map(|(index_no, index)| index.as_deref().map(|index| (index_no, index)))
+            .flatten()
+            .map(|entry| (entry.index_ref(), entry.runtime()))
     }
 }
 
 /// Retired user-table secondary-index runtime awaiting async MemIndex destroy.
 pub(crate) struct RetiredSecondaryIndex {
-    /// Stable secondary-index slot retired from the active runtime layout.
-    pub(crate) index_no: usize,
+    /// Exact secondary-index generation retired from the active runtime layout.
+    pub(crate) index: IndexRef,
     /// Layout generation that retired this runtime index.
     pub(crate) retired_generation: u64,
     /// Secondary-index runtime waiting for asynchronous MemIndex destruction.
-    pub(crate) index: Arc<SecondaryIndex<EvictableBufferPool>>,
+    pub(crate) runtime: Arc<SecondaryIndex<EvictableBufferPool>>,
 }
 
 #[cfg(test)]
@@ -176,7 +369,7 @@ mod tests {
     use super::*;
     use crate::buffer::{BufferPool, PoolGuards, PoolRole};
     use crate::catalog::{
-        ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexAttributes, IndexDdlKind, IndexKey,
+        ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexAttributes, IndexDdlKind, IndexKeySpec,
         IndexSpec,
     };
     use crate::id::TrxID;
@@ -184,7 +377,38 @@ mod tests {
     use crate::trx::purge::PurgeTestEvent;
     use crate::value::ValKind;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    static MAP_RESOLUTIONS: AtomicUsize = AtomicUsize::new(0);
+    static DIRECT_VALIDATIONS: AtomicUsize = AtomicUsize::new(0);
+    static ACTIVE_ITERATIONS: AtomicUsize = AtomicUsize::new(0);
+
+    pub(super) fn record_map_resolution() {
+        MAP_RESOLUTIONS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_direct_validation() {
+        DIRECT_VALIDATIONS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_active_iteration() {
+        ACTIVE_ITERATIONS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn reset_index_access_counters() {
+        MAP_RESOLUTIONS.store(0, Ordering::Relaxed);
+        DIRECT_VALIDATIONS.store(0, Ordering::Relaxed);
+        ACTIVE_ITERATIONS.store(0, Ordering::Relaxed);
+    }
+
+    pub(super) fn index_access_counters() -> (usize, usize, usize) {
+        (
+            MAP_RESOLUTIONS.load(Ordering::Relaxed),
+            DIRECT_VALIDATIONS.load(Ordering::Relaxed),
+            ACTIVE_ITERATIONS.load(Ordering::Relaxed),
+        )
+    }
 
     fn table2_columns() -> Vec<ColumnSpec> {
         vec![
@@ -228,7 +452,12 @@ mod tests {
             let engine = lightweight_test_engine(&temp_dir, "runtime_layout_validation").await;
             let table_id = create_table2_for_test(&engine).await;
             let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
-            let runtime = Arc::clone(layout.secondary_indexes()[0].as_ref().unwrap());
+            let runtime = Arc::clone(
+                layout.secondary_indexes()[0]
+                    .as_ref()
+                    .unwrap()
+                    .runtime_arc(),
+            );
 
             assert!(
                 catch_unwind(AssertUnwindSafe(|| {
@@ -242,7 +471,12 @@ mod tests {
             );
 
             let inactive_metadata = Arc::new(
-                TableMetadata::try_new_with_next_index_no(table2_columns(), vec![], 1).unwrap(),
+                TableMetadata::try_new_with_next_index_slot(
+                    table2_columns(),
+                    vec![],
+                    IndexSlot::new(1),
+                )
+                .unwrap(),
             );
             assert!(
                 catch_unwind(AssertUnwindSafe(|| {
@@ -256,13 +490,13 @@ mod tests {
             );
 
             let shifted_metadata = Arc::new(
-                TableMetadata::try_new_with_next_index_no(
+                TableMetadata::try_new_with_next_index_slot(
                     table2_columns(),
                     vec![ActiveIndexSpec::new(
-                        1,
-                        IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK),
+                        IndexSlot::new(1),
+                        IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK),
                     )],
-                    2,
+                    IndexSlot::new(2),
                 )
                 .unwrap(),
             );
@@ -281,7 +515,7 @@ mod tests {
                 TableMetadata::try_new(
                     table2_columns(),
                     vec![IndexSpec::new(
-                        vec![IndexKey::new(0)],
+                        vec![IndexKeySpec::new(0)],
                         IndexAttributes::empty(),
                     )],
                 )
@@ -297,6 +531,40 @@ mod tests {
                 }))
                 .is_err()
             );
+        });
+    }
+
+    #[test]
+    fn runtime_layout_validates_exact_generation_without_id_map_lookup() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "runtime_layout_generation").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let current = table_for_internal_assertion(&engine, table_id).layout_snapshot();
+            let runtime = Arc::clone(
+                current.secondary_indexes()[0]
+                    .as_ref()
+                    .unwrap()
+                    .runtime_arc(),
+            );
+            let slot = IndexSlot::new(0);
+            let old_ref = IndexRef::from_active_slot(slot);
+            let replacement_ref = IndexRef::new(IndexID::new(100), slot);
+            let replacement = TableRuntimeLayout::from_entries(
+                current.generation() + 1,
+                Arc::clone(current.metadata_arc()),
+                vec![Some(RuntimeIndexEntry::new(replacement_ref, runtime))].into_boxed_slice(),
+            );
+
+            TableRuntimeLayout::reset_index_access_counters();
+            assert_eq!(
+                replacement.resolve_index_id(IndexID::new(100)),
+                Some(replacement_ref)
+            );
+            assert_eq!(replacement.resolve_index_id(IndexID::new(0)), None);
+            assert!(!replacement.validate_index_ref(old_ref));
+            assert!(replacement.validate_index_ref(replacement_ref));
+            assert_eq!(TableRuntimeLayout::index_access_counters(), (2, 2, 0));
         });
     }
 
@@ -327,13 +595,13 @@ mod tests {
             assert_eq!(old_layout.metadata().idx.active_index_count(), 1);
 
             let metadata_without_indexes = Arc::new(
-                TableMetadata::try_new_with_next_index_no(
+                TableMetadata::try_new_with_next_index_slot(
                     vec![
                         ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
                         ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
                     ],
                     vec![],
-                    old_layout.metadata().idx.next_index_no(),
+                    old_layout.metadata().idx.next_index_slot(),
                 )
                 .unwrap(),
             );
@@ -369,8 +637,8 @@ mod tests {
             assert_eq!(old_layout.metadata().idx.active_index_count(), 1);
             assert_eq!(installed.metadata().idx.active_index_count(), 0);
             assert_eq!(
-                installed.metadata().idx.next_index_no(),
-                old_layout.metadata().idx.next_index_no()
+                installed.metadata().idx.next_index_slot(),
+                old_layout.metadata().idx.next_index_slot()
             );
             assert_eq!(
                 installed.metadata().idx.index_slot_count(),
@@ -387,6 +655,30 @@ mod tests {
             );
             assert!(
                 table_for_internal_assertion(&engine, table_id).has_retired_secondary_indexes()
+            );
+
+            let reused_slot_layout = Arc::new(TableRuntimeLayout::from_entries(
+                installed.generation() + 1,
+                Arc::clone(old_layout.metadata_arc()),
+                vec![Some(RuntimeIndexEntry::new(
+                    old_layout.secondary_indexes()[0]
+                        .as_ref()
+                        .unwrap()
+                        .index_ref(),
+                    Arc::clone(
+                        old_layout.secondary_indexes()[0]
+                            .as_ref()
+                            .unwrap()
+                            .runtime_arc(),
+                    ),
+                ))]
+                .into_boxed_slice(),
+            ));
+            assert!(
+                table_for_internal_assertion(&engine, table_id)
+                    .try_replace_runtime_layout(&installed, reused_slot_layout)
+                    .is_none(),
+                "a physical slot cannot be reused while its exact retired owner is registered"
             );
 
             let guards = PoolGuards::builder()

@@ -1727,7 +1727,7 @@ mod tests {
     use core::str;
 
     use crate::catalog::{
-        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexOrder, IndexSpec,
+        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexOrder, IndexSpec,
         TableMetadata,
     };
     use crate::value::ValKind;
@@ -1789,7 +1789,7 @@ mod tests {
                 column_attributes: ColumnAttributes::empty(),
             }],
             vec![IndexSpec {
-                cols: vec![IndexKey {
+                cols: vec![IndexKeySpec {
                     col_no: 0,
                     order: IndexOrder::Asc,
                 }],
@@ -1822,7 +1822,7 @@ mod tests {
                 ColumnAttributes::empty(),
             )],
             vec![IndexSpec {
-                cols: vec![IndexKey::new(0)],
+                cols: vec![IndexKeySpec::new(0)],
                 attributes: IndexAttributes::UK,
             }],
         )
@@ -1856,7 +1856,7 @@ mod tests {
                 column_attributes: ColumnAttributes::empty(),
             }],
             vec![IndexSpec {
-                cols: vec![IndexKey::new(0)],
+                cols: vec![IndexKeySpec::new(0)],
                 attributes: IndexAttributes::PK,
             }],
         )
@@ -1889,7 +1889,7 @@ mod tests {
                 },
             ],
             vec![IndexSpec {
-                cols: vec![IndexKey::new(0)],
+                cols: vec![IndexKeySpec::new(0)],
                 attributes: IndexAttributes::UK,
             }],
         )
@@ -1949,10 +1949,13 @@ mod tests {
         let expected = vec![Val::U32(7), Val::from("row-value")];
         assert!(page.insert(metadata.col.as_ref(), &expected).is_ok());
 
-        let (index_no, indexed_metadata) = metadata
-            .try_with_created_index(IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK))
+        let (index_slot, indexed_metadata) = metadata
+            .try_with_created_index(IndexSpec::new(
+                vec![IndexKeySpec::new(0)],
+                IndexAttributes::UK,
+            ))
             .unwrap();
-        let dropped_metadata = indexed_metadata.without_index(index_no);
+        let dropped_metadata = indexed_metadata.without_index(index_slot);
 
         let row = page.row(0);
         assert_eq!(row.clone_vals(metadata.col.as_ref()), expected);
@@ -1991,7 +1994,7 @@ mod tests {
                 },
             ],
             vec![IndexSpec {
-                cols: vec![IndexKey::new(2)],
+                cols: vec![IndexKeySpec::new(2)],
                 attributes: IndexAttributes::PK,
             }],
         )

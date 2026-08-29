@@ -1,5 +1,5 @@
 use super::{RowRecord, validate_catalog_row};
-use crate::catalog::{CatalogSelectKey, table::TableMetadata};
+use crate::catalog::{CatalogIndexNo, CatalogSelectKey, table::TableMetadata};
 use crate::error::{DataIntegrityError, DataIntegrityResult};
 use crate::index::{BTreeKey, BTreeKeyEncoder};
 use crate::row::ops::UpdateCol;
@@ -141,8 +141,8 @@ impl CatalogFoldedRows {
         let merge_key = self.key_builder.key_from_select_key(key, "update")?;
         let Some(entry) = self.rows.get_mut(&merge_key) else {
             return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-                "catalog checkpoint update-by-primary-key target missing: index_no={}, key_vals={:?}",
-                key.index.as_usize(), key.vals
+                "catalog checkpoint update-by-primary-key target missing: index_slot={}, key_vals={:?}",
+                key.index_slot, key.vals
             )));
         };
         match entry {
@@ -182,8 +182,8 @@ impl CatalogFoldedRows {
         match self.rows.entry(merge_key) {
             Entry::Vacant(_) => {
                 return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-                    "catalog checkpoint delete-by-primary-key target missing: index_no={}, key_vals={:?}",
-                    key.index.as_usize(), key.vals
+                    "catalog checkpoint delete-by-primary-key target missing: index_slot={}, key_vals={:?}",
+                    key.index_slot, key.vals
                 )));
             }
             Entry::Occupied(mut entry) => match entry.get() {
@@ -221,7 +221,7 @@ impl CatalogFoldedRows {
 }
 
 pub(super) struct CatalogMergeKeyBuilder {
-    index_no: usize,
+    index_slot: CatalogIndexNo,
     col_idxs: Box<[usize]>,
     val_types: Box<[ValType]>,
     encoder: BTreeKeyEncoder,
@@ -255,7 +255,7 @@ impl CatalogMergeKeyBuilder {
         }
         let encoder = BTreeKeyEncoder::new(val_types.clone());
         Ok(Self {
-            index_no: primary_key.index_no(),
+            index_slot: primary_key.index_slot(),
             col_idxs: col_idxs.into_boxed_slice(),
             val_types: val_types.into_boxed_slice(),
             encoder,
@@ -309,10 +309,10 @@ impl CatalogMergeKeyBuilder {
         key: &CatalogSelectKey,
         operation: &'static str,
     ) -> DataIntegrityResult<()> {
-        if key.index.as_usize() != self.index_no {
+        if key.index_slot != self.index_slot {
             return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-                "catalog checkpoint {operation} key is not primary key: index_no={}, primary_key_index_no={}",
-                key.index.as_usize(), self.index_no
+                "catalog checkpoint {operation} key is not primary key: index_slot={}, primary_key_index_slot={}",
+                key.index_slot, self.index_slot
             )));
         }
         if key.vals.len() != self.col_idxs.len() {
@@ -330,8 +330,8 @@ impl CatalogMergeKeyBuilder {
         {
             return Err(
                 Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-                    "catalog checkpoint {operation} key type mismatch: index_no={}",
-                    key.index.as_usize()
+                    "catalog checkpoint {operation} key type mismatch: index_slot={}",
+                    key.index_slot
                 )),
             );
         }
@@ -431,8 +431,8 @@ fn apply_catalog_update_by_primary_key(
     }
     if !key_builder.row_matches_key(row, &key.vals) {
         return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-            "catalog checkpoint update-by-primary-key changed stable key: index_no={}, key_vals={:?}",
-            key.index.as_usize(), key.vals
+            "catalog checkpoint update-by-primary-key changed stable key: index_slot={}, key_vals={:?}",
+            key.index_slot, key.vals
         )));
     }
     Ok(())

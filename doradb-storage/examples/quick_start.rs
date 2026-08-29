@@ -1,6 +1,6 @@
 use doradb_storage::{
-    ColumnAttributes, ColumnSpec, Engine, EngineConfig, IndexAttributes, IndexKey, IndexSpec,
-    ScanRowDecision, SelectKey, TableSpec, UpdateCol, Val, ValKind,
+    ColumnAttributes, ColumnSpec, Engine, EngineConfig, IndexAttributes, IndexID, IndexKeySpec,
+    IndexSpec, ScanRowDecision, TableIndex, TableSpec, UpdateCol, Val, ValKind,
 };
 use futures::executor;
 use std::error::Error;
@@ -31,8 +31,8 @@ async fn run() -> ExampleResult<()> {
                 ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
             ]),
             vec![
-                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK),
-                IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK),
+                IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty()),
             ],
         )
         .await?;
@@ -49,13 +49,13 @@ async fn run() -> ExampleResult<()> {
         )
         .await?;
 
-    let id_one = SelectKey::new(0, vec![Val::from(1i32)]);
+    let id_index = IndexID::new(0);
+    let id_one = [Val::from(1i32)];
     // Update one row by its unique id key.
     let updated = write_trx
         .table_update_unique_mvcc(
-            table_id,
-            id_one.index_no,
-            &id_one.vals,
+            TableIndex(table_id, id_index),
+            &id_one,
             vec![UpdateCol {
                 idx: 1,
                 val: Val::from("ada"),
@@ -64,10 +64,10 @@ async fn run() -> ExampleResult<()> {
         .await?;
     assert!(updated.is_updated());
 
-    let id_two = SelectKey::new(0, vec![Val::from(2i32)]);
+    let id_two = [Val::from(2i32)];
     // Delete one row by its unique id key.
     let deleted = write_trx
-        .table_delete_unique_mvcc(table_id, id_two.index_no, &id_two.vals)
+        .table_delete_unique_mvcc(TableIndex(table_id, id_index), &id_two)
         .await?;
     assert!(deleted.is_deleted());
     write_trx.commit().await?;
@@ -87,15 +87,16 @@ async fn run() -> ExampleResult<()> {
 
     // Lookup one row through the unique id index.
     let found = read_trx
-        .table_lookup_unique_mvcc(table_id, id_one.index_no, &id_one.vals, &[0, 1])
+        .table_lookup_unique_mvcc(TableIndex(table_id, id_index), &id_one, &[0, 1])
         .await?
         .unwrap_found();
     assert_eq!(row_pair(found), (1, String::from("ada")));
 
-    let name_key = SelectKey::new(1, vec![Val::from("ada")]);
+    let name_index = IndexID::new(1);
+    let name_key = [Val::from("ada")];
     // Scan rows that match one secondary-index key.
     let mut matching_rows = read_trx
-        .table_index_lookup_mvcc(table_id, name_key.index_no, &name_key.vals, &[0, 1])
+        .table_index_lookup_mvcc(TableIndex(table_id, name_index), &name_key, &[0, 1])
         .await?
         .unwrap_rows()
         .into_iter()
@@ -107,9 +108,8 @@ async fn run() -> ExampleResult<()> {
     // Stream the same secondary-index match one row at a time.
     let mut stream = read_trx
         .table_index_scan_mvcc_stream(
-            table_id,
-            name_key.index_no,
-            &name_key.vals[..]..=&name_key.vals[..],
+            TableIndex(table_id, name_index),
+            &name_key[..]..=&name_key[..],
             &[0, 1],
         )
         .await?;

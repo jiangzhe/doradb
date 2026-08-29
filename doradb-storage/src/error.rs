@@ -1813,8 +1813,8 @@ impl fmt::Display for SecondaryIndexBinding {
 /// Printable recovery duplicate-key context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecoveryDuplicateKey {
-    /// Table index number being rebuilt.
-    pub index_no: usize,
+    /// Table index slot being rebuilt.
+    pub index_slot: usize,
     /// Duplicate row id reported by the index insert.
     pub row_id: RowID,
     /// Whether the duplicate row id was already marked deleted.
@@ -1826,8 +1826,8 @@ impl fmt::Display for RecoveryDuplicateKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "index_no={}, row_id={}, deleted={}",
-            self.index_no, self.row_id, self.deleted
+            "index_slot={}, row_id={}, deleted={}",
+            self.index_slot, self.row_id, self.deleted
         )
     }
 }

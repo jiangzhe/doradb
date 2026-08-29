@@ -83,6 +83,12 @@ recovery uses the root as proof that the DDL metadata change reached durable
 table state. Catalog multi-table roots use the catalog checkpoint replay
 boundary/safe timestamp.
 
+The current durable index-DDL record still stores one `u16`. Recovery converts
+that value into the Phase 2 exact runtime identity only after proving the record
+is at or beyond the catalog replay floor; in this transitional format the
+`IndexID` and physical slot are equal. No table-file or redo format changes are
+introduced by the runtime identity split.
+
 Notably, the table file does **not** need `index_rec_cts`.
 
 Persistent secondary-index state is recovered by loading the checkpointed

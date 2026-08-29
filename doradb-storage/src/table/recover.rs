@@ -1,4 +1,5 @@
 use crate::buffer::PoolGuards;
+use crate::catalog::IndexSlot;
 use crate::error::{
     DataIntegrityError, DataIntegrityResult, RecoveryDuplicateKey, RuntimeError, RuntimeResult,
 };
@@ -164,13 +165,14 @@ impl Table {
         let layout = self.layout_snapshot();
         let metadata = layout.metadata();
         let index_pool_guard = self.mem.index_pool_guard(guards);
-        for (index_no, index_spec) in metadata.idx.active_indexes() {
+        for (index_slot, index_spec) in metadata.idx.active_indexes() {
             let sec_idx = layout
-                .secondary_index(index_no)
+                .index_entry_at_slot(index_slot)
+                .map(super::RuntimeIndexEntry::runtime)
                 .change_context(RuntimeError::TableAccess)
                 .attach_with(|| {
                     format!(
-                        "operation=populate_index_via_row_page, table_id={}, page_id={page_id}, index_no={index_no}",
+                        "operation=populate_index_via_row_page, table_id={}, page_id={page_id}, index_slot={index_slot}",
                         self.table_id()
                     )
                 })?;
@@ -185,7 +187,7 @@ impl Table {
                                 .change_context(RuntimeError::TableAccess)
                                 .attach_with(|| {
                                     format!(
-                                        "operation=populate_index_via_row_page, table_id={}, page_id={page_id}, index_no={index_no}",
+                                        "operation=populate_index_via_row_page, table_id={}, page_id={page_id}, index_slot={index_slot}",
                                         self.table_id()
                                     )
                                 })?;
@@ -193,11 +195,11 @@ impl Table {
                                 .bind(index_pool_guard)
                                 .insert_if_not_exists(&vals, row_id, false, MIN_SNAPSHOT_TS)
                                 .await?;
-                            ensure_recovery_index_insert(sec_idx.index_no(), res)
+                            ensure_recovery_index_insert(sec_idx.index_slot(), res)
                                 .change_context(RuntimeError::TableAccess)
                                 .attach_with(|| {
                                     format!(
-                                        "operation=populate_index_via_row_page, table_id={}, page_id={page_id}, index_no={index_no}, row_id={row_id}",
+                                        "operation=populate_index_via_row_page, table_id={}, page_id={page_id}, index_slot={index_slot}, row_id={row_id}",
                                         self.table_id()
                                     )
                                 })?;
@@ -207,7 +209,7 @@ impl Table {
                                 .change_context(RuntimeError::TableAccess)
                                 .attach_with(|| {
                                     format!(
-                                        "operation=populate_index_via_row_page, table_id={}, page_id={page_id}, index_no={index_no}",
+                                        "operation=populate_index_via_row_page, table_id={}, page_id={page_id}, index_slot={index_slot}",
                                         self.table_id()
                                     )
                                 })?;
@@ -215,11 +217,11 @@ impl Table {
                                 .bind(index_pool_guard)
                                 .insert_if_not_exists(&vals, row_id, false, MIN_SNAPSHOT_TS)
                                 .await?;
-                            ensure_recovery_index_insert(sec_idx.index_no(), res)
+                            ensure_recovery_index_insert(sec_idx.index_slot(), res)
                                 .change_context(RuntimeError::TableAccess)
                                 .attach_with(|| {
                                     format!(
-                                        "operation=populate_index_via_row_page, table_id={}, page_id={page_id}, index_no={index_no}, row_id={row_id}",
+                                        "operation=populate_index_via_row_page, table_id={}, page_id={page_id}, index_slot={index_slot}, row_id={row_id}",
                                         self.table_id()
                                     )
                                 })?;
@@ -237,7 +239,7 @@ impl Table {
 /// Reject duplicate secondary-index entries during recovery rebuild.
 #[inline]
 pub(super) fn ensure_recovery_index_insert(
-    index_no: usize,
+    index_slot: IndexSlot,
     res: IndexInsert,
 ) -> DataIntegrityResult<()> {
     match res {
@@ -246,7 +248,7 @@ pub(super) fn ensure_recovery_index_insert(
             DataIntegrityError::UnexpectedRecoveryDuplicateKey,
         )
         .attach(RecoveryDuplicateKey {
-            index_no,
+            index_slot: index_slot.as_usize(),
             row_id,
             deleted,
         })),
@@ -262,7 +264,7 @@ mod tests {
         assert_dropped_table_floor, assert_no_dropped_table_operational_state,
         wait_for_no_dropped_table_operational_state,
     };
-    use crate::catalog::{TableMetadata, USER_TABLE_ID_START};
+    use crate::catalog::{IndexSlot, TableMetadata, USER_TABLE_ID_START};
     use crate::engine::Engine;
     use crate::error::{DataIntegrityError, RecoveryDuplicateKey, RuntimeError};
     use crate::id::RowID;
@@ -279,18 +281,22 @@ mod tests {
 
     #[test]
     fn test_ensure_recovery_index_insert_accepts_ok_variants() {
-        assert!(ensure_recovery_index_insert(1, IndexInsert::Ok(false)).is_ok());
-        assert!(ensure_recovery_index_insert(1, IndexInsert::Ok(true)).is_ok());
+        let index_slot = IndexSlot::new(1);
+        assert!(ensure_recovery_index_insert(index_slot, IndexInsert::Ok(false)).is_ok());
+        assert!(ensure_recovery_index_insert(index_slot, IndexInsert::Ok(true)).is_ok());
     }
 
     #[test]
     fn test_ensure_recovery_index_insert_rejects_duplicate_key() {
-        let err = ensure_recovery_index_insert(3, IndexInsert::DuplicateKey(RowID::new(42), false))
-            .unwrap_err();
+        let err = ensure_recovery_index_insert(
+            IndexSlot::new(3),
+            IndexInsert::DuplicateKey(RowID::new(42), false),
+        )
+        .unwrap_err();
         let duplicate = err
             .downcast_ref::<RecoveryDuplicateKey>()
             .unwrap_or_else(|| panic!("unexpected error: {err:?}"));
-        assert_eq!(duplicate.index_no, 3);
+        assert_eq!(duplicate.index_slot, 3);
         assert_eq!(duplicate.row_id, RowID::new(42));
         assert!(!duplicate.deleted);
     }

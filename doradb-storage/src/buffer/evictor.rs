@@ -1028,7 +1028,7 @@ mod tests {
     use crate::buffer::page::Page;
     use crate::buffer::{EvictableBufferPool, ReadonlyBufferPool};
     use crate::catalog::{
-        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
+        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexSpec, TableMetadata,
     };
     use crate::component::{ComponentRegistry, DiskPoolConfig, RegistryBuilder};
     use crate::conf::{EvictableBufferPoolConfig, FileSystemConfig};
@@ -1239,7 +1239,10 @@ mod tests {
                     ValKind::U32,
                     ColumnAttributes::empty(),
                 )],
-                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+                vec![IndexSpec::new(
+                    vec![IndexKeySpec::new(0)],
+                    IndexAttributes::PK,
+                )],
             )
             .expect("valid table metadata"),
         )

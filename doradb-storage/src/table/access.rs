@@ -1,13 +1,10 @@
 use super::{
-    hot::{
-        DeleteInternal, HotRowMutator, InsertRowIntoPage, RowInserter, UpdateRowInplace,
-        read_hot_row_mvcc,
-    },
+    hot::{DeleteInternal, HotRowMutator, InsertRowIntoPage, RowInserter, UpdateRowInplace},
     index_mutate::IndexMutator,
 };
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::buffer::{EvictableBufferPool, PoolGuards};
-use crate::catalog::{ResolvedUserIndexKey, TableColumnLayout, TableMetadata};
+use crate::catalog::{IndexRef, IndexSlot, ResolvedIndexKey, TableColumnLayout, TableMetadata};
 use crate::error::{
     DataIntegrityError, DataIntegrityResult, DiscloseError, DiscloseResultExt, InternalError,
     MultiDomainResultExt, OperationError, OperationOrFatalResult, OperationOrRuntimeError,
@@ -22,7 +19,7 @@ use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{
     BorrowedIndexMutationStream, ColumnBlockIndex, ColumnBlockScanEntry, ColumnLeafEntry,
     ColumnScanDeletePlan, CurrentIndexReadHandle, DeferredColumnScanDeletes, IndexBatchStream,
-    IndexCompareExchange, IndexInsert, IndexMask, KeyRange, LwcRowLocation,
+    IndexCompareExchange, IndexInsert, IndexLookupCandidate, IndexMask, KeyRange, LwcRowLocation,
     NonUniqueSecondaryIndex, OwnedCurrentIndexReadHandle, OwnedIndexCandidateStream, RowLocation,
     SecondaryIndex, UniqueInsertAttempt, UniqueSecondaryIndex,
 };
@@ -39,7 +36,7 @@ use crate::table::{
     ColdVisibilityOverride, ColumnDeletionBuffer, ColumnStorage, DeleteMarker, DeletionClaim,
     DeletionError, DmlValidator, MemTable, RowPageDescriptor, Table, TableRootSnapshot,
     TableRuntimeLayout, TableScanRootView, UpdateUniqueMvcc, index_key_is_changed,
-    index_key_replace, read_latest_index_key, read_physical_index_keys_for_delete, row_len,
+    index_key_vals_replace, read_latest_index_key, read_physical_index_keys_for_delete, row_len,
     unique_key_from_full_row,
 };
 use crate::trx::row::{
@@ -47,7 +44,7 @@ use crate::trx::row::{
     RowWriteAccess,
 };
 use crate::trx::stmt::StmtEffects;
-use crate::trx::undo::{IndexBranch, OwnedRowUndo, RowUndoKind, UserIndexBranchDomain};
+use crate::trx::undo::{IndexBranch, OwnedRowUndo, RowUndoKind};
 use crate::trx::{
     MIN_SNAPSHOT_TS, MvccReadView, MvccVisibility, PrepareListenerResult, SharedTrxStatus,
     TrxContext, TrxRuntime, trx_is_committed,
@@ -603,35 +600,63 @@ enum PendingColdMutation<'op> {
 /// One mutation key derived from an admitted foreground write accessor.
 ///
 /// The lifetime marker keeps the key within the admitted layout lifetime. The
-/// raw key is exposed only when `UserTableAccessor` consumes it at leaf index,
-/// undo, or runtime-link boundaries.
+/// resolved reference is the sole identity and physical-slot source. Raw key
+/// values are exposed only when `UserTableAccessor` consumes them at leaf
+/// index, undo, or runtime-link boundaries.
+#[derive(Debug, PartialEq, Eq)]
 struct WriteIndexKey<'op> {
-    key: SelectKey,
+    index: IndexRef,
+    vals: Vec<Val>,
     _layout: PhantomData<&'op TableRuntimeLayout>,
 }
 
 impl<'op> WriteIndexKey<'op> {
     #[inline]
-    fn new(_accessor: &UserTableAccessor<'op>, key: SelectKey) -> Self {
+    fn new(layout: &'op TableRuntimeLayout, key: SelectKey) -> Self {
+        let SelectKey { index_slot, vals } = key;
+        let index = layout
+            .index_entry_at_slot(index_slot)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "write index key must reference an active layout entry: layout_generation={}, index_slot={index_slot}, error={err:?}",
+                    layout.generation()
+                )
+            })
+            .index_ref();
         Self {
-            key,
+            index,
+            vals,
             _layout: PhantomData,
         }
     }
 
     #[inline]
-    fn index_no(&self) -> usize {
-        self.key.index_no
+    fn index_slot(&self) -> IndexSlot {
+        self.index.slot()
     }
 
     #[inline]
-    fn as_select_key(&self) -> &SelectKey {
-        &self.key
+    fn index_ref(&self) -> IndexRef {
+        self.index
     }
 
     #[inline]
-    fn into_select_key(self) -> SelectKey {
-        self.key
+    fn vals(&self) -> &[Val] {
+        &self.vals
+    }
+
+    #[inline]
+    fn with_vals(&self, vals: Vec<Val>) -> Self {
+        Self {
+            index: self.index,
+            vals,
+            _layout: PhantomData,
+        }
+    }
+
+    #[inline]
+    fn into_parts(self) -> (IndexRef, Vec<Val>) {
+        (self.index, self.vals)
     }
 }
 
@@ -641,17 +666,34 @@ impl<'op> WriteIndexKey<'op> {
 /// lifetime remains attached from construction through either new-side claims
 /// or old-row ownership proof construction.
 pub(super) struct WriteIndexKeySet<'op> {
-    keys: Vec<SelectKey>,
-    _layout: PhantomData<&'op TableRuntimeLayout>,
+    keys: Vec<WriteIndexKey<'op>>,
 }
 
 impl<'op> WriteIndexKeySet<'op> {
     #[inline]
     pub(super) fn from_full_row(accessor: &UserTableAccessor<'op>, row: &[Val]) -> Self {
-        Self {
-            keys: accessor.metadata().idx.keys_for_insert(row),
-            _layout: PhantomData,
-        }
+        let keys = accessor
+            .layout()
+            .active_secondary_indexes()
+            .map(|(index, _)| {
+                let spec = accessor
+                    .metadata()
+                    .idx
+                    .index_spec(index.slot())
+                    .expect("active runtime entry has matching metadata");
+                let vals = spec
+                    .cols
+                    .iter()
+                    .map(|key| row[key.col_no as usize].clone())
+                    .collect();
+                WriteIndexKey {
+                    index,
+                    vals,
+                    _layout: PhantomData,
+                }
+            })
+            .collect();
+        Self { keys }
     }
 
     #[inline]
@@ -660,10 +702,34 @@ impl<'op> WriteIndexKeySet<'op> {
         page_guard: &PageSharedGuard<RowPage>,
         row_id: RowID,
     ) -> Self {
-        Self {
-            keys: read_physical_index_keys_for_delete(accessor.metadata(), page_guard, row_id),
-            _layout: PhantomData,
-        }
+        let mut raw_keys =
+            read_physical_index_keys_for_delete(accessor.metadata(), page_guard, row_id)
+                .into_iter()
+                .map(|key| (key.index_slot, key))
+                .collect::<FastHashMap<_, _>>();
+        let keys = accessor
+            .layout()
+            .active_secondary_indexes()
+            .map(|(index, _)| {
+                let index_slot = index.slot();
+                let key = raw_keys.remove(&index_slot).unwrap_or_else(|| {
+                    panic!(
+                        "physical row key set missing active layout entry: table_id={}, index={index}, row_id={row_id}",
+                        accessor.table_id()
+                    )
+                });
+                WriteIndexKey {
+                    index,
+                    vals: key.vals,
+                    _layout: PhantomData,
+                }
+            })
+            .collect();
+        assert!(
+            raw_keys.is_empty(),
+            "physical row key set has inactive entries"
+        );
+        Self { keys }
     }
 
     #[inline]
@@ -686,11 +752,15 @@ impl<'op> WriteIndexKeySet<'op> {
             .zip(vals)
             .collect::<FastHashMap<_, _>>();
         let keys = accessor
-            .metadata()
-            .idx
-            .active_indexes()
-            .map(|(index_no, index)| {
-                let vals = index
+            .layout()
+            .active_secondary_indexes()
+            .map(|(index_ref, _)| {
+                let index_spec = accessor
+                    .metadata()
+                    .idx
+                    .index_spec(index_ref.slot())
+                    .expect("active layout entry has matching metadata");
+                let vals = index_spec
                     .cols
                     .iter()
                     .map(|key| {
@@ -699,33 +769,30 @@ impl<'op> WriteIndexKeySet<'op> {
                             .cloned()
                             .unwrap_or_else(|| {
                                 panic!(
-                                    "active index column must be present in the metadata-derived read set: table_id={table_id}, index_no={index_no}, column_no={}",
+                                    "active index column must be present in the metadata-derived read set: table_id={table_id}, index={index_ref}, column_no={}",
                                     key.col_no
                                 )
                             })
                     })
                     .collect();
-                SelectKey::new(index_no, vals)
+                WriteIndexKey {
+                    index: index_ref,
+                    vals,
+                    _layout: PhantomData,
+                }
             })
             .collect();
-        Self {
-            keys,
-            _layout: PhantomData,
-        }
+        Self { keys }
     }
 
     #[inline]
-    fn as_slice(&self) -> &[SelectKey] {
+    fn as_slice(&self) -> &[WriteIndexKey<'op>] {
         &self.keys
     }
 
     #[inline]
     fn into_keys(self) -> impl Iterator<Item = WriteIndexKey<'op>> {
-        let Self { keys, _layout: _ } = self;
-        keys.into_iter().map(move |key| WriteIndexKey {
-            key,
-            _layout: PhantomData,
-        })
+        self.keys.into_iter()
     }
 }
 
@@ -878,13 +945,13 @@ impl<'op> UserTableAccessor<'op> {
     }
 
     #[inline]
-    pub(super) fn table(&self) -> &Table {
-        self.table
+    pub(super) fn validates_index_ref(&self, index: IndexRef) -> bool {
+        self.layout.validate_index_ref(index)
     }
 
     #[inline]
-    fn user_sec_idx(&self) -> &[Option<Arc<SecondaryIndex<EvictableBufferPool>>>] {
-        self.layout().secondary_indexes()
+    pub(super) fn table(&self) -> &Table {
+        self.table
     }
 
     #[inline]
@@ -903,66 +970,28 @@ impl<'op> UserTableAccessor<'op> {
     }
 
     #[inline]
-    fn sec_idx_is_active(&self, index_no: usize) -> bool {
-        self.user_sec_idx()
-            .get(index_no)
-            .is_some_and(Option::is_some)
-    }
-
-    #[inline]
-    fn sec_idx_is_unique(&self, index_no: usize) -> bool {
-        self.require_sec_idx(index_no)
-            .expect("active user index slot")
+    fn sec_idx_is_unique(&self, index: IndexRef) -> bool {
+        self.require_sec_idx(index)
+            .expect("active user index reference")
             .is_unique()
     }
 
     #[inline]
     fn require_sec_idx(
         &self,
-        index_no: usize,
+        index: IndexRef,
     ) -> RuntimeResult<&SecondaryIndex<EvictableBufferPool>> {
-        self.user_sec_idx()
-            .get(index_no)
-            .and_then(Option::as_deref)
-            .ok_or_else(|| {
-                Report::new(InternalError::SecondaryIndexOutOfBounds)
-                    .attach(format!(
-                        "index_no={index_no}, index_count={}",
-                        self.user_sec_idx().len()
-                    ))
-                    .change_context(RuntimeError::IndexAccess)
-                    .attach("operation=resolve_table_secondary_index")
-            })
-    }
-
-    #[inline]
-    fn require_sec_idx_arc(
-        &self,
-        index_no: usize,
-    ) -> RuntimeResult<Arc<SecondaryIndex<EvictableBufferPool>>> {
-        self.user_sec_idx()
-            .get(index_no)
-            .and_then(Option::as_ref)
-            .cloned()
-            .ok_or_else(|| {
-                Report::new(InternalError::SecondaryIndexOutOfBounds)
-                    .attach(format!(
-                        "index_no={index_no}, index_count={}",
-                        self.user_sec_idx().len()
-                    ))
-                    .change_context(RuntimeError::IndexAccess)
-                    .attach("operation=resolve_table_secondary_index")
-            })
+        self.layout().secondary_index(index)
     }
 
     #[inline]
     fn require_unique_index_unchecked<'g>(
         &self,
         guards: &'g PoolGuards,
-        index_no: usize,
+        index: IndexRef,
         root: BlockID,
     ) -> RuntimeResult<UniqueSecondaryIndex<'_, 'g, EvictableBufferPool>> {
-        self.require_sec_idx(index_no)?
+        self.require_sec_idx(index)?
             .bind_unique_unchecked(guards, root)
     }
 
@@ -970,10 +999,10 @@ impl<'op> UserTableAccessor<'op> {
     fn require_non_unique_index_unchecked<'g>(
         &self,
         guards: &'g PoolGuards,
-        index_no: usize,
+        index: IndexRef,
         root: BlockID,
     ) -> RuntimeResult<NonUniqueSecondaryIndex<'_, 'g, EvictableBufferPool>> {
-        self.require_sec_idx(index_no)?
+        self.require_sec_idx(index)?
             .bind_non_unique_unchecked(guards, root)
     }
 
@@ -981,19 +1010,21 @@ impl<'op> UserTableAccessor<'op> {
     fn current_index_read_handle<'g, 'idx>(
         &'idx self,
         rt: TrxRuntime<'g>,
-        index_no: usize,
+        index: IndexRef,
     ) -> RuntimeResult<CurrentIndexReadHandle<'g, 'idx, EvictableBufferPool>> {
         // User accessors pin metadata/runtime layout, while secondary DiskTree
         // operations bind to the latest proof-gated root for the same stable
         // slot. Checkpoint publication may advance roots without changing
         // layout shape.
-        let index = self.require_sec_idx(index_no)?;
+        let index_slot = index.slot();
+        let runtime = self.layout().secondary_index(index)?;
         let proof = rt.read_proof();
-        let root = self
-            .storage
-            .with_active_root(&proof, |root| root.secondary_index_roots[index_no]);
+        let root = self.storage.with_active_root(&proof, |root| {
+            root.secondary_index_roots[index_slot.as_usize()]
+        });
         Ok(CurrentIndexReadHandle::new(
             index,
+            runtime,
             rt.pool_guards(),
             root,
             &proof,
@@ -1004,16 +1035,18 @@ impl<'op> UserTableAccessor<'op> {
     fn owned_current_index_read_handle(
         &self,
         rt: TrxRuntime<'_>,
-        index_no: usize,
+        index: IndexRef,
     ) -> RuntimeResult<OwnedCurrentIndexReadHandle<EvictableBufferPool>> {
-        let index = self.require_sec_idx_arc(index_no)?;
+        let index_slot = index.slot();
+        let runtime = Arc::clone(self.layout().index_entry(index)?.runtime_arc());
         let proof = rt.read_proof();
-        let root = self
-            .storage
-            .with_active_root(&proof, |root| root.secondary_index_roots[index_no]);
+        let root = self.storage.with_active_root(&proof, |root| {
+            root.secondary_index_roots[index_slot.as_usize()]
+        });
         let pool_guards = rt.pool_guards();
         Ok(OwnedCurrentIndexReadHandle::new(
             index,
+            runtime,
             pool_guards.index_guard().clone(),
             pool_guards.disk_guard().clone(),
             root,
@@ -1022,14 +1055,14 @@ impl<'op> UserTableAccessor<'op> {
     }
 
     #[inline]
-    fn unchecked_secondary_root(&self, index_no: usize) -> BlockID {
+    fn unchecked_secondary_root(&self, index_slot: IndexSlot) -> BlockID {
         // Unchecked internal callers share the same layout/root compatibility
         // contract as proof-gated foreground reads. Purge additionally treats
         // inactive layout slots as no-ops before reaching this binding point.
         self.storage
             .file()
             .active_root_unchecked()
-            .secondary_index_roots[index_no]
+            .secondary_index_roots[index_slot.as_usize()]
     }
 
     /// Captures the full proof-branded root used by transaction scan planning.
@@ -1139,9 +1172,9 @@ impl<'op> UserTableAccessor<'op> {
         let pivot_row_id = root_snapshot.pivot_row_id();
         assert!(
             row_id >= pivot_row_id,
-            "owned-row index-set invariant violated: individually bound RowPage entry is persisted in captured root, table_id={}, row_id={row_id}, index_no={}, pivot_row_id={pivot_row_id}",
+            "owned-row index-set invariant violated: individually bound RowPage entry is persisted in captured root, table_id={}, row_id={row_id}, index={}, pivot_row_id={pivot_row_id}",
             self.table_id(),
-            key.index_no()
+            key.index_ref()
         );
         OwnedOldIndexEntry {
             row_id,
@@ -1231,13 +1264,11 @@ impl<'op> UserTableAccessor<'op> {
         &'idx self,
         guards: &'g PoolGuards,
         snapshot: &'g TableRootSnapshot<'_>,
-        index_no: usize,
+        index: IndexRef,
     ) -> RuntimeResult<CurrentIndexReadHandle<'g, 'idx, EvictableBufferPool>> {
+        let runtime = self.layout().secondary_index(index)?;
         Ok(CurrentIndexReadHandle::from_snapshot(
-            self.require_sec_idx(index_no)?,
-            guards,
-            snapshot,
-            index_no,
+            index, runtime, guards, snapshot,
         ))
     }
 
@@ -1291,13 +1322,12 @@ impl<'op> UserTableAccessor<'op> {
     }
 
     #[inline]
-    fn retained_user_key(&self, key: SelectKey) -> ResolvedUserIndexKey {
-        let index_no = key.index_no;
+    fn retained_user_key(&self, index: IndexRef, vals: Vec<Val>) -> ResolvedIndexKey {
         self.layout()
-            .resolve_active_user_key(index_no, key.vals)
+            .resolve_active_user_key(index, vals)
             .unwrap_or_else(|err| {
                 panic!(
-                    "retained user index key must reference the accessor's active layout: table_id={}, index_no={index_no}, error={err:?}",
+                    "retained user index key must reference the accessor's active layout: table_id={}, index={index}, error={err:?}",
                     self.table_id()
                 )
             })
@@ -1309,14 +1339,15 @@ impl<'op> UserTableAccessor<'op> {
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
         row_id: RowID,
-        key: SelectKey,
+        index: IndexRef,
+        vals: Vec<Val>,
         merge_old_deleted: bool,
     ) {
         self.debug_assert_table_write_lock_held(rt);
-        effects.push_user_insert_unique_index_undo(
+        effects.push_insert_unique_index_undo(
             self.table_id(),
             row_id,
-            self.retained_user_key(key),
+            self.retained_user_key(index, vals),
             merge_old_deleted,
         );
     }
@@ -1327,14 +1358,15 @@ impl<'op> UserTableAccessor<'op> {
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
         row_id: RowID,
-        key: SelectKey,
+        index: IndexRef,
+        vals: Vec<Val>,
         merge_old_deleted: bool,
     ) {
         self.debug_assert_table_write_lock_held(rt);
-        effects.push_user_insert_non_unique_index_undo(
+        effects.push_insert_non_unique_index_undo(
             self.table_id(),
             row_id,
-            self.retained_user_key(key),
+            self.retained_user_key(index, vals),
             merge_old_deleted,
         );
     }
@@ -1345,14 +1377,15 @@ impl<'op> UserTableAccessor<'op> {
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
         row_id: RowID,
-        key: SelectKey,
+        index: IndexRef,
+        vals: Vec<Val>,
         unique: bool,
     ) {
         self.debug_assert_table_write_lock_held(rt);
-        effects.push_user_delete_index_undo(
+        effects.push_delete_index_undo(
             self.table_id(),
             row_id,
-            self.retained_user_key(key),
+            self.retained_user_key(index, vals),
             unique,
         );
     }
@@ -1364,76 +1397,17 @@ impl<'op> UserTableAccessor<'op> {
         effects: &mut StmtEffects,
         old_row_id: RowID,
         new_row_id: RowID,
-        key: SelectKey,
+        key: ResolvedIndexKey,
         old_deleted: bool,
     ) {
         self.debug_assert_table_write_lock_held(rt);
-        effects.push_user_update_unique_index_undo(
+        effects.push_update_unique_index_undo(
             self.table_id(),
             old_row_id,
             new_row_id,
-            self.retained_user_key(key),
+            key,
             old_deleted,
         );
-    }
-
-    #[inline]
-    async fn index_lookup_unique_row_mvcc(
-        &self,
-        rt: TrxRuntime<'_>,
-        index_no: usize,
-        key_vals: &[Val],
-        user_read_set: &[usize],
-        row_id: RowID,
-    ) -> RuntimeResult<SelectMvcc> {
-        loop {
-            let location = self.resolve_row_location(rt.pool_guards(), row_id).await?;
-            match location {
-                RowLocation::NotFound => return Ok(SelectMvcc::NotFound),
-                RowLocation::LwcBlock(LwcRowLocation {
-                    block_id,
-                    row_idx,
-                    row_shape_fingerprint,
-                    durable_deleted,
-                }) => {
-                    if !cold_row_visible_mvcc(
-                        self.lwc_deletion_buffer(),
-                        rt.ctx(),
-                        row_id,
-                        durable_deleted,
-                    ) {
-                        return Ok(SelectMvcc::NotFound);
-                    }
-                    let vals = self
-                        .read_lwc_row(
-                            rt.pool_guards(),
-                            block_id,
-                            row_idx,
-                            row_shape_fingerprint,
-                            user_read_set,
-                        )
-                        .await?;
-                    return Ok(SelectMvcc::Found(vals));
-                }
-                RowLocation::RowPage(page_id) => {
-                    let Some(page_guard) = self
-                        .mem()
-                        .try_get_validated_row_page_shared_result(rt.pool_guards(), page_id, row_id)
-                        .await?
-                    else {
-                        continue;
-                    };
-                    return Ok(read_hot_row_mvcc(
-                        rt,
-                        self.metadata(),
-                        &page_guard,
-                        row_id,
-                        Some((index_no, key_vals)),
-                        user_read_set,
-                    ));
-                }
-            }
-        }
     }
 
     /// Resolves one index scan candidate through row MVCC and exact key recheck.
@@ -1444,7 +1418,8 @@ impl<'op> UserTableAccessor<'op> {
         candidate: BoundIndexCandidate<'_>,
         read_set: &[usize],
     ) -> RuntimeResult<SelectMvcc> {
-        let index_no = candidate.index_no;
+        let index = candidate.index;
+        let index_slot = index.slot();
         loop {
             let location = self
                 .resolve_row_location(rt.pool_guards(), candidate.row_id)
@@ -1469,7 +1444,15 @@ impl<'op> UserTableAccessor<'op> {
                     let file_kind = storage.file().file_kind();
                     let persisted = storage
                         .load_lwc_block(rt.pool_guards().disk_guard(), block_id)
-                        .await?;
+                        .await
+                        .change_context(RuntimeError::TableAccess)
+                        .attach_with(|| {
+                            format!(
+                                "operation=index_lookup_candidate_row_mvcc, table_id={}, index={index}, row_id={}",
+                                self.table_id(),
+                                candidate.row_id
+                            )
+                        })?;
                     let block = persisted.block();
                     if block.row_shape_fingerprint() != row_shape_fingerprint {
                         return Err(Report::new(DataIntegrityError::InvalidPayload)
@@ -1478,7 +1461,7 @@ impl<'op> UserTableAccessor<'op> {
                             ))
                             .change_context(RuntimeError::TableAccess)
                             .attach(format!(
-                                "operation=index_lookup_candidate_row_mvcc, table_id={}, index_no={index_no}, row_id={}",
+                                "operation=index_lookup_candidate_row_mvcc, table_id={}, index={index}, row_id={}",
                                 self.table_id(),
                                 candidate.row_id
                             )));
@@ -1486,11 +1469,11 @@ impl<'op> UserTableAccessor<'op> {
                     let index_spec = self
                         .metadata()
                         .idx
-                        .require_index_spec(candidate.index_no)
+                        .require_index_spec(index_slot)
                         .change_context(RuntimeError::TableAccess)
                         .attach_with(|| {
                             format!(
-                                "operation=index_lookup_candidate_row_mvcc, table_id={}, index_no={index_no}, row_id={}",
+                                "operation=index_lookup_candidate_row_mvcc, table_id={}, index={index}, row_id={}",
                                 self.table_id(),
                                 candidate.row_id
                             )
@@ -1503,7 +1486,7 @@ impl<'op> UserTableAccessor<'op> {
                         .change_context(RuntimeError::TableAccess)
                         .attach_with(|| {
                             format!(
-                                "operation=index_lookup_candidate_row_mvcc, table_id={}, index_no={index_no}, row_id={}",
+                                "operation=index_lookup_candidate_row_mvcc, table_id={}, index={index}, row_id={}",
                                 self.table_id(),
                                 candidate.row_id
                             )
@@ -1519,7 +1502,7 @@ impl<'op> UserTableAccessor<'op> {
                         .change_context(RuntimeError::TableAccess)
                         .attach_with(|| {
                             format!(
-                                "operation=index_lookup_candidate_row_mvcc, table_id={}, index_no={index_no}, row_id={}",
+                                "operation=index_lookup_candidate_row_mvcc, table_id={}, index={index}, row_id={}",
                                 self.table_id(),
                                 candidate.row_id
                             )
@@ -1559,11 +1542,12 @@ impl<'op> UserTableAccessor<'op> {
     pub(crate) fn index_scan_candidates(
         &self,
         rt: TrxRuntime<'_>,
-        index_no: usize,
+        index: IndexRef,
         range: KeyRange,
     ) -> RuntimeResult<OwnedIndexCandidateStream<EvictableBufferPool>> {
-        debug_assert!(index_no < self.sec_idx_len());
-        let handle = self.owned_current_index_read_handle(rt, index_no)?;
+        let index_slot = index.slot();
+        debug_assert!(index_slot.as_usize() < self.sec_idx_len());
+        let handle = self.owned_current_index_read_handle(rt, index)?;
         Ok(OwnedIndexCandidateStream::new(handle, range))
     }
 
@@ -1772,7 +1756,7 @@ impl<'op> UserTableAccessor<'op> {
     async fn persisted_lwc_key_differs(
         &self,
         guards: &PoolGuards,
-        index_no: usize,
+        index_slot: IndexSlot,
         key_vals: &[Val],
         block_id: BlockID,
         row_idx: usize,
@@ -1781,11 +1765,11 @@ impl<'op> UserTableAccessor<'op> {
         let read_set = self
             .metadata()
             .idx
-            .require_index_spec(index_no)
+            .require_index_spec(index_slot)
             .change_context(RuntimeError::TableAccess)
             .attach_with(|| {
                 format!(
-                    "operation=compare_persisted_lwc_key, table_id={}, index_no={index_no}, block_id={block_id}, row_idx={row_idx}",
+                    "operation=compare_persisted_lwc_key, table_id={}, index_slot={index_slot}, block_id={block_id}, row_idx={row_idx}",
                     self.table_id()
                 )
             })?
@@ -1803,7 +1787,7 @@ impl<'op> UserTableAccessor<'op> {
     async fn index_purge_decision(
         &self,
         guards: &PoolGuards,
-        index_no: usize,
+        index_slot: IndexSlot,
         key_vals: &[Val],
         row_id: RowID,
         min_active_sts: TrxID,
@@ -1840,7 +1824,7 @@ impl<'op> UserTableAccessor<'op> {
                     || self
                         .persisted_lwc_key_differs(
                             guards,
-                            index_no,
+                            index_slot,
                             key_vals,
                             block_id,
                             row_idx,
@@ -1867,17 +1851,17 @@ impl<'op> UserTableAccessor<'op> {
         page_guard: &PageSharedGuard<RowPage>,
         root_snapshot: &TableRootSnapshot<'_>,
     ) -> OperationOrRuntimeResult<()> {
-        let key = key.into_select_key();
+        let index_slot = key.index_slot();
         if self
             .metadata()
             .idx
-            .require_index_spec(key.index_no)
+            .require_index_spec(index_slot)
             .change_context(RuntimeError::TableAccess)
             .attach_with(|| {
                 format!(
-                    "operation=insert_index, table_id={}, index_no={}, row_id={row_id}",
+                    "operation=insert_index, table_id={}, index={}, row_id={row_id}",
                     self.table_id(),
-                    key.index_no
+                    key.index_ref()
                 )
             })?
             .unique()
@@ -1885,7 +1869,8 @@ impl<'op> UserTableAccessor<'op> {
             self.insert_unique_index(rt, effects, key, row_id, page_guard, root_snapshot)
                 .await?;
         } else {
-            self.insert_non_unique_index(rt, effects, key, row_id, root_snapshot)
+            let (index_ref, vals) = key.into_parts();
+            self.insert_non_unique_index(rt, effects, index_ref, vals, row_id, root_snapshot)
                 .await?;
         }
         Ok(())
@@ -1949,7 +1934,11 @@ impl<'op> UserTableAccessor<'op> {
         old_guard: PageSharedGuard<RowPage>,
     ) -> RuntimeOrFatalResult<(RowID, FastHashMap<usize, Val>, PageSharedGuard<RowPage>)> {
         let prepared = HotRowMutator::new(self.table_id(), self.metadata(), rt, &old_guard, old_id)
-            .prepare_move_update::<UserIndexBranchDomain>(old_row, update);
+            .prepare_move_update(old_row, update, |key, target, undo_vals| {
+                let key = WriteIndexKey::new(self.layout(), key);
+                let (index, vals) = key.into_parts();
+                IndexBranch::new(self.retained_user_key(index, vals), target, undo_vals)
+            });
         // Release the old row page before awaiting replacement-row insertion.
         drop(old_guard);
         let (new_row_id, new_guard) = self
@@ -1992,19 +1981,23 @@ impl<'op> UserTableAccessor<'op> {
         root_snapshot: &TableRootSnapshot<'_>,
     ) -> OperationOrRuntimeResult<()> {
         let metadata = self.metadata();
-        for (index_no, index_schema) in metadata.idx.active_indexes() {
-            debug_assert_eq!(self.sec_idx_is_unique(index_no), index_schema.unique());
+        for (index_slot, index_schema) in metadata.idx.active_indexes() {
             if index_key_is_changed(index_schema, index_change_cols) {
                 let new_key = WriteIndexKey::new(
-                    self,
-                    read_latest_index_key(metadata, index_no, page_guard, row_id),
+                    self.layout(),
+                    read_latest_index_key(metadata, index_slot, page_guard, row_id),
+                );
+                debug_assert_eq!(
+                    self.sec_idx_is_unique(new_key.index_ref()),
+                    index_schema.unique()
                 );
                 let old_entry = self.owned_row_page_index_entry(
                     row_id,
-                    WriteIndexKey::new(
-                        self,
-                        index_key_replace(index_schema, new_key.as_select_key(), index_change_cols),
-                    ),
+                    new_key.with_vals(index_key_vals_replace(
+                        index_schema,
+                        new_key.vals(),
+                        index_change_cols,
+                    )),
                     root_snapshot,
                 );
                 // First we need to insert new entry to index due to key change.
@@ -2043,12 +2036,15 @@ impl<'op> UserTableAccessor<'op> {
             proof.row_id
         );
         for old_entry in proof.into_entries() {
-            let index_no = old_entry.key.index_no();
+            let index_slot = old_entry.key.index_slot();
             let index_schema = metadata
                 .idx
-                .index_spec(index_no)
+                .index_spec(index_slot)
                 .expect("owned proof contains active index keys");
-            debug_assert_eq!(self.sec_idx_is_unique(index_no), index_schema.unique());
+            debug_assert_eq!(
+                self.sec_idx_is_unique(old_entry.key.index_ref()),
+                index_schema.unique()
+            );
             if index_schema.unique() {
                 self.update_unique_index_only_row_id_change(rt, effects, old_entry, new_row_id)
                     .await?;
@@ -2082,20 +2078,24 @@ impl<'op> UserTableAccessor<'op> {
             row_id_move.new
         );
         for old_entry in proof.into_entries() {
-            let index_no = old_entry.key.index_no();
+            let index_slot = old_entry.key.index_slot();
             let index_schema = metadata
                 .idx
-                .index_spec(index_no)
+                .index_spec(index_slot)
                 .expect("owned proof contains active index keys");
-            debug_assert_eq!(self.sec_idx_is_unique(index_no), index_schema.unique());
+            debug_assert_eq!(
+                self.sec_idx_is_unique(old_entry.key.index_ref()),
+                index_schema.unique()
+            );
             if index_key_is_changed(index_schema, index_change_cols) {
                 let key = WriteIndexKey::new(
-                    self,
-                    read_latest_index_key(metadata, index_no, page_guard, row_id_move.new),
+                    self.layout(),
+                    read_latest_index_key(metadata, index_slot, page_guard, row_id_move.new),
                 );
+                debug_assert_eq!(old_entry.key.index_ref(), key.index_ref());
                 debug_assert_eq!(
-                    old_entry.key.as_select_key(),
-                    &index_key_replace(index_schema, key.as_select_key(), index_change_cols)
+                    old_entry.key.vals(),
+                    index_key_vals_replace(index_schema, key.vals(), index_change_cols)
                 );
                 // key change and row id change.
                 if index_schema.unique() {
@@ -2146,14 +2146,15 @@ impl<'op> UserTableAccessor<'op> {
     async fn delete_unique_index(
         &self,
         guards: &PoolGuards,
-        index_no: usize,
+        index_ref: IndexRef,
         key_vals: &[Val],
         row_id: RowID,
         min_active_sts: TrxID,
     ) -> RuntimeResult<bool> {
+        let index_slot = index_ref.slot();
         let (page_guard, row_id, index) = loop {
-            let root = self.unchecked_secondary_root(index_no);
-            let index = self.require_unique_index_unchecked(guards, index_no, root)?;
+            let root = self.unchecked_secondary_root(index_slot);
+            let index = self.require_unique_index_unchecked(guards, index_ref, root)?;
             match index.lookup(key_vals, MIN_SNAPSHOT_TS).await? {
                 None => return Ok(false), // Another thread deleted this entry.
                 Some((index_row_id, deleted)) => {
@@ -2166,7 +2167,7 @@ impl<'op> UserTableAccessor<'op> {
                         return Ok(false);
                     }
                     match self
-                        .index_purge_decision(guards, index_no, key_vals, row_id, min_active_sts)
+                        .index_purge_decision(guards, index_slot, key_vals, row_id, min_active_sts)
                         .await?
                     {
                         IndexPurgeDecision::Delete => {
@@ -2194,7 +2195,7 @@ impl<'op> UserTableAccessor<'op> {
         // no version with matched keys can be found in either page
         // data or version chain. Hot row pages still have undo chains, unlike
         // LWC rows whose persisted image is the only current key material.
-        if !access.any_version_matches_key(self.metadata(), index_no, key_vals) {
+        if !access.any_version_matches_key(self.metadata(), index_slot, key_vals) {
             return index
                 .compare_delete_mem(key_vals, row_id, false, MIN_SNAPSHOT_TS)
                 .await;
@@ -2206,14 +2207,15 @@ impl<'op> UserTableAccessor<'op> {
     async fn delete_non_unique_index(
         &self,
         guards: &PoolGuards,
-        index_no: usize,
+        index_ref: IndexRef,
         key_vals: &[Val],
         row_id: RowID,
         min_active_sts: TrxID,
     ) -> RuntimeResult<bool> {
+        let index_slot = index_ref.slot();
         let (page_guard, row_id, index) = loop {
-            let root = self.unchecked_secondary_root(index_no);
-            let index = self.require_non_unique_index_unchecked(guards, index_no, root)?;
+            let root = self.unchecked_secondary_root(index_slot);
+            let index = self.require_non_unique_index_unchecked(guards, index_ref, root)?;
             match index
                 .lookup_unique(key_vals, row_id, MIN_SNAPSHOT_TS)
                 .await?
@@ -2229,7 +2231,7 @@ impl<'op> UserTableAccessor<'op> {
                         return Ok(false);
                     }
                     match self
-                        .index_purge_decision(guards, index_no, key_vals, row_id, min_active_sts)
+                        .index_purge_decision(guards, index_slot, key_vals, row_id, min_active_sts)
                         .await?
                     {
                         IndexPurgeDecision::Delete => {
@@ -2257,7 +2259,7 @@ impl<'op> UserTableAccessor<'op> {
         // no version with matched keys can be found in either page
         // data or version chain. Hot row pages still have undo chains, unlike
         // LWC rows whose persisted image is the only current key material.
-        if !access.any_version_matches_key(self.metadata(), index_no, key_vals) {
+        if !access.any_version_matches_key(self.metadata(), index_slot, key_vals) {
             return index
                 .compare_delete_mem(key_vals, row_id, false, MIN_SNAPSHOT_TS)
                 .await;
@@ -2312,11 +2314,12 @@ impl<'op> UserTableAccessor<'op> {
         &self,
         rt: TrxRuntime<'_>,
         old_id: RowID,
-        index_no: usize,
+        index_ref: IndexRef,
         key_vals: &[Val],
         target: UniqueIndexLinkTarget<'_>,
         location: LwcRowLocation,
     ) -> OperationOrRuntimeResult<LinkForUniqueIndex> {
+        let index_slot = index_ref.slot();
         let deletion_buffer = self.lwc_deletion_buffer();
         // Convert the CDB marker into the delete timestamp carried by a cold
         // terminal unique branch. `None` below means the old cold owner is
@@ -2364,7 +2367,11 @@ impl<'op> UserTableAccessor<'op> {
             .await?;
         // The unique index entry may be stale while purge is catching up, so
         // verify the persisted row still owns the key before linking it.
-        if !self.metadata().idx.match_key(index_no, key_vals, &old_row) {
+        if !self
+            .metadata()
+            .idx
+            .match_key(index_slot, key_vals, &old_row)
+        {
             return Ok(LinkForUniqueIndex::NotNeeded);
         }
         let Some(delete_cts) = delete_cts else {
@@ -2378,8 +2385,8 @@ impl<'op> UserTableAccessor<'op> {
         // The new hot row owns the key now. The terminal branch preserves the
         // old cold image for snapshots that still need to see it. The branch is
         // runtime-only; recovery restores only the latest committed mapping.
-        new_access.link_user_for_unique_index_cold_terminal(
-            SelectKey::new(index_no, key_vals.to_vec()),
+        new_access.link_for_unique_index_cold_terminal(
+            self.retained_user_key(index_ref, key_vals.to_vec()),
             delete_cts,
             undo_vals,
         );
@@ -2403,11 +2410,12 @@ impl<'op> UserTableAccessor<'op> {
         &self,
         rt: TrxRuntime<'_>,
         old_id: RowID,
-        index_no: usize,
+        index_ref: IndexRef,
         key_vals: &[Val],
         target: UniqueIndexLinkTarget<'_>,
         resolved_lwc: Option<LwcRowLocation>,
     ) -> OperationOrRuntimeResult<LinkForUniqueIndex> {
+        let index_slot = index_ref.slot();
         debug_assert!(old_id != target.row_id);
         let mut resolved_lwc = resolved_lwc;
         let (old_guard, old_id) = loop {
@@ -2419,7 +2427,9 @@ impl<'op> UserTableAccessor<'op> {
                 Ok(RowLocation::NotFound) => return Ok(LinkForUniqueIndex::NotNeeded),
                 Ok(RowLocation::LwcBlock(location)) => {
                     return self
-                        .link_for_unique_index_lwc(rt, old_id, index_no, key_vals, target, location)
+                        .link_for_unique_index_lwc(
+                            rt, old_id, index_ref, key_vals, target, location,
+                        )
                         .await;
                 }
                 Ok(RowLocation::RowPage(page_id)) => {
@@ -2447,16 +2457,16 @@ impl<'op> UserTableAccessor<'op> {
         let metadata = self.metadata();
         let old_access = old_guard.read_row_by_id(old_id);
         match old_access
-            .find_old_version_for_unique_key(metadata, index_no, key_vals, rt.ctx())
-            .attach_with(|| format!("operation=link_for_unique_index, index_no={index_no}"))?
+            .find_old_version_for_unique_key(metadata, index_slot, key_vals, rt.ctx())
+            .attach_with(|| format!("operation=link_for_unique_index, index={index_ref}"))?
         {
             FindOldVersion::None => Ok(LinkForUniqueIndex::NotNeeded),
             FindOldVersion::Found(old_row, cts, old_entry) => {
                 // row latch is enough, because row lock is already acquired.
                 let mut new_access = target.guard.write_row_by_id(target.row_id);
                 let undo_vals = new_access.row().calc_delta(metadata.col.as_ref(), &old_row);
-                new_access.link_user_for_unique_index(
-                    SelectKey::new(index_no, key_vals.to_vec()),
+                new_access.link_for_unique_index(
+                    self.retained_user_key(index_ref, key_vals.to_vec()),
                     cts,
                     old_entry,
                     undo_vals,
@@ -2471,38 +2481,39 @@ impl<'op> UserTableAccessor<'op> {
         &self,
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
-        key: SelectKey,
+        key: WriteIndexKey<'_>,
         row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
         root_snapshot: &TableRootSnapshot<'_>,
     ) -> OperationOrRuntimeResult<()> {
+        let (index_ref, vals) = key.into_parts();
         let sts = rt.sts();
         let handle = self
-            .snapshot_index_read_handle(rt.pool_guards(), root_snapshot, key.index_no)
+            .snapshot_index_read_handle(rt.pool_guards(), root_snapshot, index_ref)
             .change_context(RuntimeError::TableAccess)
             .attach_with(|| {
                 format!(
-                    "operation=insert_unique_index, table_id={}, index_no={}, row_id={row_id}",
+                    "operation=insert_unique_index, table_id={}, index={index_ref}, row_id={row_id}",
                     self.table_id(),
-                    key.index_no
                 )
             })?;
         let index = handle.bind_unique()?;
         loop {
             match index
-                .insert_if_not_exists_observed(&key.vals, row_id, false, sts)
+                .insert_if_not_exists_observed(&vals, row_id, false, sts)
                 .await
                 .change_context(RuntimeError::TableAccess)
                 .attach_with(|| {
                     format!(
-                        "operation=insert_unique_index, table_id={}, index_no={}, row_id={row_id}",
+                        "operation=insert_unique_index, table_id={}, index={index_ref}, row_id={row_id}",
                         self.table_id(),
-                        key.index_no
                     )
                 })? {
                 UniqueInsertAttempt::Inserted { merged } => {
                     // insert index success.
-                    self.push_insert_unique_index_undo(rt, effects, row_id, key, merged);
+                    self.push_insert_unique_index_undo(
+                        rt, effects, row_id, index_ref, vals, merged,
+                    );
                     return Ok(());
                 }
                 UniqueInsertAttempt::Occupied(observation) => {
@@ -2521,26 +2532,23 @@ impl<'op> UserTableAccessor<'op> {
                         .change_context(RuntimeError::TableAccess)
                         .attach_with(|| {
                             format!(
-                                "operation=insert_unique_index, phase=check_duplicate_owner, table_id={}, index_no={}, row_id={old_row_id}",
-                                self.table_id(), key.index_no
+                                "operation=insert_unique_index, phase=check_duplicate_owner, table_id={}, index={index_ref}, row_id={old_row_id}",
+                                self.table_id()
                             )
                         })?
                     {
                         Some(location)
                     } else {
                         return Err(Report::new(OperationError::DuplicateKey)
-                            .attach(format!(
-                                "operation=insert_unique_index, index_no={}",
-                                key.index_no
-                            ))
+                            .attach(format!("operation=insert_unique_index, index={index_ref}"))
                             .into());
                     };
                     match self
                         .link_for_unique_index(
                             rt,
                             old_row_id,
-                            key.index_no,
-                            &key.vals,
+                            index_ref,
+                            &vals,
                             UniqueIndexLinkTarget::new(row_id, page_guard),
                             resolved_lwc,
                         )
@@ -2556,14 +2564,19 @@ impl<'op> UserTableAccessor<'op> {
                                 .change_context(RuntimeError::TableAccess)
                                 .attach_with(|| {
                                     format!(
-                                        "operation=insert_unique_index, phase=claim_latest_owner, table_id={}, index_no={}, row_id={row_id}",
-                                        self.table_id(), key.index_no
+                                        "operation=insert_unique_index, phase=claim_latest_owner, table_id={}, index={index_ref}, row_id={row_id}",
+                                        self.table_id()
                                     )
                                 })?
                             {
                                 IndexCompareExchange::Ok => {
                                     self.push_update_unique_index_undo(
-                                        rt, effects, old_row_id, row_id, key, deleted,
+                                        rt,
+                                        effects,
+                                        old_row_id,
+                                        row_id,
+                                        self.retained_user_key(index_ref, vals),
+                                        deleted,
                                     );
                                     return Ok(());
                                 }
@@ -2571,8 +2584,7 @@ impl<'op> UserTableAccessor<'op> {
                                 IndexCompareExchange::Mismatch => {
                                     return Err(Report::new(OperationError::WriteConflict)
                                         .attach(format!(
-                                            "operation=insert_unique_index, index_no={}",
-                                            key.index_no
+                                            "operation=insert_unique_index, index={index_ref}"
                                         ))
                                         .into());
                                 }
@@ -2588,7 +2600,8 @@ impl<'op> UserTableAccessor<'op> {
     async fn insert_non_unique_index_mem_required(
         &self,
         rt: TrxRuntime<'_>,
-        key: &SelectKey,
+        index_ref: IndexRef,
+        vals: &[Val],
         row_id: RowID,
         merge_if_match_deleted: bool,
         root_snapshot: &TableRootSnapshot<'_>,
@@ -2596,15 +2609,13 @@ impl<'op> UserTableAccessor<'op> {
         let pivot_row_id = root_snapshot.pivot_row_id();
         assert!(
             row_id >= pivot_row_id,
-            "captured-pivot non-unique insertion invariant violated: table_id={}, index_no={}, row_id={row_id}, pivot_row_id={pivot_row_id}",
+            "captured-pivot non-unique insertion invariant violated: table_id={}, index={index_ref}, row_id={row_id}, pivot_row_id={pivot_row_id}",
             self.table_id(),
-            key.index_no
         );
-        let handle =
-            self.snapshot_index_read_handle(rt.pool_guards(), root_snapshot, key.index_no)?;
+        let handle = self.snapshot_index_read_handle(rt.pool_guards(), root_snapshot, index_ref)?;
         handle
             .bind_non_unique()?
-            .insert_mem_if_not_exists(&key.vals, row_id, merge_if_match_deleted, rt.sts())
+            .insert_mem_if_not_exists(vals, row_id, merge_if_match_deleted, rt.sts())
             .await
     }
 
@@ -2613,7 +2624,8 @@ impl<'op> UserTableAccessor<'op> {
         &self,
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
-        key: SelectKey,
+        index_ref: IndexRef,
+        vals: Vec<Val>,
         row_id: RowID,
         root_snapshot: &TableRootSnapshot<'_>,
     ) -> RuntimeResult<()> {
@@ -2621,7 +2633,8 @@ impl<'op> UserTableAccessor<'op> {
         match self
             .insert_non_unique_index_mem_required(
                 rt,
-                &key,
+                index_ref,
+                &vals,
                 row_id,
                 false,
                 root_snapshot,
@@ -2630,15 +2643,16 @@ impl<'op> UserTableAccessor<'op> {
             .change_context(RuntimeError::TableAccess)
             .attach_with(|| {
                 format!(
-                    "operation=insert_non_unique_index, phase=insert_entry, table_id={}, index_no={}, row_id={row_id}",
+                    "operation=insert_non_unique_index, phase=insert_entry, table_id={}, index={index_ref}, row_id={row_id}",
                     self.table_id(),
-                    key.index_no
                 )
             })?
         {
             IndexInsert::Ok(merged) => {
                 // insert index success.
-                self.push_insert_non_unique_index_undo(rt, effects, row_id, key, merged);
+                self.push_insert_non_unique_index_undo(
+                    rt, effects, row_id, index_ref, vals, merged,
+                );
                 Ok(())
             }
             IndexInsert::DuplicateKey(..) => unreachable!(),
@@ -2660,20 +2674,18 @@ impl<'op> UserTableAccessor<'op> {
             ownership,
             root_snapshot,
         } = entry;
-        let key = key.into_select_key();
+        let (index_ref, vals) = key.into_parts();
         let index_spec = self
             .metadata()
             .idx
-            .index_spec(key.index_no)
+            .index_spec(index_ref.slot())
             .unwrap_or_else(|| {
                 panic!(
-                    "owned-row index-set invariant violated: proof key became inactive, table_id={}, row_id={row_id}, index_no={}, pivot_row_id={pivot_row_id}, storage={storage:?}, ownership={ownership:?}",
+                    "owned-row index-set invariant violated: proof key became inactive, table_id={}, row_id={row_id}, index={index_ref}, pivot_row_id={pivot_row_id}, storage={storage:?}, ownership={ownership:?}",
                     self.table_id(),
-                    key.index_no
                 )
             });
-        let handle =
-            self.snapshot_index_read_handle(rt.pool_guards(), root_snapshot, key.index_no)?;
+        let handle = self.snapshot_index_read_handle(rt.pool_guards(), root_snapshot, index_ref)?;
         // Both storage modes conditionally transition an existing MemIndex
         // copy; neither probes or mutates DiskTree here. Persisted mode alone
         // may accept absence because the CDB already hides the durable row and
@@ -2682,14 +2694,14 @@ impl<'op> UserTableAccessor<'op> {
         if index_spec.unique() {
             let result = handle
                 .bind_unique()?
-                .compare_exchange_mem(&key.vals, row_id, row_id.deleted(), rt.sts())
+                .compare_exchange_mem(&vals, row_id, row_id.deleted(), rt.sts())
                 .await?;
             match (storage, result) {
                 (
                     OwnedRowIndexStorage::MemRequired | OwnedRowIndexStorage::Persisted,
                     IndexCompareExchange::Ok,
                 ) => {
-                    self.push_delete_index_undo(rt, effects, row_id, key, true);
+                    self.push_delete_index_undo(rt, effects, row_id, index_ref, vals, true);
                     Ok(())
                 }
                 (OwnedRowIndexStorage::Persisted, IndexCompareExchange::NotExists) => {
@@ -2699,24 +2711,23 @@ impl<'op> UserTableAccessor<'op> {
                 }
                 (_, result) => {
                     panic!(
-                        "owned-row index-set invariant violated: illegal unique mask result, table_id={}, index_no={}, key={:?}, row_id={row_id}, pivot_row_id={pivot_row_id}, storage={storage:?}, ownership={ownership:?}, result={result:?}",
+                        "owned-row index-set invariant violated: illegal unique mask result, table_id={}, index={index_ref}, key={:?}, row_id={row_id}, pivot_row_id={pivot_row_id}, storage={storage:?}, ownership={ownership:?}, result={result:?}",
                         self.table_id(),
-                        key.index_no,
-                        key.vals
+                        vals
                     );
                 }
             }
         } else {
             let result = handle
                 .bind_non_unique()?
-                .mask_mem_if_present(&key.vals, row_id, rt.sts())
+                .mask_mem_if_present(&vals, row_id, rt.sts())
                 .await?;
             match (storage, result) {
                 (
                     OwnedRowIndexStorage::MemRequired | OwnedRowIndexStorage::Persisted,
                     IndexMask::Masked,
                 ) => {
-                    self.push_delete_index_undo(rt, effects, row_id, key, false);
+                    self.push_delete_index_undo(rt, effects, row_id, index_ref, vals, false);
                     Ok(())
                 }
                 (OwnedRowIndexStorage::Persisted, IndexMask::NotFound) => {
@@ -2726,10 +2737,9 @@ impl<'op> UserTableAccessor<'op> {
                 }
                 (_, result) => {
                     panic!(
-                        "owned-row index-set invariant violated: illegal non-unique mask result, table_id={}, index_no={}, key={:?}, row_id={row_id}, pivot_row_id={pivot_row_id}, storage={storage:?}, ownership={ownership:?}, result={result:?}",
+                        "owned-row index-set invariant violated: illegal non-unique mask result, table_id={}, index={index_ref}, key={:?}, row_id={row_id}, pivot_row_id={pivot_row_id}, storage={storage:?}, ownership={ownership:?}, result={result:?}",
                         self.table_id(),
-                        key.index_no,
-                        key.vals
+                        vals
                     );
                 }
             }
@@ -2766,36 +2776,39 @@ impl<'op> UserTableAccessor<'op> {
             ownership,
             root_snapshot,
         } = entry;
-        let key = key.into_select_key();
+        let (index_ref, vals) = key.into_parts();
         assert_eq!(
             storage,
             OwnedRowIndexStorage::MemRequired,
-            "owned-row index-set invariant violated: direct unique RowID replacement requires MemRequired, table_id={}, index_no={}, old_row_id={old_row_id}, new_row_id={new_row_id}, pivot_row_id={pivot_row_id}, storage={storage:?}",
+            "owned-row index-set invariant violated: direct unique RowID replacement requires MemRequired, table_id={}, index={index_ref}, old_row_id={old_row_id}, new_row_id={new_row_id}, pivot_row_id={pivot_row_id}, storage={storage:?}",
             self.table_id(),
-            key.index_no
         );
         assert_eq!(
             ownership,
             OwnedRowMutationOwnership::RowPage,
-            "owned-row index-set invariant violated: direct unique RowID replacement requires RowPage ownership, table_id={}, index_no={}, old_row_id={old_row_id}, new_row_id={new_row_id}, pivot_row_id={pivot_row_id}, ownership={ownership:?}",
+            "owned-row index-set invariant violated: direct unique RowID replacement requires RowPage ownership, table_id={}, index={index_ref}, old_row_id={old_row_id}, new_row_id={new_row_id}, pivot_row_id={pivot_row_id}, ownership={ownership:?}",
             self.table_id(),
-            key.index_no
         );
-        let handle =
-            self.snapshot_index_read_handle(rt.pool_guards(), root_snapshot, key.index_no)?;
+        let handle = self.snapshot_index_read_handle(rt.pool_guards(), root_snapshot, index_ref)?;
         let result = handle
             .bind_unique()?
-            .compare_exchange_mem(&key.vals, old_row_id, new_row_id, rt.sts())
+            .compare_exchange_mem(&vals, old_row_id, new_row_id, rt.sts())
             .await?;
         assert_eq!(
             result,
             IndexCompareExchange::Ok,
-            "owned-row index-set invariant violated: illegal unique replacement result, table_id={}, index_no={}, key={:?}, old_row_id={old_row_id}, new_row_id={new_row_id}, pivot_row_id={pivot_row_id}, storage={storage:?}, ownership={ownership:?}, result={result:?}",
+            "owned-row index-set invariant violated: illegal unique replacement result, table_id={}, index={index_ref}, key={:?}, old_row_id={old_row_id}, new_row_id={new_row_id}, pivot_row_id={pivot_row_id}, storage={storage:?}, ownership={ownership:?}, result={result:?}",
             self.table_id(),
-            key.index_no,
-            key.vals
+            vals
         );
-        self.push_update_unique_index_undo(rt, effects, old_row_id, new_row_id, key, false);
+        self.push_update_unique_index_undo(
+            rt,
+            effects,
+            old_row_id,
+            new_row_id,
+            self.retained_user_key(index_ref, vals),
+            false,
+        );
         Ok(())
     }
 
@@ -2811,17 +2824,16 @@ impl<'op> UserTableAccessor<'op> {
     ) -> OperationOrRuntimeResult<()> {
         let old_row_id = old_entry.row_id;
         debug_assert!(old_row_id != new_row_id);
-        let new_key = new_key.into_select_key();
-        let index_no = new_key.index_no;
-        debug_assert_eq!(old_entry.key.index_no(), index_no);
+        let (index_ref, new_vals) = new_key.into_parts();
+        debug_assert_eq!(old_entry.key.index_ref(), index_ref);
         let sts = rt.sts();
         let handle = self
-            .snapshot_index_read_handle(rt.pool_guards(), old_entry.root_snapshot, index_no)
+            .snapshot_index_read_handle(rt.pool_guards(), old_entry.root_snapshot, index_ref)
             .change_context(RuntimeError::TableAccess)
             .attach_with(|| {
                 format!(
-                    "operation=update_unique_index_key_and_row_id, table_id={}, index_no={}, old_row_id={old_row_id}, new_row_id={new_row_id}",
-                    self.table_id(), index_no
+                    "operation=update_unique_index_key_and_row_id, table_id={}, index={index_ref}, old_row_id={old_row_id}, new_row_id={new_row_id}",
+                    self.table_id()
                 )
             })?;
         let index = handle.bind_unique()?;
@@ -2831,13 +2843,13 @@ impl<'op> UserTableAccessor<'op> {
             // whether an existing logical-key owner is visible, stale, or
             // should be linked for older snapshots.
             match index
-                .insert_if_not_exists_observed(&new_key.vals, new_row_id, false, sts)
+                .insert_if_not_exists_observed(&new_vals, new_row_id, false, sts)
                 .await
                 .change_context(RuntimeError::TableAccess)
                 .attach_with(|| {
                     format!(
-                        "operation=update_unique_index_key_and_row_id, phase=insert_new_key, table_id={}, index_no={}, new_row_id={new_row_id}",
-                        self.table_id(), index_no
+                        "operation=update_unique_index_key_and_row_id, phase=insert_new_key, table_id={}, index={index_ref}, new_row_id={new_row_id}",
+                        self.table_id()
                     )
                 })?
             {
@@ -2845,7 +2857,7 @@ impl<'op> UserTableAccessor<'op> {
                     debug_assert!(!merged);
                     // New key insert succeed.
                     self.push_insert_unique_index_undo(
-                        rt, effects, new_row_id, new_key, false,
+                        rt, effects, new_row_id, index_ref, new_vals, false,
                     );
                     // mark index of old row as deleted and defer delete.
                     self.defer_delete_owned_old_index_entry(
@@ -2857,8 +2869,8 @@ impl<'op> UserTableAccessor<'op> {
                         .change_context(RuntimeError::TableAccess)
                         .attach_with(|| {
                             format!(
-                                "operation=update_unique_index_key_and_row_id, phase=defer_old_key_delete, table_id={}, index_no={}, old_row_id={old_row_id}",
-                                self.table_id(), index_no
+                                "operation=update_unique_index_key_and_row_id, phase=defer_old_key_delete, table_id={}, index={index_ref}, old_row_id={old_row_id}",
+                                self.table_id()
                             )
                         })?;
                     return Ok(());
@@ -2877,8 +2889,8 @@ impl<'op> UserTableAccessor<'op> {
                         .change_context(RuntimeError::TableAccess)
                         .attach_with(|| {
                             format!(
-                                "operation=update_unique_index_key_and_row_id, phase=check_duplicate_owner, table_id={}, index_no={}, row_id={index_row_id}",
-                                self.table_id(), index_no
+                                "operation=update_unique_index_key_and_row_id, phase=check_duplicate_owner, table_id={}, index={index_ref}, row_id={index_row_id}",
+                                self.table_id()
                             )
                         })?
                     {
@@ -2886,7 +2898,7 @@ impl<'op> UserTableAccessor<'op> {
                     } else {
                         return Err(OperationOrRuntimeError::from(
                             Report::new(OperationError::DuplicateKey).attach(format!(
-                                "operation=update_unique_index_key_and_row_id_change, table_id={}, index_no={index_no}, new_row_id={new_row_id}",
+                                "operation=update_unique_index_key_and_row_id_change, table_id={}, index={index_ref}, new_row_id={new_row_id}",
                                 self.table_id()
                             )),
                         ));
@@ -2920,15 +2932,20 @@ impl<'op> UserTableAccessor<'op> {
                             .change_context(RuntimeError::TableAccess)
                             .attach_with(|| {
                                 format!(
-                                    "operation=update_unique_index_key_and_row_id, phase=restore_reused_key, table_id={}, index_no={}, new_row_id={new_row_id}",
-                                    self.table_id(), index_no
+                                    "operation=update_unique_index_key_and_row_id, phase=restore_reused_key, table_id={}, index={index_ref}, new_row_id={new_row_id}",
+                                    self.table_id()
                                 )
                             })?
                         {
                             IndexCompareExchange::Ok => {
                                 // New key update succeed.
                                 self.push_update_unique_index_undo(
-                                    rt, effects, old_row_id, new_row_id, new_key, deleted,
+                                    rt,
+                                    effects,
+                                    old_row_id,
+                                    new_row_id,
+                                    self.retained_user_key(index_ref, new_vals),
+                                    deleted,
                                 );
                                 // mark index of old row as deleted and defer delete.
                                 self.defer_delete_owned_old_index_entry(
@@ -2940,8 +2957,8 @@ impl<'op> UserTableAccessor<'op> {
                                 .change_context(RuntimeError::TableAccess)
                                 .attach_with(|| {
                                     format!(
-                                        "operation=update_unique_index_key_and_row_id, phase=defer_old_key_delete, table_id={}, index_no={}, old_row_id={old_row_id}",
-                                        self.table_id(), index_no
+                                        "operation=update_unique_index_key_and_row_id, phase=defer_old_key_delete, table_id={}, index={index_ref}, old_row_id={old_row_id}",
+                                        self.table_id()
                                     )
                                 })?;
                                 return Ok(());
@@ -2962,8 +2979,8 @@ impl<'op> UserTableAccessor<'op> {
                         .link_for_unique_index(
                             rt,
                             index_row_id,
-                            index_no,
-                            &new_key.vals,
+                            index_ref,
+                            &new_vals,
                             UniqueIndexLinkTarget::new(new_row_id, new_guard),
                             resolved_lwc,
                         )
@@ -2979,8 +2996,8 @@ impl<'op> UserTableAccessor<'op> {
                                 .change_context(RuntimeError::TableAccess)
                                 .attach_with(|| {
                                     format!(
-                                        "operation=update_unique_index_key_and_row_id, phase=claim_stale_owner, table_id={}, index_no={}, new_row_id={new_row_id}",
-                                        self.table_id(), index_no
+                                        "operation=update_unique_index_key_and_row_id, phase=claim_stale_owner, table_id={}, index={index_ref}, new_row_id={new_row_id}",
+                                        self.table_id()
                                     )
                                 })?
                             {
@@ -2991,7 +3008,7 @@ impl<'op> UserTableAccessor<'op> {
                                         effects,
                                         index_row_id,
                                         new_row_id,
-                                        new_key,
+                                        self.retained_user_key(index_ref, new_vals),
                                         deleted,
                                     );
                                     self.defer_delete_owned_old_index_entry(
@@ -3003,8 +3020,8 @@ impl<'op> UserTableAccessor<'op> {
                                     .change_context(RuntimeError::TableAccess)
                                     .attach_with(|| {
                                         format!(
-                                            "operation=update_unique_index_key_and_row_id, phase=defer_old_key_delete, table_id={}, index_no={}, old_row_id={old_row_id}",
-                                            self.table_id(), index_no
+                                            "operation=update_unique_index_key_and_row_id, phase=defer_old_key_delete, table_id={}, index={index_ref}, old_row_id={old_row_id}",
+                                            self.table_id()
                                         )
                                     })?;
                                     return Ok(());
@@ -3013,7 +3030,7 @@ impl<'op> UserTableAccessor<'op> {
                                     // This may happen when another transaction insert/update with same key.
                                     return Err(OperationOrRuntimeError::from(
                                         Report::new(OperationError::WriteConflict).attach(format!(
-                                            "operation=update_unique_index_key_and_row_id_change, table_id={}, index_no={index_no}, new_row_id={new_row_id}",
+                                            "operation=update_unique_index_key_and_row_id_change, table_id={}, index={index_ref}, new_row_id={new_row_id}",
                                             self.table_id()
                                         )),
                                     ));
@@ -3035,8 +3052,8 @@ impl<'op> UserTableAccessor<'op> {
                                 .change_context(RuntimeError::TableAccess)
                                 .attach_with(|| {
                                     format!(
-                                        "operation=update_unique_index_key_and_row_id, phase=claim_linked_owner, table_id={}, index_no={}, new_row_id={new_row_id}",
-                                        self.table_id(), index_no
+                                        "operation=update_unique_index_key_and_row_id, phase=claim_linked_owner, table_id={}, index={index_ref}, new_row_id={new_row_id}",
+                                        self.table_id()
                                     )
                                 })?
                             {
@@ -3047,7 +3064,7 @@ impl<'op> UserTableAccessor<'op> {
                                         effects,
                                         index_row_id,
                                         new_row_id,
-                                        new_key,
+                                        self.retained_user_key(index_ref, new_vals),
                                         deleted,
                                     );
                                     self.defer_delete_owned_old_index_entry(
@@ -3059,8 +3076,8 @@ impl<'op> UserTableAccessor<'op> {
                                     .change_context(RuntimeError::TableAccess)
                                     .attach_with(|| {
                                         format!(
-                                            "operation=update_unique_index_key_and_row_id, phase=defer_old_key_delete, table_id={}, index_no={}, old_row_id={old_row_id}",
-                                            self.table_id(), index_no
+                                            "operation=update_unique_index_key_and_row_id, phase=defer_old_key_delete, table_id={}, index={index_ref}, old_row_id={old_row_id}",
+                                            self.table_id()
                                         )
                                     })?;
                                     return Ok(());
@@ -3088,15 +3105,15 @@ impl<'op> UserTableAccessor<'op> {
     ) -> RuntimeResult<()> {
         let old_row_id = old_entry.row_id;
         debug_assert!(old_row_id != new_row_id);
-        let new_key = new_key.into_select_key();
-        let index_no = new_key.index_no;
-        debug_assert_eq!(old_entry.key.index_no(), index_no);
+        let (index_ref, new_vals) = new_key.into_parts();
+        debug_assert_eq!(old_entry.key.index_ref(), index_ref);
         // Non-unique indexes store exact `(key, row_id)` entries, so a move
         // update inserts the new exact entry and masks the old one.
         match self
             .insert_non_unique_index_mem_required(
                 rt,
-                &new_key,
+                index_ref,
+                &new_vals,
                 new_row_id,
                 false,
                 old_entry.root_snapshot,
@@ -3105,8 +3122,8 @@ impl<'op> UserTableAccessor<'op> {
             .change_context(RuntimeError::TableAccess)
             .attach_with(|| {
                 format!(
-                    "operation=update_non_unique_index_key_and_row_id, phase=insert_new_key, table_id={}, index_no={}, new_row_id={new_row_id}",
-                    self.table_id(), index_no
+                    "operation=update_non_unique_index_key_and_row_id, phase=insert_new_key, table_id={}, index={index_ref}, new_row_id={new_row_id}",
+                    self.table_id()
                 )
             })?
         {
@@ -3114,7 +3131,7 @@ impl<'op> UserTableAccessor<'op> {
                 debug_assert!(!merged);
                 // New key insert succeed.
                 self.push_insert_non_unique_index_undo(
-                    rt, effects, new_row_id, new_key, false,
+                    rt, effects, new_row_id, index_ref, new_vals, false,
                 );
                 // mark index of old row as deleted and defer delete.
                 self.defer_delete_owned_old_index_entry(
@@ -3126,8 +3143,8 @@ impl<'op> UserTableAccessor<'op> {
                     .change_context(RuntimeError::TableAccess)
                     .attach_with(|| {
                         format!(
-                            "operation=update_non_unique_index_key_and_row_id, phase=defer_old_key_delete, table_id={}, index_no={}, old_row_id={old_row_id}",
-                            self.table_id(), index_no
+                            "operation=update_non_unique_index_key_and_row_id, phase=defer_old_key_delete, table_id={}, index={index_ref}, old_row_id={old_row_id}",
+                            self.table_id()
                         )
                     })?;
                 Ok(())
@@ -3160,13 +3177,15 @@ impl<'op> UserTableAccessor<'op> {
     ) -> RuntimeResult<()> {
         let old_row_id = old_entry.row_id;
         debug_assert!(old_row_id != new_row_id);
-        let key = old_entry.key.as_select_key().clone();
+        let index_ref = old_entry.key.index_ref();
+        let vals = old_entry.key.vals().to_vec();
         // Non-unique key unchanged but RowID changed: publish the replacement
         // exact entry, then mask the old exact entry for rollback/GC.
         let res = self
             .insert_non_unique_index_mem_required(
                 rt,
-                &key,
+                index_ref,
+                &vals,
                 new_row_id,
                 false,
                 old_entry.root_snapshot,
@@ -3175,12 +3194,12 @@ impl<'op> UserTableAccessor<'op> {
             .change_context(RuntimeError::TableAccess)
             .attach_with(|| {
                 format!(
-                    "operation=update_non_unique_index_row_id, phase=insert_new_entry, table_id={}, index_no={}, new_row_id={new_row_id}",
-                    self.table_id(), key.index_no
+                    "operation=update_non_unique_index_row_id, phase=insert_new_entry, table_id={}, index={index_ref}, new_row_id={new_row_id}",
+                    self.table_id()
                 )
             })?;
         debug_assert!(res.is_ok());
-        self.push_insert_non_unique_index_undo(rt, effects, new_row_id, key, false);
+        self.push_insert_non_unique_index_undo(rt, effects, new_row_id, index_ref, vals, false);
         // defer delete old entry.
         self.defer_delete_owned_old_index_entry(
             rt,
@@ -3211,18 +3230,16 @@ impl<'op> UserTableAccessor<'op> {
         page_guard: &PageSharedGuard<RowPage>,
     ) -> OperationOrRuntimeResult<()> {
         let row_id = old_entry.row_id;
-        let new_key = new_key.into_select_key();
-        let index_no = new_key.index_no;
-        debug_assert_eq!(old_entry.key.index_no(), index_no);
+        let (index_ref, new_vals) = new_key.into_parts();
+        debug_assert_eq!(old_entry.key.index_ref(), index_ref);
         let sts = rt.sts();
         let handle = self
-            .snapshot_index_read_handle(rt.pool_guards(), old_entry.root_snapshot, index_no)
+            .snapshot_index_read_handle(rt.pool_guards(), old_entry.root_snapshot, index_ref)
             .change_context(RuntimeError::TableAccess)
             .attach_with(|| {
                 format!(
-                    "operation=update_unique_index_key, table_id={}, index_no={}, row_id={row_id}",
-                    self.table_id(),
-                    index_no
+                    "operation=update_unique_index_key, table_id={}, index={index_ref}, row_id={row_id}",
+                    self.table_id()
                 )
             })?;
         let index = handle.bind_unique()?;
@@ -3243,20 +3260,20 @@ impl<'op> UserTableAccessor<'op> {
             // the delete flag) if key and row id all match.
             // So we set merge_if_match_deleted to true.
             match index
-                .insert_if_not_exists_observed(&new_key.vals, row_id, true, sts)
+                .insert_if_not_exists_observed(&new_vals, row_id, true, sts)
                 .await
                 .change_context(RuntimeError::TableAccess)
                 .attach_with(|| {
                     format!(
-                        "operation=update_unique_index_key, phase=insert_new_key, table_id={}, index_no={}, row_id={row_id}",
-                        self.table_id(), index_no
+                        "operation=update_unique_index_key, phase=insert_new_key, table_id={}, index={index_ref}, row_id={row_id}",
+                        self.table_id()
                     )
                 })?
             {
                 UniqueInsertAttempt::Inserted { merged } => {
                     // Insert new key success.
                     self.push_insert_unique_index_undo(
-                        rt, effects, row_id, new_key, merged,
+                        rt, effects, row_id, index_ref, new_vals, merged,
                     );
                     // Defer delete old key.
                     self.defer_delete_owned_old_index_entry(
@@ -3268,8 +3285,8 @@ impl<'op> UserTableAccessor<'op> {
                         .change_context(RuntimeError::TableAccess)
                         .attach_with(|| {
                             format!(
-                                "operation=update_unique_index_key, phase=defer_old_key_delete, table_id={}, index_no={}, row_id={row_id}",
-                                self.table_id(), index_no
+                                "operation=update_unique_index_key, phase=defer_old_key_delete, table_id={}, index={index_ref}, row_id={row_id}",
+                                self.table_id()
                             )
                         })?;
                     return Ok(());
@@ -3289,8 +3306,8 @@ impl<'op> UserTableAccessor<'op> {
                         .change_context(RuntimeError::TableAccess)
                         .attach_with(|| {
                             format!(
-                                "operation=update_unique_index_key, phase=check_duplicate_owner, table_id={}, index_no={}, row_id={index_row_id}",
-                                self.table_id(), index_no
+                                "operation=update_unique_index_key, phase=check_duplicate_owner, table_id={}, index={index_ref}, row_id={index_row_id}",
+                                self.table_id()
                             )
                         })?
                     {
@@ -3298,7 +3315,7 @@ impl<'op> UserTableAccessor<'op> {
                     } else {
                         return Err(OperationOrRuntimeError::from(
                             Report::new(OperationError::DuplicateKey).attach(format!(
-                                "operation=update_unique_index_only_key_change, table_id={}, index_no={index_no}, row_id={row_id}",
+                                "operation=update_unique_index_only_key_change, table_id={}, index={index_ref}, row_id={row_id}",
                                 self.table_id()
                             )),
                         ));
@@ -3307,8 +3324,8 @@ impl<'op> UserTableAccessor<'op> {
                         .link_for_unique_index(
                             rt,
                             index_row_id,
-                            index_no,
-                            &new_key.vals,
+                            index_ref,
+                            &new_vals,
                             UniqueIndexLinkTarget::new(row_id, page_guard),
                             resolved_lwc,
                         )
@@ -3324,8 +3341,8 @@ impl<'op> UserTableAccessor<'op> {
                                 .change_context(RuntimeError::TableAccess)
                                 .attach_with(|| {
                                     format!(
-                                        "operation=update_unique_index_key, phase=claim_latest_owner, table_id={}, index_no={}, row_id={row_id}",
-                                        self.table_id(), index_no
+                                        "operation=update_unique_index_key, phase=claim_latest_owner, table_id={}, index={index_ref}, row_id={row_id}",
+                                        self.table_id()
                                     )
                                 })?
                             {
@@ -3336,7 +3353,7 @@ impl<'op> UserTableAccessor<'op> {
                                         effects,
                                         index_row_id,
                                         row_id,
-                                        new_key,
+                                        self.retained_user_key(index_ref, new_vals),
                                         deleted,
                                     );
                                     self.defer_delete_owned_old_index_entry(
@@ -3348,8 +3365,8 @@ impl<'op> UserTableAccessor<'op> {
                                     .change_context(RuntimeError::TableAccess)
                                     .attach_with(|| {
                                         format!(
-                                            "operation=update_unique_index_key, phase=defer_old_key_delete, table_id={}, index_no={}, row_id={row_id}",
-                                            self.table_id(), index_no
+                                            "operation=update_unique_index_key, phase=defer_old_key_delete, table_id={}, index={index_ref}, row_id={row_id}",
+                                            self.table_id()
                                         )
                                     })?;
                                     return Ok(());
@@ -3357,7 +3374,7 @@ impl<'op> UserTableAccessor<'op> {
                                 IndexCompareExchange::Mismatch => {
                                     return Err(OperationOrRuntimeError::from(
                                         Report::new(OperationError::WriteConflict).attach(format!(
-                                            "operation=update_unique_index_only_key_change, table_id={}, index_no={index_no}, row_id={row_id}",
+                                            "operation=update_unique_index_only_key_change, table_id={}, index={index_ref}, row_id={row_id}",
                                             self.table_id()
                                         )),
                                     ));
@@ -3380,9 +3397,8 @@ impl<'op> UserTableAccessor<'op> {
         new_key: WriteIndexKey<'_>,
     ) -> RuntimeResult<()> {
         let row_id = old_entry.row_id;
-        let new_key = new_key.into_select_key();
-        let index_no = new_key.index_no;
-        debug_assert_eq!(old_entry.key.index_no(), index_no);
+        let (index_ref, new_vals) = new_key.into_parts();
+        debug_assert_eq!(old_entry.key.index_ref(), index_ref);
         // This is case for one transaction or multiple transactions to update
         // key of the same row back and forth.
         // e.g. update k=1 to k=2, then update k=2 to k=1, ...
@@ -3396,7 +3412,8 @@ impl<'op> UserTableAccessor<'op> {
         match self
             .insert_non_unique_index_mem_required(
                 rt,
-                &new_key,
+                index_ref,
+                &new_vals,
                 row_id,
                 true,
                 old_entry.root_snapshot,
@@ -3405,14 +3422,14 @@ impl<'op> UserTableAccessor<'op> {
             .change_context(RuntimeError::TableAccess)
             .attach_with(|| {
                 format!(
-                    "operation=update_non_unique_index_key, phase=insert_new_key, table_id={}, index_no={}, row_id={row_id}",
-                    self.table_id(), index_no
+                    "operation=update_non_unique_index_key, phase=insert_new_key, table_id={}, index={index_ref}, row_id={row_id}",
+                    self.table_id()
                 )
             })?
         {
             IndexInsert::Ok(merged) => {
                 self.push_insert_non_unique_index_undo(
-                    rt, effects, row_id, new_key, merged,
+                    rt, effects, row_id, index_ref, new_vals, merged,
                 );
                 // Defer delete old key.
                 self.defer_delete_owned_old_index_entry(
@@ -3424,8 +3441,8 @@ impl<'op> UserTableAccessor<'op> {
                     .change_context(RuntimeError::TableAccess)
                     .attach_with(|| {
                         format!(
-                            "operation=update_non_unique_index_key, phase=defer_old_key_delete, table_id={}, index_no={}, row_id={row_id}",
-                            self.table_id(), index_no
+                            "operation=update_non_unique_index_key, phase=defer_old_key_delete, table_id={}, index={index_ref}, row_id={row_id}",
+                            self.table_id()
                         )
                     })?;
                 Ok(())
@@ -3699,7 +3716,7 @@ impl<'op> UserTableAccessor<'op> {
         &self,
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
-        index_no: usize,
+        index_ref: IndexRef,
         range: R,
         validate_updates: bool,
         mut mutate_row: F,
@@ -3709,7 +3726,7 @@ impl<'op> UserTableAccessor<'op> {
         F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<RowMutation>,
     {
         let root_snapshot = self.root_snapshot(rt.ctx());
-        let index = self.require_sec_idx(index_no).disclose()?;
+        let index = self.require_sec_idx(index_ref).disclose()?;
         let unique = index.is_unique();
         let encoder = index.key_encoder();
         let encoded_range = if unique {
@@ -3731,7 +3748,7 @@ impl<'op> UserTableAccessor<'op> {
 
         while let Some(batch) = stream.next_batch().await.disclose()? {
             for candidate in batch {
-                let candidate = BoundIndexCandidate::new(index_no, unique, encoder, candidate);
+                let candidate = BoundIndexCandidate::new(index_ref, unique, encoder, candidate);
                 mutator
                     .mutate_index_candidate(
                         candidate,
@@ -4399,21 +4416,22 @@ impl<'op> UserTableAccessor<'op> {
     pub(crate) async fn index_lookup_unique_mvcc(
         &self,
         rt: TrxRuntime<'_>,
-        index_no: usize,
+        index_ref: IndexRef,
         key_vals: &[Val],
         user_read_set: &[usize],
     ) -> RuntimeResult<SelectMvcc> {
-        debug_assert!(index_no < self.sec_idx_len());
+        let index_slot = index_ref.slot();
+        debug_assert!(index_slot.as_usize() < self.sec_idx_len());
         debug_assert!(
             self.metadata()
                 .idx
-                .require_index_spec(index_no)
+                .require_index_spec(index_slot)
                 .unwrap()
                 .unique()
         );
         debug_assert!(self.metadata().idx.index_type_match(
             self.metadata().col.as_ref(),
-            index_no,
+            index_slot,
             key_vals
         ));
         debug_assert!({
@@ -4423,12 +4441,21 @@ impl<'op> UserTableAccessor<'op> {
                     .zip(user_read_set.iter().skip(1))
                     .all(|(l, r)| l < r)
         });
-        let handle = self.current_index_read_handle(rt, index_no)?;
+        let handle = self.current_index_read_handle(rt, index_ref)?;
         let index = handle.bind_unique()?;
         match index.lookup(key_vals, rt.sts()).await? {
             None => Ok(SelectMvcc::NotFound),
             Some((row_id, _)) => {
-                self.index_lookup_unique_row_mvcc(rt, index_no, key_vals, user_read_set, row_id)
+                let candidate = BoundIndexCandidate::new(
+                    index_ref,
+                    true,
+                    handle.key_encoder(),
+                    IndexLookupCandidate {
+                        encoded_key: handle.key_encoder().encode(key_vals),
+                        row_id,
+                    },
+                );
+                self.index_lookup_candidate_row_mvcc(rt, candidate, user_read_set)
                     .await
             }
         }
@@ -4438,24 +4465,25 @@ impl<'op> UserTableAccessor<'op> {
     pub(crate) async fn index_lookup_mvcc(
         &self,
         rt: TrxRuntime<'_>,
-        index_no: usize,
+        index_ref: IndexRef,
         key_vals: &[Val],
         read_set: &[usize],
     ) -> RuntimeResult<ScanMvcc> {
-        debug_assert!(index_no < self.sec_idx_len());
+        let index_slot = index_ref.slot();
+        debug_assert!(index_slot.as_usize() < self.sec_idx_len());
         // Index scan should be applied to non-unique index.
         // todo: support partial key scan on unique index.
         debug_assert!(
             !self
                 .metadata()
                 .idx
-                .require_index_spec(index_no)
+                .require_index_spec(index_slot)
                 .unwrap()
                 .unique()
         );
         debug_assert!(self.metadata().idx.index_type_match(
             self.metadata().col.as_ref(),
-            index_no,
+            index_slot,
             key_vals
         ));
         debug_assert!({
@@ -4466,14 +4494,14 @@ impl<'op> UserTableAccessor<'op> {
                     .all(|(l, r)| l < r)
         });
         let mut res = vec![];
-        let handle = self.current_index_read_handle(rt, index_no)?;
+        let handle = self.current_index_read_handle(rt, index_ref)?;
         let encoder = handle.key_encoder();
         let index = handle.bind_non_unique()?;
         let range = encoder.encode_non_unique_equal_range(key_vals);
         let mut stream = index.equal_scan_candidates(&range, rt.sts())?;
         while let Some(batch) = stream.next_batch().await? {
             for candidate in batch {
-                let candidate = BoundIndexCandidate::new(index_no, false, encoder, candidate);
+                let candidate = BoundIndexCandidate::new(index_ref, false, encoder, candidate);
                 match self
                     .index_lookup_candidate_row_mvcc(rt, candidate, read_set)
                     .await?
@@ -4492,14 +4520,15 @@ impl<'op> UserTableAccessor<'op> {
     pub(crate) async fn index_scan_mvcc<'r, R>(
         &self,
         rt: TrxRuntime<'_>,
-        index_no: usize,
+        index_ref: IndexRef,
         range: R,
         read_set: &[usize],
     ) -> RuntimeResult<ScanMvcc>
     where
         R: RangeBounds<&'r [Val]>,
     {
-        debug_assert!(index_no < self.sec_idx_len());
+        let index_slot = index_ref.slot();
+        debug_assert!(index_slot.as_usize() < self.sec_idx_len());
         debug_assert!({
             !read_set.is_empty()
                 && read_set
@@ -4508,7 +4537,7 @@ impl<'op> UserTableAccessor<'op> {
                     .all(|(l, r)| l < r)
         });
         let mut res = vec![];
-        let handle = self.current_index_read_handle(rt, index_no)?;
+        let handle = self.current_index_read_handle(rt, index_ref)?;
         let unique = handle.is_unique();
         let encoder = handle.key_encoder();
         let range = if unique {
@@ -4521,7 +4550,7 @@ impl<'op> UserTableAccessor<'op> {
             let mut stream = index.index_scan_candidates(&range, rt.sts())?;
             while let Some(batch) = stream.next_batch().await? {
                 for candidate in batch {
-                    let candidate = BoundIndexCandidate::new(index_no, true, encoder, candidate);
+                    let candidate = BoundIndexCandidate::new(index_ref, true, encoder, candidate);
                     match self
                         .index_lookup_candidate_row_mvcc(rt, candidate, read_set)
                         .await?
@@ -4538,7 +4567,7 @@ impl<'op> UserTableAccessor<'op> {
             let mut stream = index.index_scan_candidates(&range, rt.sts())?;
             while let Some(batch) = stream.next_batch().await? {
                 for candidate in batch {
-                    let candidate = BoundIndexCandidate::new(index_no, false, encoder, candidate);
+                    let candidate = BoundIndexCandidate::new(index_ref, false, encoder, candidate);
                     match self
                         .index_lookup_candidate_row_mvcc(rt, candidate, read_set)
                         .await?
@@ -4593,19 +4622,19 @@ impl<'op> UserTableAccessor<'op> {
         &self,
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
-        unique_index_no: usize,
+        index_ref: IndexRef,
         cols: Vec<Val>,
         log_by_key: bool,
     ) -> QuadResult<UpsertMvcc> {
         let key = unique_key_from_full_row(
             self.metadata(),
-            unique_index_no,
+            index_ref.slot(),
             &cols,
             "upsert_unique_mvcc",
         );
         let input = RowUpdateInput::FullRow(cols);
         match self
-            .update_unique_mvcc_input(rt, effects, key.index_no, &key.vals, input, log_by_key)
+            .update_unique_mvcc_input(rt, effects, index_ref, &key.vals, input, log_by_key)
             .await?
         {
             UpdateUniqueMvcc::Updated(row_id) => Ok(UpsertMvcc::Updated(row_id)),
@@ -4625,14 +4654,14 @@ impl<'op> UserTableAccessor<'op> {
         &self,
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
-        index_no: usize,
+        index_ref: IndexRef,
         key_vals: &[Val],
         update: Vec<UpdateCol>,
         log_by_key: bool,
     ) -> QuadResult<UpdateMvcc> {
         let input = RowUpdateInput::Sparse(update);
         match self
-            .update_unique_mvcc_input(rt, effects, index_no, key_vals, input, log_by_key)
+            .update_unique_mvcc_input(rt, effects, index_ref, key_vals, input, log_by_key)
             .await?
         {
             UpdateUniqueMvcc::Updated(row_id) => Ok(UpdateMvcc::Updated(row_id)),
@@ -4645,22 +4674,23 @@ impl<'op> UserTableAccessor<'op> {
         &self,
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
-        index_no: usize,
+        index_ref: IndexRef,
         key_vals: &[Val],
         mut input: RowUpdateInput,
         log_by_key: bool,
     ) -> QuadResult<UpdateUniqueMvcc> {
-        debug_assert!(index_no < self.sec_idx_len());
+        let index_slot = index_ref.slot();
+        debug_assert!(index_slot.as_usize() < self.sec_idx_len());
         debug_assert!(
             self.metadata()
                 .idx
-                .require_index_spec(index_no)
+                .require_index_spec(index_slot)
                 .unwrap()
                 .unique()
         );
         debug_assert!(self.metadata().idx.index_type_match(
             self.metadata().col.as_ref(),
-            index_no,
+            index_slot,
             key_vals
         ));
         debug_assert!(
@@ -4671,7 +4701,7 @@ impl<'op> UserTableAccessor<'op> {
             let attempt = 'attempt: {
                 let root_snapshot = self.root_snapshot(rt.ctx());
                 let handle =
-                    self.snapshot_index_read_handle(rt.pool_guards(), &root_snapshot, index_no)?;
+                    self.snapshot_index_read_handle(rt.pool_guards(), &root_snapshot, index_ref)?;
                 let index = handle.bind_unique()?;
                 match index.lookup(key_vals, rt.sts()).await? {
                     None => return Ok(UpdateUniqueMvcc::NotFound(input)),
@@ -4691,7 +4721,7 @@ impl<'op> UserTableAccessor<'op> {
                             let metadata = self.metadata();
                             let old_vals = match self
                                 .read_lwc_row_for_update(rt, row_id, location, |vals| {
-                                    metadata.idx.match_key(index_no, key_vals, vals)
+                                    metadata.idx.match_key(index_slot, key_vals, vals)
                                 })
                                 .await?
                             {
@@ -4805,7 +4835,7 @@ impl<'op> UserTableAccessor<'op> {
                 }
             };
             let res = HotRowMutator::new(self.table_id(), self.metadata(), rt, &page_guard, row_id)
-                .update_inplace(effects, index_no, key_vals, input, log_by_key)
+                .update_inplace(effects, index_slot, key_vals, input, log_by_key)
                 .await?;
             match res {
                 UpdateRowInplace::Ok(new_row_id, index_change_cols) => {
@@ -4893,27 +4923,28 @@ impl<'op> UserTableAccessor<'op> {
         &self,
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
-        index_no: usize,
+        index_ref: IndexRef,
         key_vals: &[Val],
     ) -> QuadResult<DeleteMvcc> {
-        debug_assert!(index_no < self.sec_idx_len());
+        let index_slot = index_ref.slot();
+        debug_assert!(index_slot.as_usize() < self.sec_idx_len());
         debug_assert!(
             self.metadata()
                 .idx
-                .require_index_spec(index_no)
+                .require_index_spec(index_slot)
                 .unwrap()
                 .unique()
         );
         debug_assert!(self.metadata().idx.index_type_match(
             self.metadata().col.as_ref(),
-            index_no,
+            index_slot,
             key_vals
         ));
         'retry: loop {
             let attempt = 'attempt: {
                 let root_snapshot = self.root_snapshot(rt.ctx());
                 let handle =
-                    self.snapshot_index_read_handle(rt.pool_guards(), &root_snapshot, index_no)?;
+                    self.snapshot_index_read_handle(rt.pool_guards(), &root_snapshot, index_ref)?;
                 let index = handle.bind_unique()?;
                 match index.lookup(key_vals, rt.sts()).await? {
                     None => return Ok(DeleteMvcc::NotFound),
@@ -4939,7 +4970,7 @@ impl<'op> UserTableAccessor<'op> {
                                         row_shape_fingerprint,
                                     )
                                     .await?;
-                                if !index_key_matches(index_keys.as_slice(), index_no, key_vals) {
+                                if !index_key_matches(index_keys.as_slice(), index_slot, key_vals) {
                                     return Ok(DeleteMvcc::NotFound);
                                 }
                                 let deletion_buffer = self.lwc_deletion_buffer();
@@ -5018,7 +5049,7 @@ impl<'op> UserTableAccessor<'op> {
                 }
             };
             let res = HotRowMutator::new(self.table_id(), self.metadata(), rt, &page_guard, row_id)
-                .delete(effects, index_no, key_vals, false)
+                .delete(effects, index_slot, key_vals, false)
                 .await?;
             match res {
                 DeleteInternal::NotFound => return Ok(DeleteMvcc::NotFound),
@@ -5052,43 +5083,44 @@ impl<'op> UserTableAccessor<'op> {
     pub(crate) async fn delete_index(
         &self,
         guards: &PoolGuards,
-        index_no: usize,
+        index_ref: IndexRef,
         key_vals: &[Val],
         row_id: RowID,
         unique: bool,
         min_active_sts: TrxID,
     ) -> RuntimeResult<bool> {
         // Undo can outlive the secondary index that produced it. Once the
-        // index slot is inactive, row-level purge has no per-entry cleanup to do.
-        let Some(index_schema) = self.metadata().idx.index_spec(index_no) else {
-            return Ok(false);
-        };
-        if !self.sec_idx_is_active(index_no) {
+        // exact generation is inactive, row-level purge has no per-entry cleanup to do.
+        if !self.validates_index_ref(index_ref) {
             return Ok(false);
         }
+        let index_slot = index_ref.slot();
+        let Some(index_schema) = self.metadata().idx.index_spec(index_slot) else {
+            return Ok(false);
+        };
         debug_assert_eq!(unique, index_schema.unique());
         if unique {
-            self.delete_unique_index(guards, index_no, key_vals, row_id, min_active_sts)
+            self.delete_unique_index(guards, index_ref, key_vals, row_id, min_active_sts)
                 .await
         } else {
-            self.delete_non_unique_index(guards, index_no, key_vals, row_id, min_active_sts)
+            self.delete_non_unique_index(guards, index_ref, key_vals, row_id, min_active_sts)
                 .await
         }
     }
 }
 
 #[inline]
-fn index_key_matches(keys: &[SelectKey], index_no: usize, key_vals: &[Val]) -> bool {
+fn index_key_matches(keys: &[WriteIndexKey<'_>], index_slot: IndexSlot, key_vals: &[Val]) -> bool {
     let old_key = keys
         .iter()
-        .find(|old_key| old_key.index_no == index_no)
+        .find(|old_key| old_key.index_slot() == index_slot)
         .unwrap_or_else(|| {
             panic!(
-                "target index key must be present in metadata-derived row keys: index_no={index_no}, key_count={}",
+                "target index key must be present in metadata-derived row keys: index_slot={index_slot}, key_count={}",
                 keys.len()
             )
         });
-    old_key.vals.as_slice() == key_vals
+    old_key.vals() == key_vals
 }
 
 fn persisted_delete_set_for_scan(
@@ -5327,7 +5359,8 @@ mod tests {
     use crate::buffer::test_frame_kind;
     use crate::catalog::tests::table4;
     use crate::catalog::{
-        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableSpec,
+        ColumnAttributes, ColumnSpec, IndexAttributes, IndexID, IndexKeySpec, IndexRef, IndexSlot,
+        IndexSpec, TableSpec,
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
@@ -5396,7 +5429,7 @@ mod tests {
         let layout = table.layout_snapshot();
         assert_eq!(
             layout
-                .secondary_index(unique_key.index_no)
+                .secondary_index(unique_key.index_slot)
                 .unwrap()
                 .unique_mem()
                 .unwrap()
@@ -5408,7 +5441,7 @@ mod tests {
         );
         assert_eq!(
             layout
-                .secondary_index(non_unique_key.index_no)
+                .secondary_index(non_unique_key.index_slot)
                 .unwrap()
                 .non_unique_mem()
                 .unwrap()
@@ -5542,10 +5575,14 @@ mod tests {
     ) -> Vec<Vec<Val>> {
         let key_vals = [Val::from(key)];
         let read_set = [0usize, 1];
-        trx.table_index_lookup_mvcc(table_id, 1, &key_vals, &read_set)
-            .await
-            .unwrap()
-            .unwrap_rows()
+        trx.table_index_lookup_mvcc(
+            crate::TableIndex(table_id, crate::IndexID::new(1)),
+            &key_vals,
+            &read_set,
+        )
+        .await
+        .unwrap()
+        .unwrap_rows()
     }
 
     async fn secondary_index_stream_rows(
@@ -5556,7 +5593,11 @@ mod tests {
         let key_vals = [Val::from(key)];
         let read_set = [0usize, 1];
         let mut stream = trx
-            .table_index_scan_mvcc_stream(table_id, 1, &key_vals[..]..=&key_vals[..], &read_set)
+            .table_index_scan_mvcc_stream(
+                crate::TableIndex(table_id, crate::IndexID::new(1)),
+                &key_vals[..]..=&key_vals[..],
+                &read_set,
+            )
             .await
             .unwrap();
         let mut rows = Vec::new();
@@ -5663,7 +5704,7 @@ mod tests {
             {
                 let mut trx = session.begin_trx().unwrap();
                 for i in 16..SIZE {
-                    let key = SelectKey::new(0, vec![Val::from(i)]);
+                    let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(i)]);
                     trx = expect_trx_select(table_id, trx, &key, |vals| {
                         assert!(vals.len() == 2);
                         assert!(vals[0] == Val::from(i));
@@ -5807,7 +5848,10 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let inserted = trx
-                .table_upsert_unique_mvcc(table_id, 0, vec![Val::from(1i32), Val::from("hello")])
+                .table_upsert_unique_mvcc(
+                    crate::TableIndex(table_id, crate::IndexID::new(0)),
+                    vec![Val::from(1i32), Val::from("hello")],
+                )
                 .await
                 .unwrap();
             let inserted_row_id = match inserted {
@@ -5818,7 +5862,10 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let updated = trx
-                .table_upsert_unique_mvcc(table_id, 0, vec![Val::from(1i32), Val::from("world")])
+                .table_upsert_unique_mvcc(
+                    crate::TableIndex(table_id, crate::IndexID::new(0)),
+                    vec![Val::from(1i32), Val::from("world")],
+                )
                 .await
                 .unwrap();
             assert_eq!(updated, UpsertMvcc::Updated(inserted_row_id));
@@ -5851,8 +5898,8 @@ mod tests {
                             ColumnSpec::new("payload", ValKind::VarByte, ColumnAttributes::empty()),
                         ]),
                         vec![
-                            IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK),
-                            IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                            IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK),
+                            IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty()),
                         ],
                     )
                     .await
@@ -5897,8 +5944,7 @@ mod tests {
             let mut writer = session.begin_trx().unwrap();
             let updated = writer
                 .table_upsert_unique_mvcc(
-                    table_id,
-                    0,
+                    crate::TableIndex(table_id, crate::IndexID::new(0)),
                     vec![
                         Val::from(0i32),
                         Val::from("name0"),
@@ -5927,7 +5973,7 @@ mod tests {
             let layout = table.layout_snapshot();
             let guards = session.pool_guards();
             let non_unique = layout
-                .secondary_index(1)
+                .secondary_index(IndexSlot::new(1))
                 .unwrap()
                 .non_unique_mem()
                 .unwrap()
@@ -6006,8 +6052,7 @@ mod tests {
             let mut trx1 = session.begin_trx().unwrap();
             assert!(matches!(
                 trx1.table_upsert_unique_mvcc(
-                    table_id,
-                    0,
+                    crate::TableIndex(table_id, crate::IndexID::new(0)),
                     vec![Val::from(1i32), Val::from("held")],
                 )
                 .await
@@ -6018,7 +6063,10 @@ mod tests {
             let mut session2 = engine.new_session().unwrap();
             let mut trx2 = session2.begin_trx().unwrap();
             let err = trx2
-                .table_upsert_unique_mvcc(table_id, 0, vec![Val::from(1i32), Val::from("conflict")])
+                .table_upsert_unique_mvcc(
+                    crate::TableIndex(table_id, crate::IndexID::new(0)),
+                    vec![Val::from(1i32), Val::from("conflict")],
+                )
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -6031,8 +6079,7 @@ mod tests {
             let mut trx1 = session.begin_trx().unwrap();
             assert!(matches!(
                 trx1.table_upsert_unique_mvcc(
-                    table_id,
-                    0,
+                    crate::TableIndex(table_id, crate::IndexID::new(0)),
                     vec![Val::from(2i32), Val::from("first")],
                 )
                 .await
@@ -6042,7 +6089,10 @@ mod tests {
 
             let mut trx2 = session2.begin_trx().unwrap();
             let err = trx2
-                .table_upsert_unique_mvcc(table_id, 0, vec![Val::from(2i32), Val::from("second")])
+                .table_upsert_unique_mvcc(
+                    crate::TableIndex(table_id, crate::IndexID::new(0)),
+                    vec![Val::from(2i32), Val::from("second")],
+                )
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -6188,7 +6238,7 @@ mod tests {
             let trx = session.begin_trx().unwrap();
             let table = table_for_internal_assertion(&engine, table_id);
             let pool_guards = session.pool_guards();
-            let index = bound_unique_index(&table, &pool_guards, key.index_no);
+            let index = bound_unique_index(&table, &pool_guards, key.index_slot);
             let (row_id, _) = index.lookup(&key.vals, trx.sts()).await.unwrap().unwrap();
 
             let snapshot = column_block_index_snapshot(&engine, table_id);
@@ -7273,7 +7323,7 @@ mod tests {
             let index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
-                claimed_key.index_no,
+                claimed_key.index_slot,
             );
             assert!(
                 index
@@ -7338,11 +7388,26 @@ mod tests {
             // and skips the entry, so rollback must not recreate that skipped
             // delete-masked owner.
             let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
+            let active_index = active_index_ref(&layout, claimed_key.index_slot);
+            let stale_index = IndexRef::new(IndexID::new(u32::MAX), active_index.slot());
+            let ignored = table_for_internal_assertion(&engine, table_id)
+                .accessor_with_layout(&layout)
+                .delete_index(
+                    &session.pool_guards(),
+                    stale_index,
+                    &claimed_key.vals,
+                    claimed_row_id,
+                    true,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap();
+            assert!(!ignored);
             let deleted = table_for_internal_assertion(&engine, table_id)
                 .accessor_with_layout(&layout)
                 .delete_index(
                     &session.pool_guards(),
-                    claimed_key.index_no,
+                    active_index,
                     &claimed_key.vals,
                     claimed_row_id,
                     true,
@@ -7385,7 +7450,7 @@ mod tests {
             let index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
-                key.index_no,
+                key.index_slot,
             );
             let (row_id, _) = index.lookup(&key.vals, trx.sts()).await.unwrap().unwrap();
             let page_id = match table_for_internal_assertion(&engine, table_id)
@@ -7678,9 +7743,9 @@ mod tests {
                             ColumnSpec::new("region", ValKind::I32, ColumnAttributes::empty()),
                         ]),
                         vec![
-                            IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK),
-                            IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::UK),
-                            IndexSpec::new(vec![IndexKey::new(2)], IndexAttributes::UK),
+                            IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK),
+                            IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::UK),
+                            IndexSpec::new(vec![IndexKeySpec::new(2)], IndexAttributes::UK),
                         ],
                     )
                     .await
@@ -7693,10 +7758,10 @@ mod tests {
                 vec![Val::from(1i32), Val::from(10i32), Val::from(100i32)],
             )
             .await;
-            let id_key = SelectKey::new(0, vec![Val::from(1i32)]);
-            let old_code_key = SelectKey::new(1, vec![Val::from(10i32)]);
-            let new_code_key = SelectKey::new(1, vec![Val::from(20i32)]);
-            let region_key = SelectKey::new(2, vec![Val::from(100i32)]);
+            let id_key = SelectKey::new(IndexSlot::new(0), vec![Val::from(1i32)]);
+            let old_code_key = SelectKey::new(IndexSlot::new(1), vec![Val::from(10i32)]);
+            let new_code_key = SelectKey::new(IndexSlot::new(1), vec![Val::from(20i32)]);
+            let region_key = SelectKey::new(IndexSlot::new(2), vec![Val::from(100i32)]);
 
             let mut trx = session.begin_trx().unwrap();
             assert_eq!(
@@ -7827,7 +7892,7 @@ mod tests {
                 let value = vec![1u8; SIZE];
                 let insert = vec![Val::from(1i32), Val::from(&[])];
                 expect_insert_committed(table_id, &mut session, insert).await;
-                let key = SelectKey::new(0, vec![Val::from(1i32)]);
+                let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(1i32)]);
                 for i in SIZE - COUNT..SIZE {
                     expect_update_committed(
                         table_id,
@@ -7868,7 +7933,7 @@ mod tests {
                 }
                 // perform updates.
                 for i in 0..COUNT {
-                    let key = SelectKey::new(0, vec![Val::from(&s[..i])]);
+                    let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(&s[..i])]);
                     let update = vec![UpdateCol {
                         idx: 0,
                         val: Val::from(&s[..i + 1]),
@@ -7909,7 +7974,7 @@ mod tests {
                 // perform updates to trigger out-of-place update.
                 // try to update k=s[..BASE+DELTA] to s[..BASE+COUNT+DELTA]
                 for i in 0..DELTA {
-                    let key = SelectKey::new(0, vec![Val::from(&s[..BASE + i])]);
+                    let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(&s[..BASE + i])]);
                     let update = vec![UpdateCol {
                         idx: 0,
                         val: Val::from(&s[..BASE + COUNT + i]),
@@ -8169,7 +8234,7 @@ mod tests {
 
             let pool_guards = session.pool_guards();
             assert!(
-                bound_unique_index(&table, &pool_guards, key.index_no)
+                bound_unique_index(&table, &pool_guards, key.index_slot,)
                     .inject_mem_entry_if_absent(&key.vals, row_id, true, MAX_SNAPSHOT_TS)
                     .await
                     .unwrap()
@@ -8246,24 +8311,22 @@ mod tests {
 
             let pool_guards = session.pool_guards();
             assert!(
-                bound_non_unique_index_no(&table, &pool_guards, non_unique_key.index_no)
-                    .inject_mem_entry_if_absent(
-                        &non_unique_key.vals,
-                        row_id,
-                        true,
-                        MAX_SNAPSHOT_TS,
-                    )
-                    .await
-                    .unwrap()
-                    .is_ok()
+                bound_non_unique_index(
+                    &table,
+                    &pool_guards,
+                    non_unique_key.index_slot,
+                )
+                .inject_mem_entry_if_absent(&non_unique_key.vals, row_id, true, MAX_SNAPSHOT_TS,)
+                .await
+                .unwrap()
+                .is_ok()
             );
             drop(pool_guards);
 
             let mut trx = session.begin_trx().unwrap();
             let rows = trx
                 .table_index_lookup_mvcc(
-                    table_id,
-                    non_unique_key.index_no,
+                    crate::TableIndex(table_id, non_unique_key.index_slot.transitional_id()),
                     &non_unique_key.vals,
                     &[0, 1],
                 )
@@ -8770,9 +8833,12 @@ mod tests {
             for id in [0, 10] {
                 let key = single_key(id);
                 assert_eq!(
-                    trx.table_delete_unique_mvcc(table_id, key.index_no, &key.vals)
-                        .await
-                        .unwrap(),
+                    trx.table_delete_unique_mvcc(
+                        crate::TableIndex(table_id, key.index_slot.transitional_id()),
+                        &key.vals
+                    )
+                    .await
+                    .unwrap(),
                     DeleteMvcc::Deleted
                 );
             }
@@ -8998,7 +9064,11 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let rows = trx
-                .table_index_lookup_mvcc(table_id, 1, &[Val::from("shared")], &[0])
+                .table_index_lookup_mvcc(
+                    crate::TableIndex(table_id, crate::IndexID::new(1)),
+                    &[Val::from("shared")],
+                    &[0],
+                )
                 .await
                 .unwrap();
             assert_eq!(
@@ -9034,7 +9104,11 @@ mod tests {
                 .unwrap();
             assert_eq!(outcome.delete_count, 2);
             let rows = trx
-                .table_index_lookup_mvcc(table_id, 1, &[Val::from("shared")], &[0])
+                .table_index_lookup_mvcc(
+                    crate::TableIndex(table_id, crate::IndexID::new(1)),
+                    &[Val::from("shared")],
+                    &[0],
+                )
                 .await
                 .unwrap();
             assert_eq!(
@@ -9051,7 +9125,11 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let rows = trx
-                .table_index_lookup_mvcc(table_id, 1, &[Val::from("shared")], &[0])
+                .table_index_lookup_mvcc(
+                    crate::TableIndex(table_id, crate::IndexID::new(1)),
+                    &[Val::from("shared")],
+                    &[0],
+                )
                 .await
                 .unwrap();
             assert_eq!(
@@ -9092,7 +9170,11 @@ mod tests {
             let deleted = trx_delete_row_by_id(&mut trx, table_id, &key).await;
             assert!(matches!(deleted, Ok(DeleteMvcc::Deleted)));
             let rows = trx
-                .table_index_lookup_mvcc(table_id, 1, &[Val::from("shared")], &[0])
+                .table_index_lookup_mvcc(
+                    crate::TableIndex(table_id, crate::IndexID::new(1)),
+                    &[Val::from("shared")],
+                    &[0],
+                )
                 .await
                 .unwrap();
             assert_eq!(
@@ -9111,7 +9193,11 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let rows = trx
-                .table_index_lookup_mvcc(table_id, 1, &[Val::from("shared")], &[0])
+                .table_index_lookup_mvcc(
+                    crate::TableIndex(table_id, crate::IndexID::new(1)),
+                    &[Val::from("shared")],
+                    &[0],
+                )
                 .await
                 .unwrap();
             assert_eq!(
@@ -9136,7 +9222,11 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let rows = trx
-                .table_index_lookup_mvcc(table_id, 1, &[Val::from("shared")], &[0])
+                .table_index_lookup_mvcc(
+                    crate::TableIndex(table_id, crate::IndexID::new(1)),
+                    &[Val::from("shared")],
+                    &[0],
+                )
                 .await
                 .unwrap();
             assert_eq!(
@@ -10324,7 +10414,7 @@ mod tests {
             // reuse the still-active second page.
             {
                 let mut trx = session1.begin_trx().unwrap();
-                let key = SelectKey::new(0, vec![Val::from(1)]);
+                let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(1)]);
                 let res = trx_update_row_by_id(
                     &mut trx,
                     table_id,
@@ -10344,7 +10434,7 @@ mod tests {
             // update row 1 will just be in-place.
             {
                 let mut trx = session1.begin_trx().unwrap();
-                let key = SelectKey::new(0, vec![Val::from(1)]);
+                let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(1)]);
                 let res = trx_update_row_by_id(
                     &mut trx,
                     table_id,
@@ -10393,7 +10483,7 @@ mod tests {
             let index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
-                key.index_no,
+                key.index_slot,
             );
             let (row_id, _) = index.lookup(&key.vals, trx.sts()).await.unwrap().unwrap();
             let page_id = match table_for_internal_assertion(&engine, table_id)
@@ -11056,7 +11146,7 @@ mod tests {
     fn test_user_secondary_indexes_evict_and_continue_serving_lookups() {
         smol::block_on(async {
             use crate::catalog::{
-                ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableSpec,
+                ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexSpec, TableSpec,
             };
             use crate::value::ValKind;
 
@@ -11081,10 +11171,13 @@ mod tests {
             .unwrap();
 
             let mut ddl_session = engine.new_session().unwrap();
-            let mut index_specs = vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)];
+            let mut index_specs = vec![IndexSpec::new(
+                vec![IndexKeySpec::new(0)],
+                IndexAttributes::UK,
+            )];
             for _ in 0..12 {
                 index_specs.push(IndexSpec::new(
-                    vec![IndexKey::new(1)],
+                    vec![IndexKeySpec::new(1)],
                     IndexAttributes::empty(),
                 ));
             }
@@ -11138,7 +11231,7 @@ mod tests {
             );
 
             for key_idx in [0usize, inserted.len() / 2, inserted.len() - 1] {
-                let key = SelectKey::new(0, vec![Val::from(inserted[key_idx].0)]);
+                let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(inserted[key_idx].0)]);
                 let mut trx = session.begin_trx().unwrap();
                 let res = trx_select_row_mvcc_by_id(&mut trx, table_id, &key, &[0, 1]).await;
                 match res {
@@ -11189,7 +11282,7 @@ mod tests {
             assert_checkpoint_published(&mut session, table_id).await;
 
             let table = table_for_internal_assertion(&engine, table_id);
-            let key = SelectKey::new(0, vec![Val::from(10i32)]);
+            let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(10i32)]);
             let reader = session.begin_trx().unwrap();
             assert_row_in_lwc(&table, &session.pool_guards(), &key, reader.sts()).await;
             reader.commit().await.unwrap();
@@ -11200,7 +11293,11 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let rows = trx
-                .table_index_lookup_mvcc(table_id, 1, &key_vals, &read_set)
+                .table_index_lookup_mvcc(
+                    crate::TableIndex(table_id, crate::IndexID::new(1)),
+                    &key_vals,
+                    &read_set,
+                )
                 .await
                 .unwrap()
                 .unwrap_rows();
@@ -11209,7 +11306,11 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let mut stream = trx
-                .table_index_scan_mvcc_stream(table_id, 1, &key_vals[..]..=&key_vals[..], &read_set)
+                .table_index_scan_mvcc_stream(
+                    crate::TableIndex(table_id, crate::IndexID::new(1)),
+                    &key_vals[..]..=&key_vals[..],
+                    &read_set,
+                )
                 .await
                 .unwrap();
             let mut rows = Vec::new();
@@ -11247,7 +11348,11 @@ mod tests {
             let key_vals = [Val::from(7i32)];
             let mut trx = session.begin_trx().unwrap();
             let err = match trx
-                .table_index_scan_mvcc_stream(table_id, 1, &key_vals[..]..=&key_vals[..], &[])
+                .table_index_scan_mvcc_stream(
+                    crate::TableIndex(table_id, crate::IndexID::new(1)),
+                    &key_vals[..]..=&key_vals[..],
+                    &[],
+                )
                 .await
             {
                 Ok(_) => panic!("empty read set should fail stream construction"),
@@ -11261,7 +11366,11 @@ mod tests {
             trx.disable_dml_validation(true);
             trx.noop().await.unwrap();
             let mut stream = trx
-                .table_index_scan_mvcc_stream(table_id, 1, &key_vals[..]..=&key_vals[..], &[])
+                .table_index_scan_mvcc_stream(
+                    crate::TableIndex(table_id, crate::IndexID::new(1)),
+                    &key_vals[..]..=&key_vals[..],
+                    &[],
+                )
                 .await
                 .unwrap();
             assert_eq!(stream.next().await.unwrap(), Some(Vec::new()));
@@ -11270,7 +11379,11 @@ mod tests {
             trx.disable_dml_validation(false);
 
             let err = match trx
-                .table_index_scan_mvcc_stream(table_id, 1, &key_vals[..]..=&key_vals[..], &[])
+                .table_index_scan_mvcc_stream(
+                    crate::TableIndex(table_id, crate::IndexID::new(1)),
+                    &key_vals[..]..=&key_vals[..],
+                    &[],
+                )
                 .await
             {
                 Ok(_) => panic!("empty read set should fail after opt-out stream"),
@@ -11284,7 +11397,11 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let err = match trx
-                .table_index_scan_mvcc_stream(table_id, 1, &key_vals[..]..=&key_vals[..], &[])
+                .table_index_scan_mvcc_stream(
+                    crate::TableIndex(table_id, crate::IndexID::new(1)),
+                    &key_vals[..]..=&key_vals[..],
+                    &[],
+                )
                 .await
             {
                 Ok(_) => panic!("empty read set should fail in a new transaction"),
@@ -11325,15 +11442,19 @@ mod tests {
                 trx.commit().await.unwrap();
 
                 let mut trx = session.begin_trx().unwrap();
-                let key = SelectKey::new(0, vec![Val::from(1i32)]);
+                let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(1i32)]);
                 let res = trx_select_row_mvcc_by_id(&mut trx, table_id, &key, user_read_set).await;
                 trx.commit().await.unwrap();
                 assert!(matches!(res, Ok(SelectMvcc::Found(_))));
 
                 let mut trx = session.begin_trx().unwrap();
-                let key = SelectKey::new(1, vec![Val::from(1i32)]);
+                let key = SelectKey::new(IndexSlot::new(1), vec![Val::from(1i32)]);
                 let res = trx
-                    .table_index_lookup_mvcc(table_id, key.index_no, &key.vals, user_read_set)
+                    .table_index_lookup_mvcc(
+                        crate::TableIndex(table_id, key.index_slot.transitional_id()),
+                        &key.vals,
+                        user_read_set,
+                    )
                     .await;
                 trx.commit().await.unwrap();
                 assert!(res.unwrap().unwrap_rows().len() == 1);
@@ -11342,8 +11463,7 @@ mod tests {
                 let key_vals = [Val::from(1i32)];
                 let rows = trx
                     .table_index_scan_mvcc(
-                        table_id,
-                        1,
+                        crate::TableIndex(table_id, crate::IndexID::new(1)),
                         &key_vals[..]..=&key_vals[..],
                         user_read_set,
                     )
@@ -11356,8 +11476,7 @@ mod tests {
                 let mut trx = session.begin_trx().unwrap();
                 let mut stream = trx
                     .table_index_scan_mvcc_stream(
-                        table_id,
-                        1,
+                        crate::TableIndex(table_id, crate::IndexID::new(1)),
                         &key_vals[..]..=&key_vals[..],
                         user_read_set,
                     )
@@ -11377,8 +11496,7 @@ mod tests {
                 let upper = [Val::from(4i32)];
                 let mut stream = trx
                     .table_index_scan_mvcc_stream(
-                        table_id,
-                        0,
+                        crate::TableIndex(table_id, crate::IndexID::new(0)),
                         &lower[..]..&upper[..],
                         user_read_set,
                     )
@@ -11399,7 +11517,11 @@ mod tests {
 
                 let mut trx = session.begin_trx().unwrap();
                 let rows = trx
-                    .table_index_scan_mvcc(table_id, 0, &lower[..]..&upper[..], user_read_set)
+                    .table_index_scan_mvcc(
+                        crate::TableIndex(table_id, crate::IndexID::new(0)),
+                        &lower[..]..&upper[..],
+                        user_read_set,
+                    )
                     .await
                     .unwrap()
                     .unwrap_rows();
@@ -11408,18 +11530,29 @@ mod tests {
 
                 let mut trx = session.begin_trx().unwrap();
                 let mut stream = trx
-                    .table_index_scan_mvcc_stream(table_id, 1, .., user_read_set)
+                    .table_index_scan_mvcc_stream(
+                        crate::TableIndex(table_id, crate::IndexID::new(1)),
+                        ..,
+                        user_read_set,
+                    )
                     .await
                     .unwrap();
                 assert!(stream.next().await.unwrap().is_some());
                 drop(stream);
-                let key = SelectKey::new(0, vec![Val::from(2i32)]);
+                let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(2i32)]);
                 let res = trx_select_row_mvcc_by_id(&mut trx, table_id, &key, user_read_set).await;
                 trx.commit().await.unwrap();
                 assert!(matches!(res, Ok(SelectMvcc::Found(_))));
 
                 let mut trx = session.begin_trx().unwrap();
-                let err = match trx.table_index_scan_mvcc_stream(table_id, 1, .., &[]).await {
+                let err = match trx
+                    .table_index_scan_mvcc_stream(
+                        crate::TableIndex(table_id, crate::IndexID::new(1)),
+                        ..,
+                        &[],
+                    )
+                    .await
+                {
                     Ok(_) => panic!("empty read set should fail stream construction"),
                     Err(err) => err,
                 };
@@ -11433,8 +11566,7 @@ mod tests {
                 let invalid_key_vals = [Val::from(1i32), Val::from(2i32)];
                 let err = match trx
                     .table_index_scan_mvcc_stream(
-                        table_id,
-                        1,
+                        crate::TableIndex(table_id, crate::IndexID::new(1)),
                         &invalid_key_vals[..]..=&invalid_key_vals[..],
                         user_read_set,
                     )
@@ -11450,7 +11582,7 @@ mod tests {
                 trx.commit().await.unwrap();
 
                 let mut trx = session.begin_trx().unwrap();
-                let key = SelectKey::new(0, vec![Val::from(1i32)]);
+                let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(1i32)]);
                 let update = vec![UpdateCol {
                     idx: 1,
                     val: Val::from(0i32),
@@ -11460,9 +11592,13 @@ mod tests {
                 assert!(matches!(res, Ok(UpdateMvcc::Updated(_))));
 
                 let mut trx = session.begin_trx().unwrap();
-                let key = SelectKey::new(1, vec![Val::from(0i32)]);
+                let key = SelectKey::new(IndexSlot::new(1), vec![Val::from(0i32)]);
                 let res = trx
-                    .table_index_lookup_mvcc(table_id, key.index_no, &key.vals, user_read_set)
+                    .table_index_lookup_mvcc(
+                        crate::TableIndex(table_id, key.index_slot.transitional_id()),
+                        &key.vals,
+                        user_read_set,
+                    )
                     .await;
                 trx.commit().await.unwrap();
                 assert!(res.unwrap().unwrap_rows().len() == 2);
@@ -11472,8 +11608,7 @@ mod tests {
                 let upper = [Val::from(5i32)];
                 let mut stream = trx
                     .table_index_scan_mvcc_stream(
-                        table_id,
-                        1,
+                        crate::TableIndex(table_id, crate::IndexID::new(1)),
                         &lower[..]..&upper[..],
                         user_read_set,
                     )
@@ -11495,7 +11630,11 @@ mod tests {
 
                 let mut trx = session.begin_trx().unwrap();
                 let rows = trx
-                    .table_index_scan_mvcc(table_id, 1, &lower[..]..&upper[..], user_read_set)
+                    .table_index_scan_mvcc(
+                        crate::TableIndex(table_id, crate::IndexID::new(1)),
+                        &lower[..]..&upper[..],
+                        user_read_set,
+                    )
                     .await
                     .unwrap()
                     .unwrap_rows();
@@ -11509,15 +11648,19 @@ mod tests {
                 );
 
                 let mut trx = session.begin_trx().unwrap();
-                let key = SelectKey::new(0, vec![Val::from(0i32)]);
+                let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(0i32)]);
                 let res = trx_delete_row_by_id(&mut trx, table_id, &key).await;
                 trx.commit().await.unwrap();
                 assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
 
                 let mut trx = session.begin_trx().unwrap();
-                let key = SelectKey::new(1, vec![Val::from(0i32)]);
+                let key = SelectKey::new(IndexSlot::new(1), vec![Val::from(0i32)]);
                 let res = trx
-                    .table_index_lookup_mvcc(table_id, key.index_no, &key.vals, user_read_set)
+                    .table_index_lookup_mvcc(
+                        crate::TableIndex(table_id, key.index_slot.transitional_id()),
+                        &key.vals,
+                        user_read_set,
+                    )
                     .await;
                 _ = trx.commit().await.unwrap();
                 assert!(res.unwrap().unwrap_rows().len() == 1);
@@ -11548,7 +11691,7 @@ mod tests {
             insert.commit().await.unwrap();
 
             let mut writer = session.begin_trx().unwrap();
-            let key = SelectKey::new(0, vec![Val::from(10i32)]);
+            let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(10i32)]);
             let res = trx_delete_row_by_id(&mut writer, table_id, &key).await;
             assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
 
@@ -11603,7 +11746,7 @@ mod tests {
             let mut old_reader = reader_session.begin_trx().unwrap();
 
             let mut writer = session.begin_trx().unwrap();
-            let key = SelectKey::new(0, vec![Val::from(10i32)]);
+            let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(10i32)]);
             let res = trx_delete_row_by_id(&mut writer, table_id, &key).await;
             assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
             writer.commit().await.unwrap();

@@ -1,9 +1,7 @@
+use super::index_ref::IndexSlot;
 use crate::value::ValKind;
 use bitflags::bitflags;
 use semistr::SemiStr;
-
-/// Stable table-local secondary-index number.
-pub type IndexNo = u16;
 
 /// User-facing table definition used by DDL/create-table paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,7 +49,7 @@ impl ColumnSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexSpec {
     /// Ordered index key columns.
-    pub cols: Vec<IndexKey>,
+    pub cols: Vec<IndexKeySpec>,
     /// Index-level schema attributes.
     pub attributes: IndexAttributes,
 }
@@ -59,7 +57,7 @@ pub struct IndexSpec {
 impl IndexSpec {
     /// Create one index specification.
     #[inline]
-    pub fn new(cols: Vec<IndexKey>, attributes: IndexAttributes) -> Self {
+    pub fn new(cols: Vec<IndexKeySpec>, attributes: IndexAttributes) -> Self {
         Self { cols, attributes }
     }
 
@@ -77,12 +75,11 @@ impl IndexSpec {
     }
 }
 
-/// One active index definition paired with its allocated stable table-local
-/// index number.
+/// One active index definition paired with its physical table-local slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ActiveIndexSpec {
-    /// Stable table-local index number.
-    pub(crate) index_no: IndexNo,
+    /// Physical table-local index slot.
+    pub(crate) index_slot: IndexSlot,
     /// Logical index definition stored in this slot.
     pub(crate) spec: IndexSpec,
 }
@@ -90,8 +87,8 @@ pub(crate) struct ActiveIndexSpec {
 impl ActiveIndexSpec {
     /// Create one active index specification.
     #[inline]
-    pub(crate) fn new(index_no: IndexNo, spec: IndexSpec) -> Self {
-        Self { index_no, spec }
+    pub(crate) fn new(index_slot: IndexSlot, spec: IndexSpec) -> Self {
+        Self { index_slot, spec }
     }
 }
 
@@ -117,18 +114,18 @@ bitflags! {
 
 /// One indexed column descriptor inside an index definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IndexKey {
+pub struct IndexKeySpec {
     /// User-column number included in this key position.
     pub col_no: u16,
     /// Sort direction for this key column.
     pub order: IndexOrder,
 }
 
-impl IndexKey {
+impl IndexKeySpec {
     /// Create an index key on one user column with ascending order.
     #[inline]
     pub fn new(col_no: u16) -> Self {
-        IndexKey {
+        IndexKeySpec {
             col_no,
             order: IndexOrder::Asc,
         }

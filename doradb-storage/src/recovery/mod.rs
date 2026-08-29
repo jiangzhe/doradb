@@ -20,7 +20,8 @@ mod timeline;
 use crate::buffer::BufferPool;
 use crate::buffer::guard::PageGuard;
 use crate::catalog::{
-    CatalogTable, IndexDdlKind, IndexDdlRootProof, TableColumnLayout, classify_index_ddl_root,
+    CatalogTable, IndexDdlKind, IndexDdlRootProof, IndexSlot, ReplayVisibleIndexDdl,
+    TableColumnLayout, classify_index_ddl_root,
 };
 use crate::error::{
     DataIntegrityError, DataIntegrityResult, IoResult, RuntimeError, RuntimeResult,
@@ -563,11 +564,11 @@ impl<'a> RecoveryCoordinator<'a> {
                 let pending = self.pending_index_ddl_reconciliations.contains(&table_id);
                 return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
                     .attach(format!(
-                        "recovered user table metadata mismatch after redo replay: table_id={table_id}, root_ts={}, catalog_replay_start_ts={}, pending_index_ddl_reconciliation={pending}, catalog_next_index_no={}, root_next_index_no={}",
+                        "recovered user table metadata mismatch after redo replay: table_id={table_id}, root_ts={}, catalog_replay_start_ts={}, pending_index_ddl_reconciliation={pending}, catalog_next_index_slot={}, root_next_index_slot={}",
                         active_root.root_ts,
                         self.timeline.catalog_replay_start_ts,
-                        catalog_metadata.idx.next_index_no(),
-                        active_root.metadata.idx.next_index_no()
+                        catalog_metadata.idx.next_index_slot(),
+                        active_root.metadata.idx.next_index_slot()
                     ))
                     .change_context(RuntimeError::Recovery));
             }
@@ -649,12 +650,18 @@ impl<'a> RecoveryCoordinator<'a> {
                 self.replay_create_table_ddl(table_id, dml, cts).await?
             }
             DDLRedo::DropTable(table_id) => self.replay_drop_table_ddl(table_id, dml, cts).await?,
-            DDLRedo::CreateIndex { table_id, index_no } => {
-                self.replay_create_index_ddl(table_id, index_no, dml, cts)
+            DDLRedo::CreateIndex {
+                table_id,
+                index_slot,
+            } => {
+                self.replay_create_index_ddl(table_id, index_slot, dml, cts)
                     .await?
             }
-            DDLRedo::DropIndex { table_id, index_no } => {
-                self.replay_drop_index_ddl(table_id, index_no, dml, cts)
+            DDLRedo::DropIndex {
+                table_id,
+                index_slot,
+            } => {
+                self.replay_drop_index_ddl(table_id, index_slot, dml, cts)
                     .await?
             }
             DDLRedo::CreateRowPage {
@@ -791,7 +798,7 @@ impl<'a> RecoveryCoordinator<'a> {
     async fn replay_create_index_ddl(
         &mut self,
         table_id: TableID,
-        index_no: u16,
+        index_slot: IndexSlot,
         dml: BTreeMap<TableID, TableDML>,
         cts: TrxID,
     ) -> RuntimeResult<()> {
@@ -806,7 +813,7 @@ impl<'a> RecoveryCoordinator<'a> {
             return Ok(());
         }
         let proof = self
-            .classify_index_ddl_root(IndexDdlKind::Create, table_id, index_no, cts)
+            .classify_index_ddl_root(IndexDdlKind::Create, table_id, index_slot, cts)
             .change_context(RuntimeError::Recovery)?;
         match proof {
             IndexDdlRootProof::DurableFinalCreate | IndexDdlRootProof::DurableAllocationOnly => {
@@ -823,7 +830,7 @@ impl<'a> RecoveryCoordinator<'a> {
     async fn replay_drop_index_ddl(
         &mut self,
         table_id: TableID,
-        index_no: u16,
+        index_slot: IndexSlot,
         dml: BTreeMap<TableID, TableDML>,
         cts: TrxID,
     ) -> RuntimeResult<()> {
@@ -838,7 +845,7 @@ impl<'a> RecoveryCoordinator<'a> {
             return Ok(());
         }
         let proof = self
-            .classify_index_ddl_root(IndexDdlKind::Drop, table_id, index_no, cts)
+            .classify_index_ddl_root(IndexDdlKind::Drop, table_id, index_slot, cts)
             .change_context(RuntimeError::Recovery)?;
         match proof {
             IndexDdlRootProof::DurableFinalDrop => {
@@ -970,14 +977,19 @@ impl<'a> RecoveryCoordinator<'a> {
         &self,
         kind: IndexDdlKind,
         table_id: TableID,
-        index_no: u16,
+        index_slot: IndexSlot,
         cts: TrxID,
     ) -> DataIntegrityResult<IndexDdlRootProof> {
         let table = self.resources.catalog.get_table_now(table_id);
         let active_root = table
             .as_ref()
             .map(|table| table.file().active_root_unchecked());
-        classify_index_ddl_root(kind, table_id, index_no, cts, active_root)
+        let ddl = ReplayVisibleIndexDdl::from_replay_visible(
+            index_slot,
+            cts,
+            self.timeline.catalog_replay_start_ts,
+        );
+        classify_index_ddl_root(kind, table_id, ddl, active_root)
     }
 
     /// Replay DML log.
@@ -1081,7 +1093,7 @@ impl<'a> RecoveryCoordinator<'a> {
                     table
                         .delete_primary_key_no_trx(
                             &self.resources.pool_guards,
-                            key.index.as_usize(),
+                            key.index_slot,
                             &key.vals,
                             self.recovery_disable_dml_validation,
                         )
@@ -1091,7 +1103,7 @@ impl<'a> RecoveryCoordinator<'a> {
                     table
                         .update_primary_key_no_trx(
                             &self.resources.pool_guards,
-                            key.index.as_usize(),
+                            key.index_slot,
                             &key.vals,
                             cols,
                             self.recovery_disable_dml_validation,
@@ -1256,8 +1268,8 @@ mod tests {
     use crate::catalog::storage::tests::begin_catalog_test_trx;
     use crate::catalog::{
         ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexAttributes, IndexColumnObject,
-        IndexKey, IndexObject, IndexOrder, IndexSpec, TableMetadata, TableObject, TableSpec,
-        USER_TABLE_ID_START, catalog_key_from_active_ordinal,
+        IndexKeySpec, IndexObject, IndexOrder, IndexSlot, IndexSpec, TableMetadata, TableObject,
+        TableSpec, USER_TABLE_ID_START, catalog_key_from_active_ordinal,
     };
     use crate::component::EnginePools;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
@@ -1678,22 +1690,22 @@ mod tests {
     }
 
     fn base_unique_index_spec() -> IndexSpec {
-        IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)
+        IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK)
     }
 
     fn added_index_spec() -> IndexSpec {
-        IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty())
+        IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty())
     }
 
     fn created_index_metadata() -> Arc<TableMetadata> {
         Arc::new(
-            TableMetadata::try_new_with_next_index_no(
+            TableMetadata::try_new_with_next_index_slot(
                 index_ddl_columns(),
                 vec![
-                    ActiveIndexSpec::new(0, base_unique_index_spec()),
-                    ActiveIndexSpec::new(1, added_index_spec()),
+                    ActiveIndexSpec::new(IndexSlot::new(0), base_unique_index_spec()),
+                    ActiveIndexSpec::new(IndexSlot::new(1), added_index_spec()),
                 ],
-                2,
+                IndexSlot::new(2),
             )
             .unwrap(),
         )
@@ -1701,10 +1713,13 @@ mod tests {
 
     fn dropped_index_metadata() -> Arc<TableMetadata> {
         Arc::new(
-            TableMetadata::try_new_with_next_index_no(
+            TableMetadata::try_new_with_next_index_slot(
                 index_ddl_columns(),
-                vec![ActiveIndexSpec::new(0, base_unique_index_spec())],
-                2,
+                vec![ActiveIndexSpec::new(
+                    IndexSlot::new(0),
+                    base_unique_index_spec(),
+                )],
+                IndexSlot::new(2),
             )
             .unwrap(),
         )
@@ -1734,7 +1749,7 @@ mod tests {
                     trx.trx(),
                     &TableObject {
                         table_id,
-                        next_index_no: 2,
+                        next_index_slot: IndexSlot::new(2),
                     },
                 )
                 .await
@@ -1750,7 +1765,7 @@ mod tests {
                 trx.trx(),
                 &IndexObject {
                     table_id,
-                    index_no: 1,
+                    index_slot: IndexSlot::new(1),
                     index_attributes: IndexAttributes::empty(),
                 },
             )
@@ -1766,7 +1781,7 @@ mod tests {
                 trx.trx(),
                 &IndexColumnObject {
                     table_id,
-                    index_no: 1,
+                    index_slot: IndexSlot::new(1),
                     index_column_no: 0,
                     column_no: 1,
                     index_order: IndexOrder::Asc,
@@ -1777,7 +1792,7 @@ mod tests {
         let cts = trx
             .commit(DDLRedo::CreateIndex {
                 table_id,
-                index_no: 1,
+                index_slot: IndexSlot::new(1),
             })
             .await;
         drop(session);
@@ -1794,7 +1809,7 @@ mod tests {
                 .catalog()
                 .storage
                 .index_columns()
-                .delete_by_index(trx.trx(), table_id, 1)
+                .delete_by_index(trx.trx(), table_id, IndexSlot::new(1))
                 .await
                 .unwrap(),
             1
@@ -1806,14 +1821,14 @@ mod tests {
                 .catalog()
                 .storage
                 .indexes()
-                .delete_by_id(trx.trx(), table_id, 1)
+                .delete_by_id(trx.trx(), table_id, IndexSlot::new(1))
                 .await
                 .unwrap()
         );
         let cts = trx
             .commit(DDLRedo::DropIndex {
                 table_id,
-                index_no: 1,
+                index_slot: IndexSlot::new(1),
             })
             .await;
         drop(session);
@@ -1839,8 +1854,9 @@ mod tests {
             .secondary_index_roots
             .clone();
         roots.resize(metadata.idx.index_slot_count(), SUPER_BLOCK_ID);
-        for (index_no, root) in roots.iter_mut().enumerate() {
-            if metadata.idx.index_spec(index_no).is_none() {
+        for (index_slot, root) in roots.iter_mut().enumerate() {
+            let index_slot = IndexSlot::try_from(index_slot).unwrap();
+            if metadata.idx.index_spec(index_slot).is_none() {
                 *root = SUPER_BLOCK_ID;
             }
         }
@@ -1863,7 +1879,7 @@ mod tests {
     async fn assert_recovered_index_state(
         engine: &Engine,
         table_id: TableID,
-        next_index_no: u16,
+        next_index_slot: IndexSlot,
         index_one_active: bool,
     ) {
         let table = engine
@@ -1874,8 +1890,14 @@ mod tests {
             .await
             .unwrap();
         let metadata = table.metadata();
-        assert_eq!(metadata.idx.next_index_no(), next_index_no);
-        assert_eq!(metadata.idx.index_spec(1).is_some(), index_one_active);
+        assert_eq!(metadata.idx.next_index_slot(), next_index_slot);
+        assert_eq!(
+            metadata
+                .idx
+                .index_spec(crate::catalog::IndexSlot::new(1))
+                .is_some(),
+            index_one_active
+        );
 
         let session = engine.new_session().unwrap();
         let table_obj = engine
@@ -1888,7 +1910,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(table_obj.next_index_no, next_index_no);
+        assert_eq!(table_obj.next_index_slot, next_index_slot);
         let indexes = engine
             .inner()
             .core
@@ -1899,7 +1921,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            indexes.iter().any(|index| index.index_no == 1),
+            indexes
+                .iter()
+                .any(|index| index.index_slot == IndexSlot::new(1)),
             index_one_active
         );
         drop(session);
@@ -2227,7 +2251,7 @@ mod tests {
             ))
             .await
             .unwrap();
-            assert_recovered_index_state(&recovered, table_id, 1, false).await;
+            assert_recovered_index_state(&recovered, table_id, IndexSlot::new(1), false).await;
             drop(recovered);
         });
     }
@@ -2262,7 +2286,7 @@ mod tests {
             ))
             .await
             .unwrap();
-            assert_recovered_index_state(&recovered, table_id, 2, true).await;
+            assert_recovered_index_state(&recovered, table_id, IndexSlot::new(2), true).await;
             drop(recovered);
         });
     }
@@ -2300,7 +2324,7 @@ mod tests {
             ))
             .await
             .unwrap();
-            assert_recovered_index_state(&recovered, table_id, 2, false).await;
+            assert_recovered_index_state(&recovered, table_id, IndexSlot::new(2), false).await;
             drop(recovered);
         });
     }
@@ -2339,7 +2363,7 @@ mod tests {
             ))
             .await
             .unwrap();
-            assert_recovered_index_state(&recovered, table_id, 2, false).await;
+            assert_recovered_index_state(&recovered, table_id, IndexSlot::new(2), false).await;
             drop(recovered);
         });
     }
@@ -2375,7 +2399,7 @@ mod tests {
             ))
             .await
             .unwrap();
-            assert_recovered_index_state(&recovered, table_id, 2, true).await;
+            assert_recovered_index_state(&recovered, table_id, IndexSlot::new(2), true).await;
             drop(recovered);
         });
     }
@@ -2414,7 +2438,7 @@ mod tests {
             ))
             .await
             .unwrap();
-            assert_recovered_index_state(&recovered, table_id, 2, false).await;
+            assert_recovered_index_state(&recovered, table_id, IndexSlot::new(2), false).await;
             drop(recovered);
         });
     }
@@ -2456,7 +2480,7 @@ mod tests {
             ))
             .await
             .unwrap();
-            assert_recovered_index_state(&recovered, table_id, 1, false).await;
+            assert_recovered_index_state(&recovered, table_id, IndexSlot::new(1), false).await;
             drop(recovered);
         });
     }
@@ -2499,7 +2523,7 @@ mod tests {
             ))
             .await
             .unwrap();
-            assert_recovered_index_state(&recovered, table_id, 2, true).await;
+            assert_recovered_index_state(&recovered, table_id, IndexSlot::new(2), true).await;
             drop(recovered);
         });
     }
@@ -2711,14 +2735,14 @@ mod tests {
                 ColumnSpec::new("c2", ValKind::U32, ColumnAttributes::empty()),
             ]);
             let index_specs = vec![
-                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK),
+                IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK),
                 IndexSpec::new(
                     vec![
-                        IndexKey {
+                        IndexKeySpec {
                             col_no: 1,
                             order: IndexOrder::Desc,
                         },
-                        IndexKey::new(2),
+                        IndexKeySpec::new(2),
                     ],
                     IndexAttributes::empty(),
                 ),
@@ -2801,7 +2825,10 @@ mod tests {
             let table_id = session
                 .create_table(
                     table_spec,
-                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
+                    vec![IndexSpec::new(
+                        vec![IndexKeySpec::new(0)],
+                        IndexAttributes::UK,
+                    )],
                 )
                 .await
                 .unwrap();
@@ -2822,7 +2849,7 @@ mod tests {
             let s2: String = repeat_n('2', 100).collect();
             for i in (0..DML_SIZE).step_by(UPD_STEP) {
                 let mut trx = session.begin_trx().unwrap();
-                let key = SelectKey::new(0, vec![Val::from(i as u32)]);
+                let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(i as u32)]);
                 let uc = UpdateCol {
                     idx: 1,
                     val: Val::from(&s2[..]),
@@ -2834,7 +2861,7 @@ mod tests {
             // delete
             for i in (0..DML_SIZE).step_by(DEL_STEP) {
                 let mut trx = session.begin_trx().unwrap();
-                let key = SelectKey::new(0, vec![Val::from(i as u32)]);
+                let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(i as u32)]);
                 let res = trx_delete_row_by_id(&mut trx, table_id, &key).await;
                 assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
                 trx.commit().await.unwrap();
@@ -2917,7 +2944,10 @@ mod tests {
                         ValKind::U32,
                         ColumnAttributes::empty(),
                     )]),
-                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
+                    vec![IndexSpec::new(
+                        vec![IndexKeySpec::new(0)],
+                        IndexAttributes::UK,
+                    )],
                 )
                 .await
                 .unwrap();
@@ -3135,7 +3165,10 @@ mod tests {
                         ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
                         ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
                     ]),
-                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
+                    vec![IndexSpec::new(
+                        vec![IndexKeySpec::new(0)],
+                        IndexAttributes::UK,
+                    )],
                 )
                 .await
                 .unwrap();
@@ -3213,10 +3246,12 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             assert_eq!(session.total_row_pages(table.table_id()).await.unwrap(), 0);
 
-            let key = SelectKey::new(0, vec![Val::from(7u32)]);
+            let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(7u32)]);
             let layout = table.layout_snapshot();
-            let index = layout.secondary_index(key.index_no).unwrap();
-            let root = table.file().active_root_unchecked().secondary_index_roots[key.index_no];
+            let index_slot = key.index_slot;
+            let index = layout.secondary_index(index_slot).unwrap();
+            let root =
+                table.file().active_root_unchecked().secondary_index_roots[index_slot.as_usize()];
             {
                 let pool_guards = session.pool_guards();
                 let disk = index
@@ -3277,7 +3312,10 @@ mod tests {
                         ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
                         ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
                     ]),
-                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
+                    vec![IndexSpec::new(
+                        vec![IndexKeySpec::new(0)],
+                        IndexAttributes::UK,
+                    )],
                 )
                 .await
                 .unwrap();
@@ -3318,7 +3356,7 @@ mod tests {
             assert_checkpoint_published(&mut checkpoint_session, table.table_id()).await;
             assert!(table.file().active_root_unchecked().pivot_row_id > cold_row_id);
 
-            let key = SelectKey::new(0, vec![Val::from(7u32)]);
+            let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(7u32)]);
             let mut trx = session.begin_trx().unwrap();
             let delete = trx_delete_row_by_id(&mut trx, table.table_id(), &key).await;
             assert!(matches!(delete, Ok(DeleteMvcc::Deleted)));
@@ -3366,8 +3404,10 @@ mod tests {
             assert!(session.total_row_pages(table.table_id()).await.unwrap() > 0);
 
             let layout = table.layout_snapshot();
-            let index = layout.secondary_index(key.index_no).unwrap();
-            let root = table.file().active_root_unchecked().secondary_index_roots[key.index_no];
+            let index_slot = key.index_slot;
+            let index = layout.secondary_index(index_slot).unwrap();
+            let root =
+                table.file().active_root_unchecked().secondary_index_roots[index_slot.as_usize()];
             {
                 let pool_guards = session.pool_guards();
                 let disk = index
@@ -3424,8 +3464,8 @@ mod tests {
                         ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
                     ]),
                     vec![
-                        IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK),
-                        IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                        IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK),
+                        IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty()),
                     ],
                 )
                 .await
@@ -3475,7 +3515,7 @@ mod tests {
                     .all(|row_id| *row_id < table.file().active_root_unchecked().pivot_row_id)
             );
 
-            let delete_key = SelectKey::new(0, vec![Val::from(2u32)]);
+            let delete_key = SelectKey::new(IndexSlot::new(0), vec![Val::from(2u32)]);
             let mut trx = session.begin_trx().unwrap();
             let delete = trx_delete_row_by_id(&mut trx, table.table_id(), &delete_key).await;
             assert!(matches!(delete, Ok(DeleteMvcc::Deleted)));
@@ -3501,14 +3541,15 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             assert_eq!(session.total_row_pages(table.table_id()).await.unwrap(), 0);
 
-            let name_key = SelectKey::new(1, vec![Val::from("same-name")]);
+            let name_key = SelectKey::new(IndexSlot::new(1), vec![Val::from("same-name")]);
             let layout = table.layout_snapshot();
-            let non_unique = layout.secondary_index(name_key.index_no).unwrap();
+            let index_slot = name_key.index_slot;
+            let non_unique = layout.secondary_index(index_slot).unwrap();
             let range = non_unique
                 .key_encoder()
                 .encode_non_unique_equal_range(&name_key.vals);
             let root =
-                table.file().active_root_unchecked().secondary_index_roots[name_key.index_no];
+                table.file().active_root_unchecked().secondary_index_roots[index_slot.as_usize()];
             let disk_rows = {
                 let pool_guards = session.pool_guards();
                 let disk = non_unique
@@ -3532,8 +3573,7 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let rows = trx
                 .table_index_lookup_mvcc(
-                    table.table_id(),
-                    name_key.index_no,
+                    crate::TableIndex(table.table_id(), name_key.index_slot.transitional_id()),
                     &name_key.vals,
                     &[0, 1],
                 )
@@ -3578,8 +3618,8 @@ mod tests {
                         ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
                     ]),
                     vec![
-                        IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK),
-                        IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                        IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK),
+                        IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty()),
                     ],
                 )
                 .await
@@ -3663,14 +3703,22 @@ mod tests {
                 ]
             );
             let cold_rows = trx
-                .table_index_lookup_mvcc(table_id, 1, &[Val::from("cold")], &[0])
+                .table_index_lookup_mvcc(
+                    crate::TableIndex(table_id, crate::IndexID::new(1)),
+                    &[Val::from("cold")],
+                    &[0],
+                )
                 .await
                 .unwrap()
                 .unwrap_rows();
             assert_eq!(cold_rows, vec![vec![Val::from(2u32)]]);
             for deleted_id in [0u32, 10] {
                 let deleted = trx
-                    .table_lookup_unique_mvcc(table_id, 0, &[Val::from(deleted_id)], &[0])
+                    .table_lookup_unique_mvcc(
+                        crate::TableIndex(table_id, crate::IndexID::new(0)),
+                        &[Val::from(deleted_id)],
+                        &[0],
+                    )
                     .await
                     .unwrap();
                 assert_eq!(deleted, SelectMvcc::NotFound);
@@ -3707,7 +3755,10 @@ mod tests {
                         ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
                         ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
                     ]),
-                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
+                    vec![IndexSpec::new(
+                        vec![IndexKeySpec::new(0)],
+                        IndexAttributes::UK,
+                    )],
                 )
                 .await
                 .unwrap();
@@ -3796,7 +3847,7 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
 
-            let cold_key = SelectKey::new(0, vec![Val::from(7u32)]);
+            let cold_key = SelectKey::new(IndexSlot::new(0), vec![Val::from(7u32)]);
             let cold_row =
                 trx_select_row_mvcc_by_id(&mut trx, table.table_id(), &cold_key, &[0, 1]).await;
             assert_eq!(
@@ -3804,7 +3855,7 @@ mod tests {
                 vec![Val::from(7u32), Val::from("cold-row")]
             );
 
-            let hot_key = SelectKey::new(0, vec![Val::from(8u32)]);
+            let hot_key = SelectKey::new(IndexSlot::new(0), vec![Val::from(8u32)]);
             let hot_row =
                 trx_select_row_mvcc_by_id(&mut trx, table.table_id(), &hot_key, &[0, 1]).await;
             assert_eq!(
@@ -3840,7 +3891,10 @@ mod tests {
                         ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
                         ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
                     ]),
-                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
+                    vec![IndexSpec::new(
+                        vec![IndexKeySpec::new(0)],
+                        IndexAttributes::UK,
+                    )],
                 )
                 .await
                 .unwrap();
@@ -3886,7 +3940,7 @@ mod tests {
             let delete = trx_delete_row_by_id(
                 &mut delete_trx,
                 table.table_id(),
-                &SelectKey::new(0, vec![Val::from(0u32)]),
+                &SelectKey::new(IndexSlot::new(0), vec![Val::from(0u32)]),
             )
             .await;
             assert!(matches!(delete, Ok(DeleteMvcc::Deleted)));
@@ -3942,7 +3996,7 @@ mod tests {
             let deleted_row = trx_select_row_mvcc_by_id(
                 &mut trx,
                 table.table_id(),
-                &SelectKey::new(0, vec![Val::from(0u32)]),
+                &SelectKey::new(IndexSlot::new(0), vec![Val::from(0u32)]),
                 &[0, 1],
             )
             .await;
@@ -3950,7 +4004,7 @@ mod tests {
             let cold_row = trx_select_row_mvcc_by_id(
                 &mut trx,
                 table.table_id(),
-                &SelectKey::new(0, vec![Val::from(1u32)]),
+                &SelectKey::new(IndexSlot::new(0), vec![Val::from(1u32)]),
                 &[0, 1],
             )
             .await;
@@ -3961,7 +4015,7 @@ mod tests {
             let hot_row = trx_select_row_mvcc_by_id(
                 &mut trx,
                 table.table_id(),
-                &SelectKey::new(0, vec![Val::from(199u32)]),
+                &SelectKey::new(IndexSlot::new(0), vec![Val::from(199u32)]),
                 &[0, 1],
             )
             .await;
@@ -4003,7 +4057,10 @@ mod tests {
                         ValKind::U32,
                         ColumnAttributes::empty(),
                     )]),
-                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
+                    vec![IndexSpec::new(
+                        vec![IndexKeySpec::new(0)],
+                        IndexAttributes::UK,
+                    )],
                 )
                 .await
                 .unwrap();
@@ -4041,7 +4098,7 @@ mod tests {
             assert_checkpoint_published(&mut checkpoint_session, table.table_id()).await;
 
             let mut trx = session.begin_trx().unwrap();
-            let key0 = SelectKey::new(0, vec![Val::from(0u32)]);
+            let key0 = SelectKey::new(IndexSlot::new(0), vec![Val::from(0u32)]);
             let delete = trx_delete_row_by_id(&mut trx, table.table_id(), &key0).await;
             assert!(matches!(delete, Ok(DeleteMvcc::Deleted)));
             trx.commit().await.unwrap();
@@ -4056,7 +4113,7 @@ mod tests {
             assert!(checkpointed_cutoff > marker0_ts);
 
             let mut trx = session.begin_trx().unwrap();
-            let key1 = SelectKey::new(0, vec![Val::from(1u32)]);
+            let key1 = SelectKey::new(IndexSlot::new(0), vec![Val::from(1u32)]);
             let delete = trx_delete_row_by_id(&mut trx, table.table_id(), &key1).await;
             assert!(matches!(delete, Ok(DeleteMvcc::Deleted)));
             trx.commit().await.unwrap();
@@ -4114,7 +4171,7 @@ mod tests {
             let row0 = trx_select_row_mvcc_by_id(
                 &mut trx,
                 table.table_id(),
-                &SelectKey::new(0, vec![Val::from(0u32)]),
+                &SelectKey::new(IndexSlot::new(0), vec![Val::from(0u32)]),
                 &[0],
             )
             .await;
@@ -4123,7 +4180,7 @@ mod tests {
             let row1 = trx_select_row_mvcc_by_id(
                 &mut trx,
                 table.table_id(),
-                &SelectKey::new(0, vec![Val::from(1u32)]),
+                &SelectKey::new(IndexSlot::new(0), vec![Val::from(1u32)]),
                 &[0],
             )
             .await;
@@ -4132,7 +4189,7 @@ mod tests {
             let row100 = trx_select_row_mvcc_by_id(
                 &mut trx,
                 table.table_id(),
-                &SelectKey::new(0, vec![Val::from(100u32)]),
+                &SelectKey::new(IndexSlot::new(0), vec![Val::from(100u32)]),
                 &[0],
             )
             .await;
@@ -4170,7 +4227,10 @@ mod tests {
                         ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
                         ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
                     ]),
-                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
+                    vec![IndexSpec::new(
+                        vec![IndexKeySpec::new(0)],
+                        IndexAttributes::UK,
+                    )],
                 )
                 .await
                 .unwrap();
@@ -4180,7 +4240,10 @@ mod tests {
                         ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
                         ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
                     ]),
-                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
+                    vec![IndexSpec::new(
+                        vec![IndexKeySpec::new(0)],
+                        IndexAttributes::UK,
+                    )],
                 )
                 .await
                 .unwrap();
@@ -4334,7 +4397,7 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
 
-            let checkpointed_key = SelectKey::new(0, vec![Val::from(7u32)]);
+            let checkpointed_key = SelectKey::new(IndexSlot::new(0), vec![Val::from(7u32)]);
             let checkpointed_row = trx_select_row_mvcc_by_id(
                 &mut trx,
                 checkpointed_table.table_id(),
@@ -4347,7 +4410,7 @@ mod tests {
                 vec![Val::from(7u32), Val::from("persisted-row")]
             );
 
-            let replay_only_key = SelectKey::new(0, vec![Val::from(8u32)]);
+            let replay_only_key = SelectKey::new(IndexSlot::new(0), vec![Val::from(8u32)]);
             let replay_only_row = trx_select_row_mvcc_by_id(
                 &mut trx,
                 replay_only_table.table_id(),
@@ -4394,7 +4457,10 @@ mod tests {
                         ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
                         ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
                     ]),
-                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
+                    vec![IndexSpec::new(
+                        vec![IndexKeySpec::new(0)],
+                        IndexAttributes::UK,
+                    )],
                 )
                 .await
                 .unwrap();
@@ -4483,7 +4549,7 @@ mod tests {
                 .unwrap();
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
-            let key = SelectKey::new(0, vec![Val::from(7u32)]);
+            let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(7u32)]);
             let res = trx_select_row_mvcc_by_id(&mut trx, table.table_id(), &key, &[0, 1]).await;
             let err = match res {
                 Err(err) => err,
@@ -4529,7 +4595,10 @@ mod tests {
                         ValKind::U32,
                         ColumnAttributes::empty(),
                     )]),
-                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
+                    vec![IndexSpec::new(
+                        vec![IndexKeySpec::new(0)],
+                        IndexAttributes::UK,
+                    )],
                 )
                 .await
                 .unwrap();
@@ -4568,7 +4637,7 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             for i in 0..64u32 {
-                let key = SelectKey::new(0, vec![Val::from(i)]);
+                let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(i)]);
                 let delete = trx_delete_row_by_id(&mut trx, table.table_id(), &key).await;
                 assert!(matches!(delete, Ok(DeleteMvcc::Deleted)));
             }

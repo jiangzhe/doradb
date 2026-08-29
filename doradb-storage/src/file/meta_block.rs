@@ -1,6 +1,6 @@
 use crate::bitmap::AllocMap;
-use crate::catalog::USER_TABLE_ID_LIMIT;
 use crate::catalog::table::{TableBriefMetadata, TableBriefMetadataSerView, TableMetadata};
+use crate::catalog::{IndexSlot, USER_TABLE_ID_LIMIT};
 use crate::error::{DataIntegrityError, DataIntegrityResult};
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::file::multi_table_file::{
@@ -42,7 +42,7 @@ pub(crate) struct MetaBlock {
     pub(crate) schema: TableMetadata,
     /// Root block id of column block index.
     pub(crate) column_block_index_root: BlockID,
-    /// Root block ids of secondary DiskTrees, ordered by index number.
+    /// Root block ids of secondary DiskTrees, ordered by index slot.
     pub(crate) secondary_index_roots: Vec<BlockID>,
     /// Page allocation bitmap.
     pub(crate) alloc_map: AllocMap,
@@ -54,7 +54,7 @@ impl Deser for MetaBlock {
             + mem::size_of::<TrxID>() * 2
             + mem::size_of::<u64>() * 3 // AllocMap fixed prefix
             + mem::size_of::<u64>() * 4 // TableBriefMetadata vector prefixes
-            + mem::size_of::<u16>() // TableBriefMetadata next_index_no
+            + mem::size_of::<u16>() // TableBriefMetadata next_index_slot
             + mem::size_of::<u64>() // column_block_index_root
             + mem::size_of::<u64>(), // secondary_index_roots vector prefix
     );
@@ -71,10 +71,10 @@ impl Deser for MetaBlock {
         let (idx, secondary_index_roots) = <Vec<BlockID>>::deser(input, idx)?;
         validate_secondary_index_roots(
             &secondary_index_roots,
-            meta.next_index_no,
+            meta.next_index_slot,
             meta.index_specs
                 .iter()
-                .map(|active_index_spec| active_index_spec.index_no as usize),
+                .map(|active_index_spec| active_index_spec.index_slot),
         )?;
         // Table metadata is serialized only from a validated `TableMetadata`.
         // The surrounding format/version/checksum validation establishes that
@@ -132,17 +132,17 @@ impl<'a> MetaBlockSerView<'a> {
     ) -> Self {
         let validation = validate_secondary_index_roots(
             secondary_index_roots,
-            schema.next_index_no,
+            schema.next_index_slot,
             schema
                 .index_specs
                 .active_indexes()
-                .map(|(index_no, _)| index_no),
+                .map(|(index_slot, _)| index_slot),
         );
         assert!(
             validation.is_ok(),
-            "trusted table meta-block root layout must match active index metadata: secondary_root_count={}, next_index_no={}",
+            "trusted table meta-block root layout must match active index metadata: secondary_root_count={}, next_index_slot={}",
             secondary_index_roots.len(),
-            schema.next_index_no
+            schema.next_index_slot
         );
         MetaBlockSerView {
             pivot_row_id,
@@ -329,34 +329,34 @@ fn validate_alloc_map(alloc_map: &AllocMap) -> DataIntegrityResult<()> {
 #[inline]
 fn validate_secondary_index_roots(
     secondary_index_roots: &[BlockID],
-    next_index_no: u16,
-    active_index_nos: impl IntoIterator<Item = usize>,
+    next_index_slot: IndexSlot,
+    active_index_slots: impl IntoIterator<Item = IndexSlot>,
 ) -> DataIntegrityResult<()> {
-    let index_slot_count = next_index_no as usize;
+    let index_slot_count = next_index_slot.as_usize();
     if secondary_index_roots.len() != index_slot_count {
         return Err(
             Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-                "secondary index root count {} does not match next_index_no {}",
+                "secondary index root count {} does not match next_index_slot {}",
                 secondary_index_roots.len(),
-                next_index_no
+                next_index_slot
             )),
         );
     }
 
     let mut active_slots = vec![false; index_slot_count];
-    for index_no in active_index_nos {
-        if let Some(active_slot) = active_slots.get_mut(index_no) {
+    for index_slot in active_index_slots {
+        if let Some(active_slot) = active_slots.get_mut(index_slot.as_usize()) {
             *active_slot = true;
         }
     }
-    for (index_no, (&root, active)) in secondary_index_roots
+    for (index_slot, (&root, active)) in secondary_index_roots
         .iter()
         .zip(active_slots.iter())
         .enumerate()
     {
         if !active && root != SUPER_BLOCK_ID {
             return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-                "inactive secondary index slot {index_no} has root {root}, expected SUPER_BLOCK_ID {SUPER_BLOCK_ID}"
+                "inactive secondary index slot {index_slot} has root {root}, expected SUPER_BLOCK_ID {SUPER_BLOCK_ID}"
             )));
         }
     }
@@ -367,7 +367,7 @@ fn validate_secondary_index_roots(
 mod tests {
     use super::*;
     use crate::catalog::{
-        ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec,
+        ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexSpec,
         USER_TABLE_ID_START, catalog_table_id_from_slot,
     };
     use crate::file::multi_table_file::CATALOG_TABLE_ROOT_DESC_COUNT;
@@ -377,7 +377,7 @@ mod tests {
 
     fn sparse_secondary_root_metadata() -> Arc<TableMetadata> {
         Arc::new(
-            TableMetadata::try_new_with_next_index_no(
+            TableMetadata::try_new_with_next_index_slot(
                 vec![
                     ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
                     ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::empty()),
@@ -385,15 +385,15 @@ mod tests {
                 ],
                 vec![
                     ActiveIndexSpec::new(
-                        0,
-                        IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                        IndexSlot::new(0),
+                        IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::PK),
                     ),
                     ActiveIndexSpec::new(
-                        2,
-                        IndexSpec::new(vec![IndexKey::new(2)], IndexAttributes::empty()),
+                        IndexSlot::new(2),
+                        IndexSpec::new(vec![IndexKeySpec::new(2)], IndexAttributes::empty()),
                     ),
                 ],
-                3,
+                IndexSlot::new(3),
             )
             .unwrap(),
         )
@@ -431,7 +431,10 @@ mod tests {
                     ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
                     ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
                 ],
-                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+                vec![IndexSpec::new(
+                    vec![IndexKeySpec::new(0)],
+                    IndexAttributes::PK,
+                )],
             )
             .expect("valid table metadata"),
         );
@@ -499,8 +502,8 @@ mod tests {
                     ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
                 ],
                 vec![
-                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
-                    IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                    IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::PK),
+                    IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty()),
                 ],
             )
             .expect("valid table metadata"),
@@ -533,8 +536,14 @@ mod tests {
         assert_eq!(res_idx, ser_len);
 
         let (_, meta_block) = MetaBlock::deser(&data[..], 0).unwrap();
-        assert_eq!(meta_block.schema.idx.next_index_no(), 3);
-        assert!(meta_block.schema.idx.index_spec(1).is_none());
+        assert_eq!(meta_block.schema.idx.next_index_slot(), IndexSlot::new(3));
+        assert!(
+            meta_block
+                .schema
+                .idx
+                .index_spec(crate::catalog::IndexSlot::new(1))
+                .is_none()
+        );
         assert_eq!(
             meta_block.secondary_index_roots,
             active_root.secondary_index_roots
@@ -561,7 +570,10 @@ mod tests {
                     ValKind::U32,
                     ColumnAttributes::empty(),
                 )],
-                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+                vec![IndexSpec::new(
+                    vec![IndexKeySpec::new(0)],
+                    IndexAttributes::PK,
+                )],
             )
             .expect("valid table metadata"),
         );
