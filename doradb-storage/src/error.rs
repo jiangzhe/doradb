@@ -308,6 +308,12 @@ pub enum OperationError {
     /// Catalog metadata is invalid for the requested operation.
     #[error("invalid metadata")]
     InvalidMetadata,
+    /// The complete stable column-identity domain has been allocated.
+    #[error("column id exhausted")]
+    ColumnIdExhausted,
+    /// The complete stable index-identity domain has been allocated.
+    #[error("index id exhausted")]
+    IndexIdExhausted,
     /// A lock upgrade would have to wait.
     #[error("lock upgrade would block")]
     LockUpgradeWouldBlock,

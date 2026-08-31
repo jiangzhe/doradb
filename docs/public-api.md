@@ -151,48 +151,51 @@ indexes:
 
 ```rust,ignore
 use doradb_storage::{
-    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexSpec,
-    TableSpec, ValKind,
+    ColumnOrdinal, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags,
+    StorageIndexKey, StorageIndexSpec, StorageTableSpec, ValKind,
 };
 
-let table_spec = TableSpec::new(vec![
-    ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
-    ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::NULLABLE),
+let table_spec = StorageTableSpec::new(vec![
+    StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+    StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::NULLABLE),
 ]);
 
 let index_specs = vec![
-    IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK),
-    IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty()),
+    StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::UK),
+    StorageIndexSpec::new(vec![StorageIndexKey::new(1)], StorageIndexFlags::empty()),
 ];
 
-let table_id = session.create_table(table_spec, index_specs).await?;
+let created = session.create_table(table_spec, index_specs).await?;
+let table_id = created.table_id();
+let id_index_id = created.index_ids()[0];
+let name_index_id = created.index_ids()[1];
 ```
 
-Column numbers are zero-based and follow `TableSpec::columns`. The caller
-controls nullability with `ColumnAttributes::NULLABLE`; index membership is
-declared with `IndexSpec`, not by setting `ColumnAttributes::INDEX`.
+Column ordinals are zero-based and follow `StorageTableSpec::columns`. The
+caller controls nullability with `StorageColumnFlags::NULLABLE`; index
+membership is declared with `StorageIndexSpec`.
 
-An `IndexSpec` contains one or more `IndexKeySpec` values in logical key order.
-`IndexKeySpec::new(column_no)` creates an ascending key. Construct the public
-fields directly to request `IndexOrder::Desc`:
+A `StorageIndexSpec` contains one or more `StorageIndexKey` values in logical
+key order. `StorageIndexKey::new(column_ordinal)` creates an ascending key.
+Construct the public fields directly to request `IndexOrder::Desc`:
 
 ```rust,ignore
-let descending_name = IndexKeySpec {
-    col_no: 1,
+let descending_name = StorageIndexKey {
+    column_ordinal: ColumnOrdinal::new(1),
     order: IndexOrder::Desc,
 };
 ```
 
-`IndexAttributes::UK` creates a unique index; empty attributes create a
-non-unique index. `IndexAttributes::PK` exists in catalog metadata, but public
-user-table `create_table` and `create_index` currently reject primary-key
-specifications. Use `UK` when a public user table needs uniqueness.
+`StorageIndexFlags::UK` creates a unique index; empty flags create a non-unique
+index. `StorageIndexFlags::PK` exists for catalog metadata, but public user-table
+`create_table` and `create_index` reject primary-key specifications. Use `UK`
+when a public user table needs uniqueness.
 
-Initial index identities are allocated from zero in the order supplied to
-`create_table`. `Session::create_index` returns a stable table-local `IndexID`.
+`CreateTableOutcome::index_ids` returns finalized initial identities in the
+same order as the supplied index definitions. `Session::create_index` returns a
+stable table-local `IndexID`.
 Index-driven transaction methods accept `TableIndex(table_id, index_id)`, and
-`IndexID::new` is used only when an initial identity is known from table
-construction. Dropping an index does not renumber the remaining indexes.
+Dropping an index does not renumber the remaining indexes.
 The sealed `TableIndexArgument::into_selector` conversion normalizes a
 `TableIndex` or `ResolvedTableIndex` into an opaque `TableIndexSelector`; its
 public accessors expose only the stable table and index identities.
@@ -475,7 +478,7 @@ and returns `ScanMvcc::Rows`, because one key may select multiple rows. Use
 
 `table_index_scan_mvcc` materializes all visible projections in a logical key
 range. Bounds contain a complete index key in the same order as the
-`IndexSpec`; partial-prefix bounds are not accepted.
+`StorageIndexSpec`; partial-prefix bounds are not accepted.
 
 ```rust,ignore
 let lower = [Val::from("a")];
@@ -795,7 +798,7 @@ Most application-facing types are re-exported from the crate root:
 | --- | --- |
 | Lifecycle | `Engine`, `Session`, `Transaction`, `ReadSnapshotBuilder`, `ReadSnapshot`, `IndexScanMvccStream`, `TableScanMvccStream`, `TableScanPartitionStream` |
 | Configuration | `EngineConfig`, `TableScanConfig`, `TrxSysConfig`, `MandatoryRuntimeConfig`, `FileSystemConfig`, `EvictableBufferPoolConfig`, `LogSync`, `DEFAULT_COW_FILE_MAX_SIZE` |
-| Schema | `TableSpec`, `ColumnSpec`, `ColumnAttributes`, `IndexSpec`, `IndexKeySpec`, `IndexOrder`, `IndexAttributes`, `IndexID`, `TableIndex`, `ResolvedTableIndex`, `TableIndexSelector`, `TableIndexArgument` |
+| Schema | `StorageTableSpec`, `StorageColumnSpec`, `StorageColumnFlags`, `StorageIndexSpec`, `StorageIndexKey`, `ColumnID`, `ColumnOrdinal`, `IndexOrder`, `StorageIndexFlags`, `CreateTableOutcome`, `IndexID`, `TableIndex`, `ResolvedTableIndex`, `TableIndexSelector`, `TableIndexArgument` |
 | Values | `Val`, `ValKind`, `ValType`, `MemVar` |
 | Reads | `SelectMvcc`, `ScanMvcc`, `LazyRow`, `ScanRowDecision`, `TableScanOptions`, `TableScanPlan` |
 | Writes | `UpdateCol`, `UpdateMvcc`, `UpsertMvcc`, `DeleteMvcc`, `RowMutation`, `TableMutationOutcome` |

@@ -876,7 +876,8 @@ mod tests {
     use super::*;
     use crate::catalog::table::TableMetadata;
     use crate::catalog::{
-        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexSpec, USER_TABLE_ID_START,
+        StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
+        StorageIndexSpec, USER_TABLE_ID_START,
     };
     use crate::compression::BitPackable;
     use crate::error::{DiscloseResultExt, MultiDomainResultExt, RuntimeError};
@@ -906,14 +907,13 @@ mod tests {
     fn build_test_metadata() -> Arc<TableMetadata> {
         Arc::new(
             TableMetadata::try_new(
-                vec![ColumnSpec::new(
-                    "c0",
+                vec![StorageColumnSpec::new(
                     ValKind::U32,
-                    ColumnAttributes::empty(),
+                    StorageColumnFlags::empty(),
                 )],
-                vec![IndexSpec::new(
-                    vec![IndexKeySpec::new(0)],
-                    IndexAttributes::PK,
+                vec![StorageIndexSpec::new(
+                    vec![StorageIndexKey::new(0)],
+                    StorageIndexFlags::PK,
                 )],
             )
             .expect("valid table metadata"),

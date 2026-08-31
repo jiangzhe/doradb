@@ -12,7 +12,7 @@
 
 use super::index_stream::{NonUniqueDiskTreeCandidateStream, UniqueDiskTreeCandidateStream};
 use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
-use crate::catalog::{IndexSpec, TableMetadata};
+use crate::catalog::{TableIndexMetadata, TableMetadata};
 use crate::error::{
     DataIntegrityError, DataIntegrityResult, MultiDomainResultExt, RuntimeError,
     RuntimeOrFatalResult, RuntimeResult,
@@ -538,16 +538,17 @@ impl<F: DiskTreeSpec> DiskTreeRuntime<F> {
         }
     }
 
-    /// Open a typed view over one root snapshot.
-    ///
-    /// `SUPER_BLOCK_ID` is accepted here and interpreted by read/write paths as
-    /// the empty tree sentinel.
+    /// Open a typed view over one optional root snapshot.
     #[inline]
     pub(crate) fn open<'a>(
         &'a self,
-        root_block_id: BlockID,
+        root_block_id: Option<BlockID>,
         disk_pool_guard: &'a PoolGuard,
     ) -> DiskTree<'a, F> {
+        assert!(
+            root_block_id.is_none_or(|block_id| block_id != SUPER_BLOCK_ID),
+            "present DiskTree root is the table-file super block"
+        );
         DiskTree::from_root_snapshot(root_block_id, self, disk_pool_guard)
     }
 
@@ -571,7 +572,7 @@ impl UniqueDiskTreeRuntime {
     /// Create a reusable unique DiskTree runtime for one index shape.
     #[inline]
     pub(crate) fn new(
-        index_spec: &IndexSpec,
+        index_spec: &TableIndexMetadata,
         metadata: &TableMetadata,
         file_kind: FileKind,
         file: Arc<SparseFile>,
@@ -595,7 +596,7 @@ impl NonUniqueDiskTreeRuntime {
     /// Create a reusable non-unique DiskTree runtime for one index shape.
     #[inline]
     pub(crate) fn new(
-        index_spec: &IndexSpec,
+        index_spec: &TableIndexMetadata,
         metadata: &TableMetadata,
         file_kind: FileKind,
         file: Arc<SparseFile>,
@@ -618,7 +619,7 @@ impl NonUniqueDiskTreeRuntime {
 /// replacement CoW blocks through a mutable table-file fork and return a new root
 /// block id for the caller to publish later.
 pub(crate) struct DiskTree<'a, F: DiskTreeSpec> {
-    root_block_id: BlockID,
+    root_block_id: Option<BlockID>,
     runtime: &'a DiskTreeRuntime<F>,
     disk_pool_guard: &'a PoolGuard,
 }
@@ -626,7 +627,7 @@ pub(crate) struct DiskTree<'a, F: DiskTreeSpec> {
 impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
     #[inline]
     fn from_root_snapshot(
-        root_block_id: BlockID,
+        root_block_id: Option<BlockID>,
         runtime: &'a DiskTreeRuntime<F>,
         disk_pool_guard: &'a PoolGuard,
     ) -> Self {
@@ -703,10 +704,9 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
     /// Branch traversal follows child block ids until a leaf is reached. Empty
     /// roots and leaf misses return `Ok(None)`.
     async fn lookup_encoded_entry(&self, key: &[u8]) -> RuntimeResult<Option<LogicalEntry>> {
-        if self.root_block_id == SUPER_BLOCK_ID {
+        let Some(mut block_id) = self.root_block_id else {
             return Ok(None);
-        }
-        let mut block_id = self.root_block_id;
+        };
         loop {
             let guard = self.read_node(block_id).await?;
             let node = guard.node();
@@ -728,10 +728,10 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         &self,
         out: &mut BTreeSet<BlockID>,
     ) -> RuntimeResult<()> {
-        if self.root_block_id == SUPER_BLOCK_ID {
+        let Some(root_block_id) = self.root_block_id else {
             return Ok(());
-        }
-        let mut stack = vec![self.root_block_id];
+        };
+        let mut stack = vec![root_block_id];
         while let Some(block_id) = stack.pop() {
             out.insert(block_id);
             let guard = self.read_node(block_id).await?;
@@ -746,7 +746,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                     if child_block_id == SUPER_BLOCK_ID {
                         return Err(Report::new(DataIntegrityError::InvalidPayload)
                             .attach(format!(
-                                "file={}, block=secondary_disk_tree, block_id={block_id}, branch child points to empty-root sentinel",
+                                "file={}, block=secondary_disk_tree, block_id={block_id}, branch child points to the table-file super block",
                                 self.file_kind()
                             ))
                             .change_context(RuntimeError::IndexAccess)
@@ -758,7 +758,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                 if child_block_id == SUPER_BLOCK_ID {
                     return Err(Report::new(DataIntegrityError::InvalidPayload)
                         .attach(format!(
-                            "file={}, block=secondary_disk_tree, block_id={block_id}, lower-fence child points to empty-root sentinel",
+                            "file={}, block=secondary_disk_tree, block_id={block_id}, lower-fence child points to the table-file super block",
                             self.file_kind()
                         ))
                         .change_context(RuntimeError::IndexAccess)
@@ -771,7 +771,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                     if child_block_id == SUPER_BLOCK_ID {
                         return Err(Report::new(DataIntegrityError::InvalidPayload)
                             .attach(format!(
-                                "file={}, block=secondary_disk_tree, block_id={block_id}, branch child points to empty-root sentinel",
+                                "file={}, block=secondary_disk_tree, block_id={block_id}, branch child points to the table-file super block",
                                 self.file_kind()
                             ))
                             .change_context(RuntimeError::IndexAccess)
@@ -783,7 +783,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                 if child_block_id == SUPER_BLOCK_ID {
                     return Err(Report::new(DataIntegrityError::InvalidPayload)
                         .attach(format!(
-                            "file={}, block=secondary_disk_tree, block_id={block_id}, lower-fence child points to empty-root sentinel",
+                            "file={}, block=secondary_disk_tree, block_id={block_id}, lower-fence child points to the table-file super block",
                             self.file_kind()
                         ))
                         .change_context(RuntimeError::IndexAccess)
@@ -804,29 +804,23 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         mutable_file: &'b mut M,
         operations: &'b [DiskTreeOperation],
         create_ts: TrxID,
-    ) -> Pin<Box<dyn Future<Output = RuntimeOrFatalResult<BlockID>> + Send + 'b>> {
+    ) -> Pin<Box<dyn Future<Output = RuntimeOrFatalResult<Option<BlockID>>> + Send + 'b>> {
         Box::pin(async move {
             if operations.is_empty() {
                 // An empty companion batch should preserve the exact root block.
                 // This avoids producing a new tree image for checkpoint no-ops.
                 return Ok(self.root_block_id);
             }
-            if self.root_block_id == SUPER_BLOCK_ID {
+            let Some(root_block_id) = self.root_block_id else {
                 // Empty roots have no block to rewrite. Apply the batch against
                 // an empty logical set and build the resulting tree from scratch.
                 let entries = F::apply_operations(&[], operations);
                 return self
                     .build_tree_from_entries(mutable_file, &entries, create_ts)
                     .await;
-            }
+            };
             let res = self
-                .rewrite_subtree(
-                    mutable_file,
-                    self.root_block_id,
-                    operations,
-                    create_ts,
-                    None,
-                )
+                .rewrite_subtree(mutable_file, root_block_id, operations, create_ts, None)
                 .await?;
             // Finalization decides whether the rewritten result is empty, can
             // promote a single child, or needs new branch levels above it.
@@ -962,26 +956,26 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         mutable_file: &mut M,
         entries: &[LogicalEntry],
         create_ts: TrxID,
-    ) -> RuntimeOrFatalResult<BlockID> {
+    ) -> RuntimeOrFatalResult<Option<BlockID>> {
         let leaf_entries = self.pack_leaf_rewrite_entries(entries, None)?;
         self.finalize_root_rewrite(mutable_file, leaf_entries, create_ts)
             .await
     }
 
-    /// Convert rewritten child entries into the final root block id.
+    /// Convert rewritten child entries into the final optional root block id.
     ///
-    /// Empty entries become `SUPER_BLOCK_ID`, a single child is promoted as the
-    /// root, and larger sets are wrapped in new branch levels.
+    /// Empty entries become `None`, a single child is promoted as the root, and
+    /// larger sets are wrapped in new branch levels.
     async fn finalize_root_rewrite<M: MutableCowFile>(
         &self,
         mutable_file: &mut M,
         entries: Vec<RewriteEntry>,
         create_ts: TrxID,
-    ) -> RuntimeOrFatalResult<BlockID> {
+    ) -> RuntimeOrFatalResult<Option<BlockID>> {
         if entries.is_empty() {
-            // A rewrite that removes every logical entry returns the empty-root
-            // sentinel instead of writing an empty node block.
-            return Ok(SUPER_BLOCK_ID);
+            // A rewrite that removes every logical entry returns no root instead
+            // of writing an empty node block.
+            return Ok(None);
         }
         // Multiple children need branch levels above them; a single child is
         // already a root candidate. In both cases, root-only single-child branch
@@ -989,6 +983,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         let root_entry = self.build_branch_levels(entries)?;
         self.collapse_root_chain(mutable_file, root_entry, create_ts)
             .await
+            .map(Some)
     }
 
     /// Build branch levels until the tree has a single root block.
@@ -1507,7 +1502,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
             .map(|entry| {
                 assert_ne!(
                     entry.block_id, SUPER_BLOCK_ID,
-                    "DiskTree rewrite invariant violated: branch child is empty-root sentinel"
+                    "DiskTree rewrite invariant violated: branch child is the table-file super block"
                 );
                 PackedNodeEntry {
                     key: entry.key.as_slice(),
@@ -1572,16 +1567,16 @@ pub(crate) struct DiskTreeLeaf<F: DiskTreeSpec> {
 
 /// Resumable root-snapshot cursor state over persisted DiskTree leaf nodes.
 pub(crate) struct DiskTreeNodeCursorState {
-    root_block_id: BlockID,
+    root_block_id: Option<BlockID>,
     stack: Vec<BlockID>,
     seek_key: Vec<u8>,
     seek_pending: bool,
 }
 
 impl DiskTreeNodeCursorState {
-    /// Create cursor state rooted at the given DiskTree root block.
+    /// Create cursor state rooted at the given optional DiskTree root block.
     #[inline]
-    pub(crate) fn new(root_block_id: BlockID) -> Self {
+    pub(crate) fn new(root_block_id: Option<BlockID>) -> Self {
         Self {
             root_block_id,
             stack: Vec::new(),
@@ -1600,11 +1595,13 @@ impl DiskTreeNodeCursorState {
     pub(crate) async fn seek(&mut self, key: &[u8]) -> RuntimeResult<()> {
         self.stack.clear();
         self.seek_key.clear();
+        let Some(root_block_id) = self.root_block_id else {
+            self.seek_pending = false;
+            return Ok(());
+        };
         self.seek_key.extend_from_slice(key);
         self.seek_pending = true;
-        if self.root_block_id != SUPER_BLOCK_ID {
-            self.stack.push(self.root_block_id);
-        }
+        self.stack.push(root_block_id);
         Ok(())
     }
 
@@ -1884,11 +1881,11 @@ impl<M: MutableCowFile> UniqueDiskTreeBatchWriter<'_, '_, M> {
         }
     }
 
-    /// Write touched CoW paths and return the final root block id.
+    /// Write touched CoW paths and return the final optional root block id.
     ///
     /// This does not publish the root into table metadata; the caller owns that
     /// higher-level checkpoint state transition.
-    pub(crate) async fn finish(self) -> RuntimeOrFatalResult<BlockID> {
+    pub(crate) async fn finish(self) -> RuntimeOrFatalResult<Option<BlockID>> {
         let Self {
             tree,
             mutable_file,
@@ -1951,11 +1948,11 @@ impl<M: MutableCowFile> NonUniqueDiskTreeBatchWriter<'_, '_, M> {
         Ok(())
     }
 
-    /// Write touched CoW paths and return the final root block id.
+    /// Write touched CoW paths and return the final optional root block id.
     ///
-    /// This returns `SUPER_BLOCK_ID` if the staged operations make the tree
-    /// empty, otherwise it returns the root block of the replacement tree.
-    pub(crate) async fn finish(self) -> RuntimeOrFatalResult<BlockID> {
+    /// This returns `None` if the staged operations make the tree empty,
+    /// otherwise it returns the root block of the replacement tree.
+    pub(crate) async fn finish(self) -> RuntimeOrFatalResult<Option<BlockID>> {
         let Self {
             tree,
             mutable_file,
@@ -2037,10 +2034,10 @@ fn validate_disk_tree_block<F: DiskTreeSpec>(block: &[u8]) -> DataIntegrityResul
     Ok(())
 }
 
-/// Reject branch blocks that point at the empty-root sentinel.
+/// Reject branch blocks that point at the table-file super block.
 ///
-/// `SUPER_BLOCK_ID` means an empty root, not a valid child block. Once a tree has
-/// branches, every child pointer must refer to a real persisted block.
+/// DiskTree roots represent absence with `None`, while every branch child must
+/// refer to a real persisted node block.
 fn validate_branch_children(node: &BTreeNode) -> DataIntegrityResult<()> {
     if BlockID::from(node.lower_fence_value().to_u64()) == SUPER_BLOCK_ID {
         return Err(invalid_node_decode());
@@ -2059,16 +2056,16 @@ fn validate_branch_children(node: &BTreeNode) -> DataIntegrityResult<()> {
 /// `(logical_key, row_id)` while using the same key encoder as runtime indexes.
 fn index_key_types(
     metadata: &TableMetadata,
-    index_spec: &IndexSpec,
+    index_spec: &TableIndexMetadata,
     append_row_id: bool,
 ) -> Vec<ValType> {
     assert!(
-        !index_spec.cols.is_empty(),
+        !index_spec.keys.is_empty(),
         "secondary DiskTree invariant violated: index has no key columns"
     );
-    let mut types = Vec::with_capacity(index_spec.cols.len() + usize::from(append_row_id));
-    for key in &index_spec.cols {
-        let col_no = key.col_no as usize;
+    let mut types = Vec::with_capacity(index_spec.keys.len() + usize::from(append_row_id));
+    for key in &index_spec.keys {
+        let col_no = key.column_ordinal.as_usize();
         let ty = metadata
             .col
             .col_types()
@@ -2221,7 +2218,9 @@ fn validate_rewrite_entries_for_height(entries: &[RewriteEntry], height: u16) {
         if let RewriteEntry::Block(entry) = entry
             && entry.block_id == SUPER_BLOCK_ID
         {
-            panic!("DiskTree rewrite invariant violated: entry points to empty-root sentinel");
+            panic!(
+                "DiskTree rewrite invariant violated: entry points to the table-file super block"
+            );
         }
         assert!(
             prev.is_none_or(|prev_key: &[u8]| prev_key < entry.key()),
@@ -2270,7 +2269,10 @@ fn branch_entries_from_node(node: &BTreeNode) -> DataIntegrityResult<Vec<BranchE
 mod tests {
     use super::*;
     use crate::buffer::{global_readonly_pool_scope, table_readonly_pool};
-    use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexSlot};
+    use crate::catalog::{
+        IndexSlot, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
+        StorageIndexSpec,
+    };
     use crate::error::{CompletionErrorBridge, CompletionResult, DataIntegrityError, IoError};
     use crate::file::block_integrity::checksum_offset;
     use crate::file::build_test_fs;
@@ -2550,12 +2552,15 @@ mod tests {
         Arc::new(
             TableMetadata::try_new(
                 vec![
-                    ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
-                    ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::empty()),
+                    StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
+                    StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
                 ],
                 vec![
-                    IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK),
-                    IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::empty()),
+                    StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::UK),
+                    StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(0)],
+                        StorageIndexFlags::empty(),
+                    ),
                 ],
             )
             .expect("valid table metadata"),
@@ -2565,14 +2570,13 @@ mod tests {
     fn metadata_with_varbyte_unique_index() -> Arc<TableMetadata> {
         Arc::new(
             TableMetadata::try_new(
-                vec![ColumnSpec::new(
-                    "c0",
+                vec![StorageColumnSpec::new(
                     ValKind::VarByte,
-                    ColumnAttributes::empty(),
+                    StorageColumnFlags::empty(),
                 )],
-                vec![IndexSpec::new(
-                    vec![IndexKeySpec::new(0)],
-                    IndexAttributes::UK,
+                vec![StorageIndexSpec::new(
+                    vec![StorageIndexKey::new(0)],
+                    StorageIndexFlags::UK,
                 )],
             )
             .expect("valid table metadata"),
@@ -2609,11 +2613,11 @@ mod tests {
     async fn collect_node_summaries<F: DiskTreeSpec>(
         tree: &DiskTree<'_, F>,
     ) -> RuntimeResult<Vec<NodeSummary>> {
-        if tree.root_block_id == SUPER_BLOCK_ID {
+        let Some(root_block_id) = tree.root_block_id else {
             return Ok(Vec::new());
-        }
+        };
         let mut summaries = Vec::new();
-        let mut stack = vec![tree.root_block_id];
+        let mut stack = vec![root_block_id];
         while let Some(block_id) = stack.pop() {
             let guard = tree.read_node(block_id).await?;
             let node = guard.node();
@@ -2641,11 +2645,11 @@ mod tests {
     async fn collect_leaf_blocks<F: DiskTreeSpec>(
         tree: &DiskTree<'_, F>,
     ) -> RuntimeResult<Vec<LeafBlock>> {
-        if tree.root_block_id == SUPER_BLOCK_ID {
+        let Some(root_block_id) = tree.root_block_id else {
             return Ok(Vec::new());
-        }
+        };
         let mut leaves = Vec::new();
-        let mut stack = vec![tree.root_block_id];
+        let mut stack = vec![root_block_id];
         while let Some(block_id) = stack.pop() {
             let guard = tree.read_node(block_id).await?;
             let node = guard.node();
@@ -2711,6 +2715,18 @@ mod tests {
     }
 
     #[test]
+    fn test_empty_disk_tree_cursor_seek_skips_key_copy() {
+        smol::block_on(async {
+            let mut state = DiskTreeNodeCursorState::new(None);
+            state.seek(&[7; 128]).await.unwrap();
+
+            assert!(state.stack.is_empty());
+            assert!(state.seek_key.is_empty());
+            assert!(!state.seek_pending);
+        });
+    }
+
+    #[test]
     fn test_empty_unique_root_reads_empty() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
@@ -2724,7 +2740,7 @@ mod tests {
             let disk_pool = table_readonly_pool(&global, test_user_table_id(301), &table);
             let guard = disk_pool.create_base_guard();
             let runtime = unique_runtime!(metadata, disk_pool);
-            let tree = runtime.open(SUPER_BLOCK_ID, &guard);
+            let tree = runtime.open(None, &guard);
             assert_eq!(tree.lookup(&[Val::from(1u32)]).await.unwrap(), None);
             assert!(unique_scan_entries(&tree).await.is_empty());
             drop(table);
@@ -2746,7 +2762,7 @@ mod tests {
             let disk_pool = table_readonly_pool(&global, test_user_table_id(302), &table);
             let guard = disk_pool.create_base_guard();
             let runtime = non_unique_runtime!(metadata, disk_pool);
-            let tree = runtime.open(SUPER_BLOCK_ID, &guard);
+            let tree = runtime.open(None, &guard);
             assert!(
                 !tree
                     .contains_exact(&[Val::from(1u32)], RowID::new(10))
@@ -2784,7 +2800,7 @@ mod tests {
                 guard.clone(),
             );
             let runtime = unique_runtime!(metadata, disk_pool);
-            let tree = runtime.open(SUPER_BLOCK_ID, &guard);
+            let tree = runtime.open(None, &guard);
             let key1 = [Val::from(1u32)];
             let key2 = [Val::from(2u32)];
             let key3 = [Val::from(3u32)];
@@ -2806,7 +2822,7 @@ mod tests {
                 ])
                 .unwrap();
             let root = writer.finish().await.unwrap();
-            assert_ne!(root, SUPER_BLOCK_ID);
+            assert!(root.is_some());
 
             let tree = runtime.open(root, &guard);
             assert_eq!(tree.lookup(&key2).await.unwrap(), Some(RowID::new(20)));
@@ -2858,7 +2874,7 @@ mod tests {
                 guard.clone(),
             );
             let runtime = unique_runtime!(metadata, disk_pool);
-            let tree = runtime.open(SUPER_BLOCK_ID, &guard);
+            let tree = runtime.open(None, &guard);
 
             const ENTRY_COUNT: u32 = 10_000;
             let keys = (0..ENTRY_COUNT)
@@ -2943,7 +2959,7 @@ mod tests {
                 guard.clone(),
             );
             let runtime = non_unique_runtime!(metadata, disk_pool);
-            let tree = runtime.open(SUPER_BLOCK_ID, &guard);
+            let tree = runtime.open(None, &guard);
 
             const ENTRY_COUNT: usize = 10_000;
             let key = [Val::from(0x1234_5678u32)];
@@ -2990,7 +3006,7 @@ mod tests {
                 guard.clone(),
             );
             let runtime = unique_runtime!(metadata, disk_pool);
-            let tree = runtime.open(SUPER_BLOCK_ID, &guard);
+            let tree = runtime.open(None, &guard);
 
             const ENTRY_COUNT: usize = 400;
             let keys = (0..ENTRY_COUNT).map(long_encoded_key).collect::<Vec<_>>();
@@ -3057,7 +3073,7 @@ mod tests {
                 guard.clone(),
             );
             let runtime = non_unique_runtime!(metadata, disk_pool);
-            let tree = runtime.open(SUPER_BLOCK_ID, &guard);
+            let tree = runtime.open(None, &guard);
             let key1 = [Val::from(1u32)];
             let key2 = [Val::from(2u32)];
             let mut writer = tree.batch_writer(&mut mutable, TrxID::new(2));
@@ -3143,7 +3159,7 @@ mod tests {
                 guard.clone(),
             );
             let runtime = non_unique_runtime!(metadata, disk_pool);
-            let tree = runtime.open(SUPER_BLOCK_ID, &guard);
+            let tree = runtime.open(None, &guard);
 
             const ENTRY_COUNT: u32 = 65_536;
             let keys = (0..ENTRY_COUNT)
@@ -3161,7 +3177,7 @@ mod tests {
             let mut writer = tree.batch_writer(&mut mutable, TrxID::new(2));
             writer.batch_insert(&entries).unwrap();
             let root = writer.finish().await.unwrap();
-            assert_ne!(root, SUPER_BLOCK_ID);
+            assert!(root.is_some());
             let tree_blocks = mutable.root().alloc_map.allocated() - allocated_before;
             assert!(tree_blocks > 8);
 
@@ -3204,7 +3220,7 @@ mod tests {
             let allocated_before = inner.root().alloc_map.allocated();
             let mut mutable = FailingDiskTreeWriteFile::new(inner, Some(1), None);
             let runtime = unique_runtime!(metadata, disk_pool);
-            let tree = runtime.open(SUPER_BLOCK_ID, &guard);
+            let tree = runtime.open(None, &guard);
 
             const ENTRY_COUNT: u32 = 8192;
             let keys = (0..ENTRY_COUNT)
@@ -3250,7 +3266,7 @@ mod tests {
             let allocated_before = inner.root().alloc_map.allocated();
             let mut mutable = FailingDiskTreeWriteFile::new(inner, None, Some(0));
             let runtime = unique_runtime!(metadata, disk_pool);
-            let tree = runtime.open(SUPER_BLOCK_ID, &guard);
+            let tree = runtime.open(None, &guard);
 
             const ENTRY_COUNT: u32 = 8192;
             let keys = (0..ENTRY_COUNT)
@@ -3298,7 +3314,7 @@ mod tests {
             );
 
             let unique_runtime = unique_runtime!(metadata, disk_pool);
-            let unique_tree = unique_runtime.open(SUPER_BLOCK_ID, &guard);
+            let unique_tree = unique_runtime.open(None, &guard);
             let key1 = [Val::from(1u32)];
             let key2 = [Val::from(2u32)];
             let encoded_unique1 = unique_tree.encoder().encode(&key1).as_bytes().to_vec();
@@ -3353,7 +3369,7 @@ mod tests {
             );
 
             let non_unique_runtime = non_unique_runtime!(metadata, disk_pool);
-            let non_unique_tree = non_unique_runtime.open(SUPER_BLOCK_ID, &guard);
+            let non_unique_tree = non_unique_runtime.open(None, &guard);
             let encoded_exact10 = non_unique_tree
                 .encoder()
                 .encode_pair(&key1, Val::from(10u64))
@@ -3461,7 +3477,7 @@ mod tests {
                 guard.clone(),
             );
             let runtime = unique_runtime!(metadata, disk_pool);
-            let tree = runtime.open(SUPER_BLOCK_ID, &guard);
+            let tree = runtime.open(None, &guard);
             let key1 = [Val::from(1u32)];
             let key2 = [Val::from(2u32)];
             let key3 = [Val::from(3u32)];
@@ -3483,7 +3499,7 @@ mod tests {
                 ])
                 .unwrap();
             let root = writer.finish().await.unwrap();
-            assert_ne!(root, SUPER_BLOCK_ID);
+            assert!(root.is_some());
 
             let tree = runtime.open(root, &guard);
             let rows = unique_scan_entries(&tree)
@@ -3511,7 +3527,7 @@ mod tests {
                 ])
                 .unwrap();
             let empty_root = writer.finish().await.unwrap();
-            assert_eq!(empty_root, SUPER_BLOCK_ID);
+            assert_eq!(empty_root, None);
 
             let empty_tree = runtime.open(empty_root, &guard);
             assert_eq!(empty_tree.lookup(&key1).await.unwrap(), None);
@@ -3548,7 +3564,7 @@ mod tests {
                 guard.clone(),
             );
             let runtime = non_unique_runtime!(metadata, disk_pool);
-            let tree = runtime.open(SUPER_BLOCK_ID, &guard);
+            let tree = runtime.open(None, &guard);
             let key1 = [Val::from(1u32)];
             let key2 = [Val::from(2u32)];
             let mut writer = tree.batch_writer(&mut mutable, TrxID::new(2));
@@ -3569,7 +3585,7 @@ mod tests {
                 ])
                 .unwrap();
             let root = writer.finish().await.unwrap();
-            assert_ne!(root, SUPER_BLOCK_ID);
+            assert!(root.is_some());
 
             let tree = runtime.open(root, &guard);
             assert_eq!(
@@ -3599,7 +3615,7 @@ mod tests {
                 ])
                 .unwrap();
             let empty_root = writer.finish().await.unwrap();
-            assert_eq!(empty_root, SUPER_BLOCK_ID);
+            assert_eq!(empty_root, None);
 
             let empty_tree = runtime.open(empty_root, &guard);
             assert!(
@@ -3663,7 +3679,7 @@ mod tests {
                 guard.clone(),
             );
             let runtime = unique_runtime!(metadata, disk_pool);
-            let tree = runtime.open(SUPER_BLOCK_ID, &guard);
+            let tree = runtime.open(None, &guard);
 
             const ENTRY_COUNT: u32 = 8192;
             const KEEP_EVERY: usize = 100;
@@ -3681,10 +3697,10 @@ mod tests {
             let mut writer = tree.batch_writer(&mut mutable, TrxID::new(2));
             writer.batch_put(&puts).unwrap();
             let root = writer.finish().await.unwrap();
-            assert_ne!(root, SUPER_BLOCK_ID);
+            assert!(root.is_some());
 
             let tree = runtime.open(root, &guard);
-            let root_guard = tree.read_node(root).await.unwrap();
+            let root_guard = tree.read_node(root.unwrap()).await.unwrap();
             assert!(!root_guard.node().is_leaf());
             drop(root_guard);
 
@@ -3706,14 +3722,17 @@ mod tests {
             let mut writer = tree.batch_writer(&mut mutable, TrxID::new(3));
             writer.batch_conditional_delete(&deletes).unwrap();
             let compacted_root = writer.finish().await.unwrap();
-            assert_ne!(compacted_root, SUPER_BLOCK_ID);
+            assert!(compacted_root.is_some());
             assert_eq!(
                 mutable.root().alloc_map.allocated(),
                 allocated_before_delete + 1
             );
 
             let compacted_tree = runtime.open(compacted_root, &guard);
-            let compacted_guard = compacted_tree.read_node(compacted_root).await.unwrap();
+            let compacted_guard = compacted_tree
+                .read_node(compacted_root.unwrap())
+                .await
+                .unwrap();
             assert!(compacted_guard.node().is_leaf());
             assert!(compacted_guard.node().has_no_upper_fence());
             assert_eq!(compacted_guard.node().count(), expected_rows.len());
@@ -3751,7 +3770,7 @@ mod tests {
                 write_guard.clone(),
             );
             let write_runtime = unique_runtime!(metadata, write_disk_pool);
-            let tree = write_runtime.open(SUPER_BLOCK_ID, &write_guard);
+            let tree = write_runtime.open(None, &write_guard);
 
             const ENTRY_COUNT: u32 = 10_000;
             let keys = (0..ENTRY_COUNT)
@@ -3775,10 +3794,11 @@ mod tests {
             let inspect_guard = inspect_disk_pool.create_base_guard();
             let inspect_runtime = unique_runtime!(metadata, inspect_disk_pool);
             let inspect_tree = inspect_runtime.open(root, &inspect_guard);
-            let root_guard = inspect_tree.read_node(root).await.unwrap();
+            let root_block_id = root.unwrap();
+            let root_guard = inspect_tree.read_node(root_block_id).await.unwrap();
             assert_eq!(root_guard.node().height(), 1);
             let leaf_entries = inspect_tree
-                .node_result(root, branch_entries_from_node(root_guard.node()))
+                .node_result(root_block_id, branch_entries_from_node(root_guard.node()))
                 .unwrap();
             assert!(leaf_entries.iter().all(|entry| entry.height == 0));
             drop(root_guard);
@@ -3801,7 +3821,7 @@ mod tests {
             assert_eq!(delta.queued_reads, 1);
             assert_eq!(delta.completed_reads, 1);
             assert_eq!(reachable.len(), leaf_entries.len() + 1);
-            assert!(reachable.contains(&root));
+            assert!(reachable.contains(&root_block_id));
             for entry in leaf_entries {
                 assert!(reachable.contains(&entry.block_id));
             }
@@ -3828,7 +3848,7 @@ mod tests {
                 guard.clone(),
             );
             let runtime = unique_runtime!(metadata, disk_pool);
-            let tree = runtime.open(SUPER_BLOCK_ID, &guard);
+            let tree = runtime.open(None, &guard);
 
             // Long single-column keys make a small fixture produce multiple
             // leaves, keeping this test focused on rewrite behavior rather
@@ -3858,7 +3878,7 @@ mod tests {
             writer.batch_put(&puts).unwrap();
             let root = writer.finish().await.unwrap();
             let tree = runtime.open(root, &guard);
-            let root_guard = tree.read_node(root).await.unwrap();
+            let root_guard = tree.read_node(root.unwrap()).await.unwrap();
             assert_eq!(root_guard.node().height(), 1);
             drop(root_guard);
 
@@ -3943,7 +3963,7 @@ mod tests {
                 guard.clone(),
             );
             let runtime = unique_runtime!(metadata, disk_pool);
-            let tree = runtime.open(SUPER_BLOCK_ID, &guard);
+            let tree = runtime.open(None, &guard);
 
             const ENTRY_COUNT: u32 = 10_000;
             let keys = (0..ENTRY_COUNT)
@@ -3970,7 +3990,7 @@ mod tests {
             writer.batch_put(&puts).unwrap();
             let root = writer.finish().await.unwrap();
             let tree = runtime.open(root, &guard);
-            let root_guard = tree.read_node(root).await.unwrap();
+            let root_guard = tree.read_node(root.unwrap()).await.unwrap();
             assert_eq!(root_guard.node().height(), 1);
             drop(root_guard);
 
@@ -4038,7 +4058,7 @@ mod tests {
                 guard.clone(),
             );
             let runtime = unique_runtime!(metadata, disk_pool);
-            let tree = runtime.open(SUPER_BLOCK_ID, &guard);
+            let tree = runtime.open(None, &guard);
             let key1 = [Val::from(1u32)];
             let key2 = [Val::from(2u32)];
             let mut writer = tree.batch_writer(&mut mutable, TrxID::new(2));

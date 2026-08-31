@@ -110,7 +110,16 @@ impl TableRuntimeLayout {
                             "table runtime layout slot exceeds persisted u16 domain: slot={slot}"
                         )
                     });
-                    RuntimeIndexEntry::new(IndexRef::from_active_slot(slot), runtime)
+                    let index = metadata
+                        .idx
+                        .index_spec(slot)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "table runtime layout has runtime for inactive metadata slot: slot={slot}"
+                            )
+                        })
+                        .index;
+                    RuntimeIndexEntry::new(index, runtime)
                 })
             })
             .collect::<Vec<_>>()
@@ -305,7 +314,15 @@ impl TableRuntimeLayout {
         self.secondary_indexes
             .get(slot.as_usize())
             .and_then(Option::as_ref)
-            .ok_or_else(|| self.index_access_error(IndexRef::new(slot.transitional_id(), slot)))
+            .ok_or_else(|| {
+                Report::new(InternalError::SecondaryIndexOutOfBounds)
+                    .attach(format!(
+                        "index_slot={slot}, index_slot_count={}",
+                        self.index_slot_count()
+                    ))
+                    .change_context(RuntimeError::IndexAccess)
+                    .attach("operation=resolve_secondary_index_runtime")
+            })
     }
 
     #[inline]
@@ -369,8 +386,8 @@ mod tests {
     use super::*;
     use crate::buffer::{BufferPool, PoolGuards, PoolRole};
     use crate::catalog::{
-        ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexAttributes, IndexDdlKind, IndexKeySpec,
-        IndexSpec,
+        ActiveIndexSpec, IndexDdlKind, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags,
+        StorageIndexKey, StorageIndexSpec,
     };
     use crate::id::TrxID;
     use crate::table::tests::*;
@@ -410,20 +427,19 @@ mod tests {
         )
     }
 
-    fn table2_columns() -> Vec<ColumnSpec> {
+    fn table2_columns() -> Vec<StorageColumnSpec> {
         vec![
-            ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
-            ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+            StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+            StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
         ]
     }
 
     fn metadata_without_indexes() -> Arc<TableMetadata> {
         Arc::new(
             TableMetadata::try_new(
-                vec![ColumnSpec::new(
-                    "id",
+                vec![StorageColumnSpec::new(
                     ValKind::I32,
-                    ColumnAttributes::empty(),
+                    StorageColumnFlags::empty(),
                 )],
                 vec![],
             )
@@ -471,7 +487,7 @@ mod tests {
             );
 
             let inactive_metadata = Arc::new(
-                TableMetadata::try_new_with_next_index_slot(
+                TableMetadata::try_new_with_index_slot_count(
                     table2_columns(),
                     vec![],
                     IndexSlot::new(1),
@@ -490,11 +506,11 @@ mod tests {
             );
 
             let shifted_metadata = Arc::new(
-                TableMetadata::try_new_with_next_index_slot(
+                TableMetadata::try_new_with_index_slot_count(
                     table2_columns(),
                     vec![ActiveIndexSpec::new(
-                        IndexSlot::new(1),
-                        IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK),
+                        IndexRef::new(IndexID::new(1), IndexSlot::new(1)),
+                        StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::UK),
                     )],
                     IndexSlot::new(2),
                 )
@@ -514,9 +530,9 @@ mod tests {
             let non_unique_metadata = Arc::new(
                 TableMetadata::try_new(
                     table2_columns(),
-                    vec![IndexSpec::new(
-                        vec![IndexKeySpec::new(0)],
-                        IndexAttributes::empty(),
+                    vec![StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(0)],
+                        StorageIndexFlags::empty(),
                     )],
                 )
                 .unwrap(),
@@ -548,7 +564,10 @@ mod tests {
                     .runtime_arc(),
             );
             let slot = IndexSlot::new(0);
-            let old_ref = IndexRef::from_active_slot(slot);
+            let old_ref = current
+                .index_entry_at_slot(slot)
+                .expect("fixture index must be active")
+                .index_ref();
             let replacement_ref = IndexRef::new(IndexID::new(100), slot);
             let replacement = TableRuntimeLayout::from_entries(
                 current.generation() + 1,
@@ -595,13 +614,13 @@ mod tests {
             assert_eq!(old_layout.metadata().idx.active_index_count(), 1);
 
             let metadata_without_indexes = Arc::new(
-                TableMetadata::try_new_with_next_index_slot(
+                TableMetadata::try_new_with_index_slot_count(
                     vec![
-                        ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
-                        ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                        StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+                        StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
                     ],
                     vec![],
-                    old_layout.metadata().idx.next_index_slot(),
+                    old_layout.metadata().idx.index_slot_count_u32(),
                 )
                 .unwrap(),
             );
@@ -637,8 +656,8 @@ mod tests {
             assert_eq!(old_layout.metadata().idx.active_index_count(), 1);
             assert_eq!(installed.metadata().idx.active_index_count(), 0);
             assert_eq!(
-                installed.metadata().idx.next_index_slot(),
-                old_layout.metadata().idx.next_index_slot()
+                installed.metadata().idx.index_slot_count_u32(),
+                old_layout.metadata().idx.index_slot_count_u32()
             );
             assert_eq!(
                 installed.metadata().idx.index_slot_count(),

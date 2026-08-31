@@ -50,7 +50,7 @@ pub(crate) use tests::{test_hooks, test_user_table_id};
 
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards, PoolRole, ReadonlyBufferPool};
-use crate::catalog::{IndexSlot, IndexSpec, TableMetadata};
+use crate::catalog::{IndexSlot, SecondaryIndexSlot, TableIndexMetadata, TableMetadata};
 use crate::error::{
     DataIntegrityError, DataIntegrityResult, OperationResult, RuntimeError, RuntimeResult,
 };
@@ -944,7 +944,7 @@ pub(crate) struct TableRootSnapshot<'read> {
     effective_ts: TrxID,
     pivot_row_id: RowID,
     column_block_index_root: BlockID,
-    secondary_index_roots: Vec<BlockID>,
+    secondary_index_slots: Vec<SecondaryIndexSlot>,
     deletion_cutoff_ts: TrxID,
     _read: PhantomData<&'read ()>,
 }
@@ -957,7 +957,7 @@ impl<'read> TableRootSnapshot<'read> {
             effective_ts: root.effective_ts(),
             pivot_row_id: root.pivot_row_id,
             column_block_index_root: root.column_block_index_root,
-            secondary_index_roots: root.secondary_index_roots.clone(),
+            secondary_index_slots: root.secondary_index_slots.clone(),
             deletion_cutoff_ts: root.deletion_cutoff_ts,
             _read: PhantomData,
         }
@@ -970,7 +970,7 @@ impl<'read> TableRootSnapshot<'read> {
             effective_ts: root.effective_ts(),
             pivot_row_id: root.pivot_row_id,
             column_block_index_root: root.column_block_index_root,
-            secondary_index_roots: root.secondary_index_roots.clone(),
+            secondary_index_slots: root.secondary_index_slots.clone(),
             deletion_cutoff_ts: root.deletion_cutoff_ts,
             _read: PhantomData,
         }
@@ -1011,10 +1011,15 @@ impl<'read> TableRootSnapshot<'read> {
         self.deletion_cutoff_ts
     }
 
-    /// Returns the captured DiskTree root for one secondary index.
+    /// Returns the captured DiskTree root for one secondary index, if present.
     #[inline]
-    pub(crate) fn secondary_index_root(&self, index_slot: IndexSlot) -> BlockID {
-        self.secondary_index_roots[index_slot.as_usize()]
+    pub(crate) fn secondary_index_root(&self, index_slot: IndexSlot) -> Option<BlockID> {
+        self.secondary_index_slots[index_slot.as_usize()]
+            .active_root()
+            .unwrap_or_else(|| {
+                panic!("secondary index root requested for inactive snapshot slot {index_slot}")
+            })
+            .block_id()
     }
 
     /// Returns whether the captured root was observable before the supplied
@@ -1193,18 +1198,18 @@ fn row_len(metadata: &TableMetadata, cols: &[Val]) -> usize {
 
 #[inline]
 fn index_key_is_changed(
-    index_spec: &IndexSpec,
+    index_spec: &TableIndexMetadata,
     index_change_cols: &FastHashMap<usize, Val>,
 ) -> bool {
     index_spec
-        .cols
+        .keys
         .iter()
-        .any(|key| index_change_cols.contains_key(&(key.col_no as usize)))
+        .any(|key| index_change_cols.contains_key(&(key.column_ordinal.as_usize())))
 }
 
 #[inline]
 fn index_key_replace(
-    index_spec: &IndexSpec,
+    index_spec: &TableIndexMetadata,
     key: &SelectKey,
     updates: &FastHashMap<usize, Val>,
 ) -> SelectKey {
@@ -1216,16 +1221,16 @@ fn index_key_replace(
 
 #[inline]
 fn index_key_vals_replace(
-    index_spec: &IndexSpec,
+    index_spec: &TableIndexMetadata,
     vals: &[Val],
     updates: &FastHashMap<usize, Val>,
 ) -> Vec<Val> {
     index_spec
-        .cols
+        .keys
         .iter()
         .zip(vals)
         .map(|(ik, val)| {
-            let col_no = ik.col_no as usize;
+            let col_no = ik.column_ordinal.as_usize();
             updates.get(&col_no).cloned().unwrap_or_else(|| val.clone())
         })
         .collect()
@@ -1247,10 +1252,12 @@ fn read_latest_index_key(
         .idx
         .index_spec(index_slot)
         .expect("active index spec must exist for latest key read");
-    let mut new_key = SelectKey::null(index_slot, index_spec.cols.len());
-    for (pos, key) in index_spec.cols.iter().enumerate() {
+    let mut new_key = SelectKey::null(index_slot, index_spec.keys.len());
+    for (pos, key) in index_spec.keys.iter().enumerate() {
         let access = page_guard.read_row_by_id(row_id);
-        let val = access.row().val(metadata.col.as_ref(), key.col_no as usize);
+        let val = access
+            .row()
+            .val(metadata.col.as_ref(), key.column_ordinal.as_usize());
         new_key.vals[pos] = val;
     }
     new_key
@@ -1299,9 +1306,9 @@ fn unique_key_from_full_row(
         "unique-key construction requires a unique index: operation={operation}, index_slot={unique_index_slot}"
     );
     let vals = index_spec
-        .cols
+        .keys
         .iter()
-        .map(|key| cols[key.col_no as usize].clone())
+        .map(|key| cols[key.column_ordinal.as_usize()].clone())
         .collect();
     SelectKey::new(unique_index_slot, vals)
 }
@@ -1314,8 +1321,8 @@ pub(crate) mod tests {
     use crate::buffer::{PoolGuard, PoolGuards, ReadonlyBufferPool};
     use crate::catalog::tests::table2;
     use crate::catalog::{
-        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexRef, IndexSlot,
-        IndexSpec, TableSpec, USER_TABLE_ID_START,
+        IndexID, IndexRef, IndexSlot, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags,
+        StorageIndexKey, StorageIndexSpec, StorageTableSpec, USER_TABLE_ID_START,
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
@@ -2159,7 +2166,7 @@ pub(crate) mod tests {
         layout: Arc<TableRuntimeLayout>,
         guards: &'a PoolGuards,
         index_slot: IndexSlot,
-        root: BlockID,
+        root: Option<BlockID>,
     }
 
     impl BoundUniqueIndex<'_> {
@@ -2218,7 +2225,7 @@ pub(crate) mod tests {
         layout: Arc<TableRuntimeLayout>,
         guards: &'a PoolGuards,
         index_slot: IndexSlot,
-        root: BlockID,
+        root: Option<BlockID>,
     }
 
     impl BoundNonUniqueIndex<'_> {
@@ -2366,11 +2373,8 @@ pub(crate) mod tests {
         table_id: TableID,
         key: &SelectKey,
     ) -> Result<DeleteMvcc> {
-        trx.table_delete_unique_mvcc(
-            crate::TableIndex(table_id, key.index_slot.transitional_id()),
-            &key.vals,
-        )
-        .await
+        trx.table_delete_unique_mvcc(crate::TableIndex(table_id, IndexID::new(0)), &key.vals)
+            .await
     }
 
     /// Provides test-only access to `trx_update_row_by_id`.
@@ -2381,7 +2385,7 @@ pub(crate) mod tests {
         update: Vec<UpdateCol>,
     ) -> Result<UpdateMvcc> {
         trx.table_update_unique_mvcc(
-            crate::TableIndex(table_id, key.index_slot.transitional_id()),
+            crate::TableIndex(table_id, IndexID::new(0)),
             &key.vals,
             update,
         )
@@ -2502,8 +2506,19 @@ pub(crate) mod tests {
         key: &SelectKey,
         user_read_set: &[usize],
     ) -> Result<SelectMvcc> {
+        trx_select_row_mvcc_by_index_id(trx, table_id, IndexID::new(0), key, user_read_set).await
+    }
+
+    /// Provides test-only lookup through an explicitly identified unique index.
+    pub(crate) async fn trx_select_row_mvcc_by_index_id(
+        trx: &mut Transaction,
+        table_id: TableID,
+        index_id: IndexID,
+        key: &SelectKey,
+        user_read_set: &[usize],
+    ) -> Result<SelectMvcc> {
         trx.table_lookup_unique_mvcc(
-            crate::TableIndex(table_id, key.index_slot.transitional_id()),
+            crate::TableIndex(table_id, index_id),
             &key.vals,
             user_read_set,
         )
@@ -2560,17 +2575,21 @@ pub(crate) mod tests {
         let mut ddl_session = engine.new_session().unwrap();
         let table_id = ddl_session
             .create_table(
-                TableSpec::new(vec![
-                    ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
-                    ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                StorageTableSpec::new(vec![
+                    StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+                    StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
                 ]),
                 vec![
-                    IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK),
-                    IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty()),
+                    StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::UK),
+                    StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(1)],
+                        StorageIndexFlags::empty(),
+                    ),
                 ],
             )
             .await
-            .unwrap();
+            .unwrap()
+            .table_id();
         drop(ddl_session);
         table_id
     }
@@ -2581,17 +2600,18 @@ pub(crate) mod tests {
         let mut ddl_session = engine.new_session().unwrap();
         let table_id = ddl_session
             .create_table(
-                TableSpec::new(vec![
-                    ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
-                    ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::NULLABLE),
+                StorageTableSpec::new(vec![
+                    StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+                    StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::NULLABLE),
                 ]),
-                vec![IndexSpec::new(
-                    vec![IndexKeySpec::new(0)],
-                    IndexAttributes::UK,
+                vec![StorageIndexSpec::new(
+                    vec![StorageIndexKey::new(0)],
+                    StorageIndexFlags::UK,
                 )],
             )
             .await
-            .unwrap();
+            .unwrap()
+            .table_id();
         drop(ddl_session);
         table_id
     }
@@ -2843,15 +2863,15 @@ pub(crate) mod tests {
     }
 
     /// Provides test-only access to `drop_table_test_spec`.
-    pub(crate) fn drop_table_test_spec() -> (TableSpec, Vec<IndexSpec>) {
+    pub(crate) fn drop_table_test_spec() -> (StorageTableSpec, Vec<StorageIndexSpec>) {
         (
-            TableSpec::new(vec![
-                ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
-                ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+            StorageTableSpec::new(vec![
+                StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
             ]),
             vec![
-                IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK),
-                IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty()),
+                StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::UK),
+                StorageIndexSpec::new(vec![StorageIndexKey::new(1)], StorageIndexFlags::empty()),
             ],
         )
     }
@@ -3020,8 +3040,11 @@ pub(crate) mod tests {
     }
 
     /// Returns secondary root for tests.
-    pub(crate) fn active_secondary_root(table: &Table, index_slot: IndexSlot) -> BlockID {
-        table.file().active_root_unchecked().secondary_index_roots[index_slot.as_usize()]
+    pub(crate) fn active_secondary_root(table: &Table, index_slot: IndexSlot) -> Option<BlockID> {
+        table
+            .file()
+            .active_root_unchecked()
+            .secondary_index_root(index_slot)
     }
 
     /// Returns the exact active index reference for one test-visible slot.
@@ -3178,7 +3201,7 @@ pub(crate) mod tests {
             after.column_block_index_root,
             before.column_block_index_root
         );
-        assert_eq!(after.secondary_index_roots, before.secondary_index_roots);
+        assert_eq!(after.secondary_index_slots, before.secondary_index_slots);
     }
 
     /// Corrupts page checksum for an integrity test.
@@ -3486,7 +3509,7 @@ pub(crate) mod tests {
             let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(1i32)]);
             let err = trx
                 .table_update_unique_mvcc(
-                    crate::TableIndex(table_id, key.index_slot.transitional_id()),
+                    crate::TableIndex(table_id, IndexID::new(0)),
                     &key.vals,
                     vec![
                         UpdateCol {
@@ -3507,10 +3530,7 @@ pub(crate) mod tests {
             let mut trx = session.begin_trx().unwrap();
             let key = SelectKey::new(IndexSlot::new(1), vec![Val::from("old")]);
             let err = trx
-                .table_delete_unique_mvcc(
-                    crate::TableIndex(table_id, key.index_slot.transitional_id()),
-                    &key.vals,
-                )
+                .table_delete_unique_mvcc(crate::TableIndex(table_id, IndexID::new(1)), &key.vals)
                 .await
                 .unwrap_err();
             assert_invalid_dml_input(err);

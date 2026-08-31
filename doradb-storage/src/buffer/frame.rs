@@ -256,17 +256,16 @@ pub(super) enum FrameContext {
 #[cfg(test)]
 mod tests {
     use super::BufferFrame;
-    use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
+    use crate::catalog::{StorageColumnFlags, StorageColumnSpec, TableMetadata};
     use crate::id::TrxID;
     use crate::value::ValKind;
     use std::sync::Arc;
 
     fn metadata() -> TableMetadata {
         TableMetadata::try_new(
-            vec![ColumnSpec::new(
-                "id",
+            vec![StorageColumnSpec::new(
                 ValKind::I64,
-                ColumnAttributes::empty(),
+                StorageColumnFlags::empty(),
             )],
             Vec::new(),
         )

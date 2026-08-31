@@ -766,11 +766,11 @@ and table-file decoders apply the same `<= ID_DOMAIN_END` and allocated-ID
 ordering validation; neither representation may truncate a watermark to
 `u32`. [U14]
 
-Each physical index slot also persists its last durable generation as
-`Active(IndexID)` or `Retired(IndexID)`; a never-published generation leaves no
-slot tag. Active catalog index rows remain the authority for the current index
-set, while the retired root tag exists only for exact-generation recovery proof
-until a safe reuse overwrites it. [D4], [D5], [C6], [U11]
+Each physical index slot persists one unified state: `Vacant`,
+`Active { index_id, root: Empty | Present(nonzero_block_id) }`, or
+`Retired(IndexID)`. Active catalog index rows remain the authority for the
+current index set, while retired slot state exists only for exact-generation
+recovery proof until a safe reuse overwrites it. [D4], [D5], [C6], [U11]
 
 Retired tags are table-file operational metadata, not active storage schema.
 They are excluded from the descriptor's active-schema fingerprint and from
@@ -995,23 +995,23 @@ DropIndex {
 }
 ```
 
-#### Persisted slot generations
+#### Persisted slot states
 
-The table root distinguishes three physical slot states independently of the
-secondary-root `BlockID`: [D5], [C6], [U11]
+The table root stores each generation and its explicit root state together:
+[D5], [C6], [U11]
 
 ```text
-Vacant                  no durable generation has occupied this slot
-Active(IndexID)         exact current durable generation
-Retired(IndexID)        exact last durable generation, with empty root
+Vacant                                      no durable generation published here
+Active(IndexID, Empty | Present(BlockID))   exact current durable generation/root
+Retired(IndexID)                            exact last durable generation
 ```
 
-CREATE root publication changes a selected slot to `Active(new_id)`. DROP root
-publication changes the exact same slot to `Retired(old_id)` and publishes the
-empty secondary-root sentinel. The retired tag remains in table-file metadata
-after the slot becomes allocator-eligible and is overwritten only by a later
-safe CREATE. `catalog.indexes` continues to store only active generations.
-[D4], [D5], [U11]
+CREATE root publication changes a selected slot to `Active(new_id, root)`.
+DROP root publication changes the exact same slot to `Retired(old_id)`, which
+cannot carry a root. The retired state remains in table-file metadata after the
+slot becomes allocator-eligible and is overwritten only by a later safe
+CREATE. `catalog.indexes` continues to store only active generations. [D4],
+[D5], [U11]
 
 The retired tag preserves create-then-drop proof. An empty root plus an
 advanced allocator watermark is not sufficient: the same shape can result
@@ -1163,13 +1163,13 @@ test `Arc` counts. [C10], [C13], [C16], [U12], [U17]
 #### Reusing a durably dropped slot
 
 DROP INDEX performs the existing physical retirement first: remove the active
-catalog mapping, publish `Retired(old_id)` in table-file metadata, and set the
-secondary-root slot to the empty sentinel. The slot remains quarantined after
+catalog mapping and publish `Retired(old_id)` in table-file metadata. The slot
+state itself proves that no root remains. The slot remains quarantined after
 commit. It becomes reusable only when all of these conditions hold: [D4],
 [D5], [D7], [C6], [C11], [C16], [U4], [U11], [U17]
 
 1. A table-root proof at or after `drop_cts` shows `Retired(old_id)` in the
-   exact slot and the empty secondary-root sentinel.
+   exact slot.
 2. Catalog checkpoint has folded the DROP and published
    `catalog_replay_start_ts > drop_cts`, so recovery cannot begin from catalog
    state in which that DROP is still absent.
@@ -1466,8 +1466,8 @@ DoraDB guarantees physical integrity: [D3], [C1]-[C8], [C10], [C13]-[C16],
 - foreground index execution reads only the admitted current layout and never
   consults runtime-retirement state;
 - catalog and table-file canonical storage metadata agree after recovery;
-- inactive slots have the empty secondary-root sentinel, and a durable retired
-  slot retains the exact last root-proven ID;
+- inactive slots cannot carry secondary roots, and a durable retired slot
+  retains the exact last root-proven ID;
 - a slot has at most one current, retired, or destroying runtime generation;
   every retired runtime carries its exact `IndexRef`;
 - `Reusable` means both the durable replay proof and exact runtime destruction

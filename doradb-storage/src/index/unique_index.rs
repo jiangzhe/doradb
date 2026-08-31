@@ -1,5 +1,5 @@
 use crate::buffer::{BufferPool, PoolGuard};
-use crate::catalog::IndexSpec;
+use crate::catalog::TableIndexMetadata;
 use crate::error::RuntimeResult;
 use crate::id::{RowID, TrxID};
 use crate::index::btree::{BTreeDelete, BTreeInsert, BTreeReplaceOrInsert, BTreeUpdate};
@@ -30,16 +30,16 @@ impl<P: BufferPool> UniqueMemIndex<P> {
     pub(crate) async fn new<F: Fn(usize) -> ValType>(
         index_pool: QuiescentGuard<P>,
         index_pool_guard: &PoolGuard,
-        index_spec: &IndexSpec,
+        index_spec: &TableIndexMetadata,
         ty_infer: F,
         ts: TrxID,
     ) -> RuntimeResult<Self> {
         debug_assert!(index_spec.unique());
-        debug_assert!(!index_spec.cols.is_empty());
+        debug_assert!(!index_spec.keys.is_empty());
         let types = index_spec
-            .cols
+            .keys
             .iter()
-            .map(|key| ty_infer(key.col_no as usize))
+            .map(|key| ty_infer(key.column_ordinal.as_usize()))
             .collect();
         Ok(Self(
             MemIndex::new_with_types(index_pool, index_pool_guard, types, ts).await?,
@@ -333,7 +333,10 @@ impl<P: BufferPool> GuardedUniqueMemIndex<'_, '_, P> {
 mod tests {
     use super::*;
     use crate::buffer::{FixedBufferPool, PoolRole};
-    use crate::catalog::{IndexAttributes, IndexKeySpec};
+    use crate::catalog::{
+        IndexSlot, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
+        StorageIndexSpec, TableMetadata,
+    };
     use crate::index::mem_index::MemIndexEntry;
     use crate::index::util::tests::drain_row_ids;
     use crate::quiescent::QuiescentBox;
@@ -345,16 +348,31 @@ mod tests {
         pool_guard: &PoolGuard,
         types: Vec<ValType>,
     ) -> UniqueMemIndex<FixedBufferPool> {
-        let index_spec = IndexSpec::new(
+        let index_spec = StorageIndexSpec::new(
             (0..types.len())
-                .map(|col_no| IndexKeySpec::new(col_no as u16))
+                .map(|col_no| StorageIndexKey::new(col_no as u16))
                 .collect(),
-            IndexAttributes::UK,
+            StorageIndexFlags::UK,
         );
+        let columns = types
+            .iter()
+            .map(|ty| {
+                StorageColumnSpec::new(
+                    ty.kind,
+                    if ty.nullable {
+                        StorageColumnFlags::NULLABLE
+                    } else {
+                        StorageColumnFlags::empty()
+                    },
+                )
+            })
+            .collect();
+        let metadata = TableMetadata::try_new(columns, vec![index_spec]).unwrap();
+        let index_spec = metadata.idx.index_spec(IndexSlot::new(0)).unwrap();
         UniqueMemIndex::new(
             pool.guard(),
             pool_guard,
-            &index_spec,
+            index_spec,
             |col_no| types[col_no],
             TrxID::new(100),
         )

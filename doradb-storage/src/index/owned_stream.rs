@@ -124,7 +124,7 @@ impl<P: BufferPool> OwnedUniqueDiskTreeCursor<P> {
         Self {
             index,
             disk_pool_guard,
-            state: DiskTreeNodeCursorState::new(root),
+            state: DiskTreeNodeCursorState::new(Some(root)),
         }
     }
 }
@@ -161,7 +161,7 @@ impl<P: BufferPool> OwnedNonUniqueDiskTreeCursor<P> {
         Self {
             index,
             disk_pool_guard,
-            state: DiskTreeNodeCursorState::new(root),
+            state: DiskTreeNodeCursorState::new(Some(root)),
         }
     }
 }
@@ -286,10 +286,12 @@ impl<P: BufferPool + 'static> OwnedIndexCandidateStream<P> {
                     OwnedUniqueMemIndexCursor::new(Arc::clone(&index), index_pool_guard),
                     Arc::clone(&range),
                 );
-                let disk = OwnedUniqueDiskTreeCandidateStream::new(
-                    OwnedUniqueDiskTreeCursor::new(index, disk_pool_guard, root),
-                    range,
-                );
+                let disk = root.map(|root| {
+                    OwnedUniqueDiskTreeCandidateStream::new(
+                        OwnedUniqueDiskTreeCursor::new(index, disk_pool_guard, root),
+                        range,
+                    )
+                });
                 OwnedIndexCandidateStreamKind::Unique(SecondaryIndexCandidateStream::new(mem, disk))
             }
             SecondaryIndex::NonUnique { .. } => {
@@ -297,10 +299,12 @@ impl<P: BufferPool + 'static> OwnedIndexCandidateStream<P> {
                     OwnedNonUniqueMemIndexCursor::new(Arc::clone(&index), index_pool_guard),
                     Arc::clone(&range),
                 );
-                let disk = OwnedNonUniqueDiskTreeCandidateStream::new(
-                    OwnedNonUniqueDiskTreeCursor::new(index, disk_pool_guard, root),
-                    range,
-                );
+                let disk = root.map(|root| {
+                    OwnedNonUniqueDiskTreeCandidateStream::new(
+                        OwnedNonUniqueDiskTreeCursor::new(index, disk_pool_guard, root),
+                        range,
+                    )
+                });
                 OwnedIndexCandidateStreamKind::NonUnique(SecondaryIndexCandidateStream::new(
                     mem, disk,
                 ))

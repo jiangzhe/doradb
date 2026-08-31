@@ -1,18 +1,25 @@
 use crate::buffer::PoolGuards;
-use crate::catalog::spec::{ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexSpec};
-use crate::catalog::{Catalog, IndexSlot, catalog_table_id_from_slot};
+#[cfg(test)]
+use crate::catalog::spec::ActiveIndexSpec;
+use crate::catalog::spec::{
+    IndexOrder, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexSpec,
+};
+use crate::catalog::{
+    Catalog, ColumnID, ColumnOrdinal, ID_DOMAIN_END, IndexID, IndexRef, IndexSlot,
+    catalog_table_id_from_slot,
+};
 use crate::component::EnginePools;
 use crate::engine::EngineCore;
 use crate::error::{
-    CompletionErrorBridge, CompletionResult, FatalError, FatalResult, InternalError,
-    InternalResult, IoResult, OperationError, OperationOrRuntimeResult, OperationResult,
-    RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
+    CompletionErrorBridge, CompletionResult, DataIntegrityError, DataIntegrityResult, FatalError,
+    FatalResult, InternalError, InternalResult, IoResult, OperationError, OperationOrRuntimeResult,
+    OperationResult, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
 };
 use crate::file::fs::FileSystem;
 use crate::file::table_file::{MutableTableFile, TableFile};
-use crate::id::{TableID, TrxID};
+use crate::id::{BlockID, TableID, TrxID};
 use crate::index::BlockIndex;
-use crate::map::FastHashSet;
+use crate::map::{FastHashMap, FastHashSet};
 use crate::obs;
 use crate::poison::EnginePoisoner;
 use crate::row::ops::SelectKey;
@@ -25,28 +32,53 @@ use crate::trx::PrivateTransaction;
 use crate::trx::sys::TransactionSystem;
 use crate::value::{Val, ValKind, ValType};
 use error_stack::{Report, ResultExt};
-use semistr::SemiStr;
 use std::any::Any;
 use std::mem;
+use std::num::NonZeroU64;
 use std::ops::Index;
 use std::result::Result as StdResult;
 use std::sync::Arc;
 #[cfg(test)]
 use tests::{CreateTableTestFailure, TableDdlTestPhase};
 
-const CREATE_TABLE_CATALOG_WRITE_TARGETS: [TableID; 4] = [
+const CREATE_TABLE_CATALOG_WRITE_TARGETS: [TableID; 3] = [
     catalog_table_id_from_slot(0),
     catalog_table_id_from_slot(1),
     catalog_table_id_from_slot(2),
-    catalog_table_id_from_slot(3),
 ];
-const DROP_TABLE_CATALOG_WRITE_TARGETS: [TableID; 5] = [
+const DROP_TABLE_CATALOG_WRITE_TARGETS: [TableID; 4] = [
     catalog_table_id_from_slot(0),
     catalog_table_id_from_slot(1),
     catalog_table_id_from_slot(2),
-    catalog_table_id_from_slot(3),
     catalog_table_id_from_slot(4),
 ];
+
+/// Authoritative identities finalized by a successful CREATE TABLE.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateTableOutcome {
+    table_id: TableID,
+    index_ids: Box<[IndexID]>,
+}
+
+impl CreateTableOutcome {
+    /// Returns the newly created table identity.
+    #[inline]
+    pub const fn table_id(&self) -> TableID {
+        self.table_id
+    }
+
+    /// Returns finalized initial index identities in input-definition order.
+    #[inline]
+    pub fn index_ids(&self) -> &[IndexID] {
+        &self.index_ids
+    }
+
+    /// Consumes the outcome into its table and initial-index identities.
+    #[inline]
+    pub fn into_parts(self) -> (TableID, Box<[IndexID]>) {
+        (self.table_id, self.index_ids)
+    }
+}
 
 /// Purely validated public CREATE TABLE input.
 pub(crate) struct ValidatedCreateTable {
@@ -57,8 +89,8 @@ impl ValidatedCreateTable {
     /// Validate public metadata before reserving a session operation or table id.
     #[inline]
     pub(crate) fn try_new(
-        table_spec: super::TableSpec,
-        index_specs: Vec<IndexSpec>,
+        table_spec: super::StorageTableSpec,
+        index_specs: Vec<StorageIndexSpec>,
     ) -> OperationResult<Self> {
         reject_user_table_primary_key_indexes(&index_specs, "create_table")?;
         let metadata = Arc::new(TableMetadata::try_new(
@@ -71,9 +103,20 @@ impl ValidatedCreateTable {
     /// Bind validated metadata to one gap-tolerant allocated table id.
     #[inline]
     pub(crate) fn into_plan(self, table_id: TableID) -> CreateTablePlan {
+        let index_ids = self
+            .metadata
+            .idx
+            .active_indexes()
+            .map(|(_, index)| index.index.id())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         CreateTablePlan {
             table_id,
             metadata: self.metadata,
+            outcome: CreateTableOutcome {
+                table_id,
+                index_ids,
+            },
         }
     }
 }
@@ -82,6 +125,7 @@ impl ValidatedCreateTable {
 pub(crate) struct CreateTablePlan {
     table_id: TableID,
     metadata: Arc<TableMetadata>,
+    outcome: CreateTableOutcome,
 }
 
 /// Owned DROP TABLE target selected under complete target exclusion.
@@ -406,73 +450,186 @@ impl CreateTableProgress {
     }
 }
 
-/// Sparse secondary-index metadata slots keyed by stable table-local index number.
+/// Canonical metadata for one physical storage column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TableColumnMetadata {
+    /// Stable table-local column identity.
+    pub(crate) id: ColumnID,
+    /// Physical position in the stored row layout.
+    pub(crate) ordinal: ColumnOrdinal,
+    /// Stored value kind.
+    pub(crate) value_kind: ValKind,
+    /// Validated storage-column flags.
+    pub(crate) flags: StorageColumnFlags,
+}
+
+/// Canonical validated key metadata shared by persistence and execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TableIndexKeySpec {
+    /// Stable identity of the referenced column.
+    pub(crate) column_id: ColumnID,
+    /// Compiled physical ordinal of the referenced column.
+    pub(crate) column_ordinal: ColumnOrdinal,
+    /// Logical index-key ordering.
+    pub(crate) order: IndexOrder,
+}
+
+/// Canonical metadata for one active exact index generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TableIndexMetadata {
+    /// Exact stable generation and physical slot.
+    pub(crate) index: IndexRef,
+    /// Validated index flags.
+    pub(crate) flags: StorageIndexFlags,
+    /// Ordered canonical index-key definition.
+    pub(crate) keys: Box<[TableIndexKeySpec]>,
+}
+
+impl TableIndexMetadata {
+    /// Returns whether this index enforces uniqueness.
+    #[inline]
+    pub(crate) fn unique(&self) -> bool {
+        self.flags.contains(StorageIndexFlags::PK) || self.flags.contains(StorageIndexFlags::UK)
+    }
+
+    /// Returns whether this index is the table primary key.
+    #[inline]
+    pub(crate) fn primary_key(&self) -> bool {
+        self.flags.contains(StorageIndexFlags::PK)
+    }
+}
+
+/// Persisted root state of one active secondary index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SecondaryIndexRoot {
+    /// The active index has no persisted DiskTree nodes.
+    Empty,
+    /// The active index is rooted at this nonzero table-file block.
+    Present(NonZeroU64),
+}
+
+impl SecondaryIndexRoot {
+    /// Converts the storage root state into an optional physical block.
+    #[inline]
+    pub(crate) fn block_id(self) -> Option<BlockID> {
+        match self {
+            Self::Empty => None,
+            Self::Present(block_id) => Some(BlockID::new(block_id.get())),
+        }
+    }
+
+    /// Converts an optional physical root into its persisted representation.
+    ///
+    /// A present root must identify a real DiskTree node rather than the table
+    /// file's super block.
+    #[inline]
+    pub(crate) fn from_block_id(block_id: Option<BlockID>) -> Self {
+        match block_id {
+            None => Self::Empty,
+            Some(block_id) => Self::Present(
+                NonZeroU64::new(block_id.as_u64())
+                    .expect("present secondary index root is the table-file super block"),
+            ),
+        }
+    }
+}
+
+/// Persisted state of one physical table-file index slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SecondaryIndexSlot {
+    /// The durable root covers this slot, but no index generation was durably
+    /// published in it.
+    ///
+    /// This can happen when recovery reserves a slot for a replay-visible
+    /// CREATE whose table-root publication failed, and a later CREATE skips
+    /// that reservation and durably extends the slot array. The crossed slot
+    /// is persisted as vacant while the earlier CREATE remains reserved by the
+    /// recovery overlay until its redo is checkpoint-covered. A failed root
+    /// publication alone does not persist a vacant slot; without a later
+    /// extension, the slot remains outside the durable slot count.
+    Vacant,
+    /// The slot currently owns this exact stable identity and DiskTree root.
+    Active {
+        /// Stable identity of the active generation.
+        index_id: IndexID,
+        /// Explicit empty or present DiskTree root state.
+        root: SecondaryIndexRoot,
+    },
+    /// This exact stable identity was dropped and remains retired.
+    Retired(IndexID),
+}
+
+impl SecondaryIndexSlot {
+    /// Returns the stable identity carried by an active or retired generation.
+    #[inline]
+    pub(crate) fn index_id(self) -> Option<IndexID> {
+        match self {
+            Self::Vacant => None,
+            Self::Active { index_id, .. } | Self::Retired(index_id) => Some(index_id),
+        }
+    }
+
+    /// Returns the root of an active generation.
+    #[inline]
+    pub(crate) fn active_root(self) -> Option<SecondaryIndexRoot> {
+        match self {
+            Self::Active { root, .. } => Some(root),
+            Self::Vacant | Self::Retired(_) => None,
+        }
+    }
+}
+
+/// Sparse active secondary-index metadata keyed by physical slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IndexSpecs {
-    slots: Vec<Option<IndexSpec>>,
+    slots: Vec<Option<TableIndexMetadata>>,
     active_count: usize,
 }
 
 impl IndexSpecs {
+    /// Returns the sparse physical slot count.
     #[inline]
-    fn try_from_active(
-        next_index_slot: IndexSlot,
-        active_index_specs: Vec<ActiveIndexSpec>,
-        col_count: usize,
-    ) -> OperationResult<Self> {
-        let mut slots = vec![None; next_index_slot.as_usize()];
-        let mut active_count = 0usize;
-        for active_index_spec in active_index_specs {
-            let index_slot = active_index_spec.index_slot;
-            if index_slot >= next_index_slot {
-                return Err(Report::new(OperationError::InvalidMetadata).attach(format!(
-                    "index_slot {index_slot} must be less than next_index_slot {next_index_slot}"
-                )));
-            }
-            if slots[index_slot.as_usize()].is_some() {
-                return Err(Report::new(OperationError::InvalidMetadata)
-                    .attach(format!("duplicate index_slot {index_slot}")));
-            }
-            validate_index_spec(index_slot, &active_index_spec.spec, col_count)?;
-            slots[index_slot.as_usize()] = Some(active_index_spec.spec);
-            active_count += 1;
-        }
-        Ok(Self {
+    fn new(slots: Vec<Option<TableIndexMetadata>>) -> Self {
+        let active_count = slots.iter().flatten().count();
+        Self {
             slots,
             active_count,
-        })
+        }
     }
 
-    /// Returns the sparse slot count, equal to table metadata `next_index_slot`.
+    /// Returns the number of active index generations.
     #[inline]
     pub(crate) fn len(&self) -> usize {
         self.slots.len()
     }
 
-    /// Returns the number of active secondary indexes.
+    /// Returns the number of active index definitions.
     #[inline]
     pub(crate) fn active_count(&self) -> usize {
         self.active_count
     }
 
-    /// Returns active secondary indexes with their stable slot numbers.
+    /// Iterates active definitions with their physical slots.
     #[inline]
-    pub(crate) fn active_indexes(&self) -> impl Iterator<Item = (IndexSlot, &IndexSpec)> {
+    pub(crate) fn active_indexes(&self) -> impl Iterator<Item = (IndexSlot, &TableIndexMetadata)> {
         self.slots.iter().enumerate().filter_map(|(slot_no, spec)| {
-            spec.as_ref()
-                .map(|spec| (IndexSlot::try_from(slot_no).unwrap(), spec))
+            spec.as_ref().map(|spec| {
+                let slot = IndexSlot::try_from(slot_no)
+                    .expect("validated table metadata slot is representable");
+                (slot, spec)
+            })
         })
     }
 
-    /// Returns active secondary-index specs only.
+    /// Iterates active definitions without their slots.
     #[inline]
-    pub(crate) fn values(&self) -> impl Iterator<Item = &IndexSpec> {
-        self.slots.iter().filter_map(Option::as_ref)
+    pub(crate) fn values(&self) -> impl Iterator<Item = &TableIndexMetadata> {
+        self.slots.iter().flatten()
     }
 
-    /// Returns one active secondary-index spec by stable slot number.
+    /// Returns one active definition by physical slot.
     #[inline]
-    pub(crate) fn get(&self, index_slot: IndexSlot) -> Option<&IndexSpec> {
+    pub(crate) fn get(&self, index_slot: IndexSlot) -> Option<&TableIndexMetadata> {
         self.slots
             .get(index_slot.as_usize())
             .and_then(Option::as_ref)
@@ -480,7 +637,7 @@ impl IndexSpecs {
 }
 
 impl Index<IndexSlot> for IndexSpecs {
-    type Output = IndexSpec;
+    type Output = TableIndexMetadata;
 
     #[inline]
     fn index(&self, index_slot: IndexSlot) -> &Self::Output {
@@ -493,104 +650,106 @@ impl Index<IndexSlot> for IndexSpecs {
     }
 }
 
-/// Immutable physical column layout used to interpret row pages, LWC blocks,
-/// and undo row bytes.
+/// Immutable physical column layout and stable-ID translation map.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableColumnLayout {
-    /// Column names in physical column order.
-    pub(crate) col_names: Vec<SemiStr>,
-    /// Column value types in physical column order.
+    next_column_id: u64,
+    columns: Box<[TableColumnMetadata]>,
+    ordinal_by_id: FastHashMap<ColumnID, ColumnOrdinal>,
+    /// Runtime value types in physical ordinal order.
     pub(crate) col_types: Vec<ValType>,
-    /// Column attributes in physical column order.
-    pub(crate) col_attrs: Vec<ColumnAttributes>,
-    // fix length is the total inline length of all columns.
     fix_len: usize,
-    // index of var-length columns.
     var_cols: Vec<usize>,
-    // number of nullable columns.
     nullable_cols: usize,
-    // scan sums of null bitmap, it can locate null bitmap
-    // in row page.
     null_scan_sums: Vec<usize>,
 }
 
 impl TableColumnLayout {
-    /// Try to create a physical column layout from column specifications.
+    /// Returns the exclusive stable column-ID allocator bound.
     #[inline]
-    pub(crate) fn try_new(column_specs: Vec<ColumnSpec>) -> OperationResult<Self> {
-        if column_specs.is_empty() {
-            return Err(Report::new(OperationError::InvalidMetadata)
-                .attach("table column layout requires columns"));
+    fn build(
+        next_column_id: u64,
+        mut columns: Vec<TableColumnMetadata>,
+    ) -> StdResult<Self, String> {
+        validate_next_id(next_column_id, "next_column_id")?;
+        if columns.is_empty() {
+            return Err("table column layout requires columns".to_owned());
         }
-        let col_names: Vec<_> = column_specs.iter().map(|c| c.column_name.clone()).collect();
-        let col_attrs: Vec<_> = column_specs.iter().map(|c| c.column_attributes).collect();
-        let col_types: Vec<_> = column_specs
-            .iter()
-            .map(|c| {
-                let nullable = c.column_attributes.contains(ColumnAttributes::NULLABLE);
-                ValType {
-                    kind: c.column_type,
-                    nullable,
-                }
-            })
-            .collect();
-        Self::try_create(col_names, col_types, col_attrs)
-    }
-
-    #[inline]
-    fn try_create(
-        col_names: Vec<SemiStr>,
-        col_types: Vec<ValType>,
-        col_attrs: Vec<ColumnAttributes>,
-    ) -> OperationResult<Self> {
-        if col_names.is_empty() || col_types.is_empty() || col_attrs.is_empty() {
-            return Err(Report::new(OperationError::InvalidMetadata)
-                .attach("table column layout requires columns"));
+        if columns.len() > usize::from(u16::MAX) + 1 {
+            return Err("column count exceeds physical ordinal domain".to_owned());
         }
-        if col_names.len() != col_types.len() || col_names.len() != col_attrs.len() {
-            return Err(Report::new(OperationError::InvalidMetadata).attach(format!(
-                "column metadata length mismatch: names={}, types={}, attrs={}",
-                col_names.len(),
-                col_types.len(),
-                col_attrs.len()
-            )));
-        }
-        for (idx, ((col_name, col_type), col_attr)) in
-            col_names.iter().zip(&col_types).zip(&col_attrs).enumerate()
-        {
-            let type_nullable = col_type.nullable;
-            let attr_nullable = col_attr.contains(ColumnAttributes::NULLABLE);
-            if type_nullable != attr_nullable {
-                return Err(Report::new(OperationError::InvalidMetadata).attach(format!(
-                    "column nullability metadata mismatch: column_index={idx}, column_name={}, type_nullable={type_nullable}, attr_nullable={attr_nullable}",
-                    col_name.as_str()
-                )));
-            }
-        }
-        let mut fix_len = 0;
-        let mut var_cols = vec![];
-        for (idx, ty) in col_types.iter().enumerate() {
-            fix_len += ty.kind.inline_len();
-            if !ty.kind.is_fixed() {
-                var_cols.push(idx);
-            }
-        }
-        // calculate column null bitmap offsets.
+        columns.sort_unstable_by_key(|column| column.ordinal);
+        let mut ordinal_by_id = FastHashMap::default();
+        let mut col_types = Vec::with_capacity(columns.len());
+        let mut fix_len = 0usize;
+        let mut var_cols = Vec::new();
         let mut nullable_cols = 0usize;
-        let mut null_scan_sums = vec![];
-        for ty in &col_types {
+        let mut null_scan_sums = Vec::with_capacity(columns.len());
+        for (expected_ordinal, column) in columns.iter().enumerate() {
+            let expected = ColumnOrdinal::try_from(expected_ordinal)
+                .map_err(|_| "column ordinal exceeds physical domain".to_owned())?;
+            if column.ordinal != expected {
+                return Err(format!(
+                    "column ordinals are not dense: expected={expected}, actual={}",
+                    column.ordinal
+                ));
+            }
+            if u64::from(column.id.get()) >= next_column_id {
+                return Err(format!(
+                    "column id must be below next_column_id: column_id={}, next_column_id={next_column_id}",
+                    column.id
+                ));
+            }
+            if ordinal_by_id.insert(column.id, column.ordinal).is_some() {
+                return Err(format!("duplicate column id {}", column.id));
+            }
+            let unknown = column.flags.bits() & !StorageColumnFlags::all().bits();
+            if unknown != 0 {
+                return Err(format!("unknown column flags: bits={unknown:#x}"));
+            }
+            let nullable = column.flags.contains(StorageColumnFlags::NULLABLE);
+            let ty = ValType {
+                kind: column.value_kind,
+                nullable,
+            };
             null_scan_sums.push(nullable_cols);
-            nullable_cols += if ty.nullable { 1 } else { 0 };
+            nullable_cols += usize::from(nullable);
+            fix_len = fix_len
+                .checked_add(ty.kind.inline_len())
+                .ok_or_else(|| "column fixed-length sum overflow".to_owned())?;
+            if !ty.kind.is_fixed() {
+                var_cols.push(expected_ordinal);
+            }
+            col_types.push(ty);
         }
         Ok(Self {
-            col_names,
+            next_column_id,
+            columns: columns.into_boxed_slice(),
+            ordinal_by_id,
             col_types,
-            col_attrs,
             fix_len,
             var_cols,
             nullable_cols,
             null_scan_sums,
         })
+    }
+
+    /// Returns the exclusive stable column-ID allocator bound.
+    #[inline]
+    pub(crate) const fn next_column_id(&self) -> u64 {
+        self.next_column_id
+    }
+
+    /// Returns canonical columns in physical ordinal order.
+    #[inline]
+    pub(crate) fn columns(&self) -> &[TableColumnMetadata] {
+        &self.columns
+    }
+
+    /// Resolves a stable column identity to its physical ordinal.
+    #[inline]
+    pub(crate) fn ordinal_for_id(&self, id: ColumnID) -> Option<ColumnOrdinal> {
+        self.ordinal_by_id.get(&id).copied()
     }
 
     /// Returns column count of this layout.
@@ -640,18 +799,6 @@ impl TableColumnLayout {
         self.null_scan_sums[col_idx]
     }
 
-    /// Returns column names in physical order.
-    #[inline]
-    pub(crate) fn col_names(&self) -> &[SemiStr] {
-        &self.col_names
-    }
-
-    /// Returns column attributes in physical order.
-    #[inline]
-    pub(crate) fn col_attrs(&self) -> &[ColumnAttributes] {
-        &self.col_attrs
-    }
-
     /// Returns variable-length column positions.
     #[inline]
     pub(crate) fn var_cols(&self) -> &[usize] {
@@ -674,96 +821,94 @@ impl TableColumnLayout {
 /// Immutable sparse secondary-index layout for one table metadata envelope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableIndexLayout {
-    // Next physical table-local index slot to allocate.
-    next_index_slot: IndexSlot,
-    // Secondary index specs keyed by physical table-local slot.
+    next_index_id: u64,
+    index_slot_count: u32,
     index_specs: IndexSpecs,
-    // columns that are included in any index.
+    slot_by_id: FastHashMap<IndexID, IndexSlot>,
     index_cols: FastHashSet<usize>,
 }
 
 impl TableIndexLayout {
+    /// Returns the exclusive stable index-ID allocator bound.
     #[inline]
-    fn try_create(
+    fn build(
         column_layout: &TableColumnLayout,
-        index_specs: Vec<ActiveIndexSpec>,
-        next_index_slot: IndexSlot,
-    ) -> OperationResult<Self> {
-        let index_specs =
-            IndexSpecs::try_from_active(next_index_slot, index_specs, column_layout.col_count())?;
-        validate_primary_key_contract(column_layout, &index_specs)?;
-        let mut index_cols = FastHashSet::default();
-        for index_spec in index_specs.values() {
-            for key in &index_spec.cols {
-                index_cols.insert(key.col_no as usize);
-            }
+        next_index_id: u64,
+        index_slot_count: u32,
+        index_specs: Vec<TableIndexMetadata>,
+    ) -> StdResult<Self, String> {
+        validate_next_id(next_index_id, "next_index_id")?;
+        if index_slot_count > u32::from(u16::MAX) + 1 {
+            return Err(format!(
+                "index_slot_count exceeds physical domain: {index_slot_count}"
+            ));
         }
+        let slot_count = usize::try_from(index_slot_count)
+            .map_err(|_| "index_slot_count exceeds usize".to_owned())?;
+        let mut slots = vec![None; slot_count];
+        let mut slot_by_id = FastHashMap::default();
+        let mut index_cols = FastHashSet::default();
+        for index_spec in index_specs {
+            let index = index_spec.index;
+            if u64::from(index.id().get()) >= next_index_id {
+                return Err(format!(
+                    "index id must be below next_index_id: index={index}, next_index_id={next_index_id}"
+                ));
+            }
+            if index.slot().as_usize() >= slot_count {
+                return Err(format!(
+                    "index slot outside index_slot_count: index={index}, index_slot_count={index_slot_count}"
+                ));
+            }
+            validate_table_index_metadata(column_layout, &index_spec)?;
+            if slot_by_id.insert(index.id(), index.slot()).is_some() {
+                return Err(format!("duplicate index id {}", index.id()));
+            }
+            let slot = &mut slots[index.slot().as_usize()];
+            if slot.is_some() {
+                return Err(format!("duplicate active index slot {}", index.slot()));
+            }
+            for key in &index_spec.keys {
+                index_cols.insert(key.column_ordinal.as_usize());
+            }
+            *slot = Some(index_spec);
+        }
+        let index_specs = IndexSpecs::new(slots);
+        validate_primary_key_contract(column_layout, &index_specs)?;
         Ok(Self {
-            next_index_slot,
+            next_index_id,
+            index_slot_count,
             index_specs,
+            slot_by_id,
             index_cols,
         })
     }
 
-    /// Returns the next physical table-local index slot to allocate.
+    /// Returns the exclusive stable index-ID allocator bound.
     #[inline]
-    pub(crate) fn next_index_slot(&self) -> IndexSlot {
-        self.next_index_slot
+    pub(crate) const fn next_index_id(&self) -> u64 {
+        self.next_index_id
     }
 
-    /// Allocates the next physical table-local slot and returns an index layout with
-    /// the new active index appended in the corresponding sparse slot.
+    /// Returns the exclusive physical index-slot count.
     #[inline]
-    fn try_with_created_index(
-        &self,
-        column_layout: &TableColumnLayout,
-        index_spec: IndexSpec,
-    ) -> OperationResult<(IndexSlot, Self)> {
-        let index_slot = self.next_index_slot;
-        validate_index_spec(index_slot, &index_spec, column_layout.col_count())?;
-        let next_index_slot = index_slot.checked_next().ok_or_else(|| {
-            Report::new(OperationError::InvalidMetadata).attach("next_index_slot overflow")
-        })?;
-        let mut index_specs = self
-            .active_indexes()
-            .map(|(slot, spec)| ActiveIndexSpec::new(slot, spec.clone()))
-            .collect::<Vec<_>>();
-        index_specs.push(ActiveIndexSpec::new(index_slot, index_spec));
-        let index_layout = Self::try_create(column_layout, index_specs, next_index_slot)?;
-        Ok((index_slot, index_layout))
+    pub(crate) const fn index_slot_count_u32(&self) -> u32 {
+        self.index_slot_count
     }
 
-    /// Returns an index layout with one active index slot made inactive.
+    /// Resolves a stable index identity to its exact active generation.
     #[inline]
-    fn without_index(&self, column_layout: &TableColumnLayout, index_slot: IndexSlot) -> Self {
-        assert!(
-            index_slot < self.next_index_slot,
-            "drop-index metadata invariant violated: index_slot={index_slot}, next_index_slot={}",
-            self.next_index_slot
-        );
-        assert!(
-            self.index_spec(index_slot).is_some(),
-            "drop-index metadata invariant violated: inactive index_slot={index_slot}, next_index_slot={}",
-            self.next_index_slot
-        );
-
-        let index_specs = self
-            .active_indexes()
-            .filter(|(active_slot, _)| *active_slot != index_slot)
-            .map(|(active_slot, spec)| ActiveIndexSpec::new(active_slot, spec.clone()))
-            .collect::<Vec<_>>();
-        Self::try_create(column_layout, index_specs, self.next_index_slot).unwrap_or_else(|err| {
-            panic!(
-                "drop-index metadata rebuild invariant violated: index_slot={index_slot}, next_index_slot={}, error={err:?}",
-                self.next_index_slot
-            )
-        })
+    pub(crate) fn resolve_index_id(&self, id: IndexID) -> Option<IndexRef> {
+        self.slot_by_id
+            .get(&id)
+            .copied()
+            .map(|slot| IndexRef::new(id, slot))
     }
 
     /// Returns the sparse secondary-index slot count.
     #[inline]
     pub(crate) fn index_slot_count(&self) -> usize {
-        self.next_index_slot.as_usize()
+        self.index_specs.len()
     }
 
     /// Returns the active secondary-index count.
@@ -774,19 +919,22 @@ impl TableIndexLayout {
 
     /// Returns active secondary indexes with their stable slot numbers.
     #[inline]
-    pub(crate) fn active_indexes(&self) -> impl Iterator<Item = (IndexSlot, &IndexSpec)> {
+    pub(crate) fn active_indexes(&self) -> impl Iterator<Item = (IndexSlot, &TableIndexMetadata)> {
         self.index_specs.active_indexes()
     }
 
     /// Returns one active secondary-index spec by physical slot.
     #[inline]
-    pub(crate) fn index_spec(&self, slot: IndexSlot) -> Option<&IndexSpec> {
+    pub(crate) fn index_spec(&self, slot: IndexSlot) -> Option<&TableIndexMetadata> {
         self.index_specs.get(slot)
     }
 
     /// Requires one active secondary-index spec by physical slot.
     #[inline]
-    pub(crate) fn require_index_spec(&self, slot: IndexSlot) -> InternalResult<&IndexSpec> {
+    pub(crate) fn require_index_spec(
+        &self,
+        slot: IndexSlot,
+    ) -> InternalResult<&TableIndexMetadata> {
         self.index_spec(slot).ok_or_else(|| {
             Report::new(InternalError::SecondaryIndexOutOfBounds).attach(format!(
                 "index_slot={slot}, index_slot_count={}",
@@ -797,12 +945,13 @@ impl TableIndexLayout {
 
     /// Returns the primary-key index slot and spec when this table has one.
     #[inline]
-    pub(crate) fn primary_key_index(&self) -> Option<(IndexSlot, &IndexSpec)> {
+    pub(crate) fn primary_key_index(&self) -> Option<(IndexSlot, &TableIndexMetadata)> {
         self.active_indexes()
             .find(|(_, index_spec)| index_spec.primary_key())
     }
 
-    /// Returns the sparse secondary-index specs.
+    /// Returns sparse secondary-index specs to lower-level test fixtures.
+    #[cfg(test)]
     #[inline]
     pub(crate) fn index_specs(&self) -> &IndexSpecs {
         &self.index_specs
@@ -825,14 +974,14 @@ impl TableIndexLayout {
         let Some(index) = self.index_spec(slot) else {
             return false;
         };
-        if index.cols.len() != vals.len() {
+        if index.keys.len() != vals.len() {
             return false;
         }
         index
-            .cols
+            .keys
             .iter()
             .zip(vals)
-            .all(|(key, val)| column_layout.col_type_match(usize::from(key.col_no), val))
+            .all(|(key, val)| column_layout.col_type_match(key.column_ordinal.as_usize(), val))
     }
 
     /// Returns index keys of a new row.
@@ -841,9 +990,9 @@ impl TableIndexLayout {
         self.active_indexes()
             .map(|(slot, is)| {
                 let vals: Vec<Val> = is
-                    .cols
+                    .keys
                     .iter()
-                    .map(|k| row[k.col_no as usize].clone())
+                    .map(|k| row[k.column_ordinal.as_usize()].clone())
                     .collect();
                 SelectKey {
                     index_slot: slot,
@@ -863,9 +1012,9 @@ impl TableIndexLayout {
         self.active_indexes()
             .map(|(slot, is)| {
                 let vals: Vec<Val> = is
-                    .cols
+                    .keys
                     .iter()
-                    .map(|k| row.val(column_layout, k.col_no as usize))
+                    .map(|k| row.val(column_layout, k.column_ordinal.as_usize()))
                     .collect();
                 SelectKey {
                     index_slot: slot,
@@ -878,7 +1027,7 @@ impl TableIndexLayout {
     /// Returns whether key matches given row.
     #[inline]
     pub(crate) fn match_key(&self, slot: IndexSlot, key_vals: &[Val], row: &[Val]) -> bool {
-        let Some(keys) = self.index_spec(slot).map(|spec| &spec.cols) else {
+        let Some(keys) = self.index_spec(slot).map(|spec| &spec.keys) else {
             return false;
         };
         if keys.len() != key_vals.len() {
@@ -886,7 +1035,7 @@ impl TableIndexLayout {
         }
         keys.iter()
             .zip(key_vals)
-            .all(|(key, val)| &row[key.col_no as usize] == val)
+            .all(|(key, val)| &row[key.column_ordinal.as_usize()] == val)
     }
 }
 
@@ -894,7 +1043,7 @@ impl TableIndexLayout {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PrimaryKeySpec<'a> {
     index_slot: IndexSlot,
-    index_spec: &'a IndexSpec,
+    index_spec: &'a TableIndexMetadata,
     column_layout: &'a TableColumnLayout,
 }
 
@@ -907,7 +1056,7 @@ impl<'a> PrimaryKeySpec<'a> {
 
     /// Returns the primary-key index specification.
     #[inline]
-    pub(crate) fn spec(&self) -> &'a IndexSpec {
+    pub(crate) fn spec(&self) -> &'a TableIndexMetadata {
         self.index_spec
     }
 
@@ -925,20 +1074,20 @@ impl<'a> PrimaryKeySpec<'a> {
                 expected: self.index_slot,
             });
         }
-        if key_vals.len() != self.index_spec.cols.len() {
+        if key_vals.len() != self.index_spec.keys.len() {
             return Err(PrimaryKeyMatchError::ValueCount {
                 actual: key_vals.len(),
-                expected: self.index_spec.cols.len(),
+                expected: self.index_spec.keys.len(),
             });
         }
         if !self
             .index_spec
-            .cols
+            .keys
             .iter()
             .zip(key_vals)
             .all(|(index_key, val)| {
                 self.column_layout
-                    .col_type_match(usize::from(index_key.col_no), val)
+                    .col_type_match(index_key.column_ordinal.as_usize(), val)
             })
         {
             return Err(PrimaryKeyMatchError::Type { index_slot });
@@ -967,6 +1116,8 @@ pub(crate) enum PrimaryKeyMatchError {
 /// Constraints and other advanced configurations are not implemented.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableMetadata {
+    /// Monotonic active storage-schema epoch.
+    pub(crate) storage_epoch: u64,
     /// Physical column layout.
     pub(crate) col: Arc<TableColumnLayout>,
     /// Sparse secondary-index layout.
@@ -974,64 +1125,101 @@ pub(crate) struct TableMetadata {
 }
 
 impl TableMetadata {
+    /// Reconstructs canonical metadata from validated persisted catalog rows.
+    pub(crate) fn try_from_persisted_parts(
+        storage_epoch: u64,
+        next_column_id: u64,
+        columns: Vec<TableColumnMetadata>,
+        next_index_id: u64,
+        index_slot_count: u32,
+        indexes: Vec<TableIndexMetadata>,
+    ) -> DataIntegrityResult<Self> {
+        let columns = TableColumnLayout::build(next_column_id, columns)
+            .map_err(|detail| Report::new(DataIntegrityError::InvalidPayload).attach(detail))?;
+        Self::build(
+            storage_epoch,
+            columns,
+            next_index_id,
+            index_slot_count,
+            indexes,
+        )
+        .map_err(|detail| Report::new(DataIntegrityError::InvalidPayload).attach(detail))
+    }
+
     /// Try to create metadata of a new table.
     #[inline]
     pub(crate) fn try_new(
-        column_specs: Vec<ColumnSpec>,
-        index_specs: Vec<IndexSpec>,
+        column_specs: Vec<StorageColumnSpec>,
+        index_specs: Vec<StorageIndexSpec>,
     ) -> OperationResult<Self> {
-        let next_index_slot = IndexSlot::try_from(index_specs.len()).map_err(|_| {
-            Report::new(OperationError::InvalidMetadata)
-                .attach("next_index_slot overflow while deriving table metadata")
-        })?;
-        let col_count = column_specs.len();
-        let active_index_specs = index_specs
+        let mut next_column_id = 0u64;
+        let columns = column_specs
             .into_iter()
             .enumerate()
-            .map(|(slot_no, spec)| {
-                let index_slot = IndexSlot::try_from(slot_no).map_err(|_| {
+            .map(|(ordinal, spec)| {
+                let ordinal = ColumnOrdinal::try_from(ordinal).map_err(|_| {
                     Report::new(OperationError::InvalidMetadata)
-                        .attach("index_slot overflow while deriving table metadata")
+                        .attach("column count exceeds physical ordinal domain")
                 })?;
-                if col_count > 0 {
-                    validate_index_spec(index_slot, &spec, col_count)?;
-                }
-                Ok(ActiveIndexSpec::new(index_slot, spec))
+                let id = allocate_column_id(&mut next_column_id)?;
+                Ok(TableColumnMetadata {
+                    id,
+                    ordinal,
+                    value_kind: spec.value_kind,
+                    flags: spec.flags,
+                })
             })
             .collect::<OperationResult<Vec<_>>>()?;
-        Self::try_new_with_next_index_slot(column_specs, active_index_specs, next_index_slot)
+        let column_layout =
+            TableColumnLayout::build(next_column_id, columns).map_err(invalid_metadata)?;
+
+        if index_specs.len() > usize::from(u16::MAX) + 1 {
+            return Err(invalid_metadata(
+                "index count exceeds physical slot domain".to_owned(),
+            ));
+        }
+        let mut next_index_id = 0u64;
+        let mut indexes = Vec::with_capacity(index_specs.len());
+        for (slot, spec) in index_specs.into_iter().enumerate() {
+            let slot = IndexSlot::try_from(slot)
+                .map_err(|_| invalid_metadata("index slot overflow".to_owned()))?;
+            let id = allocate_index_id(&mut next_index_id)?;
+            indexes.push(compile_storage_index_spec(
+                &column_layout,
+                IndexRef::new(id, slot),
+                spec,
+            )?);
+        }
+        let index_slot_count = u32::try_from(indexes.len())
+            .map_err(|_| invalid_metadata("index slot count overflow".to_owned()))?;
+        Self::build(0, column_layout, next_index_id, index_slot_count, indexes)
+            .map_err(invalid_metadata)
     }
 
-    /// Try to create metadata with an explicit next physical index slot.
+    /// Creates metadata from explicit canonical parts for catalog bootstrap and tests.
+    #[cfg(test)]
     #[inline]
-    pub(crate) fn try_new_with_next_index_slot(
-        column_specs: Vec<ColumnSpec>,
+    pub(crate) fn try_new_with_index_slot_count(
+        column_specs: Vec<StorageColumnSpec>,
         index_specs: Vec<ActiveIndexSpec>,
-        next_index_slot: IndexSlot,
+        index_slot_count: impl Into<u32>,
     ) -> OperationResult<Self> {
-        let column_layout = Arc::new(TableColumnLayout::try_new(column_specs)?);
-        let index_layout =
-            TableIndexLayout::try_create(&column_layout, index_specs, next_index_slot)?;
-        Ok(Self {
-            col: column_layout,
-            idx: index_layout,
-        })
-    }
-
-    /// Reconstructs metadata previously validated and persisted by the engine.
-    #[inline]
-    pub(crate) fn from_persisted_parts(
-        column_specs: Vec<ColumnSpec>,
-        index_specs: Vec<ActiveIndexSpec>,
-        next_index_slot: IndexSlot,
-    ) -> Self {
-        Self::try_new_with_next_index_slot(column_specs, index_specs, next_index_slot).unwrap_or_else(
-            |err| {
-                panic!(
-                    "persisted table metadata invariant violated: next_index_slot={next_index_slot}, error={err:?}"
-                )
-            },
-        )
+        let index_slot_count = index_slot_count.into();
+        let mut metadata = Self::try_new(column_specs, Vec::new())?;
+        let mut next_index_id = 0u64;
+        let mut indexes = Vec::with_capacity(index_specs.len());
+        for active in index_specs {
+            next_index_id = next_index_id.max(u64::from(active.index.id().get()) + 1);
+            indexes.push(compile_storage_index_spec(
+                &metadata.col,
+                active.index,
+                active.spec,
+            )?);
+        }
+        metadata.idx =
+            TableIndexLayout::build(&metadata.col, next_index_id, index_slot_count, indexes)
+                .map_err(invalid_metadata)?;
+        Ok(metadata)
     }
 
     /// Returns the primary-key metadata view when this table has one.
@@ -1047,78 +1235,161 @@ impl TableMetadata {
     }
 
     #[inline]
-    fn try_create(
-        col_names: Vec<SemiStr>,
-        col_types: Vec<ValType>,
-        col_attrs: Vec<ColumnAttributes>,
-        index_specs: Vec<ActiveIndexSpec>,
-        next_index_slot: IndexSlot,
-    ) -> OperationResult<Self> {
-        let column_layout = Arc::new(TableColumnLayout::try_create(
-            col_names, col_types, col_attrs,
-        )?);
+    fn build(
+        storage_epoch: u64,
+        column_layout: TableColumnLayout,
+        next_index_id: u64,
+        index_slot_count: u32,
+        indexes: Vec<TableIndexMetadata>,
+    ) -> StdResult<Self, String> {
+        let column_layout = Arc::new(column_layout);
         let index_layout =
-            TableIndexLayout::try_create(&column_layout, index_specs, next_index_slot)?;
+            TableIndexLayout::build(&column_layout, next_index_id, index_slot_count, indexes)?;
         Ok(Self {
+            storage_epoch,
             col: column_layout,
             idx: index_layout,
         })
     }
 
-    /// Allocates the next physical table-local slot and returns metadata with
-    /// the new active index appended in the corresponding sparse slot.
+    /// Allocates an exact ID and append slot for a new index.
+    #[cfg(test)]
     #[inline]
     pub(crate) fn try_with_created_index(
         &self,
-        index_spec: IndexSpec,
-    ) -> OperationResult<(IndexSlot, Self)> {
-        let (index_slot, index_layout) = self.idx.try_with_created_index(&self.col, index_spec)?;
-        let metadata = Self {
-            col: Arc::clone(&self.col),
-            idx: index_layout,
-        };
-        Ok((index_slot, metadata))
+        index_spec: StorageIndexSpec,
+    ) -> OperationResult<(IndexRef, Self)> {
+        self.try_with_created_index_at(
+            index_spec,
+            self.idx.next_index_id,
+            self.idx.index_slot_count,
+        )
     }
 
-    /// Returns metadata with one active index slot made inactive.
-    #[inline]
-    pub(crate) fn without_index(&self, index_slot: IndexSlot) -> Self {
-        let index_layout = self.idx.without_index(&self.col, index_slot);
-        Self {
-            col: Arc::clone(&self.col),
-            idx: index_layout,
+    /// Allocates at an overlay-qualified ID and append slot.
+    pub(crate) fn try_with_created_index_at(
+        &self,
+        index_spec: StorageIndexSpec,
+        effective_next_index_id: u64,
+        index_slot: u32,
+    ) -> OperationResult<(IndexRef, Self)> {
+        validate_next_id(effective_next_index_id, "effective_next_index_id")
+            .map_err(invalid_metadata)?;
+        if effective_next_index_id < self.idx.next_index_id {
+            return Err(invalid_metadata(format!(
+                "effective_next_index_id regressed: durable={}, effective={effective_next_index_id}",
+                self.idx.next_index_id
+            )));
         }
+        if index_slot < self.idx.index_slot_count {
+            return Err(invalid_metadata(format!(
+                "CREATE INDEX slot precedes append bound: slot={index_slot}, durable_count={}",
+                self.idx.index_slot_count
+            )));
+        }
+        if index_slot > u32::from(u16::MAX) {
+            return Err(invalid_metadata("index slot domain exhausted".to_owned()));
+        }
+        let mut next_index_id = effective_next_index_id;
+        let id = allocate_index_id(&mut next_index_id)?;
+        let slot = IndexSlot::new(index_slot as u16);
+        let index = IndexRef::new(id, slot);
+        let compiled = compile_storage_index_spec(&self.col, index, index_spec)?;
+        let mut indexes = self.idx.index_specs.values().cloned().collect::<Vec<_>>();
+        indexes.push(compiled);
+        let index_slot_count = index_slot
+            .checked_add(1)
+            .ok_or_else(|| invalid_metadata("index_slot_count overflow".to_owned()))?;
+        let storage_epoch = self
+            .storage_epoch
+            .checked_add(1)
+            .ok_or_else(|| invalid_metadata("storage_epoch overflow".to_owned()))?;
+        let mut metadata = Self::build(
+            storage_epoch,
+            (*self.col).clone(),
+            next_index_id,
+            index_slot_count,
+            indexes,
+        )
+        .map_err(invalid_metadata)?;
+        metadata.col = Arc::clone(&self.col);
+        Ok((index, metadata))
+    }
+
+    /// Returns metadata with one exact active index generation removed.
+    #[inline]
+    pub(crate) fn without_index(&self, index: IndexRef) -> OperationResult<Self> {
+        if self
+            .idx
+            .index_spec(index.slot())
+            .is_none_or(|spec| spec.index != index)
+        {
+            return Err(Report::new(OperationError::IndexNotFound).attach(format!(
+                "inactive or replaced index generation: index={index}"
+            )));
+        }
+        let indexes = self
+            .idx
+            .index_specs
+            .values()
+            .filter(|spec| spec.index != index)
+            .cloned()
+            .collect();
+        let storage_epoch = self
+            .storage_epoch
+            .checked_add(1)
+            .ok_or_else(|| invalid_metadata("storage_epoch overflow".to_owned()))?;
+        let mut metadata = Self::build(
+            storage_epoch,
+            (*self.col).clone(),
+            self.idx.next_index_id,
+            self.idx.index_slot_count,
+            indexes,
+        )
+        .map_err(invalid_metadata)?;
+        metadata.col = Arc::clone(&self.col);
+        Ok(metadata)
     }
 
     /// Create a view for serialization.
     #[inline]
     pub(crate) fn ser_view(&self) -> TableBriefMetadataSerView<'_> {
-        TableBriefMetadataSerView {
-            col_names: self.col.col_names(),
-            col_types: self.col.col_types(),
-            col_attrs: self.col.col_attrs(),
-            next_index_slot: self.idx.next_index_slot(),
-            index_specs: self.idx.index_specs(),
-        }
+        TableBriefMetadataSerView { metadata: self }
     }
-}
 
-impl From<TableBriefMetadata> for TableMetadata {
-    #[inline]
-    fn from(value: TableBriefMetadata) -> Self {
-        TableMetadata::try_create(
-            value.col_names,
-            value.col_types,
-            value.col_attrs,
-            value.index_specs,
-            value.next_index_slot,
+    /// Computes the canonical active storage-schema fingerprint.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the canonical digest is installed now for the descriptor phase consumer"
         )
-        .unwrap_or_else(|err| {
-            panic!(
-                "persisted table-file metadata invariant violated: next_index_slot={}, error={err:?}",
-                value.next_index_slot
-            )
-        })
+    )]
+    pub(crate) fn storage_schema_fingerprint(&self) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"doradb.storage-schema\0");
+        hasher.update(&[1]);
+        hasher.update(&(self.col.col_count() as u32).to_le_bytes());
+        for column in self.col.columns() {
+            hasher.update(&column.id.get().to_le_bytes());
+            hasher.update(&column.ordinal.get().to_le_bytes());
+            hasher.update(&(column.value_kind as u32).to_le_bytes());
+            hasher.update(&column.flags.bits().to_le_bytes());
+        }
+        hasher.update(&(self.idx.active_index_count() as u32).to_le_bytes());
+        let mut indexes = self.idx.index_specs.values().collect::<Vec<_>>();
+        indexes.sort_unstable_by_key(|spec| spec.index.id());
+        for index in indexes {
+            hasher.update(&index.index.id().get().to_le_bytes());
+            hasher.update(&index.index.slot().get().to_le_bytes());
+            hasher.update(&index.flags.bits().to_le_bytes());
+            hasher.update(&(index.keys.len() as u16).to_le_bytes());
+            for key in &index.keys {
+                hasher.update(&key.column_id.get().to_le_bytes());
+                hasher.update(&[key.order as u8]);
+            }
+        }
+        *hasher.finalize().as_bytes()
     }
 }
 
@@ -1126,43 +1397,53 @@ impl From<TableBriefMetadata> for TableMetadata {
 /// metadata.
 /// It's used for serialization.
 pub(crate) struct TableBriefMetadataSerView<'a> {
-    /// Column names in physical column order.
-    pub(crate) col_names: &'a [SemiStr],
-    /// Column value types in physical column order.
-    pub(crate) col_types: &'a [ValType],
-    /// Column attributes in physical column order.
-    pub(crate) col_attrs: &'a [ColumnAttributes],
-    /// Next physical table-local secondary-index slot.
-    pub(crate) next_index_slot: IndexSlot,
-    /// Active sparse secondary-index specs.
-    pub(crate) index_specs: &'a IndexSpecs,
+    /// Canonical metadata being serialized.
+    pub(crate) metadata: &'a TableMetadata,
 }
 
 impl<'a> Ser<'a> for TableBriefMetadataSerView<'a> {
     #[inline]
     fn ser_len(&self) -> usize {
-        self.col_names.ser_len()
-            + self.col_types.ser_len()
-            + self.col_attrs.ser_len()
-            + mem::size_of::<u16>()
-            + mem::size_of::<u64>()
+        mem::size_of::<u64>() * 3
+            + mem::size_of::<u32>() * 3
+            + self.metadata.col.col_count() * (mem::size_of::<u32>() * 3 + mem::size_of::<u16>())
             + self
+                .metadata
+                .idx
                 .index_specs
-                .active_indexes()
-                .map(|(_, index_spec)| mem::size_of::<u16>() + index_spec.ser_len())
+                .values()
+                .map(|index| {
+                    mem::size_of::<u32>() * 2
+                        + mem::size_of::<u16>() * 2
+                        + index.keys.len() * (mem::size_of::<u32>() + mem::size_of::<u8>())
+                })
                 .sum::<usize>()
     }
 
     #[inline]
     fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
-        let idx = self.col_names.ser(out, start_idx);
-        let idx = self.col_types.ser(out, idx);
-        let idx = self.col_attrs.ser(out, idx);
-        let mut idx = out.ser_u16(idx, self.next_index_slot.get());
-        idx = out.ser_u64(idx, self.index_specs.active_count() as u64);
-        for (index_slot, index_spec) in self.index_specs.active_indexes() {
-            idx = out.ser_u16(idx, index_slot.get());
-            idx = index_spec.ser(out, idx);
+        let metadata = self.metadata;
+        let mut idx = out.ser_u64(start_idx, metadata.storage_epoch);
+        idx = out.ser_u64(idx, metadata.col.next_column_id);
+        idx = out.ser_u32(idx, metadata.col.col_count() as u32);
+        for column in metadata.col.columns() {
+            idx = out.ser_u32(idx, column.id.get());
+            idx = out.ser_u16(idx, column.ordinal.get());
+            idx = out.ser_u32(idx, column.value_kind as u32);
+            idx = out.ser_u32(idx, column.flags.bits());
+        }
+        idx = out.ser_u64(idx, metadata.idx.next_index_id);
+        idx = out.ser_u32(idx, metadata.idx.index_slot_count);
+        idx = out.ser_u32(idx, metadata.idx.active_index_count() as u32);
+        for index in metadata.idx.index_specs.values() {
+            idx = out.ser_u32(idx, index.index.id().get());
+            idx = out.ser_u16(idx, index.index.slot().get());
+            idx = out.ser_u32(idx, index.flags.bits());
+            idx = out.ser_u16(idx, index.keys.len() as u16);
+            for key in &index.keys {
+                idx = out.ser_u32(idx, key.column_id.get());
+                idx = out.ser_u8(idx, key.order as u8);
+            }
         }
         idx
     }
@@ -1172,40 +1453,107 @@ impl<'a> Ser<'a> for TableBriefMetadataSerView<'a> {
 /// It's used as a deserialization container.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableBriefMetadata {
-    /// Column names in physical column order.
-    pub(crate) col_names: Vec<SemiStr>,
-    /// Column value types in physical column order.
-    pub(crate) col_types: Vec<ValType>,
-    /// Column attributes in physical column order.
-    pub(crate) col_attrs: Vec<ColumnAttributes>,
-    /// Next physical table-local secondary-index slot.
-    pub(crate) next_index_slot: IndexSlot,
-    /// Active sparse secondary-index specs.
-    pub(crate) index_specs: Vec<ActiveIndexSpec>,
+    /// Canonical metadata reconstructed from the persisted payload.
+    pub(crate) metadata: TableMetadata,
 }
 
 impl Deser for TableBriefMetadata {
-    const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(
-        mem::size_of::<u64>() * 4 // four vector length prefixes
-            + mem::size_of::<u16>(), // next_index_slot
-    );
+    const MIN_BYTES_HINT: MinBytesHint =
+        min_bytes_hint(mem::size_of::<u64>() * 3 + mem::size_of::<u32>() * 3);
 
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
-        let (idx, col_names) = <Vec<SemiStr>>::deser(input, start_idx)?;
-        let (idx, col_types) = <Vec<ValType>>::deser(input, idx)?;
-        let (idx, col_attrs) = <Vec<ColumnAttributes>>::deser(input, idx)?;
-        let (idx, next_index_slot) = input.deser_u16(idx)?;
-        let (idx, index_specs) = <Vec<ActiveIndexSpec>>::deser(input, idx)?;
-        Ok((
-            idx,
-            TableBriefMetadata {
-                col_names,
-                col_types,
-                col_attrs,
-                next_index_slot: IndexSlot::from(next_index_slot),
-                index_specs,
-            },
-        ))
+        let (mut idx, storage_epoch) = input.deser_u64(start_idx)?;
+        let (next_idx, next_column_id) = input.deser_u64(idx)?;
+        idx = next_idx;
+        let (next_idx, column_count) = input.deser_u32(idx)?;
+        idx = next_idx;
+        if column_count == 0 || column_count > u32::from(u16::MAX) + 1 {
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!("invalid table column count {column_count}")));
+        }
+        let mut columns = Vec::with_capacity(column_count as usize);
+        for _ in 0..column_count {
+            let (next_idx, id) = input.deser_u32(idx)?;
+            let (next_idx, ordinal) = input.deser_u16(next_idx)?;
+            let (next_idx, value_kind) = input.deser_u32(next_idx)?;
+            let (next_idx, flags) = input.deser_u32(next_idx)?;
+            idx = next_idx;
+            let value_kind = ValKind::try_from(value_kind).map_err(|_| {
+                Report::new(DataIntegrityError::InvalidPayload)
+                    .attach(format!("unknown table column value kind {value_kind}"))
+            })?;
+            let flags = StorageColumnFlags::from_bits(flags).ok_or_else(|| {
+                Report::new(DataIntegrityError::InvalidPayload)
+                    .attach(format!("unknown table column flags {flags:#x}"))
+            })?;
+            columns.push(TableColumnMetadata {
+                id: ColumnID::new(id),
+                ordinal: ColumnOrdinal::new(ordinal),
+                value_kind,
+                flags,
+            });
+        }
+        let column_layout = TableColumnLayout::build(next_column_id, columns)
+            .map_err(|detail| Report::new(DataIntegrityError::InvalidPayload).attach(detail))?;
+        let (next_idx, next_index_id) = input.deser_u64(idx)?;
+        let (next_idx, index_slot_count) = input.deser_u32(next_idx)?;
+        let (next_idx, active_index_count) = input.deser_u32(next_idx)?;
+        idx = next_idx;
+        if active_index_count > index_slot_count {
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach("active index count exceeds index slot count"));
+        }
+        let mut indexes = Vec::with_capacity(active_index_count as usize);
+        for _ in 0..active_index_count {
+            let (next_idx, id) = input.deser_u32(idx)?;
+            let (next_idx, slot) = input.deser_u16(next_idx)?;
+            let (next_idx, flags) = input.deser_u32(next_idx)?;
+            let (next_idx, key_count) = input.deser_u16(next_idx)?;
+            idx = next_idx;
+            if key_count == 0 {
+                return Err(Report::new(DataIntegrityError::InvalidPayload)
+                    .attach("persisted index has no keys"));
+            }
+            let flags = StorageIndexFlags::from_bits(flags).ok_or_else(|| {
+                Report::new(DataIntegrityError::InvalidPayload)
+                    .attach(format!("unknown table index flags {flags:#x}"))
+            })?;
+            let mut keys = Vec::with_capacity(key_count as usize);
+            for _ in 0..key_count {
+                let (next_idx, column_id) = input.deser_u32(idx)?;
+                let (next_idx, order) = input.deser_u8(next_idx)?;
+                idx = next_idx;
+                let column_id = ColumnID::new(column_id);
+                let column_ordinal = column_layout.ordinal_for_id(column_id).ok_or_else(|| {
+                    Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                        "index key references missing column id {column_id}"
+                    ))
+                })?;
+                let order = IndexOrder::try_from(order).map_err(|()| {
+                    Report::new(DataIntegrityError::InvalidPayload)
+                        .attach(format!("unknown index key order {order}"))
+                })?;
+                keys.push(TableIndexKeySpec {
+                    column_id,
+                    column_ordinal,
+                    order,
+                });
+            }
+            indexes.push(TableIndexMetadata {
+                index: IndexRef::new(IndexID::new(id), IndexSlot::new(slot)),
+                flags,
+                keys: keys.into_boxed_slice(),
+            });
+        }
+        let metadata = TableMetadata::build(
+            storage_epoch,
+            column_layout,
+            next_index_id,
+            index_slot_count,
+            indexes,
+        )
+        .map_err(|detail| Report::new(DataIntegrityError::InvalidPayload).attach(detail))?;
+        Ok((idx, TableBriefMetadata { metadata }))
     }
 }
 
@@ -1234,7 +1582,7 @@ impl PreparedCreateTable {
 }
 
 impl PreparedExecution for PreparedCreateTable {
-    type Output = TableID;
+    type Output = CreateTableOutcome;
     type Accepted = AcceptedCreateTable;
 
     const LABEL: &'static str = "create_table";
@@ -1268,7 +1616,7 @@ pub(crate) struct AcceptedCreateTable {
 }
 
 impl AcceptedExecution for AcceptedCreateTable {
-    type Output = TableID;
+    type Output = CreateTableOutcome;
 
     #[inline]
     async fn execute(&mut self) -> CompletionResult<Self::Output> {
@@ -1301,7 +1649,7 @@ impl AcceptedExecution for AcceptedCreateTable {
 }
 
 impl AcceptedCreateTable {
-    async fn execute_inner(&mut self) -> CompletionResult<TableID> {
+    async fn execute_inner(&mut self) -> CompletionResult<CreateTableOutcome> {
         let scope = &mut self.scope;
         let progress = self
             .progress
@@ -1482,7 +1830,7 @@ impl AcceptedCreateTable {
             .reach_phase(TableDdlTestPhase::CreateRuntimeInstalled)
             .await;
 
-        Ok(table_id)
+        Ok(progress.plan.outcome.clone())
     }
 }
 
@@ -1839,7 +2187,7 @@ pub(crate) async fn validated_index_ddl_target(
 /// Reject primary-key flags in public user-table DDL for now.
 #[inline]
 pub(crate) fn reject_user_table_primary_key_index(
-    index_spec: &IndexSpec,
+    index_spec: &StorageIndexSpec,
     operation: &'static str,
 ) -> OperationResult<()> {
     if !index_spec.primary_key() {
@@ -1852,7 +2200,7 @@ pub(crate) fn reject_user_table_primary_key_index(
 
 #[inline]
 fn reject_user_table_primary_key_indexes(
-    index_specs: &[IndexSpec],
+    index_specs: &[StorageIndexSpec],
     operation: &'static str,
 ) -> OperationResult<()> {
     for index_spec in index_specs {
@@ -1920,21 +2268,145 @@ fn poison_error_source(
 }
 
 #[inline]
-fn validate_index_spec(
-    index_slot: IndexSlot,
-    spec: &IndexSpec,
-    col_count: usize,
-) -> OperationResult<()> {
-    if spec.cols.is_empty() {
-        return Err(Report::new(OperationError::InvalidMetadata)
-            .attach(format!("index_slot {index_slot} has no key columns")));
+fn invalid_metadata(detail: String) -> Report<OperationError> {
+    Report::new(OperationError::InvalidMetadata).attach(detail)
+}
+
+#[inline]
+fn validate_next_id(next_id: u64, field: &'static str) -> StdResult<(), String> {
+    if next_id > ID_DOMAIN_END {
+        return Err(format!(
+            "{field} exceeds stable identity domain: value={next_id}, max={ID_DOMAIN_END}"
+        ));
     }
-    for key in &spec.cols {
-        let col_no = key.col_no as usize;
-        if col_no >= col_count {
-            return Err(Report::new(OperationError::InvalidMetadata).attach(format!(
-                "index_slot {index_slot} references column {col_no} outside column count {col_count}"
+    Ok(())
+}
+
+#[inline]
+fn allocate_column_id(next_id: &mut u64) -> OperationResult<ColumnID> {
+    validate_next_id(*next_id, "next_column_id").map_err(invalid_metadata)?;
+    if *next_id == ID_DOMAIN_END {
+        return Err(Report::new(OperationError::ColumnIdExhausted));
+    }
+    let allocated = ColumnID::new(*next_id as u32);
+    *next_id = next_id
+        .checked_add(1)
+        .ok_or_else(|| invalid_metadata("next_column_id arithmetic overflow".to_owned()))?;
+    Ok(allocated)
+}
+
+#[inline]
+fn allocate_index_id(next_id: &mut u64) -> OperationResult<IndexID> {
+    validate_next_id(*next_id, "next_index_id").map_err(invalid_metadata)?;
+    if *next_id == ID_DOMAIN_END {
+        return Err(Report::new(OperationError::IndexIdExhausted));
+    }
+    let allocated = IndexID::new(*next_id as u32);
+    *next_id = next_id
+        .checked_add(1)
+        .ok_or_else(|| invalid_metadata("next_index_id arithmetic overflow".to_owned()))?;
+    Ok(allocated)
+}
+
+fn compile_storage_index_spec(
+    columns: &TableColumnLayout,
+    index: IndexRef,
+    spec: StorageIndexSpec,
+) -> OperationResult<TableIndexMetadata> {
+    let unknown = spec.flags.bits() & !StorageIndexFlags::all().bits();
+    if unknown != 0 {
+        return Err(invalid_metadata(format!(
+            "index {index} has unknown flags: bits={unknown:#x}"
+        )));
+    }
+    if spec.keys.is_empty() {
+        return Err(invalid_metadata(format!(
+            "index {index} has no key columns"
+        )));
+    }
+    if spec.keys.len() > usize::from(u16::MAX) {
+        return Err(invalid_metadata(format!(
+            "index {index} key count exceeds persisted u16 domain"
+        )));
+    }
+    if 3usize
+        .checked_add(spec.keys.len().saturating_mul(5))
+        .is_none_or(|len| len > usize::from(u16::MAX))
+    {
+        return Err(invalid_metadata(format!(
+            "index {index} key specification exceeds VarByte payload limit"
+        )));
+    }
+    let mut seen = FastHashSet::default();
+    let mut keys = Vec::with_capacity(spec.keys.len());
+    for key in spec.keys {
+        let ordinal = key.column_ordinal;
+        let Some(column) = columns.columns().get(ordinal.as_usize()) else {
+            return Err(invalid_metadata(format!(
+                "index {index} references column ordinal {ordinal} outside column count {}",
+                columns.col_count()
             )));
+        };
+        if !seen.insert(ordinal) {
+            return Err(invalid_metadata(format!(
+                "index {index} repeats column ordinal {ordinal}"
+            )));
+        }
+        keys.push(TableIndexKeySpec {
+            column_id: column.id,
+            column_ordinal: ordinal,
+            order: key.order,
+        });
+    }
+    Ok(TableIndexMetadata {
+        index,
+        flags: spec.flags,
+        keys: keys.into_boxed_slice(),
+    })
+}
+
+fn validate_table_index_metadata(
+    columns: &TableColumnLayout,
+    spec: &TableIndexMetadata,
+) -> StdResult<(), String> {
+    let unknown = spec.flags.bits() & !StorageIndexFlags::all().bits();
+    if unknown != 0 {
+        return Err(format!(
+            "index {} has unknown flags: bits={unknown:#x}",
+            spec.index
+        ));
+    }
+    if spec.keys.is_empty() {
+        return Err(format!("index {} has no key columns", spec.index));
+    }
+    if 3usize
+        .checked_add(spec.keys.len().saturating_mul(5))
+        .is_none_or(|len| len > usize::from(u16::MAX))
+    {
+        return Err(format!(
+            "index {} key specification exceeds VarByte payload limit",
+            spec.index
+        ));
+    }
+    let mut seen = FastHashSet::default();
+    for key in &spec.keys {
+        let Some(expected_ordinal) = columns.ordinal_for_id(key.column_id) else {
+            return Err(format!(
+                "index {} references missing column id {}",
+                spec.index, key.column_id
+            ));
+        };
+        if expected_ordinal != key.column_ordinal {
+            return Err(format!(
+                "index {} key translation mismatch: column_id={}, expected_ordinal={expected_ordinal}, actual_ordinal={}",
+                spec.index, key.column_id, key.column_ordinal
+            ));
+        }
+        if !seen.insert(key.column_id) {
+            return Err(format!(
+                "index {} repeats column id {}",
+                spec.index, key.column_id
+            ));
         }
     }
     Ok(())
@@ -1944,23 +2416,23 @@ fn validate_index_spec(
 fn validate_primary_key_contract(
     column_layout: &TableColumnLayout,
     index_specs: &IndexSpecs,
-) -> OperationResult<()> {
+) -> StdResult<(), String> {
     let mut primary_key_index_slot = None;
     for (index_slot, index_spec) in index_specs.active_indexes() {
         if !index_spec.primary_key() {
             continue;
         }
         if let Some(existing_index_slot) = primary_key_index_slot {
-            return Err(Report::new(OperationError::InvalidMetadata).attach(format!(
+            return Err(format!(
                 "multiple primary keys: index_slot {existing_index_slot} and index_slot {index_slot}"
-            )));
+            ));
         }
-        for key in &index_spec.cols {
-            let col_no = usize::from(key.col_no);
+        for key in &index_spec.keys {
+            let col_no = key.column_ordinal.as_usize();
             if column_layout.nullable(col_no) {
-                return Err(Report::new(OperationError::InvalidMetadata).attach(format!(
+                return Err(format!(
                     "primary key index_slot {index_slot} references nullable column {col_no}"
-                )));
+                ));
             }
         }
         primary_key_index_slot = Some(index_slot);
@@ -1979,8 +2451,8 @@ pub(crate) mod tests {
         wait_for_no_dropped_table_operational_state,
     };
     use crate::catalog::{
-        CatalogCheckpointScanStopReason, ColumnAttributes, ColumnSpec, CurrentTableState,
-        IndexAttributes, IndexKeySpec, IndexSpec, TableMetadata, TableSpec,
+        CatalogCheckpointScanStopReason, CurrentTableState, StorageColumnFlags, StorageColumnSpec,
+        StorageIndexFlags, StorageIndexKey, StorageIndexSpec, StorageTableSpec, TableMetadata,
     };
     use crate::engine::Engine;
     use crate::error::{
@@ -2311,12 +2783,12 @@ pub(crate) mod tests {
     fn test_table_metadata_serde() {
         let metadata = TableMetadata::try_new(
             vec![
-                ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
-                ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
+                StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::NULLABLE),
             ],
-            vec![IndexSpec::new(
-                vec![IndexKeySpec::new(0)],
-                IndexAttributes::PK,
+            vec![StorageIndexSpec::new(
+                vec![StorageIndexKey::new(0)],
+                StorageIndexFlags::PK,
             )],
         )
         .expect("valid table metadata");
@@ -2329,53 +2801,207 @@ pub(crate) mod tests {
         assert_eq!(idx, vec.len());
         let (idx, brief) = TableBriefMetadata::deser(&vec[..], 0).unwrap();
         assert_eq!(idx, vec.len());
-        assert_eq!(metadata.col.col_names, brief.col_names);
-        assert_eq!(metadata.col.col_types, brief.col_types);
-        assert_eq!(metadata.col.col_attrs, brief.col_attrs);
-        assert_eq!(metadata.idx.next_index_slot(), brief.next_index_slot);
-        assert_eq!(
-            metadata
-                .idx
-                .active_indexes()
-                .map(|(index_slot, spec)| ActiveIndexSpec::new(index_slot, spec.clone()))
-                .collect::<Vec<_>>(),
-            brief.index_specs
-        );
+        assert_eq!(metadata, brief.metadata);
     }
 
     #[test]
-    fn test_table_metadata_dense_indexes_derive_next_index_slot() {
+    fn test_table_metadata_dense_indexes_derive_index_slot_count() {
         let metadata = TableMetadata::try_new(
             vec![
-                ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
-                ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::empty()),
+                StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
             ],
             vec![
-                IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::PK),
-                IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty()),
+                StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::PK),
+                StorageIndexSpec::new(vec![StorageIndexKey::new(1)], StorageIndexFlags::empty()),
             ],
         )
         .expect("valid table metadata");
-        assert_eq!(metadata.idx.next_index_slot(), IndexSlot::new(2));
+        assert_eq!(metadata.idx.index_slot_count_u32(), 2);
         assert_eq!(metadata.idx.index_slot_count(), 2);
         assert_eq!(metadata.idx.active_index_count(), 2);
         let primary_key = metadata
             .primary_key()
             .expect("metadata should expose primary key index");
         assert_eq!(primary_key.index_slot(), IndexSlot::new(0));
-        assert_eq!(primary_key.spec().cols, vec![IndexKeySpec::new(0)]);
+        assert_eq!(primary_key.spec().keys.len(), 1);
+        assert_eq!(primary_key.spec().keys[0].column_id, ColumnID::new(0));
+    }
+
+    #[test]
+    fn test_stable_id_allocators_cover_full_u32_domain() {
+        let mut next_column_id = 0;
+        assert_eq!(
+            allocate_column_id(&mut next_column_id).unwrap(),
+            ColumnID::new(0)
+        );
+        assert_eq!(next_column_id, 1);
+
+        next_column_id = u64::from(u32::MAX);
+        assert_eq!(
+            allocate_column_id(&mut next_column_id).unwrap(),
+            ColumnID::new(u32::MAX)
+        );
+        assert_eq!(next_column_id, ID_DOMAIN_END);
+        let err = allocate_column_id(&mut next_column_id).unwrap_err();
+        assert_eq!(*err.current_context(), OperationError::ColumnIdExhausted);
+
+        let mut next_index_id = u64::from(u32::MAX);
+        assert_eq!(
+            allocate_index_id(&mut next_index_id).unwrap(),
+            IndexID::new(u32::MAX)
+        );
+        assert_eq!(next_index_id, ID_DOMAIN_END);
+        let err = allocate_index_id(&mut next_index_id).unwrap_err();
+        assert_eq!(*err.current_context(), OperationError::IndexIdExhausted);
+
+        let mut invalid_next_id = ID_DOMAIN_END + 1;
+        let err = allocate_index_id(&mut invalid_next_id).unwrap_err();
+        assert_eq!(*err.current_context(), OperationError::InvalidMetadata);
+    }
+
+    #[test]
+    fn test_canonical_metadata_rejects_allocator_and_slot_boundary_violations() {
+        let column = TableColumnMetadata {
+            id: ColumnID::new(0),
+            ordinal: ColumnOrdinal::new(0),
+            value_kind: ValKind::U32,
+            flags: StorageColumnFlags::empty(),
+        };
+        let index = TableIndexMetadata {
+            index: IndexRef::new(IndexID::new(7), IndexSlot::new(0)),
+            flags: StorageIndexFlags::UK,
+            keys: vec![TableIndexKeySpec {
+                column_id: ColumnID::new(0),
+                column_ordinal: ColumnOrdinal::new(0),
+                order: IndexOrder::Asc,
+            }]
+            .into_boxed_slice(),
+        };
+        assert!(
+            TableMetadata::try_from_persisted_parts(0, 1, vec![column], 7, 1, vec![index]).is_err()
+        );
+        assert!(
+            TableMetadata::try_from_persisted_parts(
+                0,
+                ID_DOMAIN_END + 1,
+                vec![column],
+                0,
+                0,
+                vec![],
+            )
+            .is_err()
+        );
+
+        let full_slot_domain = TableMetadata::try_from_persisted_parts(
+            0,
+            1,
+            vec![column],
+            0,
+            u32::from(u16::MAX) + 1,
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(full_slot_domain.idx.index_slot_count_u32(), 65_536);
+        let err = full_slot_domain
+            .try_with_created_index_at(
+                StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::UK),
+                0,
+                65_536,
+            )
+            .unwrap_err();
+        assert_eq!(*err.current_context(), OperationError::InvalidMetadata);
+    }
+
+    #[test]
+    fn test_storage_epoch_overflow_fails_before_metadata_change() {
+        let mut metadata = TableMetadata::try_new(
+            vec![StorageColumnSpec::new(
+                ValKind::U32,
+                StorageColumnFlags::empty(),
+            )],
+            vec![],
+        )
+        .unwrap();
+        metadata.storage_epoch = u64::MAX;
+        let err = metadata
+            .try_with_created_index(StorageIndexSpec::new(
+                vec![StorageIndexKey::new(0)],
+                StorageIndexFlags::UK,
+            ))
+            .unwrap_err();
+        assert_eq!(*err.current_context(), OperationError::InvalidMetadata);
+        assert_eq!(metadata.idx.active_index_count(), 0);
+    }
+
+    #[test]
+    fn test_storage_schema_fingerprint_is_canonical() {
+        let metadata = TableMetadata::try_new(
+            vec![
+                StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::NULLABLE),
+            ],
+            vec![StorageIndexSpec::new(
+                vec![StorageIndexKey {
+                    column_ordinal: ColumnOrdinal::new(1),
+                    order: IndexOrder::Desc,
+                }],
+                StorageIndexFlags::UK,
+            )],
+        )
+        .unwrap();
+        let fingerprint = metadata.storage_schema_fingerprint();
+        assert_eq!(
+            fingerprint,
+            [
+                93, 98, 157, 121, 231, 186, 186, 42, 170, 226, 50, 231, 4, 188, 50, 164, 167, 7,
+                108, 60, 242, 232, 63, 176, 70, 255, 16, 249, 122, 34, 127, 207,
+            ]
+        );
+
+        let canonical_clone = TableMetadata::try_from_persisted_parts(
+            99,
+            metadata.col.next_column_id() + 10,
+            metadata.col.columns().to_vec(),
+            metadata.idx.next_index_id() + 10,
+            5,
+            metadata
+                .idx
+                .active_indexes()
+                .map(|(_, index)| index.clone())
+                .collect(),
+        )
+        .unwrap();
+        assert_eq!(
+            fingerprint,
+            canonical_clone.storage_schema_fingerprint(),
+            "epoch and allocator/slot high-water fields are not part of active schema"
+        );
+
+        let reordered = TableMetadata::try_new(
+            vec![
+                StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::NULLABLE),
+            ],
+            vec![StorageIndexSpec::new(
+                vec![StorageIndexKey::new(1)],
+                StorageIndexFlags::UK,
+            )],
+        )
+        .unwrap();
+        assert_ne!(fingerprint, reordered.storage_schema_fingerprint());
     }
 
     #[test]
     fn test_primary_key_spec_validates_select_key() {
         let metadata = TableMetadata::try_new(
             vec![
-                ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
-                ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
+                StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::NULLABLE),
             ],
             vec![
-                IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::PK),
-                IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::UK),
+                StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::PK),
+                StorageIndexSpec::new(vec![StorageIndexKey::new(1)], StorageIndexFlags::UK),
             ],
         )
         .expect("valid table metadata");
@@ -2423,8 +3049,8 @@ pub(crate) mod tests {
     fn test_table_metadata_index_only_changes_share_column_layout() {
         let metadata = TableMetadata::try_new(
             vec![
-                ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
-                ColumnSpec::new("c1", ValKind::VarByte, ColumnAttributes::NULLABLE),
+                StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::NULLABLE),
             ],
             vec![],
         )
@@ -2439,13 +3065,13 @@ pub(crate) mod tests {
         assert_eq!(metadata.col.null_offset(0), 0);
         assert_eq!(metadata.col.null_offset(1), 0);
 
-        let (index_slot, created) = metadata
-            .try_with_created_index(IndexSpec::new(
-                vec![IndexKeySpec::new(0)],
-                IndexAttributes::UK,
+        let (index, created) = metadata
+            .try_with_created_index(StorageIndexSpec::new(
+                vec![StorageIndexKey::new(0)],
+                StorageIndexFlags::UK,
             ))
             .unwrap();
-        let dropped = created.without_index(index_slot);
+        let dropped = created.without_index(index).unwrap();
 
         assert!(Arc::ptr_eq(&metadata.col, &created.col));
         assert!(Arc::ptr_eq(&metadata.col, &dropped.col));
@@ -2455,27 +3081,30 @@ pub(crate) mod tests {
 
     #[test]
     fn test_table_metadata_sparse_active_indexes_preserve_index_slot() {
-        let metadata = TableMetadata::try_new_with_next_index_slot(
+        let metadata = TableMetadata::try_new_with_index_slot_count(
             vec![
-                ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
-                ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::empty()),
-                ColumnSpec::new("c2", ValKind::U32, ColumnAttributes::empty()),
+                StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
             ],
             vec![
                 ActiveIndexSpec::new(
-                    IndexSlot::new(0),
-                    IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::PK),
+                    IndexRef::new(IndexID::new(0), IndexSlot::new(0)),
+                    StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::PK),
                 ),
                 ActiveIndexSpec::new(
-                    IndexSlot::new(2),
-                    IndexSpec::new(vec![IndexKeySpec::new(2)], IndexAttributes::empty()),
+                    IndexRef::new(IndexID::new(2), IndexSlot::new(2)),
+                    StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(2)],
+                        StorageIndexFlags::empty(),
+                    ),
                 ),
             ],
             IndexSlot::new(3),
         )
         .unwrap();
 
-        assert_eq!(metadata.idx.next_index_slot(), IndexSlot::new(3));
+        assert_eq!(metadata.idx.index_slot_count_u32(), 3);
         assert_eq!(metadata.idx.index_slot_count(), 3);
         assert!(metadata.idx.index_spec(IndexSlot::new(1)).is_none());
         assert_eq!(
@@ -2496,33 +3125,35 @@ pub(crate) mod tests {
 
     #[test]
     fn test_table_metadata_rejects_invalid_index_slots() {
-        let columns = vec![ColumnSpec::new(
-            "c0",
+        let columns = vec![StorageColumnSpec::new(
             ValKind::U32,
-            ColumnAttributes::empty(),
+            StorageColumnFlags::empty(),
         )];
         assert!(
-            TableMetadata::try_new_with_next_index_slot(
+            TableMetadata::try_new_with_index_slot_count(
                 columns.clone(),
                 vec![ActiveIndexSpec::new(
-                    IndexSlot::new(1),
-                    IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::PK),
+                    IndexRef::new(IndexID::new(1), IndexSlot::new(1)),
+                    StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::PK),
                 )],
                 IndexSlot::new(1),
             )
             .is_err()
         );
         assert!(
-            TableMetadata::try_new_with_next_index_slot(
+            TableMetadata::try_new_with_index_slot_count(
                 columns.clone(),
                 vec![
                     ActiveIndexSpec::new(
-                        IndexSlot::new(0),
-                        IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::PK),
+                        IndexRef::new(IndexID::new(0), IndexSlot::new(0)),
+                        StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::PK),
                     ),
                     ActiveIndexSpec::new(
-                        IndexSlot::new(0),
-                        IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::empty()),
+                        IndexRef::new(IndexID::new(0), IndexSlot::new(0)),
+                        StorageIndexSpec::new(
+                            vec![StorageIndexKey::new(0)],
+                            StorageIndexFlags::empty()
+                        ),
                     ),
                 ],
                 IndexSlot::new(1),
@@ -2534,15 +3165,15 @@ pub(crate) mod tests {
     #[test]
     fn test_table_metadata_rejects_multiple_primary_keys() {
         let columns = vec![
-            ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
-            ColumnSpec::new("c1", ValKind::U32, ColumnAttributes::empty()),
+            StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
+            StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
         ];
 
         let err = TableMetadata::try_new(
             columns,
             vec![
-                IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::PK),
-                IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::PK),
+                StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::PK),
+                StorageIndexSpec::new(vec![StorageIndexKey::new(1)], StorageIndexFlags::PK),
             ],
         )
         .unwrap_err();
@@ -2553,20 +3184,20 @@ pub(crate) mod tests {
     #[test]
     fn test_table_metadata_rejects_sparse_multiple_primary_keys() {
         let columns = vec![
-            ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
-            ColumnSpec::new("c1", ValKind::U32, ColumnAttributes::empty()),
+            StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
+            StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
         ];
 
-        let err = TableMetadata::try_new_with_next_index_slot(
+        let err = TableMetadata::try_new_with_index_slot_count(
             columns,
             vec![
                 ActiveIndexSpec::new(
-                    IndexSlot::new(0),
-                    IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::PK),
+                    IndexRef::new(IndexID::new(0), IndexSlot::new(0)),
+                    StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::PK),
                 ),
                 ActiveIndexSpec::new(
-                    IndexSlot::new(2),
-                    IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::PK),
+                    IndexRef::new(IndexID::new(2), IndexSlot::new(2)),
+                    StorageIndexSpec::new(vec![StorageIndexKey::new(1)], StorageIndexFlags::PK),
                 ),
             ],
             IndexSlot::new(3),
@@ -2579,14 +3210,13 @@ pub(crate) mod tests {
     #[test]
     fn test_table_metadata_rejects_nullable_primary_key_column() {
         let err = TableMetadata::try_new(
-            vec![ColumnSpec::new(
-                "c0",
+            vec![StorageColumnSpec::new(
                 ValKind::U32,
-                ColumnAttributes::NULLABLE,
+                StorageColumnFlags::NULLABLE,
             )],
-            vec![IndexSpec::new(
-                vec![IndexKeySpec::new(0)],
-                IndexAttributes::PK,
+            vec![StorageIndexSpec::new(
+                vec![StorageIndexKey::new(0)],
+                StorageIndexFlags::PK,
             )],
         )
         .unwrap_err();
@@ -2599,60 +3229,68 @@ pub(crate) mod tests {
 
     #[test]
     fn test_table_metadata_rejects_invalid_index_specs_as_operation_errors() {
-        let columns = vec![ColumnSpec::new(
-            "c0",
+        let columns = vec![StorageColumnSpec::new(
             ValKind::U32,
-            ColumnAttributes::empty(),
+            StorageColumnFlags::empty(),
         )];
 
         let err = TableMetadata::try_new(
             columns.clone(),
-            vec![IndexSpec::new(vec![], IndexAttributes::PK)],
+            vec![StorageIndexSpec::new(vec![], StorageIndexFlags::PK)],
         )
         .unwrap_err();
-        assert_invalid_metadata(err.disclose(), "index_slot 0 has no key columns");
+        assert_invalid_metadata(
+            err.disclose(),
+            "index IndexRef(id=0, slot=0) has no key columns",
+        );
 
-        let err = TableMetadata::try_new_with_next_index_slot(
+        let err = TableMetadata::try_new_with_index_slot_count(
             columns.clone(),
             vec![ActiveIndexSpec::new(
-                IndexSlot::new(1),
-                IndexSpec::new(vec![], IndexAttributes::PK),
+                IndexRef::new(IndexID::new(1), IndexSlot::new(1)),
+                StorageIndexSpec::new(vec![], StorageIndexFlags::PK),
             )],
             IndexSlot::new(2),
         )
         .unwrap_err();
-        assert_invalid_metadata(err.disclose(), "index_slot 1 has no key columns");
+        assert_invalid_metadata(
+            err.disclose(),
+            "index IndexRef(id=1, slot=1) has no key columns",
+        );
 
         let err = TableMetadata::try_new(
             columns,
-            vec![IndexSpec::new(
-                vec![IndexKeySpec::new(1)],
-                IndexAttributes::PK,
+            vec![StorageIndexSpec::new(
+                vec![StorageIndexKey::new(1)],
+                StorageIndexFlags::PK,
             )],
         )
         .unwrap_err();
         assert_invalid_metadata(
             err.disclose(),
-            "index_slot 0 references column 1 outside column count 1",
+            "index IndexRef(id=0, slot=0) references column ordinal 1 outside column count 1",
         );
     }
 
     #[test]
     fn test_table_metadata_create_index_allocates_sparse_next_slot() {
-        let metadata = TableMetadata::try_new_with_next_index_slot(
+        let metadata = TableMetadata::try_new_with_index_slot_count(
             vec![
-                ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
-                ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::empty()),
-                ColumnSpec::new("c2", ValKind::U32, ColumnAttributes::empty()),
+                StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
             ],
             vec![
                 ActiveIndexSpec::new(
-                    IndexSlot::new(0),
-                    IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::PK),
+                    IndexRef::new(IndexID::new(0), IndexSlot::new(0)),
+                    StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::PK),
                 ),
                 ActiveIndexSpec::new(
-                    IndexSlot::new(2),
-                    IndexSpec::new(vec![IndexKeySpec::new(2)], IndexAttributes::empty()),
+                    IndexRef::new(IndexID::new(2), IndexSlot::new(2)),
+                    StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(2)],
+                        StorageIndexFlags::empty(),
+                    ),
                 ),
             ],
             IndexSlot::new(3),
@@ -2660,14 +3298,14 @@ pub(crate) mod tests {
         .unwrap();
 
         let (index_slot, metadata) = metadata
-            .try_with_created_index(IndexSpec::new(
-                vec![IndexKeySpec::new(1)],
-                IndexAttributes::UK,
+            .try_with_created_index(StorageIndexSpec::new(
+                vec![StorageIndexKey::new(1)],
+                StorageIndexFlags::UK,
             ))
             .unwrap();
 
-        assert_eq!(index_slot, IndexSlot::new(3));
-        assert_eq!(metadata.idx.next_index_slot(), IndexSlot::new(4));
+        assert_eq!(index_slot.slot(), IndexSlot::new(3));
+        assert_eq!(metadata.idx.index_slot_count_u32(), 4);
         assert_eq!(metadata.idx.index_slot_count(), 4);
         assert!(metadata.idx.index_spec(IndexSlot::new(1)).is_none());
         assert!(metadata.idx.index_spec(IndexSlot::new(3)).unwrap().unique());
@@ -2684,10 +3322,9 @@ pub(crate) mod tests {
     #[test]
     fn test_table_metadata_create_index_rejects_invalid_spec() {
         let metadata = TableMetadata::try_new(
-            vec![ColumnSpec::new(
-                "c0",
+            vec![StorageColumnSpec::new(
                 ValKind::U32,
-                ColumnAttributes::empty(),
+                StorageColumnFlags::empty(),
             )],
             vec![],
         )
@@ -2695,14 +3332,14 @@ pub(crate) mod tests {
 
         assert!(
             metadata
-                .try_with_created_index(IndexSpec::new(vec![], IndexAttributes::UK))
+                .try_with_created_index(StorageIndexSpec::new(vec![], StorageIndexFlags::UK))
                 .is_err()
         );
         assert!(
             metadata
-                .try_with_created_index(IndexSpec::new(
-                    vec![IndexKeySpec::new(1)],
-                    IndexAttributes::UK,
+                .try_with_created_index(StorageIndexSpec::new(
+                    vec![StorageIndexKey::new(1)],
+                    StorageIndexFlags::UK,
                 ))
                 .is_err()
         );
@@ -2710,22 +3347,21 @@ pub(crate) mod tests {
 
     #[test]
     fn test_table_metadata_create_index_rejects_next_index_overflow() {
-        let metadata = TableMetadata::try_new_with_next_index_slot(
-            vec![ColumnSpec::new(
-                "c0",
+        let metadata = TableMetadata::try_new_with_index_slot_count(
+            vec![StorageColumnSpec::new(
                 ValKind::U32,
-                ColumnAttributes::empty(),
+                StorageColumnFlags::empty(),
             )],
             vec![],
-            IndexSlot::MAX,
+            u32::from(u16::MAX) + 1,
         )
         .unwrap();
 
         assert!(
             metadata
-                .try_with_created_index(IndexSpec::new(
-                    vec![IndexKeySpec::new(0)],
-                    IndexAttributes::empty(),
+                .try_with_created_index(StorageIndexSpec::new(
+                    vec![StorageIndexKey::new(0)],
+                    StorageIndexFlags::empty(),
                 ))
                 .is_err()
         );
@@ -2733,29 +3369,34 @@ pub(crate) mod tests {
 
     #[test]
     fn test_table_metadata_drop_index_preserves_sparse_allocation() {
-        let metadata = TableMetadata::try_new_with_next_index_slot(
+        let metadata = TableMetadata::try_new_with_index_slot_count(
             vec![
-                ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
-                ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::empty()),
-                ColumnSpec::new("c2", ValKind::U32, ColumnAttributes::empty()),
+                StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
             ],
             vec![
                 ActiveIndexSpec::new(
-                    IndexSlot::new(0),
-                    IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::PK),
+                    IndexRef::new(IndexID::new(0), IndexSlot::new(0)),
+                    StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::PK),
                 ),
                 ActiveIndexSpec::new(
-                    IndexSlot::new(2),
-                    IndexSpec::new(vec![IndexKeySpec::new(2)], IndexAttributes::empty()),
+                    IndexRef::new(IndexID::new(2), IndexSlot::new(2)),
+                    StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(2)],
+                        StorageIndexFlags::empty(),
+                    ),
                 ),
             ],
             IndexSlot::new(4),
         )
         .unwrap();
 
-        let dropped = metadata.without_index(IndexSlot::new(2));
+        let dropped = metadata
+            .without_index(IndexRef::new(IndexID::new(2), IndexSlot::new(2)))
+            .unwrap();
 
-        assert_eq!(dropped.idx.next_index_slot(), IndexSlot::new(4));
+        assert_eq!(dropped.idx.index_slot_count_u32(), 4);
         assert_eq!(dropped.idx.index_slot_count(), 4);
         assert_eq!(dropped.idx.active_index_count(), 1);
         assert!(dropped.idx.index_spec(IndexSlot::new(0)).is_some());
@@ -2783,7 +3424,7 @@ pub(crate) mod tests {
             let key = single_key(0i32);
             let selected = trx
                 .table_lookup_unique_mvcc(
-                    crate::TableIndex(table_id, key.index_slot.transitional_id()),
+                    crate::TableIndex(table_id, IndexID::new(0)),
                     &key.vals,
                     &[0, 1],
                 )
@@ -2792,7 +3433,7 @@ pub(crate) mod tests {
             assert!(selected.is_found());
             let repeated = trx
                 .table_lookup_unique_mvcc(
-                    crate::TableIndex(table_id, key.index_slot.transitional_id()),
+                    crate::TableIndex(table_id, IndexID::new(0)),
                     &key.vals,
                     &[0, 1],
                 )
@@ -2875,8 +3516,8 @@ pub(crate) mod tests {
             let create2 =
                 smol::spawn(async move { session2.create_table(table_spec, index_specs).await });
 
-            let table_id1 = create1.await.unwrap();
-            let table_id2 = create2.await.unwrap();
+            let table_id1 = create1.await.unwrap().table_id();
+            let table_id2 = create2.await.unwrap().table_id();
             assert_ne!(table_id1, table_id2);
 
             let verify_session = engine.new_session().unwrap();
@@ -2928,21 +3569,61 @@ pub(crate) mod tests {
                         .is_empty()
                 );
                 assert!(
-                    !engine
-                        .inner()
-                        .core
-                        .catalog()
-                        .storage
-                        .index_columns()
-                        .list_uncommitted_by_table_id(&guards, table_id)
-                        .await
-                        .unwrap()
-                        .is_empty()
-                );
-                assert!(
                     Path::new(&engine.inner().table_fs.user_table_file_path(table_id)).exists()
                 );
             }
+        });
+    }
+
+    #[test]
+    fn test_create_table_outcome_returns_finalized_index_ids_in_input_order() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "create-table-outcome").await;
+            let mut session = engine.new_session().unwrap();
+
+            let empty = session
+                .create_table(
+                    StorageTableSpec::new(vec![StorageColumnSpec::new(
+                        ValKind::U32,
+                        StorageColumnFlags::empty(),
+                    )]),
+                    vec![],
+                )
+                .await
+                .unwrap();
+            assert!(empty.index_ids().is_empty());
+
+            let outcome = session
+                .create_table(
+                    StorageTableSpec::new(vec![
+                        StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
+                        StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
+                    ]),
+                    vec![
+                        StorageIndexSpec::new(vec![StorageIndexKey::new(1)], StorageIndexFlags::UK),
+                        StorageIndexSpec::new(
+                            vec![StorageIndexKey::new(0)],
+                            StorageIndexFlags::empty(),
+                        ),
+                    ],
+                )
+                .await
+                .unwrap();
+            assert_eq!(outcome.index_ids(), [IndexID::new(0), IndexID::new(1)]);
+            let table = table_for_internal_assertion(&engine, outcome.table_id());
+            let metadata = table.metadata();
+            for (input_ordinal, index_id) in outcome.index_ids().iter().copied().enumerate() {
+                let index = metadata
+                    .idx
+                    .resolve_index_id(index_id)
+                    .expect("outcome index id must resolve in installed metadata");
+                assert_eq!(index.slot().as_usize(), input_ordinal);
+            }
+
+            let (table_id, index_ids) = outcome.into_parts();
+            assert_eq!(table_id, table.table_id());
+            assert_eq!(&*index_ids, [IndexID::new(0), IndexID::new(1)]);
         });
     }
 
@@ -2964,12 +3645,11 @@ pub(crate) mod tests {
 
             let err = session
                 .create_table(
-                    TableSpec::new(vec![ColumnSpec::new(
-                        "id",
+                    StorageTableSpec::new(vec![StorageColumnSpec::new(
                         ValKind::I32,
-                        ColumnAttributes::empty(),
+                        StorageColumnFlags::empty(),
                     )]),
-                    vec![IndexSpec::new(vec![], IndexAttributes::UK)],
+                    vec![StorageIndexSpec::new(vec![], StorageIndexFlags::UK)],
                 )
                 .await
                 .unwrap_err();
@@ -3012,14 +3692,13 @@ pub(crate) mod tests {
 
             let err = session
                 .create_table(
-                    TableSpec::new(vec![ColumnSpec::new(
-                        "id",
+                    StorageTableSpec::new(vec![StorageColumnSpec::new(
                         ValKind::I32,
-                        ColumnAttributes::empty(),
+                        StorageColumnFlags::empty(),
                     )]),
-                    vec![IndexSpec::new(
-                        vec![IndexKeySpec::new(0)],
-                        IndexAttributes::PK,
+                    vec![StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(0)],
+                        StorageIndexFlags::PK,
                     )],
                 )
                 .await
@@ -3359,7 +4038,7 @@ pub(crate) mod tests {
             let key = single_key(0i32);
             let selected = read_trx
                 .table_lookup_unique_mvcc(
-                    crate::TableIndex(table_id, key.index_slot.transitional_id()),
+                    crate::TableIndex(table_id, IndexID::new(0)),
                     &key.vals,
                     &[0, 1],
                 )
@@ -4016,7 +4695,8 @@ pub(crate) mod tests {
             let created_table_id = create_session
                 .create_table(table_spec, index_specs)
                 .await
-                .unwrap();
+                .unwrap()
+                .table_id();
             assert_ne!(created_table_id, table_id);
             assert!(
                 engine
@@ -4217,7 +4897,7 @@ pub(crate) mod tests {
                 LockResource::TableMetadata(create_table_id),
             )
             .expect("accepted CREATE should retain its operation owner");
-            assert_eq!(lock_entry_count(&engine, create_owner), 9);
+            assert_eq!(lock_entry_count(&engine, create_owner), 7);
             assert!(has_lock_entry(
                 &engine,
                 create_owner,
@@ -4247,7 +4927,7 @@ pub(crate) mod tests {
                 .install_gate(TableDdlTestPhase::CreateCatalogStaged);
             create_release.send_async(()).await.unwrap();
             create_staged.recv_async().await.unwrap();
-            assert_eq!(lock_entry_count(&engine, create_owner), 9);
+            assert_eq!(lock_entry_count(&engine, create_owner), 7);
             assert!(
                 debug_snapshot(engine.inner().lock_manager())
                     .entries
@@ -4259,7 +4939,7 @@ pub(crate) mod tests {
                 "accepted CREATE must retain only physical held-family diagnostics"
             );
             create_staged_release.send_async(()).await.unwrap();
-            assert_eq!(create_fut.await.unwrap(), create_table_id);
+            assert_eq!(create_fut.await.unwrap().table_id(), create_table_id);
 
             let (drop_entered, drop_release) = engine
                 .inner()
@@ -4280,7 +4960,7 @@ pub(crate) mod tests {
                 LockResource::TableMetadata(create_table_id),
             )
             .expect("accepted DROP should retain its operation owner");
-            assert_eq!(lock_entry_count(&engine, drop_owner), 12);
+            assert_eq!(lock_entry_count(&engine, drop_owner), 10);
             assert!(has_lock_entry(
                 &engine,
                 drop_owner,
@@ -4317,7 +4997,7 @@ pub(crate) mod tests {
                 .install_gate(TableDdlTestPhase::DropCatalogStaged);
             drop_release.send_async(()).await.unwrap();
             drop_staged.recv_async().await.unwrap();
-            assert_eq!(lock_entry_count(&engine, drop_owner), 12);
+            assert_eq!(lock_entry_count(&engine, drop_owner), 10);
             assert!(
                 debug_snapshot(engine.inner().lock_manager())
                     .entries
@@ -4566,7 +5246,8 @@ pub(crate) mod tests {
             let other_table_id = session
                 .create_table(other_spec, other_indexes)
                 .await
-                .unwrap();
+                .unwrap()
+                .table_id();
             let session_id = session.id();
 
             assert!(Path::new(&table_file_path).exists());
@@ -4633,18 +5314,6 @@ pub(crate) mod tests {
                     .core
                     .catalog()
                     .storage
-                    .index_columns()
-                    .list_uncommitted_by_table_id(&session.pool_guards(), table_id)
-                    .await
-                    .unwrap()
-                    .is_empty()
-            );
-            assert!(
-                engine
-                    .inner()
-                    .core
-                    .catalog()
-                    .storage
                     .tables()
                     .find_uncommitted_by_id(&session.pool_guards(), other_table_id)
                     .await
@@ -4696,7 +5365,8 @@ pub(crate) mod tests {
             let later_table_id = session
                 .create_table(later_spec, later_indexes)
                 .await
-                .unwrap();
+                .unwrap()
+                .table_id();
             assert!(later_table_id > table_id);
             assert!(later_table_id > other_table_id);
         });
@@ -4713,7 +5383,11 @@ pub(crate) mod tests {
                     .unwrap();
             let mut session = engine.new_session().unwrap();
             let (table_spec, index_specs) = drop_table_test_spec();
-            let table_id = session.create_table(table_spec, index_specs).await.unwrap();
+            let table_id = session
+                .create_table(table_spec, index_specs)
+                .await
+                .unwrap()
+                .table_id();
             insert_one_row(
                 table_id,
                 &mut session,
@@ -4793,7 +5467,7 @@ pub(crate) mod tests {
             let key = single_key(11);
             let err = trx
                 .table_lookup_unique_mvcc(
-                    crate::TableIndex(table_id, key.index_slot.transitional_id()),
+                    crate::TableIndex(table_id, IndexID::new(0)),
                     &key.vals,
                     &[0, 1],
                 )
@@ -4989,7 +5663,11 @@ pub(crate) mod tests {
             .unwrap();
             let mut session = engine.new_session().unwrap();
             let (table_spec, index_specs) = drop_table_test_spec();
-            let table_id = session.create_table(table_spec, index_specs).await.unwrap();
+            let table_id = session
+                .create_table(table_spec, index_specs)
+                .await
+                .unwrap()
+                .table_id();
             let mut trx = session.begin_trx().unwrap();
             let insert = trx
                 .table_insert_mvcc(

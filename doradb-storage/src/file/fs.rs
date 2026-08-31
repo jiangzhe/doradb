@@ -2160,7 +2160,8 @@ pub(crate) mod tests {
         table_readonly_pool, test_dispatch_dirty_pages, test_persist_and_evict_page,
     };
     use crate::catalog::{
-        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexSpec, USER_TABLE_ID_START,
+        StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
+        StorageIndexSpec, USER_TABLE_ID_START,
     };
     use crate::completion::Completion;
     use crate::component::{DiskPoolConfig, MetaPoolConfig, RegistryBuilder};
@@ -2696,14 +2697,13 @@ pub(crate) mod tests {
     fn make_metadata() -> Arc<TableMetadata> {
         Arc::new(
             TableMetadata::try_new(
-                vec![ColumnSpec::new(
-                    "c0",
+                vec![StorageColumnSpec::new(
                     ValKind::U32,
-                    ColumnAttributes::empty(),
+                    StorageColumnFlags::empty(),
                 )],
-                vec![IndexSpec::new(
-                    vec![IndexKeySpec::new(0)],
-                    IndexAttributes::PK,
+                vec![StorageIndexSpec::new(
+                    vec![StorageIndexKey::new(0)],
+                    StorageIndexFlags::PK,
                 )],
             )
             .expect("valid table metadata"),
@@ -3495,14 +3495,13 @@ pub(crate) mod tests {
 
             let metadata = Arc::new(
                 TableMetadata::try_new(
-                    vec![ColumnSpec::new(
-                        "c0",
+                    vec![StorageColumnSpec::new(
                         ValKind::U32,
-                        ColumnAttributes::empty(),
+                        StorageColumnFlags::empty(),
                     )],
-                    vec![IndexSpec::new(
-                        vec![IndexKeySpec::new(0)],
-                        IndexAttributes::PK,
+                    vec![StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(0)],
+                        StorageIndexFlags::PK,
                     )],
                 )
                 .expect("valid table metadata"),
@@ -3532,14 +3531,13 @@ pub(crate) mod tests {
             let table_id = USER_TABLE_ID_START + 9;
             let metadata = Arc::new(
                 TableMetadata::try_new(
-                    vec![ColumnSpec::new(
-                        "c0",
+                    vec![StorageColumnSpec::new(
                         ValKind::U32,
-                        ColumnAttributes::empty(),
+                        StorageColumnFlags::empty(),
                     )],
-                    vec![IndexSpec::new(
-                        vec![IndexKeySpec::new(0)],
-                        IndexAttributes::PK,
+                    vec![StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(0)],
+                        StorageIndexFlags::PK,
                     )],
                 )
                 .expect("valid table metadata"),

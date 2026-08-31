@@ -2277,7 +2277,7 @@ fn read_i8(input: &[u8]) -> DataIntegrityResult<(i8, &[u8])> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
+    use crate::catalog::{StorageColumnFlags, StorageColumnSpec, TableMetadata};
     use crate::error::{DataIntegrityError, DataIntegrityResult, InternalError, InternalResult};
     use crate::file::{FileKind, test_block_id};
     use crate::id::RowID;
@@ -2726,8 +2726,8 @@ mod tests {
     fn test_lwc_builder_from_row_page() {
         let metadata = TableMetadata::try_new(
             vec![
-                ColumnSpec::new("c0", ValKind::U8, ColumnAttributes::empty()),
-                ColumnSpec::new("c1", ValKind::I16, ColumnAttributes::NULLABLE),
+                StorageColumnSpec::new(ValKind::U8, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::I16, StorageColumnFlags::NULLABLE),
             ],
             vec![],
         )
@@ -2801,10 +2801,10 @@ mod tests {
     fn test_lwc_builder_append_row_values_matches_row_page() {
         let metadata = TableMetadata::try_new(
             vec![
-                ColumnSpec::new("c_i16", ValKind::I16, ColumnAttributes::NULLABLE),
-                ColumnSpec::new("c_u64", ValKind::U64, ColumnAttributes::empty()),
-                ColumnSpec::new("c_bytes", ValKind::VarByte, ColumnAttributes::NULLABLE),
-                ColumnSpec::new("c_f32", ValKind::F32, ColumnAttributes::empty()),
+                StorageColumnSpec::new(ValKind::I16, StorageColumnFlags::NULLABLE),
+                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::NULLABLE),
+                StorageColumnSpec::new(ValKind::F32, StorageColumnFlags::empty()),
             ],
             vec![],
         )
@@ -2856,10 +2856,9 @@ mod tests {
     #[test]
     fn test_lwc_builder_append_row_values_rolls_back_on_capacity() {
         let metadata = TableMetadata::try_new(
-            vec![ColumnSpec::new(
-                "bytes",
+            vec![StorageColumnSpec::new(
                 ValKind::VarByte,
-                ColumnAttributes::empty(),
+                StorageColumnFlags::empty(),
             )],
             vec![],
         )
@@ -2878,10 +2877,9 @@ mod tests {
     #[test]
     fn test_lwc_builder_reports_reachable_row_count_encoding_contract() {
         let metadata = TableMetadata::try_new(
-            vec![ColumnSpec::new(
-                "compressible",
+            vec![StorageColumnSpec::new(
                 ValKind::U8,
-                ColumnAttributes::empty(),
+                StorageColumnFlags::empty(),
             )],
             vec![],
         )
@@ -2909,10 +2907,9 @@ mod tests {
     #[test]
     fn test_lwc_builder_nullable_integer_stats_skip_nulls_and_deleted_rows() {
         let metadata = TableMetadata::try_new(
-            vec![ColumnSpec::new(
-                "nullable_i16",
+            vec![StorageColumnSpec::new(
                 ValKind::I16,
-                ColumnAttributes::NULLABLE,
+                StorageColumnFlags::NULLABLE,
             )],
             vec![],
         )
@@ -2952,8 +2949,8 @@ mod tests {
     fn test_lwc_builder_rollback() {
         let metadata = TableMetadata::try_new(
             vec![
-                ColumnSpec::new("c0", ValKind::U8, ColumnAttributes::empty()),
-                ColumnSpec::new("c1", ValKind::I16, ColumnAttributes::empty()),
+                StorageColumnSpec::new(ValKind::U8, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::I16, StorageColumnFlags::empty()),
             ],
             vec![],
         )
@@ -3028,17 +3025,17 @@ mod tests {
     fn test_lwc_builder_all_column_types() {
         let metadata = TableMetadata::try_new(
             vec![
-                ColumnSpec::new("c_i8", ValKind::I8, ColumnAttributes::empty()),
-                ColumnSpec::new("c_u8", ValKind::U8, ColumnAttributes::empty()),
-                ColumnSpec::new("c_i16", ValKind::I16, ColumnAttributes::empty()),
-                ColumnSpec::new("c_u16", ValKind::U16, ColumnAttributes::empty()),
-                ColumnSpec::new("c_i32", ValKind::I32, ColumnAttributes::empty()),
-                ColumnSpec::new("c_u32", ValKind::U32, ColumnAttributes::empty()),
-                ColumnSpec::new("c_i64", ValKind::I64, ColumnAttributes::empty()),
-                ColumnSpec::new("c_u64", ValKind::U64, ColumnAttributes::empty()),
-                ColumnSpec::new("c_f32", ValKind::F32, ColumnAttributes::empty()),
-                ColumnSpec::new("c_f64", ValKind::F64, ColumnAttributes::empty()),
-                ColumnSpec::new("c_bytes", ValKind::VarByte, ColumnAttributes::empty()),
+                StorageColumnSpec::new(ValKind::I8, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::U8, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::I16, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::U16, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::I64, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::F32, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::F64, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
             ],
             vec![],
         )

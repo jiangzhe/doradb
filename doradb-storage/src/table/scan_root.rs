@@ -72,7 +72,7 @@ impl TableScanRootView for TableRootSnapshot<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
+    use crate::catalog::{StorageColumnFlags, StorageColumnSpec, TableMetadata};
     use crate::file::cow_file::SUPER_BLOCK_ID;
     use crate::id::TrxID;
     use crate::value::ValKind;
@@ -103,10 +103,9 @@ mod tests {
     fn checked_out_root_exposes_exact_scan_projection() {
         let metadata = Arc::new(
             TableMetadata::try_new(
-                vec![ColumnSpec::new(
-                    "c0",
+                vec![StorageColumnSpec::new(
                     ValKind::U64,
-                    ColumnAttributes::empty(),
+                    StorageColumnFlags::empty(),
                 )],
                 vec![],
             )

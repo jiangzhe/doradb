@@ -1465,7 +1465,7 @@ pub(crate) mod tests {
     use crate::buffer::guard::PageSharedGuard;
     use crate::catalog::storage::tables::TABLE_ID_TABLES;
     use crate::catalog::storage::tests::begin_catalog_test_trx;
-    use crate::catalog::{IndexSlot, user_key_from_active_slot};
+    use crate::catalog::{IndexID, IndexRef, IndexSlot, user_key_from_index_ref};
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{
@@ -1872,7 +1872,7 @@ pub(crate) mod tests {
             table_id: TableID::new(41),
             row_id: RowID::new(1),
             kind: IndexUndoKind::DeferDelete(
-                user_key_from_active_slot(IndexSlot::new(0), vec![]),
+                user_key_from_index_ref(IndexRef::new(IndexID::new(0), IndexSlot::new(0)), vec![]),
                 true,
             ),
         });
@@ -1888,7 +1888,7 @@ pub(crate) mod tests {
         effects.push_delete_index_undo(
             TableID::new(42),
             RowID::new(2),
-            user_key_from_active_slot(IndexSlot::new(0), vec![]),
+            user_key_from_index_ref(IndexRef::new(IndexID::new(0), IndexSlot::new(0)), vec![]),
             true,
         );
         effects.insert_row_redo(
@@ -1930,7 +1930,7 @@ pub(crate) mod tests {
             effects.push_delete_index_undo(
                 table_id,
                 row_id,
-                user_key_from_active_slot(IndexSlot::new(0), vec![]),
+                user_key_from_index_ref(IndexRef::new(IndexID::new(0), IndexSlot::new(0)), vec![]),
                 true,
             );
             effects.push_row_undo(OwnedRowUndo::new(
@@ -2082,7 +2082,13 @@ pub(crate) mod tests {
             trx.trx()
                 .catalog_insert_mvcc(
                     table.as_ref(),
-                    vec![Val::from(TableID::new(42)), Val::from(0u16)],
+                    vec![
+                        Val::from(TableID::new(42)),
+                        Val::from(0u64),
+                        Val::from(0u64),
+                        Val::from(0u64),
+                        Val::from(0u32),
+                    ],
                 )
                 .await
                 .unwrap();
@@ -2093,8 +2099,20 @@ pub(crate) mod tests {
                         stmt,
                         table.as_ref(),
                         vec![
-                            vec![Val::from(TableID::new(43)), Val::from(0u16)],
-                            vec![Val::from(TableID::new(44)), Val::from(0u16)],
+                            vec![
+                                Val::from(TableID::new(43)),
+                                Val::from(0u64),
+                                Val::from(0u64),
+                                Val::from(0u64),
+                                Val::from(0u32),
+                            ],
+                            vec![
+                                Val::from(TableID::new(44)),
+                                Val::from(0u64),
+                                Val::from(0u64),
+                                Val::from(0u64),
+                                Val::from(0u32),
+                            ],
                         ],
                     )
                     .await
@@ -2199,7 +2217,10 @@ pub(crate) mod tests {
                     effects.push_delete_index_undo(
                         TableID::new(12),
                         RowID::new(23),
-                        user_key_from_active_slot(IndexSlot::new(0), vec![]),
+                        user_key_from_index_ref(
+                            IndexRef::new(IndexID::new(0), IndexSlot::new(0)),
+                            vec![],
+                        ),
                         true,
                     );
                     Err(Report::new(OperationError::InvalidDmlInput).disclose())

@@ -55,13 +55,13 @@ pub(crate) use unique_index::{GuardedUniqueMemIndex, UniqueMemIndex};
 
 /// Proof-bound secondary-index root with no standalone address accessor.
 struct ProvenIndexRoot<'op> {
-    block_id: BlockID,
+    block_id: Option<BlockID>,
     _proof: PhantomData<&'op TrxReadProof<'op>>,
 }
 
 impl<'op> ProvenIndexRoot<'op> {
     #[inline]
-    fn new(block_id: BlockID, _proof: &TrxReadProof<'op>) -> Self {
+    fn new(block_id: Option<BlockID>, _proof: &TrxReadProof<'op>) -> Self {
         Self {
             block_id,
             _proof: PhantomData,
@@ -84,7 +84,7 @@ impl<'op, 'idx, P: BufferPool + 'static> CurrentIndexReadHandle<'op, 'idx, P> {
         index_ref: IndexRef,
         index: &'idx SecondaryIndex<P>,
         guards: &'op PoolGuards,
-        root: BlockID,
+        root: Option<BlockID>,
         proof: &TrxReadProof<'op>,
     ) -> Self {
         Self {
@@ -150,7 +150,7 @@ pub(crate) struct OwnedCurrentIndexReadHandle<P: BufferPool + 'static> {
     index: Arc<SecondaryIndex<P>>,
     index_pool_guard: PoolGuard,
     disk_pool_guard: PoolGuard,
-    root: BlockID,
+    root: Option<BlockID>,
 }
 
 impl<P: BufferPool + 'static> OwnedCurrentIndexReadHandle<P> {
@@ -161,7 +161,7 @@ impl<P: BufferPool + 'static> OwnedCurrentIndexReadHandle<P> {
         index: Arc<SecondaryIndex<P>>,
         index_pool_guard: PoolGuard,
         disk_pool_guard: PoolGuard,
-        root: BlockID,
+        root: Option<BlockID>,
         _proof: &TrxReadProof<'_>,
     ) -> Self {
         Self {

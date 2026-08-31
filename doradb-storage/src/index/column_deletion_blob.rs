@@ -669,7 +669,7 @@ fn encode_blob_page_header(buf: &mut [u8], next_block_id: BlockID, used_size: us
 mod tests {
     use super::*;
     use crate::buffer::{global_readonly_pool_scope, table_readonly_pool};
-    use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
+    use crate::catalog::{StorageColumnFlags, StorageColumnSpec, TableMetadata};
     use crate::error::DataIntegrityError;
     use crate::file::build_test_fs;
     use crate::file::table_file::MutableTableFile;
@@ -681,10 +681,9 @@ mod tests {
     fn metadata() -> Arc<TableMetadata> {
         Arc::new(
             TableMetadata::try_new(
-                vec![ColumnSpec::new(
-                    "c0",
+                vec![StorageColumnSpec::new(
                     ValKind::U64,
-                    ColumnAttributes::empty(),
+                    StorageColumnFlags::empty(),
                 )],
                 vec![],
             )

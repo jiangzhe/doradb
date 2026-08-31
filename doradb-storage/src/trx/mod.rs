@@ -3632,7 +3632,8 @@ pub(crate) mod tests {
     use crate::catalog::storage::tables::TABLE_ID_TABLES;
     use crate::catalog::tests as catalog_tests;
     use crate::catalog::{
-        ColumnAttributes, ColumnSpec, IndexSlot, TableMetadata, user_key_from_active_slot,
+        IndexID, IndexRef, IndexSlot, StorageColumnFlags, StorageColumnSpec, TableMetadata,
+        user_key_from_index_ref,
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
@@ -3703,7 +3704,7 @@ pub(crate) mod tests {
         /// `deletion_cutoff_ts` value exposed to test helpers.
         pub(crate) deletion_cutoff_ts: TrxID,
         /// `secondary_index_root` value exposed to test helpers.
-        pub(crate) secondary_index_root: BlockID,
+        pub(crate) secondary_index_root: Option<BlockID>,
         /// `visible` value exposed to test helpers.
         pub(crate) visible: bool,
         /// `sts` value exposed to test helpers.
@@ -4635,10 +4636,9 @@ pub(crate) mod tests {
     async fn publish_initial_test_root(engine: &Engine, table_id_offset: u64) -> Arc<TableFile> {
         let metadata = Arc::new(
             TableMetadata::try_new(
-                vec![ColumnSpec::new(
-                    "c0",
+                vec![StorageColumnSpec::new(
                     ValKind::U64,
-                    ColumnAttributes::empty(),
+                    StorageColumnFlags::empty(),
                 )],
                 vec![],
             )
@@ -5418,7 +5418,10 @@ pub(crate) mod tests {
                     table_id: TableID::new(11),
                     row_id: RowID::new(22),
                     kind: IndexUndoKind::DeferDelete(
-                        user_key_from_active_slot(IndexSlot::new(0), vec![]),
+                        user_key_from_index_ref(
+                            IndexRef::new(IndexID::new(0), IndexSlot::new(0)),
+                            vec![],
+                        ),
                         true,
                     ),
                 });
@@ -5461,7 +5464,10 @@ pub(crate) mod tests {
                     table_id: TableID::new(11),
                     row_id: RowID::new(22),
                     kind: IndexUndoKind::DeferDelete(
-                        user_key_from_active_slot(IndexSlot::new(0), vec![]),
+                        user_key_from_index_ref(
+                            IndexRef::new(IndexID::new(0), IndexSlot::new(0)),
+                            vec![],
+                        ),
                         true,
                     ),
                 });
@@ -5754,7 +5760,10 @@ pub(crate) mod tests {
                 effects.push_delete_index_undo(
                     TableID::new(12),
                     RowID::new(23),
-                    user_key_from_active_slot(IndexSlot::new(0), vec![]),
+                    user_key_from_index_ref(
+                        IndexRef::new(IndexID::new(0), IndexSlot::new(0)),
+                        vec![],
+                    ),
                     true,
                 );
                 effects.insert_row_redo(
@@ -7177,7 +7186,10 @@ pub(crate) mod tests {
                     table_id: TableID::new(47),
                     row_id: RowID::new(1),
                     kind: IndexUndoKind::DeferDelete(
-                        user_key_from_active_slot(IndexSlot::new(0), vec![]),
+                        user_key_from_index_ref(
+                            IndexRef::new(IndexID::new(0), IndexSlot::new(0)),
+                            vec![],
+                        ),
                         true,
                     ),
                 });

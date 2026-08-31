@@ -1,15 +1,22 @@
-use crate::catalog::{ColumnAttributes, IndexAttributes, IndexOrder, IndexSlot};
+use crate::catalog::{
+    ColumnID, ColumnOrdinal, IndexRef, StorageColumnFlags, StorageIndexFlags, TableIndexKeySpec,
+};
 use crate::id::{TableID, TrxID};
 use crate::value::ValKind;
-use semistr::SemiStr;
 
 /// One row object in `catalog.tables`.
 #[derive(Debug)]
 pub(crate) struct TableObject {
     /// User table identifier.
     pub(crate) table_id: TableID,
-    /// Next physical index slot to assign for the table.
-    pub(crate) next_index_slot: IndexSlot,
+    /// Monotonic active storage-schema epoch.
+    pub(crate) storage_epoch: u64,
+    /// Exclusive stable column-ID allocator bound.
+    pub(crate) next_column_id: u64,
+    /// Exclusive stable index-ID allocator bound.
+    pub(crate) next_index_id: u64,
+    /// Exclusive physical index-slot count.
+    pub(crate) index_slot_count: u32,
 }
 
 /// One row object in `catalog.columns`.
@@ -17,14 +24,14 @@ pub(crate) struct TableObject {
 pub(crate) struct ColumnObject {
     /// User table identifier.
     pub(crate) table_id: TableID,
-    /// Column ordinal in the table.
-    pub(crate) column_no: u16,
-    /// Column name.
-    pub(crate) column_name: SemiStr,
+    /// Stable column identity.
+    pub(crate) column_id: ColumnID,
+    /// Physical column ordinal in stored rows.
+    pub(crate) storage_ordinal: ColumnOrdinal,
     /// Stored value kind.
-    pub(crate) column_type: ValKind,
+    pub(crate) value_kind: ValKind,
     /// Column attribute bitset.
-    pub(crate) column_attributes: ColumnAttributes,
+    pub(crate) value_flags: StorageColumnFlags,
 }
 
 /// One row object in `catalog.indexes`.
@@ -32,25 +39,12 @@ pub(crate) struct ColumnObject {
 pub(crate) struct IndexObject {
     /// User table identifier.
     pub(crate) table_id: TableID,
-    /// Physical index slot within the table.
-    pub(crate) index_slot: IndexSlot,
+    /// Exact stable generation and physical slot.
+    pub(crate) index: IndexRef,
     /// Index attribute bitset.
-    pub(crate) index_attributes: IndexAttributes,
-}
-
-/// One row object in `catalog.index_columns`.
-#[derive(Debug)]
-pub(crate) struct IndexColumnObject {
-    /// User table identifier.
-    pub(crate) table_id: TableID,
-    /// Physical index slot within the table.
-    pub(crate) index_slot: IndexSlot,
-    /// Column position in the index.
-    pub(crate) index_column_no: u16,
-    /// Column position in the table.
-    pub(crate) column_no: u16,
-    /// Sort order for the indexed column.
-    pub(crate) index_order: IndexOrder,
+    pub(crate) index_flags: StorageIndexFlags,
+    /// Ordered stable-column key specification.
+    pub(crate) keys: Box<[TableIndexKeySpec]>,
 }
 
 /// One row object in `catalog.table_replay_silent_watermarks`.

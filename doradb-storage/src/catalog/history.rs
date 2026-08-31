@@ -601,9 +601,10 @@ fn assert_current_layout_metadata(table: &Arc<Table>, metadata: &Arc<TableMetada
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{IndexAttributes, IndexKeySpec, IndexSpec};
+    use crate::catalog::{
+        IndexID, SecondaryIndexSlot, StorageIndexFlags, StorageIndexKey, StorageIndexSpec,
+    };
     use crate::engine::Engine;
-    use crate::file::cow_file::SUPER_BLOCK_ID;
     use crate::id::TableID;
     use crate::session::tests::active_operation_count;
     use crate::table::tests::{create_table2_for_test, lightweight_test_engine};
@@ -745,7 +746,10 @@ mod tests {
             let index_id = ddl_session
                 .create_index(
                     table_id,
-                    IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty()),
+                    StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(1)],
+                        StorageIndexFlags::empty(),
+                    ),
                 )
                 .await
                 .unwrap();
@@ -971,7 +975,10 @@ mod tests {
             let index_id = ddl_session
                 .create_index(
                     table_id,
-                    IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty()),
+                    StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(1)],
+                        StorageIndexFlags::empty(),
+                    ),
                 )
                 .await
                 .unwrap();
@@ -1019,7 +1026,10 @@ mod tests {
                 let index_id = session
                     .create_index(
                         table_id,
-                        IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty()),
+                        StorageIndexSpec::new(
+                            vec![StorageIndexKey::new(1)],
+                            StorageIndexFlags::empty(),
+                        ),
                     )
                     .await
                     .unwrap();
@@ -1048,8 +1058,8 @@ mod tests {
                 assert!(table.layout_snapshot().secondary_indexes()[1].is_none());
                 assert!(!table.has_retired_secondary_indexes());
                 assert_eq!(
-                    table.file().active_root_unchecked().secondary_index_roots[1],
-                    SUPER_BLOCK_ID
+                    table.file().active_root_unchecked().secondary_index_slots[1],
+                    SecondaryIndexSlot::Retired(index_id)
                 );
                 (table_id, retained_metadata)
             };
@@ -1088,8 +1098,8 @@ mod tests {
             assert_eq!(current.live_metadata().unwrap().idx.index_slot_count(), 2);
             assert!(table.layout_snapshot().secondary_indexes()[1].is_none());
             assert_eq!(
-                table.file().active_root_unchecked().secondary_index_roots[1],
-                SUPER_BLOCK_ID
+                table.file().active_root_unchecked().secondary_index_slots[1],
+                SecondaryIndexSlot::Retired(IndexID::new(1))
             );
             assert!(!table.has_retired_secondary_indexes());
             assert_eq!(

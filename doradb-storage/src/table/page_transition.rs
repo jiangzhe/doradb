@@ -873,7 +873,7 @@ fn active_writer_sts(trx_id: TrxID) -> TrxID {
 pub(crate) mod tests {
     use super::*;
     use crate::bitmap::Bitmap;
-    use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
+    use crate::catalog::{StorageColumnFlags, StorageColumnSpec, TableMetadata};
     use crate::id::RowID;
     use crate::trx::row::tests::test_row_write_access;
     use crate::trx::tests::{commit_shared_trx_status, shared_trx_status};
@@ -983,10 +983,9 @@ pub(crate) mod tests {
     ) -> FrozenAnalyzerFixture {
         assert!(!nodes.is_empty());
         let metadata = TableMetadata::try_new(
-            vec![ColumnSpec::new(
-                "id",
+            vec![StorageColumnSpec::new(
                 ValKind::I32,
-                ColumnAttributes::empty(),
+                StorageColumnFlags::empty(),
             )],
             vec![],
         )
@@ -1086,10 +1085,9 @@ pub(crate) mod tests {
     #[test]
     fn test_frozen_mutation_finishing_during_analysis_discards_optimistic_plan() {
         let metadata = TableMetadata::try_new(
-            vec![ColumnSpec::new(
-                "id",
+            vec![StorageColumnSpec::new(
                 ValKind::I32,
-                ColumnAttributes::empty(),
+                StorageColumnFlags::empty(),
             )],
             vec![],
         )

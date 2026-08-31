@@ -32,6 +32,7 @@ use crate::quiescent::QuiescentGuard;
 use crate::serde::{Deser, Ser};
 use crate::trx::MIN_SNAPSHOT_TS;
 use error_stack::{Report, ResultExt};
+use std::array::from_fn;
 use std::collections::BTreeSet;
 use std::io::ErrorKind as IoErrorKind;
 use std::num::NonZeroU64;
@@ -43,9 +44,9 @@ pub(crate) use crate::file::CATALOG_MTB_FILE_ID;
 pub(crate) use tests::publish_first_redo_log_seq_for_test;
 
 /// On-disk format version of `catalog.mtb`.
-pub(crate) const CATALOG_MTB_VERSION: u64 = 5;
+pub(crate) const CATALOG_MTB_VERSION: u64 = 6;
 /// Reserved number of catalog logical-table root descriptors.
-pub(crate) const CATALOG_TABLE_ROOT_DESC_COUNT: usize = 5;
+pub(crate) const CATALOG_TABLE_ROOT_DESC_COUNT: usize = 6;
 /// Initial sparse-file size for `catalog.mtb`.
 pub(crate) const MULTI_TABLE_FILE_INITIAL_SIZE: usize = TABLE_FILE_INITIAL_SIZE;
 
@@ -53,27 +54,76 @@ const MULTI_TABLE_FILE_MAGIC_WORD: [u8; 8] = [b'D', b'O', b'R', b'A', b'M', b'T'
 const MULTI_TABLE_META_BLOCK_SPEC: BlockIntegritySpec =
     BlockIntegritySpec::new(MULTI_TABLE_META_BLOCK_MAGIC_WORD, CATALOG_MTB_VERSION);
 
+/// Explicit checkpointed root state of one catalog logical table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum CatalogTableRootState {
+    /// No checkpointed persisted root exists yet.
+    #[default]
+    Empty,
+    /// A checkpoint published this root block and row-id boundary together.
+    Published {
+        /// Nonzero persisted root block identity.
+        root_block_id: NonZeroU64,
+        /// Row-id boundary covered by the published root.
+        pivot_row_id: RowID,
+    },
+}
+
 /// Root descriptor reserved for one catalog logical table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct CatalogTableRootDesc {
     /// Catalog table id.
     pub table_id: TableID,
-    /// Checkpointed persisted root block id for one catalog logical table.
-    ///
-    /// `None` means no checkpointed persisted root exists yet. On disk, the
-    /// absent case is encoded as raw `0` because block `0` is reserved for the
-    /// `catalog.mtb` super block and can never be a logical table root.
-    pub root_block_id: Option<NonZeroU64>,
-    /// Row-id boundary paired with `root_block_id`.
-    pub pivot_row_id: RowID,
+    /// Explicit empty or published root state.
+    pub(crate) state: CatalogTableRootState,
 }
 
 impl CatalogTableRootDesc {
+    /// Constructs an empty descriptor for one catalog table.
+    #[inline]
+    pub(crate) const fn empty(table_id: TableID) -> Self {
+        Self {
+            table_id,
+            state: CatalogTableRootState::Empty,
+        }
+    }
+
+    /// Constructs a descriptor for one published catalog root.
+    #[inline]
+    pub(crate) fn published(
+        table_id: TableID,
+        root_block_id: BlockID,
+        pivot_row_id: RowID,
+    ) -> Self {
+        let root_block_id = NonZeroU64::new(root_block_id.as_u64())
+            .expect("published catalog root block must be nonzero");
+        Self {
+            table_id,
+            state: CatalogTableRootState::Published {
+                root_block_id,
+                pivot_row_id,
+            },
+        }
+    }
+
     /// Returns the checkpointed persisted root block id, if one exists.
     #[inline]
     pub(crate) fn checkpoint_root_block_id(&self) -> Option<BlockID> {
-        self.root_block_id
-            .map(|block_id| BlockID::from(block_id.get()))
+        match self.state {
+            CatalogTableRootState::Empty => None,
+            CatalogTableRootState::Published { root_block_id, .. } => {
+                Some(BlockID::from(root_block_id.get()))
+            }
+        }
+    }
+
+    /// Returns the checkpointed row-id boundary, or zero for an empty state.
+    #[inline]
+    pub(crate) const fn pivot_row_id(&self) -> RowID {
+        match self.state {
+            CatalogTableRootState::Empty => RowID::new(0),
+            CatalogTableRootState::Published { pivot_row_id, .. } => pivot_row_id,
+        }
     }
 }
 
@@ -95,10 +145,8 @@ impl MultiTableMetaBlock {
     /// Create a meta payload initialized with allocator lower bound.
     #[inline]
     pub(crate) fn new(next_table_id: TableID) -> Self {
-        let mut table_roots = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
-        for (idx, root) in table_roots.iter_mut().enumerate() {
-            root.table_id = catalog_table_id_from_slot(idx);
-        }
+        let table_roots =
+            from_fn(|idx| CatalogTableRootDesc::empty(catalog_table_id_from_slot(idx)));
         MultiTableMetaBlock {
             next_table_id,
             first_redo_log_seq: 0,
@@ -357,15 +405,6 @@ impl MutableMultiTableFile {
             next_table_id <= USER_TABLE_ID_LIMIT,
             "catalog root descriptor invariant violated: next_table_id={next_table_id}, user_table_id_limit={USER_TABLE_ID_LIMIT}"
         );
-        for root in &table_roots {
-            assert!(
-                root.root_block_id.is_some() || root.pivot_row_id == RowID::new(0),
-                "catalog root descriptor invariant violated: table_id={}, root block missing but pivot_row_id={}",
-                root.table_id,
-                root.pivot_row_id
-            );
-        }
-
         root.root_ts = catalog_replay_start_ts;
         root.next_table_id = next_table_id;
         root.table_roots = table_roots;
@@ -579,16 +618,15 @@ fn validate_multi_table_root(
         );
     }
     for (idx, root) in parsed_meta.meta.table_roots.iter().enumerate() {
-        if catalog_table_slot(root.table_id) != Some(idx)
-            || (root.root_block_id.is_none() && root.pivot_row_id != RowID::new(0))
-        {
-            return Err(Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
-                "file={}, descriptor_slot={idx}, table_id={}, root_block_id={:?}, pivot_row_id={}",
-                FileKind::CatalogMultiTableFile,
-                root.table_id,
-                root.root_block_id,
-                root.pivot_row_id
-            )));
+        if catalog_table_slot(root.table_id) != Some(idx) {
+            return Err(
+                Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
+                    "file={}, descriptor_slot={idx}, table_id={}, root_state={:?}",
+                    FileKind::CatalogMultiTableFile,
+                    root.table_id,
+                    root.state,
+                )),
+            );
         }
         if let Some(root_block_id) = root.checkpoint_root_block_id() {
             let root_idx = usize::try_from(root_block_id.as_u64()).map_err(|_| {
@@ -692,7 +730,6 @@ mod tests {
     use crate::io::IOBuf;
     use std::fs::{OpenOptions, read, remove_file};
     use std::io::{Seek, SeekFrom, Write};
-    use std::num::NonZeroU64;
 
     /// Publishes first redo log seq for tests.
     pub(crate) async fn publish_first_redo_log_seq_for_test(
@@ -786,7 +823,11 @@ mod tests {
         let alloc_map = AllocMap::new(MULTI_TABLE_FILE_INITIAL_SIZE / COW_FILE_PAGE_SIZE);
         assert!(alloc_map.allocate_at(usize::from(meta_block_id)));
         let mut meta = MultiTableMetaBlock::new(USER_TABLE_ID_START);
-        meta.table_roots[0].pivot_row_id = RowID::new(1);
+        meta.table_roots[0] = CatalogTableRootDesc::published(
+            catalog_table_id_from_slot(0),
+            test_block_id(2),
+            RowID::new(1),
+        );
         let parsed = ParsedMeta { meta, alloc_map };
         let err = validate_multi_table_root(meta_block_id, &parsed).unwrap_err();
         assert_eq!(
@@ -859,12 +900,13 @@ mod tests {
             let meta_block_id_0 = mtb.active_root_unchecked().meta_block_id;
             assert!(meta_block_id_0 > test_block_id(0));
 
-            let mut roots = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
-            for (idx, root) in roots.iter_mut().enumerate() {
-                root.table_id = catalog_table_id_from_slot(idx);
-                root.root_block_id = NonZeroU64::new((idx + 10) as u64);
-                root.pivot_row_id = RowID::new((idx * 100) as u64);
-            }
+            let roots = from_fn(|idx| {
+                CatalogTableRootDesc::published(
+                    catalog_table_id_from_slot(idx),
+                    BlockID::new((idx + 10) as u64),
+                    RowID::new((idx * 100) as u64),
+                )
+            });
             publish_checkpoint_for_test(
                 &mtb,
                 background_writes,
@@ -1215,12 +1257,13 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut roots_v1 = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
-            for (idx, root) in roots_v1.iter_mut().enumerate() {
-                root.table_id = catalog_table_id_from_slot(idx);
-                root.root_block_id = NonZeroU64::new((idx + 10) as u64);
-                root.pivot_row_id = RowID::new((idx as u64) + 1);
-            }
+            let roots_v1 = from_fn(|idx| {
+                CatalogTableRootDesc::published(
+                    catalog_table_id_from_slot(idx),
+                    BlockID::new((idx + 10) as u64),
+                    RowID::new((idx as u64) + 1),
+                )
+            });
             publish_checkpoint_for_test(
                 &mtb,
                 background_writes,
@@ -1232,8 +1275,11 @@ mod tests {
             let older_snapshot = mtb.load_snapshot();
 
             let mut roots_v2 = roots_v1;
-            roots_v2[0].root_block_id = NonZeroU64::new(99);
-            roots_v2[0].pivot_row_id = RowID::new(100);
+            roots_v2[0] = CatalogTableRootDesc::published(
+                catalog_table_id_from_slot(0),
+                BlockID::new(99),
+                RowID::new(100),
+            );
             publish_checkpoint_for_test(
                 &mtb,
                 background_writes,
@@ -1277,12 +1323,13 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut roots_v1 = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
-            for (idx, root) in roots_v1.iter_mut().enumerate() {
-                root.table_id = catalog_table_id_from_slot(idx);
-                root.root_block_id = NonZeroU64::new((idx + 20) as u64);
-                root.pivot_row_id = RowID::new((idx as u64) + 10);
-            }
+            let roots_v1 = from_fn(|idx| {
+                CatalogTableRootDesc::published(
+                    catalog_table_id_from_slot(idx),
+                    BlockID::new((idx + 20) as u64),
+                    RowID::new((idx as u64) + 10),
+                )
+            });
             publish_checkpoint_for_test(
                 &mtb,
                 background_writes,
@@ -1293,8 +1340,11 @@ mod tests {
             .await;
 
             let mut roots_v2 = roots_v1;
-            roots_v2[1].root_block_id = NonZeroU64::new(123);
-            roots_v2[1].pivot_row_id = RowID::new(222);
+            roots_v2[1] = CatalogTableRootDesc::published(
+                catalog_table_id_from_slot(1),
+                BlockID::new(123),
+                RowID::new(222),
+            );
             publish_checkpoint_for_test(
                 &mtb,
                 background_writes,

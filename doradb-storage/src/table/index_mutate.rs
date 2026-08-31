@@ -680,9 +680,9 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
             .idx
             .require_index_spec(candidate.index.slot())
             .expect("IndexWrite admission must retain an active index spec");
-        let mut key_vals = Vec::with_capacity(index_spec.cols.len());
-        for key in &index_spec.cols {
-            let column_no = key.col_no as usize;
+        let mut key_vals = Vec::with_capacity(index_spec.keys.len());
+        for key in &index_spec.keys {
+            let column_no = key.column_ordinal.as_usize();
             let val = update
                 .iter()
                 .find(|update_col| update_col.idx == column_no)

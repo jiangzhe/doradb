@@ -4,26 +4,30 @@ use crate::catalog::storage::object::TableObject;
 use crate::catalog::table::{TableColumnLayout, TableMetadata};
 use crate::catalog::{CatalogIndexNo, CatalogTable};
 use crate::catalog::{
-    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexSlot, IndexSpec,
-    catalog_table_id_from_slot,
+    ID_DOMAIN_END, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
+    StorageIndexSpec, catalog_table_id_from_slot,
 };
-use crate::error::{MultiDomainResultExt, RuntimeError, RuntimeOrFatalResult, RuntimeResult};
+use crate::error::{
+    DataIntegrityError, DataIntegrityResult, MultiDomainResultExt, RuntimeError,
+    RuntimeOrFatalResult, RuntimeResult,
+};
 use crate::id::TableID;
 use crate::row::ops::DeleteMvcc;
 use crate::row::{Row, RowRead};
 use crate::trx::PrivateTransaction;
 use crate::value::Val;
 use crate::value::ValKind;
+use error_stack::Report;
 use error_stack::ResultExt;
-use semistr::SemiStr;
 use std::sync::OnceLock;
 
 /// Catalog table id for `catalog.tables`.
 pub(crate) const TABLE_ID_TABLES: TableID = catalog_table_id_from_slot(0);
 const COL_NO_TABLES_TABLE_ID: usize = 0;
-const COL_NAME_TABLES_TABLE_ID: &str = "table_id";
-const COL_NO_TABLES_NEXT_INDEX_NO: usize = 1;
-const COL_NAME_TABLES_NEXT_INDEX_NO: &str = "next_index_no";
+const COL_NO_TABLES_STORAGE_EPOCH: usize = 1;
+const COL_NO_TABLES_NEXT_COLUMN_ID: usize = 2;
+const COL_NO_TABLES_NEXT_INDEX_ID: usize = 3;
+const COL_NO_TABLES_INDEX_SLOT_COUNT: usize = 4;
 const PK_NO_TABLES: CatalogIndexNo = CatalogIndexNo::new(0);
 
 /// Runtime accessor for `catalog.tables`.
@@ -38,17 +42,31 @@ impl Tables<'_> {
         guards: &PoolGuards,
     ) -> RuntimeResult<Vec<TableObject>> {
         let mut res = vec![];
+        let mut decode_error = None;
         self.table
             .table_scan_uncommitted(guards, |col_layout, row| {
                 if row.is_deleted() {
                     return true;
                 }
-                res.push(row_to_table_object(col_layout, row));
-                true
+                match row_to_table_object(col_layout, row) {
+                    Ok(object) => {
+                        res.push(object);
+                        true
+                    }
+                    Err(err) => {
+                        decode_error = Some(err);
+                        false
+                    }
+                }
             })
             .await
             .change_context(RuntimeError::CatalogAccess)
             .attach("operation=list_catalog_tables")?;
+        if let Some(err) = decode_error {
+            return Err(err
+                .change_context(RuntimeError::CatalogAccess)
+                .attach("operation=list_catalog_tables, phase=decode_row"));
+        }
         Ok(res)
     }
 
@@ -60,11 +78,22 @@ impl Tables<'_> {
         table_id: TableID,
     ) -> RuntimeResult<Option<TableObject>> {
         let key_vals = [Val::from(table_id)];
-        self.table
-            .index_lookup_unique_uncommitted(guards, PK_NO_TABLES, &key_vals, row_to_table_object)
+        let vals = self
+            .table
+            .index_lookup_unique_uncommitted(guards, PK_NO_TABLES, &key_vals, |col_layout, row| {
+                (0..5)
+                    .map(|idx| row.val(col_layout, idx))
+                    .collect::<Vec<_>>()
+            })
             .await
             .change_context(RuntimeError::CatalogAccess)
-            .attach_with(|| format!("operation=find_catalog_table, table_id={table_id}"))
+            .attach_with(|| format!("operation=find_catalog_table, table_id={table_id}"))?;
+        vals.map(|vals| table_object_from_vals(&vals))
+            .transpose()
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!("operation=find_catalog_table, phase=decode_row, table_id={table_id}")
+            })
     }
 
     /// Insert a table row whose primary key is owned by the current DDL.
@@ -80,7 +109,10 @@ impl Tables<'_> {
     ) -> RuntimeOrFatalResult<()> {
         let cols = vec![
             Val::from(obj.table_id),
-            Val::from(obj.next_index_slot.get()),
+            Val::from(obj.storage_epoch),
+            Val::from(obj.next_column_id),
+            Val::from(obj.next_index_id),
+            Val::from(obj.index_slot_count),
         ];
         trx.catalog_insert_mvcc(self.table, cols)
             .await
@@ -110,7 +142,10 @@ impl Tables<'_> {
         let key_vals = vec![Val::from(obj.table_id)];
         let cols = vec![
             Val::from(obj.table_id),
-            Val::from(obj.next_index_slot.get()),
+            Val::from(obj.storage_epoch),
+            Val::from(obj.next_column_id),
+            Val::from(obj.next_index_id),
+            Val::from(obj.index_slot_count),
         ];
         let res = trx
             .catalog_replace_primary_key_mvcc(self.table, PK_NO_TABLES, key_vals, cols)
@@ -133,22 +168,20 @@ pub(crate) fn catalog_definition_of_tables() -> &'static CatalogDefinition {
             table_id: TABLE_ID_TABLES,
             metadata: TableMetadata::try_new(
                 vec![
-                    // table_id unsigned bigint primary key not null
-                    ColumnSpec {
-                        column_name: SemiStr::new(COL_NAME_TABLES_TABLE_ID),
-                        column_type: ValKind::U64,
-                        column_attributes: ColumnAttributes::INDEX,
-                    },
-                    // next_index_no unsigned smallint not null
-                    ColumnSpec {
-                        column_name: SemiStr::new(COL_NAME_TABLES_NEXT_INDEX_NO),
-                        column_type: ValKind::U16,
-                        column_attributes: ColumnAttributes::empty(),
-                    },
+                    // table_id U64: stable user-table identity.
+                    StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
+                    // storage_epoch U64: monotonic active storage-schema epoch.
+                    StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
+                    // next_column_id U64: exclusive stable column-ID allocator bound.
+                    StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
+                    // next_index_id U64: exclusive stable index-ID allocator bound.
+                    StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
+                    // index_slot_count U32: exclusive physical index-slot count.
+                    StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
                 ],
                 vec![
-                    // primary key (table_id)
-                    IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::PK),
+                    // Primary key: table_id.
+                    StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::PK),
                 ],
             )
             .expect("valid table metadata"),
@@ -157,20 +190,60 @@ pub(crate) fn catalog_definition_of_tables() -> &'static CatalogDefinition {
 }
 
 #[inline]
-fn row_to_table_object(col_layout: &TableColumnLayout, row: Row<'_>) -> TableObject {
-    let table_id = TableID::from(
-        row.val(col_layout, COL_NO_TABLES_TABLE_ID)
-            .as_u64()
-            .unwrap(),
-    );
-    let next_index_slot = row
-        .val(col_layout, COL_NO_TABLES_NEXT_INDEX_NO)
-        .as_u16()
-        .unwrap();
-    TableObject {
-        table_id,
-        next_index_slot: IndexSlot::from(next_index_slot),
+fn row_to_table_object(
+    col_layout: &TableColumnLayout,
+    row: Row<'_>,
+) -> DataIntegrityResult<TableObject> {
+    let vals = (0..5)
+        .map(|idx| row.val(col_layout, idx))
+        .collect::<Vec<_>>();
+    table_object_from_vals(&vals)
+}
+
+pub(super) fn table_object_from_vals(vals: &[Val]) -> DataIntegrityResult<TableObject> {
+    if vals.len() != 5 {
+        return Err(
+            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                "catalog.tables value count {}, expected 5",
+                vals.len()
+            )),
+        );
     }
+    let table_id = vals[COL_NO_TABLES_TABLE_ID]
+        .as_u64()
+        .map(TableID::from)
+        .ok_or_else(|| Report::new(DataIntegrityError::InvalidPayload))?;
+    let storage_epoch = vals[COL_NO_TABLES_STORAGE_EPOCH]
+        .as_u64()
+        .ok_or_else(|| Report::new(DataIntegrityError::InvalidPayload))?;
+    let next_column_id = vals[COL_NO_TABLES_NEXT_COLUMN_ID]
+        .as_u64()
+        .ok_or_else(|| Report::new(DataIntegrityError::InvalidPayload))?;
+    let next_index_id = vals[COL_NO_TABLES_NEXT_INDEX_ID]
+        .as_u64()
+        .ok_or_else(|| Report::new(DataIntegrityError::InvalidPayload))?;
+    let index_slot_count = vals[COL_NO_TABLES_INDEX_SLOT_COUNT]
+        .as_u32()
+        .ok_or_else(|| Report::new(DataIntegrityError::InvalidPayload))?;
+    if next_column_id > ID_DOMAIN_END || next_index_id > ID_DOMAIN_END {
+        return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+            "catalog.tables allocator exceeds stable ID domain: next_column_id={next_column_id}, next_index_id={next_index_id}"
+        )));
+    }
+    if index_slot_count > u32::from(u16::MAX) + 1 {
+        return Err(
+            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                "catalog.tables index_slot_count exceeds physical domain: {index_slot_count}"
+            )),
+        );
+    }
+    Ok(TableObject {
+        table_id,
+        storage_epoch,
+        next_column_id,
+        next_index_id,
+        index_slot_count,
+    })
 }
 
 #[cfg(test)]
@@ -193,11 +266,17 @@ mod tests {
 
             let table100 = TableObject {
                 table_id: TableID::new(100),
-                next_index_slot: IndexSlot::new(0),
+                storage_epoch: 0,
+                next_column_id: 0,
+                next_index_id: 0,
+                index_slot_count: 0,
             };
             let table101 = TableObject {
                 table_id: TableID::new(101),
-                next_index_slot: IndexSlot::new(0),
+                storage_epoch: 0,
+                next_column_id: 0,
+                next_index_id: 0,
+                index_slot_count: 0,
             };
             let mut trx = begin_catalog_test_trx(&session);
             engine

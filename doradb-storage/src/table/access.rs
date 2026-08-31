@@ -682,9 +682,9 @@ impl<'op> WriteIndexKeySet<'op> {
                     .index_spec(index.slot())
                     .expect("active runtime entry has matching metadata");
                 let vals = spec
-                    .cols
+                    .keys
                     .iter()
-                    .map(|key| row[key.col_no as usize].clone())
+                    .map(|key| row[key.column_ordinal.as_usize()].clone())
                     .collect();
                 WriteIndexKey {
                     index,
@@ -761,16 +761,16 @@ impl<'op> WriteIndexKeySet<'op> {
                     .index_spec(index_ref.slot())
                     .expect("active layout entry has matching metadata");
                 let vals = index_spec
-                    .cols
+                    .keys
                     .iter()
                     .map(|key| {
                         indexed_vals
-                            .get(&(key.col_no as usize))
+                            .get(&(key.column_ordinal.as_usize()))
                             .cloned()
                             .unwrap_or_else(|| {
                                 panic!(
                                     "active index column must be present in the metadata-derived read set: table_id={table_id}, index={index_ref}, column_no={}",
-                                    key.col_no
+                                    key.column_ordinal
                                 )
                             })
                     })
@@ -989,7 +989,7 @@ impl<'op> UserTableAccessor<'op> {
         &self,
         guards: &'g PoolGuards,
         index: IndexRef,
-        root: BlockID,
+        root: Option<BlockID>,
     ) -> RuntimeResult<UniqueSecondaryIndex<'_, 'g, EvictableBufferPool>> {
         self.require_sec_idx(index)?
             .bind_unique_unchecked(guards, root)
@@ -1000,7 +1000,7 @@ impl<'op> UserTableAccessor<'op> {
         &self,
         guards: &'g PoolGuards,
         index: IndexRef,
-        root: BlockID,
+        root: Option<BlockID>,
     ) -> RuntimeResult<NonUniqueSecondaryIndex<'_, 'g, EvictableBufferPool>> {
         self.require_sec_idx(index)?
             .bind_non_unique_unchecked(guards, root)
@@ -1019,9 +1019,9 @@ impl<'op> UserTableAccessor<'op> {
         let index_slot = index.slot();
         let runtime = self.layout().secondary_index(index)?;
         let proof = rt.read_proof();
-        let root = self.storage.with_active_root(&proof, |root| {
-            root.secondary_index_roots[index_slot.as_usize()]
-        });
+        let root = self
+            .storage
+            .with_active_root(&proof, |root| root.secondary_index_root(index_slot));
         Ok(CurrentIndexReadHandle::new(
             index,
             runtime,
@@ -1040,9 +1040,9 @@ impl<'op> UserTableAccessor<'op> {
         let index_slot = index.slot();
         let runtime = Arc::clone(self.layout().index_entry(index)?.runtime_arc());
         let proof = rt.read_proof();
-        let root = self.storage.with_active_root(&proof, |root| {
-            root.secondary_index_roots[index_slot.as_usize()]
-        });
+        let root = self
+            .storage
+            .with_active_root(&proof, |root| root.secondary_index_root(index_slot));
         let pool_guards = rt.pool_guards();
         Ok(OwnedCurrentIndexReadHandle::new(
             index,
@@ -1055,14 +1055,14 @@ impl<'op> UserTableAccessor<'op> {
     }
 
     #[inline]
-    fn unchecked_secondary_root(&self, index_slot: IndexSlot) -> BlockID {
+    fn unchecked_secondary_root(&self, index_slot: IndexSlot) -> Option<BlockID> {
         // Unchecked internal callers share the same layout/root compatibility
         // contract as proof-gated foreground reads. Purge additionally treats
         // inactive layout slots as no-ops before reaching this binding point.
         self.storage
             .file()
             .active_root_unchecked()
-            .secondary_index_roots[index_slot.as_usize()]
+            .secondary_index_root(index_slot)
     }
 
     /// Captures the full proof-branded root used by transaction scan planning.
@@ -1097,10 +1097,10 @@ impl<'op> UserTableAccessor<'op> {
             layout.generation()
         );
         assert_eq!(
-            root.secondary_index_roots.len(),
+            root.secondary_index_slots.len(),
             layout.index_slot_count(),
             "foreground root/layout invariant violated: root_slots={}, layout_slots={}, table_id={}, layout_generation={}",
-            root.secondary_index_roots.len(),
+            root.secondary_index_slots.len(),
             layout.index_slot_count(),
             self.table_id(),
             layout.generation()
@@ -1773,9 +1773,9 @@ impl<'op> UserTableAccessor<'op> {
                     self.table_id()
                 )
             })?
-            .cols
+            .keys
             .iter()
-            .map(|key| key.col_no as usize)
+            .map(|key| key.column_ordinal.as_usize())
             .collect::<Vec<_>>();
         let vals = self
             .read_lwc_row(guards, block_id, row_idx, row_shape_fingerprint, &read_set)
@@ -5359,8 +5359,8 @@ mod tests {
     use crate::buffer::test_frame_kind;
     use crate::catalog::tests::table4;
     use crate::catalog::{
-        ColumnAttributes, ColumnSpec, IndexAttributes, IndexID, IndexKeySpec, IndexRef, IndexSlot,
-        IndexSpec, TableSpec,
+        IndexID, IndexRef, IndexSlot, SecondaryIndexSlot, StorageColumnFlags, StorageColumnSpec,
+        StorageIndexFlags, StorageIndexKey, StorageIndexSpec, StorageTableSpec,
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
@@ -5368,7 +5368,6 @@ mod tests {
         DataIntegrityError, DiscloseError, Error, ErrorKind, FatalError, IoError, OperationError,
         Result, RuntimeError,
     };
-    use crate::file::cow_file::SUPER_BLOCK_ID;
     use crate::id::{PageID, RowID, TableID, TrxID};
     use crate::index::{LwcRowLocation, RowLocation};
     use crate::io::{StorageBackendFileIdentity, install_storage_backend_test_hook};
@@ -5671,7 +5670,9 @@ mod tests {
             );
 
             let mut slot_mismatch = root;
-            slot_mismatch.secondary_index_roots.push(SUPER_BLOCK_ID);
+            slot_mismatch
+                .secondary_index_slots
+                .push(SecondaryIndexSlot::Vacant);
             assert!(
                 catch_unwind(AssertUnwindSafe(|| {
                     accessor.assert_foreground_root_layout_compatible(&slot_mismatch);
@@ -5892,18 +5893,25 @@ mod tests {
                 let mut ddl_session = engine.new_session().unwrap();
                 ddl_session
                     .create_table(
-                        TableSpec::new(vec![
-                            ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
-                            ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
-                            ColumnSpec::new("payload", ValKind::VarByte, ColumnAttributes::empty()),
+                        StorageTableSpec::new(vec![
+                            StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+                            StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
+                            StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
                         ]),
                         vec![
-                            IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK),
-                            IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty()),
+                            StorageIndexSpec::new(
+                                vec![StorageIndexKey::new(0)],
+                                StorageIndexFlags::UK,
+                            ),
+                            StorageIndexSpec::new(
+                                vec![StorageIndexKey::new(1)],
+                                StorageIndexFlags::empty(),
+                            ),
                         ],
                     )
                     .await
                     .unwrap()
+                    .table_id()
             };
             let mut session = engine.new_session().unwrap();
             let base_payload = vec![b'a'; BASE_PAYLOAD_SIZE];
@@ -7737,19 +7745,29 @@ mod tests {
                 let mut ddl_session = engine.new_session().unwrap();
                 ddl_session
                     .create_table(
-                        TableSpec::new(vec![
-                            ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
-                            ColumnSpec::new("code", ValKind::I32, ColumnAttributes::empty()),
-                            ColumnSpec::new("region", ValKind::I32, ColumnAttributes::empty()),
+                        StorageTableSpec::new(vec![
+                            StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+                            StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+                            StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
                         ]),
                         vec![
-                            IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK),
-                            IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::UK),
-                            IndexSpec::new(vec![IndexKeySpec::new(2)], IndexAttributes::UK),
+                            StorageIndexSpec::new(
+                                vec![StorageIndexKey::new(0)],
+                                StorageIndexFlags::UK,
+                            ),
+                            StorageIndexSpec::new(
+                                vec![StorageIndexKey::new(1)],
+                                StorageIndexFlags::UK,
+                            ),
+                            StorageIndexSpec::new(
+                                vec![StorageIndexKey::new(2)],
+                                StorageIndexFlags::UK,
+                            ),
                         ],
                     )
                     .await
                     .unwrap()
+                    .table_id()
             };
             let mut session = engine.new_session().unwrap();
             let row_id = insert_one_row(
@@ -7779,14 +7797,24 @@ mod tests {
                 UpdateMvcc::Updated(row_id)
             );
             assert!(
-                trx_select_row_mvcc_by_id(&mut trx, table_id, &old_code_key, &[0, 1, 2])
-                    .await
-                    .unwrap()
-                    .not_found()
+                trx_select_row_mvcc_by_index_id(
+                    &mut trx,
+                    table_id,
+                    IndexID::new(1),
+                    &old_code_key,
+                    &[0, 1, 2],
+                )
+                .await
+                .unwrap()
+                .not_found()
             );
-            for key in [&id_key, &new_code_key, &region_key] {
+            for (index_id, key) in [
+                (IndexID::new(0), &id_key),
+                (IndexID::new(1), &new_code_key),
+                (IndexID::new(2), &region_key),
+            ] {
                 assert_eq!(
-                    trx_select_row_mvcc_by_id(&mut trx, table_id, key, &[0, 1, 2])
+                    trx_select_row_mvcc_by_index_id(&mut trx, table_id, index_id, key, &[0, 1, 2],)
                         .await
                         .unwrap()
                         .unwrap_found(),
@@ -7797,14 +7825,24 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             assert!(
-                trx_select_row_mvcc_by_id(&mut trx, table_id, &new_code_key, &[0, 1, 2])
-                    .await
-                    .unwrap()
-                    .not_found()
+                trx_select_row_mvcc_by_index_id(
+                    &mut trx,
+                    table_id,
+                    IndexID::new(1),
+                    &new_code_key,
+                    &[0, 1, 2],
+                )
+                .await
+                .unwrap()
+                .not_found()
             );
-            for key in [&id_key, &old_code_key, &region_key] {
+            for (index_id, key) in [
+                (IndexID::new(0), &id_key),
+                (IndexID::new(1), &old_code_key),
+                (IndexID::new(2), &region_key),
+            ] {
                 assert_eq!(
-                    trx_select_row_mvcc_by_id(&mut trx, table_id, key, &[0, 1, 2])
+                    trx_select_row_mvcc_by_index_id(&mut trx, table_id, index_id, key, &[0, 1, 2],)
                         .await
                         .unwrap()
                         .unwrap_found(),
@@ -8326,7 +8364,7 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let rows = trx
                 .table_index_lookup_mvcc(
-                    crate::TableIndex(table_id, non_unique_key.index_slot.transitional_id()),
+                    crate::TableIndex(table_id, IndexID::new(1)),
                     &non_unique_key.vals,
                     &[0, 1],
                 )
@@ -8834,7 +8872,7 @@ mod tests {
                 let key = single_key(id);
                 assert_eq!(
                     trx.table_delete_unique_mvcc(
-                        crate::TableIndex(table_id, key.index_slot.transitional_id()),
+                        crate::TableIndex(table_id, IndexID::new(0)),
                         &key.vals
                     )
                     .await
@@ -11146,7 +11184,8 @@ mod tests {
     fn test_user_secondary_indexes_evict_and_continue_serving_lookups() {
         smol::block_on(async {
             use crate::catalog::{
-                ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexSpec, TableSpec,
+                StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
+                StorageIndexSpec, StorageTableSpec,
             };
             use crate::value::ValKind;
 
@@ -11171,26 +11210,27 @@ mod tests {
             .unwrap();
 
             let mut ddl_session = engine.new_session().unwrap();
-            let mut index_specs = vec![IndexSpec::new(
-                vec![IndexKeySpec::new(0)],
-                IndexAttributes::UK,
+            let mut index_specs = vec![StorageIndexSpec::new(
+                vec![StorageIndexKey::new(0)],
+                StorageIndexFlags::UK,
             )];
             for _ in 0..12 {
-                index_specs.push(IndexSpec::new(
-                    vec![IndexKeySpec::new(1)],
-                    IndexAttributes::empty(),
+                index_specs.push(StorageIndexSpec::new(
+                    vec![StorageIndexKey::new(1)],
+                    StorageIndexFlags::empty(),
                 ));
             }
             let table_id = ddl_session
                 .create_table(
-                    TableSpec::new(vec![
-                        ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
-                        ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                    StorageTableSpec::new(vec![
+                        StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+                        StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
                     ]),
                     index_specs,
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .table_id();
             drop(ddl_session);
 
             let mut session = engine.new_session().unwrap();
@@ -11451,7 +11491,7 @@ mod tests {
                 let key = SelectKey::new(IndexSlot::new(1), vec![Val::from(1i32)]);
                 let res = trx
                     .table_index_lookup_mvcc(
-                        crate::TableIndex(table_id, key.index_slot.transitional_id()),
+                        crate::TableIndex(table_id, IndexID::new(1)),
                         &key.vals,
                         user_read_set,
                     )
@@ -11595,7 +11635,7 @@ mod tests {
                 let key = SelectKey::new(IndexSlot::new(1), vec![Val::from(0i32)]);
                 let res = trx
                     .table_index_lookup_mvcc(
-                        crate::TableIndex(table_id, key.index_slot.transitional_id()),
+                        crate::TableIndex(table_id, IndexID::new(1)),
                         &key.vals,
                         user_read_set,
                     )
@@ -11657,7 +11697,7 @@ mod tests {
                 let key = SelectKey::new(IndexSlot::new(1), vec![Val::from(0i32)]);
                 let res = trx
                     .table_index_lookup_mvcc(
-                        crate::TableIndex(table_id, key.index_slot.transitional_id()),
+                        crate::TableIndex(table_id, IndexID::new(1)),
                         &key.vals,
                         user_read_set,
                     )

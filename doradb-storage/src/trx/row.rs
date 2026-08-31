@@ -181,9 +181,9 @@ impl<'a> RowReadAccess<'a> {
             return ReadRow::InvalidIndex;
         };
         let key_vals = index_spec
-            .cols
+            .keys
             .iter()
-            .map(|key| row.val(metadata.col.as_ref(), key.col_no as usize))
+            .map(|key| row.val(metadata.col.as_ref(), key.column_ordinal.as_usize()))
             .collect::<Vec<_>>();
         if !candidate.matches_key(&key_vals) {
             return ReadRow::InvalidIndex;
@@ -303,17 +303,20 @@ impl<'a> RowReadAccess<'a> {
                     let mut next = &undo_head.next;
                     let read_set: BTreeSet<usize> = read_set.iter().copied().collect();
                     let user_key_idx_map: FastHashMap<usize, usize> = index_spec
-                        .cols
+                        .keys
                         .iter()
                         .enumerate()
-                        .map(|(key_pos, key)| (key.col_no as usize, key_pos))
+                        .map(|(key_pos, key)| (key.column_ordinal.as_usize(), key_pos))
                         .collect();
                     let undo_key = SelectKey {
                         index_slot: candidate.index.slot(),
                         vals: index_spec
-                            .cols
+                            .keys
                             .iter()
-                            .map(|key| self.row().val(metadata.col.as_ref(), key.col_no as usize))
+                            .map(|key| {
+                                self.row()
+                                    .val(metadata.col.as_ref(), key.column_ordinal.as_usize())
+                            })
                             .collect(),
                     };
                     let mut ver = RowVersion {
@@ -566,16 +569,16 @@ impl<'a> RowReadAccess<'a> {
                     // chain now.
                     let mut entry = undo_head.next.main.entry.as_ref();
                     let vals = index_spec
-                        .cols
+                        .keys
                         .iter()
-                        .map(|key| row.val(metadata.col.as_ref(), key.col_no as usize))
+                        .map(|key| row.val(metadata.col.as_ref(), key.column_ordinal.as_usize()))
                         .collect();
                     let mvcc_key = SelectKey::new(index_slot, vals);
                     let mapping: FastHashMap<usize, usize> = index_spec
-                        .cols
+                        .keys
                         .iter()
                         .enumerate()
-                        .map(|(key_no, key)| (key.col_no as usize, key_no))
+                        .map(|(key_no, key)| (key.column_ordinal.as_usize(), key_no))
                         .collect();
                     let mut ver = KeyVersion {
                         deleted,
@@ -817,10 +820,10 @@ impl RowVersion {
             candidate.matches_key(&undo_key.vals)
         } else {
             let key_vals = index_spec
-                .cols
+                .keys
                 .iter()
                 .map(|key| {
-                    let col_no = key.col_no as usize;
+                    let col_no = key.column_ordinal.as_usize();
                     self.undo_vals
                         .get(&col_no)
                         .cloned()
@@ -1334,8 +1337,9 @@ pub(crate) enum FindOldVersion {
 pub(crate) mod tests {
     use super::*;
     use crate::catalog::{
-        ActiveIndexSpec, CATALOG_TABLE_ID_START, ColumnAttributes, ColumnSpec, IndexAttributes,
-        IndexID, IndexKeySpec, IndexSlot, IndexSpec, catalog_index_ref, resolve_catalog_key,
+        ActiveIndexSpec, CATALOG_TABLE_ID_START, IndexID, IndexSlot, StorageColumnFlags,
+        StorageColumnSpec, StorageIndexFlags, StorageIndexKey, StorageIndexSpec, catalog_index_ref,
+        resolve_catalog_key,
     };
     use crate::trx::tests::{commit_shared_trx_status, shared_trx_status};
     use crate::trx::undo::{MainBranch, NextRowUndo, RowUndoHead, UndoStatus};
@@ -1358,14 +1362,14 @@ pub(crate) mod tests {
     }
 
     fn sparse_metadata() -> TableMetadata {
-        TableMetadata::try_new_with_next_index_slot(
+        TableMetadata::try_new_with_index_slot_count(
             vec![
-                ColumnSpec::new("c0", ValKind::I32, ColumnAttributes::empty()),
-                ColumnSpec::new("c1", ValKind::I32, ColumnAttributes::empty()),
+                StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
             ],
             vec![ActiveIndexSpec::new(
-                IndexSlot::new(0),
-                IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::PK),
+                IndexRef::new(IndexID::new(0), IndexSlot::new(0)),
+                StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::PK),
             )],
             IndexSlot::new(2),
         )

@@ -1,3 +1,4 @@
+mod auxiliary;
 mod columns;
 mod ddl;
 mod indexes;
@@ -7,20 +8,22 @@ mod table_replay_silent_watermarks;
 pub(crate) mod tables;
 
 use crate::buffer::{FixedBufferPool, PoolGuard, PoolGuards, ReadonlyBufferPool};
+use crate::catalog::storage::auxiliary::*;
 use crate::catalog::storage::columns::*;
 use crate::catalog::storage::indexes::*;
 use crate::catalog::storage::merge::{CatalogFoldedRows, CatalogMergeKeyBuilder};
 pub(crate) use crate::catalog::storage::object::*;
 use crate::catalog::storage::table_replay_silent_watermarks::*;
 use crate::catalog::storage::tables::*;
-use crate::catalog::table::TableMetadata;
 use crate::catalog::{
     CatalogCheckpointBatch, CatalogCheckpointOutcome, CatalogRedoEntry, CatalogTable,
+    ID_DOMAIN_END, IndexID, IndexRef, IndexSlot, SecondaryIndexSlot, TableMetadata,
     catalog_table_id_from_slot, catalog_table_slot,
 };
 use crate::error::{
-    DataIntegrityError, DataIntegrityResult, MultiDomainResultExt, RuntimeError,
-    RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeOrFatalResultExt, RuntimeResult,
+    DataIntegrityError, DataIntegrityResult, MultiDomainResultExt, OperationError, OperationResult,
+    RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeOrFatalResultExt,
+    RuntimeResult,
 };
 use crate::file::FileKind;
 use crate::file::cow_file::{MutableCowFile, SUPER_BLOCK_ID};
@@ -40,12 +43,29 @@ use crate::table::TableRedoReplayFloor;
 use crate::value::Val;
 use error_stack::{Report, ResultExt};
 use parking_lot::Mutex;
-use std::collections::BTreeSet;
-use std::num::NonZeroU64;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 #[cfg(test)]
 pub(crate) use tests::publish_first_redo_log_seq_for_test;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProvisionalIndexReservation {
+    index: IndexRef,
+    create_cts: TrxID,
+}
+
+#[derive(Debug)]
+struct ProvisionalTableIndexState {
+    effective_next_index_id: u64,
+    reservations_by_slot: BTreeMap<IndexSlot, ProvisionalIndexReservation>,
+    slot_by_id: FastHashMap<IndexID, IndexSlot>,
+}
+
+#[derive(Debug, Default)]
+struct ProvisionalIndexReservations {
+    by_table: FastHashMap<TableID, ProvisionalTableIndexState>,
+}
 
 /// Runtime storage container for all catalog logical tables.
 pub(crate) struct CatalogStorage {
@@ -65,6 +85,7 @@ pub(crate) struct CatalogStorage {
     /// Callers combine these overlays with user-table root floors by fieldwise
     /// maximum.
     checkpointed_silent_watermarks: Mutex<Arc<FastHashMap<TableID, TableRedoReplayFloor>>>,
+    provisional_index_reservations: Mutex<ProvisionalIndexReservations>,
 }
 
 impl CatalogStorage {
@@ -88,8 +109,9 @@ impl CatalogStorage {
             catalog_definition_of_tables(),
             catalog_definition_of_columns(),
             catalog_definition_of_indexes(),
-            catalog_definition_of_index_columns(),
+            catalog_definition_of_table_descriptors(),
             catalog_definition_of_table_replay_silent_watermarks(),
+            catalog_definition_of_table_bindings(),
         ] {
             // Make sure catalog table ids match their dense root slots.
             assert_eq!(cat.len(), must_catalog_table_slot(*table_id));
@@ -121,7 +143,141 @@ impl CatalogStorage {
             mtb,
             disk_pool,
             checkpointed_silent_watermarks: Mutex::new(Arc::new(FastHashMap::default())),
+            provisional_index_reservations: Mutex::new(ProvisionalIndexReservations::default()),
         })
+    }
+
+    /// Returns the overlay-qualified next ID and first unreserved append slot.
+    pub(crate) fn plan_create_index_allocation(
+        &self,
+        table_id: TableID,
+        metadata: &TableMetadata,
+    ) -> OperationResult<(u64, u32)> {
+        let durable_next_id = metadata.idx.next_index_id();
+        if durable_next_id > ID_DOMAIN_END {
+            return Err(Report::new(OperationError::InvalidMetadata).attach(format!(
+                "next_index_id exceeds domain: table_id={table_id}, value={durable_next_id}"
+            )));
+        }
+        let durable_slot_count = metadata.idx.index_slot_count_u32();
+        let mut overlay = self.provisional_index_reservations.lock();
+        let state =
+            overlay
+                .by_table
+                .entry(table_id)
+                .or_insert_with(|| ProvisionalTableIndexState {
+                    effective_next_index_id: durable_next_id,
+                    reservations_by_slot: BTreeMap::new(),
+                    slot_by_id: FastHashMap::default(),
+                });
+        state.effective_next_index_id = state.effective_next_index_id.max(durable_next_id);
+        if state.effective_next_index_id == ID_DOMAIN_END {
+            return Err(Report::new(OperationError::IndexIdExhausted));
+        }
+
+        let mut slot = durable_slot_count;
+        loop {
+            if slot > u32::from(u16::MAX) {
+                return Err(Report::new(OperationError::InvalidMetadata)
+                    .attach(format!("index slot domain exhausted: table_id={table_id}")));
+            }
+            let candidate = IndexSlot::new(slot as u16);
+            if !state.reservations_by_slot.contains_key(&candidate) {
+                return Ok((state.effective_next_index_id, slot));
+            }
+            slot = slot.checked_add(1).ok_or_else(|| {
+                Report::new(OperationError::InvalidMetadata)
+                    .attach("index slot allocation arithmetic overflow")
+            })?;
+        }
+    }
+
+    /// Records one replay-visible CREATE whose exact generation is not root-proven.
+    pub(crate) fn reserve_provisional_index(
+        &self,
+        table_id: TableID,
+        index: IndexRef,
+        create_cts: TrxID,
+        durable_slots: &[SecondaryIndexSlot],
+    ) -> DataIntegrityResult<()> {
+        for (slot, state) in durable_slots.iter().copied().enumerate() {
+            let Some(durable_id) = state.index_id() else {
+                continue;
+            };
+            let slot = IndexSlot::try_from(slot).map_err(|_| {
+                Report::new(DataIntegrityError::InvalidRootInvariant)
+                    .attach("durable index generation slot exceeds u16 domain")
+            })?;
+            if slot == index.slot() || durable_id == index.id() {
+                return Err(Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
+                    "provisional reservation conflicts with durable generation: table_id={table_id}, index={index}, durable_id={durable_id}, durable_slot={slot}"
+                )));
+            }
+        }
+        if let Some(state) = durable_slots.get(index.slot().as_usize())
+            && !matches!(state, SecondaryIndexSlot::Vacant)
+        {
+            return Err(Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
+                "provisional reservation conflicts with durable generation: table_id={table_id}, index={index}, state={state:?}"
+            )));
+        }
+        let widened_next = u64::from(index.id().get())
+            .checked_add(1)
+            .ok_or_else(|| Report::new(DataIntegrityError::InvalidPayload))?;
+        if widened_next > ID_DOMAIN_END {
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach("provisional index id exceeds stable domain"));
+        }
+        let mut overlay = self.provisional_index_reservations.lock();
+        let state =
+            overlay
+                .by_table
+                .entry(table_id)
+                .or_insert_with(|| ProvisionalTableIndexState {
+                    effective_next_index_id: 0,
+                    reservations_by_slot: BTreeMap::new(),
+                    slot_by_id: FastHashMap::default(),
+                });
+        if let Some(existing_slot) = state.slot_by_id.get(&index.id()).copied()
+            && existing_slot != index.slot()
+        {
+            return Err(Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
+                "provisional index id has conflicting slots: table_id={table_id}, index_id={}, existing_slot={existing_slot}, new_slot={}",
+                index.id(), index.slot()
+            )));
+        }
+        if let Some(existing) = state.reservations_by_slot.get(&index.slot()) {
+            if existing.index != index {
+                return Err(Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
+                    "provisional index slot has conflicting generations: table_id={table_id}, existing={}, new={index}",
+                    existing.index
+                )));
+            }
+            return Ok(());
+        }
+        state.slot_by_id.insert(index.id(), index.slot());
+        state.reservations_by_slot.insert(
+            index.slot(),
+            ProvisionalIndexReservation { index, create_cts },
+        );
+        state.effective_next_index_id = state.effective_next_index_id.max(widened_next);
+        Ok(())
+    }
+
+    #[inline]
+    fn release_checkpointed_index_reservations(&self, catalog_replay_start_ts: TrxID) {
+        let mut overlay = self.provisional_index_reservations.lock();
+        for state in overlay.by_table.values_mut() {
+            state.reservations_by_slot.retain(|slot, reservation| {
+                if reservation.create_cts < catalog_replay_start_ts {
+                    state.slot_by_id.remove(&reservation.index.id());
+                    false
+                } else {
+                    debug_assert_eq!(*slot, reservation.index.slot());
+                    true
+                }
+            });
+        }
     }
 
     /// Accessor of `catalog.tables`.
@@ -145,14 +301,6 @@ impl CatalogStorage {
     pub(crate) fn indexes(&self) -> Indexes<'_> {
         Indexes {
             table: &self.tables[must_catalog_table_slot(TABLE_ID_INDEXES)],
-        }
-    }
-
-    /// Accessor of `catalog.index_columns`.
-    #[inline]
-    pub(crate) fn index_columns(&self) -> IndexColumns<'_> {
-        IndexColumns {
-            table: &self.tables[must_catalog_table_slot(TABLE_ID_INDEX_COLUMNS)],
         }
     }
 
@@ -264,17 +412,7 @@ impl CatalogStorage {
                 .change_context(RuntimeError::CatalogAccess)
                 .attach("operation=bootstrap_catalog, phase=validate_table_root");
             }
-            if root.root_block_id.is_none() {
-                if root.pivot_row_id != RowID::new(0) {
-                    return Err(
-                        Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-                            "empty catalog root has nonzero pivot_row_id={}",
-                            root.pivot_row_id
-                        )),
-                    )
-                    .change_context(RuntimeError::CatalogAccess)
-                    .attach("operation=bootstrap_catalog, phase=validate_empty_root");
-                }
+            if root.checkpoint_root_block_id().is_none() {
                 continue;
             }
             let rows = self
@@ -523,20 +661,6 @@ impl CatalogStorage {
                 .attach("operation=collect_catalog_reachable_blocks, phase=validate_table_root");
             }
             let Some(root_block_id) = table_root.checkpoint_root_block_id() else {
-                if table_root.pivot_row_id != RowID::new(0) {
-                    return Err(
-                        Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
-                            "file={}, root_ts={}, pivot_row_id={}",
-                            FileKind::CatalogMultiTableFile,
-                            root.root_ts,
-                            table_root.pivot_row_id
-                        )),
-                    )
-                    .change_context(RuntimeError::CatalogAccess)
-                    .attach(
-                        "operation=collect_catalog_reachable_blocks, phase=validate_empty_root",
-                    );
-                }
                 continue;
             };
             validate_catalog_reachable_block(root, root_block_id)
@@ -549,7 +673,7 @@ impl CatalogStorage {
                 })?;
             let column_index = ColumnBlockIndex::new(
                 root_block_id,
-                table_root.pivot_row_id,
+                table_root.pivot_row_id(),
                 self.mtb.file_kind(),
                 self.mtb.sparse_file(),
                 &self.disk_pool,
@@ -648,12 +772,8 @@ impl CatalogStorage {
         let output_vals = folded.materialize_output_rows();
         if output_vals.is_empty() {
             return Ok((
-                CatalogTableRootDesc {
-                    table_id,
-                    root_block_id: None,
-                    pivot_row_id: RowID::new(0),
-                },
-                root.root_block_id.is_some() || root.pivot_row_id != RowID::new(0),
+                CatalogTableRootDesc::empty(table_id),
+                root.checkpoint_root_block_id().is_some(),
             ));
         }
 
@@ -710,23 +830,8 @@ impl CatalogStorage {
                     "operation=apply_catalog_table_ops, phase=build_column_index, table_id={table_id}"
                 )
             })?;
-        let root_block_id = NonZeroU64::new(root_block_id.into())
-            .ok_or_else(|| {
-                Report::new(DataIntegrityError::InvalidPayload)
-                    .attach("catalog root block id resolved to zero")
-            })
-            .change_context(RuntimeError::CatalogAccess)
-            .attach_with(|| {
-                format!(
-                    "operation=apply_catalog_table_ops, phase=validate_column_index_root, table_id={table_id}"
-                )
-            })?;
         Ok((
-            CatalogTableRootDesc {
-                table_id,
-                root_block_id: Some(root_block_id),
-                pivot_row_id,
-            },
+            CatalogTableRootDesc::published(table_id, root_block_id, pivot_row_id),
             true,
         ))
     }
@@ -770,31 +875,16 @@ impl CatalogStorage {
     /// `table_id` matches the supplied metadata; callers that iterate descriptor
     /// slots must enforce that outer invariant.
     ///
-    /// Empty roots are represented by `root_block_id == None` and
-    /// `pivot_row_id == 0`. Any other empty-root shape is treated as catalog
-    /// payload corruption. Returned rows are decoded with `metadata`; malformed
-    /// row ids, delete deltas, or LWC payloads are surfaced as catalog payload
-    /// errors.
+    /// Empty roots return no rows. Published rows are decoded with `metadata`;
+    /// malformed row ids, delete deltas, or LWC payloads are surfaced as
+    /// catalog payload errors.
     async fn load_rows_from_root(
         &self,
         metadata: &TableMetadata,
         disk_pool_guard: &PoolGuard,
         root: CatalogTableRootDesc,
     ) -> RuntimeResult<Vec<RowRecord>> {
-        if root.root_block_id.is_none() {
-            if root.pivot_row_id != RowID::new(0) {
-                return Err(
-                    Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-                        "empty catalog root has nonzero pivot_row_id={}",
-                        root.pivot_row_id
-                    )),
-                )
-                .change_context(RuntimeError::CatalogAccess)
-                .attach(format!(
-                    "operation=load_catalog_rows_from_root, table_id={}",
-                    root.table_id
-                ));
-            }
+        if root.checkpoint_root_block_id().is_none() {
             return Ok(Vec::new());
         }
         let root_block_id = root
@@ -805,7 +895,7 @@ impl CatalogStorage {
             .await?;
         let column_index = ColumnBlockIndex::new(
             root_block_id,
-            root.pivot_row_id,
+            root.pivot_row_id(),
             self.mtb.file_kind(),
             self.mtb.sparse_file(),
             &self.disk_pool,
@@ -1071,6 +1161,7 @@ impl PreparedCatalogCheckpoint {
                     .attach("operation=commit_catalog_checkpoint")?;
                 drop(old_root);
                 storage.install_checkpointed_silent_watermarks(checkpointed_silent_watermarks);
+                storage.release_checkpointed_index_reservations(catalog_replay_start_ts);
                 Ok(CatalogCheckpointOutcome::Published {
                     catalog_replay_start_ts,
                 })
@@ -1270,6 +1361,15 @@ fn validate_catalog_row(
                 .attach(format!("{context} column type mismatch: column_no={idx}")));
         }
     }
+    if metadata == &catalog_definition_of_tables().metadata {
+        table_object_from_vals(row)?;
+    } else if metadata == &catalog_definition_of_columns().metadata {
+        column_object_from_vals(row)?;
+    } else if metadata == &catalog_definition_of_indexes().metadata {
+        index_object_from_vals(row)?;
+    } else if metadata == &catalog_definition_of_table_replay_silent_watermarks().metadata {
+        table_replay_silent_watermark_object_from_vals(row)?;
+    }
     Ok(())
 }
 
@@ -1280,7 +1380,8 @@ pub(crate) mod tests {
     use crate::catalog::USER_TABLE_ID_START;
     use crate::catalog::tests::{open_catalog_test_engine, table1, table2};
     use crate::catalog::{
-        CatalogCheckpointBatch, CatalogCheckpointScanStopReason, ColumnAttributes, ColumnSpec,
+        CatalogCheckpointBatch, CatalogCheckpointScanStopReason, SecondaryIndexRoot,
+        StorageColumnFlags, StorageColumnSpec,
     };
     use crate::catalog::{CatalogSelectKey, catalog_key_from_active_ordinal};
     use crate::error::{
@@ -1288,7 +1389,9 @@ pub(crate) mod tests {
     };
     use crate::file::BlockKey;
     use crate::file::multi_table_file::publish_first_redo_log_seq_for_test as publish_mtb_first_redo_log_seq_for_test;
-    use crate::file::multi_table_file::{CATALOG_MTB_FILE_ID, MutableMultiTableFile};
+    use crate::file::multi_table_file::{
+        CATALOG_MTB_FILE_ID, CatalogTableRootState, MutableMultiTableFile,
+    };
     use crate::id::{BlockID, PageID};
     use crate::index::{ColumnBlockIndex, ColumnDeleteDeltaPatch};
     use crate::log::redo::{DDLRedo, RowRedoKind};
@@ -1417,21 +1520,33 @@ pub(crate) mod tests {
         }
     }
 
+    fn provisional_allocation_metadata() -> TableMetadata {
+        TableMetadata::try_new(
+            vec![StorageColumnSpec::new(
+                ValKind::U32,
+                StorageColumnFlags::empty(),
+            )],
+            vec![crate::catalog::StorageIndexSpec::new(
+                vec![crate::catalog::StorageIndexKey::new(0)],
+                crate::catalog::StorageIndexFlags::UK,
+            )],
+        )
+        .unwrap()
+    }
+
     fn catalog_column_insert(
         table_id: TableID,
         column_no: u16,
-        name_len: usize,
+        _name_len: usize,
     ) -> CatalogRedoEntry {
-        let mut name = vec![b'x'; name_len];
-        name[0] = b'a' + (column_no % 26) as u8;
         CatalogRedoEntry {
             table_id: TABLE_ID_COLUMNS,
             kind: RowRedoKind::Insert(
                 PageID::new(0),
                 vec![
                     Val::from(table_id),
+                    Val::from(u32::from(column_no)),
                     Val::from(column_no),
-                    Val::from(name),
                     Val::from(ValKind::U64 as u32),
                     Val::from(0u32),
                 ],
@@ -1443,26 +1558,54 @@ pub(crate) mod tests {
         row_id: RowID,
         table_id: TableID,
         column_no: u16,
-        name_len: usize,
+        _name_len: usize,
     ) -> RowRecord {
-        let mut name = vec![b'x'; name_len];
-        if let Some(first) = name.first_mut() {
-            *first = b'a' + (column_no % 26) as u8;
-        }
         RowRecord {
             row_id,
             vals: vec![
                 Val::from(table_id),
+                Val::from(u32::from(column_no)),
                 Val::from(column_no),
-                Val::from(name),
                 Val::from(ValKind::U64 as u32),
                 Val::from(0u32),
             ],
         }
     }
 
-    fn catalog_table_vals(table_id: TableID, next_index_no: u16) -> Vec<Val> {
-        vec![Val::from(table_id), Val::from(next_index_no)]
+    fn catalog_index_row_record(
+        row_id: RowID,
+        table_id: TableID,
+        index_id: u32,
+        key_spec_len: usize,
+    ) -> RowRecord {
+        let key_count = key_spec_len.saturating_sub(3) / 5;
+        let mut key_spec = Vec::with_capacity(3 + key_count * 5);
+        key_spec.push(1);
+        key_spec.extend_from_slice(&(key_count as u16).to_le_bytes());
+        for column_id in 0..key_count as u32 {
+            key_spec.extend_from_slice(&column_id.to_le_bytes());
+            key_spec.push(0);
+        }
+        RowRecord {
+            row_id,
+            vals: vec![
+                Val::from(table_id),
+                Val::from(index_id),
+                Val::from(index_id as u16),
+                Val::from(0u32),
+                Val::from(key_spec),
+            ],
+        }
+    }
+
+    fn catalog_table_vals(table_id: TableID, index_slot_count: u16) -> Vec<Val> {
+        vec![
+            Val::from(table_id),
+            Val::from(0u64),
+            Val::from(0u64),
+            Val::from(0u64),
+            Val::from(u32::from(index_slot_count)),
+        ]
     }
 
     async fn catalog_root_rows(storage: &CatalogStorage, table_id: TableID) -> Vec<RowRecord> {
@@ -1486,13 +1629,13 @@ pub(crate) mod tests {
         for (idx, row) in rows.iter().enumerate() {
             assert_eq!(row.row_id, RowID::new(idx as u64));
         }
-        if root.root_block_id.is_none() {
-            assert_eq!(root.pivot_row_id, RowID::new(0));
+        if root.checkpoint_root_block_id().is_none() {
+            assert_eq!(root.pivot_row_id(), RowID::new(0));
             assert!(rows.is_empty());
             return rows;
         }
-        assert_eq!(root.pivot_row_id, RowID::new(rows.len() as u64));
-        let root_block_id = BlockID::from(root.root_block_id.unwrap().get());
+        assert_eq!(root.pivot_row_id(), RowID::new(rows.len() as u64));
+        let root_block_id = root.checkpoint_root_block_id().unwrap();
         let disk_pool_guard = storage.disk_pool.create_base_guard();
         let entries = storage
             .collect_index_entries(&disk_pool_guard, root_block_id)
@@ -1503,10 +1646,10 @@ pub(crate) mod tests {
         for pair in entries.windows(2) {
             assert_eq!(pair[1].start_row_id, pair[0].end_row_id());
         }
-        assert_eq!(entries.last().unwrap().end_row_id(), root.pivot_row_id);
+        assert_eq!(entries.last().unwrap().end_row_id(), root.pivot_row_id());
         let index = ColumnBlockIndex::new(
             root_block_id,
-            root.pivot_row_id,
+            root.pivot_row_id(),
             storage.mtb.file_kind(),
             storage.mtb.sparse_file(),
             &storage.disk_pool,
@@ -1569,11 +1712,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
         }
-        CatalogTableRootDesc {
-            table_id,
-            root_block_id: NonZeroU64::new(root_block_id.into()),
-            pivot_row_id,
-        }
+        CatalogTableRootDesc::published(table_id, root_block_id, pivot_row_id)
     }
 
     async fn assert_checkpoint_rejects_delete_key(
@@ -1628,7 +1767,6 @@ pub(crate) mod tests {
             catalog_definition_of_tables(),
             catalog_definition_of_columns(),
             catalog_definition_of_indexes(),
-            catalog_definition_of_index_columns(),
             catalog_definition_of_table_replay_silent_watermarks(),
         ] {
             let primary_keys = metadata
@@ -1641,11 +1779,11 @@ pub(crate) mod tests {
                 1,
                 "catalog table {table_id} must expose exactly one primary key"
             );
-            for key in &primary_keys[0].1.cols {
+            for key in &primary_keys[0].1.keys {
                 assert!(
-                    !metadata.col.nullable(usize::from(key.col_no)),
+                    !metadata.col.nullable(usize::from(key.column_ordinal)),
                     "catalog table {table_id} primary key column {} must be non-null",
-                    key.col_no
+                    key.column_ordinal
                 );
             }
         }
@@ -1686,8 +1824,7 @@ pub(crate) mod tests {
             let storage = &engine.inner().core.catalog().storage;
             let mut snapshot = storage.checkpoint_snapshot();
             let root = &mut snapshot.meta.table_roots[0];
-            assert_eq!(root.root_block_id, None);
-            assert_eq!(root.pivot_row_id, RowID::new(0));
+            assert_eq!(root.state, CatalogTableRootState::Empty);
             root.table_id = TABLE_ID_COLUMNS;
 
             let guards = PoolGuards::builder()
@@ -1834,9 +1971,11 @@ pub(crate) mod tests {
             assert!(!blocks.is_empty());
             assert_eq!(storage.meta_pool.allocated(), allocated_before);
 
+            let index_catalog_table = storage.get_catalog_table(TABLE_ID_INDEXES).unwrap();
+            let index_metadata = index_catalog_table.metadata();
             let oversized_row =
-                catalog_column_row_record(RowID::new(0), table_id, 0, u16::MAX as usize);
-            let result = build_lwc_blocks_from_row_records(metadata, &[oversized_row]);
+                catalog_index_row_record(RowID::new(0), table_id, 0, u16::MAX as usize);
+            let result = build_lwc_blocks_from_row_records(index_metadata, &[oversized_row]);
             let err = match result {
                 Ok(_) => panic!("oversized row should fail LWC block build"),
                 Err(err) => err,
@@ -1864,10 +2003,9 @@ pub(crate) mod tests {
     #[test]
     fn test_catalog_lwc_rows_are_validated_before_trusted_builder() {
         let metadata = TableMetadata::try_new(
-            vec![ColumnSpec::new(
-                "required_u8",
+            vec![StorageColumnSpec::new(
                 ValKind::U8,
-                ColumnAttributes::empty(),
+                StorageColumnFlags::empty(),
             )],
             vec![],
         )
@@ -2145,10 +2283,7 @@ pub(crate) mod tests {
                 catalog_ops: vec![
                     CatalogRedoEntry {
                         table_id: TABLE_ID_TABLES,
-                        kind: RowRedoKind::Insert(
-                            PageID::new(0),
-                            vec![Val::from(table_id), Val::from(0u16)],
-                        ),
+                        kind: RowRedoKind::Insert(PageID::new(0), catalog_table_vals(table_id, 0)),
                     },
                     CatalogRedoEntry {
                         table_id: TABLE_ID_TABLES,
@@ -2179,8 +2314,10 @@ pub(crate) mod tests {
                     .is_allocated(usize::from(old_meta_block_id))
             );
             assert_eq!(after_root.alloc_map.allocated(), before_allocated);
-            assert_eq!(after_root.table_roots[0].root_block_id, None);
-            assert_eq!(after_root.table_roots[0].pivot_row_id, RowID::new(0));
+            assert_eq!(
+                after_root.table_roots[0].state,
+                CatalogTableRootState::Empty
+            );
         });
     }
 
@@ -2200,18 +2337,15 @@ pub(crate) mod tests {
                 vec![
                     CatalogRedoEntry {
                         table_id: TABLE_ID_TABLES,
-                        kind: RowRedoKind::Insert(
-                            PageID::new(0),
-                            vec![Val::from(table_id), Val::from(0u16)],
-                        ),
+                        kind: RowRedoKind::Insert(PageID::new(0), catalog_table_vals(table_id, 0)),
                     },
                     CatalogRedoEntry {
                         table_id: TABLE_ID_TABLES,
                         kind: RowRedoKind::UpdateByPrimaryKey(
                             catalog_key_from_active_ordinal(0, vec![Val::from(table_id)]),
                             vec![UpdateCol {
-                                idx: 1,
-                                val: Val::from(7u16),
+                                idx: 4,
+                                val: Val::from(7u32),
                             }],
                         ),
                     },
@@ -2233,7 +2367,7 @@ pub(crate) mod tests {
                 .filter(|row| row.vals[0] == Val::from(table_id))
                 .collect::<Vec<_>>();
             assert_eq!(matching_rows.len(), 1);
-            assert_eq!(matching_rows[0].vals[1], Val::from(7u16));
+            assert_eq!(matching_rows[0].vals[4], Val::from(7u32));
             assert_compact_catalog_root(storage, TABLE_ID_TABLES).await;
         });
     }
@@ -2252,10 +2386,7 @@ pub(crate) mod tests {
                 vec![
                     CatalogRedoEntry {
                         table_id: TABLE_ID_TABLES,
-                        kind: RowRedoKind::Insert(
-                            PageID::new(0),
-                            vec![Val::from(table_id), Val::from(0u16)],
-                        ),
+                        kind: RowRedoKind::Insert(PageID::new(0), catalog_table_vals(table_id, 0)),
                     },
                     CatalogRedoEntry {
                         table_id: TABLE_ID_TABLES,
@@ -2318,8 +2449,8 @@ pub(crate) mod tests {
                     kind: RowRedoKind::UpdateByPrimaryKey(
                         catalog_key_from_active_ordinal(0, vec![Val::from(table_id)]),
                         vec![UpdateCol {
-                            idx: 1,
-                            val: Val::from(9u16),
+                            idx: 4,
+                            val: Val::from(9u32),
                         }],
                     ),
                 }],
@@ -2340,7 +2471,7 @@ pub(crate) mod tests {
                 .filter(|row| row.vals[0] == Val::from(table_id))
                 .collect::<Vec<_>>();
             assert_eq!(matching_rows.len(), 1);
-            assert_eq!(matching_rows[0].vals[1], Val::from(9u16));
+            assert_eq!(matching_rows[0].vals[4], Val::from(9u32));
             assert_compact_catalog_root(storage, TABLE_ID_TABLES).await;
         });
     }
@@ -2364,8 +2495,11 @@ pub(crate) mod tests {
                 .unwrap();
 
             let mut roots = storage.checkpoint_snapshot().meta.table_roots;
-            roots[0].root_block_id = NonZeroU64::new(u64::from(bogus_root_block_id));
-            roots[0].pivot_row_id = RowID::new(1);
+            roots[0] = CatalogTableRootDesc::published(
+                roots[0].table_id,
+                bogus_root_block_id,
+                RowID::new(1),
+            );
 
             let mut mutable =
                 MutableMultiTableFile::fork(&storage.mtb, storage.table_fs.background_writes());
@@ -2404,14 +2538,10 @@ pub(crate) mod tests {
 
             let storage = &engine.inner().core.catalog().storage;
             let table = storage.get_catalog_table(TABLE_ID_TABLES).unwrap();
-            let root = CatalogTableRootDesc {
-                table_id: TABLE_ID_TABLES,
-                root_block_id: None,
-                pivot_row_id: RowID::new(0),
-            };
+            let root = CatalogTableRootDesc::empty(TABLE_ID_TABLES);
             let table_id = USER_TABLE_ID_START + 42;
             let table_ops = vec![
-                RowRedoKind::Insert(PageID::new(0), vec![Val::from(table_id), Val::from(0u16)]),
+                RowRedoKind::Insert(PageID::new(0), catalog_table_vals(table_id, 0)),
                 RowRedoKind::DeleteByPrimaryKey(catalog_key_from_active_ordinal(
                     0,
                     vec![Val::from(table_id)],
@@ -2433,8 +2563,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
 
-            assert_eq!(next_root.root_block_id, None);
-            assert_eq!(next_root.pivot_row_id, RowID::new(0));
+            assert_eq!(next_root.state, CatalogTableRootState::Empty);
             assert!(!blocks_changed);
         });
     }
@@ -2461,11 +2590,11 @@ pub(crate) mod tests {
             let storage = &engine.inner().core.catalog().storage;
             let table = storage.get_catalog_table(TABLE_ID_TABLES).unwrap();
             let root = storage.checkpoint_snapshot().meta.table_roots[0];
-            assert!(root.root_block_id.is_some());
+            assert!(root.checkpoint_root_block_id().is_some());
 
             let table_id = USER_TABLE_ID_START + 4242;
             let table_ops = vec![
-                RowRedoKind::Insert(PageID::new(0), vec![Val::from(table_id), Val::from(0u16)]),
+                RowRedoKind::Insert(PageID::new(0), catalog_table_vals(table_id, 0)),
                 RowRedoKind::DeleteByPrimaryKey(catalog_key_from_active_ordinal(
                     0,
                     vec![Val::from(table_id)],
@@ -2487,8 +2616,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
 
-            assert_eq!(next_root.root_block_id, root.root_block_id);
-            assert_eq!(next_root.pivot_row_id, root.pivot_row_id);
+            assert_eq!(next_root.state, root.state);
             assert!(!blocks_changed);
         });
     }
@@ -2511,7 +2639,7 @@ pub(crate) mod tests {
 
             let snap = engine.inner().core.catalog().storage.checkpoint_snapshot();
             let tables_root = snap.meta.table_roots[0];
-            let root_block_id = BlockID::from(tables_root.root_block_id.unwrap().get());
+            let root_block_id = tables_root.checkpoint_root_block_id().unwrap();
             let disk_pool_guard = engine
                 .inner()
                 .core
@@ -2578,7 +2706,7 @@ pub(crate) mod tests {
 
             let snap1 = engine.inner().core.catalog().storage.checkpoint_snapshot();
             let tables_root1 = snap1.meta.table_roots[0];
-            assert!(tables_root1.root_block_id.is_some());
+            assert!(tables_root1.checkpoint_root_block_id().is_some());
             assert_compact_catalog_root(&engine.inner().core.catalog().storage, TABLE_ID_TABLES)
                 .await;
 
@@ -2598,8 +2726,8 @@ pub(crate) mod tests {
             )
             .await;
 
-            assert!(tables_root2.root_block_id != tables_root1.root_block_id);
-            assert_eq!(tables_root2.pivot_row_id, RowID::new(rows.len() as u64));
+            assert_ne!(tables_root2.state, tables_root1.state);
+            assert_eq!(tables_root2.pivot_row_id(), RowID::new(rows.len() as u64));
             let active_root = engine
                 .inner()
                 .core
@@ -2607,8 +2735,8 @@ pub(crate) mod tests {
                 .storage
                 .mtb
                 .active_root_unchecked();
-            let root_block_id1 = BlockID::from(tables_root1.root_block_id.unwrap().get());
-            let root_block_id2 = BlockID::from(tables_root2.root_block_id.unwrap().get());
+            let root_block_id1 = tables_root1.checkpoint_root_block_id().unwrap();
+            let root_block_id2 = tables_root2.checkpoint_root_block_id().unwrap();
             assert!(
                 !active_root
                     .alloc_map
@@ -2667,11 +2795,11 @@ pub(crate) mod tests {
             let disk_pool_guard = storage.disk_pool.create_base_guard();
             let snap1 = storage.checkpoint_snapshot();
             let columns_root1 = snap1.meta.table_roots[1];
-            assert_eq!(columns_root1.pivot_row_id, RowID::new(1));
+            assert_eq!(columns_root1.pivot_row_id(), RowID::new(1));
             let entries1 = storage
                 .collect_index_entries(
                     &disk_pool_guard,
-                    BlockID::from(columns_root1.root_block_id.unwrap().get()),
+                    columns_root1.checkpoint_root_block_id().unwrap(),
                 )
                 .await
                 .unwrap();
@@ -2693,17 +2821,17 @@ pub(crate) mod tests {
             let columns_root2 = snap2.meta.table_roots[1];
             let rows = assert_compact_catalog_root(storage, TABLE_ID_COLUMNS).await;
             assert_eq!(rows.len(), 5);
-            assert_eq!(columns_root2.pivot_row_id, RowID::new(5));
+            assert_eq!(columns_root2.pivot_row_id(), RowID::new(5));
             let entries2 = storage
                 .collect_index_entries(
                     &disk_pool_guard,
-                    BlockID::from(columns_root2.root_block_id.unwrap().get()),
+                    columns_root2.checkpoint_root_block_id().unwrap(),
                 )
                 .await
                 .unwrap();
 
             assert!(
-                columns_root2.root_block_id != columns_root1.root_block_id,
+                columns_root2.state != columns_root1.state,
                 "changed catalog tables should publish a rewritten compact root"
             );
             assert_eq!(entries2[0].start_row_id, RowID::new(0));
@@ -2712,8 +2840,147 @@ pub(crate) mod tests {
             }
             assert_eq!(
                 entries2.last().unwrap().end_row_id(),
-                columns_root2.pivot_row_id
+                columns_root2.pivot_row_id()
             );
+        });
+    }
+
+    #[test]
+    fn test_provisional_index_overlay_quarantines_ids_and_slots_until_strict_floor() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = open_catalog_test_engine(
+                temp_dir.path().to_path_buf(),
+                Some("provisional-index-overlay"),
+            )
+            .await;
+            let storage = &engine.inner().core.catalog().storage;
+            let metadata = provisional_allocation_metadata();
+            let table_id = USER_TABLE_ID_START + 700;
+            let durable_generations = [SecondaryIndexSlot::Active {
+                index_id: IndexID::new(0),
+                root: SecondaryIndexRoot::Empty,
+            }];
+            let a = IndexRef::new(IndexID::new(7), IndexSlot::new(1));
+            let b = IndexRef::new(IndexID::new(8), IndexSlot::new(2));
+
+            storage
+                .reserve_provisional_index(table_id, a, TrxID::new(10), &durable_generations)
+                .unwrap();
+            assert_eq!(
+                storage
+                    .plan_create_index_allocation(table_id, &metadata)
+                    .unwrap(),
+                (8, 2)
+            );
+            storage
+                .reserve_provisional_index(table_id, b, TrxID::new(11), &durable_generations)
+                .unwrap();
+            assert_eq!(
+                storage
+                    .plan_create_index_allocation(table_id, &metadata)
+                    .unwrap(),
+                (9, 3)
+            );
+
+            storage.release_checkpointed_index_reservations(TrxID::new(10));
+            assert_eq!(
+                storage
+                    .plan_create_index_allocation(table_id, &metadata)
+                    .unwrap(),
+                (9, 3),
+                "a reservation remains visible at an equal replay floor"
+            );
+            storage.release_checkpointed_index_reservations(TrxID::new(11));
+            assert_eq!(
+                storage
+                    .plan_create_index_allocation(table_id, &metadata)
+                    .unwrap(),
+                (9, 1),
+                "released slots become selectable without lowering the running ID high-water"
+            );
+            storage.release_checkpointed_index_reservations(TrxID::new(12));
+            assert_eq!(
+                storage
+                    .plan_create_index_allocation(table_id, &metadata)
+                    .unwrap(),
+                (9, 1)
+            );
+        });
+    }
+
+    #[test]
+    fn test_provisional_index_overlay_rejects_conflicts_and_preserves_domain_end() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = open_catalog_test_engine(
+                temp_dir.path().to_path_buf(),
+                Some("provisional-index-conflicts"),
+            )
+            .await;
+            let storage = &engine.inner().core.catalog().storage;
+            let metadata = provisional_allocation_metadata();
+            let table_id = USER_TABLE_ID_START + 701;
+            let durable_generations = [SecondaryIndexSlot::Active {
+                index_id: IndexID::new(0),
+                root: SecondaryIndexRoot::Empty,
+            }];
+            let exact = IndexRef::new(IndexID::new(7), IndexSlot::new(1));
+            storage
+                .reserve_provisional_index(table_id, exact, TrxID::new(20), &durable_generations)
+                .unwrap();
+            storage
+                .reserve_provisional_index(table_id, exact, TrxID::new(20), &durable_generations)
+                .unwrap();
+            assert!(
+                storage
+                    .reserve_provisional_index(
+                        table_id,
+                        IndexRef::new(IndexID::new(7), IndexSlot::new(2)),
+                        TrxID::new(21),
+                        &durable_generations,
+                    )
+                    .is_err()
+            );
+            assert!(
+                storage
+                    .reserve_provisional_index(
+                        table_id,
+                        IndexRef::new(IndexID::new(8), IndexSlot::new(1)),
+                        TrxID::new(21),
+                        &durable_generations,
+                    )
+                    .is_err()
+            );
+            assert!(
+                storage
+                    .reserve_provisional_index(
+                        table_id,
+                        IndexRef::new(IndexID::new(9), IndexSlot::new(0)),
+                        TrxID::new(21),
+                        &durable_generations,
+                    )
+                    .is_err()
+            );
+
+            let max_table_id = USER_TABLE_ID_START + 702;
+            storage
+                .reserve_provisional_index(
+                    max_table_id,
+                    IndexRef::new(IndexID::new(u32::MAX), IndexSlot::new(1)),
+                    TrxID::new(30),
+                    &durable_generations,
+                )
+                .unwrap();
+            let err = storage
+                .plan_create_index_allocation(max_table_id, &metadata)
+                .unwrap_err();
+            assert_eq!(*err.current_context(), OperationError::IndexIdExhausted);
+            storage.release_checkpointed_index_reservations(TrxID::new(31));
+            let err = storage
+                .plan_create_index_allocation(max_table_id, &metadata)
+                .unwrap_err();
+            assert_eq!(*err.current_context(), OperationError::IndexIdExhausted);
         });
     }
 }

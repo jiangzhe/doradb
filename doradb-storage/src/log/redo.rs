@@ -1,4 +1,4 @@
-use crate::catalog::{CatalogSelectKey, IndexSlot};
+use crate::catalog::{CatalogSelectKey, IndexID, IndexSlot};
 use crate::error::DataIntegrityError;
 use crate::id::{PageID, RowID, TableID, TrxID};
 use crate::row::ops::UpdateCol;
@@ -266,10 +266,12 @@ pub(crate) enum DDLRedo {
     DropTable(TableID),
     CreateIndex {
         table_id: TableID,
+        index_id: IndexID,
         index_slot: IndexSlot,
     },
     DropIndex {
         table_id: TableID,
+        index_id: IndexID,
         index_slot: IndexSlot,
     },
     CreateRowPage {
@@ -312,7 +314,7 @@ impl Ser<'_> for DDLRedo {
                 DDLRedo::CreateTable(_) => mem::size_of::<TableID>(),
                 DDLRedo::DropTable(_) => mem::size_of::<TableID>(),
                 DDLRedo::CreateIndex { .. } | DDLRedo::DropIndex { .. } => {
-                    mem::size_of::<TableID>() + mem::size_of::<u16>()
+                    mem::size_of::<TableID>() + mem::size_of::<u32>() + mem::size_of::<u16>()
                 }
                 DDLRedo::CreateRowPage { .. } => {
                     mem::size_of::<TableID>()
@@ -339,16 +341,20 @@ impl Ser<'_> for DDLRedo {
             }
             DDLRedo::CreateIndex {
                 table_id,
+                index_id,
                 index_slot,
             } => {
                 idx = out.ser_u64(idx, table_id.as_u64());
+                idx = out.ser_u32(idx, index_id.get());
                 idx = out.ser_u16(idx, index_slot.get());
             }
             DDLRedo::DropIndex {
                 table_id,
+                index_id,
                 index_slot,
             } => {
                 idx = out.ser_u64(idx, table_id.as_u64());
+                idx = out.ser_u32(idx, index_id.get());
                 idx = out.ser_u16(idx, index_slot.get());
             }
             DDLRedo::CreateRowPage {
@@ -401,22 +407,26 @@ impl Deser for DDLRedo {
             }
             DDLRedoCode::CreateIndex => {
                 let (idx, table_id) = TableID::deser(input, idx)?;
+                let (idx, index_id) = input.deser_u32(idx)?;
                 let (idx, index_slot) = input.deser_u16(idx)?;
                 Ok((
                     idx,
                     DDLRedo::CreateIndex {
                         table_id,
+                        index_id: IndexID::new(index_id),
                         index_slot: IndexSlot::from(index_slot),
                     },
                 ))
             }
             DDLRedoCode::DropIndex => {
                 let (idx, table_id) = TableID::deser(input, idx)?;
+                let (idx, index_id) = input.deser_u32(idx)?;
                 let (idx, index_slot) = input.deser_u16(idx)?;
                 Ok((
                     idx,
                     DDLRedo::DropIndex {
                         table_id,
+                        index_id: IndexID::new(index_id),
                         index_slot: IndexSlot::from(index_slot),
                     },
                 ))
@@ -835,7 +845,7 @@ mod tests {
 
     #[test]
     fn test_catalog_keyed_row_redo_slot_bounds() {
-        for index_slot in [IndexSlot::new(0), IndexSlot::MAX] {
+        for index_slot in [IndexSlot::new(0), IndexSlot::new(u16::MAX)] {
             let expected = CatalogSelectKey::new(index_slot, vec![]);
             let kind = RowRedoKind::DeleteByPrimaryKey(expected.clone());
             let mut buf = vec![0; kind.ser_len()];
@@ -1458,6 +1468,7 @@ mod tests {
         // 测试用例3：CreateIndex
         let create_index = DDLRedo::CreateIndex {
             table_id: TableID::new(11),
+            index_id: IndexID::new(101),
             index_slot: IndexSlot::new(1),
         };
         let mut buf = vec![0; create_index.ser_len()];
@@ -1471,9 +1482,11 @@ mod tests {
         match deserialized {
             DDLRedo::CreateIndex {
                 table_id,
+                index_id,
                 index_slot,
             } => {
                 assert_eq!(table_id, TableID::new(11));
+                assert_eq!(index_id, IndexID::new(101));
                 assert_eq!(index_slot, IndexSlot::new(1));
             }
             _ => panic!("Expected CreateIndex"),
@@ -1482,6 +1495,7 @@ mod tests {
         // 测试用例4：DropIndex
         let drop_index = DDLRedo::DropIndex {
             table_id: TableID::new(22),
+            index_id: IndexID::new(202),
             index_slot: IndexSlot::new(2),
         };
         let mut buf = vec![0; drop_index.ser_len()];
@@ -1495,9 +1509,11 @@ mod tests {
         match deserialized {
             DDLRedo::DropIndex {
                 table_id,
+                index_id,
                 index_slot,
             } => {
                 assert_eq!(table_id, TableID::new(22));
+                assert_eq!(index_id, IndexID::new(202));
                 assert_eq!(index_slot, IndexSlot::new(2));
             }
             _ => panic!("Expected DropIndex"),

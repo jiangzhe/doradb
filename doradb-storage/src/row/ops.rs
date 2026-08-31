@@ -516,17 +516,22 @@ impl DeleteMvcc {
 #[cfg(test)]
 mod tests {
     use super::{RowUpdateInput, RowUpdateView, UpdateCol, UpsertMvcc};
-    use crate::catalog::{ColumnAttributes, ColumnSpec, TableColumnLayout};
+    use crate::catalog::{StorageColumnFlags, StorageColumnSpec, TableColumnLayout, TableMetadata};
     use crate::id::RowID;
     use crate::value::{Val, ValKind};
 
     fn update_test_layout() -> TableColumnLayout {
-        TableColumnLayout::try_new(vec![
-            ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
-            ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
-            ColumnSpec::new("version", ValKind::U64, ColumnAttributes::empty()),
-        ])
+        (*TableMetadata::try_new(
+            vec![
+                StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
+            ],
+            vec![],
+        )
         .unwrap()
+        .col)
+            .clone()
     }
 
     #[test]

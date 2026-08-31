@@ -8,6 +8,117 @@ use error_stack::Report;
 use std::fmt;
 use std::num::TryFromIntError;
 
+/// Exclusive end of the stable column and index identity domains.
+///
+/// Every `u32` value is a valid object identity. The wider one-past-end value
+/// is therefore required to represent allocator exhaustion.
+pub const ID_DOMAIN_END: u64 = 1_u64 << 32;
+
+/// Stable table-local identity of one storage column.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ColumnID(u32);
+
+impl ColumnID {
+    /// Creates a stable table-local column identity.
+    #[inline]
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    /// Returns the primitive stable column identity.
+    #[inline]
+    pub const fn as_u32(self) -> u32 {
+        self.0
+    }
+
+    /// Returns the primitive stable column identity.
+    #[inline]
+    pub(crate) const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl fmt::Display for ColumnID {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl TryFrom<usize> for ColumnID {
+    type Error = TryFromIntError;
+
+    #[inline]
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        u32::try_from(value).map(Self)
+    }
+}
+
+/// Physical position of one column in a stored row layout.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ColumnOrdinal(u16);
+
+impl ColumnOrdinal {
+    /// Largest representable physical column ordinal.
+    pub const MAX: Self = Self(u16::MAX);
+
+    /// Creates a physical column ordinal.
+    #[inline]
+    pub const fn new(value: u16) -> Self {
+        Self(value)
+    }
+
+    /// Returns the primitive physical column ordinal.
+    #[inline]
+    pub const fn as_u16(self) -> u16 {
+        self.0
+    }
+
+    /// Returns the physical ordinal as an array index.
+    #[inline]
+    pub(crate) const fn as_usize(self) -> usize {
+        self.0 as usize
+    }
+
+    /// Returns the primitive physical column ordinal.
+    #[inline]
+    pub(crate) const fn get(self) -> u16 {
+        self.0
+    }
+}
+
+impl From<u16> for ColumnOrdinal {
+    #[inline]
+    fn from(value: u16) -> Self {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<usize> for ColumnOrdinal {
+    type Error = TryFromIntError;
+
+    #[inline]
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        u16::try_from(value).map(Self::new)
+    }
+}
+
+impl fmt::Display for ColumnOrdinal {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl From<ColumnOrdinal> for usize {
+    #[inline]
+    fn from(value: ColumnOrdinal) -> Self {
+        value.as_usize()
+    }
+}
+
 /// Stable generation identity of a user-table index.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -30,12 +141,6 @@ impl IndexID {
     #[inline]
     pub(crate) const fn get(self) -> u32 {
         self.0
-    }
-
-    /// Converts the Phase-2 transitional persisted identity to its equal slot.
-    #[inline]
-    pub(crate) fn transitional_slot(self) -> Result<IndexSlot, TryFromIntError> {
-        u16::try_from(self.0).map(IndexSlot::from)
     }
 }
 
@@ -63,9 +168,6 @@ impl TryFrom<usize> for IndexID {
 pub(crate) struct IndexSlot(u16);
 
 impl IndexSlot {
-    /// Largest representable physical index slot.
-    pub(crate) const MAX: Self = Self(u16::MAX);
-
     /// Creates one physical index slot from its raw `u16` representation.
     #[inline]
     pub(crate) const fn new(value: u16) -> Self {
@@ -82,22 +184,6 @@ impl IndexSlot {
     #[inline]
     pub(crate) const fn as_usize(self) -> usize {
         self.0 as usize
-    }
-
-    /// Returns the following physical slot when it remains representable.
-    #[inline]
-    pub(crate) const fn checked_next(self) -> Option<Self> {
-        if self.0 == Self::MAX.0 {
-            None
-        } else {
-            Some(Self(self.0 + 1))
-        }
-    }
-
-    /// Builds the Phase-1 stable identity that is numerically equal to this slot.
-    #[inline]
-    pub(crate) const fn transitional_id(self) -> IndexID {
-        IndexID(self.0 as u32)
     }
 }
 
@@ -124,6 +210,13 @@ impl fmt::Display for IndexSlot {
     }
 }
 
+impl From<IndexSlot> for u32 {
+    #[inline]
+    fn from(value: IndexSlot) -> Self {
+        u32::from(value.get())
+    }
+}
+
 /// Runtime reference pairing one table-local index identity with its physical slot.
 ///
 /// User indexes retain their stable generation identity. Catalog indexes use a
@@ -140,18 +233,6 @@ impl IndexRef {
     #[inline]
     pub(crate) const fn new(id: IndexID, slot: IndexSlot) -> Self {
         Self { id, slot }
-    }
-
-    /// Qualifies a currently active slot under the Phase-1 non-reuse contract.
-    ///
-    /// Stable identity and physical slot are deliberately equal in this phase.
-    /// Later phases replace this adapter with direct generation-aware resolution.
-    #[inline]
-    pub(crate) const fn from_active_slot(slot: IndexSlot) -> Self {
-        Self {
-            id: slot.transitional_id(),
-            slot,
-        }
     }
 
     /// Returns the stable generation identity.
@@ -330,30 +411,8 @@ impl<T> IndexKey<T> {
 /// Semantic catalog-table name for the shared physical-slot selection key.
 pub(crate) type CatalogSelectKey = SelectKey;
 
-/// Logical user-index selector carrying only its stable identity.
-pub(crate) type UserIndexKey = IndexKey<IndexID>;
-/// Operation-local user-index key carrying only its physical execution slot.
-pub(crate) type UserIndexSlotKey = IndexKey<IndexSlot>;
 /// Transaction-retained index key carrying identity and resolved slot.
 pub(crate) type ResolvedIndexKey = IndexKey<IndexRef>;
-
-/// Qualifies one validated active user-index slot for retained transaction state.
-#[inline]
-pub(crate) fn resolve_active_user_key(key: UserIndexSlotKey) -> ResolvedIndexKey {
-    let stable = UserIndexKey::new(key.index.transitional_id(), key.vals);
-    let index = IndexRef::from_active_slot(key.index);
-    assert_eq!(
-        stable.index.get(),
-        index.id().get(),
-        "resolved user key must retain the stable selector identity"
-    );
-    assert_eq!(
-        index.id().get(),
-        u32::from(index.slot().get()),
-        "Phase-1 active user index identity must equal its non-reusable slot"
-    );
-    ResolvedIndexKey::new(index, stable.vals)
-}
 
 /// Builds the runtime reference for one fixed catalog index slot.
 #[inline]
@@ -390,12 +449,6 @@ pub(crate) fn catalog_key_from_active_ordinal(
     CatalogSelectKey::new(index_slot, vals)
 }
 
-/// Builds a retained user key after layout admission established an active slot.
-#[inline]
-pub(crate) fn user_key_from_active_slot(index_slot: IndexSlot, vals: Vec<Val>) -> ResolvedIndexKey {
-    resolve_active_user_key(UserIndexSlotKey::new(index_slot, vals))
-}
-
 /// Builds a retained user key from an already admitted exact reference.
 #[inline]
 pub(crate) fn user_key_from_index_ref(index: IndexRef, vals: Vec<Val>) -> ResolvedIndexKey {
@@ -407,15 +460,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_index_reference_checked_boundaries_and_transitional_resolution() {
+    fn test_index_reference_checked_boundaries_and_exact_resolution() {
         assert_eq!(IndexID::new(0).as_u32(), 0);
         assert_eq!(IndexID::new(u32::MAX).as_u32(), u32::MAX);
         assert_eq!(IndexID::new(42).to_string(), "42");
-        assert!(
-            IndexID::new(u32::from(u16::MAX) + 1)
-                .transitional_slot()
-                .is_err()
-        );
         assert_eq!(IndexSlot::try_from(0usize).unwrap().get(), 0);
         assert_eq!(
             IndexSlot::try_from(usize::from(u16::MAX)).unwrap().get(),
@@ -432,9 +480,15 @@ mod tests {
         );
         assert!(CatalogIndexNo::try_from(usize::from(u16::MAX) + 1).is_err());
 
-        let key = user_key_from_active_slot(IndexSlot::new(37), vec![Val::from(11u32)]);
-        assert_eq!(key.index.to_string(), "IndexRef(id=37, slot=37)");
-        assert_eq!(key.index.id().get(), 37);
+        let key = user_key_from_index_ref(
+            IndexRef::new(IndexID::new(u32::MAX), IndexSlot::new(37)),
+            vec![Val::from(11u32)],
+        );
+        assert_eq!(
+            key.index.to_string(),
+            format!("IndexRef(id={}, slot=37)", u32::MAX)
+        );
+        assert_eq!(key.index.id().get(), u32::MAX);
         assert_eq!(key.index.slot().get(), 37);
         assert_eq!(key.vals, vec![Val::from(11u32)]);
     }

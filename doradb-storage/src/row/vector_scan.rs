@@ -488,78 +488,29 @@ fn append_scan_value(buf: &mut ValBuffer, val: &Val, col_idx: usize) {
 mod tests {
     use super::*;
     use crate::bitmap::Bitmap;
-    use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
+    use crate::catalog::{StorageColumnFlags, StorageColumnSpec, TableMetadata};
     use crate::id::RowID;
     use crate::row::tests::create_row_page;
     use crate::row::{Delete, InsertRow};
     use crate::value::{Val, ValKind};
-    use semistr::SemiStr;
     use std::borrow::Cow;
 
     #[test]
     fn test_row_page_vector_scan() {
         let metadata = TableMetadata::try_new(
             vec![
-                ColumnSpec {
-                    column_name: SemiStr::new("c1"),
-                    column_type: ValKind::I8,
-                    column_attributes: ColumnAttributes::empty(),
-                },
-                ColumnSpec {
-                    column_name: SemiStr::new("c2"),
-                    column_type: ValKind::U8,
-                    column_attributes: ColumnAttributes::NULLABLE,
-                },
-                ColumnSpec {
-                    column_name: SemiStr::new("c3"),
-                    column_type: ValKind::I16,
-                    column_attributes: ColumnAttributes::empty(),
-                },
-                ColumnSpec {
-                    column_name: SemiStr::new("c4"),
-                    column_type: ValKind::U16,
-                    column_attributes: ColumnAttributes::NULLABLE,
-                },
-                ColumnSpec {
-                    column_name: SemiStr::new("c5"),
-                    column_type: ValKind::I32,
-                    column_attributes: ColumnAttributes::empty(),
-                },
-                ColumnSpec {
-                    column_name: SemiStr::new("c6"),
-                    column_type: ValKind::U32,
-                    column_attributes: ColumnAttributes::NULLABLE,
-                },
-                ColumnSpec {
-                    column_name: SemiStr::new("c7"),
-                    column_type: ValKind::F32,
-                    column_attributes: ColumnAttributes::empty(),
-                },
-                ColumnSpec {
-                    column_name: SemiStr::new("c8"),
-                    column_type: ValKind::I64,
-                    column_attributes: ColumnAttributes::NULLABLE,
-                },
-                ColumnSpec {
-                    column_name: SemiStr::new("c9"),
-                    column_type: ValKind::U64,
-                    column_attributes: ColumnAttributes::empty(),
-                },
-                ColumnSpec {
-                    column_name: SemiStr::new("c10"),
-                    column_type: ValKind::F64,
-                    column_attributes: ColumnAttributes::NULLABLE,
-                },
-                ColumnSpec {
-                    column_name: SemiStr::new("c11"),
-                    column_type: ValKind::VarByte,
-                    column_attributes: ColumnAttributes::empty(),
-                },
-                ColumnSpec {
-                    column_name: SemiStr::new("c12"),
-                    column_type: ValKind::VarByte,
-                    column_attributes: ColumnAttributes::empty(),
-                },
+                StorageColumnSpec::new(ValKind::I8, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::U8, StorageColumnFlags::NULLABLE),
+                StorageColumnSpec::new(ValKind::I16, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::U16, StorageColumnFlags::NULLABLE),
+                StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::NULLABLE),
+                StorageColumnSpec::new(ValKind::F32, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::I64, StorageColumnFlags::NULLABLE),
+                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::F64, StorageColumnFlags::NULLABLE),
+                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
             ],
             vec![],
         )
@@ -612,8 +563,8 @@ mod tests {
     fn test_page_vector_view_col_borrows_nullable_null_bitmap() {
         let metadata = TableMetadata::try_new(
             vec![
-                ColumnSpec::new("nullable_u64", ValKind::U64, ColumnAttributes::NULLABLE),
-                ColumnSpec::new("plain_u8", ValKind::U8, ColumnAttributes::empty()),
+                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::NULLABLE),
+                StorageColumnSpec::new(ValKind::U8, StorageColumnFlags::empty()),
             ],
             vec![],
         )
@@ -648,10 +599,9 @@ mod tests {
     #[test]
     fn test_nullable_vector_scan_null_bitmap_compacts_deleted_rows() {
         let metadata = TableMetadata::try_new(
-            vec![ColumnSpec::new(
-                "nullable_u8",
+            vec![StorageColumnSpec::new(
                 ValKind::U8,
-                ColumnAttributes::NULLABLE,
+                StorageColumnFlags::NULLABLE,
             )],
             vec![],
         )
@@ -685,61 +635,17 @@ mod tests {
     fn test_scan_buffer_truncate_all_types() {
         let metadata = TableMetadata::try_new(
             vec![
-                ColumnSpec {
-                    column_name: SemiStr::new("c1"),
-                    column_type: ValKind::I8,
-                    column_attributes: ColumnAttributes::empty(),
-                },
-                ColumnSpec {
-                    column_name: SemiStr::new("c2"),
-                    column_type: ValKind::U8,
-                    column_attributes: ColumnAttributes::NULLABLE,
-                },
-                ColumnSpec {
-                    column_name: SemiStr::new("c3"),
-                    column_type: ValKind::I16,
-                    column_attributes: ColumnAttributes::empty(),
-                },
-                ColumnSpec {
-                    column_name: SemiStr::new("c4"),
-                    column_type: ValKind::U16,
-                    column_attributes: ColumnAttributes::NULLABLE,
-                },
-                ColumnSpec {
-                    column_name: SemiStr::new("c5"),
-                    column_type: ValKind::I32,
-                    column_attributes: ColumnAttributes::empty(),
-                },
-                ColumnSpec {
-                    column_name: SemiStr::new("c6"),
-                    column_type: ValKind::U32,
-                    column_attributes: ColumnAttributes::NULLABLE,
-                },
-                ColumnSpec {
-                    column_name: SemiStr::new("c7"),
-                    column_type: ValKind::F32,
-                    column_attributes: ColumnAttributes::empty(),
-                },
-                ColumnSpec {
-                    column_name: SemiStr::new("c8"),
-                    column_type: ValKind::I64,
-                    column_attributes: ColumnAttributes::NULLABLE,
-                },
-                ColumnSpec {
-                    column_name: SemiStr::new("c9"),
-                    column_type: ValKind::U64,
-                    column_attributes: ColumnAttributes::empty(),
-                },
-                ColumnSpec {
-                    column_name: SemiStr::new("c10"),
-                    column_type: ValKind::F64,
-                    column_attributes: ColumnAttributes::NULLABLE,
-                },
-                ColumnSpec {
-                    column_name: SemiStr::new("c11"),
-                    column_type: ValKind::VarByte,
-                    column_attributes: ColumnAttributes::empty(),
-                },
+                StorageColumnSpec::new(ValKind::I8, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::U8, StorageColumnFlags::NULLABLE),
+                StorageColumnSpec::new(ValKind::I16, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::U16, StorageColumnFlags::NULLABLE),
+                StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::NULLABLE),
+                StorageColumnSpec::new(ValKind::F32, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::I64, StorageColumnFlags::NULLABLE),
+                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::F64, StorageColumnFlags::NULLABLE),
+                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
             ],
             vec![],
         )
@@ -908,11 +814,10 @@ mod tests {
     #[test]
     fn test_vector_view_with_del_bitmap_uses_prepared_visibility() {
         let metadata = TableMetadata::try_new(
-            vec![ColumnSpec {
-                column_name: SemiStr::new("c1"),
-                column_type: ValKind::I8,
-                column_attributes: ColumnAttributes::empty(),
-            }],
+            vec![StorageColumnSpec::new(
+                ValKind::I8,
+                StorageColumnFlags::empty(),
+            )],
             vec![],
         )
         .expect("valid table metadata");
@@ -939,11 +844,10 @@ mod tests {
     #[test]
     fn test_vector_view_with_del_bitmap_rejects_wrong_shape() {
         let metadata = TableMetadata::try_new(
-            vec![ColumnSpec {
-                column_name: SemiStr::new("c1"),
-                column_type: ValKind::I8,
-                column_attributes: ColumnAttributes::empty(),
-            }],
+            vec![StorageColumnSpec::new(
+                ValKind::I8,
+                StorageColumnFlags::empty(),
+            )],
             vec![],
         )
         .expect("valid table metadata");

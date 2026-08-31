@@ -226,7 +226,7 @@ impl Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{IndexAttributes, IndexID, IndexKeySpec, IndexSpec};
+    use crate::catalog::{IndexID, StorageIndexFlags, StorageIndexKey, StorageIndexSpec};
     use crate::error::{ErrorKind, OperationError};
     use crate::lock::{LockMode, LockResource};
     use crate::row::ops::SelectMvcc;
@@ -413,7 +413,10 @@ mod tests {
             let non_unique_id = session
                 .create_index(
                     table_id,
-                    IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty()),
+                    StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(1)],
+                        StorageIndexFlags::empty(),
+                    ),
                 )
                 .await
                 .unwrap();
