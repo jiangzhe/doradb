@@ -356,7 +356,7 @@ mod tests {
         assert!(decode_index_key_spec(&[2, 1, 0, 0, 0, 0, 0, 0]).is_err());
         assert!(decode_index_key_spec(&[1, 0, 0]).is_err());
         assert!(decode_index_key_spec(&[1, 1, 0, 0, 0, 0, 0]).is_err());
-        assert!(decode_index_key_spec(&[1, 1, 0, 0, 0, 0, 2]).is_err());
+        assert!(decode_index_key_spec(&[1, 1, 0, 0, 0, 0, 0, 2]).is_err());
         assert!(decode_index_key_spec(&[1, 1, 0, 0, 0, 0, 0, 0, 0]).is_err());
         assert!(decode_index_key_spec(&[1, 2, 0, 7, 0, 0, 0, 0, 7, 0, 0, 0, 1]).is_err());
     }

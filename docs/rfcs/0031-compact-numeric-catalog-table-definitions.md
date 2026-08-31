@@ -566,9 +566,9 @@ including create/drop index. `next_column_id` and the persisted
 decrease. Their valid persisted range is `0..=2^32`; every allocated ID in the
 corresponding domain is strictly less than its watermark. `2^32` is the valid
 exhausted boundary after allocating `u32::MAX`, while any larger value is
-invalid metadata. The Rust representation uses validated `u64`-backed
-`ColumnIDWatermark` and `IndexIDWatermark` newtypes rather than treating a
-watermark as an object ID. [U14]
+invalid metadata. Rust stores these as raw, explicitly named `u64` fields and
+uses shared checked allocation and decode helpers rather than treating either
+exclusive bound as an object ID. [U14]
 
 Allocation is exact at the boundary:
 
@@ -732,19 +732,17 @@ DROP TABLE. [D4], [C3]
 
 ### Persisted Identities Compile To Low-Level Positions
 
-The redesign introduces explicit identity, watermark, and position newtypes and
-keeps the reusable user slot internal to storage execution: [C1], [C2], [U4],
-[U5], [U12], [U14]
+The redesign introduces explicit identity and position newtypes, retains raw
+checked `u64` exclusive allocator fields, and keeps the reusable user slot
+internal to storage execution: [C1], [C2], [U4], [U5], [U12], [U14]
 
 ```rust
 pub const ID_DOMAIN_END: u64 = 1_u64 << 32;
 
 pub struct ColumnID(u32);              // stable table-local identity
-pub struct ColumnIDWatermark(u64);     // validated 0..=ID_DOMAIN_END
 pub struct ColumnOrdinal(u16);         // physical row-layout position
 
 pub struct IndexID(u32);               // stable user-table identity
-pub struct IndexIDWatermark(u64);      // validated 0..=ID_DOMAIN_END
 pub(crate) struct IndexSlot(u16);      // physical metadata/runtime/root position
 pub(crate) type CatalogIndexNo = IndexSlot; // static catalog slot semantic alias
 
@@ -755,16 +753,16 @@ pub(crate) struct IndexRef {
 ```
 
 Catalog and table-file metadata persist `ColumnID -> ColumnOrdinal` and
-`IndexID -> IndexSlot`. Persisted index keys contain `ColumnID`. Metadata
-construction validates those mappings once and compiles a runtime-only layout
-whose index keys contain `ColumnOrdinal`. [D5], [C2], [C7], [U5]
+`IndexID -> IndexSlot`. The canonical `TableIndexKeySpec` retains both the
+persisted `ColumnID` and its once-compiled runtime `ColumnOrdinal`. Metadata
+construction validates those mappings once. [D5], [C2], [C7], [U5]
 
-The table-file physical metadata also persists `storage_epoch`, the two
-watermarks as `U64`, and `index_slot_count` as `U32` so recovery and index-DDL
-root proof remain self-contained before catalog redo reconciliation. Catalog
-and table-file decoders apply the same `<= ID_DOMAIN_END` and allocated-ID
-ordering validation; neither representation may truncate a watermark to
-`u32`. [U14]
+The table-file physical metadata also persists `storage_epoch`, the two raw
+exclusive bounds as `U64`, and `index_slot_count` as `U32` so recovery and
+index-DDL root proof remain self-contained before catalog redo reconciliation.
+Catalog and table-file decoders apply the same `<= ID_DOMAIN_END` and
+allocated-ID ordering validation; neither representation may truncate an
+exclusive bound to `u32`. [U14]
 
 Each physical index slot persists one unified state: `Vacant`,
 `Active { index_id, root: Empty | Present(nonzero_block_id) }`, or
@@ -1237,7 +1235,7 @@ pub struct CreateIndexDefinitionProposal {
     pub expected_descriptor_revision: Option<u64>,
 
     /// Effective live allocator value, including provisional reservations.
-    pub expected_effective_next_index_id: IndexIDWatermark,
+    pub expected_effective_next_index_id: u64,
     /// Stable identity referenced by the opaque payload; must equal the
     /// checked, non-exhausted watermark converted to IndexID.
     pub proposed_index_id: IndexID,
@@ -1256,8 +1254,8 @@ pub struct DropIndexDefinitionProposal {
 }
 ```
 
-`expected_effective_next_index_id` is a validated `u64`-backed exclusive
-watermark in `0..=ID_DOMAIN_END`, not an `IndexID`. A current-definition read
+`expected_effective_next_index_id` is a raw `u64` exclusive bound validated in
+`0..=ID_DOMAIN_END`, not an `IndexID`. A current-definition read
 used for compilation exposes the effective live watermark, which is at least
 the durable catalog watermark and also covers every replay-visible provisional
 reservation. When it equals `ID_DOMAIN_END`, no valid `proposed_index_id`
@@ -1954,17 +1952,18 @@ marker can alias a second CREATE after restart. [U20]
     domains, normalized transient retained keys, removed unqualified delayed
     user references, established native catalog row-redo encoding, and
     established persisted-to-runtime index-generation compilation.
-  - Scope: Introduce `ColumnID`, `ColumnOrdinal`, `ColumnIDWatermark`, and
-    `IndexIDWatermark`; define bounded `0..=2^32` allocation/exhaustion and
-    typed errors; install all six final catalog tables/slots; replace table,
+  - Scope: Introduce `ColumnID` and `ColumnOrdinal`; use raw checked `u64`
+    exclusive allocator fields with bounded `0..=2^32` exhaustion and typed
+    errors; install all six final catalog tables/slots; replace table,
     column, and index row schemas; encode ordered key specs; remove names,
-    `ColumnAttributes::INDEX`, and `catalog.index_columns`; and update
+    `ColumnAttributes::INDEX`, and `catalog.index_columns`; use canonical
+    `TableIndexKeySpec`; and update
     bootstrap, merge keys, locks, reconstruction, table metadata, root
     comparison, generation-qualified user index DDL redo, active/retired
     slot-generation tags, and every affected format version in one cutover.
     Descriptor and binding tables exist but expose no public row API yet.
     Add the recovery-only provisional CREATE reservation overlay, widened
-    effective ID watermark, provisional-slot quarantine, replay-floor-qualified
+    effective ID allocator, provisional-slot quarantine, replay-floor-qualified
     exact ID/slot root classification, and release only after published
     `catalog_replay_start_ts > create_cts`. CREATE remains append-only by slot
     and must skip every replay-visible provisional ID and slot. Replace the
@@ -1986,14 +1985,14 @@ marker can alias a second CREATE after restart. [U20]
     is a mandatory phase gate.
   - Non-goals: Catalog-wide parent corruption detection, reusable dropped
     slots, storage compiler proposals, or populated descriptor/binding APIs.
-  - Phase-local Choices: Numeric encoding tags and the deterministic
-    non-security storage-fingerprint algorithm. Encodings and fingerprints are
-    versioned and covered by golden-byte tests; the durable cutover cannot be
-    split into independently published intermediate formats.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase-local Choices: Unified `Vacant`/`Active`/`Retired` slot state owns
+    explicit empty/present roots; runtime root access uses `Option<BlockID>`;
+    numeric encodings and the BLAKE3 storage fingerprint are versioned and
+    covered by golden-byte tests. The cutover has no intermediate format.
+  - Task Doc: `docs/tasks/000290-atomic-numeric-format-cutover-and-replay-safe-allocation.md`
+  - Task Issue: `#1033`
+  - Phase Status: done
+  - Implementation Summary: Implemented the atomic numeric cutover and replay-safe index allocation. [Task Resolve Sync: docs/tasks/000290-atomic-numeric-format-cutover-and-replay-safe-allocation.md @ 2026-08-31]
 
 - **Phase 4: Central Catalog Parent Integrity**
   - Prerequisites: Phase 3 provides the final six-root catalog and all five
@@ -2263,7 +2262,7 @@ marker can alias a second CREATE after restart. [U20]
   synthetic unequal ID/slot mapping plus reopen consistency. [C18], [U23]
 - **Watermark narrowing or sentinel drift:** casting an exclusive watermark to
   `u32`, or treating `u32::MAX` as exhausted, would lose a valid identity and
-  can wrap allocator state. Validated `u64` watermark newtypes are used in
+  can wrap allocator state. Raw `u64` fields use shared checked helpers in
   catalog, table-file, recovery, and compiler contracts; narrowing occurs only
   after `< 2^32`; `2^32` returns typed exhaustion; and larger values fail
   integrity validation.
