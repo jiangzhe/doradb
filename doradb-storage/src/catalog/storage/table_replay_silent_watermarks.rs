@@ -1,10 +1,10 @@
 use crate::buffer::PoolGuards;
 use crate::catalog::storage::CatalogDefinition;
 use crate::catalog::storage::object::SilentWatermarkObject;
-use crate::catalog::table::{TableColumnLayout, TableMetadata};
+use crate::catalog::table::TableMetadata;
 use crate::catalog::{CatalogIndexNo, CatalogTable};
 use crate::catalog::{
-    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexSpec,
+    StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey, StorageIndexSpec,
     catalog_table_id_from_slot,
 };
 use crate::error::{
@@ -12,24 +12,20 @@ use crate::error::{
     RuntimeOrFatalResult, RuntimeResult,
 };
 use crate::id::{TableID, TrxID};
+use crate::row::RowRead;
 use crate::row::ops::DeleteMvcc;
-use crate::row::{Row, RowRead};
 use crate::table::NoTrxUpsertChange;
 use crate::trx::PrivateTransaction;
 use crate::value::Val;
 use crate::value::ValKind;
 use error_stack::{Report, ResultExt};
-use semistr::SemiStr;
 use std::sync::OnceLock;
 
 /// Catalog table id for `catalog.table_replay_silent_watermarks`.
 pub(crate) const TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS: TableID = catalog_table_id_from_slot(4);
 const COL_NO_TABLE_REPLAY_SILENT_WATERMARKS_TABLE_ID: usize = 0;
-const COL_NAME_TABLE_REPLAY_SILENT_WATERMARKS_TABLE_ID: &str = "table_id";
 const COL_NO_TABLE_REPLAY_SILENT_WATERMARKS_HEAP_REDO_START_TS: usize = 1;
-const COL_NAME_TABLE_REPLAY_SILENT_WATERMARKS_HEAP_REDO_START_TS: &str = "heap_redo_start_ts";
 const COL_NO_TABLE_REPLAY_SILENT_WATERMARKS_DELETION_CUTOFF_TS: usize = 2;
-const COL_NAME_TABLE_REPLAY_SILENT_WATERMARKS_DELETION_CUTOFF_TS: &str = "deletion_cutoff_ts";
 const PK_NO_TABLE_REPLAY_SILENT_WATERMARKS: CatalogIndexNo = CatalogIndexNo::new(0);
 
 /// Runtime accessor for `catalog.table_replay_silent_watermarks`.
@@ -52,16 +48,27 @@ impl TableReplaySilentWatermarks<'_> {
         table_id: TableID,
     ) -> RuntimeResult<Option<SilentWatermarkObject>> {
         let key_vals = [Val::from(table_id)];
-        self.table
+        let vals = self
+            .table
             .index_lookup_unique_uncommitted(
                 guards,
                 PK_NO_TABLE_REPLAY_SILENT_WATERMARKS,
                 &key_vals,
-                row_to_table_replay_silent_watermark_object,
+                |col_layout, row| {
+                    (0..3)
+                        .map(|idx| row.val(col_layout, idx))
+                        .collect::<Vec<_>>()
+                },
             )
             .await
             .change_context(RuntimeError::CatalogAccess)
-            .attach_with(|| format!("operation=find_silent_watermark, table_id={table_id}"))
+            .attach_with(|| format!("operation=find_silent_watermark, table_id={table_id}"))?;
+        vals.map(|vals| table_replay_silent_watermark_object_from_vals(&vals))
+            .transpose()
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!("operation=find_silent_watermark, phase=decode_row, table_id={table_id}")
+            })
     }
 
     /// Upsert one caller-supplied monotonic live watermark without transaction state.
@@ -142,29 +149,17 @@ pub(super) fn catalog_definition_of_table_replay_silent_watermarks() -> &'static
         table_id: TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS,
         metadata: TableMetadata::try_new(
             vec![
-                ColumnSpec {
-                    column_name: SemiStr::new(COL_NAME_TABLE_REPLAY_SILENT_WATERMARKS_TABLE_ID),
-                    column_type: ValKind::U64,
-                    column_attributes: ColumnAttributes::INDEX,
-                },
-                ColumnSpec {
-                    column_name: SemiStr::new(
-                        COL_NAME_TABLE_REPLAY_SILENT_WATERMARKS_HEAP_REDO_START_TS,
-                    ),
-                    column_type: ValKind::U64,
-                    column_attributes: ColumnAttributes::empty(),
-                },
-                ColumnSpec {
-                    column_name: SemiStr::new(
-                        COL_NAME_TABLE_REPLAY_SILENT_WATERMARKS_DELETION_CUTOFF_TS,
-                    ),
-                    column_type: ValKind::U64,
-                    column_attributes: ColumnAttributes::empty(),
-                },
+                // table_id U64: owning user table.
+                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
+                // heap_redo_start_ts U64: silent heap replay lower bound.
+                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
+                // deletion_cutoff_ts U64: silent cold-delete replay lower bound.
+                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
             ],
-            vec![IndexSpec::new(
-                vec![IndexKeySpec::new(0)],
-                IndexAttributes::PK,
+            // Primary key: table_id.
+            vec![StorageIndexSpec::new(
+                vec![StorageIndexKey::new(0)],
+                StorageIndexFlags::PK,
             )],
         )
         .expect("valid table metadata"),
@@ -195,37 +190,6 @@ pub(super) fn table_replay_silent_watermark_object_from_vals(
         heap_redo_start_ts: TrxID::new(heap_redo_start_ts),
         deletion_cutoff_ts: TrxID::new(deletion_cutoff_ts),
     })
-}
-
-#[inline]
-fn row_to_table_replay_silent_watermark_object(
-    col_layout: &TableColumnLayout,
-    row: Row<'_>,
-) -> SilentWatermarkObject {
-    let table_id = TableID::from(
-        row.val(col_layout, COL_NO_TABLE_REPLAY_SILENT_WATERMARKS_TABLE_ID)
-            .as_u64()
-            .unwrap(),
-    );
-    let heap_redo_start_ts = row
-        .val(
-            col_layout,
-            COL_NO_TABLE_REPLAY_SILENT_WATERMARKS_HEAP_REDO_START_TS,
-        )
-        .as_u64()
-        .unwrap();
-    let deletion_cutoff_ts = row
-        .val(
-            col_layout,
-            COL_NO_TABLE_REPLAY_SILENT_WATERMARKS_DELETION_CUTOFF_TS,
-        )
-        .as_u64()
-        .unwrap();
-    SilentWatermarkObject {
-        table_id,
-        heap_redo_start_ts: TrxID::new(heap_redo_start_ts),
-        deletion_cutoff_ts: TrxID::new(deletion_cutoff_ts),
-    }
 }
 
 #[inline]

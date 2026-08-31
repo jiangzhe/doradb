@@ -327,7 +327,8 @@ mod tests {
     use crate::buffer::page::{BufferPage, VersionedPageID};
     use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard, PoolRole};
     use crate::catalog::{
-        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexSpec, TableMetadata,
+        StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
+        StorageIndexSpec, TableMetadata,
     };
     use crate::error::{IoError, RuntimeError, RuntimeResult, Validation};
     use crate::file::test_block_id;
@@ -335,7 +336,6 @@ mod tests {
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
     use crate::value::ValKind;
     use error_stack::Report;
-    use semistr::SemiStr;
     use std::future::Future;
     use std::io::Error as StdIoError;
     use std::sync::Arc;
@@ -456,14 +456,13 @@ mod tests {
     fn make_test_metadata() -> Arc<TableMetadata> {
         Arc::new(
             TableMetadata::try_new(
-                vec![ColumnSpec {
-                    column_name: SemiStr::new("id"),
-                    column_type: ValKind::I32,
-                    column_attributes: ColumnAttributes::empty(),
-                }],
-                vec![IndexSpec::new(
-                    vec![IndexKeySpec::new(0)],
-                    IndexAttributes::UK,
+                vec![StorageColumnSpec::new(
+                    ValKind::I32,
+                    StorageColumnFlags::empty(),
+                )],
+                vec![StorageIndexSpec::new(
+                    vec![StorageIndexKey::new(0)],
+                    StorageIndexFlags::UK,
                 )],
             )
             .expect("valid table metadata"),

@@ -24,8 +24,8 @@ Create a table with a schema and indexes, then drop it from an idle session.
 
 ```rust
 use doradb_storage::{
-    ColumnAttributes, ColumnSpec, Engine, EngineConfig, IndexAttributes, IndexKeySpec, IndexSpec,
-    TableSpec, ValKind,
+    Engine, EngineConfig, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags,
+    StorageIndexKey, StorageIndexSpec, StorageTableSpec, ValKind,
 };
 
 let engine = Engine::bootstrap(
@@ -34,18 +34,21 @@ let engine = Engine::bootstrap(
 .await?;
 let mut session = engine.new_session()?;
 
-let table_id = session
+let created = session
     .create_table(
-        TableSpec::new(vec![
-            ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
-            ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+        StorageTableSpec::new(vec![
+            StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+            StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
         ]),
         vec![
-            IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK),
-            IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty()),
+            StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::UK),
+            StorageIndexSpec::new(vec![StorageIndexKey::new(1)], StorageIndexFlags::empty()),
         ],
     )
     .await?;
+let table_id = created.table_id();
+let id_index = created.index_ids()[0];
+let name_index = created.index_ids()[1];
 
 session.drop_table(table_id).await?;
 session.close().await?;
@@ -55,19 +58,17 @@ engine.shutdown()?;
 Insert, update, and delete rows through direct transaction methods.
 
 ```rust
-use doradb_storage::{IndexID, UpdateCol, Val};
+use doradb_storage::{TableIndex, UpdateCol, Val};
 
 let mut trx = session.begin_trx()?;
 
 trx.table_insert_mvcc(table_id, vec![Val::from(1i32), Val::from("alice")])
     .await?;
 
-let id_index = IndexID::new(0);
 let key = [Val::from(1i32)];
 let updated = trx
     .table_update_unique_mvcc(
-        table_id,
-        id_index,
+        TableIndex(table_id, id_index),
         &key,
         vec![UpdateCol {
             idx: 1,
@@ -78,7 +79,7 @@ let updated = trx
 assert!(updated.is_updated());
 
 let deleted = trx
-    .table_delete_unique_mvcc(table_id, id_index, &key)
+    .table_delete_unique_mvcc(TableIndex(table_id, id_index), &key)
     .await?;
 assert!(deleted.is_deleted());
 
@@ -94,7 +95,7 @@ validation again.
 Stream rows, read one unique-key row, and scan matching rows through a secondary index.
 
 ```rust
-use doradb_storage::{IndexID, ScanRowDecision, Val};
+use doradb_storage::{ScanRowDecision, TableIndex, Val};
 
 let mut trx = session.begin_trx()?;
 let mut rows = Vec::new();
@@ -109,12 +110,12 @@ drop(stream);
 
 let id_key = [Val::from(1i32)];
 let _row = trx
-    .table_lookup_unique_mvcc(table_id, IndexID::new(0), &id_key, &[0, 1])
+    .table_lookup_unique_mvcc(TableIndex(table_id, id_index), &id_key, &[0, 1])
     .await?;
 
 let name_key = [Val::from("ada")];
 let _matching_rows = trx
-    .table_index_lookup_mvcc(table_id, IndexID::new(1), &name_key, &[0, 1])
+    .table_index_lookup_mvcc(TableIndex(table_id, name_index), &name_key, &[0, 1])
     .await?
     .unwrap_rows();
 

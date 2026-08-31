@@ -285,9 +285,11 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
                         return false;
                     }
                     let key_vals = index_spec
-                        .cols
+                        .keys
                         .iter()
-                        .map(|key| row.val(self.metadata.col.as_ref(), key.col_no as usize))
+                        .map(|key| {
+                            row.val(self.metadata.col.as_ref(), key.column_ordinal.as_usize())
+                        })
                         .collect::<Vec<_>>();
                     candidate.matches_key(&key_vals)
                 },
@@ -662,9 +664,9 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
                 .filter(|(_, index)| index.unique())
                 .map(|(index_slot, index)| {
                     let vals = index
-                        .cols
+                        .keys
                         .iter()
-                        .map(|key| new_row[key.col_no as usize].clone())
+                        .map(|key| new_row[key.column_ordinal.as_usize()].clone())
                         .collect();
                     branch(
                         SelectKey::new(index_slot, vals),

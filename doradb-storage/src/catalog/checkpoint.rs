@@ -1,7 +1,7 @@
 use crate::buffer::PoolGuard;
 use crate::catalog::storage::tables::TABLE_ID_TABLES;
 use crate::catalog::{
-    Catalog, IndexDdlKind, IndexDdlRootProof, IndexSlot, ReplayVisibleIndexDdl,
+    Catalog, IndexDdlKind, IndexDdlRootProof, IndexRef, IndexSlot, ReplayVisibleIndexDdl,
     classify_index_ddl_root,
 };
 use crate::error::{
@@ -660,21 +660,23 @@ impl Catalog {
             DDLRedo::TableReplaySilentWatermark { .. } => Ok(CatalogCheckpointTxnAction::Include),
             DDLRedo::CreateIndex {
                 table_id,
+                index_id,
                 index_slot,
             } => self.catalog_checkpoint_index_ddl_action(
                 IndexDdlKind::Create,
                 *table_id,
-                *index_slot,
+                IndexRef::new(*index_id, *index_slot),
                 cts,
                 catalog_replay_start_ts,
             ),
             DDLRedo::DropIndex {
                 table_id,
+                index_id,
                 index_slot,
             } => self.catalog_checkpoint_index_ddl_action(
                 IndexDdlKind::Drop,
                 *table_id,
-                *index_slot,
+                IndexRef::new(*index_id, *index_slot),
                 cts,
                 catalog_replay_start_ts,
             ),
@@ -685,7 +687,7 @@ impl Catalog {
         &self,
         kind: IndexDdlKind,
         table_id: TableID,
-        index_slot: IndexSlot,
+        index: IndexRef,
         cts: TrxID,
         catalog_replay_start_ts: TrxID,
     ) -> DataIntegrityResult<CatalogCheckpointTxnAction> {
@@ -699,8 +701,7 @@ impl Catalog {
         // folded into the checkpoint; provisional index DDL advances the safe
         // point but leaves catalog row redo for recovery to skip/replay from
         // the still-authoritative root.
-        let ddl =
-            ReplayVisibleIndexDdl::from_replay_visible(index_slot, cts, catalog_replay_start_ts);
+        let ddl = ReplayVisibleIndexDdl::from_replay_visible(index, cts, catalog_replay_start_ts);
         let proof = classify_index_ddl_root(kind, table_id, ddl, active_root)?;
         drop(table_entry);
         match (kind, proof) {

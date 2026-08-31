@@ -235,14 +235,14 @@ impl CatalogMergeKeyBuilder {
                 .attach("catalog checkpoint primary key not found"));
         };
         let index_spec = primary_key.spec();
-        let mut col_idxs = Vec::with_capacity(index_spec.cols.len());
-        let mut val_types = Vec::with_capacity(index_spec.cols.len());
-        for index_key in &index_spec.cols {
-            let col_idx = usize::from(index_key.col_no);
+        let mut col_idxs = Vec::with_capacity(index_spec.keys.len());
+        let mut val_types = Vec::with_capacity(index_spec.keys.len());
+        for index_key in &index_spec.keys {
+            let col_idx = usize::from(index_key.column_ordinal);
             if col_idx >= metadata.col.col_count() {
                 return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                     "catalog checkpoint primary key column out of range: column_no={}, column_count={}",
-                    index_key.col_no,
+                    index_key.column_ordinal,
                     metadata.col.col_count()
                 )));
             }
@@ -449,28 +449,30 @@ mod tests {
     use crate::id::{RowID, TableID};
     use crate::value::ValKind;
 
-    fn catalog_column_vals(table_id: TableID, column_no: u16, name_len: usize) -> Vec<Val> {
-        let mut name = vec![b'x'; name_len];
-        if let Some(first) = name.first_mut() {
-            *first = b'a' + (column_no % 26) as u8;
-        }
+    fn catalog_column_vals(table_id: TableID, column_no: u16, _name_len: usize) -> Vec<Val> {
         vec![
             Val::from(table_id),
+            Val::from(u32::from(column_no)),
             Val::from(column_no),
-            Val::from(name),
             Val::from(ValKind::U64 as u32),
             Val::from(0u32),
         ]
     }
 
-    fn catalog_table_vals(table_id: TableID, next_index_no: u16) -> Vec<Val> {
-        vec![Val::from(table_id), Val::from(next_index_no)]
+    fn catalog_table_vals(table_id: TableID, index_slot_count: u16) -> Vec<Val> {
+        vec![
+            Val::from(table_id),
+            Val::from(0u64),
+            Val::from(0u64),
+            Val::from(0u64),
+            Val::from(u32::from(index_slot_count)),
+        ]
     }
 
-    fn catalog_table_update(next_index_no: u16) -> Vec<UpdateCol> {
+    fn catalog_table_update(index_slot_count: u16) -> Vec<UpdateCol> {
         vec![UpdateCol {
-            idx: 1,
-            val: Val::from(next_index_no),
+            idx: 4,
+            val: Val::from(u32::from(index_slot_count)),
         }]
     }
 
@@ -513,7 +515,10 @@ mod tests {
             .key_from_select_key(
                 &catalog_key_from_active_ordinal(
                     0,
-                    vec![Val::from(columns_table_id), Val::from(columns_no)],
+                    vec![
+                        Val::from(columns_table_id),
+                        Val::from(u32::from(columns_no)),
+                    ],
                 ),
                 "test",
             )

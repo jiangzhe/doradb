@@ -33,11 +33,11 @@ impl ColumnStorage {
         // initialize column storage and validate secondary root layout.
         let active_root = file.active_root_unchecked();
         let metadata = Arc::clone(&active_root.metadata);
-        if active_root.secondary_index_roots.len() != metadata.idx.index_slot_count() {
+        if active_root.secondary_index_slots.len() != metadata.idx.index_slot_count() {
             return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
                 .attach(format!(
                     "secondary root count mismatch: root_count={}, index_slot_count={}",
-                    active_root.secondary_index_roots.len(),
+                    active_root.secondary_index_slots.len(),
                     metadata.idx.index_slot_count()
                 ))
                 .change_context(RuntimeError::TableAccess)

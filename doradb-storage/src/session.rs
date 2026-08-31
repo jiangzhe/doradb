@@ -1,10 +1,10 @@
 use crate::buffer::page::VersionedPageID;
 use crate::buffer::{BufferPool, PoolGuards};
 use crate::catalog::{
-    Catalog, CatalogCheckpointOutcome, CatalogCheckpointScope, CreateIndexPlan, DropIndexPlan,
-    DropTablePlan, IndexDdlGateScope, IndexID, IndexSpec, PreparedCreateIndex, PreparedCreateTable,
-    PreparedDropIndex, PreparedDropTable, TableSpec, ValidatedCreateTable,
-    create_index_catalog_write_targets, create_table_catalog_write_targets,
+    Catalog, CatalogCheckpointOutcome, CatalogCheckpointScope, CreateIndexPlan, CreateTableOutcome,
+    DropIndexPlan, DropTablePlan, IndexDdlGateScope, IndexID, PreparedCreateIndex,
+    PreparedCreateTable, PreparedDropIndex, PreparedDropTable, StorageIndexSpec, StorageTableSpec,
+    ValidatedCreateTable, create_index_catalog_write_targets, create_table_catalog_write_targets,
     drop_index_catalog_write_targets, drop_table_catalog_write_targets,
     prepare_catalog_checkpoint_operation, reject_non_user_table_id,
     reject_user_table_primary_key_index, validated_index_ddl_target,
@@ -1140,9 +1140,9 @@ impl Session {
     #[inline]
     pub async fn create_table(
         &mut self,
-        table_spec: TableSpec,
-        index_specs: Vec<IndexSpec>,
-    ) -> Result<TableID> {
+        table_spec: StorageTableSpec,
+        index_specs: Vec<StorageIndexSpec>,
+    ) -> Result<CreateTableOutcome> {
         let validated = ValidatedCreateTable::try_new(table_spec, index_specs).disclose()?;
         let operation = self
             .pin_operation(SessionOperationKind::Ddl)
@@ -1173,7 +1173,7 @@ impl Session {
     pub async fn create_index(
         &mut self,
         table_id: TableID,
-        index_spec: IndexSpec,
+        index_spec: StorageIndexSpec,
     ) -> Result<IndexID> {
         reject_user_table_primary_key_index(&index_spec, "create_index").disclose()?;
         reject_non_user_table_id(table_id, "create_index").disclose()?;
@@ -1204,7 +1204,8 @@ impl Session {
             .await
             .attach("operation=create_index")
             .disclose()?;
-        let plan = CreateIndexPlan::new(table_id, table, index_spec).disclose()?;
+        let plan = CreateIndexPlan::new(table_id, table, index_spec, &engine.catalog().storage)
+            .disclose()?;
         let observer = mandatory_runtime
             .submit(PreparedCreateIndex::new(gates, scope, plan))
             .await
@@ -3870,7 +3871,7 @@ pub(crate) mod tests {
     use crate::catalog::storage::tables::TABLE_ID_TABLES;
     use crate::catalog::tests::{table1, table2, wait_for_dropped_table_floor};
     use crate::catalog::{
-        CatalogTable, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec,
+        CatalogTable, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
     };
     use crate::conf::{EngineConfig, TrxSysConfig};
     use crate::engine::Engine;
@@ -4459,18 +4460,18 @@ pub(crate) mod tests {
     async fn create_cache_test_table(session: &mut Session) -> TableID {
         session
             .create_table(
-                TableSpec::new(vec![ColumnSpec::new(
-                    "id",
+                StorageTableSpec::new(vec![StorageColumnSpec::new(
                     ValKind::I32,
-                    ColumnAttributes::empty(),
+                    StorageColumnFlags::empty(),
                 )]),
-                vec![IndexSpec::new(
-                    vec![IndexKeySpec::new(0)],
-                    IndexAttributes::UK,
+                vec![StorageIndexSpec::new(
+                    vec![StorageIndexKey::new(0)],
+                    StorageIndexFlags::UK,
                 )],
             )
             .await
             .unwrap()
+            .table_id()
     }
 
     async fn catalog_row_page_count(table: &CatalogTable, guards: &PoolGuards) -> usize {
@@ -4685,10 +4686,9 @@ pub(crate) mod tests {
             assert_rejected!(
                 session
                     .create_table(
-                        TableSpec::new(vec![ColumnSpec::new(
-                            "id",
+                        StorageTableSpec::new(vec![StorageColumnSpec::new(
                             ValKind::I32,
-                            ColumnAttributes::empty(),
+                            StorageColumnFlags::empty(),
                         )]),
                         vec![],
                     )
@@ -4698,7 +4698,10 @@ pub(crate) mod tests {
                 session
                     .create_index(
                         table_id,
-                        IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::empty(),),
+                        StorageIndexSpec::new(
+                            vec![StorageIndexKey::new(0)],
+                            StorageIndexFlags::empty(),
+                        ),
                     )
                     .await
             );

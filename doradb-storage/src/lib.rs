@@ -41,9 +41,10 @@ mod value;
 pub(crate) use component::{DiskPool, IndexPool, MemPool, MetaPool};
 
 pub use catalog::{
-    CatalogCheckpointOutcome, ColumnAttributes, ColumnSpec, IndexAttributes, IndexID, IndexKeySpec,
-    IndexOrder, IndexSpec, ResolvedTableIndex, TableIndex, TableIndexArgument, TableIndexSelector,
-    TableSpec,
+    CatalogCheckpointOutcome, ColumnID, ColumnOrdinal, CreateTableOutcome, ID_DOMAIN_END, IndexID,
+    IndexOrder, ResolvedTableIndex, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags,
+    StorageIndexKey, StorageIndexSpec, StorageTableSpec, TableIndex, TableIndexArgument,
+    TableIndexSelector,
 };
 pub use conf::{
     DEFAULT_COW_FILE_MAX_SIZE, DEFAULT_TABLE_SCAN_LWC_BLOCKS_PER_PARTITION,

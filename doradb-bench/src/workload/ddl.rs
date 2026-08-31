@@ -389,7 +389,8 @@ async fn run_create_table_operations(
         table_ids.push(
             session
                 .create_table(benchmark_table_spec(), benchmark_index_specs(shape.index))
-                .await?,
+                .await?
+                .table_id(),
         );
         if let (Some(clock), Some(started)) = (clock, started) {
             latency.record(clock.raw_delta_nanos(started, clock.raw())?)?;
@@ -416,7 +417,8 @@ async fn run_table_ddl_operations(
         let started = clock.map(MeasurementClock::raw);
         let table_id = session
             .create_table(benchmark_table_spec(), Vec::new())
-            .await?;
+            .await?
+            .table_id();
         result.operations = checked(result.operations, 1)?;
         session.drop_table(table_id).await?;
         complete_cycle(&mut result, clock, started)?;
@@ -481,17 +483,17 @@ fn checked(current: u64, addition: u64) -> Result<u64> {
 mod tests {
     use super::*;
     use crate::fixture::IndexMode;
-    use doradb_storage::IndexAttributes;
+    use doradb_storage::StorageIndexFlags;
 
     #[test]
     fn schema_index_specs_match_index_mode_without_primary_key() {
         assert!(benchmark_index_specs(IndexMode::None).is_empty());
         let unique = benchmark_index_specs(IndexMode::Unique);
-        assert!(unique[0].attributes.contains(IndexAttributes::UK));
-        assert!(!unique[0].attributes.contains(IndexAttributes::PK));
+        assert!(unique[0].flags.contains(StorageIndexFlags::UK));
+        assert!(!unique[0].flags.contains(StorageIndexFlags::PK));
         assert!(
             benchmark_index_specs(IndexMode::NonUnique)[0]
-                .attributes
+                .flags
                 .is_empty()
         );
     }

@@ -70,10 +70,11 @@ impl TransactionTableBinding {
         let mut admitted_index = None;
         if let Some(selector) = request.selector() {
             let index_id = selector.index_id();
-            let visible_index_slot = index_id
-                .transitional_slot()
-                .ok()
-                .filter(|slot| self.visible.metadata().idx.index_spec(*slot).is_some())
+            let visible_index = self
+                .visible
+                .metadata()
+                .idx
+                .resolve_index_id(index_id)
                 .ok_or_else(|| {
                     Report::new(OperationError::IndexNotFound).attach(format!(
                         "operation={operation}, table_id={table_id}, index_id={index_id}"
@@ -83,9 +84,14 @@ impl TransactionTableBinding {
                 .visible
                 .metadata()
                 .idx
-                .index_spec(visible_index_slot)
+                .index_spec(visible_index.slot())
                 .expect("visible index presence was established above");
             let index = selector.resolve(&self.layout, operation)?;
+            if index != visible_index {
+                return Err(Report::new(OperationError::SchemaChanged).attach(format!(
+                    "operation={operation}, table_id={table_id}, visible_index={visible_index}, current_index={index}"
+                )));
+            }
             let current_spec = self
                 .layout
                 .metadata()
@@ -343,7 +349,7 @@ mod tests {
     use super::*;
     use crate::catalog::tests::table2;
     use crate::catalog::{
-        IndexAttributes, IndexID, IndexKeySpec, IndexSlot, IndexSpec, TableIndex,
+        IndexID, IndexSlot, StorageIndexFlags, StorageIndexKey, StorageIndexSpec, TableIndex,
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
@@ -727,9 +733,9 @@ mod tests {
     fn stale_write_first_rejects_binding_but_retains_transaction_metadata_lock() {
         smol::block_on(async {
             for (attributes, log_file_stem) in [
-                (IndexAttributes::UK, "admission_stale_write_first_unique"),
+                (StorageIndexFlags::UK, "admission_stale_write_first_unique"),
                 (
-                    IndexAttributes::empty(),
+                    StorageIndexFlags::empty(),
                     "admission_stale_write_first_non_unique",
                 ),
             ] {
@@ -745,7 +751,7 @@ mod tests {
                 ddl_session
                     .create_index(
                         table_id,
-                        IndexSpec::new(vec![IndexKeySpec::new(1)], attributes),
+                        StorageIndexSpec::new(vec![StorageIndexKey::new(1)], attributes),
                     )
                     .await
                     .unwrap();
@@ -811,9 +817,9 @@ mod tests {
     fn read_intersection_rejects_both_new_index_kinds_and_later_write() {
         smol::block_on(async {
             for (attributes, log_file_stem) in [
-                (IndexAttributes::UK, "admission_read_intersection_unique"),
+                (StorageIndexFlags::UK, "admission_read_intersection_unique"),
                 (
-                    IndexAttributes::empty(),
+                    StorageIndexFlags::empty(),
                     "admission_read_intersection_non_unique",
                 ),
             ] {
@@ -828,7 +834,7 @@ mod tests {
                 let new_index_id = ddl_session
                     .create_index(
                         table_id,
-                        IndexSpec::new(vec![IndexKeySpec::new(1)], attributes),
+                        StorageIndexSpec::new(vec![StorageIndexKey::new(1)], attributes),
                     )
                     .await
                     .unwrap();
@@ -885,7 +891,7 @@ mod tests {
 
                 let mut fresh_session = engine.new_session().unwrap();
                 let mut fresh_trx = fresh_session.begin_trx().unwrap();
-                if attributes.contains(IndexAttributes::UK) {
+                if attributes.contains(StorageIndexFlags::UK) {
                     let fresh_result = fresh_trx
                         .table_lookup_unique_mvcc(
                             TableIndex(table_id, new_index_id),
@@ -951,7 +957,7 @@ mod tests {
                 .effective_cts();
             let mut create = Box::pin(ddl_session.create_index(
                 table_id,
-                IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty()),
+                StorageIndexSpec::new(vec![StorageIndexKey::new(1)], StorageIndexFlags::empty()),
             ));
             observe_metadata_x_waiter(&engine, metadata, create.as_mut()).await;
             assert_eq!(
@@ -993,7 +999,10 @@ mod tests {
             let index_id = ddl_session
                 .create_index(
                     table_id,
-                    IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty()),
+                    StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(1)],
+                        StorageIndexFlags::empty(),
+                    ),
                 )
                 .await
                 .unwrap();

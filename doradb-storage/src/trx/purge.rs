@@ -1447,8 +1447,8 @@ mod tests {
     use super::*;
     use crate::buffer::page::VersionedPageID;
     use crate::buffer::{BufferPool, PoolGuards, PoolRole};
-    use crate::catalog::IndexSlot;
     use crate::catalog::tests::table1;
+    use crate::catalog::{IndexID, IndexSlot};
     use crate::conf::{DEFAULT_GC_BUCKETS, EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{FatalError, RuntimeError};
@@ -3447,7 +3447,7 @@ mod tests {
                 let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(i as i32)]);
                 let res = trx
                     .table_delete_unique_mvcc(
-                        crate::TableIndex(table_id, key.index_slot.transitional_id()),
+                        crate::TableIndex(table_id, IndexID::new(0)),
                         &key.vals,
                     )
                     .await;
@@ -3525,7 +3525,7 @@ mod tests {
                 let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(i as i32)]);
                 let res = trx
                     .table_delete_unique_mvcc(
-                        crate::TableIndex(table_id, key.index_slot.transitional_id()),
+                        crate::TableIndex(table_id, IndexID::new(0)),
                         &key.vals,
                     )
                     .await;

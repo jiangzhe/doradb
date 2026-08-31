@@ -1,132 +1,105 @@
-use super::index_ref::IndexSlot;
+use super::index_ref::ColumnOrdinal;
+#[cfg(test)]
+use super::index_ref::IndexRef;
 use crate::value::ValKind;
 use bitflags::bitflags;
-use semistr::SemiStr;
 
-/// User-facing table definition used by DDL/create-table paths.
+/// User-facing name-free storage table definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TableSpec {
-    /// Ordered user column definitions for the table.
-    pub columns: Vec<ColumnSpec>,
+pub struct StorageTableSpec {
+    /// Ordered physical column definitions for the table.
+    pub columns: Vec<StorageColumnSpec>,
 }
 
-impl TableSpec {
-    /// Create a table spec from ordered column definitions.
+impl StorageTableSpec {
+    /// Creates a storage table specification from ordered columns.
     #[inline]
-    pub fn new(columns: Vec<ColumnSpec>) -> Self {
+    pub fn new(columns: Vec<StorageColumnSpec>) -> Self {
         Self { columns }
     }
 }
 
-/// Logical column definition in a table schema.
+/// Logical value definition for one physical storage column.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ColumnSpec {
-    /// User-visible column name.
-    pub column_name: SemiStr,
+pub struct StorageColumnSpec {
     /// Logical value kind stored by the column.
-    pub column_type: ValKind,
-    /// Column-level schema attributes.
-    pub column_attributes: ColumnAttributes,
+    pub value_kind: ValKind,
+    /// Column-level storage flags.
+    pub flags: StorageColumnFlags,
 }
 
-impl ColumnSpec {
-    /// Create one column specification.
+impl StorageColumnSpec {
+    /// Creates one storage column specification.
     #[inline]
-    pub fn new(
-        column_name: &str,
-        column_type: ValKind,
-        column_attributes: ColumnAttributes,
-    ) -> Self {
-        Self {
-            column_name: SemiStr::new(column_name),
-            column_type,
-            column_attributes,
-        }
+    pub const fn new(value_kind: ValKind, flags: StorageColumnFlags) -> Self {
+        Self { value_kind, flags }
     }
 }
 
-/// Logical index definition in a table schema.
+/// Name-free storage index definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IndexSpec {
+pub struct StorageIndexSpec {
     /// Ordered index key columns.
-    pub cols: Vec<IndexKeySpec>,
-    /// Index-level schema attributes.
-    pub attributes: IndexAttributes,
+    pub keys: Vec<StorageIndexKey>,
+    /// Index-level storage flags.
+    pub flags: StorageIndexFlags,
 }
 
-impl IndexSpec {
-    /// Create one index specification.
+impl StorageIndexSpec {
+    /// Creates one storage index specification.
     #[inline]
-    pub fn new(cols: Vec<IndexKeySpec>, attributes: IndexAttributes) -> Self {
-        Self { cols, attributes }
+    pub fn new(keys: Vec<StorageIndexKey>, flags: StorageIndexFlags) -> Self {
+        Self { keys, flags }
     }
 
     /// Return whether this index enforces uniqueness.
     #[inline]
     pub fn unique(&self) -> bool {
-        self.attributes.contains(IndexAttributes::PK)
-            || self.attributes.contains(IndexAttributes::UK)
+        self.flags.contains(StorageIndexFlags::PK) || self.flags.contains(StorageIndexFlags::UK)
     }
 
     /// Return whether this index is the table primary key.
     #[inline]
     pub fn primary_key(&self) -> bool {
-        self.attributes.contains(IndexAttributes::PK)
-    }
-}
-
-/// One active index definition paired with its physical table-local slot.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ActiveIndexSpec {
-    /// Physical table-local index slot.
-    pub(crate) index_slot: IndexSlot,
-    /// Logical index definition stored in this slot.
-    pub(crate) spec: IndexSpec,
-}
-
-impl ActiveIndexSpec {
-    /// Create one active index specification.
-    #[inline]
-    pub(crate) fn new(index_slot: IndexSlot, spec: IndexSpec) -> Self {
-        Self { index_slot, spec }
+        self.flags.contains(StorageIndexFlags::PK)
     }
 }
 
 bitflags! {
-    /// Column-level attributes for schema definition.
+    /// Column-level flags for storage schema definition.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct ColumnAttributes: u32 {
-        // whether value can be null.
+    pub struct StorageColumnFlags: u32 {
+        /// The column accepts `NULL` values.
         const NULLABLE = 0x01;
-        // whether it belongs to any index.
-        const INDEX = 0x02;
     }
 }
 
 bitflags! {
-    /// Index-level attributes for schema definition.
+    /// Index-level flags for storage schema definition.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct IndexAttributes: u32 {
+    pub struct StorageIndexFlags: u32 {
+        /// The index is a primary key.
         const PK = 0x01;
+        /// The index enforces uniqueness.
         const UK = 0x02;
     }
 }
 
 /// One indexed column descriptor inside an index definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IndexKeySpec {
-    /// User-column number included in this key position.
-    pub col_no: u16,
+pub struct StorageIndexKey {
+    /// Physical storage-column ordinal included in this key position.
+    pub column_ordinal: ColumnOrdinal,
     /// Sort direction for this key column.
     pub order: IndexOrder,
 }
 
-impl IndexKeySpec {
-    /// Create an index key on one user column with ascending order.
+impl StorageIndexKey {
+    /// Creates an ascending index key on one storage column.
     #[inline]
-    pub fn new(col_no: u16) -> Self {
-        IndexKeySpec {
-            col_no,
+    pub const fn new(column_ordinal: u16) -> Self {
+        StorageIndexKey {
+            column_ordinal: ColumnOrdinal::new(column_ordinal),
             order: IndexOrder::Asc,
         }
     }
@@ -140,13 +113,34 @@ pub enum IndexOrder {
     Desc = 1,
 }
 
-impl From<u8> for IndexOrder {
+impl TryFrom<u8> for IndexOrder {
+    type Error = ();
+
     #[inline]
-    fn from(value: u8) -> Self {
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0 => IndexOrder::Asc,
-            1 => IndexOrder::Desc,
-            _ => panic!("unexpected index order"),
+            0 => Ok(IndexOrder::Asc),
+            1 => Ok(IndexOrder::Desc),
+            _ => Err(()),
         }
+    }
+}
+
+/// One active internal index definition paired with its exact generation.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActiveIndexSpec {
+    /// Exact table-local index generation and physical slot.
+    pub(crate) index: IndexRef,
+    /// Logical definition stored in this slot.
+    pub(crate) spec: StorageIndexSpec,
+}
+
+#[cfg(test)]
+impl ActiveIndexSpec {
+    /// Creates one active exact-generation index specification.
+    #[inline]
+    pub(crate) fn new(index: IndexRef, spec: StorageIndexSpec) -> Self {
+        Self { index, spec }
     }
 }

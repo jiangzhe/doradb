@@ -5,8 +5,11 @@ use super::checkpoint_workflow::{
 use super::lifecycle::{CheckpointPublishLease, TableCheckpointRootMutationScope, TableTerminal};
 use crate::buffer::guard::PageGuard;
 use crate::buffer::{PoolGuard, PoolGuards};
+#[cfg(test)]
+use crate::catalog::SecondaryIndexSlot;
 use crate::catalog::{
-    IndexRef, IndexSlot, IndexSpec, SilentWatermarkObject, TableColumnLayout, TableMetadata,
+    IndexRef, IndexSlot, SilentWatermarkObject, TableColumnLayout, TableIndexMetadata,
+    TableMetadata,
 };
 use crate::completion::{Completion, CompletionTake};
 use crate::error::{
@@ -1100,7 +1103,7 @@ enum SecondaryIndexSidecar {
 
 impl SecondaryIndexSidecar {
     #[inline]
-    fn new(metadata: &TableMetadata, index_spec: &IndexSpec) -> Self {
+    fn new(metadata: &TableMetadata, index_spec: &TableIndexMetadata) -> Self {
         if index_spec.unique() {
             Self::Unique {
                 encoder: secondary_disk_tree_encoder(metadata, index_spec, false),
@@ -1219,9 +1222,9 @@ impl SecondaryCheckpointSidecar {
                 ActiveSecondaryIndexSidecar {
                     index,
                     key_cols: index_spec
-                        .cols
+                        .keys
                         .iter()
-                        .map(|index_key| index_key.col_no as usize)
+                        .map(|index_key| index_key.column_ordinal.as_usize())
                         .collect(),
                     sidecar: SecondaryIndexSidecar::new(metadata, index_spec),
                 }
@@ -1352,16 +1355,16 @@ pub(crate) fn prepare_checkpoint_table_operation(
 /// Builds the durable secondary DiskTree key encoder for one index spec.
 pub(crate) fn secondary_disk_tree_encoder(
     metadata: &TableMetadata,
-    index_spec: &IndexSpec,
+    index_spec: &TableIndexMetadata,
     append_row_id: bool,
 ) -> BTreeKeyEncoder {
     assert!(
-        !index_spec.cols.is_empty(),
+        !index_spec.keys.is_empty(),
         "secondary-index encoder invariant violated: index has no key columns"
     );
-    let mut types = Vec::with_capacity(index_spec.cols.len() + usize::from(append_row_id));
-    for key in &index_spec.cols {
-        let col_no = key.col_no as usize;
+    let mut types = Vec::with_capacity(index_spec.keys.len() + usize::from(append_row_id));
+    for key in &index_spec.keys {
+        let col_no = key.column_ordinal.as_usize();
         let ty = metadata
             .col
             .col_types()
@@ -1441,11 +1444,11 @@ impl Table {
         reachable: &mut BTreeSet<BlockID>,
         disk_guard: &PoolGuard,
     ) -> RuntimeResult<()> {
-        if root.secondary_index_roots.len() != layout.index_slot_count() {
+        if root.secondary_index_slots.len() != layout.index_slot_count() {
             return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
                 .attach(format!(
                     "secondary root count mismatch: root_count={}, index_slot_count={}",
-                    root.secondary_index_roots.len(),
+                    root.secondary_index_slots.len(),
                     layout.index_slot_count()
                 ))
                 .change_context(RuntimeError::CheckpointExecution)
@@ -1486,24 +1489,12 @@ impl Table {
             let index_slot = IndexSlot::try_from(index_slot).unwrap_or_else(|_| {
                 panic!("validated runtime index slot exceeds u16: index_slot={index_slot}")
             });
-            let root_block_id = root.secondary_index_roots[index_slot.as_usize()];
             let Some(index) = index.as_ref() else {
-                if root_block_id != SUPER_BLOCK_ID {
-                    return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
-                        .attach(format!(
-                            "inactive secondary index slot has root: index_slot={index_slot}, root={root_block_id}"
-                        ))
-                        .change_context(RuntimeError::CheckpointExecution)
-                        .attach(format!(
-                            "operation=collect_root_reachable_blocks, table_id={}, root_ts={}",
-                            self.table_id(), root.root_ts
-                        )));
-                }
                 continue;
             };
-            if root_block_id == SUPER_BLOCK_ID {
+            let Some(root_block_id) = root.secondary_index_root(index_slot) else {
                 continue;
-            }
+            };
             let runtime = index.runtime().disk_runtime();
             runtime
                 .collect_reachable_blocks(root_block_id, disk_guard, &mut root_reachable)
@@ -1786,11 +1777,11 @@ impl Table {
         #[cfg(test)]
         test_hooks::maybe_force_secondary_sidecar_error(maintenance_test)?;
 
-        if mutable_file.secondary_index_roots().len() != metadata.idx.index_slot_count() {
+        if mutable_file.secondary_index_slots().len() != metadata.idx.index_slot_count() {
             return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
                 .attach(format!(
                     "secondary root count mismatch: root_count={}, index_slot_count={}",
-                    mutable_file.secondary_index_roots().len(),
+                    mutable_file.secondary_index_slots().len(),
                     metadata.idx.index_slot_count()
                 ))
                 .change_context(RuntimeError::CheckpointExecution)
@@ -2576,7 +2567,7 @@ fn silent_watermark_floor(
     // logical root fields before this decision:
     // - pivot_row_id for persisted row coverage,
     // - column_block_index_root for LWC inserts or cold-delete rewrites,
-    // - secondary_index_roots for secondary DiskTree checkpoint work,
+    // - secondary_index_slots for secondary DiskTree checkpoint work,
     // - metadata for table/index shape changes,
     // - alloc_map for CoW reachability/allocation changes.
     // Replay bounds are intentionally excluded because those are the catalog
@@ -2585,7 +2576,7 @@ fn silent_watermark_floor(
     // silent-vs-root-publication decision.
     let table_file_work = active_root.pivot_row_id != mutable_root.pivot_row_id
         || active_root.column_block_index_root != mutable_root.column_block_index_root
-        || active_root.secondary_index_roots != mutable_root.secondary_index_roots
+        || active_root.secondary_index_slots != mutable_root.secondary_index_slots
         || active_root.metadata != mutable_root.metadata
         || active_root.alloc_map != mutable_root.alloc_map;
     if table_file_work {
@@ -2629,8 +2620,8 @@ mod tests {
     use crate::buffer::page::VersionedPageID;
     use crate::catalog::tests::wait_for_dropped_table_floor;
     use crate::catalog::{
-        ColumnAttributes, ColumnSpec, CurrentTableState, IndexSlot, ResolvedVisibleTableMetadata,
-        TableCache, TableSpec,
+        CurrentTableState, IndexID, IndexSlot, ResolvedVisibleTableMetadata, StorageColumnFlags,
+        StorageColumnSpec, StorageTableSpec, TableCache,
     };
     use crate::completion::{Completion, CompletionTake};
     use crate::conf::TrxSysConfig;
@@ -3583,7 +3574,11 @@ mod tests {
                 .file()
                 .active_root_unchecked()
                 .clone();
-            assert_ne!(active_root.secondary_index_roots[0], SUPER_BLOCK_ID);
+            assert!(
+                active_root
+                    .secondary_index_root(IndexSlot::new(0))
+                    .is_some()
+            );
             let reader = session.begin_trx().unwrap();
             for key_value in 0..3 {
                 let key = single_key(key_value);
@@ -3644,7 +3639,7 @@ mod tests {
             assert_eq!(observed.deletion_cutoff_ts, active_root.deletion_cutoff_ts);
             assert_eq!(
                 observed.secondary_index_root,
-                active_root.secondary_index_roots[0]
+                active_root.secondary_index_root(IndexSlot::new(0))
             );
             assert_eq!(observed.visible, active_root.effective_ts() < observed.sts);
             trx.rollback().await.unwrap();
@@ -3659,15 +3654,15 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let table_id = session
                 .create_table(
-                    TableSpec::new(vec![ColumnSpec::new(
-                        "payload",
+                    StorageTableSpec::new(vec![StorageColumnSpec::new(
                         ValKind::VarByte,
-                        ColumnAttributes::empty(),
+                        StorageColumnFlags::empty(),
                     )]),
                     vec![],
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .table_id();
             let table = table_for_internal_assertion(&engine, table_id);
             let metadata = table.metadata();
             let guards = session.pool_guards();
@@ -3734,15 +3729,15 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let table_id = session
                 .create_table(
-                    TableSpec::new(vec![ColumnSpec::new(
-                        "value",
+                    StorageTableSpec::new(vec![StorageColumnSpec::new(
                         ValKind::U32,
-                        ColumnAttributes::empty(),
+                        StorageColumnFlags::empty(),
                     )]),
                     vec![],
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .table_id();
             let table = table_for_internal_assertion(&engine, table_id);
             let metadata = table.metadata();
             let guards = session.pool_guards();
@@ -4130,14 +4125,15 @@ mod tests {
             let mut ddl_session = engine.new_session().unwrap();
             let table_id = ddl_session
                 .create_table(
-                    TableSpec::new(vec![
-                        ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
-                        ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                    StorageTableSpec::new(vec![
+                        StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+                        StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
                     ]),
                     vec![],
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .table_id();
             drop(ddl_session);
 
             let mut session = engine.new_session().unwrap();
@@ -4184,7 +4180,7 @@ mod tests {
                 table
                     .file()
                     .active_root_unchecked()
-                    .secondary_index_roots
+                    .secondary_index_slots
                     .is_empty()
             );
             for row_id in row_ids
@@ -4398,8 +4394,8 @@ mod tests {
                 root_before.column_block_index_root
             );
             assert_eq!(
-                root_after.secondary_index_roots,
-                root_before.secondary_index_roots
+                root_after.secondary_index_slots,
+                root_before.secondary_index_slots
             );
         });
     }
@@ -7114,10 +7110,7 @@ mod tests {
             let mut writer = writer_session.begin_trx().unwrap();
             let writer_status = transaction_status_for_test(&writer);
             let deleted = writer
-                .table_delete_unique_mvcc(
-                    crate::TableIndex(table_id, key.index_slot.transitional_id()),
-                    &key.vals,
-                )
+                .table_delete_unique_mvcc(crate::TableIndex(table_id, IndexID::new(0)), &key.vals)
                 .await
                 .unwrap();
             assert_eq!(deleted, DeleteMvcc::Deleted);
@@ -9032,8 +9025,9 @@ mod tests {
                 .file()
                 .active_root_unchecked()
                 .clone();
-            let dropped_disk_root = indexed_root.secondary_index_roots[0];
-            assert_ne!(dropped_disk_root, SUPER_BLOCK_ID);
+            let dropped_disk_root = indexed_root
+                .secondary_index_root(IndexSlot::new(0))
+                .expect("checkpointed secondary index should have a DiskTree root");
             assert!(
                 indexed_root
                     .alloc_map
@@ -9075,7 +9069,10 @@ mod tests {
                 panic!("DROP INDEX must leave the table live");
             };
             assert!(metadata.idx.index_spec(IndexSlot::new(0)).is_none());
-            assert_eq!(after_drop_root.secondary_index_roots[0], SUPER_BLOCK_ID);
+            assert_eq!(
+                after_drop_root.secondary_index_slots[0],
+                SecondaryIndexSlot::Retired(crate::IndexID::new(0))
+            );
             assert!(
                 after_drop_root
                     .alloc_map
@@ -9153,7 +9150,10 @@ mod tests {
             .unwrap();
             let recovered_table = table_for_internal_assertion(&recovered, table_id);
             let recovered_root = recovered_table.file().active_root_unchecked();
-            assert_eq!(recovered_root.secondary_index_roots[0], SUPER_BLOCK_ID);
+            assert_eq!(
+                recovered_root.secondary_index_slots[0],
+                SecondaryIndexSlot::Retired(crate::IndexID::new(0))
+            );
             assert!(
                 !recovered_root
                     .alloc_map

@@ -20,7 +20,7 @@ mod timeline;
 use crate::buffer::BufferPool;
 use crate::buffer::guard::PageGuard;
 use crate::catalog::{
-    CatalogTable, IndexDdlKind, IndexDdlRootProof, IndexSlot, ReplayVisibleIndexDdl,
+    CatalogTable, IndexDdlKind, IndexDdlRootProof, IndexRef, ReplayVisibleIndexDdl,
     TableColumnLayout, classify_index_ddl_root,
 };
 use crate::error::{
@@ -564,11 +564,11 @@ impl<'a> RecoveryCoordinator<'a> {
                 let pending = self.pending_index_ddl_reconciliations.contains(&table_id);
                 return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
                     .attach(format!(
-                        "recovered user table metadata mismatch after redo replay: table_id={table_id}, root_ts={}, catalog_replay_start_ts={}, pending_index_ddl_reconciliation={pending}, catalog_next_index_slot={}, root_next_index_slot={}",
+                        "recovered user table metadata mismatch after redo replay: table_id={table_id}, root_ts={}, catalog_replay_start_ts={}, pending_index_ddl_reconciliation={pending}, catalog_index_slot_count={}, root_index_slot_count={}",
                         active_root.root_ts,
                         self.timeline.catalog_replay_start_ts,
-                        catalog_metadata.idx.next_index_slot(),
-                        active_root.metadata.idx.next_index_slot()
+                        catalog_metadata.idx.index_slot_count_u32(),
+                        active_root.metadata.idx.index_slot_count_u32()
                     ))
                     .change_context(RuntimeError::Recovery));
             }
@@ -652,16 +652,23 @@ impl<'a> RecoveryCoordinator<'a> {
             DDLRedo::DropTable(table_id) => self.replay_drop_table_ddl(table_id, dml, cts).await?,
             DDLRedo::CreateIndex {
                 table_id,
+                index_id,
                 index_slot,
             } => {
-                self.replay_create_index_ddl(table_id, index_slot, dml, cts)
-                    .await?
+                self.replay_create_index_ddl(
+                    table_id,
+                    IndexRef::new(index_id, index_slot),
+                    dml,
+                    cts,
+                )
+                .await?
             }
             DDLRedo::DropIndex {
                 table_id,
+                index_id,
                 index_slot,
             } => {
-                self.replay_drop_index_ddl(table_id, index_slot, dml, cts)
+                self.replay_drop_index_ddl(table_id, IndexRef::new(index_id, index_slot), dml, cts)
                     .await?
             }
             DDLRedo::CreateRowPage {
@@ -798,7 +805,7 @@ impl<'a> RecoveryCoordinator<'a> {
     async fn replay_create_index_ddl(
         &mut self,
         table_id: TableID,
-        index_slot: IndexSlot,
+        index: IndexRef,
         dml: BTreeMap<TableID, TableDML>,
         cts: TrxID,
     ) -> RuntimeResult<()> {
@@ -813,13 +820,30 @@ impl<'a> RecoveryCoordinator<'a> {
             return Ok(());
         }
         let proof = self
-            .classify_index_ddl_root(IndexDdlKind::Create, table_id, index_slot, cts)
+            .classify_index_ddl_root(IndexDdlKind::Create, table_id, index, cts)
             .change_context(RuntimeError::Recovery)?;
         match proof {
             IndexDdlRootProof::DurableFinalCreate | IndexDdlRootProof::DurableAllocationOnly => {
                 self.replay_catalog_modifications(dml).await?;
             }
-            IndexDdlRootProof::Provisional => {}
+            IndexDdlRootProof::Provisional => {
+                let table = self.resources.catalog.get_table_now(table_id);
+                let generations = table
+                    .as_ref()
+                    .map(|table| {
+                        table
+                            .file()
+                            .active_root_unchecked()
+                            .secondary_index_slots
+                            .as_slice()
+                    })
+                    .unwrap_or(&[]);
+                self.resources
+                    .catalog
+                    .storage
+                    .reserve_provisional_index(table_id, index, cts, generations)
+                    .change_context(RuntimeError::Recovery)?;
+            }
             IndexDdlRootProof::DurableFinalDrop => {
                 unreachable!("create-index root proof cannot classify as durable final drop")
             }
@@ -830,7 +854,7 @@ impl<'a> RecoveryCoordinator<'a> {
     async fn replay_drop_index_ddl(
         &mut self,
         table_id: TableID,
-        index_slot: IndexSlot,
+        index: IndexRef,
         dml: BTreeMap<TableID, TableDML>,
         cts: TrxID,
     ) -> RuntimeResult<()> {
@@ -845,7 +869,7 @@ impl<'a> RecoveryCoordinator<'a> {
             return Ok(());
         }
         let proof = self
-            .classify_index_ddl_root(IndexDdlKind::Drop, table_id, index_slot, cts)
+            .classify_index_ddl_root(IndexDdlKind::Drop, table_id, index, cts)
             .change_context(RuntimeError::Recovery)?;
         match proof {
             IndexDdlRootProof::DurableFinalDrop => {
@@ -977,7 +1001,7 @@ impl<'a> RecoveryCoordinator<'a> {
         &self,
         kind: IndexDdlKind,
         table_id: TableID,
-        index_slot: IndexSlot,
+        index: IndexRef,
         cts: TrxID,
     ) -> DataIntegrityResult<IndexDdlRootProof> {
         let table = self.resources.catalog.get_table_now(table_id);
@@ -985,7 +1009,7 @@ impl<'a> RecoveryCoordinator<'a> {
             .as_ref()
             .map(|table| table.file().active_root_unchecked());
         let ddl = ReplayVisibleIndexDdl::from_replay_visible(
-            index_slot,
+            index,
             cts,
             self.timeline.catalog_replay_start_ts,
         );
@@ -1267,16 +1291,17 @@ mod tests {
     use crate::catalog::storage::publish_first_redo_log_seq_for_test;
     use crate::catalog::storage::tests::begin_catalog_test_trx;
     use crate::catalog::{
-        ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexAttributes, IndexColumnObject,
-        IndexKeySpec, IndexObject, IndexOrder, IndexSlot, IndexSpec, TableMetadata, TableObject,
-        TableSpec, USER_TABLE_ID_START, catalog_key_from_active_ordinal,
+        ActiveIndexSpec, ColumnID, ColumnOrdinal, IndexID, IndexObject, IndexOrder, IndexRef,
+        IndexSlot, SecondaryIndexRoot, SecondaryIndexSlot, StorageColumnFlags, StorageColumnSpec,
+        StorageIndexFlags, StorageIndexKey, StorageIndexSpec, StorageTableSpec, TableIndexKeySpec,
+        TableMetadata, TableObject, USER_TABLE_ID_START, catalog_key_from_active_ordinal,
     };
     use crate::component::EnginePools;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{CompletionErrorBridge, DataIntegrityError, Error, ErrorKind, RuntimeError};
     use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
-    use crate::file::cow_file::{COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID};
+    use crate::file::cow_file::COW_FILE_PAGE_SIZE;
     use crate::file::table_file::MutableTableFile;
     use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
     use crate::index::{COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE, ColumnBlockIndex, RowLocation};
@@ -1682,55 +1707,72 @@ mod tests {
         )
     }
 
-    fn index_ddl_columns() -> Vec<ColumnSpec> {
+    fn index_ddl_columns() -> Vec<StorageColumnSpec> {
         vec![
-            ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
-            ColumnSpec::new("value", ValKind::I32, ColumnAttributes::empty()),
+            StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+            StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
         ]
     }
 
-    fn base_unique_index_spec() -> IndexSpec {
-        IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK)
+    fn base_unique_index_spec() -> StorageIndexSpec {
+        StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::UK)
     }
 
-    fn added_index_spec() -> IndexSpec {
-        IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty())
+    fn added_index_spec() -> StorageIndexSpec {
+        StorageIndexSpec::new(vec![StorageIndexKey::new(1)], StorageIndexFlags::empty())
     }
 
     fn created_index_metadata() -> Arc<TableMetadata> {
-        Arc::new(
-            TableMetadata::try_new_with_next_index_slot(
-                index_ddl_columns(),
-                vec![
-                    ActiveIndexSpec::new(IndexSlot::new(0), base_unique_index_spec()),
-                    ActiveIndexSpec::new(IndexSlot::new(1), added_index_spec()),
-                ],
-                IndexSlot::new(2),
-            )
-            .unwrap(),
+        let mut metadata = TableMetadata::try_new_with_index_slot_count(
+            index_ddl_columns(),
+            vec![
+                ActiveIndexSpec::new(
+                    IndexRef::new(IndexID::new(0), IndexSlot::new(0)),
+                    base_unique_index_spec(),
+                ),
+                ActiveIndexSpec::new(
+                    IndexRef::new(IndexID::new(1), IndexSlot::new(1)),
+                    added_index_spec(),
+                ),
+            ],
+            IndexSlot::new(2),
         )
+        .unwrap();
+        metadata.storage_epoch = 1;
+        Arc::new(metadata)
     }
 
     fn dropped_index_metadata() -> Arc<TableMetadata> {
-        Arc::new(
-            TableMetadata::try_new_with_next_index_slot(
-                index_ddl_columns(),
-                vec![ActiveIndexSpec::new(
-                    IndexSlot::new(0),
+        let metadata = TableMetadata::try_new_with_index_slot_count(
+            index_ddl_columns(),
+            vec![
+                ActiveIndexSpec::new(
+                    IndexRef::new(IndexID::new(0), IndexSlot::new(0)),
                     base_unique_index_spec(),
-                )],
-                IndexSlot::new(2),
-            )
-            .unwrap(),
+                ),
+                ActiveIndexSpec::new(
+                    IndexRef::new(IndexID::new(1), IndexSlot::new(1)),
+                    added_index_spec(),
+                ),
+            ],
+            IndexSlot::new(2),
         )
+        .unwrap()
+        .without_index(IndexRef::new(IndexID::new(1), IndexSlot::new(1)))
+        .unwrap();
+        Arc::new(metadata)
     }
 
-    async fn create_index_ddl_base_table(engine: &Engine, indexes: Vec<IndexSpec>) -> TableID {
+    async fn create_index_ddl_base_table(
+        engine: &Engine,
+        indexes: Vec<StorageIndexSpec>,
+    ) -> TableID {
         let mut session = engine.new_session().unwrap();
         let table_id = session
-            .create_table(TableSpec::new(index_ddl_columns()), indexes)
+            .create_table(StorageTableSpec::new(index_ddl_columns()), indexes)
             .await
-            .unwrap();
+            .unwrap()
+            .table_id();
         drop(session);
         table_id
     }
@@ -1749,7 +1791,10 @@ mod tests {
                     trx.trx(),
                     &TableObject {
                         table_id,
-                        next_index_slot: IndexSlot::new(2),
+                        storage_epoch: 1,
+                        next_column_id: 2,
+                        next_index_id: 2,
+                        index_slot_count: 2,
                     },
                 )
                 .await
@@ -1765,26 +1810,14 @@ mod tests {
                 trx.trx(),
                 &IndexObject {
                     table_id,
-                    index_slot: IndexSlot::new(1),
-                    index_attributes: IndexAttributes::empty(),
-                },
-            )
-            .await
-            .unwrap();
-        engine
-            .inner()
-            .core
-            .catalog()
-            .storage
-            .index_columns()
-            .insert(
-                trx.trx(),
-                &IndexColumnObject {
-                    table_id,
-                    index_slot: IndexSlot::new(1),
-                    index_column_no: 0,
-                    column_no: 1,
-                    index_order: IndexOrder::Asc,
+                    index: IndexRef::new(IndexID::new(1), IndexSlot::new(1)),
+                    index_flags: StorageIndexFlags::empty(),
+                    keys: vec![TableIndexKeySpec {
+                        column_id: ColumnID::new(1),
+                        column_ordinal: ColumnOrdinal::new(1),
+                        order: IndexOrder::Asc,
+                    }]
+                    .into_boxed_slice(),
                 },
             )
             .await
@@ -1792,6 +1825,7 @@ mod tests {
         let cts = trx
             .commit(DDLRedo::CreateIndex {
                 table_id,
+                index_id: IndexID::new(1),
                 index_slot: IndexSlot::new(1),
             })
             .await;
@@ -1802,17 +1836,25 @@ mod tests {
     async fn commit_drop_index_catalog_ddl(engine: &Engine, table_id: TableID) -> TrxID {
         let session = engine.new_session().unwrap();
         let mut trx = begin_catalog_test_trx(&session);
-        assert_eq!(
+        assert!(
             engine
                 .inner()
                 .core
                 .catalog()
                 .storage
-                .index_columns()
-                .delete_by_index(trx.trx(), table_id, IndexSlot::new(1))
+                .tables()
+                .replace(
+                    trx.trx(),
+                    &TableObject {
+                        table_id,
+                        storage_epoch: 1,
+                        next_column_id: 2,
+                        next_index_id: 2,
+                        index_slot_count: 2,
+                    },
+                )
                 .await
-                .unwrap(),
-            1
+                .unwrap()
         );
         assert!(
             engine
@@ -1821,13 +1863,14 @@ mod tests {
                 .catalog()
                 .storage
                 .indexes()
-                .delete_by_id(trx.trx(), table_id, IndexSlot::new(1))
+                .delete_by_id(trx.trx(), table_id, IndexID::new(1))
                 .await
                 .unwrap()
         );
         let cts = trx
             .commit(DDLRedo::DropIndex {
                 table_id,
+                index_id: IndexID::new(1),
                 index_slot: IndexSlot::new(1),
             })
             .await;
@@ -1849,15 +1892,27 @@ mod tests {
             .await
             .unwrap();
         let table_file = Arc::clone(table.file());
-        let mut roots = table_file
+        let mut slots = table_file
             .active_root_unchecked()
-            .secondary_index_roots
+            .secondary_index_slots
             .clone();
-        roots.resize(metadata.idx.index_slot_count(), SUPER_BLOCK_ID);
-        for (index_slot, root) in roots.iter_mut().enumerate() {
+        slots.resize(metadata.idx.index_slot_count(), SecondaryIndexSlot::Vacant);
+        for (index_slot, state) in slots.iter_mut().enumerate() {
             let index_slot = IndexSlot::try_from(index_slot).unwrap();
-            if metadata.idx.index_spec(index_slot).is_none() {
-                *root = SUPER_BLOCK_ID;
+            match metadata.idx.index_spec(index_slot) {
+                Some(index) => {
+                    if state.index_id() != Some(index.index.id()) {
+                        *state = SecondaryIndexSlot::Active {
+                            index_id: index.index.id(),
+                            root: SecondaryIndexRoot::Empty,
+                        };
+                    }
+                }
+                None => {
+                    if let SecondaryIndexSlot::Active { index_id, .. } = *state {
+                        *state = SecondaryIndexSlot::Retired(index_id);
+                    }
+                }
             }
         }
         let mut mutable = MutableTableFile::fork(
@@ -1866,7 +1921,7 @@ mod tests {
             table.disk_pool().clone(),
             engine.inner().core.pools.pool_guards().disk_guard().clone(),
         );
-        mutable.replace_metadata_and_secondary_index_roots(metadata, roots);
+        mutable.replace_metadata_and_secondary_index_slots(metadata, slots);
         engine
             .inner()
             .trx_sys
@@ -1879,7 +1934,7 @@ mod tests {
     async fn assert_recovered_index_state(
         engine: &Engine,
         table_id: TableID,
-        next_index_slot: IndexSlot,
+        index_slot_count: u32,
         index_one_active: bool,
     ) {
         let table = engine
@@ -1890,7 +1945,7 @@ mod tests {
             .await
             .unwrap();
         let metadata = table.metadata();
-        assert_eq!(metadata.idx.next_index_slot(), next_index_slot);
+        assert_eq!(metadata.idx.index_slot_count_u32(), index_slot_count);
         assert_eq!(
             metadata
                 .idx
@@ -1910,7 +1965,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(table_obj.next_index_slot, next_index_slot);
+        assert_eq!(table_obj.index_slot_count, index_slot_count);
         let indexes = engine
             .inner()
             .core
@@ -1923,7 +1978,7 @@ mod tests {
         assert_eq!(
             indexes
                 .iter()
-                .any(|index| index.index_slot == IndexSlot::new(1)),
+                .any(|index| index.index == IndexRef::new(IndexID::new(1), IndexSlot::new(1))),
             index_one_active
         );
         drop(session);
@@ -2223,7 +2278,7 @@ mod tests {
     }
 
     #[test]
-    fn test_recovery_skips_provisional_create_index_redo() {
+    fn test_recovery_quarantines_provisional_create_before_later_durable_create() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
@@ -2246,12 +2301,104 @@ mod tests {
             drop(engine);
 
             let recovered = Engine::bootstrap(lightweight_recovery_engine_config(
+                main_dir.clone(),
+                "recover-provisional-create-index",
+            ))
+            .await
+            .unwrap();
+            assert_recovered_index_state(&recovered, table_id, 1, false).await;
+
+            let mut session = recovered.new_session().unwrap();
+            let later_id = session
+                .create_index(table_id, added_index_spec())
+                .await
+                .unwrap();
+            assert_eq!(later_id, IndexID::new(2));
+            let table = recovered
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
+            assert_eq!(table.metadata().idx.index_slot_count_u32(), 3);
+            assert_eq!(
+                table.file().active_root_unchecked().secondary_index_slots[1],
+                SecondaryIndexSlot::Vacant
+            );
+            assert!(matches!(
+                table.file().active_root_unchecked().secondary_index_slots[2],
+                SecondaryIndexSlot::Active {
+                    index_id,
+                    root: SecondaryIndexRoot::Empty,
+                } if index_id == later_id
+            ));
+            drop(table);
+            drop(session);
+            drop(recovered);
+
+            let recovered = Engine::bootstrap(lightweight_recovery_engine_config(
+                main_dir.clone(),
+                "recover-provisional-create-index",
+            ))
+            .await
+            .unwrap();
+            let table = recovered
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
+            assert_eq!(
+                table
+                    .metadata()
+                    .idx
+                    .resolve_index_id(later_id)
+                    .unwrap()
+                    .slot(),
+                IndexSlot::new(2)
+            );
+            assert_eq!(
+                table.file().active_root_unchecked().secondary_index_slots[1],
+                SecondaryIndexSlot::Vacant
+            );
+            drop(table);
+            recovered
+                .new_session()
+                .unwrap()
+                .checkpoint_catalog()
+                .await
+                .unwrap();
+            drop(recovered);
+
+            let recovered = Engine::bootstrap(lightweight_recovery_engine_config(
                 main_dir,
                 "recover-provisional-create-index",
             ))
             .await
             .unwrap();
-            assert_recovered_index_state(&recovered, table_id, IndexSlot::new(1), false).await;
+            let table = recovered
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .await
+                .unwrap();
+            assert_eq!(
+                table
+                    .metadata()
+                    .idx
+                    .resolve_index_id(later_id)
+                    .unwrap()
+                    .slot(),
+                IndexSlot::new(2)
+            );
+            assert_eq!(
+                table.file().active_root_unchecked().secondary_index_slots[1],
+                SecondaryIndexSlot::Vacant
+            );
+            drop(table);
             drop(recovered);
         });
     }
@@ -2286,7 +2433,7 @@ mod tests {
             ))
             .await
             .unwrap();
-            assert_recovered_index_state(&recovered, table_id, IndexSlot::new(2), true).await;
+            assert_recovered_index_state(&recovered, table_id, 2, true).await;
             drop(recovered);
         });
     }
@@ -2324,7 +2471,7 @@ mod tests {
             ))
             .await
             .unwrap();
-            assert_recovered_index_state(&recovered, table_id, IndexSlot::new(2), false).await;
+            assert_recovered_index_state(&recovered, table_id, 2, false).await;
             drop(recovered);
         });
     }
@@ -2363,7 +2510,7 @@ mod tests {
             ))
             .await
             .unwrap();
-            assert_recovered_index_state(&recovered, table_id, IndexSlot::new(2), false).await;
+            assert_recovered_index_state(&recovered, table_id, 2, false).await;
             drop(recovered);
         });
     }
@@ -2399,7 +2546,7 @@ mod tests {
             ))
             .await
             .unwrap();
-            assert_recovered_index_state(&recovered, table_id, IndexSlot::new(2), true).await;
+            assert_recovered_index_state(&recovered, table_id, 2, true).await;
             drop(recovered);
         });
     }
@@ -2438,7 +2585,7 @@ mod tests {
             ))
             .await
             .unwrap();
-            assert_recovered_index_state(&recovered, table_id, IndexSlot::new(2), false).await;
+            assert_recovered_index_state(&recovered, table_id, 2, false).await;
             drop(recovered);
         });
     }
@@ -2480,7 +2627,7 @@ mod tests {
             ))
             .await
             .unwrap();
-            assert_recovered_index_state(&recovered, table_id, IndexSlot::new(1), false).await;
+            assert_recovered_index_state(&recovered, table_id, 1, false).await;
             drop(recovered);
         });
     }
@@ -2523,7 +2670,7 @@ mod tests {
             ))
             .await
             .unwrap();
-            assert_recovered_index_state(&recovered, table_id, IndexSlot::new(2), true).await;
+            assert_recovered_index_state(&recovered, table_id, 2, true).await;
             drop(recovered);
         });
     }
@@ -2729,29 +2876,33 @@ mod tests {
             .unwrap();
 
             let mut session = engine.new_session().unwrap();
-            let table_spec = TableSpec::new(vec![
-                ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
-                ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::empty()),
-                ColumnSpec::new("c2", ValKind::U32, ColumnAttributes::empty()),
+            let table_spec = StorageTableSpec::new(vec![
+                StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
             ]);
             let index_specs = vec![
-                IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK),
-                IndexSpec::new(
+                StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::UK),
+                StorageIndexSpec::new(
                     vec![
-                        IndexKeySpec {
-                            col_no: 1,
+                        StorageIndexKey {
+                            column_ordinal: ColumnOrdinal::new(1),
                             order: IndexOrder::Desc,
                         },
-                        IndexKeySpec::new(2),
+                        StorageIndexKey::new(2),
                     ],
-                    IndexAttributes::empty(),
+                    StorageIndexFlags::empty(),
                 ),
             ];
             let expected_metadata =
                 TableMetadata::try_new(table_spec.columns.clone(), index_specs.clone())
                     .expect("valid table metadata");
 
-            let table_id = session.create_table(table_spec, index_specs).await.unwrap();
+            let table_id = session
+                .create_table(table_spec, index_specs)
+                .await
+                .unwrap()
+                .table_id();
 
             drop(session);
             drop(engine);
@@ -2817,21 +2968,22 @@ mod tests {
             .unwrap();
 
             let mut session = engine.new_session().unwrap();
-            let table_spec = TableSpec::new(vec![
-                ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
-                ColumnSpec::new("c1", ValKind::VarByte, ColumnAttributes::empty()),
+            let table_spec = StorageTableSpec::new(vec![
+                StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
             ]);
 
             let table_id = session
                 .create_table(
                     table_spec,
-                    vec![IndexSpec::new(
-                        vec![IndexKeySpec::new(0)],
-                        IndexAttributes::UK,
+                    vec![StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(0)],
+                        StorageIndexFlags::UK,
                     )],
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .table_id();
 
             let s: String = repeat_n('0', 100).collect();
             // insert
@@ -2939,18 +3091,18 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let table_id = session
                 .create_table(
-                    TableSpec::new(vec![ColumnSpec::new(
-                        "id",
+                    StorageTableSpec::new(vec![StorageColumnSpec::new(
                         ValKind::U32,
-                        ColumnAttributes::empty(),
+                        StorageColumnFlags::empty(),
                     )]),
-                    vec![IndexSpec::new(
-                        vec![IndexKeySpec::new(0)],
-                        IndexAttributes::UK,
+                    vec![StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(0)],
+                        StorageIndexFlags::UK,
                     )],
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .table_id();
             engine
                 .new_session()
                 .unwrap()
@@ -3161,17 +3313,18 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let table_id = session
                 .create_table(
-                    TableSpec::new(vec![
-                        ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
-                        ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                    StorageTableSpec::new(vec![
+                        StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
+                        StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
                     ]),
-                    vec![IndexSpec::new(
-                        vec![IndexKeySpec::new(0)],
-                        IndexAttributes::UK,
+                    vec![StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(0)],
+                        StorageIndexFlags::UK,
                     )],
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .table_id();
 
             engine
                 .new_session()
@@ -3250,8 +3403,10 @@ mod tests {
             let layout = table.layout_snapshot();
             let index_slot = key.index_slot;
             let index = layout.secondary_index(index_slot).unwrap();
-            let root =
-                table.file().active_root_unchecked().secondary_index_roots[index_slot.as_usize()];
+            let root = table
+                .file()
+                .active_root_unchecked()
+                .secondary_index_root(index_slot);
             {
                 let pool_guards = session.pool_guards();
                 let disk = index
@@ -3308,17 +3463,18 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let table_id = session
                 .create_table(
-                    TableSpec::new(vec![
-                        ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
-                        ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                    StorageTableSpec::new(vec![
+                        StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
+                        StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
                     ]),
-                    vec![IndexSpec::new(
-                        vec![IndexKeySpec::new(0)],
-                        IndexAttributes::UK,
+                    vec![StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(0)],
+                        StorageIndexFlags::UK,
                     )],
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .table_id();
 
             engine
                 .new_session()
@@ -3406,8 +3562,10 @@ mod tests {
             let layout = table.layout_snapshot();
             let index_slot = key.index_slot;
             let index = layout.secondary_index(index_slot).unwrap();
-            let root =
-                table.file().active_root_unchecked().secondary_index_roots[index_slot.as_usize()];
+            let root = table
+                .file()
+                .active_root_unchecked()
+                .secondary_index_root(index_slot);
             {
                 let pool_guards = session.pool_guards();
                 let disk = index
@@ -3459,17 +3617,21 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let table_id = session
                 .create_table(
-                    TableSpec::new(vec![
-                        ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
-                        ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                    StorageTableSpec::new(vec![
+                        StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
+                        StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
                     ]),
                     vec![
-                        IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK),
-                        IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty()),
+                        StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::UK),
+                        StorageIndexSpec::new(
+                            vec![StorageIndexKey::new(1)],
+                            StorageIndexFlags::empty(),
+                        ),
                     ],
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .table_id();
 
             engine
                 .new_session()
@@ -3548,8 +3710,10 @@ mod tests {
             let range = non_unique
                 .key_encoder()
                 .encode_non_unique_equal_range(&name_key.vals);
-            let root =
-                table.file().active_root_unchecked().secondary_index_roots[index_slot.as_usize()];
+            let root = table
+                .file()
+                .active_root_unchecked()
+                .secondary_index_root(index_slot);
             let disk_rows = {
                 let pool_guards = session.pool_guards();
                 let disk = non_unique
@@ -3573,7 +3737,7 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let rows = trx
                 .table_index_lookup_mvcc(
-                    crate::TableIndex(table.table_id(), name_key.index_slot.transitional_id()),
+                    crate::TableIndex(table.table_id(), IndexID::new(1)),
                     &name_key.vals,
                     &[0, 1],
                 )
@@ -3613,17 +3777,21 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let table_id = session
                 .create_table(
-                    TableSpec::new(vec![
-                        ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
-                        ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                    StorageTableSpec::new(vec![
+                        StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
+                        StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
                     ]),
                     vec![
-                        IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK),
-                        IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty()),
+                        StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::UK),
+                        StorageIndexSpec::new(
+                            vec![StorageIndexKey::new(1)],
+                            StorageIndexFlags::empty(),
+                        ),
                     ],
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .table_id();
             engine
                 .new_session()
                 .unwrap()
@@ -3751,17 +3919,18 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let table_id = session
                 .create_table(
-                    TableSpec::new(vec![
-                        ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
-                        ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                    StorageTableSpec::new(vec![
+                        StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
+                        StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
                     ]),
-                    vec![IndexSpec::new(
-                        vec![IndexKeySpec::new(0)],
-                        IndexAttributes::UK,
+                    vec![StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(0)],
+                        StorageIndexFlags::UK,
                     )],
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .table_id();
 
             engine
                 .new_session()
@@ -3887,17 +4056,18 @@ mod tests {
             let mut setup_session = engine.new_session().unwrap();
             let table_id = setup_session
                 .create_table(
-                    TableSpec::new(vec![
-                        ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
-                        ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                    StorageTableSpec::new(vec![
+                        StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
+                        StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
                     ]),
-                    vec![IndexSpec::new(
-                        vec![IndexKeySpec::new(0)],
-                        IndexAttributes::UK,
+                    vec![StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(0)],
+                        StorageIndexFlags::UK,
                     )],
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .table_id();
             engine
                 .new_session()
                 .unwrap()
@@ -4052,18 +4222,18 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let table_id = session
                 .create_table(
-                    TableSpec::new(vec![ColumnSpec::new(
-                        "id",
+                    StorageTableSpec::new(vec![StorageColumnSpec::new(
                         ValKind::U32,
-                        ColumnAttributes::empty(),
+                        StorageColumnFlags::empty(),
                     )]),
-                    vec![IndexSpec::new(
-                        vec![IndexKeySpec::new(0)],
-                        IndexAttributes::UK,
+                    vec![StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(0)],
+                        StorageIndexFlags::UK,
                     )],
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .table_id();
 
             engine
                 .new_session()
@@ -4223,30 +4393,32 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let checkpointed_table_id = session
                 .create_table(
-                    TableSpec::new(vec![
-                        ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
-                        ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                    StorageTableSpec::new(vec![
+                        StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
+                        StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
                     ]),
-                    vec![IndexSpec::new(
-                        vec![IndexKeySpec::new(0)],
-                        IndexAttributes::UK,
+                    vec![StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(0)],
+                        StorageIndexFlags::UK,
                     )],
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .table_id();
             let replay_only_table_id = session
                 .create_table(
-                    TableSpec::new(vec![
-                        ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
-                        ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                    StorageTableSpec::new(vec![
+                        StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
+                        StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
                     ]),
-                    vec![IndexSpec::new(
-                        vec![IndexKeySpec::new(0)],
-                        IndexAttributes::UK,
+                    vec![StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(0)],
+                        StorageIndexFlags::UK,
                     )],
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .table_id();
 
             engine
                 .new_session()
@@ -4453,17 +4625,18 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let table_id = session
                 .create_table(
-                    TableSpec::new(vec![
-                        ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
-                        ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                    StorageTableSpec::new(vec![
+                        StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
+                        StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
                     ]),
-                    vec![IndexSpec::new(
-                        vec![IndexKeySpec::new(0)],
-                        IndexAttributes::UK,
+                    vec![StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(0)],
+                        StorageIndexFlags::UK,
                     )],
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .table_id();
 
             engine
                 .new_session()
@@ -4590,18 +4763,18 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let table_id = session
                 .create_table(
-                    TableSpec::new(vec![ColumnSpec::new(
-                        "id",
+                    StorageTableSpec::new(vec![StorageColumnSpec::new(
                         ValKind::U32,
-                        ColumnAttributes::empty(),
+                        StorageColumnFlags::empty(),
                     )]),
-                    vec![IndexSpec::new(
-                        vec![IndexKeySpec::new(0)],
-                        IndexAttributes::UK,
+                    vec![StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(0)],
+                        StorageIndexFlags::UK,
                     )],
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .table_id();
 
             engine
                 .new_session()

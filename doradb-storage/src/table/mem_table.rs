@@ -11,8 +11,8 @@ use crate::buffer::{
     BufferPool, PoolGuard, PoolGuards, PoolRole, RowPoolRole, get_page_versioned_shared,
 };
 use crate::catalog::{
-    CatalogSelectKey, IndexSlot, IndexSpec, PrimaryKeyMatchError, ResolvedIndexKey,
-    TableColumnLayout, TableMetadata, resolve_catalog_key, user_key_from_active_slot,
+    CatalogSelectKey, IndexSlot, PrimaryKeyMatchError, ResolvedIndexKey, TableColumnLayout,
+    TableIndexMetadata, TableMetadata, resolve_catalog_key, user_key_from_index_ref,
 };
 use crate::error::{
     DataIntegrityError, InternalError, InternalResult, MultiDomainResultExt, OperationError,
@@ -902,7 +902,21 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     fn resolved_index_key(&self, key: SelectKey) -> ResolvedIndexKey {
         match self.table_id().kind() {
             TableKind::Catalog => resolve_catalog_key(key),
-            TableKind::User => user_key_from_active_slot(key.index_slot, key.vals),
+            TableKind::User => {
+                let index = self
+                    .metadata
+                    .idx
+                    .index_spec(key.index_slot)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "metadata-proven user index slot is inactive: table_id={}, index_slot={}",
+                            self.table_id(),
+                            key.index_slot
+                        )
+                    })
+                    .index;
+                user_key_from_index_ref(index, key.vals)
+            }
         }
     }
 
@@ -3179,9 +3193,9 @@ fn prepare_update_primary_key_no_trx_index_refresh(
             continue;
         }
         let old_key_vals = index_spec
-            .cols
+            .keys
             .iter()
-            .map(|key| row.val(metadata.col.as_ref(), key.col_no as usize))
+            .map(|key| row.val(metadata.col.as_ref(), key.column_ordinal.as_usize()))
             .collect();
         let old_key = SelectKey::new(index_slot, old_key_vals);
         let new_key = index_key_replace(index_spec, &old_key, &updated_index_vals);
@@ -3268,9 +3282,9 @@ fn validate_update_primary_key_no_trx_primary_key_cols(
     for update_col in update {
         if primary_key
             .spec()
-            .cols
+            .keys
             .iter()
-            .any(|key| usize::from(key.col_no) == update_col.idx)
+            .any(|key| usize::from(key.column_ordinal) == update_col.idx)
         {
             return Err(Report::new(DataIntegrityError::InvalidPayload)
                 .attach(format!(
@@ -3290,7 +3304,7 @@ fn validate_primary_key_no_trx_key<'a>(
     index_slot: IndexSlot,
     key_vals: &[Val],
     operation: &'static str,
-) -> RuntimeResult<&'a IndexSpec> {
+) -> RuntimeResult<&'a TableIndexMetadata> {
     let Some(primary_key) = metadata.primary_key() else {
         return Err(Report::new(DataIntegrityError::InvalidPayload)
             .attach(format!("{operation} primary key not found"))
@@ -3345,8 +3359,8 @@ mod tests {
     use crate::buffer::{PoolGuards, PoolRole};
     use crate::catalog::catalog_key_from_active_ordinal;
     use crate::catalog::{
-        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexSlot, IndexSpec,
-        TableMetadata,
+        IndexSlot, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
+        StorageIndexSpec, TableMetadata,
     };
     use crate::engine::Engine;
     use crate::error::{
@@ -3383,13 +3397,16 @@ mod tests {
         Arc::new(
             TableMetadata::try_new(
                 vec![
-                    ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
-                    ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
-                    ColumnSpec::new("payload", ValKind::VarByte, ColumnAttributes::empty()),
+                    StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+                    StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
+                    StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
                 ],
                 vec![
-                    IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::PK),
-                    IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty()),
+                    StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::PK),
+                    StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(1)],
+                        StorageIndexFlags::empty(),
+                    ),
                 ],
             )
             .expect("valid indexed payload metadata"),
@@ -3400,13 +3417,13 @@ mod tests {
         Arc::new(
             TableMetadata::try_new(
                 vec![
-                    ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
-                    ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
-                    ColumnSpec::new("payload", ValKind::VarByte, ColumnAttributes::empty()),
+                    StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+                    StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
+                    StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
                 ],
                 vec![
-                    IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::PK),
-                    IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::UK),
+                    StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::PK),
+                    StorageIndexSpec::new(vec![StorageIndexKey::new(1)], StorageIndexFlags::UK),
                 ],
             )
             .expect("valid unique name payload metadata"),
@@ -3417,13 +3434,13 @@ mod tests {
         Arc::new(
             TableMetadata::try_new(
                 vec![
-                    ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
-                    ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
-                    ColumnSpec::new("payload", ValKind::VarByte, ColumnAttributes::empty()),
+                    StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+                    StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
+                    StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
                 ],
-                vec![IndexSpec::new(
-                    vec![IndexKeySpec::new(0)],
-                    IndexAttributes::PK,
+                vec![StorageIndexSpec::new(
+                    vec![StorageIndexKey::new(0)],
+                    StorageIndexFlags::PK,
                 )],
             )
             .expect("valid primary-key payload metadata"),
@@ -4984,8 +5001,8 @@ mod tests {
             use crate::buffer::frame::BufferFrame;
             use crate::buffer::page::Page;
             use crate::catalog::{
-                ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexSpec,
-                TableMetadata,
+                StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
+                StorageIndexSpec, TableMetadata,
             };
             use crate::quiescent::QuiescentBox;
             use crate::value::ValKind;
@@ -4998,14 +5015,16 @@ mod tests {
             );
             let pool_guard = (*pool).create_base_guard();
             let metadata = TableMetadata::try_new(
-                vec![ColumnSpec::new(
-                    "id",
+                vec![StorageColumnSpec::new(
                     ValKind::I32,
-                    ColumnAttributes::empty(),
+                    StorageColumnFlags::empty(),
                 )],
                 vec![
-                    IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::PK),
-                    IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::empty()),
+                    StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::PK),
+                    StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(0)],
+                        StorageIndexFlags::empty(),
+                    ),
                 ],
             )
             .expect("valid table metadata");

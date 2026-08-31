@@ -176,7 +176,11 @@ impl Table {
                         self.table_id()
                     )
                 })?;
-            let read_set: Vec<_> = index_spec.cols.iter().map(|c| c.col_no as usize).collect();
+            let read_set: Vec<_> = index_spec
+                .keys
+                .iter()
+                .map(|c| c.column_ordinal.as_usize())
+                .collect();
             for row_access in page_guard.read_all_rows() {
                 let row_id = row_access.row().row_id();
                 match row_access.read_row_latest(metadata, &read_set, None) {
@@ -572,7 +576,11 @@ mod tests {
             .unwrap();
             let mut session = engine.new_session().unwrap();
             let (table_spec, index_specs) = drop_table_test_spec();
-            let table_id = session.create_table(table_spec, index_specs).await.unwrap();
+            let table_id = session
+                .create_table(table_spec, index_specs)
+                .await
+                .unwrap()
+                .table_id();
             let table_for_internal_lifecycle = engine
                 .inner()
                 .core
@@ -632,7 +640,11 @@ mod tests {
             .unwrap();
             let mut session = engine.new_session().unwrap();
             let (table_spec, index_specs) = drop_table_test_spec();
-            let table_id = session.create_table(table_spec, index_specs).await.unwrap();
+            let table_id = session
+                .create_table(table_spec, index_specs)
+                .await
+                .unwrap()
+                .table_id();
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
 
             session.drop_table(table_id).await.unwrap();
@@ -700,7 +712,11 @@ mod tests {
             assert!(std::path::Path::new(&table_file_path).exists());
             let mut session = engine.new_session().unwrap();
             let (table_spec, index_specs) = drop_table_test_spec();
-            let _ = session.create_table(table_spec, index_specs).await.unwrap();
+            let _ = session
+                .create_table(table_spec, index_specs)
+                .await
+                .unwrap()
+                .table_id();
             engine
                 .new_session()
                 .unwrap()

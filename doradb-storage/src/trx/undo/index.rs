@@ -155,12 +155,12 @@ pub(in crate::trx) struct IndexPurgeEntry {
 mod tests {
     use super::*;
     use crate::catalog::{
-        CATALOG_TABLE_ID_START, IndexSlot, catalog_key_from_active_ordinal, resolve_catalog_key,
-        user_key_from_active_slot,
+        CATALOG_TABLE_ID_START, IndexID, IndexRef, IndexSlot, catalog_key_from_active_ordinal,
+        resolve_catalog_key, user_key_from_index_ref,
     };
 
-    fn create_test_key(index_slot: IndexSlot) -> ResolvedIndexKey {
-        user_key_from_active_slot(index_slot, vec![])
+    fn create_test_key(index: IndexRef) -> ResolvedIndexKey {
+        user_key_from_index_ref(index, vec![])
     }
 
     #[test]
@@ -177,20 +177,26 @@ mod tests {
         log1.push(IndexUndo {
             table_id: TableID::new(1),
             row_id: RowID::new(1),
-            kind: IndexUndoKind::InsertUnique(create_test_key(IndexSlot::new(1)), false),
+            kind: IndexUndoKind::InsertUnique(
+                create_test_key(IndexRef::new(IndexID::new(1), IndexSlot::new(1))),
+                false,
+            ),
         });
 
         // Add entries to log2
         log2.push(IndexUndo {
             table_id: TableID::new(2),
             row_id: RowID::new(2),
-            kind: IndexUndoKind::DeferDelete(create_test_key(IndexSlot::new(2)), true),
+            kind: IndexUndoKind::DeferDelete(
+                create_test_key(IndexRef::new(IndexID::new(2), IndexSlot::new(2))),
+                true,
+            ),
         });
         log2.push(IndexUndo {
             table_id: TableID::new(3),
             row_id: RowID::new(3),
             kind: IndexUndoKind::UpdateUnique(
-                create_test_key(IndexSlot::new(3)),
+                create_test_key(IndexRef::new(IndexID::new(3), IndexSlot::new(3))),
                 RowID::new(4),
                 false,
             ),
@@ -229,7 +235,10 @@ mod tests {
         logs.push(IndexUndo {
             table_id: TableID::new(9),
             row_id: RowID::new(11),
-            kind: IndexUndoKind::DeferDelete(create_test_key(IndexSlot::new(5)), false),
+            kind: IndexUndoKind::DeferDelete(
+                create_test_key(IndexRef::new(IndexID::new(5), IndexSlot::new(5))),
+                false,
+            ),
         });
 
         let user = &logs.0[1];

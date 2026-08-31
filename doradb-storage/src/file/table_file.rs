@@ -1,6 +1,6 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::{PoolGuard, ReadonlyBufferPool};
-use crate::catalog::{IndexSlot, table::TableMetadata};
+use crate::catalog::{IndexSlot, SecondaryIndexRoot, SecondaryIndexSlot, table::TableMetadata};
 use crate::completion::Completion;
 use crate::error::{
     CompletionErrorBridge, CompletionResult, DataIntegrityError, DataIntegrityResult, IoResult,
@@ -19,6 +19,7 @@ use crate::file::cow_file::{
 use crate::file::fs::BackgroundWriteRequest;
 use crate::file::meta_block::{
     MetaBlock, MetaBlockSerView, TABLE_META_BLOCK_MAGIC_WORD, TABLE_META_BLOCK_VERSION,
+    validate_secondary_index_state,
 };
 use crate::file::super_block::{
     SUPER_BLOCK_FOOTER_OFFSET, SUPER_BLOCK_SIZE, SUPER_BLOCK_VERSION, SuperBlock, SuperBlockBody,
@@ -55,8 +56,8 @@ pub(crate) struct TableMeta {
     pub(crate) metadata: Arc<TableMetadata>,
     /// Root block id of column block index.
     pub(crate) column_block_index_root: BlockID,
-    /// Root block ids of secondary DiskTrees, ordered by index number.
-    pub(crate) secondary_index_roots: Vec<BlockID>,
+    /// Exact generation and root state for each physical index slot.
+    pub(crate) secondary_index_slots: Vec<SecondaryIndexSlot>,
     /// Upper bound of row id in this file.
     pub(crate) pivot_row_id: RowID,
     /// Redo log start point for in-memory heap.
@@ -83,7 +84,21 @@ impl ActiveRoot {
         let alloc_map = AllocMap::new(max_pages);
         let super_block_allocated = alloc_map.allocate_at(usize::from(SUPER_BLOCK_ID));
         assert!(super_block_allocated);
-        let secondary_index_roots = vec![SUPER_BLOCK_ID; metadata.idx.index_slot_count()];
+        let secondary_index_slots = (0..metadata.idx.index_slot_count())
+            .map(|slot| {
+                let slot = IndexSlot::try_from(slot)
+                    .expect("validated table metadata slot is representable");
+                metadata
+                    .idx
+                    .index_spec(slot)
+                    .map_or(SecondaryIndexSlot::Vacant, |index| {
+                        SecondaryIndexSlot::Active {
+                            index_id: index.index.id(),
+                            root: SecondaryIndexRoot::Empty,
+                        }
+                    })
+            })
+            .collect();
 
         ActiveRoot::from_parts(
             0,
@@ -93,12 +108,23 @@ impl ActiveRoot {
             TableMeta {
                 metadata,
                 column_block_index_root: SUPER_BLOCK_ID,
-                secondary_index_roots,
+                secondary_index_slots,
                 pivot_row_id: RowID::new(0),
                 heap_redo_start_ts: root_ts,
                 deletion_cutoff_ts: root_ts.max(MIN_SNAPSHOT_TS),
             },
         )
+    }
+
+    /// Returns one active secondary DiskTree root, if persisted nodes exist.
+    #[inline]
+    pub(crate) fn secondary_index_root(&self, index_slot: IndexSlot) -> Option<BlockID> {
+        self.secondary_index_slots[index_slot.as_usize()]
+            .active_root()
+            .unwrap_or_else(|| {
+                panic!("secondary index root requested for inactive slot {index_slot}")
+            })
+            .block_id()
     }
 
     /// Build super-block serialization view for the current active root.
@@ -120,15 +146,7 @@ impl ActiveRoot {
     /// Build meta-block serialization view for the current active root.
     #[inline]
     pub(crate) fn meta_block_ser_view(&self) -> MetaBlockSerView<'_> {
-        MetaBlockSerView::new(
-            self.metadata.ser_view(),
-            self.column_block_index_root,
-            &self.secondary_index_roots,
-            &self.alloc_map,
-            self.pivot_row_id,
-            self.heap_redo_start_ts,
-            self.deletion_cutoff_ts,
-        )
+        MetaBlockSerView::new(&self.meta, &self.alloc_map)
     }
 }
 
@@ -326,16 +344,21 @@ impl MutableTableFile {
         self.new_root.root.column_block_index_root = root_block_id;
     }
 
-    /// Returns mutable-root secondary DiskTree roots ordered by index number.
+    /// Returns mutable-root secondary-index states ordered by physical slot.
     #[inline]
-    pub(crate) fn secondary_index_roots(&self) -> &[BlockID] {
-        &self.root().secondary_index_roots
+    pub(crate) fn secondary_index_slots(&self) -> &[SecondaryIndexSlot] {
+        &self.root().secondary_index_slots
     }
 
-    /// Returns one mutable-root secondary DiskTree root by physical index slot.
+    /// Returns one mutable-root secondary DiskTree root, if persisted nodes exist.
     #[inline]
-    pub(crate) fn secondary_index_root(&self, index_slot: IndexSlot) -> BlockID {
-        self.root().secondary_index_roots[index_slot.as_usize()]
+    pub(crate) fn secondary_index_root(&self, index_slot: IndexSlot) -> Option<BlockID> {
+        self.root().secondary_index_slots[index_slot.as_usize()]
+            .active_root()
+            .unwrap_or_else(|| {
+                panic!("secondary index root requested for inactive slot {index_slot}")
+            })
+            .block_id()
     }
 
     /// Updates one mutable-root secondary DiskTree root by physical index slot.
@@ -343,39 +366,29 @@ impl MutableTableFile {
     pub(crate) fn set_secondary_index_root(
         &mut self,
         index_slot: IndexSlot,
-        root_block_id: BlockID,
+        root_block_id: Option<BlockID>,
     ) {
-        self.new_root.root.secondary_index_roots[index_slot.as_usize()] = root_block_id;
+        let slot = &mut self.new_root.root.secondary_index_slots[index_slot.as_usize()];
+        let SecondaryIndexSlot::Active { root, .. } = slot else {
+            panic!("secondary index root update targeted inactive slot {index_slot}");
+        };
+        *root = SecondaryIndexRoot::from_block_id(root_block_id);
     }
 
-    /// Replaces table metadata and the matching sparse secondary-root slots.
+    /// Replaces table metadata and its matching secondary-index slot states.
     #[inline]
-    pub(crate) fn replace_metadata_and_secondary_index_roots(
+    pub(crate) fn replace_metadata_and_secondary_index_slots(
         &mut self,
         metadata: Arc<TableMetadata>,
-        roots: Vec<BlockID>,
+        slots: Vec<SecondaryIndexSlot>,
     ) {
-        // Callers derive the replacement root vector from this metadata's
-        // stable sparse slot layout, so their counts must agree exactly.
-        assert_eq!(
-            roots.len(),
-            metadata.idx.index_slot_count(),
-            "secondary-index root count does not match metadata slot count"
+        assert!(
+            validate_secondary_index_state(&metadata, &slots).is_ok(),
+            "secondary-index slot states do not match replacement metadata"
         );
-        for (index_slot, root) in roots.iter().copied().enumerate() {
-            let index_slot = IndexSlot::try_from(index_slot).unwrap_or_else(|_| {
-                panic!("validated metadata index slot exceeds u16: index_slot={index_slot}")
-            });
-            // Dropped/inactive slots remain as sparse sentinels and can never
-            // retain a live root in a replacement snapshot.
-            assert!(
-                metadata.idx.index_spec(index_slot).is_some() || root == SUPER_BLOCK_ID,
-                "inactive secondary-index slot has a live root: index_slot={index_slot}, root={root}, expected={SUPER_BLOCK_ID}"
-            );
-        }
         let root = &mut self.new_root.root;
         root.metadata = metadata;
-        root.secondary_index_roots = roots;
+        root.secondary_index_slots = slots;
     }
 
     /// Updates mutable root checkpoint metadata.
@@ -663,7 +676,7 @@ fn parse_table_meta_block(
         meta: TableMeta {
             metadata: Arc::new(meta_block.schema),
             column_block_index_root: meta_block.column_block_index_root,
-            secondary_index_roots: meta_block.secondary_index_roots,
+            secondary_index_slots: meta_block.secondary_index_slots,
             pivot_row_id: meta_block.pivot_row_id,
             heap_redo_start_ts: meta_block.heap_redo_start_ts,
             deletion_cutoff_ts: meta_block.deletion_cutoff_ts,
@@ -699,43 +712,15 @@ fn validate_table_root(
         parsed_meta.meta.column_block_index_root,
         "column_block_index_root",
     )?;
-    if parsed_meta.meta.secondary_index_roots.len()
-        != parsed_meta.meta.metadata.idx.index_slot_count()
-    {
-        return Err(
-            Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
-                "file={}, secondary_root_count={}, index_slot_count={}",
-                FileKind::TableFile,
-                parsed_meta.meta.secondary_index_roots.len(),
-                parsed_meta.meta.metadata.idx.index_slot_count()
-            )),
-        );
-    }
-    for (index_slot, root_block_id) in parsed_meta
-        .meta
-        .secondary_index_roots
-        .iter()
-        .copied()
-        .enumerate()
-    {
-        let index_slot = IndexSlot::try_from(index_slot).unwrap_or_else(|_| {
-            panic!("validated metadata index slot exceeds u16: index_slot={index_slot}")
-        });
-        if parsed_meta
-            .meta
-            .metadata
-            .idx
-            .index_spec(index_slot)
-            .is_none()
+    validate_secondary_index_state(
+        &parsed_meta.meta.metadata,
+        &parsed_meta.meta.secondary_index_slots,
+    )
+    .change_context(DataIntegrityError::InvalidRootInvariant)?;
+    for state in parsed_meta.meta.secondary_index_slots.iter().copied() {
+        if let SecondaryIndexSlot::Active { root, .. } = state
+            && let Some(root_block_id) = root.block_id()
         {
-            if root_block_id != SUPER_BLOCK_ID {
-                return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
-                .attach(format!(
-                    "file={}, inactive_secondary_index_slot={index_slot}, root_block_id={root_block_id}, expected_sentinel={SUPER_BLOCK_ID}",
-                    FileKind::TableFile
-                )));
-            }
-        } else {
             validate_table_root_block(
                 &parsed_meta.alloc_map,
                 root_block_id,
@@ -776,16 +761,7 @@ fn validate_table_root_block(
 
 #[inline]
 fn table_meta_payload_len(meta: &TableMeta, alloc_map: &AllocMap) -> usize {
-    MetaBlockSerView::new(
-        meta.metadata.ser_view(),
-        meta.column_block_index_root,
-        &meta.secondary_index_roots,
-        alloc_map,
-        meta.pivot_row_id,
-        meta.heap_redo_start_ts,
-        meta.deletion_cutoff_ts,
-    )
-    .ser_len()
+    MetaBlockSerView::new(meta, alloc_map).ser_len()
 }
 
 #[inline]
@@ -849,7 +825,10 @@ mod tests {
     use crate::buffer::{
         PoolRole, ReadonlyBufferPool, global_readonly_pool_scope, table_readonly_pool,
     };
-    use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexSpec};
+    use crate::catalog::{
+        IndexID, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
+        StorageIndexSpec,
+    };
     use crate::error::{
         DataIntegrityError, DiscloseError, DiscloseResultExt, Error, ErrorKind, Result,
         RuntimeError,
@@ -959,12 +938,12 @@ mod tests {
         Arc::new(
             TableMetadata::try_new(
                 vec![
-                    ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
-                    ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
+                    StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
+                    StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::NULLABLE),
                 ],
-                vec![IndexSpec::new(
-                    vec![IndexKeySpec::new(0)],
-                    IndexAttributes::PK,
+                vec![StorageIndexSpec::new(
+                    vec![StorageIndexKey::new(0)],
+                    StorageIndexFlags::PK,
                 )],
             )
             .expect("valid table metadata"),
@@ -1020,12 +999,12 @@ mod tests {
             let metadata = Arc::new(
                 TableMetadata::try_new(
                     vec![
-                        ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
-                        ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
+                        StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
+                        StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::NULLABLE),
                     ],
-                    vec![IndexSpec::new(
-                        vec![IndexKeySpec::new(0)],
-                        IndexAttributes::PK,
+                    vec![StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(0)],
+                        StorageIndexFlags::PK,
                     )],
                 )
                 .expect("valid table metadata"),
@@ -1037,8 +1016,17 @@ mod tests {
             assert_eq!(table_file.active_root_unchecked().slot_no, 0);
             assert_eq!(table_file.active_root_unchecked().root_ts, TrxID::new(1));
             assert_eq!(
-                table_file.active_root_unchecked().secondary_index_roots,
-                vec![SUPER_BLOCK_ID]
+                table_file
+                    .active_root_unchecked()
+                    .secondary_index_root(IndexSlot::new(0)),
+                None
+            );
+            assert_eq!(
+                table_file.active_root_unchecked().secondary_index_slots,
+                vec![SecondaryIndexSlot::Active {
+                    index_id: IndexID::new(0),
+                    root: SecondaryIndexRoot::Empty,
+                }]
             );
 
             // write
@@ -1081,16 +1069,37 @@ mod tests {
                 disk_guard.clone(),
             );
             let secondary_root = mutable.allocate_block().unwrap();
-            mutable.set_secondary_index_root(IndexSlot::new(0), secondary_root);
+            mutable.set_secondary_index_root(IndexSlot::new(0), Some(secondary_root));
             assert_eq!(
                 mutable.secondary_index_root(IndexSlot::new(0)),
-                secondary_root
+                Some(secondary_root)
+            );
+            mutable.set_secondary_index_root(IndexSlot::new(0), None);
+            assert_eq!(mutable.secondary_index_root(IndexSlot::new(0)), None);
+            mutable.set_secondary_index_root(IndexSlot::new(0), Some(secondary_root));
+            let panic = catch_unwind(AssertUnwindSafe(|| {
+                mutable.set_secondary_index_root(IndexSlot::new(0), Some(SUPER_BLOCK_ID));
+            }))
+            .unwrap_err();
+            assert!(
+                panic_message(panic)
+                    .contains("present secondary index root is the table-file super block")
+            );
+            assert_eq!(
+                mutable.secondary_index_root(IndexSlot::new(0)),
+                Some(secondary_root)
             );
             let metadata = Arc::clone(&mutable.root().metadata);
             let panic = catch_unwind(AssertUnwindSafe(|| {
-                mutable.replace_metadata_and_secondary_index_roots(
+                mutable.replace_metadata_and_secondary_index_slots(
                     metadata,
-                    vec![SUPER_BLOCK_ID, secondary_root],
+                    vec![
+                        SecondaryIndexSlot::Active {
+                            index_id: IndexID::new(0),
+                            root: SecondaryIndexRoot::Empty,
+                        },
+                        SecondaryIndexSlot::Vacant,
+                    ],
                 );
             }));
             assert!(panic.is_err());
@@ -1102,7 +1111,13 @@ mod tests {
                 .unwrap();
             assert_eq!(active_root.slot_no, 1);
             assert_eq!(active_root.root_ts, TrxID::new(2));
-            assert_eq!(active_root.secondary_index_roots, vec![secondary_root]);
+            assert_eq!(
+                active_root.secondary_index_slots,
+                vec![SecondaryIndexSlot::Active {
+                    index_id: IndexID::new(0),
+                    root: SecondaryIndexRoot::from_block_id(Some(secondary_root)),
+                }]
+            );
             drop(table_file2);
             drop(table_file3);
 
@@ -1131,7 +1146,7 @@ mod tests {
                 disk_guard.clone(),
             );
             let inherited_root = mutable.allocate_block().unwrap();
-            mutable.set_secondary_index_root(IndexSlot::new(0), inherited_root);
+            mutable.set_secondary_index_root(IndexSlot::new(0), Some(inherited_root));
             let (table_file, old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
             drop(old_root);
 
@@ -1387,12 +1402,12 @@ mod tests {
             let metadata = Arc::new(
                 TableMetadata::try_new(
                     vec![
-                        ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
-                        ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
+                        StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
+                        StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::NULLABLE),
                     ],
-                    vec![IndexSpec::new(
-                        vec![IndexKeySpec::new(0)],
-                        IndexAttributes::PK,
+                    vec![StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(0)],
+                        StorageIndexFlags::PK,
                     )],
                 )
                 .expect("valid table metadata"),
@@ -1807,7 +1822,10 @@ mod tests {
             meta: TableMeta {
                 metadata,
                 column_block_index_root: BlockID::new(9),
-                secondary_index_roots: vec![SUPER_BLOCK_ID],
+                secondary_index_slots: vec![SecondaryIndexSlot::Active {
+                    index_id: IndexID::new(0),
+                    root: SecondaryIndexRoot::Empty,
+                }],
                 pivot_row_id: RowID::new(0),
                 heap_redo_start_ts: TrxID::new(1),
                 deletion_cutoff_ts: TrxID::new(1),

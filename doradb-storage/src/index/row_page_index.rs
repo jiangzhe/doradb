@@ -1834,7 +1834,8 @@ mod tests {
     use crate::buffer::test_page_id;
     use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard, PoolRole};
     use crate::catalog::{
-        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexSpec, TableMetadata,
+        StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
+        StorageIndexSpec, TableMetadata,
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
@@ -1851,7 +1852,6 @@ mod tests {
     use crate::recovery::stream::RedoReplayPlanner;
     use crate::value::ValKind;
     use futures::{FutureExt, future::join_all};
-    use semistr::SemiStr;
     use std::future::Future;
     use std::io::Error as StdIoError;
     use std::mem::size_of;
@@ -2018,18 +2018,17 @@ mod tests {
         }
     }
 
-    fn first_i32_unique_index() -> IndexSpec {
-        IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK)
+    fn first_i32_unique_index() -> StorageIndexSpec {
+        StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::UK)
     }
 
     fn make_test_metadata() -> Arc<TableMetadata> {
         Arc::new(
             TableMetadata::try_new(
-                vec![ColumnSpec {
-                    column_name: SemiStr::new("id"),
-                    column_type: ValKind::I32,
-                    column_attributes: ColumnAttributes::empty(),
-                }],
+                vec![StorageColumnSpec::new(
+                    ValKind::I32,
+                    StorageColumnFlags::empty(),
+                )],
                 vec![first_i32_unique_index()],
             )
             .expect("valid table metadata"),

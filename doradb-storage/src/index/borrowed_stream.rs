@@ -136,20 +136,24 @@ impl<'scan, 'ctx, P: BufferPool + 'static> BorrowedIndexMutationStream<'scan, 'c
                     mem,
                     index_pool_guard: guards.index_guard(),
                 },
-                MutationDiskSource::Unique(
-                    disk.open_unique_at(root, guards.disk_guard())?
-                        .scan_candidate_stream(range),
-                ),
+                root.map(|root| {
+                    disk.open_unique_at(Some(root), guards.disk_guard())
+                        .map(|tree| MutationDiskSource::Unique(tree.scan_candidate_stream(range)))
+                })
+                .transpose()?,
             ),
             SecondaryIndex::NonUnique { mem, disk } => (
                 MutationMemSource::NonUnique {
                     mem,
                     index_pool_guard: guards.index_guard(),
                 },
-                MutationDiskSource::NonUnique(
-                    disk.open_non_unique_at(root, guards.disk_guard())?
-                        .scan_candidate_stream(range),
-                ),
+                root.map(|root| {
+                    disk.open_non_unique_at(Some(root), guards.disk_guard())
+                        .map(|tree| {
+                            MutationDiskSource::NonUnique(tree.scan_candidate_stream(range))
+                        })
+                })
+                .transpose()?,
             ),
         };
         let mem = MutationMemCandidateSource {

@@ -1,6 +1,7 @@
 use doradb_storage::{
-    ColumnAttributes, ColumnSpec, Engine, EngineConfig, IndexAttributes, IndexID, IndexKeySpec,
-    IndexSpec, ScanRowDecision, TableIndex, TableSpec, UpdateCol, Val, ValKind,
+    Engine, EngineConfig, IndexID, ScanRowDecision, StorageColumnFlags, StorageColumnSpec,
+    StorageIndexFlags, StorageIndexKey, StorageIndexSpec, StorageTableSpec, TableIndex, UpdateCol,
+    Val, ValKind,
 };
 use futures::executor;
 use std::error::Error;
@@ -26,16 +27,17 @@ async fn run() -> ExampleResult<()> {
     // Create a table with a unique id index and a secondary name index.
     let table_id = session
         .create_table(
-            TableSpec::new(vec![
-                ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
-                ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+            StorageTableSpec::new(vec![
+                StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
             ]),
             vec![
-                IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK),
-                IndexSpec::new(vec![IndexKeySpec::new(1)], IndexAttributes::empty()),
+                StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::UK),
+                StorageIndexSpec::new(vec![StorageIndexKey::new(1)], StorageIndexFlags::empty()),
             ],
         )
-        .await?;
+        .await?
+        .table_id();
 
     let mut write_trx = session.begin_trx()?;
     // Insert two rows in one statement.

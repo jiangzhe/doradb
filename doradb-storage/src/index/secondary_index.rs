@@ -15,7 +15,7 @@ use super::index_stream::{
 use super::non_unique_index::{GuardedNonUniqueMemIndex, IndexMask, NonUniqueMemIndex};
 use super::unique_index::{GuardedUniqueMemIndex, UniqueMemIndex};
 use crate::buffer::{BufferPool, PoolGuard, PoolGuards, ReadonlyBufferPool};
-use crate::catalog::{IndexSlot, IndexSpec, TableMetadata};
+use crate::catalog::{IndexSlot, TableIndexMetadata, TableMetadata};
 use crate::error::{InternalError, RuntimeError, RuntimeResult, SecondaryIndexBinding};
 use crate::file::table_file::TableFile;
 use crate::id::{BlockID, RowID, TrxID};
@@ -80,7 +80,7 @@ impl<P: BufferPool> InMemorySecondaryIndex<P> {
     pub(crate) async fn new<F: Fn(usize) -> ValType>(
         index_pool: QuiescentGuard<P>,
         index_pool_guard: &PoolGuard,
-        index_spec: &IndexSpec,
+        index_spec: &TableIndexMetadata,
         ty_infer: F,
         ts: TrxID,
     ) -> RuntimeResult<Self> {
@@ -225,11 +225,11 @@ impl SecondaryDiskTreeRuntime {
         }
     }
 
-    /// Open the unique secondary DiskTree at one captured root block id.
+    /// Open the unique secondary DiskTree at one captured optional root.
     #[inline]
     pub(crate) fn open_unique_at<'a>(
         &'a self,
-        root_block_id: BlockID,
+        root_block_id: Option<BlockID>,
         disk_pool_guard: &'a PoolGuard,
     ) -> RuntimeResult<UniqueDiskTree<'a>> {
         match &self.kind {
@@ -248,11 +248,11 @@ impl SecondaryDiskTreeRuntime {
         }
     }
 
-    /// Open the non-unique secondary DiskTree at one captured root block id.
+    /// Open the non-unique secondary DiskTree at one captured optional root.
     #[inline]
     pub(crate) fn open_non_unique_at<'a>(
         &'a self,
-        root_block_id: BlockID,
+        root_block_id: Option<BlockID>,
         disk_pool_guard: &'a PoolGuard,
     ) -> RuntimeResult<NonUniqueDiskTree<'a>> {
         match &self.kind {
@@ -282,13 +282,13 @@ impl SecondaryDiskTreeRuntime {
         match &self.kind {
             SecondaryDiskTreeRuntimeKind::Unique(runtime) => {
                 runtime
-                    .open(root_block_id, disk_pool_guard)
+                    .open(Some(root_block_id), disk_pool_guard)
                     .collect_reachable_blocks(out)
                     .await
             }
             SecondaryDiskTreeRuntimeKind::NonUnique(runtime) => {
                 runtime
-                    .open(root_block_id, disk_pool_guard)
+                    .open(Some(root_block_id), disk_pool_guard)
                     .collect_reachable_blocks(out)
                     .await
             }
@@ -389,12 +389,12 @@ impl<P: BufferPool> SecondaryIndex<P> {
         }
     }
 
-    /// Bind a unique index at a raw root for classified internal operations.
+    /// Bind a unique index at an optional root for classified internal operations.
     #[inline]
     pub(crate) fn bind_unique_unchecked<'a, 'g>(
         &'a self,
         guards: &'g PoolGuards,
-        root: BlockID,
+        root: Option<BlockID>,
     ) -> RuntimeResult<UniqueSecondaryIndex<'a, 'g, P>> {
         match self {
             Self::Unique { mem, disk } => Ok(UniqueSecondaryIndex::new(
@@ -416,12 +416,12 @@ impl<P: BufferPool> SecondaryIndex<P> {
         }
     }
 
-    /// Bind a non-unique index at a raw root for classified internal operations.
+    /// Bind a non-unique index at an optional root for classified internal operations.
     #[inline]
     pub(crate) fn bind_non_unique_unchecked<'a, 'g>(
         &'a self,
         guards: &'g PoolGuards,
-        root: BlockID,
+        root: Option<BlockID>,
     ) -> RuntimeResult<NonUniqueSecondaryIndex<'a, 'g, P>> {
         match self {
             Self::Unique { .. } => Err(Report::new(InternalError::SecondaryIndexBindingMismatch)
@@ -446,7 +446,7 @@ impl<P: BufferPool> SecondaryIndex<P> {
 pub(crate) struct UniqueSecondaryIndex<'a, 'g, P: 'static> {
     mem: GuardedUniqueMemIndex<'a, 'g, P>,
     disk: &'a SecondaryDiskTreeRuntime,
-    root: BlockID,
+    root: Option<BlockID>,
     disk_pool_guard: &'g PoolGuard,
 }
 
@@ -464,7 +464,7 @@ impl<'a, 'g, P: BufferPool> UniqueSecondaryIndex<'a, 'g, P> {
     fn new(
         mem: &'a UniqueMemIndex<P>,
         disk: &'a SecondaryDiskTreeRuntime,
-        root: BlockID,
+        root: Option<BlockID>,
         index_pool_guard: &'g PoolGuard,
         disk_pool_guard: &'g PoolGuard,
     ) -> Self {
@@ -477,8 +477,10 @@ impl<'a, 'g, P: BufferPool> UniqueSecondaryIndex<'a, 'g, P> {
     }
 
     #[inline]
-    fn open(&self) -> RuntimeResult<UniqueDiskTree<'_>> {
-        self.disk.open_unique_at(self.root, self.disk_pool_guard)
+    fn open(&self) -> RuntimeResult<Option<UniqueDiskTree<'_>>> {
+        self.root
+            .map(|root| self.disk.open_unique_at(Some(root), self.disk_pool_guard))
+            .transpose()
     }
 
     /// Atomically update only MemIndex, without lookup or DiskTree fallback.
@@ -551,8 +553,9 @@ impl<'a, 'g, P: BufferPool> UniqueSecondaryIndex<'a, 'g, P> {
             }));
         }
 
-        let disk = self.open()?;
-        if let Some(owner_row_id) = disk.lookup(key).await? {
+        if let Some(disk) = self.open()?
+            && let Some(owner_row_id) = disk.lookup(key).await?
+        {
             return Ok(UniqueInsertAttempt::Occupied(UniqueOwnerObservation {
                 index: *self,
                 key,
@@ -594,7 +597,9 @@ impl<P: BufferPool> UniqueSecondaryIndex<'_, '_, P> {
         if let Some(hit) = self.mem.lookup(key, ts).await? {
             return Ok(Some(hit));
         }
-        let disk = self.open()?;
+        let Some(disk) = self.open()? else {
+            return Ok(None);
+        };
         Ok(disk.lookup(key).await?.map(|row_id| (row_id, false)))
     }
 
@@ -626,7 +631,7 @@ impl<P: BufferPool> UniqueSecondaryIndex<'_, '_, P> {
         >,
     > {
         let mem = self.mem.index_scan_candidates(range, ts)?;
-        let disk = self.open()?.scan_candidate_stream(range);
+        let disk = self.open()?.map(|disk| disk.scan_candidate_stream(range));
         Ok(SecondaryIndexCandidateStream::new(mem, disk))
     }
 }
@@ -730,7 +735,7 @@ pub(crate) enum UniqueInsertAttempt<'a, 'g, 'k, P: 'static> {
 pub(crate) struct NonUniqueSecondaryIndex<'a, 'g, P: 'static> {
     mem: GuardedNonUniqueMemIndex<'a, 'g, P>,
     disk: &'a SecondaryDiskTreeRuntime,
-    root: BlockID,
+    root: Option<BlockID>,
     disk_pool_guard: &'g PoolGuard,
 }
 
@@ -739,7 +744,7 @@ impl<'a, 'g, P: BufferPool> NonUniqueSecondaryIndex<'a, 'g, P> {
     fn new(
         mem: &'a NonUniqueMemIndex<P>,
         disk: &'a SecondaryDiskTreeRuntime,
-        root: BlockID,
+        root: Option<BlockID>,
         index_pool_guard: &'g PoolGuard,
         disk_pool_guard: &'g PoolGuard,
     ) -> Self {
@@ -752,9 +757,13 @@ impl<'a, 'g, P: BufferPool> NonUniqueSecondaryIndex<'a, 'g, P> {
     }
 
     #[inline]
-    fn open(&self) -> RuntimeResult<NonUniqueDiskTree<'_>> {
-        self.disk
-            .open_non_unique_at(self.root, self.disk_pool_guard)
+    fn open(&self) -> RuntimeResult<Option<NonUniqueDiskTree<'_>>> {
+        self.root
+            .map(|root| {
+                self.disk
+                    .open_non_unique_at(Some(root), self.disk_pool_guard)
+            })
+            .transpose()
     }
 
     /// Atomically mask one exact MemIndex entry without lookup or DiskTree.
@@ -795,7 +804,9 @@ impl<P: BufferPool> NonUniqueSecondaryIndex<'_, '_, P> {
         if let Some(mem_hit) = self.mem.lookup_unique(key, row_id, ts).await? {
             return Ok(Some(mem_hit));
         }
-        let disk = self.open()?;
+        let Some(disk) = self.open()? else {
+            return Ok(None);
+        };
         if disk.contains_exact(key, row_id).await? {
             Ok(Some(true))
         } else {
@@ -831,7 +842,7 @@ impl<P: BufferPool> NonUniqueSecondaryIndex<'_, '_, P> {
         >,
     > {
         let mem = self.mem.index_scan_candidates(range, ts)?;
-        let disk = self.open()?.scan_candidate_stream(range);
+        let disk = self.open()?.map(|disk| disk.scan_candidate_stream(range));
         Ok(SecondaryIndexCandidateStream::new(mem, disk))
     }
 
@@ -848,7 +859,7 @@ impl<P: BufferPool> NonUniqueSecondaryIndex<'_, '_, P> {
         >,
     > {
         let mem = self.mem.equal_scan_candidates(range, ts)?;
-        let disk = self.open()?.scan_candidate_stream(range);
+        let disk = self.open()?.map(|disk| disk.scan_candidate_stream(range));
         Ok(SecondaryIndexCandidateStream::new(mem, disk))
     }
 }
@@ -861,10 +872,10 @@ enum DualTreeStreamState {
     Done,
 }
 
-/// Incremental lookup-candidate stream over a MemIndex/DiskTree pair.
+/// Incremental lookup-candidate stream over a MemIndex and optional DiskTree.
 pub(crate) struct SecondaryIndexCandidateStream<M, D> {
     mem: M,
-    disk: D,
+    disk: Option<D>,
     mem_buf: VecDeque<IndexLookupCandidate>,
     disk_buf: VecDeque<IndexLookupCandidate>,
     state: DualTreeStreamState,
@@ -876,13 +887,18 @@ where
     D: IndexBatchStream<IndexLookupCandidate>,
 {
     #[inline]
-    pub(super) fn new(mem: M, disk: D) -> Self {
+    pub(super) fn new(mem: M, disk: Option<D>) -> Self {
+        let state = if disk.is_some() {
+            DualTreeStreamState::Both
+        } else {
+            DualTreeStreamState::MemOnly
+        };
         Self {
             mem,
             disk,
             mem_buf: VecDeque::new(),
             disk_buf: VecDeque::new(),
-            state: DualTreeStreamState::Both,
+            state,
         }
     }
 
@@ -909,7 +925,10 @@ where
             if !self.disk_buf.is_empty() {
                 return Ok(true);
             }
-            match self.disk.next_batch().await? {
+            let Some(disk) = self.disk.as_mut() else {
+                return Ok(false);
+            };
+            match disk.next_batch().await? {
                 Some(entries) => {
                     if entries.is_empty() {
                         continue;
@@ -1033,10 +1052,10 @@ mod tests {
         table_readonly_pool,
     };
     use crate::catalog::{
-        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexSlot, IndexSpec,
+        IndexSlot, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
+        StorageIndexSpec,
     };
     use crate::file::build_test_fs;
-    use crate::file::cow_file::SUPER_BLOCK_ID;
     use crate::file::table_file::{MutableTableFile, TableFile};
     use crate::index::btree::BTreeKeyEncoder;
     use crate::index::disk_tree::{
@@ -1056,6 +1075,25 @@ mod tests {
     struct NonUniqueDiskTreeExact<'a> {
         key: &'a [Val],
         row_id: RowID,
+    }
+
+    struct TestCandidateStream {
+        batches: VecDeque<Vec<IndexLookupCandidate>>,
+    }
+
+    impl IndexBatchStream<IndexLookupCandidate> for TestCandidateStream {
+        #[inline]
+        async fn next_batch(&mut self) -> RuntimeResult<Option<Vec<IndexLookupCandidate>>> {
+            Ok(self.batches.pop_front())
+        }
+    }
+
+    struct NeverPolledDiskStream;
+
+    impl IndexBatchStream<IndexLookupCandidate> for NeverPolledDiskStream {
+        async fn next_batch(&mut self) -> RuntimeResult<Option<Vec<IndexLookupCandidate>>> {
+            panic!("absent DiskTree source must not be polled")
+        }
     }
 
     macro_rules! unique_runtime {
@@ -1089,14 +1127,16 @@ mod tests {
     fn metadata_with_indexes() -> Arc<TableMetadata> {
         Arc::new(
             TableMetadata::try_new(
-                vec![ColumnSpec::new(
-                    "c0",
+                vec![StorageColumnSpec::new(
                     ValKind::U32,
-                    ColumnAttributes::empty(),
+                    StorageColumnFlags::empty(),
                 )],
                 vec![
-                    IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK),
-                    IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::empty()),
+                    StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::UK),
+                    StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(0)],
+                        StorageIndexFlags::empty(),
+                    ),
                 ],
             )
             .expect("valid table metadata"),
@@ -1107,11 +1147,12 @@ mod tests {
         pool: &QuiescentBox<FixedBufferPool>,
         pool_guard: &PoolGuard,
     ) -> UniqueMemIndex<FixedBufferPool> {
-        let index_spec = IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::UK);
+        let metadata = metadata_with_indexes();
+        let index_spec = metadata.idx.index_spec(IndexSlot::new(0)).unwrap();
         UniqueMemIndex::new(
             pool.guard(),
             pool_guard,
-            &index_spec,
+            index_spec,
             |_| ValType::new(ValKind::U32, false),
             TrxID::new(100),
         )
@@ -1123,11 +1164,12 @@ mod tests {
         pool: &QuiescentBox<FixedBufferPool>,
         pool_guard: &PoolGuard,
     ) -> NonUniqueMemIndex<FixedBufferPool> {
-        let index_spec = IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::empty());
+        let metadata = metadata_with_indexes();
+        let index_spec = metadata.idx.index_spec(IndexSlot::new(1)).unwrap();
         NonUniqueMemIndex::new(
             pool.guard(),
             pool_guard,
-            &index_spec,
+            index_spec,
             |_| ValType::new(ValKind::U32, false),
             TrxID::new(100),
         )
@@ -1191,7 +1233,7 @@ mod tests {
     async fn publish_secondary_root(
         mut mutable: MutableTableFile,
         index_slot: IndexSlot,
-        root: BlockID,
+        root: Option<BlockID>,
         ts: TrxID,
     ) -> Arc<TableFile> {
         mutable.set_secondary_index_root(index_slot, root);
@@ -1201,6 +1243,93 @@ mod tests {
             .expect("test secondary root publication should commit");
         drop(old_root);
         table
+    }
+
+    #[test]
+    fn test_secondary_candidate_stream_without_disk_source_is_mem_only() {
+        smol::block_on(async {
+            let encoder = BTreeKeyEncoder::new(vec![ValType::new(ValKind::U32, false)]);
+            let expected = IndexLookupCandidate {
+                encoded_key: encoder.encode(&[Val::from(7u32)]),
+                row_id: RowID::new(70),
+            };
+            let mem = TestCandidateStream {
+                batches: VecDeque::from([vec![expected.clone()]]),
+            };
+            let mut stream = SecondaryIndexCandidateStream::new(mem, None::<NeverPolledDiskStream>);
+
+            assert_eq!(stream.state, DualTreeStreamState::MemOnly);
+            assert_eq!(stream.next_batch().await.unwrap(), Some(vec![expected]));
+            assert_eq!(stream.next_batch().await.unwrap(), None);
+            assert_eq!(stream.state, DualTreeStreamState::Done);
+        });
+    }
+
+    #[test]
+    fn test_secondary_point_reads_skip_absent_disk_root() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let metadata = metadata_with_indexes();
+            let table = fs
+                .create_table_file(test_user_table_id(610), Arc::clone(&metadata), false)
+                .unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
+            drop(old_root);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(610), &table);
+            let index_pool = QuiescentBox::new(
+                FixedBufferPool::with_capacity(PoolRole::Index, 64 * 1024 * 1024).unwrap(),
+            );
+            let index_guard = (*index_pool).create_base_guard();
+            let pool_guards = PoolGuards::builder()
+                .push(PoolRole::Index, (*index_pool).create_base_guard())
+                .push(PoolRole::Disk, disk_pool.create_base_guard())
+                .build();
+            let key = [Val::from(7u32)];
+
+            let unique = SecondaryIndex::Unique {
+                mem: unique_mem_index(&index_pool, &index_guard).await,
+                disk: SecondaryDiskTreeRuntime::new(
+                    IndexSlot::new(0),
+                    Arc::clone(&metadata),
+                    Arc::clone(&table),
+                    disk_pool.global_pool().clone(),
+                )
+                .unwrap(),
+            };
+            let unique = unique.bind_unique_unchecked(&pool_guards, None).unwrap();
+            assert!(unique.open().unwrap().is_none());
+            assert_eq!(unique.lookup(&key, TrxID::new(2)).await.unwrap(), None);
+            assert!(matches!(
+                unique
+                    .insert_if_not_exists_observed(&key, RowID::new(70), false, TrxID::new(2),)
+                    .await
+                    .unwrap(),
+                UniqueInsertAttempt::Inserted { merged: false }
+            ));
+
+            let non_unique = SecondaryIndex::NonUnique {
+                mem: non_unique_mem_index(&index_pool, &index_guard).await,
+                disk: SecondaryDiskTreeRuntime::new(
+                    IndexSlot::new(1),
+                    Arc::clone(&metadata),
+                    Arc::clone(&table),
+                    disk_pool.global_pool().clone(),
+                )
+                .unwrap(),
+            };
+            let non_unique = non_unique
+                .bind_non_unique_unchecked(&pool_guards, None)
+                .unwrap();
+            assert!(non_unique.open().unwrap().is_none());
+            assert_eq!(
+                non_unique
+                    .lookup_unique(&key, RowID::new(70), TrxID::new(2))
+                    .await
+                    .unwrap(),
+                None
+            );
+        });
     }
 
     #[test]
@@ -1223,7 +1352,7 @@ mod tests {
                 disk_guard.clone(),
             );
             let disk_runtime = unique_runtime!(metadata, disk_pool);
-            let disk = disk_runtime.open(SUPER_BLOCK_ID, &disk_guard);
+            let disk = disk_runtime.open(None, &disk_guard);
             let key1 = [Val::from(1u32)];
             let key2 = [Val::from(2u32)];
             let key3 = [Val::from(3u32)];
@@ -1280,7 +1409,12 @@ mod tests {
                 .build();
             let bound = index.bind_unique_unchecked(&pool_guards, root).unwrap();
 
-            assert_eq!(table.active_root_unchecked().secondary_index_roots[0], root);
+            assert_eq!(
+                table
+                    .active_root_unchecked()
+                    .secondary_index_root(IndexSlot::new(0)),
+                root
+            );
             assert_eq!(index.disk_runtime().index_slot(), IndexSlot::new(0));
             assert!(
                 index
@@ -1558,7 +1692,7 @@ mod tests {
                 disk_guard.clone(),
             );
             let disk_runtime = unique_runtime!(metadata, disk_pool);
-            let disk = disk_runtime.open(SUPER_BLOCK_ID, &disk_guard);
+            let disk = disk_runtime.open(None, &disk_guard);
             let root_a = {
                 let mut writer = disk.batch_writer(&mut mutable, TrxID::new(2));
                 let puts = [UniqueDiskTreePut {
@@ -1604,7 +1738,9 @@ mod tests {
             let table_after_b =
                 publish_secondary_root(mutable, IndexSlot::new(0), root_b, TrxID::new(3)).await;
             assert_eq!(
-                table_after_b.active_root_unchecked().secondary_index_roots[0],
+                table_after_b
+                    .active_root_unchecked()
+                    .secondary_index_root(IndexSlot::new(0)),
                 root_b
             );
 
@@ -1638,7 +1774,7 @@ mod tests {
                 disk_guard.clone(),
             );
             let disk_runtime = non_unique_runtime!(metadata, disk_pool);
-            let disk = disk_runtime.open(SUPER_BLOCK_ID, &disk_guard);
+            let disk = disk_runtime.open(None, &disk_guard);
             let key1 = [Val::from(1u32)];
             let key2 = [Val::from(2u32)];
             let key3 = [Val::from(3u32)];
@@ -1695,7 +1831,12 @@ mod tests {
                 .build();
             let bound = index.bind_non_unique_unchecked(&pool_guards, root).unwrap();
 
-            assert_eq!(table.active_root_unchecked().secondary_index_roots[1], root);
+            assert_eq!(
+                table
+                    .active_root_unchecked()
+                    .secondary_index_root(IndexSlot::new(1)),
+                root
+            );
             assert_eq!(index.disk_runtime().index_slot(), IndexSlot::new(1));
             assert!(
                 index
@@ -1869,7 +2010,7 @@ mod tests {
                     disk_guard.clone(),
                 );
                 let disk_runtime = unique_runtime!(metadata, disk_pool);
-                let disk = disk_runtime.open(SUPER_BLOCK_ID, &disk_guard);
+                let disk = disk_runtime.open(None, &disk_guard);
                 let key1 = [Val::from(1u32)];
                 let key2 = [Val::from(2u32)];
                 let key3 = [Val::from(3u32)];
@@ -1978,7 +2119,7 @@ mod tests {
                     disk_guard.clone(),
                 );
                 let disk_runtime = non_unique_runtime!(metadata, disk_pool);
-                let disk = disk_runtime.open(SUPER_BLOCK_ID, &disk_guard);
+                let disk = disk_runtime.open(None, &disk_guard);
                 let key1 = [Val::from(1u32)];
                 let key2 = [Val::from(2u32)];
                 let mut writer = disk.batch_writer(&mut mutable, TrxID::new(2));

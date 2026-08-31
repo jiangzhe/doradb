@@ -1,6 +1,6 @@
 use crate::catalog::{
-    ActiveIndexSpec, ColumnAttributes, IndexAttributes, IndexKeySpec, IndexOrder, IndexSlot,
-    IndexSpec,
+    ColumnOrdinal, IndexID, IndexOrder, SecondaryIndexRoot, SecondaryIndexSlot, StorageColumnFlags,
+    StorageIndexFlags, StorageIndexKey, StorageIndexSpec,
 };
 use crate::compression::bitpacking::*;
 use crate::error::{DataIntegrityError, DataIntegrityResult};
@@ -9,7 +9,7 @@ use semistr::SemiStr;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::mem;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use zerocopy::IntoBytes;
 
 /// Result returned by byte deserializers before a format caller adds context.
@@ -209,8 +209,7 @@ impl Serde for [u8] {
 
     #[inline]
     fn deser_u64(&self, idx: usize) -> DeserResult<(usize, u64)> {
-        debug_assert!(idx + mem::size_of::<u64>() <= self.len());
-        let end = idx + mem::size_of::<u64>();
+        let end = checked_deser_end(self.len(), idx, mem::size_of::<u64>())?;
         let val = u64::from_le_bytes(self[idx..end].try_into().map_err(|_| {
             Report::new(DataIntegrityError::InvalidPayload).attach("invalid u64 byte width")
         })?);
@@ -219,8 +218,7 @@ impl Serde for [u8] {
 
     #[inline]
     fn deser_i64(&self, idx: usize) -> DeserResult<(usize, i64)> {
-        debug_assert!(idx + mem::size_of::<i64>() <= self.len());
-        let end = idx + mem::size_of::<i64>();
+        let end = checked_deser_end(self.len(), idx, mem::size_of::<i64>())?;
         let val = i64::from_le_bytes(self[idx..end].try_into().map_err(|_| {
             Report::new(DataIntegrityError::InvalidPayload).attach("invalid i64 byte width")
         })?);
@@ -229,8 +227,7 @@ impl Serde for [u8] {
 
     #[inline]
     fn deser_f64(&self, idx: usize) -> DeserResult<(usize, f64)> {
-        debug_assert!(idx + mem::size_of::<f64>() <= self.len());
-        let end = idx + mem::size_of::<f64>();
+        let end = checked_deser_end(self.len(), idx, mem::size_of::<f64>())?;
         let val = f64::from_le_bytes(self[idx..end].try_into().map_err(|_| {
             Report::new(DataIntegrityError::InvalidPayload).attach("invalid f64 byte width")
         })?);
@@ -239,8 +236,7 @@ impl Serde for [u8] {
 
     #[inline]
     fn deser_u32(&self, idx: usize) -> DeserResult<(usize, u32)> {
-        debug_assert!(idx + mem::size_of::<u32>() <= self.len());
-        let end = idx + mem::size_of::<u32>();
+        let end = checked_deser_end(self.len(), idx, mem::size_of::<u32>())?;
         let val = u32::from_le_bytes(self[idx..end].try_into().map_err(|_| {
             Report::new(DataIntegrityError::InvalidPayload).attach("invalid u32 byte width")
         })?);
@@ -249,8 +245,7 @@ impl Serde for [u8] {
 
     #[inline]
     fn deser_i32(&self, idx: usize) -> DeserResult<(usize, i32)> {
-        debug_assert!(idx + mem::size_of::<i32>() <= self.len());
-        let end = idx + mem::size_of::<i32>();
+        let end = checked_deser_end(self.len(), idx, mem::size_of::<i32>())?;
         let val = i32::from_le_bytes(self[idx..end].try_into().map_err(|_| {
             Report::new(DataIntegrityError::InvalidPayload).attach("invalid i32 byte width")
         })?);
@@ -259,8 +254,7 @@ impl Serde for [u8] {
 
     #[inline]
     fn deser_f32(&self, idx: usize) -> DeserResult<(usize, f32)> {
-        debug_assert!(idx + mem::size_of::<f32>() <= self.len());
-        let end = idx + mem::size_of::<f32>();
+        let end = checked_deser_end(self.len(), idx, mem::size_of::<f32>())?;
         let val = f32::from_le_bytes(self[idx..end].try_into().map_err(|_| {
             Report::new(DataIntegrityError::InvalidPayload).attach("invalid f32 byte width")
         })?);
@@ -269,8 +263,7 @@ impl Serde for [u8] {
 
     #[inline]
     fn deser_u16(&self, idx: usize) -> DeserResult<(usize, u16)> {
-        debug_assert!(idx + mem::size_of::<u16>() <= self.len());
-        let end = idx + mem::size_of::<u16>();
+        let end = checked_deser_end(self.len(), idx, mem::size_of::<u16>())?;
         let val = u16::from_le_bytes(self[idx..end].try_into().map_err(|_| {
             Report::new(DataIntegrityError::InvalidPayload).attach("invalid u16 byte width")
         })?);
@@ -279,8 +272,7 @@ impl Serde for [u8] {
 
     #[inline]
     fn deser_i16(&self, idx: usize) -> DeserResult<(usize, i16)> {
-        debug_assert!(idx + mem::size_of::<i16>() <= self.len());
-        let end = idx + mem::size_of::<i16>();
+        let end = checked_deser_end(self.len(), idx, mem::size_of::<i16>())?;
         let val = i16::from_le_bytes(self[idx..end].try_into().map_err(|_| {
             Report::new(DataIntegrityError::InvalidPayload).attach("invalid i16 byte width")
         })?);
@@ -289,28 +281,26 @@ impl Serde for [u8] {
 
     #[inline]
     fn deser_u8(&self, idx: usize) -> DeserResult<(usize, u8)> {
-        debug_assert!(idx + mem::size_of::<u8>() <= self.len());
-        Ok((idx + mem::size_of::<u8>(), self[idx]))
+        let end = checked_deser_end(self.len(), idx, mem::size_of::<u8>())?;
+        Ok((end, self[idx]))
     }
 
     #[inline]
     fn deser_i8(&self, idx: usize) -> DeserResult<(usize, i8)> {
-        debug_assert!(idx + mem::size_of::<i8>() <= self.len());
-        Ok((idx + mem::size_of::<i8>(), self[idx] as i8))
+        let end = checked_deser_end(self.len(), idx, mem::size_of::<i8>())?;
+        Ok((end, self[idx] as i8))
     }
 
     #[inline]
     fn deser_byte_slice(&self, idx: usize, len: usize) -> DeserResult<(usize, &[u8])> {
-        debug_assert!(idx + len <= self.len());
-        let end = idx + len;
+        let end = checked_deser_end(self.len(), idx, len)?;
         let res = &self[idx..end];
         Ok((end, res))
     }
 
     #[inline]
     fn deser_byte_array<const N: usize>(&self, idx: usize) -> DeserResult<(usize, [u8; N])> {
-        debug_assert!(idx + N <= self.len());
-        let end = idx + N;
+        let end = checked_deser_end(self.len(), idx, N)?;
         let mut res = [0u8; N];
         res.copy_from_slice(&self[idx..end]);
         Ok((end, res))
@@ -318,8 +308,7 @@ impl Serde for [u8] {
 
     #[inline]
     fn deser(&self, idx: usize, len: usize) -> DeserResult<(usize, &[u8])> {
-        debug_assert!(idx + len <= self.len());
-        let end = idx + len;
+        let end = checked_deser_end(self.len(), idx, len)?;
         Ok((end, &self[idx..end]))
     }
 }
@@ -787,11 +776,15 @@ impl Deser for IndexOrder {
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let (idx, v) = input.deser_u8(start_idx)?;
-        Ok((idx, IndexOrder::from(v)))
+        let order = IndexOrder::try_from(v).map_err(|()| {
+            Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!("unknown index order {v}"))
+        })?;
+        Ok((idx, order))
     }
 }
 
-impl Ser<'_> for IndexKeySpec {
+impl Ser<'_> for StorageIndexKey {
     #[inline]
     fn ser_len(&self) -> usize {
         mem::size_of::<u16>() + mem::size_of::<u8>()
@@ -799,24 +792,30 @@ impl Ser<'_> for IndexKeySpec {
 
     #[inline]
     fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
-        let start_idx = out.ser_u16(start_idx, self.col_no);
+        let start_idx = out.ser_u16(start_idx, self.column_ordinal.as_u16());
         self.order.ser(out, start_idx)
     }
 }
 
-impl Deser for IndexKeySpec {
+impl Deser for StorageIndexKey {
     const MIN_BYTES_HINT: MinBytesHint =
         min_bytes_hint(mem::size_of::<u16>() + mem::size_of::<u8>());
 
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
-        let (idx, col_no) = input.deser_u16(start_idx)?;
+        let (idx, column_ordinal) = input.deser_u16(start_idx)?;
         let (idx, order) = IndexOrder::deser(input, idx)?;
-        Ok((idx, IndexKeySpec { col_no, order }))
+        Ok((
+            idx,
+            StorageIndexKey {
+                column_ordinal: ColumnOrdinal::new(column_ordinal),
+                order,
+            },
+        ))
     }
 }
 
-impl Ser<'_> for IndexAttributes {
+impl Ser<'_> for StorageIndexFlags {
     #[inline]
     fn ser_len(&self) -> usize {
         mem::size_of::<u32>()
@@ -828,17 +827,21 @@ impl Ser<'_> for IndexAttributes {
     }
 }
 
-impl Deser for IndexAttributes {
+impl Deser for StorageIndexFlags {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<u32>());
 
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let (idx, v) = input.deser_u32(start_idx)?;
-        Ok((idx, IndexAttributes::from_bits_truncate(v)))
+        let flags = StorageIndexFlags::from_bits(v).ok_or_else(|| {
+            Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!("unknown storage index flags {v:#x}"))
+        })?;
+        Ok((idx, flags))
     }
 }
 
-impl Ser<'_> for ColumnAttributes {
+impl Ser<'_> for StorageColumnFlags {
     #[inline]
     fn ser_len(&self) -> usize {
         mem::size_of::<u32>()
@@ -850,69 +853,127 @@ impl Ser<'_> for ColumnAttributes {
     }
 }
 
-impl Deser for ColumnAttributes {
+impl Deser for StorageColumnFlags {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<u32>());
 
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let (idx, v) = input.deser_u32(start_idx)?;
-        Ok((idx, ColumnAttributes::from_bits_truncate(v)))
+        let flags = StorageColumnFlags::from_bits(v).ok_or_else(|| {
+            Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!("unknown storage column flags {v:#x}"))
+        })?;
+        Ok((idx, flags))
     }
 }
 
-impl Ser<'_> for IndexSpec {
+impl Ser<'_> for StorageIndexSpec {
     #[inline]
     fn ser_len(&self) -> usize {
-        self.cols.ser_len() + self.attributes.ser_len()
+        self.keys.ser_len() + self.flags.ser_len()
     }
 
     #[inline]
     fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
-        let idx = self.cols.ser(out, start_idx);
-        self.attributes.ser(out, idx)
+        let idx = self.keys.ser(out, start_idx);
+        self.flags.ser(out, idx)
     }
 }
 
-impl Deser for IndexSpec {
+impl Deser for StorageIndexSpec {
     const MIN_BYTES_HINT: MinBytesHint =
         min_bytes_hint(mem::size_of::<u64>() + mem::size_of::<u32>());
 
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
-        let (idx, cols) = <Vec<IndexKeySpec>>::deser(input, start_idx)?;
-        let (idx, attributes) = IndexAttributes::deser(input, idx)?;
-        Ok((idx, IndexSpec { cols, attributes }))
+        let (idx, keys) = <Vec<StorageIndexKey>>::deser(input, start_idx)?;
+        let (idx, flags) = StorageIndexFlags::deser(input, idx)?;
+        Ok((idx, StorageIndexSpec { keys, flags }))
     }
 }
 
-impl Ser<'_> for ActiveIndexSpec {
+impl Ser<'_> for SecondaryIndexSlot {
     #[inline]
     fn ser_len(&self) -> usize {
-        mem::size_of::<u16>() + self.spec.ser_len()
+        match self {
+            Self::Vacant => mem::size_of::<u8>(),
+            Self::Active { root, .. } => {
+                mem::size_of::<u8>()
+                    + mem::size_of::<u32>()
+                    + mem::size_of::<u8>()
+                    + match root {
+                        SecondaryIndexRoot::Empty => 0,
+                        SecondaryIndexRoot::Present(_) => mem::size_of::<u64>(),
+                    }
+            }
+            Self::Retired(_) => mem::size_of::<u8>() + mem::size_of::<u32>(),
+        }
     }
 
     #[inline]
     fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
-        let idx = out.ser_u16(start_idx, self.index_slot.get());
-        self.spec.ser(out, idx)
+        match self {
+            Self::Vacant => out.ser_u8(start_idx, 0),
+            Self::Active { index_id, root } => {
+                let idx = out.ser_u8(start_idx, 1);
+                let idx = out.ser_u32(idx, index_id.get());
+                match root {
+                    SecondaryIndexRoot::Empty => out.ser_u8(idx, 0),
+                    SecondaryIndexRoot::Present(block_id) => {
+                        let idx = out.ser_u8(idx, 1);
+                        out.ser_u64(idx, block_id.get())
+                    }
+                }
+            }
+            Self::Retired(id) => {
+                let idx = out.ser_u8(start_idx, 2);
+                out.ser_u32(idx, id.get())
+            }
+        }
     }
 }
 
-impl Deser for ActiveIndexSpec {
-    const MIN_BYTES_HINT: MinBytesHint =
-        min_bytes_hint(mem::size_of::<u16>() + mem::size_of::<u64>() + mem::size_of::<u32>());
+impl Deser for SecondaryIndexSlot {
+    const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<u8>());
 
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
-        let (idx, index_slot) = input.deser_u16(start_idx)?;
-        let (idx, spec) = IndexSpec::deser(input, idx)?;
-        Ok((
-            idx,
-            ActiveIndexSpec {
-                index_slot: IndexSlot::from(index_slot),
-                spec,
-            },
-        ))
+        let (idx, tag) = input.deser_u8(start_idx)?;
+        match tag {
+            0 => Ok((idx, Self::Vacant)),
+            1 => {
+                let (idx, id) = input.deser_u32(idx)?;
+                let (idx, root_tag) = input.deser_u8(idx)?;
+                let (idx, root) = match root_tag {
+                    0 => (idx, SecondaryIndexRoot::Empty),
+                    1 => {
+                        let (idx, root_block_id) = input.deser_u64(idx)?;
+                        let Some(root_block_id) = NonZeroU64::new(root_block_id) else {
+                            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                                .attach("present secondary index root is block zero"));
+                        };
+                        (idx, SecondaryIndexRoot::Present(root_block_id))
+                    }
+                    _ => {
+                        return Err(Report::new(DataIntegrityError::InvalidPayload)
+                            .attach(format!("unknown secondary index root tag {root_tag}")));
+                    }
+                };
+                Ok((
+                    idx,
+                    Self::Active {
+                        index_id: IndexID::new(id),
+                        root,
+                    },
+                ))
+            }
+            2 => {
+                let (idx, id) = input.deser_u32(idx)?;
+                Ok((idx, Self::Retired(IndexID::new(id))))
+            }
+            _ => Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!("unknown secondary index slot tag {tag}"))),
+        }
     }
 }
 
@@ -1052,6 +1113,17 @@ impl<T: BitPackable + Deser> Deser for ForBitpackingDeser<T> {
 #[inline]
 pub(crate) const fn min_bytes_hint(bytes: usize) -> MinBytesHint {
     NonZeroUsize::new(bytes)
+}
+
+#[inline]
+fn checked_deser_end(input_len: usize, idx: usize, len: usize) -> DataIntegrityResult<usize> {
+    idx.checked_add(len)
+        .filter(|end| *end <= input_len)
+        .ok_or_else(|| {
+            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                "deserialization range exceeds input: offset={idx}, len={len}, input_len={input_len}"
+            ))
+        })
 }
 
 #[inline]
@@ -1384,24 +1456,63 @@ mod tests {
     #[test]
     fn test_index_spec_serde() {
         let cols = vec![
-            IndexKeySpec::new(0),
-            IndexKeySpec {
-                col_no: 1,
+            StorageIndexKey::new(0),
+            StorageIndexKey {
+                column_ordinal: ColumnOrdinal::new(1),
                 order: IndexOrder::Desc,
             },
         ];
         println!("cols ser_len={}", cols.ser_len());
-        let attributes = IndexAttributes::PK;
+        let attributes = StorageIndexFlags::PK;
         println!("attributes ser_len={}", attributes.ser_len());
-        let spec = IndexSpec { cols, attributes };
+        let spec = StorageIndexSpec::new(cols, attributes);
         let len = spec.ser_len();
         println!("index_spec ser_len={}", len);
         let mut vec = vec![0u8; len];
         let idx = spec.ser(&mut vec[..], 0);
         assert_eq!(idx, len);
-        let (idx, parsed) = IndexSpec::deser(&vec[..], 0).unwrap();
+        let (idx, parsed) = StorageIndexSpec::deser(&vec[..], 0).unwrap();
         assert_eq!(idx, len);
         assert_eq!(parsed, spec);
+    }
+
+    #[test]
+    fn test_secondary_index_slot_serde_is_exact_and_fallible() {
+        for (slot, expected) in [
+            (SecondaryIndexSlot::Vacant, vec![0]),
+            (
+                SecondaryIndexSlot::Active {
+                    index_id: IndexID::new(0x0102_0304),
+                    root: SecondaryIndexRoot::Empty,
+                },
+                vec![1, 4, 3, 2, 1, 0],
+            ),
+            (
+                SecondaryIndexSlot::Active {
+                    index_id: IndexID::new(0x0102_0304),
+                    root: SecondaryIndexRoot::Present(NonZeroU64::new(9).unwrap()),
+                },
+                vec![1, 4, 3, 2, 1, 1, 9, 0, 0, 0, 0, 0, 0, 0],
+            ),
+            (
+                SecondaryIndexSlot::Retired(IndexID::new(0x0506_0708)),
+                vec![2, 8, 7, 6, 5],
+            ),
+        ] {
+            let mut out = vec![0; slot.ser_len()];
+            let idx = slot.ser(&mut out[..], 0);
+            assert_eq!(idx, out.len());
+            assert_eq!(out, expected);
+            let (idx, decoded) = SecondaryIndexSlot::deser(&out[..], 0).unwrap();
+            assert_eq!(idx, out.len());
+            assert_eq!(decoded, slot);
+        }
+        assert!(SecondaryIndexSlot::deser(&[3u8][..], 0).is_err());
+        assert!(SecondaryIndexSlot::deser(&[1u8][..], 0).is_err());
+        assert!(SecondaryIndexSlot::deser(&[1, 0, 0, 0, 0, 2][..], 0).is_err());
+        assert!(
+            SecondaryIndexSlot::deser(&[1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0][..], 0).is_err()
+        );
     }
 
     #[test]

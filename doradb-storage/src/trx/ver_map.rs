@@ -175,19 +175,18 @@ mod tests {
     use super::*;
     use crate::catalog::TableMetadata;
     use crate::catalog::spec::{
-        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexSpec,
+        StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey, StorageIndexSpec,
     };
     use crate::value::ValKind;
 
     #[test]
     fn test_row_version_map_create_cts() {
         let metadata = TableMetadata::try_new(
-            vec![ColumnSpec::new(
-                "id",
+            vec![StorageColumnSpec::new(
                 ValKind::I64,
-                ColumnAttributes::empty(),
+                StorageColumnFlags::empty(),
             )],
-            Vec::<IndexSpec>::new(),
+            Vec::<StorageIndexSpec>::new(),
         )
         .expect("valid table metadata");
         let map = RowVersionMap::new(Arc::clone(&metadata.col), 1);
@@ -199,12 +198,11 @@ mod tests {
     #[test]
     fn test_row_version_map_state_transitions() {
         let metadata = TableMetadata::try_new(
-            vec![ColumnSpec::new(
-                "id",
+            vec![StorageColumnSpec::new(
                 ValKind::I64,
-                ColumnAttributes::empty(),
+                StorageColumnFlags::empty(),
             )],
-            Vec::<IndexSpec>::new(),
+            Vec::<StorageIndexSpec>::new(),
         )
         .expect("valid table metadata");
         let map = RowVersionMap::new(Arc::clone(&metadata.col), 1);
@@ -220,21 +218,21 @@ mod tests {
     #[test]
     fn test_row_version_map_stores_column_layout_arc_only() {
         let metadata = TableMetadata::try_new(
-            vec![ColumnSpec::new(
-                "id",
+            vec![StorageColumnSpec::new(
                 ValKind::I64,
-                ColumnAttributes::empty(),
+                StorageColumnFlags::empty(),
             )],
-            Vec::<IndexSpec>::new(),
+            Vec::<StorageIndexSpec>::new(),
         )
         .expect("valid table metadata");
         let (index_slot, indexed_metadata) = metadata
-            .try_with_created_index(IndexSpec::new(
-                vec![IndexKeySpec::new(0)],
-                IndexAttributes::UK,
+            .try_with_created_index(StorageIndexSpec::new(
+                vec![StorageIndexKey::new(0)],
+                StorageIndexFlags::UK,
             ))
             .unwrap();
-        assert_eq!(index_slot, crate::catalog::IndexSlot::new(0));
+        assert_eq!(index_slot.id(), crate::catalog::IndexID::new(0));
+        assert_eq!(index_slot.slot(), crate::catalog::IndexSlot::new(0));
         assert!(Arc::ptr_eq(&metadata.col, &indexed_metadata.col));
         assert_ne!(
             metadata.idx.active_index_count(),

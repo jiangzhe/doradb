@@ -6,7 +6,7 @@ pub(crate) use vector_scan::*;
 
 use crate::bitmap::bitmap_required_units;
 use crate::buffer::page::{BufferPage, PAGE_SIZE, assert_buffer_page};
-use crate::catalog::{IndexSpec, TableColumnLayout};
+use crate::catalog::{TableColumnLayout, TableIndexMetadata};
 use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
 use crate::id::RowID;
 use crate::layout;
@@ -16,7 +16,6 @@ use std::borrow::Cow;
 use std::fmt;
 use std::mem;
 use std::ptr::copy_nonoverlapping;
-use std::str::from_utf8;
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, Ordering};
 use zerocopy::byteorder::little_endian::{
     F32 as LeF32, F64 as LeF64, I16 as LeI16, I32 as LeI32, I64 as LeI64, U16 as LeU16,
@@ -1369,14 +1368,6 @@ pub(crate) trait RowRead {
         var.as_bytes(self.page().data())
     }
 
-    /// Returns string.
-    #[inline]
-    fn str(&self, col_idx: usize) -> Option<&str> {
-        let page = self.page();
-        let var = page.var(self.row_idx(), col_idx);
-        from_utf8(var.as_bytes(page.data())).ok()
-    }
-
     /// Returns RowID of current row.
     /// Row id is always the first column of a row, with 8-byte width.
     #[inline]
@@ -1447,18 +1438,18 @@ pub(crate) trait RowRead {
     fn is_key_different(
         &self,
         col_layout: &TableColumnLayout,
-        index_spec: &IndexSpec,
+        index_spec: &TableIndexMetadata,
         key_vals: &[Val],
     ) -> bool {
         debug_assert!(!key_vals.is_empty());
-        if index_spec.cols.len() != key_vals.len() {
+        if index_spec.keys.len() != key_vals.len() {
             return true;
         }
         index_spec
-            .cols
+            .keys
             .iter()
             .zip(key_vals)
-            .any(|(key, val)| self.is_different(col_layout, key.col_no as usize, val))
+            .any(|(key, val)| self.is_different(col_layout, key.column_ordinal.as_usize(), val))
     }
 
     /// Returns whether the value of current row at given column index is different from given value.
@@ -1727,11 +1718,10 @@ mod tests {
     use core::str;
 
     use crate::catalog::{
-        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexOrder, IndexSpec,
-        TableMetadata,
+        ColumnOrdinal, IndexOrder, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags,
+        StorageIndexKey, StorageIndexSpec, TableMetadata,
     };
     use crate::value::ValKind;
-    use semistr::SemiStr;
 
     use super::*;
 
@@ -1783,18 +1773,17 @@ mod tests {
     #[test]
     fn test_row_page_init() {
         let metadata = TableMetadata::try_new(
-            vec![ColumnSpec {
-                column_name: SemiStr::new("id"),
-                column_type: ValKind::I32,
-                column_attributes: ColumnAttributes::empty(),
-            }],
-            vec![IndexSpec {
-                cols: vec![IndexKeySpec {
-                    col_no: 0,
+            vec![StorageColumnSpec::new(
+                ValKind::I32,
+                StorageColumnFlags::empty(),
+            )],
+            vec![StorageIndexSpec::new(
+                vec![StorageIndexKey {
+                    column_ordinal: ColumnOrdinal::new(0),
                     order: IndexOrder::Asc,
                 }],
-                attributes: IndexAttributes::PK,
-            }],
+                StorageIndexFlags::PK,
+            )],
         )
         .expect("valid table metadata");
         let mut page = create_row_page();
@@ -1816,15 +1805,14 @@ mod tests {
     #[test]
     fn test_row_page_var_data_stops_before_checksum_footer() {
         let metadata = TableMetadata::try_new(
-            vec![ColumnSpec::new(
-                "payload",
+            vec![StorageColumnSpec::new(
                 ValKind::VarByte,
-                ColumnAttributes::empty(),
+                StorageColumnFlags::empty(),
             )],
-            vec![IndexSpec {
-                cols: vec![IndexKeySpec::new(0)],
-                attributes: IndexAttributes::UK,
-            }],
+            vec![StorageIndexSpec::new(
+                vec![StorageIndexKey::new(0)],
+                StorageIndexFlags::UK,
+            )],
         )
         .expect("valid table metadata");
         let mut page = create_row_page();
@@ -1850,15 +1838,14 @@ mod tests {
     #[test]
     fn test_row_page_new_row() {
         let metadata = TableMetadata::try_new(
-            vec![ColumnSpec {
-                column_name: SemiStr::new("id"),
-                column_type: ValKind::I32,
-                column_attributes: ColumnAttributes::empty(),
-            }],
-            vec![IndexSpec {
-                cols: vec![IndexKeySpec::new(0)],
-                attributes: IndexAttributes::PK,
-            }],
+            vec![StorageColumnSpec::new(
+                ValKind::I32,
+                StorageColumnFlags::empty(),
+            )],
+            vec![StorageIndexSpec::new(
+                vec![StorageIndexKey::new(0)],
+                StorageIndexFlags::PK,
+            )],
         )
         .expect("valid table metadata");
         let mut page = create_row_page();
@@ -1877,21 +1864,13 @@ mod tests {
     fn test_row_page_read_write_row() {
         let metadata = TableMetadata::try_new(
             vec![
-                ColumnSpec {
-                    column_name: SemiStr::new("id"),
-                    column_type: ValKind::I32,
-                    column_attributes: ColumnAttributes::NULLABLE,
-                },
-                ColumnSpec {
-                    column_name: SemiStr::new("name"),
-                    column_type: ValKind::VarByte,
-                    column_attributes: ColumnAttributes::empty(),
-                },
+                StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::NULLABLE),
+                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
             ],
-            vec![IndexSpec {
-                cols: vec![IndexKeySpec::new(0)],
-                attributes: IndexAttributes::UK,
-            }],
+            vec![StorageIndexSpec::new(
+                vec![StorageIndexKey::new(0)],
+                StorageIndexFlags::UK,
+            )],
         )
         .expect("valid table metadata");
         assert!(metadata.col.nullable(0));
@@ -1938,8 +1917,8 @@ mod tests {
     fn test_row_page_decode_stable_across_index_only_metadata_changes() {
         let metadata = TableMetadata::try_new(
             vec![
-                ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
-                ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::NULLABLE),
+                StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::NULLABLE),
             ],
             vec![],
         )
@@ -1950,12 +1929,12 @@ mod tests {
         assert!(page.insert(metadata.col.as_ref(), &expected).is_ok());
 
         let (index_slot, indexed_metadata) = metadata
-            .try_with_created_index(IndexSpec::new(
-                vec![IndexKeySpec::new(0)],
-                IndexAttributes::UK,
+            .try_with_created_index(StorageIndexSpec::new(
+                vec![StorageIndexKey::new(0)],
+                StorageIndexFlags::UK,
             ))
             .unwrap();
-        let dropped_metadata = indexed_metadata.without_index(index_slot);
+        let dropped_metadata = indexed_metadata.without_index(index_slot).unwrap();
 
         let row = page.row(0);
         assert_eq!(row.clone_vals(metadata.col.as_ref()), expected);
@@ -1967,36 +1946,16 @@ mod tests {
     fn test_row_page_crud() {
         let schema = TableMetadata::try_new(
             vec![
-                ColumnSpec {
-                    column_name: SemiStr::new("col1"),
-                    column_type: ValKind::U8,
-                    column_attributes: ColumnAttributes::empty(),
-                },
-                ColumnSpec {
-                    column_name: SemiStr::new("col2"),
-                    column_type: ValKind::U16,
-                    column_attributes: ColumnAttributes::empty(),
-                },
-                ColumnSpec {
-                    column_name: SemiStr::new("col3"),
-                    column_type: ValKind::U32,
-                    column_attributes: ColumnAttributes::empty(),
-                },
-                ColumnSpec {
-                    column_name: SemiStr::new("col4"),
-                    column_type: ValKind::U64,
-                    column_attributes: ColumnAttributes::empty(),
-                },
-                ColumnSpec {
-                    column_name: SemiStr::new("col5"),
-                    column_type: ValKind::VarByte,
-                    column_attributes: ColumnAttributes::empty(),
-                },
+                StorageColumnSpec::new(ValKind::U8, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::U16, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
             ],
-            vec![IndexSpec {
-                cols: vec![IndexKeySpec::new(2)],
-                attributes: IndexAttributes::PK,
-            }],
+            vec![StorageIndexSpec::new(
+                vec![StorageIndexKey::new(2)],
+                StorageIndexFlags::PK,
+            )],
         )
         .expect("valid table metadata");
         let mut page = create_row_page();

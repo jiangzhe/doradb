@@ -12,7 +12,7 @@ use std::mem;
 /// Magic bytes stored in every redo file super-block header.
 pub(crate) const REDO_FILE_MAGIC: [u8; 8] = *b"DREDO\0\0\0";
 /// Redo file format version for framing and serialized redo payloads.
-pub(crate) const REDO_FILE_FORMAT_VERSION: u64 = 5;
+pub(crate) const REDO_FILE_FORMAT_VERSION: u64 = 6;
 /// Shared block-integrity envelope used by redo super-block slots.
 pub(crate) const REDO_SUPER_BLOCK_SPEC: BlockIntegritySpec =
     BlockIntegritySpec::new(REDO_FILE_MAGIC, REDO_FILE_FORMAT_VERSION);

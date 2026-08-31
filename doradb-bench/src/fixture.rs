@@ -1,7 +1,8 @@
 use crate::error::{BenchError, Result};
 use doradb_storage::id::{TableID, TrxID};
 use doradb_storage::{
-    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexSpec, TableSpec, ValKind,
+    StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey, StorageIndexSpec,
+    StorageTableSpec, ValKind,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -619,28 +620,28 @@ impl FixtureRuntimeState {
 }
 
 /// Build the fixed two-column schema shared by benchmark tables.
-pub(crate) fn benchmark_table_spec() -> TableSpec {
-    TableSpec::new(vec![
-        ColumnSpec::new("logical_key", ValKind::U64, ColumnAttributes::empty()),
-        ColumnSpec::new("payload", ValKind::VarByte, ColumnAttributes::empty()),
+pub(crate) fn benchmark_table_spec() -> StorageTableSpec {
+    StorageTableSpec::new(vec![
+        StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
+        StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
     ])
 }
 
 /// Build the implicit table's configured secondary indexes.
-pub(crate) fn benchmark_index_specs(index: IndexMode) -> Vec<IndexSpec> {
+pub(crate) fn benchmark_index_specs(index: IndexMode) -> Vec<StorageIndexSpec> {
     match index {
         IndexMode::None => Vec::new(),
-        IndexMode::Unique => vec![IndexSpec::new(
-            vec![IndexKeySpec::new(0)],
-            IndexAttributes::UK,
+        IndexMode::Unique => vec![StorageIndexSpec::new(
+            vec![StorageIndexKey::new(0)],
+            StorageIndexFlags::UK,
         )],
         IndexMode::NonUnique => vec![benchmark_non_unique_index_spec()],
     }
 }
 
 /// Build the standard non-unique logical-key index.
-pub(crate) fn benchmark_non_unique_index_spec() -> IndexSpec {
-    IndexSpec::new(vec![IndexKeySpec::new(0)], IndexAttributes::empty())
+pub(crate) fn benchmark_non_unique_index_spec() -> StorageIndexSpec {
+    StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::empty())
 }
 
 fn validate_index(actual: IndexMode, requirement: IndexRequirement) -> Result<()> {

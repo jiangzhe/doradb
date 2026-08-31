@@ -1,7 +1,7 @@
 //! This module contains definition and functions of LWC(Lightweight Compression) Block.
 
 use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
-use crate::catalog::{IndexSpec, TableColumnLayout};
+use crate::catalog::{TableColumnLayout, TableIndexMetadata};
 use crate::error::{DataIntegrityError, DataIntegrityResult, RuntimeResult};
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, LWC_BLOCK_SPEC, max_payload_len, validate_block,
@@ -258,14 +258,17 @@ impl LwcBlock {
     pub(crate) fn decode_index_key_values(
         &self,
         col_layout: &TableColumnLayout,
-        index_spec: &IndexSpec,
+        index_spec: &TableIndexMetadata,
         row_idx: usize,
     ) -> DataIntegrityResult<Vec<Val>> {
         self.decode_row_values_inner(
             col_layout,
             row_idx,
-            index_spec.cols.iter().map(|key| key.col_no as usize),
-            index_spec.cols.len(),
+            index_spec
+                .keys
+                .iter()
+                .map(|key| key.column_ordinal.as_usize()),
+            index_spec.keys.len(),
         )
     }
 
@@ -679,7 +682,8 @@ pub(crate) fn validate_persisted_lwc_block(
 mod tests {
     use super::*;
     use crate::catalog::{
-        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKeySpec, IndexSpec, TableMetadata,
+        StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
+        StorageIndexSpec, TableMetadata,
     };
     // Test helper inspects the intentional `PersistedLwcBlock::load` public
     // convergence over read/completion and DataIntegrity domains.
@@ -734,8 +738,8 @@ mod tests {
     fn build_valid_persisted_lwc_block() -> (TableMetadata, DirectBuf) {
         let metadata = TableMetadata::try_new(
             vec![
-                ColumnSpec::new("c0", ValKind::U8, ColumnAttributes::empty()),
-                ColumnSpec::new("c1", ValKind::I16, ColumnAttributes::NULLABLE),
+                StorageColumnSpec::new(ValKind::U8, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::I16, StorageColumnFlags::NULLABLE),
             ],
             vec![],
         )
@@ -797,10 +801,9 @@ mod tests {
     #[test]
     fn test_lwc_block_nullable_column() {
         let metadata = TableMetadata::try_new(
-            vec![ColumnSpec::new(
-                "c0",
+            vec![StorageColumnSpec::new(
                 ValKind::U8,
-                ColumnAttributes::NULLABLE,
+                StorageColumnFlags::NULLABLE,
             )],
             vec![],
         )
@@ -843,10 +846,9 @@ mod tests {
     #[test]
     fn test_lwc_block_column_metadata_mismatch() {
         let metadata = TableMetadata::try_new(
-            vec![ColumnSpec::new(
-                "c0",
+            vec![StorageColumnSpec::new(
                 ValKind::U8,
-                ColumnAttributes::empty(),
+                StorageColumnFlags::empty(),
             )],
             vec![],
         )
@@ -1009,12 +1011,12 @@ mod tests {
     fn test_lwc_block_decode_stable_across_index_only_metadata_changes() {
         let (metadata, buf) = build_valid_persisted_lwc_block();
         let (index_slot, indexed_metadata) = metadata
-            .try_with_created_index(IndexSpec::new(
-                vec![IndexKeySpec::new(0)],
-                IndexAttributes::UK,
+            .try_with_created_index(StorageIndexSpec::new(
+                vec![StorageIndexKey::new(0)],
+                StorageIndexFlags::UK,
             ))
             .unwrap();
-        let dropped_metadata = indexed_metadata.without_index(index_slot);
+        let dropped_metadata = indexed_metadata.without_index(index_slot).unwrap();
         let page =
             LwcBlock::try_from_persisted_bytes(buf.data(), FileKind::TableFile, test_block_id(8))
                 .unwrap();

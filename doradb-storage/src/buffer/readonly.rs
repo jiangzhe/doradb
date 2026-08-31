@@ -1339,7 +1339,9 @@ pub(crate) mod tests {
     use super::*;
     use crate::buffer::page::Page;
     use crate::buffer::{test_outstanding_base_guard_count, test_page_id};
-    use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata, USER_TABLE_ID_START};
+    use crate::catalog::{
+        StorageColumnFlags, StorageColumnSpec, TableMetadata, USER_TABLE_ID_START,
+    };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{
@@ -1807,10 +1809,9 @@ pub(crate) mod tests {
     fn make_metadata() -> Arc<TableMetadata> {
         Arc::new(
             TableMetadata::try_new(
-                vec![ColumnSpec::new(
-                    "c0",
+                vec![StorageColumnSpec::new(
                     ValKind::U32,
-                    ColumnAttributes::empty(),
+                    StorageColumnFlags::empty(),
                 )],
                 vec![],
             )
