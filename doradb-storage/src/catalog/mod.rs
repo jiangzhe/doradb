@@ -42,12 +42,14 @@ use crate::index::BlockIndex;
 use crate::map::{FastDashMap, FastHashMap, FastHashSet};
 use crate::poison::EnginePoisoner;
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
+use crate::row::Row;
 use crate::table::{
-    LiveTableRedoReplayFloor, MemTable, Table, TableRedoReplayFloor, TableRuntimeLayout,
+    IndexLookupCriteria, LiveTableRedoReplayFloor, MemTable, Table, TableRedoReplayFloor,
+    TableRuntimeLayout,
 };
-use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::retention::PendingDroppedTableRedoFloor;
 use crate::trx::undo::IndexUndo;
+use crate::trx::{MIN_SNAPSHOT_TS, PrivateTransaction};
 use dashmap::mapref::entry::Entry::{Occupied, Vacant};
 use error_stack::{Report, ResultExt};
 use std::collections::hash_map::Entry;
@@ -96,6 +98,38 @@ impl CatalogTable {
         .change_context(RuntimeError::CatalogAccess)
         .attach_with(|| format!("operation=create_catalog_table, table_id={table_id}"))?;
         Ok(CatalogTable { mem })
+    }
+
+    /// Visits raw current rows selected through one catalog index while the
+    /// owning private DDL transaction retains stabilizing catalog locks.
+    pub(crate) async fn index_lookup_current_locked<F>(
+        &self,
+        trx: &PrivateTransaction,
+        index_slot: CatalogIndexNo,
+        criteria: IndexLookupCriteria<'_>,
+        row_action: F,
+    ) -> RuntimeResult<()>
+    where
+        F: for<'m, 'p> FnMut(&'m TableColumnLayout, Row<'p>) -> bool,
+    {
+        if !trx.has_catalog_current_lock_authority(self.table_id()) {
+            return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+                .attach(format!(
+                    "locked current catalog lookup lacks metadata-S or data-IX authority: table_id={}, index_slot={index_slot}",
+                    self.table_id()
+                ))
+                .change_context(RuntimeError::CatalogAccess));
+        }
+        self.mem
+            .catalog_index_lookup_current(trx.pool_guards(), index_slot, criteria, row_action)
+            .await
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=index_lookup_current_locked, table_id={}, index_slot={index_slot}",
+                    self.table_id()
+                )
+            })
     }
 }
 

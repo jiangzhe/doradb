@@ -23,8 +23,9 @@ use crate::error::{
 use crate::id::{PageID, RowID, TableID, TrxID};
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{
-    BlockIndex, GuardedNonUniqueMemIndex, GuardedUniqueMemIndex, InMemorySecondaryIndex,
-    IndexCompareExchange, IndexInsert, RowLocation,
+    BTreeKeyEncoder, BlockIndex, GuardedNonUniqueMemIndex, GuardedUniqueMemIndex,
+    InMemorySecondaryIndex, IndexBatchStream, IndexCompareExchange, IndexInsert,
+    IndexLookupCandidate, KeyRange, RowLocation,
 };
 use crate::latch::LatchFallbackMode;
 use crate::map::FastHashMap;
@@ -48,6 +49,30 @@ use std::sync::Arc;
 struct NoTrxIndexRefresh {
     old_keys: Vec<SelectKey>,
     new_keys: Vec<SelectKey>,
+}
+
+/// Logical key selection supported by current in-memory index lookups.
+pub(crate) enum IndexLookupCriteria<'a> {
+    /// One exact key in a unique index.
+    UniqueExact(&'a [Val]),
+    /// One inclusive logical-key range in a unique index.
+    UniqueInclusive {
+        /// Inclusive lower logical key.
+        lower: &'a [Val],
+        /// Inclusive upper logical key.
+        upper: &'a [Val],
+    },
+    /// All rows equal to one logical key in a non-unique index.
+    NonUniqueExact(&'a [Val]),
+}
+
+#[derive(Clone, Copy)]
+enum CurrentCatalogRowMatch<'a> {
+    Exact(&'a [Val]),
+    Range {
+        range: &'a KeyRange,
+        encoder: &'a BTreeKeyEncoder,
+    },
 }
 
 /// Successful catalog primary-key upsert performed without transaction state.
@@ -2162,6 +2187,187 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             return Ok(None);
         }
         Ok(Some(row_action(row_layout, row)))
+    }
+
+    /// Visits raw current catalog rows selected from one in-memory index.
+    ///
+    /// The catalog wrapper proves that its private transaction retains the
+    /// locks that stabilize this traversal.
+    pub(crate) async fn catalog_index_lookup_current<F>(
+        &self,
+        guards: &PoolGuards,
+        index_slot: IndexSlot,
+        criteria: IndexLookupCriteria<'_>,
+        mut row_action: F,
+    ) -> RuntimeResult<()>
+    where
+        F: for<'m, 'p> FnMut(&'m TableColumnLayout, Row<'p>) -> bool,
+    {
+        let Some(index_spec) = self.metadata().idx.index_spec(index_slot) else {
+            return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+                .attach(format!(
+                    "locked current catalog lookup selected missing index: table_id={}, index_slot={index_slot}",
+                    self.table_id()
+                ))
+                .change_context(RuntimeError::CatalogAccess));
+        };
+        match criteria {
+            IndexLookupCriteria::UniqueExact(key) => {
+                self.validate_current_catalog_lookup(index_slot, index_spec, key, true)?;
+                let index = self.require_unique_index(guards, index_slot)?;
+                let range = index.key_encoder().encode_range(key..=key);
+                let stream = index.index_scan_candidates(&range, MIN_SNAPSHOT_TS)?;
+                self.visit_current_catalog_candidates(
+                    guards,
+                    index_spec,
+                    CurrentCatalogRowMatch::Exact(key),
+                    stream,
+                    &mut row_action,
+                )
+                .await
+            }
+            IndexLookupCriteria::UniqueInclusive { lower, upper } => {
+                self.validate_current_catalog_lookup(index_slot, index_spec, lower, true)?;
+                self.validate_current_catalog_lookup(index_slot, index_spec, upper, true)?;
+                let index = self.require_unique_index(guards, index_slot)?;
+                let range = index.key_encoder().encode_range(lower..=upper);
+                let stream = index.index_scan_candidates(&range, MIN_SNAPSHOT_TS)?;
+                self.visit_current_catalog_candidates(
+                    guards,
+                    index_spec,
+                    CurrentCatalogRowMatch::Range {
+                        range: &range,
+                        encoder: index.key_encoder(),
+                    },
+                    stream,
+                    &mut row_action,
+                )
+                .await
+            }
+            IndexLookupCriteria::NonUniqueExact(key) => {
+                self.validate_current_catalog_lookup(index_slot, index_spec, key, false)?;
+                let index = self.require_non_unique_index(guards, index_slot)?;
+                let range = index.key_encoder().encode_non_unique_equal_range(key);
+                let stream = index.equal_scan_candidates(&range, MIN_SNAPSHOT_TS)?;
+                self.visit_current_catalog_candidates(
+                    guards,
+                    index_spec,
+                    CurrentCatalogRowMatch::Exact(key),
+                    stream,
+                    &mut row_action,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn visit_current_catalog_candidates<S, F>(
+        &self,
+        guards: &PoolGuards,
+        index_spec: &TableIndexMetadata,
+        row_match: CurrentCatalogRowMatch<'_>,
+        mut stream: S,
+        row_action: &mut F,
+    ) -> RuntimeResult<()>
+    where
+        S: IndexBatchStream<IndexLookupCandidate>,
+        F: for<'m, 'p> FnMut(&'m TableColumnLayout, Row<'p>) -> bool,
+    {
+        while let Some(batch) = stream.next_batch().await? {
+            for candidate in batch {
+                if !self
+                    .visit_current_catalog_candidate(
+                        guards, index_spec, row_match, candidate, row_action,
+                    )
+                    .await?
+                {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn validate_current_catalog_lookup(
+        &self,
+        index_slot: IndexSlot,
+        index_spec: &TableIndexMetadata,
+        key: &[Val],
+        require_unique: bool,
+    ) -> RuntimeResult<()> {
+        if index_spec.unique() != require_unique
+            || !self
+                .metadata()
+                .idx
+                .index_type_match(self.metadata().col.as_ref(), index_slot, key)
+        {
+            return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+                .attach(format!(
+                    "malformed locked current catalog index selection: table_id={}, index_slot={index_slot}, expected_unique={require_unique}, actual_unique={}, key_count={}",
+                    self.table_id(),
+                    index_spec.unique(),
+                    key.len()
+                ))
+                .change_context(RuntimeError::CatalogAccess));
+        }
+        Ok(())
+    }
+
+    async fn visit_current_catalog_candidate<F>(
+        &self,
+        guards: &PoolGuards,
+        index_spec: &TableIndexMetadata,
+        row_match: CurrentCatalogRowMatch<'_>,
+        candidate: IndexLookupCandidate,
+        row_action: &mut F,
+    ) -> RuntimeResult<bool>
+    where
+        F: for<'m, 'p> FnMut(&'m TableColumnLayout, Row<'p>) -> bool,
+    {
+        let page_id = match self.find_row(guards, candidate.row_id).await? {
+            RowLocation::NotFound => return Ok(true),
+            RowLocation::LwcBlock(..) => {
+                return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+                    .attach(format!(
+                        "catalog current index candidate resolved to cold storage: table_id={}, row_id={}",
+                        self.table_id(), candidate.row_id
+                    ))
+                    .change_context(RuntimeError::CatalogAccess));
+            }
+            RowLocation::RowPage(page_id) => page_id,
+        };
+        let page_guard = self.must_get_row_page_shared(guards, page_id).await?;
+        if !page_guard.page().row_id_in_valid_range(candidate.row_id) {
+            return Ok(true);
+        }
+        let row_layout = page_guard.unwrap_vmap().column_layout.as_ref();
+        let access = page_guard.read_row_by_id(candidate.row_id);
+        let row = access.row();
+        if row.is_deleted() {
+            return Ok(true);
+        }
+        match row_match {
+            CurrentCatalogRowMatch::Exact(key) => {
+                if row.is_key_different(row_layout, index_spec, key) {
+                    return Ok(true);
+                }
+            }
+            CurrentCatalogRowMatch::Range { range, encoder } => {
+                let current_key = index_spec
+                    .keys
+                    .iter()
+                    .map(|key| row.val(row_layout, key.column_ordinal.as_usize()))
+                    .collect::<Vec<_>>();
+                let encoded = encoder.encode(&current_key);
+                if !range.lower_accepts(encoded.as_bytes())
+                    || !range.upper_accepts(encoded.as_bytes())
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(row_action(row_layout, row))
     }
 
     /// Insert row in transaction.

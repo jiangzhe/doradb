@@ -33,7 +33,7 @@ pub use lifecycle::CheckpointCancelReason;
 #[cfg(test)]
 pub(crate) use lifecycle::TableTerminal;
 pub(crate) use lifecycle::{TableDropDrain, TableLifecycle};
-pub(crate) use mem_table::{MemTable, NoTrxUpsertChange, RowPageDescriptor};
+pub(crate) use mem_table::{IndexLookupCriteria, MemTable, NoTrxUpsertChange, RowPageDescriptor};
 pub use partition_stream::TableScanPartitionStream;
 pub use persistence::*;
 pub(crate) use rollback::IndexRollback;

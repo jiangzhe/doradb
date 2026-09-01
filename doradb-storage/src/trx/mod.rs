@@ -57,8 +57,8 @@ use crate::error::{
 };
 use crate::id::{RowID, SessionID, SessionOperationKey, TableID, TrxID};
 use crate::lock::{
-    FamilyLockAuthority, FreshClaimsGuard, LockMode, LockResource, LockScope, LockScopeState,
-    TableLockMode, TransactionLockState,
+    FamilyLockAuthority, FreshClaimsGuard, LockMode, LockOwner, LockResource, LockScope,
+    LockScopeState, TableLockMode, TransactionLockState,
 };
 use crate::log::block_group::TrxLog;
 use crate::log::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind};
@@ -440,6 +440,38 @@ impl PrivateTransaction {
     #[inline]
     pub(crate) fn pool_guards(&self) -> &PoolGuards {
         self.checkout().attachment().pool_guards()
+    }
+
+    /// Returns whether this private DDL transaction retains the lock pair that
+    /// stabilizes a raw current lookup on one catalog table.
+    #[inline]
+    pub(crate) fn has_catalog_current_lock_authority(&self, table_id: TableID) -> bool {
+        let locks = self.checkout().inner().checked_lock_state();
+        let operation_owner = LockOwner::operation(self.checkout().attachment().operation_key());
+        let covers = |resource, mode| {
+            locks.covers(resource, mode)
+                || locks.family_scope_covers(operation_owner, resource, mode)
+        };
+        covers(LockResource::TableMetadata(table_id), LockMode::Shared)
+            && covers(LockResource::TableData(table_id), LockMode::IntentExclusive)
+    }
+
+    /// Acquires one immediately available private-transaction lock in focused
+    /// catalog tests.
+    #[cfg(test)]
+    pub(crate) fn acquire_lock_immediate_for_test(
+        &mut self,
+        resource: LockResource,
+        mode: LockMode,
+    ) {
+        let (inner, attachment) = self.checkout_mut().inner_and_attachment_mut();
+        let engine = attachment.engine();
+        inner
+            .checked_lock_state_mut()
+            .acquire(engine.lock_manager(), &engine.poisoner, resource, mode)
+            .now_or_never()
+            .expect("catalog test private lock acquisition unexpectedly waited")
+            .expect("catalog test private lock acquisition must succeed");
     }
 
     /// Insert one catalog row through one owned private statement.

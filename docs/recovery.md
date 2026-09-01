@@ -88,13 +88,17 @@ Recovery proceeds in dependency order:
    redo family needed by that plan.
 4. Replay eligible DDL and DML into catalog state, hot RowStore pages, and
    in-memory cold-delete markers.
-5. Validate that replayed catalog metadata reconciles with every loaded
+5. Validate every final row in the five satellite catalog tables against the
+   complete replayed `catalog.tables` parent set. An orphan from either the
+   checkpoint or newer redo fails recovery before runtime indexes are rebuilt
+   or foreground sessions are admitted.
+6. Validate that replayed catalog metadata reconciles with every loaded
    table-file root.
-6. Remove provisional table files that remain absent after catalog replay,
+7. Remove provisional table files that remain absent after catalog replay,
    while preserving files queued for committed drop cleanup.
-7. Scan recovered hot RowStore pages to rebuild `MemIndex` state and initialize
+8. Scan recovered hot RowStore pages to rebuild `MemIndex` state and initialize
    their runtime undo maps.
-8. Repair accepted unsealed redo prefixes as required and select the next
+9. Repair accepted unsealed redo prefixes as required and select the next
    runtime redo file only after replay succeeds.
 
 Checkpoint freeze state is not durable. Every loaded live table begins with an
@@ -213,6 +217,7 @@ Recovery is complete only after:
 
 - checkpointed catalog and user-table roots are loaded and validated
 - eligible redo reaches the accepted log end
+- every final catalog satellite row has a live central table parent
 - provisional-file cleanup and metadata reconciliation succeed
 - hot `MemIndex` state and RowStore undo maps are rebuilt
 - the redo family is repaired and prepared for new appends

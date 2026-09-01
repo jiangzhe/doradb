@@ -1,9 +1,13 @@
 use super::{CatalogStorage, ColumnObject, IndexObject, TableObject};
 use crate::catalog::{IndexRef, TableMetadata};
-use crate::error::{MultiDomainResultExt, RuntimeOrFatalError, RuntimeOrFatalResult};
+use crate::error::{
+    DataIntegrityError, MultiDomainResultExt, RuntimeError, RuntimeOrFatalError,
+    RuntimeOrFatalResult,
+};
 use crate::id::TableID;
 use crate::log::redo::DDLRedo;
 use crate::trx::PrivateTransaction;
+use error_stack::Report;
 
 impl CatalogStorage {
     /// Stages all canonical numeric catalog rows for a newly allocated table.
@@ -58,25 +62,29 @@ impl CatalogStorage {
         validate_catalog_engine_health(trx, "stage_drop_table")?;
 
         let indexes_deleted = self.indexes().delete_by_table_id(trx, table_id).await?;
-        assert_eq!(
-            indexes_deleted,
-            metadata.idx.active_index_count(),
-            "drop-table catalog index delete count mismatch: table_id={table_id}"
-        );
+        if indexes_deleted != metadata.idx.active_index_count() {
+            return invalid_drop_catalog_state(format!(
+                "drop-table catalog index delete count mismatch: table_id={table_id}, actual={indexes_deleted}, expected={}",
+                metadata.idx.active_index_count()
+            ));
+        }
         let columns_deleted = self.columns().delete_by_table_id(trx, table_id).await?;
-        assert_eq!(
-            columns_deleted,
-            metadata.col.col_count(),
-            "drop-table catalog column delete count mismatch: table_id={table_id}"
-        );
-        let table_deleted = self.tables().delete_by_id(trx, table_id).await?;
-        assert!(
-            table_deleted,
-            "drop-table catalog table row is missing: table_id={table_id}"
-        );
+        if columns_deleted != metadata.col.col_count() {
+            return invalid_drop_catalog_state(format!(
+                "drop-table catalog column delete count mismatch: table_id={table_id}, actual={columns_deleted}, expected={}",
+                metadata.col.col_count()
+            ));
+        }
         self.table_replay_silent_watermarks()
             .delete_by_table_id(trx, table_id)
             .await?;
+        let table_deleted = self.tables().delete_by_id(trx, table_id).await?;
+        if !table_deleted {
+            return invalid_drop_catalog_state(format!(
+                "drop-table catalog table row is missing: table_id={table_id}"
+            ));
+        }
+        self.validate_drop_table_absence(trx, table_id).await?;
         trx.install_ddl_redo(DDLRedo::DropTable(table_id));
         Ok(())
     }
@@ -181,4 +189,13 @@ fn validate_catalog_engine_health(
     trx.ensure_engine_healthy()
         .map_err(RuntimeOrFatalError::from)
         .attach_with(|| format!("operation={operation}, phase=check_engine_health"))
+}
+
+#[inline]
+fn invalid_drop_catalog_state(message: String) -> RuntimeOrFatalResult<()> {
+    Err(RuntimeOrFatalError::from(
+        Report::new(DataIntegrityError::InvalidRootInvariant)
+            .attach(message)
+            .change_context(RuntimeError::CatalogAccess),
+    ))
 }

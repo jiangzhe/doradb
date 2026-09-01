@@ -15,6 +15,7 @@ use crate::id::TableID;
 use crate::map::FastHashSet;
 use crate::row::ops::DeleteMvcc;
 use crate::row::{Row, RowRead};
+use crate::table::IndexLookupCriteria;
 use crate::trx::PrivateTransaction;
 use crate::value::{Val, ValKind};
 use error_stack::{Report, ResultExt};
@@ -91,9 +92,7 @@ impl Indexes<'_> {
         trx: &mut PrivateTransaction,
         table_id: TableID,
     ) -> RuntimeOrFatalResult<usize> {
-        let indexes = self
-            .list_uncommitted_by_table_id(trx.pool_guards(), table_id)
-            .await?;
+        let indexes = self.list_current_locked_by_table_id(trx, table_id).await?;
         let keys = indexes
             .into_iter()
             .map(|index| vec![Val::from(table_id), Val::from(index.index.id().get())])
@@ -103,6 +102,48 @@ impl Indexes<'_> {
             .attach_with(|| {
                 format!("operation=catalog_indexes_delete_by_table, table_id={table_id}")
             })
+    }
+
+    /// Lists one table's indexes through its bounded primary-key range in the
+    /// owning DDL transaction's locked current view.
+    async fn list_current_locked_by_table_id(
+        &self,
+        trx: &PrivateTransaction,
+        table_id: TableID,
+    ) -> RuntimeResult<Vec<IndexObject>> {
+        let lower = [Val::from(table_id), Val::from(0u32)];
+        let upper = [Val::from(table_id), Val::from(u32::MAX)];
+        let mut indexes = Vec::new();
+        let mut decode_error = None;
+        self.table
+            .index_lookup_current_locked(
+                trx,
+                PK_NO_INDEXES,
+                IndexLookupCriteria::UniqueInclusive {
+                    lower: &lower,
+                    upper: &upper,
+                },
+                |col_layout, row| match row_to_index_object(col_layout, row) {
+                    Ok(index) => {
+                        indexes.push(index);
+                        true
+                    }
+                    Err(err) => {
+                        decode_error = Some(err);
+                        false
+                    }
+                },
+            )
+            .await
+            .attach_with(|| {
+                format!("operation=list_locked_catalog_indexes, table_id={table_id}")
+            })?;
+        if let Some(err) = decode_error {
+            return Err(err
+                .change_context(RuntimeError::CatalogAccess)
+                .attach("operation=list_locked_catalog_indexes, phase=decode_row"));
+        }
+        Ok(indexes)
     }
 
     /// Lists all active indexes for one table.
