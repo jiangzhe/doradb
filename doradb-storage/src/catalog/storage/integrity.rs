@@ -8,7 +8,7 @@ use super::indexes::TABLE_ID_INDEXES;
 use super::table_replay_silent_watermarks::TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS;
 use super::tables::TABLE_ID_TABLES;
 use crate::buffer::{PoolGuard, PoolGuards};
-use crate::catalog::CatalogIndexNo;
+use crate::catalog::{CatalogIndexNo, catalog_table_slot};
 use crate::error::{DataIntegrityError, DataIntegrityResult, RuntimeError, RuntimeResult};
 use crate::file::multi_table_file::{CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc};
 use crate::id::TableID;
@@ -20,14 +20,6 @@ use crate::value::Val;
 use error_stack::{Report, ResultExt};
 
 const PRIMARY_INDEX: CatalogIndexNo = CatalogIndexNo::new(0);
-
-#[derive(Clone, Copy)]
-struct CatalogSatelliteSpec {
-    table_id: TableID,
-    name: &'static str,
-    parent_column: usize,
-}
-
 const CATALOG_SATELLITES: [CatalogSatelliteSpec; 5] = [
     CatalogSatelliteSpec {
         table_id: TABLE_ID_COLUMNS,
@@ -55,6 +47,13 @@ const CATALOG_SATELLITES: [CatalogSatelliteSpec; 5] = [
         parent_column: 2,
     },
 ];
+
+#[derive(Clone, Copy)]
+struct CatalogSatelliteSpec {
+    table_id: TableID,
+    name: &'static str,
+    parent_column: usize,
+}
 
 enum CatalogParentView<'a> {
     Live {
@@ -129,7 +128,7 @@ impl CatalogStorage {
                     .await?;
                 }
                 CatalogParentView::Projected { roots, disk_guard } => {
-                    let slot = crate::catalog::catalog_table_slot(spec.table_id)
+                    let slot = catalog_table_slot(spec.table_id)
                         .expect("satellite inventory uses catalog table ids");
                     self.visit_projected_catalog_column(
                         roots[slot],
@@ -317,7 +316,7 @@ impl CatalogStorage {
         name: &'static str,
         table_id: TableID,
     ) -> RuntimeResult<()> {
-        let slot = crate::catalog::catalog_table_slot(catalog_table_id).ok_or_else(|| {
+        let slot = catalog_table_slot(catalog_table_id).ok_or_else(|| {
             Report::new(DataIntegrityError::InvalidRootInvariant)
                 .attach(format!(
                     "DROP absence inventory is invalid: table_id={catalog_table_id}"
@@ -457,7 +456,7 @@ mod tests {
 
             for spec in CATALOG_SATELLITES {
                 let mut transaction = begin_catalog_test_trx(&session);
-                let slot = crate::catalog::catalog_table_slot(spec.table_id).unwrap();
+                let slot = catalog_table_slot(spec.table_id).unwrap();
                 transaction
                     .trx()
                     .catalog_insert_mvcc(
@@ -497,7 +496,7 @@ mod tests {
                 .await
                 .unwrap();
             for spec in CATALOG_SATELLITES {
-                let slot = crate::catalog::catalog_table_slot(spec.table_id).unwrap();
+                let slot = catalog_table_slot(spec.table_id).unwrap();
                 transaction
                     .trx()
                     .catalog_insert_mvcc(
@@ -563,7 +562,7 @@ mod tests {
             let storage = &engine.inner().core.catalog().storage;
             let table_id = TableID::new(44);
             let mut transaction = begin_catalog_test_trx(&session);
-            let binding_slot = crate::catalog::catalog_table_slot(TABLE_ID_TABLE_BINDINGS).unwrap();
+            let binding_slot = catalog_table_slot(TABLE_ID_TABLE_BINDINGS).unwrap();
             transaction
                 .trx()
                 .catalog_insert_mvcc(

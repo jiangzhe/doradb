@@ -138,8 +138,10 @@ also supply equivalent transaction-scope claims.
 The implementation scans only matching MemIndex candidates, resolves each
 candidate to its raw current row, filters deleted rows, rejects catalog cold
 locations, and rechecks the current logical key before invoking an early-stop
-visitor. It performs no MVCC snapshot selection and is not available for
-unlocked catalog reads.
+visitor. The lower-level `MemTable::catalog_index_lookup_current` keeps this
+catalog-only scope explicit and drains every criterion stream through one
+statically dispatched candidate visitor. It performs no MVCC snapshot
+selection and is not available for unlocked catalog reads.
 
 Existing unlocked exact and whole-table helpers retain their prior visibility
 contracts. DROP-specific column and index enumeration uses new bounded
@@ -221,14 +223,18 @@ reconstruction, but now reads unchanged catalog roots for parent validation as
 required. Its test was updated to verify that roots and allocation state remain
 unchanged while validation reads occur.
 
+Follow-up review moved the lookup criteria beside the in-memory table as
+`IndexLookupCriteria` and unified the exact, range, and non-unique candidate
+draining without boxing or dynamic dispatch.
+
 No persistent format, schema, redo encoding, public API, or alternate I/O
 backend path changed.
 
 Final verification:
 
-- `tools/style_audit.rs --diff-base origin/main`: passed for 14 Rust files.
+- `tools/style_audit.rs --diff-base origin/main`: passed for 16 Rust files.
 - `rtk cargo clippy --workspace --all-targets -- -D warnings`: passed.
-- `rtk cargo nextest run --workspace`: 1,856 tests passed.
+- `rtk cargo nextest run --workspace`: 1,857 tests passed.
 
 ## Impacts
 
