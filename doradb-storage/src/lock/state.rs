@@ -168,6 +168,22 @@ impl FamilyLockState {
         }
     }
 
+    /// Returns whether one exact scope in this family retains a claim covering
+    /// the requested mode.
+    #[inline]
+    pub(crate) fn scope_covers(
+        &self,
+        owner: LockOwner,
+        resource: LockResource,
+        mode: LockMode,
+    ) -> bool {
+        self.assert_owner_family(owner);
+        self.resources
+            .get(&resource)
+            .and_then(|state| state.get(owner.scope()))
+            .is_some_and(|claim| claim.mode.covers(resource, mode))
+    }
+
     /// Acquires or immediately converts one exact logical claim.
     #[inline]
     pub(crate) async fn acquire(
@@ -806,6 +822,18 @@ impl TransactionLockState {
     #[inline]
     pub(crate) fn covers(&self, resource: LockResource, mode: LockMode) -> bool {
         self.curr_scope.covers(resource, mode)
+    }
+
+    /// Returns whether another exact scope retained in this transaction's
+    /// family authority covers the request.
+    #[inline]
+    pub(crate) fn family_scope_covers(
+        &self,
+        owner: LockOwner,
+        resource: LockResource,
+        mode: LockMode,
+    ) -> bool {
+        self.authority.family.scope_covers(owner, resource, mode)
     }
 
     /// Splits family authority from the transaction scope.

@@ -15,6 +15,7 @@ use crate::id::TableID;
 #[cfg(test)]
 use crate::row::ops::DeleteMvcc;
 use crate::row::{Row, RowRead};
+use crate::table::IndexLookupCriteria;
 use crate::trx::PrivateTransaction;
 use crate::value::Val;
 use crate::value::ValKind;
@@ -108,9 +109,7 @@ impl Columns<'_> {
         trx: &mut PrivateTransaction,
         table_id: TableID,
     ) -> RuntimeOrFatalResult<usize> {
-        let columns = self
-            .list_uncommitted_by_table_id(trx.pool_guards(), table_id)
-            .await?;
+        let columns = self.list_current_locked_by_table_id(trx, table_id).await?;
         let keys = columns
             .into_iter()
             .map(|column| vec![Val::from(table_id), Val::from(column.column_id.get())])
@@ -120,6 +119,48 @@ impl Columns<'_> {
             .attach_with(|| {
                 format!("operation=catalog_columns_delete_by_table, table_id={table_id}")
             })
+    }
+
+    /// Lists one table's columns through its bounded primary-key range in the
+    /// owning DDL transaction's locked current view.
+    async fn list_current_locked_by_table_id(
+        &self,
+        trx: &PrivateTransaction,
+        table_id: TableID,
+    ) -> RuntimeResult<Vec<ColumnObject>> {
+        let lower = [Val::from(table_id), Val::from(0u32)];
+        let upper = [Val::from(table_id), Val::from(u32::MAX)];
+        let mut columns = Vec::new();
+        let mut decode_error = None;
+        self.table
+            .index_lookup_current_locked(
+                trx,
+                PK_NO_COLUMNS,
+                IndexLookupCriteria::UniqueInclusive {
+                    lower: &lower,
+                    upper: &upper,
+                },
+                |col_layout, row| match row_to_column_object(col_layout, row) {
+                    Ok(column) => {
+                        columns.push(column);
+                        true
+                    }
+                    Err(err) => {
+                        decode_error = Some(err);
+                        false
+                    }
+                },
+            )
+            .await
+            .attach_with(|| {
+                format!("operation=list_locked_catalog_columns, table_id={table_id}")
+            })?;
+        if let Some(err) = decode_error {
+            return Err(err
+                .change_context(RuntimeError::CatalogAccess)
+                .attach("operation=list_locked_catalog_columns, phase=decode_row"));
+        }
+        Ok(columns)
     }
 }
 

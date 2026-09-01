@@ -3680,6 +3680,12 @@ impl TrxAttachment {
         self.trx_id
     }
 
+    /// Returns the stable operation identity that owns this transaction.
+    #[inline]
+    pub(crate) const fn operation_key(&self) -> SessionOperationKey {
+        self.operation_key
+    }
+
     /// Borrows the exact session's pool-guard roots.
     #[inline]
     pub(crate) fn pool_guards(&self) -> &PoolGuards {

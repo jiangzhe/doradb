@@ -2,6 +2,7 @@ mod auxiliary;
 mod columns;
 mod ddl;
 mod indexes;
+mod integrity;
 mod merge;
 mod object;
 mod table_replay_silent_watermarks;
@@ -532,6 +533,10 @@ impl CatalogStorage {
             }
         }
 
+        self.validate_projected_catalog_parent_integrity(&new_roots, disk_guard)
+            .await
+            .map_err(RuntimeOrFatalError::from)?;
+
         // Publishing the metadata block advances the durable catalog replay
         // boundary even for metadata-only checkpoints, such as DML-only
         // heartbeat batches.
@@ -1060,6 +1065,129 @@ impl CatalogStorage {
         }
         Ok(rows)
     }
+
+    /// Visits one selected column from every row in a projected catalog root
+    /// without materializing full row payloads.
+    async fn visit_projected_catalog_column<F>(
+        &self,
+        root: CatalogTableRootDesc,
+        expected_table_id: TableID,
+        column_no: usize,
+        disk_pool_guard: &PoolGuard,
+        mut visitor: F,
+    ) -> RuntimeResult<()>
+    where
+        F: FnMut(Val) -> DataIntegrityResult<()>,
+    {
+        let Some(slot) = catalog_table_slot(expected_table_id) else {
+            return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+                .attach(format!(
+                    "projected catalog inventory has non-catalog table id: expected_table_id={expected_table_id}"
+                ))
+                .change_context(RuntimeError::CatalogAccess));
+        };
+        if slot >= self.tables.len() || root.table_id != expected_table_id {
+            return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+                .attach(format!(
+                    "projected catalog root table identity mismatch: root_table_id={}, slot={slot}, expected_table_id={expected_table_id}",
+                    root.table_id
+                ))
+                .change_context(RuntimeError::CatalogAccess));
+        }
+        let metadata = self.tables[slot].metadata();
+        if column_no >= metadata.col.col_count() {
+            return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+                .attach(format!(
+                    "projected catalog parent column is out of range: table_id={}, column_no={column_no}, column_count={}",
+                    root.table_id,
+                    metadata.col.col_count()
+                ))
+                .change_context(RuntimeError::CatalogAccess));
+        }
+        let Some(root_block_id) = root.checkpoint_root_block_id() else {
+            return Ok(());
+        };
+        let entries = self
+            .collect_index_entries(disk_pool_guard, root_block_id)
+            .await?;
+        let column_index = ColumnBlockIndex::new(
+            root_block_id,
+            root.pivot_row_id(),
+            self.mtb.file_kind(),
+            self.mtb.sparse_file(),
+            &self.disk_pool,
+            disk_pool_guard,
+        );
+        for entry in entries {
+            let block_id = entry.block_id();
+            let (delete_deltas, row_ids) = column_index
+                .load_delete_deltas_and_row_ids(&entry)
+                .await
+                .change_context(RuntimeError::CatalogAccess)
+                .attach_with(|| {
+                    format!(
+                        "operation=validate_projected_catalog_parent_integrity, phase=load_row_shape, table_id={}, block_id={block_id}",
+                        root.table_id
+                    )
+                })?;
+            if !delete_deltas.is_empty() {
+                return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+                    .attach(format!(
+                        "projected catalog root contains delete deltas: table_id={}, block_id={block_id}, delete_count={}",
+                        root.table_id,
+                        delete_deltas.len()
+                    ))
+                    .change_context(RuntimeError::CatalogAccess));
+            }
+            let persisted = PersistedLwcBlock::load(
+                self.mtb.file_kind(),
+                self.mtb.sparse_file(),
+                &self.disk_pool,
+                disk_pool_guard,
+                block_id,
+            )
+            .await
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=validate_projected_catalog_parent_integrity, phase=load_lwc_block, table_id={}, block_id={block_id}",
+                    root.table_id
+                )
+            })?;
+            let block = persisted.block();
+            let block_row_count = block.row_count();
+            let entry_row_count = usize::from(entry.row_count());
+            if block_row_count != entry_row_count || block_row_count != row_ids.len() {
+                return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+                    .attach(format!(
+                        "projected catalog row count disagreement: table_id={}, block_id={block_id}, lwc_row_count={block_row_count}, entry_row_count={entry_row_count}, row_id_count={}",
+                        root.table_id,
+                        row_ids.len()
+                    ))
+                    .change_context(RuntimeError::CatalogAccess));
+            }
+            for row_idx in 0..block_row_count {
+                let val = block
+                    .decode_value(metadata.col.as_ref(), row_idx, column_no)
+                    .change_context(RuntimeError::CatalogAccess)
+                    .attach_with(|| {
+                        format!(
+                            "operation=validate_projected_catalog_parent_integrity, phase=decode_parent, table_id={}, block_id={block_id}, row_idx={row_idx}, column_no={column_no}",
+                            root.table_id
+                        )
+                    })?;
+                visitor(val)
+                    .change_context(RuntimeError::CatalogAccess)
+                    .attach_with(|| {
+                        format!(
+                            "operation=validate_projected_catalog_parent_integrity, table_id={}, block_id={block_id}, row_idx={row_idx}",
+                            root.table_id
+                        )
+                    })?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Static definition used to bootstrap one catalog logical table.
@@ -1394,6 +1522,7 @@ pub(crate) mod tests {
     };
     use crate::id::{BlockID, PageID};
     use crate::index::{ColumnBlockIndex, ColumnDeleteDeltaPatch};
+    use crate::lock::{LockMode, LockResource};
     use crate::log::redo::{DDLRedo, RowRedoKind};
     use crate::row::ops::UpdateCol;
     use crate::session::tests::begin_test_mandatory_private_trx;
@@ -1447,7 +1576,18 @@ pub(crate) mod tests {
 
     /// Begin one focused catalog accessor transaction.
     pub(crate) fn begin_catalog_test_trx(session: &Session) -> CatalogTestTransaction {
-        let (operation, trx) = begin_test_mandatory_private_trx(session);
+        let (operation, mut trx) = begin_test_mandatory_private_trx(session);
+        for slot in 0..CATALOG_TABLE_ROOT_DESC_COUNT {
+            let table_id = catalog_table_id_from_slot(slot);
+            trx.acquire_lock_immediate_for_test(
+                LockResource::TableMetadata(table_id),
+                LockMode::Shared,
+            );
+            trx.acquire_lock_immediate_for_test(
+                LockResource::TableData(table_id),
+                LockMode::IntentExclusive,
+            );
+        }
         CatalogTestTransaction {
             operation,
             trx: Some(trx),
@@ -1923,6 +2063,56 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_catalog_checkpoint_rejects_projected_orphan_before_publication() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = open_catalog_test_engine(
+                temp_dir.path().to_path_buf(),
+                Some("catalog-projected-parent-orphan"),
+            )
+            .await;
+            let storage = &engine.inner().core.catalog().storage;
+            let before = storage.checkpoint_snapshot();
+            let before_watermarks = storage.checkpointed_silent_watermarks();
+            let orphan = USER_TABLE_ID_START + 77;
+            let batch =
+                checkpoint_batch_with_ops(storage, vec![catalog_column_insert(orphan, 0, 0)]);
+
+            let prepared = storage
+                .prepare_checkpoint_batch(
+                    batch,
+                    engine.inner().core.catalog().curr_next_table_id(),
+                    engine.inner().core.pools.pool_guards().disk_guard(),
+                )
+                .await;
+            let err = match prepared {
+                Ok(_) => panic!("projected catalog orphan must fail checkpoint preparation"),
+                Err(err) => expect_runtime_report(err),
+            };
+            assert_eq!(
+                err.downcast_ref::<DataIntegrityError>().copied(),
+                Some(DataIntegrityError::InvalidRootInvariant)
+            );
+            let report = format!("{err:?}");
+            assert!(report.contains("view=projected"), "{report}");
+            assert!(report.contains("catalog.columns"), "{report}");
+            assert!(report.contains(&format!("table_id={orphan}")), "{report}");
+
+            let after = storage.checkpoint_snapshot();
+            assert_eq!(after.meta_block_id, before.meta_block_id);
+            assert_eq!(
+                after.catalog_replay_start_ts,
+                before.catalog_replay_start_ts
+            );
+            assert_eq!(after.meta.table_roots, before.meta.table_roots);
+            assert!(Arc::ptr_eq(
+                &storage.checkpointed_silent_watermarks(),
+                &before_watermarks
+            ));
+        });
+    }
+
+    #[test]
     fn test_catalog_checkpoint_rejects_delete_key_non_primary_key() {
         smol::block_on(async {
             assert_checkpoint_rejects_delete_key(
@@ -2203,7 +2393,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_catalog_metadata_only_checkpoint_skips_reachability_reads() {
+    fn test_catalog_metadata_only_checkpoint_validates_roots_without_rewrite() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
@@ -2219,6 +2409,8 @@ pub(crate) mod tests {
 
             let storage = &engine.inner().core.catalog().storage;
             let snap = storage.checkpoint_snapshot();
+            let table_roots = snap.meta.table_roots;
+            let allocated_before = storage.mtb.active_root_unchecked().alloc_map.allocated();
             let disk_pool_guard = storage.disk_pool.create_base_guard();
             let mut catalog_index_blocks = BTreeSet::new();
             for root in snap.meta.table_roots {
@@ -2253,11 +2445,20 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-            assert_eq!(engine.inner().pools.disk.allocated(), cached_before);
+            assert!(engine.inner().pools.disk.allocated() > cached_before);
+            let mut validated_index_blocks = 0usize;
             for block_id in catalog_index_blocks {
                 let key = BlockKey::new(CATALOG_MTB_FILE_ID, block_id);
-                assert!(engine.inner().pools.disk.try_get_frame_id(&key).is_none());
+                validated_index_blocks +=
+                    usize::from(engine.inner().pools.disk.try_get_frame_id(&key).is_some());
             }
+            assert!(validated_index_blocks > 0);
+            let after = storage.checkpoint_snapshot();
+            assert_eq!(after.meta.table_roots, table_roots);
+            assert_eq!(
+                storage.mtb.active_root_unchecked().alloc_map.allocated(),
+                allocated_before
+            );
         });
     }
 
@@ -2784,7 +2985,16 @@ pub(crate) mod tests {
                 .apply_checkpoint_batch(
                     checkpoint_batch_with_ops(
                         storage,
-                        vec![catalog_column_insert(table_id, 0, 30_000)],
+                        vec![
+                            CatalogRedoEntry {
+                                table_id: TABLE_ID_TABLES,
+                                kind: RowRedoKind::Insert(
+                                    PageID::new(0),
+                                    catalog_table_vals(table_id, 0),
+                                ),
+                            },
+                            catalog_column_insert(table_id, 0, 30_000),
+                        ],
                     ),
                     engine.inner().core.catalog().curr_next_table_id(),
                     engine.inner().core.pools.pool_guards().disk_guard(),

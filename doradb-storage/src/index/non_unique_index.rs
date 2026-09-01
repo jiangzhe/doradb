@@ -8,7 +8,7 @@ use crate::index::btree::{
 use crate::index::index_stream::NonUniqueMemIndexCandidateStream;
 use crate::index::mem_index::{MemIndex, MemIndexCleanupScan, NonUniqueMemIndexCleanupSpec};
 use crate::index::util::Maskable;
-use crate::index::{IndexInsert, KeyRange};
+use crate::index::{BTreeKeyEncoder, IndexInsert, KeyRange};
 use crate::quiescent::QuiescentGuard;
 use crate::value::{Val, ValKind, ValType};
 use std::ops::Deref;
@@ -139,6 +139,12 @@ pub(crate) struct GuardedNonUniqueMemIndex<'a, 'g, P: 'static> {
 }
 
 impl<P: BufferPool> GuardedNonUniqueMemIndex<'_, '_, P> {
+    /// Returns this guarded index's logical-key encoder.
+    #[inline]
+    pub(crate) fn key_encoder(&self) -> &BTreeKeyEncoder {
+        self.index.encoder()
+    }
+
     /// Atomically mask one exact entry without a preliminary lookup.
     #[inline]
     pub(crate) async fn mask_if_present(

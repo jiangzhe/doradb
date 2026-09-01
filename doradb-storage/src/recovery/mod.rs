@@ -191,7 +191,26 @@ impl<'a> RecoveryCoordinator<'a> {
             replayed_logs
         );
         let unsealed_terminals = stream.take_unsealed_terminals();
-        // 2. Ensure catalog metadata caught up with table-file roots.
+        // 2. Validate every final catalog satellite against catalog.tables.
+        obs::info!(
+            "event=recovery_phase component=recovery phase=catalog_parent_validation action=start result=ok"
+        );
+        self.resources
+            .catalog
+            .storage
+            .validate_live_catalog_parent_integrity(&self.resources.pool_guards)
+            .await
+            .change_context(RuntimeError::Recovery)
+            .inspect(|_| {
+                obs::info!("event=recovery_phase component=recovery phase=catalog_parent_validation action=finish result=ok");
+            })
+            .inspect_err(|err| {
+                obs::error!(
+                    "event=recovery_phase component=recovery phase=catalog_parent_validation action=finish result=error error={}",
+                    err
+                );
+            })?;
+        // 3. Ensure catalog metadata caught up with table-file roots.
         obs::info!(
             "event=recovery_phase component=recovery phase=metadata_validation action=start result=ok"
         );
@@ -206,7 +225,7 @@ impl<'a> RecoveryCoordinator<'a> {
                     err
                 );
             })?;
-        // 3. Remove create-table provisional files whose catalog redo never
+        // 4. Remove create-table provisional files whose catalog redo never
         //    became durable.
         obs::info!(
             "event=recovery_phase component=recovery phase=absent_file_cleanup action=start result=ok"
@@ -222,7 +241,7 @@ impl<'a> RecoveryCoordinator<'a> {
                 );
             })
             .change_context(RuntimeError::Recovery)?;
-        // 4. Rebuild hot secondary-index state from recovered RowStore pages
+        // 5. Rebuild hot secondary-index state from recovered RowStore pages
         //    and refresh pages to enable undo maps.
         obs::info!(
             "event=recovery_phase component=recovery phase=index_rebuild_page_refresh action=start result=ok"

@@ -46,11 +46,13 @@ const CREATE_TABLE_CATALOG_WRITE_TARGETS: [TableID; 3] = [
     catalog_table_id_from_slot(1),
     catalog_table_id_from_slot(2),
 ];
-const DROP_TABLE_CATALOG_WRITE_TARGETS: [TableID; 4] = [
+const DROP_TABLE_CATALOG_WRITE_TARGETS: [TableID; 6] = [
     catalog_table_id_from_slot(0),
     catalog_table_id_from_slot(1),
     catalog_table_id_from_slot(2),
+    catalog_table_id_from_slot(3),
     catalog_table_id_from_slot(4),
+    catalog_table_id_from_slot(5),
 ];
 
 /// Authoritative identities finalized by a successful CREATE TABLE.
@@ -1849,6 +1851,7 @@ struct DropTableProgress {
     plan: DropTablePlan,
     phase: DropTablePhase,
     trx: Option<PrivateTransaction>,
+    replay_floor: Option<TableRedoReplayFloor>,
 }
 
 impl DropTableProgress {
@@ -1858,6 +1861,7 @@ impl DropTableProgress {
             plan,
             phase: DropTablePhase::Prepared,
             trx: None,
+            replay_floor: None,
         }
     }
 
@@ -2021,6 +2025,12 @@ impl AcceptedDropTable {
         drain.wait().await;
         progress.phase = DropTablePhase::DrainComplete;
 
+        progress.replay_floor =
+            Some(engine.catalog().effective_user_table_redo_replay_floor(
+                table_id,
+                table.redo_replay_floor_snapshot(),
+            ));
+
         #[cfg(test)]
         engine
             .table_ddl_test
@@ -2099,9 +2109,9 @@ impl AcceptedDropTable {
             .reach_phase(TableDdlTestPhase::DropCatalogCommitted)
             .await;
 
-        let replay_floor = engine
-            .catalog()
-            .effective_user_table_redo_replay_floor(table_id, table.redo_replay_floor_snapshot());
+        let replay_floor = progress.replay_floor.unwrap_or_else(|| {
+            panic!("DROP must capture replay floor before catalog deletion: table_id={table_id}")
+        });
         finish_drop_table_runtime_retention(&engine, table_id, table, drop_cts, replay_floor)
             .map_err(CompletionErrorBridge::capture)?;
         progress.phase = DropTablePhase::RuntimeRetained;
@@ -2456,8 +2466,8 @@ pub(crate) mod tests {
     };
     use crate::engine::Engine;
     use crate::error::{
-        DiscloseError, Error, ErrorKind, FatalError, IoError, LifecycleError, OperationError,
-        RuntimeError,
+        DataIntegrityError, DiscloseError, Error, ErrorKind, FatalError, IoError, LifecycleError,
+        OperationError, RuntimeError,
     };
     use crate::id::{SessionID, TrxID};
     use crate::io::install_storage_backend_test_hook;
@@ -4410,7 +4420,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_drop_table_missing_catalog_row_panics_under_mandatory_supervision() {
+    fn test_drop_table_missing_catalog_row_returns_typed_integrity_and_poisons() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
@@ -4435,7 +4445,11 @@ pub(crate) mod tests {
 
             assert_eq!(
                 err.report().downcast_ref::<FatalError>().copied(),
-                Some(FatalError::MandatoryTaskPanic)
+                Some(FatalError::Poisoned)
+            );
+            assert_eq!(
+                err.report().downcast_ref::<DataIntegrityError>().copied(),
+                Some(DataIntegrityError::InvalidRootInvariant)
             );
             assert_eq!(
                 engine
@@ -4444,7 +4458,7 @@ pub(crate) mod tests {
                     .poison_error()
                     .as_ref()
                     .map(|error| *error.current_context()),
-                Some(FatalError::MandatoryTaskPanic)
+                Some(FatalError::Poisoned)
             );
             assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Dropping);
             assert_checkpoint_workflow_closed(&table);
@@ -4457,20 +4471,8 @@ pub(crate) mod tests {
                     .await
                     .is_some()
             );
-            assert_eq!(active_operation_count(&engine.inner().session_registry), 1);
-            let shutdown_err = engine.try_shutdown().unwrap_err();
-            assert_eq!(
-                shutdown_err
-                    .report()
-                    .downcast_ref::<LifecycleError>()
-                    .copied(),
-                Some(LifecycleError::ShutdownBusy)
-            );
-
-            // FailedRetained deliberately keeps rollback-owned row state alive
-            // and blocks destructive component teardown. This test process is
-            // the final owner of the poisoned synthetic engine.
-            mem::forget((engine, temp_dir, drop_session, table));
+            assert_eq!(active_operation_count(&engine.inner().session_registry), 0);
+            assert!(!drop_session.in_trx().unwrap());
         });
     }
 
@@ -4960,7 +4962,7 @@ pub(crate) mod tests {
                 LockResource::TableMetadata(create_table_id),
             )
             .expect("accepted DROP should retain its operation owner");
-            assert_eq!(lock_entry_count(&engine, drop_owner), 10);
+            assert_eq!(lock_entry_count(&engine, drop_owner), 14);
             assert!(has_lock_entry(
                 &engine,
                 drop_owner,
@@ -4997,7 +4999,7 @@ pub(crate) mod tests {
                 .install_gate(TableDdlTestPhase::DropCatalogStaged);
             drop_release.send_async(()).await.unwrap();
             drop_staged.recv_async().await.unwrap();
-            assert_eq!(lock_entry_count(&engine, drop_owner), 10);
+            assert_eq!(lock_entry_count(&engine, drop_owner), 14);
             assert!(
                 debug_snapshot(engine.inner().lock_manager())
                     .entries

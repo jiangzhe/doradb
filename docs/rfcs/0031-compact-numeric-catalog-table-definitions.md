@@ -2012,12 +2012,14 @@ marker can alias a second CREATE after restart. [U20]
   - Non-goals: Interpreting descriptor payloads, exposing binding resolution,
     or changing any persisted format.
   - Phase-local Choices: Hash-set representation, streaming scan mechanics,
-    and diagnostic attachment shape; all satellites must still be scanned and
-    an orphan must return typed data integrity.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+    and diagnostic attachment shape; all satellites are scanned and an orphan
+    returns typed data integrity. Online targeted reads use the catalog-only
+    `index_lookup_current_locked` view, bound to the private transaction and
+    its retained accepted-DDL operation-scope lock authority.
+  - Task Doc: `docs/tasks/000291-central-catalog-parent-integrity.md`
+  - Task Issue: `#1035`
+  - Phase Status: done
+  - Implementation Summary: Implemented central parent integrity across recovery, checkpoint, and DROP boundaries. [Task Resolve Sync: docs/tasks/000291-central-catalog-parent-integrity.md @ 2026-09-01]
 
 - **Phase 5: Checkpoint-Gated Index Slot Reuse**
   - Prerequisites: Phase 2 gives retired runtimes exact identity and unique

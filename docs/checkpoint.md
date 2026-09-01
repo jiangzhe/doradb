@@ -217,6 +217,15 @@ folds row redo by each catalog table's internal primary key, merges the result
 with checkpoint-visible rows, and writes final live rows with fresh dense row
 ids. Persisted catalog roots do not retain delete-delta payloads.
 
+Before applying checkpoint metadata or preparing allocation-map publication,
+checkpoint validates the complete projected root set. Every row in
+`catalog.columns`, `catalog.indexes`, `catalog.table_descriptors`,
+`catalog.table_replay_silent_watermarks`, and `catalog.table_bindings` must
+reference a `table_id` present in projected `catalog.tables`. Validation reads
+only the parent column from each compact row. If it fails, the mutable fork is
+discarded: active roots, `catalog_replay_start_ts`, the checkpointed silent-
+watermark cache, and provisional index reservations remain unchanged.
+
 After table rows and overlay fields such as `next_table_id` and silent
 watermarks are applied, catalog checkpoint publishes the next
 `catalog_replay_start_ts`. If catalog blocks changed, it validates reachability

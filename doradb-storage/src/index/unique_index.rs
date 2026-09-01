@@ -7,7 +7,7 @@ use crate::index::btree::{BTreeKey, BTreeU64};
 use crate::index::index_stream::UniqueMemIndexCandidateStream;
 use crate::index::mem_index::{MemIndex, MemIndexCleanupScan, UniqueMemIndexCleanupSpec};
 use crate::index::util::Maskable;
-use crate::index::{IndexCompareExchange, IndexInsert, KeyRange};
+use crate::index::{BTreeKeyEncoder, IndexCompareExchange, IndexInsert, KeyRange};
 use crate::quiescent::QuiescentGuard;
 use crate::value::{Val, ValType};
 use std::ops::Deref;
@@ -159,6 +159,12 @@ impl<P: 'static> Clone for GuardedUniqueMemIndex<'_, '_, P> {
 impl<P: 'static> Copy for GuardedUniqueMemIndex<'_, '_, P> {}
 
 impl<P: BufferPool> GuardedUniqueMemIndex<'_, '_, P> {
+    /// Returns this guarded index's logical-key encoder.
+    #[inline]
+    pub(crate) fn key_encoder(&self) -> &BTreeKeyEncoder {
+        self.index.encoder()
+    }
+
     /// Replace an exact current owner or insert the new owner on true absence.
     #[inline]
     pub(crate) async fn replace_or_insert(

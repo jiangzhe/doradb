@@ -1,7 +1,7 @@
 use crate::catalog::storage::CatalogDefinition;
 use crate::catalog::{
-    StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey, StorageIndexSpec,
-    TableMetadata, catalog_table_id_from_slot,
+    CatalogIndexNo, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
+    StorageIndexSpec, TableMetadata, catalog_table_id_from_slot,
 };
 use crate::id::TableID;
 use crate::value::ValKind;
@@ -11,6 +11,10 @@ use std::sync::OnceLock;
 pub(crate) const TABLE_ID_TABLE_DESCRIPTORS: TableID = catalog_table_id_from_slot(3);
 /// Catalog table id for the empty binding storage installed by Phase 3.
 pub(crate) const TABLE_ID_TABLE_BINDINGS: TableID = catalog_table_id_from_slot(5);
+/// Primary-key slot of `catalog.table_descriptors`.
+pub(super) const PK_NO_TABLE_DESCRIPTORS: CatalogIndexNo = CatalogIndexNo::new(0);
+/// Reverse `table_id` slot of `catalog.table_bindings`.
+pub(super) const TABLE_ID_NO_TABLE_BINDINGS: CatalogIndexNo = CatalogIndexNo::new(1);
 
 /// Returns the final, initially empty `catalog.table_descriptors` definition.
 pub(super) fn catalog_definition_of_table_descriptors() -> &'static CatalogDefinition {
