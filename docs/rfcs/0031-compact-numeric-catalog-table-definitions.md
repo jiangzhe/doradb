@@ -2050,14 +2050,17 @@ marker can alias a second CREATE after restart. [U20]
     index DDL, persisting a free-ID/free-slot list or provisional reservations,
     multiple runtime generations per slot, changing page reclamation policy,
     or making CREATE wait for runtime cleanup.
-  - Phase-local Choices: Ordered-set/bitmap representations for reusable and
-    durability-retired slots, operational-state layout, and the retry trigger
-    for pinned runtime cleanup. Observable allocation and release boundaries
-    remain deterministic.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase-local Choices: One Table-owned `BTreeMap` lifecycle state derives
+    lowest-slot reuse from durable, runtime, and provisional substates; typed
+    CREATE and DROP finalization and installation remain separate. The purge
+    dispatcher keeps a targeted `BTreeSet<TableID>` of pending runtime-cleanup
+    candidates and retries it on later control-plane events, avoiding both an
+    all-table scan and a self-rescheduling busy loop. Observable allocation and
+    release boundaries remain deterministic.
+  - Task Doc: `docs/tasks/000292-checkpoint-gated-index-slot-reuse.md`
+  - Task Issue: `#1037`
+  - Phase Status: done
+  - Implementation Summary: Implemented Table-owned checkpoint-gated index slot reuse with typed DDL finalization and targeted retired-runtime cleanup. [Task Resolve Sync: docs/tasks/000292-checkpoint-gated-index-slot-reuse.md @ 2026-09-02]
 
 - **Phase 6: Opaque Managed Table Definitions And Proposal Boundary**
   - Prerequisites: Phase 3 provides the descriptor row/format and stable
