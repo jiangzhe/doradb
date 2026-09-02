@@ -9094,9 +9094,22 @@ mod tests {
                     .index_spec(IndexSlot::new(0))
                     .is_some()
             );
+            let (runtime_tx, runtime_rx) = flume::unbounded();
+            engine.inner().trx_sys.set_purge_test_observer(runtime_tx);
+            engine.inner().trx_sys.request_retired_index_runtime_retry();
+            let mut runtime_cleanup_started = false;
+            loop {
+                match runtime_rx.recv_async().await.unwrap() {
+                    PurgeTestEvent::RetiredIndexRuntimeStarted => {
+                        runtime_cleanup_started = true;
+                    }
+                    PurgeTestEvent::CycleCompleted if runtime_cleanup_started => break,
+                    _ => {}
+                }
+            }
             assert!(
                 !table.has_retired_secondary_indexes(),
-                "logical metadata and an untouched old transaction must not retain removed runtime"
+                "logical metadata and an untouched old transaction must not retain removed runtime after scheduled cleanup"
             );
 
             old_trx.rollback().await.unwrap();

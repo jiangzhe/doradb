@@ -83,13 +83,21 @@ recovery uses the root as proof that the DDL metadata change reached durable
 table state. Catalog multi-table roots use the catalog checkpoint replay
 boundary/safe timestamp.
 
-The current durable index-DDL record still stores one `u16`. Recovery converts
-that value into the Phase 2 exact runtime identity only after proving the record
-is at or beyond the catalog replay floor; in this transitional format the
-`IndexID` and physical slot are equal. No table-file or redo format changes are
-introduced by the runtime identity split.
+The durable index-DDL record carries the exact stable `IndexID` and physical
+`u16` slot. Recovery admits that identity only after proving the record is at
+or beyond the catalog replay floor. Slot reuse changes neither the table-file
+nor redo encoding.
 
 Notably, the table file does **not** need `index_rec_cts`.
+
+Each physical secondary-index slot is durably `Vacant`, `Active(index_id,
+root)`, or `Retired(index_id)`. The vector never shrinks. Runtime allocation is
+not append-only: CREATE deterministically takes the lowest durably vacant slot,
+or a retired slot whose catalog-checkpoint and runtime-destruction gates have
+both cleared, before extending the vector. Reuse changes the stable `IndexID`
+while preserving the physical slot and `index_slot_count`; crossed append gaps
+are persisted as `Vacant`. No free list or runtime lifecycle state is written
+to the table file.
 
 Persistent secondary-index state is recovered by loading the checkpointed
 `DiskTree` roots directly. Hot post-checkpoint index state is rebuilt from redo.

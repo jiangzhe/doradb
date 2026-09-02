@@ -27,7 +27,7 @@ use crate::row::{Row, RowRead};
 use crate::runtime::mandatory::{AcceptedExecution, MandatoryTaskMetadata, PreparedExecution};
 use crate::serde::{Deser, DeserResult, MinBytesHint, Ser, Serde, min_bytes_hint};
 use crate::session::{AcceptedDdlScope, PreparedDdlScope};
-use crate::table::{Table, TableRedoReplayFloor};
+use crate::table::{IndexPlacement, Table, TableRedoReplayFloor};
 use crate::trx::PrivateTransaction;
 use crate::trx::sys::TransactionSystem;
 use crate::value::{Val, ValKind, ValType};
@@ -1261,19 +1261,28 @@ impl TableMetadata {
         &self,
         index_spec: StorageIndexSpec,
     ) -> OperationResult<(IndexRef, Self)> {
-        self.try_with_created_index_at(
+        let slot = u16::try_from(self.idx.index_slot_count)
+            .map_err(|_| invalid_metadata("index slot domain exhausted".to_owned()))?;
+        self.try_with_finalized_created_index(
             index_spec,
             self.idx.next_index_id,
-            self.idx.index_slot_count,
+            IndexPlacement::Append(IndexSlot::new(slot)),
         )
     }
 
-    /// Allocates at an overlay-qualified ID and append slot.
-    pub(crate) fn try_with_created_index_at(
+    /// Allocates an index at one authority-finalized physical placement.
+    ///
+    /// This helper validates only metadata shape and allocator bounds. The
+    /// placement remains a lifecycle capability: in particular, the
+    /// `IndexRef` carried by `ReuseRetired` names the old generation being
+    /// replaced, while the returned `IndexRef` always has a fresh `IndexID`.
+    /// The Table lifecycle revalidates and consumes that exact authorization
+    /// when the corresponding runtime layout is installed.
+    pub(crate) fn try_with_finalized_created_index(
         &self,
         index_spec: StorageIndexSpec,
         effective_next_index_id: u64,
-        index_slot: u32,
+        placement: IndexPlacement,
     ) -> OperationResult<(IndexRef, Self)> {
         validate_next_id(effective_next_index_id, "effective_next_index_id")
             .map_err(invalid_metadata)?;
@@ -1283,25 +1292,35 @@ impl TableMetadata {
                 self.idx.next_index_id
             )));
         }
-        if index_slot < self.idx.index_slot_count {
+        let slot = placement.slot();
+        let index_slot = u32::from(slot);
+        let placement_valid = match placement {
+            IndexPlacement::Append(_) => index_slot >= self.idx.index_slot_count,
+            IndexPlacement::ReuseVacant(_) | IndexPlacement::ReuseRetired(_) => {
+                index_slot < self.idx.index_slot_count
+            }
+        };
+        if !placement_valid {
             return Err(invalid_metadata(format!(
-                "CREATE INDEX slot precedes append bound: slot={index_slot}, durable_count={}",
+                "CREATE INDEX finalized placement disagrees with append bound: placement={placement:?}, durable_count={}",
                 self.idx.index_slot_count
             )));
         }
-        if index_slot > u32::from(u16::MAX) {
-            return Err(invalid_metadata("index slot domain exhausted".to_owned()));
+        if self.idx.index_spec(slot).is_some() {
+            return Err(invalid_metadata(format!(
+                "CREATE INDEX finalized placement is active: placement={placement:?}"
+            )));
         }
         let mut next_index_id = effective_next_index_id;
         let id = allocate_index_id(&mut next_index_id)?;
-        let slot = IndexSlot::new(index_slot as u16);
         let index = IndexRef::new(id, slot);
         let compiled = compile_storage_index_spec(&self.col, index, index_spec)?;
         let mut indexes = self.idx.index_specs.values().cloned().collect::<Vec<_>>();
         indexes.push(compiled);
-        let index_slot_count = index_slot
+        let selected_end = index_slot
             .checked_add(1)
             .ok_or_else(|| invalid_metadata("index_slot_count overflow".to_owned()))?;
+        let index_slot_count = self.idx.index_slot_count.max(selected_end);
         let storage_epoch = self
             .storage_epoch
             .checked_add(1)
@@ -2914,11 +2933,10 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(full_slot_domain.idx.index_slot_count_u32(), 65_536);
         let err = full_slot_domain
-            .try_with_created_index_at(
-                StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::UK),
-                0,
-                65_536,
-            )
+            .try_with_created_index(StorageIndexSpec::new(
+                vec![StorageIndexKey::new(0)],
+                StorageIndexFlags::UK,
+            ))
             .unwrap_err();
         assert_eq!(*err.current_context(), OperationError::InvalidMetadata);
     }

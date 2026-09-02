@@ -2031,13 +2031,15 @@ marker can alias a second CREATE after restart. [U20]
     exact retired-runtime cleanup and destroying state, and a current-definition
     allocator view. Define `Reusable` as the join of durable eligibility,
     runtime vacancy, and provisional vacancy. Refactor gated CREATE/DROP INDEX
-    preparation into one internal storage-owned finalizer that captures the
-    authoritative layout/root, selects only from synchronized active,
-    durability-retired, runtime-retired, destroying, provisional, and reusable
-    state, and computes the final epoch, fingerprint, and root shape. CREATE
-    skips pinned slots without waiting. Checkpoint eligibility, completed
-    runtime destruction, and CREATE finalization observe one serialized
-    allocator transition; CoW root/block reclamation ownership is unchanged.
+    preparation into typed internal Table-owned finalizers that share only
+    authoritative layout/root and lifecycle-definition capture. CREATE selects
+    only from synchronized active, durability-retired, runtime-retired,
+    destroying, provisional, and reusable state and computes its final epoch,
+    fingerprint, and root shape; DROP resolves and retires its exact active
+    generation through its separate typed boundary. CREATE skips pinned slots
+    without waiting. Checkpoint eligibility, completed runtime destruction, and
+    CREATE finalization observe one serialized allocator transition; CoW
+    root/block reclamation ownership is unchanged.
   - Goals: Reuse proven holes without a persistent free list, while preventing
     a new active runtime from sharing a slot with any old runtime or replay-
     visible marker and keeping the allocator off foreground DML paths.
@@ -2048,19 +2050,22 @@ marker can alias a second CREATE after restart. [U20]
     index DDL, persisting a free-ID/free-slot list or provisional reservations,
     multiple runtime generations per slot, changing page reclamation policy,
     or making CREATE wait for runtime cleanup.
-  - Phase-local Choices: Ordered-set/bitmap representations for reusable and
-    durability-retired slots, operational-state layout, and the retry trigger
-    for pinned runtime cleanup. Observable allocation and release boundaries
-    remain deterministic.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase-local Choices: One Table-owned `BTreeMap` lifecycle state derives
+    lowest-slot reuse from durable, runtime, and provisional substates; typed
+    CREATE and DROP finalization and installation remain separate. The purge
+    dispatcher keeps a targeted `BTreeSet<TableID>` of pending runtime-cleanup
+    candidates and retries it on later control-plane events, avoiding both an
+    all-table scan and a self-rescheduling busy loop. Observable allocation and
+    release boundaries remain deterministic.
+  - Task Doc: `docs/tasks/000292-checkpoint-gated-index-slot-reuse.md`
+  - Task Issue: `#1037`
+  - Phase Status: done
+  - Implementation Summary: Implemented Table-owned checkpoint-gated index slot reuse with typed DDL finalization and targeted retired-runtime cleanup. [Task Resolve Sync: docs/tasks/000292-checkpoint-gated-index-slot-reuse.md @ 2026-09-02]
 
 - **Phase 6: Opaque Managed Table Definitions And Proposal Boundary**
   - Prerequisites: Phase 3 provides the descriptor row/format and stable
     numeric schema; Phase 4 validates its central parent; Phase 5 provides the
-    effective allocator view and storage-owned placement finalizer.
+    effective allocator view and Table-owned CREATE placement finalizer.
   - Scope: Implement descriptor row access and structural envelope validation;
     current-state definition reads; slot-free CREATE TABLE, CREATE INDEX, and
     DROP INDEX proposal types; optimistic epoch, revision, and effective-ID
@@ -2163,8 +2168,8 @@ marker can alias a second CREATE after restart. [U20]
   not encode the transitional ID-equals-position assumption or perform an
   immediate metadata read.
 - Slot-free compiler proposals can embed stable IDs in opaque descriptors,
-  while the gated storage finalizer remains the sole authority for reusable
-  placement, epoch, fingerprint, and root shape.
+  while the gated Table-owned CREATE finalizer remains the sole authority for
+  reusable placement, epoch, fingerprint, and root shape.
 - Optimistic revalidation keeps application compilation outside DDL exclusion
   without introducing a caller-held lock token.
 - Index-slot reuse bounds sparse root growth once durable and runtime gates

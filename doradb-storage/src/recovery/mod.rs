@@ -592,6 +592,12 @@ impl<'a> RecoveryCoordinator<'a> {
                     .change_context(RuntimeError::Recovery));
             }
             self.pending_index_ddl_reconciliations.remove(&table_id);
+            table
+                .finish_index_lifecycle_recovery()
+                .change_context(RuntimeError::Recovery)
+                .attach_with(|| {
+                    format!("finish recovered index lifecycle classification: table_id={table_id}")
+                })?;
         }
         if let Some(table_id) = self
             .pending_index_ddl_reconciliations
@@ -846,21 +852,18 @@ impl<'a> RecoveryCoordinator<'a> {
                 self.replay_catalog_modifications(dml).await?;
             }
             IndexDdlRootProof::Provisional => {
-                let table = self.resources.catalog.get_table_now(table_id);
-                let generations = table
-                    .as_ref()
-                    .map(|table| {
-                        table
-                            .file()
-                            .active_root_unchecked()
-                            .secondary_index_slots
-                            .as_slice()
-                    })
-                    .unwrap_or(&[]);
-                self.resources
+                let table = self
+                    .resources
                     .catalog
-                    .storage
-                    .reserve_provisional_index(table_id, index, cts, generations)
+                    .get_table_now(table_id)
+                    .ok_or_else(|| {
+                        Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                            "replay provisional CREATE INDEX has no admitted table: table_id={table_id}, index={index}"
+                        ))
+                    })
+                    .change_context(RuntimeError::Recovery)?;
+                table
+                    .reserve_provisional_index_create(index, cts)
                     .change_context(RuntimeError::Recovery)?;
             }
             IndexDdlRootProof::DurableFinalDrop => {
@@ -893,6 +896,19 @@ impl<'a> RecoveryCoordinator<'a> {
         match proof {
             IndexDdlRootProof::DurableFinalDrop => {
                 self.replay_catalog_modifications(dml).await?;
+                let table = self
+                    .resources
+                    .catalog
+                    .get_table_now(table_id)
+                    .ok_or_else(|| {
+                        Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                            "replay root-proven DROP INDEX has no admitted table: table_id={table_id}, index={index}"
+                        ))
+                    })
+                    .change_context(RuntimeError::Recovery)?;
+                table
+                    .record_replayed_index_drop(index, cts)
+                    .change_context(RuntimeError::Recovery)?;
             }
             IndexDdlRootProof::Provisional => {}
             IndexDdlRootProof::DurableFinalCreate | IndexDdlRootProof::DurableAllocationOnly => {

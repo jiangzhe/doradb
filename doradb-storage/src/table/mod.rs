@@ -4,6 +4,8 @@ mod deletion_buffer;
 mod dml_validator;
 mod gc;
 mod hot;
+mod index_ddl_plan;
+mod index_lifecycle;
 mod index_mutate;
 mod layout;
 mod lifecycle;
@@ -28,7 +30,10 @@ pub use gc::{
     MemIndexCleanupDelay, MemIndexCleanupOutcome, MemIndexCleanupStats,
     SecondaryMemIndexCleanupIndexStats,
 };
-pub(crate) use layout::{RetiredSecondaryIndex, RuntimeIndexEntry, TableRuntimeLayout};
+pub(crate) use index_ddl_plan::{CreateIndexPlan, DropIndexPlan};
+use index_lifecycle::TableIndexLifecycleState;
+pub(crate) use index_lifecycle::{CurrentDefinitionAllocatorView, IndexPlacement};
+pub(crate) use layout::{RuntimeIndexEntry, TableRuntimeLayout};
 pub use lifecycle::CheckpointCancelReason;
 #[cfg(test)]
 pub(crate) use lifecycle::TableTerminal;
@@ -50,7 +55,7 @@ pub(crate) use tests::{test_hooks, test_user_table_id};
 
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards, PoolRole, ReadonlyBufferPool};
-use crate::catalog::{IndexSlot, SecondaryIndexSlot, TableIndexMetadata, TableMetadata};
+use crate::catalog::{IndexRef, IndexSlot, SecondaryIndexSlot, TableIndexMetadata, TableMetadata};
 use crate::error::{
     DataIntegrityError, DataIntegrityResult, OperationResult, RuntimeError, RuntimeResult,
 };
@@ -141,10 +146,10 @@ pub(crate) struct LiveTableRedoReplayFloor {
     pub(crate) floor: TableRedoReplayFloor,
 }
 
-/// Unique ownership of retired user-index runtimes keyed by physical slot.
-#[derive(Default)]
-struct RetiredSecondaryIndexRegistry {
-    by_slot: FastHashMap<IndexSlot, RetiredSecondaryIndex>,
+struct IndexLifecycleInstallContext<'a> {
+    old_metadata: &'a TableMetadata,
+    new_metadata: &'a TableMetadata,
+    active_root: &'a ActiveRoot,
 }
 
 /// Runtime handle for a user table, combining in-memory and persisted storage.
@@ -154,7 +159,7 @@ pub(crate) struct Table {
     /// Persisted column-store runtime and table file binding.
     pub(crate) storage: ColumnStorage,
     layout: Mutex<Arc<TableRuntimeLayout>>,
-    retired_secondary_indexes: Mutex<RetiredSecondaryIndexRegistry>,
+    index_lifecycle: Mutex<TableIndexLifecycleState>,
     /// Runtime lifecycle gates for foreground, checkpoint, and drop operations.
     pub(crate) lifecycle: TableLifecycle,
     /// Canonical volatile freeze-to-checkpoint workflow state.
@@ -194,6 +199,9 @@ impl Table {
         // `catalog_load_boundary`: runtime table construction uses the loaded
         // root to seed metadata and hot/cold secondary-index state.
         let active_root = file.active_root_unchecked();
+        let index_lifecycle = TableIndexLifecycleState::from_active_root(active_root)
+            .change_context(RuntimeError::TableAccess)
+            .attach_with(|| format!("operation=build_index_lifecycle, table_id={table_id}"))?;
         let metadata = Arc::clone(&active_root.metadata);
         let secondary_index_count = metadata.idx.index_slot_count();
         let sec_idx = build_dual_tree_secondary_indexes(
@@ -236,7 +244,7 @@ impl Table {
             mem,
             storage,
             layout: Mutex::new(Arc::new(layout)),
-            retired_secondary_indexes: Mutex::new(RetiredSecondaryIndexRegistry::default()),
+            index_lifecycle: Mutex::new(index_lifecycle),
             lifecycle: TableLifecycle::new(),
             checkpoint_workflow: TableCheckpointWorkflow::new(),
         })
@@ -305,16 +313,17 @@ impl Table {
             mem,
             storage: _storage,
             layout,
-            retired_secondary_indexes,
+            index_lifecycle,
             lifecycle: _lifecycle,
             checkpoint_workflow,
         } = self;
         checkpoint_workflow.assert_closed();
         let index_pool_guard = guards.index_guard();
-        for retired in retired_secondary_indexes.into_inner().by_slot.into_values() {
-            let retired_index = retired.index;
-            let _retired_identity = (retired_index, retired.retired_generation);
-            let index = Arc::try_unwrap(retired.runtime).unwrap_or_else(|index| {
+        for (retired_index, retired_generation, runtime) in
+            index_lifecycle.into_inner().into_retained_runtimes()
+        {
+            let _retired_identity = (retired_index, retired_generation);
+            let index = Arc::try_unwrap(runtime).unwrap_or_else(|index| {
                 panic!(
                     "retired secondary index still referenced during runtime destroy: index={retired_index}, strong_count={}",
                     Arc::strong_count(&index)
@@ -437,62 +446,70 @@ impl Table {
 
     /// Returns whether any retired secondary-index runtimes are queued.
     #[inline]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "future index DDL tests and maintenance use this helper"
-        )
-    )]
     pub(crate) fn has_retired_secondary_indexes(&self) -> bool {
         #[cfg(test)]
         Self::record_retirement_registry_access();
-        !self.retired_secondary_indexes.lock().by_slot.is_empty()
+        self.index_lifecycle.lock().has_retired_runtimes()
     }
 
-    /// Replaces the layout only when the exact prepared snapshot remains current.
-    ///
-    /// All rejectable checks and retirement allocation complete before the
-    /// pointer swap. The caller may therefore pair the swap with another
-    /// infallible volatile publication while holding its coordinating lock.
+    /// Installs one finalized CREATE layout and consumes its placement.
     #[inline]
-    pub(crate) fn try_replace_runtime_layout(
+    pub(crate) fn try_install_created_index(
         &self,
         expected_layout: &Arc<TableRuntimeLayout>,
         new_layout: Arc<TableRuntimeLayout>,
+        placement: IndexPlacement,
+        index: IndexRef,
     ) -> Option<()> {
-        let mut retired = Vec::new();
-        for (slot, old_entry) in expected_layout.secondary_indexes().iter().enumerate() {
-            let Some(old_entry) = old_entry else {
-                continue;
-            };
-            let unchanged = new_layout
-                .secondary_indexes()
-                .get(slot)
-                .and_then(Option::as_ref)
-                .is_some_and(|new_entry| {
-                    new_entry.index_ref() == old_entry.index_ref()
-                        && Arc::ptr_eq(new_entry.runtime_arc(), old_entry.runtime_arc())
-                });
-            if !unchanged {
-                if new_layout
-                    .secondary_indexes()
-                    .get(slot)
-                    .and_then(Option::as_ref)
-                    .is_some()
-                {
-                    // Phase 2 keeps physical slots append-only and cannot
-                    // publish another generation while the old runtime retires.
-                    return None;
-                }
-                retired.push(RetiredSecondaryIndex {
-                    index: old_entry.index_ref(),
-                    retired_generation: expected_layout.generation(),
-                    runtime: Arc::clone(old_entry.runtime_arc()),
-                });
-            }
+        if expected_layout
+            .secondary_indexes()
+            .get(index.slot().as_usize())
+            .and_then(Option::as_ref)
+            .is_some()
+        {
+            return None;
         }
+        self.try_install_index_layout(expected_layout, new_layout, |lifecycle, context| {
+            lifecycle.install_created_index(placement, index, context)
+        })
+    }
 
+    /// Installs one finalized DROP layout and retains its exact old runtime.
+    #[inline]
+    pub(crate) fn try_install_dropped_index(
+        &self,
+        expected_layout: &Arc<TableRuntimeLayout>,
+        new_layout: Arc<TableRuntimeLayout>,
+        index: IndexRef,
+        drop_cts: TrxID,
+    ) -> Option<()> {
+        let old_layout_generation = expected_layout.generation();
+        let old_runtime = Arc::clone(expected_layout.index_entry(index).ok()?.runtime_arc());
+        self.try_install_index_layout(expected_layout, new_layout, move |lifecycle, context| {
+            lifecycle.install_dropped_index(
+                index,
+                drop_cts,
+                old_layout_generation,
+                old_runtime,
+                context,
+            )
+        })
+    }
+
+    /// Installs a typed index lifecycle mutation and its matching layout swap.
+    ///
+    /// All rejectable checks and lifecycle mutation complete before the pointer
+    /// swap. The caller may therefore pair the swap with another infallible
+    /// volatile publication while holding its coordinating lock.
+    fn try_install_index_layout(
+        &self,
+        expected_layout: &Arc<TableRuntimeLayout>,
+        new_layout: Arc<TableRuntimeLayout>,
+        install_lifecycle: impl FnOnce(
+            &mut TableIndexLifecycleState,
+            IndexLifecycleInstallContext<'_>,
+        ) -> Option<()>,
+    ) -> Option<()> {
         let mut guard = self.layout.lock();
         if !Arc::ptr_eq(&guard, expected_layout)
             || new_layout.generation() <= expected_layout.generation()
@@ -500,32 +517,16 @@ impl Table {
         {
             return None;
         }
-        // Code needing both locks always takes layout before retirement.
-        #[cfg(test)]
-        Self::record_retirement_registry_access();
-        let mut registry = self.retired_secondary_indexes.lock();
-        if retired
-            .iter()
-            .any(|retired| registry.by_slot.contains_key(&retired.index.slot()))
-            || new_layout
-                .secondary_indexes()
-                .iter()
-                .flatten()
-                .any(|entry| registry.by_slot.contains_key(&entry.index_ref().slot()))
-        {
-            return None;
-        }
-        registry.by_slot.reserve(retired.len());
+        // Code needing both locks always takes layout before lifecycle.
+        let mut lifecycle = self.index_lifecycle.lock();
+        let active_root = self.file().active_root_unchecked();
+        let context = IndexLifecycleInstallContext {
+            old_metadata: expected_layout.metadata(),
+            new_metadata: new_layout.metadata(),
+            active_root,
+        };
+        install_lifecycle(&mut lifecycle, context)?;
         *guard = new_layout;
-        for retired in retired {
-            let index = retired.index;
-            let slot = index.slot();
-            let previous = registry.by_slot.insert(slot, retired);
-            assert!(
-                previous.is_none(),
-                "retirement registry vacancy was validated before layout publication: index={index}"
-            );
-        }
         Some(())
     }
 
@@ -534,74 +535,95 @@ impl Table {
         &self,
         guards: &PoolGuards,
     ) -> RuntimeResult<usize> {
-        let mut ready = Vec::new();
-        {
-            #[cfg(test)]
-            Self::record_retirement_registry_access();
-            let mut registry = self.retired_secondary_indexes.lock();
-            let ready_slots = registry
-                .by_slot
-                .iter()
-                .filter_map(|(slot, retired)| {
-                    (Arc::strong_count(&retired.runtime) == 1).then_some(*slot)
-                })
-                .collect::<Vec<_>>();
-            ready.reserve(ready_slots.len());
-            for slot in ready_slots {
-                if let Some(retired) = registry.by_slot.remove(&slot) {
-                    ready.push(retired);
-                }
-            }
-        }
-
         let index_pool_guard = guards.index_guard();
         let mut cleaned = 0usize;
-        while let Some(retired) = ready.pop() {
-            let index_ref = retired.index;
-            let retired_generation = retired.retired_generation;
-            let index = match Arc::try_unwrap(retired.runtime) {
-                Ok(index) => index,
-                Err(index) => {
-                    #[cfg(test)]
-                    Self::record_retirement_registry_access();
-                    let previous = self.retired_secondary_indexes.lock().by_slot.insert(
-                        index_ref.slot(),
-                        RetiredSecondaryIndex {
-                            index: index_ref,
-                            retired_generation,
-                            runtime: index,
-                        },
-                    );
-                    assert!(
-                        previous.is_none(),
-                        "ready retirement slot became occupied: index={index_ref}"
-                    );
-                    continue;
-                }
+        loop {
+            let Some(job) = self.index_lifecycle.lock().take_cleanup_job() else {
+                break;
             };
-            if let Err(err) = index.destroy(index_pool_guard).await {
-                // The failing index has been consumed by destroy. Keep the
-                // remaining ready entries queued so a later maintenance pass
-                // can continue after the caller handles the error.
-                #[cfg(test)]
-                Self::record_retirement_registry_access();
-                let mut registry = self.retired_secondary_indexes.lock();
-                for pending in ready {
-                    let index = pending.index;
-                    let slot = index.slot();
-                    let previous = registry.by_slot.insert(slot, pending);
-                    assert!(
-                        previous.is_none(),
-                        "ready retirement slot became occupied: index={index}"
-                    );
-                }
-                return Err(err);
-            }
-            let _destroyed_identity = (index_ref, retired_generation);
+            let index_ref = job.index();
+            let retired_generation = job.layout_generation();
+            let index = Arc::try_unwrap(job.into_runtime()).unwrap_or_else(|index| {
+                panic!(
+                    "retired secondary index cleanup ownership changed after Destroying publication: index={index_ref}, strong_count={}",
+                    Arc::strong_count(&index)
+                )
+            });
+            // On failure destroy consumed the runtime, so the Destroying
+            // sentinel remains permanently blocking while the caller poisons.
+            index.destroy(index_pool_guard).await?;
+            assert!(
+                self.index_lifecycle
+                    .lock()
+                    .finish_cleanup_job(index_ref, retired_generation)
+                    .is_some(),
+                "retired secondary index cleanup completion lost exact sentinel: index={index_ref}, layout_generation={retired_generation}"
+            );
             cleaned += 1;
             yield_now().await;
         }
         Ok(cleaned)
+    }
+
+    /// Return the current metadata/effective-watermark allocator view.
+    pub(crate) fn current_index_allocator_view(
+        &self,
+        layout: &Arc<TableRuntimeLayout>,
+        active_root: &ActiveRoot,
+    ) -> DataIntegrityResult<CurrentDefinitionAllocatorView> {
+        self.index_lifecycle
+            .lock()
+            .current_allocator_view(layout.metadata_arc(), active_root)
+    }
+
+    /// Select the lowest safe finalized CREATE placement.
+    pub(crate) fn select_index_create_placement(
+        &self,
+        durable_slot_count: u32,
+    ) -> OperationResult<(IndexPlacement, bool)> {
+        self.index_lifecycle
+            .lock()
+            .select_create_placement(durable_slot_count)
+    }
+
+    /// Record one root-unproven replay-visible CREATE reservation.
+    pub(crate) fn reserve_provisional_index_create(
+        &self,
+        index: IndexRef,
+        create_cts: TrxID,
+    ) -> DataIntegrityResult<()> {
+        let active_root = self.file().active_root_unchecked();
+        self.index_lifecycle
+            .lock()
+            .reserve_provisional_create(index, create_cts, active_root)
+    }
+
+    /// Record one root-proven replay-visible DROP retirement.
+    pub(crate) fn record_replayed_index_drop(
+        &self,
+        index: IndexRef,
+        drop_cts: TrxID,
+    ) -> DataIntegrityResult<()> {
+        self.index_lifecycle
+            .lock()
+            .record_replayed_drop(index, drop_cts)
+    }
+
+    /// Finish lifecycle reconstruction after recovery metadata agreement.
+    pub(crate) fn finish_index_lifecycle_recovery(&self) -> DataIntegrityResult<()> {
+        let active_root = self.file().active_root_unchecked();
+        self.index_lifecycle.lock().finish_recovery(active_root)
+    }
+
+    /// Apply a successfully published catalog checkpoint replay boundary.
+    pub(crate) fn apply_index_lifecycle_checkpoint(
+        &self,
+        catalog_replay_start_ts: TrxID,
+    ) -> DataIntegrityResult<()> {
+        let active_root = self.file().active_root_unchecked();
+        self.index_lifecycle
+            .lock()
+            .apply_checkpoint(catalog_replay_start_ts, active_root)
     }
 
     /// Returns the readonly disk buffer pool used by persisted table data.

@@ -371,25 +371,14 @@ impl TableRuntimeLayout {
     }
 }
 
-/// Retired user-table secondary-index runtime awaiting async MemIndex destroy.
-pub(crate) struct RetiredSecondaryIndex {
-    /// Exact secondary-index generation retired from the active runtime layout.
-    pub(crate) index: IndexRef,
-    /// Layout generation that retired this runtime index.
-    pub(crate) retired_generation: u64,
-    /// Secondary-index runtime waiting for asynchronous MemIndex destruction.
-    pub(crate) runtime: Arc<SecondaryIndex<EvictableBufferPool>>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::{BufferPool, PoolGuards, PoolRole};
     use crate::catalog::{
-        ActiveIndexSpec, IndexDdlKind, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags,
-        StorageIndexKey, StorageIndexSpec,
+        ActiveIndexSpec, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
+        StorageIndexSpec,
     };
-    use crate::id::TrxID;
+    use crate::table::IndexPlacement;
     use crate::table::tests::*;
     use crate::trx::purge::PurgeTestEvent;
     use crate::value::ValKind;
@@ -588,7 +577,7 @@ mod tests {
     }
 
     #[test]
-    fn test_runtime_layout_install_retires_removed_index_until_pinned_layout_drops() {
+    fn test_runtime_layout_install_retains_removed_index_while_layout_is_pinned() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
@@ -612,47 +601,16 @@ mod tests {
             let table = table_for_internal_assertion(&engine, table_id);
             let old_layout = table.layout_snapshot();
             assert_eq!(old_layout.metadata().idx.active_index_count(), 1);
-
-            let metadata_without_indexes = Arc::new(
-                TableMetadata::try_new_with_index_slot_count(
-                    vec![
-                        StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
-                        StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
-                    ],
-                    vec![],
-                    old_layout.metadata().idx.index_slot_count_u32(),
-                )
-                .unwrap(),
-            );
-            let mut inactive_slots: Vec<Option<Arc<SecondaryIndex<EvictableBufferPool>>>> =
-                Vec::with_capacity(old_layout.index_slot_count());
-            inactive_slots.resize_with(old_layout.index_slot_count(), || None);
-            let new_layout = TableRuntimeLayout::new(
-                old_layout.generation() + 1,
-                metadata_without_indexes,
-                inactive_slots.into_boxed_slice(),
-            );
-
-            let current_cts = engine
-                .inner()
-                .core
-                .catalog()
-                .resolve_user_table_current(table_id)
+            let retired_index = old_layout.secondary_indexes()[0]
+                .as_ref()
                 .unwrap()
-                .effective_cts();
-            let installed = engine
-                .inner()
-                .core
-                .catalog()
-                .install_index_layout_and_publish_history(
-                    table_id,
-                    TrxID::new(current_cts.as_u64() + 1),
-                    &table,
-                    &old_layout,
-                    new_layout,
-                    (&engine.inner().index_ddl_test, IndexDdlKind::Drop),
-                )
-                .expect("test runtime layout publication must succeed");
+                .index_ref();
+            let mut session = engine.new_session().unwrap();
+            session
+                .drop_index(table_id, retired_index.id())
+                .await
+                .unwrap();
+            let installed = table.layout_snapshot();
             assert_eq!(old_layout.metadata().idx.active_index_count(), 1);
             assert_eq!(installed.metadata().idx.active_index_count(), 0);
             assert_eq!(
@@ -676,54 +634,23 @@ mod tests {
                 table_for_internal_assertion(&engine, table_id).has_retired_secondary_indexes()
             );
 
-            let reused_slot_layout = Arc::new(TableRuntimeLayout::from_entries(
-                installed.generation() + 1,
-                Arc::clone(old_layout.metadata_arc()),
-                vec![Some(RuntimeIndexEntry::new(
-                    old_layout.secondary_indexes()[0]
-                        .as_ref()
-                        .unwrap()
-                        .index_ref(),
-                    Arc::clone(
-                        old_layout.secondary_indexes()[0]
-                            .as_ref()
-                            .unwrap()
-                            .runtime_arc(),
-                    ),
-                ))]
-                .into_boxed_slice(),
-            ));
-            assert!(
-                table_for_internal_assertion(&engine, table_id)
-                    .try_replace_runtime_layout(&installed, reused_slot_layout)
-                    .is_none(),
+            let (placement, _) = table_for_internal_assertion(&engine, table_id)
+                .select_index_create_placement(installed.metadata().idx.index_slot_count_u32())
+                .unwrap();
+            assert_eq!(
+                placement,
+                IndexPlacement::Append(IndexSlot::new(1)),
                 "a physical slot cannot be reused while its exact retired owner is registered"
             );
 
-            let guards = PoolGuards::builder()
-                .push(
-                    PoolRole::Index,
-                    engine.inner().pools.index.create_base_guard(),
-                )
-                .build();
             assert_eq!(
-                table_for_internal_assertion(&engine, table_id)
-                    .cleanup_retired_secondary_indexes(&guards)
+                table
+                    .cleanup_retired_secondary_indexes(engine.inner().core.pools.pool_guards())
                     .await
                     .unwrap(),
                 0
             );
             drop(old_layout);
-            assert_eq!(
-                table_for_internal_assertion(&engine, table_id)
-                    .cleanup_retired_secondary_indexes(&guards)
-                    .await
-                    .unwrap(),
-                1
-            );
-            assert!(
-                !table_for_internal_assertion(&engine, table_id).has_retired_secondary_indexes()
-            );
         })
     }
 }

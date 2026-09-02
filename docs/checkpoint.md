@@ -224,7 +224,7 @@ checkpoint validates the complete projected root set. Every row in
 reference a `table_id` present in projected `catalog.tables`. Validation reads
 only the parent column from each compact row. If it fails, the mutable fork is
 discarded: active roots, `catalog_replay_start_ts`, the checkpointed silent-
-watermark cache, and provisional index reservations remain unchanged.
+watermark cache, and Table-local index lifecycle state remain unchanged.
 
 After table rows and overlay fields such as `next_table_id` and silent
 watermarks are applied, catalog checkpoint publishes the next
@@ -232,6 +232,22 @@ watermarks are applied, catalog checkpoint publishes the next
 and rebuilds the mutable root's allocation map before publishing the
 meta/super-block pair. If only overlay metadata changed, it skips the full
 trace and reclaims only the displaced meta block.
+
+Only a successfully published root advances index lifecycle proof. Before
+checkpoint exclusion is released, the catalog snapshots live table handles and
+applies the new replay boundary to each Table-owned index lifecycle machine. A
+DROP with `drop_cts < catalog_replay_start_ts` becomes checkpoint-covered, and
+a root-unproven CREATE marker below the same strict boundary loses its
+provisional reservation without lowering the process-local ID watermark. A
+failed, stale, or no-op checkpoint makes no lifecycle transition. Standalone
+catalog checkpoint and combined catalog-checkpoint/redo-retention publication
+use this same commit boundary.
+
+Checkpoint coverage is independent of retired runtime destruction. Either may
+finish first, but a physical slot is reusable only after both have finished and
+no provisional CREATE overlays it. Successful publication schedules purge to
+retry retained secondary-index runtimes; pinned runtimes remain queued without
+blocking checkpoint or CREATE.
 
 Catalog checkpoint is periodic maintenance, commonly scheduled after redo
 rotation and sealing when useful durable progress exists. It does not create an

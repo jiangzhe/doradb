@@ -20,7 +20,7 @@ use crossbeam_utils::CachePadded;
 use error_stack::Report;
 use flume::{Receiver, Sender};
 use parking_lot::Mutex;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::mem::forget;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -203,6 +203,18 @@ impl TransactionSystem {
         let _ = self.purge_tx.send(Purge::MetadataHistory);
     }
 
+    /// Register one table for retired secondary-index runtime cleanup.
+    #[inline]
+    pub(crate) fn request_retired_index_runtime_purge(&self, table_id: TableID) {
+        let _ = self.purge_tx.send(Purge::RetiredIndexRuntime(table_id));
+    }
+
+    /// Retry all registered retired secondary-index runtime candidates.
+    #[inline]
+    pub(crate) fn request_retired_index_runtime_retry(&self) {
+        let _ = self.purge_tx.send(Purge::RetiredIndexRuntimeRetry);
+    }
+
     /// Start exactly the configured number of purge-bucket worker threads.
     ///
     /// The dispatcher is worker slot zero and the remaining configured slots
@@ -325,7 +337,13 @@ impl TransactionSystem {
             };
             handles.push(handle);
         }
-        Ok((PurgeDispatcher(chans), handles))
+        Ok((
+            PurgeDispatcher {
+                task_senders: chans,
+                retired_index_runtime_tables: BTreeSet::new(),
+            },
+            handles,
+        ))
     }
 
     /// Purge row undo logs and index entries according to given transaction
@@ -921,6 +939,10 @@ pub(crate) enum Purge {
     DroppedTable,
     /// Run only user-table metadata-history cleanup.
     MetadataHistory,
+    /// Register one live table and run retired secondary-index destruction attempts.
+    RetiredIndexRuntime(TableID),
+    /// Retry retired secondary-index destruction for all registered tables.
+    RetiredIndexRuntimeRetry,
     /// Test-only system-CTS scheduling input without a retirement payload.
     #[cfg(test)]
     TestSystemCts(TrxID),
@@ -934,6 +956,7 @@ struct PurgeWork {
     table_root_retention: bool,
     dropped_table: bool,
     metadata_history: bool,
+    retired_index_runtime: bool,
     /// Terminal shutdown marker. When set, the purge loop returns without
     /// running cleanup work collected before the marker.
     stop_after: bool,
@@ -949,6 +972,7 @@ impl PurgeWork {
             table_root_retention: false,
             dropped_table: false,
             metadata_history: false,
+            retired_index_runtime: false,
             stop_after: false,
         }
     }
@@ -963,6 +987,7 @@ impl PurgeWork {
             table_root_retention: true,
             dropped_table: false,
             metadata_history: false,
+            retired_index_runtime: false,
             stop_after: false,
         }
     }
@@ -976,6 +1001,7 @@ impl PurgeWork {
             table_root_retention: false,
             dropped_table: false,
             metadata_history: false,
+            retired_index_runtime: false,
             stop_after: true,
         }
     }
@@ -1001,10 +1027,16 @@ impl PurgeWork {
             || self.table_root_retention
             || self.dropped_table
             || self.metadata_history
+            || self.retired_index_runtime
     }
 
     #[inline]
-    fn absorb<F>(&mut self, purge: Purge, analyze_committed: &mut F) -> bool
+    fn absorb<F>(
+        &mut self,
+        purge: Purge,
+        retired_index_runtime_tables: &mut BTreeSet<TableID>,
+        analyze_committed: &mut F,
+    ) -> bool
     where
         F: FnMut(FastHashMap<usize, Vec<CommittedTrx>>) -> CommittedPurgeProgress,
     {
@@ -1033,10 +1065,16 @@ impl PurgeWork {
                 self.table_root_retention = true;
                 self.dropped_table = true;
                 self.metadata_history = true;
+                self.retired_index_runtime = true;
             }
             Purge::TableRootRetention => self.table_root_retention = true,
             Purge::DroppedTable => self.dropped_table = true,
             Purge::MetadataHistory => self.metadata_history = true,
+            Purge::RetiredIndexRuntime(table_id) => {
+                retired_index_runtime_tables.insert(table_id);
+                self.retired_index_runtime = true;
+            }
+            Purge::RetiredIndexRuntimeRetry => self.retired_index_runtime = true,
             #[cfg(test)]
             Purge::TestSystemCts(cts) => self.merge_system_cts(cts),
         }
@@ -1050,6 +1088,7 @@ struct PurgeCyclePlan {
     table_root_retention: bool,
     dropped_table: bool,
     metadata_history: bool,
+    retired_index_runtime: bool,
     advance_completed_horizon: bool,
 }
 
@@ -1105,6 +1144,10 @@ pub(crate) enum PurgeTestEvent {
     TableRootRetentionStarted,
     /// Dropped-table housekeeping is starting.
     DroppedTableStarted,
+    /// Retired secondary-index runtime housekeeping is starting.
+    RetiredIndexRuntimeStarted,
+    /// Retired secondary-index runtime housekeeping reached one registered table.
+    RetiredIndexRuntimeTableStarted { table_id: TableID },
     /// The completed purge horizon was published after cycle success.
     CompletedHorizonPublished { sts: TrxID },
     /// One planned cycle finished all selected work.
@@ -1123,9 +1166,39 @@ struct PurgeTaskResult {
 }
 
 /// Purge coordinator and worker-slot-zero executor.
-pub(crate) struct PurgeDispatcher(Vec<Sender<PurgeTask>>);
+pub(crate) struct PurgeDispatcher {
+    task_senders: Vec<Sender<PurgeTask>>,
+    retired_index_runtime_tables: BTreeSet<TableID>,
+}
 
 impl PurgeDispatcher {
+    async fn process_retired_index_runtimes(
+        &mut self,
+        trx_sys: &TransactionSystem,
+        guards: &PoolGuards,
+    ) -> RuntimeResult<()> {
+        let table_ids = self
+            .retired_index_runtime_tables
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        for table_id in table_ids {
+            #[cfg(test)]
+            trx_sys.observe_purge_test_event(PurgeTestEvent::RetiredIndexRuntimeTableStarted {
+                table_id,
+            });
+            let Some(table) = trx_sys.catalog.current_live_user_table(table_id) else {
+                self.retired_index_runtime_tables.remove(&table_id);
+                continue;
+            };
+            table.cleanup_retired_secondary_indexes(guards).await?;
+            if !table.has_retired_secondary_indexes() {
+                self.retired_index_runtime_tables.remove(&table_id);
+            }
+        }
+        Ok(())
+    }
+
     #[inline]
     async fn purge_loop(
         &mut self,
@@ -1135,9 +1208,12 @@ impl PurgeDispatcher {
     ) {
         let mut completed_horizon = trx_sys.global_visible_sts();
         'DISPATCH_LOOP: while let Ok(purge) = purge_chan.recv_async().await {
-            let work = coalesce_purge_work(&purge_chan, purge, |trx_list| {
-                trx_sys.record_committed_for_purge(trx_list)
-            });
+            let work = coalesce_purge_work(
+                &purge_chan,
+                purge,
+                &mut self.retired_index_runtime_tables,
+                |trx_list| trx_sys.record_committed_for_purge(trx_list),
+            );
             if work.stop_after {
                 break 'DISPATCH_LOOP;
             }
@@ -1155,11 +1231,11 @@ impl PurgeDispatcher {
                 advance_completed_horizon: plan.advance_completed_horizon,
             });
             if plan.transaction_gc {
-                let worker_count = self.0.len() + 1;
+                let worker_count = self.task_senders.len() + 1;
                 // Enqueue every remote bucket before the dispatcher starts its
                 // own deterministic worker-slot share. With no executors this
                 // skips completion-channel creation entirely.
-                let remote_results = if self.0.is_empty() {
+                let remote_results = if self.task_senders.is_empty() {
                     None
                 } else {
                     let (done_tx, done_rx) = flume::unbounded();
@@ -1174,7 +1250,7 @@ impl PurgeDispatcher {
                             min_active_sts: curr_sts,
                             done: done_tx.clone(),
                         };
-                        self.0[worker_slot - 1].send(task).expect(
+                        self.task_senders[worker_slot - 1].send(task).expect(
                             "purge executor receiver must stay alive while dispatcher owns sender",
                         );
                         #[cfg(test)]
@@ -1247,6 +1323,24 @@ impl PurgeDispatcher {
             if plan.metadata_history {
                 trx_sys.catalog.purge_user_table_history(curr_sts);
             }
+            if plan.retired_index_runtime {
+                #[cfg(test)]
+                trx_sys.observe_purge_test_event(PurgeTestEvent::RetiredIndexRuntimeStarted);
+                if let Err(err) = self
+                    .process_retired_index_runtimes(trx_sys, &pool_guards)
+                    .await
+                {
+                    let report = err
+                        .change_context(FatalError::PurgeDeallocate)
+                        .attach("retired secondary-index runtime destruction failed");
+                    obs::error!(
+                        "event=engine_poison component=purge action=poison result=error error={:?}",
+                        report
+                    );
+                    let _ = trx_sys.poisoner.poison(report);
+                    return;
+                }
+            }
             if plan.dropped_table {
                 #[cfg(test)]
                 trx_sys.observe_purge_test_event(PurgeTestEvent::DroppedTableStarted);
@@ -1284,7 +1378,7 @@ impl PurgeDispatcher {
         // Notify executors to quit after a normal Stop or channel close. Fatal
         // poison returns above; then the worker closure drops the dispatcher and
         // closes these same task channels.
-        self.0.clear();
+        self.task_senders.clear();
     }
 }
 
@@ -1371,6 +1465,7 @@ fn plan_purge_cycle(
         table_root_retention: work.table_root_retention || horizon_cycle,
         dropped_table: work.dropped_table || horizon_cycle,
         metadata_history: work.metadata_history || horizon_cycle,
+        retired_index_runtime: work.retired_index_runtime || horizon_cycle,
         advance_completed_horizon: horizon_cycle,
     }
 }
@@ -1397,6 +1492,7 @@ fn merge_bucket_results(
 fn coalesce_purge_work<F>(
     purge_chan: &Receiver<Purge>,
     initial: Purge,
+    retired_index_runtime_tables: &mut BTreeSet<TableID>,
     mut analyze_committed: F,
 ) -> PurgeWork
 where
@@ -1408,11 +1504,15 @@ where
     // messages before it have been absorbed, messages after it are intentionally
     // ignored.
     let mut work = PurgeWork::none();
-    if !work.absorb(initial, &mut analyze_committed) {
+    if !work.absorb(
+        initial,
+        retired_index_runtime_tables,
+        &mut analyze_committed,
+    ) {
         return work;
     }
     while let Ok(purge) = purge_chan.try_recv() {
-        if !work.absorb(purge, &mut analyze_committed) {
+        if !work.absorb(purge, retired_index_runtime_tables, &mut analyze_committed) {
             return work;
         }
     }
@@ -1734,6 +1834,7 @@ mod tests {
         .unwrap();
         tx.send(Purge::Committed(FastHashMap::default())).unwrap();
         tx.send(Purge::FullObservation).unwrap();
+        let mut retired_index_runtime_tables = BTreeSet::new();
 
         let work = coalesce_purge_work(
             &rx,
@@ -1741,6 +1842,7 @@ mod tests {
                 original_sts: TrxID::new(20),
                 new_sts: TrxID::new(30),
             }),
+            &mut retired_index_runtime_tables,
             |_| CommittedPurgeProgress {
                 min_original_sts: Some(TrxID::new(15)),
                 min_system_cts: Some(TrxID::new(40)),
@@ -1756,6 +1858,7 @@ mod tests {
                 table_root_retention: true,
                 dropped_table: true,
                 metadata_history: true,
+                retired_index_runtime: true,
                 stop_after: false,
             }
         );
@@ -1766,16 +1869,65 @@ mod tests {
         let (tx, rx) = flume::unbounded();
         tx.send(Purge::DroppedTable).unwrap();
         tx.send(Purge::MetadataHistory).unwrap();
+        let mut retired_index_runtime_tables = BTreeSet::new();
         assert_eq!(
-            coalesce_purge_work(&rx, Purge::TableRootRetention, |_| {
-                panic!("no committed payload expected")
-            }),
+            coalesce_purge_work(
+                &rx,
+                Purge::TableRootRetention,
+                &mut retired_index_runtime_tables,
+                |_| { panic!("no committed payload expected") },
+            ),
             PurgeWork {
                 dropped_table: true,
                 metadata_history: true,
                 ..PurgeWork::table_root_retention()
             }
         );
+    }
+
+    #[test]
+    fn test_coalesce_purge_work_registers_retired_index_runtime_tables() {
+        let (tx, rx) = flume::unbounded();
+        tx.send(Purge::RetiredIndexRuntime(TableID::new(9)))
+            .unwrap();
+        tx.send(Purge::RetiredIndexRuntime(TableID::new(7)))
+            .unwrap();
+        tx.send(Purge::RetiredIndexRuntimeRetry).unwrap();
+        let mut retired_index_runtime_tables = BTreeSet::new();
+
+        let work = coalesce_purge_work(
+            &rx,
+            Purge::RetiredIndexRuntime(TableID::new(7)),
+            &mut retired_index_runtime_tables,
+            |_| panic!("no committed payload expected"),
+        );
+
+        assert!(work.retired_index_runtime);
+        assert_eq!(
+            retired_index_runtime_tables.into_iter().collect::<Vec<_>>(),
+            vec![TableID::new(7), TableID::new(9)]
+        );
+    }
+
+    #[test]
+    fn test_retired_index_runtime_processing_removes_absent_table() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = purge_test_engine("retired_index_absent", 1, 1).await;
+            let absent_table_id = TableID::new(999);
+            let mut dispatcher = PurgeDispatcher {
+                task_senders: Vec::new(),
+                retired_index_runtime_tables: BTreeSet::from([absent_table_id]),
+            };
+            let guards = full_pool_guards(&engine);
+
+            dispatcher
+                .process_retired_index_runtimes(&engine.inner().trx_sys, &guards)
+                .await
+                .unwrap();
+
+            assert!(dispatcher.retired_index_runtime_tables.is_empty());
+            engine.shutdown();
+        });
     }
 
     #[test]
@@ -1787,6 +1939,7 @@ mod tests {
             table_root_retention: false,
             dropped_table: false,
             metadata_history: false,
+            retired_index_runtime: false,
             advance_completed_horizon: false,
         };
         let full_plan = PurgeCyclePlan {
@@ -1794,6 +1947,7 @@ mod tests {
             table_root_retention: true,
             dropped_table: true,
             metadata_history: true,
+            retired_index_runtime: true,
             advance_completed_horizon: true,
         };
 
@@ -1836,6 +1990,7 @@ mod tests {
             table_root_retention: true,
             dropped_table: true,
             metadata_history: true,
+            retired_index_runtime: true,
             ..PurgeWork::none()
         };
         assert_eq!(
@@ -1845,6 +2000,7 @@ mod tests {
                 table_root_retention: true,
                 dropped_table: true,
                 metadata_history: true,
+                retired_index_runtime: true,
                 advance_completed_horizon: false,
             }
         );
@@ -1864,6 +2020,7 @@ mod tests {
                 table_root_retention: false,
                 dropped_table: false,
                 metadata_history: false,
+                retired_index_runtime: false,
                 advance_completed_horizon: false,
             }
         );
@@ -1897,6 +2054,7 @@ mod tests {
                 table_root_retention: true,
                 dropped_table: false,
                 metadata_history: false,
+                retired_index_runtime: false,
                 advance_completed_horizon: false,
             }
         );
@@ -1914,6 +2072,7 @@ mod tests {
                 table_root_retention: false,
                 dropped_table: false,
                 metadata_history: true,
+                retired_index_runtime: false,
                 advance_completed_horizon: false,
             }
         );
@@ -1998,16 +2157,23 @@ mod tests {
         tx.send(Purge::Committed(FastHashMap::default())).unwrap();
         tx.send(Purge::Stop).unwrap();
         tx.send(Purge::TableRootRetention).unwrap();
+        let mut retired_index_runtime_tables = BTreeSet::new();
         assert_eq!(
-            coalesce_purge_work(&rx, Purge::DroppedTable, |_| {
-                CommittedPurgeProgress::default()
-            }),
+            coalesce_purge_work(
+                &rx,
+                Purge::DroppedTable,
+                &mut retired_index_runtime_tables,
+                |_| CommittedPurgeProgress::default(),
+            ),
             PurgeWork::stop()
         );
         assert_eq!(
-            coalesce_purge_work(&rx, Purge::Stop, |_| {
-                panic!("no committed payload expected")
-            }),
+            coalesce_purge_work(
+                &rx,
+                Purge::Stop,
+                &mut retired_index_runtime_tables,
+                |_| panic!("no committed payload expected"),
+            ),
             PurgeWork::stop()
         );
     }
@@ -2023,10 +2189,16 @@ mod tests {
         tx.send(Purge::Committed(FastHashMap::default())).unwrap();
 
         let mut analyzed = 0usize;
-        let work = coalesce_purge_work(&rx, Purge::Committed(FastHashMap::default()), |_| {
-            analyzed += 1;
-            CommittedPurgeProgress::default()
-        });
+        let mut retired_index_runtime_tables = BTreeSet::new();
+        let work = coalesce_purge_work(
+            &rx,
+            Purge::Committed(FastHashMap::default()),
+            &mut retired_index_runtime_tables,
+            |_| {
+                analyzed += 1;
+                CommittedPurgeProgress::default()
+            },
+        );
 
         assert_eq!(work, PurgeWork::stop());
         assert_eq!(analyzed, 3);
@@ -2035,13 +2207,17 @@ mod tests {
     #[test]
     fn test_coalesce_purge_work_committed_preserves_both_progress_dimensions() {
         let (_tx, rx) = flume::unbounded();
+        let mut retired_index_runtime_tables = BTreeSet::new();
 
-        let work = coalesce_purge_work(&rx, Purge::Committed(FastHashMap::default()), |_| {
-            CommittedPurgeProgress {
+        let work = coalesce_purge_work(
+            &rx,
+            Purge::Committed(FastHashMap::default()),
+            &mut retired_index_runtime_tables,
+            |_| CommittedPurgeProgress {
                 min_original_sts: Some(TrxID::new(10)),
                 min_system_cts: Some(TrxID::new(20)),
-            }
-        });
+            },
+        );
 
         assert_eq!(
             work,
