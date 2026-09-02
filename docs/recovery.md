@@ -187,10 +187,25 @@ only while the necessary index DDL remains replayable and the root timestamp
 proves the table-file state is new enough. Any mismatch left after replay is a
 root-integrity failure.
 
-The root-proof classifier receives a replay-floor-qualified exact index
-identity. The existing redo `u16` is checked and expanded to an equal
-transitional `IndexID`/slot pair only after the DDL is known to be replay
-visible; recovery does not infer a generation from an unqualified bare slot.
+The root-proof classifier receives a replay-floor-qualified exact `IndexID` and
+physical slot from redo. Recovery does not infer a generation from an
+unqualified bare slot.
+
+The loaded table root also seeds the Table-owned index lifecycle machine.
+Active slots stay solely in the runtime layout, vacant slots become reusable
+durable vacancies, and retired identities begin recovery-unclassified with no
+runtime owner. Replay-visible root-unproven CREATE markers become provisional
+reservations and advance the effective widened ID watermark. Root-proven DROP
+markers classify their exact retired generation as awaiting catalog checkpoint
+coverage.
+
+After replay and final catalog/table metadata agreement, every remaining
+unclassified retired root is checkpoint-covered. A replay-visible DROP remains
+awaiting coverage, while a provisional CREATE over an older retired hole is
+accepted only if that underlying retirement is proven reusable. Conflicting
+IDs, slots, or leftover unclassified states fail recovery before foreground
+admission. This reconstructs allocator proof without persisting a free list and
+allows checkpoint-covered holes to be reused immediately after restart.
 
 ## Secondary-Index Reconstruction
 
@@ -219,6 +234,7 @@ Recovery is complete only after:
 - eligible redo reaches the accepted log end
 - every final catalog satellite row has a live central table parent
 - provisional-file cleanup and metadata reconciliation succeed
+- every Table-local index lifecycle entry is exactly classified
 - hot `MemIndex` state and RowStore undo maps are rebuilt
 - the redo family is repaired and prepared for new appends
 

@@ -472,9 +472,11 @@ impl TransactionSystem {
                 );
                 new_first_retained_file_seq = target_marker;
             }
-            match prepared.commit(&self.catalog.storage).await {
+            match self.catalog.commit_prepared_checkpoint(prepared).await {
                 Ok(outcome) => outcome,
-                Err(err) if err.downcast_ref::<IoError>().is_some() => {
+                Err(RuntimeOrFatalError::Runtime(err))
+                    if err.downcast_ref::<IoError>().is_some() =>
+                {
                     let report = err
                         .change_context(FatalError::CheckpointWrite)
                         .attach("commit combined catalog checkpoint IO failure");
@@ -486,7 +488,7 @@ impl TransactionSystem {
                         self.poisoner.poison(report).into_report(),
                     ));
                 }
-                Err(err) => return Err(RuntimeOrFatalError::from(err)),
+                Err(err) => return Err(err),
             }
         } else {
             if target_marker > previous_first_retained_file_seq {
@@ -531,6 +533,7 @@ impl TransactionSystem {
                 self.record_catalog_redo_retention_progress(progress);
             }
             self.request_dropped_table_purge();
+            self.request_retired_index_runtime_retry();
         }
 
         // 7. Release only the catalog gate before filesystem cleanup. The redo

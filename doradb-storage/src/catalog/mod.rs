@@ -33,8 +33,8 @@ use crate::buffer::{
 };
 use crate::component::{Component, ComponentRegistry, MetaPool, ShelfScope};
 use crate::error::{
-    DataIntegrityError, DataIntegrityResult, OperationError, OperationResult, RuntimeError,
-    RuntimeOrFatalResult, RuntimeResult,
+    DataIntegrityError, DataIntegrityResult, FatalError, OperationError, OperationResult,
+    RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
 };
 use crate::file::fs::FileSystem;
 use crate::id::{RowID, TableID, TrxID};
@@ -44,8 +44,8 @@ use crate::poison::EnginePoisoner;
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
 use crate::row::Row;
 use crate::table::{
-    IndexLookupCriteria, LiveTableRedoReplayFloor, MemTable, Table, TableRedoReplayFloor,
-    TableRuntimeLayout,
+    CreateIndexPlan, DropIndexPlan, IndexLookupCriteria, LiveTableRedoReplayFloor, MemTable, Table,
+    TableRedoReplayFloor, TableRuntimeLayout,
 };
 use crate::trx::retention::PendingDroppedTableRedoFloor;
 use crate::trx::undo::IndexUndo;
@@ -159,6 +159,13 @@ impl CatalogConfig {
     }
 }
 
+struct IndexLayoutPublication<'a> {
+    effective_cts: TrxID,
+    expected_table: &'a Arc<Table>,
+    expected_old_layout: &'a Arc<TableRuntimeLayout>,
+    new_layout: TableRuntimeLayout,
+}
+
 /// Catalog contains metadata of user tables.
 pub(crate) struct Catalog {
     next_table_id: AtomicU64,
@@ -235,9 +242,8 @@ impl Catalog {
         batch: CatalogCheckpointBatch,
         disk_guard: &PoolGuard,
     ) -> RuntimeOrFatalResult<CatalogCheckpointOutcome> {
-        self.storage
-            .apply_checkpoint_batch(batch, self.curr_next_table_id(), disk_guard)
-            .await
+        let prepared = self.prepare_checkpoint_batch(batch, disk_guard).await?;
+        self.commit_prepared_checkpoint(prepared).await
     }
 
     /// Prepare one scanned catalog checkpoint batch for a later root commit.
@@ -250,6 +256,37 @@ impl Catalog {
         self.storage
             .prepare_checkpoint_batch(batch, self.curr_next_table_id(), disk_guard)
             .await
+    }
+
+    /// Commit a prepared catalog root and apply its Table-local lifecycle event.
+    pub(crate) async fn commit_prepared_checkpoint(
+        &self,
+        prepared: PreparedCatalogCheckpoint,
+    ) -> RuntimeOrFatalResult<CatalogCheckpointOutcome> {
+        let outcome = prepared
+            .commit(&self.storage)
+            .await
+            .map_err(RuntimeOrFatalError::from)?;
+        let CatalogCheckpointOutcome::Published {
+            catalog_replay_start_ts,
+        } = outcome
+        else {
+            return Ok(outcome);
+        };
+        for table in self.snapshot_live_user_tables() {
+            if let Err(err) = table.apply_index_lifecycle_checkpoint(catalog_replay_start_ts) {
+                let report = err
+                    .change_context(FatalError::CatalogWrite)
+                    .attach(format!(
+                        "published catalog checkpoint lifecycle transition failed: table_id={}, catalog_replay_start_ts={catalog_replay_start_ts}",
+                        table.table_id()
+                    ));
+                return Err(RuntimeOrFatalError::from(
+                    self.poisoner.poison(report).into_report(),
+                ));
+            }
+        }
+        Ok(outcome)
     }
 
     /// Reload one user table runtime from catalog metadata and table file.
@@ -505,6 +542,17 @@ impl Catalog {
             .and_then(|current| current.live_table().map(Arc::clone))
     }
 
+    /// Snapshot all current live user-table runtimes without retaining map guards.
+    pub(crate) fn snapshot_live_user_tables(&self) -> Vec<Arc<Table>> {
+        let mut tables = self
+            .user_tables
+            .iter()
+            .filter_map(|entry| entry.value().current_live_table())
+            .collect::<Vec<_>>();
+        tables.sort_by_key(|table| table.table_id().as_u64());
+        tables
+    }
+
     /// Returns a session-owned insert-page token to the exact current runtime.
     ///
     /// The catalog entry guard prevents DROP from replacing the live runtime
@@ -685,20 +733,83 @@ impl Catalog {
         }
     }
 
-    /// Atomically coordinates index layout and catalog-history publication.
+    /// Atomically installs one CREATE layout and publishes its catalog history.
+    #[inline]
+    pub(crate) fn install_created_index_layout_and_publish_history(
+        &self,
+        effective_cts: TrxID,
+        plan: &CreateIndexPlan,
+        new_layout: TableRuntimeLayout,
+        #[cfg(test)] test_hook: &IndexDdlTestController,
+    ) -> Option<Arc<TableRuntimeLayout>> {
+        let publication = IndexLayoutPublication {
+            effective_cts,
+            expected_table: plan.table(),
+            expected_old_layout: plan.old_layout(),
+            new_layout,
+        };
+        self.install_index_layout_and_publish_history(
+            publication,
+            |new_layout| {
+                plan.table().try_install_created_index(
+                    plan.old_layout(),
+                    new_layout,
+                    plan.placement(),
+                    plan.index(),
+                )
+            },
+            #[cfg(test)]
+            (test_hook, IndexDdlKind::Create),
+        )
+    }
+
+    /// Atomically installs one DROP layout and publishes its catalog history.
+    #[inline]
+    pub(crate) fn install_dropped_index_layout_and_publish_history(
+        &self,
+        effective_cts: TrxID,
+        plan: &DropIndexPlan,
+        new_layout: TableRuntimeLayout,
+        #[cfg(test)] test_hook: &IndexDdlTestController,
+    ) -> Option<Arc<TableRuntimeLayout>> {
+        let publication = IndexLayoutPublication {
+            effective_cts,
+            expected_table: plan.table(),
+            expected_old_layout: plan.old_layout(),
+            new_layout,
+        };
+        self.install_index_layout_and_publish_history(
+            publication,
+            |new_layout| {
+                plan.table().try_install_dropped_index(
+                    plan.old_layout(),
+                    new_layout,
+                    plan.index(),
+                    effective_cts,
+                )
+            },
+            #[cfg(test)]
+            (test_hook, IndexDdlKind::Drop),
+        )
+    }
+
+    /// Atomically coordinates typed index layout and catalog-history publication.
     ///
     /// The occupied catalog entry is held before the table layout mutex, which
     /// is the same nesting order used by metadata-history purge.
-    #[inline]
-    pub(crate) fn install_index_layout_and_publish_history(
+    fn install_index_layout_and_publish_history(
         &self,
-        table_id: TableID,
-        effective_cts: TrxID,
-        expected_table: &Arc<Table>,
-        expected_old_layout: &Arc<TableRuntimeLayout>,
-        new_layout: TableRuntimeLayout,
+        publication: IndexLayoutPublication<'_>,
+        install_layout: impl FnOnce(Arc<TableRuntimeLayout>) -> Option<()>,
         #[cfg(test)] test_hook: (&IndexDdlTestController, IndexDdlKind),
     ) -> Option<Arc<TableRuntimeLayout>> {
+        let IndexLayoutPublication {
+            effective_cts,
+            expected_table,
+            expected_old_layout,
+            new_layout,
+        } = publication;
+        let table_id = expected_table.table_id();
         new_layout.assert_valid();
         let new_layout = Arc::new(new_layout);
         match self.user_tables.entry(table_id) {
@@ -711,8 +822,7 @@ impl Catalog {
                 ) {
                     return None;
                 }
-                expected_table
-                    .try_replace_runtime_layout(expected_old_layout, Arc::clone(&new_layout))?;
+                install_layout(Arc::clone(&new_layout))?;
                 #[cfg(test)]
                 test_hook.0.reach_publication_interval(test_hook.1);
                 entry

@@ -585,6 +585,23 @@ History purge therefore observes pointer-identical old metadata/old layout or
 new metadata/new layout, never a split pair. Dropped runtime indexes are queued
 for asynchronous cleanup only after that coordinated transition.
 
+One storage-owned finalizer captures the current layout and table root for both
+CREATE and DROP. CREATE allocates the next stable ID from the Table-local
+effective watermark and selects the lowest safe physical slot. A durably vacant
+slot is immediately eligible; a retired slot is eligible only when its catalog
+checkpoint coverage and exact runtime destruction have both completed and no
+provisional CREATE overlays it. Otherwise CREATE does not wait: it skips the
+blocked hole and may append, persisting crossed gaps as vacant.
+
+DROP publishes the exact old generation as retired and moves its runtime into
+the same Table lifecycle machine. Cleanup changes `Retained` to `Destroying`
+under the lifecycle lock, destroys the runtime asynchronously without holding
+that lock, and only then publishes `Vacant`. A failed consuming destroy leaves
+`Destroying` as a permanent reuse blocker and poisons the engine. Purge retries
+cleanup after DROP, checkpoint publication, a CREATE that skipped a pinned
+runtime, and full or horizon-advancing observations; a pinned runtime does not
+self-reschedule a busy loop.
+
 ## 8. Write Path
 
 Foreground writes update `MemIndex` under the current runtime transaction

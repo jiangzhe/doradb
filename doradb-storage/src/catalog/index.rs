@@ -1,7 +1,7 @@
 use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards};
 use crate::catalog::{
-    Catalog, CatalogStorage, IndexID, IndexRef, IndexSlot, SecondaryIndexRoot, SecondaryIndexSlot,
-    StorageIndexSpec, TableIndexMetadata, TableMetadata, catalog_table_id_from_slot,
+    Catalog, IndexID, IndexRef, IndexSlot, SecondaryIndexRoot, SecondaryIndexSlot,
+    TableIndexMetadata, TableMetadata, catalog_table_id_from_slot,
 };
 use crate::engine::EngineCore;
 use crate::error::{
@@ -26,7 +26,8 @@ use crate::runtime::mandatory::{AcceptedExecution, MandatoryTaskMetadata, Prepar
 use crate::runtime::{POLL_BUDGET, yield_now};
 use crate::session::{AcceptedDdlScope, PreparedDdlScope};
 use crate::table::{
-    DeleteMarker, RuntimeIndexEntry, Table, TableRuntimeLayout, secondary_disk_tree_encoder,
+    CreateIndexPlan, DeleteMarker, DropIndexPlan, RuntimeIndexEntry, Table, TableRuntimeLayout,
+    secondary_disk_tree_encoder,
 };
 use crate::trx::{PrivateTransaction, trx_is_committed};
 use crate::value::Val;
@@ -137,112 +138,6 @@ impl Drop for IndexDdlGateScope {
             self.table_active = false;
             self.table.release_index_metadata_change();
         }
-    }
-}
-
-/// Owned, caller-validated CREATE INDEX execution plan.
-pub(crate) struct CreateIndexPlan {
-    table_id: TableID,
-    table: Arc<Table>,
-    old_layout: Arc<TableRuntimeLayout>,
-    active_root: ActiveRoot,
-    index: IndexRef,
-    new_metadata: Arc<TableMetadata>,
-    new_index_spec: TableIndexMetadata,
-    secondary_index_slots: Vec<SecondaryIndexSlot>,
-}
-
-impl CreateIndexPlan {
-    /// Captures the stable layout, root, and allocated metadata shape.
-    pub(crate) fn new(
-        table_id: TableID,
-        table: Arc<Table>,
-        index_spec: StorageIndexSpec,
-        catalog_storage: &CatalogStorage,
-    ) -> OperationOrRuntimeResult<Self> {
-        let old_layout = table.layout_snapshot();
-        let old_metadata = old_layout.metadata();
-        let active_root = table.file().active_root_unchecked().clone();
-        validate_create_index_root_shape(table_id, &active_root, old_metadata)
-            .change_context(RuntimeError::CatalogAccess)
-            .attach("operation=create_index, phase=validate_root_shape")?;
-        let (effective_next_index_id, index_slot) =
-            catalog_storage.plan_create_index_allocation(table_id, old_metadata)?;
-        let (index, new_metadata_value) = old_metadata.try_with_created_index_at(
-            index_spec,
-            effective_next_index_id,
-            index_slot,
-        )?;
-        let new_metadata = Arc::new(new_metadata_value);
-        let new_index_spec = new_metadata
-            .idx
-            .require_index_spec(index.slot())
-            .expect("newly created index metadata must contain its allocated slot")
-            .clone();
-        let mut secondary_index_slots = active_root.secondary_index_slots.clone();
-        secondary_index_slots.resize(
-            new_metadata.idx.index_slot_count(),
-            SecondaryIndexSlot::Vacant,
-        );
-        secondary_index_slots[index.slot().as_usize()] = SecondaryIndexSlot::Active {
-            index_id: index.id(),
-            root: SecondaryIndexRoot::Empty,
-        };
-        Ok(Self {
-            table_id,
-            table,
-            old_layout,
-            active_root,
-            index,
-            new_metadata,
-            new_index_spec,
-            secondary_index_slots,
-        })
-    }
-}
-
-/// Owned, caller-validated DROP INDEX execution plan.
-pub(crate) struct DropIndexPlan {
-    table_id: TableID,
-    table: Arc<Table>,
-    old_layout: Arc<TableRuntimeLayout>,
-    index: IndexRef,
-    new_metadata: Arc<TableMetadata>,
-    secondary_index_slots: Vec<SecondaryIndexSlot>,
-}
-
-impl DropIndexPlan {
-    /// Captures the stable active slot, layout, and replacement root shape.
-    pub(crate) fn new(
-        table_id: TableID,
-        table: Arc<Table>,
-        index_id: IndexID,
-    ) -> OperationOrRuntimeResult<Self> {
-        let old_layout = table.layout_snapshot();
-        let old_metadata = old_layout.metadata();
-        let index = old_layout.resolve_index_id(index_id).ok_or_else(|| {
-            Report::new(OperationError::IndexNotFound).attach(format!(
-                "drop index target not found: table_id={table_id}, index_id={index_id}, reason=inactive_runtime_layout"
-            ))
-        })?;
-        old_layout
-            .secondary_index(index)
-            .expect("active index metadata must have a matching runtime index");
-        let active_root = table.file().active_root_unchecked().clone();
-        validate_drop_index_root_shape(table_id, index.slot(), &active_root, old_metadata)
-            .change_context(RuntimeError::CatalogAccess)
-            .attach("operation=drop_index, phase=validate_root_shape")?;
-        let new_metadata = Arc::new(old_metadata.without_index(index)?);
-        let mut secondary_index_slots = active_root.secondary_index_slots.clone();
-        secondary_index_slots[index.slot().as_usize()] = SecondaryIndexSlot::Retired(index.id());
-        Ok(Self {
-            table_id,
-            table,
-            old_layout,
-            index,
-            new_metadata,
-            secondary_index_slots,
-        })
     }
 }
 
@@ -990,7 +885,7 @@ impl PreparedCreateIndex {
         let metadata = MandatoryTaskMetadata::table_operation(
             <Self as PreparedExecution>::LABEL,
             scope.key(),
-            plan.table_id,
+            plan.table_id(),
         );
         Self {
             gates,
@@ -1020,8 +915,8 @@ impl PreparedExecution for PreparedCreateIndex {
             plan,
             metadata: _,
         } = self;
-        let table_id = plan.table_id;
-        let index = plan.index;
+        let table_id = plan.table_id();
+        let index = plan.index();
         AcceptedCreateIndex {
             gates: Some(gates),
             scope: scope.accept(),
@@ -1080,15 +975,16 @@ impl AcceptedExecution for AcceptedCreateIndex {
 
 impl AcceptedCreateIndex {
     async fn execute_inner(&mut self) -> CompletionResult<IndexID> {
-        let plan = self.plan.take().unwrap_or_else(|| {
+        let mut plan = self.plan.take().unwrap_or_else(|| {
             panic!("accepted CREATE INDEX invariant violated: execution plan is missing")
         });
         let runtime = self.scope.engine().clone();
         let engine = runtime.core();
         let guards = runtime.pool_guards();
-        let table_id = plan.table_id;
-        let index = plan.index;
+        let table_id = plan.table_id();
+        let index = plan.index();
         let index_slot = index.slot();
+        let mut secondary_index_slots = plan.take_secondary_index_slots();
 
         #[cfg(test)]
         engine
@@ -1118,25 +1014,25 @@ impl AcceptedCreateIndex {
             .await;
 
         let build_ts = progress.build_ts();
-        let key_validator = CreateIndexKeyValidator::new(&plan.new_index_spec);
+        let key_validator = CreateIndexKeyValidator::new(plan.new_index_spec());
         let collector = CreateIndexCollector::new(
-            &plan.table,
+            plan.table(),
             guards,
-            plan.old_layout.as_ref(),
-            &plan.new_index_spec,
-            &plan.active_root,
+            plan.old_layout().as_ref(),
+            plan.new_index_spec(),
+            plan.active_root(),
         );
         let mut mutable_file = MutableTableFile::fork(
-            plan.table.file(),
+            plan.table().file(),
             engine.table_fs.background_writes(),
-            plan.table.disk_pool().clone(),
+            plan.table().disk_pool().clone(),
             guards.disk_guard().clone(),
         );
         let disk_runtime = match SecondaryDiskTreeRuntime::new(
             index_slot,
-            Arc::clone(&plan.new_metadata),
-            Arc::clone(plan.table.file()),
-            plan.table.disk_pool().clone(),
+            Arc::clone(plan.new_metadata()),
+            Arc::clone(plan.table().file()),
+            plan.table().disk_pool().clone(),
         ) {
             Ok(runtime) => runtime,
             Err(err) => {
@@ -1172,7 +1068,7 @@ impl AcceptedCreateIndex {
             &mut mutable_file,
             &disk_runtime,
             guards,
-            &plan.new_index_spec,
+            plan.new_index_spec(),
             &cold_rows,
             build_ts,
         )
@@ -1191,21 +1087,20 @@ impl AcceptedCreateIndex {
             .index_ddl_test
             .reach_phase(IndexDdlTestPhase::CreateDiskTreeBuilt)
             .await;
-        let mut secondary_index_slots = plan.secondary_index_slots;
         secondary_index_slots[index_slot.as_usize()] = SecondaryIndexSlot::Active {
-            index_id: plan.index.id(),
+            index_id: plan.index().id(),
             root: SecondaryIndexRoot::from_block_id(cold_root),
         };
         mutable_file.replace_metadata_and_secondary_index_slots(
-            Arc::clone(&plan.new_metadata),
+            Arc::clone(plan.new_metadata()),
             secondary_index_slots,
         );
 
         let runtime_builder = CreateIndexRuntimeBuilder::new(
             engine,
             guards,
-            plan.new_metadata.as_ref(),
-            &plan.new_index_spec,
+            plan.new_metadata().as_ref(),
+            plan.new_index_spec(),
             build_ts,
         );
         let mut hot_rows = match collector.collect_current_hot().await {
@@ -1228,7 +1123,7 @@ impl AcceptedCreateIndex {
             }
             return Err(CompletionErrorBridge::capture(err));
         }
-        let runtime_index = if plan.new_index_spec.unique() {
+        let runtime_index = if plan.new_index_spec().unique() {
             runtime_builder.build_unique(disk_runtime, hot_rows).await
         } else {
             runtime_builder
@@ -1262,15 +1157,15 @@ impl AcceptedCreateIndex {
         }
 
         let new_layout = build_created_index_runtime_layout(
-            &plan.old_layout,
-            Arc::clone(&plan.new_metadata),
+            plan.old_layout(),
+            Arc::clone(plan.new_metadata()),
             index,
             progress.clone_staged_index_for_layout(),
         );
         progress.stage_layout(new_layout);
 
         if let Err(err) = progress
-            .execute_catalog_update(engine, guards, plan.new_metadata.as_ref())
+            .execute_catalog_update(engine, guards, plan.new_metadata().as_ref())
             .await
         {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(err));
@@ -1315,14 +1210,12 @@ impl AcceptedCreateIndex {
         let new_layout = progress.take_layout_for_install();
         if engine
             .catalog()
-            .install_index_layout_and_publish_history(
-                table_id,
+            .install_created_index_layout_and_publish_history(
                 create_cts,
-                &plan.table,
-                &plan.old_layout,
+                &plan,
                 new_layout,
                 #[cfg(test)]
-                (&engine.index_ddl_test, IndexDdlKind::Create),
+                &engine.index_ddl_test,
             )
             .is_none()
         {
@@ -1367,7 +1260,7 @@ impl PreparedDropIndex {
         let metadata = MandatoryTaskMetadata::table_operation(
             <Self as PreparedExecution>::LABEL,
             scope.key(),
-            plan.table_id,
+            plan.table_id(),
         );
         Self {
             gates,
@@ -1397,8 +1290,8 @@ impl PreparedExecution for PreparedDropIndex {
             plan,
             metadata: _,
         } = self;
-        let table_id = plan.table_id;
-        let index = plan.index;
+        let table_id = plan.table_id();
+        let index = plan.index();
         AcceptedDropIndex {
             gates: Some(gates),
             scope: scope.accept(),
@@ -1457,15 +1350,16 @@ impl AcceptedExecution for AcceptedDropIndex {
 
 impl AcceptedDropIndex {
     async fn execute_inner(&mut self) -> CompletionResult<()> {
-        let plan = self.plan.take().unwrap_or_else(|| {
+        let mut plan = self.plan.take().unwrap_or_else(|| {
             panic!("accepted DROP INDEX invariant violated: execution plan is missing")
         });
         let runtime = self.scope.engine().clone();
         let engine = runtime.core();
         let guards = runtime.pool_guards();
-        let table_id = plan.table_id;
-        let index = plan.index;
+        let table_id = plan.table_id();
+        let index = plan.index();
         let index_slot = index.slot();
+        let secondary_index_slots = plan.take_secondary_index_slots();
 
         #[cfg(test)]
         engine
@@ -1494,18 +1388,18 @@ impl AcceptedDropIndex {
             .await;
 
         let mut mutable_file = MutableTableFile::fork(
-            plan.table.file(),
+            plan.table().file(),
             engine.table_fs.background_writes(),
-            plan.table.disk_pool().clone(),
+            plan.table().disk_pool().clone(),
             guards.disk_guard().clone(),
         );
         mutable_file.replace_metadata_and_secondary_index_slots(
-            Arc::clone(&plan.new_metadata),
-            plan.secondary_index_slots,
+            Arc::clone(plan.new_metadata()),
+            secondary_index_slots,
         );
         progress.stage_layout(build_dropped_index_runtime_layout(
-            &plan.old_layout,
-            Arc::clone(&plan.new_metadata),
+            plan.old_layout(),
+            Arc::clone(plan.new_metadata()),
             index_slot,
         ));
         #[cfg(test)]
@@ -1515,7 +1409,7 @@ impl AcceptedDropIndex {
             .await;
 
         if let Err(err) = progress
-            .execute_catalog_update(engine.catalog(), plan.new_metadata.as_ref())
+            .execute_catalog_update(engine.catalog(), plan.new_metadata().as_ref())
             .await
         {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(err));
@@ -1559,14 +1453,12 @@ impl AcceptedDropIndex {
         let new_layout = progress.take_layout_for_install();
         if engine
             .catalog()
-            .install_index_layout_and_publish_history(
-                table_id,
+            .install_dropped_index_layout_and_publish_history(
                 drop_cts,
-                &plan.table,
-                &plan.old_layout,
+                &plan,
                 new_layout,
                 #[cfg(test)]
-                (&engine.index_ddl_test, IndexDdlKind::Drop),
+                &engine.index_ddl_test,
             )
             .is_none()
         {
@@ -1587,20 +1479,8 @@ impl AcceptedDropIndex {
             .reach_phase(IndexDdlTestPhase::DropLayoutHistoryPublished)
             .await;
         engine.trx_sys.request_metadata_history_purge();
-        drop(plan.old_layout);
-
-        if let Err(err) = plan.table.cleanup_retired_secondary_indexes(guards).await {
-            return Err(CompletionErrorBridge::capture_runtime_or_fatal(
-                poison_index_after_catalog_commit_with_source(
-                    &engine.poisoner,
-                    IndexDdlKind::Drop,
-                    table_id,
-                    index,
-                    "retired_secondary_index_cleanup",
-                    RuntimeOrFatalError::from(err),
-                ),
-            ));
-        }
+        drop(plan);
+        engine.trx_sys.request_retired_index_runtime_purge(table_id);
         #[cfg(test)]
         engine
             .index_ddl_test
@@ -1703,61 +1583,6 @@ async fn rollback_active_ddl_trx(trx: &mut Option<PrivateTransaction>) -> Runtim
     };
     trx.rollback_catalog_ddl().await?;
     Ok(())
-}
-
-#[inline]
-fn validate_create_index_root_shape(
-    table_id: TableID,
-    active_root: &ActiveRoot,
-    metadata: &TableMetadata,
-) -> DataIntegrityResult<()> {
-    if active_root.metadata.as_ref() != metadata {
-        return Err(
-            Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
-                "create index root metadata mismatch: table_id={table_id}"
-            )),
-        );
-    }
-    let expected_slots = metadata.idx.index_slot_count();
-    let actual_slots = active_root.secondary_index_slots.len();
-    if actual_slots != expected_slots {
-        return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
-            .attach(format!(
-                "create index secondary-root slot mismatch: table_id={table_id}, actual_slots={actual_slots}, expected_slots={expected_slots}"
-            )));
-    }
-    validate_secondary_index_state(metadata, &active_root.secondary_index_slots)
-        .change_context(DataIntegrityError::InvalidRootInvariant)
-}
-
-#[inline]
-fn validate_drop_index_root_shape(
-    table_id: TableID,
-    index_slot: IndexSlot,
-    active_root: &ActiveRoot,
-    metadata: &TableMetadata,
-) -> DataIntegrityResult<()> {
-    if active_root.metadata.as_ref() != metadata {
-        return Err(
-            Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
-                "drop index root metadata mismatch: table_id={table_id}"
-            )),
-        );
-    }
-    let expected_slots = metadata.idx.index_slot_count();
-    let actual_slots = active_root.secondary_index_slots.len();
-    if actual_slots != expected_slots {
-        return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
-            .attach(format!(
-                "drop index secondary-root slot mismatch: table_id={table_id}, actual_slots={actual_slots}, expected_slots={expected_slots}"
-            )));
-    }
-    assert!(
-        metadata.idx.index_spec(index_slot).is_some(),
-        "drop-index validation invariant violated: previously validated metadata slot is inactive, table_id={table_id}, index_slot={index_slot}"
-    );
-    validate_secondary_index_state(metadata, &active_root.secondary_index_slots)
-        .change_context(DataIntegrityError::InvalidRootInvariant)
 }
 
 #[inline]
@@ -2025,9 +1850,9 @@ pub(crate) mod tests {
     use super::*;
     use crate::buffer::BufferPool;
     use crate::catalog::{
-        ActiveIndexSpec, CurrentTableState, ResolvedVisibleTableMetadata, SecondaryIndexRoot,
-        SecondaryIndexSlot, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags,
-        StorageIndexKey, StorageIndexSpec, TableMetadata, tests::table2,
+        ActiveIndexSpec, CurrentTableState, ResolvedVisibleTableMetadata, SecondaryIndexSlot,
+        StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
+        StorageIndexSpec, TableMetadata, tests::table2,
     };
     use crate::conf::{
         EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, MandatoryRuntimeConfig,
@@ -2048,9 +1873,9 @@ pub(crate) mod tests {
         assert_freeze_created, expect_delete_committed, insert_one_row, insert_rows,
     };
     use crate::trx::MAX_SNAPSHOT_TS;
+    use crate::trx::purge::PurgeTestEvent;
     use crate::value::{Val, ValKind};
     use smol::{Timer, future::race};
-    use std::num::NonZeroU64;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -2232,7 +2057,6 @@ pub(crate) mod tests {
         layout_generation: u64,
         runtime_slots: Vec<bool>,
         root: ActiveRoot,
-        has_retired_runtime: bool,
     }
 
     fn index_ddl_snapshot(engine: &Engine, table_id: TableID, table: &Table) -> IndexDdlSnapshot {
@@ -2265,7 +2089,6 @@ pub(crate) mod tests {
                 .map(Option::is_some)
                 .collect(),
             root: table.file().active_root_unchecked().clone(),
-            has_retired_runtime: table.has_retired_secondary_indexes(),
         }
     }
 
@@ -2310,10 +2133,6 @@ pub(crate) mod tests {
             before.runtime_slots
         );
         assert_root_metadata_unchanged(&before.root, table);
-        assert_eq!(
-            table.has_retired_secondary_indexes(),
-            before.has_retired_runtime
-        );
     }
 
     fn columns() -> Vec<StorageColumnSpec> {
@@ -2756,32 +2575,6 @@ pub(crate) mod tests {
             )
             .unwrap(),
             IndexDdlRootProof::DurableFinalDrop
-        );
-    }
-
-    #[test]
-    fn validate_create_index_root_shape_rejects_inconsistent_inactive_slot() {
-        let metadata = TableMetadata::try_new_with_index_slot_count(
-            columns(),
-            vec![ActiveIndexSpec::new(
-                IndexRef::new(IndexID::new(0), IndexSlot::new(0)),
-                StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::PK),
-            )],
-            IndexSlot::new(2),
-        )
-        .unwrap();
-        let mut active_root = root_with_metadata(metadata.clone(), TrxID::new(20));
-        active_root.secondary_index_slots[1] = SecondaryIndexSlot::Active {
-            index_id: IndexID::new(0),
-            root: SecondaryIndexRoot::Present(NonZeroU64::new(99).unwrap()),
-        };
-
-        let err = validate_create_index_root_shape(TableID::new(42), &active_root, &metadata)
-            .unwrap_err();
-
-        assert_eq!(
-            err.downcast_ref::<DataIntegrityError>().copied(),
-            Some(DataIntegrityError::InvalidRootInvariant)
         );
     }
 
@@ -3997,7 +3790,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_drop_index_removes_sparse_slot_and_preserves_allocation_after_restart() {
+    fn test_recovery_reconstructs_checkpoint_covered_slot_for_reuse() {
         smol::block_on(async {
             use crate::catalog::tests::table2;
 
@@ -4085,18 +3878,22 @@ pub(crate) mod tests {
             );
 
             let mut session = engine.new_session().unwrap();
+            let replacement = session
+                .create_index(
+                    table_id,
+                    StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(1)],
+                        StorageIndexFlags::empty(),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(replacement, crate::IndexID::new(2));
+            let layout = table.layout_snapshot();
+            assert_eq!(layout.metadata().idx.index_slot_count_u32(), 2);
             assert_eq!(
-                session
-                    .create_index(
-                        table_id,
-                        StorageIndexSpec::new(
-                            vec![StorageIndexKey::new(1)],
-                            StorageIndexFlags::empty()
-                        ),
-                    )
-                    .await
-                    .unwrap(),
-                crate::IndexID::new(2)
+                layout.resolve_index_id(replacement).unwrap().slot(),
+                IndexSlot::new(1)
             );
         });
     }
@@ -4367,6 +4164,171 @@ pub(crate) mod tests {
                 SecondaryIndexSlot::Retired(index_id)
             );
             assert_eq!(retained_live.metadata().idx.active_index_count(), 1);
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_and_scheduled_cleanup_gate_lowest_slot_reuse() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "index_slot_reuse").await;
+            let table_id = table2(&engine).await;
+            let unrelated_table_id = table2(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let old_layout = table.layout_snapshot();
+            let old_index = old_layout.secondary_indexes()[0]
+                .as_ref()
+                .unwrap()
+                .index_ref();
+            let mut session = engine.new_session().unwrap();
+
+            session.drop_index(table_id, old_index.id()).await.unwrap();
+            assert!(table.has_retired_secondary_indexes());
+            session
+                .checkpoint_catalog_and_truncate_redo_log()
+                .await
+                .unwrap();
+
+            let appended = session
+                .create_index(
+                    table_id,
+                    StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(1)],
+                        StorageIndexFlags::empty(),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(appended, IndexID::new(1));
+            let appended_layout = table.layout_snapshot();
+            assert_eq!(appended_layout.metadata().idx.index_slot_count_u32(), 2);
+            assert_eq!(
+                appended_layout.resolve_index_id(appended).unwrap().slot(),
+                IndexSlot::new(1)
+            );
+
+            let (purge_tx, purge_rx) = flume::unbounded();
+            engine.inner().trx_sys.set_purge_test_observer(purge_tx);
+            drop(old_layout);
+            engine.inner().trx_sys.request_retired_index_runtime_retry();
+            let mut cleanup_started = false;
+            let mut cleanup_tables = Vec::new();
+            loop {
+                match purge_rx.recv_async().await.unwrap() {
+                    PurgeTestEvent::RetiredIndexRuntimeStarted => cleanup_started = true,
+                    PurgeTestEvent::RetiredIndexRuntimeTableStarted {
+                        table_id: cleanup_table_id,
+                    } => cleanup_tables.push(cleanup_table_id),
+                    PurgeTestEvent::CycleCompleted if cleanup_started => break,
+                    _ => {}
+                }
+            }
+            assert_eq!(cleanup_tables, vec![table_id]);
+            assert!(!cleanup_tables.contains(&unrelated_table_id));
+            assert!(!table.has_retired_secondary_indexes());
+
+            engine.inner().trx_sys.request_retired_index_runtime_retry();
+            let mut retry_started = false;
+            loop {
+                match purge_rx.recv_async().await.unwrap() {
+                    PurgeTestEvent::RetiredIndexRuntimeStarted => retry_started = true,
+                    PurgeTestEvent::RetiredIndexRuntimeTableStarted { table_id } => {
+                        panic!("completed runtime candidate was retried: table_id={table_id}")
+                    }
+                    PurgeTestEvent::CycleCompleted if retry_started => break,
+                    _ => {}
+                }
+            }
+
+            let reused = session
+                .create_index(
+                    table_id,
+                    StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(0)],
+                        StorageIndexFlags::empty(),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(reused, IndexID::new(2));
+            let reused_layout = table.layout_snapshot();
+            assert_eq!(reused_layout.metadata().idx.index_slot_count_u32(), 2);
+            assert_eq!(
+                reused_layout.resolve_index_id(reused).unwrap().slot(),
+                IndexSlot::new(0)
+            );
+            assert_eq!(reused_layout.resolve_index_id(old_index.id()), None);
+            assert_eq!(
+                table.file().active_root_unchecked().secondary_index_slots[0].index_id(),
+                Some(reused)
+            );
+        });
+    }
+
+    #[test]
+    fn test_runtime_cleanup_before_checkpoint_still_blocks_slot_reuse() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "index_slot_runtime_first").await;
+            let table_id = table2(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let old_index = table.layout_snapshot().secondary_indexes()[0]
+                .as_ref()
+                .unwrap()
+                .index_ref();
+            let mut session = engine.new_session().unwrap();
+
+            session.drop_index(table_id, old_index.id()).await.unwrap();
+            let (purge_tx, purge_rx) = flume::unbounded();
+            engine.inner().trx_sys.set_purge_test_observer(purge_tx);
+            engine.inner().trx_sys.request_retired_index_runtime_retry();
+            let mut cleanup_started = false;
+            loop {
+                match purge_rx.recv_async().await.unwrap() {
+                    PurgeTestEvent::RetiredIndexRuntimeStarted => cleanup_started = true,
+                    PurgeTestEvent::CycleCompleted if cleanup_started => break,
+                    _ => {}
+                }
+            }
+            assert!(!table.has_retired_secondary_indexes());
+
+            let appended = session
+                .create_index(
+                    table_id,
+                    StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(1)],
+                        StorageIndexFlags::empty(),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                table
+                    .layout_snapshot()
+                    .resolve_index_id(appended)
+                    .unwrap()
+                    .slot(),
+                IndexSlot::new(1),
+                "runtime cleanup alone must not clear durable retirement"
+            );
+
+            session.checkpoint_catalog().await.unwrap();
+            let reused = session
+                .create_index(
+                    table_id,
+                    StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(0)],
+                        StorageIndexFlags::empty(),
+                    ),
+                )
+                .await
+                .unwrap();
+            let layout = table.layout_snapshot();
+            assert_eq!(
+                layout.resolve_index_id(reused).unwrap().slot(),
+                IndexSlot::new(0)
+            );
+            assert_eq!(layout.metadata().idx.index_slot_count_u32(), 2);
         });
     }
 }

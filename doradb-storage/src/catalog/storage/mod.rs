@@ -18,13 +18,11 @@ use crate::catalog::storage::table_replay_silent_watermarks::*;
 use crate::catalog::storage::tables::*;
 use crate::catalog::{
     CatalogCheckpointBatch, CatalogCheckpointOutcome, CatalogRedoEntry, CatalogTable,
-    ID_DOMAIN_END, IndexID, IndexRef, IndexSlot, SecondaryIndexSlot, TableMetadata,
-    catalog_table_id_from_slot, catalog_table_slot,
+    TableMetadata, catalog_table_id_from_slot, catalog_table_slot,
 };
 use crate::error::{
-    DataIntegrityError, DataIntegrityResult, MultiDomainResultExt, OperationError, OperationResult,
-    RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeOrFatalResultExt,
-    RuntimeResult,
+    DataIntegrityError, DataIntegrityResult, MultiDomainResultExt, RuntimeError,
+    RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeOrFatalResultExt, RuntimeResult,
 };
 use crate::file::FileKind;
 use crate::file::cow_file::{MutableCowFile, SUPER_BLOCK_ID};
@@ -44,29 +42,11 @@ use crate::table::TableRedoReplayFloor;
 use crate::value::Val;
 use error_stack::{Report, ResultExt};
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 #[cfg(test)]
 pub(crate) use tests::publish_first_redo_log_seq_for_test;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ProvisionalIndexReservation {
-    index: IndexRef,
-    create_cts: TrxID,
-}
-
-#[derive(Debug)]
-struct ProvisionalTableIndexState {
-    effective_next_index_id: u64,
-    reservations_by_slot: BTreeMap<IndexSlot, ProvisionalIndexReservation>,
-    slot_by_id: FastHashMap<IndexID, IndexSlot>,
-}
-
-#[derive(Debug, Default)]
-struct ProvisionalIndexReservations {
-    by_table: FastHashMap<TableID, ProvisionalTableIndexState>,
-}
 
 /// Runtime storage container for all catalog logical tables.
 pub(crate) struct CatalogStorage {
@@ -86,7 +66,6 @@ pub(crate) struct CatalogStorage {
     /// Callers combine these overlays with user-table root floors by fieldwise
     /// maximum.
     checkpointed_silent_watermarks: Mutex<Arc<FastHashMap<TableID, TableRedoReplayFloor>>>,
-    provisional_index_reservations: Mutex<ProvisionalIndexReservations>,
 }
 
 impl CatalogStorage {
@@ -144,141 +123,7 @@ impl CatalogStorage {
             mtb,
             disk_pool,
             checkpointed_silent_watermarks: Mutex::new(Arc::new(FastHashMap::default())),
-            provisional_index_reservations: Mutex::new(ProvisionalIndexReservations::default()),
         })
-    }
-
-    /// Returns the overlay-qualified next ID and first unreserved append slot.
-    pub(crate) fn plan_create_index_allocation(
-        &self,
-        table_id: TableID,
-        metadata: &TableMetadata,
-    ) -> OperationResult<(u64, u32)> {
-        let durable_next_id = metadata.idx.next_index_id();
-        if durable_next_id > ID_DOMAIN_END {
-            return Err(Report::new(OperationError::InvalidMetadata).attach(format!(
-                "next_index_id exceeds domain: table_id={table_id}, value={durable_next_id}"
-            )));
-        }
-        let durable_slot_count = metadata.idx.index_slot_count_u32();
-        let mut overlay = self.provisional_index_reservations.lock();
-        let state =
-            overlay
-                .by_table
-                .entry(table_id)
-                .or_insert_with(|| ProvisionalTableIndexState {
-                    effective_next_index_id: durable_next_id,
-                    reservations_by_slot: BTreeMap::new(),
-                    slot_by_id: FastHashMap::default(),
-                });
-        state.effective_next_index_id = state.effective_next_index_id.max(durable_next_id);
-        if state.effective_next_index_id == ID_DOMAIN_END {
-            return Err(Report::new(OperationError::IndexIdExhausted));
-        }
-
-        let mut slot = durable_slot_count;
-        loop {
-            if slot > u32::from(u16::MAX) {
-                return Err(Report::new(OperationError::InvalidMetadata)
-                    .attach(format!("index slot domain exhausted: table_id={table_id}")));
-            }
-            let candidate = IndexSlot::new(slot as u16);
-            if !state.reservations_by_slot.contains_key(&candidate) {
-                return Ok((state.effective_next_index_id, slot));
-            }
-            slot = slot.checked_add(1).ok_or_else(|| {
-                Report::new(OperationError::InvalidMetadata)
-                    .attach("index slot allocation arithmetic overflow")
-            })?;
-        }
-    }
-
-    /// Records one replay-visible CREATE whose exact generation is not root-proven.
-    pub(crate) fn reserve_provisional_index(
-        &self,
-        table_id: TableID,
-        index: IndexRef,
-        create_cts: TrxID,
-        durable_slots: &[SecondaryIndexSlot],
-    ) -> DataIntegrityResult<()> {
-        for (slot, state) in durable_slots.iter().copied().enumerate() {
-            let Some(durable_id) = state.index_id() else {
-                continue;
-            };
-            let slot = IndexSlot::try_from(slot).map_err(|_| {
-                Report::new(DataIntegrityError::InvalidRootInvariant)
-                    .attach("durable index generation slot exceeds u16 domain")
-            })?;
-            if slot == index.slot() || durable_id == index.id() {
-                return Err(Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
-                    "provisional reservation conflicts with durable generation: table_id={table_id}, index={index}, durable_id={durable_id}, durable_slot={slot}"
-                )));
-            }
-        }
-        if let Some(state) = durable_slots.get(index.slot().as_usize())
-            && !matches!(state, SecondaryIndexSlot::Vacant)
-        {
-            return Err(Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
-                "provisional reservation conflicts with durable generation: table_id={table_id}, index={index}, state={state:?}"
-            )));
-        }
-        let widened_next = u64::from(index.id().get())
-            .checked_add(1)
-            .ok_or_else(|| Report::new(DataIntegrityError::InvalidPayload))?;
-        if widened_next > ID_DOMAIN_END {
-            return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach("provisional index id exceeds stable domain"));
-        }
-        let mut overlay = self.provisional_index_reservations.lock();
-        let state =
-            overlay
-                .by_table
-                .entry(table_id)
-                .or_insert_with(|| ProvisionalTableIndexState {
-                    effective_next_index_id: 0,
-                    reservations_by_slot: BTreeMap::new(),
-                    slot_by_id: FastHashMap::default(),
-                });
-        if let Some(existing_slot) = state.slot_by_id.get(&index.id()).copied()
-            && existing_slot != index.slot()
-        {
-            return Err(Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
-                "provisional index id has conflicting slots: table_id={table_id}, index_id={}, existing_slot={existing_slot}, new_slot={}",
-                index.id(), index.slot()
-            )));
-        }
-        if let Some(existing) = state.reservations_by_slot.get(&index.slot()) {
-            if existing.index != index {
-                return Err(Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
-                    "provisional index slot has conflicting generations: table_id={table_id}, existing={}, new={index}",
-                    existing.index
-                )));
-            }
-            return Ok(());
-        }
-        state.slot_by_id.insert(index.id(), index.slot());
-        state.reservations_by_slot.insert(
-            index.slot(),
-            ProvisionalIndexReservation { index, create_cts },
-        );
-        state.effective_next_index_id = state.effective_next_index_id.max(widened_next);
-        Ok(())
-    }
-
-    #[inline]
-    fn release_checkpointed_index_reservations(&self, catalog_replay_start_ts: TrxID) {
-        let mut overlay = self.provisional_index_reservations.lock();
-        for state in overlay.by_table.values_mut() {
-            state.reservations_by_slot.retain(|slot, reservation| {
-                if reservation.create_cts < catalog_replay_start_ts {
-                    state.slot_by_id.remove(&reservation.index.id());
-                    false
-                } else {
-                    debug_assert_eq!(*slot, reservation.index.slot());
-                    true
-                }
-            });
-        }
     }
 
     /// Accessor of `catalog.tables`.
@@ -576,19 +421,6 @@ impl CatalogStorage {
                 checkpointed_silent_watermarks: Arc::new(checkpointed_silent_watermarks),
             },
         )))
-    }
-
-    /// Apply one scanned catalog checkpoint batch into catalog storage.
-    pub(crate) async fn apply_checkpoint_batch(
-        &self,
-        batch: CatalogCheckpointBatch,
-        next_table_id: TableID,
-        disk_guard: &PoolGuard,
-    ) -> RuntimeOrFatalResult<CatalogCheckpointOutcome> {
-        let prepared = self
-            .prepare_checkpoint_batch(batch, next_table_id, disk_guard)
-            .await?;
-        Ok(prepared.commit(self).await?)
     }
 
     #[inline]
@@ -1289,7 +1121,6 @@ impl PreparedCatalogCheckpoint {
                     .attach("operation=commit_catalog_checkpoint")?;
                 drop(old_root);
                 storage.install_checkpointed_silent_watermarks(checkpointed_silent_watermarks);
-                storage.release_checkpointed_index_reservations(catalog_replay_start_ts);
                 Ok(CatalogCheckpointOutcome::Published {
                     catalog_replay_start_ts,
                 })
@@ -1505,11 +1336,11 @@ fn validate_catalog_row(
 pub(crate) mod tests {
     use super::*;
     use crate::buffer::{BufferPool, PoolGuards, PoolRole};
-    use crate::catalog::USER_TABLE_ID_START;
     use crate::catalog::tests::{open_catalog_test_engine, table1, table2};
+    use crate::catalog::{Catalog, USER_TABLE_ID_START};
     use crate::catalog::{
-        CatalogCheckpointBatch, CatalogCheckpointScanStopReason, SecondaryIndexRoot,
-        StorageColumnFlags, StorageColumnSpec,
+        CatalogCheckpointBatch, CatalogCheckpointScanStopReason, StorageColumnFlags,
+        StorageColumnSpec,
     };
     use crate::catalog::{CatalogSelectKey, catalog_key_from_active_ordinal};
     use crate::error::{
@@ -1627,18 +1458,12 @@ pub(crate) mod tests {
         }
     }
 
-    async fn apply_metadata_only_checkpoint(
-        storage: &CatalogStorage,
-        next_table_id: TableID,
-    ) -> Result<()> {
+    async fn apply_metadata_only_checkpoint(catalog: &Catalog) -> Result<()> {
+        let storage = &catalog.storage;
         let replay_start_ts = storage.checkpoint_snapshot().catalog_replay_start_ts;
         let disk_guard = storage.disk_pool.create_base_guard();
-        storage
-            .apply_checkpoint_batch(
-                metadata_only_batch(replay_start_ts),
-                next_table_id,
-                &disk_guard,
-            )
+        catalog
+            .apply_checkpoint_batch(metadata_only_batch(replay_start_ts), &disk_guard)
             .await
             .map(|_| ())
             .disclose()
@@ -1658,20 +1483,6 @@ pub(crate) mod tests {
             catalog_ddl_txn_count: 0,
             stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
         }
-    }
-
-    fn provisional_allocation_metadata() -> TableMetadata {
-        TableMetadata::try_new(
-            vec![StorageColumnSpec::new(
-                ValKind::U32,
-                StorageColumnFlags::empty(),
-            )],
-            vec![crate::catalog::StorageIndexSpec::new(
-                vec![crate::catalog::StorageIndexKey::new(0)],
-                crate::catalog::StorageIndexFlags::UK,
-            )],
-        )
-        .unwrap()
     }
 
     fn catalog_column_insert(
@@ -1880,12 +1691,11 @@ pub(crate) mod tests {
         };
 
         let err = expect_runtime_report(
-            storage
-                .apply_checkpoint_batch(
-                    batch,
-                    engine.inner().core.catalog().curr_next_table_id(),
-                    engine.inner().core.pools.pool_guards().disk_guard(),
-                )
+            engine
+                .inner()
+                .core
+                .catalog()
+                .apply_checkpoint_batch(batch, engine.inner().core.pools.pool_guards().disk_guard())
                 .await
                 .unwrap_err(),
         );
@@ -2022,10 +1832,12 @@ pub(crate) mod tests {
             };
 
             let err = expect_runtime_report(
-                storage
+                engine
+                    .inner()
+                    .core
+                    .catalog()
                     .apply_checkpoint_batch(
                         batch,
-                        engine.inner().core.catalog().curr_next_table_id(),
                         engine.inner().core.pools.pool_guards().disk_guard(),
                     )
                     .await
@@ -2318,12 +2130,9 @@ pub(crate) mod tests {
             let old_meta_block_id = before_root.meta_block_id;
             let before_allocated = before_root.alloc_map.allocated();
 
-            apply_metadata_only_checkpoint(
-                storage,
-                engine.inner().core.catalog().curr_next_table_id(),
-            )
-            .await
-            .unwrap();
+            apply_metadata_only_checkpoint(engine.inner().core.catalog())
+                .await
+                .unwrap();
 
             let after_root = storage.mtb.active_root_unchecked();
             assert_ne!(after_root.meta_block_id, old_meta_block_id);
@@ -2438,12 +2247,9 @@ pub(crate) mod tests {
             }
             let cached_before = engine.inner().pools.disk.allocated();
 
-            apply_metadata_only_checkpoint(
-                storage,
-                engine.inner().core.catalog().curr_next_table_id(),
-            )
-            .await
-            .unwrap();
+            apply_metadata_only_checkpoint(engine.inner().core.catalog())
+                .await
+                .unwrap();
 
             assert!(engine.inner().pools.disk.allocated() > cached_before);
             let mut validated_index_blocks = 0usize;
@@ -2498,12 +2304,11 @@ pub(crate) mod tests {
                 stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
             };
 
-            storage
-                .apply_checkpoint_batch(
-                    batch,
-                    engine.inner().core.catalog().curr_next_table_id(),
-                    engine.inner().core.pools.pool_guards().disk_guard(),
-                )
+            engine
+                .inner()
+                .core
+                .catalog()
+                .apply_checkpoint_batch(batch, engine.inner().core.pools.pool_guards().disk_guard())
                 .await
                 .unwrap();
 
@@ -2553,12 +2358,11 @@ pub(crate) mod tests {
                 ],
             );
 
-            storage
-                .apply_checkpoint_batch(
-                    batch,
-                    engine.inner().core.catalog().curr_next_table_id(),
-                    engine.inner().core.pools.pool_guards().disk_guard(),
-                )
+            engine
+                .inner()
+                .core
+                .catalog()
+                .apply_checkpoint_batch(batch, engine.inner().core.pools.pool_guards().disk_guard())
                 .await
                 .unwrap();
 
@@ -2603,10 +2407,12 @@ pub(crate) mod tests {
             );
 
             let err = expect_runtime_report(
-                storage
+                engine
+                    .inner()
+                    .core
+                    .catalog()
                     .apply_checkpoint_batch(
                         batch,
-                        engine.inner().core.catalog().curr_next_table_id(),
                         engine.inner().core.pools.pool_guards().disk_guard(),
                     )
                     .await
@@ -2657,12 +2463,11 @@ pub(crate) mod tests {
                 }],
             );
 
-            storage
-                .apply_checkpoint_batch(
-                    batch,
-                    engine.inner().core.catalog().curr_next_table_id(),
-                    engine.inner().core.pools.pool_guards().disk_guard(),
-                )
+            engine
+                .inner()
+                .core
+                .catalog()
+                .apply_checkpoint_batch(batch, engine.inner().core.pools.pool_guards().disk_guard())
                 .await
                 .unwrap();
 
@@ -2981,7 +2786,10 @@ pub(crate) mod tests {
 
             let storage = &engine.inner().core.catalog().storage;
             let table_id = USER_TABLE_ID_START + 9000;
-            storage
+            engine
+                .inner()
+                .core
+                .catalog()
                 .apply_checkpoint_batch(
                     checkpoint_batch_with_ops(
                         storage,
@@ -2996,7 +2804,6 @@ pub(crate) mod tests {
                             catalog_column_insert(table_id, 0, 30_000),
                         ],
                     ),
-                    engine.inner().core.catalog().curr_next_table_id(),
                     engine.inner().core.pools.pool_guards().disk_guard(),
                 )
                 .await
@@ -3018,10 +2825,12 @@ pub(crate) mod tests {
             let second_batch = (1..=4)
                 .map(|column_no| catalog_column_insert(table_id, column_no, 15_000))
                 .collect();
-            storage
+            engine
+                .inner()
+                .core
+                .catalog()
                 .apply_checkpoint_batch(
                     checkpoint_batch_with_ops(storage, second_batch),
-                    engine.inner().core.catalog().curr_next_table_id(),
                     engine.inner().core.pools.pool_guards().disk_guard(),
                 )
                 .await
@@ -3052,145 +2861,6 @@ pub(crate) mod tests {
                 entries2.last().unwrap().end_row_id(),
                 columns_root2.pivot_row_id()
             );
-        });
-    }
-
-    #[test]
-    fn test_provisional_index_overlay_quarantines_ids_and_slots_until_strict_floor() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine = open_catalog_test_engine(
-                temp_dir.path().to_path_buf(),
-                Some("provisional-index-overlay"),
-            )
-            .await;
-            let storage = &engine.inner().core.catalog().storage;
-            let metadata = provisional_allocation_metadata();
-            let table_id = USER_TABLE_ID_START + 700;
-            let durable_generations = [SecondaryIndexSlot::Active {
-                index_id: IndexID::new(0),
-                root: SecondaryIndexRoot::Empty,
-            }];
-            let a = IndexRef::new(IndexID::new(7), IndexSlot::new(1));
-            let b = IndexRef::new(IndexID::new(8), IndexSlot::new(2));
-
-            storage
-                .reserve_provisional_index(table_id, a, TrxID::new(10), &durable_generations)
-                .unwrap();
-            assert_eq!(
-                storage
-                    .plan_create_index_allocation(table_id, &metadata)
-                    .unwrap(),
-                (8, 2)
-            );
-            storage
-                .reserve_provisional_index(table_id, b, TrxID::new(11), &durable_generations)
-                .unwrap();
-            assert_eq!(
-                storage
-                    .plan_create_index_allocation(table_id, &metadata)
-                    .unwrap(),
-                (9, 3)
-            );
-
-            storage.release_checkpointed_index_reservations(TrxID::new(10));
-            assert_eq!(
-                storage
-                    .plan_create_index_allocation(table_id, &metadata)
-                    .unwrap(),
-                (9, 3),
-                "a reservation remains visible at an equal replay floor"
-            );
-            storage.release_checkpointed_index_reservations(TrxID::new(11));
-            assert_eq!(
-                storage
-                    .plan_create_index_allocation(table_id, &metadata)
-                    .unwrap(),
-                (9, 1),
-                "released slots become selectable without lowering the running ID high-water"
-            );
-            storage.release_checkpointed_index_reservations(TrxID::new(12));
-            assert_eq!(
-                storage
-                    .plan_create_index_allocation(table_id, &metadata)
-                    .unwrap(),
-                (9, 1)
-            );
-        });
-    }
-
-    #[test]
-    fn test_provisional_index_overlay_rejects_conflicts_and_preserves_domain_end() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine = open_catalog_test_engine(
-                temp_dir.path().to_path_buf(),
-                Some("provisional-index-conflicts"),
-            )
-            .await;
-            let storage = &engine.inner().core.catalog().storage;
-            let metadata = provisional_allocation_metadata();
-            let table_id = USER_TABLE_ID_START + 701;
-            let durable_generations = [SecondaryIndexSlot::Active {
-                index_id: IndexID::new(0),
-                root: SecondaryIndexRoot::Empty,
-            }];
-            let exact = IndexRef::new(IndexID::new(7), IndexSlot::new(1));
-            storage
-                .reserve_provisional_index(table_id, exact, TrxID::new(20), &durable_generations)
-                .unwrap();
-            storage
-                .reserve_provisional_index(table_id, exact, TrxID::new(20), &durable_generations)
-                .unwrap();
-            assert!(
-                storage
-                    .reserve_provisional_index(
-                        table_id,
-                        IndexRef::new(IndexID::new(7), IndexSlot::new(2)),
-                        TrxID::new(21),
-                        &durable_generations,
-                    )
-                    .is_err()
-            );
-            assert!(
-                storage
-                    .reserve_provisional_index(
-                        table_id,
-                        IndexRef::new(IndexID::new(8), IndexSlot::new(1)),
-                        TrxID::new(21),
-                        &durable_generations,
-                    )
-                    .is_err()
-            );
-            assert!(
-                storage
-                    .reserve_provisional_index(
-                        table_id,
-                        IndexRef::new(IndexID::new(9), IndexSlot::new(0)),
-                        TrxID::new(21),
-                        &durable_generations,
-                    )
-                    .is_err()
-            );
-
-            let max_table_id = USER_TABLE_ID_START + 702;
-            storage
-                .reserve_provisional_index(
-                    max_table_id,
-                    IndexRef::new(IndexID::new(u32::MAX), IndexSlot::new(1)),
-                    TrxID::new(30),
-                    &durable_generations,
-                )
-                .unwrap();
-            let err = storage
-                .plan_create_index_allocation(max_table_id, &metadata)
-                .unwrap_err();
-            assert_eq!(*err.current_context(), OperationError::IndexIdExhausted);
-            storage.release_checkpointed_index_reservations(TrxID::new(31));
-            let err = storage
-                .plan_create_index_allocation(max_table_id, &metadata)
-                .unwrap_err();
-            assert_eq!(*err.current_context(), OperationError::IndexIdExhausted);
         });
     }
 }

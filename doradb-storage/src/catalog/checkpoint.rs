@@ -465,6 +465,7 @@ impl Catalog {
                     trx_sys.record_catalog_redo_retention_progress(progress);
                 }
                 trx_sys.request_dropped_table_purge();
+                trx_sys.request_retired_index_runtime_retry();
                 Ok(CatalogCheckpointOutcome::Published {
                     catalog_replay_start_ts,
                 })

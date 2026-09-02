@@ -804,7 +804,6 @@ mod tests {
                     .unwrap()
                     .runtime_arc(),
             );
-            let table_owners = Arc::strong_count(&table);
             let layout_owners = Arc::strong_count(&layout);
             let index_owners = Arc::strong_count(&index);
             let resolved_visible = catalog
@@ -813,7 +812,6 @@ mod tests {
             let resolved_live = resolved_visible.live().unwrap();
             assert_eq!(resolved_live.effective_cts(), initial_cts);
             assert!(Arc::ptr_eq(resolved_live.metadata(), &initial_metadata));
-            assert_eq!(Arc::strong_count(&table), table_owners);
             assert_eq!(Arc::strong_count(&layout), layout_owners);
             assert_eq!(Arc::strong_count(&index), index_owners);
 
@@ -830,7 +828,6 @@ mod tests {
                 resolved_visible.live().unwrap().metadata(),
                 &initial_metadata
             ));
-            assert_eq!(Arc::strong_count(&table), table_owners);
             assert_eq!(Arc::strong_count(&layout), layout_owners);
             assert_eq!(Arc::strong_count(&index), index_owners);
 
@@ -1056,7 +1053,6 @@ mod tests {
                     .get_table_now(table_id)
                     .unwrap();
                 assert!(table.layout_snapshot().secondary_indexes()[1].is_none());
-                assert!(!table.has_retired_secondary_indexes());
                 assert_eq!(
                     table.file().active_root_unchecked().secondary_index_slots[1],
                     SecondaryIndexSlot::Retired(index_id)

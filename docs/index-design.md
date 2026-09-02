@@ -38,6 +38,14 @@ This pattern appears in both indexing layers:
 This design keeps foreground writes memory-first while letting checkpoint
 publish new durable roots atomically.
 
+Secondary-index physical slots have a separate control-plane lifecycle. Active
+generations live in immutable runtime layouts; one Table-owned machine tracks
+durable vacancies, exact retired generations, provisional replay reservations,
+and retained or destroying runtimes. CREATE chooses the lowest slot whose
+durable, runtime, and provisional gates have all cleared, while stable index IDs
+remain monotonically consumed. This lifecycle lock is not consulted by
+foreground lookup, scan, insert, update, or delete.
+
 ### Mutable B-tree deletion and layout ownership
 
 The caller that owns an index entry also owns the semantic proof that permits

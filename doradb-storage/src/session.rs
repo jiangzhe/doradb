@@ -1,10 +1,10 @@
 use crate::buffer::page::VersionedPageID;
 use crate::buffer::{BufferPool, PoolGuards};
 use crate::catalog::{
-    Catalog, CatalogCheckpointOutcome, CatalogCheckpointScope, CreateIndexPlan, CreateTableOutcome,
-    DropIndexPlan, DropTablePlan, IndexDdlGateScope, IndexID, PreparedCreateIndex,
-    PreparedCreateTable, PreparedDropIndex, PreparedDropTable, StorageIndexSpec, StorageTableSpec,
-    ValidatedCreateTable, create_index_catalog_write_targets, create_table_catalog_write_targets,
+    Catalog, CatalogCheckpointOutcome, CatalogCheckpointScope, CreateTableOutcome, DropTablePlan,
+    IndexDdlGateScope, IndexID, PreparedCreateIndex, PreparedCreateTable, PreparedDropIndex,
+    PreparedDropTable, StorageIndexSpec, StorageTableSpec, ValidatedCreateTable,
+    create_index_catalog_write_targets, create_table_catalog_write_targets,
     drop_index_catalog_write_targets, drop_table_catalog_write_targets,
     prepare_catalog_checkpoint_operation, reject_non_user_table_id,
     reject_user_table_primary_key_index, validated_index_ddl_target,
@@ -1204,8 +1204,10 @@ impl Session {
             .await
             .attach("operation=create_index")
             .disclose()?;
-        let plan = CreateIndexPlan::new(table_id, table, index_spec, &engine.catalog().storage)
-            .disclose()?;
+        let plan = table.finalize_create_index(index_spec).disclose()?;
+        if plan.skipped_retired_runtime() {
+            engine.trx_sys.request_retired_index_runtime_purge(table_id);
+        }
         let observer = mandatory_runtime
             .submit(PreparedCreateIndex::new(gates, scope, plan))
             .await
@@ -1252,7 +1254,7 @@ impl Session {
             .await
             .attach("operation=drop_index")
             .disclose()?;
-        let plan = DropIndexPlan::new(table_id, table, index_id).disclose()?;
+        let plan = table.finalize_drop_index(index_id).disclose()?;
         let observer = mandatory_runtime
             .submit(PreparedDropIndex::new(gates, scope, plan))
             .await
