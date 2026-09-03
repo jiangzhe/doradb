@@ -210,6 +210,14 @@ impl<'a> RecoveryCoordinator<'a> {
                     err
                 );
             })?;
+        // Descriptor bytes remain opaque, but their storage-owned envelope must
+        // describe the same current numeric schema reconstructed after replay.
+        self.resources
+            .catalog
+            .validate_live_table_descriptors(&self.resources.pool_guards)
+            .await
+            .change_context(RuntimeError::Recovery)
+            .attach("operation=recovery, phase=managed_descriptor_validation")?;
         // 3. Ensure catalog metadata caught up with table-file roots.
         obs::info!(
             "event=recovery_phase component=recovery phase=metadata_validation action=start result=ok"

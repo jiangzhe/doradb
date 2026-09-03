@@ -1,7 +1,7 @@
 use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards};
 use crate::catalog::{
-    Catalog, IndexID, IndexRef, IndexSlot, SecondaryIndexRoot, SecondaryIndexSlot,
-    TableIndexMetadata, TableMetadata, catalog_table_id_from_slot,
+    Catalog, CatalogDefinitionEffects, IndexID, IndexRef, IndexSlot, SecondaryIndexRoot,
+    SecondaryIndexSlot, TableIndexMetadata, TableMetadata, catalog_table_id_from_slot,
 };
 use crate::engine::EngineCore;
 use crate::error::{
@@ -40,10 +40,16 @@ pub(crate) use tests::IndexDdlTestController;
 #[cfg(test)]
 use tests::{CreateIndexTestFailure, IndexDdlTestPhase};
 
-const CREATE_INDEX_CATALOG_WRITE_TARGETS: [TableID; 2] =
-    [catalog_table_id_from_slot(0), catalog_table_id_from_slot(2)];
-const DROP_INDEX_CATALOG_WRITE_TARGETS: [TableID; 2] =
-    [catalog_table_id_from_slot(0), catalog_table_id_from_slot(2)];
+const CREATE_INDEX_CATALOG_WRITE_TARGETS: [TableID; 3] = [
+    catalog_table_id_from_slot(0),
+    catalog_table_id_from_slot(2),
+    catalog_table_id_from_slot(3),
+];
+const DROP_INDEX_CATALOG_WRITE_TARGETS: [TableID; 3] = [
+    catalog_table_id_from_slot(0),
+    catalog_table_id_from_slot(2),
+    catalog_table_id_from_slot(3),
+];
 
 /// Index DDL operation kind used for root-publish durability proof.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -603,6 +609,7 @@ impl CreateIndexProgress {
         engine: &EngineCore,
         guards: &PoolGuards,
         new_metadata: &TableMetadata,
+        definition_effects: &CatalogDefinitionEffects,
     ) -> RuntimeOrFatalResult<()> {
         debug_assert_eq!(self.phase, CreateIndexBuildPhase::LayoutStaged);
         let trx = self.trx.as_mut().unwrap_or_else(|| {
@@ -614,7 +621,13 @@ impl CreateIndexProgress {
         let res = engine
             .catalog()
             .storage
-            .stage_create_index(trx, self.table_id, self.index, new_metadata)
+            .stage_create_index(
+                trx,
+                self.table_id,
+                self.index,
+                new_metadata,
+                definition_effects,
+            )
             .await;
         match res {
             Ok(()) => Ok(()),
@@ -769,6 +782,7 @@ impl DropIndexProgress {
         &mut self,
         catalog: &Catalog,
         new_metadata: &TableMetadata,
+        definition_effects: &CatalogDefinitionEffects,
     ) -> RuntimeOrFatalResult<()> {
         debug_assert_eq!(self.phase, DropIndexBuildPhase::LayoutStaged);
         let trx = self.trx.as_mut().unwrap_or_else(|| {
@@ -779,7 +793,13 @@ impl DropIndexProgress {
         });
         let res = catalog
             .storage
-            .stage_drop_index(trx, self.table_id, self.index, new_metadata)
+            .stage_drop_index(
+                trx,
+                self.table_id,
+                self.index,
+                new_metadata,
+                definition_effects,
+            )
             .await;
         match res {
             Ok(()) => Ok(()),
@@ -1165,7 +1185,12 @@ impl AcceptedCreateIndex {
         progress.stage_layout(new_layout);
 
         if let Err(err) = progress
-            .execute_catalog_update(engine, guards, plan.new_metadata().as_ref())
+            .execute_catalog_update(
+                engine,
+                guards,
+                plan.new_metadata().as_ref(),
+                plan.definition_effects(),
+            )
             .await
         {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(err));
@@ -1409,7 +1434,11 @@ impl AcceptedDropIndex {
             .await;
 
         if let Err(err) = progress
-            .execute_catalog_update(engine.catalog(), plan.new_metadata().as_ref())
+            .execute_catalog_update(
+                engine.catalog(),
+                plan.new_metadata().as_ref(),
+                plan.definition_effects(),
+            )
             .await
         {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(err));

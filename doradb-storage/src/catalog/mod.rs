@@ -1,4 +1,5 @@
 mod checkpoint;
+mod definition;
 mod history;
 pub(crate) mod index;
 mod index_ref;
@@ -8,6 +9,11 @@ pub(crate) mod table;
 
 pub use checkpoint::CatalogCheckpointOutcome;
 pub(crate) use checkpoint::*;
+pub(crate) use definition::*;
+pub use definition::{
+    DescriptorUpdate, MAX_TABLE_DESCRIPTOR_BYTES, ManagedDdlError, ManagedDdlResult,
+    TableDescriptorInterpreter,
+};
 pub(crate) use history::*;
 pub(crate) use index::*;
 pub(crate) use index_ref::*;
@@ -18,8 +24,10 @@ pub use index_ref::{
 #[cfg(test)]
 pub(crate) use spec::ActiveIndexSpec;
 pub use spec::{
-    IndexOrder, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
-    StorageIndexSpec, StorageTableSpec,
+    CreateIndexDefinition, CreateTableDefinition, DropIndexDefinition, IndexOrder,
+    StorageColumnDefinition, StorageColumnFlags, StorageColumnSpec, StorageIndexDefinition,
+    StorageIndexFlags, StorageIndexKey, StorageIndexKeyByColumnId, StorageIndexSpec,
+    StorageTableDefinition, StorageTableSpec,
 };
 pub(crate) use storage::*;
 pub use table::CreateTableOutcome;
@@ -45,7 +53,7 @@ use crate::quiescent::{QuiescentBox, QuiescentGuard};
 use crate::row::Row;
 use crate::table::{
     CreateIndexPlan, DropIndexPlan, IndexLookupCriteria, LiveTableRedoReplayFloor, MemTable, Table,
-    TableRedoReplayFloor, TableRuntimeLayout,
+    TableDefinitionKind, TableRedoReplayFloor, TableRuntimeLayout,
 };
 use crate::trx::retention::PendingDroppedTableRedoFloor;
 use crate::trx::undo::IndexUndo;
@@ -311,6 +319,17 @@ impl Catalog {
         let (table, metadata_in_catalog) = self
             .user_table_metadata_from_catalog(guards, table_id)
             .await?;
+        let definition_kind = if self
+            .storage
+            .table_descriptors()
+            .find_uncommitted_by_table_id(guards, table_id)
+            .await?
+            .is_some()
+        {
+            TableDefinitionKind::Managed
+        } else {
+            TableDefinitionKind::Unmanaged
+        };
 
         // Phase 2 allocator semantics: only table ids consume the global allocator.
         self.try_update_next_table_id(table.table_id.saturating_add(1));
@@ -378,6 +397,7 @@ impl Catalog {
                 index_pool.clone(),
                 index_pool_guard,
                 table.table_id,
+                definition_kind,
                 blk_idx,
                 table_file,
                 disk_pool.clone(),
@@ -420,78 +440,46 @@ impl Catalog {
             });
 
         // todo: use secondary index to improve performance
-        let mut columns = self
+        let columns = self
             .storage
             .columns()
             .list_uncommitted_by_table_id(guards, table_id)
             .await?;
-        columns.sort_by_key(|column| column.storage_ordinal);
-        let column_metadata = columns
-            .iter()
-            .map(|column| TableColumnMetadata {
-                id: column.column_id,
-                ordinal: column.storage_ordinal,
-                value_kind: column.value_kind,
-                flags: column.value_flags,
-            })
-            .collect::<Vec<_>>();
-        let ordinal_by_id = columns
-            .iter()
-            .map(|column| (column.column_id, column.storage_ordinal))
-            .collect::<FastHashMap<_, _>>();
-
-        let mut indexes = self
+        let indexes = self
             .storage
             .indexes()
             .list_uncommitted_by_table_id(guards, table_id)
             .await?;
-        indexes.sort_by_key(|index| index.index.id());
-        let mut index_metadata = Vec::with_capacity(indexes.len());
-        for index in indexes {
-            let keys = index
-                .keys
-                .iter()
-                .map(|key| {
-                    let column_ordinal = ordinal_by_id.get(&key.column_id).copied().ok_or_else(|| {
-                        Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-                            "catalog index references missing column: table_id={table_id}, index={}, column_id={}",
-                            index.index, key.column_id
-                        ))
-                    })?;
-                    Ok(TableIndexKeySpec {
-                        column_id: key.column_id,
-                        column_ordinal,
-                        order: key.order,
-                    })
-                })
-                .collect::<DataIntegrityResult<Vec<_>>>()
+        let metadata = reconstruct_user_table_metadata(&table, columns, indexes)
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!("operation=reconstruct_user_table_metadata, table_id={table_id}")
+            })?;
+        Ok((table, metadata))
+    }
+
+    /// Validates every managed descriptor against the current numeric schema.
+    pub(crate) async fn validate_live_table_descriptors(
+        &self,
+        guards: &PoolGuards,
+    ) -> RuntimeResult<()> {
+        let descriptors = self
+            .storage
+            .table_descriptors()
+            .list_uncommitted(guards)
+            .await?;
+        for descriptor in descriptors {
+            let table_id = descriptor.table_id;
+            let (_, metadata) = self
+                .user_table_metadata_from_catalog(guards, table_id)
+                .await?;
+            validate_table_descriptor_against_metadata(&descriptor, table_id, &metadata)
                 .change_context(RuntimeError::CatalogAccess)
                 .attach_with(|| {
-                    format!(
-                        "operation=reconstruct_user_table_metadata, phase=compile_index_keys, table_id={table_id}, index={}",
-                        index.index
-                    )
-                })?
-                .into_boxed_slice();
-            index_metadata.push(TableIndexMetadata {
-                index: index.index,
-                flags: index.index_flags,
-                keys,
-            });
+                    format!("operation=validate_live_table_descriptors, table_id={table_id}")
+                })?;
         }
-        let metadata = TableMetadata::try_from_persisted_parts(
-            table.storage_epoch,
-            table.next_column_id,
-            column_metadata,
-            table.next_index_id,
-            table.index_slot_count,
-            index_metadata,
-        )
-        .change_context(RuntimeError::CatalogAccess)
-        .attach_with(|| {
-            format!("operation=reconstruct_user_table_metadata, table_id={table_id}")
-        })?;
-        Ok((table, metadata))
+        Ok(())
     }
 
     /// Get a user-table runtime handle by table id.
@@ -1306,6 +1294,65 @@ pub(crate) fn effective_table_redo_replay_floor(
         heap_redo_start_ts: root_floor.heap_redo_start_ts.max(silent.heap_redo_start_ts),
         deletion_cutoff_ts: root_floor.deletion_cutoff_ts.max(silent.deletion_cutoff_ts),
     })
+}
+
+/// Reconstructs one canonical numeric schema from decoded catalog objects.
+pub(crate) fn reconstruct_user_table_metadata(
+    table: &TableObject,
+    mut columns: Vec<ColumnObject>,
+    mut indexes: Vec<IndexObject>,
+) -> DataIntegrityResult<TableMetadata> {
+    let table_id = table.table_id;
+    columns.sort_by_key(|column| column.storage_ordinal);
+    let column_metadata = columns
+        .iter()
+        .map(|column| TableColumnMetadata {
+            id: column.column_id,
+            ordinal: column.storage_ordinal,
+            value_kind: column.value_kind,
+            flags: column.value_flags,
+        })
+        .collect::<Vec<_>>();
+    let ordinal_by_id = columns
+        .iter()
+        .map(|column| (column.column_id, column.storage_ordinal))
+        .collect::<FastHashMap<_, _>>();
+
+    indexes.sort_by_key(|index| index.index.id());
+    let mut index_metadata = Vec::with_capacity(indexes.len());
+    for index in indexes {
+        let keys = index
+            .keys
+            .iter()
+            .map(|key| {
+                let column_ordinal = ordinal_by_id.get(&key.column_id).copied().ok_or_else(|| {
+                    Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                        "catalog index references missing column: table_id={table_id}, index={}, column_id={}",
+                        index.index, key.column_id
+                    ))
+                })?;
+                Ok(TableIndexKeySpec {
+                    column_id: key.column_id,
+                    column_ordinal,
+                    order: key.order,
+                })
+            })
+            .collect::<DataIntegrityResult<Vec<_>>>()?
+            .into_boxed_slice();
+        index_metadata.push(TableIndexMetadata {
+            index: index.index,
+            flags: index.index_flags,
+            keys,
+        });
+    }
+    TableMetadata::try_from_persisted_parts(
+        table.storage_epoch,
+        table.next_column_id,
+        column_metadata,
+        table.next_index_id,
+        table.index_slot_count,
+        index_metadata,
+    )
 }
 
 #[inline]

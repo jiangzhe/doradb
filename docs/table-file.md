@@ -268,6 +268,15 @@ inside accepted CREATE execution, while a panic or unsafe post-gate DROP
 failure is retained and poisons storage rather than running fallible cleanup
 from a destructor.
 
+Managed DDL does not place opaque descriptor bytes in the per-table file. The
+descriptor is a catalog row whose storage-owned compiled epoch and fingerprint
+bind it to the same numeric metadata published in the table root. Managed index
+callbacks execute before table/catalog gates are acquired; only the finalized
+immutable numeric change and descriptor replacement cross mandatory
+acceptance. Catalog staging commits both projections in one private
+transaction, while the existing root-proof ordering still governs table-file
+publication and recovery.
+
 ### 7.1 Data Checkpoint Publication
 
 Data checkpoint publishes:

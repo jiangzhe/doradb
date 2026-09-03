@@ -5,8 +5,8 @@ use crate::catalog::spec::{
     IndexOrder, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexSpec,
 };
 use crate::catalog::{
-    Catalog, ColumnID, ColumnOrdinal, ID_DOMAIN_END, IndexID, IndexRef, IndexSlot,
-    catalog_table_id_from_slot,
+    Catalog, CatalogDefinitionEffects, ColumnID, ColumnOrdinal, ID_DOMAIN_END, IndexID, IndexRef,
+    IndexSlot, TableDescriptorObject, catalog_table_id_from_slot,
 };
 use crate::component::EnginePools;
 use crate::engine::EngineCore;
@@ -27,7 +27,7 @@ use crate::row::{Row, RowRead};
 use crate::runtime::mandatory::{AcceptedExecution, MandatoryTaskMetadata, PreparedExecution};
 use crate::serde::{Deser, DeserResult, MinBytesHint, Ser, Serde, min_bytes_hint};
 use crate::session::{AcceptedDdlScope, PreparedDdlScope};
-use crate::table::{IndexPlacement, Table, TableRedoReplayFloor};
+use crate::table::{IndexPlacement, Table, TableDefinitionKind, TableRedoReplayFloor};
 use crate::trx::PrivateTransaction;
 use crate::trx::sys::TransactionSystem;
 use crate::value::{Val, ValKind, ValType};
@@ -41,10 +41,11 @@ use std::sync::Arc;
 #[cfg(test)]
 use tests::{CreateTableTestFailure, TableDdlTestPhase};
 
-const CREATE_TABLE_CATALOG_WRITE_TARGETS: [TableID; 3] = [
+const CREATE_TABLE_CATALOG_WRITE_TARGETS: [TableID; 4] = [
     catalog_table_id_from_slot(0),
     catalog_table_id_from_slot(1),
     catalog_table_id_from_slot(2),
+    catalog_table_id_from_slot(3),
 ];
 const DROP_TABLE_CATALOG_WRITE_TARGETS: [TableID; 6] = [
     catalog_table_id_from_slot(0),
@@ -105,6 +106,41 @@ impl ValidatedCreateTable {
     /// Bind validated metadata to one gap-tolerant allocated table id.
     #[inline]
     pub(crate) fn into_plan(self, table_id: TableID) -> CreateTablePlan {
+        self.into_plan_with_effects(
+            table_id,
+            TableDefinitionKind::Unmanaged,
+            CatalogDefinitionEffects::none(),
+        )
+    }
+
+    /// Bind validated metadata and a managed descriptor insert to an allocated id.
+    #[inline]
+    pub(crate) fn into_managed_plan(
+        self,
+        table_id: TableID,
+        descriptor: Box<[u8]>,
+    ) -> CreateTablePlan {
+        let descriptor = TableDescriptorObject {
+            table_id,
+            descriptor_revision: 0,
+            compiled_storage_epoch: self.metadata.storage_epoch,
+            storage_schema_fingerprint: self.metadata.storage_schema_fingerprint(),
+            payload: descriptor,
+        };
+        self.into_plan_with_effects(
+            table_id,
+            TableDefinitionKind::Managed,
+            CatalogDefinitionEffects::insert(descriptor),
+        )
+    }
+
+    #[inline]
+    fn into_plan_with_effects(
+        self,
+        table_id: TableID,
+        definition_kind: TableDefinitionKind,
+        definition_effects: CatalogDefinitionEffects,
+    ) -> CreateTablePlan {
         let index_ids = self
             .metadata
             .idx
@@ -115,6 +151,8 @@ impl ValidatedCreateTable {
         CreateTablePlan {
             table_id,
             metadata: self.metadata,
+            definition_kind,
+            definition_effects,
             outcome: CreateTableOutcome {
                 table_id,
                 index_ids,
@@ -127,6 +165,8 @@ impl ValidatedCreateTable {
 pub(crate) struct CreateTablePlan {
     table_id: TableID,
     metadata: Arc<TableMetadata>,
+    definition_kind: TableDefinitionKind,
+    definition_effects: CatalogDefinitionEffects,
     outcome: CreateTableOutcome,
 }
 
@@ -293,6 +333,7 @@ impl CreateTableProgress {
                 pools.index.clone(),
                 guards.index_guard(),
                 self.table_id,
+                self.plan.definition_kind,
                 blk_idx,
                 table_file,
                 pools.disk.clone(),
@@ -1379,13 +1420,6 @@ impl TableMetadata {
     }
 
     /// Computes the canonical active storage-schema fingerprint.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the canonical digest is installed now for the descriptor phase consumer"
-        )
-    )]
     pub(crate) fn storage_schema_fingerprint(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"doradb.storage-schema\0");
@@ -1732,6 +1766,7 @@ impl AcceptedCreateTable {
                     .unwrap_or_else(|| panic!("CREATE staging requires private transaction")),
                 table_id,
                 &metadata,
+                &progress.plan.definition_effects,
             )
             .await;
         if let Err(err) = exec_res {
@@ -2067,6 +2102,7 @@ impl AcceptedDropTable {
                     .unwrap_or_else(|| panic!("DROP cascade requires private transaction")),
                 table_id,
                 &metadata,
+                &CatalogDefinitionEffects::delete_if_present(table_id),
             )
             .await;
         if let Err(err) = exec_res {
@@ -4917,7 +4953,10 @@ pub(crate) mod tests {
                 LockResource::TableMetadata(create_table_id),
             )
             .expect("accepted CREATE should retain its operation owner");
-            assert_eq!(lock_entry_count(&engine, create_owner), 7);
+            assert_eq!(
+                lock_entry_count(&engine, create_owner),
+                1 + 2 * create_table_catalog_write_targets().len()
+            );
             assert!(has_lock_entry(
                 &engine,
                 create_owner,
@@ -4947,7 +4986,10 @@ pub(crate) mod tests {
                 .install_gate(TableDdlTestPhase::CreateCatalogStaged);
             create_release.send_async(()).await.unwrap();
             create_staged.recv_async().await.unwrap();
-            assert_eq!(lock_entry_count(&engine, create_owner), 7);
+            assert_eq!(
+                lock_entry_count(&engine, create_owner),
+                1 + 2 * create_table_catalog_write_targets().len()
+            );
             assert!(
                 debug_snapshot(engine.inner().lock_manager())
                     .entries

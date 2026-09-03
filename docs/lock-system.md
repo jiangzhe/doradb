@@ -1693,7 +1693,7 @@ Measure:
 - `doradb-storage/src/lock/mod.rs`
 - `doradb-storage/src/lock/claim.rs`
 - `doradb-storage/src/lock/state.rs`
-- `doradb-storage/src/session.rs`
+- `doradb-storage/src/session/mod.rs`
 - `doradb-storage/src/trx/admission.rs`
 - `doradb-storage/src/trx/mod.rs`
 - `doradb-storage/src/trx/stmt.rs`

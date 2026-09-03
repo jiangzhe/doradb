@@ -192,10 +192,11 @@ Issue Labels:
     layers can compile before entering DoraDB-owned DDL execution; store the
     supplied payload bytes exactly while leaving format identity/version,
     self-containment, and logical authority to the higher layer.
-11. Make compiler output a slot-free optimistic proposal over stable IDs and
-    physical semantics; after DDL exclusion, have DoraDB revalidate the
-    proposal and finalize slot allocation, storage epoch, fingerprint,
-    descriptor envelope, and table-root shape.
+11. Let DoraDB invoke a synchronous higher-layer interpreter outside every
+    metadata lock and DDL gate. The interpreter returns a slot-free typed
+    change plus complete replacement descriptor; DoraDB privately revalidates
+    the copied definition and finalizes IDs, slots, epochs, fingerprints,
+    descriptor envelopes, and table-root shape.
 12. Preserve the existing storage DDL set: `CREATE TABLE`, `DROP TABLE`,
    `CREATE INDEX`, and `DROP INDEX`.
 13. Keep numeric storage metadata, optional descriptor bytes, and binding
@@ -331,7 +332,7 @@ Issue Labels:
   positional `usize`, while transaction admission already captures and caches
   an `Arc<TableRuntimeLayout>` under metadata S before validating and executing
   an index operation.
-- [C14] `doradb-storage/src/session.rs`,
+- [C14] `doradb-storage/src/session/mod.rs`,
   `doradb-storage/src/catalog/index.rs`, and
   `doradb-storage/src/catalog/table.rs` - CREATE INDEX acquires prepared DDL and
   table/catalog gates before `CreateIndexPlan::new` snapshots the current
@@ -359,7 +360,7 @@ Issue Labels:
   materializes and rebuilds its complete replacement image, and currently
   clones every surviving value; cloning an outlined `VarByte` allocates and
   copies its complete payload.
-- [C18] `doradb-storage/src/session.rs`,
+- [C18] `doradb-storage/src/session/mod.rs`,
   `doradb-storage/src/catalog/table.rs`, `docs/public-api.md`, and
   `doradb-storage/examples/quick_start.rs` - `Session::create_table` currently
   returns only `TableID`; validation consumes an ordered `Vec<IndexSpec>`; and
@@ -402,12 +403,13 @@ Issue Labels:
   version bump; expose stable `IndexID` to normal user APIs; and avoid repeated
   resolution by carrying `IndexRef` through one admitted operation and
   offering an opaque cached resolved handle.
-- [U13] Round 2 compiler/finalization review on 2026-08-28: make compiler
-  output a slot-free proposal containing stable IDs and physical semantics;
-  revalidate the storage epoch, descriptor revision, and effective next index
-  ID after DDL exclusion; let storage allocate the slot and stamp the final
-  epoch/fingerprint/root shape; and reject stale proposals for recompilation
-  rather than invoking application code under storage locks.
+- [U13] Round 2 compiler/finalization review on 2026-08-28, superseded by the
+  Phase 6 boundary approval on 2026-09-03: DoraDB owns one complete optimistic
+  attempt. It copies the current schema and descriptor under short metadata-S,
+  releases all claims, invokes one synchronous interpreter, then reacquires
+  metadata-X and the DDL gates to revalidate private epoch/revision/allocator
+  state. A mismatch returns zero-effect `SchemaChanged`; callers may retry the
+  complete managed call but never construct engine version tokens.
 - [U14] Round 2 watermark review on 2026-08-28: persist `next_column_id` and
   `next_index_id` as bounded `U64` exclusive watermarks so `2^32` represents
   exhaustion of the complete `u32` ID domain; apply the same representation to
@@ -478,9 +480,11 @@ TableDefinition
 ```
 
 This is the final storage-owned durable bundle, not the direct output of a
-higher-level compiler. The compiler proposes the stable-ID semantic subset;
-DoraDB adds physical placement and the descriptor envelope under DDL exclusion
-before constructing this final bundle. [C14], [U13]
+higher-layer interpreter. The interpreter returns an operation-specific,
+slot-free physical change paired with complete opaque replacement bytes.
+DoraDB adds identities where required, physical placement, and the descriptor
+envelope under DDL exclusion before constructing this final bundle. [C14],
+[U13]
 
 `StorageSchema` is authoritative for physical execution. It contains only
 numeric identities, physical value kinds/flags, physical ordinals, index
@@ -508,8 +512,9 @@ without making it authoritative storage state. [C1], [C2], [U1]
 
 A table without a descriptor is an unmanaged numeric table. A table with a
 descriptor is managed: any existing physical DDL that changes its storage
-schema must also supply a replacement descriptor proposal compiled for the
-same stable-ID semantic mutation. After revalidation and physical placement,
+schema must use the managed API whose interpreter supplies a replacement
+descriptor paired with the same stable-ID semantic mutation. After private
+revalidation and physical placement,
 storage stamps that payload with the finalized new epoch and fingerprint. This
 ensures the exact supplied bytes are transactionally paired with the finalized
 physical schema version without asserting that the bytes actually describe it.
@@ -675,11 +680,14 @@ storage_schema_fingerprint VARBYTE
 payload                    VARBYTE
 ```
 
-The descriptor payload is accepted whenever it can be represented and inserted
-as one non-null `ValKind::VarByte` value in a valid catalog row and the
-storage-owned revision/epoch/fingerprint fields are valid. Payload bytes are
-stored and returned exactly. The catalog row and storage API contain no codec
-identity or codec version. [C12], [U2], [U8], [U15], [U18]
+The descriptor payload is accepted at every length from zero through the
+inclusive fixed limit of 64,000 bytes, provided it also satisfies the
+independent `VarByte` and complete-row-fit checks and the storage-owned
+revision/epoch/fingerprint fields are valid. A live callback output of 64,001
+bytes is invalid metadata; the same oversized persisted input is data
+integrity failure. Payload bytes are stored and returned exactly. The catalog
+row and storage API contain no codec identity or codec version. [C12], [U2],
+[U8], [U15], [U18]
 
 A higher layer using one descriptor format may select it through application
 configuration. A higher layer supporting multiple formats may encode its own
@@ -689,8 +697,9 @@ registration, selection, compatibility, decoding, and dispatch belong to
 `doradb-datafusion` or another higher-level catalog/application crate. [U18]
 
 This RFC adds no larger blob subsystem, storage-owned external registry,
-codec registry/trait/dispatch container, dereferencing behavior, or independent
-descriptor size setting. That is not a content restriction: a UTF-8 URL, JSON
+codec registry/trait/dispatch container, or dereferencing behavior. The fixed
+64,000-byte limit is an API and integrity invariant, not a content restriction:
+a UTF-8 URL, JSON
 containing only an external URL, serialized Protobuf, arbitrary binary data,
 an application lookup token, or bytes beginning with a higher-layer private
 format header are all valid payloads when their storage envelope is
@@ -844,12 +853,11 @@ returns no successful outcome. There is no parallel compatibility method that
 returns only `TableID`; all dependent callers migrate at the Phase 3 API
 cutover. [C14], [U9], [U13], [U23]
 
-Phase 6 managed CREATE TABLE uses the same outcome type. Its returned IDs must
-equal the stable IDs in the revalidated slot-free proposal, while storage
-remains authoritative for the physical slots and accepted mapping. A caller
-that no longer retains the immediate outcome may use the Phase 6 latest
-current-definition read to rediscover the table's IDs; that read is not part of
-the normal create flow. [U13], [U23]
+Phase 6 managed CREATE TABLE uses the same outcome type. Its interpreter
+returns an ID-free ordered definition; DoraDB allocates dense `ColumnID` and
+initial `IndexID` values only after successful interpretation and returns the
+initial index IDs in definition order. The initial opaque descriptor cannot
+depend semantically on those subsequently assigned identities. [U13], [U23]
 
 ### Catalog-Static And User-Generation Index References Are Separate
 
@@ -1205,7 +1213,39 @@ The reusable pool is derived rather than persisted:
 - the gated storage finalizer chooses a reusable slot deterministically,
   otherwise appends at `index_slot_count` and advances the high-water mark.
 
-### Compilers Propose Stable Semantics; Storage Finalizes Placement
+### DoraDB Orchestrates Unlocked Interpretation And Private Revalidation
+
+The Phase 6 public boundary consists of distinct managed CREATE TABLE, CREATE
+INDEX, and DROP INDEX methods plus one synchronous interpreter trait. CREATE
+TABLE receives only the opaque source and returns an ID-free ordered storage
+definition plus the complete initial descriptor. Existing-table callbacks
+receive the source unchanged, previous descriptor bytes, and a separate
+stable-ID schema projection; CREATE INDEX additionally receives DoraDB's
+proposed next `IndexID`. No callback sees epochs, revisions, allocator
+watermarks, slots, roots, locks, transactions, or mandatory-runtime ownership.
+
+For an existing table DoraDB pins a short definition-read operation, acquires
+target `TableMetadata(S)`, copies one coherent numeric-schema/descriptor pair,
+and releases the entire scope before invoking the interpreter exactly once.
+After validating the returned typed change and payload, it pins a fresh DDL
+operation, acquires metadata-X and the existing gates, and compares its private
+storage epoch, descriptor revision, and (for CREATE INDEX) effective allocator.
+A mismatch releases every authority and returns `OperationError::SchemaChanged`
+without effects or implicit reinvocation. The caller alone chooses whether to
+issue a new complete managed call.
+
+Successful finalization binds the proposed CREATE INDEX identity, compiles
+stable `ColumnID` keys to current ordinals, chooses the safe physical slot,
+increments storage epoch and descriptor revision, and stamps the finalized
+fingerprint around unchanged replacement bytes. CREATE TABLE assigns all IDs
+after interpretation and stamps revision/epoch zero. All numeric and descriptor
+rows are staged in the same private transaction and committed once.
+
+### Superseded Caller-Owned Proposal Illustration (Historical)
+
+The proposal structs and caller-visible version fields below record the design
+that preceded the Phase 6 approval. They are not public APIs or current caller
+responsibilities; the engine-orchestrated boundary above supersedes them.
 
 Extensibility is declarative, but compiler output is an optimistic proposal,
 not a final placement-complete `StorageSchema`. A higher-level compiler may
@@ -1385,11 +1425,12 @@ this RFC. [D2], [C6], [U6]
 | CREATE INDEX | update/insert | required replacement for managed table | unchanged | publish new metadata/root |
 | DROP INDEX | update/delete | required replacement for managed table | unchanged | publish new metadata/root |
 
-CREATE TABLE compiles a complete slot-free proposal before DDL exclusion.
-Storage validates it, assigns table identity and initial index slots, computes
-allocator watermarks/epoch/fingerprint, and constructs the accepted plan.
-That plan also constructs `CreateTableOutcome` from its finalized stable index
-identities in proposal/input order and carries the outcome through mandatory
+Managed CREATE TABLE interprets and validates a complete ID-free slot-free
+definition before DDL exclusion or table-ID allocation. Storage then assigns
+table, column, and initial-index identities and slots, computes allocator
+watermarks/epoch/fingerprint, and constructs the accepted plan. That plan also
+constructs `CreateTableOutcome` from its finalized stable index identities in
+definition order and carries the outcome through mandatory
 execution without deriving it again from the selected slots.
 Accepted execution stages the initial table file using the existing
 create-table ordering, stages all applicable catalog rows in one private
@@ -1401,9 +1442,10 @@ CREATE INDEX and DROP INDEX preserve the root-proof ordering required by the
 current implementation: [D5], [C6], [U3]
 
 ```text
-compile slot-free stable-ID proposal outside DDL exclusion
+copy definition under metadata-S, then release every claim
+    -> invoke the interpreter once outside DDL exclusion
     -> acquire DDL/table/catalog exclusion
-    -> revalidate and finalize ID/slot/epoch/fingerprint/root shape
+    -> privately revalidate and finalize ID/slot/epoch/fingerprint/root shape
     -> accept immutable storage-owned plan
     -> stage numeric and optional descriptor catalog DML
     -> commit catalog DDL and obtain commit CTS
@@ -1411,8 +1453,9 @@ compile slot-free stable-ID proposal outside DDL exclusion
     -> install the new current runtime metadata/layout
 ```
 
-Proposal rejection releases the gates without catalog, file, or allocator
-effects. Once accepted, the catalog transaction includes the finalized numeric
+Stale-state rejection releases the gates without catalog, file, or allocator
+effects and returns `SchemaChanged` without reinvoking the interpreter. Once
+accepted, the catalog transaction includes the finalized numeric
 rows and storage-stamped managed descriptor replacement, and its DDL marker
 carries `IndexRef`. Catalog checkpoint cannot fold that transaction until the
 table root proves the same generation durable. If root publication fails after
@@ -1665,26 +1708,27 @@ deferred to a later phase.
    mismatched replacement layout. Phase 5 extends the same test through an
    actual drop and safe slot reuse; the old handle must return `IndexNotFound`
    or `SchemaChanged` and never reach the replacement index.
-4. Phase 6 explicitly synchronized proposal/finalization races: compile two
-   CREATE INDEX proposals from the same epoch, descriptor revision, and
-   effective next ID; accept one; prove the other is rejected before any
-   catalog/file/allocator effect; reread/recompile; and then succeed with the
-   next stable ID.
+4. Phase 6 explicitly synchronizes two managed CREATE INDEX callbacks after
+   they receive the same descriptor, stable-ID schema, and proposed ID. One
+   call finalizes first; the other invokes its interpreter exactly once, drops
+   every scope, returns zero-effect `SchemaChanged`, and succeeds only when the
+   caller explicitly issues a new managed call with the refreshed definition
+   and next stable ID. DROP INDEX covers the equivalent target-removal race.
 5. Phase 3 effective-allocator tests where durable `next_index_id` is below a
    provisional recovery reservation, including a provisional
    `IndexID(u32::MAX)` marker: recovery succeeds, the effective watermark
    becomes `2^32`, and CREATE returns typed exhaustion while it is reserved.
    Phase 5 adds a synchronized allocation case where checkpoint publication
    completes the durable condition for an already runtime-vacant slot before
-   gated CREATE finalization. Phase 6 repeats that transition between proposal
-   compilation and gate acquisition: the definition read exposes the
-   effective watermark, and storage—not the proposal—selects the authoritative
-   safe slot.
+   gated CREATE finalization. Phase 6 repeats that transition between unlocked
+   callback execution and gate acquisition: the private preflight captures the
+   effective watermark, the callback sees only the proposed stable ID, and
+   storage selects the authoritative safe slot.
 6. Phase 6 storage-finalization tests proving CREATE TABLE/INDEX and DROP INDEX
    build final root shape, checked epoch, and fingerprint from the selected
    mapping; the descriptor envelope is stamped by storage; opaque bytes are
-   unchanged; managed CREATE TABLE returns the same revalidated proposed
-   `IndexID` values through `CreateTableOutcome`; DROP resolves by stable ID;
+   unchanged; managed CREATE TABLE assigns IDs after the callback and returns
+   them through `CreateTableOutcome` in definition order; DROP resolves by stable ID;
    an injected pre-acceptance failure releases any internal slot reservation;
    and no compiler callback or caller-held gate token exists during
    finalization.
@@ -2066,38 +2110,40 @@ marker can alias a second CREATE after restart. [U20]
   - Prerequisites: Phase 3 provides the descriptor row/format and stable
     numeric schema; Phase 4 validates its central parent; Phase 5 provides the
     effective allocator view and Table-owned CREATE placement finalizer.
-  - Scope: Implement descriptor row access and structural envelope validation;
-    current-state definition reads; slot-free CREATE TABLE, CREATE INDEX, and
-    DROP INDEX proposal types; optimistic epoch, revision, and effective-ID
-    revalidation after DDL exclusion; typed exhaustion before proposed-ID
-    conversion; storage-stamped descriptor envelopes; owned opaque proposal
-    inputs; and storage-owned accepted-plan interfaces. Persist exact opaque
-    bytes, enforce descriptor replacement for managed physical index DDL by
-    row presence, and make optional descriptor effects atomic with all four
-    existing DDL operations. Preserve `CreateTableOutcome` for managed CREATE
-    TABLE and return the revalidated proposed stable index IDs while keeping
-    slots private. Expose no codec fields, registry/dispatch,
-    external-reference variant, classifier, dereference path, compiler callback
-    under storage gates, or caller-held gate token.
-  - Goals: Deliver one complete managed-definition feature whose compiler owns
-    stable semantics while storage alone finalizes placement and the matching
-    numeric descriptor envelope, with the same authoritative immediate CREATE
-    result for managed and unmanaged tables.
+  - Scope: Implement descriptor row access and structural validation; a
+    `ManagedTableOps` extension trait implemented for `Session`; ID-free managed
+    CREATE TABLE input; slot-free
+    stable-ID CREATE/DROP INDEX changes; one synchronous higher-layer
+    interpreter invoked after short metadata-S preflight is fully released;
+    private epoch/revision/effective-ID revalidation under metadata-X; typed
+    exhaustion before proposed-ID conversion; zero-effect caller-visible
+    `SchemaChanged`; storage-stamped descriptor envelopes; the inclusive
+    64,000-byte payload limit; and storage-owned accepted-plan effects. Persist
+    exact opaque bytes, reject unmanaged index DDL on managed tables, delete a
+    descriptor with DROP TABLE, and commit descriptor effects atomically with
+    numeric effects. Preserve `CreateTableOutcome` ordering while keeping IDs
+    (until assigned), slots, versions, roots, gates, and transactions private.
+  - Goals: Deliver one complete managed-definition feature whose interpreter
+    owns stable semantics while DoraDB owns the attempt, concurrency, identity,
+    placement, and matching numeric descriptor envelope.
   - Validation: Own tests 4 and 6, descriptor-boundary cases from test 7,
     managed/unmanaged descriptor cases from test 9, and all descriptor payload,
     revision, epoch, and fingerprint cases from test 17. Managed CREATE TABLE
-    additionally proves that returned IDs equal the revalidated proposal and
-    that current-definition reads rediscover the same identities.
+    additionally proves IDs are assigned only after interpretation and returned
+    in definition order.
   - Non-goals: Table bindings, new logical DDL, snapshot-consistent resolution,
     external registry atomicity, codec identity/registration/dispatch,
     payload-self-containment policy, or external-reference rejection.
-  - Phase-local Choices: Proposal type layout, owned payload byte container,
-    retry error shape, and higher-layer crate integration names. Higher-layer
-    format headers and codecs remain outside storage APIs and DDL exclusion.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase-local Choices: Separate operation-specific callback methods and
+    changes, `DescriptorUpdate<C>`, `ManagedDdlError<E>`, caller-selected retry
+    policy, and the fixed inclusive descriptor limit. Higher-layer format
+    headers and codecs remain outside storage APIs and DDL exclusion.
+  - Task Doc: `docs/tasks/000293-opaque-managed-table-definitions-and-proposal-boundary.md`
+  - Task Issue: `#1039`
+  - Phase Status: implemented
+  - Implementation Summary: Added the opaque managed interpreter boundary,
+    descriptor persistence/recovery validation, private stale revalidation,
+    and atomic descriptor effects for the existing DDL lifecycle.
 
 - **Phase 7: Table Bindings**
   - Prerequisites: Phase 3 provides the binding table and reverse index; Phase

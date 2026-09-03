@@ -1,7 +1,10 @@
-use super::{CurrentDefinitionAllocatorView, IndexPlacement, Table, TableRuntimeLayout};
+use super::{
+    CurrentDefinitionAllocatorView, IndexPlacement, Table, TableDefinitionKind, TableRuntimeLayout,
+};
 use crate::catalog::{
-    IndexID, IndexRef, SecondaryIndexRoot, SecondaryIndexSlot, StorageIndexSpec,
-    TableIndexMetadata, TableMetadata,
+    CatalogDefinitionEffects, CurrentTableDefinition, IndexID, IndexRef, SecondaryIndexRoot,
+    SecondaryIndexSlot, StorageIndexSpec, StorageTableDefinition, TableDescriptorObject,
+    TableIndexMetadata, TableMetadata, validate_table_descriptor_against_metadata,
 };
 use crate::error::{
     DataIntegrityError, DataIntegrityResult, OperationError, OperationOrRuntimeResult, RuntimeError,
@@ -25,6 +28,59 @@ pub(crate) struct CreateIndexPlan {
     secondary_index_slots: Vec<SecondaryIndexSlot>,
     placement: IndexPlacement,
     skipped_retired_runtime: bool,
+    definition_effects: CatalogDefinitionEffects,
+}
+
+/// Table-finalized CREATE INDEX state awaiting catalog definition effects.
+struct CreateIndexPartialPlan {
+    table_id: TableID,
+    table: Arc<Table>,
+    old_layout: Arc<TableRuntimeLayout>,
+    active_root: ActiveRoot,
+    index: IndexRef,
+    new_metadata: Arc<TableMetadata>,
+    new_index_spec: TableIndexMetadata,
+    secondary_index_slots: Vec<SecondaryIndexSlot>,
+    placement: IndexPlacement,
+    skipped_retired_runtime: bool,
+}
+
+impl CreateIndexPartialPlan {
+    /// Completes this partial plan with explicit catalog definition effects.
+    #[inline]
+    fn with_effects(self, definition_effects: CatalogDefinitionEffects) -> CreateIndexPlan {
+        let Self {
+            table_id,
+            table,
+            old_layout,
+            active_root,
+            index,
+            new_metadata,
+            new_index_spec,
+            secondary_index_slots,
+            placement,
+            skipped_retired_runtime,
+        } = self;
+        CreateIndexPlan {
+            table_id,
+            table,
+            old_layout,
+            active_root,
+            index,
+            new_metadata,
+            new_index_spec,
+            secondary_index_slots,
+            placement,
+            skipped_retired_runtime,
+            definition_effects,
+        }
+    }
+
+    /// Completes this partial plan without catalog definition effects.
+    #[inline]
+    fn no_effects(self) -> CreateIndexPlan {
+        self.with_effects(CatalogDefinitionEffects::none())
+    }
 }
 
 impl CreateIndexPlan {
@@ -87,6 +143,12 @@ impl CreateIndexPlan {
     pub(crate) const fn skipped_retired_runtime(&self) -> bool {
         self.skipped_retired_runtime
     }
+
+    /// Returns catalog definition effects committed with numeric metadata.
+    #[inline]
+    pub(crate) const fn definition_effects(&self) -> &CatalogDefinitionEffects {
+        &self.definition_effects
+    }
 }
 
 /// Owned, Table-finalized DROP INDEX execution plan.
@@ -97,6 +159,47 @@ pub(crate) struct DropIndexPlan {
     index: IndexRef,
     new_metadata: Arc<TableMetadata>,
     secondary_index_slots: Vec<SecondaryIndexSlot>,
+    definition_effects: CatalogDefinitionEffects,
+}
+
+/// Table-finalized DROP INDEX state awaiting catalog definition effects.
+struct DropIndexPartialPlan {
+    table_id: TableID,
+    table: Arc<Table>,
+    old_layout: Arc<TableRuntimeLayout>,
+    index: IndexRef,
+    new_metadata: Arc<TableMetadata>,
+    secondary_index_slots: Vec<SecondaryIndexSlot>,
+}
+
+impl DropIndexPartialPlan {
+    /// Completes this partial plan with explicit catalog definition effects.
+    #[inline]
+    fn with_effects(self, definition_effects: CatalogDefinitionEffects) -> DropIndexPlan {
+        let Self {
+            table_id,
+            table,
+            old_layout,
+            index,
+            new_metadata,
+            secondary_index_slots,
+        } = self;
+        DropIndexPlan {
+            table_id,
+            table,
+            old_layout,
+            index,
+            new_metadata,
+            secondary_index_slots,
+            definition_effects,
+        }
+    }
+
+    /// Completes this partial plan without catalog definition effects.
+    #[inline]
+    fn no_effects(self) -> DropIndexPlan {
+        self.with_effects(CatalogDefinitionEffects::none())
+    }
 }
 
 impl DropIndexPlan {
@@ -135,6 +238,12 @@ impl DropIndexPlan {
     pub(crate) fn take_secondary_index_slots(&mut self) -> Vec<SecondaryIndexSlot> {
         take(&mut self.secondary_index_slots)
     }
+
+    /// Returns catalog definition effects committed with numeric metadata.
+    #[inline]
+    pub(crate) const fn definition_effects(&self) -> &CatalogDefinitionEffects {
+        &self.definition_effects
+    }
 }
 
 /// Authoritative current Table definition captured under index-DDL exclusion.
@@ -146,15 +255,111 @@ struct CurrentIndexDdlDefinition {
 }
 
 impl Table {
+    /// Requires one DDL API family to match the table's immutable definition owner.
+    #[inline]
+    fn require_definition_kind(
+        &self,
+        expected: TableDefinitionKind,
+        operation: &'static str,
+    ) -> OperationOrRuntimeResult<()> {
+        if self.definition_kind == expected {
+            return Ok(());
+        }
+        Err(Report::new(OperationError::InvalidMetadata)
+            .attach(format!(
+                "{} {operation} is not allowed for {} table_id={}",
+                expected.label(),
+                self.definition_kind.label(),
+                self.table_id()
+            ))
+            .into())
+    }
+
     /// Finalizes one CREATE INDEX from the current Table-owned definition.
     pub(crate) fn finalize_create_index(
         self: &Arc<Self>,
         index_spec: StorageIndexSpec,
     ) -> OperationOrRuntimeResult<CreateIndexPlan> {
+        self.require_definition_kind(TableDefinitionKind::Unmanaged, "CREATE INDEX")?;
         let definition = self
             .current_index_ddl_definition()
             .change_context(RuntimeError::CatalogAccess)
             .attach("operation=create_index, phase=validate_current_definition")?;
+        let partial = self.prepare_create_index_from_definition(definition, index_spec)?;
+        Ok(partial.no_effects())
+    }
+
+    /// Captures the private current managed definition under metadata-S.
+    pub(crate) fn current_managed_definition(
+        self: &Arc<Self>,
+        descriptor: TableDescriptorObject,
+    ) -> OperationOrRuntimeResult<CurrentTableDefinition> {
+        self.require_definition_kind(TableDefinitionKind::Managed, "DDL")?;
+        let definition = self
+            .current_index_ddl_definition()
+            .change_context(RuntimeError::CatalogAccess)
+            .attach("operation=managed_ddl, phase=validate_current_definition")?;
+        validate_table_descriptor_against_metadata(
+            &descriptor,
+            definition.table_id,
+            definition.allocator.metadata(),
+        )
+        .change_context(RuntimeError::CatalogAccess)
+        .attach("operation=managed_ddl, phase=validate_descriptor_stamp")?;
+        Ok(CurrentTableDefinition::new(
+            StorageTableDefinition::from_metadata(definition.allocator.metadata()),
+            descriptor,
+            definition.allocator.metadata().storage_epoch,
+            definition.allocator.effective_next_index_id(),
+        ))
+    }
+
+    /// Revalidates and finalizes a managed CREATE INDEX callback result.
+    pub(crate) fn finalize_managed_create_index(
+        self: &Arc<Self>,
+        expected: &CurrentTableDefinition,
+        current_descriptor: TableDescriptorObject,
+        index_spec: StorageIndexSpec,
+        payload: Box<[u8]>,
+    ) -> OperationOrRuntimeResult<CreateIndexPlan> {
+        self.require_definition_kind(TableDefinitionKind::Managed, "CREATE INDEX")?;
+        let definition = self
+            .current_index_ddl_definition()
+            .change_context(RuntimeError::CatalogAccess)
+            .attach("operation=create_managed_index, phase=validate_current_definition")?;
+        validate_table_descriptor_against_metadata(
+            &current_descriptor,
+            definition.table_id,
+            definition.allocator.metadata(),
+        )
+        .change_context(RuntimeError::CatalogAccess)
+        .attach("operation=create_managed_index, phase=validate_descriptor_stamp")?;
+        if managed_definition_changed(expected, &definition, &current_descriptor, true) {
+            return Err(schema_changed(definition.table_id, "create_managed_index").into());
+        }
+        let revision = current_descriptor
+            .descriptor_revision
+            .checked_add(1)
+            .ok_or_else(|| {
+                Report::new(OperationError::InvalidMetadata)
+                    .attach("managed descriptor revision exhausted")
+            })?;
+        let partial = self.prepare_create_index_from_definition(definition, index_spec)?;
+        let descriptor = TableDescriptorObject {
+            table_id: partial.table_id,
+            descriptor_revision: revision,
+            compiled_storage_epoch: partial.new_metadata.storage_epoch,
+            storage_schema_fingerprint: partial.new_metadata.storage_schema_fingerprint(),
+            payload,
+        };
+        Ok(partial.with_effects(CatalogDefinitionEffects::replace(descriptor)))
+    }
+
+    fn prepare_create_index_from_definition(
+        self: &Arc<Self>,
+        definition: CurrentIndexDdlDefinition,
+        index_spec: StorageIndexSpec,
+    ) -> OperationOrRuntimeResult<CreateIndexPartialPlan> {
         let CurrentIndexDdlDefinition {
             table_id,
             old_layout,
@@ -183,7 +388,7 @@ impl Table {
             index_id: index.id(),
             root: SecondaryIndexRoot::Empty,
         };
-        Ok(CreateIndexPlan {
+        Ok(CreateIndexPartialPlan {
             table_id,
             table: Arc::clone(self),
             old_layout,
@@ -202,10 +407,61 @@ impl Table {
         self: &Arc<Self>,
         index_id: IndexID,
     ) -> OperationOrRuntimeResult<DropIndexPlan> {
+        self.require_definition_kind(TableDefinitionKind::Unmanaged, "DROP INDEX")?;
         let definition = self
             .current_index_ddl_definition()
             .change_context(RuntimeError::CatalogAccess)
             .attach("operation=drop_index, phase=validate_current_definition")?;
+        let partial = self.prepare_drop_index_from_definition(definition, index_id)?;
+        Ok(partial.no_effects())
+    }
+
+    /// Revalidates and finalizes a managed DROP INDEX callback result.
+    pub(crate) fn finalize_managed_drop_index(
+        self: &Arc<Self>,
+        expected: &CurrentTableDefinition,
+        current_descriptor: TableDescriptorObject,
+        index_id: IndexID,
+        payload: Box<[u8]>,
+    ) -> OperationOrRuntimeResult<DropIndexPlan> {
+        self.require_definition_kind(TableDefinitionKind::Managed, "DROP INDEX")?;
+        let definition = self
+            .current_index_ddl_definition()
+            .change_context(RuntimeError::CatalogAccess)
+            .attach("operation=drop_managed_index, phase=validate_current_definition")?;
+        validate_table_descriptor_against_metadata(
+            &current_descriptor,
+            definition.table_id,
+            definition.allocator.metadata(),
+        )
+        .change_context(RuntimeError::CatalogAccess)
+        .attach("operation=drop_managed_index, phase=validate_descriptor_stamp")?;
+        if managed_definition_changed(expected, &definition, &current_descriptor, false) {
+            return Err(schema_changed(definition.table_id, "drop_managed_index").into());
+        }
+        let revision = current_descriptor
+            .descriptor_revision
+            .checked_add(1)
+            .ok_or_else(|| {
+                Report::new(OperationError::InvalidMetadata)
+                    .attach("managed descriptor revision exhausted")
+            })?;
+        let partial = self.prepare_drop_index_from_definition(definition, index_id)?;
+        let descriptor = TableDescriptorObject {
+            table_id: partial.table_id,
+            descriptor_revision: revision,
+            compiled_storage_epoch: partial.new_metadata.storage_epoch,
+            storage_schema_fingerprint: partial.new_metadata.storage_schema_fingerprint(),
+            payload,
+        };
+        Ok(partial.with_effects(CatalogDefinitionEffects::replace(descriptor)))
+    }
+
+    fn prepare_drop_index_from_definition(
+        self: &Arc<Self>,
+        definition: CurrentIndexDdlDefinition,
+        index_id: IndexID,
+    ) -> OperationOrRuntimeResult<DropIndexPartialPlan> {
         let CurrentIndexDdlDefinition {
             table_id,
             old_layout,
@@ -226,7 +482,7 @@ impl Table {
         let new_metadata = Arc::new(old_metadata.without_index(index)?);
         let mut secondary_index_slots = active_root.secondary_index_slots.clone();
         secondary_index_slots[index.slot().as_usize()] = SecondaryIndexSlot::Retired(index.id());
-        Ok(DropIndexPlan {
+        Ok(DropIndexPartialPlan {
             table_id,
             table: Arc::clone(self),
             old_layout,
@@ -252,6 +508,29 @@ impl Table {
             allocator,
         })
     }
+}
+
+#[inline]
+fn managed_definition_changed(
+    expected: &CurrentTableDefinition,
+    current: &CurrentIndexDdlDefinition,
+    current_descriptor: &TableDescriptorObject,
+    compare_allocator: bool,
+) -> bool {
+    expected.storage_epoch() != current.allocator.metadata().storage_epoch
+        || expected.descriptor().descriptor_revision != current_descriptor.descriptor_revision
+        || expected.descriptor().compiled_storage_epoch != current_descriptor.compiled_storage_epoch
+        || expected.descriptor().storage_schema_fingerprint
+            != current_descriptor.storage_schema_fingerprint
+        || (compare_allocator
+            && expected.effective_next_index_id() != current.allocator.effective_next_index_id())
+}
+
+#[inline]
+fn schema_changed(table_id: TableID, operation: &'static str) -> Report<OperationError> {
+    Report::new(OperationError::SchemaChanged).attach(format!(
+        "managed DDL definition changed after interpretation: operation={operation}, table_id={table_id}"
+    ))
 }
 
 /// Validates that one active root represents the captured runtime metadata.

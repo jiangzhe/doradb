@@ -1,10 +1,8 @@
 use super::CatalogStorage;
-use super::auxiliary::{
-    PK_NO_TABLE_DESCRIPTORS, TABLE_ID_NO_TABLE_BINDINGS, TABLE_ID_TABLE_BINDINGS,
-    TABLE_ID_TABLE_DESCRIPTORS,
-};
+use super::auxiliary::{TABLE_ID_NO_TABLE_BINDINGS, TABLE_ID_TABLE_BINDINGS};
 use super::columns::TABLE_ID_COLUMNS;
 use super::indexes::TABLE_ID_INDEXES;
+use super::table_descriptors::{PK_NO_TABLE_DESCRIPTORS, TABLE_ID_TABLE_DESCRIPTORS};
 use super::table_replay_silent_watermarks::TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS;
 use super::tables::TABLE_ID_TABLES;
 use crate::buffer::{PoolGuard, PoolGuards};

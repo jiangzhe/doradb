@@ -41,10 +41,13 @@ mod value;
 pub(crate) use component::{DiskPool, IndexPool, MemPool, MetaPool};
 
 pub use catalog::{
-    CatalogCheckpointOutcome, ColumnID, ColumnOrdinal, CreateTableOutcome, ID_DOMAIN_END, IndexID,
-    IndexOrder, ResolvedTableIndex, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags,
-    StorageIndexKey, StorageIndexSpec, StorageTableSpec, TableIndex, TableIndexArgument,
-    TableIndexSelector,
+    CatalogCheckpointOutcome, ColumnID, ColumnOrdinal, CreateIndexDefinition,
+    CreateTableDefinition, CreateTableOutcome, DescriptorUpdate, DropIndexDefinition,
+    ID_DOMAIN_END, IndexID, IndexOrder, MAX_TABLE_DESCRIPTOR_BYTES, ManagedDdlError,
+    ManagedDdlResult, ResolvedTableIndex, StorageColumnDefinition, StorageColumnFlags,
+    StorageColumnSpec, StorageIndexDefinition, StorageIndexFlags, StorageIndexKey,
+    StorageIndexKeyByColumnId, StorageIndexSpec, StorageTableDefinition, StorageTableSpec,
+    TableDescriptorInterpreter, TableIndex, TableIndexArgument, TableIndexSelector,
 };
 pub use conf::{
     DEFAULT_COW_FILE_MAX_SIZE, DEFAULT_TABLE_SCAN_LWC_BLOCKS_PER_PARTITION,
@@ -60,7 +63,8 @@ pub use row::ops::{
     UpdateCol, UpdateMvcc, UpsertMvcc,
 };
 pub use session::{
-    CatalogRedoMaintenanceOutcome, RedoTruncationBlockerInfo, RedoTruncationOutcome, Session,
+    CatalogRedoMaintenanceOutcome, ManagedTableOps, RedoTruncationBlockerInfo,
+    RedoTruncationOutcome, Session,
 };
 pub use stats::{
     BufferPoolCounters, BufferPoolRuntimeStats, BufferPoolStats, IoBackendStats, LogicalLockStats,

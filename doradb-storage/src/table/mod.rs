@@ -93,6 +93,26 @@ pub(crate) enum TableKind {
     Catalog,
 }
 
+/// API family that owns one user table's logical definition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TableDefinitionKind {
+    /// Numeric storage DDL owns the table definition.
+    Unmanaged,
+    /// Opaque descriptor DDL owns the table definition.
+    Managed,
+}
+
+impl TableDefinitionKind {
+    /// Returns the definition family label used in operation diagnostics.
+    #[inline]
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Unmanaged => "unmanaged",
+            Self::Managed => "managed",
+        }
+    }
+}
+
 impl TableID {
     /// First table identifier reserved for built-in catalog tables.
     pub(crate) const CATALOG_START: Self = Self::new(1u64 << 63);
@@ -158,6 +178,7 @@ pub(crate) struct Table {
     pub(crate) mem: MemTable<EvictableBufferPool, EvictableBufferPool>,
     /// Persisted column-store runtime and table file binding.
     pub(crate) storage: ColumnStorage,
+    definition_kind: TableDefinitionKind,
     layout: Mutex<Arc<TableRuntimeLayout>>,
     index_lifecycle: Mutex<TableIndexLifecycleState>,
     /// Runtime lifecycle gates for foreground, checkpoint, and drop operations.
@@ -187,11 +208,16 @@ impl Table {
 
     /// Create a new table.
     #[inline]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "construction binds distinct pool, identity, definition, index, and storage capabilities"
+    )]
     pub(crate) async fn new(
         mem_pool: QuiescentGuard<EvictableBufferPool>,
         index_pool: QuiescentGuard<EvictableBufferPool>,
         index_pool_guard: &PoolGuard,
         table_id: TableID,
+        definition_kind: TableDefinitionKind,
         blk_idx: BlockIndex,
         file: Arc<TableFile>,
         disk_pool: QuiescentGuard<ReadonlyBufferPool>,
@@ -243,6 +269,7 @@ impl Table {
         Ok(Table {
             mem,
             storage,
+            definition_kind,
             layout: Mutex::new(Arc::new(layout)),
             index_lifecycle: Mutex::new(index_lifecycle),
             lifecycle: TableLifecycle::new(),
@@ -312,6 +339,7 @@ impl Table {
         let Table {
             mem,
             storage: _storage,
+            definition_kind: _definition_kind,
             layout,
             index_lifecycle,
             lifecycle: _lifecycle,
