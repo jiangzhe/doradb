@@ -31,58 +31,6 @@ pub(crate) struct CreateIndexPlan {
     definition_effects: CatalogDefinitionEffects,
 }
 
-/// Table-finalized CREATE INDEX state awaiting catalog definition effects.
-struct CreateIndexPartialPlan {
-    table_id: TableID,
-    table: Arc<Table>,
-    old_layout: Arc<TableRuntimeLayout>,
-    active_root: ActiveRoot,
-    index: IndexRef,
-    new_metadata: Arc<TableMetadata>,
-    new_index_spec: TableIndexMetadata,
-    secondary_index_slots: Vec<SecondaryIndexSlot>,
-    placement: IndexPlacement,
-    skipped_retired_runtime: bool,
-}
-
-impl CreateIndexPartialPlan {
-    /// Completes this partial plan with explicit catalog definition effects.
-    #[inline]
-    fn with_effects(self, definition_effects: CatalogDefinitionEffects) -> CreateIndexPlan {
-        let Self {
-            table_id,
-            table,
-            old_layout,
-            active_root,
-            index,
-            new_metadata,
-            new_index_spec,
-            secondary_index_slots,
-            placement,
-            skipped_retired_runtime,
-        } = self;
-        CreateIndexPlan {
-            table_id,
-            table,
-            old_layout,
-            active_root,
-            index,
-            new_metadata,
-            new_index_spec,
-            secondary_index_slots,
-            placement,
-            skipped_retired_runtime,
-            definition_effects,
-        }
-    }
-
-    /// Completes this partial plan without catalog definition effects.
-    #[inline]
-    fn no_effects(self) -> CreateIndexPlan {
-        self.with_effects(CatalogDefinitionEffects::none())
-    }
-}
-
 impl CreateIndexPlan {
     /// Returns the target Table identity.
     #[inline]
@@ -151,6 +99,58 @@ impl CreateIndexPlan {
     }
 }
 
+/// Table-finalized CREATE INDEX state awaiting catalog definition effects.
+struct CreateIndexPartialPlan {
+    table_id: TableID,
+    table: Arc<Table>,
+    old_layout: Arc<TableRuntimeLayout>,
+    active_root: ActiveRoot,
+    index: IndexRef,
+    new_metadata: Arc<TableMetadata>,
+    new_index_spec: TableIndexMetadata,
+    secondary_index_slots: Vec<SecondaryIndexSlot>,
+    placement: IndexPlacement,
+    skipped_retired_runtime: bool,
+}
+
+impl CreateIndexPartialPlan {
+    /// Completes this partial plan with explicit catalog definition effects.
+    #[inline]
+    fn with_effects(self, definition_effects: CatalogDefinitionEffects) -> CreateIndexPlan {
+        let Self {
+            table_id,
+            table,
+            old_layout,
+            active_root,
+            index,
+            new_metadata,
+            new_index_spec,
+            secondary_index_slots,
+            placement,
+            skipped_retired_runtime,
+        } = self;
+        CreateIndexPlan {
+            table_id,
+            table,
+            old_layout,
+            active_root,
+            index,
+            new_metadata,
+            new_index_spec,
+            secondary_index_slots,
+            placement,
+            skipped_retired_runtime,
+            definition_effects,
+        }
+    }
+
+    /// Completes this partial plan without catalog definition effects.
+    #[inline]
+    fn no_effects(self) -> CreateIndexPlan {
+        self.with_effects(CatalogDefinitionEffects::none())
+    }
+}
+
 /// Owned, Table-finalized DROP INDEX execution plan.
 pub(crate) struct DropIndexPlan {
     table_id: TableID,
@@ -160,46 +160,6 @@ pub(crate) struct DropIndexPlan {
     new_metadata: Arc<TableMetadata>,
     secondary_index_slots: Vec<SecondaryIndexSlot>,
     definition_effects: CatalogDefinitionEffects,
-}
-
-/// Table-finalized DROP INDEX state awaiting catalog definition effects.
-struct DropIndexPartialPlan {
-    table_id: TableID,
-    table: Arc<Table>,
-    old_layout: Arc<TableRuntimeLayout>,
-    index: IndexRef,
-    new_metadata: Arc<TableMetadata>,
-    secondary_index_slots: Vec<SecondaryIndexSlot>,
-}
-
-impl DropIndexPartialPlan {
-    /// Completes this partial plan with explicit catalog definition effects.
-    #[inline]
-    fn with_effects(self, definition_effects: CatalogDefinitionEffects) -> DropIndexPlan {
-        let Self {
-            table_id,
-            table,
-            old_layout,
-            index,
-            new_metadata,
-            secondary_index_slots,
-        } = self;
-        DropIndexPlan {
-            table_id,
-            table,
-            old_layout,
-            index,
-            new_metadata,
-            secondary_index_slots,
-            definition_effects,
-        }
-    }
-
-    /// Completes this partial plan without catalog definition effects.
-    #[inline]
-    fn no_effects(self) -> DropIndexPlan {
-        self.with_effects(CatalogDefinitionEffects::none())
-    }
 }
 
 impl DropIndexPlan {
@@ -243,6 +203,46 @@ impl DropIndexPlan {
     #[inline]
     pub(crate) const fn definition_effects(&self) -> &CatalogDefinitionEffects {
         &self.definition_effects
+    }
+}
+
+/// Table-finalized DROP INDEX state awaiting catalog definition effects.
+struct DropIndexPartialPlan {
+    table_id: TableID,
+    table: Arc<Table>,
+    old_layout: Arc<TableRuntimeLayout>,
+    index: IndexRef,
+    new_metadata: Arc<TableMetadata>,
+    secondary_index_slots: Vec<SecondaryIndexSlot>,
+}
+
+impl DropIndexPartialPlan {
+    /// Completes this partial plan with explicit catalog definition effects.
+    #[inline]
+    fn with_effects(self, definition_effects: CatalogDefinitionEffects) -> DropIndexPlan {
+        let Self {
+            table_id,
+            table,
+            old_layout,
+            index,
+            new_metadata,
+            secondary_index_slots,
+        } = self;
+        DropIndexPlan {
+            table_id,
+            table,
+            old_layout,
+            index,
+            new_metadata,
+            secondary_index_slots,
+            definition_effects,
+        }
+    }
+
+    /// Completes this partial plan without catalog definition effects.
+    #[inline]
+    fn no_effects(self) -> DropIndexPlan {
+        self.with_effects(CatalogDefinitionEffects::none())
     }
 }
 

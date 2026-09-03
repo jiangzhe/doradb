@@ -2140,10 +2140,11 @@ marker can alias a second CREATE after restart. [U20]
     headers and codecs remain outside storage APIs and DDL exclusion.
   - Task Doc: `docs/tasks/000293-opaque-managed-table-definitions-and-proposal-boundary.md`
   - Task Issue: `#1039`
-  - Phase Status: implemented
-  - Implementation Summary: Added the opaque managed interpreter boundary,
-    descriptor persistence/recovery validation, private stale revalidation,
-    and atomic descriptor effects for the existing DDL lifecycle.
+  - Phase Status: done
+  - Implementation Summary: Implemented opaque managed definition interpretation,
+    stable-ID projections, private stale revalidation, descriptor persistence and
+    recovery validation, and atomic descriptor effects for the existing DDL lifecycle.
+    [Task Resolve Sync: docs/tasks/000293-opaque-managed-table-definitions-and-proposal-boundary.md @ 2026-09-04]
 
 - **Phase 7: Table Bindings**
   - Prerequisites: Phase 3 provides the binding table and reverse index; Phase

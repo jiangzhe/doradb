@@ -2,7 +2,7 @@ use super::spec::{
     CreateIndexDefinition, CreateTableDefinition, DropIndexDefinition, StorageTableDefinition,
 };
 use super::storage::TableDescriptorObject;
-use crate::error::{Error, OperationError};
+use crate::error::{Error, OperationError, OperationResult};
 use crate::id::TableID;
 use error_stack::Report;
 use std::error::Error as StdError;
@@ -252,6 +252,7 @@ impl CatalogDefinitionEffects {
     }
 }
 
+/// Descriptor-row mutation committed with one numeric catalog DDL operation.
 #[derive(Clone)]
 pub(crate) enum TableDescriptorEffect {
     /// No descriptor change for unmanaged DDL.
@@ -266,7 +267,7 @@ pub(crate) enum TableDescriptorEffect {
 
 /// Validates the live managed DDL descriptor payload envelope.
 #[inline]
-pub(crate) fn validate_descriptor_payload(payload: &[u8]) -> crate::error::OperationResult<()> {
+pub(crate) fn validate_descriptor_payload(payload: &[u8]) -> OperationResult<()> {
     if payload.len() > MAX_TABLE_DESCRIPTOR_BYTES || payload.len() > usize::from(u16::MAX) {
         return Err(Report::new(OperationError::InvalidMetadata).attach(format!(
             "managed table descriptor exceeds maximum: actual={}, maximum={MAX_TABLE_DESCRIPTOR_BYTES}",

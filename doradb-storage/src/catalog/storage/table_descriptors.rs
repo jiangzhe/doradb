@@ -157,6 +157,24 @@ impl TableDescriptors<'_> {
     }
 }
 
+/// Validates one descriptor stamp against the separately reconstructed schema.
+pub(crate) fn validate_table_descriptor_against_metadata(
+    descriptor: &TableDescriptorObject,
+    table_id: TableID,
+    metadata: &TableMetadata,
+) -> DataIntegrityResult<()> {
+    if descriptor.table_id != table_id
+        || descriptor.compiled_storage_epoch != metadata.storage_epoch
+        || descriptor.storage_schema_fingerprint != metadata.storage_schema_fingerprint()
+    {
+        return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+            "managed descriptor stamp mismatch: table_id={table_id}, descriptor_table_id={}, descriptor_epoch={}, storage_epoch={}",
+            descriptor.table_id, descriptor.compiled_storage_epoch, metadata.storage_epoch
+        )));
+    }
+    Ok(())
+}
+
 /// Returns the durable definition of `catalog.table_descriptors`.
 pub(super) fn catalog_definition_of_table_descriptors() -> &'static CatalogDefinition {
     static DEF: OnceLock<CatalogDefinition> = OnceLock::new();
@@ -183,17 +201,6 @@ pub(super) fn catalog_definition_of_table_descriptors() -> &'static CatalogDefin
         )
         .expect("valid catalog.table_descriptors metadata"),
     })
-}
-
-#[inline]
-fn cols_from_table_descriptor(descriptor: &TableDescriptorObject) -> Vec<Val> {
-    vec![
-        Val::from(descriptor.table_id),
-        Val::from(descriptor.descriptor_revision),
-        Val::from(descriptor.compiled_storage_epoch),
-        Val::from(&descriptor.storage_schema_fingerprint),
-        Val::from(descriptor.payload.as_ref()),
-    ]
 }
 
 pub(super) fn table_descriptor_object_from_vals(
@@ -252,22 +259,15 @@ pub(super) fn table_descriptor_object_from_vals(
     })
 }
 
-/// Validates one descriptor stamp against the separately reconstructed schema.
-pub(crate) fn validate_table_descriptor_against_metadata(
-    descriptor: &TableDescriptorObject,
-    table_id: TableID,
-    metadata: &TableMetadata,
-) -> DataIntegrityResult<()> {
-    if descriptor.table_id != table_id
-        || descriptor.compiled_storage_epoch != metadata.storage_epoch
-        || descriptor.storage_schema_fingerprint != metadata.storage_schema_fingerprint()
-    {
-        return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-            "managed descriptor stamp mismatch: table_id={table_id}, descriptor_table_id={}, descriptor_epoch={}, storage_epoch={}",
-            descriptor.table_id, descriptor.compiled_storage_epoch, metadata.storage_epoch
-        )));
-    }
-    Ok(())
+#[inline]
+fn cols_from_table_descriptor(descriptor: &TableDescriptorObject) -> Vec<Val> {
+    vec![
+        Val::from(descriptor.table_id),
+        Val::from(descriptor.descriptor_revision),
+        Val::from(descriptor.compiled_storage_epoch),
+        Val::from(&descriptor.storage_schema_fingerprint),
+        Val::from(descriptor.payload.as_ref()),
+    ]
 }
 
 #[cfg(test)]
