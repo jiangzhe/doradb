@@ -1,3 +1,7 @@
+mod managed_table_ops;
+
+pub use managed_table_ops::ManagedTableOps;
+
 use crate::buffer::page::VersionedPageID;
 use crate::buffer::{BufferPool, PoolGuards};
 use crate::catalog::{

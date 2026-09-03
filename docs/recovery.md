@@ -156,6 +156,15 @@ Catalog row redo is logical and keyed by catalog primary keys because catalog
 checkpoint rewrites dense row ids. User-table row redo retains row and page
 identity for hot RowStore reconstruction.
 
+After catalog replay, recovery validates every `catalog.table_descriptors` row
+against its central `catalog.tables` parent and reconstructed numeric schema.
+The opaque payload is never decoded, but its length must be at most 64,000
+bytes, its fingerprint must be exactly 32 bytes, and its compiled epoch and
+fingerprint must match the current numeric definition. This validation occurs
+before final table-root reconciliation, so a catalog definition that is
+legitimately newer than a checkpointed table root remains eligible for the
+existing replay reconciliation path.
+
 ### Create Table
 
 `CREATE TABLE` publishes its initial table-file root before the catalog

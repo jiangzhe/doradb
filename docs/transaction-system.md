@@ -667,7 +667,10 @@ root-mutation authority.
 
 `CREATE TABLE` validates metadata before reservation, allocates a distinct
 gap-tolerant id, and caller-prepares target metadata X plus metadata-S/data-IX
-authority for the four catalog tables it writes. Mandatory acceptance then
+authority for the four catalog tables it may write. Managed CREATE first calls
+the synchronous interpreter with only source bytes, before operation pinning or
+ID allocation, then carries the exact returned descriptor into that same
+accepted plan. Mandatory acceptance then
 owns those locks while it creates the deterministic table file, runs its nested
 catalog transaction without further manager acquisition, builds the per-id
 runtime, commits, and publishes the current history/runtime entry. The initial
@@ -675,7 +678,7 @@ table-file root uses the create transaction STS as `root_ts`.
 
 `DROP TABLE` rejects non-user ids and same-session explicit target locks before
 waiting, then caller-prepares target metadata/data X plus metadata-S/data-IX
-authority for all five cascade catalog tables. Under target exclusion it
+authority for all six cascade catalog tables. Under target exclusion it
 selects the exact current-live `Arc<Table>` without an extra catalog-row scan.
 Mandatory execution begins the nested transaction, closes and drains the
 terminal lifecycle, performs the catalog cascade, commits, and publishes
@@ -696,6 +699,17 @@ bypass exists. Catalog commit remains followed by table-root publication. The
 final runtime-layout and catalog history transition holds the user-table
 catalog entry before the table layout mutex, exposing only the old/old or
 new/new metadata pointer pair to history purge.
+
+Managed index DDL adds a bounded optimistic phase before that preparation. A
+short operation acquires target `TableMetadata(S)` plus descriptor-catalog read
+admission, copies one coherent stable-ID schema/descriptor pair (and the
+effective allocator for CREATE), and releases the entire operation before
+calling user interpreter code. The callback result is structurally validated
+without locks. A fresh DDL operation then takes metadata-X and the normal gates,
+reloads the private version fields, and either returns zero-effect
+`SchemaChanged` or transfers an immutable numeric-plus-descriptor effect bundle
+to mandatory execution. Descriptor and numeric rows use one private
+transaction and one commit.
 
 CREATE INDEX and DROP INDEX also take same-table `TableMetadata(X)`. That grant
 waits for every transaction that successfully bound the table, but an older

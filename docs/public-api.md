@@ -200,6 +200,42 @@ The sealed `TableIndexArgument::into_selector` conversion normalizes a
 `TableIndex` or `ResolvedTableIndex` into an opaque `TableIndexSelector`; its
 public accessors expose only the stable table and index identities.
 
+### Managed opaque definitions
+
+Higher layers that own names or logical schema formats can implement
+`TableDescriptorInterpreter`, import the `ManagedTableOps` extension trait, and
+call `create_managed_table`, `create_managed_index`, or `drop_managed_index`.
+The engine passes arbitrary source bytes unchanged and never interprets the
+descriptor format. Each callback returns `DescriptorUpdate<C>`: one
+operation-specific, slot-free physical change paired with the complete opaque
+replacement payload.
+
+```rust
+use doradb_storage::ManagedTableOps;
+```
+
+CREATE TABLE interpretation runs before any table ID is allocated and returns
+an ID-free ordered `CreateTableDefinition`. DoraDB assigns table, column, and
+initial-index identities afterward. Existing-table callbacks receive the
+previous descriptor and a separate `StorageTableDefinition` whose columns are
+in physical order and indexes are in stable-ID order. CREATE INDEX also
+receives the engine-proposed next `IndexID`; physical `IndexSlot` values and all
+version/lock/transaction state remain private.
+
+Callbacks are synchronous and run after the engine has released its short
+metadata-S preflight. DoraDB reacquires DDL exclusion and privately revalidates
+the definition before effects. A concurrent schema change returns
+`ManagedDdlError::Engine` containing `OperationError::SchemaChanged`; the
+interpreter is called exactly once per API call, and the caller chooses whether
+to retry the whole operation. Interpreter failures remain in
+`ManagedDdlError::Interpreter` without being flattened into storage errors.
+
+Descriptor payloads may be empty or arbitrary binary bytes and are persisted
+byte-for-byte. The inclusive maximum is
+`MAX_TABLE_DESCRIPTOR_BYTES` (64,000 bytes). Unmanaged numeric index DDL is
+rejected for a managed table, while DROP TABLE automatically deletes any
+descriptor.
+
 ## Values and identifiers
 
 `ValKind` describes schema types, while `Val` carries row and key values:
@@ -245,13 +281,17 @@ Create sessions with `Engine::new_session`. `Session::id` returns its
 engine-local identifier, and `Session::list_table_ids` returns sorted IDs for
 currently loaded user-table runtimes.
 
-The effectful DDL methods require an idle mutable session:
+The effectful DDL methods require an idle mutable session. Managed methods are
+provided by `ManagedTableOps` and require that trait in scope:
 
 | Method | Effect |
 | --- | --- |
-| `create_table` | Validate metadata, create the table, and return its `TableID`. |
+| `create_table` | Validate numeric metadata and return a `CreateTableOutcome`. |
+| `create_managed_table` | Interpret opaque bytes, atomically create numeric metadata plus a descriptor, and return a `CreateTableOutcome`. |
 | `create_index` | Build and publish a secondary index, returning its stable `IndexID`. |
+| `create_managed_index` | Interpret one managed index addition and atomically replace its descriptor. |
 | `drop_index` | Logically remove an active secondary index. |
+| `drop_managed_index` | Interpret one managed index removal and atomically replace its descriptor. |
 | `drop_table` | Logically remove a user table and schedule safe physical reclamation. |
 
 DDL is executed as accepted mandatory work. Before acceptance, cancellation

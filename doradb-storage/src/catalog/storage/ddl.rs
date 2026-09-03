@@ -1,5 +1,5 @@
 use super::{CatalogStorage, ColumnObject, IndexObject, TableObject};
-use crate::catalog::{IndexRef, TableMetadata};
+use crate::catalog::{CatalogDefinitionEffects, IndexRef, TableDescriptorEffect, TableMetadata};
 use crate::error::{
     DataIntegrityError, MultiDomainResultExt, RuntimeError, RuntimeOrFatalError,
     RuntimeOrFatalResult,
@@ -16,6 +16,7 @@ impl CatalogStorage {
         trx: &mut PrivateTransaction,
         table_id: TableID,
         metadata: &TableMetadata,
+        definition_effects: &CatalogDefinitionEffects,
     ) -> RuntimeOrFatalResult<()> {
         validate_catalog_engine_health(trx, "stage_create_table")?;
 
@@ -48,6 +49,8 @@ impl CatalogStorage {
         if !indexes.is_empty() {
             self.indexes().insert_batch(trx, &indexes).await?;
         }
+        self.stage_definition_effects(trx, definition_effects)
+            .await?;
         trx.install_ddl_redo(DDLRedo::CreateTable(table_id));
         Ok(())
     }
@@ -58,6 +61,7 @@ impl CatalogStorage {
         trx: &mut PrivateTransaction,
         table_id: TableID,
         metadata: &TableMetadata,
+        definition_effects: &CatalogDefinitionEffects,
     ) -> RuntimeOrFatalResult<()> {
         validate_catalog_engine_health(trx, "stage_drop_table")?;
 
@@ -78,6 +82,8 @@ impl CatalogStorage {
         self.table_replay_silent_watermarks()
             .delete_by_table_id(trx, table_id)
             .await?;
+        self.stage_definition_effects(trx, definition_effects)
+            .await?;
         let table_deleted = self.tables().delete_by_id(trx, table_id).await?;
         if !table_deleted {
             return invalid_drop_catalog_state(format!(
@@ -96,6 +102,7 @@ impl CatalogStorage {
         table_id: TableID,
         index: IndexRef,
         new_metadata: &TableMetadata,
+        definition_effects: &CatalogDefinitionEffects,
     ) -> RuntimeOrFatalResult<()> {
         validate_catalog_engine_health(trx, "stage_create_index")?;
 
@@ -127,6 +134,8 @@ impl CatalogStorage {
                 },
             )
             .await?;
+        self.stage_definition_effects(trx, definition_effects)
+            .await?;
         trx.install_ddl_redo(DDLRedo::CreateIndex {
             table_id,
             index_id: index.id(),
@@ -142,6 +151,7 @@ impl CatalogStorage {
         table_id: TableID,
         index: IndexRef,
         new_metadata: &TableMetadata,
+        definition_effects: &CatalogDefinitionEffects,
     ) -> RuntimeOrFatalResult<()> {
         validate_catalog_engine_health(trx, "stage_drop_index")?;
 
@@ -161,11 +171,41 @@ impl CatalogStorage {
             table_replaced,
             "drop-index catalog table row is missing: table_id={table_id}"
         );
+        self.stage_definition_effects(trx, definition_effects)
+            .await?;
         trx.install_ddl_redo(DDLRedo::DropIndex {
             table_id,
             index_id: index.id(),
             index_slot: index.slot(),
         });
+        Ok(())
+    }
+
+    async fn stage_definition_effects(
+        &self,
+        trx: &mut PrivateTransaction,
+        effects: &CatalogDefinitionEffects,
+    ) -> RuntimeOrFatalResult<()> {
+        match effects.descriptor() {
+            TableDescriptorEffect::None => {}
+            TableDescriptorEffect::Insert(descriptor) => {
+                self.table_descriptors().insert(trx, descriptor).await?;
+            }
+            TableDescriptorEffect::Replace(descriptor) => {
+                let replaced = self.table_descriptors().replace(trx, descriptor).await?;
+                if !replaced {
+                    return invalid_drop_catalog_state(format!(
+                        "managed descriptor replacement target is missing: table_id={}",
+                        descriptor.table_id
+                    ));
+                }
+            }
+            TableDescriptorEffect::DeleteIfPresent(table_id) => {
+                self.table_descriptors()
+                    .delete_by_table_id(trx, *table_id)
+                    .await?;
+            }
+        }
         Ok(())
     }
 }

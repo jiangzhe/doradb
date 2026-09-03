@@ -99,6 +99,14 @@ displaced catalog meta block. Unlike user-table block reclamation, catalog
 reclamation does not retain the displaced active catalog root because
 foreground catalog access is served from in-memory catalog tables.
 
+Managed user tables add one optional row in `catalog.table_descriptors`. Its
+payload is opaque to storage and limited to 64,000 bytes; the envelope records
+a private revision plus the numeric schema epoch and canonical fingerprint.
+Managed CREATE/DROP INDEX commits the numeric catalog mutation and complete
+replacement descriptor in one private transaction, and DROP TABLE deletes the
+descriptor through the same cascade. Recovery validates envelope/schema
+agreement without interpreting payload bytes.
+
 ### Redo Log File
 
 **Redo Log File** contains all committed data of recent transactions.

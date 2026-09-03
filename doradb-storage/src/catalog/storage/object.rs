@@ -47,6 +47,21 @@ pub(crate) struct IndexObject {
     pub(crate) keys: Box<[TableIndexKeySpec]>,
 }
 
+/// One opaque managed-definition envelope in `catalog.table_descriptors`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TableDescriptorObject {
+    /// User table described by this envelope.
+    pub(crate) table_id: TableID,
+    /// Monotonic replacement revision owned by the storage engine.
+    pub(crate) descriptor_revision: u64,
+    /// Storage epoch against which the opaque payload was compiled.
+    pub(crate) compiled_storage_epoch: u64,
+    /// Canonical fingerprint of the separately persisted numeric schema.
+    pub(crate) storage_schema_fingerprint: [u8; 32],
+    /// Exact opaque higher-layer descriptor bytes.
+    pub(crate) payload: Box<[u8]>,
+}
+
 /// One row object in `catalog.table_replay_silent_watermarks`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SilentWatermarkObject {

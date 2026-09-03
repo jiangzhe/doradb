@@ -5,6 +5,7 @@ mod indexes;
 mod integrity;
 mod merge;
 mod object;
+mod table_descriptors;
 mod table_replay_silent_watermarks;
 pub(crate) mod tables;
 
@@ -14,11 +15,17 @@ use crate::catalog::storage::columns::*;
 use crate::catalog::storage::indexes::*;
 use crate::catalog::storage::merge::{CatalogFoldedRows, CatalogMergeKeyBuilder};
 pub(crate) use crate::catalog::storage::object::*;
+pub(crate) use crate::catalog::storage::table_descriptors::{
+    TABLE_ID_TABLE_DESCRIPTORS, TableDescriptors, validate_table_descriptor_against_metadata,
+};
+use crate::catalog::storage::table_descriptors::{
+    catalog_definition_of_table_descriptors, table_descriptor_object_from_vals,
+};
 use crate::catalog::storage::table_replay_silent_watermarks::*;
 use crate::catalog::storage::tables::*;
 use crate::catalog::{
     CatalogCheckpointBatch, CatalogCheckpointOutcome, CatalogRedoEntry, CatalogTable,
-    TableMetadata, catalog_table_id_from_slot, catalog_table_slot,
+    TableMetadata, catalog_table_id_from_slot, catalog_table_slot, reconstruct_user_table_metadata,
 };
 use crate::error::{
     DataIntegrityError, DataIntegrityResult, MultiDomainResultExt, RuntimeError,
@@ -147,6 +154,14 @@ impl CatalogStorage {
     pub(crate) fn indexes(&self) -> Indexes<'_> {
         Indexes {
             table: &self.tables[must_catalog_table_slot(TABLE_ID_INDEXES)],
+        }
+    }
+
+    /// Accessor of `catalog.table_descriptors`.
+    #[inline]
+    pub(crate) fn table_descriptors(&self) -> TableDescriptors<'_> {
+        TableDescriptors {
+            table: &self.tables[must_catalog_table_slot(TABLE_ID_TABLE_DESCRIPTORS)],
         }
     }
 
@@ -379,6 +394,9 @@ impl CatalogStorage {
         }
 
         self.validate_projected_catalog_parent_integrity(&new_roots, disk_guard)
+            .await
+            .map_err(RuntimeOrFatalError::from)?;
+        self.validate_projected_table_descriptors(&new_roots, disk_guard)
             .await
             .map_err(RuntimeOrFatalError::from)?;
 
@@ -835,6 +853,102 @@ impl CatalogStorage {
             }
         }
         Ok(rows)
+    }
+
+    /// Validates descriptor stamps against one not-yet-published catalog root set.
+    async fn validate_projected_table_descriptors(
+        &self,
+        roots: &[CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
+        disk_guard: &PoolGuard,
+    ) -> RuntimeResult<()> {
+        let descriptor_rows = self
+            .load_rows_from_root(
+                self.tables[must_catalog_table_slot(TABLE_ID_TABLE_DESCRIPTORS)].metadata(),
+                disk_guard,
+                roots[must_catalog_table_slot(TABLE_ID_TABLE_DESCRIPTORS)],
+            )
+            .await?;
+        if descriptor_rows.is_empty() {
+            return Ok(());
+        }
+
+        let table_rows = self
+            .load_rows_from_root(
+                self.tables[must_catalog_table_slot(TABLE_ID_TABLES)].metadata(),
+                disk_guard,
+                roots[must_catalog_table_slot(TABLE_ID_TABLES)],
+            )
+            .await?;
+        let column_rows = self
+            .load_rows_from_root(
+                self.tables[must_catalog_table_slot(TABLE_ID_COLUMNS)].metadata(),
+                disk_guard,
+                roots[must_catalog_table_slot(TABLE_ID_COLUMNS)],
+            )
+            .await?;
+        let index_rows = self
+            .load_rows_from_root(
+                self.tables[must_catalog_table_slot(TABLE_ID_INDEXES)].metadata(),
+                disk_guard,
+                roots[must_catalog_table_slot(TABLE_ID_INDEXES)],
+            )
+            .await?;
+
+        let mut tables = FastHashMap::default();
+        for row in table_rows {
+            let table = table_object_from_vals(&row.vals)
+                .change_context(RuntimeError::CatalogAccess)
+                .attach("operation=validate_projected_table_descriptors, phase=decode_table")?;
+            tables.insert(table.table_id, table);
+        }
+        let mut columns: FastHashMap<TableID, Vec<ColumnObject>> = FastHashMap::default();
+        for row in column_rows {
+            let column = column_object_from_vals(&row.vals)
+                .change_context(RuntimeError::CatalogAccess)
+                .attach("operation=validate_projected_table_descriptors, phase=decode_column")?;
+            columns.entry(column.table_id).or_default().push(column);
+        }
+        let mut indexes: FastHashMap<TableID, Vec<IndexObject>> = FastHashMap::default();
+        for row in index_rows {
+            let index = index_object_from_vals(&row.vals)
+                .change_context(RuntimeError::CatalogAccess)
+                .attach("operation=validate_projected_table_descriptors, phase=decode_index")?;
+            indexes.entry(index.table_id).or_default().push(index);
+        }
+
+        for row in descriptor_rows {
+            let descriptor = table_descriptor_object_from_vals(&row.vals)
+                .change_context(RuntimeError::CatalogAccess)
+                .attach(
+                    "operation=validate_projected_table_descriptors, phase=decode_descriptor",
+                )?;
+            let table_id = descriptor.table_id;
+            let table = tables
+                .get(&table_id)
+                .ok_or_else(|| {
+                    Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
+                        "projected managed descriptor has no central table: table_id={table_id}"
+                    ))
+                })
+                .change_context(RuntimeError::CatalogAccess)?;
+            let metadata = reconstruct_user_table_metadata(
+                table,
+                columns.remove(&table_id).unwrap_or_default(),
+                indexes.remove(&table_id).unwrap_or_default(),
+            )
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=validate_projected_table_descriptors, phase=reconstruct_schema, table_id={table_id}"
+                )
+            })?;
+            validate_table_descriptor_against_metadata(&descriptor, table_id, &metadata)
+                .change_context(RuntimeError::CatalogAccess)
+                .attach_with(|| {
+                    format!("operation=validate_projected_table_descriptors, table_id={table_id}")
+                })?;
+        }
+        Ok(())
     }
 
     async fn decode_lwc_page_rows(
@@ -1326,6 +1440,8 @@ fn validate_catalog_row(
         column_object_from_vals(row)?;
     } else if metadata == &catalog_definition_of_indexes().metadata {
         index_object_from_vals(row)?;
+    } else if metadata == &catalog_definition_of_table_descriptors().metadata {
+        table_descriptor_object_from_vals(row)?;
     } else if metadata == &catalog_definition_of_table_replay_silent_watermarks().metadata {
         table_replay_silent_watermark_object_from_vals(row)?;
     }
