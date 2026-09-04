@@ -2320,9 +2320,9 @@ marker can alias a second CREATE after restart. [U20]
     descriptor integrity, key-boundary and duplicate-key behavior,
     deterministic reverse enumeration, narrow-path no-central-metadata/no-
     schema/no-descriptor instrumentation, version changes across managed
-    index DDL and drop/recreate, two-pass DROP/recreate races and cancellation,
-    empty-root reopen without a format bump, and injected rollback at every
-    existing CREATE/DROP TABLE failure boundary.
+    index DDL and drop/recreate, two-pass DROP/recreate and DROP-only races,
+    cancellation, empty-root reopen without a format bump, and injected
+    rollback at every existing CREATE/DROP TABLE failure boundary.
   - Non-goals: Any binding for an unmanaged table; post-CREATE rename,
     add/remove alias, retarget, role/history mutation; binding interpretation;
     descriptor-only ALTER; external registry coordination; or consistency
@@ -2336,9 +2336,9 @@ marker can alias a second CREATE after restart. [U20]
     for future descriptor-revision extension. Persisted key order, uniqueness,
     central authority, reverse-index DROP, and final absence remain fixed.
   - Task Doc: `docs/tasks/000294-managed-table-bindings-and-versioned-resolution.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Issue: `#1041`
+  - Phase Status: done
+  - Implementation Summary: Implemented managed table bindings with atomic managed CREATE and DROP effects, two-pass versioned resolution, managed-only integrity validation, and deterministic reverse enumeration. [Task Resolve Sync: docs/tasks/000294-managed-table-bindings-and-versioned-resolution.md @ 2026-09-04]
 
 - **Phase 8: Catalog Checkpoint Scale Proof**
   - Prerequisites: Phases 4, 6, and 7 provide the final parent validator and
