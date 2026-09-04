@@ -753,6 +753,7 @@ mod tests {
     use crate::lock::tests::TestLockOwner;
     use crate::lock::{LockMode, LockOwner, LockResource};
     use crate::log::redo::DDLRedo;
+    use crate::map::FastHashMap;
     use crate::session::tests::SessionTestExt;
     use crate::table::tests::lock_entry_count;
     use crate::trx::SessionOperationKind;
@@ -761,6 +762,7 @@ mod tests {
         OperationError, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
         StorageIndexSpec, StorageTableSpec, TableBinding, ValKind,
     };
+    use std::collections::hash_map::Entry;
     use std::result::Result as StdResult;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Barrier, Mutex, OnceLock, mpsc};
@@ -768,11 +770,12 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
-    static BINDING_PROBE_PAUSE: OnceLock<Mutex<Option<BindingProbePause>>> = OnceLock::new();
+    static BINDING_PROBE_PAUSES: OnceLock<BindingProbePauseRegistry> = OnceLock::new();
+
+    type BindingProbePauseRegistry =
+        Mutex<FastHashMap<(BindingNamespaceID, Box<[u8]>), BindingProbePause>>;
 
     struct BindingProbePause {
-        namespace_id: BindingNamespaceID,
-        binding_key: Box<[u8]>,
         entered: mpsc::SyncSender<()>,
         release: mpsc::Receiver<()>,
     }
@@ -962,13 +965,12 @@ mod tests {
 
     /// Pauses one matching resolver after its binding-only probe scope closes.
     pub(super) fn pause_after_binding_probe(namespace_id: BindingNamespaceID, binding_key: &[u8]) {
-        let pause = BINDING_PROBE_PAUSE
-            .get_or_init(|| Mutex::new(None))
+        let key = (namespace_id, Box::<[u8]>::from(binding_key));
+        let pause = BINDING_PROBE_PAUSES
+            .get_or_init(|| Mutex::new(FastHashMap::default()))
             .lock()
             .unwrap()
-            .take_if(|pause| {
-                pause.namespace_id == namespace_id && pause.binding_key.as_ref() == binding_key
-            });
+            .remove(&key);
         if let Some(pause) = pause {
             pause.entered.send(()).unwrap();
             pause.release.recv().unwrap();
@@ -982,18 +984,50 @@ mod tests {
         let (entered_tx, entered_rx) = mpsc::sync_channel(0);
         let (release_tx, release_rx) = mpsc::sync_channel(0);
         let pause = BindingProbePause {
-            namespace_id,
-            binding_key: binding_key.into(),
             entered: entered_tx,
             release: release_rx,
         };
-        let previous = BINDING_PROBE_PAUSE
-            .get_or_init(|| Mutex::new(None))
+        let key = (namespace_id, binding_key.into());
+        let mut pauses = BINDING_PROBE_PAUSES
+            .get_or_init(|| Mutex::new(FastHashMap::default()))
             .lock()
-            .unwrap()
-            .replace(pause);
-        assert!(previous.is_none(), "binding probe pause already installed");
+            .unwrap();
+        let duplicate = match pauses.entry(key) {
+            Entry::Occupied(_) => true,
+            Entry::Vacant(entry) => {
+                entry.insert(pause);
+                false
+            }
+        };
+        drop(pauses);
+        assert!(!duplicate, "binding probe pause already installed for key");
         (entered_rx, release_tx)
+    }
+
+    #[test]
+    fn test_binding_probe_pauses_are_keyed() {
+        let first_namespace_id = BindingNamespaceID::new(90_200);
+        let second_namespace_id = BindingNamespaceID::new(90_201);
+        let (first_entered, first_release) =
+            install_binding_probe_pause(first_namespace_id, &b"first"[..]);
+        let (second_entered, second_release) =
+            install_binding_probe_pause(second_namespace_id, &b"second"[..]);
+
+        thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                pause_after_binding_probe(first_namespace_id, b"first");
+            });
+            let second = scope.spawn(|| {
+                pause_after_binding_probe(second_namespace_id, b"second");
+            });
+
+            first_entered.recv().unwrap();
+            second_entered.recv().unwrap();
+            first_release.send(()).unwrap();
+            second_release.send(()).unwrap();
+            first.join().unwrap();
+            second.join().unwrap();
+        });
     }
 
     #[test]
