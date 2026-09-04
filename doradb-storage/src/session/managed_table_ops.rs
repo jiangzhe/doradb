@@ -455,7 +455,13 @@ impl ManagedTableOps for Session {
         let table = engine
             .catalog()
             .current_live_user_table(table_id)
-            .ok_or_else(|| invalid_binding_target(table_id, "current runtime is missing"))?;
+            .ok_or_else(|| {
+                Report::new(OperationError::TableNotFound)
+                    .attach(format!(
+                        "list table bindings current-live lookup: table_id={table_id}"
+                    ))
+                    .disclose()
+            })?;
         if !table.definition_kind().is_managed() {
             return Err(Report::new(OperationError::InvalidMetadata)
                 .attach(format!(
@@ -739,10 +745,17 @@ mod tests {
         reset_storage_schema_fingerprint_count, set_create_table_failure,
         storage_schema_fingerprint_count, user_table_file_exists,
     };
-    use crate::catalog::{TableBindingObject, TableDescriptorObject, TableDescriptors};
-    use crate::id::TableID;
+    use crate::catalog::{
+        TABLE_ID_TABLE_BINDINGS, TABLE_ID_TABLE_DESCRIPTORS, TableBindingObject,
+        TableDescriptorObject, TableDescriptors,
+    };
+    use crate::id::{SessionID, TableID};
+    use crate::lock::tests::TestLockOwner;
+    use crate::lock::{LockMode, LockOwner, LockResource};
     use crate::log::redo::DDLRedo;
     use crate::session::tests::SessionTestExt;
+    use crate::table::tests::lock_entry_count;
+    use crate::trx::SessionOperationKind;
     use crate::{
         BindingNamespaceID, Engine, EngineConfig, Error, ErrorKind, IndexID, ManagedTableOps,
         OperationError, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
@@ -984,6 +997,99 @@ mod tests {
     }
 
     #[test]
+    fn test_binding_probe_acquisition_cancellation_releases_every_claim() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let manager = engine.inner().core.lock_manager();
+            let blocker_owner = LockOwner::session_explicit(SessionID::new(90_100));
+            let mut blocker = TestLockOwner::new(blocker_owner);
+            blocker
+                .acquire(
+                    manager,
+                    LockResource::TableData(TABLE_ID_TABLE_BINDINGS),
+                    LockMode::Exclusive,
+                )
+                .await
+                .unwrap();
+            let session = engine.new_session().unwrap();
+            let resolver_owner = LockOwner::session_explicit(session.id());
+            let mut operation = session.pin_operation(SessionOperationKind::Ddl).unwrap();
+            let mut acquire = Box::pin(operation.acquire_table_binding_probe());
+
+            assert!(matches!(
+                futures::poll!(acquire.as_mut()),
+                std::task::Poll::Pending
+            ));
+            assert_eq!(lock_entry_count(&engine, resolver_owner), 2);
+            drop(acquire);
+            assert_eq!(lock_entry_count(&engine, resolver_owner), 0);
+            assert_eq!(lock_entry_count(&engine, blocker_owner), 1);
+
+            drop(operation);
+            blocker.close(manager);
+        });
+    }
+
+    #[test]
+    fn test_binding_final_acquisition_cancellation_releases_every_claim() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let manager = engine.inner().core.lock_manager();
+            let blocker_owner = LockOwner::session_explicit(SessionID::new(90_101));
+            let mut blocker = TestLockOwner::new(blocker_owner);
+            blocker
+                .acquire(
+                    manager,
+                    LockResource::TableData(TABLE_ID_TABLE_DESCRIPTORS),
+                    LockMode::Exclusive,
+                )
+                .await
+                .unwrap();
+            let session = engine.new_session().unwrap();
+            let resolver_owner = LockOwner::session_explicit(session.id());
+            let mut operation = session.pin_operation(SessionOperationKind::Ddl).unwrap();
+            let mut acquire =
+                Box::pin(operation.acquire_table_binding_resolution(TableID::new(90_102), true));
+
+            assert!(matches!(
+                futures::poll!(acquire.as_mut()),
+                std::task::Poll::Pending
+            ));
+            assert_eq!(lock_entry_count(&engine, resolver_owner), 4);
+            drop(acquire);
+            assert_eq!(lock_entry_count(&engine, resolver_owner), 0);
+            assert_eq!(lock_entry_count(&engine, blocker_owner), 1);
+
+            drop(operation);
+            blocker.close(manager);
+        });
+    }
+
+    #[test]
+    fn test_list_table_bindings_reports_unallocated_table_as_not_found() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+
+            let err = session
+                .list_table_bindings(TableID::new(90_000))
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::Operation);
+            assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+        });
+    }
+
+    #[test]
     fn test_managed_ddl_round_trips_descriptor_and_rejects_unmanaged_index_changes() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
@@ -1137,6 +1243,9 @@ mod tests {
             assert_eq!(&*descriptor.payload, dropped_index_descriptor);
 
             session.drop_table(table_id).await.unwrap();
+            let err = session.list_table_bindings(table_id).await.unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::Operation);
+            assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
             for (namespace_id, key) in [
                 (BindingNamespaceID::new(1), &b"alpha"[..]),
                 (BindingNamespaceID::new(1), &b"beta"[..]),
@@ -1748,6 +1857,55 @@ mod tests {
             assert_ne!(recreated.table_id(), old_table_id);
             assert_eq!(resolved.table_id(), recreated.table_id());
             assert_eq!(resolved.full_schema().unwrap().descriptor(), [2]);
+        });
+    }
+
+    #[test]
+    fn test_binding_resolution_returns_none_after_drop_between_passes() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let mut creator = engine.new_session().unwrap();
+            let mut initial = CreateFailureInterpreter {
+                result: Ok(vec![1]),
+                bindings: vec![TableBinding::new(
+                    BindingNamespaceID::new(32),
+                    &b"disappearing"[..],
+                )],
+            };
+            let table_id = creator
+                .create_managed_table(b"initial", &mut initial)
+                .await
+                .unwrap()
+                .table_id();
+            let (probe_entered, probe_release) =
+                install_binding_probe_pause(BindingNamespaceID::new(32), &b"disappearing"[..]);
+            let resolver = engine.new_session().unwrap();
+            let resolver_owner = LockOwner::session_explicit(resolver.id());
+
+            let resolved = thread::scope(|scope| {
+                let resolver = scope.spawn(move || {
+                    let mut resolver = resolver;
+                    smol::block_on(resolver.resolve_table_binding(
+                        BindingNamespaceID::new(32),
+                        b"disappearing",
+                        true,
+                    ))
+                });
+                let mutator = scope.spawn(move || {
+                    probe_entered.recv().unwrap();
+                    smol::block_on(creator.drop_table(table_id)).unwrap();
+                    probe_release.send(()).unwrap();
+                });
+                let resolved = resolver.join().unwrap();
+                mutator.join().unwrap();
+                resolved
+            });
+
+            assert!(resolved.unwrap().is_none());
+            assert_eq!(lock_entry_count(&engine, resolver_owner), 0);
         });
     }
 

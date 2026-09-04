@@ -257,7 +257,8 @@ one coherent `ManagedTableDefinitionSnapshot` holding the stable-ID numeric
 schema and exact descriptor bytes. The false path performs only binding and
 constant-size runtime validation; it does not load central numeric metadata or
 copy the full schema or descriptor. `list_table_bindings(table_id)` returns the
-table's bindings sorted by namespace and key.
+table's bindings sorted by namespace and key, or `OperationError::TableNotFound`
+when the target table does not exist or has already been dropped.
 
 Resolution is coherent only at the admitted point inside the call. No returned
 value retains a metadata lock. Comparing a cached version with a later narrow

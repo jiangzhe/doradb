@@ -389,8 +389,10 @@ claims on error or retry.
 `list_table_bindings(table_id)` already knows its target. It directly acquires
 target metadata-S followed by `catalog.table_bindings` read claims, validates
 the live managed target, scans the reverse index, and returns sorted roleless
-bindings. It does not query central numeric metadata, the descriptor payload,
-or numeric schema.
+bindings. A missing or already-dropped target returns
+`OperationError::TableNotFound`; only an existing unmanaged target returns
+`OperationError::InvalidMetadata`. It does not query central numeric metadata,
+the descriptor payload, or numeric schema.
 
 No returned object retains a lock. Equality with a later version-only result
 means the cached definition was unchanged at that later resolution point; it
@@ -518,7 +520,9 @@ Primary implementation areas:
     either acquisition pass releases every claim.
 11. Reverse enumeration returns every roleless binding exactly once in
     `(namespace_id, key)` order. DROP deletes all of them through the reverse
-    index and subsequent forward lookups return `None`.
+    index and subsequent forward lookups return `None`. Listing an unallocated
+    or already-dropped table returns `OperationError::TableNotFound`, while an
+    existing managed table with no bindings returns an empty collection.
 12. Injected CREATE and DROP failures at every existing staging, commit, file,
     root, and runtime boundary prove bindings commit and roll back with numeric
     schema and descriptor effects.
