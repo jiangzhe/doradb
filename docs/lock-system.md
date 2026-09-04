@@ -115,10 +115,13 @@ The current implementation uses the following table-level mapping:
 | Explicit shared table lock | session `S` | session `S` | explicit session |
 | Explicit exclusive table lock | session `S` | session `X` | explicit session |
 | Freeze/checkpoint | prepared owned `S` | prepared owned `IS` | prepared maintenance operation, then mandatory owner |
-| CREATE TABLE on a new id | target `X`; catalog slots 0-3 `S` | catalog slots 0-3 `IX` | prepared DDL operation, then mandatory owner |
-| DROP TABLE | target `X`; catalog slots 0-4 `S` | target `X`; catalog slots 0-4 `IX` | prepared DDL operation, then mandatory owner |
+| CREATE TABLE on a new id | target `X`; catalog slots 0-3 `S`, plus slot 5 for nonempty managed bindings | matching catalog slots `IX` | prepared DDL operation, then mandatory owner |
+| DROP TABLE | target `X`; catalog slots 0-5 `S` | target `X`; catalog slots 0-5 `IX` | prepared DDL operation, then mandatory owner |
 | CREATE INDEX | target `X`; catalog slots 0,2,3 `S` | target `X`; catalog slots 0,2,3 `IX` | prepared DDL operation, then mandatory owner |
 | DROP INDEX | target `X`; catalog slots 2,3 `S` | target `X`; catalog slots 2,3 `IX` | prepared DDL operation, then mandatory owner |
+| Binding probe | slot 5 `S` | slot 5 `IS` | short caller-owned operation |
+| Binding final resolution | target `S`; slot 5 `S`, plus slot 3 in full mode | matching catalog slots `IS` | short caller-owned operation |
+| List table bindings | target `S`; slot 5 `S` | slot 5 `IS` | short caller-owned operation |
 
 On first touch, metadata protection belongs directly to the transaction:
 
@@ -141,6 +144,12 @@ Nested catalog transactions acquire their ordinary exact metadata-S and
 data-IX claims. The enclosing DDL operation already holds
 covering physical modes, so these claims publish owner-locally without another
 manager transition.
+
+Binding resolution deliberately releases its binding-only probe before waiting
+for target metadata-S. Its final pass takes the target first and then catalog
+slots in canonical order, matching DDL and avoiding a binding-S/target-X lock
+cycle with DROP. Nonempty managed CREATE and DROP both keep slot 5 data-IX;
+binding CREATE uses the primary index to arbitrate key-local uniqueness races.
 Effectful maintenance likewise prepares an owned lock scope before mandatory
 admission and transfers the exact authority without a release/reacquire
 window. The read-only `total_row_pages` observation remains caller-owned and

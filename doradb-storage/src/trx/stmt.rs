@@ -1180,6 +1180,49 @@ impl<'stmt> Statement<'stmt> {
         Ok(())
     }
 
+    /// Inserts an ordered catalog batch whose unique-key races are expected.
+    ///
+    /// This path is reserved for catalog mutations, such as managed binding
+    /// creation, where a concurrent writer can legitimately reach the unique
+    /// index after an optimistic precheck.
+    #[inline]
+    pub(super) async fn catalog_try_insert_unique_batch_mvcc(
+        mut self,
+        table: &CatalogTable,
+        rows: Vec<Vec<Val>>,
+    ) -> QuadResult<()> {
+        const OPERATION: &str = "catalog_try_insert_unique_batch_mvcc";
+        let table_id = table.table_id();
+        let metadata_lock = self
+            .acquire_table_write_metadata_lock(table_id)
+            .await
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"));
+        narrow_catalog_operation_or_fatal(table_id, metadata_lock)?;
+        let validator = DmlValidator::new(table.metadata());
+        for (batch_index, row) in rows.iter().enumerate() {
+            let validation = validator
+                .validate_full_row(row)
+                .change_context(OperationError::InvalidDmlInput)
+                .attach_with(|| {
+                    format!("operation={OPERATION}, table_id={table_id}, batch_index={batch_index}")
+                });
+            assert_catalog_operation_invariant(table_id, validation);
+        }
+        let data_lock = self
+            .acquire_table_write_data_lock(table_id)
+            .await
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"));
+        narrow_catalog_operation_or_fatal(table_id, data_lock)?;
+        let (rt, effects) = self.runtime_and_effects_mut();
+        for (batch_index, row) in rows.into_iter().enumerate() {
+            let result = table.insert_mvcc(rt, effects, row).await;
+            preserve_expected_catalog_insert_error(table_id, result, || {
+                format!("operation={OPERATION}, table_id={table_id}, batch_index={batch_index}")
+            })?;
+        }
+        Ok(())
+    }
+
     /// Deletes one catalog-table row through the foreground lock-aware path.
     #[inline]
     pub(super) async fn catalog_delete_primary_key_mvcc(
@@ -1422,6 +1465,40 @@ where
         Err(OperationOrRuntimeError::Runtime(report)) => Err(report
             .change_context(RuntimeError::CatalogAccess)
             .attach(attachment())),
+    }
+}
+
+/// Preserve unique-key races expected by an optimistic catalog insertion.
+#[inline]
+fn preserve_expected_catalog_insert_error<T, F>(
+    table_id: TableID,
+    result: OperationOrRuntimeResult<T>,
+    attachment: F,
+) -> QuadResult<T>
+where
+    F: FnOnce() -> String,
+{
+    match result {
+        Ok(value) => Ok(value),
+        Err(OperationOrRuntimeError::Operation(report))
+            if matches!(
+                *report.current_context(),
+                OperationError::DuplicateKey | OperationError::WriteConflict
+            ) =>
+        {
+            Err(QuadError::Operation(report.attach(attachment())))
+        }
+        Err(OperationOrRuntimeError::Operation(report)) => {
+            let report = report.attach(attachment());
+            panic!(
+                "catalog mutation invariant violated outside expected unique-key race: table_id={table_id}, error={report:?}"
+            )
+        }
+        Err(OperationOrRuntimeError::Runtime(report)) => Err(QuadError::Runtime(
+            report
+                .change_context(RuntimeError::CatalogAccess)
+                .attach(attachment()),
+        )),
     }
 }
 
@@ -1990,6 +2067,29 @@ pub(crate) mod tests {
             catch_unwind(AssertUnwindSafe(|| {
                 let _ = narrow_catalog_operation_or_runtime(table_id, insert, || {
                     "operation=test_catalog_insert".to_owned()
+                });
+            }))
+            .is_err()
+        );
+
+        for expected in [OperationError::DuplicateKey, OperationError::WriteConflict] {
+            let insert: OperationOrRuntimeResult<()> = Err(Report::new(expected).into());
+            let Err(QuadError::Operation(report)) =
+                preserve_expected_catalog_insert_error(table_id, insert, || {
+                    "operation=test_expected_catalog_insert".to_owned()
+                })
+            else {
+                panic!("expected catalog key race changed domain")
+            };
+            assert_eq!(*report.current_context(), expected);
+        }
+
+        let unexpected_insert: OperationOrRuntimeResult<()> =
+            Err(Report::new(OperationError::InvalidDmlInput).into());
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                let _ = preserve_expected_catalog_insert_error(table_id, unexpected_insert, || {
+                    "operation=test_unexpected_catalog_insert".to_owned()
                 });
             }))
             .is_err()

@@ -23,7 +23,8 @@ use error_stack::Report;
 use error_stack::ResultExt;
 use std::sync::OnceLock;
 
-pub(super) const TABLE_ID_COLUMNS: TableID = catalog_table_id_from_slot(1);
+/// Catalog table id for `catalog.columns`.
+pub(crate) const TABLE_ID_COLUMNS: TableID = catalog_table_id_from_slot(1);
 const COL_NO_COLUMNS_TABLE_ID: usize = 0;
 const COL_NO_COLUMNS_COLUMN_ID: usize = 1;
 const COL_NO_COLUMNS_STORAGE_ORDINAL: usize = 2;

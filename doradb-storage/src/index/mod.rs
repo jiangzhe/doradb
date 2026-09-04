@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 pub(crate) use block_index::BlockIndex;
 pub(crate) use borrowed_stream::BorrowedIndexMutationStream;
-pub(crate) use btree::{BTreeKey, BTreeKeyEncoder, KeyRange};
+pub(crate) use btree::{BTREE_NODE_USABLE_SIZE, BTreeKey, BTreeKeyEncoder, KeyRange};
 #[cfg(test)]
 pub(crate) use column_block_index::{
     COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, COLUMN_BLOCK_NODE_PAYLOAD_SIZE,

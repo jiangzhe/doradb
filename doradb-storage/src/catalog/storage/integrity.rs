@@ -1,7 +1,7 @@
 use super::CatalogStorage;
-use super::auxiliary::{TABLE_ID_NO_TABLE_BINDINGS, TABLE_ID_TABLE_BINDINGS};
 use super::columns::TABLE_ID_COLUMNS;
 use super::indexes::TABLE_ID_INDEXES;
+use super::table_bindings::{TABLE_ID_NO_TABLE_BINDINGS, TABLE_ID_TABLE_BINDINGS};
 use super::table_descriptors::{PK_NO_TABLE_DESCRIPTORS, TABLE_ID_TABLE_DESCRIPTORS};
 use super::table_replay_silent_watermarks::TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS;
 use super::tables::TABLE_ID_TABLES;
@@ -113,6 +113,7 @@ impl CatalogStorage {
             }
         }
 
+        let mut managed_tables = FastHashSet::default();
         for spec in CATALOG_SATELLITES {
             match &view {
                 CatalogParentView::Live { guards } => {
@@ -121,7 +122,10 @@ impl CatalogStorage {
                         spec.table_id,
                         spec.parent_column,
                         "live",
-                        |table_id| require_parent(&parents, spec, table_id, "live"),
+                        |table_id| {
+                            require_parent(&parents, spec, table_id, "live")?;
+                            track_or_require_managed(&mut managed_tables, spec, table_id, "live")
+                        },
                     )
                     .await?;
                 }
@@ -135,7 +139,13 @@ impl CatalogStorage {
                         disk_guard,
                         |val| {
                             let table_id = decode_table_id(val, spec.name, "projected")?;
-                            require_parent(&parents, spec, table_id, "projected")
+                            require_parent(&parents, spec, table_id, "projected")?;
+                            track_or_require_managed(
+                                &mut managed_tables,
+                                spec,
+                                table_id,
+                                "projected",
+                            )
                         },
                     )
                     .await?;
@@ -351,6 +361,26 @@ fn require_parent(
     Err(orphan_error(spec, table_id, view))
 }
 
+fn track_or_require_managed(
+    managed_tables: &mut FastHashSet<TableID>,
+    spec: CatalogSatelliteSpec,
+    table_id: TableID,
+    view: &'static str,
+) -> DataIntegrityResult<()> {
+    if spec.table_id == TABLE_ID_TABLE_DESCRIPTORS {
+        managed_tables.insert(table_id);
+        return Ok(());
+    }
+    if spec.table_id != TABLE_ID_TABLE_BINDINGS || managed_tables.contains(&table_id) {
+        return Ok(());
+    }
+    Err(
+        Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
+            "binding targets unmanaged table: view={view}, table_id={table_id}"
+        )),
+    )
+}
+
 fn orphan_error(
     spec: CatalogSatelliteSpec,
     table_id: TableID,
@@ -425,12 +455,7 @@ mod tests {
             return vec![Val::from(parent), Val::from(1u64), Val::from(1u64)];
         }
         assert_eq!(table_id, TABLE_ID_TABLE_BINDINGS);
-        vec![
-            Val::from(0u64),
-            Val::from(vec![1u8]),
-            Val::from(parent),
-            Val::from(0u8),
-        ]
+        vec![Val::from(0u64), Val::from(vec![1u8]), Val::from(parent)]
     }
 
     fn central_row(table_id: TableID) -> Vec<Val> {
@@ -524,6 +549,42 @@ mod tests {
                 err.downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidRootInvariant)
             );
+            transaction.rollback().await;
+        });
+    }
+
+    #[test]
+    fn test_live_parent_validation_rejects_binding_without_descriptor() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = open_catalog_test_engine(temp_dir.path().to_path_buf(), None).await;
+            let session = engine.new_session().unwrap();
+            let storage = &engine.inner().core.catalog().storage;
+            let parent = TableID::new(45);
+            let mut transaction = begin_catalog_test_trx(&session);
+            transaction
+                .trx()
+                .catalog_insert_mvcc(&storage.tables[0], central_row(parent))
+                .await
+                .unwrap();
+            let binding_slot = catalog_table_slot(TABLE_ID_TABLE_BINDINGS).unwrap();
+            transaction
+                .trx()
+                .catalog_insert_mvcc(
+                    &storage.tables[binding_slot],
+                    satellite_row(TABLE_ID_TABLE_BINDINGS, parent),
+                )
+                .await
+                .unwrap();
+            let error = storage
+                .validate_live_catalog_parent_integrity(&session.pool_guards())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<DataIntegrityError>().copied(),
+                Some(DataIntegrityError::InvalidRootInvariant)
+            );
+            assert!(format!("{error:?}").contains("unmanaged"));
             transaction.rollback().await;
         });
     }

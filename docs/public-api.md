@@ -203,20 +203,24 @@ public accessors expose only the stable table and index identities.
 ### Managed opaque definitions
 
 Higher layers that own names or logical schema formats can implement
-`TableDescriptorInterpreter`, import the `ManagedTableOps` extension trait, and
+`ManagedTableInterpreter`, import the `ManagedTableOps` extension trait, and
 call `create_managed_table`, `create_managed_index`, or `drop_managed_index`.
 The engine passes arbitrary source bytes unchanged and never interprets the
-descriptor format. Each callback returns `DescriptorUpdate<C>`: one
-operation-specific, slot-free physical change paired with the complete opaque
-replacement payload.
+descriptor or binding-key formats. The CREATE TABLE callback returns one
+`ManagedCreateTableDefinition` containing the ID-free physical definition,
+complete descriptor, and zero or more `TableBinding` values. Existing-table
+callbacks return `DescriptorUpdate<C>`: one operation-specific, slot-free
+physical change paired with the complete opaque replacement payload.
 
 ```rust
 use doradb_storage::ManagedTableOps;
 ```
 
 CREATE TABLE interpretation runs before any table ID is allocated and returns
-an ID-free ordered `CreateTableDefinition`. DoraDB assigns table, column, and
-initial-index identities afterward. Existing-table callbacks receive the
+an ID-free ordered `CreateTableDefinition` inside that bundle. DoraDB validates
+the complete bundle and assigns table, column, and initial-index identities
+afterward. The numeric schema, descriptor, and bindings commit atomically.
+Existing-table callbacks receive the
 previous descriptor and a separate `StorageTableDefinition` whose columns are
 in physical order and indexes are in stable-ID order. CREATE INDEX also
 receives the engine-proposed next `IndexID`; physical `IndexSlot` values and all
@@ -234,7 +238,32 @@ Descriptor payloads may be empty or arbitrary binary bytes and are persisted
 byte-for-byte. The inclusive maximum is
 `MAX_TABLE_DESCRIPTOR_BYTES` (64,000 bytes). Unmanaged numeric index DDL is
 rejected for a managed table, while DROP TABLE automatically deletes any
-descriptor.
+descriptor and all of its bindings.
+
+`BindingNamespaceID` and `TableBinding` carry roleless opaque names. Empty and
+arbitrary binary keys are valid through the inclusive
+`MAX_TABLE_BINDING_KEY_BYTES` limit of 16,000 bytes. A key is unique only
+within its namespace, and bindings can be created only as part of managed
+CREATE TABLE. A binding already present at precheck or insertion is reported as
+`OperationError::DuplicateKey`; a concurrent binding ownership or deletion
+race may instead report `OperationError::WriteConflict`. Both are returned in
+the engine arm of `ManagedDdlError`.
+
+`resolve_table_binding(namespace_id, key, include_full_schema)` returns `None`
+when the exact key is absent. A successful `ResolvedTableBinding` always
+contains the assigned table ID and an opaque, equality-comparable
+`TableDefinitionVersion`. With `include_full_schema == true`, it also contains
+one coherent `ManagedTableDefinitionSnapshot` holding the stable-ID numeric
+schema and exact descriptor bytes. The false path performs only binding and
+constant-size runtime validation; it does not load central numeric metadata or
+copy the full schema or descriptor. `list_table_bindings(table_id)` returns the
+table's bindings sorted by namespace and key, or `OperationError::TableNotFound`
+when the target table does not exist or has already been dropped.
+
+Resolution is coherent only at the admitted point inside the call. No returned
+value retains a metadata lock. Comparing a cached version with a later narrow
+resolution tells the caller whether the definition changed between those two
+points, but does not guard later planning or execution.
 
 ## Values and identifiers
 
@@ -287,7 +316,9 @@ provided by `ManagedTableOps` and require that trait in scope:
 | Method | Effect |
 | --- | --- |
 | `create_table` | Validate numeric metadata and return a `CreateTableOutcome`. |
-| `create_managed_table` | Interpret opaque bytes, atomically create numeric metadata plus a descriptor, and return a `CreateTableOutcome`. |
+| `create_managed_table` | Interpret opaque bytes, atomically create numeric metadata, a descriptor, and bindings, and return a `CreateTableOutcome`. |
+| `resolve_table_binding` | Resolve one opaque managed name, always returning a definition version and optionally a full definition snapshot. |
+| `list_table_bindings` | Enumerate one managed table's roleless bindings in deterministic order. |
 | `create_index` | Build and publish a secondary index, returning its stable `IndexID`. |
 | `create_managed_index` | Interpret one managed index addition and atomically replace its descriptor. |
 | `drop_index` | Logically remove an active secondary index. |

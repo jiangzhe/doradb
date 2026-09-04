@@ -102,10 +102,16 @@ foreground catalog access is served from in-memory catalog tables.
 Managed user tables add one optional row in `catalog.table_descriptors`. Its
 payload is opaque to storage and limited to 64,000 bytes; the envelope records
 a private revision plus the numeric schema epoch and canonical fingerprint.
+They may also own zero or more roleless rows in `catalog.table_bindings`, keyed
+by an opaque namespace plus at most 16,000 opaque bytes. Managed CREATE commits
+the numeric schema, descriptor, and bindings atomically. Binding resolution
+returns an optimistic `(TableID, storage_epoch)` token and may optionally copy
+one coherent stable-ID schema/descriptor snapshot; no read lock escapes the
+call. DROP removes bindings through their reverse `table_id` index.
 Managed CREATE/DROP INDEX commits the numeric catalog mutation and complete
 replacement descriptor in one private transaction, and DROP TABLE deletes the
 descriptor through the same cascade. Recovery validates envelope/schema
-agreement without interpreting payload bytes.
+agreement and binding ownership without interpreting opaque bytes.
 
 ### Redo Log File
 

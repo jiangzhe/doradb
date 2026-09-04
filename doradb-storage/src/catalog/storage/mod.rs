@@ -1,28 +1,34 @@
-mod auxiliary;
 mod columns;
 mod ddl;
 mod indexes;
 mod integrity;
 mod merge;
 mod object;
+mod table_bindings;
 mod table_descriptors;
 mod table_replay_silent_watermarks;
 pub(crate) mod tables;
 
 use crate::buffer::{FixedBufferPool, PoolGuard, PoolGuards, ReadonlyBufferPool};
-use crate::catalog::storage::auxiliary::*;
+pub(crate) use crate::catalog::storage::columns::TABLE_ID_COLUMNS;
 use crate::catalog::storage::columns::*;
+pub(crate) use crate::catalog::storage::indexes::TABLE_ID_INDEXES;
 use crate::catalog::storage::indexes::*;
 use crate::catalog::storage::merge::{CatalogFoldedRows, CatalogMergeKeyBuilder};
 pub(crate) use crate::catalog::storage::object::*;
+pub(crate) use crate::catalog::storage::table_bindings::{TABLE_ID_TABLE_BINDINGS, TableBindings};
+use crate::catalog::storage::table_bindings::{
+    catalog_definition_of_table_bindings, table_binding_object_from_vals,
+};
 pub(crate) use crate::catalog::storage::table_descriptors::{
     TABLE_ID_TABLE_DESCRIPTORS, TableDescriptors, validate_table_descriptor_against_metadata,
 };
 use crate::catalog::storage::table_descriptors::{
     catalog_definition_of_table_descriptors, table_descriptor_object_from_vals,
 };
+pub(crate) use crate::catalog::storage::table_replay_silent_watermarks::TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS;
 use crate::catalog::storage::table_replay_silent_watermarks::*;
-use crate::catalog::storage::tables::*;
+pub(crate) use crate::catalog::storage::tables::*;
 use crate::catalog::{
     CatalogCheckpointBatch, CatalogCheckpointOutcome, CatalogRedoEntry, CatalogTable,
     TableMetadata, catalog_table_id_from_slot, catalog_table_slot, reconstruct_user_table_metadata,
@@ -162,6 +168,14 @@ impl CatalogStorage {
     pub(crate) fn table_descriptors(&self) -> TableDescriptors<'_> {
         TableDescriptors {
             table: &self.tables[must_catalog_table_slot(TABLE_ID_TABLE_DESCRIPTORS)],
+        }
+    }
+
+    /// Accessor of `catalog.table_bindings`.
+    #[inline]
+    pub(crate) fn table_bindings(&self) -> TableBindings<'_> {
+        TableBindings {
+            table: &self.tables[must_catalog_table_slot(TABLE_ID_TABLE_BINDINGS)],
         }
     }
 
@@ -1444,6 +1458,8 @@ fn validate_catalog_row(
         table_descriptor_object_from_vals(row)?;
     } else if metadata == &catalog_definition_of_table_replay_silent_watermarks().metadata {
         table_replay_silent_watermark_object_from_vals(row)?;
+    } else if metadata == &catalog_definition_of_table_bindings().metadata {
+        table_binding_object_from_vals(row)?;
     }
     Ok(())
 }

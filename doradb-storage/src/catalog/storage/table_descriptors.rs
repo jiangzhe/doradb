@@ -30,12 +30,26 @@ pub(crate) struct TableDescriptors<'a> {
 }
 
 impl TableDescriptors<'_> {
+    /// Resets the narrow test-only descriptor lookup counter.
+    #[cfg(test)]
+    pub(crate) fn reset_lookup_count() {
+        tests::reset_lookup_count();
+    }
+
+    /// Returns the narrow test-only descriptor lookup count.
+    #[cfg(test)]
+    pub(crate) fn lookup_count() -> usize {
+        tests::lookup_count()
+    }
+
     /// Finds one current uncommitted-visible descriptor by user table id.
     pub(crate) async fn find_uncommitted_by_table_id(
         &self,
         guards: &PoolGuards,
         table_id: TableID,
     ) -> RuntimeResult<Option<TableDescriptorObject>> {
+        #[cfg(test)]
+        tests::record_lookup();
         let key = [Val::from(table_id)];
         let vals = self
             .table
@@ -274,6 +288,21 @@ fn cols_from_table_descriptor(descriptor: &TableDescriptorObject) -> Vec<Val> {
 mod tests {
     use super::*;
     use crate::catalog::TableDescriptorObject;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static DESCRIPTOR_LOOKUPS: AtomicUsize = AtomicUsize::new(0);
+
+    pub(super) fn reset_lookup_count() {
+        DESCRIPTOR_LOOKUPS.store(0, Ordering::Relaxed);
+    }
+
+    pub(super) fn lookup_count() -> usize {
+        DESCRIPTOR_LOOKUPS.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn record_lookup() {
+        DESCRIPTOR_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+    }
 
     fn descriptor_vals(payload: Vec<u8>) -> Vec<Val> {
         vec![

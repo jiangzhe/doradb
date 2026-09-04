@@ -669,12 +669,18 @@ root-mutation authority.
 gap-tolerant id, and caller-prepares target metadata X plus metadata-S/data-IX
 authority for the four catalog tables it may write. Managed CREATE first calls
 the synchronous interpreter with only source bytes, before operation pinning or
-ID allocation, then carries the exact returned descriptor into that same
-accepted plan. Mandatory acceptance then
-owns those locks while it creates the deterministic table file, runs its nested
-catalog transaction without further manager acquisition, builds the per-id
-runtime, commits, and publishes the current history/runtime entry. The initial
-table-file root uses the create transaction STS as `root_ts`.
+ID allocation, then validates and carries the returned ID-free storage
+definition, exact descriptor, and roleless bindings into that same accepted
+plan. A nonempty binding bundle adds catalog slot 5 with the normal data-IX
+claim. An optimistic namespace/key precheck rejects stable collisions before
+mandatory acceptance, while authoritative primary-index insertion returns
+`DuplicateKey` or `WriteConflict` for later races. Mandatory acceptance then
+owns those locks while it creates the deterministic table file. Within the
+nested catalog transaction, binding insertion is the first catalog DML so a
+late uniqueness race fails before numeric or descriptor rows are staged. The
+operation then builds the per-id runtime, commits, and publishes the current
+history/runtime entry. The initial table-file root uses the create transaction
+STS as `root_ts`.
 
 `DROP TABLE` rejects non-user ids and same-session explicit target locks before
 waiting, then caller-prepares target metadata/data X plus metadata-S/data-IX
@@ -710,6 +716,17 @@ reloads the private version fields, and either returns zero-effect
 `SchemaChanged` or transfers an immutable numeric-plus-descriptor effect bundle
 to mandatory execution. Descriptor and numeric rows use one private
 transaction and one commit.
+
+Managed binding resolution uses two short operations because the first lookup
+discovers the target ID. The probe holds only binding-catalog metadata-S/data-IS
+and releases it completely. A fresh operation then takes target metadata-S,
+followed by catalog metadata-S and data-IS for the descriptor table only in
+full mode and for `catalog.table_bindings`. It rechecks the binding under that
+final scope and retries if the target changed. The narrow path reads only the
+binding target, then checks managed runtime kind and captures the runtime
+layout's storage epoch. Full mode additionally projects the pinned runtime
+layout and validates/copies the descriptor. All claims are released before
+returning the optimistic definition token or snapshot.
 
 CREATE INDEX and DROP INDEX also take same-table `TableMetadata(X)`. That grant
 waits for every transaction that successfully bound the table, but an older
