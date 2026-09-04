@@ -13,7 +13,12 @@ doradb-storage/src/log/mod.rs,LogSync::from_str,1
 doradb-storage/src/session/managed_table_ops.rs,Session::create_managed_index,15
 doradb-storage/src/session/managed_table_ops.rs,Session::create_managed_table,6
 doradb-storage/src/session/managed_table_ops.rs,Session::drop_managed_index,12
+doradb-storage/src/session/managed_table_ops.rs,Session::list_table_bindings,5
+doradb-storage/src/session/managed_table_ops.rs,Session::probe_table_binding,3
 doradb-storage/src/session/managed_table_ops.rs,Session::read_managed_current_definition,8
+doradb-storage/src/session/managed_table_ops.rs,Session::resolve_table_binding,6
+doradb-storage/src/session/managed_table_ops.rs,SessionOperationPin::prepare_managed_create_table,2
+doradb-storage/src/session/managed_table_ops.rs,invalid_binding_target,1
 doradb-storage/src/session/managed_table_ops.rs,managed_schema_changed,1
 doradb-storage/src/session/mod.rs,Session::begin_read_snapshot,5
 doradb-storage/src/session/mod.rs,Session::begin_trx,5

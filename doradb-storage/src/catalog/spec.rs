@@ -1,5 +1,3 @@
-#[cfg(test)]
-use super::index_ref::IndexRef;
 use super::index_ref::{ColumnID, ColumnOrdinal, IndexID};
 use super::table::TableMetadata;
 use crate::error::{OperationError, OperationResult};
@@ -7,6 +5,8 @@ use crate::map::FastHashSet;
 use crate::value::ValKind;
 use bitflags::bitflags;
 use error_stack::Report;
+#[cfg(test)]
+pub(crate) use tests::ActiveIndexSpec;
 
 /// User-facing name-free storage table definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -284,6 +284,8 @@ impl StorageTableDefinition {
 
     /// Projects private physical metadata into the public slot-free schema.
     pub(crate) fn from_metadata(metadata: &TableMetadata) -> Self {
+        #[cfg(test)]
+        tests::record_projection();
         let columns = metadata
             .col
             .columns()
@@ -443,21 +445,44 @@ impl TryFrom<u8> for IndexOrder {
     }
 }
 
-/// One active internal index definition paired with its exact generation.
 #[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ActiveIndexSpec {
-    /// Exact table-local index generation and physical slot.
-    pub(crate) index: IndexRef,
-    /// Logical definition stored in this slot.
-    pub(crate) spec: StorageIndexSpec,
-}
+mod tests {
+    use super::super::index_ref::IndexRef;
+    use super::{StorageIndexSpec, StorageTableDefinition};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-#[cfg(test)]
-impl ActiveIndexSpec {
-    /// Creates one active exact-generation index specification.
-    #[inline]
-    pub(crate) fn new(index: IndexRef, spec: StorageIndexSpec) -> Self {
-        Self { index, spec }
+    static STORAGE_DEFINITION_PROJECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+    /// One active internal index definition paired with its exact generation.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct ActiveIndexSpec {
+        /// Exact table-local index generation and physical slot.
+        pub(crate) index: IndexRef,
+        /// Logical definition stored in this slot.
+        pub(crate) spec: StorageIndexSpec,
+    }
+
+    impl ActiveIndexSpec {
+        /// Creates one active exact-generation index specification.
+        #[inline]
+        pub(crate) fn new(index: IndexRef, spec: StorageIndexSpec) -> Self {
+            Self { index, spec }
+        }
+    }
+
+    impl StorageTableDefinition {
+        /// Resets the narrow test-only schema-projection counter.
+        pub(crate) fn reset_projection_count() {
+            STORAGE_DEFINITION_PROJECTIONS.store(0, Ordering::Relaxed);
+        }
+
+        /// Returns the narrow test-only schema-projection count.
+        pub(crate) fn projection_count() -> usize {
+            STORAGE_DEFINITION_PROJECTIONS.load(Ordering::Relaxed)
+        }
+    }
+
+    pub(super) fn record_projection() {
+        STORAGE_DEFINITION_PROJECTIONS.fetch_add(1, Ordering::Relaxed);
     }
 }

@@ -21,7 +21,8 @@ use crate::value::{Val, ValKind};
 use error_stack::{Report, ResultExt};
 use std::sync::OnceLock;
 
-pub(super) const TABLE_ID_INDEXES: TableID = catalog_table_id_from_slot(2);
+/// Catalog table id for `catalog.indexes`.
+pub(crate) const TABLE_ID_INDEXES: TableID = catalog_table_id_from_slot(2);
 const COL_NO_INDEXES_TABLE_ID: usize = 0;
 const COL_NO_INDEXES_INDEX_ID: usize = 1;
 const COL_NO_INDEXES_INDEX_SLOT: usize = 2;

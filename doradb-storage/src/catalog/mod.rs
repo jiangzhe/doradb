@@ -11,8 +11,10 @@ pub use checkpoint::CatalogCheckpointOutcome;
 pub(crate) use checkpoint::*;
 pub(crate) use definition::*;
 pub use definition::{
-    DescriptorUpdate, MAX_TABLE_DESCRIPTOR_BYTES, ManagedDdlError, ManagedDdlResult,
-    TableDescriptorInterpreter,
+    BindingNamespaceID, DescriptorUpdate, MAX_TABLE_BINDING_KEY_BYTES, MAX_TABLE_DESCRIPTOR_BYTES,
+    ManagedCreateTableDefinition, ManagedDdlError, ManagedDdlResult,
+    ManagedTableDefinitionSnapshot, ManagedTableInterpreter, ResolvedTableBinding, TableBinding,
+    TableDefinitionVersion,
 };
 pub(crate) use history::*;
 pub(crate) use index::*;
@@ -1755,9 +1757,20 @@ pub(crate) mod tests {
         assert!(!last_user.is_catalog());
         assert!(!CATALOG_TABLE_ID_START.is_user());
         assert!(CATALOG_TABLE_ID_START.is_catalog());
-        assert_eq!(catalog_table_id_from_slot(0), CATALOG_TABLE_ID_START);
-        assert_eq!(catalog_table_slot(CATALOG_TABLE_ID_START), Some(0));
-        assert_eq!(catalog_table_slot(catalog_table_id_from_slot(4)), Some(4));
+        for (slot, table_id) in [
+            TABLE_ID_TABLES,
+            TABLE_ID_COLUMNS,
+            TABLE_ID_INDEXES,
+            TABLE_ID_TABLE_DESCRIPTORS,
+            TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS,
+            TABLE_ID_TABLE_BINDINGS,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(table_id, catalog_table_id_from_slot(slot));
+            assert_eq!(catalog_table_slot(table_id), Some(slot));
+        }
     }
 
     #[test]

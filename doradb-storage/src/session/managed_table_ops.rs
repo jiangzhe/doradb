@@ -1,15 +1,19 @@
 use super::{PreparedDdlScope, Session, SessionOperationPin};
 use crate::catalog::{
-    CreateTableOutcome, CurrentTableDefinition, ID_DOMAIN_END, IndexDdlGateScope, IndexID,
-    ManagedDdlError, ManagedDdlResult, PreparedCreateIndex, PreparedCreateTable, PreparedDropIndex,
-    TABLE_ID_TABLE_DESCRIPTORS, TableDescriptorInterpreter, ValidatedCreateTable,
-    create_index_catalog_write_targets, create_table_catalog_write_targets,
-    drop_index_catalog_write_targets, reject_non_user_table_id,
-    reject_user_table_primary_key_index, validate_descriptor_payload, validated_index_ddl_target,
+    BindingNamespaceID, CreateTableOutcome, CurrentTableDefinition, ID_DOMAIN_END,
+    IndexDdlGateScope, IndexID, ManagedDdlError, ManagedDdlResult, ManagedTableDefinitionSnapshot,
+    ManagedTableInterpreter, PreparedCreateIndex, PreparedCreateTable, PreparedDropIndex,
+    ResolvedTableBinding, StorageTableDefinition, TABLE_ID_TABLE_BINDINGS,
+    TABLE_ID_TABLE_DESCRIPTORS, TableBinding, TableDefinitionVersion, ValidatedCreateTable,
+    create_index_catalog_write_targets, drop_index_catalog_write_targets,
+    managed_create_table_catalog_write_targets, reject_non_user_table_id,
+    reject_user_table_primary_key_index, validate_descriptor_payload, validate_table_binding_key,
+    validate_table_bindings, validate_table_descriptor_against_metadata,
+    validated_index_ddl_target,
 };
 use crate::error::{
-    DiscloseError, DiscloseResultExt, MultiDomainResultExt, OperationError, OperationOrFatalResult,
-    Result, RuntimeError,
+    DataIntegrityError, DiscloseError, DiscloseResultExt, MultiDomainResultExt, OperationError,
+    OperationOrFatalResult, Result, RuntimeError,
 };
 use crate::id::TableID;
 use crate::lock::{FreshClaimsGuard, LockMode, LockResource};
@@ -21,13 +25,17 @@ use std::sync::Arc;
 /// Managed table-definition operations implemented by [`Session`].
 pub trait ManagedTableOps {
     /// Interprets and creates one managed table from opaque higher-layer bytes.
+    ///
+    /// Binding collisions are returned in the engine-error arm as
+    /// [`OperationError::DuplicateKey`] or, for a concurrent ownership race,
+    /// [`OperationError::WriteConflict`].
     fn create_managed_table<I>(
         &mut self,
         source: &[u8],
         interpreter: &mut I,
     ) -> impl Future<Output = ManagedDdlResult<CreateTableOutcome, I::Error>>
     where
-        I: TableDescriptorInterpreter;
+        I: ManagedTableInterpreter;
 
     /// Interprets and creates one managed secondary index from opaque bytes.
     fn create_managed_index<I>(
@@ -37,7 +45,7 @@ pub trait ManagedTableOps {
         interpreter: &mut I,
     ) -> impl Future<Output = ManagedDdlResult<IndexID, I::Error>>
     where
-        I: TableDescriptorInterpreter;
+        I: ManagedTableInterpreter;
 
     /// Interprets and drops one managed secondary index from opaque bytes.
     fn drop_managed_index<I>(
@@ -47,7 +55,25 @@ pub trait ManagedTableOps {
         interpreter: &mut I,
     ) -> impl Future<Output = ManagedDdlResult<(), I::Error>>
     where
-        I: TableDescriptorInterpreter;
+        I: ManagedTableInterpreter;
+
+    /// Resolves one binding at an admitted current point.
+    ///
+    /// The returned version is an optimistic cache token. No lock survives the
+    /// call, so equality with a later resolution does not guard intervening
+    /// planning or execution.
+    fn resolve_table_binding(
+        &mut self,
+        namespace_id: BindingNamespaceID,
+        binding_key: &[u8],
+        include_full_schema: bool,
+    ) -> impl Future<Output = Result<Option<ResolvedTableBinding>>>;
+
+    /// Lists every roleless binding for one current managed table.
+    fn list_table_bindings(
+        &mut self,
+        table_id: TableID,
+    ) -> impl Future<Output = Result<Box<[TableBinding]>>>;
 }
 
 impl ManagedTableOps for Session {
@@ -57,16 +83,19 @@ impl ManagedTableOps for Session {
         interpreter: &mut I,
     ) -> ManagedDdlResult<CreateTableOutcome, I::Error>
     where
-        I: TableDescriptorInterpreter,
+        I: ManagedTableInterpreter,
     {
-        let update = interpreter
+        let definition = interpreter
             .create_table(source)
             .map_err(ManagedDdlError::Interpreter)?;
-        validate_descriptor_payload(update.descriptor())
+        validate_descriptor_payload(definition.descriptor())
             .disclose()
             .map_err(ManagedDdlError::Engine)?;
-        let (definition, descriptor) = update.into_parts();
-        let (table_spec, index_specs) = definition.into_parts();
+        validate_table_bindings(definition.bindings())
+            .disclose()
+            .map_err(ManagedDdlError::Engine)?;
+        let (storage, descriptor, bindings) = definition.into_parts();
+        let (table_spec, index_specs) = storage.into_parts();
         let validated = ValidatedCreateTable::try_new(table_spec, index_specs.into_vec())
             .disclose()
             .map_err(ManagedDdlError::Engine)?;
@@ -77,10 +106,8 @@ impl ManagedTableOps for Session {
             .map_err(ManagedDdlError::Engine)?;
         let mandatory_runtime = operation.runtime.mandatory_runtime.clone();
         let prepared = operation
-            .prepare_managed_create_table(validated, descriptor)
+            .prepare_managed_create_table(validated, descriptor, bindings)
             .await
-            .attach("operation=create_managed_table")
-            .disclose()
             .map_err(ManagedDdlError::Engine)?;
         let observer = mandatory_runtime
             .submit(prepared)
@@ -105,7 +132,7 @@ impl ManagedTableOps for Session {
         interpreter: &mut I,
     ) -> ManagedDdlResult<IndexID, I::Error>
     where
-        I: TableDescriptorInterpreter,
+        I: ManagedTableInterpreter,
     {
         let current = self
             .read_managed_current_definition(table_id, "create_managed_index")
@@ -234,7 +261,7 @@ impl ManagedTableOps for Session {
         interpreter: &mut I,
     ) -> ManagedDdlResult<(), I::Error>
     where
-        I: TableDescriptorInterpreter,
+        I: ManagedTableInterpreter,
     {
         let current = self
             .read_managed_current_definition(table_id, "drop_managed_index")
@@ -322,9 +349,164 @@ impl ManagedTableOps for Session {
                 .disclose()
                 .map_err(ManagedDdlError::Engine)
     }
+
+    async fn resolve_table_binding(
+        &mut self,
+        namespace_id: BindingNamespaceID,
+        binding_key: &[u8],
+        include_full_schema: bool,
+    ) -> Result<Option<ResolvedTableBinding>> {
+        validate_table_binding_key(binding_key).disclose()?;
+        let mut candidate = match self.probe_table_binding(namespace_id, binding_key).await? {
+            Some(table_id) => table_id,
+            None => return Ok(None),
+        };
+
+        loop {
+            let mut operation = self
+                .pin_operation(SessionOperationKind::Ddl)
+                .attach("operation=resolve_table_binding, phase=final_admission")
+                .disclose()?;
+            operation
+                .acquire_table_binding_resolution(candidate, include_full_schema)
+                .await
+                .attach_with(|| {
+                    format!(
+                        "operation=resolve_table_binding, phase=acquire_final_claims, table_id={candidate}"
+                    )
+                })
+                .disclose()?;
+            let engine = &operation.runtime;
+            let rebound = engine
+                .catalog()
+                .storage
+                .table_bindings()
+                .find_uncommitted_table_id(engine.pool_guards(), namespace_id, binding_key)
+                .await
+                .disclose()?;
+            let Some(rebound) = rebound else {
+                return Ok(None);
+            };
+            if rebound != candidate {
+                candidate = rebound;
+                drop(operation);
+                continue;
+            }
+
+            let table = engine
+                .catalog()
+                .current_live_user_table(candidate)
+                .ok_or_else(|| invalid_binding_target(candidate, "current runtime is missing"))?;
+            if !table.definition_kind().is_managed() {
+                return Err(invalid_binding_target(
+                    candidate,
+                    "binding targets an unmanaged runtime",
+                ));
+            }
+            let layout = table.layout_snapshot();
+            let version = TableDefinitionVersion::new(candidate, layout.metadata().storage_epoch);
+            let full_schema = if include_full_schema {
+                let descriptor = engine
+                    .catalog()
+                    .storage
+                    .table_descriptors()
+                    .find_uncommitted_by_table_id(engine.pool_guards(), candidate)
+                    .await
+                    .disclose()?
+                    .ok_or_else(|| {
+                        invalid_binding_target(candidate, "managed descriptor is missing")
+                    })?;
+                validate_table_descriptor_against_metadata(
+                    &descriptor,
+                    candidate,
+                    layout.metadata(),
+                )
+                .attach("operation=resolve_table_binding, phase=validate_full_definition")
+                .disclose()?;
+                Some(ManagedTableDefinitionSnapshot::new(
+                    StorageTableDefinition::from_metadata(layout.metadata()),
+                    descriptor.payload,
+                ))
+            } else {
+                None
+            };
+            return Ok(Some(ResolvedTableBinding::new(
+                candidate,
+                version,
+                full_schema,
+            )));
+        }
+    }
+
+    async fn list_table_bindings(&mut self, table_id: TableID) -> Result<Box<[TableBinding]>> {
+        reject_non_user_table_id(table_id, "list_table_bindings").disclose()?;
+        let mut operation = self
+            .pin_operation(SessionOperationKind::Ddl)
+            .attach("operation=list_table_bindings")
+            .disclose()?;
+        operation
+            .acquire_table_binding_list(table_id)
+            .await
+            .attach_with(|| {
+                format!("operation=list_table_bindings, phase=acquire_claims, table_id={table_id}")
+            })
+            .disclose()?;
+        let engine = &operation.runtime;
+        let table = engine
+            .catalog()
+            .current_live_user_table(table_id)
+            .ok_or_else(|| invalid_binding_target(table_id, "current runtime is missing"))?;
+        if !table.definition_kind().is_managed() {
+            return Err(Report::new(OperationError::InvalidMetadata)
+                .attach(format!(
+                    "list_table_bindings requires managed table: table_id={table_id}"
+                ))
+                .disclose());
+        }
+        let bindings = engine
+            .catalog()
+            .storage
+            .table_bindings()
+            .list_uncommitted_by_table_id(engine.pool_guards(), table_id)
+            .await
+            .disclose()?
+            .into_iter()
+            .map(|binding| TableBinding::new(binding.namespace_id, binding.binding_key))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Ok(bindings)
+    }
 }
 
 impl Session {
+    async fn probe_table_binding(
+        &mut self,
+        namespace_id: BindingNamespaceID,
+        binding_key: &[u8],
+    ) -> Result<Option<TableID>> {
+        let mut operation = self
+            .pin_operation(SessionOperationKind::Ddl)
+            .attach("operation=resolve_table_binding, phase=probe")
+            .disclose()?;
+        operation
+            .acquire_table_binding_probe()
+            .await
+            .attach("operation=resolve_table_binding, phase=acquire_probe_claims")
+            .disclose()?;
+        let result = operation
+            .runtime
+            .catalog()
+            .storage
+            .table_bindings()
+            .find_uncommitted_table_id(operation.runtime.pool_guards(), namespace_id, binding_key)
+            .await
+            .disclose()?;
+        drop(operation);
+        #[cfg(test)]
+        tests::pause_after_binding_probe(namespace_id, binding_key);
+        Ok(result)
+    }
+
     async fn read_managed_current_definition(
         &mut self,
         table_id: TableID,
@@ -378,6 +560,98 @@ impl Session {
 }
 
 impl SessionOperationPin {
+    /// Acquires the short binding-only probe scope.
+    async fn acquire_table_binding_probe(&mut self) -> OperationOrFatalResult<()> {
+        let (engine, family, curr_scope) = self.operation_lock_parts();
+        let mut fresh =
+            FreshClaimsGuard::<2>::new(family, curr_scope, engine.lock_manager(), &engine.poisoner);
+        fresh
+            .acquire(
+                LockResource::TableMetadata(TABLE_ID_TABLE_BINDINGS),
+                LockMode::Shared,
+            )
+            .await?;
+        fresh
+            .acquire(
+                LockResource::TableData(TABLE_ID_TABLE_BINDINGS),
+                LockMode::IntentShared,
+            )
+            .await?;
+        fresh.disarm();
+        Ok(())
+    }
+
+    /// Acquires target-first claims for the coherent final resolution pass.
+    async fn acquire_table_binding_resolution(
+        &mut self,
+        table_id: TableID,
+        include_full_schema: bool,
+    ) -> OperationOrFatalResult<()> {
+        let (engine, family, curr_scope) = self.operation_lock_parts();
+        let mut fresh =
+            FreshClaimsGuard::<5>::new(family, curr_scope, engine.lock_manager(), &engine.poisoner);
+        fresh
+            .acquire(LockResource::TableMetadata(table_id), LockMode::Shared)
+            .await?;
+        if include_full_schema {
+            fresh
+                .acquire(
+                    LockResource::TableMetadata(TABLE_ID_TABLE_DESCRIPTORS),
+                    LockMode::Shared,
+                )
+                .await?;
+        }
+        fresh
+            .acquire(
+                LockResource::TableMetadata(TABLE_ID_TABLE_BINDINGS),
+                LockMode::Shared,
+            )
+            .await?;
+        if include_full_schema {
+            fresh
+                .acquire(
+                    LockResource::TableData(TABLE_ID_TABLE_DESCRIPTORS),
+                    LockMode::IntentShared,
+                )
+                .await?;
+        }
+        fresh
+            .acquire(
+                LockResource::TableData(TABLE_ID_TABLE_BINDINGS),
+                LockMode::IntentShared,
+            )
+            .await?;
+        fresh.disarm();
+        Ok(())
+    }
+
+    /// Acquires target-first claims for reverse binding enumeration.
+    async fn acquire_table_binding_list(
+        &mut self,
+        table_id: TableID,
+    ) -> OperationOrFatalResult<()> {
+        let (engine, family, curr_scope) = self.operation_lock_parts();
+        let mut fresh =
+            FreshClaimsGuard::<3>::new(family, curr_scope, engine.lock_manager(), &engine.poisoner);
+        fresh
+            .acquire(LockResource::TableMetadata(table_id), LockMode::Shared)
+            .await?;
+        fresh
+            .acquire(
+                LockResource::TableMetadata(TABLE_ID_TABLE_BINDINGS),
+                LockMode::Shared,
+            )
+            .await?;
+        fresh
+            .acquire(
+                LockResource::TableData(TABLE_ID_TABLE_BINDINGS),
+                LockMode::IntentShared,
+            )
+            .await?;
+        fresh.disarm();
+        Ok(())
+    }
+
     /// Acquires the short managed-definition read set in canonical order.
     async fn acquire_managed_definition_read(
         &mut self,
@@ -410,12 +684,31 @@ impl SessionOperationPin {
         self,
         validated: ValidatedCreateTable,
         descriptor: Box<[u8]>,
-    ) -> OperationOrFatalResult<PreparedCreateTable> {
+        bindings: Box<[TableBinding]>,
+    ) -> Result<PreparedCreateTable> {
         let table_id = self.runtime.catalog().next_table_id();
-        let plan = validated.into_managed_plan(table_id, descriptor);
-        let scope = PreparedDdlScope::create(self, table_id, create_table_catalog_write_targets())
+        let has_bindings = !bindings.is_empty();
+        let targets = managed_create_table_catalog_write_targets(has_bindings);
+        let scope = PreparedDdlScope::create(self, table_id, targets)
             .await
-            .attach_with(|| format!("prepare managed CREATE TABLE locks: table_id={table_id}"))?;
+            .attach_with(|| format!("prepare managed CREATE TABLE locks: table_id={table_id}"))
+            .disclose()?;
+        if has_bindings {
+            scope
+                .engine()
+                .catalog()
+                .storage
+                .table_bindings()
+                .precheck_create_keys_absent(scope.engine().pool_guards(), &bindings)
+                .await
+                .attach_with(|| {
+                    format!(
+                        "operation=create_managed_table, phase=check_binding_uniqueness, table_id={table_id}"
+                    )
+                })
+                .disclose()?;
+        }
+        let plan = validated.into_managed_plan(table_id, descriptor, bindings);
         Ok(PreparedCreateTable::new(scope, plan))
     }
 }
@@ -429,19 +722,47 @@ fn managed_schema_changed(table_id: TableID, operation: &'static str) -> crate::
         .disclose()
 }
 
+#[inline]
+fn invalid_binding_target(table_id: TableID, reason: &'static str) -> crate::Error {
+    Report::new(DataIntegrityError::InvalidRootInvariant)
+        .attach(format!(
+            "managed table binding integrity failure: table_id={table_id}, reason={reason}"
+        ))
+        .disclose()
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::catalog::storage::tests::begin_catalog_test_trx;
+    use crate::catalog::table::{
+        CreateTableTestFailure, install_create_before_first_effect_gate,
+        reset_storage_schema_fingerprint_count, set_create_table_failure,
+        storage_schema_fingerprint_count, user_table_file_exists,
+    };
+    use crate::catalog::{TableBindingObject, TableDescriptorObject, TableDescriptors};
+    use crate::id::TableID;
+    use crate::log::redo::DDLRedo;
     use crate::session::tests::SessionTestExt;
     use crate::{
-        Engine, EngineConfig, Error, IndexID, ManagedTableOps, OperationError, StorageColumnFlags,
-        StorageColumnSpec, StorageIndexFlags, StorageIndexKey, StorageIndexSpec, StorageTableSpec,
-        ValKind,
+        BindingNamespaceID, Engine, EngineConfig, Error, ErrorKind, IndexID, ManagedTableOps,
+        OperationError, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
+        StorageIndexSpec, StorageTableSpec, TableBinding, ValKind,
     };
     use std::result::Result as StdResult;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-    use std::sync::{Arc, Barrier};
+    use std::sync::{Arc, Barrier, Mutex, OnceLock, mpsc};
     use std::thread;
+    use std::time::Duration;
     use tempfile::TempDir;
+
+    static BINDING_PROBE_PAUSE: OnceLock<Mutex<Option<BindingProbePause>>> = OnceLock::new();
+
+    struct BindingProbePause {
+        namespace_id: BindingNamespaceID,
+        binding_key: Box<[u8]>,
+        entered: mpsc::SyncSender<()>,
+        release: mpsc::Receiver<()>,
+    }
 
     struct ManagedRoundTripInterpreter {
         initial_descriptor: Vec<u8>,
@@ -449,17 +770,18 @@ mod tests {
         dropped_index_descriptor: Vec<u8>,
         create_index_calls: usize,
         drop_index_calls: usize,
+        bindings: Vec<TableBinding>,
     }
 
-    impl crate::TableDescriptorInterpreter for ManagedRoundTripInterpreter {
+    impl crate::ManagedTableInterpreter for ManagedRoundTripInterpreter {
         type Error = &'static str;
 
         fn create_table(
             &mut self,
             source: &[u8],
-        ) -> StdResult<crate::DescriptorUpdate<crate::CreateTableDefinition>, Self::Error> {
+        ) -> StdResult<crate::ManagedCreateTableDefinition, Self::Error> {
             assert_eq!(source, [0xff, 0x00, 0xfe]);
-            Ok(crate::DescriptorUpdate::new(
+            Ok(crate::ManagedCreateTableDefinition::new(
                 crate::CreateTableDefinition::new(
                     StorageTableSpec::new(vec![
                         StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
@@ -471,6 +793,7 @@ mod tests {
                     )],
                 ),
                 self.initial_descriptor.clone(),
+                self.bindings.clone(),
             ))
         }
 
@@ -528,17 +851,18 @@ mod tests {
 
     struct CreateFailureInterpreter {
         result: StdResult<Vec<u8>, &'static str>,
+        bindings: Vec<TableBinding>,
     }
 
-    impl crate::TableDescriptorInterpreter for CreateFailureInterpreter {
+    impl crate::ManagedTableInterpreter for CreateFailureInterpreter {
         type Error = &'static str;
 
         fn create_table(
             &mut self,
             _source: &[u8],
-        ) -> StdResult<crate::DescriptorUpdate<crate::CreateTableDefinition>, Self::Error> {
+        ) -> StdResult<crate::ManagedCreateTableDefinition, Self::Error> {
             let descriptor = self.result.clone()?;
-            Ok(crate::DescriptorUpdate::new(
+            Ok(crate::ManagedCreateTableDefinition::new(
                 crate::CreateTableDefinition::new(
                     StorageTableSpec::new(vec![StorageColumnSpec::new(
                         ValKind::I32,
@@ -547,6 +871,7 @@ mod tests {
                     vec![],
                 ),
                 descriptor,
+                self.bindings.clone(),
             ))
         }
 
@@ -578,13 +903,13 @@ mod tests {
         descriptor: Vec<u8>,
     }
 
-    impl crate::TableDescriptorInterpreter for CreateIndexOnlyInterpreter {
+    impl crate::ManagedTableInterpreter for CreateIndexOnlyInterpreter {
         type Error = &'static str;
 
         fn create_table(
             &mut self,
             _source: &[u8],
-        ) -> StdResult<crate::DescriptorUpdate<crate::CreateTableDefinition>, Self::Error> {
+        ) -> StdResult<crate::ManagedCreateTableDefinition, Self::Error> {
             unreachable!()
         }
 
@@ -622,6 +947,42 @@ mod tests {
         }
     }
 
+    /// Pauses one matching resolver after its binding-only probe scope closes.
+    pub(super) fn pause_after_binding_probe(namespace_id: BindingNamespaceID, binding_key: &[u8]) {
+        let pause = BINDING_PROBE_PAUSE
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap()
+            .take_if(|pause| {
+                pause.namespace_id == namespace_id && pause.binding_key.as_ref() == binding_key
+            });
+        if let Some(pause) = pause {
+            pause.entered.send(()).unwrap();
+            pause.release.recv().unwrap();
+        }
+    }
+
+    fn install_binding_probe_pause(
+        namespace_id: BindingNamespaceID,
+        binding_key: impl Into<Box<[u8]>>,
+    ) -> (mpsc::Receiver<()>, mpsc::SyncSender<()>) {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let pause = BindingProbePause {
+            namespace_id,
+            binding_key: binding_key.into(),
+            entered: entered_tx,
+            release: release_rx,
+        };
+        let previous = BINDING_PROBE_PAUSE
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap()
+            .replace(pause);
+        assert!(previous.is_none(), "binding probe pause already installed");
+        (entered_rx, release_tx)
+    }
+
     #[test]
     fn test_managed_ddl_round_trips_descriptor_and_rejects_unmanaged_index_changes() {
         smol::block_on(async {
@@ -641,6 +1002,11 @@ mod tests {
                 dropped_index_descriptor: dropped_index_descriptor.clone(),
                 create_index_calls: 0,
                 drop_index_calls: 0,
+                bindings: vec![
+                    TableBinding::new(BindingNamespaceID::new(2), &b"zeta"[..]),
+                    TableBinding::new(BindingNamespaceID::new(1), &b"beta"[..]),
+                    TableBinding::new(BindingNamespaceID::new(1), &b"alpha"[..]),
+                ],
             };
 
             let outcome = session
@@ -649,6 +1015,46 @@ mod tests {
                 .unwrap();
             let table_id = outcome.table_id();
             assert_eq!(outcome.index_ids(), [IndexID::new(0)]);
+            crate::StorageTableDefinition::reset_projection_count();
+            TableDescriptors::reset_lookup_count();
+            reset_storage_schema_fingerprint_count();
+            let narrow = session
+                .resolve_table_binding(BindingNamespaceID::new(1), b"alpha", false)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(narrow.table_id(), table_id);
+            assert!(narrow.full_schema().is_none());
+            assert_eq!(crate::StorageTableDefinition::projection_count(), 0);
+            assert_eq!(TableDescriptors::lookup_count(), 0);
+            assert_eq!(storage_schema_fingerprint_count(), 0);
+            let full = session
+                .resolve_table_binding(BindingNamespaceID::new(1), b"alpha", true)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(full.version(), narrow.version());
+            let second_binding = session
+                .resolve_table_binding(BindingNamespaceID::new(1), b"beta", false)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(second_binding.version(), narrow.version());
+            let snapshot = full.full_schema().unwrap();
+            assert_eq!(crate::StorageTableDefinition::projection_count(), 1);
+            assert_eq!(TableDescriptors::lookup_count(), 1);
+            assert_eq!(storage_schema_fingerprint_count(), 1);
+            assert_eq!(snapshot.schema().columns().len(), 2);
+            assert_eq!(snapshot.schema().indexes().len(), 1);
+            assert_eq!(snapshot.descriptor(), initial_descriptor);
+            assert_eq!(
+                &*session.list_table_bindings(table_id).await.unwrap(),
+                [
+                    TableBinding::new(BindingNamespaceID::new(1), &b"alpha"[..]),
+                    TableBinding::new(BindingNamespaceID::new(1), &b"beta"[..]),
+                    TableBinding::new(BindingNamespaceID::new(2), &b"zeta"[..]),
+                ]
+            );
             let runtime = session.engine();
             let descriptor = runtime
                 .catalog()
@@ -686,6 +1092,12 @@ mod tests {
                 .unwrap();
             assert_eq!(index_id, IndexID::new(1));
             assert_eq!(interpreter.create_index_calls, 1);
+            let after_create = session
+                .resolve_table_binding(BindingNamespaceID::new(1), b"alpha", false)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(after_create.version(), narrow.version());
             let descriptor = runtime
                 .catalog()
                 .storage
@@ -706,6 +1118,12 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(interpreter.drop_index_calls, 1);
+            let after_drop = session
+                .resolve_table_binding(BindingNamespaceID::new(1), b"alpha", false)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(after_drop.version(), after_create.version());
             let descriptor = runtime
                 .catalog()
                 .storage
@@ -719,6 +1137,19 @@ mod tests {
             assert_eq!(&*descriptor.payload, dropped_index_descriptor);
 
             session.drop_table(table_id).await.unwrap();
+            for (namespace_id, key) in [
+                (BindingNamespaceID::new(1), &b"alpha"[..]),
+                (BindingNamespaceID::new(1), &b"beta"[..]),
+                (BindingNamespaceID::new(2), &b"zeta"[..]),
+            ] {
+                assert!(
+                    session
+                        .resolve_table_binding(namespace_id, key, false)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            }
             assert!(
                 runtime
                     .catalog()
@@ -729,6 +1160,17 @@ mod tests {
                     .unwrap()
                     .is_none()
             );
+            let recreated = session
+                .create_managed_table(&[0xff, 0x00, 0xfe], &mut interpreter)
+                .await
+                .unwrap();
+            assert_ne!(recreated.table_id(), table_id);
+            let recreated_binding = session
+                .resolve_table_binding(BindingNamespaceID::new(1), b"alpha", false)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(recreated_binding.version(), after_drop.version());
         });
     }
 
@@ -747,6 +1189,14 @@ mod tests {
                 dropped_index_descriptor: Vec::new(),
                 create_index_calls: 0,
                 drop_index_calls: 0,
+                bindings: vec![
+                    TableBinding::new(BindingNamespaceID::new(11), &b"restart"[..]),
+                    TableBinding::new(BindingNamespaceID::new(12), Vec::<u8>::new()),
+                    TableBinding::new(
+                        BindingNamespaceID::new(13),
+                        vec![0xa5; crate::MAX_TABLE_BINDING_KEY_BYTES],
+                    ),
+                ],
             };
             let managed = session
                 .create_managed_table(&[0xff, 0x00, 0xfe], &mut interpreter)
@@ -770,6 +1220,34 @@ mod tests {
                 .await
                 .unwrap();
             let mut session = engine.new_session().unwrap();
+            assert_eq!(
+                session
+                    .resolve_table_binding(BindingNamespaceID::new(11), b"restart", true)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .table_id(),
+                managed.table_id()
+            );
+            assert_eq!(
+                session
+                    .resolve_table_binding(BindingNamespaceID::new(12), b"", false)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .table_id(),
+                managed.table_id()
+            );
+            let maximum_key = vec![0xa5; crate::MAX_TABLE_BINDING_KEY_BYTES];
+            assert_eq!(
+                session
+                    .resolve_table_binding(BindingNamespaceID::new(13), &maximum_key, false)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .table_id(),
+                managed.table_id()
+            );
             let err = session
                 .create_index(
                     managed.table_id(),
@@ -830,6 +1308,7 @@ mod tests {
 
             let mut interpreter = CreateFailureInterpreter {
                 result: Err("invalid source"),
+                bindings: vec![],
             };
             let err = session
                 .create_managed_table(b"bad", &mut interpreter)
@@ -843,6 +1322,7 @@ mod tests {
 
             let mut interpreter = CreateFailureInterpreter {
                 result: Ok(vec![0; crate::MAX_TABLE_DESCRIPTOR_BYTES + 1]),
+                bindings: vec![],
             };
             let err = session
                 .create_managed_table(b"large", &mut interpreter)
@@ -863,6 +1343,479 @@ mod tests {
                     .list_user_table_ids_now()
                     .is_empty()
             );
+
+            let mut interpreter = CreateFailureInterpreter {
+                result: Ok(vec![]),
+                bindings: vec![
+                    TableBinding::new(BindingNamespaceID::new(5), &b"duplicate"[..]),
+                    TableBinding::new(BindingNamespaceID::new(5), &b"duplicate"[..]),
+                ],
+            };
+            let err = session
+                .create_managed_table(b"duplicate", &mut interpreter)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.engine().and_then(Error::operation_error),
+                Some(OperationError::InvalidMetadata)
+            );
+            assert_eq!(
+                session.engine().catalog().curr_next_table_id(),
+                initial_next
+            );
+
+            let mut interpreter = CreateFailureInterpreter {
+                result: Ok(vec![]),
+                bindings: vec![TableBinding::new(
+                    BindingNamespaceID::new(5),
+                    vec![0; crate::MAX_TABLE_BINDING_KEY_BYTES + 1],
+                )],
+            };
+            let err = session
+                .create_managed_table(b"oversized binding", &mut interpreter)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.engine().and_then(Error::operation_error),
+                Some(OperationError::InvalidMetadata)
+            );
+            assert_eq!(
+                session.engine().catalog().curr_next_table_id(),
+                initial_next
+            );
+
+            let oversized_lookup = vec![0; crate::MAX_TABLE_BINDING_KEY_BYTES + 1];
+            let error = session
+                .resolve_table_binding(BindingNamespaceID::new(5), &oversized_lookup, false)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.operation_error(),
+                Some(OperationError::InvalidMetadata)
+            );
+        });
+    }
+
+    #[test]
+    fn test_managed_create_binding_collision_is_atomic_and_namespace_local() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let mut first = CreateFailureInterpreter {
+                result: Ok(vec![1]),
+                bindings: vec![TableBinding::new(
+                    BindingNamespaceID::new(7),
+                    &b"shared"[..],
+                )],
+            };
+            let first_id = session
+                .create_managed_table(b"first", &mut first)
+                .await
+                .unwrap()
+                .table_id();
+
+            let mut duplicate = CreateFailureInterpreter {
+                result: Ok(vec![2]),
+                bindings: vec![TableBinding::new(
+                    BindingNamespaceID::new(7),
+                    &b"shared"[..],
+                )],
+            };
+            let error = session
+                .create_managed_table(b"duplicate", &mut duplicate)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.engine().and_then(Error::operation_error),
+                Some(OperationError::DuplicateKey)
+            );
+            assert_eq!(
+                session
+                    .resolve_table_binding(BindingNamespaceID::new(7), b"shared", false)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .table_id(),
+                first_id
+            );
+            assert_eq!(
+                session.engine().catalog().list_user_table_ids_now(),
+                [first_id]
+            );
+
+            let mut other_namespace = CreateFailureInterpreter {
+                result: Ok(vec![3]),
+                bindings: vec![TableBinding::new(
+                    BindingNamespaceID::new(8),
+                    &b"shared"[..],
+                )],
+            };
+            let second_id = session
+                .create_managed_table(b"other namespace", &mut other_namespace)
+                .await
+                .unwrap()
+                .table_id();
+            assert_ne!(second_id, first_id);
+        });
+    }
+
+    #[test]
+    fn test_managed_create_failure_rolls_back_binding_definition_bundle() {
+        for failure in [
+            CreateTableTestFailure::AfterCatalogStaged,
+            CreateTableTestFailure::AfterFilePublished,
+            CreateTableTestFailure::AfterRuntimeBuilt,
+        ] {
+            smol::block_on(async {
+                let root = TempDir::new().unwrap();
+                let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                    .await
+                    .unwrap();
+                let mut session = engine.new_session().unwrap();
+                let table_id = session.engine().catalog().curr_next_table_id();
+                let mut interpreter = CreateFailureInterpreter {
+                    result: Ok(vec![1]),
+                    bindings: vec![TableBinding::new(
+                        BindingNamespaceID::new(19),
+                        &b"rollback"[..],
+                    )],
+                };
+
+                set_create_table_failure(&engine, Some(failure));
+                let result = session
+                    .create_managed_table(b"create", &mut interpreter)
+                    .await;
+                set_create_table_failure(&engine, None);
+                assert!(result.is_err());
+                assert!(
+                    session
+                        .engine()
+                        .catalog()
+                        .list_user_table_ids_now()
+                        .is_empty()
+                );
+                assert!(
+                    session
+                        .resolve_table_binding(BindingNamespaceID::new(19), b"rollback", false)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    session
+                        .engine()
+                        .catalog()
+                        .storage
+                        .tables()
+                        .find_uncommitted_by_id(session.engine().pool_guards(), table_id)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    session
+                        .engine()
+                        .catalog()
+                        .storage
+                        .table_descriptors()
+                        .find_uncommitted_by_table_id(session.engine().pool_guards(), table_id)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn test_concurrent_managed_create_binding_collision_has_one_clean_winner() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let first_table_id = engine.inner().core.catalog().curr_next_table_id();
+            let (first_entered, release_first) = install_create_before_first_effect_gate(&engine);
+            let mut session1 = engine.new_session().unwrap();
+            let mut interpreter1 = CreateFailureInterpreter {
+                result: Ok(vec![1]),
+                bindings: vec![
+                    TableBinding::new(BindingNamespaceID::new(20), &b"rolled-back"[..]),
+                    TableBinding::new(BindingNamespaceID::new(20), &b"contended"[..]),
+                ],
+            };
+            let mut first = Box::pin(session1.create_managed_table(b"first", &mut interpreter1));
+            assert!(matches!(
+                futures::poll!(first.as_mut()),
+                std::task::Poll::Pending
+            ));
+            first_entered.recv_async().await.unwrap();
+
+            // The first CREATE already owns binding-table data-IX but has not
+            // staged its key. A second CREATE must pass lock acquisition and
+            // commit before the first is released.
+            let (second_done_tx, second_done_rx) = mpsc::sync_channel(1);
+            let mut session2 = engine.new_session().unwrap();
+            let second = thread::spawn(move || {
+                let mut interpreter = CreateFailureInterpreter {
+                    result: Ok(vec![2]),
+                    bindings: vec![TableBinding::new(
+                        BindingNamespaceID::new(20),
+                        &b"contended"[..],
+                    )],
+                };
+                let result =
+                    smol::block_on(session2.create_managed_table(b"second", &mut interpreter));
+                second_done_tx.send(result).unwrap();
+            });
+            let winner = match second_done_rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(result) => result.unwrap(),
+                Err(error) => {
+                    release_first.send_async(()).await.unwrap();
+                    second.join().unwrap();
+                    panic!("non-conflicting binding data-IX acquisition stalled: {error}");
+                }
+            };
+            release_first.send_async(()).await.unwrap();
+            let loser = first.await.unwrap_err();
+            second.join().unwrap();
+            assert!(matches!(
+                loser.engine().and_then(Error::operation_error),
+                Some(OperationError::DuplicateKey | OperationError::WriteConflict)
+            ));
+            assert_ne!(winner.table_id(), first_table_id);
+            let mut verifier = engine.new_session().unwrap();
+            assert_eq!(
+                verifier
+                    .resolve_table_binding(BindingNamespaceID::new(20), b"contended", false)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .table_id(),
+                winner.table_id()
+            );
+            assert!(
+                verifier
+                    .resolve_table_binding(BindingNamespaceID::new(20), b"rolled-back", false)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                verifier.engine().catalog().list_user_table_ids_now(),
+                [winner.table_id()]
+            );
+            assert!(
+                verifier
+                    .engine()
+                    .catalog()
+                    .storage
+                    .tables()
+                    .find_uncommitted_by_id(verifier.engine().pool_guards(), first_table_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                verifier
+                    .engine()
+                    .catalog()
+                    .storage
+                    .table_descriptors()
+                    .find_uncommitted_by_table_id(verifier.engine().pool_guards(), first_table_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(!user_table_file_exists(&engine, first_table_id));
+        });
+    }
+
+    #[test]
+    fn test_binding_resolution_classifies_existing_invalid_targets_as_integrity() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let unmanaged = session
+                .create_table(
+                    StorageTableSpec::new(vec![StorageColumnSpec::new(
+                        ValKind::I32,
+                        StorageColumnFlags::empty(),
+                    )]),
+                    vec![],
+                )
+                .await
+                .unwrap()
+                .table_id();
+            let missing = TableID::new(10_000);
+            let mut transaction = begin_catalog_test_trx(&session);
+            session
+                .engine()
+                .catalog()
+                .storage
+                .table_bindings()
+                .insert_batch(
+                    transaction.trx(),
+                    &[
+                        TableBindingObject {
+                            namespace_id: BindingNamespaceID::new(1),
+                            binding_key: Box::from(&b"unmanaged"[..]),
+                            table_id: unmanaged,
+                        },
+                        TableBindingObject {
+                            namespace_id: BindingNamespaceID::new(1),
+                            binding_key: Box::from(&b"missing"[..]),
+                            table_id: missing,
+                        },
+                    ],
+                )
+                .await
+                .unwrap();
+            transaction.commit(DDLRedo::CreateTable(missing)).await;
+
+            for key in [&b"unmanaged"[..], &b"missing"[..]] {
+                let error = session
+                    .resolve_table_binding(BindingNamespaceID::new(1), key, false)
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.kind(), ErrorKind::DataIntegrity);
+            }
+        });
+    }
+
+    #[test]
+    fn test_binding_resolution_revalidates_after_drop_and_recreate() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let mut creator = engine.new_session().unwrap();
+            let mut initial = CreateFailureInterpreter {
+                result: Ok(vec![1]),
+                bindings: vec![TableBinding::new(
+                    BindingNamespaceID::new(30),
+                    &b"moving"[..],
+                )],
+            };
+            let old_table_id = creator
+                .create_managed_table(b"initial", &mut initial)
+                .await
+                .unwrap()
+                .table_id();
+            let (probe_entered, probe_release) =
+                install_binding_probe_pause(BindingNamespaceID::new(30), &b"moving"[..]);
+            let resolver = engine.new_session().unwrap();
+
+            let (resolved, recreated) = thread::scope(|scope| {
+                let resolver = scope.spawn(move || {
+                    let mut resolver = resolver;
+                    smol::block_on(resolver.resolve_table_binding(
+                        BindingNamespaceID::new(30),
+                        b"moving",
+                        true,
+                    ))
+                });
+                let mutator = scope.spawn(move || {
+                    probe_entered.recv().unwrap();
+                    let recreated = smol::block_on(async {
+                        creator.drop_table(old_table_id).await.unwrap();
+                        let mut replacement = CreateFailureInterpreter {
+                            result: Ok(vec![2]),
+                            bindings: vec![TableBinding::new(
+                                BindingNamespaceID::new(30),
+                                &b"moving"[..],
+                            )],
+                        };
+                        creator
+                            .create_managed_table(b"replacement", &mut replacement)
+                            .await
+                            .unwrap()
+                    });
+                    probe_release.send(()).unwrap();
+                    recreated
+                });
+                (resolver.join().unwrap(), mutator.join().unwrap())
+            });
+
+            let resolved = resolved.unwrap().unwrap();
+            assert_ne!(recreated.table_id(), old_table_id);
+            assert_eq!(resolved.table_id(), recreated.table_id());
+            assert_eq!(resolved.full_schema().unwrap().descriptor(), [2]);
+        });
+    }
+
+    #[test]
+    fn test_full_binding_resolution_rejects_descriptor_stamp_disagreement() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let mut interpreter = CreateFailureInterpreter {
+                result: Ok(vec![1]),
+                bindings: vec![TableBinding::new(
+                    BindingNamespaceID::new(31),
+                    &b"stamp"[..],
+                )],
+            };
+            let table_id = session
+                .create_managed_table(b"create", &mut interpreter)
+                .await
+                .unwrap()
+                .table_id();
+            let original = session
+                .engine()
+                .catalog()
+                .storage
+                .table_descriptors()
+                .find_uncommitted_by_table_id(session.engine().pool_guards(), table_id)
+                .await
+                .unwrap()
+                .unwrap();
+
+            for corrupt in [
+                TableDescriptorObject {
+                    compiled_storage_epoch: original.compiled_storage_epoch + 1,
+                    ..original.clone()
+                },
+                TableDescriptorObject {
+                    storage_schema_fingerprint: [0xff; 32],
+                    ..original.clone()
+                },
+            ] {
+                let mut transaction = begin_catalog_test_trx(&session);
+                assert!(
+                    session
+                        .engine()
+                        .catalog()
+                        .storage
+                        .table_descriptors()
+                        .replace(transaction.trx(), &corrupt)
+                        .await
+                        .unwrap()
+                );
+                transaction.commit(DDLRedo::CreateTable(table_id)).await;
+                let error = session
+                    .resolve_table_binding(BindingNamespaceID::new(31), b"stamp", true)
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.kind(), ErrorKind::DataIntegrity);
+                assert!(
+                    session
+                        .resolve_table_binding(BindingNamespaceID::new(31), b"stamp", false)
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+            }
         });
     }
 
@@ -876,6 +1829,7 @@ mod tests {
             let mut creator = engine.new_session().unwrap();
             let mut create_interpreter = CreateFailureInterpreter {
                 result: Ok(vec![9]),
+                bindings: vec![],
             };
             let table_id = creator
                 .create_managed_table(b"create", &mut create_interpreter)

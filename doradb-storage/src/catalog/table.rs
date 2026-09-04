@@ -4,16 +4,21 @@ use crate::catalog::spec::ActiveIndexSpec;
 use crate::catalog::spec::{
     IndexOrder, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexSpec,
 };
+use crate::catalog::storage::{
+    TABLE_ID_COLUMNS, TABLE_ID_INDEXES, TABLE_ID_TABLE_BINDINGS, TABLE_ID_TABLE_DESCRIPTORS,
+    TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS, TABLE_ID_TABLES,
+};
 use crate::catalog::{
     Catalog, CatalogDefinitionEffects, ColumnID, ColumnOrdinal, ID_DOMAIN_END, IndexID, IndexRef,
-    IndexSlot, TableDescriptorObject, catalog_table_id_from_slot,
+    IndexSlot, TableBinding, TableBindingObject, TableDescriptorObject,
 };
 use crate::component::EnginePools;
 use crate::engine::EngineCore;
 use crate::error::{
     CompletionErrorBridge, CompletionResult, DataIntegrityError, DataIntegrityResult, FatalError,
     FatalResult, InternalError, InternalResult, IoResult, OperationError, OperationOrRuntimeResult,
-    OperationResult, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
+    OperationResult, QuadError, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult,
+    RuntimeResult,
 };
 use crate::file::fs::FileSystem;
 use crate::file::table_file::{MutableTableFile, TableFile};
@@ -39,21 +44,34 @@ use std::ops::Index;
 use std::result::Result as StdResult;
 use std::sync::Arc;
 #[cfg(test)]
-use tests::{CreateTableTestFailure, TableDdlTestPhase};
+use tests::TableDdlTestPhase;
+#[cfg(test)]
+pub(crate) use tests::{
+    CreateTableTestFailure, install_create_before_first_effect_gate,
+    reset_storage_schema_fingerprint_count, set_create_table_failure,
+    storage_schema_fingerprint_count, user_table_file_exists,
+};
 
 const CREATE_TABLE_CATALOG_WRITE_TARGETS: [TableID; 4] = [
-    catalog_table_id_from_slot(0),
-    catalog_table_id_from_slot(1),
-    catalog_table_id_from_slot(2),
-    catalog_table_id_from_slot(3),
+    TABLE_ID_TABLES,
+    TABLE_ID_COLUMNS,
+    TABLE_ID_INDEXES,
+    TABLE_ID_TABLE_DESCRIPTORS,
+];
+const MANAGED_CREATE_TABLE_WITH_BINDINGS_CATALOG_WRITE_TARGETS: [TableID; 5] = [
+    TABLE_ID_TABLES,
+    TABLE_ID_COLUMNS,
+    TABLE_ID_INDEXES,
+    TABLE_ID_TABLE_DESCRIPTORS,
+    TABLE_ID_TABLE_BINDINGS,
 ];
 const DROP_TABLE_CATALOG_WRITE_TARGETS: [TableID; 6] = [
-    catalog_table_id_from_slot(0),
-    catalog_table_id_from_slot(1),
-    catalog_table_id_from_slot(2),
-    catalog_table_id_from_slot(3),
-    catalog_table_id_from_slot(4),
-    catalog_table_id_from_slot(5),
+    TABLE_ID_TABLES,
+    TABLE_ID_COLUMNS,
+    TABLE_ID_INDEXES,
+    TABLE_ID_TABLE_DESCRIPTORS,
+    TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS,
+    TABLE_ID_TABLE_BINDINGS,
 ];
 
 /// Authoritative identities finalized by a successful CREATE TABLE.
@@ -119,6 +137,7 @@ impl ValidatedCreateTable {
         self,
         table_id: TableID,
         descriptor: Box<[u8]>,
+        bindings: Box<[TableBinding]>,
     ) -> CreateTablePlan {
         let descriptor = TableDescriptorObject {
             table_id,
@@ -127,10 +146,23 @@ impl ValidatedCreateTable {
             storage_schema_fingerprint: self.metadata.storage_schema_fingerprint(),
             payload: descriptor,
         };
+        let bindings = bindings
+            .into_vec()
+            .into_iter()
+            .map(|binding| {
+                let (namespace_id, binding_key) = binding.into_parts();
+                TableBindingObject {
+                    namespace_id,
+                    binding_key,
+                    table_id,
+                }
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         self.into_plan_with_effects(
             table_id,
             TableDefinitionKind::Managed,
-            CatalogDefinitionEffects::insert(descriptor),
+            CatalogDefinitionEffects::insert(descriptor, bindings),
         )
     }
 
@@ -419,7 +451,63 @@ impl CreateTableProgress {
     ) -> RuntimeOrFatalError {
         let source = source.into();
         let source_debug = format!("{source:?}");
-        let mut error = source;
+        let cleanup = self
+            .cleanup_before_catalog_commit(engine, guards, operation, &source_debug)
+            .await;
+        self.phase = CreateTablePhase::Aborted;
+        match cleanup {
+            Some(cleanup) => source.merge_cleanup(cleanup),
+            None => source,
+        }
+    }
+
+    /// Aborts optimistic CREATE staging while preserving an expected Operation error.
+    async fn abort_before_catalog_commit_quad(
+        &mut self,
+        engine: &EngineCore,
+        guards: &PoolGuards,
+        operation: &'static str,
+        source: QuadError,
+    ) -> CompletionErrorBridge {
+        let source_debug = format!("{source:?}");
+        let cleanup = self
+            .cleanup_before_catalog_commit(engine, guards, operation, &source_debug)
+            .await;
+        self.phase = CreateTablePhase::Aborted;
+        match (source, cleanup) {
+            (QuadError::Operation(report), None) => CompletionErrorBridge::capture(report),
+            (QuadError::Runtime(report), None) => CompletionErrorBridge::capture(report),
+            (QuadError::Lifecycle(report), None) => CompletionErrorBridge::capture(report),
+            (QuadError::Fatal(report), None) => CompletionErrorBridge::capture(report),
+            (QuadError::Runtime(report), Some(cleanup)) => {
+                CompletionErrorBridge::capture_runtime_or_fatal(
+                    RuntimeOrFatalError::Runtime(report).merge_cleanup(cleanup),
+                )
+            }
+            (QuadError::Fatal(report), Some(cleanup)) => {
+                CompletionErrorBridge::capture_runtime_or_fatal(
+                    RuntimeOrFatalError::Fatal(report).merge_cleanup(cleanup),
+                )
+            }
+            (source, Some(cleanup)) => {
+                CompletionErrorBridge::capture_runtime_or_fatal(cleanup.attach_with(|| {
+                    format!(
+                        "primary CREATE staging failure before cleanup: source_error={source:?}"
+                    )
+                }))
+            }
+        }
+    }
+
+    /// Releases every provisional CREATE resource before catalog commit.
+    async fn cleanup_before_catalog_commit(
+        &mut self,
+        engine: &EngineCore,
+        guards: &PoolGuards,
+        operation: &'static str,
+        source_debug: &str,
+    ) -> Option<RuntimeOrFatalError> {
+        let mut error: Option<RuntimeOrFatalError> = None;
         if let Err(err) = self.destroy_staged_runtime(guards).await {
             let cleanup = poison_error_source(
                 &engine.poisoner,
@@ -430,7 +518,10 @@ impl CreateTableProgress {
                     self.table_id
                 ),
             );
-            error = error.merge_cleanup(cleanup);
+            error = Some(match error {
+                Some(error) => error.merge_cleanup(cleanup),
+                None => cleanup,
+            });
         }
         if let Some(trx) = self.trx.take()
             && let Err(err) = trx.rollback_catalog_ddl().await
@@ -444,19 +535,24 @@ impl CreateTableProgress {
                     self.table_id
                 ),
             );
-            error = error.merge_cleanup(cleanup);
+            error = Some(match error {
+                Some(error) => error.merge_cleanup(cleanup),
+                None => cleanup,
+            });
         }
         if let Err(err) = self.delete_provisional_file(&engine.table_fs) {
             let cleanup = RuntimeOrFatalError::from(
                 err.change_context(RuntimeError::CatalogAccess)
                     .attach(format!(
-                        "operation=create_table, phase=delete_provisional_file, table_id={}",
-                        self.table_id
+                        "operation=create_table, phase=delete_provisional_file, table_id={}, source_error={source_debug}",
+                        self.table_id,
                     )),
             );
-            error = error.merge_cleanup(cleanup);
+            error = Some(match error {
+                Some(error) => error.merge_cleanup(cleanup),
+                None => cleanup,
+            });
         }
-        self.phase = CreateTablePhase::Aborted;
         error
     }
 
@@ -1421,6 +1517,8 @@ impl TableMetadata {
 
     /// Computes the canonical active storage-schema fingerprint.
     pub(crate) fn storage_schema_fingerprint(&self) -> [u8; 32] {
+        #[cfg(test)]
+        tests::record_storage_schema_fingerprint();
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"doradb.storage-schema\0");
         hasher.update(&[1]);
@@ -1770,11 +1868,9 @@ impl AcceptedCreateTable {
             )
             .await;
         if let Err(err) = exec_res {
-            return Err(CompletionErrorBridge::capture_runtime_or_fatal(
-                progress
-                    .abort_before_catalog_commit(&engine, guards, "catalog_staging", err)
-                    .await,
-            ));
+            return Err(progress
+                .abort_before_catalog_commit_quad(&engine, guards, "catalog_staging", err)
+                .await);
         }
         progress.mark_catalog_staged();
 
@@ -2189,6 +2285,18 @@ pub(crate) const fn create_table_catalog_write_targets() -> &'static [TableID] {
     &CREATE_TABLE_CATALOG_WRITE_TARGETS
 }
 
+/// Return managed CREATE TABLE targets, including bindings only when populated.
+#[inline]
+pub(crate) const fn managed_create_table_catalog_write_targets(
+    has_bindings: bool,
+) -> &'static [TableID] {
+    if has_bindings {
+        &MANAGED_CREATE_TABLE_WITH_BINDINGS_CATALOG_WRITE_TARGETS
+    } else {
+        &CREATE_TABLE_CATALOG_WRITE_TARGETS
+    }
+}
+
 /// Return the fixed catalog tables written by DROP TABLE.
 #[inline]
 pub(crate) const fn drop_table_catalog_write_targets() -> &'static [TableID] {
@@ -2508,7 +2616,6 @@ fn validate_primary_key_contract(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::catalog::storage::tables::TABLE_ID_TABLES;
     use crate::catalog::storage::tests::begin_catalog_test_trx;
     use crate::catalog::tests::{
         assert_dropped_table_floor, assert_dropped_table_runtime,
@@ -2541,10 +2648,14 @@ pub(crate) mod tests {
     use crate::value::{Val, ValKind};
     use std::path::Path;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use tempfile::TempDir;
 
+    static STORAGE_SCHEMA_FINGERPRINTS: AtomicUsize = AtomicUsize::new(0);
+
+    /// CREATE TABLE lifecycle failures injectable by cross-module tests.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(super) enum CreateTableTestFailure {
+    pub(crate) enum CreateTableTestFailure {
         AfterCatalogStaged,
         AfterFilePublished,
         AfterRuntimeBuilt,
@@ -2674,8 +2785,41 @@ pub(crate) mod tests {
         poisoned: bool,
     }
 
-    fn set_create_table_failure(engine: &Engine, failure: Option<CreateTableTestFailure>) {
+    /// Resets the test-only storage-schema fingerprint counter.
+    pub(crate) fn reset_storage_schema_fingerprint_count() {
+        STORAGE_SCHEMA_FINGERPRINTS.store(0, AtomicOrdering::Relaxed);
+    }
+
+    /// Returns the test-only storage-schema fingerprint count.
+    pub(crate) fn storage_schema_fingerprint_count() -> usize {
+        STORAGE_SCHEMA_FINGERPRINTS.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Selects an injected CREATE TABLE lifecycle failure for cross-module tests.
+    pub(crate) fn set_create_table_failure(
+        engine: &Engine,
+        failure: Option<CreateTableTestFailure>,
+    ) {
         engine.inner().table_ddl_test.set_create_failure(failure);
+    }
+
+    /// Pauses the next accepted CREATE before it performs its first effect.
+    pub(crate) fn install_create_before_first_effect_gate(
+        engine: &Engine,
+    ) -> (flume::Receiver<()>, flume::Sender<()>) {
+        engine
+            .inner()
+            .table_ddl_test
+            .install_gate(TableDdlTestPhase::CreateBeforeFirstEffect)
+    }
+
+    /// Returns whether the file allocated to one user table still exists.
+    pub(crate) fn user_table_file_exists(engine: &Engine, table_id: TableID) -> bool {
+        Path::new(&engine.inner().table_fs.user_table_file_path(table_id)).exists()
+    }
+
+    pub(super) fn record_storage_schema_fingerprint() {
+        STORAGE_SCHEMA_FINGERPRINTS.fetch_add(1, AtomicOrdering::Relaxed);
     }
 
     fn assert_invalid_metadata(err: Error, expected_message: &str) {

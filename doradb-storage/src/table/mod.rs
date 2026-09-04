@@ -103,6 +103,12 @@ pub(crate) enum TableDefinitionKind {
 }
 
 impl TableDefinitionKind {
+    /// Returns whether opaque managed-definition DDL owns this table.
+    #[inline]
+    pub(crate) const fn is_managed(self) -> bool {
+        matches!(self, Self::Managed)
+    }
+
     /// Returns the definition family label used in operation diagnostics.
     #[inline]
     pub(crate) const fn label(self) -> &'static str {
@@ -281,6 +287,12 @@ impl Table {
     #[inline]
     pub fn table_id(&self) -> TableID {
         self.mem.table_id()
+    }
+
+    /// Returns the immutable definition-owner family of this table.
+    #[inline]
+    pub(crate) const fn definition_kind(&self) -> TableDefinitionKind {
+        self.definition_kind
     }
 
     /// Ensures a foreground operation may access this table after logical locks.

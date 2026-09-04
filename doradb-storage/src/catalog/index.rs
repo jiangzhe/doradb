@@ -1,7 +1,8 @@
 use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards};
+use crate::catalog::storage::{TABLE_ID_INDEXES, TABLE_ID_TABLE_DESCRIPTORS, TABLE_ID_TABLES};
 use crate::catalog::{
     Catalog, CatalogDefinitionEffects, IndexID, IndexRef, IndexSlot, SecondaryIndexRoot,
-    SecondaryIndexSlot, TableIndexMetadata, TableMetadata, catalog_table_id_from_slot,
+    SecondaryIndexSlot, TableIndexMetadata, TableMetadata,
 };
 use crate::engine::EngineCore;
 use crate::error::{
@@ -41,14 +42,14 @@ pub(crate) use tests::IndexDdlTestController;
 use tests::{CreateIndexTestFailure, IndexDdlTestPhase};
 
 const CREATE_INDEX_CATALOG_WRITE_TARGETS: [TableID; 3] = [
-    catalog_table_id_from_slot(0),
-    catalog_table_id_from_slot(2),
-    catalog_table_id_from_slot(3),
+    TABLE_ID_TABLES,
+    TABLE_ID_INDEXES,
+    TABLE_ID_TABLE_DESCRIPTORS,
 ];
 const DROP_INDEX_CATALOG_WRITE_TARGETS: [TableID; 3] = [
-    catalog_table_id_from_slot(0),
-    catalog_table_id_from_slot(2),
-    catalog_table_id_from_slot(3),
+    TABLE_ID_TABLES,
+    TABLE_ID_INDEXES,
+    TABLE_ID_TABLE_DESCRIPTORS,
 ];
 
 /// Index DDL operation kind used for root-publish durability proof.

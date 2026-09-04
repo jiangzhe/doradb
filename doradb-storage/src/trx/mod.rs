@@ -52,8 +52,8 @@ use crate::engine::EngineCore;
 use crate::error::{
     CompletionErrorBridge, DiscloseError, DiscloseResultExt, Error, FatalError, FatalResult,
     LifecycleError, LifecycleOrFatalError, LifecycleOrFatalResult, LifecycleResult,
-    MultiDomainResultExt, OperationOrFatalResult, OperationResult, ResourceError, Result,
-    RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, SharedFatalError,
+    MultiDomainResultExt, OperationOrFatalResult, OperationResult, QuadResult, ResourceError,
+    Result, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, SharedFatalError,
 };
 use crate::id::{RowID, SessionID, SessionOperationKey, TableID, TrxID};
 use crate::lock::{
@@ -81,6 +81,7 @@ use std::mem;
 use std::ops::AsyncFnOnce;
 use std::panic::{AssertUnwindSafe, resume_unwind};
 use std::ptr::addr_eq;
+use std::result::Result as StdResult;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -295,7 +296,12 @@ impl Transaction {
             }
             Err(err) => match stmt_state.rollback_effects().await {
                 Ok(()) => ExecOutcome::StatementError(err),
-                Err(rollback_err) => ExecOutcome::FatalRollback(rollback_err),
+                Err(rollback_err) => {
+                    // Failed rollback makes the transaction unsafe and poisons
+                    // storage, so its Fatal report intentionally supersedes the
+                    // initiating statement error.
+                    ExecOutcome::FatalRollback(rollback_err)
+                }
             },
         };
         match outcome {
@@ -411,9 +417,10 @@ impl PrivateTransaction {
 
     /// Execute one owned private statement without returning the core to its entry.
     #[inline]
-    async fn exec<T, F>(&mut self, operation: F) -> RuntimeOrFatalResult<T>
+    async fn exec<T, E, F>(&mut self, operation: F) -> StdResult<T, E>
     where
-        F: for<'stmt> AsyncFnOnce(Statement<'stmt>) -> RuntimeOrFatalResult<T>,
+        E: From<Report<FatalError>>,
+        F: for<'stmt> AsyncFnOnce(Statement<'stmt>) -> StdResult<T, E>,
     {
         let mut stmt_state = PrivateStmtState::new(self.checkout_mut());
         let outcome = {
@@ -427,7 +434,12 @@ impl PrivateTransaction {
             }
             Ok(Err(err)) => match stmt_state.rollback_effects().await {
                 Ok(()) => Err(err),
-                Err(rollback_err) => Err(RuntimeOrFatalError::Fatal(rollback_err)),
+                Err(rollback_err) => {
+                    // Failed rollback makes the transaction unsafe and poisons
+                    // storage, so its Fatal report intentionally supersedes the
+                    // initiating statement error.
+                    Err(E::from(rollback_err))
+                }
             },
             Err(panic) => {
                 stmt_state.fold_cancelled_into_transaction();
@@ -493,6 +505,17 @@ impl PrivateTransaction {
         rows: Vec<Vec<Val>>,
     ) -> RuntimeOrFatalResult<()> {
         self.exec(async move |stmt| stmt.catalog_insert_batch_mvcc(table, rows).await)
+            .await
+    }
+
+    /// Insert one catalog batch while preserving expected unique-key races.
+    #[inline]
+    pub(crate) async fn catalog_try_insert_unique_batch_mvcc(
+        &mut self,
+        table: &CatalogTable,
+        rows: Vec<Vec<Val>>,
+    ) -> QuadResult<()> {
+        self.exec(async move |stmt| stmt.catalog_try_insert_unique_batch_mvcc(table, rows).await)
             .await
     }
 

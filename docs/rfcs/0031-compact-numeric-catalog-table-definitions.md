@@ -22,8 +22,11 @@ admitted layout boundary before positional execution.
 When CREATE TABLE allocates the initial stable index identities, return those
 authoritative `IndexID` values with the new `TableID` instead of requiring the
 caller to reconstruct identities from the input vector positions.
-Add optional opaque descriptor and binding projections so higher layers can own
-names and logical schema without injecting code into storage transactions.
+Add optional opaque descriptors and managed-table-only binding projections so
+higher layers can own names and logical schema without injecting code into
+storage transactions. A roleless binding resolves to an opaque definition
+version and, when requested, one coherent numeric-schema/descriptor snapshot;
+the version-only path avoids loading either full projection.
 Higher layers propose stable IDs and physical semantics, while storage
 revalidates under DDL gates and finalizes slots, epochs, fingerprints, and root
 shape. Storage preserves descriptor payload bytes exactly and validates only
@@ -35,7 +38,8 @@ catalog, table-file, and redo formats change in one unsupported cutover; old
 formats are rejected rather than migrated. Catalog-wide final-state validation
 rejects every satellite row whose `table_id` lacks its authoritative
 `catalog.tables` parent during recovery, checkpoint preparation, binding
-resolution, and DROP validation. A dropped slot becomes reusable only after
+resolution, and DROP validation, and additionally rejects a binding target
+without a descriptor. A dropped slot becomes reusable only after
 both its durable replay proof and exact retired-runtime reclamation complete;
 there is never more than one current, retired, or destroying runtime generation
 for one slot, and retirement state is absent from foreground DML paths.
@@ -128,8 +132,10 @@ orphan `catalog.index_columns` check can find an unexpected child only while
 reconstructing a known parent; it cannot discover a column, index, descriptor,
 watermark, or binding row whose `table_id` has no central row at all. Catalog
 checkpoint likewise folds independent projected roots without a cross-table
-parent pass. Atomic normal DDL prevents creation of such rows but does not
-establish the claimed corruption/recovery guarantee. [C15], [U16]
+parent pass. The central-parent check alone also cannot establish the Phase 7
+rule that a binding target has a descriptor. Atomic normal DDL prevents
+creation of such rows but does not establish the claimed corruption/recovery
+guarantee. [C15], [U16], [U24]
 
 Current catalog checkpoint folding is also full-image by logical catalog
 table. For every table with a net redo change, it loads the complete previous
@@ -188,10 +194,11 @@ Issue Labels:
    retirement durable and its exact old runtime has been reclaimed; permit at
    most one current, retired, or destroying runtime generation per slot without
    adding retirement-state work to foreground DML.
-10. Add optional opaque descriptor and binding catalog projections that higher
-    layers can compile before entering DoraDB-owned DDL execution; store the
-    supplied payload bytes exactly while leaving format identity/version,
-    self-containment, and logical authority to the higher layer.
+10. Add optional opaque descriptor and managed-table-only binding catalog
+    projections that higher layers can compile before entering DoraDB-owned
+    DDL execution; store supplied bytes exactly while leaving format
+    identity/version, self-containment, binding roles, and logical authority to
+    the higher layer.
 11. Let DoraDB invoke a synchronous higher-layer interpreter outside every
     metadata lock and DDL gate. The interpreter returns a slot-free typed
     change plus complete replacement descriptor; DoraDB privately revalidates
@@ -204,22 +211,28 @@ Issue Labels:
 14. Perform one clean on-disk format cutover with explicit old-version
     rejection and no migration implementation.
 15. Enforce the central-parent invariant by scanning every satellite in the
-    recovered and checkpoint-projected final catalog state, and fail closed if
-    binding resolution or a DROP cascade exposes an orphan.
+    recovered and checkpoint-projected final catalog state, require every
+    binding target to have a descriptor, and fail closed if binding resolution
+    or a DROP cascade exposes either breach.
 16. State and benchmark the retained full-image catalog checkpoint cost at an
     explicit initial catalog scale without turning that scale envelope into a
     persisted format or correctness limit.
 17. Return the storage-finalized initial `IndexID` values from CREATE TABLE in
     input-definition order, without exposing `IndexSlot` or requiring an
     immediate metadata read.
+18. Resolve a binding to an opaque definition version and optionally one
+    coherent stable-ID numeric-schema/descriptor snapshot; make version-only
+    validation avoid numeric-schema and descriptor access.
 
 ## Non-Goals
 
 1. Implementing column add/drop/type-change or physical row-format migration.
-2. Implementing rename, alias, descriptor-only ALTER, logical constraints,
+2. Implementing post-CREATE binding mutation, including rename, add/remove
+   alias, retarget, role changes, descriptor-only ALTER, logical constraints,
    virtual columns, or other DDL operations that do not currently exist.
-3. Providing snapshot-consistent descriptor, binding, or complete-definition
-   resolution for query planning.
+3. Holding descriptor, binding, or complete-definition consistency across
+   higher-level planning or execution. Binding resolution provides one
+   point-in-time optimistic snapshot and version, not a caller-held guard.
 4. Replacing low-level column ordinals or index slots with stable IDs in hot
    row/index execution loops.
 5. Persisting or restoring pre-crash metadata snapshots for active queries.
@@ -460,6 +473,18 @@ Issue Labels:
   initial `IndexID` values in input-definition order; do not add a compatibility
   method, mandatory read-after-create discovery, backlog, or separate task;
   preserve the same outcome for managed Phase 6 creation.
+- [U24] Phase 7 design review on 2026-09-04: make bindings a managed-table-only
+  complement to the opaque descriptor; refactor the existing managed CREATE
+  callback rather than adding a parallel CREATE API; remove the semantically
+  undefined binding role; retain the reverse index for table-centered name
+  enumeration and DROP; and explicitly exclude every post-CREATE binding
+  change, including rename.
+- [U25] Phase 7 resolution approval on 2026-09-04: return an opaque optimistic
+  definition version from binding resolution; use one
+  `include_full_schema: bool` to request the optional numeric-schema/descriptor
+  snapshot; keep the false path free of numeric-schema and descriptor queries;
+  and document future execution-time version admission instead of claiming
+  consistency across application planning and execution.
 
 ### Source Backlogs
 
@@ -470,7 +495,7 @@ Issue Labels:
 ### Storage Owns A Numeric Definition; Higher Layers Own Meaning
 
 The selected model is a versioned table-definition bundle with three
-projections: [D1], [D3], [U1], [U2]
+projections: [D1], [D3], [U1], [U2], [U24], [U25]
 
 ```text
 TableDefinition
@@ -498,11 +523,15 @@ does not execute. It may contain names, SQL, JSON, Protobuf, logical types,
 comments, constraints, URLs, external lookup tokens, or any application-private
 bytes. DoraDB guarantees exact transactional storage of the supplied payload;
 it does not claim that the bytes are authoritative or self-contained.
-`BindingSet` is an indexed projection used for canonical lookup and uniqueness.
+`BindingSet` is a roleless indexed projection used for canonical lookup and
+uniqueness. Only a managed table may own bindings, so the binding projection is
+a lookup complement to that table's opaque descriptor; descriptor presence is
+required for every binding target, while a descriptor may have zero bindings.
 Storage compares descriptor/binding bytes only where their catalog schema
 requires byte equality or ordering and never interprets their logical meaning,
-format, or version. Any higher-layer format discriminator is itself part of the
-opaque payload. [U1], [U2], [U15], [U18]
+format, role, or version. Any preferred name or higher-layer format
+discriminator belongs to the descriptor or application catalog. [U1], [U2],
+[U15], [U18], [U24]
 
 Names are removed from storage API and persistence types, including
 `TableSpec`/`ColumnSpec` successors, `TableMetadata`, table-file serialization,
@@ -520,8 +549,10 @@ ensures the exact supplied bytes are transactionally paired with the finalized
 physical schema version without asserting that the bytes actually describe it.
 Storage enforces replacement presence, revision, and envelope consistency; the
 compiler owns semantic correspondence. Managed/unmanaged classification
-depends only on descriptor-row presence, not payload content. [D2], [C6],
-[U2], [U6], [U13], [U15], [U18]
+depends only on descriptor-row presence, not payload content. Managed CREATE
+may attach zero or more roleless bindings in the same accepted definition
+bundle; unmanaged CREATE has no binding effect. [D2], [C6], [U2], [U6],
+[U13], [U15], [U18], [U24]
 
 ### Final Catalog Tables And Root Slots
 
@@ -534,10 +565,12 @@ This is a hard catalog-wide parent invariant, not merely a construction rule:
 every row in `catalog.columns`, `catalog.indexes`,
 `catalog.table_descriptors`, `catalog.table_replay_silent_watermarks`, and
 `catalog.table_bindings` must reference a `table_id` present in
-`catalog.tables`. Table-driven reconstruction does not establish this
-invariant because it cannot encounter a child whose parent is absent; the
-explicit full-state validation defined below is therefore mandatory. [C15],
-[U16]
+`catalog.tables`. Every binding target must additionally have a
+`catalog.table_descriptors` row; this one-way requirement makes bindings
+managed-only without requiring every managed table to have a binding.
+Table-driven reconstruction does not establish these invariants because it
+cannot encounter a child whose parent is absent; the explicit full-state
+validation defined below is therefore mandatory. [C15], [U16], [U24]
 
 The final dense `catalog.mtb` root-slot assignment is:
 
@@ -719,21 +752,109 @@ definition. [U2], [U15], [U18]
 namespace_id          U64
 binding_key           VARBYTE
 table_id              U64
-binding_role          U8
 
 PRIMARY KEY (namespace_id, binding_key)
 INDEX       (table_id)
 ```
 
 `binding_key` is opaque canonical bytes selected by the calling higher-level
-compiler. The primary key enforces namespace uniqueness; the reverse
-`table_id` index supports table-centered DROP and enumeration. A descriptor may
-also contain names, but scanning an opaque document is not a replacement for
-an indexed transactional lookup projection. Binding resolution validates that
-the resolved `table_id` still has a central row in the same admitted current
-catalog view. An absent binding is ordinary not-found; an existing binding
-whose parent is absent returns `DataIntegrityError::InvalidRootInvariant` and
-must never be translated to `TableNotFound`. [C15], [U1], [U2], [U16]
+compiler. The inclusive storage API and integrity bound is 16,000 bytes; empty
+and arbitrary binary keys are valid. Oversized live inputs are invalid
+metadata, while oversized persisted rows are data-integrity failures. The
+primary key enforces namespace
+uniqueness; the reverse `table_id` index supports table-centered DROP and
+deterministically sorted enumeration. Bindings have no storage-owned role or
+primary/alias distinction. A descriptor may also contain names, but scanning
+an opaque document is not a replacement for an indexed transactional lookup
+projection. [U1], [U2], [U24]
+
+A binding may target only a managed table. Resolution validates that the
+resolved `table_id` has an admitted managed runtime and uses its metadata-S-
+protected layout as the current epoch authority. An absent binding is ordinary
+not-found; an existing binding whose runtime is absent or unmanaged returns
+`DataIntegrityError::InvalidRootInvariant` and must never be translated to
+`TableNotFound`. Complete live-state, recovery, and projected-checkpoint
+validation reject a binding whose central parent is absent before runtime
+admission or checkpoint publication. Full resolution additionally requires and
+validates the descriptor row. [C15], [U16], [U24], [U25]
+
+The Phase 3 binding root was deliberately dormant and no supported writer can
+have populated it before Phase 7. Removing its unused trailing role column
+therefore retains the six-root format version and existing primary/reverse
+index shapes; bootstrap and empty-root checkpoint/reopen tests enforce that
+cutover assumption. [U24]
+
+#### Binding Resolution Returns An Optimistic Definition Version
+
+Binding operations extend the existing managed-table API family. CREATE TABLE
+interpretation returns one ID-free storage definition, complete opaque
+descriptor, and zero or more roleless bindings; DoraDB assigns the `TableID`
+and stages all three projections atomically through the existing managed
+CREATE operation rather than adding a parallel CREATE API. There is no
+post-CREATE bind, unbind, rename, alias, or retarget operation. [U24]
+
+The generic catalog insert path treats duplicate keys as an impossible
+internal invariant, while a binding collision is an expected caller error.
+For a nonempty binding bundle, managed CREATE keeps the normal binding-table
+data-IX claim and performs a best-effort precheck before mandatory execution.
+A binding-specific fallible insertion remains authoritative and preserves
+`OperationError::DuplicateKey` or `OperationError::WriteConflict` through
+CREATE cleanup and mandatory completion. The primary index therefore
+arbitrates individual keys without table-wide binding-writer serialization;
+DROP retains its compatible binding-table data-IX claim. [U24]
+
+The public resolution shape is conceptually: [U25]
+
+```rust
+fn resolve_table_binding(
+    namespace_id: BindingNamespaceID,
+    binding_key: &[u8],
+    include_full_schema: bool,
+) -> Result<Option<ResolvedTableBinding>>;
+
+struct ResolvedTableBinding {
+    table_id: TableID,
+    version: TableDefinitionVersion,
+    full_schema: Option<ManagedTableDefinitionSnapshot>,
+}
+
+struct ManagedTableDefinitionSnapshot {
+    schema: StorageTableDefinition,
+    descriptor: Box<[u8]>,
+}
+```
+
+`TableDefinitionVersion` is opaque and equality-comparable. Its Phase 7 private
+state is `(TableID, storage_epoch)`: `TableID` detects drop/recreate, and every
+currently supported managed descriptor replacement accompanies a physical
+schema change that advances `storage_epoch`. The token exposes no raw epoch
+contract, so future descriptor-only DDL may add descriptor revision without
+changing the public resolution signature. [U25]
+
+When `include_full_schema` is false, resolution performs only the exact binding
+lookup and constant-size live managed-runtime validation, taking the epoch from
+the protected runtime layout. It does not query `catalog.tables`,
+`catalog.columns`, `catalog.indexes`, or `catalog.table_descriptors`; project a
+numeric schema; compute a fingerprint; or access/copy descriptor bytes. When
+the flag is true, the same admitted current point additionally projects the
+stable-ID numeric schema from the pinned runtime layout, reads the descriptor,
+validates its epoch/fingerprint envelope, and returns both together. [U25]
+
+Because the target ID is initially unknown, resolution first probes the
+binding in a disposable read scope. It then acquires target metadata-S before
+catalog read claims in canonical root order and re-reads the binding. A changed
+target releases all claims and retries. This two-pass protocol preserves the
+existing target-before-catalog DDL lock order and avoids holding binding-table
+S while waiting behind target DROP metadata-X. All locks are released before
+the result is returned. [U25]
+
+The returned bundle is coherent only at that admitted read point. A later
+version-only call can invalidate an application cache but cannot close the
+race from validation through planning and execution. A future execution API
+may accept expected versions, validate them while acquiring existing target
+metadata-S authority in canonical `TableID` order, and retain engine-owned
+admission through execution; Phase 7 neither returns a lock token nor claims
+that stronger guarantee. [U7], [U25]
 
 `catalog.table_replay_silent_watermarks` retains its current fields and
 semantics. Its rows remain subordinate to `catalog.tables` and are deleted by
@@ -1216,13 +1337,15 @@ The reusable pool is derived rather than persisted:
 ### DoraDB Orchestrates Unlocked Interpretation And Private Revalidation
 
 The Phase 6 public boundary consists of distinct managed CREATE TABLE, CREATE
-INDEX, and DROP INDEX methods plus one synchronous interpreter trait. CREATE
-TABLE receives only the opaque source and returns an ID-free ordered storage
-definition plus the complete initial descriptor. Existing-table callbacks
-receive the source unchanged, previous descriptor bytes, and a separate
-stable-ID schema projection; CREATE INDEX additionally receives DoraDB's
-proposed next `IndexID`. No callback sees epochs, revisions, allocator
-watermarks, slots, roots, locks, transactions, or mandatory-runtime ownership.
+INDEX, and DROP INDEX methods plus one synchronous interpreter trait. Phase 7
+renames that trait for the complete managed-table boundary and refactors only
+its CREATE TABLE result: CREATE receives the opaque source and returns an
+ID-free ordered storage definition, the complete initial descriptor, and zero
+or more roleless bindings. Existing-table callbacks continue to receive the
+source unchanged, previous descriptor bytes, and a separate stable-ID schema
+projection; CREATE INDEX additionally receives DoraDB's proposed next
+`IndexID`. No callback sees table IDs, epochs, revisions, allocator watermarks,
+slots, roots, locks, transactions, or mandatory-runtime ownership. [U24]
 
 For an existing table DoraDB pins a short definition-read operation, acquires
 target `TableMetadata(S)`, copies one coherent numeric-schema/descriptor pair,
@@ -1238,8 +1361,9 @@ Successful finalization binds the proposed CREATE INDEX identity, compiles
 stable `ColumnID` keys to current ordinals, chooses the safe physical slot,
 increments storage epoch and descriptor revision, and stamps the finalized
 fingerprint around unchanged replacement bytes. CREATE TABLE assigns all IDs
-after interpretation and stamps revision/epoch zero. All numeric and descriptor
-rows are staged in the same private transaction and committed once.
+after interpretation and stamps revision/epoch zero. All applicable numeric,
+descriptor, and binding rows are staged in the same private transaction and
+committed once. [U24]
 
 ### Superseded Caller-Owned Proposal Illustration (Historical)
 
@@ -1420,23 +1544,24 @@ this RFC. [D2], [C6], [U6]
 
 | Existing operation | Numeric metadata | Descriptor | Bindings | Table root |
 | --- | --- | --- | --- | --- |
-| CREATE TABLE | insert | optional insert | optional insert | create |
+| CREATE TABLE | insert | required insert for managed, none for unmanaged | optional managed-only insert | create |
 | DROP TABLE | delete all | delete if present | delete all | existing drop lifecycle |
 | CREATE INDEX | update/insert | required replacement for managed table | unchanged | publish new metadata/root |
 | DROP INDEX | update/delete | required replacement for managed table | unchanged | publish new metadata/root |
 
 Managed CREATE TABLE interprets and validates a complete ID-free slot-free
-definition before DDL exclusion or table-ID allocation. Storage then assigns
-table, column, and initial-index identities and slots, computes allocator
-watermarks/epoch/fingerprint, and constructs the accepted plan. That plan also
-constructs `CreateTableOutcome` from its finalized stable index identities in
-definition order and carries the outcome through mandatory
+storage definition, descriptor, and roleless binding set before DDL exclusion
+or table-ID allocation. Storage then assigns table, column, and initial-index
+identities and slots, binds every supplied key to that table ID, computes
+allocator watermarks/epoch/fingerprint, and constructs one accepted plan. That
+plan also constructs `CreateTableOutcome` from its finalized stable index
+identities in definition order and carries the outcome through mandatory
 execution without deriving it again from the selected slots.
 Accepted execution stages the initial table file using the existing
 create-table ordering, stages all applicable catalog rows in one private
 transaction, commits once, then installs the runtime. A failed pre-commit
 create leaves only the existing recoverable provisional-file case and returns
-no successful outcome. [D2], [D4], [D5], [C18], [U13], [U23]
+no successful outcome. [D2], [D4], [D5], [C18], [U13], [U23], [U24]
 
 CREATE INDEX and DROP INDEX preserve the root-proof ordering required by the
 current implementation: [D5], [C6], [U3]
@@ -1482,7 +1607,7 @@ checkpoint proofs. [D2], [D5], [C15], [U16]
 ### Validation Boundaries
 
 DoraDB guarantees physical integrity: [D3], [C1]-[C8], [C10], [C13]-[C16],
-[C18], [U12]-[U17], [U23]
+[C18], [U12]-[U17], [U23]-[U25]
 
 - the central `catalog.tables` row exists for every satellite row;
 - column IDs and physical ordinals are table-local unique;
@@ -1532,7 +1657,8 @@ DoraDB guarantees physical integrity: [D3], [C1]-[C8], [C10], [C13]-[C16],
   codec identity/version fields, codec registry or dispatch interface,
   external-only variant, content classifier, or dereference path and makes no
   payload format/authority/self-containment claim;
-- binding keys are unique within a namespace.
+- binding keys are unique within a namespace, have no storage-owned role, and
+  target only tables present in `catalog.table_descriptors`.
 
 The central-parent guarantee is assigned to one reusable full-state validator,
 not inferred from DDL atomicity or table-driven reconstruction. Given any
@@ -1540,23 +1666,27 @@ complete final catalog view, it performs the equivalent of: [C15], [U16]
 
 ```text
 parent_ids = set(all catalog.tables.table_id)
+managed_ids = set(all catalog.table_descriptors.table_id)
 
 for satellite in [
     catalog.columns,
     catalog.indexes,
     catalog.table_descriptors,
     catalog.table_replay_silent_watermarks,
-    catalog.table_bindings,
 ]:
     for row in all_rows(satellite):
         require row.table_id in parent_ids
+
+for row in all_rows(catalog.table_bindings):
+    require row.table_id in parent_ids
+    require row.table_id in managed_ids
 ```
 
-The scan visits every satellite row exactly once and reuses one central
-`TableID` hash set, so its complexity is linear in the catalog row count. A
-missing parent returns `DataIntegrityError::InvalidRootInvariant` with the
-satellite table and orphan `table_id` attached. It is never treated as an
-ordinary missing user object.
+The scan visits every satellite row exactly once and reuses central-parent and
+managed-descriptor `TableID` sets, so its complexity remains linear in the
+catalog row count. A missing parent or descriptor owner returns
+`DataIntegrityError::InvalidRootInvariant` with the satellite table and target
+`table_id` attached. It is never treated as an ordinary missing user object.
 
 Recovery invokes the validator after checkpoint bootstrap and all
 catalog-replay/root-proof classification have produced the recovered final
@@ -1574,16 +1704,17 @@ fork; neither the durable root nor the replay cursor changes. A scan or
 preparation that has not published a checkpoint is not integrity proof. [D4],
 [C15], [U11], [U16]
 
-Binding lookup retains a defensive parent check even though successful startup
-and checkpoint validation should make an orphan unreachable. DROP TABLE also
-checks its transaction-visible staged final state as described above. These
-online boundaries prevent a local invariant breach from being converted into
-a successful binding or committed orphan state. [C15], [U16]
+Binding lookup retains defensive central-parent and managed-target checks even
+though successful startup and checkpoint validation should make either breach
+unreachable. DROP TABLE also checks its transaction-visible staged final state
+as described above. These online boundaries prevent a local invariant breach
+from being converted into a successful binding or committed orphan state.
+[C15], [U16], [U24]
 
 DoraDB guarantees transactional consistency: the applicable numeric metadata,
 descriptor bytes, binding changes, and root-proven physical mutation are
 storage-finalized into one immutable plan and accepted or rejected as one DDL
-outcome. [D2], [D4], [C11], [C15], [U13], [U16]
+outcome. [D2], [D4], [C11], [C15], [U13], [U16], [U24]
 
 The higher-level compiler owns semantic consistency: it proves that its names,
 logical types, constraints, and bindings refer to the intended stable numeric
@@ -1741,7 +1872,9 @@ deferred to a later phase.
    `VarByte` descriptor boundaries.
 8. Phase 3 fresh-cluster bootstrap with six catalog roots, catalog checkpoint
    followed by reopen, table-file reopen, and explicit rejection of every old
-   affected version.
+   affected version. Phase 7 proves the supported still-empty binding root
+   reopens after removing its unused trailing role column without another
+   format bump.
 9. Phase 3 CREATE/DROP TABLE and CREATE/DROP INDEX coverage for unmanaged
    numeric tables. CREATE TABLE with zero indexes returns an empty outcome;
    multiple initial indexes return finalized `IndexID` values one-for-one in
@@ -1749,7 +1882,8 @@ deferred to a later phase.
    reopen exposes the same mapping. A narrow internal fixture with distinct ID
    and slot proves the outcome is sourced from IDs rather than enumerated
    positions. Phase 6 extends the DDL coverage to managed descriptor effects,
-   and Phase 7 adds binding effects and combined descriptor/binding bundles.
+   and Phase 7 adds managed-only binding effects and combined
+   storage/descriptor/binding callback bundles.
    Each owner covers all existing injected failure points around catalog
    commit, root publication, and runtime install; no failing CREATE TABLE
    produces a successful outcome.
@@ -1798,22 +1932,29 @@ deferred to a later phase.
    beginning with an arbitrary higher-layer format/version header. The catalog
    row and storage API expose no codec ID/version, registry, dispatch, or
    external-only variant. Higher-layer format selection and self-containment
-   rejection are not storage tests. Phase 7 owns duplicate binding and table-
-   centered binding deletion.
+   rejection are not storage tests. Phase 7 owns empty, binary, 16,000-byte,
+   and oversized binding keys; same-namespace duplicate rejection;
+   cross-namespace equality; managed-only ownership; deterministic reverse
+   enumeration; and table-centered binding deletion.
 18. Phase 4 catalog-wide recovery parent validation with an orphan
    independently injected into each of `columns`, `indexes`,
    `table_descriptors`, `table_replay_silent_watermarks`, and
    `table_bindings`. Cover both an orphan in checkpoint state and one in the
    replay-visible final state; each restart must return typed data integrity
    before foreground admission. Also prove a valid multi-table catalog
-   completes the linear pass.
+   completes the linear pass. Phase 7 additionally rejects a binding whose
+   central parent exists but has no descriptor, while accepting a managed
+   descriptor with zero bindings.
 19. Phase 4 projected-checkpoint and online fail-closed behavior: folding a
    batch whose final `new_roots` contain any orphan must reject preparation and
    publication and leave both the durable root and catalog replay cursor
    unchanged, and a DROP fault that leaves any satellite in its staged
    transaction view must abort and roll back all catalog effects. Phase 7 adds
-   the public orphan-binding lookup, which returns data integrity rather than
-   `TableNotFound`.
+   public missing-runtime/unmanaged-binding lookup, version-only no-central-
+   metadata/no-schema/no-descriptor instrumentation, full coherent definition
+   resolution, version changes
+   across index DDL and drop/recreate, and deterministic two-pass races with
+   DROP/recreate; integrity failures are never translated to `TableNotFound`.
 20. A Phase 8 end-to-end `doradb-bench` catalog-checkpoint workload with
    small, target-envelope, and above-envelope stress profiles. Starting from
    equivalent populated, checkpointed catalog images, measure separate cases
@@ -2045,8 +2186,8 @@ marker can alias a second CREATE after restart. [U20]
     satellite; invoke it after checkpoint bootstrap plus redo/root proof and
     before runtime admission, and over checkpoint-projected roots before root
     or replay-cursor publication. Require DROP TABLE's staged final view to
-    contain neither its central row nor any satellite. Provide the checked
-    parent-resolution helper that the later binding API must use.
+    contain neither its central row nor any satellite. Provide a checked
+    parent-resolution helper for locked catalog validation.
   - Goals: Make `catalog.tables` centrality a fail-closed recovery, checkpoint,
     and DDL invariant independently of descriptor/binding product APIs.
   - Validation: Own tests 18 and 19 except the public binding-lookup case,
@@ -2148,26 +2289,53 @@ marker can alias a second CREATE after restart. [U20]
 
 - **Phase 7: Table Bindings**
   - Prerequisites: Phase 3 provides the binding table and reverse index; Phase
-    4 provides parent validation and checked resolution; Phase 6 provides the
-    accepted DDL bundle that binding effects extend.
-  - Scope: Implement binding row access, namespace/key uniqueness, resolution
-    through the central parent, reverse `table_id` enumeration, and atomic
-    optional binding effects for CREATE TABLE and DROP TABLE. DROP deletes all
-    bindings through the reverse index and proves none survives in its staged
-    final view. An orphan binding target returns typed data integrity, not
-    `TableNotFound`.
-  - Goals: Deliver the complete name-mapping extension independently of opaque
-    descriptor semantics while preserving central-table authority and DDL
-    atomicity.
-  - Validation: Own binding cases from tests 9 and 17, the public orphan-binding
-    lookup case from test 19, duplicate-key behavior, reverse enumeration, and
-    injected rollback at every existing CREATE/DROP TABLE failure boundary.
-  - Non-goals: Rename, alias history, snapshot-consistent resolution, external
-    registry coordination, or binding interpretation inside storage.
-  - Phase-local Choices: Ergonomic namespace/key wrapper names and enumeration
-    API shape; persisted key order, uniqueness, parent checking, and DROP
-    behavior remain fixed.
-  - Task Doc: `docs/tasks/TBD.md`
+    4 provides reusable parent/final-state validation; Phase 5 provides the
+    pinned runtime layout; and Phase 6 provides the managed CREATE and accepted
+    DDL-effect boundaries that bindings extend.
+  - Scope: Remove the unused dormant binding-role column and implement roleless
+    binding row access with a 16,000-byte inclusive key bound, namespace/key
+    uniqueness, primary-key resolution, reverse `table_id` enumeration, and
+    managed-only ownership. Refactor the existing managed CREATE callback to
+    return storage definition, descriptor, and zero or more bindings as one
+    bundle; stage them atomically without adding another CREATE API. Add
+    `resolve_table_binding(..., include_full_schema: bool)`, which always
+    returns an opaque `(TableID, storage_epoch)` definition version and
+    optionally returns the coherent stable-ID numeric schema and descriptor.
+    The false path reads only the binding target and constant-size runtime
+    state, including the protected runtime epoch; it does not query central
+    numeric metadata, numeric schema, or descriptor data. Use two-pass target
+    discovery so final read admission retains the
+    existing target-before-catalog lock order. Nonempty binding CREATE bundles
+    use binding-table data-IX, perform an optimistic precheck, and preserve
+    expected primary-index conflicts through a binding-specific catalog insert.
+    DROP deletes all bindings through the reverse index and proves none
+    survives in its staged final view.
+  - Goals: Deliver bindings as the managed descriptor's indexed name-resolution
+    complement, with atomic DDL, central and descriptor ownership validation,
+    inexpensive application-cache version checks, and no storage-owned naming
+    policy. One result is coherent at its admitted read point; no lock survives
+    the call.
+  - Validation: Own binding cases from tests 9 and 17, the public missing-
+    runtime/unmanaged-binding lookup case from test 19, binding-without-
+    descriptor integrity, key-boundary and duplicate-key behavior,
+    deterministic reverse enumeration, narrow-path no-central-metadata/no-
+    schema/no-descriptor instrumentation, version changes across managed
+    index DDL and drop/recreate, two-pass DROP/recreate races and cancellation,
+    empty-root reopen without a format bump, and injected rollback at every
+    existing CREATE/DROP TABLE failure boundary.
+  - Non-goals: Any binding for an unmanaged table; post-CREATE rename,
+    add/remove alias, retarget, role/history mutation; binding interpretation;
+    descriptor-only ALTER; external registry coordination; or consistency
+    across higher-level planning and execution. A future execution boundary may
+    validate expected versions while retaining engine-owned metadata-S.
+  - Phase-local Choices: Use `BindingNamespaceID`, roleless `TableBinding`,
+    opaque `TableDefinitionVersion`, `ManagedTableDefinitionSnapshot`, and
+    `ResolvedTableBinding`; extend `ManagedTableOps`; use a boolean full-schema
+    switch rather than a projection enum; sort reverse enumeration by
+    `(namespace_id, binding_key)`; and keep the version representation private
+    for future descriptor-revision extension. Persisted key order, uniqueness,
+    central authority, reverse-index DROP, and final absence remain fixed.
+  - Task Doc: `docs/tasks/000294-managed-table-bindings-and-versioned-resolution.md`
   - Task Issue: `#0`
   - Phase Status: `pending`
   - Implementation Summary: `pending`
@@ -2228,6 +2396,8 @@ marker can alias a second CREATE after restart. [U20]
   older marker.
 - Higher layers gain an atomic descriptor/binding extension boundary without
   making recovery depend on application code.
+- Roleless managed bindings provide indexed name resolution and cheap opaque
+  cache-version checks without loading numeric schema or descriptor data.
 - Descriptor storage is byte-transparent and policy-neutral: URLs, external
   tokens, and self-contained documents share one persistence contract.
 - Descriptor rows and APIs contain no high-level format discriminator; a
@@ -2264,6 +2434,9 @@ marker can alias a second CREATE after restart. [U20]
   overlay.
 - Descriptor/binding rows increase the final catalog root count from five to
   six after removing one existing table and adding two extensions.
+- Binding CREATE uses optimistic primary-index arbitration, so a raced
+  insertion can return `DuplicateKey` or `WriteConflict` after provisional
+  CREATE effects have begun and must cleanly roll them back.
 - Managed physical DDL requires the higher layer to provide a coherent
   descriptor replacement, increasing caller responsibility.
 - Opaque descriptors preserve bytes but storage cannot guarantee that they are
@@ -2277,7 +2450,8 @@ marker can alias a second CREATE after restart. [U20]
   sparse-checkpoint memory and write volume linearly with their full images,
   not with the changed bytes.
 - Recovery and catalog checkpoint preparation perform an additional linear
-  scan of satellite rows and build a temporary central `TableID` set.
+  scan of satellite rows and build temporary central and managed-descriptor
+  `TableID` sets.
 - A durably eligible slot remains unavailable while its exact retired runtime
   is pinned or being destroyed. CREATE does not wait and may temporarily append
   a new slot, delaying reuse under unusually long-lived runtime owners.
@@ -2348,9 +2522,10 @@ marker can alias a second CREATE after restart. [U20]
 - **Hidden orphan satellite:** table-driven reconstruction can ignore a child
   whose central row is absent, and an orphan binding could otherwise appear to
   resolve successfully. One full-state validator scans all five satellites
-  after recovery replay and against projected checkpoint roots; binding lookup
-  checks its parent defensively; and DROP proves its staged final state before
-  commit.
+  after recovery replay and against projected checkpoint roots; binding rows
+  additionally require descriptor ownership; binding lookup requires an
+  admitted managed runtime, whose admission follows complete validation; and
+  DROP proves its staged final state before commit.
 - **Provisional CREATE aliasing:** skipping root-unproven catalog DML without a
   reservation could let the next CREATE reuse its ID or slot. Recovery raises
   the effective allocator, quarantines the slot, and the mandatory sequence
@@ -2370,7 +2545,8 @@ marker can alias a second CREATE after restart. [U20]
   explicit old-version rejection plus fresh bootstrap/restart.
 - **Oversized opaque input:** descriptors and keys could exhaust row/log
   capacity. Both are validated against existing `VarByte` and catalog-row
-  encoding before mandatory acceptance.
+  encoding before mandatory acceptance; binding keys have a fixed inclusive
+  16,000-byte API and integrity bound.
 - **Catalog checkpoint scale amplification:** a sparse binding or descriptor
   change can consume peak memory several times larger than its complete live
   logical table and rewrite the whole table. Phase 8 measures scoped peak
@@ -2391,10 +2567,16 @@ to task design.
 
 ## Future Work
 
-- Snapshot-consistent binding/descriptor/storage resolution for a query
-  snapshot and DataFusion planning.
+- Execution-lifetime binding/descriptor/storage consistency for query and DML
+  planning: accept expected definition versions, validate them while acquiring
+  existing target metadata-S authority in canonical `TableID` order, and
+  retain engine-owned admission through execution. An immutable runtime-layout
+  pin is an alternative only if designed with index/runtime reclamation.
 - Descriptor-only rename, comment, ownership, alias, and logical-constraint
-  DDL.
+  DDL. Before descriptor-only replacement becomes public, extend the private
+  definition version with descriptor revision and cache that fixed-size stamp
+  in the runtime definition snapshot so version-only resolution need not access
+  descriptor payload data.
 - Physical add/drop/reorder/type-change column DDL and row-format migration.
 - Higher-layer SQL, JSON, Protobuf, or other descriptor codecs and name
   mappings in `doradb-datafusion` or another application/catalog crate.

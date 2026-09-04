@@ -1,5 +1,6 @@
 use crate::catalog::{
-    ColumnID, ColumnOrdinal, IndexRef, StorageColumnFlags, StorageIndexFlags, TableIndexKeySpec,
+    BindingNamespaceID, ColumnID, ColumnOrdinal, IndexRef, StorageColumnFlags, StorageIndexFlags,
+    TableIndexKeySpec,
 };
 use crate::id::{TableID, TrxID};
 use crate::value::ValKind;
@@ -60,6 +61,17 @@ pub(crate) struct TableDescriptorObject {
     pub(crate) storage_schema_fingerprint: [u8; 32],
     /// Exact opaque higher-layer descriptor bytes.
     pub(crate) payload: Box<[u8]>,
+}
+
+/// One finalized roleless row in `catalog.table_bindings`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TableBindingObject {
+    /// Opaque higher-layer namespace identity.
+    pub(crate) namespace_id: BindingNamespaceID,
+    /// Exact namespace-local opaque lookup key.
+    pub(crate) binding_key: Box<[u8]>,
+    /// Storage-assigned managed user table identity.
+    pub(crate) table_id: TableID,
 }
 
 /// One row object in `catalog.table_replay_silent_watermarks`.

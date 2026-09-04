@@ -1,7 +1,9 @@
 use super::{CatalogStorage, ColumnObject, IndexObject, TableObject};
-use crate::catalog::{CatalogDefinitionEffects, IndexRef, TableDescriptorEffect, TableMetadata};
+use crate::catalog::{
+    CatalogDefinitionEffects, IndexRef, TableBindingEffect, TableDescriptorEffect, TableMetadata,
+};
 use crate::error::{
-    DataIntegrityError, MultiDomainResultExt, RuntimeError, RuntimeOrFatalError,
+    DataIntegrityError, MultiDomainResultExt, QuadResult, RuntimeError, RuntimeOrFatalError,
     RuntimeOrFatalResult,
 };
 use crate::id::TableID;
@@ -17,8 +19,13 @@ impl CatalogStorage {
         table_id: TableID,
         metadata: &TableMetadata,
         definition_effects: &CatalogDefinitionEffects,
-    ) -> RuntimeOrFatalResult<()> {
+    ) -> QuadResult<()> {
         validate_catalog_engine_health(trx, "stage_create_table")?;
+
+        // Binding uniqueness is the only expected CREATE catalog-DML failure.
+        // Resolve it before staging invariant-only numeric and descriptor rows.
+        self.stage_create_binding_effect(trx, definition_effects)
+            .await?;
 
         let table = table_object(table_id, metadata);
         let columns = metadata
@@ -49,7 +56,7 @@ impl CatalogStorage {
         if !indexes.is_empty() {
             self.indexes().insert_batch(trx, &indexes).await?;
         }
-        self.stage_definition_effects(trx, definition_effects)
+        self.stage_create_descriptor_effect(trx, definition_effects)
             .await?;
         trx.install_ddl_redo(DDLRedo::CreateTable(table_id));
         Ok(())
@@ -187,7 +194,6 @@ impl CatalogStorage {
         effects: &CatalogDefinitionEffects,
     ) -> RuntimeOrFatalResult<()> {
         match effects.descriptor() {
-            TableDescriptorEffect::None => {}
             TableDescriptorEffect::Insert(descriptor) => {
                 self.table_descriptors().insert(trx, descriptor).await?;
             }
@@ -200,10 +206,65 @@ impl CatalogStorage {
                     ));
                 }
             }
+            TableDescriptorEffect::None | TableDescriptorEffect::DeleteIfPresent(_) => {}
+        }
+        match effects.bindings() {
+            TableBindingEffect::None => {}
+            TableBindingEffect::Insert(bindings) => {
+                self.table_bindings().insert_batch(trx, bindings).await?;
+            }
+            TableBindingEffect::DeleteByTableID(table_id) => {
+                self.table_bindings()
+                    .delete_by_table_id(trx, *table_id)
+                    .await?;
+            }
+        }
+        match effects.descriptor() {
             TableDescriptorEffect::DeleteIfPresent(table_id) => {
                 self.table_descriptors()
                     .delete_by_table_id(trx, *table_id)
                     .await?;
+            }
+            TableDescriptorEffect::None
+            | TableDescriptorEffect::Insert(_)
+            | TableDescriptorEffect::Replace(_) => {}
+        }
+        Ok(())
+    }
+
+    /// Stages the optimistic binding insertion before invariant-only CREATE DML.
+    async fn stage_create_binding_effect(
+        &self,
+        trx: &mut PrivateTransaction,
+        effects: &CatalogDefinitionEffects,
+    ) -> QuadResult<()> {
+        match effects.bindings() {
+            TableBindingEffect::Insert(bindings) => {
+                self.table_bindings()
+                    .try_insert_unique_batch(trx, bindings)
+                    .await?;
+            }
+            TableBindingEffect::None => {}
+            TableBindingEffect::DeleteByTableID(_) => {
+                panic!("CREATE TABLE received a binding-delete effect")
+            }
+        }
+        Ok(())
+    }
+
+    /// Stages the managed descriptor after all canonical numeric CREATE rows.
+    async fn stage_create_descriptor_effect(
+        &self,
+        trx: &mut PrivateTransaction,
+        effects: &CatalogDefinitionEffects,
+    ) -> QuadResult<()> {
+        match effects.descriptor() {
+            TableDescriptorEffect::Insert(descriptor) => {
+                self.table_descriptors().insert(trx, descriptor).await?;
+            }
+            TableDescriptorEffect::None => {}
+            TableDescriptorEffect::Replace(_) | TableDescriptorEffect::DeleteIfPresent(_) => {
+                panic!("CREATE TABLE received a non-insert descriptor effect")
             }
         }
         Ok(())
@@ -238,4 +299,96 @@ fn invalid_drop_catalog_state(message: String) -> RuntimeOrFatalResult<()> {
             .attach(message)
             .change_context(RuntimeError::CatalogAccess),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::storage::tests::begin_catalog_test_trx;
+    use crate::catalog::tests::open_catalog_test_engine;
+    use crate::catalog::{
+        BindingNamespaceID, StorageColumnFlags, StorageColumnSpec, TableBindingObject,
+        TableDescriptorObject,
+    };
+    use crate::error::{OperationError, QuadError};
+    use crate::session::tests::SessionTestExt;
+    use crate::value::ValKind;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_create_binding_collision_precedes_numeric_and_descriptor_dml() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = open_catalog_test_engine(temp_dir.path().to_path_buf(), None).await;
+            let session = engine.new_session().unwrap();
+            let storage = &engine.inner().core.catalog().storage;
+            let namespace_id = BindingNamespaceID::new(42);
+            let binding_key: Box<[u8]> = Box::from(&b"occupied"[..]);
+            let candidate_table_id = TableID::new(90_001);
+            let metadata = TableMetadata::try_new(
+                vec![StorageColumnSpec::new(
+                    ValKind::I32,
+                    StorageColumnFlags::empty(),
+                )],
+                vec![],
+            )
+            .unwrap();
+            let descriptor = TableDescriptorObject {
+                table_id: candidate_table_id,
+                descriptor_revision: 0,
+                compiled_storage_epoch: metadata.storage_epoch,
+                storage_schema_fingerprint: metadata.storage_schema_fingerprint(),
+                payload: Box::from(&b"candidate"[..]),
+            };
+            let effects = CatalogDefinitionEffects::insert(
+                descriptor,
+                vec![TableBindingObject {
+                    namespace_id,
+                    binding_key: binding_key.clone(),
+                    table_id: candidate_table_id,
+                }]
+                .into_boxed_slice(),
+            );
+            let mut trx = begin_catalog_test_trx(&session);
+            storage
+                .table_bindings()
+                .insert_batch(
+                    trx.trx(),
+                    &[TableBindingObject {
+                        namespace_id,
+                        binding_key,
+                        table_id: TableID::new(90_000),
+                    }],
+                )
+                .await
+                .unwrap();
+
+            let err = storage
+                .stage_create_table(trx.trx(), candidate_table_id, &metadata, &effects)
+                .await
+                .unwrap_err();
+            let QuadError::Operation(report) = err else {
+                panic!("binding collision changed error domain")
+            };
+            assert_eq!(*report.current_context(), OperationError::DuplicateKey);
+            assert!(
+                storage
+                    .tables()
+                    .find_uncommitted_by_id(&session.pool_guards(), candidate_table_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                storage
+                    .table_descriptors()
+                    .find_uncommitted_by_table_id(&session.pool_guards(), candidate_table_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+
+            trx.rollback().await;
+        });
+    }
 }
