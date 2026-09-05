@@ -15,9 +15,8 @@ pub use checkpoint::{
 pub(crate) use definition::*;
 pub use definition::{
     BindingNamespaceID, DescriptorUpdate, MAX_TABLE_BINDING_KEY_BYTES, MAX_TABLE_DESCRIPTOR_BYTES,
-    ManagedCreateTableDefinition, ManagedDdlError, ManagedDdlResult,
-    ManagedTableDefinitionSnapshot, ManagedTableInterpreter, ResolvedTableBinding, TableBinding,
-    TableDefinitionVersion,
+    ManagedCreateTableDefinition, ManagedTableDefinitionSnapshot, ManagedTableInterpreter,
+    ResolvedTableBinding, TableBinding, TableDefinitionVersion,
 };
 pub(crate) use history::*;
 pub(crate) use index::*;

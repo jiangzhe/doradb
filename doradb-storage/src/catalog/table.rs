@@ -2616,6 +2616,7 @@ fn validate_primary_key_contract(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::CallbackResult;
     use crate::catalog::storage::tests::begin_catalog_test_trx;
     use crate::catalog::tests::{
         assert_dropped_table_floor, assert_dropped_table_runtime,
@@ -5784,7 +5785,9 @@ pub(crate) mod tests {
             let mut reader_session = engine.new_session().unwrap();
             let mut reader_trx = reader_session.begin_trx().unwrap();
             let reader_stream = reader_trx
-                .table_scan_mvcc_stream(table_id, &[0], |_| Ok(ScanRowDecision::Include))
+                .table_scan_mvcc_stream(table_id, &[0], |_| -> CallbackResult<_> {
+                    Ok(ScanRowDecision::Include)
+                })
                 .await
                 .unwrap();
             drop(reader_stream);

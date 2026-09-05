@@ -144,6 +144,11 @@ separate inspectable variants, and `ManagedDdlResult<T, E>` retains the
 interpreter's error type. Interpreter panics unwind normally because no engine
 authority is held at callback time.
 
+Follow-up [task 000297](000297-generalize-public-callback-error-boundaries.md)
+replaced the managed-specific carrier with `CallbackError` / `CallbackResult`
+and the `User` arm across managed DDL and programmable row APIs. The names
+above describe this task's original implementation.
+
 The public storage projections contain stable IDs but no physical slots or
 concurrency fields. Columns are projected in physical ordinal order, active
 indexes in stable `IndexID` order, and index keys by stable `ColumnID`.

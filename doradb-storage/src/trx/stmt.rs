@@ -6,8 +6,8 @@ use crate::catalog::{
     TableIndex, TableIndexArgument, TableIndexSelector,
 };
 use crate::error::{
-    DiscloseResultExt, FatalError, FatalResult, MultiDomainResultExt, OperationError,
-    OperationOrFatalError, OperationOrFatalResult, OperationOrRuntimeError,
+    CallbackResult, DiscloseResultExt, FatalError, FatalResult, MultiDomainResultExt,
+    OperationError, OperationOrFatalError, OperationOrFatalResult, OperationOrRuntimeError,
     OperationOrRuntimeResult, OperationResult, QuadError, QuadResult, Result, RuntimeError,
     RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
 };
@@ -688,13 +688,13 @@ impl<'stmt> Statement<'stmt> {
     /// reports delete and update decisions independently after all actions
     /// succeed.
     #[inline]
-    pub(super) async fn table_mutate_mvcc<F>(
+    pub(super) async fn table_mutate_mvcc<F, E>(
         mut self,
         table_id: TableID,
         mutate_row: F,
-    ) -> Result<TableMutationOutcome>
+    ) -> CallbackResult<TableMutationOutcome, E>
     where
-        F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<RowMutation>,
+        F: for<'row> FnMut(&mut LazyRow<'row>) -> CallbackResult<RowMutation, E>,
     {
         const OPERATION: &str = "table_mutate_mvcc";
         let AdmittedUserTable { table, layout } = self
@@ -726,15 +726,15 @@ impl<'stmt> Statement<'stmt> {
     /// callbacks have run. Deferred updates are memory-only and intentionally
     /// uncapped; callbacks must not depend on candidate-order physical effects.
     #[inline]
-    pub(super) async fn table_index_mutate_mvcc<'r, R, F>(
+    pub(super) async fn table_index_mutate_mvcc<'r, R, F, E>(
         mut self,
         selector: TableIndexSelector,
         range: R,
         mutate_row: F,
-    ) -> Result<TableMutationOutcome>
+    ) -> CallbackResult<TableMutationOutcome, E>
     where
         R: RangeBounds<&'r [Val]>,
-        F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<RowMutation>,
+        F: for<'row> FnMut(&mut LazyRow<'row>) -> CallbackResult<RowMutation, E>,
     {
         const OPERATION: &str = "table_index_mutate_mvcc";
         let table_id = selector.table_id();
@@ -1546,8 +1546,8 @@ pub(crate) mod tests {
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{
-        DiscloseError, DiscloseResultExt, FatalError, InternalError, LifecycleError,
-        OperationError, ResourceError,
+        CallbackError, DiscloseError, DiscloseResultExt, Error, FatalError, InternalError,
+        LifecycleError, OperationError, ResourceError,
     };
     use crate::id::TrxID;
     use crate::lock::LockOwner;
@@ -1903,7 +1903,9 @@ pub(crate) mod tests {
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
             let first = trx
-                .exec(async |mut stmt| Ok(statement_effects_mut(&mut stmt).stmt_no()))
+                .exec::<_, Error, _>(
+                    async |mut stmt| Ok(statement_effects_mut(&mut stmt).stmt_no()),
+                )
                 .await
                 .unwrap();
             let failed: Result<u64> = trx
@@ -1917,7 +1919,9 @@ pub(crate) mod tests {
             let failed = failed.unwrap_err();
             let second = format!("{failed:?}");
             let third = trx
-                .exec(async |mut stmt| Ok(statement_effects_mut(&mut stmt).stmt_no()))
+                .exec::<_, Error, _>(
+                    async |mut stmt| Ok(statement_effects_mut(&mut stmt).stmt_no()),
+                )
                 .await
                 .unwrap();
             assert_eq!(first, 1);
@@ -1927,7 +1931,9 @@ pub(crate) mod tests {
 
             let mut next = session.begin_trx().unwrap();
             let first = next
-                .exec(async |mut stmt| Ok(statement_effects_mut(&mut stmt).stmt_no()))
+                .exec::<_, Error, _>(
+                    async |mut stmt| Ok(statement_effects_mut(&mut stmt).stmt_no()),
+                )
                 .await
                 .unwrap();
             assert_eq!(first, 1);
@@ -2280,81 +2286,97 @@ pub(crate) mod tests {
 
     #[test]
     fn test_statement_index_rollback_failure_poisons_and_discards_transaction() {
-        smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("redo_stmt_index_rollback_fail").await;
-            let (mut trx, _session_state) = test_trx(&engine, TrxID::new(52));
-            let session_id = trx.operation_key.session_id();
-            let trx_owner = trx_lock_owner(&mut trx).unwrap();
-            acquire_transaction_lock_immediate(
-                &mut trx,
-                LockResource::TableData(TableID::new(91_250)),
-                LockMode::IntentExclusive,
-            )
-            .unwrap();
-            // Owned-runner raw-effect injection forces index-before-row
-            // rollback and fatal residual retention.
-            set_test_force_stmt_index_rollback_error(true);
-            let res: Result<()> = trx
-                .exec(async |mut stmt| {
-                    acquire_transaction_lock(
-                        &mut stmt,
-                        LockResource::TableMetadata(TableID::new(91_250)),
-                        LockMode::Shared,
-                    )
-                    .await?;
-                    // This row undo references a table that does not exist. If
-                    // statement rollback ever runs row rollback before index
-                    // rollback, this test fails before the injected index
-                    // rollback error can discard the statement safely.
-                    let effects = statement_effects_mut(&mut stmt);
-                    effects.push_row_undo(OwnedRowUndo::new(
-                        effects.stmt_no(),
-                        TableID::new(99_999_999),
-                        None,
-                        RowID::new(24),
-                        RowUndoKind::Delete,
-                    ));
-                    effects.push_delete_index_undo(
-                        TableID::new(12),
-                        RowID::new(23),
-                        user_key_from_index_ref(
-                            IndexRef::new(IndexID::new(0), IndexSlot::new(0)),
-                            vec![],
-                        ),
-                        true,
-                    );
-                    Err(Report::new(OperationError::InvalidDmlInput).disclose())
-                })
-                .await;
-            set_test_force_stmt_index_rollback_error(false);
+        for user_failure in [false, true] {
+            smol::block_on(async {
+                let (_temp_dir, engine) = test_engine("redo_stmt_index_rollback_fail").await;
+                let (mut trx, _session_state) = test_trx(&engine, TrxID::new(52));
+                let session_id = trx.operation_key.session_id();
+                let trx_owner = trx_lock_owner(&mut trx).unwrap();
+                acquire_transaction_lock_immediate(
+                    &mut trx,
+                    LockResource::TableData(TableID::new(91_250)),
+                    LockMode::IntentExclusive,
+                )
+                .unwrap();
+                // Owned-runner raw-effect injection forces index-before-row
+                // rollback and fatal residual retention.
+                set_test_force_stmt_index_rollback_error(true);
+                let res: CallbackResult<(), String> = trx
+                    .exec(async |mut stmt| {
+                        acquire_transaction_lock(
+                            &mut stmt,
+                            LockResource::TableMetadata(TableID::new(91_250)),
+                            LockMode::Shared,
+                        )
+                        .await?;
+                        // This row undo references a table that does not exist. If
+                        // statement rollback ever runs row rollback before index
+                        // rollback, this test fails before the injected index
+                        // rollback error can discard the statement safely.
+                        let effects = statement_effects_mut(&mut stmt);
+                        effects.push_row_undo(OwnedRowUndo::new(
+                            effects.stmt_no(),
+                            TableID::new(99_999_999),
+                            None,
+                            RowID::new(24),
+                            RowUndoKind::Delete,
+                        ));
+                        effects.push_delete_index_undo(
+                            TableID::new(12),
+                            RowID::new(23),
+                            user_key_from_index_ref(
+                                IndexRef::new(IndexID::new(0), IndexSlot::new(0)),
+                                vec![],
+                            ),
+                            true,
+                        );
+                        Err(if user_failure {
+                            CallbackError::User("initiating user failure".to_owned())
+                        } else {
+                            Report::new(OperationError::InvalidDmlInput)
+                                .disclose()
+                                .into()
+                        })
+                    })
+                    .await;
+                set_test_force_stmt_index_rollback_error(false);
 
-            let err = res.unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<FatalError>().copied(),
-                Some(FatalError::RollbackAccess)
-            );
-            assert_eq!(
-                err.report().downcast_ref::<RuntimeError>().copied(),
-                Some(RuntimeError::IndexAccess)
-            );
-            assert!(sys_tests::retains_statement_row_undo(
-                &engine.inner().trx_sys,
-                TableID::new(99_999_999),
-                RowID::new(24)
-            ));
-            assert_eq!(lock_entry_count(&engine, trx_owner), 0);
-            assert!(
-                engine
-                    .inner()
-                    .poisoner
-                    .poison_error()
-                    .as_ref()
-                    .is_some_and(|err| *err.current_context() == FatalError::RollbackAccess)
-            );
+                let err = res
+                    .unwrap_err()
+                    .into_engine()
+                    .expect("fatal rollback takes engine precedence");
+                assert_eq!(err.kind(), crate::ErrorKind::Fatal);
+                assert!(format!("{err:?}").contains("operation=test_statement_index_rollback"));
+                assert_eq!(
+                    err.report().downcast_ref::<FatalError>().copied(),
+                    Some(FatalError::RollbackAccess)
+                );
+                assert_eq!(
+                    err.report().downcast_ref::<RuntimeError>().copied(),
+                    Some(RuntimeError::IndexAccess)
+                );
+                assert!(sys_tests::retains_statement_row_undo(
+                    &engine.inner().trx_sys,
+                    TableID::new(99_999_999),
+                    RowID::new(24)
+                ));
+                assert_eq!(lock_entry_count(&engine, trx_owner), 0);
+                assert!(
+                    engine
+                        .inner()
+                        .poisoner
+                        .poison_error()
+                        .as_ref()
+                        .is_some_and(|err| *err.current_context() == FatalError::RollbackAccess)
+                );
 
-            let err = trx.commit().await.unwrap_err();
-            assert!(err.report().downcast_ref::<InternalError>().is_none());
-            session_tests::remove_session_for_test(&engine.inner().session_registry, session_id);
-        });
+                let err = trx.commit().await.unwrap_err();
+                assert!(err.report().downcast_ref::<InternalError>().is_none());
+                session_tests::remove_session_for_test(
+                    &engine.inner().session_registry,
+                    session_id,
+                );
+            });
+        }
     }
 }

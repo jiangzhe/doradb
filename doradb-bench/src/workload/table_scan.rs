@@ -16,7 +16,7 @@ use crate::workload::util::{
 use crate::workload::{RunCancellation, SessionPlan};
 use doradb_storage::id::TableID;
 use doradb_storage::{
-    Engine, ScanRowDecision, Session, TableScanOptions, TableScanPartitionStream,
+    CallbackResult, Engine, ScanRowDecision, Session, TableScanOptions, TableScanPartitionStream,
 };
 use parking_lot::Mutex;
 use smol::future::zip;
@@ -348,7 +348,9 @@ async fn run_sequential_scans(
         for _ in 0..count {
             let scan_result = async {
                 let mut stream = trx
-                    .table_scan_mvcc_stream(table_id, &[0, 1], |_| Ok(ScanRowDecision::Include))
+                    .table_scan_mvcc_stream(table_id, &[0, 1], |_| -> CallbackResult<_> {
+                        Ok(ScanRowDecision::Include)
+                    })
                     .await?;
                 let mut rows = 0u64;
                 while stream.next().await?.is_some() {

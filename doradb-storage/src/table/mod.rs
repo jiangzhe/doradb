@@ -1378,6 +1378,7 @@ fn unique_key_from_full_row(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::lifecycle::{CheckpointPublishLease, TableCheckpointRootMutationScope};
+    use crate::CallbackResult;
     use crate::buffer::guard::PageSharedGuard;
     use crate::buffer::page::PAGE_SIZE;
     use crate::buffer::{PoolGuard, PoolGuards, ReadonlyBufferPool};
@@ -3447,7 +3448,9 @@ pub(crate) mod tests {
         read_set: &[usize],
     ) -> Vec<Vec<Val>> {
         let mut stream = trx
-            .table_scan_mvcc_stream(table_id, read_set, |_| Ok(ScanRowDecision::Include))
+            .table_scan_mvcc_stream(table_id, read_set, |_| -> CallbackResult<_> {
+                Ok(ScanRowDecision::Include)
+            })
             .await
             .unwrap();
         let mut rows = Vec::new();

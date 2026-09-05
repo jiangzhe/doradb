@@ -30,3 +30,10 @@ Managed DDL and all three public programmable row APIs use one general engine-or
 
 This is intentionally a coordinated breaking public signature change. The crate is version 0.1.0 and task 000294's managed result names are not yet finalized, making this the least costly point to establish the general boundary.
 
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000297-generalize-public-callback-error-boundaries.md
+- Closed By: backlog close
+- Reference: User decision
+- Closed At: 2026-09-05

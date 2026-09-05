@@ -1,3 +1,5 @@
+use doradb_storage::CallbackError;
+use std::convert::Infallible;
 use std::io;
 use std::result::Result as StdResult;
 use thiserror::Error;
@@ -25,5 +27,39 @@ pub enum BenchError {
 impl BenchError {
     pub(super) fn message(message: impl Into<String>) -> Self {
         Self::Message(message.into())
+    }
+}
+
+/// Preserves application errors and classifies engine failures as storage errors.
+impl From<CallbackError<BenchError>> for BenchError {
+    fn from(error: CallbackError<BenchError>) -> Self {
+        match error {
+            CallbackError::Engine(error) => Self::Storage(error),
+            CallbackError::User(error) => error,
+        }
+    }
+}
+
+/// Converts callbacks that can fail only through engine operations.
+impl From<CallbackError<Infallible>> for BenchError {
+    fn from(error: CallbackError<Infallible>) -> Self {
+        Self::Storage(error.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn callback_user_error_preserves_owned_payload() {
+        let message = String::from("application marker");
+        let address = message.as_ptr();
+        let error = BenchError::from(CallbackError::User(BenchError::Message(message)));
+        let BenchError::Message(message) = error else {
+            panic!("callback user error must preserve its variant")
+        };
+        assert_eq!(message, "application marker");
+        assert_eq!(message.as_ptr(), address);
     }
 }

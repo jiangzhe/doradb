@@ -347,6 +347,7 @@ pub(super) async fn admit_user_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CallbackResult;
     use crate::catalog::tests::table2;
     use crate::catalog::{
         IndexID, IndexSlot, StorageIndexFlags, StorageIndexKey, StorageIndexSpec, TableIndex,
@@ -451,7 +452,9 @@ mod tests {
 
     async fn touch_table_read(trx: &mut Transaction, table_id: TableID) -> Result<()> {
         let stream = trx
-            .table_scan_mvcc_stream(table_id, &[0], |_| Ok(ScanRowDecision::Include))
+            .table_scan_mvcc_stream(table_id, &[0], |_| -> CallbackResult<_> {
+                Ok(ScanRowDecision::Include)
+            })
             .await?;
         drop(stream);
         Ok(())
@@ -684,9 +687,11 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let metadata = LockResource::TableMetadata(table_id);
             pause_after_transaction_metadata_grant();
-            let mut constructor = Box::pin(
-                trx.table_scan_mvcc_stream(table_id, &[0], |_| Ok(ScanRowDecision::Include)),
-            );
+            let mut constructor = Box::pin(trx.table_scan_mvcc_stream(
+                table_id,
+                &[0],
+                |_| -> CallbackResult<_> { Ok(ScanRowDecision::Include) },
+            ));
 
             assert!(matches!(
                 futures::poll!(constructor.as_mut()),

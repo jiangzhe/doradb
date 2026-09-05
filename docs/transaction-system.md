@@ -313,7 +313,14 @@ guard, reuses one lazy-row buffer, applies the existing cold/hot MVCC helpers,
 and destroys an exhausted unit before exposing the next boundary. Cancelling a
 pending load therefore cannot omit its descriptor. Transaction scans keep
 their callback and read-your-own-write view; snapshot streams always include
-visible rows and return the requested owned `Vec<Val>` projection.
+visible rows and return the requested owned `Vec<Val>` projection. Cursor
+advancement is generic over an error convertible from public `Error`:
+transaction streams use `CallbackError<E>`, while snapshot partition streams
+use `Error`. Callback errors pass through intact. Projection errors convert
+only after the lazy-row buffer resets. Either transaction-stream error arm
+closes callback/page/cursor state before returning the checkout, and later
+`next()` calls return `Ok(None)`. The exclusive transaction borrow ends when
+the stream is dropped; accepted locks remain transaction-owned.
 
 The frozen core also owns a snapshot-wide first-error execution control: one
 atomic healthy/failed flag and a mutex-protected first table/partition record.
@@ -572,6 +579,21 @@ Row inserts, updates, and deletes then acquire transaction-lifetime
 secondary-index write undo. Repeated operations reuse the binding and
 transaction lock cache rather than re-entering the metadata resolver or lock
 manager.
+
+Public programmable row callbacks return `CallbackResult<Decision, E>`.
+Engine row-access failures convert to `CallbackError::Engine`; application
+failures are wrapped explicitly in `CallbackError::User`. The public statement
+runner uses one generic `CE: From<Error>` settlement path: ordinary direct
+operations use `Error`, and programmable mutations use `CallbackError<E>`.
+Admission errors disclose once. Successful statements merge effects; failed
+statements roll back index and row effects and clear statement redo before
+returning the original carrier intact. Earlier successful statements stay in
+the transaction. Fatal rollback failure retains residual undo, poisons the
+engine, discards the checkout, and returns the fatal engine arm instead of the
+initiating error. Cancellation keeps the existing armed statement-drop owner
+and whole-transaction cleanup path. Application payloads do not enter mandatory
+cleanup, and the separate private transaction runner retains its typed fatal
+boundary.
 
 Sequential full-table MVCC mutation acquires transaction-lifetime
 `TableMetadata(S)` followed by `TableData(X)` before it captures the table root

@@ -229,10 +229,10 @@ version/lock/transaction state remain private.
 Callbacks are synchronous and run after the engine has released its short
 metadata-S preflight. DoraDB reacquires DDL exclusion and privately revalidates
 the definition before effects. A concurrent schema change returns
-`ManagedDdlError::Engine` containing `OperationError::SchemaChanged`; the
+`CallbackError::Engine` containing `OperationError::SchemaChanged`; the
 interpreter is called exactly once per API call, and the caller chooses whether
 to retry the whole operation. Interpreter failures remain in
-`ManagedDdlError::Interpreter` without being flattened into storage errors.
+`CallbackError::User` without being flattened into storage errors.
 
 Descriptor payloads may be empty or arbitrary binary bytes and are persisted
 byte-for-byte. The inclusive maximum is
@@ -247,7 +247,7 @@ within its namespace, and bindings can be created only as part of managed
 CREATE TABLE. A binding already present at precheck or insertion is reported as
 `OperationError::DuplicateKey`; a concurrent binding ownership or deletion
 race may instead report `OperationError::WriteConflict`. Both are returned in
-the engine arm of `ManagedDdlError`.
+the engine arm of `CallbackError`.
 
 `resolve_table_binding(namespace_id, key, include_full_schema)` returns `None`
 when the exact key is absent. A successful `ResolvedTableBinding` always
@@ -404,7 +404,7 @@ projection:
 
 ```rust,ignore
 let mut stream = trx
-    .table_scan_mvcc_stream(table_id, &[0, 2], |row| {
+    .table_scan_mvcc_stream(table_id, &[0, 2], |row| -> CallbackResult<_> {
         if row.val(1)? == &Val::from("active") {
             Ok(ScanRowDecision::Include)
         } else {
@@ -423,7 +423,8 @@ drop(stream);
 the current `next` call. `Skip` continues internally without materializing the
 projection. `Stop` excludes the current row and closes the stream successfully.
 Exhaustion, `Stop`, callback or storage error, and early drop release the
-stream's operation checkout. Cancelling a pending stream constructor also
+stream's callback and scan resources before returning its operation checkout.
+Cancelling a pending stream constructor also
 returns its checkout and leaves the transaction reusable; transaction claims
 already accepted during admission remain until commit or rollback. After a
 terminal result, later `next` calls return `Ok(None)` without invoking the
@@ -649,7 +650,8 @@ target row exists.
 `table_mutate_mvcc` traverses the latest modifiable rows of a table.
 `table_index_mutate_mvcc` performs the same decision process for rows selected
 through one secondary-index range. Their callback receives `LazyRow`, which
-loads and caches requested columns on demand, and returns one `RowMutation`:
+loads and caches requested columns on demand, and returns
+`CallbackResult<RowMutation, E>` with one of these decisions:
 
 - `Skip` leaves the row unchanged;
 - `Delete` deletes the row; or
@@ -657,7 +659,7 @@ loads and caches requested columns on demand, and returns one `RowMutation`:
 
 ```rust,ignore
 let outcome = trx
-    .table_mutate_mvcc(table_id, |row| {
+    .table_mutate_mvcc(table_id, |row| -> CallbackResult<_> {
         if row.val(0)?.as_i32() == Some(7) {
             return Ok(RowMutation::Delete);
         }
@@ -784,8 +786,47 @@ available after session close, registry removal, or engine shutdown.
 
 ## Error handling
 
-Public fallible methods return `doradb_storage::Result<T>`, an alias for
-`Result<T, doradb_storage::Error>`.
+Engine-only fallible methods return `doradb_storage::Result<T>`, an alias for
+`Result<T, doradb_storage::Error>`. Managed DDL, programmable mutations, and
+programmable scan construction and `next` return `CallbackResult<T, E>`.
+
+`CallbackError<E>` preserves failures as `Engine(Error)` or `User(E)`. Its
+`engine()` and `user()` accessors borrow the corresponding arm; `into_engine()`
+and `into_user()` consume the carrier and return that arm, dropping the other
+arm when it is present. Engine conversion always constructs `Engine`, even
+when the application error type is itself `Error`. Wrap application errors
+explicitly:
+
+```rust,ignore
+let outcome = trx.table_mutate_mvcc(table_id, |row| -> CallbackResult<_, AppError> {
+    let value = row.val(0)?;
+    let mutation = choose_mutation(value).map_err(CallbackError::User)?;
+    Ok(mutation)
+}).await?;
+```
+
+The carrier imposes no `Clone`, `Send`, `Sync`, lifetime, formatting, or standard
+error bounds on the application payload. Applications may return errors
+borrowing caller-owned data; the callback still cannot let borrowed row values
+escape. `Debug`, `Display`, and standard `Error` are available when the payload
+supports their respective traits, and `source()` exposes the contained error.
+
+Use the explicit return annotation `|row| -> CallbackResult<_> { ... }` for
+callbacks with no application failures. It fixes `E` to `Infallible` while
+allowing engine operations such as `row.val(0)?`. Bare `Ok(...)` followed by an
+unconstrained `.unwrap()` does not infer the generic application error type.
+`CallbackError<Infallible>` converts losslessly to `Error`, so these operations
+can use `?` inside an engine-only `Result` function. An application-specific
+enclosing error needs its own explicit conversion; Rust does not chain two
+`From` conversions automatically.
+
+Mutation failure rolls back the current statement before returning the
+original engine or user payload. Earlier successful statements remain usable.
+If rollback fails, the fatal engine error supersedes that payload and the
+transaction is discarded. Application-owned external side effects are outside
+statement rollback. Scan failures in either arm close the stream and return
+once; subsequent `next()` calls return `Ok(None)`. Snapshot partition streams
+and secondary-index scan streams keep their engine-only public results.
 
 `ErrorKind` supplies the stable outer classification:
 
@@ -875,7 +916,7 @@ Most application-facing types are re-exported from the crate root:
 | Writes | `UpdateCol`, `UpdateMvcc`, `UpsertMvcc`, `DeleteMvcc`, `RowMutation`, `TableMutationOutcome` |
 | Locks | `TableLockMode` |
 | Maintenance | `FreezeOutcome`, `FrozenPageBatchInfo`, `CheckpointOutcome`, `CheckpointDelayReason`, `CheckpointCancelReason`, `CatalogCheckpointOutcome`, `RedoTruncationOutcome`, `RedoTruncationBlockerInfo`, `CatalogRedoMaintenanceOutcome`, `MemIndexCleanupOutcome`, `MemIndexCleanupStats`, `MemIndexCleanupDelay`, `SecondaryMemIndexCleanupIndexStats` |
-| Errors | `Result`, `Error`, `ErrorKind`, `OperationError` |
+| Errors | `Result`, `Error`, `ErrorKind`, `OperationError`, `CallbackResult`, `CallbackError` |
 | Diagnostics | `BufferPoolStats`, `BufferPoolRuntimeStats`, `BufferPoolCounters`, `StorageIoStats`, `IoBackendStats`, `TransactionSystemStats`, `MandatoryRuntimeStats`, `MandatoryTaskStats`, `LogicalLockStats` |
 
 The public modules provide the same domains with additional specialized items:

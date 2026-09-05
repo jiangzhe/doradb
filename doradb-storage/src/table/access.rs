@@ -6,10 +6,10 @@ use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::buffer::{EvictableBufferPool, PoolGuards};
 use crate::catalog::{IndexRef, IndexSlot, ResolvedIndexKey, TableColumnLayout, TableMetadata};
 use crate::error::{
-    DataIntegrityError, DataIntegrityResult, DiscloseError, DiscloseResultExt, InternalError,
-    MultiDomainResultExt, OperationError, OperationOrFatalResult, OperationOrRuntimeError,
-    OperationOrRuntimeResult, OperationResult, QuadResult, Result, RuntimeError,
-    RuntimeOrFatalResult, RuntimeResult,
+    CallbackResult, DataIntegrityError, DataIntegrityResult, DiscloseError, DiscloseResultExt,
+    InternalError, MultiDomainResultExt, OperationError, OperationOrFatalResult,
+    OperationOrRuntimeError, OperationOrRuntimeResult, OperationResult, QuadResult, Result,
+    RuntimeError, RuntimeOrFatalResult, RuntimeResult,
 };
 use crate::file::FileKind;
 use crate::file::cow_file::SUPER_BLOCK_ID;
@@ -3712,7 +3712,7 @@ impl<'op> UserTableAccessor<'op> {
     }
 
     /// Mutate latest rows selected by one secondary-index logical-key range.
-    pub(crate) async fn table_index_mutate_mvcc<'r, R, F>(
+    pub(crate) async fn table_index_mutate_mvcc<'r, R, F, E>(
         &self,
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
@@ -3720,10 +3720,10 @@ impl<'op> UserTableAccessor<'op> {
         range: R,
         validate_updates: bool,
         mut mutate_row: F,
-    ) -> Result<TableMutationOutcome>
+    ) -> CallbackResult<TableMutationOutcome, E>
     where
         R: RangeBounds<&'r [Val]>,
-        F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<RowMutation>,
+        F: for<'row> FnMut(&mut LazyRow<'row>) -> CallbackResult<RowMutation, E>,
     {
         let root_snapshot = self.root_snapshot(rt.ctx());
         let index = self.require_sec_idx(index_ref).disclose()?;
@@ -3765,17 +3765,17 @@ impl<'op> UserTableAccessor<'op> {
 
     /// Mutate callback-selected rows from one original latest-read worklist.
     ///
-    /// This public-result contract is retained solely to transport an arbitrary
-    /// public error returned by the caller-owned mutation callback.
-    pub(crate) async fn table_mutate_mvcc<F>(
+    /// The callback result preserves engine reports and application payloads at
+    /// this boundary combining storage work with caller-owned decisions.
+    pub(crate) async fn table_mutate_mvcc<F, E>(
         &self,
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
         validate_updates: bool,
         mut mutate_row: F,
-    ) -> Result<TableMutationOutcome>
+    ) -> CallbackResult<TableMutationOutcome, E>
     where
-        F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<RowMutation>,
+        F: for<'row> FnMut(&mut LazyRow<'row>) -> CallbackResult<RowMutation, E>,
     {
         // Step 1: Freeze the statement's cold root and original hot-page shape
         // before any replacement rows can change scan boundaries.
@@ -3817,9 +3817,9 @@ impl<'op> UserTableAccessor<'op> {
 
     /// Mutate callback-selected rows from the statement's persisted region.
     ///
-    /// This helper retains public `Result` only while merging typed storage
-    /// failures with an arbitrary public error from the mutation callback.
-    async fn mutate_cold_rows_mvcc<F>(
+    /// This helper combines disclosed storage failures with callback results
+    /// while preserving the engine or application error arm.
+    async fn mutate_cold_rows_mvcc<F, E>(
         &self,
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
@@ -3827,9 +3827,9 @@ impl<'op> UserTableAccessor<'op> {
         validator: Option<&DmlValidator<'_>>,
         state: &mut TableMutationState,
         mutate_row: &mut F,
-    ) -> Result<()>
+    ) -> CallbackResult<(), E>
     where
-        F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<RowMutation>,
+        F: for<'row> FnMut(&mut LazyRow<'row>) -> CallbackResult<RowMutation, E>,
     {
         let column_root = root_snapshot.column_block_index_root();
         let pivot_row_id = root_snapshot.pivot_row_id();
@@ -3903,7 +3903,8 @@ impl<'op> UserTableAccessor<'op> {
                                 .attach(format!(
                                     "full-table mutation latest cold-row read: row_id={row_id}"
                                 ))
-                                .disclose());
+                                .disclose()
+                                .into());
                         }
                         ColdLatestRow::Preparing(listener) => {
                             prepare_wait = Some(listener);
@@ -3998,9 +3999,9 @@ impl<'op> UserTableAccessor<'op> {
 
     /// Mutate callback-selected rows from the statement's original hot pages.
     ///
-    /// This helper retains public `Result` only while merging typed storage
-    /// failures with an arbitrary public error from the mutation callback.
-    async fn mutate_hot_rows_mvcc<F>(
+    /// This helper combines disclosed storage failures with callback results
+    /// while preserving the engine or application error arm.
+    async fn mutate_hot_rows_mvcc<F, E>(
         &self,
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
@@ -4008,9 +4009,9 @@ impl<'op> UserTableAccessor<'op> {
         validator: Option<&DmlValidator<'_>>,
         state: &mut TableMutationState,
         mutate_row: &mut F,
-    ) -> Result<()>
+    ) -> CallbackResult<(), E>
     where
-        F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<RowMutation>,
+        F: for<'row> FnMut(&mut LazyRow<'row>) -> CallbackResult<RowMutation, E>,
     {
         // Visit only the hot pages captured at statement start; pages created
         // by cold or hot replacements are outside this descriptor list.
@@ -4056,7 +4057,8 @@ impl<'op> UserTableAccessor<'op> {
                             .attach(format!(
                                 "full-table mutation latest hot-row read: row_id={row_id}"
                             ))
-                            .disclose());
+                            .disclose()
+                            .into());
                     }
                 }
                 // Retain one latest-row read guard through the callback, count
@@ -5351,8 +5353,9 @@ pub(super) fn read_latest_cold_row(
 #[cfg(test)]
 mod tests {
     use super::{
-        ColdDeleteMask, ColdLatestRow, InsertedRow, LazyRowBuffer, OrdinalVisibilityOverride,
-        ScanBoundaryTracker, cold_row_visible_mvcc, read_latest_cold_row,
+        ColdDeleteMask, ColdLatestRow, InsertedRow, LazyRow, LazyRowBuffer,
+        OrdinalVisibilityOverride, ScanBoundaryTracker, cold_row_visible_mvcc,
+        read_latest_cold_row,
     };
     use crate::buffer::BufferPool;
     use crate::buffer::frame::FrameKind;
@@ -5365,8 +5368,8 @@ mod tests {
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{
-        DataIntegrityError, DiscloseError, Error, ErrorKind, FatalError, IoError, OperationError,
-        Result, RuntimeError,
+        DataIntegrityError, Error, ErrorKind, FatalError, IoError, OperationError, Result,
+        RuntimeError,
     };
     use crate::id::{PageID, RowID, TableID, TrxID};
     use crate::index::{LwcRowLocation, RowLocation};
@@ -5398,17 +5401,26 @@ mod tests {
     use crate::trx::ver_map::RowPageState;
     use crate::trx::{MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID, MvccReadView, Transaction};
     use crate::value::{Val, ValKind};
+    use crate::{CallbackError, CallbackResult, TableIndex};
     use error_stack::Report;
     use futures::FutureExt;
     use smol::Timer;
     use smol::future::yield_now;
+    use std::cell::Cell;
     use std::io::Error as StdIoError;
     use std::iter::repeat_n;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::rc::Rc;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tempfile::TempDir;
+
+    // A borrowing payload with no formatting, standard Error, Clone, or Send bounds.
+    struct CallbackFailure<'a> {
+        message: &'a str,
+        identity: Rc<()>,
+    }
 
     enum CachedInsertPageSessionEnd {
         Close,
@@ -6362,7 +6374,9 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let mut stream = trx
-                .table_scan_mvcc_stream(table_id, &[0, 1], |_| Ok(ScanRowDecision::Include))
+                .table_scan_mvcc_stream(table_id, &[0, 1], |_| -> CallbackResult<_> {
+                    Ok(ScanRowDecision::Include)
+                })
                 .await
                 .unwrap();
             let err = stream.next().await.unwrap_err();
@@ -6375,7 +6389,7 @@ mod tests {
             );
             assert_eq!(rendered.matches(&format!("table_id={table_id}")).count(), 1);
             assert_table_data_integrity(
-                err,
+                err.into(),
                 "lwc_block",
                 block_id,
                 DataIntegrityError::ChecksumMismatch,
@@ -8615,7 +8629,7 @@ mod tests {
             let mut writer = writer_session.begin_trx().unwrap();
             let mutate = async {
                 let result = writer
-                    .table_mutate_mvcc(table_id, |_| {
+                    .table_mutate_mvcc(table_id, |_| -> CallbackResult<_> {
                         callbacks.fetch_add(1, Ordering::SeqCst);
                         table
                             .deletion_buffer()
@@ -8667,7 +8681,7 @@ mod tests {
             let mut writer = writer_session.begin_trx().unwrap();
             let mutate = async {
                 let result = writer
-                    .table_mutate_mvcc(table_id, |_| {
+                    .table_mutate_mvcc(table_id, |_| -> CallbackResult<_> {
                         callbacks.fetch_add(1, Ordering::SeqCst);
                         Ok(RowMutation::Delete)
                     })
@@ -8711,7 +8725,7 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let mut callbacks = 0usize;
             let outcome = trx
-                .table_mutate_mvcc(table_id, |row| {
+                .table_mutate_mvcc(table_id, |row| -> CallbackResult<_> {
                     callbacks += 1;
                     assert_eq!(row.column_count(), 2);
                     let first = row.val(0)?.as_i32().unwrap();
@@ -8750,7 +8764,7 @@ mod tests {
             );
             let before_error = scan_table_pairs(&mut trx, table_id).await;
             let result = trx
-                .table_mutate_mvcc(table_id, |row| {
+                .table_mutate_mvcc(table_id, |row| -> CallbackResult<_> {
                     let id = row.val(0)?.as_i32().unwrap();
                     if id == 2 {
                         _ = row.val(2)?;
@@ -8764,6 +8778,8 @@ mod tests {
             assert_eq!(
                 result
                     .unwrap_err()
+                    .engine()
+                    .unwrap()
                     .report()
                     .downcast_ref::<OperationError>()
                     .copied(),
@@ -8840,7 +8856,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
             let outcome = trx
-                .table_mutate_mvcc(table_id, |_| -> Result<RowMutation> {
+                .table_mutate_mvcc(table_id, |_| -> CallbackResult<_> {
                     panic!("empty table must not invoke mutation callback")
                 })
                 .await
@@ -8903,7 +8919,7 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let outcome = trx
-                .table_mutate_mvcc(table_id, |row| {
+                .table_mutate_mvcc(table_id, |row| -> CallbackResult<_> {
                     let id = row.val(0)?.as_i32().unwrap();
                     Ok(match id {
                         0 | 10 => RowMutation::Delete,
@@ -8957,59 +8973,101 @@ mod tests {
 
     #[test]
     fn test_table_mutate_mvcc_mixed_actions_callback_error_rolls_back() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine = evictable_test_engine(
-                &temp_dir,
-                64u64 * 1024 * 1024,
-                "full_mutate_callback_rollback",
-            )
-            .await;
-            let table_id = create_table2_for_test(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            insert_rows(table_id, &mut session, 0, 2, "cold").await;
-            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            assert_checkpoint_published(&mut session, table_id).await;
-            insert_rows(table_id, &mut session, 10, 2, "hot").await;
+        for (indexed, deferred) in [(false, false), (true, false), (true, true)] {
+            smol::block_on(async {
+                let temp_dir = TempDir::new().unwrap();
+                let engine = evictable_test_engine(
+                    &temp_dir,
+                    64u64 * 1024 * 1024,
+                    "full_mutate_callback_rollback",
+                )
+                .await;
+                let table_id = create_table2_for_test(&engine).await;
+                let mut session = engine.new_session().unwrap();
+                insert_rows(table_id, &mut session, 0, 2, "cold").await;
+                assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+                assert_checkpoint_published(&mut session, table_id).await;
+                insert_rows(table_id, &mut session, 10, 3, "hot").await;
 
-            let expected = vec![
-                (0, "cold".to_owned()),
-                (1, "cold".to_owned()),
-                (10, "hot".to_owned()),
-                (11, "hot".to_owned()),
-            ];
-            let mut trx = session.begin_trx().unwrap();
-            let result = trx
-                .table_mutate_mvcc(table_id, |row| {
+                let expected = vec![
+                    (0, "cold".to_owned()),
+                    (1, "cold".to_owned()),
+                    (10, "hot".to_owned()),
+                    (11, "hot".to_owned()),
+                    (12, "hot".to_owned()),
+                    (99, "prior statement".to_owned()),
+                ];
+                let mut trx = session.begin_trx().unwrap();
+                trx.table_insert_mvcc(
+                    table_id,
+                    vec![Val::from(99i32), Val::from("prior statement")],
+                )
+                .await
+                .unwrap();
+                let message = String::from("application decision failed");
+                let identity = Rc::new(());
+                let mut failure = Some(CallbackFailure {
+                    message: &message,
+                    identity: identity.clone(),
+                });
+                let mut seen = Vec::new();
+                let mutate = |row: &mut LazyRow<'_>| -> CallbackResult<_, CallbackFailure<'_>> {
                     let id = row.val(0)?.as_i32().unwrap();
-                    match id {
-                        0 | 10 => Ok(RowMutation::Delete),
-                        1 => Ok(RowMutation::Update(vec![UpdateCol {
+                    seen.push(id);
+                    if id == 11 {
+                        return Err(CallbackError::User(failure.take().unwrap()));
+                    }
+                    if deferred && matches!(id, 1 | 10) {
+                        return Ok(RowMutation::Update(vec![UpdateCol {
+                            idx: 0,
+                            val: Val::from(id + 100),
+                        }]));
+                    }
+                    Ok(match id {
+                        0 | 10 => RowMutation::Delete,
+                        1 => RowMutation::Update(vec![UpdateCol {
                             idx: 1,
                             val: Val::from("changed"),
-                        }])),
-                        11 => Err(Report::new(OperationError::InvalidDmlInput).disclose()),
-                        _ => unreachable!(),
-                    }
-                })
-                .await;
-            assert_eq!(
-                result
-                    .unwrap_err()
-                    .report()
-                    .downcast_ref::<OperationError>()
-                    .copied(),
-                Some(OperationError::InvalidDmlInput)
-            );
-            assert_eq!(scan_table_pairs(&mut trx, table_id).await, expected);
-            for id in [0, 1, 10, 11] {
-                assert!(matches!(
-                    trx_select_row_mvcc_by_id(&mut trx, table_id, &single_key(id), &[0, 1]).await,
-                    Ok(SelectMvcc::Found(_))
-                ));
-            }
-            trx.commit().await.unwrap();
-        });
+                        }]),
+                        _ => unreachable!("callback must stop at its first error"),
+                    })
+                };
+                let result = if indexed {
+                    trx.table_index_mutate_mvcc(TableIndex(table_id, IndexID::new(0)), .., mutate)
+                        .await
+                } else {
+                    trx.table_mutate_mvcc(table_id, mutate).await
+                };
+                let Err(CallbackError::User(failure)) = result else {
+                    panic!("user failure must return intact")
+                };
+                assert_eq!(failure.message, message);
+                assert!(Rc::ptr_eq(&failure.identity, &identity));
+                assert_eq!(seen, [0, 1, 10, 11]);
+                assert_eq!(scan_table_pairs(&mut trx, table_id).await, expected);
+                for id in [0, 1, 10, 11, 12, 99] {
+                    assert!(matches!(
+                        trx_select_row_mvcc_by_id(&mut trx, table_id, &single_key(id), &[0, 1])
+                            .await,
+                        Ok(SelectMvcc::Found(_))
+                    ));
+                }
+                for id in [101, 110] {
+                    assert!(
+                        trx.table_lookup_unique_mvcc(
+                            TableIndex(table_id, IndexID::new(0)),
+                            &single_key(id).vals,
+                            &[0]
+                        )
+                        .await
+                        .unwrap()
+                        .not_found()
+                    );
+                }
+                trx.noop().await.unwrap();
+                trx.commit().await.unwrap();
+            });
+        }
     }
 
     #[test]
@@ -9037,7 +9095,7 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let outcome = trx
-                .table_mutate_mvcc(table_id, |row| {
+                .table_mutate_mvcc(table_id, |row| -> CallbackResult<_> {
                     Ok(match row.val(0)?.as_i32().unwrap() {
                         0 | 10 => RowMutation::Delete,
                         1 | 11 => RowMutation::Update(vec![UpdateCol {
@@ -9087,7 +9145,7 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let outcome = trx
-                .table_mutate_mvcc(table_id, |row| {
+                .table_mutate_mvcc(table_id, |row| -> CallbackResult<_> {
                     let id = row.val(0)?.as_i32().unwrap();
                     Ok(if id % 2 == 0 {
                         RowMutation::Delete
@@ -9130,7 +9188,7 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let outcome = trx
-                .table_mutate_mvcc(table_id, |row| {
+                .table_mutate_mvcc(table_id, |row| -> CallbackResult<_> {
                     let id = row.val(0)?.as_i32().unwrap();
                     Ok(if id % 2 == 0 {
                         RowMutation::Delete
@@ -9299,7 +9357,7 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let outcome = trx
-                .table_mutate_mvcc(table_id, |row| {
+                .table_mutate_mvcc(table_id, |row| -> CallbackResult<_> {
                     Ok(match row.val(0)?.as_i32().unwrap() {
                         1 => RowMutation::Delete,
                         2 => RowMutation::Update(vec![UpdateCol {
@@ -9323,7 +9381,7 @@ mod tests {
             insert_rows(second_table_id, &mut session, 1, 2, "name").await;
             let mut trx = session.begin_trx().unwrap();
             let result = trx
-                .table_mutate_mvcc(second_table_id, |row| {
+                .table_mutate_mvcc(second_table_id, |row| -> CallbackResult<_> {
                     Ok(match row.val(0)?.as_i32().unwrap() {
                         1 => RowMutation::Update(vec![UpdateCol {
                             idx: 0,
@@ -9337,6 +9395,8 @@ mod tests {
             assert_eq!(
                 result
                     .unwrap_err()
+                    .engine()
+                    .unwrap()
                     .report()
                     .downcast_ref::<OperationError>()
                     .copied(),
@@ -9377,7 +9437,7 @@ mod tests {
             writer.commit().await.unwrap();
 
             let outcome = older
-                .table_mutate_mvcc(table_id, |row| {
+                .table_mutate_mvcc(table_id, |row| -> CallbackResult<_> {
                     assert_eq!(row.val(1)?.as_str(), Some("newer"));
                     Ok(RowMutation::Update(Vec::new()))
                 })
@@ -9422,7 +9482,7 @@ mod tests {
 
             let mut seen = Vec::new();
             let outcome = older
-                .table_mutate_mvcc(table_id, |row| {
+                .table_mutate_mvcc(table_id, |row| -> CallbackResult<_> {
                     seen.push((
                         row.val(0)?.as_i32().unwrap(),
                         row.val(1)?.as_str().unwrap().to_owned(),
@@ -9453,7 +9513,7 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let outcome = trx
-                .table_mutate_mvcc(table_id, |row| {
+                .table_mutate_mvcc(table_id, |row| -> CallbackResult<_> {
                     let id = row.val(0)?.as_i32().unwrap();
                     Ok(RowMutation::Update(vec![UpdateCol {
                         idx: 0,
@@ -9490,7 +9550,7 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let result = trx
-                .table_mutate_mvcc(table_id, |row| {
+                .table_mutate_mvcc(table_id, |row| -> CallbackResult<_> {
                     let id = row.val(0)?.as_i32().unwrap();
                     let new_id = if id < 2 { 10 } else { id };
                     Ok(RowMutation::Update(vec![UpdateCol {
@@ -9502,6 +9562,8 @@ mod tests {
             assert_eq!(
                 result
                     .unwrap_err()
+                    .engine()
+                    .unwrap()
                     .report()
                     .downcast_ref::<OperationError>()
                     .copied(),
@@ -9551,7 +9613,7 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let result = trx
-                .table_mutate_mvcc(table_id, |row| {
+                .table_mutate_mvcc(table_id, |row| -> CallbackResult<_> {
                     let id = row.val(0)?.as_i32().unwrap();
                     Ok(if id == 0 {
                         RowMutation::Update(vec![UpdateCol {
@@ -9566,6 +9628,8 @@ mod tests {
             assert_eq!(
                 result
                     .unwrap_err()
+                    .engine()
+                    .unwrap()
                     .report()
                     .downcast_ref::<OperationError>()
                     .copied(),
@@ -9608,7 +9672,9 @@ mod tests {
 
             let mut writer = writer_session.begin_trx().unwrap();
             let outcome = writer
-                .table_mutate_mvcc(table_id, |_| Ok(RowMutation::Update(Vec::new())))
+                .table_mutate_mvcc(table_id, |_| -> CallbackResult<_> {
+                    Ok(RowMutation::Update(Vec::new()))
+                })
                 .await
                 .unwrap();
             assert_eq!(outcome.update_count, 1);
@@ -9678,7 +9744,7 @@ mod tests {
 
             let mut callbacks = 0usize;
             let result = first
-                .table_mutate_mvcc(table_id, |_| {
+                .table_mutate_mvcc(table_id, |_| -> CallbackResult<_> {
                     callbacks += 1;
                     Ok(RowMutation::Skip)
                 })
@@ -9686,6 +9752,8 @@ mod tests {
             assert_eq!(
                 result
                     .unwrap_err()
+                    .engine()
+                    .unwrap()
                     .report()
                     .downcast_ref::<OperationError>()
                     .copied(),
@@ -9799,7 +9867,9 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
             let mut stream = trx
-                .table_scan_mvcc_stream(table_id, &[0], |_| Ok(ScanRowDecision::Include))
+                .table_scan_mvcc_stream(table_id, &[0], |_| -> CallbackResult<_> {
+                    Ok(ScanRowDecision::Include)
+                })
                 .await
                 .unwrap();
 
@@ -9857,7 +9927,7 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let mut callbacks = 0;
             let mut stream = trx
-                .table_scan_mvcc_stream(table_id, &[0], |row| {
+                .table_scan_mvcc_stream(table_id, &[0], |row| -> CallbackResult<_> {
                     callbacks += 1;
                     let name = row.val(1)?.clone();
                     assert_eq!(row.val(1)?, &name, "repeated lazy reads must be stable");
@@ -9906,7 +9976,7 @@ mod tests {
             let mut callbacks = 0;
             for read_set in [&[][..], &[0, 0][..], &[1, 0][..], &[2][..]] {
                 let err = match trx
-                    .table_scan_mvcc_stream(table_id, read_set, |_| {
+                    .table_scan_mvcc_stream(table_id, read_set, |_| -> CallbackResult<_> {
                         callbacks += 1;
                         Ok(ScanRowDecision::Include)
                     })
@@ -9915,13 +9985,18 @@ mod tests {
                     Ok(_) => panic!("invalid projection should fail stream construction"),
                     Err(err) => err,
                 };
-                assert_eq!(err.operation_error(), Some(OperationError::InvalidDmlInput));
+                assert_eq!(
+                    err.engine().unwrap().operation_error(),
+                    Some(OperationError::InvalidDmlInput)
+                );
             }
             assert_eq!(callbacks, 0);
 
             trx.disable_dml_validation(true);
             let mut stream = trx
-                .table_scan_mvcc_stream(table_id, &[], |_| Ok(ScanRowDecision::Include))
+                .table_scan_mvcc_stream(table_id, &[], |_| -> CallbackResult<_> {
+                    Ok(ScanRowDecision::Include)
+                })
                 .await
                 .unwrap();
             assert_eq!(stream.next().await.unwrap(), Some(Vec::new()));
@@ -9962,7 +10037,7 @@ mod tests {
             }
 
             let mut stream = reader
-                .table_scan_mvcc_stream(table_id, &[0, 1], |row| {
+                .table_scan_mvcc_stream(table_id, &[0, 1], |row| -> CallbackResult<_> {
                     assert_eq!(row.val(1)?, &Val::from("old"));
                     Ok(ScanRowDecision::Include)
                 })
@@ -10017,7 +10092,7 @@ mod tests {
             .await;
 
             let mut stream = reader
-                .table_scan_mvcc_stream(table_id, &[0, 1], |row| {
+                .table_scan_mvcc_stream(table_id, &[0, 1], |row| -> CallbackResult<_> {
                     let _ = row.val(1)?;
                     Ok(ScanRowDecision::Include)
                 })
@@ -10062,7 +10137,9 @@ mod tests {
             let mut reader_session = engine.new_session().unwrap();
             let mut reader = reader_session.begin_trx().unwrap();
             let mut stream = reader
-                .table_scan_mvcc_stream(table_id, &[0, 1], |_| Ok(ScanRowDecision::Include))
+                .table_scan_mvcc_stream(table_id, &[0, 1], |_| -> CallbackResult<_> {
+                    Ok(ScanRowDecision::Include)
+                })
                 .await
                 .unwrap();
             assert_eq!(
@@ -10126,7 +10203,9 @@ mod tests {
             let mut reader_session = engine.new_session().unwrap();
             let mut reader = reader_session.begin_trx().unwrap();
             let mut stream = reader
-                .table_scan_mvcc_stream(table_id, &[0], |_| Ok(ScanRowDecision::Include))
+                .table_scan_mvcc_stream(table_id, &[0], |_| -> CallbackResult<_> {
+                    Ok(ScanRowDecision::Include)
+                })
                 .await
                 .unwrap();
 
@@ -10149,6 +10228,107 @@ mod tests {
     }
 
     #[test]
+    fn test_table_scan_callback_errors_release_state_and_are_terminal() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "callback_scan_errors").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 3, "rows").await;
+            let message = String::from("scan callback failed");
+            for cold in [false, true] {
+                if cold {
+                    assert_freeze_created(
+                        session.freeze_table(table_id, usize::MAX).await.unwrap(),
+                    );
+                    assert_checkpoint_published(&mut session, table_id).await;
+                }
+                for user_error in [true, false] {
+                    let mut trx = session.begin_trx().unwrap();
+                    let callbacks = Cell::new(0);
+                    let identity = Rc::new(());
+                    let callback_state = Rc::new(());
+                    let retained_state = callback_state.clone();
+                    let mut failure = Some(CallbackFailure {
+                        message: &message,
+                        identity: identity.clone(),
+                    });
+                    let callback_count = &callbacks;
+                    let mut stream = match trx
+                        .table_scan_mvcc_stream(
+                            table_id,
+                            &[0],
+                            move |row| -> CallbackResult<_, CallbackFailure<'_>> {
+                                let _retained = &retained_state;
+                                callback_count.set(callback_count.get() + 1);
+                                let decision = if callback_count.get() == 2 && user_error {
+                                    Err(failure.take().unwrap())
+                                } else {
+                                    if callback_count.get() == 2 {
+                                        row.val(usize::MAX)?;
+                                    }
+                                    Ok(ScanRowDecision::Include)
+                                };
+                                decision.map_err(CallbackError::User)
+                            },
+                        )
+                        .await
+                    {
+                        Ok(stream) => stream,
+                        Err(_) => panic!("valid stream construction must succeed"),
+                    };
+                    assert_eq!(Rc::strong_count(&callback_state), 2);
+                    assert_eq!(stream.next().await.ok(), Some(Some(vec![Val::from(0i32)])));
+                    let error = match stream.next().await {
+                        Err(error) => error,
+                        Ok(_) => panic!("second callback must fail"),
+                    };
+                    if user_error {
+                        let failure = error.into_user().unwrap();
+                        assert_eq!(failure.message, message);
+                        assert!(Rc::ptr_eq(&failure.identity, &identity));
+                    } else {
+                        let error = error.into_engine().unwrap();
+                        assert_eq!(
+                            error.operation_error(),
+                            Some(OperationError::InvalidDmlInput)
+                        );
+                        assert!(format!("{error:?}").contains("column"));
+                    }
+                    assert_eq!(stream.next().await.ok(), Some(None));
+                    assert_eq!(callbacks.get(), 2);
+                    assert_eq!(Rc::strong_count(&callback_state), 1);
+                    drop(stream);
+                    trx.noop().await.unwrap();
+                    trx.rollback().await.unwrap();
+                }
+                // Trusted projection validation is disabled so failure occurs after Include.
+                let mut trx = session.begin_trx().unwrap();
+                trx.disable_dml_validation(true);
+                let callbacks = Cell::new(0);
+                let mut stream = trx
+                    .table_scan_mvcc_stream(table_id, &[usize::MAX], |_| -> CallbackResult<_> {
+                        callbacks.set(callbacks.get() + 1);
+                        Ok(ScanRowDecision::Include)
+                    })
+                    .await
+                    .unwrap();
+                let error = stream.next().await.unwrap_err().into_engine().unwrap();
+                assert_eq!(
+                    error.operation_error(),
+                    Some(OperationError::InvalidDmlInput)
+                );
+                assert_eq!(stream.next().await.unwrap(), None);
+                assert_eq!(callbacks.get(), 1);
+                drop(stream);
+                trx.noop().await.unwrap();
+                trx.rollback().await.unwrap();
+            }
+        });
+    }
+
+    #[test]
     fn test_table_scan_mvcc_stream_stop_and_error_are_terminal() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
@@ -10161,7 +10341,7 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let mut callbacks = 0;
             let mut stream = trx
-                .table_scan_mvcc_stream(table_id, &[0], |_| {
+                .table_scan_mvcc_stream(table_id, &[0], |_| -> CallbackResult<_> {
                     callbacks += 1;
                     Ok(if callbacks == 1 {
                         ScanRowDecision::Include
@@ -10178,20 +10358,25 @@ mod tests {
             assert_eq!(callbacks, 2);
 
             let mut stream = trx
-                .table_scan_mvcc_stream(table_id, &[0], |row| {
+                .table_scan_mvcc_stream(table_id, &[0], |row| -> CallbackResult<_> {
                     let _ = row.val(usize::MAX)?;
                     Ok(ScanRowDecision::Include)
                 })
                 .await
                 .unwrap();
             let err = stream.next().await.unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::InvalidDmlInput));
+            assert_eq!(
+                err.engine().unwrap().operation_error(),
+                Some(OperationError::InvalidDmlInput)
+            );
             assert_eq!(stream.next().await.unwrap(), None);
             drop(stream);
             trx.noop().await.unwrap();
 
             let stream = trx
-                .table_scan_mvcc_stream(table_id, &[0], |_| Ok(ScanRowDecision::Include))
+                .table_scan_mvcc_stream(table_id, &[0], |_| -> CallbackResult<_> {
+                    Ok(ScanRowDecision::Include)
+                })
                 .await
                 .unwrap();
             drop(stream);
@@ -10213,7 +10398,9 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
             let stream = trx
-                .table_scan_mvcc_stream(table_id, &[0], |_| Ok(ScanRowDecision::Include))
+                .table_scan_mvcc_stream(table_id, &[0], |_| -> CallbackResult<_> {
+                    Ok(ScanRowDecision::Include)
+                })
                 .await
                 .unwrap();
             drop(stream);
@@ -10389,7 +10576,7 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let mut callbacks = 0usize;
             let mut stream = trx
-                .table_scan_mvcc_stream(table_id, &[0], |_| {
+                .table_scan_mvcc_stream(table_id, &[0], |_| -> CallbackResult<_> {
                     callbacks += 1;
                     Ok(if callbacks <= 3 {
                         ScanRowDecision::Include

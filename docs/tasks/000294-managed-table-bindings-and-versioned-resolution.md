@@ -289,9 +289,10 @@ acceptance criteria:
 - `docs/backlogs/000190-preallocate-catalog-lock-manager-slots.md` — replace
   dynamic lookup for the fixed built-in catalog lock resources only after
   benchmark validation.
-- `docs/backlogs/000191-generalize-public-callback-error-boundaries.md` — promote
-  the managed engine/interpreter result split into a general callback boundary
-  and migrate programmable DML/scan APIs coherently.
+- [Task 000297](000297-generalize-public-callback-error-boundaries.md) implemented
+  backlog 000191 with the shared `CallbackError` / `CallbackResult` boundary for
+  managed DDL and programmable DML/scan APIs. The original deferral above is
+  retained as implementation history.
 - `docs/backlogs/000192-cache-managed-table-definitions-in-current-catalog-state.md`
   — cache managed definitions beside current runtime metadata after recovery.
 

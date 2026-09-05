@@ -1331,6 +1331,7 @@ mod tests {
         RecoveryCoordinator, invalid_user_table_keyed_redo, should_replay_heap_row,
         validate_create_table_reloaded_root_ts,
     };
+    use crate::CallbackResult;
     use crate::catalog::storage::publish_first_redo_log_seq_for_test;
     use crate::catalog::storage::tests::begin_catalog_test_trx;
     use crate::catalog::{
@@ -3862,7 +3863,7 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let outcome = trx
-                .table_mutate_mvcc(table_id, |row| {
+                .table_mutate_mvcc(table_id, |row| -> CallbackResult<_> {
                     Ok(match row.val(0)?.as_u32().unwrap() {
                         0 | 10 => RowMutation::Delete,
                         1 => RowMutation::Update(vec![UpdateCol {
@@ -3893,7 +3894,9 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
             let mut stream = trx
-                .table_scan_mvcc_stream(table_id, &[0, 1], |_| Ok(ScanRowDecision::Include))
+                .table_scan_mvcc_stream(table_id, &[0, 1], |_| -> CallbackResult<_> {
+                    Ok(ScanRowDecision::Include)
+                })
                 .await
                 .unwrap();
             let mut rows = Vec::new();

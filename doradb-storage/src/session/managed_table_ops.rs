@@ -1,19 +1,18 @@
 use super::{PreparedDdlScope, Session, SessionOperationPin};
 use crate::catalog::{
     BindingNamespaceID, CreateTableOutcome, CurrentTableDefinition, ID_DOMAIN_END,
-    IndexDdlGateScope, IndexID, ManagedDdlError, ManagedDdlResult, ManagedTableDefinitionSnapshot,
-    ManagedTableInterpreter, PreparedCreateIndex, PreparedCreateTable, PreparedDropIndex,
-    ResolvedTableBinding, StorageTableDefinition, TABLE_ID_TABLE_BINDINGS,
-    TABLE_ID_TABLE_DESCRIPTORS, TableBinding, TableDefinitionVersion, ValidatedCreateTable,
-    create_index_catalog_write_targets, drop_index_catalog_write_targets,
-    managed_create_table_catalog_write_targets, reject_non_user_table_id,
-    reject_user_table_primary_key_index, validate_descriptor_payload, validate_table_binding_key,
-    validate_table_bindings, validate_table_descriptor_against_metadata,
-    validated_index_ddl_target,
+    IndexDdlGateScope, IndexID, ManagedTableDefinitionSnapshot, ManagedTableInterpreter,
+    PreparedCreateIndex, PreparedCreateTable, PreparedDropIndex, ResolvedTableBinding,
+    StorageTableDefinition, TABLE_ID_TABLE_BINDINGS, TABLE_ID_TABLE_DESCRIPTORS, TableBinding,
+    TableDefinitionVersion, ValidatedCreateTable, create_index_catalog_write_targets,
+    drop_index_catalog_write_targets, managed_create_table_catalog_write_targets,
+    reject_non_user_table_id, reject_user_table_primary_key_index, validate_descriptor_payload,
+    validate_table_binding_key, validate_table_bindings,
+    validate_table_descriptor_against_metadata, validated_index_ddl_target,
 };
 use crate::error::{
-    DataIntegrityError, DiscloseError, DiscloseResultExt, MultiDomainResultExt, OperationError,
-    OperationOrFatalResult, Result, RuntimeError,
+    CallbackError, CallbackResult, DataIntegrityError, DiscloseError, DiscloseResultExt,
+    MultiDomainResultExt, OperationError, OperationOrFatalResult, Result, RuntimeError,
 };
 use crate::id::TableID;
 use crate::lock::{FreshClaimsGuard, LockMode, LockResource};
@@ -33,7 +32,7 @@ pub trait ManagedTableOps {
         &mut self,
         source: &[u8],
         interpreter: &mut I,
-    ) -> impl Future<Output = ManagedDdlResult<CreateTableOutcome, I::Error>>
+    ) -> impl Future<Output = CallbackResult<CreateTableOutcome, I::Error>>
     where
         I: ManagedTableInterpreter;
 
@@ -43,7 +42,7 @@ pub trait ManagedTableOps {
         table_id: TableID,
         source: &[u8],
         interpreter: &mut I,
-    ) -> impl Future<Output = ManagedDdlResult<IndexID, I::Error>>
+    ) -> impl Future<Output = CallbackResult<IndexID, I::Error>>
     where
         I: ManagedTableInterpreter;
 
@@ -53,7 +52,7 @@ pub trait ManagedTableOps {
         table_id: TableID,
         source: &[u8],
         interpreter: &mut I,
-    ) -> impl Future<Output = ManagedDdlResult<(), I::Error>>
+    ) -> impl Future<Output = CallbackResult<(), I::Error>>
     where
         I: ManagedTableInterpreter;
 
@@ -81,40 +80,32 @@ impl ManagedTableOps for Session {
         &mut self,
         source: &[u8],
         interpreter: &mut I,
-    ) -> ManagedDdlResult<CreateTableOutcome, I::Error>
+    ) -> CallbackResult<CreateTableOutcome, I::Error>
     where
         I: ManagedTableInterpreter,
     {
         let definition = interpreter
             .create_table(source)
-            .map_err(ManagedDdlError::Interpreter)?;
-        validate_descriptor_payload(definition.descriptor())
-            .disclose()
-            .map_err(ManagedDdlError::Engine)?;
-        validate_table_bindings(definition.bindings())
-            .disclose()
-            .map_err(ManagedDdlError::Engine)?;
+            .map_err(CallbackError::User)?;
+        validate_descriptor_payload(definition.descriptor()).disclose()?;
+        validate_table_bindings(definition.bindings()).disclose()?;
         let (storage, descriptor, bindings) = definition.into_parts();
         let (table_spec, index_specs) = storage.into_parts();
-        let validated = ValidatedCreateTable::try_new(table_spec, index_specs.into_vec())
-            .disclose()
-            .map_err(ManagedDdlError::Engine)?;
+        let validated =
+            ValidatedCreateTable::try_new(table_spec, index_specs.into_vec()).disclose()?;
         let operation = self
             .pin_operation(SessionOperationKind::Ddl)
             .attach("operation=create_managed_table")
-            .disclose()
-            .map_err(ManagedDdlError::Engine)?;
+            .disclose()?;
         let mandatory_runtime = operation.runtime.mandatory_runtime.clone();
         let prepared = operation
             .prepare_managed_create_table(validated, descriptor, bindings)
-            .await
-            .map_err(ManagedDdlError::Engine)?;
+            .await?;
         let observer = mandatory_runtime
             .submit(prepared)
             .await
             .attach("operation=create_managed_table")
-            .disclose()
-            .map_err(ManagedDdlError::Engine)?;
+            .disclose()?;
         drop(mandatory_runtime);
         observer
             .wait()
@@ -122,7 +113,7 @@ impl ManagedTableOps for Session {
             .map_err(|error| error.into_quad(RuntimeError::CatalogAccess))
             .attach("operation=create_managed_table, phase=wait_mandatory_completion")
             .disclose()
-            .map_err(ManagedDdlError::Engine)
+            .map_err(CallbackError::Engine)
     }
 
     async fn create_managed_index<I>(
@@ -130,17 +121,16 @@ impl ManagedTableOps for Session {
         table_id: TableID,
         source: &[u8],
         interpreter: &mut I,
-    ) -> ManagedDdlResult<IndexID, I::Error>
+    ) -> CallbackResult<IndexID, I::Error>
     where
         I: ManagedTableInterpreter,
     {
         let current = self
             .read_managed_current_definition(table_id, "create_managed_index")
-            .await
-            .map_err(ManagedDdlError::Engine)?;
+            .await?;
         let effective_next_index_id = current.effective_next_index_id();
         if effective_next_index_id == ID_DOMAIN_END {
-            return Err(ManagedDdlError::Engine(
+            return Err(CallbackError::Engine(
                 Report::new(OperationError::IndexIdExhausted)
                     .attach(format!("table_id={table_id}"))
                     .disclose(),
@@ -154,30 +144,21 @@ impl ManagedTableOps for Session {
                 current.schema(),
                 proposed_index_id,
             )
-            .map_err(ManagedDdlError::Interpreter)?;
-        validate_descriptor_payload(update.descriptor())
-            .disclose()
-            .map_err(ManagedDdlError::Engine)?;
+            .map_err(CallbackError::User)?;
+        validate_descriptor_payload(update.descriptor()).disclose()?;
         let (change, descriptor) = update.into_parts();
-        let index_spec = change
-            .compile(current.schema())
-            .disclose()
-            .map_err(ManagedDdlError::Engine)?;
-        reject_user_table_primary_key_index(&index_spec, "create_managed_index")
-            .disclose()
-            .map_err(ManagedDdlError::Engine)?;
+        let index_spec = change.compile(current.schema()).disclose()?;
+        reject_user_table_primary_key_index(&index_spec, "create_managed_index").disclose()?;
 
         let operation = self
             .pin_operation(SessionOperationKind::Ddl)
             .attach("operation=create_managed_index")
-            .disclose()
-            .map_err(ManagedDdlError::Engine)?;
+            .disclose()?;
         let mandatory_runtime = operation.runtime.mandatory_runtime.clone();
         operation
             .reject_table_ddl_explicit_session_lock(table_id)
             .attach("operation=create_managed_index")
-            .disclose()
-            .map_err(ManagedDdlError::Engine)?;
+            .disclose()?;
         let scope = PreparedDdlScope::create_index(
             operation,
             table_id,
@@ -185,8 +166,7 @@ impl ManagedTableOps for Session {
         )
         .await
         .attach_with(|| format!("prepare managed CREATE INDEX locks: table_id={table_id}"))
-        .disclose()
-        .map_err(ManagedDdlError::Engine)?;
+        .disclose()?;
         let engine = scope.engine();
         let table = validated_index_ddl_target(
             engine,
@@ -195,34 +175,25 @@ impl ManagedTableOps for Session {
             "create_managed_index",
         )
         .await
-        .disclose()
-        .map_err(ManagedDdlError::Engine)?;
-        engine
-            .poisoner
-            .ensure_healthy()
-            .disclose()
-            .map_err(ManagedDdlError::Engine)?;
+        .disclose()?;
+        engine.poisoner.ensure_healthy().disclose()?;
         let gates = IndexDdlGateScope::acquire(Arc::clone(&table), engine.catalog_guard())
             .await
             .attach("operation=create_managed_index")
-            .disclose()
-            .map_err(ManagedDdlError::Engine)?;
+            .disclose()?;
         let current_descriptor = engine
             .catalog()
             .storage
             .table_descriptors()
             .find_uncommitted_by_table_id(engine.pool_guards(), table_id)
             .await
-            .disclose()
-            .map_err(ManagedDdlError::Engine)?
-            .ok_or_else(|| managed_schema_changed(table_id, "create_managed_index"))
-            .map_err(ManagedDdlError::Engine)?;
+            .disclose()?
+            .ok_or_else(|| managed_schema_changed(table_id, "create_managed_index"))?;
         let plan = table
             .finalize_managed_create_index(&current, current_descriptor, index_spec, descriptor)
-            .disclose()
-            .map_err(ManagedDdlError::Engine)?;
+            .disclose()?;
         if plan.index().id() != proposed_index_id {
-            return Err(ManagedDdlError::Engine(
+            return Err(CallbackError::Engine(
                     Report::new(OperationError::SchemaChanged)
                         .attach(format!(
                             "managed CREATE INDEX proposed identity changed: table_id={table_id}, proposed={proposed_index_id}, finalized={}",
@@ -238,8 +209,7 @@ impl ManagedTableOps for Session {
             .submit(PreparedCreateIndex::new(gates, scope, plan))
             .await
             .attach("operation=create_managed_index")
-            .disclose()
-            .map_err(ManagedDdlError::Engine)?;
+            .disclose()?;
         drop(mandatory_runtime);
         observer
                 .wait()
@@ -251,7 +221,7 @@ impl ManagedTableOps for Session {
                     )
                 })
                 .disclose()
-                .map_err(ManagedDdlError::Engine)
+                .map_err(CallbackError::Engine)
     }
 
     async fn drop_managed_index<I>(
@@ -259,43 +229,34 @@ impl ManagedTableOps for Session {
         table_id: TableID,
         source: &[u8],
         interpreter: &mut I,
-    ) -> ManagedDdlResult<(), I::Error>
+    ) -> CallbackResult<(), I::Error>
     where
         I: ManagedTableInterpreter,
     {
         let current = self
             .read_managed_current_definition(table_id, "drop_managed_index")
-            .await
-            .map_err(ManagedDdlError::Engine)?;
+            .await?;
         let update = interpreter
             .drop_index(source, &current.descriptor().payload, current.schema())
-            .map_err(ManagedDdlError::Interpreter)?;
-        validate_descriptor_payload(update.descriptor())
-            .disclose()
-            .map_err(ManagedDdlError::Engine)?;
+            .map_err(CallbackError::User)?;
+        validate_descriptor_payload(update.descriptor()).disclose()?;
         let (change, descriptor) = update.into_parts();
-        let index_id = change
-            .validate(current.schema())
-            .disclose()
-            .map_err(ManagedDdlError::Engine)?;
+        let index_id = change.validate(current.schema()).disclose()?;
 
         let operation = self
             .pin_operation(SessionOperationKind::Ddl)
             .attach("operation=drop_managed_index")
-            .disclose()
-            .map_err(ManagedDdlError::Engine)?;
+            .disclose()?;
         let mandatory_runtime = operation.runtime.mandatory_runtime.clone();
         operation
             .reject_table_ddl_explicit_session_lock(table_id)
             .attach("operation=drop_managed_index")
-            .disclose()
-            .map_err(ManagedDdlError::Engine)?;
+            .disclose()?;
         let scope =
             PreparedDdlScope::drop_index(operation, table_id, drop_index_catalog_write_targets())
                 .await
                 .attach_with(|| format!("prepare managed DROP INDEX locks: table_id={table_id}"))
-                .disclose()
-                .map_err(ManagedDdlError::Engine)?;
+                .disclose()?;
         let engine = scope.engine();
         let table = validated_index_ddl_target(
             engine,
@@ -304,38 +265,28 @@ impl ManagedTableOps for Session {
             "drop_managed_index",
         )
         .await
-        .disclose()
-        .map_err(ManagedDdlError::Engine)?;
-        engine
-            .poisoner
-            .ensure_healthy()
-            .disclose()
-            .map_err(ManagedDdlError::Engine)?;
+        .disclose()?;
+        engine.poisoner.ensure_healthy().disclose()?;
         let gates = IndexDdlGateScope::acquire(Arc::clone(&table), engine.catalog_guard())
             .await
             .attach("operation=drop_managed_index")
-            .disclose()
-            .map_err(ManagedDdlError::Engine)?;
+            .disclose()?;
         let current_descriptor = engine
             .catalog()
             .storage
             .table_descriptors()
             .find_uncommitted_by_table_id(engine.pool_guards(), table_id)
             .await
-            .disclose()
-            .map_err(ManagedDdlError::Engine)?
-            .ok_or_else(|| managed_schema_changed(table_id, "drop_managed_index"))
-            .map_err(ManagedDdlError::Engine)?;
+            .disclose()?
+            .ok_or_else(|| managed_schema_changed(table_id, "drop_managed_index"))?;
         let plan = table
             .finalize_managed_drop_index(&current, current_descriptor, index_id, descriptor)
-            .disclose()
-            .map_err(ManagedDdlError::Engine)?;
+            .disclose()?;
         let observer = mandatory_runtime
             .submit(PreparedDropIndex::new(gates, scope, plan))
             .await
             .attach("operation=drop_managed_index")
-            .disclose()
-            .map_err(ManagedDdlError::Engine)?;
+            .disclose()?;
         drop(mandatory_runtime);
         observer
                 .wait()
@@ -347,7 +298,7 @@ impl ManagedTableOps for Session {
                     )
                 })
                 .disclose()
-                .map_err(ManagedDdlError::Engine)
+                .map_err(CallbackError::Engine)
     }
 
     async fn resolve_table_binding(
@@ -898,7 +849,8 @@ mod tests {
             _current_schema: &crate::StorageTableDefinition,
             _proposed_index_id: IndexID,
         ) -> StdResult<crate::DescriptorUpdate<crate::CreateIndexDefinition>, Self::Error> {
-            unreachable!()
+            self.result.clone()?;
+            unreachable!("failure interpreter expects invalid source for index operations")
         }
 
         fn drop_index(
@@ -907,7 +859,8 @@ mod tests {
             _previous_descriptor: &[u8],
             _current_schema: &crate::StorageTableDefinition,
         ) -> StdResult<crate::DescriptorUpdate<crate::DropIndexDefinition>, Self::Error> {
-            unreachable!()
+            self.result.clone()?;
+            unreachable!("failure interpreter expects invalid source for index operations")
         }
     }
 
@@ -1440,6 +1393,67 @@ mod tests {
     }
 
     #[test]
+    fn test_managed_index_user_failures_preserve_definition_and_allocation() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let mut interpreter = CreateFailureInterpreter {
+                result: Ok(b"original".to_vec()),
+                bindings: vec![TableBinding::new(
+                    BindingNamespaceID::new(1),
+                    b"callback".as_slice(),
+                )],
+            };
+            let table_id = session
+                .create_managed_table(b"create", &mut interpreter)
+                .await
+                .unwrap()
+                .table_id();
+            let before = session
+                .resolve_table_binding(BindingNamespaceID::new(1), b"callback", true)
+                .await
+                .unwrap()
+                .unwrap();
+            interpreter.result = Err("invalid source");
+            let error = session
+                .create_managed_index(table_id, b"bad", &mut interpreter)
+                .await
+                .unwrap_err();
+            assert_eq!(error.into_user(), Some("invalid source"));
+            let error = session
+                .drop_managed_index(table_id, b"bad", &mut interpreter)
+                .await
+                .unwrap_err();
+            assert_eq!(error.into_user(), Some("invalid source"));
+            let after = session
+                .resolve_table_binding(BindingNamespaceID::new(1), b"callback", true)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(before.version(), after.version());
+            assert_eq!(before.full_schema(), after.full_schema());
+            let mut valid = CreateIndexOnlyInterpreter {
+                barrier: None,
+                calls: Arc::new(AtomicUsize::new(0)),
+                expected_index_count: 0,
+                expected_proposed: IndexID::new(0),
+                descriptor: b"updated".to_vec(),
+            };
+            assert_eq!(
+                session
+                    .create_managed_index(table_id, b"valid", &mut valid)
+                    .await
+                    .unwrap(),
+                IndexID::new(0)
+            );
+            assert_eq!(valid.calls.load(AtomicOrdering::SeqCst), 1);
+        });
+    }
+
+    #[test]
     fn test_managed_create_interpreter_and_size_fail_before_table_id_allocation() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
@@ -1457,7 +1471,7 @@ mod tests {
                 .create_managed_table(b"bad", &mut interpreter)
                 .await
                 .unwrap_err();
-            assert_eq!(err.interpreter(), Some(&"invalid source"));
+            assert_eq!(err.user(), Some(&"invalid source"));
             assert_eq!(
                 session.engine().catalog().curr_next_table_id(),
                 initial_next

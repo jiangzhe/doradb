@@ -45,12 +45,12 @@ pub use catalog::{
     CatalogTableCheckpointChange, CatalogTableCheckpointIoStats, ColumnID, ColumnOrdinal,
     CreateIndexDefinition, CreateTableDefinition, CreateTableOutcome, DescriptorUpdate,
     DropIndexDefinition, ID_DOMAIN_END, IndexID, IndexOrder, MAX_TABLE_BINDING_KEY_BYTES,
-    MAX_TABLE_DESCRIPTOR_BYTES, ManagedCreateTableDefinition, ManagedDdlError, ManagedDdlResult,
-    ManagedTableDefinitionSnapshot, ManagedTableInterpreter, ResolvedTableBinding,
-    ResolvedTableIndex, StorageColumnDefinition, StorageColumnFlags, StorageColumnSpec,
-    StorageIndexDefinition, StorageIndexFlags, StorageIndexKey, StorageIndexKeyByColumnId,
-    StorageIndexSpec, StorageTableDefinition, StorageTableSpec, TableBinding,
-    TableDefinitionVersion, TableIndex, TableIndexArgument, TableIndexSelector,
+    MAX_TABLE_DESCRIPTOR_BYTES, ManagedCreateTableDefinition, ManagedTableDefinitionSnapshot,
+    ManagedTableInterpreter, ResolvedTableBinding, ResolvedTableIndex, StorageColumnDefinition,
+    StorageColumnFlags, StorageColumnSpec, StorageIndexDefinition, StorageIndexFlags,
+    StorageIndexKey, StorageIndexKeyByColumnId, StorageIndexSpec, StorageTableDefinition,
+    StorageTableSpec, TableBinding, TableDefinitionVersion, TableIndex, TableIndexArgument,
+    TableIndexSelector,
 };
 pub use conf::{
     DEFAULT_COW_FILE_MAX_SIZE, DEFAULT_TABLE_SCAN_LWC_BLOCKS_PER_PARTITION,
@@ -59,7 +59,7 @@ pub use conf::{
     TableScanConfig, ThreadPoolConfig, TrxSysConfig,
 };
 pub use engine::Engine;
-pub use error::{Error, ErrorKind, OperationError, Result};
+pub use error::{CallbackError, CallbackResult, Error, ErrorKind, OperationError, Result};
 pub use lock::TableLockMode;
 pub use row::ops::{
     DeleteMvcc, RowMutation, ScanMvcc, ScanRowDecision, SelectMvcc, TableMutationOutcome,
