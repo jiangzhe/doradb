@@ -14,6 +14,7 @@ use crate::workload::util::{
     merge_measurement, operation_plans, verify_samples, verify_simple_counters,
 };
 use crate::workload::{RunCancellation, SessionPlan};
+use doradb_storage::id::TableID;
 use doradb_storage::{
     BindingNamespaceID, CatalogCheckpointOutcome, CatalogCheckpointReport, CreateIndexDefinition,
     CreateTableDefinition, DescriptorUpdate, DropIndexDefinition, Engine, IndexID,
@@ -239,6 +240,7 @@ impl SessionExecutor for CatalogCheckpointExecutor {
     }
 }
 
+/// Session measurements and fixture summary produced by catalog preparation.
 pub(crate) struct CatalogCheckpointPrepareSessionOutcome {
     measurement: SessionMeasurement,
     summary: Option<CatalogCheckpointFixtureSummary>,
@@ -269,6 +271,7 @@ impl SessionOutcome for CatalogCheckpointPrepareSessionOutcome {
     }
 }
 
+/// Session measurements and checkpoint metrics produced by the measured operation.
 pub(crate) struct CatalogCheckpointSessionOutcome {
     measurement: SessionMeasurement,
     metrics: Option<WorkloadMetrics>,
@@ -300,6 +303,121 @@ impl SessionOutcome for CatalogCheckpointSessionOutcome {
 
     fn into_measurement(self) -> SessionMeasurement {
         self.measurement
+    }
+}
+
+struct CreateScaleTableInterpreter {
+    expected_source: [u8; 8],
+    descriptor: Option<Vec<u8>>,
+    bindings: Option<Vec<TableBinding>>,
+}
+
+impl ManagedTableInterpreter for CreateScaleTableInterpreter {
+    type Error = BenchError;
+
+    fn create_table(
+        &mut self,
+        source: &[u8],
+    ) -> StdResult<ManagedCreateTableDefinition, Self::Error> {
+        if source != self.expected_source {
+            return Err(BenchError::message(
+                "catalog-checkpoint CREATE source differs from its deterministic ordinal",
+            ));
+        }
+        let descriptor = self.descriptor.take().ok_or_else(|| {
+            BenchError::message("catalog-checkpoint CREATE interpreter was invoked more than once")
+        })?;
+        if descriptor.len() > MAX_TABLE_DESCRIPTOR_BYTES {
+            return Err(BenchError::message(
+                "catalog-checkpoint descriptor exceeds the public storage limit",
+            ));
+        }
+        let bindings = self.bindings.take().ok_or_else(|| {
+            BenchError::message("catalog-checkpoint CREATE bindings were already consumed")
+        })?;
+        Ok(ManagedCreateTableDefinition::new(
+            CreateTableDefinition::new(benchmark_table_spec(), Vec::new()),
+            descriptor,
+            bindings,
+        ))
+    }
+
+    fn create_index(
+        &mut self,
+        _source: &[u8],
+        _previous_descriptor: &[u8],
+        _current_schema: &StorageTableDefinition,
+        _proposed_index_id: IndexID,
+    ) -> StdResult<DescriptorUpdate<CreateIndexDefinition>, Self::Error> {
+        Err(BenchError::message(
+            "catalog-checkpoint CREATE TABLE interpreter received CREATE INDEX",
+        ))
+    }
+
+    fn drop_index(
+        &mut self,
+        _source: &[u8],
+        _previous_descriptor: &[u8],
+        _current_schema: &StorageTableDefinition,
+    ) -> StdResult<DescriptorUpdate<DropIndexDefinition>, Self::Error> {
+        Err(BenchError::message(
+            "catalog-checkpoint CREATE TABLE interpreter received DROP INDEX",
+        ))
+    }
+}
+
+struct CreateScaleIndexInterpreter;
+
+impl ManagedTableInterpreter for CreateScaleIndexInterpreter {
+    type Error = BenchError;
+
+    fn create_table(
+        &mut self,
+        _source: &[u8],
+    ) -> StdResult<ManagedCreateTableDefinition, Self::Error> {
+        Err(BenchError::message(
+            "catalog-checkpoint CREATE INDEX interpreter received CREATE TABLE",
+        ))
+    }
+
+    fn create_index(
+        &mut self,
+        source: &[u8],
+        previous_descriptor: &[u8],
+        current_schema: &StorageTableDefinition,
+        _proposed_index_id: IndexID,
+    ) -> StdResult<DescriptorUpdate<CreateIndexDefinition>, Self::Error> {
+        if source != b"catalog-checkpoint-index"
+            || current_schema.columns().len() != 2
+            || !current_schema.indexes().is_empty()
+            || previous_descriptor.is_empty()
+        {
+            return Err(BenchError::message(
+                "catalog-checkpoint CREATE INDEX callback received an unexpected current definition",
+            ));
+        }
+        let mut descriptor = previous_descriptor.to_vec();
+        descriptor[0] ^= 0xff;
+        Ok(DescriptorUpdate::new(
+            CreateIndexDefinition::new(
+                vec![StorageIndexKeyByColumnId::new(
+                    current_schema.columns()[0].column_id(),
+                )],
+                StorageIndexFlags::empty(),
+            ),
+            descriptor,
+        ))
+    }
+
+    fn drop_index(
+        &mut self,
+        _source: &[u8],
+        _previous_descriptor: &[u8],
+        _current_schema: &StorageTableDefinition,
+    ) -> StdResult<DescriptorUpdate<DropIndexDefinition>, Self::Error> {
+        Err(BenchError::message(
+            "catalog-checkpoint CREATE INDEX interpreter received DROP INDEX",
+        ))
     }
 }
 
@@ -530,7 +648,7 @@ fn binding_key(table_ordinal: usize, binding_ordinal: usize) -> [u8; 16] {
 
 async fn verify_probe_bindings(
     session: &mut Session,
-    table_id: doradb_storage::id::TableID,
+    table_id: TableID,
     table_ordinal: usize,
 ) -> Result<()> {
     let bindings = session.list_table_bindings(table_id).await?;
@@ -694,121 +812,6 @@ fn managed_result<T>(result: ManagedDdlResult<T, BenchError>) -> Result<T> {
         ManagedDdlError::Engine(error) => BenchError::from(error),
         ManagedDdlError::Interpreter(error) => error,
     })
-}
-
-struct CreateScaleTableInterpreter {
-    expected_source: [u8; 8],
-    descriptor: Option<Vec<u8>>,
-    bindings: Option<Vec<TableBinding>>,
-}
-
-impl ManagedTableInterpreter for CreateScaleTableInterpreter {
-    type Error = BenchError;
-
-    fn create_table(
-        &mut self,
-        source: &[u8],
-    ) -> StdResult<ManagedCreateTableDefinition, Self::Error> {
-        if source != self.expected_source {
-            return Err(BenchError::message(
-                "catalog-checkpoint CREATE source differs from its deterministic ordinal",
-            ));
-        }
-        let descriptor = self.descriptor.take().ok_or_else(|| {
-            BenchError::message("catalog-checkpoint CREATE interpreter was invoked more than once")
-        })?;
-        if descriptor.len() > MAX_TABLE_DESCRIPTOR_BYTES {
-            return Err(BenchError::message(
-                "catalog-checkpoint descriptor exceeds the public storage limit",
-            ));
-        }
-        let bindings = self.bindings.take().ok_or_else(|| {
-            BenchError::message("catalog-checkpoint CREATE bindings were already consumed")
-        })?;
-        Ok(ManagedCreateTableDefinition::new(
-            CreateTableDefinition::new(benchmark_table_spec(), Vec::new()),
-            descriptor,
-            bindings,
-        ))
-    }
-
-    fn create_index(
-        &mut self,
-        _source: &[u8],
-        _previous_descriptor: &[u8],
-        _current_schema: &StorageTableDefinition,
-        _proposed_index_id: IndexID,
-    ) -> StdResult<DescriptorUpdate<CreateIndexDefinition>, Self::Error> {
-        Err(BenchError::message(
-            "catalog-checkpoint CREATE TABLE interpreter received CREATE INDEX",
-        ))
-    }
-
-    fn drop_index(
-        &mut self,
-        _source: &[u8],
-        _previous_descriptor: &[u8],
-        _current_schema: &StorageTableDefinition,
-    ) -> StdResult<DescriptorUpdate<DropIndexDefinition>, Self::Error> {
-        Err(BenchError::message(
-            "catalog-checkpoint CREATE TABLE interpreter received DROP INDEX",
-        ))
-    }
-}
-
-struct CreateScaleIndexInterpreter;
-
-impl ManagedTableInterpreter for CreateScaleIndexInterpreter {
-    type Error = BenchError;
-
-    fn create_table(
-        &mut self,
-        _source: &[u8],
-    ) -> StdResult<ManagedCreateTableDefinition, Self::Error> {
-        Err(BenchError::message(
-            "catalog-checkpoint CREATE INDEX interpreter received CREATE TABLE",
-        ))
-    }
-
-    fn create_index(
-        &mut self,
-        source: &[u8],
-        previous_descriptor: &[u8],
-        current_schema: &StorageTableDefinition,
-        _proposed_index_id: IndexID,
-    ) -> StdResult<DescriptorUpdate<CreateIndexDefinition>, Self::Error> {
-        if source != b"catalog-checkpoint-index"
-            || current_schema.columns().len() != 2
-            || !current_schema.indexes().is_empty()
-            || previous_descriptor.is_empty()
-        {
-            return Err(BenchError::message(
-                "catalog-checkpoint CREATE INDEX callback received an unexpected current definition",
-            ));
-        }
-        let mut descriptor = previous_descriptor.to_vec();
-        descriptor[0] ^= 0xff;
-        Ok(DescriptorUpdate::new(
-            CreateIndexDefinition::new(
-                vec![StorageIndexKeyByColumnId::new(
-                    current_schema.columns()[0].column_id(),
-                )],
-                StorageIndexFlags::empty(),
-            ),
-            descriptor,
-        ))
-    }
-
-    fn drop_index(
-        &mut self,
-        _source: &[u8],
-        _previous_descriptor: &[u8],
-        _current_schema: &StorageTableDefinition,
-    ) -> StdResult<DescriptorUpdate<DropIndexDefinition>, Self::Error> {
-        Err(BenchError::message(
-            "catalog-checkpoint CREATE INDEX interpreter received DROP INDEX",
-        ))
-    }
 }
 
 #[cfg(test)]

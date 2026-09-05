@@ -2370,32 +2370,15 @@ marker can alias a second CREATE after restart. [U20]
     write accounting; existing public snapshots own physical runtime metrics.
     Allocation-map bytes stay attributed to the metadata page. Small/stress
     profile sizes and the target profile remain fixed by test 20.
+    Projected parent and descriptor checks share decoded schema inputs, and
+    catalog deletion invariants are enforced in every build. Full-image
+    materialization met the target without streaming or value-consumption
+    changes; further leaf-read reuse is deferred to
+    `docs/backlogs/000193-eliminate-repeated-leaf-node-loads-in-catalog-root-readers.md`.
   - Task Doc: `docs/tasks/000295-catalog-checkpoint-scale-proof.md`
   - Task Issue: `#1043`
-  - Phase Status: `in-progress`
-  - Implementation Summary: Implemented the public `CatalogCheckpointReport`,
-    cache-independent checkpoint block accounting, deterministic public-API
-    prepare/checkpoint workloads, strict fixture lifecycle, sampled Linux
-    process-RSS measurement, stable result serialization, and a normal release
-    template. A descriptor-density run also found and fixed a stale 24-byte LWC
-    header estimate after the persisted header had become 32 bytes. Projected
-    parent and managed-descriptor validation now share one decode of their four
-    common schema roots; at stress managed-CREATE scale this removed 174.1875
-    MiB of redundant logical reads without changing physical I/O or writes. The
-    complete release matrix passed: small CREATE/INDEX/DROP wrote 8,028,160 /
-    7,700,480 / 8,028,160 bytes with sampled RSS growth 7,430,144 / 7,319,552 /
-    7,434,240;
-    target wrote 75,530,240 / 73,236,480 / 75,530,240 bytes with RSS growth
-    77,434,880 / 75,423,744 / 76,800,000; informational stress wrote 94,404,608 /
-    91,455,488 / 94,404,608 bytes with RSS growth 95,678,464 / 94,232,576 /
-    95,682,560. All target cases completed without OOM, and same-case
-    target-to-stress logical bytes, physical request counts, and RSS growth
-    tracked the 1.25x profile ratio without unexplained superlinear behavior.
-    Evidence used release `rustc 1.98.0`, default `iouring`, Linux
-    `7.0.14-orbstack-00380-ga7e0a2dc9535` on 10 `aarch64` vCPUs, 12,304,840 KiB
-    RAM plus 13,353,408 KiB swap, and workspace `target/` roots on `/dev/vdb1`
-    Btrfs. Full raw matrix, elapsed/read/write/request values, engine
-    configuration, environment, and command shape are recorded in task 000295.
+  - Phase Status: done
+  - Implementation Summary: Implemented public checkpoint reports, deterministic public-API catalog benchmarks, sampled RSS, fused projected validation, and release-build catalog deletion checks. All nine release cases completed; the 10,000-table, 100,000-binding, 64-MiB-descriptor target had no OOM and same-case target-to-stress byte/RSS growth followed the 1.25x profile ratio. Target CREATE/INDEX/DROP writes were 75,530,240 / 73,236,480 / 75,530,240 bytes and RSS growth was 77,434,880 / 75,423,744 / 76,800,000 bytes. Stress CREATE logical reads fell from 559,611,904 to 376,963,072 bytes with unchanged physical reads/writes. Evidence used release rustc 1.98.0, iouring, Linux 7.0.14-orbstack-00380-ga7e0a2dc9535 on ten aarch64 vCPUs, 12,304,840 KiB RAM, 13,353,408 KiB swap, and target/ roots on /dev/vdb1 Btrfs. Task 000295 preserves all profile results, engine configuration, environment, and commands. Validation passed 1,900 workspace tests, 1,803 libaio tests, focused debug/release checks, and the 22-file branch style audit. Full-image materialization required no streaming change; repeated leaf-read reuse is tracked by backlog 000193. [Task Resolve Sync: docs/tasks/000295-catalog-checkpoint-scale-proof.md @ 2026-09-05]
 
 ## Consequences
 

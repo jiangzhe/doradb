@@ -1485,17 +1485,19 @@ pub(crate) mod tests {
     use crate::session::{ManagedTableOps, MandatoryOperationGuard, Session};
     use crate::trx::PrivateTransaction;
     use crate::value::{Val, ValKind};
+    use std::convert::Infallible;
+    use std::result::Result as StdResult;
     use tempfile::TempDir;
 
     struct ProjectedIntegrityInterpreter;
 
     impl ManagedTableInterpreter for ProjectedIntegrityInterpreter {
-        type Error = std::convert::Infallible;
+        type Error = Infallible;
 
         fn create_table(
             &mut self,
             _source: &[u8],
-        ) -> std::result::Result<ManagedCreateTableDefinition, Self::Error> {
+        ) -> StdResult<ManagedCreateTableDefinition, Self::Error> {
             Ok(ManagedCreateTableDefinition::new(
                 CreateTableDefinition::new(
                     StorageTableSpec::new(vec![StorageColumnSpec::new(
@@ -1515,7 +1517,7 @@ pub(crate) mod tests {
             _previous_descriptor: &[u8],
             _current_schema: &StorageTableDefinition,
             _proposed_index_id: IndexID,
-        ) -> std::result::Result<DescriptorUpdate<CreateIndexDefinition>, Self::Error> {
+        ) -> StdResult<DescriptorUpdate<CreateIndexDefinition>, Self::Error> {
             unreachable!("projected-integrity test does not create an index")
         }
 
@@ -1524,7 +1526,7 @@ pub(crate) mod tests {
             _source: &[u8],
             _previous_descriptor: &[u8],
             _current_schema: &StorageTableDefinition,
-        ) -> std::result::Result<DescriptorUpdate<DropIndexDefinition>, Self::Error> {
+        ) -> StdResult<DescriptorUpdate<DropIndexDefinition>, Self::Error> {
             unreachable!("projected-integrity test does not drop an index")
         }
     }
