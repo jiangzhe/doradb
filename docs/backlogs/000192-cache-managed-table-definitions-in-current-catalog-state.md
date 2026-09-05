@@ -10,11 +10,11 @@ Discovered while implementing docs/tasks/000294-managed-table-bindings-and-versi
 
 ## Deferred From (Optional)
 
-docs/tasks/000294-managed-table-bindings-and-versioned-resolution.md; docs/rfcs/0031-compact-numeric-catalog-table-definitions.md Phase 7
+docs/tasks/000294-managed-table-bindings-and-versioned-resolution.md; docs/rfcs/0031-compact-numeric-catalog-table-definitions.md Phase 7; docs/tasks/000296-preallocate-catalog-lock-manager-slots.md (cache and benchmark follow-up)
 
 ## Deferral Context (Optional)
 
-- Defer Reason: The active task establishes persistent bindings and versioned resolution. Adding a new authoritative runtime-definition cache broadens DDL publication and recovery state, so it should be designed and validated as a focused follow-up instead of expanding the current task.
+- Defer Reason: Task 000294 established persistent bindings and versioned resolution. Adding a new authoritative runtime-definition cache broadens DDL publication and recovery state, so it requires a focused follow-up. Task 000296 likewise keeps cache publication and hydration outside its lock-manager representation change; the resolution comparison must be revisited after this cache changes the execution path.
 - Findings: CurrentTableState::Live metadata is pointer-identical to the current Table runtime-layout metadata, and index-DDL publication already coordinates the user_tables entry with the layout/history update while target metadata-X excludes readers. Caching directly in physical TableMetadata would mix opaque logical descriptors into table-file metadata and retain payloads in old layouts/history. Recovery initially constructs tables before all catalog redo is complete, so cache hydration must wait until parent, descriptor, and table-file/catalog metadata validation finishes. The cache cannot replace the namespace/key binding lookup because user_tables is keyed by TableID.
 - Direction Hint: Prefer an immutable shared managed-definition value stored beside metadata in CurrentTableState::Live. Make durable descriptor effects and cache publication derive from the same validated value, use the cache for binding full resolution plus managed-DDL preflight/revalidation, and fail closed on an admitted managed table with absent or inconsistent cache state. Keep catalog.table_descriptors authoritative for durability, checkpoint, recovery, and integrity validation. Future descriptor-only DDL must update the cache atomically and extend the public definition version beyond storage_epoch.
 

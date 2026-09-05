@@ -30,3 +30,10 @@ All twelve built-in catalog metadata and data resources use fixed slots without 
 
 Do not assume preallocation removes contention among sessions touching the same catalog resource. Use benchmark evidence to distinguish reduced DashMap overhead and cross-resource shard contention from unavoidable per-resource serialization.
 
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000296-preallocate-catalog-lock-manager-slots.md. Review replaced unconditional idle-state reset with independent retention of family-map and waiter-slab capacity through 1024, reclaiming oversized containers only after complete drain and freeing them after unlock.
+- Closed By: backlog close
+- Reference: User decision
+- Closed At: 2026-09-05
