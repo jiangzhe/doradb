@@ -10,7 +10,7 @@ Identified during docs/tasks/000294-managed-table-bindings-and-versioned-resolut
 
 ## Deferred From (Optional)
 
-docs/tasks/000294-managed-table-bindings-and-versioned-resolution.md
+docs/tasks/000294-managed-table-bindings-and-versioned-resolution.md; docs/rfcs/0031-compact-numeric-catalog-table-definitions.md Phase 7
 
 ## Deferral Context (Optional)
 
