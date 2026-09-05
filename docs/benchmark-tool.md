@@ -185,12 +185,40 @@ successful freeze installs a typed canonical-batch summary. `checkpoint-table`
 requires and consumes that summary, so duplicate freeze and
 checkpoint-before-freeze plans fail in the ordered fixture fold.
 
+`managed-bindings-prepare` owns a separate typed fixture category and executes
+once as an unmeasured prepare phase. It creates empty managed tables with the
+standard two-column benchmark schema, one deterministic 8-byte binding key per
+table, and a deterministic 256-byte descriptor. It validates each returned ID,
+binding, schema, and descriptor before publishing the fixture. Missing or
+duplicate preparation fails plan resolution.
+
+`resolve-table-binding` selects these keys round-robin using each session's
+operation range. It accepts `num`, `threads`, `sessions`, `include_stats`, and
+`include_full_schema` (default false). Every result must match the prepared table
+ID and version. Full results must match the schema and descriptor; narrow
+results must omit them. Missing or mismatched results fail the run. Each
+`table-binding-resolution` latency sample covers one complete public call
+through return and operation-claim release. Validation and result destruction
+are outside the sample but included in run wall time. Successful runs report
+`operations = found = num`, exactly `num` samples, and zero other generic
+counters. Warm-ups execute the same validation and discard measurements.
+Every standalone run verifies logical-lock drain after session close.
+
+The `resolve-table-binding.toml` template prepares 64 targets. Use one target
+for shared target metadata contention, or 64 to distribute target metadata;
+both still share the catalog binding resources. For comparisons, keep fixture,
+worker/session topology, operation count, engine configuration, and statistics
+capture identical across separately built revisions. The basic paired shared
+`lock-table` workload provides a user-resource control.
+
 ## Workloads
 
 All serde-facing counts, ranges, widths, and table counts are positive.
 
 | Workload | Controls beyond common worker/diagnostic fields | Fixture requirement | Replay |
 | --- | --- | --- | --- |
+| `managed-bindings-prepare` | required `tables`; no worker/diagnostic overrides | absent managed bindings | prepare only, once |
+| `resolve-table-binding` | required `num`; optional `include_full_schema` (false) | prepared managed bindings | safe |
 | `create-table` | required `index`; optional `tables` | absent primary | single run |
 | `stmt-noop`, `trx-noop` | required `num` | none | safe |
 | `insert-seq`, `insert-rand` | required `num`; optional `seed`, `value_size`, `batch_size` | any primary | single run |

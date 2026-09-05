@@ -2,8 +2,9 @@ use crate::error::{BenchError, Result};
 use crate::plan::{CatalogCheckpointCase, CatalogCheckpointProfile};
 use doradb_storage::id::{TableID, TrxID};
 use doradb_storage::{
-    StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey, StorageIndexSpec,
-    StorageTableSpec, ValKind,
+    BindingNamespaceID, ManagedTableDefinitionSnapshot, StorageColumnFlags, StorageColumnSpec,
+    StorageIndexFlags, StorageIndexKey, StorageIndexSpec, StorageTableSpec, TableDefinitionVersion,
+    ValKind,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -91,6 +92,10 @@ pub enum FixtureRequirement {
     None,
     /// The implicit table pool must not exist.
     AbsentPrimary,
+    /// Managed bindings must not have been prepared.
+    AbsentManagedBindings,
+    /// Consume prepared managed table bindings.
+    ManagedBindings,
     /// Consume the primary table with typed shape/load constraints.
     Primary {
         /// Accepted index shape.
@@ -146,6 +151,11 @@ pub enum FixturePlanEffect {
     },
     /// Consume the planned active frozen-prefix state.
     Checkpoint,
+    /// Establish the deterministic managed-binding fixture.
+    PrepareManagedBindings {
+        /// Positive number of prepared tables.
+        tables: usize,
+    },
     /// Install one pending deterministic catalog-checkpoint fixture.
     PrepareCatalogCheckpoint {
         /// Prepared deterministic profile.
@@ -176,6 +186,7 @@ struct PrimaryPlanFixture {
 pub struct FixturePlanState {
     primary: Option<PrimaryPlanFixture>,
     catalog_checkpoint: Option<(CatalogCheckpointProfile, CatalogCheckpointCase)>,
+    managed_bindings: Option<usize>,
 }
 
 impl FixturePlanState {
@@ -258,6 +269,22 @@ impl FixturePlanState {
                 if primary.frozen_max_rows.is_none() {
                     return Err(BenchError::message(
                         "checkpoint-table requires a preceding successful freeze-table phase",
+                    ));
+                }
+                Ok(())
+            }
+            FixtureRequirement::AbsentManagedBindings => {
+                if self.managed_bindings.is_some() {
+                    return Err(BenchError::message(
+                        "managed-bindings-prepare requires an absent fixture",
+                    ));
+                }
+                Ok(())
+            }
+            FixtureRequirement::ManagedBindings => {
+                if self.managed_bindings.is_none() {
+                    return Err(BenchError::message(
+                        "resolution requires a preceding managed-bindings-prepare phase",
                     ));
                 }
                 Ok(())
@@ -369,6 +396,16 @@ impl FixturePlanState {
                 primary.frozen_max_rows = None;
                 Ok(())
             }
+            FixturePlanEffect::PrepareManagedBindings { tables } => {
+                self.validate(FixtureRequirement::AbsentManagedBindings)?;
+                if tables == 0 {
+                    return Err(BenchError::message(
+                        "managed binding table count must be positive",
+                    ));
+                }
+                self.managed_bindings = Some(tables);
+                Ok(())
+            }
             FixturePlanEffect::PrepareCatalogCheckpoint { profile, case } => {
                 self.validate(FixtureRequirement::AbsentCatalogCheckpoint)?;
                 self.catalog_checkpoint = Some((profile, case));
@@ -431,6 +468,28 @@ pub(crate) struct FrozenFixtureSummary {
     pub(crate) stable_page_count: u64,
 }
 
+/// Verified identity and full definition for one deterministic binding key.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ManagedBindingExpectation {
+    /// Fixed-width deterministic binding key.
+    pub(crate) key: [u8; 8],
+    /// Storage-assigned table identity.
+    pub(crate) table_id: TableID,
+    /// Version observed after creation.
+    pub(crate) version: TableDefinitionVersion,
+    /// Verified expected schema and descriptor.
+    pub(crate) full: ManagedTableDefinitionSnapshot,
+}
+
+/// Immutable prepared managed-binding fixture shared by resolution sessions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ManagedBindingsFixture {
+    /// Namespace shared by every prepared key.
+    pub(crate) namespace: BindingNamespaceID,
+    /// Ordered keys and validated expectations.
+    pub(crate) bindings: Arc<[ManagedBindingExpectation]>,
+}
+
 /// Runtime fixture transition returned by one completely drained workload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum FixtureRuntimeEffect {
@@ -464,6 +523,8 @@ pub(crate) enum FixtureRuntimeEffect {
         /// Verified aggregate state and retained probe IDs.
         summary: CatalogCheckpointFixtureSummary,
     },
+    /// Publish verified managed bindings.
+    PrepareManagedBindings(ManagedBindingsFixture),
     /// Consume the pending catalog-checkpoint fixture.
     CheckpointCatalog,
 }
@@ -496,6 +557,8 @@ pub(crate) enum FixtureBinding {
     TablePool(Arc<[TableID]>),
     /// Prepared deterministic catalog-checkpoint state.
     CatalogCheckpoint(CatalogCheckpointFixtureSummary),
+    /// Prepared managed table bindings.
+    ManagedBindings(ManagedBindingsFixture),
 }
 
 #[derive(Debug)]
@@ -514,6 +577,7 @@ struct RuntimePrimaryFixture {
 pub struct FixtureRuntimeState {
     primary: Option<RuntimePrimaryFixture>,
     catalog_checkpoint: Option<CatalogCheckpointFixtureSummary>,
+    managed_bindings: Option<ManagedBindingsFixture>,
 }
 
 impl FixtureRuntimeState {
@@ -615,6 +679,17 @@ impl FixtureRuntimeState {
                 }
                 Ok(FixtureBinding::Primary(runtime_primary_binding(primary)))
             }
+            FixtureRequirement::AbsentManagedBindings => {
+                if self.managed_bindings.is_some() {
+                    return Err(BenchError::message("managed bindings are already prepared"));
+                }
+                Ok(FixtureBinding::None)
+            }
+            FixtureRequirement::ManagedBindings => self
+                .managed_bindings
+                .clone()
+                .map(FixtureBinding::ManagedBindings)
+                .ok_or_else(|| BenchError::message("managed binding runtime fixture is missing")),
             FixtureRequirement::AbsentCatalogCheckpoint => {
                 if self.catalog_checkpoint.is_some() {
                     return Err(BenchError::message(
@@ -730,6 +805,15 @@ impl FixtureRuntimeState {
                         "runtime checkpoint effect has no frozen batch to consume",
                     ));
                 }
+                Ok(())
+            }
+            FixtureRuntimeEffect::PrepareManagedBindings(fixture) => {
+                if self.managed_bindings.is_some() || fixture.bindings.is_empty() {
+                    return Err(BenchError::message(
+                        "invalid managed binding fixture publication",
+                    ));
+                }
+                self.managed_bindings = Some(fixture);
                 Ok(())
             }
             FixtureRuntimeEffect::PrepareCatalogCheckpoint { summary } => {

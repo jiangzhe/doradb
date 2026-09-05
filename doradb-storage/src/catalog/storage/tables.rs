@@ -1,11 +1,12 @@
 use crate::buffer::PoolGuards;
 use crate::catalog::storage::CatalogDefinition;
+pub(crate) use crate::catalog::storage::layout::TABLE_ID_TABLES;
 use crate::catalog::storage::object::TableObject;
 use crate::catalog::table::{TableColumnLayout, TableMetadata};
 use crate::catalog::{CatalogIndexNo, CatalogTable};
 use crate::catalog::{
     ID_DOMAIN_END, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
-    StorageIndexSpec, catalog_table_id_from_slot,
+    StorageIndexSpec,
 };
 use crate::error::{
     DataIntegrityError, DataIntegrityResult, MultiDomainResultExt, RuntimeError,
@@ -21,8 +22,6 @@ use error_stack::Report;
 use error_stack::ResultExt;
 use std::sync::OnceLock;
 
-/// Catalog table id for `catalog.tables`.
-pub(crate) const TABLE_ID_TABLES: TableID = catalog_table_id_from_slot(0);
 const COL_NO_TABLES_TABLE_ID: usize = 0;
 const COL_NO_TABLES_STORAGE_EPOCH: usize = 1;
 const COL_NO_TABLES_NEXT_COLUMN_ID: usize = 2;

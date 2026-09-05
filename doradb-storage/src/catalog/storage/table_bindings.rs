@@ -1,9 +1,10 @@
 use crate::buffer::PoolGuards;
+pub(crate) use crate::catalog::storage::layout::TABLE_ID_TABLE_BINDINGS;
 use crate::catalog::storage::{CatalogDefinition, TableBindingObject};
 use crate::catalog::{
     BindingNamespaceID, CatalogIndexNo, CatalogTable, MAX_TABLE_BINDING_KEY_BYTES,
     StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey, StorageIndexSpec,
-    TableBinding, TableColumnLayout, TableMetadata, catalog_table_id_from_slot,
+    TableBinding, TableColumnLayout, TableMetadata,
 };
 use crate::error::{
     DataIntegrityError, DataIntegrityResult, MultiDomainResultExt, OperationError,
@@ -18,8 +19,6 @@ use crate::value::{Val, ValKind};
 use error_stack::{Report, ResultExt};
 use std::sync::OnceLock;
 
-/// Catalog table id for `catalog.table_bindings`.
-pub(crate) const TABLE_ID_TABLE_BINDINGS: TableID = catalog_table_id_from_slot(5);
 /// Primary `(namespace_id, binding_key)` slot of `catalog.table_bindings`.
 const PK_NO_TABLE_BINDINGS: CatalogIndexNo = CatalogIndexNo::new(0);
 /// Reverse `table_id` slot of `catalog.table_bindings`.

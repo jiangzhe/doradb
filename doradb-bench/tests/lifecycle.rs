@@ -184,6 +184,41 @@ mod tests {
     }
 
     #[test]
+    fn managed_binding_resolution_repeats_with_exact_results_and_samples() {
+        for full in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let phases = format!(
+                r#"
+[[phase]]
+workload = {{ type = "managed-bindings-prepare", tables = 4 }}
+[[phase]]
+kind = "benchmark"
+warmup_runs = 1
+measured_runs = 2
+workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 4, include_full_schema = {full}, include_stats = true }}
+"#
+            );
+            let (_, report) = execute_plan(&temp, "bindings", &phases);
+            assert_eq!(report.prepare_phases[0].counters.operations, 4);
+            assert_eq!(report.measured_runs.len(), 2);
+            for run in &report.measured_runs {
+                assert_eq!(
+                    run.counters,
+                    WorkloadCounters {
+                        operations: 17,
+                        found: 17,
+                        ..WorkloadCounters::default()
+                    }
+                );
+                assert_eq!(run.latency.unit, LatencyUnit::TableBindingResolution);
+                assert_eq!(run.latency.sample_count, 17);
+                assert!(!run.internal_metrics.is_empty());
+            }
+            assert_eq!(report.aggregate.latency.sample_count, 34);
+        }
+    }
+
+    #[test]
     fn required_plan_is_the_only_cli_contract() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("bench");

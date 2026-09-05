@@ -468,9 +468,12 @@ None within the delivered scope; the follow-ups below do not gate completed phas
 
 ## Future Work
 
-There were no source or phase-related backlogs requiring closure. Open follow-ups:
+There were no source or phase-related backlogs requiring closure at RFC
+completion. Backlog
+`docs/backlogs/closed/000190-preallocate-catalog-lock-manager-slots.md` was
+subsequently implemented and benchmark-validated by standalone task 000296.
+Open follow-ups:
 
-- `docs/backlogs/000190-preallocate-catalog-lock-manager-slots.md` — benchmark fixed catalog lock resources.
 - `docs/backlogs/000191-generalize-public-callback-error-boundaries.md` — generalize engine/user callback errors.
 - `docs/backlogs/000192-cache-managed-table-definitions-in-current-catalog-state.md`
   — Phase 7 deferred coherent online definition caching beside current runtime

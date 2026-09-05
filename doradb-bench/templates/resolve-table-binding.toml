@@ -1,0 +1,11 @@
+name = "managed table binding resolution"
+engine_defaults = "engine-defaults.toml"
+
+[[phase]]
+workload = { type = "managed-bindings-prepare", tables = 64 }
+
+[[phase]]
+kind = "benchmark"
+warmup_runs = 2
+measured_runs = 5
+workload = { type = "resolve-table-binding", num = 100000, include_full_schema = false, threads = 4, sessions = 4, include_stats = true }

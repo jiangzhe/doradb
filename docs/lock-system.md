@@ -829,9 +829,10 @@ physical holders; `Queued` is linked but uncounted. Exact lookup, directional
 family validation, DDL policy, cleanup, and accepted-claim diagnostics all use
 the fixed owner-side slots.
 
-`ResourceState` is removed only when its family map and linked queue are empty,
+A resource completely drains when its family map and linked queue are empty,
 all counts and mask bits are zero, and the waiter slab has no live queued or
-provisional nodes.
+provisional nodes. Dynamic entries are then eligible for removal; fixed
+catalog cells become inactive and apply the bounded capacity-retention policy.
 
 ### Persistent waiter state
 
@@ -1426,7 +1427,46 @@ generational waiter node.
 
 ### 3. Resource sharding
 
-The current `FastDashMap` supplies resource-level shard synchronization.
+The six built-in catalog tables use six permanent paired slots. Each metadata
+and data `Mutex<ResourceState>` has its own `CachePadded` wrapper, giving twelve
+independently synchronized resources. The pure catalog-storage layout defines
+the durable ID order and count. Routing uses checked subtraction, bounds the
+64-bit offset before narrowing, and checks the exact array identity. All other
+IDs, including unknown reserved catalog IDs, use the `user: FastDashMap` and
+its shard synchronization.
+
+One synchronous access boundary handles acquisition, observation, conversion,
+cancellation, and release for both stores. Fixed cells account activation under
+their mutex. Complete drain requires no family entries, holder counts, mask
+bits, linked waiters, or live waiter nodes. Provisional grants retain their
+nodes after FIFO unlinking and therefore pin the active state and its storage.
+
+On complete drain, the cell decrements active-resource accounting under the
+same mutex and checks each container independently against a private retention
+limit of 1024. The family map uses its reported entry capacity; the waiter slab
+uses the vector's slot capacity, including reserved but uninitialized space.
+Capacity at or below 1024 is retained for subsequent acquisitions. A container
+above 1024 is replaced with its empty default under the mutex and freed after
+unlocking. Container growth can round upward, so the limit applies to reported
+capacity rather than participant count or bytes.
+
+Retained slabs preserve their free lists and slot generations across drains.
+The existing unique pending-token contract permits a discarded slab to restart
+without an incarnation counter: no live observer survives complete drain.
+Each metadata/data cell applies this policy independently of its sibling.
+Retained capacity does not make an empty resource active. Existing slab growth
+and reuse counters still measure initialized-slot growth versus vacant-slot
+reuse; the capacity accessor does not change their meanings.
+
+Dynamic entries retain vacant-entry accounting and unlock-before-`remove_if`
+cleanup with a guarded emptiness recheck. A racing acquisition preserves the
+entry and its accounting. `current_physical_resources` and its peak count
+active states across both stores: an idle manager is zero, while all built-in
+pairs contribute twelve. Statistics remain relaxed snapshots; test diagnostics
+include only active resources in canonical resource order. Promotion collects
+completions inside transitions and publishes after synchronization releases,
+including the outer `DeferredNotifications` drop fallback.
+
 Explicit repartitioning remains possible future work and would require:
 
 - stable partition hashing;

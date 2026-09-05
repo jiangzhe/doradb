@@ -1,11 +1,11 @@
 use crate::buffer::PoolGuards;
 use crate::catalog::storage::CatalogDefinition;
+pub(crate) use crate::catalog::storage::layout::TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS;
 use crate::catalog::storage::object::SilentWatermarkObject;
 use crate::catalog::table::TableMetadata;
 use crate::catalog::{CatalogIndexNo, CatalogTable};
 use crate::catalog::{
     StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey, StorageIndexSpec,
-    catalog_table_id_from_slot,
 };
 use crate::error::{
     DataIntegrityError, DataIntegrityResult, MultiDomainResultExt, RuntimeError,
@@ -21,8 +21,6 @@ use crate::value::ValKind;
 use error_stack::{Report, ResultExt};
 use std::sync::OnceLock;
 
-/// Catalog table id for `catalog.table_replay_silent_watermarks`.
-pub(crate) const TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS: TableID = catalog_table_id_from_slot(4);
 const COL_NO_TABLE_REPLAY_SILENT_WATERMARKS_TABLE_ID: usize = 0;
 const COL_NO_TABLE_REPLAY_SILENT_WATERMARKS_HEAP_REDO_START_TS: usize = 1;
 const COL_NO_TABLE_REPLAY_SILENT_WATERMARKS_DELETION_CUTOFF_TS: usize = 2;
