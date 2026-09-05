@@ -433,10 +433,18 @@ async fn prepare_catalog_checkpoint(
     config: CatalogCheckpointConfig,
 ) -> Result<CatalogCheckpointFixtureSummary> {
     let before = baseline_cardinalities(config.profile);
+    prepare_catalog_fixture(session, config, before).await
+}
+
+async fn prepare_catalog_fixture(
+    session: &mut Session,
+    config: CatalogCheckpointConfig,
+    before: CatalogCardinalities,
+) -> Result<CatalogCheckpointFixtureSummary> {
     let mut drop_probe_id = None;
     let mut index_probe_id = None;
     for ordinal in 0..before.user_tables {
-        let descriptor = deterministic_descriptor(ordinal, descriptor_len(config.profile, ordinal));
+        let descriptor = deterministic_descriptor(ordinal, descriptor_len(before, ordinal));
         let bindings = deterministic_bindings(ordinal);
         let source = (ordinal as u64).to_le_bytes();
         let mut interpreter = CreateScaleTableInterpreter {
@@ -519,7 +527,7 @@ async fn prepare_catalog_checkpoint(
                 BenchError::message("catalog-checkpoint index probe returned no full schema")
             })?;
             if full.schema().indexes().len() != 1
-                || full.descriptor().len() != descriptor_len(config.profile, INDEX_PROBE_ORDINAL)
+                || full.descriptor().len() != descriptor_len(before, INDEX_PROBE_ORDINAL)
             {
                 return Err(BenchError::message(
                     "catalog-checkpoint managed-index effect has an unexpected schema or descriptor length",
@@ -605,11 +613,10 @@ fn cardinalities_after_case(
     Ok(final_state)
 }
 
-fn descriptor_len(profile: CatalogCheckpointProfile, ordinal: usize) -> usize {
+fn descriptor_len(cardinalities: CatalogCardinalities, ordinal: usize) -> usize {
     if ordinal == DROP_PROBE_ORDINAL {
         return 0;
     }
-    let cardinalities = baseline_cardinalities(profile);
     let populated = cardinalities.user_tables - 1;
     let base = cardinalities.descriptor_bytes / populated;
     let remainder = cardinalities.descriptor_bytes % populated;
@@ -817,21 +824,486 @@ fn managed_result<T>(result: ManagedDdlResult<T, BenchError>) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::measurement::SampledProcessRss;
+    use doradb_storage::id::TrxID;
+    use doradb_storage::{
+        CatalogTableCheckpointChange, CatalogTableCheckpointIoStats, ColumnID, EngineConfig,
+        LogSync, StorageColumnDefinition, StorageIndexDefinition,
+    };
+    use smol::block_on;
     use std::collections::BTreeSet;
+    use std::fs;
+    use std::path::Path;
+    use tempfile::{Builder, TempDir};
+
+    const CASES: [CatalogCheckpointCase; 3] = [
+        CatalogCheckpointCase::ManagedCreate,
+        CatalogCheckpointCase::ManagedIndexCreate,
+        CatalogCheckpointCase::ManagedDrop,
+    ];
+
+    type InvalidCase<T> = (&'static str, fn(&mut T));
+
+    fn small_cardinalities() -> CatalogCardinalities {
+        CatalogCardinalities {
+            user_tables: 1_000,
+            columns: 2_000,
+            indexes: 0,
+            bindings: 10_000,
+            descriptor_rows: 1_000,
+            descriptor_bytes: 6_710_886,
+        }
+    }
+
+    fn expected_final(case: CatalogCheckpointCase) -> CatalogCardinalities {
+        let (user_tables, columns, indexes, bindings, descriptor_rows) = match case {
+            CatalogCheckpointCase::ManagedCreate => (1_001, 2_002, 0, 10_010, 1_001),
+            CatalogCheckpointCase::ManagedIndexCreate => (1_000, 2_000, 1, 10_000, 1_000),
+            CatalogCheckpointCase::ManagedDrop => (999, 1_998, 0, 9_990, 999),
+        };
+        CatalogCardinalities {
+            user_tables,
+            columns,
+            indexes,
+            bindings,
+            descriptor_rows,
+            descriptor_bytes: 6_710_886,
+        }
+    }
+
+    fn fixture_summary(case: CatalogCheckpointCase) -> CatalogCheckpointFixtureSummary {
+        CatalogCheckpointFixtureSummary {
+            profile: CatalogCheckpointProfile::Small,
+            case,
+            before: small_cardinalities(),
+            final_state: expected_final(case),
+            drop_probe_id: TableID::new(101),
+            index_probe_id: TableID::new(102),
+        }
+    }
+
+    fn checkpoint_report(
+        ddl_count: usize,
+        changes: &[(u64, usize, usize)],
+    ) -> CatalogCheckpointReport {
+        let table_changes = changes
+            .iter()
+            .map(
+                |&(slot, before_row_count, after_row_count)| CatalogTableCheckpointChange {
+                    // Built-in catalog IDs occupy the high half of the table-ID domain.
+                    table_id: TableID::new((1_u64 << 63) + slot),
+                    before_row_count,
+                    after_row_count,
+                },
+            )
+            .collect::<Box<[_]>>();
+        let table_io = table_changes
+            .iter()
+            .map(|change| CatalogTableCheckpointIoStats {
+                table_id: change.table_id,
+                compact_bytes_read: 16_384,
+                final_compact_bytes: 16_384,
+                lwc_bytes_written: 16_384,
+                index_bytes_written: 16_384,
+            })
+            .collect();
+        CatalogCheckpointReport {
+            outcome: CatalogCheckpointOutcome::Published {
+                catalog_replay_start_ts: TrxID::new(42),
+            },
+            catalog_ddl_txn_count: ddl_count,
+            table_changes,
+            table_io,
+            metadata_bytes_written: 24_576,
+        }
+    }
+
+    fn baseline_report() -> CatalogCheckpointReport {
+        checkpoint_report(
+            1_000,
+            &[(0, 0, 1_000), (1, 0, 2_000), (3, 0, 1_000), (5, 0, 10_000)],
+        )
+    }
+
+    fn case_report(case: CatalogCheckpointCase) -> CatalogCheckpointReport {
+        let changes: &[_] = match case {
+            CatalogCheckpointCase::ManagedCreate => &[
+                (0, 1_000, 1_001),
+                (1, 2_000, 2_002),
+                (3, 1_000, 1_001),
+                (5, 10_000, 10_010),
+            ],
+            CatalogCheckpointCase::ManagedIndexCreate => {
+                &[(0, 1_000, 1_000), (2, 0, 1), (3, 1_000, 1_000)]
+            }
+            CatalogCheckpointCase::ManagedDrop => &[
+                (0, 1_000, 999),
+                (1, 2_000, 1_998),
+                (3, 1_000, 999),
+                (5, 10_000, 9_990),
+            ],
+        };
+        checkpoint_report(1, changes)
+    }
+
+    fn executor_config(
+        case: CatalogCheckpointCase,
+        binding: FixtureBinding,
+    ) -> SessionExecutorConfig<CatalogCheckpointConfig> {
+        SessionExecutorConfig {
+            resolved: CatalogCheckpointConfig {
+                profile: CatalogCheckpointProfile::Small,
+                case,
+                include_stats: true,
+            },
+            binding,
+            execution_ordinal: 0,
+        }
+    }
+
+    fn prepare_outcome() -> CatalogCheckpointPrepareSessionOutcome {
+        let mut measurement = empty_measurement().unwrap();
+        measurement.counters.operations = 1_002;
+        CatalogCheckpointPrepareSessionOutcome {
+            measurement,
+            summary: Some(fixture_summary(CatalogCheckpointCase::ManagedCreate)),
+        }
+    }
+
+    fn measured_outcome() -> CatalogCheckpointSessionOutcome {
+        let case = CatalogCheckpointCase::ManagedCreate;
+        let mut measurement = empty_measurement().unwrap();
+        measurement.counters.operations = 1;
+        measurement.latency.record(100).unwrap();
+        CatalogCheckpointSessionOutcome {
+            measurement,
+            metrics: Some(WorkloadMetrics::CatalogCheckpoint {
+                profile: CatalogCheckpointProfile::Small,
+                case,
+                before: small_cardinalities(),
+                final_state: expected_final(case),
+                sampled_process_rss: SampledProcessRss {
+                    baseline_bytes: 10,
+                    peak_bytes: 20,
+                    peak_above_baseline_bytes: 10,
+                },
+                checkpoint: case_report(case),
+            }),
+        }
+    }
+
+    fn assert_error<T>(result: Result<T>, expected: &str) {
+        let error = result.err().expect("expected a benchmark error");
+        assert!(
+            error.to_string().contains(expected),
+            "expected {expected:?}, got {error}"
+        );
+    }
+
+    fn table_interpreter(ordinal: u64, descriptor: Vec<u8>) -> CreateScaleTableInterpreter {
+        CreateScaleTableInterpreter {
+            expected_source: ordinal.to_le_bytes(),
+            descriptor: Some(descriptor),
+            bindings: Some(deterministic_bindings(ordinal as usize)),
+        }
+    }
+
+    fn current_schema() -> StorageTableDefinition {
+        // Nonordinal stable IDs catch accidental use of a physical column position.
+        let columns = [ColumnID::new(17), ColumnID::new(42)]
+            .into_iter()
+            .zip(benchmark_table_spec().columns)
+            .map(|(id, storage)| StorageColumnDefinition::new(id, storage))
+            .collect();
+        StorageTableDefinition::new(columns, Vec::new())
+    }
+
+    fn test_directory() -> TempDir {
+        let parent = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("target/catalog-workload-tests");
+        fs::create_dir_all(&parent).unwrap();
+        Builder::new()
+            .prefix("catalog-")
+            .tempdir_in(parent)
+            .unwrap()
+    }
+
+    fn test_engine_config(directory: &TempDir) -> EngineConfig {
+        let mut config = EngineConfig {
+            storage_root: directory.path().join("storage"),
+            ..EngineConfig::default()
+        };
+        config.trx.log_sync = LogSync::None;
+        config
+    }
+
+    async fn assert_recovered_catalog(
+        session: &mut Session,
+        case: CatalogCheckpointCase,
+        before: CatalogCardinalities,
+    ) {
+        for ordinal in [
+            DROP_PROBE_ORDINAL,
+            INDEX_PROBE_ORDINAL,
+            before.user_tables - 1,
+            before.user_tables,
+        ] {
+            let absent = (ordinal == DROP_PROBE_ORDINAL
+                && case == CatalogCheckpointCase::ManagedDrop)
+                || (ordinal == before.user_tables && case != CatalogCheckpointCase::ManagedCreate);
+            let mut table_id = None;
+            for binding_ordinal in 0..BINDINGS_PER_TABLE {
+                let resolved = session
+                    .resolve_table_binding(
+                        BINDING_NAMESPACE,
+                        &binding_key(ordinal, binding_ordinal),
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                if absent {
+                    assert!(resolved.is_none(), "ordinal {ordinal} must remain absent");
+                    continue;
+                }
+                let resolved = resolved.unwrap();
+                if let Some(expected) = table_id {
+                    assert_eq!(resolved.table_id(), expected);
+                } else {
+                    table_id = Some(resolved.table_id());
+                }
+                let full = resolved.full_schema().unwrap();
+                let schema = full.schema();
+                assert_eq!(schema.columns().len(), 2);
+                let indexed = ordinal == INDEX_PROBE_ORDINAL
+                    && case == CatalogCheckpointCase::ManagedIndexCreate;
+                assert_eq!(schema.indexes().len(), usize::from(indexed));
+                let len = if ordinal == before.user_tables {
+                    0
+                } else {
+                    descriptor_len(before, ordinal)
+                };
+                let mut descriptor = deterministic_descriptor(ordinal, len);
+                if indexed {
+                    descriptor[0] ^= 0xff;
+                    assert_eq!(
+                        schema.indexes()[0].keys(),
+                        &[StorageIndexKeyByColumnId::new(
+                            schema.columns()[0].column_id()
+                        ),]
+                    );
+                    assert!(schema.indexes()[0].flags().is_empty());
+                }
+                assert_eq!(full.descriptor(), descriptor);
+            }
+            if let Some(table_id) = table_id {
+                let actual = session
+                    .list_table_bindings(table_id)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(TableBinding::into_parts)
+                    .collect::<BTreeSet<_>>();
+                let expected = deterministic_bindings(ordinal)
+                    .into_iter()
+                    .map(TableBinding::into_parts)
+                    .collect::<BTreeSet<_>>();
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    fn run_catalog_lifecycle(case: CatalogCheckpointCase, sample_latency: bool) {
+        block_on(async {
+            let directory = test_directory();
+            let config = test_engine_config(&directory);
+            let before = CatalogCardinalities {
+                user_tables: 4,
+                columns: 8,
+                indexes: 0,
+                bindings: 40,
+                descriptor_rows: 4,
+                descriptor_bytes: 192,
+            };
+            let (tables, columns, indexes, bindings, descriptors) = match case {
+                CatalogCheckpointCase::ManagedCreate => (5, 10, 0, 50, 5),
+                CatalogCheckpointCase::ManagedIndexCreate => (4, 8, 1, 40, 4),
+                CatalogCheckpointCase::ManagedDrop => (3, 6, 0, 30, 3),
+            };
+            let after = CatalogCardinalities {
+                user_tables: tables,
+                columns,
+                indexes,
+                bindings,
+                descriptor_rows: descriptors,
+                descriptor_bytes: 192,
+            };
+            let engine = Engine::bootstrap(config.clone()).await.unwrap();
+            let mut session = engine.new_session().unwrap();
+            let summary = prepare_catalog_fixture(
+                &mut session,
+                executor_config(case, FixtureBinding::None).resolved,
+                before,
+            )
+            .await
+            .unwrap();
+            assert_eq!(summary.before, before);
+            assert_eq!(summary.final_state, after);
+            assert_ne!(summary.drop_probe_id, summary.index_probe_id);
+            let executor = CatalogCheckpointExecutor::new(executor_config(
+                case,
+                FixtureBinding::CatalogCheckpoint(summary),
+            ))
+            .unwrap();
+            let outcome = executor
+                .execute(
+                    &engine,
+                    &mut session,
+                    &executor.session_plans().unwrap()[0],
+                    &MeasurementClock::new(),
+                    sample_latency,
+                    &RunCancellation::new(),
+                )
+                .await
+                .unwrap();
+            let effect = FixturePlanEffect::CheckpointCatalog {
+                profile: CatalogCheckpointProfile::Small,
+                case,
+            };
+            assert_eq!(
+                executor
+                    .verify_outcome(&effect, &outcome, u64::from(sample_latency))
+                    .unwrap(),
+                FixtureRuntimeEffect::CheckpointCatalog
+            );
+            assert_eq!(
+                outcome.measurement.counters,
+                WorkloadCounters {
+                    operations: 1,
+                    ..WorkloadCounters::default()
+                }
+            );
+            assert_eq!(
+                outcome.measurement.latency.sample_count(),
+                u64::from(sample_latency)
+            );
+            let metrics = outcome.workload_metrics().unwrap();
+            let decoded: WorkloadMetrics =
+                toml::from_str(&toml::to_string(&metrics).unwrap()).unwrap();
+            assert_eq!(decoded, metrics);
+            let WorkloadMetrics::CatalogCheckpoint {
+                profile,
+                case: actual_case,
+                before: actual_before,
+                final_state,
+                sampled_process_rss,
+                checkpoint,
+            } = decoded
+            else {
+                panic!("catalog checkpoint metrics must survive report serialization");
+            };
+            assert_eq!(profile, CatalogCheckpointProfile::Small);
+            assert_eq!(actual_case, case);
+            assert_eq!(actual_before, before);
+            assert_eq!(final_state, after);
+            assert!(matches!(
+                checkpoint.outcome,
+                CatalogCheckpointOutcome::Published { .. }
+            ));
+            assert_eq!(checkpoint.catalog_ddl_txn_count, 1);
+            assert!(checkpoint.metadata_bytes_written > 0);
+            let expected = if case == CatalogCheckpointCase::ManagedIndexCreate {
+                checkpoint_report(1, &[(0, 4, 4), (2, 0, 1), (3, 4, 4)])
+            } else {
+                checkpoint_report(
+                    1,
+                    &[
+                        (0, 4, tables),
+                        (1, 8, columns),
+                        (3, 4, descriptors),
+                        (5, 40, bindings),
+                    ],
+                )
+            };
+            assert_eq!(checkpoint.table_changes, expected.table_changes);
+            assert!(
+                checkpoint
+                    .table_io
+                    .windows(2)
+                    .all(|pair| pair[0].table_id < pair[1].table_id)
+            );
+            assert!(checkpoint.table_io.iter().all(|io| {
+                io.compact_bytes_read > 0 || io.lwc_bytes_written > 0 || io.index_bytes_written > 0
+            }));
+            for change in &checkpoint.table_changes {
+                assert!(
+                    checkpoint
+                        .table_io
+                        .iter()
+                        .any(|io| io.table_id == change.table_id)
+                );
+            }
+            assert!(sampled_process_rss.peak_bytes >= sampled_process_rss.baseline_bytes);
+            assert_eq!(
+                sampled_process_rss.peak_above_baseline_bytes,
+                sampled_process_rss.peak_bytes - sampled_process_rss.baseline_bytes
+            );
+
+            session.close().await.unwrap();
+            engine.shutdown();
+            drop(engine);
+            let engine = Engine::bootstrap(config).await.unwrap();
+            let mut session = engine.new_session().unwrap();
+            assert_recovered_catalog(&mut session, case, before).await;
+            let noop = session.checkpoint_catalog().await.unwrap();
+            assert_eq!(noop.outcome, CatalogCheckpointOutcome::Noop);
+            assert_eq!(noop.catalog_ddl_txn_count, 0);
+            assert!(noop.table_changes.is_empty());
+            assert!(noop.table_io.is_empty());
+            assert_eq!(noop.metadata_bytes_written, 0);
+            session.close().await.unwrap();
+            engine.shutdown();
+        });
+    }
+
+    #[test]
+    fn managed_create_checkpoint_recovers() {
+        for sample_latency in [false, true] {
+            run_catalog_lifecycle(CatalogCheckpointCase::ManagedCreate, sample_latency);
+        }
+    }
+
+    #[test]
+    fn managed_index_checkpoint_recovers() {
+        for sample_latency in [false, true] {
+            run_catalog_lifecycle(CatalogCheckpointCase::ManagedIndexCreate, sample_latency);
+        }
+    }
+
+    #[test]
+    fn managed_drop_checkpoint_recovers() {
+        for sample_latency in [false, true] {
+            run_catalog_lifecycle(CatalogCheckpointCase::ManagedDrop, sample_latency);
+        }
+    }
 
     #[test]
     fn profiles_have_exact_deterministic_cardinalities_and_payloads() {
-        for profile in [
-            CatalogCheckpointProfile::Small,
-            CatalogCheckpointProfile::Target,
-            CatalogCheckpointProfile::Stress,
+        for (profile, tables, bytes) in [
+            (CatalogCheckpointProfile::Small, 1_000, 6_710_886),
+            (CatalogCheckpointProfile::Target, 10_000, 67_108_864),
+            (CatalogCheckpointProfile::Stress, 12_500, 83_886_080),
         ] {
             let cardinalities = baseline_cardinalities(profile);
+            assert_eq!(cardinalities.user_tables, tables);
+            assert_eq!(cardinalities.descriptor_bytes, bytes);
+            assert_eq!(cardinalities.indexes, 0);
             assert_eq!(cardinalities.columns, cardinalities.user_tables * 2);
             assert_eq!(cardinalities.bindings, cardinalities.user_tables * 10);
             assert_eq!(cardinalities.descriptor_rows, cardinalities.user_tables);
             let lengths = (0..cardinalities.user_tables)
-                .map(|ordinal| descriptor_len(profile, ordinal))
+                .map(|ordinal| descriptor_len(cardinalities, ordinal))
                 .collect::<Vec<_>>();
             assert_eq!(lengths[DROP_PROBE_ORDINAL], 0);
             assert_eq!(
@@ -846,6 +1318,11 @@ mod tests {
                 first,
                 deterministic_descriptor(INDEX_PROBE_ORDINAL, lengths[1])
             );
+            assert_ne!(
+                first,
+                deterministic_descriptor(INDEX_PROBE_ORDINAL + 1, lengths[1])
+            );
+            assert!(deterministic_descriptor(DROP_PROBE_ORDINAL, 0).is_empty());
         }
     }
 
@@ -858,5 +1335,501 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(keys.len(), 32 * BINDINGS_PER_TABLE);
         assert!(keys.iter().all(|key| key.len() == 16));
+        for (ordinal, binding) in deterministic_bindings(7).iter().enumerate() {
+            assert_eq!(binding.namespace_id(), BINDING_NAMESPACE);
+            assert_eq!(&binding.binding_key()[..8], &7_u64.to_be_bytes());
+            assert_eq!(&binding.binding_key()[8..], &(ordinal as u64).to_be_bytes());
+        }
+    }
+
+    #[test]
+    fn case_cardinalities_preserve_payload_bytes_and_check_drop_underflow() {
+        for case in CASES {
+            assert_eq!(
+                cardinalities_after_case(small_cardinalities(), case).unwrap(),
+                expected_final(case)
+            );
+        }
+        let cases: &[InvalidCase<CatalogCardinalities>] = &[
+            ("table-count underflow", |counts| counts.user_tables = 0),
+            ("column-count underflow", |counts| counts.columns = 1),
+            ("binding-count underflow", |counts| counts.bindings = 9),
+            ("descriptor-count underflow", |counts| {
+                counts.descriptor_rows = 0
+            }),
+        ];
+        for &(error, alter) in cases {
+            let mut before = small_cardinalities();
+            alter(&mut before);
+            assert_error(
+                cardinalities_after_case(before, CatalogCheckpointCase::ManagedDrop),
+                error,
+            );
+        }
+    }
+
+    #[test]
+    fn report_validators_accept_baseline_and_each_case() {
+        verify_baseline_report(small_cardinalities(), &baseline_report()).unwrap();
+        for case in CASES {
+            let mut report = case_report(case);
+            verify_checkpoint_report(&fixture_summary(case), &report).unwrap();
+            // Validation may read an unchanged table, so I/O and change lists need not coincide.
+            let mut read_only = report.table_io[0].clone();
+            read_only.table_id = TableID::new((1_u64 << 63) + 6);
+            read_only.lwc_bytes_written = 0;
+            read_only.index_bytes_written = 0;
+            let mut io = report.table_io.into_vec();
+            io.push(read_only);
+            report.table_io = io.into_boxed_slice();
+            verify_checkpoint_report(&fixture_summary(case), &report).unwrap();
+        }
+    }
+
+    #[test]
+    fn report_validators_reject_invalid_publication_and_table_shapes() {
+        let cases: &[InvalidCase<CatalogCheckpointReport>] = &[
+            ("unexpected shape", |report| {
+                report.outcome = CatalogCheckpointOutcome::Noop
+            }),
+            ("unexpected shape", |report| {
+                report.catalog_ddl_txn_count += 1
+            }),
+            ("unexpected shape", |report| {
+                report.metadata_bytes_written = 0
+            }),
+            ("table changes differ", |report| {
+                report.table_changes[0].before_row_count += 1
+            }),
+            ("table changes differ", |report| {
+                report.table_changes[0].after_row_count += 1
+            }),
+            ("table changes differ", |report| {
+                report.table_changes = report.table_changes[1..].into();
+            }),
+            ("changes are not in increasing", |report| {
+                report.table_changes.swap(0, 1)
+            }),
+            ("changes are not in increasing", |report| {
+                report.table_changes[1].table_id = report.table_changes[0].table_id;
+            }),
+            ("I/O is not in increasing", |report| {
+                report.table_io.swap(0, 1)
+            }),
+            ("I/O is not in increasing", |report| {
+                report.table_io[1].table_id = report.table_io[0].table_id;
+            }),
+            ("inactive table", |report| {
+                let io = &mut report.table_io[0];
+                io.compact_bytes_read = 0;
+                io.lwc_bytes_written = 0;
+                io.index_bytes_written = 0;
+                // A reachable image is not evidence of activity in this checkpoint.
+                assert!(io.final_compact_bytes > 0);
+            }),
+            ("changed table has no measured I/O", |report| {
+                report.table_io = report.table_io[1..].into();
+            }),
+        ];
+        for &(error, alter) in cases {
+            let mut baseline = baseline_report();
+            alter(&mut baseline);
+            assert_error(
+                verify_baseline_report(small_cardinalities(), &baseline),
+                error,
+            );
+            for case in CASES {
+                let mut report = case_report(case);
+                alter(&mut report);
+                assert_error(
+                    verify_checkpoint_report(&fixture_summary(case), &report),
+                    error,
+                );
+            }
+        }
+        let mut summary = fixture_summary(CatalogCheckpointCase::ManagedCreate);
+        summary.index_probe_id = summary.drop_probe_id;
+        assert_error(
+            verify_checkpoint_report(&summary, &case_report(summary.case)),
+            "identities unexpectedly coincide",
+        );
+    }
+
+    #[test]
+    fn executors_require_matching_fixture_bindings_and_one_session() {
+        for case in CASES {
+            let summary = fixture_summary(case);
+            let prepare =
+                CatalogCheckpointPrepareExecutor::new(executor_config(case, FixtureBinding::None))
+                    .unwrap();
+            let checkpoint = CatalogCheckpointExecutor::new(executor_config(
+                case,
+                FixtureBinding::CatalogCheckpoint(summary.clone()),
+            ))
+            .unwrap();
+            let expected = vec![SessionPlan {
+                session_index: 0,
+                key_start: 0,
+                number: 1,
+            }];
+            assert_eq!(prepare.threads(), 1);
+            assert_eq!(checkpoint.threads(), 1);
+            assert_eq!(prepare.session_plans().unwrap(), expected);
+            assert_eq!(checkpoint.session_plans().unwrap(), expected);
+            assert_error(
+                CatalogCheckpointPrepareExecutor::new(executor_config(
+                    case,
+                    FixtureBinding::CatalogCheckpoint(summary.clone()),
+                )),
+                "requires an empty",
+            );
+            assert_error(
+                CatalogCheckpointExecutor::new(executor_config(case, FixtureBinding::None)),
+                "requires a prepared",
+            );
+            let mut mismatched = summary.clone();
+            mismatched.profile = CatalogCheckpointProfile::Target;
+            assert_error(
+                CatalogCheckpointExecutor::new(executor_config(
+                    case,
+                    FixtureBinding::CatalogCheckpoint(mismatched),
+                )),
+                "fixture differs",
+            );
+            for other_case in CASES.into_iter().filter(|other| *other != case) {
+                assert_error(
+                    CatalogCheckpointExecutor::new(executor_config(
+                        other_case,
+                        FixtureBinding::CatalogCheckpoint(summary.clone()),
+                    )),
+                    "fixture differs",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prepare_outcome_verification_checks_summary_effect_and_measurement() {
+        let case = CatalogCheckpointCase::ManagedCreate;
+        let executor =
+            CatalogCheckpointPrepareExecutor::new(executor_config(case, FixtureBinding::None))
+                .unwrap();
+        let effect = FixturePlanEffect::PrepareCatalogCheckpoint {
+            profile: CatalogCheckpointProfile::Small,
+            case,
+        };
+        assert_eq!(
+            executor
+                .verify_outcome(&effect, &prepare_outcome(), 0)
+                .unwrap(),
+            FixtureRuntimeEffect::PrepareCatalogCheckpoint {
+                summary: fixture_summary(case)
+            }
+        );
+        assert_error(
+            executor.verify_outcome(&FixturePlanEffect::None, &prepare_outcome(), 0),
+            "incompatible fixture effect",
+        );
+        assert_error(
+            executor.verify_outcome(&effect, &prepare_outcome(), 1),
+            "latency sample count",
+        );
+        let cases: &[InvalidCase<CatalogCheckpointPrepareSessionOutcome>] = &[
+            ("no fixture summary", |outcome| outcome.summary = None),
+            ("summary differs", |outcome| {
+                outcome.summary.as_mut().unwrap().profile = CatalogCheckpointProfile::Stress
+            }),
+            ("summary differs", |outcome| {
+                outcome.summary.as_mut().unwrap().case = CatalogCheckpointCase::ManagedDrop
+            }),
+            ("invalid counters", |outcome| {
+                outcome.measurement.counters.operations -= 1
+            }),
+            ("invalid counters", |outcome| {
+                outcome.measurement.counters.inserted_rows = 1
+            }),
+        ];
+        for &(error, alter) in cases {
+            let mut outcome = prepare_outcome();
+            alter(&mut outcome);
+            assert_error(executor.verify_outcome(&effect, &outcome, 0), error);
+        }
+    }
+
+    #[test]
+    fn checkpoint_outcome_verification_checks_effect_metrics_and_measurement() {
+        let case = CatalogCheckpointCase::ManagedCreate;
+        let executor = CatalogCheckpointExecutor::new(executor_config(
+            case,
+            FixtureBinding::CatalogCheckpoint(fixture_summary(case)),
+        ))
+        .unwrap();
+        let effect = FixturePlanEffect::CheckpointCatalog {
+            profile: CatalogCheckpointProfile::Small,
+            case,
+        };
+        assert_eq!(
+            executor
+                .verify_outcome(&effect, &measured_outcome(), 1)
+                .unwrap(),
+            FixtureRuntimeEffect::CheckpointCatalog
+        );
+        assert_error(
+            executor.verify_outcome(&FixturePlanEffect::None, &measured_outcome(), 1),
+            "incompatible fixture effect",
+        );
+        assert_error(
+            executor.verify_outcome(&effect, &measured_outcome(), 0),
+            "latency sample count",
+        );
+        for (profile, case) in [
+            (CatalogCheckpointProfile::Target, case),
+            (
+                CatalogCheckpointProfile::Small,
+                CatalogCheckpointCase::ManagedDrop,
+            ),
+        ] {
+            assert_error(
+                executor.verify_outcome(
+                    &FixturePlanEffect::CheckpointCatalog { profile, case },
+                    &measured_outcome(),
+                    1,
+                ),
+                "effect differs",
+            );
+        }
+        let cases: &[InvalidCase<CatalogCheckpointSessionOutcome>] = &[
+            ("no workload metrics", |outcome| outcome.metrics = None),
+            ("invalid counters", |outcome| {
+                outcome.measurement.counters.operations = 0
+            }),
+            ("invalid counters", |outcome| {
+                outcome.measurement.counters.updated_rows = 1
+            }),
+        ];
+        for &(error, alter) in cases {
+            let mut outcome = measured_outcome();
+            alter(&mut outcome);
+            assert_error(executor.verify_outcome(&effect, &outcome, 1), error);
+        }
+    }
+
+    #[test]
+    fn outcomes_merge_measurements_and_reject_duplicate_payloads() {
+        let mut prepare = CatalogCheckpointPrepareSessionOutcome::empty().unwrap();
+        assert!(prepare.summary.is_none());
+        assert_eq!(prepare.measurement.counters, WorkloadCounters::default());
+        assert_eq!(prepare.measurement.latency.sample_count(), 0);
+        prepare.merge(prepare_outcome()).unwrap();
+        prepare
+            .merge(CatalogCheckpointPrepareSessionOutcome::empty().unwrap())
+            .unwrap();
+        assert_eq!(prepare.summary, prepare_outcome().summary);
+        let measurement = prepare.into_measurement();
+        assert_eq!(measurement.counters.operations, 1_002);
+        assert_eq!(measurement.latency.sample_count(), 0);
+        assert_error(
+            prepare_outcome().merge(prepare_outcome()),
+            "multiple catalog-checkpoint preparation sessions",
+        );
+
+        let mut measured = CatalogCheckpointSessionOutcome::empty().unwrap();
+        assert!(measured.workload_metrics().is_none());
+        assert_eq!(measured.measurement.counters, WorkloadCounters::default());
+        assert_eq!(measured.measurement.latency.sample_count(), 0);
+        measured.merge(measured_outcome()).unwrap();
+        let mut measurement_only = CatalogCheckpointSessionOutcome::empty().unwrap();
+        measurement_only.measurement.counters.operations = 2;
+        measurement_only.measurement.latency.record(200).unwrap();
+        measured.merge(measurement_only).unwrap();
+        assert_eq!(measured.workload_metrics(), measured_outcome().metrics);
+        let measurement = measured.into_measurement();
+        assert_eq!(measurement.counters.operations, 3);
+        assert_eq!(measurement.latency.sample_count(), 2);
+        assert_error(
+            measured_outcome().merge(measured_outcome()),
+            "multiple catalog-checkpoint sessions",
+        );
+    }
+
+    #[test]
+    fn create_table_interpreter_preserves_definition_and_consumes_once() {
+        for len in [0, 32, MAX_TABLE_DESCRIPTOR_BYTES] {
+            let descriptor = vec![0x5a; len];
+            let mut interpreter = table_interpreter(7, descriptor.clone());
+            // A rejected source must not consume either owned input.
+            assert_error(
+                interpreter.create_table(&8_u64.to_le_bytes()),
+                "source differs",
+            );
+            let definition = interpreter.create_table(&7_u64.to_le_bytes()).unwrap();
+            assert_eq!(definition.storage().table(), &benchmark_table_spec());
+            assert!(definition.storage().indexes().is_empty());
+            assert_eq!(definition.descriptor(), descriptor);
+            assert_eq!(definition.bindings(), deterministic_bindings(7));
+            assert!(interpreter.descriptor.is_none());
+            assert!(interpreter.bindings.is_none());
+            assert_error(
+                interpreter.create_table(&7_u64.to_le_bytes()),
+                "invoked more than once",
+            );
+        }
+        let mut oversized = table_interpreter(7, vec![0; MAX_TABLE_DESCRIPTOR_BYTES + 1]);
+        assert_error(
+            oversized.create_table(&7_u64.to_le_bytes()),
+            "descriptor exceeds",
+        );
+        let mut consumed = table_interpreter(7, Vec::new());
+        consumed.bindings = None;
+        assert_error(
+            consumed.create_table(&7_u64.to_le_bytes()),
+            "bindings were already consumed",
+        );
+    }
+
+    #[test]
+    fn create_index_interpreter_uses_stable_id_and_replaces_only_first_byte() {
+        let schema = current_schema();
+        let original = vec![0x12, 0x34, 0x56];
+        let mut interpreter = CreateScaleIndexInterpreter;
+        let update = interpreter
+            .create_index(
+                b"catalog-checkpoint-index",
+                &original,
+                &schema,
+                IndexID::new(9),
+            )
+            .unwrap();
+        assert_eq!(update.descriptor(), &[0xed, 0x34, 0x56]);
+        assert_eq!(original, [0x12, 0x34, 0x56]);
+        assert_eq!(
+            update.change().keys(),
+            &[StorageIndexKeyByColumnId::new(ColumnID::new(17))]
+        );
+        assert!(update.change().flags().is_empty());
+
+        let one_column = StorageTableDefinition::new(schema.columns()[..1].to_vec(), Vec::new());
+        let indexed = StorageTableDefinition::new(
+            schema.columns().to_vec(),
+            vec![StorageIndexDefinition::new(
+                IndexID::new(3),
+                update.change().keys().to_vec(),
+                StorageIndexFlags::empty(),
+            )],
+        );
+        for (source, descriptor, schema) in [
+            (b"wrong".as_slice(), original.as_slice(), &schema),
+            (b"catalog-checkpoint-index".as_slice(), &[][..], &schema),
+            (
+                b"catalog-checkpoint-index".as_slice(),
+                original.as_slice(),
+                &one_column,
+            ),
+            (
+                b"catalog-checkpoint-index".as_slice(),
+                original.as_slice(),
+                &indexed,
+            ),
+        ] {
+            assert_error(
+                interpreter.create_index(source, descriptor, schema, IndexID::new(9)),
+                "unexpected current definition",
+            );
+        }
+    }
+
+    #[test]
+    fn interpreters_reject_unrelated_ddl_callbacks() {
+        let schema = current_schema();
+        let mut table = table_interpreter(7, Vec::new());
+        let mut index = CreateScaleIndexInterpreter;
+        assert_error(
+            table.create_index(b"", b"", &schema, IndexID::new(1)),
+            "CREATE TABLE interpreter received CREATE INDEX",
+        );
+        assert_error(
+            table.drop_index(b"", b"", &schema),
+            "CREATE TABLE interpreter received DROP INDEX",
+        );
+        assert_error(
+            index.create_table(b""),
+            "CREATE INDEX interpreter received CREATE TABLE",
+        );
+        assert_error(
+            index.drop_index(b"", b"", &schema),
+            "CREATE INDEX interpreter received DROP INDEX",
+        );
+    }
+
+    #[test]
+    fn probe_binding_validation_rejects_count_keys_and_wrong_identity() {
+        block_on(async {
+            let directory = test_directory();
+            let engine = Engine::bootstrap(test_engine_config(&directory))
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            for (ordinal, bindings, expected) in [
+                (10, Vec::new(), "0 bindings instead of 10"),
+                (11, deterministic_bindings(12), "binding did not resolve"),
+                (13, deterministic_bindings(13), ""),
+                (
+                    14,
+                    deterministic_bindings(14),
+                    "resolved to a different table",
+                ),
+            ] {
+                let mut interpreter = table_interpreter(ordinal, Vec::new());
+                interpreter.bindings = Some(bindings);
+                let (table_id, indexes) = managed_result(
+                    session
+                        .create_managed_table(&ordinal.to_le_bytes(), &mut interpreter)
+                        .await,
+                )
+                .unwrap()
+                .into_parts();
+                assert!(indexes.is_empty());
+                let probe = if ordinal == 14 { 13 } else { ordinal as usize };
+                let result = verify_probe_bindings(&mut session, table_id, probe).await;
+                if expected.is_empty() {
+                    result.unwrap();
+                } else {
+                    assert_error(result, expected);
+                }
+            }
+            // A valid callback for a nonexistent table yields a real public engine error.
+            let error = session
+                .create_managed_index(
+                    TableID::new(999_999),
+                    b"catalog-checkpoint-index",
+                    &mut CreateScaleIndexInterpreter,
+                )
+                .await
+                .unwrap_err();
+            let ManagedDdlError::Engine(error) = error else {
+                panic!("expected an engine error")
+            };
+            let kind = error.kind();
+            let diagnostic = format!("{error:?}");
+            let mapped: Result<()> = managed_result(Err(ManagedDdlError::Engine(error)));
+            let BenchError::Storage(error) = mapped.unwrap_err() else {
+                panic!("expected a storage error")
+            };
+            assert_eq!(error.kind(), kind);
+            assert_eq!(format!("{error:?}"), diagnostic);
+            session.close().await.unwrap();
+            engine.shutdown();
+        });
+    }
+
+    #[test]
+    fn managed_results_preserve_success_and_interpreter_errors() {
+        assert_eq!(managed_result(Ok(42)).unwrap(), 42);
+        let result: Result<()> = managed_result(Err(ManagedDdlError::Interpreter(
+            BenchError::message("interpreter marker"),
+        )));
+        assert!(
+            matches!(result, Err(BenchError::Message(message)) if message == "interpreter marker")
+        );
     }
 }
