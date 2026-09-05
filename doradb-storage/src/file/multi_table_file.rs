@@ -1,5 +1,6 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::{PoolGuard, ReadonlyBufferPool};
+use crate::catalog::storage::layout::BUILTIN_CATALOG_TABLE_COUNT;
 use crate::catalog::{
     USER_TABLE_ID_LIMIT, USER_TABLE_ID_START, catalog_table_id_from_slot, catalog_table_slot,
 };
@@ -46,7 +47,7 @@ pub(crate) use tests::publish_first_redo_log_seq_for_test;
 /// On-disk format version of `catalog.mtb`.
 pub(crate) const CATALOG_MTB_VERSION: u64 = 6;
 /// Reserved number of catalog logical-table root descriptors.
-pub(crate) const CATALOG_TABLE_ROOT_DESC_COUNT: usize = 6;
+pub(crate) const CATALOG_TABLE_ROOT_DESC_COUNT: usize = BUILTIN_CATALOG_TABLE_COUNT;
 /// Initial sparse-file size for `catalog.mtb`.
 pub(crate) const MULTI_TABLE_FILE_INITIAL_SIZE: usize = TABLE_FILE_INITIAL_SIZE;
 

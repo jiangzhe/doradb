@@ -172,6 +172,10 @@ impl fmt::Display for CatalogCheckpointCase {
 pub enum WorkloadSpec {
     /// Create the invocation's implicit homogeneous table pool.
     CreateTable(CreateTableSpec),
+    /// Prepare deterministic managed table bindings.
+    ManagedBindingsPrepare(ManagedBindingsPrepareSpec),
+    /// Resolve prepared managed table bindings.
+    ResolveTableBinding(ResolveTableBindingSpec),
     /// Execute no-op statements in public transactions.
     StmtNoop(CountWorkerSpec),
     /// Begin and commit public transactions without statements.
@@ -208,6 +212,54 @@ pub enum WorkloadSpec {
     CatalogCheckpointPrepare(CatalogCheckpointSpec),
     /// Measure one pending deterministic managed-catalog checkpoint.
     CatalogCheckpoint(CatalogCheckpointSpec),
+}
+
+/// Strict managed-binding fixture controls.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedBindingsPrepareSpec {
+    /// Required positive number of managed tables.
+    pub tables: NonZeroUsize,
+}
+
+/// Strict public binding-resolution controls.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveTableBindingSpec {
+    /// Positive aggregate resolution count.
+    pub num: NonZeroU64,
+    /// Include the coherent schema and descriptor, defaulting to false.
+    pub include_full_schema: Option<bool>,
+    /// Optional executor thread override.
+    pub threads: Option<NonZeroUsize>,
+    /// Optional public session override.
+    pub sessions: Option<NonZeroUsize>,
+    /// Optional engine-diagnostic override.
+    pub include_stats: Option<bool>,
+}
+
+/// Resolved managed-binding fixture controls.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedBindingsPrepareConfig {
+    /// Positive number of managed tables.
+    pub tables: usize,
+}
+
+/// Resolved public binding-resolution controls.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveTableBindingConfig {
+    /// Aggregate resolution count.
+    pub num: u64,
+    /// Whether each result includes its schema and descriptor.
+    pub include_full_schema: bool,
+    /// Executor thread count.
+    pub threads: usize,
+    /// Public session count.
+    pub sessions: usize,
+    /// Whether to capture engine diagnostics.
+    pub include_stats: bool,
 }
 
 /// Strict catalog-checkpoint scale-proof controls.
@@ -818,6 +870,10 @@ pub struct LockTableConfig {
 pub enum ResolvedWorkload {
     /// Table-pool creation workload.
     CreateTable(CreateTableConfig),
+    /// Deterministic managed-binding fixture preparation.
+    ManagedBindingsPrepare(ManagedBindingsPrepareConfig),
+    /// Public managed-binding resolution.
+    ResolveTableBinding(ResolveTableBindingConfig),
     /// Statement-noop workload.
     StmtNoop(CountConfig),
     /// Transaction-noop workload.
@@ -861,6 +917,8 @@ impl ResolvedWorkload {
     pub fn identity(&self) -> &'static str {
         match self {
             Self::CreateTable(_) => "create-table",
+            Self::ManagedBindingsPrepare(_) => "managed-bindings-prepare",
+            Self::ResolveTableBinding(_) => "resolve-table-binding",
             Self::StmtNoop(_) => "stmt-noop",
             Self::TrxNoop(_) => "trx-noop",
             Self::InsertSeq(_) => "insert-seq",
@@ -886,6 +944,8 @@ impl ResolvedWorkload {
     pub(crate) fn fixture_requirement(&self) -> FixtureRequirement {
         match self {
             Self::CreateTable(_) => FixtureRequirement::AbsentPrimary,
+            Self::ManagedBindingsPrepare(_) => FixtureRequirement::AbsentManagedBindings,
+            Self::ResolveTableBinding(_) => FixtureRequirement::ManagedBindings,
             Self::InsertSeq(_) | Self::InsertRand(_) => FixtureRequirement::Primary {
                 index: IndexRequirement::Any,
                 load: LoadRequirement::Optional,
@@ -938,7 +998,8 @@ impl ResolvedWorkload {
             | Self::IndexScan(_)
             | Self::IndexStream(_)
             | Self::UpdateRand(_)
-            | Self::LockTable(_) => ReplayPolicy::Safe,
+            | Self::LockTable(_)
+            | Self::ResolveTableBinding(_) => ReplayPolicy::Safe,
             Self::CreateTable(_)
             | Self::InsertSeq(_)
             | Self::InsertRand(_)
@@ -946,16 +1007,17 @@ impl ResolvedWorkload {
             | Self::IndexDdl(_)
             | Self::FreezeTable(_)
             | Self::CheckpointTable(_) => ReplayPolicy::SingleRun,
-            Self::CatalogCheckpointPrepare(_) | Self::CatalogCheckpoint(_) => {
-                ReplayPolicy::SingleRun
-            }
+            Self::ManagedBindingsPrepare(_)
+            | Self::CatalogCheckpointPrepare(_)
+            | Self::CatalogCheckpoint(_) => ReplayPolicy::SingleRun,
         }
     }
 
     /// Return the resolved worker/session counts.
     pub fn worker_counts(&self) -> (usize, usize) {
         match self {
-            Self::CreateTable(_) => (1, 1),
+            Self::CreateTable(_) | Self::ManagedBindingsPrepare(_) => (1, 1),
+            Self::ResolveTableBinding(config) => (config.threads, config.sessions),
             Self::StmtNoop(config) | Self::TrxNoop(config) => (config.threads, config.sessions),
             Self::InsertSeq(config) | Self::InsertRand(config) => (config.threads, config.sessions),
             Self::UpdateRand(config) => (config.threads, config.sessions),
@@ -978,6 +1040,8 @@ impl ResolvedWorkload {
     pub fn include_stats(&self) -> bool {
         match self {
             Self::CreateTable(config) => config.include_stats,
+            Self::ManagedBindingsPrepare(_) => false,
+            Self::ResolveTableBinding(config) => config.include_stats,
             Self::StmtNoop(config) | Self::TrxNoop(config) => config.include_stats,
             Self::InsertSeq(config) | Self::InsertRand(config) => config.include_stats,
             Self::UpdateRand(config) => config.include_stats,
@@ -1000,7 +1064,8 @@ impl ResolvedWorkload {
     /// Return the semantic latency unit for sampled executions.
     pub fn latency_unit(&self) -> LatencyUnit {
         match self {
-            Self::CreateTable(_) => LatencyUnit::TableCreation,
+            Self::CreateTable(_) | Self::ManagedBindingsPrepare(_) => LatencyUnit::TableCreation,
+            Self::ResolveTableBinding(_) => LatencyUnit::TableBindingResolution,
             Self::StmtNoop(_) => LatencyUnit::StatementExecution,
             Self::TrxNoop(_) => LatencyUnit::TransactionLifecycle,
             Self::InsertSeq(_) | Self::InsertRand(_) => LatencyUnit::InsertBatchTransaction,
@@ -1036,6 +1101,8 @@ impl ResolvedWorkload {
             Self::CreateTable(config) => u64::try_from(config.table_count)
                 .map_err(|_| BenchError::message("table count exceeds u64")),
             Self::StmtNoop(config) | Self::TrxNoop(config) => Ok(config.num),
+            Self::ManagedBindingsPrepare(_) => Ok(0),
+            Self::ResolveTableBinding(config) => Ok(config.num),
             Self::InsertSeq(config) | Self::InsertRand(config) => {
                 aggregate_batch_count(config.num, config.sessions, config.batch_size)
             }
@@ -1145,11 +1212,16 @@ fn validate_and_resolve_phases(
             )));
         }
         if raw.kind == PhaseKind::Benchmark
-            && matches!(workload, ResolvedWorkload::CatalogCheckpointPrepare(_))
+            && matches!(
+                workload,
+                ResolvedWorkload::CatalogCheckpointPrepare(_)
+                    | ResolvedWorkload::ManagedBindingsPrepare(_)
+            )
         {
             return Err(BenchError::message(format!(
-                "phase {} workload catalog-checkpoint-prepare is allowed only in a prepare phase",
-                index + 1
+                "phase {} workload {} is allowed only in a prepare phase",
+                index + 1,
+                workload.identity()
             )));
         }
         if raw.kind == PhaseKind::Prepare
@@ -1364,6 +1436,26 @@ fn resolve_workload(
             }),
             FixturePlanEffect::Checkpoint,
         )),
+        WorkloadSpec::ManagedBindingsPrepare(spec) => Ok((
+            ResolvedWorkload::ManagedBindingsPrepare(ManagedBindingsPrepareConfig {
+                tables: spec.tables.get(),
+            }),
+            FixturePlanEffect::PrepareManagedBindings {
+                tables: spec.tables.get(),
+            },
+        )),
+        WorkloadSpec::ResolveTableBinding(spec) => {
+            let (threads, sessions) = resolve_workers(spec.threads, spec.sessions, defaults)?;
+            no_effect(ResolvedWorkload::ResolveTableBinding(
+                ResolveTableBindingConfig {
+                    num: spec.num.get(),
+                    include_full_schema: spec.include_full_schema.unwrap_or(false),
+                    threads,
+                    sessions,
+                    include_stats: spec.include_stats.unwrap_or(defaults.include_stats),
+                },
+            ))
+        }
         WorkloadSpec::CatalogCheckpointPrepare(spec) => Ok((
             ResolvedWorkload::CatalogCheckpointPrepare(CatalogCheckpointConfig {
                 profile: spec.profile,
@@ -1699,6 +1791,49 @@ mod tests {
     fn resolve(raw: &str) -> Result<Vec<Phase>> {
         let raw = parse(raw).unwrap();
         validate_and_resolve_phases(raw.phases, WorkloadDefaults::default().resolve().unwrap())
+    }
+
+    #[test]
+    fn managed_binding_plan_validates_fixture_counts_roles_and_repetition() {
+        let prepare = r#"[[phase]]
+workload = { type = "managed-bindings-prepare", tables = 2 }
+"#;
+        let benchmark = r#"[[phase]]
+kind = "benchmark"
+warmup_runs = 2
+measured_runs = 3
+workload = { type = "resolve-table-binding", num = 17, threads = 2, sessions = 4 }
+"#;
+        let valid = format!("{prepare}{benchmark}");
+        let phases = resolve(&valid).unwrap();
+        let workload = phases[1].workload();
+        assert_eq!(workload.replay_policy(), ReplayPolicy::Safe);
+        assert_eq!(workload.expected_samples().unwrap(), 17);
+        assert_eq!(workload.latency_unit(), LatencyUnit::TableBindingResolution);
+        assert_eq!(workload.worker_counts(), (2, 4));
+        let ResolvedWorkload::ResolveTableBinding(config) = workload else {
+            panic!("resolution config")
+        };
+        assert!(!config.include_full_schema);
+        assert!(resolve(benchmark).is_err());
+        assert!(resolve(&format!("{prepare}{prepare}{benchmark}")).is_err());
+        assert!(resolve(&valid.replace("sessions = 4", "sessions = 1")).is_err());
+        assert!(
+            resolve(
+                r#"[[phase]]
+kind = "benchmark"
+workload = { type = "managed-bindings-prepare", tables = 1 }
+"#
+            )
+            .is_err()
+        );
+        for invalid in [
+            valid.replace("tables = 2", "tables = 0"),
+            valid.replace("num = 17", "num = 0"),
+            valid.replace("num = 17", "num = 17, unknown = true"),
+        ] {
+            assert!(parse(&invalid).is_err());
+        }
     }
 
     #[test]
@@ -2097,6 +2232,7 @@ mod tests {
             ("index-stream.toml", "index-stream"),
             ("index-ddl.toml", "index-ddl"),
             ("lock-table.toml", "lock-table"),
+            ("resolve-table-binding.toml", "resolve-table-binding"),
             ("checkpoint-table.toml", "checkpoint-table"),
             ("catalog-checkpoint.toml", "catalog-checkpoint"),
         ];

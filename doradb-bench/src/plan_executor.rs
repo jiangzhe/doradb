@@ -16,9 +16,10 @@ use crate::workload::{
     CatalogCheckpointExecutor, CatalogCheckpointPrepareExecutor, CheckpointTableExecutor,
     CreateTableExecutor, FreezeTableExecutor, IndexDdlExecutor, IndexScanExecutor,
     IndexStreamExecutor, InsertRandExecutor, InsertSeqExecutor, LockTableExecutor,
-    LookupRandExecutor, LookupSeqExecutor, ParallelTableScanExecutor,
-    ParallelTableScanExecutorConfig, RunCancellation, SessionPlan, StmtNoopExecutor,
-    TableDdlExecutor, TableScanExecutor, TrxNoopExecutor, UpdateRandExecutor,
+    LookupRandExecutor, LookupSeqExecutor, ManagedBindingsPrepareExecutor,
+    ParallelTableScanExecutor, ParallelTableScanExecutorConfig, ResolveTableBindingExecutor,
+    RunCancellation, SessionPlan, StmtNoopExecutor, TableDdlExecutor, TableScanExecutor,
+    TrxNoopExecutor, UpdateRandExecutor,
 };
 use doradb_storage::{Engine, Session};
 use easy_parallel::Parallel;
@@ -560,6 +561,28 @@ async fn dispatch_workload(
         }
         ResolvedWorkload::CheckpointTable(config) => {
             run_executor::<CheckpointTableExecutor>(
+                engine,
+                clock,
+                workload,
+                SessionExecutorConfig::new(*config, binding, execution_ordinal),
+                planned_effect,
+                sample_latency,
+            )
+            .await
+        }
+        ResolvedWorkload::ManagedBindingsPrepare(config) => {
+            run_executor::<ManagedBindingsPrepareExecutor>(
+                engine,
+                clock,
+                workload,
+                SessionExecutorConfig::new(*config, binding, execution_ordinal),
+                planned_effect,
+                sample_latency,
+            )
+            .await
+        }
+        ResolvedWorkload::ResolveTableBinding(config) => {
+            run_executor::<ResolveTableBindingExecutor>(
                 engine,
                 clock,
                 workload,

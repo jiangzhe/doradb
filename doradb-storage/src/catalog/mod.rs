@@ -34,6 +34,7 @@ pub use spec::{
     StorageIndexFlags, StorageIndexKey, StorageIndexKeyByColumnId, StorageIndexSpec,
     StorageTableDefinition, StorageTableSpec,
 };
+pub(crate) use storage::layout::{catalog_table_id_from_slot, catalog_table_slot};
 pub(crate) use storage::*;
 pub use table::CreateTableOutcome;
 pub(crate) use table::*;
@@ -1270,22 +1271,6 @@ impl<'a> TableCache<'a> {
             Some(entry) => entry,
             None => panic!("table {table_id} not found in catalog"),
         }
-    }
-}
-
-/// Build a built-in catalog table id from its dense root slot.
-#[inline]
-pub(crate) const fn catalog_table_id_from_slot(slot: usize) -> TableID {
-    TableID::new(CATALOG_TABLE_ID_START.as_u64() + slot as u64)
-}
-
-/// Return the dense root slot for a built-in catalog table id.
-#[inline]
-pub(crate) const fn catalog_table_slot(table_id: TableID) -> Option<usize> {
-    if table_id.is_catalog() {
-        Some((table_id.as_u64() - CATALOG_TABLE_ID_START.as_u64()) as usize)
-    } else {
-        None
     }
 }
 

@@ -26,6 +26,24 @@ Add an immutable cached managed definition adjacent to metadata in CurrentTableS
 
 All online managed-definition reads use the current-state cache with no read-through fallback; cache publication is coherent with layout/history publication; recovery hydrates caches before foreground admission; missing or mismatched cache state fails as data integrity; tests cover no descriptor-catalog reads, DDL races, rollback, recovery, and unchanged public/on-disk formats.
 
+After the cache lands, revisit the binding-resolution benchmarks introduced by
+task 000296. Repeat narrow/full resolution with one and 64 targets across the
+existing worker/session topologies, including the user-table lock controls.
+Recalibrate operation counts and compare lock-store variants using identical
+cache-enabled resolution paths. Keep benchmark results and supporting artifacts
+only under the ignored `target/` directory.
+
 ## Notes (Optional)
 
+Review of task 000296 treats hot built-in catalog resources under frequent
+uncached resolution as an expected contention limit and an acceptable tradeoff
+for that task. Higher-layer callers are expected to cache versioned definitions
+where their cache-validity rules permit reuse. The returned version is an
+optimistic comparison token; it does not independently notify a caller of
+invalidation. Revalidating every cache hit through narrow resolution still
+performs the catalog binding lookup.
 
+This backlog changes the cost of full resolution by removing descriptor-row
+reads. Binding-key lookup remains catalog-backed, so the benchmark should
+reassess the resulting bottlenecks after implementation rather than carry
+forward conclusions from the earlier uncached path.

@@ -2,6 +2,7 @@ mod columns;
 mod ddl;
 mod indexes;
 mod integrity;
+pub(crate) mod layout;
 mod measure;
 mod merge;
 mod object;
@@ -10,25 +11,28 @@ mod table_descriptors;
 mod table_replay_silent_watermarks;
 pub(crate) mod tables;
 
+use layout::BUILTIN_CATALOG_TABLE_IDS;
+pub(crate) use layout::{
+    TABLE_ID_COLUMNS, TABLE_ID_INDEXES, TABLE_ID_TABLE_BINDINGS, TABLE_ID_TABLE_DESCRIPTORS,
+    TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS, TABLE_ID_TABLES,
+};
+
 use crate::buffer::{FixedBufferPool, PoolGuard, PoolGuards, ReadonlyBufferPool};
-pub(crate) use crate::catalog::storage::columns::TABLE_ID_COLUMNS;
 use crate::catalog::storage::columns::*;
-pub(crate) use crate::catalog::storage::indexes::TABLE_ID_INDEXES;
 use crate::catalog::storage::indexes::*;
 use crate::catalog::storage::measure::{CatalogCheckpointMeasurement, MeasurableMutableCowFile};
 use crate::catalog::storage::merge::{CatalogFoldedRows, CatalogMergeKeyBuilder};
 pub(crate) use crate::catalog::storage::object::*;
-pub(crate) use crate::catalog::storage::table_bindings::{TABLE_ID_TABLE_BINDINGS, TableBindings};
+pub(crate) use crate::catalog::storage::table_bindings::TableBindings;
 use crate::catalog::storage::table_bindings::{
     catalog_definition_of_table_bindings, table_binding_object_from_vals,
 };
 pub(crate) use crate::catalog::storage::table_descriptors::{
-    TABLE_ID_TABLE_DESCRIPTORS, TableDescriptors, validate_table_descriptor_against_metadata,
+    TableDescriptors, validate_table_descriptor_against_metadata,
 };
 use crate::catalog::storage::table_descriptors::{
     catalog_definition_of_table_descriptors, table_descriptor_object_from_vals,
 };
-pub(crate) use crate::catalog::storage::table_replay_silent_watermarks::TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS;
 use crate::catalog::storage::table_replay_silent_watermarks::*;
 pub(crate) use crate::catalog::storage::tables::*;
 use crate::catalog::{
@@ -114,7 +118,11 @@ impl CatalogStorage {
             catalog_definition_of_table_bindings(),
         ] {
             // Make sure catalog table ids match their dense root slots.
-            assert_eq!(cat.len(), must_catalog_table_slot(*table_id));
+            assert_eq!(
+                BUILTIN_CATALOG_TABLE_IDS[cat.len()],
+                *table_id,
+                "catalog bootstrap definition order differs from durable layout"
+            );
             let metadata = Arc::new(metadata.clone());
             let blk_idx = BlockIndex::new_catalog(meta_pool.clone(), bootstrap_guards.meta_guard())
                 .await
@@ -134,7 +142,11 @@ impl CatalogStorage {
             );
             cat.push(table);
         }
-        debug_assert_eq!(cat.len(), CATALOG_TABLE_ROOT_DESC_COUNT);
+        assert_eq!(
+            cat.len(),
+            CATALOG_TABLE_ROOT_DESC_COUNT,
+            "catalog bootstrap definition count differs from durable layout"
+        );
         Ok(CatalogStorage {
             meta_pool,
             table_fs,

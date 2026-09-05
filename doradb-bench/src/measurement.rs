@@ -97,6 +97,8 @@ pub enum LatencyUnit {
     StatementExecution,
     /// One public primary-table creation request.
     TableCreation,
+    /// One complete public binding resolution through operation-claim release.
+    TableBindingResolution,
     /// One insert batch transaction from begin through successful commit.
     InsertBatchTransaction,
     /// One index update range transaction from begin through successful commit.
@@ -137,6 +139,7 @@ impl fmt::Display for LatencyUnit {
             Self::TransactionLifecycle => "transaction-lifecycle",
             Self::StatementExecution => "statement-execution",
             Self::TableCreation => "table-creation",
+            Self::TableBindingResolution => "table-binding-resolution",
             Self::InsertBatchTransaction => "insert-batch-transaction",
             Self::UpdateRangeTransaction => "update-range-transaction",
             Self::TableCreateDropCycle => "table-create-drop-cycle",

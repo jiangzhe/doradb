@@ -431,6 +431,12 @@ impl WaitQueue {
     pub(super) fn allocated_slots(&self) -> usize {
         self.nodes.slots.len()
     }
+
+    /// Returns the retained vector capacity in waiter slots, including unused space.
+    #[inline]
+    pub(super) fn capacity(&self) -> usize {
+        self.nodes.slots.capacity()
+    }
 }
 
 pub(super) enum PendingGuardState {
@@ -716,6 +722,7 @@ pub(in crate::lock) mod tests {
     use super::*;
     use crate::error::FatalError;
     use crate::id::{SessionID, TableID, TrxID};
+    use crate::lock::tests::{inspect_resource, resource_variants};
     use crate::lock::{FamilyLockAuthority, LockResource};
     use crate::poison::healthy_test_poisoner;
     use error_stack::Report;
@@ -759,6 +766,14 @@ pub(in crate::lock) mod tests {
         pub(in crate::lock) queue_order: Vec<WaitNodeID>,
         pub(in crate::lock) occupied: Vec<WaitNodeID>,
         pub(in crate::lock) slab: WaitSlabSnapshot,
+    }
+
+    /// Reserves waiter storage to exercise capacity limits independently of live nodes.
+    pub(in crate::lock) fn reserve_waiter_capacity(queue: &mut WaitQueue, capacity: usize) {
+        queue
+            .nodes
+            .slots
+            .reserve_exact(capacity.saturating_sub(queue.nodes.slots.len()));
     }
 
     #[inline]
@@ -1098,107 +1113,110 @@ pub(in crate::lock) mod tests {
 
     #[test]
     fn guard_drop_rolls_back_partial_local_publication_and_fresh_grant() {
-        for publish_scope in [false, true] {
-            let manager = LockManager::new();
-            let mut authority = FamilyLockAuthority::new(SessionID::new(90));
-            let resource = LockResource::TableMetadata(TableID::new(90 + u64::from(publish_scope)));
-            let (family, curr_scope) = authority.parts();
-            let owner = curr_scope.owner();
-            let guard_token = PendingClaimToken {
-                resource,
-                owner,
-                claim_no: ClaimNo::new(7),
-            };
-            assert!(matches!(
-                manager
-                    .start_pending(&guard_token, LockMode::Shared)
-                    .unwrap(),
-                PendingStart::Immediate
-            ));
-            let publication_token = PendingClaimToken {
-                resource,
-                owner,
-                claim_no: ClaimNo::new(7),
-            };
-            let mut guard = PendingClaimGuard::new(
-                &manager,
-                healthy_test_poisoner(),
-                family,
-                curr_scope,
-                guard_token,
-                LockMode::Shared,
-                false,
-            );
-            guard.state = PendingGuardState::FreshGranted;
-            guard.transfer_started = true;
-            guard
-                .family
-                .publish_pending_family(&publication_token, LockMode::Shared);
-            if publish_scope {
+        for resource in resource_variants(LockResource::TableMetadata(TableID::new(90))) {
+            for publish_scope in [false, true] {
+                let manager = LockManager::new();
+                let mut authority = FamilyLockAuthority::new(SessionID::new(90));
+                let (family, curr_scope) = authority.parts();
+                let owner = curr_scope.owner();
+                let guard_token = PendingClaimToken {
+                    resource,
+                    owner,
+                    claim_no: ClaimNo::new(7),
+                };
+                assert!(matches!(
+                    manager
+                        .start_pending(&guard_token, LockMode::Shared)
+                        .unwrap(),
+                    PendingStart::Immediate
+                ));
+                let publication_token = PendingClaimToken {
+                    resource,
+                    owner,
+                    claim_no: ClaimNo::new(7),
+                };
+                let mut guard = PendingClaimGuard::new(
+                    &manager,
+                    healthy_test_poisoner(),
+                    family,
+                    curr_scope,
+                    guard_token,
+                    LockMode::Shared,
+                    false,
+                );
+                guard.state = PendingGuardState::FreshGranted;
+                guard.transfer_started = true;
                 guard
-                    .curr_scope
-                    .publish_pending_scope(&publication_token, LockMode::Shared);
+                    .family
+                    .publish_pending_family(&publication_token, LockMode::Shared);
+                if publish_scope {
+                    guard
+                        .curr_scope
+                        .publish_pending_scope(&publication_token, LockMode::Shared);
+                }
+
+                drop(guard);
+
+                family.assert_empty();
+                curr_scope.assert_cleared();
+                assert!(inspect_resource(&manager, resource, |_| ()).is_none());
             }
-
-            drop(guard);
-
-            family.assert_empty();
-            curr_scope.assert_cleared();
-            assert!(manager.resources.get(&resource).is_none());
         }
     }
 
     #[test]
     fn adopted_exact_grant_pins_resource_until_guard_drop() {
-        let manager = LockManager::new();
-        let resource = LockResource::TableMetadata(TableID::new(92));
-        let blocker = owner(91);
-        let blocker_token = PendingClaimToken {
-            resource,
-            owner: blocker,
-            claim_no: ClaimNo::new(1),
-        };
-        assert!(matches!(
-            manager
-                .start_pending(&blocker_token, LockMode::Exclusive)
-                .unwrap(),
-            PendingStart::Immediate
-        ));
+        for resource in resource_variants(LockResource::TableMetadata(TableID::new(92))) {
+            let manager = LockManager::new();
+            let blocker = owner(91);
+            let blocker_token = PendingClaimToken {
+                resource,
+                owner: blocker,
+                claim_no: ClaimNo::new(1),
+            };
+            assert!(matches!(
+                manager
+                    .start_pending(&blocker_token, LockMode::Exclusive)
+                    .unwrap(),
+                PendingStart::Immediate
+            ));
 
-        let mut authority = FamilyLockAuthority::new(SessionID::new(92));
-        let (family, curr_scope) = authority.parts();
-        let pending = PendingClaimToken {
-            resource,
-            owner: curr_scope.owner(),
-            claim_no: ClaimNo::new(1),
-        };
-        let PendingStart::Waiting { node_id, .. } =
-            manager.start_pending(&pending, LockMode::Shared).unwrap()
-        else {
-            panic!("conflicting fresh request must wait")
-        };
-        manager.cancel_fresh_grant(blocker_token, LockMode::Exclusive);
-        manager.observe_pending(&pending, LockMode::Shared, node_id);
-        let resource_state = manager.resources.get(&resource).unwrap();
-        assert_eq!(resource_state.wait_queue.live_count(), 0);
-        assert_eq!(resource_state.families.len(), 1);
-        assert_eq!(resource_state.granted_counts, [0, 0, 1, 0]);
-        drop(resource_state);
+            let mut authority = FamilyLockAuthority::new(SessionID::new(92));
+            let (family, curr_scope) = authority.parts();
+            let pending = PendingClaimToken {
+                resource,
+                owner: curr_scope.owner(),
+                claim_no: ClaimNo::new(1),
+            };
+            let PendingStart::Waiting { node_id, .. } =
+                manager.start_pending(&pending, LockMode::Shared).unwrap()
+            else {
+                panic!("conflicting fresh request must wait")
+            };
+            manager.cancel_fresh_grant(blocker_token, LockMode::Exclusive);
+            manager.observe_pending(&pending, LockMode::Shared, node_id);
+            inspect_resource(&manager, resource, |resource_state| {
+                assert_eq!(resource_state.wait_queue.live_count(), 0);
+                assert_eq!(resource_state.families.len(), 1);
+                assert_eq!(resource_state.granted_counts, [0, 0, 1, 0]);
+            })
+            .unwrap();
 
-        let mut guard = PendingClaimGuard::new(
-            &manager,
-            healthy_test_poisoner(),
-            family,
-            curr_scope,
-            pending,
-            LockMode::Shared,
-            false,
-        );
-        guard.state = PendingGuardState::FreshGranted;
-        drop(guard);
+            let mut guard = PendingClaimGuard::new(
+                &manager,
+                healthy_test_poisoner(),
+                family,
+                curr_scope,
+                pending,
+                LockMode::Shared,
+                false,
+            );
+            guard.state = PendingGuardState::FreshGranted;
+            drop(guard);
 
-        family.assert_empty();
-        curr_scope.assert_cleared();
-        assert!(manager.resources.get(&resource).is_none());
+            family.assert_empty();
+            curr_scope.assert_cleared();
+            assert!(inspect_resource(&manager, resource, |_| ()).is_none());
+        }
     }
 }
