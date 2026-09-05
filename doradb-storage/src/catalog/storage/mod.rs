@@ -839,24 +839,6 @@ impl CatalogStorage {
         let mut rows = Vec::new();
         let mut primary_keys = FastHashSet::default();
         for entry in entries {
-            debug_assert!(
-                {
-                    let delete_deltas = column_index
-                        .load_delete_deltas(&entry)
-                        .await
-                        .change_context(RuntimeError::CatalogAccess)
-                        .attach_with(|| {
-                            format!(
-                                "operation=load_catalog_rows_from_root, phase=load_delete_deltas, table_id={}, block_id={}",
-                                root.table_id,
-                                entry.block_id()
-                            )
-                        })?;
-                    delete_deltas.is_empty()
-                },
-                "catalog root should not contain delete deltas: start_row_id={}",
-                entry.start_row_id
-            );
             let page_rows = self
                 .decode_lwc_page_rows(
                     metadata,
@@ -964,15 +946,23 @@ impl CatalogStorage {
             .fetch_add(1, Ordering::Relaxed);
         let lwc_block = persisted.block();
         let row_count = lwc_block.row_count();
-        let row_ids = column_index
-            .load_entry_row_ids(entry)
+        let (delete_deltas, row_ids) = column_index
+            .load_delete_deltas_and_row_ids(entry)
             .await
             .change_context(RuntimeError::CatalogAccess)
             .attach_with(|| {
                 format!(
-                    "operation=decode_catalog_lwc_page_rows, phase=load_row_ids, block_id={block_id}"
+                    "operation=decode_catalog_lwc_page_rows, phase=load_row_shape, block_id={block_id}"
                 )
             })?;
+        if !delete_deltas.is_empty() {
+            return Err(Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
+                "catalog root contains delete deltas: table_id={table_id}, block_id={block_id}, delete_count={}",
+                delete_deltas.len()
+            )))
+            .change_context(RuntimeError::CatalogAccess)
+            .attach("operation=decode_catalog_lwc_page_rows, phase=validate_delete_deltas");
+        }
         if row_count != row_ids.len() {
             return Err(
                 Report::new(DataIntegrityError::InvalidPayload).attach(format!(
@@ -1789,7 +1779,8 @@ pub(crate) mod tests {
             &disk_pool_guard,
         );
         for entry in entries {
-            assert!(index.load_delete_deltas(&entry).await.unwrap().is_empty());
+            let (delete_deltas, _) = index.load_delete_deltas_and_row_ids(&entry).await.unwrap();
+            assert!(delete_deltas.is_empty());
         }
         rows
     }
@@ -2219,10 +2210,8 @@ pub(crate) mod tests {
         }
     }
 
-    #[cfg(debug_assertions)]
     #[test]
-    #[should_panic(expected = "catalog root should not contain delete deltas")]
-    fn test_catalog_root_loader_debug_asserts_delete_deltas() {
+    fn test_catalog_root_loader_rejects_delete_deltas() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
@@ -2247,10 +2236,25 @@ pub(crate) mod tests {
 
             let disk_pool_guard = storage.disk_pool.create_base_guard();
             let measurement = catalog_measurement(storage);
-            storage
+            let err = storage
                 .load_rows_from_root(table.metadata(), &disk_pool_guard, root, &measurement)
                 .await
-                .unwrap();
+                .unwrap_err();
+            assert_eq!(*err.current_context(), RuntimeError::CatalogAccess);
+            assert_eq!(
+                err.downcast_ref::<DataIntegrityError>().copied(),
+                Some(DataIntegrityError::InvalidRootInvariant)
+            );
+            let report = format!("{err:?}");
+            assert!(
+                report.contains("catalog root contains delete deltas"),
+                "{report}"
+            );
+            assert!(
+                report.contains(&format!("table_id={TABLE_ID_TABLES}")),
+                "{report}"
+            );
+            assert!(report.contains("delete_count=1"), "{report}");
         });
     }
 
@@ -2585,10 +2589,10 @@ pub(crate) mod tests {
                     .iter()
                     .find(|stats| stats.table_id == table_id)
                     .unwrap();
-                // In a debug build one single-block root costs its root read,
-                // LWC read, row-ID read, and delete-delta assertion read. A
-                // second projected validation pass would double this value.
-                assert_eq!(stats.compact_bytes_read, 4 * COW_FILE_PAGE_SIZE);
+                // One single-block root costs its root read, LWC read, and one
+                // combined delete-delta/row-ID read. A second projected
+                // validation pass would double this value.
+                assert_eq!(stats.compact_bytes_read, 3 * COW_FILE_PAGE_SIZE);
                 assert_eq!(stats.final_compact_bytes, 2 * COW_FILE_PAGE_SIZE);
             }
         });

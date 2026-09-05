@@ -10361,7 +10361,7 @@ mod tests {
             let pool_guards = session.pool_guards();
             let index = snapshot.index(pool_guards.disk_guard());
             let entry = index.locate_block(row_id).await.unwrap().unwrap();
-            let deltas = index.load_delete_deltas(&entry).await.unwrap();
+            let (deltas, _) = index.load_delete_deltas_and_row_ids(&entry).await.unwrap();
             assert!(deltas.contains(&((row_id - entry.start_row_id) as u32)));
 
             let mut trx = session.begin_trx().unwrap();

@@ -4951,7 +4951,7 @@ mod tests {
                     .await
                     .unwrap()
                     .expect("deleted row should still have a checkpoint entry");
-                let err = match index.load_delete_deltas(&entry).await {
+                let err = match index.load_delete_deltas_and_row_ids(&entry).await {
                     Ok(_) => panic!("expected invalid delete blob on delta load"),
                     Err(err) => err,
                 };

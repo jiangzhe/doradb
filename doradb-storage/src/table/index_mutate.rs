@@ -952,7 +952,10 @@ mod tests {
             let snapshot = column_block_index_snapshot(&engine, table_id);
             let column_index = snapshot.index(pool_guards.disk_guard());
             let entry = column_index.locate_block(row_id).await.unwrap().unwrap();
-            let delete_deltas = column_index.load_delete_deltas(&entry).await.unwrap();
+            let (delete_deltas, _) = column_index
+                .load_delete_deltas_and_row_ids(&entry)
+                .await
+                .unwrap();
             assert!(delete_deltas.contains(&((row_id - entry.start_row_id) as u32)));
 
             table.deletion_buffer().remove(row_id);
