@@ -474,7 +474,10 @@ completion. Backlog
 subsequently implemented and benchmark-validated by standalone task 000296.
 Open follow-ups:
 
-- `docs/backlogs/000191-generalize-public-callback-error-boundaries.md` — generalize engine/user callback errors.
+- [Task 000297](../tasks/000297-generalize-public-callback-error-boundaries.md)
+  completed backlog 000191 by generalizing engine/user callback errors across
+  managed DDL and programmable row APIs. This standalone follow-up adds no RFC
+  phase and leaves the completed phase contracts unchanged.
 - `docs/backlogs/000192-cache-managed-table-definitions-in-current-catalog-state.md`
   — Phase 7 deferred coherent online definition caching beside current runtime
   metadata; hydrate after recovery validation and retain durable descriptors.

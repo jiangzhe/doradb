@@ -13,7 +13,10 @@ use crate::workload::util::{
 };
 use crate::workload::{RunCancellation, SessionPlan};
 use doradb_storage::id::TableID;
-use doradb_storage::{Engine, IndexID, RowMutation, Session, TableIndex, UpdateCol, Val};
+use doradb_storage::{
+    CallbackError, CallbackResult, Engine, IndexID, RowMutation, Session, TableIndex, UpdateCol,
+    Val,
+};
 
 const SPLITMIX_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
 const UPDATE_RANGE_SALT: u64 = 0xd743_8f29_51ce_6a0b;
@@ -375,40 +378,29 @@ async fn run_update_operations(
         let mut trx = session.begin_trx()?;
         let lower = [Val::from(range.start)];
         let upper = [Val::from(range_end)];
-        let mut callback_error = None;
         let mutation_result = trx
             .table_index_mutate_mvcc(
                 TableIndex(spec.table_id, IndexID::new(0)),
                 &lower[..]..&upper[..],
-                |row| {
-                    if callback_error.is_some() {
-                        return Ok(RowMutation::Skip);
-                    }
-                    let Some(key) = row.val(0)?.as_u64() else {
-                        callback_error = Some(BenchError::message(
+                |row| -> CallbackResult<_, BenchError> {
+                    let key = row.val(0)?.as_u64().ok_or_else(|| {
+                        CallbackError::User(BenchError::message(
                             "update callback logical key is not u64",
-                        ));
-                        return Ok(RowMutation::Skip);
-                    };
-                    let base_offset = match domain_offset(key, spec.source_domain) {
-                        Ok(offset) => offset,
-                        Err(error) => {
-                            callback_error = Some(error);
-                            return Ok(RowMutation::Skip);
-                        }
-                    };
+                        ))
+                    })?;
+                    let base_offset =
+                        domain_offset(key, spec.source_domain).map_err(CallbackError::User)?;
                     let preferred = generate_update_payload(
                         base_offset,
                         spec.seed,
                         spec.value_size,
                         payload_variant,
                     );
-                    let Some(current_payload) = row.val(1)?.as_bytes() else {
-                        callback_error = Some(BenchError::message(
+                    let current_payload = row.val(1)?.as_bytes().ok_or_else(|| {
+                        CallbackError::User(BenchError::message(
                             "update callback payload is not variable bytes",
-                        ));
-                        return Ok(RowMutation::Skip);
-                    };
+                        ))
+                    })?;
                     let payload = if current_payload == preferred.as_slice() {
                         generate_update_payload(
                             base_offset,
@@ -421,14 +413,8 @@ async fn run_update_operations(
                     };
                     let mut update = Vec::with_capacity(usize::from(spec.change_key) + 1);
                     if spec.change_key {
-                        let mapped_key = match key_at_domain_offset(spec.target_domain, base_offset)
-                        {
-                            Ok(key) => key,
-                            Err(error) => {
-                                callback_error = Some(error);
-                                return Ok(RowMutation::Skip);
-                            }
-                        };
+                        let mapped_key = key_at_domain_offset(spec.target_domain, base_offset)
+                            .map_err(CallbackError::User)?;
                         update.push(UpdateCol {
                             idx: 0,
                             val: Val::from(mapped_key),
@@ -442,10 +428,6 @@ async fn run_update_operations(
                 },
             )
             .await;
-        if let Some(error) = callback_error {
-            let _ = trx.rollback().await;
-            return Err(error);
-        }
         let outcome = match mutation_result {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -545,6 +527,11 @@ mod tests {
     use super::*;
     use crate::fixture::IndexMode;
     use crate::workload::util::generate_insert_keys;
+    use doradb_storage::{
+        EngineConfig, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
+        StorageIndexSpec, StorageTableSpec, ValKind,
+    };
+    use tempfile::TempDir;
 
     fn collect_ranges(mut generator: RandomUpdateRangeGenerator) -> Vec<KeyRange> {
         let mut ranges = Vec::new();
@@ -552,6 +539,80 @@ mod tests {
             ranges.push(range);
         }
         ranges
+    }
+
+    #[test]
+    fn update_callback_failure_rolls_back_preceding_rows_and_releases_transaction() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let table_id = session
+                .create_table(
+                    StorageTableSpec::new(vec![
+                        StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
+                        StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
+                    ]),
+                    vec![StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(0)],
+                        StorageIndexFlags::UK,
+                    )],
+                )
+                .await
+                .unwrap()
+                .table_id();
+            let mut trx = session.begin_trx().unwrap();
+            for key in 0..3u64 {
+                trx.table_insert_mvcc(
+                    table_id,
+                    vec![Val::from(key), Val::from(b"original".as_slice())],
+                )
+                .await
+                .unwrap();
+            }
+            trx.commit().await.unwrap();
+            let result = run_update_operations(
+                &mut session,
+                UpdateOperationSpec {
+                    table_id,
+                    seed: 7,
+                    value_size: 16,
+                    batch_size: 3,
+                    change_key: false,
+                    source_domain: KeyRange { start: 0, len: 1 },
+                    target_domain: KeyRange { start: 0, len: 1 },
+                },
+                &SessionPlan {
+                    session_index: 0,
+                    key_start: 0,
+                    number: 3,
+                },
+                KeyRange { start: 0, len: 3 },
+                false,
+                None,
+                None,
+            )
+            .await;
+            assert!(
+                matches!(result, Err(BenchError::Message(message)) if message == "update callback key is outside its source domain")
+            );
+            let mut trx = session.begin_trx().unwrap();
+            for key in 0..3u64 {
+                let row = trx
+                    .table_lookup_unique_mvcc(
+                        TableIndex(table_id, IndexID::new(0)),
+                        &[Val::from(key)],
+                        &[1],
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap_found();
+                assert_eq!(row, vec![Val::from(b"original".as_slice())]);
+            }
+            trx.rollback().await.unwrap();
+        });
     }
 
     #[test]

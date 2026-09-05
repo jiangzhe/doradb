@@ -1,7 +1,7 @@
 use doradb_storage::{
-    Engine, EngineConfig, IndexID, ScanRowDecision, StorageColumnFlags, StorageColumnSpec,
-    StorageIndexFlags, StorageIndexKey, StorageIndexSpec, StorageTableSpec, TableIndex, UpdateCol,
-    Val, ValKind,
+    CallbackResult, Engine, EngineConfig, IndexID, ScanRowDecision, StorageColumnFlags,
+    StorageColumnSpec, StorageIndexFlags, StorageIndexKey, StorageIndexSpec, StorageTableSpec,
+    TableIndex, UpdateCol, Val, ValKind,
 };
 use futures::executor;
 use std::error::Error;
@@ -78,7 +78,9 @@ async fn run() -> ExampleResult<()> {
     let mut scanned_rows = Vec::new();
     // Stream visible rows from the table.
     let mut table_stream = read_trx
-        .table_scan_mvcc_stream(table_id, &[0, 1], |_| Ok(ScanRowDecision::Include))
+        .table_scan_mvcc_stream(table_id, &[0, 1], |_| -> CallbackResult<_> {
+            Ok(ScanRowDecision::Include)
+        })
         .await?;
     while let Some(vals) = table_stream.next().await? {
         scanned_rows.push(row_pair(vals));

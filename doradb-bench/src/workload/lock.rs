@@ -11,7 +11,7 @@ use crate::workload::util::{
 };
 use crate::workload::{RunCancellation, SessionPlan};
 use doradb_storage::id::TableID;
-use doradb_storage::{Engine, ScanRowDecision, Session, TableLockMode};
+use doradb_storage::{CallbackResult, Engine, ScanRowDecision, Session, TableLockMode};
 use smol::channel;
 use smol::future::or;
 use std::sync::{Arc, Mutex};
@@ -369,7 +369,9 @@ async fn run_specialized_lifecycle(
             let mut trx = session.begin_trx()?;
             let scan_result = async {
                 let mut stream = trx
-                    .table_scan_mvcc_stream(table_id, &[0], |_| Ok(ScanRowDecision::Include))
+                    .table_scan_mvcc_stream(table_id, &[0], |_| -> CallbackResult<_> {
+                        Ok(ScanRowDecision::Include)
+                    })
                     .await?;
                 while stream.next().await?.is_some() {}
                 Ok::<(), BenchError>(())

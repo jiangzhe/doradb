@@ -18,9 +18,9 @@ use doradb_storage::id::TableID;
 use doradb_storage::{
     BindingNamespaceID, CatalogCheckpointOutcome, CatalogCheckpointReport, CreateIndexDefinition,
     CreateTableDefinition, DescriptorUpdate, DropIndexDefinition, Engine, IndexID,
-    MAX_TABLE_DESCRIPTOR_BYTES, ManagedCreateTableDefinition, ManagedDdlError, ManagedDdlResult,
-    ManagedTableInterpreter, ManagedTableOps, Session, StorageIndexFlags,
-    StorageIndexKeyByColumnId, StorageTableDefinition, TableBinding,
+    MAX_TABLE_DESCRIPTOR_BYTES, ManagedCreateTableDefinition, ManagedTableInterpreter,
+    ManagedTableOps, Session, StorageIndexFlags, StorageIndexKeyByColumnId, StorageTableDefinition,
+    TableBinding,
 };
 use std::result::Result as StdResult;
 
@@ -452,11 +452,10 @@ async fn prepare_catalog_fixture(
             descriptor: Some(descriptor),
             bindings: Some(bindings),
         };
-        let outcome = managed_result(
-            session
-                .create_managed_table(&source, &mut interpreter)
-                .await,
-        )?;
+        let outcome = (session
+            .create_managed_table(&source, &mut interpreter)
+            .await)
+            .map_err(BenchError::from)?;
         let (table_id, index_ids) = outcome.into_parts();
         if !index_ids.is_empty() {
             return Err(BenchError::message(
@@ -489,11 +488,10 @@ async fn prepare_catalog_fixture(
                 descriptor: Some(Vec::new()),
                 bindings: Some(deterministic_bindings(ordinal)),
             };
-            let outcome = managed_result(
-                session
-                    .create_managed_table(&source, &mut interpreter)
-                    .await,
-            )?;
+            let outcome = (session
+                .create_managed_table(&source, &mut interpreter)
+                .await)
+                .map_err(BenchError::from)?;
             let (table_id, index_ids) = outcome.into_parts();
             if !index_ids.is_empty() {
                 return Err(BenchError::message(
@@ -504,15 +502,14 @@ async fn prepare_catalog_fixture(
         }
         CatalogCheckpointCase::ManagedIndexCreate => {
             let mut interpreter = CreateScaleIndexInterpreter;
-            managed_result(
-                session
-                    .create_managed_index(
-                        index_probe_id,
-                        b"catalog-checkpoint-index",
-                        &mut interpreter,
-                    )
-                    .await,
-            )?;
+            (session
+                .create_managed_index(
+                    index_probe_id,
+                    b"catalog-checkpoint-index",
+                    &mut interpreter,
+                )
+                .await)
+                .map_err(BenchError::from)?;
             let resolved = session
                 .resolve_table_binding(
                     BINDING_NAMESPACE,
@@ -814,17 +811,11 @@ fn verify_changed_tables_have_io(report: &CatalogCheckpointReport) -> Result<()>
     Ok(())
 }
 
-fn managed_result<T>(result: ManagedDdlResult<T, BenchError>) -> Result<T> {
-    result.map_err(|error| match error {
-        ManagedDdlError::Engine(error) => BenchError::from(error),
-        ManagedDdlError::Interpreter(error) => error,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::measurement::SampledProcessRss;
+    use doradb_storage::CallbackError;
     use doradb_storage::id::TrxID;
     use doradb_storage::{
         CatalogTableCheckpointChange, CatalogTableCheckpointIoStats, ColumnID, EngineConfig,
@@ -1781,13 +1772,12 @@ mod tests {
             ] {
                 let mut interpreter = table_interpreter(ordinal, Vec::new());
                 interpreter.bindings = Some(bindings);
-                let (table_id, indexes) = managed_result(
-                    session
-                        .create_managed_table(&ordinal.to_le_bytes(), &mut interpreter)
-                        .await,
-                )
-                .unwrap()
-                .into_parts();
+                let (table_id, indexes) = (session
+                    .create_managed_table(&ordinal.to_le_bytes(), &mut interpreter)
+                    .await)
+                    .map_err(BenchError::from)
+                    .unwrap()
+                    .into_parts();
                 assert!(indexes.is_empty());
                 let probe = if ordinal == 14 { 13 } else { ordinal as usize };
                 let result = verify_probe_bindings(&mut session, table_id, probe).await;
@@ -1806,30 +1796,25 @@ mod tests {
                 )
                 .await
                 .unwrap_err();
-            let ManagedDdlError::Engine(error) = error else {
+            let CallbackError::Engine(error) = error else {
                 panic!("expected an engine error")
             };
             let kind = error.kind();
             let diagnostic = format!("{error:?}");
-            let mapped: Result<()> = managed_result(Err(ManagedDdlError::Engine(error)));
-            let BenchError::Storage(error) = mapped.unwrap_err() else {
+            let mapped = BenchError::from(CallbackError::<BenchError>::Engine(error));
+            let BenchError::Storage(error) = mapped else {
                 panic!("expected a storage error")
+            };
+            assert_eq!(error.kind(), kind);
+            assert_eq!(format!("{error:?}"), diagnostic);
+            let callback: CallbackError = CallbackError::Engine(error);
+            let BenchError::Storage(error) = BenchError::from(callback) else {
+                panic!("expected engine-only callback to preserve storage error")
             };
             assert_eq!(error.kind(), kind);
             assert_eq!(format!("{error:?}"), diagnostic);
             session.close().await.unwrap();
             engine.shutdown();
         });
-    }
-
-    #[test]
-    fn managed_results_preserve_success_and_interpreter_errors() {
-        assert_eq!(managed_result(Ok(42)).unwrap(), 42);
-        let result: Result<()> = managed_result(Err(ManagedDdlError::Interpreter(
-            BenchError::message("interpreter marker"),
-        )));
-        assert!(
-            matches!(result, Err(BenchError::Message(message)) if message == "interpreter marker")
-        );
     }
 }

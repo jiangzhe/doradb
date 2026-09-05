@@ -11,8 +11,8 @@ use super::access::{
 use crate::buffer::guard::PageSharedGuard;
 use crate::catalog::IndexRef;
 use crate::error::{
-    DataIntegrityError, DiscloseError, DiscloseResultExt, MultiDomainResultExt, OperationError,
-    Result,
+    CallbackResult, DataIntegrityError, DiscloseError, DiscloseResultExt, MultiDomainResultExt,
+    OperationError, Result,
 };
 use crate::id::{PageID, RowID};
 use crate::index::{LwcRowLocation, RowLocation};
@@ -64,15 +64,15 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
     }
 
     /// Resolves and mutates one candidate, restarting its physical route after waits.
-    pub(super) async fn mutate_index_candidate<F>(
+    pub(super) async fn mutate_index_candidate<F, E>(
         &mut self,
         candidate: BoundIndexCandidate<'_>,
         row_buffer: &mut LazyRowBuffer,
         outcome: &mut TableMutationOutcome,
         mutate_row: &mut F,
-    ) -> Result<()>
+    ) -> CallbackResult<(), E>
     where
-        F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<RowMutation>,
+        F: for<'row> FnMut(&mut LazyRow<'row>) -> CallbackResult<RowMutation, E>,
     {
         loop {
             let location = self
@@ -103,16 +103,16 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
     }
 
     /// Acquires one hot candidate and applies its callback while ownership is held.
-    async fn mutate_hot_index_candidate<F>(
+    async fn mutate_hot_index_candidate<F, E>(
         &mut self,
         candidate: &BoundIndexCandidate<'_>,
         page_id: PageID,
         row_buffer: &mut LazyRowBuffer,
         outcome: &mut TableMutationOutcome,
         mutate_row: &mut F,
-    ) -> Result<CandidateProgress>
+    ) -> CallbackResult<CandidateProgress, E>
     where
-        F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<RowMutation>,
+        F: for<'row> FnMut(&mut LazyRow<'row>) -> CallbackResult<RowMutation, E>,
     {
         let accessor = self.accessor;
         let Some(page_guard) = accessor
@@ -145,7 +145,8 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                         "index-driven mutation hot-row ownership: row_id={}",
                         candidate.row_id
                     ))
-                    .disclose());
+                    .disclose()
+                    .into());
             }
             LockRowForWrite::RetryInTransition => {
                 drop(locked);
@@ -191,16 +192,16 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
     }
 
     /// Validates, claims, and mutates one persisted candidate.
-    async fn mutate_cold_index_candidate<F>(
+    async fn mutate_cold_index_candidate<F, E>(
         &mut self,
         candidate: &BoundIndexCandidate<'_>,
         location: LwcRowLocation,
         row_buffer: &mut LazyRowBuffer,
         outcome: &mut TableMutationOutcome,
         mutate_row: &mut F,
-    ) -> Result<CandidateProgress>
+    ) -> CallbackResult<CandidateProgress, E>
     where
-        F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<RowMutation>,
+        F: for<'row> FnMut(&mut LazyRow<'row>) -> CallbackResult<RowMutation, E>,
     {
         let accessor = self.accessor;
         let LwcRowLocation {
@@ -221,7 +222,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                 .attach(format!(
                     "file={file_kind}, block=lwc_block, block_id={block_id}, row shape fingerprint mismatch"
                 ))
-                .disclose());
+                .disclose().into());
         }
         let index_spec = accessor
             .metadata()
@@ -249,7 +250,8 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                         "index-driven mutation cold-row ownership: row_id={}",
                         candidate.row_id
                     ))
-                    .disclose());
+                    .disclose()
+                    .into());
             }
             ColdLatestRow::Preparing(listener) => {
                 drop(persisted);
@@ -279,7 +281,8 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                         "index-driven mutation cold-row ownership: row_id={}",
                         candidate.row_id
                     ))
-                    .disclose());
+                    .disclose()
+                    .into());
             }
         }
         self.effects.push_row_undo(OwnedRowUndo::new(
@@ -360,7 +363,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
     }
 
     /// Applies the callback and selected action to an already-owned hot row.
-    async fn mutate_owned_hot_index_candidate<F>(
+    async fn mutate_owned_hot_index_candidate<F, E>(
         &mut self,
         candidate: &BoundIndexCandidate<'_>,
         page_guard: &PageSharedGuard<RowPage>,
@@ -368,9 +371,9 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
         row_buffer: &mut LazyRowBuffer,
         outcome: &mut TableMutationOutcome,
         mutate_row: &mut F,
-    ) -> Result<Option<WriteIndexKeySet<'op>>>
+    ) -> CallbackResult<Option<WriteIndexKeySet<'op>>, E>
     where
-        F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<RowMutation>,
+        F: for<'row> FnMut(&mut LazyRow<'row>) -> CallbackResult<RowMutation, E>,
     {
         let accessor = self.accessor;
         let source = LazyRowSource::HotWrite {
@@ -699,6 +702,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
 
 #[cfg(test)]
 mod tests {
+    use crate::CallbackResult;
     use crate::catalog::tests::{table3, table4};
     use crate::error::{DiscloseResultExt, OperationError};
     use crate::index::{IndexInsert, RowLocation};
@@ -803,7 +807,7 @@ mod tests {
         let mut mutation = Box::pin(writer.table_index_mutate_mvcc(
             crate::TableIndex(table_id, crate::IndexID::new(0)),
             ..,
-            |row| {
+            |row| -> CallbackResult<_> {
                 assert_eq!(row.val(0)?.as_i32(), Some(1));
                 Ok(RowMutation::Update(vec![UpdateCol {
                     idx: 0,
@@ -866,7 +870,7 @@ mod tests {
                 .table_index_mutate_mvcc(
                     crate::TableIndex(table_id, crate::IndexID::new(0)),
                     ..,
-                    |row| {
+                    |row| -> CallbackResult<_> {
                         callbacks += 1;
                         Ok(match row.val(0)?.as_i32().unwrap() {
                             0 => RowMutation::Update(vec![UpdateCol {
@@ -973,7 +977,7 @@ mod tests {
                 .table_index_mutate_mvcc(
                     crate::TableIndex(table_id, crate::IndexID::new(0)),
                     &range_key[..]..=&range_key[..],
-                    |_| {
+                    |_| -> CallbackResult<_> {
                         callbacks += 1;
                         Ok(RowMutation::Skip)
                     },
@@ -1002,7 +1006,7 @@ mod tests {
                 .table_index_mutate_mvcc(
                     crate::TableIndex(table_id, crate::IndexID::new(0)),
                     ..,
-                    |row| {
+                    |row| -> CallbackResult<_> {
                         let id = row.val(0)?.as_i32().unwrap();
                         callbacks.push(id);
                         Ok(RowMutation::Update(vec![UpdateCol {
@@ -1057,7 +1061,7 @@ mod tests {
                 .table_index_mutate_mvcc(
                     crate::TableIndex(table_id, crate::IndexID::new(0)),
                     ..,
-                    |row| {
+                    |row| -> CallbackResult<_> {
                         assert_eq!(row.val(0)?.as_str(), Some("old"));
                         Ok(RowMutation::Update(vec![UpdateCol {
                             idx: 0,
@@ -1113,7 +1117,7 @@ mod tests {
                 .table_index_mutate_mvcc(
                     crate::TableIndex(table_id, crate::IndexID::new(0)),
                     ..,
-                    |row| {
+                    |row| -> CallbackResult<_> {
                         let id = row.val(0)?.as_i32().unwrap();
                         callbacks.push(id);
                         Ok(RowMutation::Update(vec![UpdateCol {
@@ -1127,6 +1131,8 @@ mod tests {
             assert_eq!(
                 result
                     .unwrap_err()
+                    .engine()
+                    .unwrap()
                     .report()
                     .downcast_ref::<OperationError>()
                     .copied(),
@@ -1164,7 +1170,7 @@ mod tests {
                 .table_index_mutate_mvcc(
                     crate::TableIndex(table_id, crate::IndexID::new(0)),
                     ..,
-                    |row| {
+                    |row| -> CallbackResult<_> {
                         let id = row.val(0)?.as_i32().unwrap();
                         callbacks.push(id);
                         Ok(RowMutation::Update(vec![UpdateCol {
@@ -1218,7 +1224,7 @@ mod tests {
             let mut mutation = Box::pin(writer.table_index_mutate_mvcc(
                 crate::TableIndex(table_id, crate::IndexID::new(0)),
                 ..,
-                |_| {
+                |_| -> CallbackResult<_> {
                     Ok(RowMutation::Update(vec![UpdateCol {
                         idx: 0,
                         val: Val::from(101i32),
@@ -1254,7 +1260,7 @@ mod tests {
             let mut mutation = Box::pin(writer.table_index_mutate_mvcc(
                 crate::TableIndex(table_id, crate::IndexID::new(0)),
                 ..,
-                |_| {
+                |_| -> CallbackResult<_> {
                     Ok(RowMutation::Update(vec![UpdateCol {
                         idx: 0,
                         val: Val::from(101i32),
@@ -1314,7 +1320,7 @@ mod tests {
                 .table_index_mutate_mvcc(
                     crate::TableIndex(table_id, crate::IndexID::new(1)),
                     &lower[..]..=&upper[..],
-                    |row| {
+                    |row| -> CallbackResult<_> {
                         callbacks += 1;
                         let value = row.val(1)?.as_i32().unwrap();
                         Ok(RowMutation::Update(vec![UpdateCol {
@@ -1340,7 +1346,9 @@ mod tests {
 
             let mut reader = session.begin_trx().unwrap();
             let mut stream = reader
-                .table_scan_mvcc_stream(table_id, &[0, 1], |_| Ok(ScanRowDecision::Include))
+                .table_scan_mvcc_stream(table_id, &[0, 1], |_| -> CallbackResult<_> {
+                    Ok(ScanRowDecision::Include)
+                })
                 .await
                 .unwrap();
             let mut rows = Vec::new();
@@ -1379,7 +1387,7 @@ mod tests {
                 .table_index_mutate_mvcc(
                     crate::TableIndex(table_id, crate::IndexID::new(0)),
                     ..,
-                    |row| {
+                    |row| -> CallbackResult<_> {
                         Ok(match row.val(0)?.as_i32().unwrap() {
                             0 => RowMutation::Skip,
                             10 => RowMutation::Update(Vec::new()),
@@ -1438,7 +1446,7 @@ mod tests {
                 .table_index_mutate_mvcc(
                     crate::TableIndex(table_id, crate::IndexID::new(0)),
                     ..,
-                    |row| {
+                    |row| -> CallbackResult<_> {
                         callbacks += 1;
                         assert_eq!(row.val(0)?.as_i32(), Some(7));
                         Ok(RowMutation::Skip)
@@ -1454,7 +1462,7 @@ mod tests {
                 .table_index_mutate_mvcc(
                     crate::TableIndex(table_id, crate::IndexID::new(0)),
                     ..,
-                    |row| {
+                    |row| -> CallbackResult<_> {
                         later_callbacks += 1;
                         assert_eq!(row.val(0)?.as_i32(), Some(7));
                         Ok(RowMutation::Skip)
@@ -1494,7 +1502,7 @@ mod tests {
                 .table_index_mutate_mvcc(
                     crate::TableIndex(table_id, crate::IndexID::new(0)),
                     &key[..]..=&key[..],
-                    |_| {
+                    |_| -> CallbackResult<_> {
                         callbacks += 1;
                         Ok(RowMutation::Skip)
                     },
@@ -1503,6 +1511,8 @@ mod tests {
             assert_eq!(
                 result
                     .unwrap_err()
+                    .engine()
+                    .unwrap()
                     .report()
                     .downcast_ref::<OperationError>()
                     .copied(),
@@ -1549,7 +1559,7 @@ mod tests {
                 .table_index_mutate_mvcc(
                     crate::TableIndex(table_id, crate::IndexID::new(0)),
                     &old_key[..]..=&old_key[..],
-                    |_| {
+                    |_| -> CallbackResult<_> {
                         callbacks += 1;
                         Ok(RowMutation::Skip)
                     },
@@ -1558,6 +1568,8 @@ mod tests {
             assert_eq!(
                 result
                     .unwrap_err()
+                    .engine()
+                    .unwrap()
                     .report()
                     .downcast_ref::<OperationError>()
                     .copied(),
@@ -1599,7 +1611,7 @@ mod tests {
                     .table_index_mutate_mvcc(
                         crate::TableIndex(table_id, crate::IndexID::new(0)),
                         &key[..]..=&key[..],
-                        |_| {
+                        |_| -> CallbackResult<_> {
                             callbacks.fetch_add(1, Ordering::SeqCst);
                             Ok(RowMutation::Skip)
                         },
