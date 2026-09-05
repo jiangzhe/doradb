@@ -1,11 +1,21 @@
 use crate::error::{BenchError, Result};
+use crate::fixture::CatalogCardinalities;
+use crate::plan::{CatalogCheckpointCase, CatalogCheckpointProfile};
+use doradb_storage::CatalogCheckpointReport;
 use hdrhistogram::Histogram;
 use quanta::{Clock, Instant};
+use rustix::param::page_size;
 use serde::de::Error as DeserializeError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
+use std::fs;
+use std::path::Path;
 use std::result::Result as StdResult;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 const LOWEST_LATENCY_NANOS: u64 = 1;
 const HIGHEST_LATENCY_NANOS: u64 = 3_600_000_000_000;
@@ -115,6 +125,10 @@ pub enum LatencyUnit {
     TableFreeze,
     /// One public table-checkpoint retry lifecycle through publication.
     TableCheckpoint,
+    /// One complete deterministic catalog population and pending public DDL setup.
+    CatalogCheckpointPreparation,
+    /// One public catalog checkpoint through durable publication.
+    CatalogCheckpoint,
 }
 
 impl fmt::Display for LatencyUnit {
@@ -139,12 +153,14 @@ impl fmt::Display for LatencyUnit {
             Self::TableLockOperationLifecycle => "table-lock-operation-lifecycle",
             Self::TableFreeze => "table-freeze",
             Self::TableCheckpoint => "table-checkpoint",
+            Self::CatalogCheckpointPreparation => "catalog-checkpoint-preparation",
+            Self::CatalogCheckpoint => "catalog-checkpoint",
         })
     }
 }
 
 /// Strict workload-specific metrics retained beside generic counters and latency.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum WorkloadMetrics {
     /// Requested and realized shared-snapshot table-scan partition counts.
@@ -176,6 +192,118 @@ pub enum WorkloadMetrics {
         #[serde(with = "u128_decimal")]
         retry_wait_elapsed_nanos: u128,
     },
+    /// Deterministic catalog state, process RSS, and public checkpoint report.
+    CatalogCheckpoint {
+        /// Fixed deterministic population profile.
+        profile: CatalogCheckpointProfile,
+        /// Public managed DDL effect included in the checkpoint.
+        case: CatalogCheckpointCase,
+        /// Equivalent baseline cardinalities before the pending DDL effect.
+        before: CatalogCardinalities,
+        /// Cardinalities after applying the pending DDL effect.
+        final_state: CatalogCardinalities,
+        /// Sampled process-RSS measurements around the checkpoint.
+        sampled_process_rss: SampledProcessRss,
+        /// Checkpoint-owned logical image and successful-write measurement.
+        checkpoint: CatalogCheckpointReport,
+    },
+}
+
+/// Benchmark-local sampled process resident-set measurements.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SampledProcessRss {
+    /// Synchronous RSS sample immediately before starting the sampler.
+    pub baseline_bytes: usize,
+    /// Greatest one-millisecond or terminal synchronous RSS sample.
+    pub peak_bytes: usize,
+    /// Saturating sampled peak above the pre-checkpoint baseline.
+    pub peak_above_baseline_bytes: usize,
+}
+
+/// Running one-millisecond Linux process-RSS sampler.
+pub(crate) struct ProcessRssSampler {
+    baseline_bytes: usize,
+    peak_bytes: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+    thread: JoinHandle<Result<()>>,
+}
+
+impl ProcessRssSampler {
+    /// Capture the baseline, start sampling, and wait for sampler readiness.
+    pub(crate) fn start() -> Result<Self> {
+        let baseline_bytes = current_process_rss()?;
+        let peak_bytes = Arc::new(AtomicUsize::new(baseline_bytes));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let thread_peak = Arc::clone(&peak_bytes);
+        let thread_stop = Arc::clone(&stop);
+        let thread = thread::Builder::new()
+            .name("doradb-bench-rss".to_owned())
+            .spawn(move || {
+                let first = current_process_rss();
+                match first {
+                    Ok(bytes) => {
+                        thread_peak.fetch_max(bytes, Ordering::Relaxed);
+                        let _ = ready_tx.send(Ok(()));
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        let _ = ready_tx.send(Err(message));
+                        return Err(error);
+                    }
+                }
+                while !thread_stop.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(1));
+                    let bytes = current_process_rss()?;
+                    thread_peak.fetch_max(bytes, Ordering::Relaxed);
+                }
+                Ok(())
+            })
+            .map_err(|error| {
+                BenchError::message(format!("failed to start process RSS sampler: {error}"))
+            })?;
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                baseline_bytes,
+                peak_bytes,
+                stop,
+                thread,
+            }),
+            Ok(Err(message)) => {
+                let _ = thread.join();
+                Err(BenchError::message(format!(
+                    "process RSS sampler could not read Linux procfs: {message}"
+                )))
+            }
+            Err(error) => {
+                let _ = thread.join();
+                Err(BenchError::message(format!(
+                    "process RSS sampler readiness channel closed: {error}"
+                )))
+            }
+        }
+    }
+
+    /// Take the terminal sample, stop and join the sampler, and return its peak.
+    pub(crate) fn stop(self) -> Result<SampledProcessRss> {
+        let final_sample = current_process_rss();
+        if let Ok(bytes) = &final_sample {
+            self.peak_bytes.fetch_max(*bytes, Ordering::Relaxed);
+        }
+        self.stop.store(true, Ordering::Release);
+        let thread_result = self.thread.join().map_err(|_| {
+            BenchError::message("process RSS sampler thread panicked before joining")
+        })?;
+        thread_result?;
+        final_sample?;
+        let peak_bytes = self.peak_bytes.load(Ordering::Relaxed);
+        Ok(SampledProcessRss {
+            baseline_bytes: self.baseline_bytes,
+            peak_bytes,
+            peak_above_baseline_bytes: peak_bytes.saturating_sub(self.baseline_bytes),
+        })
+    }
 }
 
 /// Exact session-local latency samples and their HDR distribution.
@@ -497,11 +625,6 @@ pub fn operations_per_second(operations: u64, elapsed_nanos: u128) -> f64 {
     }
 }
 
-fn checked_counter(left: u64, right: u64, name: &str) -> Result<u64> {
-    left.checked_add(right)
-        .ok_or_else(|| BenchError::message(format!("workload counter overflow: {name}")))
-}
-
 /// Decimal-string serde for exact values wider than TOML's signed integer.
 pub(crate) mod u128_decimal {
     use super::*;
@@ -522,9 +645,51 @@ pub(crate) mod u128_decimal {
     }
 }
 
+fn checked_counter(left: u64, right: u64, name: &str) -> Result<u64> {
+    left.checked_add(right)
+        .ok_or_else(|| BenchError::message(format!("workload counter overflow: {name}")))
+}
+
+fn current_process_rss() -> Result<usize> {
+    read_process_rss(Path::new("/proc/self/statm"), page_size())
+}
+
+fn read_process_rss(path: &Path, page_size: usize) -> Result<usize> {
+    let contents = fs::read_to_string(path).map_err(|error| {
+        BenchError::message(format!(
+            "failed to read process RSS from {}: {error}",
+            path.display()
+        ))
+    })?;
+    parse_statm_rss(&contents, page_size)
+}
+
+fn parse_statm_rss(contents: &str, page_size: usize) -> Result<usize> {
+    let resident_pages = contents
+        .split_ascii_whitespace()
+        .nth(1)
+        .ok_or_else(|| BenchError::message("/proc/self/statm has no resident-page field"))?
+        .parse::<usize>()
+        .map_err(|error| {
+            BenchError::message(format!(
+                "/proc/self/statm resident-page field is malformed: {error}"
+            ))
+        })?;
+    resident_pages.checked_mul(page_size).ok_or_else(|| {
+        BenchError::message(format!(
+            "process RSS byte count overflow: resident_pages={resident_pages}, page_size={page_size}"
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use doradb_storage::id::{TableID, TrxID};
+    use doradb_storage::{
+        CatalogCheckpointOutcome, CatalogTableCheckpointChange, CatalogTableCheckpointIoStats,
+    };
+    use tempfile::TempDir;
 
     #[test]
     fn raw_timestamp_order_is_checked() {
@@ -629,7 +794,7 @@ mod tests {
 
     #[test]
     fn workload_metrics_round_trip_strictly() {
-        let cases = [
+        let cases = vec![
             WorkloadMetrics::ParallelTableScan {
                 target_partitions: 4,
                 actual_partitions: 3,
@@ -645,9 +810,64 @@ mod tests {
                 retry_wait_count: 2,
                 retry_wait_elapsed_nanos: u128::MAX - 1,
             },
+            WorkloadMetrics::CatalogCheckpoint {
+                profile: CatalogCheckpointProfile::Small,
+                case: CatalogCheckpointCase::ManagedCreate,
+                before: CatalogCardinalities {
+                    user_tables: 1_000,
+                    columns: 2_000,
+                    indexes: 0,
+                    bindings: 10_000,
+                    descriptor_rows: 1_000,
+                    descriptor_bytes: 6_710_886,
+                },
+                final_state: CatalogCardinalities {
+                    user_tables: 1_001,
+                    columns: 2_002,
+                    indexes: 0,
+                    bindings: 10_010,
+                    descriptor_rows: 1_001,
+                    descriptor_bytes: 6_710_886,
+                },
+                sampled_process_rss: SampledProcessRss {
+                    baseline_bytes: 10,
+                    peak_bytes: 20,
+                    peak_above_baseline_bytes: 10,
+                },
+                checkpoint: CatalogCheckpointReport {
+                    outcome: CatalogCheckpointOutcome::Published {
+                        catalog_replay_start_ts: TrxID::new(42),
+                    },
+                    catalog_ddl_txn_count: 1,
+                    table_changes: vec![CatalogTableCheckpointChange {
+                        table_id: TableID::new(9),
+                        before_row_count: 1,
+                        after_row_count: 2,
+                    }]
+                    .into_boxed_slice(),
+                    table_io: vec![CatalogTableCheckpointIoStats {
+                        table_id: TableID::new(9),
+                        compact_bytes_read: 16_384,
+                        final_compact_bytes: 32_768,
+                        lwc_bytes_written: 16_384,
+                        index_bytes_written: 16_384,
+                    }]
+                    .into_boxed_slice(),
+                    metadata_bytes_written: 24_576,
+                },
+            },
         ];
         for metrics in cases {
             let encoded = toml::to_string(&metrics).unwrap();
+            if matches!(&metrics, WorkloadMetrics::CatalogCheckpoint { .. }) {
+                assert!(encoded.contains("type = \"catalog-checkpoint\""));
+                let obsolete = encoded.replacen(
+                    "type = \"catalog-checkpoint\"",
+                    "type = \"catalog-checkpoint-scale\"",
+                    1,
+                );
+                assert!(toml::from_str::<WorkloadMetrics>(&obsolete).is_err());
+            }
             assert_eq!(
                 toml::from_str::<WorkloadMetrics>(&encoded).unwrap(),
                 metrics
@@ -659,5 +879,30 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn process_rss_parser_checks_shape_and_overflow() {
+        assert_eq!(parse_statm_rss("100 7 2 1\n", 4_096).unwrap(), 28_672);
+        assert!(parse_statm_rss("100\n", 4_096).is_err());
+        assert!(parse_statm_rss("100 nope\n", 4_096).is_err());
+        assert!(parse_statm_rss("1 2\n", usize::MAX).is_err());
+    }
+
+    #[test]
+    fn process_rss_sampler_synchronizes_and_returns_a_nondecreasing_peak() {
+        let sample = ProcessRssSampler::start().unwrap().stop().unwrap();
+        assert!(sample.peak_bytes >= sample.baseline_bytes);
+        assert_eq!(
+            sample.peak_above_baseline_bytes,
+            sample.peak_bytes.saturating_sub(sample.baseline_bytes)
+        );
+    }
+
+    #[test]
+    fn process_rss_reader_rejects_unavailable_input() {
+        let temp = TempDir::new().unwrap();
+        let error = read_process_rss(&temp.path().join("missing-statm"), 4_096).unwrap_err();
+        assert!(error.to_string().contains("failed to read process RSS"));
     }
 }

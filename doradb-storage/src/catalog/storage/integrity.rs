@@ -1,16 +1,21 @@
 use super::CatalogStorage;
-use super::columns::TABLE_ID_COLUMNS;
-use super::indexes::TABLE_ID_INDEXES;
+use super::columns::{TABLE_ID_COLUMNS, column_object_from_vals};
+use super::indexes::{TABLE_ID_INDEXES, index_object_from_vals};
+use super::measure::CatalogCheckpointMeasurement;
+use super::object::{ColumnObject, IndexObject};
 use super::table_bindings::{TABLE_ID_NO_TABLE_BINDINGS, TABLE_ID_TABLE_BINDINGS};
-use super::table_descriptors::{PK_NO_TABLE_DESCRIPTORS, TABLE_ID_TABLE_DESCRIPTORS};
+use super::table_descriptors::{
+    PK_NO_TABLE_DESCRIPTORS, TABLE_ID_TABLE_DESCRIPTORS, table_descriptor_object_from_vals,
+    validate_table_descriptor_against_metadata,
+};
 use super::table_replay_silent_watermarks::TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS;
-use super::tables::TABLE_ID_TABLES;
+use super::tables::{TABLE_ID_TABLES, table_object_from_vals};
 use crate::buffer::{PoolGuard, PoolGuards};
-use crate::catalog::{CatalogIndexNo, catalog_table_slot};
+use crate::catalog::{CatalogIndexNo, catalog_table_slot, reconstruct_user_table_metadata};
 use crate::error::{DataIntegrityError, DataIntegrityResult, RuntimeError, RuntimeResult};
 use crate::file::multi_table_file::{CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc};
 use crate::id::TableID;
-use crate::map::FastHashSet;
+use crate::map::{FastHashMap, FastHashSet};
 use crate::row::RowRead;
 use crate::table::IndexLookupCriteria;
 use crate::trx::PrivateTransaction;
@@ -53,106 +58,176 @@ struct CatalogSatelliteSpec {
     parent_column: usize,
 }
 
-enum CatalogParentView<'a> {
-    Live {
-        guards: &'a PoolGuards,
-    },
-    Projected {
-        roots: &'a [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
-        disk_guard: &'a PoolGuard,
-    },
-}
-
 impl CatalogStorage {
     /// Validates the complete post-replay in-memory catalog parent relation.
     pub(crate) async fn validate_live_catalog_parent_integrity(
         &self,
         guards: &PoolGuards,
     ) -> RuntimeResult<()> {
-        self.validate_catalog_parent_integrity(CatalogParentView::Live { guards })
-            .await
-    }
-
-    /// Validates the complete not-yet-published catalog root set.
-    pub(super) async fn validate_projected_catalog_parent_integrity(
-        &self,
-        roots: &[CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
-        disk_guard: &PoolGuard,
-    ) -> RuntimeResult<()> {
-        self.validate_catalog_parent_integrity(CatalogParentView::Projected { roots, disk_guard })
-            .await
-    }
-
-    async fn validate_catalog_parent_integrity(
-        &self,
-        view: CatalogParentView<'_>,
-    ) -> RuntimeResult<()> {
         let mut parents = FastHashSet::default();
-        match &view {
-            CatalogParentView::Live { guards } => {
-                self.visit_live_catalog_parent_column(
-                    guards,
-                    TABLE_ID_TABLES,
-                    0,
-                    "live",
-                    |table_id| {
-                        parents.insert(table_id);
-                        Ok(())
-                    },
-                )
-                .await?;
-            }
-            CatalogParentView::Projected { roots, disk_guard } => {
-                let root = roots[0];
-                self.visit_projected_catalog_column(root, TABLE_ID_TABLES, 0, disk_guard, |val| {
-                    let table_id = decode_table_id(val, "catalog.tables", "projected")?;
-                    parents.insert(table_id);
-                    Ok(())
-                })
-                .await?;
-            }
-        }
+        self.visit_live_catalog_parent_column(guards, TABLE_ID_TABLES, 0, "live", |table_id| {
+            parents.insert(table_id);
+            Ok(())
+        })
+        .await?;
 
         let mut managed_tables = FastHashSet::default();
         for spec in CATALOG_SATELLITES {
-            match &view {
-                CatalogParentView::Live { guards } => {
-                    self.visit_live_catalog_parent_column(
-                        guards,
-                        spec.table_id,
-                        spec.parent_column,
-                        "live",
-                        |table_id| {
-                            require_parent(&parents, spec, table_id, "live")?;
-                            track_or_require_managed(&mut managed_tables, spec, table_id, "live")
-                        },
-                    )
-                    .await?;
-                }
-                CatalogParentView::Projected { roots, disk_guard } => {
-                    let slot = catalog_table_slot(spec.table_id)
-                        .expect("satellite inventory uses catalog table ids");
-                    self.visit_projected_catalog_column(
-                        roots[slot],
-                        spec.table_id,
-                        spec.parent_column,
-                        disk_guard,
-                        |val| {
-                            let table_id = decode_table_id(val, spec.name, "projected")?;
-                            require_parent(&parents, spec, table_id, "projected")?;
-                            track_or_require_managed(
-                                &mut managed_tables,
-                                spec,
-                                table_id,
-                                "projected",
-                            )
-                        },
-                    )
-                    .await?;
-                }
-            }
+            self.visit_live_catalog_parent_column(
+                guards,
+                spec.table_id,
+                spec.parent_column,
+                "live",
+                |table_id| {
+                    require_parent(&parents, spec, table_id, "live")?;
+                    track_or_require_managed(&mut managed_tables, spec, table_id, "live")
+                },
+            )
+            .await?;
         }
         Ok(())
+    }
+
+    /// Validates the complete not-yet-published catalog root set, including
+    /// managed descriptor stamps, with one full decode of the shared schema
+    /// tables.
+    pub(super) async fn validate_projected_catalog_integrity(
+        &self,
+        roots: &[CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
+        disk_guard: &PoolGuard,
+        measurement: &CatalogCheckpointMeasurement,
+    ) -> RuntimeResult<()> {
+        let operation = "operation=validate_projected_catalog_integrity";
+        let mut parents = FastHashSet::default();
+        let mut tables = FastHashMap::default();
+        for row in self
+            .load_projected_catalog_rows(roots, TABLE_ID_TABLES, disk_guard, measurement)
+            .await?
+        {
+            let table = table_object_from_vals(&row.vals)
+                .change_context(RuntimeError::CatalogAccess)
+                .attach(format!("{operation}, phase=decode_table"))?;
+            parents.insert(table.table_id);
+            tables.insert(table.table_id, table);
+        }
+
+        let columns_spec = catalog_satellite_spec(TABLE_ID_COLUMNS);
+        let mut columns: FastHashMap<TableID, Vec<ColumnObject>> = FastHashMap::default();
+        for row in self
+            .load_projected_catalog_rows(roots, TABLE_ID_COLUMNS, disk_guard, measurement)
+            .await?
+        {
+            let column = column_object_from_vals(&row.vals)
+                .change_context(RuntimeError::CatalogAccess)
+                .attach(format!("{operation}, phase=decode_column"))?;
+            require_parent(&parents, columns_spec, column.table_id, "projected")
+                .change_context(RuntimeError::CatalogAccess)
+                .attach(operation)?;
+            columns.entry(column.table_id).or_default().push(column);
+        }
+
+        let indexes_spec = catalog_satellite_spec(TABLE_ID_INDEXES);
+        let mut indexes: FastHashMap<TableID, Vec<IndexObject>> = FastHashMap::default();
+        for row in self
+            .load_projected_catalog_rows(roots, TABLE_ID_INDEXES, disk_guard, measurement)
+            .await?
+        {
+            let index = index_object_from_vals(&row.vals)
+                .change_context(RuntimeError::CatalogAccess)
+                .attach(format!("{operation}, phase=decode_index"))?;
+            require_parent(&parents, indexes_spec, index.table_id, "projected")
+                .change_context(RuntimeError::CatalogAccess)
+                .attach(operation)?;
+            indexes.entry(index.table_id).or_default().push(index);
+        }
+
+        let descriptors_spec = catalog_satellite_spec(TABLE_ID_TABLE_DESCRIPTORS);
+        let mut managed_tables = FastHashSet::default();
+        let mut descriptors = Vec::new();
+        for row in self
+            .load_projected_catalog_rows(roots, TABLE_ID_TABLE_DESCRIPTORS, disk_guard, measurement)
+            .await?
+        {
+            let descriptor = table_descriptor_object_from_vals(&row.vals)
+                .change_context(RuntimeError::CatalogAccess)
+                .attach(format!("{operation}, phase=decode_descriptor"))?;
+            require_parent(&parents, descriptors_spec, descriptor.table_id, "projected")
+                .change_context(RuntimeError::CatalogAccess)
+                .attach(operation)?;
+            track_or_require_managed(
+                &mut managed_tables,
+                descriptors_spec,
+                descriptor.table_id,
+                "projected",
+            )
+            .change_context(RuntimeError::CatalogAccess)
+            .attach(operation)?;
+            descriptors.push(descriptor);
+        }
+
+        for table_id in [
+            TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS,
+            TABLE_ID_TABLE_BINDINGS,
+        ] {
+            let spec = catalog_satellite_spec(table_id);
+            let slot = catalog_table_slot(table_id).expect("catalog satellite has a root slot");
+            self.visit_projected_catalog_column(
+                roots[slot],
+                table_id,
+                spec.parent_column,
+                disk_guard,
+                measurement,
+                |val| {
+                    let table_id = decode_table_id(val, spec.name, "projected")?;
+                    require_parent(&parents, spec, table_id, "projected")?;
+                    track_or_require_managed(&mut managed_tables, spec, table_id, "projected")
+                },
+            )
+            .await?;
+        }
+
+        for descriptor in descriptors {
+            let table_id = descriptor.table_id;
+            let table = tables
+                .get(&table_id)
+                .ok_or_else(|| {
+                    Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
+                        "projected managed descriptor has no central table: table_id={table_id}"
+                    ))
+                })
+                .change_context(RuntimeError::CatalogAccess)
+                .attach(operation)?;
+            let metadata = reconstruct_user_table_metadata(
+                table,
+                columns.remove(&table_id).unwrap_or_default(),
+                indexes.remove(&table_id).unwrap_or_default(),
+            )
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!("{operation}, phase=reconstruct_schema, table_id={table_id}")
+            })?;
+            validate_table_descriptor_against_metadata(&descriptor, table_id, &metadata)
+                .change_context(RuntimeError::CatalogAccess)
+                .attach_with(|| format!("{operation}, table_id={table_id}"))?;
+        }
+        Ok(())
+    }
+
+    async fn load_projected_catalog_rows(
+        &self,
+        roots: &[CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
+        table_id: TableID,
+        disk_guard: &PoolGuard,
+        measurement: &CatalogCheckpointMeasurement,
+    ) -> RuntimeResult<Vec<super::RowRecord>> {
+        let slot = catalog_table_slot(table_id).expect("catalog table has a root slot");
+        self.load_rows_from_root(
+            self.tables[slot].metadata(),
+            disk_guard,
+            roots[slot],
+            measurement,
+        )
+        .await
     }
 
     async fn visit_live_catalog_parent_column<F>(
@@ -359,6 +434,14 @@ fn require_parent(
         return Ok(());
     }
     Err(orphan_error(spec, table_id, view))
+}
+
+fn catalog_satellite_spec(table_id: TableID) -> CatalogSatelliteSpec {
+    CATALOG_SATELLITES
+        .iter()
+        .copied()
+        .find(|spec| spec.table_id == table_id)
+        .expect("catalog satellite inventory contains table")
 }
 
 fn track_or_require_managed(

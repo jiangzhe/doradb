@@ -103,7 +103,7 @@ pub(crate) fn render_stdout_summary(
         let metrics = report
             .measured_runs
             .first()
-            .and_then(|run| run.workload_metrics)
+            .and_then(|run| run.workload_metrics.as_ref())
             .ok_or_else(|| BenchError::message("checkpoint report has no workload metrics"))?;
         let WorkloadMetrics::CheckpointTable {
             attempt_count,
@@ -127,7 +127,7 @@ pub(crate) fn render_stdout_summary(
         let metrics = report
             .measured_runs
             .first()
-            .and_then(|run| run.workload_metrics)
+            .and_then(|run| run.workload_metrics.as_ref())
             .ok_or_else(|| BenchError::message("parallel scan report has no workload metrics"))?;
         let WorkloadMetrics::ParallelTableScan {
             target_partitions,
@@ -141,7 +141,7 @@ pub(crate) fn render_stdout_summary(
         if report
             .measured_runs
             .iter()
-            .any(|run| run.workload_metrics != Some(metrics))
+            .any(|run| run.workload_metrics.as_ref() != Some(metrics))
         {
             return Err(BenchError::message(
                 "parallel scan report has inconsistent per-run partition metrics",
@@ -154,6 +154,79 @@ pub(crate) fn render_stdout_summary(
              rows_per_second: {:.3}",
             aggregate.counters.rows_returned,
             operations_per_second(aggregate.counters.rows_returned, aggregate.elapsed_nanos)
+        ));
+    }
+    if workload.identity() == "catalog-checkpoint" {
+        let metrics = report
+            .measured_runs
+            .first()
+            .and_then(|run| run.workload_metrics.as_ref())
+            .ok_or_else(|| {
+                BenchError::message("catalog checkpoint report has no workload metrics")
+            })?;
+        let WorkloadMetrics::CatalogCheckpoint {
+            profile,
+            case,
+            sampled_process_rss,
+            checkpoint,
+            ..
+        } = metrics
+        else {
+            return Err(BenchError::message(
+                "catalog checkpoint report has incompatible workload metrics",
+            ));
+        };
+        let compact_bytes_read = checkpoint
+            .table_io
+            .iter()
+            .map(|table| table.compact_bytes_read)
+            .sum::<usize>();
+        let lwc_bytes_written = checkpoint
+            .table_io
+            .iter()
+            .map(|table| table.lwc_bytes_written)
+            .sum::<usize>();
+        let index_bytes_written = checkpoint
+            .table_io
+            .iter()
+            .map(|table| table.index_bytes_written)
+            .sum::<usize>();
+        let changed_final_compact_bytes = checkpoint
+            .table_io
+            .iter()
+            .filter(|table| {
+                checkpoint
+                    .table_changes
+                    .iter()
+                    .any(|change| change.table_id == table.table_id)
+            })
+            .map(|table| table.final_compact_bytes)
+            .sum::<usize>();
+        let checkpoint_bytes_written = lwc_bytes_written
+            .saturating_add(index_bytes_written)
+            .saturating_add(checkpoint.metadata_bytes_written);
+        let write_amplification = if changed_final_compact_bytes == 0 {
+            0.0
+        } else {
+            checkpoint_bytes_written as f64 / changed_final_compact_bytes as f64
+        };
+        summary.push_str(&format!(
+            "\ncatalog_profile: {profile}\n\
+             catalog_case: {case}\n\
+             sampled_process_rss_baseline_bytes: {}\n\
+             sampled_process_rss_peak_bytes: {}\n\
+             sampled_process_rss_peak_above_baseline_bytes: {}\n\
+             catalog_compact_bytes_read: {compact_bytes_read}\n\
+             catalog_lwc_bytes_written: {lwc_bytes_written}\n\
+             catalog_index_bytes_written: {index_bytes_written}\n\
+             catalog_metadata_bytes_written: {}\n\
+             catalog_changed_final_compact_bytes: {changed_final_compact_bytes}\n\
+             catalog_checkpoint_bytes_written: {checkpoint_bytes_written}\n\
+             catalog_write_amplification: {write_amplification:.6}",
+            sampled_process_rss.baseline_bytes,
+            sampled_process_rss.peak_bytes,
+            sampled_process_rss.peak_above_baseline_bytes,
+            checkpoint.metadata_bytes_written,
         ));
     }
     summary.push_str(&format!("\ndetailed_result: {}", detailed_result.display()));

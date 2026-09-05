@@ -3551,7 +3551,7 @@ mod tests {
             assert_eq!(entry.end_row_id(), entry_before.end_row_id());
             assert_eq!(entry.row_id_span(), entry_before.row_id_span());
             assert_eq!(entry.row_count(), entry_before.row_count());
-            let deltas = index.load_delete_deltas(&entry).await.unwrap();
+            let (deltas, _) = index.load_delete_deltas_and_row_ids(&entry).await.unwrap();
             let expected_delta = (row_id - entry.start_row_id) as u32;
             assert!(deltas.contains(&expected_delta));
         });
@@ -4486,13 +4486,11 @@ mod tests {
                 .unwrap()
                 .expect("transition snapshot should persist the row into LWC");
             assert!(root_after_first.deletion_cutoff_ts <= delete_cts);
-            assert!(
-                index_after_first
-                    .load_delete_deltas(&entry_after_first)
-                    .await
-                    .unwrap()
-                    .is_empty()
-            );
+            let (deltas, _) = index_after_first
+                .load_delete_deltas_and_row_ids(&entry_after_first)
+                .await
+                .unwrap();
+            assert!(deltas.is_empty());
 
             hold_trx.rollback().await.unwrap();
             checkpoint_session
@@ -4510,8 +4508,8 @@ mod tests {
                 .await
                 .unwrap()
                 .expect("persisted entry should still exist");
-            let deltas = index_after_second
-                .load_delete_deltas(&entry_after_second)
+            let (deltas, _) = index_after_second
+                .load_delete_deltas_and_row_ids(&entry_after_second)
                 .await
                 .unwrap();
             let expected_delta = (row_id - entry_after_second.start_row_id) as u32;
@@ -4731,7 +4729,8 @@ mod tests {
                 .unwrap()
                 .expect("persisted entry should exist");
             assert!(active_root.deletion_cutoff_ts <= delete_cts);
-            assert!(index.load_delete_deltas(&entry).await.unwrap().is_empty());
+            let (deltas, _) = index.load_delete_deltas_and_row_ids(&entry).await.unwrap();
+            assert!(deltas.is_empty());
 
             hold_trx.rollback().await.unwrap();
         });

@@ -25,6 +25,7 @@ use std::mem;
 use std::pin::Pin;
 use std::result::Result as StdResult;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use zerocopy::byteorder::little_endian::{U32 as LeU32, U64 as LeU64};
 use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
@@ -1509,6 +1510,7 @@ pub(crate) struct ColumnBlockIndex<'a> {
     disk_pool_guard: &'a PoolGuard,
     root_block_id: BlockID,
     end_row_id: RowID,
+    logical_read_counter: Option<&'a AtomicUsize>,
 }
 
 impl<'a> ColumnBlockIndex<'a> {
@@ -1529,7 +1531,15 @@ impl<'a> ColumnBlockIndex<'a> {
             disk_pool_guard,
             root_block_id,
             end_row_id,
+            logical_read_counter: None,
         }
+    }
+
+    /// Attaches a cache-independent counter for successful logical node reads.
+    #[inline]
+    pub(crate) fn with_logical_read_counter(mut self, counter: &'a AtomicUsize) -> Self {
+        self.logical_read_counter = Some(counter);
+        self
     }
 
     /// Returns the file kind used for validation diagnostics and reads.
@@ -1557,6 +1567,9 @@ impl<'a> ColumnBlockIndex<'a> {
                     self.file_kind
                 )
             })?;
+        if let Some(counter) = self.logical_read_counter {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(ValidatedColumnBlockNode::from_validated_guard(g))
     }
 
@@ -1728,71 +1741,6 @@ impl<'a> ColumnBlockIndex<'a> {
             };
             block_id = entries[idx].block_id();
         }
-    }
-
-    /// Loads validated delete deltas for one persisted entry.
-    pub(crate) async fn load_delete_deltas(
-        &self,
-        entry: &ColumnLeafEntry,
-    ) -> RuntimeResult<Vec<u32>> {
-        let node = self.read_node(entry.leaf_block_id).await?;
-        let view = self.read_entry_view(&node, entry)?;
-        let row_set = self
-            .node_result(entry.leaf_block_id, decode_logical_row_set(&view))
-            .change_context(RuntimeError::IndexAccess)
-            .attach_with(|| {
-                format!(
-                    "operation=load_column_delete_deltas, start_row_id={}",
-                    entry.start_row_id
-                )
-            })?;
-        let delete_set = self
-            .decode_logical_delete_set(&view, &row_set, entry.leaf_block_id)
-            .await?;
-        Ok(match delete_set {
-            LogicalDeleteSet::None { .. } => Vec::new(),
-            LogicalDeleteSet::Inline { row_id_deltas, .. } => row_id_deltas,
-            LogicalDeleteSet::External { row_id_deltas, .. } => row_id_deltas.ok_or_else(|| {
-                invalid_node_payload()
-                    .attach(format!(
-                        "file={}, block=column_block_index, block_id={}",
-                        self.file_kind(),
-                        entry.leaf_block_id
-                    ))
-                    .change_context(RuntimeError::IndexAccess)
-                    .attach("operation=load_column_delete_deltas")
-            })?,
-        })
-    }
-
-    /// Loads the authoritative persisted row-id set for one validated leaf
-    /// entry.
-    pub(crate) async fn load_entry_row_ids(
-        &self,
-        entry: &ColumnLeafEntry,
-    ) -> RuntimeResult<Vec<RowID>> {
-        let node = self.read_node(entry.leaf_block_id).await?;
-        let view = self.read_entry_view(&node, entry)?;
-        let row_set = self
-            .node_result(entry.leaf_block_id, decode_logical_row_set(&view))
-            .change_context(RuntimeError::IndexAccess)
-            .attach_with(|| {
-                format!(
-                    "operation=load_column_entry_row_ids, start_row_id={}",
-                    entry.start_row_id
-                )
-            })?;
-        self.node_result(
-            entry.leaf_block_id,
-            decode_row_ids_from_row_set(view.start_row_id, &row_set),
-        )
-        .change_context(RuntimeError::IndexAccess)
-        .attach_with(|| {
-            format!(
-                "operation=load_column_entry_row_ids, start_row_id={}",
-                entry.start_row_id
-            )
-        })
     }
 
     /// Loads validated delete deltas and authoritative row ids for one
@@ -4255,10 +4203,8 @@ mod tests {
             let dense = index.locate_block(RowID::new(2)).await.unwrap().unwrap();
             let sparse = index.locate_block(RowID::new(15)).await.unwrap().unwrap();
 
-            assert_eq!(
-                index.load_entry_row_ids(&dense).await.unwrap(),
-                test_row_ids([0, 1, 2, 3])
-            );
+            let (_, dense_row_ids) = index.load_delete_deltas_and_row_ids(&dense).await.unwrap();
+            assert_eq!(dense_row_ids, test_row_ids([0, 1, 2, 3]));
             assert_eq!(
                 dense.row_shape_fingerprint(),
                 row_shape_fingerprint_for_row_ids(
@@ -4267,10 +4213,8 @@ mod tests {
                     &test_row_ids([0, 1, 2, 3])
                 )
             );
-            assert_eq!(
-                index.load_entry_row_ids(&sparse).await.unwrap(),
-                test_row_ids([12, 15, 18])
-            );
+            let (_, sparse_row_ids) = index.load_delete_deltas_and_row_ids(&sparse).await.unwrap();
+            assert_eq!(sparse_row_ids, test_row_ids([12, 15, 18]));
             assert_eq!(
                 sparse.row_shape_fingerprint(),
                 row_shape_fingerprint_for_row_ids(
@@ -4478,12 +4422,8 @@ mod tests {
             assert_eq!(entry.row_count(), 8);
             assert_eq!(entry.del_count(), 3);
             assert!(entry.deletion_blob_ref().is_none());
-            let loaded: BTreeSet<_> = index
-                .load_delete_deltas(&entry)
-                .await
-                .unwrap()
-                .into_iter()
-                .collect();
+            let (delete_deltas, _) = index.load_delete_deltas_and_row_ids(&entry).await.unwrap();
+            let loaded: BTreeSet<_> = delete_deltas.into_iter().collect();
             assert_eq!(loaded, BTreeSet::from([1u32, 3, 6]));
             assert!(
                 index
@@ -4676,13 +4616,9 @@ mod tests {
             );
             let entry = index.locate_block(RowID::new(0)).await.unwrap().unwrap();
             assert_eq!(entry.delete_domain(), ColumnDeleteDomain::Ordinal);
+            let (delete_deltas, _) = index.load_delete_deltas_and_row_ids(&entry).await.unwrap();
             assert_eq!(
-                index
-                    .load_delete_deltas(&entry)
-                    .await
-                    .unwrap()
-                    .into_iter()
-                    .collect::<BTreeSet<_>>(),
+                delete_deltas.into_iter().collect::<BTreeSet<_>>(),
                 BTreeSet::from([1u32, 3, 6])
             );
         });

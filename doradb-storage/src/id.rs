@@ -234,6 +234,7 @@ impl_id_bitpackable!(RowID);
 
 impl_id! {
     /// Stable logical table identity and deterministic user table file identity.
+    #[derive(::serde::Deserialize, ::serde::Serialize)]
     pub struct TableID;
     methods pub
 }
@@ -285,6 +286,7 @@ impl_id_serde!(TableID);
 
 impl_id! {
     /// Transaction timestamp and active transaction identity.
+    #[derive(::serde::Deserialize, ::serde::Serialize)]
     pub struct TrxID;
     methods pub
 }

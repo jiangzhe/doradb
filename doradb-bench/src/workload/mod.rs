@@ -3,6 +3,7 @@ use event_listener::Event;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+mod catalog;
 mod ddl;
 mod insert;
 mod lock;
@@ -13,6 +14,7 @@ mod table_scan;
 mod update;
 mod util;
 
+pub(crate) use catalog::{CatalogCheckpointExecutor, CatalogCheckpointPrepareExecutor};
 pub(crate) use ddl::{CreateTableExecutor, IndexDdlExecutor, TableDdlExecutor};
 pub(crate) use insert::{InsertRandExecutor, InsertSeqExecutor};
 pub(crate) use lock::LockTableExecutor;

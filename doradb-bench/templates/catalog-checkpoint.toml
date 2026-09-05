@@ -1,0 +1,14 @@
+name = "catalog checkpoint scale proof"
+engine_defaults = "engine-defaults.toml"
+
+[engine]
+meta_buffer_size = "1 GiB"
+
+[[phase]]
+workload = { type = "catalog-checkpoint-prepare", profile = "small", case = "managed-create" }
+
+[[phase]]
+kind = "benchmark"
+warmup_runs = 0
+measured_runs = 1
+workload = { type = "catalog-checkpoint", profile = "small", case = "managed-create" }

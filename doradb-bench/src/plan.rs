@@ -122,6 +122,50 @@ pub enum PhaseKind {
     Benchmark,
 }
 
+/// Deterministic catalog population used by the checkpoint scale proof.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CatalogCheckpointProfile {
+    /// One-tenth target-envelope catalog.
+    Small,
+    /// RFC-0031 target-envelope catalog.
+    Target,
+    /// Informational above-envelope catalog.
+    Stress,
+}
+
+impl fmt::Display for CatalogCheckpointProfile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Small => f.write_str("small"),
+            Self::Target => f.write_str("target"),
+            Self::Stress => f.write_str("stress"),
+        }
+    }
+}
+
+/// Public catalog DDL effect measured by the checkpoint scale proof.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CatalogCheckpointCase {
+    /// Create one managed table with an empty descriptor.
+    ManagedCreate,
+    /// Create one managed secondary index with an equal-length descriptor replacement.
+    ManagedIndexCreate,
+    /// Drop the designated empty-descriptor managed table.
+    ManagedDrop,
+}
+
+impl fmt::Display for CatalogCheckpointCase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ManagedCreate => f.write_str("managed-create"),
+            Self::ManagedIndexCreate => f.write_str("managed-index-create"),
+            Self::ManagedDrop => f.write_str("managed-drop"),
+        }
+    }
+}
+
 /// Closed set of plan workload specifications.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
@@ -160,6 +204,20 @@ pub enum WorkloadSpec {
     FreezeTable(FreezeTableSpec),
     /// Checkpoint the primary table's installed frozen-page batch.
     CheckpointTable(CheckpointTableSpec),
+    /// Populate, checkpoint, and mutate one deterministic managed catalog.
+    CatalogCheckpointPrepare(CatalogCheckpointSpec),
+    /// Measure one pending deterministic managed-catalog checkpoint.
+    CatalogCheckpoint(CatalogCheckpointSpec),
+}
+
+/// Strict catalog-checkpoint scale-proof controls.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogCheckpointSpec {
+    /// Fixed deterministic population profile.
+    pub profile: CatalogCheckpointProfile,
+    /// Public managed DDL effect left pending after preparation.
+    pub case: CatalogCheckpointCase,
 }
 
 /// Strict plan-local table-pool creation controls.
@@ -640,6 +698,18 @@ pub struct CheckpointTableConfig {
     pub include_stats: bool,
 }
 
+/// Resolved catalog-checkpoint scale-proof configuration.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogCheckpointConfig {
+    /// Fixed deterministic population profile.
+    pub profile: CatalogCheckpointProfile,
+    /// Public managed DDL effect measured by the checkpoint.
+    pub case: CatalogCheckpointCase,
+    /// Forced engine-diagnostic capture setting.
+    pub include_stats: bool,
+}
+
 /// Resolved create/drop DDL configuration.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -780,6 +850,10 @@ pub enum ResolvedWorkload {
     FreezeTable(FreezeTableConfig),
     /// Single-table checkpoint workload.
     CheckpointTable(CheckpointTableConfig),
+    /// Deterministic managed-catalog preparation workload.
+    CatalogCheckpointPrepare(CatalogCheckpointConfig),
+    /// Single catalog-checkpoint workload.
+    CatalogCheckpoint(CatalogCheckpointConfig),
 }
 
 impl ResolvedWorkload {
@@ -803,6 +877,8 @@ impl ResolvedWorkload {
             Self::LockTable(_) => "lock-table",
             Self::FreezeTable(_) => "freeze-table",
             Self::CheckpointTable(_) => "checkpoint-table",
+            Self::CatalogCheckpointPrepare(_) => "catalog-checkpoint-prepare",
+            Self::CatalogCheckpoint(_) => "catalog-checkpoint",
         }
     }
 
@@ -841,6 +917,11 @@ impl ResolvedWorkload {
                 max_rows: config.max_rows,
             },
             Self::CheckpointTable(_) => FixtureRequirement::FrozenPrimary,
+            Self::CatalogCheckpointPrepare(_) => FixtureRequirement::AbsentCatalogCheckpoint,
+            Self::CatalogCheckpoint(config) => FixtureRequirement::CatalogCheckpointPending {
+                profile: config.profile,
+                case: config.case,
+            },
             Self::StmtNoop(_) | Self::TrxNoop(_) | Self::TableDdl(_) => FixtureRequirement::None,
         }
     }
@@ -865,6 +946,9 @@ impl ResolvedWorkload {
             | Self::IndexDdl(_)
             | Self::FreezeTable(_)
             | Self::CheckpointTable(_) => ReplayPolicy::SingleRun,
+            Self::CatalogCheckpointPrepare(_) | Self::CatalogCheckpoint(_) => {
+                ReplayPolicy::SingleRun
+            }
         }
     }
 
@@ -883,7 +967,10 @@ impl ResolvedWorkload {
             Self::ParallelTableScan(config) => (config.target_partitions, 1),
             Self::IndexStream(config) => (config.threads, config.sessions),
             Self::LockTable(config) => (config.threads, config.sessions),
-            Self::FreezeTable(_) | Self::CheckpointTable(_) => (1, 1),
+            Self::FreezeTable(_)
+            | Self::CheckpointTable(_)
+            | Self::CatalogCheckpointPrepare(_)
+            | Self::CatalogCheckpoint(_) => (1, 1),
         }
     }
 
@@ -904,6 +991,9 @@ impl ResolvedWorkload {
             Self::LockTable(config) => config.include_stats,
             Self::FreezeTable(config) => config.include_stats,
             Self::CheckpointTable(config) => config.include_stats,
+            Self::CatalogCheckpointPrepare(config) | Self::CatalogCheckpoint(config) => {
+                config.include_stats
+            }
         }
     }
 
@@ -935,6 +1025,8 @@ impl ResolvedWorkload {
             Self::LockTable(_) => LatencyUnit::TableLockOperationLifecycle,
             Self::FreezeTable(_) => LatencyUnit::TableFreeze,
             Self::CheckpointTable(_) => LatencyUnit::TableCheckpoint,
+            Self::CatalogCheckpointPrepare(_) => LatencyUnit::CatalogCheckpointPreparation,
+            Self::CatalogCheckpoint(_) => LatencyUnit::CatalogCheckpoint,
         }
     }
 
@@ -965,7 +1057,10 @@ impl ResolvedWorkload {
                 nonempty_session_count(config.num, config.sessions)
             }
             Self::LockTable(config) => Ok(config.num),
-            Self::FreezeTable(_) | Self::CheckpointTable(_) => Ok(1),
+            Self::FreezeTable(_)
+            | Self::CheckpointTable(_)
+            | Self::CatalogCheckpointPrepare(_)
+            | Self::CatalogCheckpoint(_) => Ok(1),
         }
     }
 }
@@ -1046,6 +1141,22 @@ fn validate_and_resolve_phases(
         if raw.kind == PhaseKind::Prepare && matches!(workload, ResolvedWorkload::UpdateRand(_)) {
             return Err(BenchError::message(format!(
                 "phase {} workload update-rand is allowed only as the final benchmark",
+                index + 1
+            )));
+        }
+        if raw.kind == PhaseKind::Benchmark
+            && matches!(workload, ResolvedWorkload::CatalogCheckpointPrepare(_))
+        {
+            return Err(BenchError::message(format!(
+                "phase {} workload catalog-checkpoint-prepare is allowed only in a prepare phase",
+                index + 1
+            )));
+        }
+        if raw.kind == PhaseKind::Prepare
+            && matches!(workload, ResolvedWorkload::CatalogCheckpoint(_))
+        {
+            return Err(BenchError::message(format!(
+                "phase {} workload catalog-checkpoint is allowed only as the final benchmark",
                 index + 1
             )));
         }
@@ -1252,6 +1363,28 @@ fn resolve_workload(
                 include_stats: spec.include_stats.unwrap_or(defaults.include_stats),
             }),
             FixturePlanEffect::Checkpoint,
+        )),
+        WorkloadSpec::CatalogCheckpointPrepare(spec) => Ok((
+            ResolvedWorkload::CatalogCheckpointPrepare(CatalogCheckpointConfig {
+                profile: spec.profile,
+                case: spec.case,
+                include_stats: false,
+            }),
+            FixturePlanEffect::PrepareCatalogCheckpoint {
+                profile: spec.profile,
+                case: spec.case,
+            },
+        )),
+        WorkloadSpec::CatalogCheckpoint(spec) => Ok((
+            ResolvedWorkload::CatalogCheckpoint(CatalogCheckpointConfig {
+                profile: spec.profile,
+                case: spec.case,
+                include_stats: true,
+            }),
+            FixturePlanEffect::CheckpointCatalog {
+                profile: spec.profile,
+                case: spec.case,
+            },
         )),
     }
 }
@@ -1888,6 +2021,65 @@ mod tests {
     }
 
     #[test]
+    fn catalog_checkpoint_plan_is_strict_typed_and_single_run() {
+        for profile in ["small", "target", "stress"] {
+            for case in ["managed-create", "managed-index-create", "managed-drop"] {
+                let phases = resolve(&format!(
+                    "[[phase]]\nworkload = {{ type = \"catalog-checkpoint-prepare\", profile = \"{profile}\", case = \"{case}\" }}\n\
+                     [[phase]]\nkind = \"benchmark\"\nwarmup_runs = 0\nmeasured_runs = 1\n\
+                     workload = {{ type = \"catalog-checkpoint\", profile = \"{profile}\", case = \"{case}\" }}\n"
+                ))
+                .unwrap();
+                assert_eq!(phases.len(), 2);
+                let prepare = phases[0].workload();
+                let checkpoint = phases[1].workload();
+                assert_eq!(prepare.identity(), "catalog-checkpoint-prepare");
+                assert_eq!(checkpoint.identity(), "catalog-checkpoint");
+                assert_eq!(prepare.worker_counts(), (1, 1));
+                assert_eq!(checkpoint.worker_counts(), (1, 1));
+                assert!(!prepare.include_stats());
+                assert!(checkpoint.include_stats());
+                assert_eq!(checkpoint.latency_unit(), LatencyUnit::CatalogCheckpoint);
+                assert_eq!(checkpoint.expected_samples().unwrap(), 1);
+            }
+        }
+
+        for invalid in [
+            "[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"catalog-checkpoint-prepare\", profile = \"small\", case = \"managed-create\" }\n",
+            "[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"catalog-checkpoint\", profile = \"small\", case = \"managed-create\" }\n",
+            "[[phase]]\nworkload = { type = \"catalog-checkpoint-prepare\", profile = \"small\", case = \"managed-create\" }\n[[phase]]\nkind = \"benchmark\"\nwarmup_runs = 1\nworkload = { type = \"catalog-checkpoint\", profile = \"small\", case = \"managed-create\" }\n",
+            "[[phase]]\nworkload = { type = \"catalog-checkpoint-prepare\", profile = \"small\", case = \"managed-create\" }\n[[phase]]\nkind = \"benchmark\"\nmeasured_runs = 2\nworkload = { type = \"catalog-checkpoint\", profile = \"small\", case = \"managed-create\" }\n",
+            "[[phase]]\nworkload = { type = \"catalog-checkpoint-prepare\", profile = \"small\", case = \"managed-create\" }\n[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"catalog-checkpoint\", profile = \"target\", case = \"managed-create\" }\n",
+        ] {
+            assert!(resolve(invalid).is_err(), "{invalid}");
+        }
+        assert!(
+            parse(
+                "[[phase]]\nworkload = { type = \"catalog-scale-prepare\", profile = \"small\", case = \"managed-create\" }\n"
+            )
+            .is_err()
+        );
+        assert!(
+            parse(
+                "[[phase]]\nworkload = { type = \"catalog-checkpoint-prepare\", profile = \"small\", case = \"managed-create\" }\n[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"catalog-checkpoint-scale\", profile = \"small\", case = \"managed-create\" }\n"
+            )
+            .is_err()
+        );
+        assert!(
+            parse(
+                "[[phase]]\nworkload = { type = \"catalog-checkpoint-prepare\", profile = \"small\", case = \"managed-create\", include_stats = true }\n[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"catalog-checkpoint\", profile = \"small\", case = \"managed-create\" }\n"
+            )
+            .is_err()
+        );
+        assert!(
+            parse(
+                "[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"catalog-checkpoint\", profile = \"huge\", case = \"managed-create\" }\n"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn checked_in_templates_are_the_exact_complete_workload_inventory() {
         let templates = Path::new(env!("CARGO_MANIFEST_DIR")).join("templates");
         let cases = [
@@ -1906,6 +2098,7 @@ mod tests {
             ("index-ddl.toml", "index-ddl"),
             ("lock-table.toml", "lock-table"),
             ("checkpoint-table.toml", "checkpoint-table"),
+            ("catalog-checkpoint.toml", "catalog-checkpoint"),
         ];
         let temp = TempDir::new().unwrap();
         for (index, (file, identity)) in cases.into_iter().enumerate() {
