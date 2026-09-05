@@ -1746,9 +1746,10 @@ checkpoint write volume            = O(sum of final changed-table images)
 The concrete implementation at the time of this RFC additionally clones every
 surviving row during materialization, deep-copies outlined `VarByte` values,
 and buffers replacement LWC pages. Its peak memory can therefore be a multiple
-of the changed table's live image. One binding-only change rewrites all binding
-rows; one descriptor-only change rewrites all descriptor rows and payloads; a
-checkpoint changing both rewrites both complete logical tables. Supporting
+of the changed table's live image. The supported public contract does not offer
+binding-only or descriptor-only mutation: managed CREATE/DROP rewrites the
+complete numeric-definition, descriptor, and binding tables, while managed
+index DDL rewrites numeric index metadata and the descriptor table. Supporting
 index, allocation-map, and metadata blocks also contribute to write volume.
 [C17]
 
@@ -1957,22 +1958,27 @@ deferred to a later phase.
    DROP/recreate; integrity failures are never translated to `TableNotFound`.
 20. A Phase 8 end-to-end `doradb-bench` catalog-checkpoint workload with
    small, target-envelope, and above-envelope stress profiles. Starting from
-   equivalent populated, checkpointed catalog images, measure separate cases
-   for one binding-row change, one descriptor-payload change, and both changes
-   in one checkpoint. Every result records table count, every satellite row
-   count, binding count, descriptor row count, total descriptor payload bytes,
-   live compact-image bytes, elapsed time, scoped peak memory above the
-   pre-checkpoint baseline, and exact catalog checkpoint bytes read and
-   written. Write reporting separates LWC, index, allocation-map, and metadata
-   blocks and reports amplification against the changed logical table's live
-   final image. The target profile uses 10,000 user tables, 100,000 bindings,
-   and 64 MiB of descriptor payload and must complete without OOM; memory and
-   write growth across profiles must be consistent with the documented linear
-   full-image model. The stress profile is informational, and no wall-clock CI
-   threshold or runner timeout is added. Record the environment and results in
-   the Phase 8 implementation summary. A target-profile OOM or superlinear
-   growth blocks Phase 8 completion pending a bounded full-image optimization
-   or a follow-up design decision.
+   equivalent deterministic populated and checkpointed catalog images, measure
+   one public managed CREATE TABLE, managed CREATE INDEX with a different
+   same-length replacement descriptor, and DROP TABLE in separate fresh-root
+   cases. Every result records table count, every satellite row count, binding
+   count, descriptor row count, total descriptor payload bytes, elapsed time,
+   sampled process-RSS peak above the immediate pre-checkpoint baseline, the
+   public checkpoint report's logical compact-image and successful LWC/index/
+   metadata write bytes, and the existing public buffer-pool and storage-I/O
+   deltas. The allocation map is attributed to its containing metadata page and
+   is not counted as a second physical write. Write amplification uses the
+   changed logical tables' final compact bytes as its denominator; no result
+   claims binding-only or descriptor-only attribution. The target profile uses
+   10,000 user tables, 100,000 bindings, and 64 MiB of descriptor payload and
+   must complete without OOM; memory and write growth across profiles must be
+   consistent with the documented linear full-image model. The stress profile
+   is informational, and no wall-clock CI threshold or runner timeout is added.
+   Record the build mode, backend, engine configuration, OS/kernel, CPU,
+   available memory, storage medium, commands, and results in the Phase 8
+   implementation summary. A target-profile OOM or superlinear growth blocks
+   Phase 8 completion pending a bounded full-image optimization or a follow-up
+   design decision.
 21. Standard `cargo nextest run --workspace`; changes touching backend-neutral
    file I/O also run the documented `libaio` workspace validation command.
 
@@ -2343,12 +2349,13 @@ marker can alias a second CREATE after restart. [U20]
 - **Phase 8: Catalog Checkpoint Scale Proof**
   - Prerequisites: Phases 4, 6, and 7 provide the final parent validator and
     populated descriptor/binding paths whose checkpoint cost must be measured.
-  - Scope: Add the end-to-end `doradb-bench` workload and scoped memory/I/O
-    instrumentation specified by test 20; run small, target-envelope, and
-    above-envelope stress profiles for binding-only, descriptor-only, and
-    combined changes. If required to satisfy the target envelope, consume
-    folded values instead of cloning and stream full-image page construction
-    without changing the complete compact-image persistence model.
+  - Scope: Add the public-API-only end-to-end `doradb-bench` workload and
+    checkpoint/RSS/runtime instrumentation specified by test 20; run small,
+    target-envelope, and above-envelope stress profiles for managed CREATE
+    TABLE, managed CREATE INDEX, and DROP TABLE. If required to satisfy the
+    target envelope, consume folded values instead of cloning and stream
+    full-image page construction without changing the complete compact-image
+    persistence model.
   - Goals: Establish reproducible peak-memory and write-amplification evidence
     for the stated initial scale envelope and record the implementation result.
   - Validation: Own test 20. The target profile must complete without OOM and
@@ -2356,13 +2363,39 @@ marker can alias a second CREATE after restart. [U20]
     standard test-runner timeouts do not change.
   - Non-goals: Incremental or base-plus-delta checkpoints, a durable format
     change, or a checkpoint performance guarantee above the initial envelope.
-  - Phase-local Choices: Scoped peak-memory measurement, exact block-byte
-    accounting, and small/stress profile sizes. The target profile and required
-    metrics remain fixed by test 20.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase-local Choices: The workload uses only `ManagedTableOps`, public
+    `Session` DDL, and public checkpoint operations. Memory evidence is sampled
+    process RSS rather than allocator-requested heap size. The public checkpoint
+    report owns cache-independent logical compact-image and successful block
+    write accounting; existing public snapshots own physical runtime metrics.
+    Allocation-map bytes stay attributed to the metadata page. Small/stress
+    profile sizes and the target profile remain fixed by test 20.
+  - Task Doc: `docs/tasks/000295-catalog-checkpoint-scale-proof.md`
+  - Task Issue: `#1043`
+  - Phase Status: `in-progress`
+  - Implementation Summary: Implemented the public `CatalogCheckpointReport`,
+    cache-independent checkpoint block accounting, deterministic public-API
+    prepare/checkpoint workloads, strict fixture lifecycle, sampled Linux
+    process-RSS measurement, stable result serialization, and a normal release
+    template. A descriptor-density run also found and fixed a stale 24-byte LWC
+    header estimate after the persisted header had become 32 bytes. Projected
+    parent and managed-descriptor validation now share one decode of their four
+    common schema roots; at stress managed-CREATE scale this removed 174.1875
+    MiB of redundant logical reads without changing physical I/O or writes. The
+    complete release matrix passed: small CREATE/INDEX/DROP wrote 8,028,160 /
+    7,700,480 / 8,028,160 bytes with sampled RSS growth 7,430,144 / 7,319,552 /
+    7,434,240;
+    target wrote 75,530,240 / 73,236,480 / 75,530,240 bytes with RSS growth
+    77,434,880 / 75,423,744 / 76,800,000; informational stress wrote 94,404,608 /
+    91,455,488 / 94,404,608 bytes with RSS growth 95,678,464 / 94,232,576 /
+    95,682,560. All target cases completed without OOM, and same-case
+    target-to-stress logical bytes, physical request counts, and RSS growth
+    tracked the 1.25x profile ratio without unexplained superlinear behavior.
+    Evidence used release `rustc 1.98.0`, default `iouring`, Linux
+    `7.0.14-orbstack-00380-ga7e0a2dc9535` on 10 `aarch64` vCPUs, 12,304,840 KiB
+    RAM plus 13,353,408 KiB swap, and workspace `target/` roots on `/dev/vdb1`
+    Btrfs. Full raw matrix, elapsed/read/write/request values, engine
+    configuration, environment, and command shape are recorded in task 000295.
 
 ## Consequences
 

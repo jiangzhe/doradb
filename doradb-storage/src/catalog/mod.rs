@@ -7,8 +7,11 @@ pub(crate) mod spec;
 pub(crate) mod storage;
 pub(crate) mod table;
 
-pub use checkpoint::CatalogCheckpointOutcome;
 pub(crate) use checkpoint::*;
+pub use checkpoint::{
+    CatalogCheckpointOutcome, CatalogCheckpointReport, CatalogTableCheckpointChange,
+    CatalogTableCheckpointIoStats,
+};
 pub(crate) use definition::*;
 pub use definition::{
     BindingNamespaceID, DescriptorUpdate, MAX_TABLE_BINDING_KEY_BYTES, MAX_TABLE_DESCRIPTOR_BYTES,
@@ -251,7 +254,7 @@ impl Catalog {
         &self,
         batch: CatalogCheckpointBatch,
         disk_guard: &PoolGuard,
-    ) -> RuntimeOrFatalResult<CatalogCheckpointOutcome> {
+    ) -> RuntimeOrFatalResult<CatalogCheckpointReport> {
         let prepared = self.prepare_checkpoint_batch(batch, disk_guard).await?;
         self.commit_prepared_checkpoint(prepared).await
     }
@@ -272,16 +275,16 @@ impl Catalog {
     pub(crate) async fn commit_prepared_checkpoint(
         &self,
         prepared: PreparedCatalogCheckpoint,
-    ) -> RuntimeOrFatalResult<CatalogCheckpointOutcome> {
-        let outcome = prepared
+    ) -> RuntimeOrFatalResult<CatalogCheckpointReport> {
+        let report = prepared
             .commit(&self.storage)
             .await
             .map_err(RuntimeOrFatalError::from)?;
         let CatalogCheckpointOutcome::Published {
             catalog_replay_start_ts,
-        } = outcome
+        } = report.outcome
         else {
-            return Ok(outcome);
+            return Ok(report);
         };
         for table in self.snapshot_live_user_tables() {
             if let Err(err) = table.apply_index_lifecycle_checkpoint(catalog_replay_start_ts) {
@@ -296,7 +299,7 @@ impl Catalog {
                 ));
             }
         }
-        Ok(outcome)
+        Ok(report)
     }
 
     /// Reload one user table runtime from catalog metadata and table file.

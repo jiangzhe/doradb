@@ -41,10 +41,11 @@ mod value;
 pub(crate) use component::{DiskPool, IndexPool, MemPool, MetaPool};
 
 pub use catalog::{
-    BindingNamespaceID, CatalogCheckpointOutcome, ColumnID, ColumnOrdinal, CreateIndexDefinition,
-    CreateTableDefinition, CreateTableOutcome, DescriptorUpdate, DropIndexDefinition,
-    ID_DOMAIN_END, IndexID, IndexOrder, MAX_TABLE_BINDING_KEY_BYTES, MAX_TABLE_DESCRIPTOR_BYTES,
-    ManagedCreateTableDefinition, ManagedDdlError, ManagedDdlResult,
+    BindingNamespaceID, CatalogCheckpointOutcome, CatalogCheckpointReport,
+    CatalogTableCheckpointChange, CatalogTableCheckpointIoStats, ColumnID, ColumnOrdinal,
+    CreateIndexDefinition, CreateTableDefinition, CreateTableOutcome, DescriptorUpdate,
+    DropIndexDefinition, ID_DOMAIN_END, IndexID, IndexOrder, MAX_TABLE_BINDING_KEY_BYTES,
+    MAX_TABLE_DESCRIPTOR_BYTES, ManagedCreateTableDefinition, ManagedDdlError, ManagedDdlResult,
     ManagedTableDefinitionSnapshot, ManagedTableInterpreter, ResolvedTableBinding,
     ResolvedTableIndex, StorageColumnDefinition, StorageColumnFlags, StorageColumnSpec,
     StorageIndexDefinition, StorageIndexFlags, StorageIndexKey, StorageIndexKeyByColumnId,

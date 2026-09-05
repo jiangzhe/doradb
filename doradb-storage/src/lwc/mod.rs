@@ -23,7 +23,7 @@ use std::slice::Iter;
 use std::sync::Arc;
 use zerocopy::{Immutable, IntoBytes};
 
-const LWC_BLOCK_HEADER_SIZE: usize = 24;
+const LWC_BLOCK_HEADER_SIZE: usize = mem::size_of::<LwcBlockHeader>();
 
 /// Lightweight compressed data.
 pub(crate) enum LwcData<'a> {
@@ -2871,6 +2871,39 @@ mod tests {
 
         assert_eq!(builder.row_count(), 1);
         assert_eq!(builder.row_ids(), &[RowID::new(1)]);
+        assert!(builder.build(0).is_ok());
+    }
+
+    #[test]
+    fn test_lwc_builder_capacity_includes_complete_persisted_header() {
+        let metadata = TableMetadata::try_new(
+            vec![
+                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
+            ],
+            vec![],
+        )
+        .expect("valid descriptor-like metadata");
+        let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
+        let mut accepted = 0;
+        for row_no in 0..100 {
+            let vals = [
+                Val::U64(row_no),
+                Val::U64(0),
+                Val::U64(0),
+                Val::from(vec![0u8; 32]),
+                Val::from(vec![row_no as u8; 6_718]),
+            ];
+            if !builder.append_row_values(RowID::new(row_no), &vals) {
+                break;
+            }
+            accepted += 1;
+        }
+        assert!(accepted > 1);
+        assert!(accepted < 100);
         assert!(builder.build(0).is_ok());
     }
 

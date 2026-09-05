@@ -1,4 +1,5 @@
 use crate::error::{BenchError, Result};
+use crate::plan::{CatalogCheckpointCase, CatalogCheckpointProfile};
 use doradb_storage::id::{TableID, TrxID};
 use doradb_storage::{
     StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey, StorageIndexSpec,
@@ -109,6 +110,15 @@ pub enum FixtureRequirement {
     },
     /// Consume one index-free primary with an installed frozen-prefix summary.
     FrozenPrimary,
+    /// No catalog-checkpoint fixture may already be pending.
+    AbsentCatalogCheckpoint,
+    /// Consume the matching prepared catalog-checkpoint fixture.
+    CatalogCheckpointPending {
+        /// Required deterministic profile.
+        profile: CatalogCheckpointProfile,
+        /// Required pending public DDL case.
+        case: CatalogCheckpointCase,
+    },
 }
 
 /// Plan-time fixture transition produced by one successful phase.
@@ -136,6 +146,20 @@ pub enum FixturePlanEffect {
     },
     /// Consume the planned active frozen-prefix state.
     Checkpoint,
+    /// Install one pending deterministic catalog-checkpoint fixture.
+    PrepareCatalogCheckpoint {
+        /// Prepared deterministic profile.
+        profile: CatalogCheckpointProfile,
+        /// Prepared public DDL case.
+        case: CatalogCheckpointCase,
+    },
+    /// Consume one pending deterministic catalog-checkpoint fixture.
+    CheckpointCatalog {
+        /// Consumed deterministic profile.
+        profile: CatalogCheckpointProfile,
+        /// Consumed public DDL case.
+        case: CatalogCheckpointCase,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -151,6 +175,7 @@ struct PrimaryPlanFixture {
 #[derive(Clone, Debug, Default)]
 pub struct FixturePlanState {
     primary: Option<PrimaryPlanFixture>,
+    catalog_checkpoint: Option<(CatalogCheckpointProfile, CatalogCheckpointCase)>,
 }
 
 impl FixturePlanState {
@@ -236,6 +261,24 @@ impl FixturePlanState {
                     ));
                 }
                 Ok(())
+            }
+            FixtureRequirement::AbsentCatalogCheckpoint => {
+                if self.catalog_checkpoint.is_some() {
+                    Err(BenchError::message(
+                        "catalog-checkpoint-prepare found an existing pending catalog-checkpoint fixture",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            FixtureRequirement::CatalogCheckpointPending { profile, case } => {
+                if self.catalog_checkpoint == Some((profile, case)) {
+                    Ok(())
+                } else {
+                    Err(BenchError::message(format!(
+                        "catalog-checkpoint requires a matching preceding catalog-checkpoint-prepare phase: profile={profile}, case={case}"
+                    )))
+                }
             }
         }
     }
@@ -326,8 +369,53 @@ impl FixturePlanState {
                 primary.frozen_max_rows = None;
                 Ok(())
             }
+            FixturePlanEffect::PrepareCatalogCheckpoint { profile, case } => {
+                self.validate(FixtureRequirement::AbsentCatalogCheckpoint)?;
+                self.catalog_checkpoint = Some((profile, case));
+                Ok(())
+            }
+            FixturePlanEffect::CheckpointCatalog { profile, case } => {
+                self.validate(FixtureRequirement::CatalogCheckpointPending { profile, case })?;
+                self.catalog_checkpoint = None;
+                Ok(())
+            }
         }
     }
+}
+
+/// Exact public catalog cardinalities retained by the scale workload.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogCardinalities {
+    /// User table-definition rows.
+    pub user_tables: usize,
+    /// User column-definition rows.
+    pub columns: usize,
+    /// User secondary-index-definition rows.
+    pub indexes: usize,
+    /// Managed roleless binding rows.
+    pub bindings: usize,
+    /// Managed descriptor rows.
+    pub descriptor_rows: usize,
+    /// Total opaque descriptor payload bytes.
+    pub descriptor_bytes: usize,
+}
+
+/// Minimal runtime authority retained after catalog-checkpoint preparation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CatalogCheckpointFixtureSummary {
+    /// Prepared deterministic profile.
+    pub(crate) profile: CatalogCheckpointProfile,
+    /// Pending public DDL case.
+    pub(crate) case: CatalogCheckpointCase,
+    /// Cardinalities of the equivalent checkpointed baseline.
+    pub(crate) before: CatalogCardinalities,
+    /// Cardinalities after the one pending public DDL effect.
+    pub(crate) final_state: CatalogCardinalities,
+    /// Designated empty-descriptor DROP probe identity.
+    pub(crate) drop_probe_id: TableID,
+    /// Designated surviving managed-index probe identity.
+    pub(crate) index_probe_id: TableID,
 }
 
 /// Verified runtime summary of the active canonical frozen-page batch.
@@ -371,6 +459,13 @@ pub(crate) enum FixtureRuntimeEffect {
     },
     /// Consume the verified canonical frozen-page batch summary.
     Checkpoint,
+    /// Install one prepared catalog-checkpoint fixture.
+    PrepareCatalogCheckpoint {
+        /// Verified aggregate state and retained probe IDs.
+        summary: CatalogCheckpointFixtureSummary,
+    },
+    /// Consume the pending catalog-checkpoint fixture.
+    CheckpointCatalog,
 }
 
 /// Typed primary-table runtime binding.
@@ -399,6 +494,8 @@ pub(crate) enum FixtureBinding {
     Primary(PrimaryBinding),
     /// Workload consumes the ordered homogeneous table pool.
     TablePool(Arc<[TableID]>),
+    /// Prepared deterministic catalog-checkpoint state.
+    CatalogCheckpoint(CatalogCheckpointFixtureSummary),
 }
 
 #[derive(Debug)]
@@ -416,6 +513,7 @@ struct RuntimePrimaryFixture {
 #[derive(Debug, Default)]
 pub struct FixtureRuntimeState {
     primary: Option<RuntimePrimaryFixture>,
+    catalog_checkpoint: Option<CatalogCheckpointFixtureSummary>,
 }
 
 impl FixtureRuntimeState {
@@ -517,6 +615,25 @@ impl FixtureRuntimeState {
                 }
                 Ok(FixtureBinding::Primary(runtime_primary_binding(primary)))
             }
+            FixtureRequirement::AbsentCatalogCheckpoint => {
+                if self.catalog_checkpoint.is_some() {
+                    return Err(BenchError::message(
+                        "catalog-checkpoint-prepare runtime found an existing pending fixture",
+                    ));
+                }
+                Ok(FixtureBinding::None)
+            }
+            FixtureRequirement::CatalogCheckpointPending { profile, case } => {
+                let summary = self.catalog_checkpoint.as_ref().ok_or_else(|| {
+                    BenchError::message("catalog-checkpoint runtime fixture is missing")
+                })?;
+                if summary.profile != profile || summary.case != case {
+                    return Err(BenchError::message(
+                        "catalog-checkpoint runtime fixture does not match the plan",
+                    ));
+                }
+                Ok(FixtureBinding::CatalogCheckpoint(summary.clone()))
+            }
         }
     }
 
@@ -611,6 +728,22 @@ impl FixtureRuntimeState {
                 if primary.frozen.take().is_none() {
                     return Err(BenchError::message(
                         "runtime checkpoint effect has no frozen batch to consume",
+                    ));
+                }
+                Ok(())
+            }
+            FixtureRuntimeEffect::PrepareCatalogCheckpoint { summary } => {
+                if self.catalog_checkpoint.replace(summary).is_some() {
+                    return Err(BenchError::message(
+                        "catalog-checkpoint preparation replaced an existing runtime fixture",
+                    ));
+                }
+                Ok(())
+            }
+            FixtureRuntimeEffect::CheckpointCatalog => {
+                if self.catalog_checkpoint.take().is_none() {
+                    return Err(BenchError::message(
+                        "catalog-checkpoint has no pending runtime fixture",
                     ));
                 }
                 Ok(())

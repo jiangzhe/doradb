@@ -13,9 +13,10 @@ use crate::plan_output::{
     write_plan_output,
 };
 use crate::workload::{
-    CheckpointTableExecutor, CreateTableExecutor, FreezeTableExecutor, IndexDdlExecutor,
-    IndexScanExecutor, IndexStreamExecutor, InsertRandExecutor, InsertSeqExecutor,
-    LockTableExecutor, LookupRandExecutor, LookupSeqExecutor, ParallelTableScanExecutor,
+    CatalogCheckpointExecutor, CatalogCheckpointPrepareExecutor, CheckpointTableExecutor,
+    CreateTableExecutor, FreezeTableExecutor, IndexDdlExecutor, IndexScanExecutor,
+    IndexStreamExecutor, InsertRandExecutor, InsertSeqExecutor, LockTableExecutor,
+    LookupRandExecutor, LookupSeqExecutor, ParallelTableScanExecutor,
     ParallelTableScanExecutorConfig, RunCancellation, SessionPlan, StmtNoopExecutor,
     TableDdlExecutor, TableScanExecutor, TrxNoopExecutor, UpdateRandExecutor,
 };
@@ -559,6 +560,28 @@ async fn dispatch_workload(
         }
         ResolvedWorkload::CheckpointTable(config) => {
             run_executor::<CheckpointTableExecutor>(
+                engine,
+                clock,
+                workload,
+                SessionExecutorConfig::new(*config, binding, execution_ordinal),
+                planned_effect,
+                sample_latency,
+            )
+            .await
+        }
+        ResolvedWorkload::CatalogCheckpointPrepare(config) => {
+            run_executor::<CatalogCheckpointPrepareExecutor>(
+                engine,
+                clock,
+                workload,
+                SessionExecutorConfig::new(*config, binding, execution_ordinal),
+                planned_effect,
+                sample_latency,
+            )
+            .await
+        }
+        ResolvedWorkload::CatalogCheckpoint(config) => {
+            run_executor::<CatalogCheckpointExecutor>(
                 engine,
                 clock,
                 workload,

@@ -5,10 +5,10 @@ pub use managed_table_ops::ManagedTableOps;
 use crate::buffer::page::VersionedPageID;
 use crate::buffer::{BufferPool, PoolGuards};
 use crate::catalog::{
-    Catalog, CatalogCheckpointOutcome, CatalogCheckpointScope, CreateTableOutcome, DropTablePlan,
-    IndexDdlGateScope, IndexID, PreparedCreateIndex, PreparedCreateTable, PreparedDropIndex,
-    PreparedDropTable, StorageIndexSpec, StorageTableSpec, ValidatedCreateTable,
-    create_index_catalog_write_targets, create_table_catalog_write_targets,
+    Catalog, CatalogCheckpointOutcome, CatalogCheckpointReport, CatalogCheckpointScope,
+    CreateTableOutcome, DropTablePlan, IndexDdlGateScope, IndexID, PreparedCreateIndex,
+    PreparedCreateTable, PreparedDropIndex, PreparedDropTable, StorageIndexSpec, StorageTableSpec,
+    ValidatedCreateTable, create_index_catalog_write_targets, create_table_catalog_write_targets,
     drop_index_catalog_write_targets, drop_table_catalog_write_targets,
     prepare_catalog_checkpoint_operation, reject_non_user_table_id,
     reject_user_table_primary_key_index, validated_index_ddl_target,
@@ -1316,7 +1316,7 @@ impl Session {
     /// refreshes internal catalog-safe redo retention progress for future
     /// truncation planning.
     #[inline]
-    pub async fn checkpoint_catalog(&mut self) -> Result<()> {
+    pub async fn checkpoint_catalog(&mut self) -> Result<CatalogCheckpointReport> {
         let operation = self
             .pin_operation(SessionOperationKind::Maintenance)
             .attach("operation=checkpoint_catalog")
@@ -1339,7 +1339,6 @@ impl Session {
             .await
             .map_err(|error| error.into_quad(RuntimeError::CatalogAccess))
             .attach("operation=checkpoint_catalog, phase=wait_mandatory_completion")
-            .map(|_| ())
             .disclose()
     }
 
