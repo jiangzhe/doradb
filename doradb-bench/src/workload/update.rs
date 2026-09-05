@@ -14,8 +14,8 @@ use crate::workload::util::{
 use crate::workload::{RunCancellation, SessionPlan};
 use doradb_storage::id::TableID;
 use doradb_storage::{
-    CallbackError, CallbackResult, Engine, IndexID, RowMutation, Session, TableIndex, UpdateCol,
-    Val,
+    CallbackError, CallbackResult, Engine, ErrorKind, IndexID, RowMutation, Session, TableIndex,
+    UpdateCol, Val,
 };
 
 const SPLITMIX_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
@@ -432,7 +432,17 @@ async fn run_update_operations(
             Ok(outcome) => outcome,
             Err(error) => {
                 let primary = BenchError::from(error);
-                let _ = trx.rollback().await;
+                if let Err(rollback_error) = trx.rollback().await {
+                    // Fatal statement rollback can discard the transaction;
+                    // retain that report over a later nonfatal cleanup error.
+                    let primary_is_fatal = matches!(
+                        &primary,
+                        BenchError::Storage(error) if error.is_kind(ErrorKind::Fatal)
+                    );
+                    if rollback_error.is_kind(ErrorKind::Fatal) || !primary_is_fatal {
+                        return Err(rollback_error.into());
+                    }
+                }
                 return Err(primary);
             }
         };

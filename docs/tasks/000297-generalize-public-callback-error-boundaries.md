@@ -160,8 +160,11 @@ conversion because Rust does not chain `From` implementations automatically.
 The benchmark implements concrete conversions for `CallbackError<BenchError>`
 and `CallbackError<Infallible>`. Engine reports enter its storage variant and
 user `BenchError` values return intact. Update callbacks now stop immediately
-on validation failure through statement settlement, preserving any fatal
-rollback error and the workload's terminal transaction cleanup policy.
+on validation failure through statement settlement. The mutation-error path
+then attempts terminal transaction rollback: success preserves the mutation
+error, and failure returns the rollback error unless an existing fatal mutation
+error would be replaced by a nonfatal cleanup error. A fatal terminal rollback
+error always takes precedence.
 
 ## Implementation Notes
 
@@ -169,7 +172,15 @@ All planned callback boundaries now preserve engine classification and
 application payload identity through existing settlement and cleanup paths.
 The coordinated workspace migration includes managed consumers, row API tests,
 the quick-start example, benchmark workloads, and public/error guidance.
-There were no material plan deviations or deferred implementation issues.
+The benchmark rollback-error precedence was refined during follow-up review;
+there are no deferred implementation issues.
+
+The September 6 review identified discarded terminal rollback errors in the
+benchmark mutation-error branch. Those failures now propagate, with the
+requester-approved exception that preserves an existing fatal report over a
+later nonfatal cleanup error such as a discarded transaction. This refines the
+original benchmark cleanup-result policy without changing engine settlement.
+Other benchmark rollback branches remain outside this correction's scope.
 
 Regression coverage uses a caller-borrowed, non-Clone, non-Send payload without
 formatting or standard-error traits. One shared mixed-storage scenario covers
@@ -186,18 +197,27 @@ sendability coverage passed. The benchmark regression verifies that a later
 application validation failure restores earlier row updates and releases its
 transaction.
 
-Verification completed on 2026-09-05:
+Initial implementation and alternate-backend verification completed on
+2026-09-05. Workspace validation was repeated after the benchmark review fix
+on 2026-09-06:
 
-- Strict workspace clippy and alternate `libaio` clippy passed for all targets.
-- Workspace nextest passed 1,933 tests across four binaries.
-- Alternate `libaio` nextest passed 1,817 storage tests.
+- Strict workspace clippy passed for all targets after the review fix;
+  alternate `libaio` clippy passed during the initial storage validation.
+- Workspace nextest again passed 1,933 tests across four binaries, including
+  the benchmark callback-rollback regression and storage fatal-rollback tests.
+- Alternate `libaio` nextest passed 1,817 storage tests before the benchmark-only
+  refinement; storage code did not change in that refinement.
 - Branch-diff style audit against `origin/main` passed for 24 Rust files,
-  including formatting and strict workspace clippy. Two conversion impl
-  placement findings were corrected before the final passing gate.
+  including formatting and strict workspace clippy, during final resolution on
+  2026-09-06.
 - The public-error disclosure audit was regenerated and remained unchanged;
   no new disclosure sites or unrelated public-error ownership appeared.
 - Diff review confirmed unchanged cancellation owners, private-runner behavior,
   deferred-update settlement ordering, and callback-free stream results.
+- The benchmark's four terminal-result cases were reviewed directly: rollback
+  success, ordinary rollback failure, fatal rollback failure, and an existing
+  fatal mutation error followed by nonfatal cleanup failure. No new fault
+  injection hooks were introduced for this localized correction.
 
 Source backlog 000191 is closed as implemented. Historical tasks 000293/000294
 and RFC 0031 link this follow-up; no parent RFC phase synchronization applies.
