@@ -3,12 +3,13 @@ use super::{
     TableScanColdPage, TableScanRuntime, TableScanUnit, TableScanWorklist,
 };
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
-use crate::error::{Result, RuntimeResult};
+use crate::error::{Error, RuntimeResult};
 use crate::id::{BlockID, RowID};
 use crate::row::RowPage;
 use crate::row::ops::ScanRowDecision;
 use crate::trx::MvccReadView;
 use crate::value::Val;
+use std::result::Result as StdResult;
 use std::sync::Arc;
 use std::vec::IntoIter;
 
@@ -181,16 +182,17 @@ where
     }
 
     /// Advance visible rows in the loaded unit until a row or boundary is reached.
-    pub(crate) fn advance<F>(
+    pub(crate) fn advance<F, CE>(
         &mut self,
         table: &Table,
         layout: &TableRuntimeLayout,
         read_view: &MvccReadView,
         projection: &[usize],
         scan_row: &mut F,
-    ) -> Result<TableScanCursorAdvance>
+    ) -> StdResult<TableScanCursorAdvance, CE>
     where
-        F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<ScanRowDecision>,
+        CE: From<Error>,
+        F: for<'row> FnMut(&mut LazyRow<'row>) -> StdResult<ScanRowDecision, CE>,
     {
         let accessor = table.accessor_with_layout(layout);
         loop {
@@ -248,20 +250,23 @@ where
 }
 
 #[inline]
-fn apply_row<F>(
+fn apply_row<F, CE>(
     scan_row: &mut F,
     projection: &[usize],
     mut lazy_row: LazyRow<'_>,
-) -> Result<Option<TableScanCursorAdvance>>
+) -> StdResult<Option<TableScanCursorAdvance>, CE>
 where
-    F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<ScanRowDecision>,
+    CE: From<Error>,
+    F: for<'row> FnMut(&mut LazyRow<'row>) -> StdResult<ScanRowDecision, CE>,
 {
     let decision = scan_row(&mut lazy_row);
     match decision {
         Ok(ScanRowDecision::Include) => {
             let projected = lazy_row.project(projection);
             lazy_row.reset();
-            projected.map(|row| Some(TableScanCursorAdvance::Row(row)))
+            projected
+                .map(|row| Some(TableScanCursorAdvance::Row(row)))
+                .map_err(CE::from)
         }
         Ok(ScanRowDecision::Skip) => {
             lazy_row.reset();

@@ -271,18 +271,19 @@ impl Transaction {
 
     /// Executes one engine-selected owned statement operation.
     #[inline]
-    async fn exec<T, F>(&mut self, action: F) -> Result<T>
+    async fn exec<T, CE, F>(&mut self, action: F) -> StdResult<T, CE>
     where
-        F: for<'stmt> AsyncFnOnce(Statement<'stmt>) -> Result<T>,
+        CE: From<Error>,
+        F: for<'stmt> AsyncFnOnce(Statement<'stmt>) -> StdResult<T, CE>,
     {
         let checkout = self
             .checkout()
             .attach("operation=execute_statement")
             .disclose()?;
         let mut stmt_state = StmtState::public(checkout, self.dml_validation_disabled);
-        enum ExecOutcome<T> {
+        enum ExecOutcome<T, CE> {
             Success(T),
-            StatementError(Error),
+            StatementError(CE),
             FatalRollback(Report<FatalError>),
         }
         let stmt_result = {
@@ -315,7 +316,7 @@ impl Transaction {
             }
             ExecOutcome::FatalRollback(err) => {
                 stmt_state.discard_after_fatal_rollback();
-                Err(err.disclose())
+                Err(CE::from(err.disclose()))
             }
         }
     }
@@ -3692,7 +3693,7 @@ pub(crate) mod tests {
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
-    use crate::error::{InternalError, OperationError};
+    use crate::error::{CallbackError, CallbackResult, InternalError, OperationError};
     use crate::file::cow_file::tests::old_root_drop_count;
     use crate::file::table_file::{MutableTableFile, TableFile};
     use crate::id::{BlockID, OperationID, PageID, RowID, SessionID};
@@ -4273,7 +4274,7 @@ pub(crate) mod tests {
 
         // Focused owned-runner tests inject raw redo without a physical row
         // operation.
-        trx.exec(async |mut stmt| {
+        trx.exec::<_, Error, _>(async |mut stmt| {
             // Simulate one sysbench record:
             // uint64 + int32 + int32 + char(60) + char(120)
             stmt_tests::statement_effects_mut(&mut stmt).insert_row_redo(
@@ -4747,10 +4748,10 @@ pub(crate) mod tests {
         }
         // Focused owned-runner cancellation during statement rollback folds
         // residual row and index undo into cleanup.
-        let mut exec = Box::pin(trx.exec(async |stmt| {
+        let mut exec = Box::pin(trx.exec(async |stmt| -> CallbackResult<_, String> {
             stmt.table_insert_mvcc(table_id, vec![Val::from(value), Val::from("cancelled")])
                 .await?;
-            Err::<(), Error>(Report::new(OperationError::InvalidDmlInput).disclose())
+            Err::<(), _>(CallbackError::User("cancelled callback".to_owned()))
         }));
 
         poll_until_statement_rollback_pauses(
@@ -5803,7 +5804,7 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_stmt_effect_merge").await;
             let (_session, mut trx) = begin_production_test_transaction(&engine);
-            trx.exec(async |mut stmt| {
+            trx.exec::<_, Error, _>(async |mut stmt| {
                 let effects = stmt_tests::statement_effects_mut(&mut stmt);
                 effects.push_row_undo(OwnedRowUndo::new(
                     effects.stmt_no(),
@@ -6027,7 +6028,7 @@ pub(crate) mod tests {
             let (_temp_dir, engine) = test_engine("redo_stmt_error_rollback").await;
             let (_session, mut trx) = begin_production_test_transaction(&engine);
 
-            trx.exec(async |mut stmt| {
+            trx.exec::<_, Error, _>(async |mut stmt| {
                 stmt_tests::statement_effects_mut(&mut stmt).insert_row_redo(
                     TableID::new(12),
                     RowRedo {
@@ -6083,7 +6084,7 @@ pub(crate) mod tests {
                 .unwrap();
 
             let (owner, count) = trx
-                .exec(async |mut stmt| {
+                .exec::<_, Error, _>(async |mut stmt| {
                     let owner = stmt_tests::transaction_lock_owner(&stmt);
                     stmt_tests::acquire_transaction_lock(
                         &mut stmt,
@@ -6105,7 +6106,7 @@ pub(crate) mod tests {
             assert_eq!(count, 2);
 
             let (owner, count) = trx
-                .exec(async |mut stmt| {
+                .exec::<_, Error, _>(async |mut stmt| {
                     let owner = stmt_tests::transaction_lock_owner(&stmt);
                     stmt_tests::acquire_transaction_lock(
                         &mut stmt,

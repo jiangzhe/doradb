@@ -2,16 +2,99 @@ use crate::id::RowID;
 use crate::io::BackendError;
 use error_stack::{AttachmentKind, Frame, FrameKind, Report};
 use std::backtrace::Backtrace;
+use std::convert::Infallible;
 use std::error::Error as StdError;
 use std::fmt::{self, Debug, Display};
 use std::io::ErrorKind as IoErrorKind;
 use std::ops::ControlFlow;
 use std::panic::Location;
-use std::result;
+use std::result::{self, Result as StdResult};
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use thiserror::Error as ThisError;
+
+/// Public boundary preserving engine failures and application callback failures.
+#[derive(Debug)]
+pub enum CallbackError<E = Infallible> {
+    /// DoraDB validation, lifecycle, persistence, or execution failure.
+    Engine(Error),
+    /// Application-defined callback failure.
+    User(E),
+}
+
+impl<E> CallbackError<E> {
+    /// Returns the engine error, if this failure came from DoraDB.
+    #[inline]
+    pub const fn engine(&self) -> Option<&Error> {
+        match self {
+            Self::Engine(error) => Some(error),
+            Self::User(_) => None,
+        }
+    }
+
+    /// Returns the user error, if the application callback failed.
+    #[inline]
+    pub const fn user(&self) -> Option<&E> {
+        match self {
+            Self::Engine(_) => None,
+            Self::User(error) => Some(error),
+        }
+    }
+
+    /// Consumes this failure and returns its engine error arm.
+    #[inline]
+    pub fn into_engine(self) -> Option<Error> {
+        match self {
+            Self::Engine(error) => Some(error),
+            Self::User(_) => None,
+        }
+    }
+
+    /// Consumes this failure and returns its user error arm.
+    #[inline]
+    pub fn into_user(self) -> Option<E> {
+        match self {
+            Self::Engine(_) => None,
+            Self::User(error) => Some(error),
+        }
+    }
+}
+
+impl<E: fmt::Display> fmt::Display for CallbackError<E> {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Engine(error) => write!(f, "callback engine error: {error}"),
+            Self::User(error) => write!(f, "callback user error: {error}"),
+        }
+    }
+}
+
+impl<E: StdError + 'static> StdError for CallbackError<E> {
+    #[inline]
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Engine(error) => Some(error),
+            Self::User(error) => Some(error),
+        }
+    }
+}
+
+/// Converts an engine failure without changing its report or classification.
+impl<E> From<Error> for CallbackError<E> {
+    #[inline]
+    fn from(error: Error) -> Self {
+        Self::Engine(error)
+    }
+}
+
+/// Result of an engine operation with an application callback.
+///
+/// Annotate callbacks with `CallbackResult<_>` when they can fail only through
+/// engine operations such as `LazyRow::val`. Wrap application errors explicitly
+/// with `CallbackError::User`; engine errors convert through `From<Error>`.
+pub type CallbackResult<T, E = Infallible> = StdResult<T, CallbackError<E>>;
 
 /// Explicitly converges one audited typed error into the public wrapper.
 pub(crate) trait DiscloseError {
@@ -1918,6 +2001,17 @@ impl fmt::Debug for Error {
 
 impl StdError for Error {}
 
+/// Recovers the engine error from a callback with no application-error arm.
+impl From<CallbackError<Infallible>> for Error {
+    #[inline]
+    fn from(error: CallbackError<Infallible>) -> Self {
+        match error {
+            CallbackError::Engine(error) => error,
+            CallbackError::User(error) => match error {},
+        }
+    }
+}
+
 impl DiscloseError for Report<ConfigError> {
     #[inline]
     fn disclose(self) -> Error {
@@ -2095,6 +2189,39 @@ mod tests {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.write_str("unknown attachment")
         }
+    }
+
+    #[test]
+    fn callback_error_preserves_both_domains_and_standard_error_traits() {
+        let engine_error = Report::new(OperationError::InvalidMetadata).disclose();
+        let error = CallbackError::<StdIoError>::Engine(engine_error);
+        assert!(error.engine().is_some());
+        assert!(error.user().is_none());
+        assert!(format!("{error}").contains("callback engine error"));
+        assert!(StdError::source(&error).is_some());
+        assert!(error.into_engine().is_some());
+
+        let error = CallbackError::User(StdIoError::other("interpretation failed"));
+        assert!(error.engine().is_none());
+        assert_eq!(
+            error.user().map(ToString::to_string).as_deref(),
+            Some("interpretation failed")
+        );
+        assert!(format!("{error}").contains("callback user error"));
+        assert!(StdError::source(&error).is_some());
+        assert!(error.into_user().is_some());
+
+        let engine_error = Report::new(OperationError::InvalidMetadata).disclose();
+        assert!(
+            CallbackError::<StdIoError>::Engine(engine_error)
+                .into_user()
+                .is_none()
+        );
+        assert!(
+            CallbackError::User(StdIoError::other("failure"))
+                .into_engine()
+                .is_none()
+        );
     }
 
     #[test]
@@ -3337,5 +3464,51 @@ mod tests {
     fn test_completion_bridge_rejects_unknown_attachment() {
         let report = Report::new(IoError::from(IoErrorKind::Other)).attach(UnknownAttachment);
         let _ = CompletionErrorBridge::capture(report);
+    }
+    #[test]
+    fn test_callback_engine_conversions_preserve_reports_and_distinguish_user_error() {
+        for user in [false, true] {
+            let engine = Report::new(IoError::from(IoErrorKind::BrokenPipe))
+                .attach("callback IO source")
+                .change_context(RuntimeError::TableAccess)
+                .attach("callback operation context")
+                .disclose();
+            let expected = format!("{engine:?}");
+            let wrapped: CallbackError<Error> = if user {
+                CallbackError::User(engine)
+            } else {
+                engine.into()
+            };
+            assert_eq!(wrapped.user().is_some(), user);
+            assert_eq!(wrapped.engine().is_some(), !user);
+            let engine = if user {
+                wrapped.into_user().unwrap()
+            } else {
+                wrapped.into_engine().unwrap()
+            };
+            let wrapped: CallbackError = engine.into();
+            let engine: Error = wrapped.into();
+            assert_eq!(engine.kind(), ErrorKind::Runtime);
+            assert_eq!(
+                engine.report().downcast_ref::<RuntimeError>(),
+                Some(&RuntimeError::TableAccess)
+            );
+            assert!(engine.report().downcast_ref::<IoError>().is_some());
+            assert_eq!(
+                engine
+                    .report()
+                    .frames()
+                    .filter(|frame| frame.is::<ErrorKind>())
+                    .count(),
+                1
+            );
+            assert_eq!(format!("{engine:?}"), expected);
+        }
+        let payload = String::from("owned application error");
+        let address = payload.as_ptr();
+        let error = CallbackError::User(payload);
+        assert!(format!("{error:?}").contains("User"));
+        let payload = error.into_user().unwrap();
+        assert_eq!(payload.as_ptr(), address);
     }
 }

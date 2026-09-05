@@ -15,9 +15,8 @@ use crate::workload::util::{
 use crate::workload::{RunCancellation, SessionPlan};
 use doradb_storage::{
     BindingNamespaceID, CreateIndexDefinition, CreateTableDefinition, DescriptorUpdate,
-    DropIndexDefinition, Engine, IndexID, ManagedCreateTableDefinition, ManagedDdlError,
-    ManagedTableInterpreter, ManagedTableOps, ResolvedTableBinding, Session,
-    StorageTableDefinition, TableBinding,
+    DropIndexDefinition, Engine, IndexID, ManagedCreateTableDefinition, ManagedTableInterpreter,
+    ManagedTableOps, ResolvedTableBinding, Session, StorageTableDefinition, TableBinding,
 };
 
 const BINDING_NAMESPACE: BindingNamespaceID = BindingNamespaceID::new(0x4249_4e44_4245_4e43);
@@ -71,13 +70,7 @@ impl SessionExecutor for ManagedBindingsPrepareExecutor {
                 key,
                 descriptor: descriptor.clone(),
             };
-            let created = session
-                .create_managed_table(&key, &mut interpreter)
-                .await
-                .map_err(|error| match error {
-                    ManagedDdlError::Engine(error) => BenchError::from(error),
-                    ManagedDdlError::Interpreter(error) => error,
-                })?;
+            let created = session.create_managed_table(&key, &mut interpreter).await?;
             let resolved = session
                 .resolve_table_binding(BINDING_NAMESPACE, &key, true)
                 .await?

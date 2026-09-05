@@ -1,5 +1,5 @@
 use crate::catalog::{ResolvedTableIndex, TableIndex, TableIndexArgument};
-use crate::error::{DiscloseResultExt, MultiDomainResultExt, Result};
+use crate::error::{CallbackResult, DiscloseResultExt, MultiDomainResultExt, Result};
 use crate::id::{RowID, TableID};
 use crate::row::ops::{
     DeleteMvcc, RowMutation, ScanMvcc, ScanRowDecision, SelectMvcc, TableMutationOutcome,
@@ -71,30 +71,39 @@ impl Transaction {
     }
 
     /// Mutates callback-selected rows from a sequential latest-row traversal.
+    ///
+    /// Callback errors roll back this statement and return intact unless rollback
+    /// itself fails, in which case the fatal engine error takes precedence. Use
+    /// `CallbackResult<_>` for callbacks with engine failures only, or wrap
+    /// application failures explicitly in `CallbackError::User`.
     #[inline]
-    pub async fn table_mutate_mvcc<F>(
+    pub async fn table_mutate_mvcc<F, E>(
         &mut self,
         table_id: TableID,
         mutate_row: F,
-    ) -> Result<TableMutationOutcome>
+    ) -> CallbackResult<TableMutationOutcome, E>
     where
-        F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<RowMutation>,
+        F: for<'row> FnMut(&mut LazyRow<'row>) -> CallbackResult<RowMutation, E>,
     {
         self.exec(async move |stmt| stmt.table_mutate_mvcc(table_id, mutate_row).await)
             .await
     }
 
     /// Mutates callback-selected rows from one secondary-index range.
+    ///
+    /// Callback errors stop traversal and roll back the statement, including
+    /// deferred unique-key updates. Fatal rollback errors take engine precedence.
+    /// Annotate engine-only callbacks with `CallbackResult<_>`.
     #[inline]
-    pub async fn table_index_mutate_mvcc<'r, R, F, I>(
+    pub async fn table_index_mutate_mvcc<'r, R, F, I, E>(
         &mut self,
         index: I,
         range: R,
         mutate_row: F,
-    ) -> Result<TableMutationOutcome>
+    ) -> CallbackResult<TableMutationOutcome, E>
     where
         R: RangeBounds<&'r [Val]>,
-        F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<RowMutation>,
+        F: for<'row> FnMut(&mut LazyRow<'row>) -> CallbackResult<RowMutation, E>,
         I: TableIndexArgument,
     {
         let selector = index.into_selector();
@@ -198,15 +207,20 @@ impl Transaction {
     }
 
     /// Creates a caller-driven programmable stream over visible table rows.
+    ///
+    /// Construction errors use the engine arm. Callback and projection failures
+    /// returned by `next` close the stream; later calls return `Ok(None)`.
+    /// Annotate engine-only callbacks with `CallbackResult<_>`. The stream keeps
+    /// its exclusive transaction borrow until dropped.
     #[inline]
-    pub async fn table_scan_mvcc_stream<'trx, F>(
+    pub async fn table_scan_mvcc_stream<'trx, F, E>(
         &'trx mut self,
         table_id: TableID,
         read_set: &[usize],
         scan_row: F,
-    ) -> Result<TableScanMvccStream<'trx, F>>
+    ) -> CallbackResult<TableScanMvccStream<'trx, F>, E>
     where
-        F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<ScanRowDecision>,
+        F: for<'row> FnMut(&mut LazyRow<'row>) -> CallbackResult<ScanRowDecision, E>,
     {
         let dml_validation_disabled = self.dml_validation_disabled;
         let checkout = self
@@ -483,9 +497,11 @@ mod tests {
             let mut normal_mutation = session.begin_trx().unwrap();
             assert_eq!(
                 normal_mutation
-                    .table_index_mutate_mvcc(TableIndex(table_id, non_unique_id), .., |_| {
-                        Ok(RowMutation::Skip)
-                    })
+                    .table_index_mutate_mvcc(
+                        TableIndex(table_id, non_unique_id),
+                        ..,
+                        |_| -> CallbackResult<_> { Ok(RowMutation::Skip) }
+                    )
                     .await
                     .unwrap(),
                 TableMutationOutcome::default()
@@ -564,7 +580,9 @@ mod tests {
             let mut mutation = session.begin_trx().unwrap();
             assert_eq!(
                 mutation
-                    .table_index_mutate_mvcc(resolved_non_unique, .., |_| Ok(RowMutation::Skip))
+                    .table_index_mutate_mvcc(resolved_non_unique, .., |_| -> CallbackResult<_> {
+                        Ok(RowMutation::Skip)
+                    })
                     .await
                     .unwrap(),
                 TableMutationOutcome::default()
@@ -632,15 +650,21 @@ mod tests {
             let table_id = TableID::new(91_225);
 
             let err = match trx
-                .table_scan_mvcc_stream(table_id, &[0], |_| Ok(ScanRowDecision::Include))
+                .table_scan_mvcc_stream(table_id, &[0], |_| -> CallbackResult<_> {
+                    Ok(ScanRowDecision::Include)
+                })
                 .await
             {
                 Ok(_) => panic!("missing table must fail stream construction"),
                 Err(err) => err,
             };
-            assert_eq!(err.kind(), ErrorKind::Operation);
+            assert_eq!(err.engine().unwrap().kind(), ErrorKind::Operation);
             assert_eq!(
-                err.report().downcast_ref::<OperationError>().copied(),
+                err.engine()
+                    .unwrap()
+                    .report()
+                    .downcast_ref::<OperationError>()
+                    .copied(),
                 Some(OperationError::TableNotFound)
             );
             let rendered = format!("{err:?}");
@@ -651,6 +675,48 @@ mod tests {
             assert_eq!(rendered.matches(&format!("table_id={table_id}")).count(), 1);
             trx.noop().await.unwrap();
             trx.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_callback_infallible_inference_in_engine_result() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "callback_infallible").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let result: Result<()> = async {
+                let mut trx = session.begin_trx()?;
+                trx.table_insert_mvcc(table_id, vec![Val::from(1i32), Val::from("row")])
+                    .await?;
+                trx.table_mutate_mvcc(table_id, |row| -> CallbackResult<_> {
+                    row.val(0)?;
+                    Ok(RowMutation::Skip)
+                })
+                .await?;
+                trx.table_index_mutate_mvcc(
+                    TableIndex(table_id, IndexID::new(0)),
+                    ..,
+                    |row| -> CallbackResult<_> {
+                        row.val(0)?;
+                        Ok(RowMutation::Skip)
+                    },
+                )
+                .await?;
+                let mut stream = trx
+                    .table_scan_mvcc_stream(table_id, &[0], |row| -> CallbackResult<_> {
+                        row.val(0)?;
+                        Ok(ScanRowDecision::Include)
+                    })
+                    .await?;
+                assert_eq!(stream.next().await?, Some(vec![Val::from(1i32)]));
+                assert_eq!(stream.next().await?, None);
+                drop(stream);
+                trx.rollback().await?;
+                Ok(())
+            }
+            .await;
+            result.unwrap();
         });
     }
 }

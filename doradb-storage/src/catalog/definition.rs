@@ -2,12 +2,10 @@ use super::spec::{
     CreateIndexDefinition, CreateTableDefinition, DropIndexDefinition, StorageTableDefinition,
 };
 use super::storage::{TableBindingObject, TableDescriptorObject};
-use crate::error::{Error, OperationError, OperationResult};
+use crate::error::{OperationError, OperationResult};
 use crate::id::TableID;
 use crate::map::FastHashSet;
 use error_stack::Report;
-use std::error::Error as StdError;
-use std::fmt;
 use std::result::Result as StdResult;
 
 /// Maximum persisted opaque descriptor payload accepted by managed table DDL.
@@ -308,76 +306,6 @@ pub trait ManagedTableInterpreter {
     ) -> StdResult<DescriptorUpdate<DropIndexDefinition>, Self::Error>;
 }
 
-/// Public failure boundary for one managed DDL attempt.
-#[derive(Debug)]
-pub enum ManagedDdlError<E> {
-    /// DoraDB validation, lifecycle, persistence, or execution failure.
-    Engine(Error),
-    /// User-defined interpreter failure.
-    Interpreter(E),
-}
-
-impl<E> ManagedDdlError<E> {
-    /// Returns the engine error, if this failure came from DoraDB.
-    #[inline]
-    pub const fn engine(&self) -> Option<&Error> {
-        match self {
-            Self::Engine(error) => Some(error),
-            Self::Interpreter(_) => None,
-        }
-    }
-
-    /// Returns the interpreter error, if interpretation failed.
-    #[inline]
-    pub const fn interpreter(&self) -> Option<&E> {
-        match self {
-            Self::Engine(_) => None,
-            Self::Interpreter(error) => Some(error),
-        }
-    }
-
-    /// Consumes this failure and returns its engine error arm.
-    #[inline]
-    pub fn into_engine(self) -> Option<Error> {
-        match self {
-            Self::Engine(error) => Some(error),
-            Self::Interpreter(_) => None,
-        }
-    }
-
-    /// Consumes this failure and returns its interpreter error arm.
-    #[inline]
-    pub fn into_interpreter(self) -> Option<E> {
-        match self {
-            Self::Engine(_) => None,
-            Self::Interpreter(error) => Some(error),
-        }
-    }
-}
-
-impl<E: fmt::Display> fmt::Display for ManagedDdlError<E> {
-    #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Engine(error) => write!(f, "managed DDL engine error: {error}"),
-            Self::Interpreter(error) => write!(f, "managed DDL interpreter error: {error}"),
-        }
-    }
-}
-
-impl<E: StdError + 'static> StdError for ManagedDdlError<E> {
-    #[inline]
-    fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        match self {
-            Self::Engine(error) => Some(error),
-            Self::Interpreter(error) => Some(error),
-        }
-    }
-}
-
-/// Result of one complete engine-orchestrated managed DDL attempt.
-pub type ManagedDdlResult<T, E> = StdResult<T, ManagedDdlError<E>>;
-
 /// Private optimistic definition copied while target metadata-S is held.
 pub(crate) struct CurrentTableDefinition {
     schema: StorageTableDefinition,
@@ -560,10 +488,8 @@ pub(crate) fn validate_table_bindings(bindings: &[TableBinding]) -> OperationRes
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::DiscloseError;
     use crate::{StorageColumnFlags, StorageColumnSpec, StorageTableSpec, ValKind};
     use std::collections::HashSet;
-    use std::io;
 
     #[test]
     fn descriptor_update_exposes_and_consumes_both_parts() {
@@ -661,39 +587,6 @@ mod tests {
                 TableBinding::new(BindingNamespaceID::new(1), b"same".as_slice()),
             ])
             .is_err()
-        );
-    }
-
-    #[test]
-    fn managed_error_preserves_both_domains_and_standard_error_traits() {
-        let engine_error = Report::new(OperationError::InvalidMetadata).disclose();
-        let error = ManagedDdlError::<io::Error>::Engine(engine_error);
-        assert!(error.engine().is_some());
-        assert!(error.interpreter().is_none());
-        assert!(format!("{error}").contains("managed DDL engine error"));
-        assert!(StdError::source(&error).is_some());
-        assert!(error.into_engine().is_some());
-
-        let error = ManagedDdlError::Interpreter(io::Error::other("interpretation failed"));
-        assert!(error.engine().is_none());
-        assert_eq!(
-            error.interpreter().map(ToString::to_string).as_deref(),
-            Some("interpretation failed")
-        );
-        assert!(format!("{error}").contains("managed DDL interpreter error"));
-        assert!(StdError::source(&error).is_some());
-        assert!(error.into_interpreter().is_some());
-
-        let engine_error = Report::new(OperationError::InvalidMetadata).disclose();
-        assert!(
-            ManagedDdlError::<io::Error>::Engine(engine_error)
-                .into_interpreter()
-                .is_none()
-        );
-        assert!(
-            ManagedDdlError::Interpreter(io::Error::other("failure"))
-                .into_engine()
-                .is_none()
         );
     }
 }

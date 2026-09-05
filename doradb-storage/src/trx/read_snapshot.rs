@@ -1583,6 +1583,7 @@ fn read_snapshot_unavailable(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CallbackResult;
     use crate::catalog::CATALOG_TABLE_ID_START;
     use crate::catalog::tests::{table2, table3};
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TableScanConfig, TrxSysConfig};
@@ -1890,7 +1891,9 @@ mod tests {
             let concatenated = rows.into_iter().flatten().collect::<Vec<_>>();
             let mut trx = session.begin_trx().unwrap();
             let mut sequential_stream = trx
-                .table_scan_mvcc_stream(table_id, &[0], |_| Ok(ScanRowDecision::Include))
+                .table_scan_mvcc_stream(table_id, &[0], |_| -> CallbackResult<_> {
+                    Ok(ScanRowDecision::Include)
+                })
                 .await
                 .unwrap();
             let mut sequential = Vec::new();

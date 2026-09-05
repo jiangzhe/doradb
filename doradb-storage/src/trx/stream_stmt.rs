@@ -1,7 +1,8 @@
 use crate::buffer::EvictableBufferPool;
 use crate::catalog::{IndexRef, TableIndexSelector};
 use crate::error::{
-    DiscloseResultExt, OperationError, OperationOrFatalResult, Result, RuntimeResult,
+    CallbackResult, DiscloseResultExt, OperationError, OperationOrFatalResult, Result,
+    RuntimeResult,
 };
 use crate::id::TableID;
 use crate::index::{
@@ -136,14 +137,14 @@ impl StreamStmtState {
 
     /// Creates a caller-driven programmable MVCC full-table scan stream.
     #[inline]
-    pub(super) async fn table_scan_mvcc_stream<'trx, F>(
+    pub(super) async fn table_scan_mvcc_stream<'trx, F, E>(
         mut self,
         table_id: TableID,
         read_set: &[usize],
         scan_row: F,
-    ) -> Result<TableScanMvccStream<'trx, F>>
+    ) -> CallbackResult<TableScanMvccStream<'trx, F>, E>
     where
-        F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<ScanRowDecision>,
+        F: for<'row> FnMut(&mut LazyRow<'row>) -> CallbackResult<ScanRowDecision, E>,
     {
         let AdmittedUserTable { table, layout } =
             self.admit_user_table(table_id, false).await.disclose()?;
@@ -365,11 +366,11 @@ impl<F> TableScanMvccStreamState<F> {
     }
 }
 
-impl<F> TableScanMvccStreamState<F>
+impl<F, E> TableScanMvccStreamState<F>
 where
-    F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<ScanRowDecision>,
+    F: for<'row> FnMut(&mut LazyRow<'row>) -> CallbackResult<ScanRowDecision, E>,
 {
-    fn advance(&mut self) -> Result<TableScanCursorAdvance> {
+    fn advance(&mut self) -> CallbackResult<TableScanCursorAdvance, E> {
         self.cursor.advance(
             &self.table,
             &self.layout,
@@ -392,9 +393,9 @@ pub struct TableScanMvccStream<'trx, F> {
     _trx: PhantomData<&'trx mut Transaction>,
 }
 
-impl<'trx, F> TableScanMvccStream<'trx, F>
+impl<'trx, F, E> TableScanMvccStream<'trx, F>
 where
-    F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<ScanRowDecision>,
+    F: for<'row> FnMut(&mut LazyRow<'row>) -> CallbackResult<ScanRowDecision, E>,
 {
     #[inline]
     fn new(state: TableScanMvccStreamState<F>) -> Self {
@@ -405,7 +406,7 @@ where
     }
 
     /// Returns the next included projected row, or `None` after a terminal state.
-    pub async fn next(&mut self) -> Result<Option<Vec<Val>>> {
+    pub async fn next(&mut self) -> CallbackResult<Option<Vec<Val>>, E> {
         if self.state.is_none() {
             return Ok(None);
         }
@@ -416,7 +417,7 @@ where
         result
     }
 
-    async fn next_inner(&mut self) -> Result<Option<Vec<Val>>> {
+    async fn next_inner(&mut self) -> CallbackResult<Option<Vec<Val>>, E> {
         loop {
             let advance = self
                 .state
