@@ -23,7 +23,6 @@ use crate::table::{DeleteMarker, DeletionClaim, DeletionError, TableRootSnapshot
 use crate::trx::TrxRuntime;
 use crate::trx::row::{BoundIndexCandidate, LockRowForWrite, RowWriteAccess};
 use crate::trx::stmt::StmtEffects;
-use crate::trx::undo::{OwnedRowUndo, RowUndoKind};
 use error_stack::{Report, ResultExt};
 use std::sync::Arc;
 
@@ -258,11 +257,10 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                 return Ok(CandidateProgress::RetryLocation);
             }
         }
-        accessor.debug_assert_table_write_lock_held(self.rt);
-        match accessor.lwc_deletion_buffer().claim_ref(
+        match accessor.claim_cold_row_for_write(
+            self.rt,
+            self.effects,
             candidate.row_id,
-            Arc::clone(self.rt.status()),
-            self.rt.sts(),
             durable_deleted,
         ) {
             Ok(DeletionClaim::Acquired) => (),
@@ -284,13 +282,6 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                     .into());
             }
         }
-        self.effects.push_row_undo(OwnedRowUndo::new(
-            self.effects.stmt_no(),
-            accessor.table_id(),
-            None,
-            candidate.row_id,
-            RowUndoKind::Lock,
-        ));
         let source = LazyRowSource::Cold {
             block,
             column_layout: accessor.metadata().col.as_ref(),
@@ -302,7 +293,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
         match mutate_row(&mut lazy_row)? {
             RowMutation::Skip => {
                 lazy_row.reset();
-                self.cancel_owned_cold_row(candidate.row_id);
+                accessor.cancel_owned_cold_row(self.rt, self.effects, candidate.row_id);
                 drop(persisted);
             }
             RowMutation::Delete => {
@@ -329,7 +320,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                     && self.unique_driver_key_changed(&mut lazy_row, candidate, &update)?;
                 if update.is_empty() {
                     lazy_row.reset();
-                    self.cancel_owned_cold_row(candidate.row_id);
+                    accessor.cancel_owned_cold_row(self.rt, self.effects, candidate.row_id);
                     drop(persisted);
                 } else if defer {
                     lazy_row.reset();
@@ -383,7 +374,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
         match mutate_row(&mut lazy_row)? {
             RowMutation::Skip => {
                 let access = lazy_row.into_hot_write_access();
-                self.cancel_owned_hot_row(access);
+                accessor.cancel_owned_hot_row(self.effects, access);
                 Ok(None)
             }
             RowMutation::Delete => {
@@ -413,7 +404,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                     && self.unique_driver_key_changed(&mut lazy_row, candidate, &update)?;
                 let access = lazy_row.into_hot_write_access();
                 if update.is_empty() {
-                    self.cancel_owned_hot_row(access);
+                    accessor.cancel_owned_hot_row(self.effects, access);
                     return Ok(None);
                 }
                 if defer {
@@ -575,26 +566,6 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
             .await
             .disclose()?;
         Ok(())
-    }
-
-    #[inline]
-    fn cancel_owned_hot_row(&mut self, mut access: RowWriteAccess<'_>) {
-        let metadata = self.accessor.metadata();
-        self.effects.cancel_last_row_undo_lock(|undo| {
-            access.rollback_first_undo(metadata, undo);
-        });
-    }
-
-    #[inline]
-    fn cancel_owned_cold_row(&mut self, row_id: RowID) {
-        let deletion_buffer = self.accessor.lwc_deletion_buffer();
-        let status = self.rt.status();
-        self.effects.cancel_last_row_undo_lock(|_| {
-            assert!(
-                deletion_buffer.remove_ref_if_owned(row_id, status),
-                "provisional cold-row marker ownership changed before callback cancellation"
-            );
-        });
     }
 
     fn unique_driver_key_changed(

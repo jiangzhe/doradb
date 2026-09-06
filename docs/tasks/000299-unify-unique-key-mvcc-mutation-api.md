@@ -11,30 +11,28 @@ github_issue: 1053
 ## Summary
 
 Implemented `Transaction::table_unique_mutate_mvcc`, a programmable unique-point
-write boundary. Its synchronous `FnOnce` callback receives the latest acquired
-row as `Some(&mut LazyRow)`, or an observed missing entry as `None`, and chooses
-`Skip`, missing-only `Insert`, occupied sparse `Update`, or occupied `Delete`.
-The result distinguishes `Noop`, `Inserted(RowID)`, `Updated(RowID)`, and `Deleted`.
-Physical replacement remains a logical update and returns its replacement RowID.
+write boundary replacing the public upsert/update/delete methods. Its synchronous
+`FnOnce` callback receives the latest acquired row as `Some(&mut LazyRow)`, or an
+observed missing entry as `None`, and chooses Skip, missing-only Insert, occupied
+sparse Update, or occupied Delete. Results distinguish Noop, Inserted(RowID),
+Updated(RowID), and Deleted; physical replacement remains a logical update.
 
-The callback API replaces the public unique upsert/update/delete methods and
-uses specialized point selection with shared owned physical mutation. Point
-lookup remains MemIndex-first, and key changes apply immediately. Zero-read
-callbacks defer dense column-cache allocation.
+Specialized MemIndex-first point selection reuses owned hot/cold mutation and
+statement settlement. Key changes apply immediately, and callbacks that do not
+read columns avoid dense lazy-row cache initialization.
 
 ## Context
 
-Legacy point methods take values before row selection and cannot express an
-owned-current-row computation such as `b = b + 1`. A preceding snapshot read is
-not the same ownership boundary. Existing index-range mutation has suitable
-ownership primitives but different traversal, cold-delete, empty-update, and
-deferred driver-key semantics. Points therefore retain a separate executor.
+Legacy methods accepted mutation values before row selection and could not
+express an owned-current-row computation such as `b = b + 1`. A preceding
+snapshot read did not provide the same ownership boundary. Index-range mutation
+already supplied owned-row primitives, but its traversal and deferred driver-key
+updates were unsuitable for direct point execution.
 
-This task intentionally removes the legacy public point APIs following user
-review. It has no parent RFC, durable-format migration, or internal catalog/
-MemTable API change. Internal full-row ownership from tasks 000202 and 000205
-remains; point execution reuses owned-row mutation/cancellation from tasks
-000265 and 000271.
+User review selected removal of the legacy public APIs without compatibility
+adapters. Internal catalog/MemTable contracts and full-row ownership from tasks
+000202 and 000205 remain. Shared point/range machinery builds on tasks 000265
+and 000271. This task has no parent RFC or durable-format migration.
 
 Source Backlogs:
 
@@ -48,196 +46,184 @@ Issue Labels:
 
 ## Goals
 
-- Provide one programmable current-write point boundary with at-most-once
-  synchronous callback execution and both public index argument forms.
-- Enforce occupied/missing action validity and selected-key insertion agreement.
-- Preserve application error payloads and ordinary statement rollback behavior.
-- Return the resulting physical RowID for every successful insert/update.
-- Replace legacy public point methods and adapters with one callback executor,
-  sharing existing owned hot/cold effects with range mutation.
-- Defer dense callback scratch until a column is actually accessed.
-- Deliver complete caller documentation, compiled examples, regression coverage,
-  and temporary comparative latency/allocation validation.
+- Provide one current-write unique-point callback boundary with at-most-once
+  execution, both public index argument forms, and resulting physical RowIDs.
+- Enforce action/entry validity and selected-key agreement for inserted rows.
+- Preserve application error payloads, statement rollback, and cancellation.
+- Reuse owned physical mutation while retaining point-specific selection.
+- Defer dense callback storage until values are read or seeded from undo.
+- Supply caller migration, public documentation, regression coverage, and
+  temporary performance validation.
 
 ## Non-Goals
 
-- Introducing a public full-row replacement action, implicit occupied `Insert`,
-  or a combined point/range interface.
-- Changing range traversal or deferred unique-driver ordering.
-- Adding gap locks, async/retried callbacks, insertion-race retry as update, or
-  unique-key permutation planning.
-- Changing durable records, catalog behavior, transaction cleanup ownership,
+- A public full-row replacement action, implicit occupied Insert, or a combined
+  point/range interface.
+- Gap locks, asynchronous/retried callbacks, retrying a racing insert as an
+  update, or statement-wide unique-key permutation planning.
+- Changes to durable records, catalog/MemTable behavior, cleanup ownership,
   wait families, storage backends, or test timeout configuration.
-- Implementing a sparse/inline cache or claiming zero total mutation allocation.
+- A sparse/inline cache or a claim of zero total mutation allocation.
+- Repairing the inherited row-replacement race deferred to backlog 000196.
 
 ## Rejected Alternatives
 
-- A direct public request enum cannot compute from the latest acquired row.
-- Equal-bound range execution would inherit unnecessary traversal state and
-  different key-change, cold-conflict, missing, and empty-update behavior.
-- Occupied insertion or implicit put hides the caller's entry-state policy and
-  encourages construction of an unused insertion payload.
+- A direct request enum cannot compute a decision from the latest acquired row.
+- Equal-bound range execution adds traversal state and inherits different cold
+  eligibility and driver-key ordering policies.
+- An implicit put action hides entry-state policy and can require constructing
+  an insertion payload that the occupied path never uses.
 
 ## Plan
 
 ### Public boundary and validation
 
-`UniqueMutation` and `UniqueMutationOutcome` are exported from the crate root.
-The transaction method delegates through exactly one ordinary statement runner.
-The statement admits the index for writing, checks uniqueness, validates the
-lookup key under the transaction's ordinary DML-validation policy, and acquires
-transaction-lifetime `TableData(IX)` before ownership or callback execution.
+The transaction method uses one ordinary statement runner. The statement admits
+an active unique index, validates the lookup key under the DML-validation
+policy, and acquires transaction-lifetime TableData(IX) before the callback.
 
-On a miss, only skip and insertion are valid. On a hit, skip, sparse update, and
-delete are valid. Invalid entry-state decisions always return `InvalidDmlInput`,
-including missing empty updates. Inserted values must agree with the admitted
-selected key even when ordinary payload validation is disabled. Full-row shape,
-nullability/kinds, and sparse ordering/bounds/types use `DmlValidator` normally;
-trusted-input opt-out retains the existing caller obligations.
+Missing entries accept Skip or Insert; occupied entries accept Skip, Update, or
+Delete. Entry/action validity and insertion-key agreement remain mandatory when
+payload validation is disabled. Ordinary full-row shape and sparse-update
+validation follow the existing opt-out policy. Invalid decisions return
+InvalidDmlInput without converting application errors into engine errors.
 
-Callbacks impose no `Send`, `Sync`, `Clone`, `'static`, or application-error trait
-bounds. Borrowed row values cannot outlive the callback. Engine failures disclose
-through `CallbackError::Engine`; application payloads remain `User(E)`.
+Callbacks require no Send, Sync, Clone, static lifetime, or application-error
+trait bounds. Borrowed row values cannot outlive the callback. Engine failures
+remain CallbackError::Engine; application payloads remain CallbackError::User.
 
-### Specialized point execution
+### Selection and ownership
 
-`table/unique_mutate.rs` owns the operation-scoped accessor, transaction/effects,
-index, and validation context. Each attempt owns its root/index/page/block
-resources. Selection uses `UniqueSecondaryIndex::lookup`, authoritative RowID
-routing, and exact current-key revalidation. It constructs no range stream,
-candidate batch, or deferred driver-update list.
+The operation-scoped point executor owns no range stream or candidate batch.
+Each selection attempt binds its root/index and resolves the physical RowID.
+Hot selection reuses `HotRowMutator::lock_for_write`, retaining the row write
+access through callback execution and action conversion. Foreign ownership is
+classified before interpreting mutable deletion/key state.
 
-Hot acquisition reuses `HotRowMutator::lock_for_write` and provisional undo
-installation. Foreign ownership admission precedes mutable deletion/key
-interpretation. The callback and conversion to physical action retain the same
-write access and page-state guard. Prepare and transition retries happen before
-the callback is invoked.
+Cold selection checks CDB ownership/timestamps before durable deletion, loads
+the immutable block, and revalidates the key. A committed delete newer than the
+writer snapshot can conflict; an already-consumed same-transaction image is
+missing. Point and range eligibility remain separate because their committed
+cold-delete policies differ.
 
-Cold point eligibility is separated from full-row decoding. CDB timestamp and
-ownership information precedes durable delete membership. A matching committed
-delete newer than the writer STS may conflict. A same-transaction consumed cold
-image is missing. Definitive `claim_ref` acquisition is immediately recorded as
-provisional statement-owned `Lock` undo before any callback or later fallible
-work. Transaction serialization plus authoritative cold routing preserves fresh
-claim provenance; a preliminary same-owner marker is never cancellable by a
-new callback invocation.
+After eligibility, both executors use the same cold claim helper. Successful
+claims register provisional Lock undo before returning, with no intervening
+await. Failed/preparing claims register no undo. Callers exclude earlier
+same-transaction markers, so serialized statement execution establishes fresh
+claim provenance. Callers retain their existing wait/retry and error handling.
 
-A miss unwinds attempt-local resources before invoking the callback with `None`.
-It takes no gap lock. A racing insertion can produce ordinary duplicate/conflict
-errors without rerunning the callback or converting insertion to update.
+A miss releases attempt resources before invoking the callback with None. It
+creates no gap lock: a racing insertion may fail normally without repeating the
+callback or changing the chosen action. Preparing and transition retries occur
+before callback invocation; the inherited stale-hot-RowID exception remains
+explicitly deferred.
 
-### Owned action application and API removal
+### Owned actions and shared machinery
 
-Engine-only physical helpers keep native errors. Shared hot updates convert the
-same provisional undo through `update_owned_row`, retaining existing move,
-index-proof, branch-link, and index-maintenance protocols. Shared cold updates
-accept `RowUpdateInput`, install cold delete effects, and insert/link the owned
-replacement. Logical result conversion occurs at the action boundary.
+Point and range execution share the owned hot update/move/index-maintenance
+helper, owned cold replacement/deletion effects, and provisional hot/cold
+cancellation. The range helper was extracted into the accessor so both
+executors use one physical implementation. Insertion, undo/redo, index claims,
+and statement settlement continue through existing machinery.
 
-Hot deletion converts retained ownership, copies complete indexed keys while
-guarded, and releases the page guard before asynchronous index masking. Cold
-deletes decode only indexed columns. Sparse cold replacement materializes old
-values only when needed, reusing callback-cached values when present and decoding
-directly when the cache is unused.
+Skip and empty Update release only this invocation's provisional ownership.
+Empty Update returns Updated(original_row_id), including frozen/cold rows;
+nonempty updates retain ordinary physical movement and return the replacement
+RowID. Earlier statement effects and transaction-lifetime table locks remain.
 
-The three legacy public methods, statement/accessor wrappers, request adapters,
-and compatibility-only branches are removed. `UniquePointMutator` directly
-accepts the callback and dispatches `UniqueMutation`. Internal update/delete/
-upsert result types remain crate-private for catalog and MemTable consumers.
-User-table callers and test helpers use `UniqueMutationOutcome`; update/delete
-callers skip a missing entry, and upsert callers select insertion or ordered
-sparse assignments. There is no deprecation wrapper or public replacement action.
+Hot deletion captures complete index keys before releasing the page guard and
+awaiting index masking. Cold deletion decodes only indexed columns. Retained
+cold-block decoding and block-loading helpers share sorted indexed-column
+selection while retaining their own loading, validation, and error context.
 
-Skip cancels only this invocation's provisional ownership. Empty callback updates
-do the same and return `Updated(original_row_id)`. Nonempty same-value assignments
-use ordinary update machinery. Table locks and earlier statement effects remain.
-Ordinary errors leave undo with statement settlement; fatal rollback precedence
-and dropped-operation whole-transaction cleanup use the existing lifecycle.
+The three old public methods and their statement/accessor wrappers are removed.
+Internal update/delete/upsert outcomes remain crate-private for catalog and
+MemTable consumers. User-table callers use UniqueMutationOutcome, choosing Skip
+for missing update/delete targets and Insert or sparse assignments for upsert.
 
 ### Deferred row cache
 
-`LazyRowBuffer` stores logical width separately from allocated values/readiness.
-Point buffers start with empty vectors. First access or snapshot undo seeding
-initializes storage; readiness is independent of `Val::Null`. Reset visits touched
-columns only. Full materialization transfers owned values with `mem::take`,
-clears readiness/touched state, and does not replenish a placeholder vector.
-Eager reusable buffers remain for scans/ranges, including prepared cold access.
+LazyRowBuffer separates logical width from allocated values/readiness. Point
+buffers start empty; first column access or snapshot undo seeding initializes
+storage. Readiness remains independent of null values. Reset clears touched
+columns, and full materialization transfers owned values without replenishing a
+placeholder vector. Cold updates reuse callback-cached values or decode directly
+when the cache is unused. Existing eager buffers remain available to scans.
 
 ## Implementation Notes
 
-Shipped the new callback API, shared typed point executor and physical helpers,
-deferred cache, complete public contract, example migration, and performance validation.
-The implementation preserves existing point/range semantic differences and uses
-no new durable format, cleanup carrier, or production wait family.
+Shipped the unified callback API, specialized point executor, shared owned
+mutation and ownership bookkeeping, deferred cache, and complete caller
+migration. No new durable format, cleanup carrier, or production wait family
+was introduced. Source backlog 000195 is closed as implemented.
 
-The final executor removes the legacy cold-delete policy and separate request
-futures. User-table tests adopt callback semantics, including `Noop` for skipped
-misses and no movement for empty updates; nonempty updates retain movement
-coverage. Internal catalog and MemTable behavior stays unchanged. The quick-start
-example uses `smol::block_on`; its previous futures executor exposed nested-
-executor shutdown panics when exercised after migration.
+Review removed legacy compatibility adapters and normalized empty updates to
+release provisional ownership without moving rows. A subsequent duplication
+review consolidated cold claim/undo registration, hot/cold cancellation, and
+indexed-column selection while preserving separate point/range policies.
 
-Temporary performance experiments informed the implementation. Benchmark code,
-reports, and raw measurements are not retained in the repository.
+Concurrency review identified an inherited stale-RowID race when a concurrent
+writer replaces a selected hot row. Source comparison with pre-refactor
+`7a1d0a1` confirmed the old point APIs shared the rejection behavior. The interim
+retry fix and its tests were withdrawn for separate design in backlog 000196,
+which preserves Move/re-lookup and Delete/successor-RowID alternatives.
 
-Validation after legacy API removal:
+Temporary performance experiments informed implementation; benchmark code,
+reports, and raw measurements are not retained. The quick-start executable was
+migrated and exercised using smol::block_on after its previous executor exposed
+nested-executor shutdown panics.
 
-- `rtk cargo nextest run --workspace`: 1,963 passed.
-- `rtk cargo nextest run -p doradb-storage --no-default-features --features libaio`:
-  1,847 passed.
-- Focused unique-point, upsert, and statement-validation regressions: 19 passed.
-- Formatting and strict workspace/all-target Clippy passed on stable Rust.
-- Branch style audit passed for 15 tracked Rust files. The untracked unique
-  executor passed formatting/Clippy and manual structural review.
-- Public error audit refreshed; storage unsafe inventory remained unchanged.
-- No removed public method or request-adapter references remain in Rust source.
+Final validation after the duplication cleanup on 2026-09-07:
 
-The earlier implementation validation also exercised the quick-start executable
-and measured focused line coverage of 96.71% for the unique executor and 93.45%
-for shared access code (including inline tests). Those coverage measurements
-predate adapter removal.
+- Focused point/range and deferred-cache tests: 31 passed.
+- Standard workspace validation: 1,963 passed on the second invocation.
+- Alternate libaio storage validation: 1,847 passed.
+- Branch style audit: 16 Rust files passed, including formatting and strict
+  workspace/all-target Clippy.
+- Public error audit matched the tracked CSV; no unsafe-code changes occurred.
+- No removed public API or compatibility-adapter references remain in Rust.
+
+The first workspace invocation passed 1,962 tests but timed out in the existing
+benchmark update-template lifecycle test. That test subsequently passed 100
+focused stress iterations, and the repeated workspace run passed. Its cause is
+unresolved and recorded in backlog 000197; rerun success is not treated as a fix.
+
+Earlier focused line coverage measured 96.71% for the unique executor and 93.45%
+for shared access code, including inline tests. Those measurements predate
+adapter removal and the final helper extraction.
 
 ## Impacts
 
-- Adds public decision/outcome types and one transaction method; removes the
-  three legacy methods and public result exports without adding callback or
-  application-error bounds.
-- Consolidates user-table point orchestration and shares typed owned application
-  with index mutation while preserving range traversal/ordering behavior.
-- Changes lazy-buffer storage reuse for snapshot, table, and index consumers;
-  broad scan, checkpoint, rollback, and recovery suites remain passing.
-- Updates `docs/public-api.md`, transaction documentation, error audit, and the
-  compiled quick start.
+- Replaces three public methods/result exports with one callback method and
+  explicit decision/outcome types; callers migrate without a deprecation wrapper.
+- Consolidates user-table point orchestration and shares mutation/ownership
+  mechanics with range execution while preserving traversal and visibility rules.
+- Changes lazy-buffer allocation and reuse for point, scan, and index consumers.
+- Updates public API/transaction documentation, error audit, and the compiled
+  quick-start example; catalog/MemTable behavior and durable formats remain.
 
 ## Test Cases
 
-- Complete occupied/missing action matrix, trusted-mode semantic checks,
-  insertion-key disagreement, malformed row/update input, invalid indexes, and
-  resolved index arguments.
-- Owned latest-hot read-modify-write, branch-local construction counters,
-  non-Clone/non-Send captures, borrowed application errors, and conditional delete.
-- In-place, frozen, cold, and forced space-pressure moves; immediate driver and
-  other-index key changes; physical RowID outcomes; old snapshots before and
-  after commit; and statement/transaction rollback after unique conflicts.
-- Skip/empty cancellation, prior hot/cold effects, consumed cold markers,
-  committed-delete timing, active/preparing ownership, at-most-once callbacks,
-  insertion races, dropped direct operations, empty-update RowID preservation,
-  and nonempty row movement.
-- Deferred storage, null caching, bounds, undo seeding, reset/reuse after transfer,
-  zero-read action initialization counts, indexed-only cold decoding, and
-  MemIndex-hit DiskTree short circuiting.
+- Occupied/missing action matrix, trusted-mode semantic checks, insertion-key
+  disagreement, malformed payloads, invalid indexes, and resolved arguments.
+- Current-row read-modify-write, conditional deletion, branch-local payload
+  construction, non-Clone/non-Send captures, and borrowed application errors.
+- Hot/frozen/cold and space-pressure movement, immediate key changes across
+  indexes, resulting RowIDs, old snapshots, and rollback after unique conflicts.
+- Skip/empty cancellation, prior ownership, consumed cold markers, committed
+  delete timing, active/preparing owners, and callback-at-most-once behavior.
+- Missing-entry insertion races, dropped-operation cleanup, empty-update RowID
+  preservation, null caching, undo seeding, and buffer reuse after transfer.
+- Dense-cache initialization counts, indexed-only cold deletion, and MemIndex
+  hit short-circuiting of DiskTree lookup.
 
 ## Open Questions
 
-No blocking questions or deferred in-scope implementation work remain.
-A follow-up review identified an inherited stale-RowID race in current-write
-unique selection during concurrent row replacement. Its fix is deferred to
-[backlog 000196](../backlogs/000196-resolve-stale-unique-point-lookups-across-row-replacement.md)
-for separate design of Move undo with re-lookup versus a successor RowID in
-Delete undo. The interim retry implementation and regression tests were
-withdrawn from this task; the race remains unresolved here.
+- [Backlog 000196](../backlogs/000196-resolve-stale-unique-point-lookups-across-row-replacement.md):
+  design a replacement-aware unique access protocol; the inherited race remains
+  unresolved in this task.
+- [Backlog 000197](../backlogs/000197-investigate-benchmark-update-template-lifecycle-timeout.md):
+  investigate the unexplained benchmark lifecycle timeout observed in validation.
 
-A sparse/inline cache and further reduction of the shortest point-dispatch cost
-remain possible future optimizations; this task deliberately retains deferred
-dense storage. A point/range API merger
-remains outside this task.
+Sparse/inline cache storage and further point-dispatch optimization remain
+possible future improvements; neither is required by the shipped contract.

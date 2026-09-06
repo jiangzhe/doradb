@@ -55,6 +55,7 @@ use std::marker::PhantomData;
 use std::mem;
 use std::ops::RangeBounds;
 use std::ptr::addr_eq;
+use std::result;
 use std::sync::Arc;
 
 #[cfg(test)]
@@ -719,14 +720,7 @@ impl<'op> WriteIndexKeySet<'op> {
         block: &LwcBlock,
         row_idx: usize,
     ) -> DataIntegrityResult<Self> {
-        let mut read_set: Vec<_> = accessor
-            .metadata()
-            .idx
-            .index_columns()
-            .iter()
-            .copied()
-            .collect();
-        read_set.sort_unstable();
+        let read_set = accessor.indexed_column_read_set();
         let values =
             block.decode_row_values(accessor.metadata().col.as_ref(), row_idx, &read_set)?;
         Ok(Self::from_indexed_values(accessor, &read_set, values))
@@ -1685,13 +1679,7 @@ impl<'op> UserTableAccessor<'op> {
     }
 
     #[inline]
-    async fn read_lwc_index_keys(
-        &self,
-        guards: &PoolGuards,
-        block_id: BlockID,
-        row_idx: usize,
-        row_shape_fingerprint: u128,
-    ) -> RuntimeResult<WriteIndexKeySet<'op>> {
+    fn indexed_column_read_set(&self) -> Vec<usize> {
         let mut read_set = self
             .metadata()
             .idx
@@ -1700,6 +1688,18 @@ impl<'op> UserTableAccessor<'op> {
             .copied()
             .collect::<Vec<_>>();
         read_set.sort_unstable();
+        read_set
+    }
+
+    #[inline]
+    async fn read_lwc_index_keys(
+        &self,
+        guards: &PoolGuards,
+        block_id: BlockID,
+        row_idx: usize,
+        row_shape_fingerprint: u128,
+    ) -> RuntimeResult<WriteIndexKeySet<'op>> {
+        let read_set = self.indexed_column_read_set();
         let vals = self
             .read_lwc_row(guards, block_id, row_idx, row_shape_fingerprint, &read_set)
             .await?;
@@ -4160,6 +4160,67 @@ impl<'op> UserTableAccessor<'op> {
                 })?;
         }
         Ok(())
+    }
+
+    /// Claims an eligible cold row and records provisional undo before returning.
+    ///
+    /// Callers first exclude existing same-transaction markers. Serialized
+    /// statement execution then makes an acquired claim fresh for this invocation.
+    /// Preparing and failed claims do not register undo; callers own their retries.
+    #[inline]
+    pub(super) fn claim_cold_row_for_write(
+        &self,
+        rt: TrxRuntime<'_>,
+        effects: &mut StmtEffects,
+        row_id: RowID,
+        durable_deleted: bool,
+    ) -> result::Result<DeletionClaim, DeletionError> {
+        self.debug_assert_table_write_lock_held(rt);
+        let claim = self.lwc_deletion_buffer().claim_ref(
+            row_id,
+            Arc::clone(rt.status()),
+            rt.sts(),
+            durable_deleted,
+        )?;
+        if matches!(claim, DeletionClaim::Acquired) {
+            effects.push_row_undo(OwnedRowUndo::new(
+                effects.stmt_no(),
+                self.table_id(),
+                None,
+                row_id,
+                RowUndoKind::Lock,
+            ));
+        }
+        Ok(claim)
+    }
+
+    /// Releases only the retained hot row's last provisional undo lock.
+    #[inline]
+    pub(super) fn cancel_owned_hot_row(
+        &self,
+        effects: &mut StmtEffects,
+        mut access: RowWriteAccess<'_>,
+    ) {
+        effects.cancel_last_row_undo_lock(|undo| {
+            access.rollback_first_undo(self.metadata(), undo);
+        });
+    }
+
+    /// Releases only the cold marker owned by this invocation's provisional lock.
+    #[inline]
+    pub(super) fn cancel_owned_cold_row(
+        &self,
+        rt: TrxRuntime<'_>,
+        effects: &mut StmtEffects,
+        row_id: RowID,
+    ) {
+        effects.cancel_last_row_undo_lock(|_| {
+            assert!(
+                self.lwc_deletion_buffer().remove_ref_if_owned(row_id, rt.status()),
+                "provisional cold-row marker ownership changed before callback cancellation: table_id={}, row_id={row_id}",
+                self.table_id()
+            );
+        });
     }
 
     #[inline]

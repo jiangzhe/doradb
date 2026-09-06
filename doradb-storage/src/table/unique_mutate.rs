@@ -10,16 +10,13 @@ use crate::error::{
     CallbackResult, DataIntegrityError, DiscloseError, DiscloseResultExt, OperationError,
     OperationResult, RuntimeError,
 };
-use crate::id::RowID;
 use crate::index::RowLocation;
 use crate::row::ops::{RowUpdateInput, UniqueMutation, UniqueMutationOutcome};
 use crate::trx::TrxRuntime;
 use crate::trx::row::LockRowForWrite;
 use crate::trx::stmt::StmtEffects;
-use crate::trx::undo::{OwnedRowUndo, RowUndoKind};
 use crate::value::Val;
 use error_stack::{Report, ResultExt};
-use std::sync::Arc;
 
 #[cfg(test)]
 pub(crate) use tests::record_point_disk_lookup;
@@ -53,7 +50,7 @@ impl<'a, 'op, 'r> UniquePointMutator<'a, 'op, 'r> {
     /// Retries only selection; invoking the callback commits to the selected entry.
     #[inline]
     pub(super) async fn execute<F, E>(
-        mut self,
+        self,
         key_vals: &[Val],
         mutate_row: F,
     ) -> CallbackResult<UniqueMutationOutcome, E>
@@ -137,19 +134,15 @@ impl<'a, 'op, 'r> UniquePointMutator<'a, 'op, 'r> {
                         };
                         let mut row = LazyRow::new(source, &mut buffer, width);
                         let action = mutate_row(Some(&mut row))?;
-                        let mut access = row.into_hot_write_access();
+                        let access = row.into_hot_write_access();
                         self.validate_action(true, &action, key_vals).disclose()?;
                         match action {
                             UniqueMutation::Skip => {
-                                self.effects.cancel_last_row_undo_lock(|undo| {
-                                    access.rollback_first_undo(accessor.metadata(), undo)
-                                });
+                                accessor.cancel_owned_hot_row(self.effects, access);
                                 return Ok(UniqueMutationOutcome::Noop);
                             }
                             UniqueMutation::Update(ref cols) if cols.is_empty() => {
-                                self.effects.cancel_last_row_undo_lock(|undo| {
-                                    access.rollback_first_undo(accessor.metadata(), undo)
-                                });
+                                accessor.cancel_owned_hot_row(self.effects, access);
                                 return Ok(UniqueMutationOutcome::Updated(row_id));
                             }
                             UniqueMutation::Update(input) => {
@@ -236,11 +229,10 @@ impl<'a, 'op, 'r> UniquePointMutator<'a, 'op, 'r> {
                             break 'retry;
                         }
                         drop(actual_key);
-                        accessor.debug_assert_table_write_lock_held(rt);
-                        match accessor.lwc_deletion_buffer().claim_ref(
+                        match accessor.claim_cold_row_for_write(
+                            rt,
+                            self.effects,
                             row_id,
-                            Arc::clone(rt.status()),
-                            rt.sts(),
                             location.durable_deleted,
                         ) {
                             Ok(DeletionClaim::Acquired) => (),
@@ -255,16 +247,6 @@ impl<'a, 'op, 'r> UniquePointMutator<'a, 'op, 'r> {
                                     .into());
                             }
                         }
-                        // Selection excludes earlier same-transaction markers.
-                        // Exclusive statement execution prevents this transaction
-                        // from acquiring another marker before this claim.
-                        self.effects.push_row_undo(OwnedRowUndo::new(
-                            self.effects.stmt_no(),
-                            accessor.table_id(),
-                            None,
-                            row_id,
-                            RowUndoKind::Lock,
-                        ));
                         let source = || LazyRowSource::Cold {
                             block,
                             column_layout: accessor.metadata().col.as_ref(),
@@ -279,11 +261,11 @@ impl<'a, 'op, 'r> UniquePointMutator<'a, 'op, 'r> {
                         self.validate_action(true, &action, key_vals).disclose()?;
                         match action {
                             UniqueMutation::Skip => {
-                                self.cancel_cold(row_id);
+                                accessor.cancel_owned_cold_row(rt, self.effects, row_id);
                                 return Ok(UniqueMutationOutcome::Noop);
                             }
                             UniqueMutation::Update(ref cols) if cols.is_empty() => {
-                                self.cancel_cold(row_id);
+                                accessor.cancel_owned_cold_row(rt, self.effects, row_id);
                                 return Ok(UniqueMutationOutcome::Updated(row_id));
                             }
                             UniqueMutation::Update(input) => {
@@ -399,16 +381,6 @@ impl<'a, 'op, 'r> UniquePointMutator<'a, 'op, 'r> {
         }
         Ok(())
     }
-
-    fn cancel_cold(&mut self, row_id: RowID) {
-        let buffer = self.accessor.lwc_deletion_buffer();
-        self.effects.cancel_last_row_undo_lock(|_| {
-            assert!(
-                buffer.remove_ref_if_owned(row_id, self.rt.status()),
-                "unique point provisional cold marker owner changed: row_id={row_id}"
-            );
-        });
-    }
 }
 
 #[cfg(test)]
@@ -421,17 +393,20 @@ mod tests {
     use crate::error::{CallbackError, CallbackResult, OperationError};
     use crate::id::RowID;
     use crate::index::RowLocation;
+    use crate::lwc::test_decode_counts;
     use crate::row::ops::{UniqueMutation, UniqueMutationOutcome, UpdateCol};
     use crate::session::tests::{
         SessionTestExt, assert_checkpoint_published, wait_for_session_idle,
     };
+    use crate::table::access::dense_initializations;
     use crate::table::tests::{
         assert_freeze_created, bound_unique_index, evictable_test_engine,
         table_for_internal_assertion,
     };
     use crate::trx::tests::{
         commit_preparing_shared_trx_status, prepare_event_is_installed, prepare_shared_trx_status,
-        rollback_preparing_shared_trx_status, shared_trx_status, transaction_status_for_test,
+        prepare_transaction, rollback_preparing_shared_trx_status,
+        rollback_production_prepared_for_test, shared_trx_status, transaction_status_for_test,
     };
     use crate::trx::{MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID};
     use crate::{Engine, Session, TableIndex, Transaction, Val, ValKind};
@@ -1189,13 +1164,13 @@ mod tests {
                     UniqueMutation::Delete,
                 ] {
                     let mut trx = session.begin_trx().unwrap();
-                    let before = super::super::access::dense_initializations();
+                    let before = dense_initializations();
                     apply(&mut trx, index, 0, action).await.unwrap();
-                    assert_eq!(super::super::access::dense_initializations(), before);
+                    assert_eq!(dense_initializations(), before);
                     trx.rollback().await.unwrap();
                 }
                 let mut trx = session.begin_trx().unwrap();
-                let before = super::super::access::dense_initializations();
+                let before = dense_initializations();
                 trx.table_unique_mutate_mvcc(
                     index,
                     &[Val::from(0i32)],
@@ -1210,7 +1185,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                assert_eq!(super::super::access::dense_initializations(), before + 1);
+                assert_eq!(dense_initializations(), before + 1);
                 trx.rollback().await.unwrap();
             }
         });
@@ -1238,7 +1213,7 @@ mod tests {
                 assert_eq!(error.operation_error(), Some(OperationError::WriteConflict));
                 assert_eq!(calls.get(), 0);
                 let status = transaction_status_for_test(&owner);
-                let prepared = crate::trx::tests::prepare_transaction(owner).unwrap();
+                let prepared = prepare_transaction(owner).unwrap();
                 let key = [Val::from(0i32)];
                 let mutate =
                     competitor.table_unique_mutate_mvcc(index, &key, |row| -> CallbackResult<_> {
@@ -1259,7 +1234,7 @@ mod tests {
                             .await
                             .unwrap();
                     } else {
-                        crate::trx::tests::rollback_production_prepared_for_test(prepared).await;
+                        rollback_production_prepared_for_test(prepared).await;
                     }
                 };
                 let (result, ()) = futures::join!(mutate, settle);
@@ -1275,11 +1250,11 @@ mod tests {
         smol::block_on(async {
             let (_root, _engine, mut session, index, _) = fixture("cold", 1).await;
             let mut trx = session.begin_trx().unwrap();
-            let before = crate::lwc::test_decode_counts();
+            let before = test_decode_counts();
             apply(&mut trx, index, 0, UniqueMutation::Delete)
                 .await
                 .unwrap();
-            let after = crate::lwc::test_decode_counts();
+            let after = test_decode_counts();
             assert!(after[0] > before[0]);
             assert!(after[1] > before[1]);
             assert_eq!(
