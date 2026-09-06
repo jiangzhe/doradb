@@ -2721,7 +2721,7 @@ pub(crate) mod tests {
             .inner()
             .core
             .catalog()
-            .get_table_now(table_id)
+            .get_table(table_id)
             .expect("test table should exist")
     }
 

@@ -2,9 +2,8 @@ use super::{
     CurrentDefinitionAllocatorView, IndexPlacement, Table, TableDefinitionKind, TableRuntimeLayout,
 };
 use crate::catalog::{
-    CatalogDefinitionEffects, CurrentTableDefinition, IndexID, IndexRef, SecondaryIndexRoot,
-    SecondaryIndexSlot, StorageIndexSpec, StorageTableDefinition, TableDescriptorObject,
-    TableIndexMetadata, TableMetadata, validate_table_descriptor_against_metadata,
+    CatalogDefinitionEffects, CurrentTableDefinition, IndexID, IndexRef, ManagedTableDefinition,
+    SecondaryIndexRoot, SecondaryIndexSlot, StorageIndexSpec, TableIndexMetadata, TableMetadata,
 };
 use crate::error::{
     DataIntegrityError, DataIntegrityResult, OperationError, OperationOrRuntimeResult, RuntimeError,
@@ -291,26 +290,17 @@ impl Table {
 
     /// Captures the private current managed definition under metadata-S.
     pub(crate) fn current_managed_definition(
-        self: &Arc<Self>,
-        descriptor: TableDescriptorObject,
+        &self,
+        definition: Arc<ManagedTableDefinition>,
     ) -> OperationOrRuntimeResult<CurrentTableDefinition> {
         self.require_definition_kind(TableDefinitionKind::Managed, "DDL")?;
-        let definition = self
+        let index_ddl_definition = self
             .current_index_ddl_definition()
             .change_context(RuntimeError::CatalogAccess)
             .attach("operation=managed_ddl, phase=validate_current_definition")?;
-        validate_table_descriptor_against_metadata(
-            &descriptor,
-            definition.table_id,
-            definition.allocator.metadata(),
-        )
-        .change_context(RuntimeError::CatalogAccess)
-        .attach("operation=managed_ddl, phase=validate_descriptor_stamp")?;
         Ok(CurrentTableDefinition::new(
-            StorageTableDefinition::from_metadata(definition.allocator.metadata()),
-            descriptor,
-            definition.allocator.metadata().storage_epoch,
-            definition.allocator.effective_next_index_id(),
+            definition,
+            index_ddl_definition.allocator.effective_next_index_id(),
         ))
     }
 
@@ -318,41 +308,37 @@ impl Table {
     pub(crate) fn finalize_managed_create_index(
         self: &Arc<Self>,
         expected: &CurrentTableDefinition,
-        current_descriptor: TableDescriptorObject,
+        definition: Arc<ManagedTableDefinition>,
         index_spec: StorageIndexSpec,
         payload: Box<[u8]>,
     ) -> OperationOrRuntimeResult<CreateIndexPlan> {
         self.require_definition_kind(TableDefinitionKind::Managed, "CREATE INDEX")?;
-        let definition = self
+        let index_ddl_definition = self
             .current_index_ddl_definition()
             .change_context(RuntimeError::CatalogAccess)
             .attach("operation=create_managed_index, phase=validate_current_definition")?;
-        validate_table_descriptor_against_metadata(
-            &current_descriptor,
-            definition.table_id,
-            definition.allocator.metadata(),
-        )
-        .change_context(RuntimeError::CatalogAccess)
-        .attach("operation=create_managed_index, phase=validate_descriptor_stamp")?;
-        if managed_definition_changed(expected, &definition, &current_descriptor, true) {
-            return Err(schema_changed(definition.table_id, "create_managed_index").into());
+        if managed_definition_changed(expected, &index_ddl_definition, &definition, true) {
+            return Err(
+                schema_changed(index_ddl_definition.table_id, "create_managed_index").into(),
+            );
         }
-        let revision = current_descriptor
+        let revision = definition
+            .descriptor()
             .descriptor_revision
             .checked_add(1)
             .ok_or_else(|| {
                 Report::new(OperationError::InvalidMetadata)
                     .attach("managed descriptor revision exhausted")
             })?;
-        let partial = self.prepare_create_index_from_definition(definition, index_spec)?;
-        let descriptor = TableDescriptorObject {
-            table_id: partial.table_id,
-            descriptor_revision: revision,
-            compiled_storage_epoch: partial.new_metadata.storage_epoch,
-            storage_schema_fingerprint: partial.new_metadata.storage_schema_fingerprint(),
+        let partial =
+            self.prepare_create_index_from_definition(index_ddl_definition, index_spec)?;
+        let definition = Arc::new(ManagedTableDefinition::for_ddl(
+            partial.table_id,
+            &partial.new_metadata,
+            revision,
             payload,
-        };
-        Ok(partial.with_effects(CatalogDefinitionEffects::replace(descriptor)))
+        ));
+        Ok(partial.with_effects(CatalogDefinitionEffects::replace(definition)))
     }
 
     fn prepare_create_index_from_definition(
@@ -420,41 +406,34 @@ impl Table {
     pub(crate) fn finalize_managed_drop_index(
         self: &Arc<Self>,
         expected: &CurrentTableDefinition,
-        current_descriptor: TableDescriptorObject,
+        definition: Arc<ManagedTableDefinition>,
         index_id: IndexID,
         payload: Box<[u8]>,
     ) -> OperationOrRuntimeResult<DropIndexPlan> {
         self.require_definition_kind(TableDefinitionKind::Managed, "DROP INDEX")?;
-        let definition = self
+        let index_ddl_definition = self
             .current_index_ddl_definition()
             .change_context(RuntimeError::CatalogAccess)
             .attach("operation=drop_managed_index, phase=validate_current_definition")?;
-        validate_table_descriptor_against_metadata(
-            &current_descriptor,
-            definition.table_id,
-            definition.allocator.metadata(),
-        )
-        .change_context(RuntimeError::CatalogAccess)
-        .attach("operation=drop_managed_index, phase=validate_descriptor_stamp")?;
-        if managed_definition_changed(expected, &definition, &current_descriptor, false) {
-            return Err(schema_changed(definition.table_id, "drop_managed_index").into());
+        if managed_definition_changed(expected, &index_ddl_definition, &definition, false) {
+            return Err(schema_changed(index_ddl_definition.table_id, "drop_managed_index").into());
         }
-        let revision = current_descriptor
+        let revision = definition
+            .descriptor()
             .descriptor_revision
             .checked_add(1)
             .ok_or_else(|| {
                 Report::new(OperationError::InvalidMetadata)
                     .attach("managed descriptor revision exhausted")
             })?;
-        let partial = self.prepare_drop_index_from_definition(definition, index_id)?;
-        let descriptor = TableDescriptorObject {
-            table_id: partial.table_id,
-            descriptor_revision: revision,
-            compiled_storage_epoch: partial.new_metadata.storage_epoch,
-            storage_schema_fingerprint: partial.new_metadata.storage_schema_fingerprint(),
+        let partial = self.prepare_drop_index_from_definition(index_ddl_definition, index_id)?;
+        let definition = Arc::new(ManagedTableDefinition::for_ddl(
+            partial.table_id,
+            &partial.new_metadata,
+            revision,
             payload,
-        };
-        Ok(partial.with_effects(CatalogDefinitionEffects::replace(descriptor)))
+        ));
+        Ok(partial.with_effects(CatalogDefinitionEffects::replace(definition)))
     }
 
     fn prepare_drop_index_from_definition(
@@ -493,9 +472,7 @@ impl Table {
     }
 
     /// Captures and validates state shared by typed CREATE and DROP finalization.
-    fn current_index_ddl_definition(
-        self: &Arc<Self>,
-    ) -> DataIntegrityResult<CurrentIndexDdlDefinition> {
+    fn current_index_ddl_definition(&self) -> DataIntegrityResult<CurrentIndexDdlDefinition> {
         let table_id = self.table_id();
         let old_layout = self.layout_snapshot();
         let active_root = self.file().active_root_unchecked().clone();
@@ -514,10 +491,12 @@ impl Table {
 fn managed_definition_changed(
     expected: &CurrentTableDefinition,
     current: &CurrentIndexDdlDefinition,
-    current_descriptor: &TableDescriptorObject,
+    definition: &Arc<ManagedTableDefinition>,
     compare_allocator: bool,
 ) -> bool {
-    expected.storage_epoch() != current.allocator.metadata().storage_epoch
+    let current_descriptor = definition.descriptor();
+    !Arc::ptr_eq(expected.definition(), definition)
+        || expected.storage_epoch() != current.allocator.metadata().storage_epoch
         || expected.descriptor().descriptor_revision != current_descriptor.descriptor_revision
         || expected.descriptor().compiled_storage_epoch != current_descriptor.compiled_storage_epoch
         || expected.descriptor().storage_schema_fingerprint

@@ -108,10 +108,29 @@ the numeric schema, descriptor, and bindings atomically. Binding resolution
 returns an optimistic `(TableID, storage_epoch)` token and may optionally copy
 one coherent stable-ID schema/descriptor snapshot; no read lock escapes the
 call. DROP removes bindings through their reverse `table_id` index.
-Managed CREATE/DROP INDEX commits the numeric catalog mutation and complete
-replacement descriptor in one private transaction, and DROP TABLE deletes the
-descriptor through the same cascade. Recovery validates envelope/schema
-agreement and binding ownership without interpreting opaque bytes.
+Each live managed catalog entry owns an immutable shared stable-ID schema
+projection and complete descriptor envelope. Binding resolution and managed-DDL
+reads use that value; descriptor rows remain authoritative for persistence and
+independent integrity validation. Managed CREATE/DROP INDEX stages descriptor
+rows from the same accepted definition that it publishes with numeric metadata
+and the runtime layout. DROP TABLE deletes the descriptor through its cascade
+and removes the current definition. Metadata history retains only numeric
+metadata, so obsolete definitions live only as long as their readers.
+
+Recovery validates envelope/schema agreement and binding ownership without
+interpreting opaque bytes. It hydrates managed definitions after final catalog
+and table-file reconciliation, including tables without bindings, before
+foreground admission.
+
+Metadata ownership serves several distinct lifetimes. Runtime-layout metadata
+is pointer-identical to current catalog metadata. Superseded history keeps
+logical schema versions, and each table-file root describes its durable numeric
+schema. The embedded `MemTable` retains construction-time metadata for row-page
+helpers; current index interpretation belongs to captured runtime layouts.
+Index DDL reuses the immutable column-layout allocation. The embedded metadata
+is broader than those row helpers require, but these owners remain separate.
+The managed definition owns its projection and envelope, with no metadata or
+executable-runtime reference.
 
 ### Redo Log File
 

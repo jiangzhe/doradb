@@ -201,7 +201,7 @@ impl RowUndoLogs {
                         }
                     }
                 } else {
-                    let table = table_cache.must_get_user_table(entry.table_id).await;
+                    let table = table_cache.must_get_user_table(entry.table_id);
                     loop {
                         if entry.page_id.is_none() {
                             table.deletion_buffer().remove(entry.row_id);

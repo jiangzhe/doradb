@@ -3,16 +3,15 @@ use crate::catalog::{
     BindingNamespaceID, CreateTableOutcome, CurrentTableDefinition, ID_DOMAIN_END,
     IndexDdlGateScope, IndexID, ManagedTableDefinitionSnapshot, ManagedTableInterpreter,
     PreparedCreateIndex, PreparedCreateTable, PreparedDropIndex, ResolvedTableBinding,
-    StorageTableDefinition, TABLE_ID_TABLE_BINDINGS, TABLE_ID_TABLE_DESCRIPTORS, TableBinding,
-    TableDefinitionVersion, ValidatedCreateTable, create_index_catalog_write_targets,
-    drop_index_catalog_write_targets, managed_create_table_catalog_write_targets,
-    reject_non_user_table_id, reject_user_table_primary_key_index, validate_descriptor_payload,
-    validate_table_binding_key, validate_table_bindings,
-    validate_table_descriptor_against_metadata, validated_index_ddl_target,
+    TABLE_ID_TABLE_BINDINGS, TableBinding, TableDefinitionVersion, ValidatedCreateTable,
+    create_index_catalog_write_targets, drop_index_catalog_write_targets,
+    managed_create_table_catalog_write_targets, reject_non_user_table_id,
+    reject_user_table_primary_key_index, validate_descriptor_payload, validate_table_binding_key,
+    validate_table_bindings, validated_current_user_table,
 };
 use crate::error::{
-    CallbackError, CallbackResult, DataIntegrityError, DiscloseError, DiscloseResultExt,
-    MultiDomainResultExt, OperationError, OperationOrFatalResult, Result, RuntimeError,
+    CallbackError, CallbackResult, DiscloseError, DiscloseResultExt, MultiDomainResultExt,
+    OperationError, OperationOrFatalResult, Result, RuntimeError,
 };
 use crate::id::TableID;
 use crate::lock::{FreshClaimsGuard, LockMode, LockResource};
@@ -167,44 +166,41 @@ impl ManagedTableOps for Session {
         .await
         .attach_with(|| format!("prepare managed CREATE INDEX locks: table_id={table_id}"))
         .disclose()?;
-        let engine = scope.engine();
-        let table = validated_index_ddl_target(
-            engine,
-            engine.pool_guards(),
-            table_id,
-            "create_managed_index",
-        )
-        .await
-        .disclose()?;
-        engine.poisoner.ensure_healthy().disclose()?;
-        let gates = IndexDdlGateScope::acquire(Arc::clone(&table), engine.catalog_guard())
-            .await
-            .attach("operation=create_managed_index")
-            .disclose()?;
-        let current_descriptor = engine
-            .catalog()
-            .storage
-            .table_descriptors()
-            .find_uncommitted_by_table_id(engine.pool_guards(), table_id)
-            .await
-            .disclose()?
-            .ok_or_else(|| managed_schema_changed(table_id, "create_managed_index"))?;
-        let plan = table
-            .finalize_managed_create_index(&current, current_descriptor, index_spec, descriptor)
-            .disclose()?;
-        if plan.index().id() != proposed_index_id {
-            return Err(CallbackError::Engine(
-                    Report::new(OperationError::SchemaChanged)
-                        .attach(format!(
-                            "managed CREATE INDEX proposed identity changed: table_id={table_id}, proposed={proposed_index_id}, finalized={}",
-                            plan.index().id()
-                        ))
-                        .disclose(),
-                ));
-        }
-        if plan.skipped_retired_runtime() {
-            engine.trx_sys.request_retired_index_runtime_purge(table_id);
-        }
+        let (gates, plan) = {
+            let engine = scope.engine();
+            let (table, definition) =
+                validated_current_user_table(engine, table_id, "create_managed_index")
+                    .disclose()?;
+            engine.poisoner.ensure_healthy().disclose()?;
+            let gates = IndexDdlGateScope::acquire(Arc::clone(&table), engine.catalog_guard())
+                .await
+                .attach("operation=create_managed_index")
+                .disclose()?;
+            let definition = definition
+                .ok_or_else(|| {
+                    Report::new(OperationError::InvalidMetadata).attach(format!(
+                        "managed DDL requires a managed table: table_id={table_id}"
+                    ))
+                })
+                .disclose()?;
+            let plan = table
+                .finalize_managed_create_index(&current, definition, index_spec, descriptor)
+                .disclose()?;
+            if plan.index().id() != proposed_index_id {
+                return Err(CallbackError::Engine(
+                        Report::new(OperationError::SchemaChanged)
+                            .attach(format!(
+                                "managed CREATE INDEX proposed identity changed: table_id={table_id}, proposed={proposed_index_id}, finalized={}",
+                                plan.index().id()
+                            ))
+                            .disclose(),
+                    ));
+            }
+            if plan.skipped_retired_runtime() {
+                engine.trx_sys.request_retired_index_runtime_purge(table_id);
+            }
+            (gates, plan)
+        };
         let observer = mandatory_runtime
             .submit(PreparedCreateIndex::new(gates, scope, plan))
             .await
@@ -257,31 +253,27 @@ impl ManagedTableOps for Session {
                 .await
                 .attach_with(|| format!("prepare managed DROP INDEX locks: table_id={table_id}"))
                 .disclose()?;
-        let engine = scope.engine();
-        let table = validated_index_ddl_target(
-            engine,
-            engine.pool_guards(),
-            table_id,
-            "drop_managed_index",
-        )
-        .await
-        .disclose()?;
-        engine.poisoner.ensure_healthy().disclose()?;
-        let gates = IndexDdlGateScope::acquire(Arc::clone(&table), engine.catalog_guard())
-            .await
-            .attach("operation=drop_managed_index")
-            .disclose()?;
-        let current_descriptor = engine
-            .catalog()
-            .storage
-            .table_descriptors()
-            .find_uncommitted_by_table_id(engine.pool_guards(), table_id)
-            .await
-            .disclose()?
-            .ok_or_else(|| managed_schema_changed(table_id, "drop_managed_index"))?;
-        let plan = table
-            .finalize_managed_drop_index(&current, current_descriptor, index_id, descriptor)
-            .disclose()?;
+        let (gates, plan) = {
+            let engine = scope.engine();
+            let (table, definition) =
+                validated_current_user_table(engine, table_id, "drop_managed_index").disclose()?;
+            engine.poisoner.ensure_healthy().disclose()?;
+            let gates = IndexDdlGateScope::acquire(Arc::clone(&table), engine.catalog_guard())
+                .await
+                .attach("operation=drop_managed_index")
+                .disclose()?;
+            let definition = definition
+                .ok_or_else(|| {
+                    Report::new(OperationError::InvalidMetadata).attach(format!(
+                        "managed DDL requires a managed table: table_id={table_id}"
+                    ))
+                })
+                .disclose()?;
+            let plan = table
+                .finalize_managed_drop_index(&current, definition, index_id, descriptor)
+                .disclose()?;
+            (gates, plan)
+        };
         let observer = mandatory_runtime
             .submit(PreparedDropIndex::new(gates, scope, plan))
             .await
@@ -319,7 +311,7 @@ impl ManagedTableOps for Session {
                 .attach("operation=resolve_table_binding, phase=final_admission")
                 .disclose()?;
             operation
-                .acquire_table_binding_resolution(candidate, include_full_schema)
+                .acquire_table_binding_resolution(candidate)
                 .await
                 .attach_with(|| {
                     format!(
@@ -344,43 +336,21 @@ impl ManagedTableOps for Session {
                 continue;
             }
 
-            let table = engine
+            let definition = engine
                 .catalog()
-                .current_live_user_table(candidate)
-                .ok_or_else(|| invalid_binding_target(candidate, "current runtime is missing"))?;
-            if !table.definition_kind().is_managed() {
-                return Err(invalid_binding_target(
-                    candidate,
-                    "binding targets an unmanaged runtime",
-                ));
-            }
-            let layout = table.layout_snapshot();
-            let version = TableDefinitionVersion::new(candidate, layout.metadata().storage_epoch);
-            let full_schema = if include_full_schema {
-                let descriptor = engine
-                    .catalog()
-                    .storage
-                    .table_descriptors()
-                    .find_uncommitted_by_table_id(engine.pool_guards(), candidate)
-                    .await
-                    .disclose()?
-                    .ok_or_else(|| {
-                        invalid_binding_target(candidate, "managed descriptor is missing")
-                    })?;
-                validate_table_descriptor_against_metadata(
-                    &descriptor,
-                    candidate,
-                    layout.metadata(),
-                )
-                .attach("operation=resolve_table_binding, phase=validate_full_definition")
+                .binding_target_definition(candidate)
+                .attach("operation=resolve_table_binding, phase=validate_current_definition")
                 .disclose()?;
-                Some(ManagedTableDefinitionSnapshot::new(
-                    StorageTableDefinition::from_metadata(layout.metadata()),
-                    descriptor.payload,
-                ))
-            } else {
-                None
-            };
+            let version = TableDefinitionVersion::new(
+                candidate,
+                definition.descriptor().compiled_storage_epoch,
+            );
+            let full_schema = include_full_schema.then(|| {
+                ManagedTableDefinitionSnapshot::new(
+                    definition.schema().clone(),
+                    definition.descriptor().payload.clone(),
+                )
+            });
             return Ok(Some(ResolvedTableBinding::new(
                 candidate,
                 version,
@@ -403,23 +373,10 @@ impl ManagedTableOps for Session {
             })
             .disclose()?;
         let engine = &operation.runtime;
-        let table = engine
+        engine
             .catalog()
-            .current_live_user_table(table_id)
-            .ok_or_else(|| {
-                Report::new(OperationError::TableNotFound)
-                    .attach(format!(
-                        "list table bindings current-live lookup: table_id={table_id}"
-                    ))
-                    .disclose()
-            })?;
-        if !table.definition_kind().is_managed() {
-            return Err(Report::new(OperationError::InvalidMetadata)
-                .attach(format!(
-                    "list_table_bindings requires managed table: table_id={table_id}"
-                ))
-                .disclose());
-        }
+            .current_managed_definition(table_id)
+            .disclose()?;
         let bindings = engine
             .catalog()
             .storage
@@ -489,25 +446,16 @@ impl Session {
             .disclose()?;
         let current = {
             let engine = &operation.runtime;
-            let table =
-                validated_index_ddl_target(engine, engine.pool_guards(), table_id, operation_name)
-                    .await
-                    .disclose()?;
-            let descriptor = engine
-                .catalog()
-                .storage
-                .table_descriptors()
-                .find_uncommitted_by_table_id(engine.pool_guards(), table_id)
-                .await
-                .disclose()?
+            let (table, definition) =
+                validated_current_user_table(engine, table_id, operation_name).disclose()?;
+            let definition = definition
                 .ok_or_else(|| {
-                    Report::new(OperationError::InvalidMetadata)
-                        .attach(format!(
-                            "managed DDL requires a descriptor row: operation={operation_name}, table_id={table_id}"
-                        ))
-                        .disclose()
-                })?;
-            table.current_managed_definition(descriptor).disclose()?
+                    Report::new(OperationError::InvalidMetadata).attach(format!(
+                        "managed DDL requires a managed table: table_id={table_id}"
+                    ))
+                })
+                .disclose()?;
+            table.current_managed_definition(definition).disclose()?
         };
         // Dropping the complete operation scope releases target metadata-S and
         // catalog read admission before arbitrary interpreter code can run.
@@ -542,36 +490,19 @@ impl SessionOperationPin {
     async fn acquire_table_binding_resolution(
         &mut self,
         table_id: TableID,
-        include_full_schema: bool,
     ) -> OperationOrFatalResult<()> {
         let (engine, family, curr_scope) = self.operation_lock_parts();
         let mut fresh =
-            FreshClaimsGuard::<5>::new(family, curr_scope, engine.lock_manager(), &engine.poisoner);
+            FreshClaimsGuard::<3>::new(family, curr_scope, engine.lock_manager(), &engine.poisoner);
         fresh
             .acquire(LockResource::TableMetadata(table_id), LockMode::Shared)
             .await?;
-        if include_full_schema {
-            fresh
-                .acquire(
-                    LockResource::TableMetadata(TABLE_ID_TABLE_DESCRIPTORS),
-                    LockMode::Shared,
-                )
-                .await?;
-        }
         fresh
             .acquire(
                 LockResource::TableMetadata(TABLE_ID_TABLE_BINDINGS),
                 LockMode::Shared,
             )
             .await?;
-        if include_full_schema {
-            fresh
-                .acquire(
-                    LockResource::TableData(TABLE_ID_TABLE_DESCRIPTORS),
-                    LockMode::IntentShared,
-                )
-                .await?;
-        }
         fresh
             .acquire(
                 LockResource::TableData(TABLE_ID_TABLE_BINDINGS),
@@ -616,21 +547,9 @@ impl SessionOperationPin {
     ) -> OperationOrFatalResult<()> {
         let (engine, family, curr_scope) = self.operation_lock_parts();
         let mut fresh =
-            FreshClaimsGuard::<3>::new(family, curr_scope, engine.lock_manager(), &engine.poisoner);
+            FreshClaimsGuard::<1>::new(family, curr_scope, engine.lock_manager(), &engine.poisoner);
         fresh
             .acquire(LockResource::TableMetadata(table_id), LockMode::Shared)
-            .await?;
-        fresh
-            .acquire(
-                LockResource::TableMetadata(TABLE_ID_TABLE_DESCRIPTORS),
-                LockMode::Shared,
-            )
-            .await?;
-        fresh
-            .acquire(
-                LockResource::TableData(TABLE_ID_TABLE_DESCRIPTORS),
-                LockMode::IntentShared,
-            )
             .await?;
         fresh.disarm();
         Ok(())
@@ -670,24 +589,6 @@ impl SessionOperationPin {
     }
 }
 
-#[inline]
-fn managed_schema_changed(table_id: TableID, operation: &'static str) -> crate::Error {
-    Report::new(OperationError::SchemaChanged)
-        .attach(format!(
-            "managed descriptor disappeared during revalidation: operation={operation}, table_id={table_id}"
-        ))
-        .disclose()
-}
-
-#[inline]
-fn invalid_binding_target(table_id: TableID, reason: &'static str) -> crate::Error {
-    Report::new(DataIntegrityError::InvalidRootInvariant)
-        .attach(format!(
-            "managed table binding integrity failure: table_id={table_id}, reason={reason}"
-        ))
-        .disclose()
-}
-
 #[cfg(test)]
 mod tests {
     use crate::catalog::storage::tests::begin_catalog_test_trx;
@@ -697,9 +598,15 @@ mod tests {
         storage_schema_fingerprint_count, user_table_file_exists,
     };
     use crate::catalog::{
-        TABLE_ID_TABLE_BINDINGS, TABLE_ID_TABLE_DESCRIPTORS, TableBindingObject,
-        TableDescriptorObject, TableDescriptors,
+        IndexDdlTestPhase, IndexRef, IndexSlot, current_table_lookup_count,
+        full_current_table_lookup_count, replace_managed_definition,
+        reset_current_table_lookup_count,
     };
+    use crate::catalog::{
+        TABLE_ID_TABLE_BINDINGS, TABLE_ID_TABLE_DESCRIPTORS, TableBindingObject,
+        TableDescriptorObject, TableDescriptors, Tables,
+    };
+    use crate::id::TrxID;
     use crate::id::{SessionID, TableID};
     use crate::lock::tests::TestLockOwner;
     use crate::lock::{LockMode, LockOwner, LockResource};
@@ -707,13 +614,18 @@ mod tests {
     use crate::map::FastHashMap;
     use crate::session::tests::SessionTestExt;
     use crate::table::tests::lock_entry_count;
+    use crate::trx::MAX_SNAPSHOT_TS;
     use crate::trx::SessionOperationKind;
     use crate::{
         BindingNamespaceID, Engine, EngineConfig, Error, ErrorKind, IndexID, ManagedTableOps,
         OperationError, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
         StorageIndexSpec, StorageTableSpec, TableBinding, ValKind,
     };
+    use rand::rngs::StdRng;
     use std::collections::hash_map::Entry;
+    use std::fmt::Debug;
+    use std::future::Future;
+    use std::pin::Pin;
     use std::result::Result as StdResult;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Barrier, Mutex, OnceLock, mpsc};
@@ -916,6 +828,118 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct DefinitionModel {
+        payload: Vec<u8>,
+        indexes: Vec<IndexID>,
+        epoch: u64,
+        calls: usize,
+        callback_gate: Option<(Arc<Barrier>, Arc<Barrier>)>,
+        bindings: Vec<TableBinding>,
+    }
+
+    impl DefinitionModel {
+        fn new(payload: Vec<u8>, bindings: usize) -> Self {
+            Self {
+                payload,
+                indexes: vec![],
+                epoch: 0,
+                calls: 0,
+                callback_gate: None,
+                bindings: (0..bindings)
+                    .map(|key| TableBinding::new(BindingNamespaceID::new(298), vec![key as u8]))
+                    .collect(),
+            }
+        }
+
+        fn pause_callback(&self) {
+            if let Some((entered, release)) = &self.callback_gate {
+                entered.wait();
+                release.wait();
+            }
+        }
+
+        fn schema(&self) -> crate::StorageTableDefinition {
+            crate::StorageTableDefinition::new(
+                vec![crate::StorageColumnDefinition::new(
+                    crate::ColumnID::new(0),
+                    StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+                )],
+                self.indexes
+                    .iter()
+                    .map(|id| {
+                        crate::StorageIndexDefinition::new(
+                            *id,
+                            vec![crate::StorageIndexKeyByColumnId::new(crate::ColumnID::new(
+                                0,
+                            ))],
+                            StorageIndexFlags::empty(),
+                        )
+                    })
+                    .collect(),
+            )
+        }
+    }
+
+    impl crate::ManagedTableInterpreter for DefinitionModel {
+        type Error = &'static str;
+
+        fn create_table(
+            &mut self,
+            _source: &[u8],
+        ) -> StdResult<crate::ManagedCreateTableDefinition, Self::Error> {
+            Ok(crate::ManagedCreateTableDefinition::new(
+                crate::CreateTableDefinition::new(
+                    StorageTableSpec::new(vec![StorageColumnSpec::new(
+                        ValKind::I32,
+                        StorageColumnFlags::empty(),
+                    )]),
+                    vec![],
+                ),
+                self.payload.clone(),
+                self.bindings.clone(),
+            ))
+        }
+
+        fn create_index(
+            &mut self,
+            source: &[u8],
+            previous: &[u8],
+            schema: &crate::StorageTableDefinition,
+            _proposed: IndexID,
+        ) -> StdResult<crate::DescriptorUpdate<crate::CreateIndexDefinition>, Self::Error> {
+            self.calls += 1;
+            assert_eq!(previous, self.payload);
+            assert_eq!(schema, &self.schema());
+            self.pause_callback();
+            Ok(crate::DescriptorUpdate::new(
+                crate::CreateIndexDefinition::new(
+                    vec![crate::StorageIndexKeyByColumnId::new(crate::ColumnID::new(
+                        0,
+                    ))],
+                    StorageIndexFlags::empty(),
+                ),
+                source.to_vec(),
+            ))
+        }
+
+        fn drop_index(
+            &mut self,
+            source: &[u8],
+            previous: &[u8],
+            schema: &crate::StorageTableDefinition,
+        ) -> StdResult<crate::DescriptorUpdate<crate::DropIndexDefinition>, Self::Error> {
+            self.calls += 1;
+            assert_eq!(previous, self.payload);
+            assert_eq!(schema, &self.schema());
+            self.pause_callback();
+            Ok(crate::DescriptorUpdate::new(
+                crate::DropIndexDefinition::new(*self.indexes.last().unwrap()),
+                source.to_vec(),
+            ))
+        }
+    }
+
     /// Pauses one matching resolver after its binding-only probe scope closes.
     pub(super) fn pause_after_binding_probe(namespace_id: BindingNamespaceID, binding_key: &[u8]) {
         let key = (namespace_id, Box::<[u8]>::from(binding_key));
@@ -955,6 +979,1184 @@ mod tests {
         drop(pauses);
         assert!(!duplicate, "binding probe pause already installed for key");
         (entered_rx, release_tx)
+    }
+
+    // Independent expected stable identities and bytes accompany every cross-store check.
+    async fn assert_definition_model(
+        session: &mut super::Session,
+        table_id: TableID,
+        model: &DefinitionModel,
+    ) {
+        use crate::catalog::CurrentTableState;
+        let runtime = session.engine();
+        let catalog = runtime.catalog();
+        let current = catalog.resolve_user_table_current(table_id).unwrap();
+        let CurrentTableState::Live {
+            metadata, table, ..
+        } = &current
+        else {
+            panic!("model expects a live table");
+        };
+        assert!(Arc::ptr_eq(
+            metadata,
+            table.layout_snapshot().metadata_arc()
+        ));
+        let (_, numeric) = catalog
+            .user_table_metadata_from_catalog(runtime.pool_guards(), table_id)
+            .await
+            .unwrap();
+        assert_eq!(metadata.as_ref(), &numeric);
+        let definition = current.managed_definition(table_id).unwrap().unwrap();
+        assert_eq!(definition.schema(), &model.schema());
+        let descriptor = definition.descriptor();
+        assert_eq!(descriptor.table_id, table_id);
+        assert_eq!(descriptor.compiled_storage_epoch, model.epoch);
+        assert_eq!(descriptor.descriptor_revision, model.epoch);
+        assert_eq!(
+            descriptor.storage_schema_fingerprint,
+            numeric.storage_schema_fingerprint()
+        );
+        assert_eq!(descriptor.payload.as_ref(), model.payload);
+        let row = catalog
+            .storage
+            .table_descriptors()
+            .find_uncommitted_by_table_id(runtime.pool_guards(), table_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&row, descriptor);
+        for binding in &model.bindings {
+            for full in [false, true] {
+                let resolved = session
+                    .resolve_table_binding(binding.namespace_id(), binding.binding_key(), full)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(resolved.table_id(), table_id);
+                assert_eq!(
+                    resolved.version(),
+                    crate::TableDefinitionVersion::new(table_id, model.epoch)
+                );
+                if full {
+                    assert_eq!(resolved.full_schema().unwrap().schema(), &model.schema());
+                    assert_eq!(resolved.full_schema().unwrap().descriptor(), model.payload);
+                } else {
+                    assert!(resolved.full_schema().is_none());
+                }
+            }
+        }
+    }
+
+    fn reset_definition_read_counts() {
+        crate::StorageTableDefinition::reset_projection_count();
+        TableDescriptors::reset_lookup_count();
+        reset_storage_schema_fingerprint_count();
+    }
+
+    fn assert_no_definition_work() {
+        assert_eq!(crate::StorageTableDefinition::projection_count(), 0);
+        assert_eq!(TableDescriptors::lookup_count(), 0);
+        assert_eq!(storage_schema_fingerprint_count(), 0);
+    }
+
+    fn reset_table_lookup_counts(table_id: TableID) {
+        reset_current_table_lookup_count(table_id);
+        Tables::reset_lookup_count(table_id);
+    }
+
+    fn assert_table_lookup_counts(expected: usize, context: &str) {
+        assert_eq!(current_table_lookup_count(), expected, "{context}");
+        assert_eq!(
+            full_current_table_lookup_count(),
+            0,
+            "{context}: full-state lookups"
+        );
+        assert_eq!(Tables::lookup_count(), 0, "{context}: parent-row reads");
+    }
+
+    async fn wait_for_index_ddl_first_effect<F>(entered: &flume::Receiver<()>, ddl: Pin<&mut F>)
+    where
+        F: Future,
+        F::Output: Debug,
+    {
+        use futures::future::{Either, select};
+        match select(Box::pin(entered.recv_async()), ddl).await {
+            Either::Left((entered, _)) => entered.unwrap(),
+            Either::Right((result, _)) => {
+                panic!("index DDL completed before the first-effect gate: {result:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_managed_definition_reads_ignore_descriptor_exclusion() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let mut model = DefinitionModel::new(vec![0, 0xff], 2);
+            let table_id = session
+                .create_managed_table(b"", &mut model)
+                .await
+                .unwrap()
+                .table_id();
+            let manager = engine.inner().core.lock_manager();
+            let mut blocker =
+                TestLockOwner::new(LockOwner::session_explicit(SessionID::new(90_298)));
+            blocker
+                .acquire(
+                    manager,
+                    LockResource::TableMetadata(TABLE_ID_TABLE_DESCRIPTORS),
+                    LockMode::Exclusive,
+                )
+                .await
+                .unwrap();
+            blocker
+                .acquire(
+                    manager,
+                    LockResource::TableData(TABLE_ID_TABLE_DESCRIPTORS),
+                    LockMode::Exclusive,
+                )
+                .await
+                .unwrap();
+            reset_definition_read_counts();
+            for full in [false, true] {
+                session
+                    .resolve_table_binding(BindingNamespaceID::new(298), &[0], full)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            session.list_table_bindings(table_id).await.unwrap();
+            let before = session
+                .read_managed_current_definition(table_id, "test")
+                .await
+                .unwrap();
+            assert_no_definition_work();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
+            let definition = engine
+                .inner()
+                .core
+                .catalog()
+                .current_managed_definition(table_id)
+                .unwrap();
+            let spec =
+                StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::empty());
+            let plan = table
+                .finalize_managed_create_index(&before, definition, spec, vec![1].into())
+                .unwrap();
+            // Only replacement construction projects and hashes; revalidation never reads rows.
+            assert_eq!(TableDescriptors::lookup_count(), 0);
+            assert_eq!(crate::StorageTableDefinition::projection_count(), 1);
+            assert_eq!(storage_schema_fingerprint_count(), 1);
+            drop(plan);
+            blocker.close(manager);
+            assert_definition_model(&mut session, table_id, &model).await;
+        });
+    }
+
+    #[test]
+    fn test_managed_index_uses_one_current_lookup_per_phase() {
+        use crate::catalog::IndexDdlKind;
+
+        // block_on keeps foreground polling on this thread; background work is
+        // excluded from the target-specific current-table lookup counter.
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let mut model = DefinitionModel::new(vec![0], 1);
+            let table_id = session
+                .create_managed_table(b"", &mut model)
+                .await
+                .unwrap()
+                .table_id();
+            for (kind, phase) in [
+                (
+                    IndexDdlKind::Create,
+                    IndexDdlTestPhase::CreateBeforeFirstEffect,
+                ),
+                (IndexDdlKind::Drop, IndexDdlTestPhase::DropBeforeFirstEffect),
+            ] {
+                for full in [false, true] {
+                    reset_table_lookup_counts(table_id);
+                    reset_definition_read_counts();
+                    let resolved = session
+                        .resolve_table_binding(BindingNamespaceID::new(298), &[0], full)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_table_lookup_counts(1, "binding resolution");
+                    assert_no_definition_work();
+                    assert_eq!(
+                        resolved.version(),
+                        crate::TableDefinitionVersion::new(table_id, model.epoch)
+                    );
+                    assert_eq!(resolved.full_schema().is_some(), full);
+                    if let Some(snapshot) = resolved.full_schema() {
+                        assert_eq!(snapshot.schema(), &model.schema());
+                        assert_eq!(snapshot.descriptor(), model.payload);
+                    }
+                }
+                reset_table_lookup_counts(table_id);
+                let current = session
+                    .read_managed_current_definition(table_id, "test")
+                    .await
+                    .unwrap();
+                assert_table_lookup_counts(1, &format!("{kind:?} preflight"));
+                assert_eq!(current.schema(), &model.schema());
+
+                reset_table_lookup_counts(table_id);
+                let definition = engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .current_managed_definition(table_id)
+                    .unwrap();
+                assert_table_lookup_counts(1, "definition-only lookup");
+                assert!(Arc::ptr_eq(current.definition(), &definition));
+                drop(definition);
+                drop(current);
+
+                let (entered, release) = engine.inner().index_ddl_test.install_gate(phase);
+                reset_table_lookup_counts(table_id);
+                let mut ddl = Box::pin(async {
+                    match kind {
+                        IndexDdlKind::Create => session
+                            .create_managed_index(table_id, &[1], &mut model)
+                            .await
+                            .map(Some),
+                        IndexDdlKind::Drop => session
+                            .drop_managed_index(table_id, &[2], &mut model)
+                            .await
+                            .map(|()| None),
+                    }
+                });
+                wait_for_index_ddl_first_effect(&entered, ddl.as_mut()).await;
+                // Both foreground phases have completed, and mandatory work is
+                // paused before its first effect. Each phase selects the table once.
+                assert_table_lookup_counts(2, &format!("{kind:?} both phases"));
+                release.send_async(()).await.unwrap();
+                match ddl.await.unwrap() {
+                    Some(index_id) => {
+                        model.indexes.push(index_id);
+                        model.payload = vec![1];
+                    }
+                    None => {
+                        model.indexes.pop();
+                        model.payload = vec![2];
+                    }
+                }
+                model.epoch += 1;
+                assert_definition_model(&mut session, table_id, &model).await;
+            }
+        });
+    }
+
+    #[test]
+    fn test_unmanaged_index_uses_one_current_lookup_per_phase() {
+        use crate::catalog::IndexDdlKind;
+
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let table_id = session
+                .create_table(
+                    StorageTableSpec::new(vec![StorageColumnSpec::new(
+                        ValKind::I32,
+                        StorageColumnFlags::empty(),
+                    )]),
+                    vec![],
+                )
+                .await
+                .unwrap()
+                .table_id();
+            let mut index_id = None;
+            for (kind, phase) in [
+                (
+                    IndexDdlKind::Create,
+                    IndexDdlTestPhase::CreateBeforeFirstEffect,
+                ),
+                (IndexDdlKind::Drop, IndexDdlTestPhase::DropBeforeFirstEffect),
+            ] {
+                let (entered, release) = engine.inner().index_ddl_test.install_gate(phase);
+                reset_table_lookup_counts(table_id);
+                reset_definition_read_counts();
+                let mut ddl = Box::pin(async {
+                    match kind {
+                        IndexDdlKind::Create => session
+                            .create_index(
+                                table_id,
+                                StorageIndexSpec::new(
+                                    vec![StorageIndexKey::new(0)],
+                                    StorageIndexFlags::empty(),
+                                ),
+                            )
+                            .await
+                            .map(Some),
+                        IndexDdlKind::Drop => session
+                            .drop_index(table_id, index_id.unwrap())
+                            .await
+                            .map(|()| None),
+                    }
+                });
+                wait_for_index_ddl_first_effect(&entered, ddl.as_mut()).await;
+                assert_table_lookup_counts(1, &format!("unmanaged {kind:?} preparation"));
+                assert_no_definition_work();
+                release.send_async(()).await.unwrap();
+                index_id = ddl.await.unwrap();
+                let table = engine.inner().core.catalog().get_table(table_id).unwrap();
+                assert_eq!(
+                    table.metadata().idx.active_index_count(),
+                    usize::from(index_id.is_some())
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn test_managed_cache_corruption_fails_all_definition_readers() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let mut model = DefinitionModel::new(vec![1], 1);
+            let table_id = session
+                .create_managed_table(b"", &mut model)
+                .await
+                .unwrap()
+                .table_id();
+            let mut other = DefinitionModel::new(vec![2], 0);
+            let other_id = session
+                .create_managed_table(b"", &mut other)
+                .await
+                .unwrap()
+                .table_id();
+            let catalog = engine.inner().core.catalog();
+            let original_definition = catalog.current_managed_definition(table_id).unwrap();
+            let foreign_definition = catalog.current_managed_definition(other_id).unwrap();
+            let id = session
+                .create_managed_index(table_id, &[3], &mut model)
+                .await
+                .unwrap();
+            model.indexes.push(id);
+            model.epoch += 1;
+            model.payload = vec![3];
+            let definition = catalog.current_managed_definition(table_id).unwrap();
+            for definition in [None, Some(foreign_definition), Some(original_definition)] {
+                replace_managed_definition(catalog, table_id, definition);
+                reset_definition_read_counts();
+                for full in [false, true] {
+                    let error = session
+                        .resolve_table_binding(BindingNamespaceID::new(298), &[0], full)
+                        .await
+                        .unwrap_err();
+                    assert_eq!(error.kind(), ErrorKind::DataIntegrity);
+                }
+                let error = session
+                    .read_managed_current_definition(table_id, "test")
+                    .await
+                    .err()
+                    .unwrap();
+                assert!(
+                    error
+                        .report()
+                        .contains::<crate::error::DataIntegrityError>()
+                );
+                assert!(
+                    session
+                        .list_table_bindings(table_id)
+                        .await
+                        .unwrap_err()
+                        .report()
+                        .contains::<crate::error::DataIntegrityError>()
+                );
+                assert_no_definition_work();
+            }
+            replace_managed_definition(catalog, table_id, Some(definition.clone()));
+            let unmanaged = session
+                .create_table(
+                    StorageTableSpec::new(vec![StorageColumnSpec::new(
+                        ValKind::I32,
+                        StorageColumnFlags::empty(),
+                    )]),
+                    vec![],
+                )
+                .await
+                .unwrap()
+                .table_id();
+            replace_managed_definition(catalog, unmanaged, Some(definition));
+            let error = session
+                .read_managed_current_definition(unmanaged, "test")
+                .await
+                .err()
+                .unwrap();
+            assert!(
+                error
+                    .report()
+                    .contains::<crate::error::DataIntegrityError>()
+            );
+            replace_managed_definition(catalog, unmanaged, None);
+            for error in [
+                session
+                    .read_managed_current_definition(unmanaged, "test")
+                    .await
+                    .err()
+                    .unwrap(),
+                session.list_table_bindings(unmanaged).await.unwrap_err(),
+            ] {
+                assert_eq!(
+                    error.operation_error(),
+                    Some(OperationError::InvalidMetadata)
+                );
+            }
+            assert_definition_model(&mut session, table_id, &model).await;
+            assert_definition_model(&mut session, other_id, &other).await;
+        });
+    }
+
+    #[test]
+    fn test_managed_definition_generations_follow_readers_and_drop() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let mut model = DefinitionModel::new(vec![0, 0xff], 1);
+            let table_id = session
+                .create_managed_table(b"", &mut model)
+                .await
+                .unwrap()
+                .table_id();
+            let mut reader = engine.new_session().unwrap();
+            let transaction = reader.begin_trx().unwrap();
+            let old = session
+                .read_managed_current_definition(table_id, "test")
+                .await
+                .unwrap();
+            let weak = Arc::downgrade(old.definition());
+            let id = session
+                .create_managed_index(table_id, &[1], &mut model)
+                .await
+                .unwrap();
+            assert_eq!(old.schema(), &model.schema());
+            assert_eq!(old.descriptor().payload.as_ref(), model.payload);
+            model.indexes.push(id);
+            model.payload = vec![1];
+            model.epoch += 1;
+            assert_definition_model(&mut session, table_id, &model).await;
+            drop(old);
+            assert!(
+                weak.upgrade().is_none(),
+                "metadata history retained obsolete definition"
+            );
+            let retained = engine.inner().core.catalog().get_table(table_id).unwrap();
+            let definition = engine
+                .inner()
+                .core
+                .catalog()
+                .current_managed_definition(table_id)
+                .unwrap();
+            let weak = Arc::downgrade(&definition);
+            drop(definition);
+            session.drop_table(table_id).await.unwrap();
+            assert!(
+                weak.upgrade().is_none(),
+                "DROP or retained runtime kept managed definition"
+            );
+            assert!(
+                engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .resolve_user_table_current(table_id)
+                    .unwrap()
+                    .live_table()
+                    .is_none()
+            );
+            drop(retained);
+            drop(transaction);
+        });
+    }
+
+    #[test]
+    fn test_managed_definition_seeded_recovery_model() {
+        use rand::{RngExt, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(298);
+        smol::block_on(async {
+            for bindings in [0, 1, 3] {
+                let root = TempDir::new().unwrap();
+                let config = EngineConfig::default().storage_root(root.path());
+                let mut engine = Engine::bootstrap(config.clone()).await.unwrap();
+                let mut session = engine.new_session().unwrap();
+                let mut model = DefinitionModel::new(vec![0, 0xff, bindings as u8], bindings);
+                let mut table_id = session
+                    .create_managed_table(b"", &mut model)
+                    .await
+                    .unwrap()
+                    .table_id();
+                assert_definition_model(&mut session, table_id, &model).await;
+                for step in 0..24 {
+                    match rng.random_range(0..6) {
+                        0 => {
+                            // Reopen first to isolate the known catalog block-reuse cache bug
+                            // tracked separately from managed-definition publication.
+                            drop(session);
+                            drop(engine);
+                            engine = Engine::bootstrap(config.clone()).await.unwrap();
+                            session = engine.new_session().unwrap();
+                            assert_definition_model(&mut session, table_id, &model).await;
+                            session.checkpoint_catalog().await.unwrap();
+                            drop(session);
+                            drop(engine);
+                            engine = Engine::bootstrap(config.clone()).await.unwrap();
+                            session = engine.new_session().unwrap();
+                        }
+                        1 => {
+                            drop(session);
+                            drop(engine);
+                            engine = Engine::bootstrap(config.clone()).await.unwrap();
+                            session = engine.new_session().unwrap();
+                        }
+                        2 if !model.indexes.is_empty() => {
+                            session
+                                .drop_managed_index(table_id, &[step], &mut model)
+                                .await
+                                .unwrap();
+                            model.indexes.pop();
+                            model.epoch += 1;
+                            model.payload = vec![step];
+                        }
+                        3 => {
+                            session.drop_table(table_id).await.unwrap();
+                            assert!(
+                                engine
+                                    .inner()
+                                    .core
+                                    .catalog()
+                                    .current_live_user_table(table_id)
+                                    .is_none()
+                            );
+                            model.indexes.clear();
+                            model.epoch = 0;
+                            model.payload = vec![step, 0xff];
+                            table_id = session
+                                .create_managed_table(b"", &mut model)
+                                .await
+                                .unwrap()
+                                .table_id();
+                        }
+                        4 => {
+                            let definition = engine
+                                .inner()
+                                .core
+                                .catalog()
+                                .current_managed_definition(table_id)
+                                .unwrap();
+                            let mut invalid = CreateFailureInterpreter {
+                                result: Err("invalid"),
+                                bindings: vec![],
+                            };
+                            assert!(
+                                session
+                                    .create_managed_index(table_id, b"", &mut invalid)
+                                    .await
+                                    .is_err()
+                            );
+                            assert!(Arc::ptr_eq(
+                                &definition,
+                                &engine
+                                    .inner()
+                                    .core
+                                    .catalog()
+                                    .current_managed_definition(table_id)
+                                    .unwrap()
+                            ));
+                        }
+                        _ => {
+                            let id = session
+                                .create_managed_index(table_id, &[step], &mut model)
+                                .await
+                                .unwrap();
+                            model.indexes.push(id);
+                            model.epoch += 1;
+                            model.payload = vec![step];
+                        }
+                    }
+                    assert_definition_model(&mut session, table_id, &model).await;
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn test_managed_index_staging_failure_preserves_exact_generation() {
+        use crate::catalog::IndexDdlKind;
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let mut model = DefinitionModel::new(vec![0], 1);
+            let table_id = session
+                .create_managed_table(b"", &mut model)
+                .await
+                .unwrap()
+                .table_id();
+            for kind in [IndexDdlKind::Create, IndexDdlKind::Drop] {
+                if kind == IndexDdlKind::Drop {
+                    let id = session
+                        .create_managed_index(table_id, &[1], &mut model)
+                        .await
+                        .unwrap();
+                    model.indexes.push(id);
+                    model.payload = vec![1];
+                    model.epoch += 1;
+                }
+                let original_definition = engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .current_managed_definition(table_id)
+                    .unwrap();
+                engine.inner().index_ddl_test.set_failure_phase(match kind {
+                    IndexDdlKind::Create => IndexDdlTestPhase::CreateCatalogStaged,
+                    IndexDdlKind::Drop => IndexDdlTestPhase::DropCatalogStaged,
+                });
+                let error = match kind {
+                    IndexDdlKind::Create => session
+                        .create_managed_index(table_id, &[2], &mut model)
+                        .await
+                        .map(|_| ()),
+                    IndexDdlKind::Drop => {
+                        session.drop_managed_index(table_id, &[2], &mut model).await
+                    }
+                }
+                .unwrap_err();
+                assert_eq!(error.engine().unwrap().kind(), ErrorKind::Runtime);
+                let definition = engine
+                    .inner()
+                    .core
+                    .catalog()
+                    .current_managed_definition(table_id)
+                    .unwrap();
+                assert!(Arc::ptr_eq(&original_definition, &definition));
+                assert_definition_model(&mut session, table_id, &model).await;
+            }
+        });
+    }
+
+    #[test]
+    fn test_managed_allocator_only_change_stales_create_but_not_drop() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let mut model = DefinitionModel::new(vec![0], 1);
+            let table_id = session
+                .create_managed_table(b"", &mut model)
+                .await
+                .unwrap()
+                .table_id();
+            let id = session
+                .create_managed_index(table_id, &[1], &mut model)
+                .await
+                .unwrap();
+            model.indexes.push(id);
+            model.payload = vec![1];
+            model.epoch += 1;
+            let expected = session
+                .read_managed_current_definition(table_id, "test")
+                .await
+                .unwrap();
+            let catalog = engine.inner().core.catalog();
+            let table = catalog.get_table(table_id).unwrap();
+            table
+                .reserve_provisional_index_create(
+                    IndexRef::new(IndexID::new(9), IndexSlot::new(9)),
+                    TrxID::new(table.file().active_root_unchecked().root_ts.as_u64() + 1),
+                )
+                .unwrap();
+            let definition = catalog.current_managed_definition(table_id).unwrap();
+            assert!(Arc::ptr_eq(expected.definition(), &definition));
+            reset_definition_read_counts();
+            let error = table
+                .finalize_managed_create_index(
+                    &expected,
+                    definition.clone(),
+                    StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(0)],
+                        StorageIndexFlags::empty(),
+                    ),
+                    vec![2].into(),
+                )
+                .err()
+                .unwrap();
+            assert!(
+                matches!(error, crate::error::OperationOrRuntimeError::Operation(report) if report.current_context() == &OperationError::SchemaChanged)
+            );
+            assert_no_definition_work();
+            let plan = table
+                .finalize_managed_drop_index(&expected, definition, id, vec![2].into())
+                .unwrap();
+            assert_eq!(plan.index().id(), id);
+            assert_eq!(TableDescriptors::lookup_count(), 0);
+            drop(plan);
+            assert_definition_model(&mut session, table_id, &model).await;
+        });
+    }
+
+    #[test]
+    fn test_managed_readers_wait_through_durable_publication_boundaries() {
+        use crate::catalog::IndexDdlKind;
+        smol::block_on(async {
+            for (kind, phase) in [
+                (
+                    IndexDdlKind::Create,
+                    IndexDdlTestPhase::CreateCatalogCommitted,
+                ),
+                (IndexDdlKind::Create, IndexDdlTestPhase::CreateRootPublished),
+                (
+                    IndexDdlKind::Create,
+                    IndexDdlTestPhase::CreateLayoutHistoryPublished,
+                ),
+                (IndexDdlKind::Drop, IndexDdlTestPhase::DropCatalogCommitted),
+                (IndexDdlKind::Drop, IndexDdlTestPhase::DropRootPublished),
+                (
+                    IndexDdlKind::Drop,
+                    IndexDdlTestPhase::DropLayoutHistoryPublished,
+                ),
+            ] {
+                let root = TempDir::new().unwrap();
+                let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                    .await
+                    .unwrap();
+                let mut writer = engine.new_session().unwrap();
+                let mut model = DefinitionModel::new(vec![0], 1);
+                let table_id = writer
+                    .create_managed_table(b"", &mut model)
+                    .await
+                    .unwrap()
+                    .table_id();
+                if kind == IndexDdlKind::Drop {
+                    let id = writer
+                        .create_managed_index(table_id, &[1], &mut model)
+                        .await
+                        .unwrap();
+                    model.indexes.push(id);
+                    model.payload = vec![1];
+                    model.epoch += 1;
+                }
+                assert_definition_model(&mut writer, table_id, &model).await;
+                let (entered, release) = engine.inner().index_ddl_test.install_gate(phase);
+                let mut ddl = Box::pin(async {
+                    match kind {
+                        IndexDdlKind::Create => writer
+                            .create_managed_index(table_id, &[2], &mut model)
+                            .await
+                            .map(Some),
+                        IndexDdlKind::Drop => writer
+                            .drop_managed_index(table_id, &[2], &mut model)
+                            .await
+                            .map(|()| None),
+                    }
+                });
+                assert!(futures::poll!(ddl.as_mut()).is_pending());
+                entered.recv_async().await.unwrap();
+                let mut resolver = engine.new_session().unwrap();
+                let mut preflight = engine.new_session().unwrap();
+                let mut resolve = Box::pin(resolver.resolve_table_binding(
+                    BindingNamespaceID::new(298),
+                    &[0],
+                    true,
+                ));
+                let mut read =
+                    Box::pin(preflight.read_managed_current_definition(table_id, "test"));
+                assert!(futures::poll!(resolve.as_mut()).is_pending());
+                assert!(futures::poll!(read.as_mut()).is_pending());
+                release.send_async(()).await.unwrap();
+                let index_id = ddl.await.unwrap();
+                if let Some(id) = index_id {
+                    model.indexes.push(id);
+                } else {
+                    model.indexes.pop();
+                }
+                model.payload = vec![2];
+                model.epoch += 1;
+                let resolved = resolve.await.unwrap().unwrap();
+                let captured = read.await.unwrap();
+                assert_eq!(resolved.full_schema().unwrap().schema(), &model.schema());
+                assert_eq!(resolved.full_schema().unwrap().descriptor(), model.payload);
+                assert_eq!(captured.schema(), &model.schema());
+                assert_eq!(captured.descriptor().payload.as_ref(), model.payload);
+                assert_definition_model(&mut writer, table_id, &model).await;
+            }
+        });
+    }
+
+    #[test]
+    fn test_managed_fatal_publication_recovers_root_qualified_definition() {
+        use crate::catalog::IndexDdlKind;
+        smol::block_on(async {
+            for checkpoint in [false, true] {
+                for (kind, phase, proven) in [
+                    (
+                        IndexDdlKind::Create,
+                        IndexDdlTestPhase::CreateCatalogCommitted,
+                        false,
+                    ),
+                    (
+                        IndexDdlKind::Create,
+                        IndexDdlTestPhase::CreateRootPublished,
+                        true,
+                    ),
+                    (
+                        IndexDdlKind::Drop,
+                        IndexDdlTestPhase::DropCatalogCommitted,
+                        false,
+                    ),
+                    (
+                        IndexDdlKind::Drop,
+                        IndexDdlTestPhase::DropRootPublished,
+                        true,
+                    ),
+                ] {
+                    let root = TempDir::new().unwrap();
+                    let config = EngineConfig::default().storage_root(root.path());
+                    let engine = Engine::bootstrap(config.clone()).await.unwrap();
+                    let mut session = engine.new_session().unwrap();
+                    let mut model = DefinitionModel::new(vec![0], 1);
+                    let table_id = session
+                        .create_managed_table(b"", &mut model)
+                        .await
+                        .unwrap()
+                        .table_id();
+                    if kind == IndexDdlKind::Drop {
+                        let id = session
+                            .create_managed_index(table_id, &[1], &mut model)
+                            .await
+                            .unwrap();
+                        model.indexes.push(id);
+                        model.payload = vec![1];
+                        model.epoch += 1;
+                    }
+                    if checkpoint {
+                        session.checkpoint_catalog().await.unwrap();
+                    }
+                    engine.inner().index_ddl_test.set_failure_phase(phase);
+                    let error = match kind {
+                        IndexDdlKind::Create => session
+                            .create_managed_index(table_id, &[2], &mut model)
+                            .await
+                            .map(|_| ()),
+                        IndexDdlKind::Drop => {
+                            session.drop_managed_index(table_id, &[2], &mut model).await
+                        }
+                    }
+                    .unwrap_err();
+                    assert_eq!(error.engine().unwrap().kind(), ErrorKind::Fatal);
+                    assert_eq!(
+                        session
+                            .resolve_table_binding(BindingNamespaceID::new(298), &[0], true)
+                            .await
+                            .unwrap_err()
+                            .kind(),
+                        ErrorKind::Fatal
+                    );
+                    drop(session);
+                    drop(engine);
+                    let engine = Engine::bootstrap(config).await.unwrap();
+                    let mut session = engine.new_session().unwrap();
+                    if proven {
+                        if kind == IndexDdlKind::Create {
+                            model.indexes.push(IndexID::new(0));
+                        } else {
+                            model.indexes.pop();
+                        }
+                        model.payload = vec![2];
+                        model.epoch += 1;
+                    }
+                    assert_definition_model(&mut session, table_id, &model).await;
+                    if kind == IndexDdlKind::Create && !proven {
+                        let current = session
+                            .read_managed_current_definition(table_id, "test")
+                            .await
+                            .unwrap();
+                        assert_eq!(current.effective_next_index_id(), 1);
+                        assert_eq!(current.schema(), &model.schema());
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn test_recovery_hydration_rejects_missing_foreign_and_duplicate_ownership() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let mut model = DefinitionModel::new(vec![0], 0);
+            let table_id = session
+                .create_managed_table(b"", &mut model)
+                .await
+                .unwrap()
+                .table_id();
+            let runtime = session.engine();
+            let catalog = runtime.catalog();
+            let descriptors = catalog
+                .validate_live_table_descriptors(runtime.pool_guards())
+                .await
+                .unwrap();
+            assert!(
+                catalog
+                    .hydrate_recovered_managed_definitions(descriptors.clone())
+                    .is_err()
+            );
+            replace_managed_definition(catalog, table_id, None);
+            assert!(
+                catalog
+                    .hydrate_recovered_managed_definitions(vec![])
+                    .is_err()
+            );
+            let mut foreign = descriptors.clone();
+            foreign[0].table_id = TableID::new(99_999);
+            assert!(
+                catalog
+                    .hydrate_recovered_managed_definitions(foreign)
+                    .is_err()
+            );
+            let mut duplicate = descriptors.clone();
+            duplicate.push(descriptors[0].clone());
+            assert!(
+                catalog
+                    .hydrate_recovered_managed_definitions(duplicate)
+                    .is_err()
+            );
+            catalog
+                .hydrate_recovered_managed_definitions(descriptors)
+                .unwrap();
+            assert_definition_model(&mut session, table_id, &model).await;
+        });
+    }
+
+    #[test]
+    fn test_managed_drop_interpretation_becomes_stale_without_retry() {
+        let root = TempDir::new().unwrap();
+        let engine = smol::block_on(Engine::bootstrap(
+            EngineConfig::default().storage_root(root.path()),
+        ))
+        .unwrap();
+        let mut writer = engine.new_session().unwrap();
+        let mut model = DefinitionModel::new(vec![0], 1);
+        let table_id = smol::block_on(writer.create_managed_table(b"", &mut model))
+            .unwrap()
+            .table_id();
+        let id = smol::block_on(writer.create_managed_index(table_id, &[1], &mut model)).unwrap();
+        model.indexes.push(id);
+        model.epoch += 1;
+        model.payload = vec![1];
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let mut stale_model = model.clone();
+        stale_model.callback_gate = Some((entered.clone(), release.clone()));
+        let mut stale_session = engine.new_session().unwrap();
+        let stale = thread::spawn(move || {
+            let result =
+                smol::block_on(stale_session.drop_managed_index(table_id, &[9], &mut stale_model));
+            (result, stale_model.calls)
+        });
+        entered.wait();
+        let id = smol::block_on(writer.create_managed_index(table_id, &[2], &mut model)).unwrap();
+        model.indexes.push(id);
+        model.epoch += 1;
+        model.payload = vec![2];
+        let definition = engine
+            .inner()
+            .core
+            .catalog()
+            .current_managed_definition(table_id)
+            .unwrap();
+        release.wait();
+        let (result, calls) = stale.join().unwrap();
+        assert_eq!(
+            result.unwrap_err().engine().unwrap().operation_error(),
+            Some(OperationError::SchemaChanged)
+        );
+        assert_eq!(calls, model.calls);
+        assert!(Arc::ptr_eq(
+            &definition,
+            &engine
+                .inner()
+                .core
+                .catalog()
+                .current_managed_definition(table_id)
+                .unwrap()
+        ));
+        smol::block_on(assert_definition_model(&mut writer, table_id, &model));
+    }
+
+    #[test]
+    fn test_managed_publication_excludes_direct_current_read_and_purge() {
+        use crate::catalog::IndexDdlKind;
+        smol::block_on(async {
+            for kind in [IndexDdlKind::Create, IndexDdlKind::Drop] {
+                let root = TempDir::new().unwrap();
+                let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                    .await
+                    .unwrap();
+                let mut session = engine.new_session().unwrap();
+                let mut model = DefinitionModel::new(vec![0], 0);
+                let table_id = session
+                    .create_managed_table(b"", &mut model)
+                    .await
+                    .unwrap()
+                    .table_id();
+                if kind == IndexDdlKind::Drop {
+                    let id = session
+                        .create_managed_index(table_id, &[1], &mut model)
+                        .await
+                        .unwrap();
+                    model.indexes.push(id);
+                    model.epoch += 1;
+                    model.payload = vec![1];
+                }
+                let (entered, release) =
+                    engine.inner().index_ddl_test.install_publication_gate(kind);
+                let mut ddl = Box::pin(async {
+                    match kind {
+                        IndexDdlKind::Create => session
+                            .create_managed_index(table_id, &[2], &mut model)
+                            .await
+                            .map(Some),
+                        IndexDdlKind::Drop => session
+                            .drop_managed_index(table_id, &[2], &mut model)
+                            .await
+                            .map(|()| None),
+                    }
+                });
+                assert!(futures::poll!(ddl.as_mut()).is_pending());
+                entered.recv_async().await.unwrap();
+                thread::scope(|scope| {
+                    let (started_tx, started_rx) = mpsc::channel();
+                    let (done_tx, done_rx) = mpsc::channel();
+                    for purge in [false, true] {
+                        let catalog = engine.inner().core.catalog();
+                        let started = started_tx.clone();
+                        let done = done_tx.clone();
+                        scope.spawn(move || {
+                            started.send(()).unwrap();
+                            if purge {
+                                catalog.purge_user_table_history(MAX_SNAPSHOT_TS);
+                            } else {
+                                let current = catalog.resolve_user_table_current(table_id).unwrap();
+                                current.managed_definition(table_id).unwrap().unwrap();
+                            }
+                            done.send(()).unwrap();
+                        });
+                    }
+                    started_rx.recv().unwrap();
+                    started_rx.recv().unwrap();
+                    assert!(matches!(
+                        done_rx.recv_timeout(Duration::from_millis(20)),
+                        Err(mpsc::RecvTimeoutError::Timeout)
+                    ));
+                    release.send(()).unwrap();
+                    done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                    done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                });
+                let id = ddl.await.unwrap();
+                if let Some(id) = id {
+                    model.indexes.push(id);
+                } else {
+                    model.indexes.pop();
+                }
+                model.epoch += 1;
+                model.payload = vec![2];
+                assert_definition_model(&mut session, table_id, &model).await;
+            }
+        });
+    }
+
+    #[test]
+    fn test_managed_recovery_rejects_row_corruption_before_session_admission() {
+        smol::block_on(async {
+            for missing in [false, true] {
+                let root = TempDir::new().unwrap();
+                let config = EngineConfig::default().storage_root(root.path());
+                let engine = Engine::bootstrap(config.clone()).await.unwrap();
+                let mut session = engine.new_session().unwrap();
+                let mut model = DefinitionModel::new(vec![0], 1);
+                let table_id = session
+                    .create_managed_table(b"", &mut model)
+                    .await
+                    .unwrap()
+                    .table_id();
+                session.checkpoint_catalog().await.unwrap();
+                let runtime = session.engine();
+                let mut transaction = begin_catalog_test_trx(&session);
+                if missing {
+                    runtime
+                        .catalog()
+                        .storage
+                        .table_descriptors()
+                        .delete_by_table_id(transaction.trx(), table_id)
+                        .await
+                        .unwrap();
+                } else {
+                    let mut descriptor = runtime
+                        .catalog()
+                        .current_managed_definition(table_id)
+                        .unwrap()
+                        .descriptor()
+                        .clone();
+                    descriptor.compiled_storage_epoch += 1;
+                    runtime
+                        .catalog()
+                        .storage
+                        .table_descriptors()
+                        .replace(transaction.trx(), &descriptor)
+                        .await
+                        .unwrap();
+                }
+                transaction
+                    .commit(DDLRedo::TableReplaySilentWatermark { table_id })
+                    .await;
+                // The current generation remains independently valid until shutdown.
+                session
+                    .resolve_table_binding(BindingNamespaceID::new(298), &[0], true)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                drop(runtime);
+                drop(session);
+                drop(engine);
+                let error = Engine::bootstrap(config)
+                    .await
+                    .err()
+                    .expect("corrupt durable catalog admitted an engine");
+                assert!(
+                    error
+                        .report()
+                        .contains::<crate::error::DataIntegrityError>()
+                );
+            }
+        });
     }
 
     #[test]
@@ -1033,7 +2235,7 @@ mod tests {
             blocker
                 .acquire(
                     manager,
-                    LockResource::TableData(TABLE_ID_TABLE_DESCRIPTORS),
+                    LockResource::TableData(TABLE_ID_TABLE_BINDINGS),
                     LockMode::Exclusive,
                 )
                 .await
@@ -1042,13 +2244,13 @@ mod tests {
             let resolver_owner = LockOwner::session_explicit(session.id());
             let mut operation = session.pin_operation(SessionOperationKind::Ddl).unwrap();
             let mut acquire =
-                Box::pin(operation.acquire_table_binding_resolution(TableID::new(90_102), true));
+                Box::pin(operation.acquire_table_binding_resolution(TableID::new(90_102)));
 
             assert!(matches!(
                 futures::poll!(acquire.as_mut()),
                 std::task::Poll::Pending
             ));
-            assert_eq!(lock_entry_count(&engine, resolver_owner), 4);
+            assert_eq!(lock_entry_count(&engine, resolver_owner), 3);
             drop(acquire);
             assert_eq!(lock_entry_count(&engine, resolver_owner), 0);
             assert_eq!(lock_entry_count(&engine, blocker_owner), 1);
@@ -1134,9 +2336,9 @@ mod tests {
                 .unwrap();
             assert_eq!(second_binding.version(), narrow.version());
             let snapshot = full.full_schema().unwrap();
-            assert_eq!(crate::StorageTableDefinition::projection_count(), 1);
-            assert_eq!(TableDescriptors::lookup_count(), 1);
-            assert_eq!(storage_schema_fingerprint_count(), 1);
+            assert_eq!(crate::StorageTableDefinition::projection_count(), 0);
+            assert_eq!(TableDescriptors::lookup_count(), 0);
+            assert_eq!(storage_schema_fingerprint_count(), 0);
             assert_eq!(snapshot.schema().columns().len(), 2);
             assert_eq!(snapshot.schema().indexes().len(), 1);
             assert_eq!(snapshot.descriptor(), initial_descriptor);
@@ -1958,7 +3160,7 @@ mod tests {
     }
 
     #[test]
-    fn test_full_binding_resolution_rejects_descriptor_stamp_disagreement() {
+    fn test_cached_definition_is_independent_of_corrupt_descriptor_rows() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
             let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
@@ -2009,11 +3211,21 @@ mod tests {
                         .unwrap()
                 );
                 transaction.commit(DDLRedo::CreateTable(table_id)).await;
-                let error = session
+                let full = session
                     .resolve_table_binding(BindingNamespaceID::new(31), b"stamp", true)
                     .await
-                    .unwrap_err();
-                assert_eq!(error.kind(), ErrorKind::DataIntegrity);
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(full.full_schema().unwrap().descriptor(), [1]);
+                let runtime = session.engine();
+                let error = runtime
+                    .catalog()
+                    .validate_live_table_descriptors(runtime.pool_guards())
+                    .await
+                    .err()
+                    .unwrap();
+                assert!(error.contains::<crate::error::DataIntegrityError>());
+                assert!(session.checkpoint_catalog().await.is_err());
                 assert!(
                     session
                         .resolve_table_binding(BindingNamespaceID::new(31), b"stamp", false)

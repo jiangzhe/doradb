@@ -212,7 +212,8 @@ impl<'a> RecoveryCoordinator<'a> {
             })?;
         // Descriptor bytes remain opaque, but their storage-owned envelope must
         // describe the same current numeric schema reconstructed after replay.
-        self.resources
+        let descriptors = self
+            .resources
             .catalog
             .validate_live_table_descriptors(&self.resources.pool_guards)
             .await
@@ -233,6 +234,11 @@ impl<'a> RecoveryCoordinator<'a> {
                     err
                 );
             })?;
+        self.resources
+            .catalog
+            .hydrate_recovered_managed_definitions(descriptors)
+            .change_context(RuntimeError::Recovery)
+            .attach("operation=recovery, phase=hydrate_managed_definitions")?;
         // 4. Remove create-table provisional files whose catalog redo never
         //    became durable.
         obs::info!(
@@ -381,7 +387,6 @@ impl<'a> RecoveryCoordinator<'a> {
                 .await?;
             let state = self
                 .track_loaded_table(table.table_id)
-                .await
                 .change_context(RuntimeError::Recovery)?;
             let pending_index_ddl_reconciliation = !metadata_matched;
             if pending_index_ddl_reconciliation {
@@ -424,19 +429,11 @@ impl<'a> RecoveryCoordinator<'a> {
             )))
     }
 
-    async fn track_loaded_table(
-        &mut self,
-        table_id: TableID,
-    ) -> DataIntegrityResult<TableReplayBounds> {
-        let table = self
-            .resources
-            .catalog
-            .get_table(table_id)
-            .await
-            .ok_or_else(|| {
-                Report::new(DataIntegrityError::InvalidPayload)
-                    .attach(format!("track loaded table runtime: table_id={table_id}"))
-            })?;
+    fn track_loaded_table(&mut self, table_id: TableID) -> DataIntegrityResult<TableReplayBounds> {
+        let table = self.resources.catalog.get_table(table_id).ok_or_else(|| {
+            Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!("track loaded table runtime: table_id={table_id}"))
+        })?;
         // Recovery seeds per-table replay bounds before normal transactions
         // run. The loaded table root supplies the physical root timestamp and
         // the root-local replay floors, but checkpointed silent watermark rows
@@ -548,7 +545,7 @@ impl<'a> RecoveryCoordinator<'a> {
         // Checkpointed cold secondary-index state is already available through
         // the table's DiskTree roots. Rebuild only hot row-page MemIndex state.
         for (table_id, pages) in &self.recovered_tables {
-            if let Some(table) = self.resources.catalog.get_table(*table_id).await {
+            if let Some(table) = self.resources.catalog.get_table(*table_id) {
                 let metadata = table.metadata();
                 for page_id in pages {
                     table
@@ -574,7 +571,6 @@ impl<'a> RecoveryCoordinator<'a> {
                 .resources
                 .catalog
                 .get_table(table_id)
-                .await
                 .ok_or_else(|| {
                     Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                         "validate recovered user table metadata: table_id={table_id}"
@@ -721,7 +717,7 @@ impl<'a> RecoveryCoordinator<'a> {
                 .await?
             }
             DDLRedo::DataCheckpoint { table_id, .. } => {
-                self.replay_data_checkpoint_ddl(table_id, dml, cts).await?
+                self.replay_data_checkpoint_ddl(table_id, dml, cts)?
             }
             DDLRedo::TableReplaySilentWatermark { table_id } => {
                 self.replay_table_replay_silent_watermark_ddl(table_id, dml, cts)
@@ -758,7 +754,6 @@ impl<'a> RecoveryCoordinator<'a> {
             .await?;
         let state = self
             .track_loaded_table(table_id)
-            .await
             .change_context(RuntimeError::Recovery)?;
         self.timeline
             .seed_recovered_cts(state.max_recovered_cts_seed());
@@ -863,7 +858,7 @@ impl<'a> RecoveryCoordinator<'a> {
                 let table = self
                     .resources
                     .catalog
-                    .get_table_now(table_id)
+                    .get_table(table_id)
                     .ok_or_else(|| {
                         Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                             "replay provisional CREATE INDEX has no admitted table: table_id={table_id}, index={index}"
@@ -907,7 +902,7 @@ impl<'a> RecoveryCoordinator<'a> {
                 let table = self
                     .resources
                     .catalog
-                    .get_table_now(table_id)
+                    .get_table(table_id)
                     .ok_or_else(|| {
                         Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                             "replay root-proven DROP INDEX has no admitted table: table_id={table_id}, index={index}"
@@ -956,7 +951,6 @@ impl<'a> RecoveryCoordinator<'a> {
             .resources
             .catalog
             .get_table(table_id)
-            .await
             .ok_or_else(|| {
                 Report::new(DataIntegrityError::InvalidPayload)
                     .attach(format!("replay create row page: table_id={table_id}"))
@@ -987,7 +981,7 @@ impl<'a> RecoveryCoordinator<'a> {
         Ok(())
     }
 
-    async fn replay_data_checkpoint_ddl(
+    fn replay_data_checkpoint_ddl(
         &mut self,
         table_id: TableID,
         dml: BTreeMap<TableID, TableDML>,
@@ -1012,7 +1006,6 @@ impl<'a> RecoveryCoordinator<'a> {
             .resources
             .catalog
             .get_table(table_id)
-            .await
             .ok_or_else(|| {
                 Report::new(DataIntegrityError::InvalidPayload)
                     .attach(format!("replay data checkpoint: table_id={table_id}"))
@@ -1047,7 +1040,7 @@ impl<'a> RecoveryCoordinator<'a> {
         index: IndexRef,
         cts: TrxID,
     ) -> DataIntegrityResult<IndexDdlRootProof> {
-        let table = self.resources.catalog.get_table_now(table_id);
+        let table = self.resources.catalog.get_table(table_id);
         let active_root = table
             .as_ref()
             .map(|table| table.file().active_root_unchecked());
@@ -1105,7 +1098,6 @@ impl<'a> RecoveryCoordinator<'a> {
                 .resources
                 .catalog
                 .get_table(table_id)
-                .await
                 .ok_or_else(|| {
                     Report::new(DataIntegrityError::InvalidPayload)
                         .attach(format!("replay user table DML: table_id={table_id}"))
@@ -1533,13 +1525,7 @@ mod tests {
             "test setup should create retained redo suffix"
         );
 
-        let table = engine
-            .inner()
-            .core
-            .catalog()
-            .get_table(table_id)
-            .await
-            .unwrap();
+        let table = engine.inner().core.catalog().get_table(table_id).unwrap();
         assert_checkpoint_published(&mut session, table.table_id()).await;
         drop(table);
         let mut durability_trx = session.begin_trx().unwrap();
@@ -1928,13 +1914,7 @@ mod tests {
         metadata: Arc<TableMetadata>,
         cts: TrxID,
     ) {
-        let table = engine
-            .inner()
-            .core
-            .catalog()
-            .get_table(table_id)
-            .await
-            .unwrap();
+        let table = engine.inner().core.catalog().get_table(table_id).unwrap();
         let table_file = Arc::clone(table.file());
         let mut slots = table_file
             .active_root_unchecked()
@@ -1981,13 +1961,7 @@ mod tests {
         index_slot_count: u32,
         index_one_active: bool,
     ) {
-        let table = engine
-            .inner()
-            .core
-            .catalog()
-            .get_table(table_id)
-            .await
-            .unwrap();
+        let table = engine.inner().core.catalog().get_table(table_id).unwrap();
         let metadata = table.metadata();
         assert_eq!(metadata.idx.index_slot_count_u32(), index_slot_count);
         assert_eq!(
@@ -2363,7 +2337,6 @@ mod tests {
                 .core
                 .catalog()
                 .get_table(table_id)
-                .await
                 .unwrap();
             assert_eq!(table.metadata().idx.index_slot_count_u32(), 3);
             assert_eq!(
@@ -2392,7 +2365,6 @@ mod tests {
                 .core
                 .catalog()
                 .get_table(table_id)
-                .await
                 .unwrap();
             assert_eq!(
                 table
@@ -2427,7 +2399,6 @@ mod tests {
                 .core
                 .catalog()
                 .get_table(table_id)
-                .await
                 .unwrap();
             assert_eq!(
                 table
@@ -2965,22 +2936,8 @@ mod tests {
             .await
             .unwrap();
 
-            assert!(
-                engine
-                    .inner()
-                    .core
-                    .catalog()
-                    .get_table(table_id)
-                    .await
-                    .is_some()
-            );
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table(table_id)
-                .await
-                .unwrap();
+            assert!(engine.inner().core.catalog().get_table(table_id).is_some());
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             assert_eq!(table.metadata().as_ref(), &expected_metadata);
 
             drop(table);
@@ -3080,13 +3037,7 @@ mod tests {
             .await
             .unwrap();
 
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table(table_id)
-                .await
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             let session = engine.new_session().unwrap();
             let mut rows = 0usize;
             {
@@ -3172,15 +3123,7 @@ mod tests {
             .await
             .unwrap();
 
-            assert!(
-                engine
-                    .inner()
-                    .core
-                    .catalog()
-                    .get_table(table_id)
-                    .await
-                    .is_some()
-            );
+            assert!(engine.inner().core.catalog().get_table(table_id).is_some());
             drop(engine);
         })
     }
@@ -3198,13 +3141,7 @@ mod tests {
                     .unwrap();
             let table_id =
                 create_index_ddl_base_table(&engine, vec![base_unique_index_spec()]).await;
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table(table_id)
-                .await
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             let root_floor = table.redo_replay_floor_snapshot();
             let mut session = engine.new_session().unwrap();
             assert_checkpoint_published(&mut session, table.table_id()).await;
@@ -3384,13 +3321,7 @@ mod tests {
                 .checkpoint_snapshot()
                 .catalog_replay_start_ts;
 
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table(table_id)
-                .await
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             let mut trx = session.begin_trx().unwrap();
             let insert = trx
                 .table_insert_mvcc(
@@ -3433,13 +3364,7 @@ mod tests {
             .await
             .unwrap();
 
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table(table_id)
-                .await
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             let mut session = engine.new_session().unwrap();
             assert_eq!(session.total_row_pages(table.table_id()).await.unwrap(), 0);
 
@@ -3527,13 +3452,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table(table_id)
-                .await
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             let mut trx = session.begin_trx().unwrap();
             let insert = trx
                 .table_insert_mvcc(
@@ -3593,13 +3512,7 @@ mod tests {
             .await
             .unwrap();
 
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table(table_id)
-                .await
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             let mut session = engine.new_session().unwrap();
             assert!(session.total_row_pages(table.table_id()).await.unwrap() > 0);
 
@@ -3684,13 +3597,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table(table_id)
-                .await
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             let mut same_row_ids = Vec::new();
             let mut trx = session.begin_trx().unwrap();
             for id in [1u32, 2, 3] {
@@ -3737,13 +3644,7 @@ mod tests {
                     .await
                     .unwrap();
 
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table(table_id)
-                .await
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             let mut session = engine.new_session().unwrap();
             assert_eq!(session.total_row_pages(table.table_id()).await.unwrap(), 0);
 
@@ -3993,13 +3894,7 @@ mod tests {
                 .catalog_replay_start_ts;
             assert!(catalog_replay_start_ts > MIN_SNAPSHOT_TS);
 
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table(table_id)
-                .await
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
 
             let mut trx = session.begin_trx().unwrap();
             let insert = trx
@@ -4050,13 +3945,7 @@ mod tests {
             .await
             .unwrap();
 
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table(table_id)
-                .await
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             let mut session = engine.new_session().unwrap();
             assert!(session.total_row_pages(table.table_id()).await.unwrap() > 0);
 
@@ -4121,13 +4010,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table(table_id)
-                .await
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             let payload = "x".repeat(1024);
             let mut insert_trx = setup_session.begin_trx().unwrap();
             let mut row_ids = Vec::with_capacity(200);
@@ -4185,13 +4068,7 @@ mod tests {
                     .await
                     .unwrap();
 
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table(table_id)
-                .await
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             assert_eq!(
                 table.file().active_root_unchecked().pivot_row_id,
                 pivot_row_id
@@ -4288,13 +4165,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table(table_id)
-                .await
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             let mut trx = session.begin_trx().unwrap();
             for i in 0..10u32 {
                 let insert = trx
@@ -4364,13 +4235,7 @@ mod tests {
             .await
             .unwrap();
 
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table(table_id)
-                .await
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             assert_eq!(
                 table.file().active_root_unchecked().deletion_cutoff_ts,
                 checkpointed_cutoff
@@ -4486,14 +4351,12 @@ mod tests {
                 .core
                 .catalog()
                 .get_table(checkpointed_table_id)
-                .await
                 .unwrap();
             let replay_only_table = engine
                 .inner()
                 .core
                 .catalog()
                 .get_table(replay_only_table_id)
-                .await
                 .unwrap();
 
             let mut trx = session.begin_trx().unwrap();
@@ -4587,14 +4450,12 @@ mod tests {
                 .core
                 .catalog()
                 .get_table(checkpointed_table_id)
-                .await
                 .unwrap();
             let replay_only_table = engine
                 .inner()
                 .core
                 .catalog()
                 .get_table(replay_only_table_id)
-                .await
                 .unwrap();
 
             let mut session = engine.new_session().unwrap();
@@ -4691,13 +4552,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table(table_id)
-                .await
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             let mut trx = session.begin_trx().unwrap();
             let insert = trx
                 .table_insert_mvcc(
@@ -4759,13 +4614,7 @@ mod tests {
             .await
             .unwrap();
 
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table(table_id)
-                .await
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
             let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(7u32)]);
@@ -4829,13 +4678,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table(table_id)
-                .await
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             let mut trx = session.begin_trx().unwrap();
             for i in 0..80u32 {
                 let insert = trx
@@ -4930,13 +4773,7 @@ mod tests {
             .await
             .unwrap();
 
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table(table_id)
-                .await
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             let session = engine.new_session().unwrap();
             let active_root = table.file().active_root_unchecked();
             {

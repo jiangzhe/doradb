@@ -67,7 +67,7 @@ impl IndexUndoLogs {
                     let table = table_cache.must_get_catalog_table(entry.table_id);
                     table.rollback_index_entry(entry, guards, ts).await?;
                 } else {
-                    let table = table_cache.must_get_user_entry_mut(entry.table_id).await;
+                    let table = table_cache.must_get_user_entry_mut(entry.table_id);
                     table.rollback_index_entry(entry, guards, ts).await?;
                 }
             }

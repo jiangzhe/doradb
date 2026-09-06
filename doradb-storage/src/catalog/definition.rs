@@ -2,11 +2,13 @@ use super::spec::{
     CreateIndexDefinition, CreateTableDefinition, DropIndexDefinition, StorageTableDefinition,
 };
 use super::storage::{TableBindingObject, TableDescriptorObject};
-use crate::error::{OperationError, OperationResult};
+use super::{TableMetadata, validate_table_descriptor_against_metadata};
+use crate::error::{DataIntegrityError, DataIntegrityResult, OperationError, OperationResult};
 use crate::id::TableID;
 use crate::map::FastHashSet;
 use error_stack::Report;
 use std::result::Result as StdResult;
+use std::sync::Arc;
 
 /// Maximum persisted opaque descriptor payload accepted by managed table DDL.
 pub const MAX_TABLE_DESCRIPTOR_BYTES: usize = 64_000;
@@ -306,11 +308,68 @@ pub trait ManagedTableInterpreter {
     ) -> StdResult<DescriptorUpdate<DropIndexDefinition>, Self::Error>;
 }
 
-/// Private optimistic definition copied while target metadata-S is held.
-pub(crate) struct CurrentTableDefinition {
+/// Immutable current managed schema and its complete durable descriptor envelope.
+pub(crate) struct ManagedTableDefinition {
     schema: StorageTableDefinition,
     descriptor: TableDescriptorObject,
-    storage_epoch: u64,
+}
+
+impl ManagedTableDefinition {
+    /// Derives a DDL definition from finalized metadata and an already validated payload.
+    pub(crate) fn for_ddl(
+        table_id: TableID,
+        metadata: &TableMetadata,
+        revision: u64,
+        payload: Box<[u8]>,
+    ) -> Self {
+        Self {
+            schema: StorageTableDefinition::from_metadata(metadata),
+            descriptor: TableDescriptorObject {
+                table_id,
+                descriptor_revision: revision,
+                compiled_storage_epoch: metadata.storage_epoch,
+                storage_schema_fingerprint: metadata.storage_schema_fingerprint(),
+                payload,
+            },
+        }
+    }
+
+    /// Validates a recovered envelope against final metadata before projecting it.
+    pub(crate) fn recover(
+        table_id: TableID,
+        metadata: &TableMetadata,
+        descriptor: TableDescriptorObject,
+    ) -> DataIntegrityResult<Self> {
+        if descriptor.payload.len() > MAX_TABLE_DESCRIPTOR_BYTES {
+            return Err(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                    "managed descriptor payload exceeds maximum: table_id={table_id}"
+                )),
+            );
+        }
+        validate_table_descriptor_against_metadata(&descriptor, table_id, metadata)?;
+        Ok(Self {
+            schema: StorageTableDefinition::from_metadata(metadata),
+            descriptor,
+        })
+    }
+
+    /// Returns the cached slot-free schema projection.
+    #[inline]
+    pub(crate) const fn schema(&self) -> &StorageTableDefinition {
+        &self.schema
+    }
+
+    /// Returns the complete immutable descriptor envelope.
+    #[inline]
+    pub(crate) const fn descriptor(&self) -> &TableDescriptorObject {
+        &self.descriptor
+    }
+}
+
+/// Private optimistic definition retained while interpreter code runs without claims.
+pub(crate) struct CurrentTableDefinition {
+    definition: Arc<ManagedTableDefinition>,
     effective_next_index_id: u64,
 }
 
@@ -318,35 +377,37 @@ impl CurrentTableDefinition {
     /// Builds one private coherent preflight snapshot.
     #[inline]
     pub(crate) fn new(
-        schema: StorageTableDefinition,
-        descriptor: TableDescriptorObject,
-        storage_epoch: u64,
+        definition: Arc<ManagedTableDefinition>,
         effective_next_index_id: u64,
     ) -> Self {
         Self {
-            schema,
-            descriptor,
-            storage_epoch,
+            definition,
             effective_next_index_id,
         }
     }
 
     /// Returns the slot-free public projection supplied to the interpreter.
     #[inline]
-    pub(crate) const fn schema(&self) -> &StorageTableDefinition {
-        &self.schema
+    pub(crate) fn schema(&self) -> &StorageTableDefinition {
+        self.definition.schema()
     }
 
     /// Returns the exact descriptor envelope copied during preflight.
     #[inline]
-    pub(crate) const fn descriptor(&self) -> &TableDescriptorObject {
-        &self.descriptor
+    pub(crate) fn descriptor(&self) -> &TableDescriptorObject {
+        self.definition.descriptor()
     }
 
     /// Returns the private expected storage epoch.
     #[inline]
-    pub(crate) const fn storage_epoch(&self) -> u64 {
-        self.storage_epoch
+    pub(crate) fn storage_epoch(&self) -> u64 {
+        self.descriptor().compiled_storage_epoch
+    }
+
+    /// Returns the captured generation for optimistic identity revalidation.
+    #[inline]
+    pub(crate) const fn definition(&self) -> &Arc<ManagedTableDefinition> {
+        &self.definition
     }
 
     /// Returns the private effective stable-index allocator watermark.
@@ -376,11 +437,11 @@ impl CatalogDefinitionEffects {
     /// Builds a managed CREATE TABLE descriptor and binding insertion bundle.
     #[inline]
     pub(crate) fn insert(
-        descriptor: TableDescriptorObject,
+        definition: Arc<ManagedTableDefinition>,
         bindings: Box<[TableBindingObject]>,
     ) -> Self {
         Self {
-            descriptor: TableDescriptorEffect::Insert(descriptor),
+            descriptor: TableDescriptorEffect::Insert(definition),
             bindings: if bindings.is_empty() {
                 TableBindingEffect::None
             } else {
@@ -391,9 +452,9 @@ impl CatalogDefinitionEffects {
 
     /// Builds a managed index DDL descriptor replacement bundle.
     #[inline]
-    pub(crate) const fn replace(descriptor: TableDescriptorObject) -> Self {
+    pub(crate) const fn replace(definition: Arc<ManagedTableDefinition>) -> Self {
         Self {
-            descriptor: TableDescriptorEffect::Replace(descriptor),
+            descriptor: TableDescriptorEffect::Replace(definition),
             bindings: TableBindingEffect::None,
         }
     }
@@ -418,6 +479,16 @@ impl CatalogDefinitionEffects {
     pub(crate) const fn bindings(&self) -> &TableBindingEffect {
         &self.bindings
     }
+
+    /// Borrows the same accepted definition used to stage the descriptor row.
+    #[inline]
+    pub(crate) const fn managed_definition(&self) -> Option<&Arc<ManagedTableDefinition>> {
+        match &self.descriptor {
+            TableDescriptorEffect::Insert(definition)
+            | TableDescriptorEffect::Replace(definition) => Some(definition),
+            TableDescriptorEffect::None | TableDescriptorEffect::DeleteIfPresent(_) => None,
+        }
+    }
 }
 
 /// Descriptor-row mutation committed with one numeric catalog DDL operation.
@@ -426,9 +497,9 @@ pub(crate) enum TableDescriptorEffect {
     /// No descriptor change for unmanaged DDL.
     None,
     /// Insert a new managed descriptor.
-    Insert(TableDescriptorObject),
+    Insert(Arc<ManagedTableDefinition>),
     /// Replace a required current managed descriptor.
-    Replace(TableDescriptorObject),
+    Replace(Arc<ManagedTableDefinition>),
     /// Delete a descriptor if the dropped table was managed.
     DeleteIfPresent(TableID),
 }
@@ -490,6 +561,47 @@ mod tests {
     use super::*;
     use crate::{StorageColumnFlags, StorageColumnSpec, StorageTableSpec, ValKind};
     use std::collections::HashSet;
+
+    #[test]
+    fn managed_definition_recovery_validates_envelope_and_derives_projection() {
+        let table_id = TableID::new(7);
+        let metadata = TableMetadata::try_new(
+            vec![crate::StorageColumnSpec::new(
+                crate::ValKind::I32,
+                crate::StorageColumnFlags::NULLABLE,
+            )],
+            vec![],
+        )
+        .unwrap();
+        let original_definition =
+            ManagedTableDefinition::for_ddl(table_id, &metadata, 3, Box::from(&b"\x00\xff"[..]));
+        assert_eq!(
+            original_definition.schema().columns()[0].column_id(),
+            crate::ColumnID::new(0)
+        );
+        assert!(original_definition.schema().indexes().is_empty());
+        let definition = ManagedTableDefinition::recover(
+            table_id,
+            &metadata,
+            original_definition.descriptor().clone(),
+        )
+        .unwrap();
+        assert_eq!(definition.schema(), original_definition.schema());
+        assert_eq!(definition.descriptor(), original_definition.descriptor());
+        for case in 0..4 {
+            let mut descriptor = original_definition.descriptor().clone();
+            match case {
+                0 => descriptor.table_id = TableID::new(8),
+                1 => descriptor.compiled_storage_epoch += 1,
+                2 => descriptor.storage_schema_fingerprint = [0xff; 32],
+                _ => descriptor.payload = vec![0; MAX_TABLE_DESCRIPTOR_BYTES + 1].into(),
+            }
+            let error = ManagedTableDefinition::recover(table_id, &metadata, descriptor)
+                .err()
+                .unwrap();
+            assert_eq!(error.current_context(), &DataIntegrityError::InvalidPayload);
+        }
+    }
 
     #[test]
     fn descriptor_update_exposes_and_consumes_both_parts() {

@@ -729,26 +729,33 @@ catalog entry before the table layout mutex, exposing only the old/old or
 new/new metadata pointer pair to history purge.
 
 Managed index DDL adds a bounded optimistic phase before that preparation. A
-short operation acquires target `TableMetadata(S)` plus descriptor-catalog read
-admission, copies one coherent stable-ID schema/descriptor pair (and the
-effective allocator for CREATE), and releases the entire operation before
-calling user interpreter code. The callback result is structurally validated
-without locks. A fresh DDL operation then takes metadata-X and the normal gates,
-reloads the private version fields, and either returns zero-effect
-`SchemaChanged` or transfers an immutable numeric-plus-descriptor effect bundle
-to mandatory execution. Descriptor and numeric rows use one private
-transaction and one commit.
+short operation acquires target `TableMetadata(S)`, retains the current shared
+managed definition and a separate effective allocator snapshot, then releases
+all operation and executable-runtime authority before calling the interpreter.
+The callback result is structurally validated without locks. A fresh DDL
+operation takes metadata-X and the normal gates and revalidates the cached
+generation identity, epoch, revision, and (for CREATE only) effective allocator.
+A stale attempt returns zero-effect `SchemaChanged` without another callback.
+
+The accepted plan derives its immutable schema projection and descriptor stamps
+from finalized numeric metadata. Descriptor staging and current publication use
+that same value. Publication prevalidates the old metadata identity and managed
+ownership under the catalog entry guard before installing the layout, then
+publishes metadata and definition without an await or further projection.
+Target metadata-X spans durable effects and publication. Before-commit failure
+preserves the old generation; an unexpected failure after commit follows the
+existing fatal policy. Historical metadata and dropped runtimes retain no
+managed definition.
 
 Managed binding resolution uses two short operations because the first lookup
 discovers the target ID. The probe holds only binding-catalog metadata-S/data-IS
-and releases it completely. A fresh operation then takes target metadata-S,
-followed by catalog metadata-S and data-IS for the descriptor table only in
-full mode and for `catalog.table_bindings`. It rechecks the binding under that
-final scope and retries if the target changed. The narrow path reads only the
-binding target, then checks managed runtime kind and captures the runtime
-layout's storage epoch. Full mode additionally projects the pinned runtime
-layout and validates/copies the descriptor. All claims are released before
-returning the optimistic definition token or snapshot.
+and releases it completely. A fresh operation takes target metadata-S followed
+by binding-catalog metadata-S/data-IS. It rechecks the binding and retries if
+the target changed. Both modes validate managed ownership and the cached
+generation against current metadata. Narrow resolution reads constant-size
+identity and version fields; full resolution copies the cached schema and
+payload into an owned public snapshot. Neither mode reads descriptor rows,
+projects metadata, or hashes the schema. All claims are released before return.
 
 CREATE INDEX and DROP INDEX also take same-table `TableMetadata(X)`. That grant
 waits for every transaction that successfully bound the table, but an older

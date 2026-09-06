@@ -1,7 +1,14 @@
-use super::TableMetadata;
+use super::{ManagedTableDefinition, TableMetadata};
+use crate::error::{
+    DataIntegrityError, DataIntegrityResult, OperationError, OperationOrRuntimeResult, RuntimeError,
+};
+use crate::id::TableID;
 use crate::id::TrxID;
 use crate::table::{Table, TableRedoReplayFloor};
+use error_stack::{Report, ResultExt};
 use std::sync::Arc;
+#[cfg(test)]
+pub(crate) use tests::replace_managed_definition;
 
 /// One superseded live logical metadata version.
 pub(crate) struct TableMetadataVersion {
@@ -30,6 +37,8 @@ pub(crate) enum CurrentTableState {
         metadata: Arc<TableMetadata>,
         /// Current foreground table runtime.
         table: Arc<Table>,
+        /// Immutable managed generation; absent only for unmanaged tables or private recovery.
+        managed_definition: Option<Arc<ManagedTableDefinition>>,
     },
     /// Terminal logical DROP TABLE tombstone.
     Dropped {
@@ -46,6 +55,62 @@ impl CurrentTableState {
             CurrentTableState::Live { effective_cts, .. }
             | CurrentTableState::Dropped { effective_cts } => *effective_cts,
         }
+    }
+
+    /// Validates managed ownership and the selected generation under target metadata admission.
+    pub(crate) fn managed_definition(
+        &self,
+        table_id: TableID,
+    ) -> DataIntegrityResult<Option<&Arc<ManagedTableDefinition>>> {
+        let Self::Live {
+            metadata,
+            table,
+            managed_definition: definition,
+            ..
+        } = self
+        else {
+            return Err(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                    "managed definition target is dropped: table_id={table_id}"
+                )),
+            );
+        };
+        let layout = table.layout_snapshot();
+        if table.table_id() != table_id
+            || !Arc::ptr_eq(metadata, layout.metadata_arc())
+            || !managed_definition_matches(table, metadata, definition.as_ref())
+        {
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!("current managed definition ownership or generation mismatch: table_id={table_id}")));
+        }
+        Ok(definition.as_ref())
+    }
+
+    /// Requires an admitted managed generation, preserving managed DDL target errors.
+    pub(crate) fn require_managed_definition(
+        &self,
+        table_id: TableID,
+    ) -> OperationOrRuntimeResult<Arc<ManagedTableDefinition>> {
+        if self.live_table().is_none() {
+            return Err(Report::new(OperationError::TableNotFound)
+                .attach(format!(
+                    "managed definition target is absent: table_id={table_id}"
+                ))
+                .into());
+        }
+        let definition = self
+            .managed_definition(table_id)
+            .change_context(RuntimeError::CatalogAccess)
+            .attach(format!(
+                "operation=read_managed_definition, table_id={table_id}"
+            ))?;
+        definition.cloned().ok_or_else(|| {
+            Report::new(OperationError::InvalidMetadata)
+                .attach(format!(
+                    "managed DDL requires a managed table: table_id={table_id}"
+                ))
+                .into()
+        })
     }
 
     /// Returns the current foreground table runtime when live.
@@ -98,7 +163,12 @@ pub(crate) struct TableHistoryEntry {
 
 impl TableHistoryEntry {
     #[inline]
-    fn new_live(effective_cts: TrxID, metadata: Arc<TableMetadata>, table: Arc<Table>) -> Self {
+    fn new_live(
+        effective_cts: TrxID,
+        metadata: Arc<TableMetadata>,
+        table: Arc<Table>,
+        definition: Option<Arc<ManagedTableDefinition>>,
+    ) -> Self {
         assert_current_layout_metadata(&table, &metadata);
         Self {
             versions: Vec::new(),
@@ -106,6 +176,7 @@ impl TableHistoryEntry {
                 effective_cts,
                 metadata,
                 table,
+                managed_definition: definition,
             },
         }
     }
@@ -158,6 +229,7 @@ impl TableHistoryEntry {
             effective_cts: current_cts,
             metadata: current_metadata,
             table,
+            ..
         } = &self.current
         else {
             return false;
@@ -173,11 +245,17 @@ impl TableHistoryEntry {
     }
 
     #[inline]
-    fn commit_publish_live(&mut self, effective_cts: TrxID, new_metadata: Arc<TableMetadata>) {
+    fn commit_publish_live(
+        &mut self,
+        effective_cts: TrxID,
+        new_metadata: Arc<TableMetadata>,
+        definition: Option<Arc<ManagedTableDefinition>>,
+    ) {
         let CurrentTableState::Live {
             effective_cts: current_cts,
             metadata: current_metadata,
             table,
+            ..
         } = &self.current
         else {
             unreachable!("prepared live publication requires live current state");
@@ -191,6 +269,7 @@ impl TableHistoryEntry {
             effective_cts,
             metadata: new_metadata,
             table,
+            managed_definition: definition,
         };
         self.assert_valid();
     }
@@ -201,6 +280,7 @@ impl TableHistoryEntry {
             effective_cts: current_cts,
             metadata,
             table,
+            ..
         } = &self.current
         else {
             return false;
@@ -308,13 +388,53 @@ impl UserTableEntry {
         effective_cts: TrxID,
         metadata: Arc<TableMetadata>,
         table: Arc<Table>,
+        definition: Option<Arc<ManagedTableDefinition>>,
     ) -> Self {
         let entry = Self {
-            history: Some(TableHistoryEntry::new_live(effective_cts, metadata, table)),
+            history: Some(TableHistoryEntry::new_live(
+                effective_cts,
+                metadata,
+                table,
+                definition,
+            )),
             dropped: None,
         };
         entry.assert_valid();
         entry
+    }
+
+    /// Creates an unhydrated runtime confined to private recovery construction.
+    pub(crate) fn new_recovery_live(metadata: Arc<TableMetadata>, table: Arc<Table>) -> Self {
+        Self::new_live(TrxID::new(0), metadata, table, None)
+    }
+
+    /// Installs a validated generation once during private recovery, without history changes.
+    pub(crate) fn hydrate_recovered_definition(
+        &mut self,
+        definition: Arc<ManagedTableDefinition>,
+    ) -> DataIntegrityResult<()> {
+        let table_id = definition.descriptor().table_id;
+        if let Some(TableHistoryEntry {
+            current:
+                CurrentTableState::Live {
+                    metadata,
+                    table,
+                    managed_definition: current_definition,
+                    ..
+                },
+            ..
+        }) = &mut self.history
+            && current_definition.is_none()
+            && managed_definition_matches(table, metadata, Some(&definition))
+        {
+            *current_definition = Some(definition);
+            return Ok(());
+        }
+        Err(
+            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                "invalid or duplicate managed definition hydration: table_id={table_id}"
+            )),
+        )
     }
 
     /// Creates one recovery-retained dropped replay floor without logical history.
@@ -347,11 +467,18 @@ impl UserTableEntry {
             .map(TableHistoryEntry::resolve_current)
     }
 
+    /// Borrows the current logical state while its catalog entry is guarded.
+    #[inline]
+    pub(crate) fn current_state_ref(&self) -> Option<&CurrentTableState> {
+        self.history.as_ref().map(|history| &history.current)
+    }
+
     /// Returns the current foreground runtime without consulting operational state.
     #[inline]
     pub(crate) fn current_live_table(&self) -> Option<Arc<Table>> {
-        self.resolve_current()
-            .and_then(|current| current.live_table().map(Arc::clone))
+        self.history
+            .as_ref()
+            .and_then(|history| history.current.live_table().map(Arc::clone))
     }
 
     /// Borrows the current foreground runtime while its catalog entry is guarded.
@@ -395,11 +522,12 @@ impl UserTableEntry {
         &mut self,
         effective_cts: TrxID,
         new_metadata: Arc<TableMetadata>,
+        definition: Option<Arc<ManagedTableDefinition>>,
     ) {
         self.history
             .as_mut()
             .unwrap_or_else(|| unreachable!("prepared live publication requires logical history"))
-            .commit_publish_live(effective_cts, new_metadata);
+            .commit_publish_live(effective_cts, new_metadata, definition);
         self.assert_valid();
     }
 
@@ -588,6 +716,23 @@ impl UserTableEntry {
     }
 }
 
+/// Checks constant-size ownership stamps; constructors establish full schema agreement.
+#[inline]
+pub(crate) fn managed_definition_matches(
+    table: &Table,
+    metadata: &TableMetadata,
+    definition: Option<&Arc<ManagedTableDefinition>>,
+) -> bool {
+    match definition {
+        Some(definition) => {
+            table.definition_kind().is_managed()
+                && definition.descriptor().table_id == table.table_id()
+                && definition.descriptor().compiled_storage_epoch == metadata.storage_epoch
+        }
+        None => !table.definition_kind().is_managed(),
+    }
+}
+
 #[inline]
 fn assert_current_layout_metadata(table: &Arc<Table>, metadata: &Arc<TableMetadata>) {
     let layout = table.layout_snapshot();
@@ -601,6 +746,7 @@ fn assert_current_layout_metadata(table: &Arc<Table>, metadata: &Arc<TableMetada
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::Catalog;
     use crate::catalog::{
         IndexID, SecondaryIndexSlot, StorageIndexFlags, StorageIndexKey, StorageIndexSpec,
     };
@@ -609,6 +755,7 @@ mod tests {
     use crate::session::tests::active_operation_count;
     use crate::table::tests::{create_table2_for_test, lightweight_test_engine};
     use crate::trx::MAX_SNAPSHOT_TS;
+    use std::mem::replace;
     use tempfile::TempDir;
 
     trait CurrentTableStateTestExt {
@@ -660,6 +807,23 @@ mod tests {
         }
     }
 
+    /// Replaces only the private cache in a quiescent corruption fixture.
+    pub(crate) fn replace_managed_definition(
+        catalog: &Catalog,
+        table_id: TableID,
+        definition: Option<Arc<ManagedTableDefinition>>,
+    ) -> Option<Arc<ManagedTableDefinition>> {
+        let mut entry = catalog.user_tables.get_mut(&table_id).unwrap();
+        let CurrentTableState::Live {
+            managed_definition: current_definition,
+            ..
+        } = &mut entry.history.as_mut().unwrap().current
+        else {
+            panic!("cache corruption fixture requires a live table");
+        };
+        replace(current_definition, definition)
+    }
+
     #[inline]
     fn after(ts: TrxID) -> TrxID {
         TrxID::new(ts.as_u64() + 1)
@@ -703,7 +867,7 @@ mod tests {
             heap_redo_start_ts: TrxID::new(7),
             deletion_cutoff_ts: TrxID::new(9),
         };
-        let mut entry = UserTableEntry::new_live(initial_cts, metadata, Arc::clone(&table));
+        let mut entry = UserTableEntry::new_live(initial_cts, metadata, Arc::clone(&table), None);
         assert!(entry.publish_drop(drop_cts, Arc::clone(&table), replay_floor));
         (entry, table, initial_cts, drop_cts, replay_floor)
     }
@@ -846,7 +1010,7 @@ mod tests {
             let drop_table_cts = dropped.effective_cts();
             assert!(dropped.is_dropped());
             assert!(dropped.live_table().is_none());
-            assert!(catalog.get_table_now(table_id).is_none());
+            assert!(catalog.get_table(table_id).is_none());
 
             let at_table_drop_equality = catalog
                 .resolve_user_table_visible(table_id, drop_table_cts)
@@ -1046,12 +1210,7 @@ mod tests {
                 );
 
                 session.drop_index(table_id, index_id).await.unwrap();
-                let table = engine
-                    .inner()
-                    .core
-                    .catalog()
-                    .get_table_now(table_id)
-                    .unwrap();
+                let table = engine.inner().core.catalog().get_table(table_id).unwrap();
                 assert!(table.layout_snapshot().secondary_indexes()[1].is_none());
                 assert_eq!(
                     table.file().active_root_unchecked().secondary_index_slots[1],

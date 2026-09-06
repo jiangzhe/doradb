@@ -180,6 +180,7 @@ pub(crate) fn resolve_table_read_binding(
             effective_cts,
             metadata,
             table,
+            ..
         } => (effective_cts, metadata, table),
         CurrentTableState::Dropped { .. } => {
             return Err(Report::new(OperationError::SchemaChanged)
@@ -945,12 +946,7 @@ mod tests {
             touch_table_read(&mut bound_trx, table_id).await.unwrap();
 
             let mut ddl_session = engine.new_session().unwrap();
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table_now(table_id)
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             let before_layout = table.layout_snapshot();
             let before_root = table.file().active_root_unchecked().clone();
             let before_current_cts = engine
@@ -1011,12 +1007,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table_now(table_id)
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
 
             let mut bound_session = engine.new_session().unwrap();
             let bound_session_id = bound_session.id();
@@ -1099,12 +1090,7 @@ mod tests {
             let table_id = table2(&engine).await;
             let metadata_resource = LockResource::TableMetadata(table_id);
             let table_runtime = {
-                let table = engine
-                    .inner()
-                    .core
-                    .catalog()
-                    .get_table_now(table_id)
-                    .unwrap();
+                let table = engine.inner().core.catalog().get_table(table_id).unwrap();
                 Arc::downgrade(&table)
             };
             let mut bound_session = engine.new_session().unwrap();
@@ -1137,14 +1123,7 @@ mod tests {
                     .resolve_user_table_current(table_id),
                 Some(CurrentTableState::Live { .. })
             ));
-            assert!(
-                engine
-                    .inner()
-                    .core
-                    .catalog()
-                    .get_table_now(table_id)
-                    .is_none()
-            );
+            assert!(engine.inner().core.catalog().get_table(table_id).is_none());
             assert_no_table_locks(&engine, table_id);
 
             drop(ddl_session);
