@@ -62,8 +62,8 @@ pub use engine::Engine;
 pub use error::{CallbackError, CallbackResult, Error, ErrorKind, OperationError, Result};
 pub use lock::TableLockMode;
 pub use row::ops::{
-    DeleteMvcc, RowMutation, ScanMvcc, ScanRowDecision, SelectMvcc, TableMutationOutcome,
-    UpdateCol, UpdateMvcc, UpsertMvcc,
+    RowMutation, ScanMvcc, ScanRowDecision, SelectMvcc, TableMutationOutcome, UniqueMutation,
+    UniqueMutationOutcome, UpdateCol,
 };
 pub use session::{
     CatalogRedoMaintenanceOutcome, ManagedTableOps, RedoTruncationBlockerInfo,

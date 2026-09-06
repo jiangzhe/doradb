@@ -600,6 +600,11 @@ impl<P: BufferPool> UniqueSecondaryIndex<'_, '_, P> {
         let Some(disk) = self.open()? else {
             return Ok(None);
         };
+        #[cfg(test)]
+        {
+            use crate::table::record_point_disk_lookup;
+            record_point_disk_lookup();
+        }
         Ok(disk.lookup(key).await?.map(|row_id| (row_id, false)))
     }
 

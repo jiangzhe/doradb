@@ -48,3 +48,10 @@ Prefer a dedicated unique-point API initially. Evaluate whether it should accept
 - Existing `RowMutation` only supports skip/delete/sparse update, and `TableMutationOutcome` only counts deletes/updates. Full-row insertion and point results require explicit type design. If sharing the index method name, use a result variant or typed request output rather than adding unnecessary per-row result storage to ranges.
 - Investigation validation: 20 focused existing tests covering upsert, cold point conflicts, and index mutation passed. No implementation or comparative benchmark was performed. Performance findings above come from source inspection.
 
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000299-unify-unique-key-mvcc-mutation-api.md
+- Closed By: backlog close
+- Reference: User decision
+- Closed At: 2026-09-06

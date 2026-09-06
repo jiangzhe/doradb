@@ -19,6 +19,7 @@ mod scan_cursor;
 mod scan_plan;
 mod scan_root;
 mod storage;
+mod unique_mutate;
 pub use access::LazyRow;
 pub(crate) use access::*;
 pub use checkpoint_workflow::{FreezeOutcome, FrozenPageBatchInfo};
@@ -52,6 +53,8 @@ pub(crate) use scan_root::{CheckedOutTableScanRoot, OwnedTableScanRoot, TableSca
 pub(crate) use storage::ColumnStorage;
 #[cfg(test)]
 pub(crate) use tests::{test_hooks, test_user_table_id};
+#[cfg(test)]
+pub(crate) use unique_mutate::record_point_disk_lookup;
 
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards, PoolRole, ReadonlyBufferPool};
@@ -1378,7 +1381,6 @@ fn unique_key_from_full_row(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::lifecycle::{CheckpointPublishLease, TableCheckpointRootMutationScope};
-    use crate::CallbackResult;
     use crate::buffer::guard::PageSharedGuard;
     use crate::buffer::page::PAGE_SIZE;
     use crate::buffer::{PoolGuard, PoolGuards, ReadonlyBufferPool};
@@ -1390,8 +1392,8 @@ pub(crate) mod tests {
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{
-        CompletionErrorBridge, DataIntegrityError, DiscloseError, DiscloseResultExt, Error,
-        FatalError, OperationError, Result, RuntimeResult,
+        CallbackResult, CompletionErrorBridge, DataIntegrityError, DiscloseError,
+        DiscloseResultExt, Error, FatalError, OperationError, Result, RuntimeResult,
     };
     use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
     use crate::file::cow_file::{COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID};
@@ -1410,7 +1412,7 @@ pub(crate) mod tests {
     use crate::quiescent::QuiescentGuard;
     use crate::row::RowPage;
     use crate::row::ops::{
-        DeleteMvcc, ScanRowDecision, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc,
+        ScanRowDecision, SelectKey, SelectMvcc, UniqueMutation, UniqueMutationOutcome, UpdateCol,
     };
     use crate::session::{Session, tests::SessionTestExt};
     use crate::table::hot::{
@@ -2435,9 +2437,20 @@ pub(crate) mod tests {
         trx: &mut Transaction,
         table_id: TableID,
         key: &SelectKey,
-    ) -> Result<DeleteMvcc> {
-        trx.table_delete_unique_mvcc(crate::TableIndex(table_id, IndexID::new(0)), &key.vals)
-            .await
+    ) -> Result<UniqueMutationOutcome> {
+        trx.table_unique_mutate_mvcc(
+            crate::TableIndex(table_id, IndexID::new(0)),
+            &key.vals,
+            |entry| -> CallbackResult<_> {
+                Ok(if entry.is_some() {
+                    UniqueMutation::Delete
+                } else {
+                    UniqueMutation::Skip
+                })
+            },
+        )
+        .await
+        .map_err(Error::from)
     }
 
     /// Provides test-only access to `trx_update_row_by_id`.
@@ -2446,13 +2459,20 @@ pub(crate) mod tests {
         table_id: TableID,
         key: &SelectKey,
         update: Vec<UpdateCol>,
-    ) -> Result<UpdateMvcc> {
-        trx.table_update_unique_mvcc(
+    ) -> Result<UniqueMutationOutcome> {
+        trx.table_unique_mutate_mvcc(
             crate::TableIndex(table_id, IndexID::new(0)),
             &key.vals,
-            update,
+            |entry| -> CallbackResult<_> {
+                Ok(if entry.is_some() {
+                    UniqueMutation::Update(update)
+                } else {
+                    UniqueMutation::Skip
+                })
+            },
         )
         .await
+        .map_err(Error::from)
     }
 
     /// Run the raw transition-page insert and update primitives for one test operation.
@@ -2785,7 +2805,7 @@ pub(crate) mod tests {
         key: &SelectKey,
     ) -> Transaction {
         let res = trx_delete_row_by_id(&mut trx, table_id, key).await;
-        if !matches!(res, Ok(DeleteMvcc::Deleted)) {
+        if !matches!(res, Ok(UniqueMutationOutcome::Deleted)) {
             panic!("res={:?}", res);
         }
         trx
@@ -2813,7 +2833,7 @@ pub(crate) mod tests {
         update: Vec<UpdateCol>,
     ) -> Transaction {
         let res = trx_update_row_by_id(&mut trx, table_id, key, update).await;
-        if !matches!(res, Ok(UpdateMvcc::Updated(_))) {
+        if !matches!(res, Ok(UniqueMutationOutcome::Updated(_))) {
             panic!("res={:?}", res);
         }
         trx
@@ -3561,11 +3581,18 @@ pub(crate) mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let err = trx
-                .table_upsert_unique_mvcc(
+                .table_unique_mutate_mvcc(
                     crate::TableIndex(table_id, crate::IndexID::new(1)),
-                    vec![Val::from(2i32), Val::from("new")],
+                    &[Val::from("new")],
+                    |_| -> CallbackResult<_> {
+                        Ok(UniqueMutation::Insert(vec![
+                            Val::from(2i32),
+                            Val::from("new"),
+                        ]))
+                    },
                 )
                 .await
+                .map_err(Error::from)
                 .unwrap_err();
             assert_invalid_dml_input(err);
             trx.rollback().await.unwrap();
@@ -3573,21 +3600,28 @@ pub(crate) mod tests {
             let mut trx = session.begin_trx().unwrap();
             let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(1i32)]);
             let err = trx
-                .table_update_unique_mvcc(
+                .table_unique_mutate_mvcc(
                     crate::TableIndex(table_id, IndexID::new(0)),
                     &key.vals,
-                    vec![
-                        UpdateCol {
-                            idx: 1,
-                            val: Val::from("new"),
-                        },
-                        UpdateCol {
-                            idx: 1,
-                            val: Val::from("duplicate"),
-                        },
-                    ],
+                    |entry| -> CallbackResult<_> {
+                        Ok(if entry.is_some() {
+                            UniqueMutation::Update(vec![
+                                UpdateCol {
+                                    idx: 1,
+                                    val: Val::from("new"),
+                                },
+                                UpdateCol {
+                                    idx: 1,
+                                    val: Val::from("duplicate"),
+                                },
+                            ])
+                        } else {
+                            UniqueMutation::Skip
+                        })
+                    },
                 )
                 .await
+                .map_err(Error::from)
                 .unwrap_err();
             assert_invalid_dml_input(err);
             trx.rollback().await.unwrap();
@@ -3595,8 +3629,19 @@ pub(crate) mod tests {
             let mut trx = session.begin_trx().unwrap();
             let key = SelectKey::new(IndexSlot::new(1), vec![Val::from("old")]);
             let err = trx
-                .table_delete_unique_mvcc(crate::TableIndex(table_id, IndexID::new(1)), &key.vals)
+                .table_unique_mutate_mvcc(
+                    crate::TableIndex(table_id, IndexID::new(1)),
+                    &key.vals,
+                    |entry| -> CallbackResult<_> {
+                        Ok(if entry.is_some() {
+                            UniqueMutation::Delete
+                        } else {
+                            UniqueMutation::Skip
+                        })
+                    },
+                )
                 .await
+                .map_err(Error::from)
                 .unwrap_err();
             assert_invalid_dml_input(err);
             trx.rollback().await.unwrap();

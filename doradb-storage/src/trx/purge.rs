@@ -1547,8 +1547,8 @@ mod tests {
     use super::*;
     use crate::buffer::page::VersionedPageID;
     use crate::buffer::{BufferPool, PoolGuards, PoolRole};
+    use crate::catalog::IndexSlot;
     use crate::catalog::tests::table1;
-    use crate::catalog::{IndexID, IndexSlot};
     use crate::conf::{DEFAULT_GC_BUCKETS, EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{FatalError, RuntimeError};
@@ -1557,7 +1557,7 @@ mod tests {
     use crate::latch::LatchFallbackMode;
     use crate::row::RowPage;
     use crate::row::ops::SelectKey;
-    use crate::table::tests::bound_unique_index;
+    use crate::table::tests::{bound_unique_index, trx_delete_row_by_id};
     use crate::table::{DeleteMarker, TableRedoReplayFloor};
     use crate::trx::tests::shared_trx_status;
     use crate::trx::undo::{OwnedRowUndo, RowUndoKind, RowUndoLogs};
@@ -3592,12 +3592,7 @@ mod tests {
             for i in 0..PURGE_SIZE {
                 let mut trx = session.begin_trx().unwrap();
                 let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(i as i32)]);
-                let res = trx
-                    .table_delete_unique_mvcc(
-                        crate::TableIndex(table_id, IndexID::new(0)),
-                        &key.vals,
-                    )
-                    .await;
+                let res = trx_delete_row_by_id(&mut trx, table_id, &key).await;
                 assert!(res.is_ok());
                 purge_target = trx.commit().await.unwrap();
             }
@@ -3670,12 +3665,7 @@ mod tests {
             for i in 0..PURGE_SIZE {
                 let mut trx = session.begin_trx().unwrap();
                 let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(i as i32)]);
-                let res = trx
-                    .table_delete_unique_mvcc(
-                        crate::TableIndex(table_id, IndexID::new(0)),
-                        &key.vals,
-                    )
-                    .await;
+                let res = trx_delete_row_by_id(&mut trx, table_id, &key).await;
                 assert!(res.is_ok());
                 purge_target = trx.commit().await.unwrap();
             }

@@ -2,8 +2,8 @@ use crate::catalog::{ResolvedTableIndex, TableIndex, TableIndexArgument};
 use crate::error::{CallbackResult, DiscloseResultExt, MultiDomainResultExt, Result};
 use crate::id::{RowID, TableID};
 use crate::row::ops::{
-    DeleteMvcc, RowMutation, ScanMvcc, ScanRowDecision, SelectMvcc, TableMutationOutcome,
-    UpdateCol, UpdateMvcc, UpsertMvcc,
+    RowMutation, ScanMvcc, ScanRowDecision, SelectMvcc, TableMutationOutcome, UniqueMutation,
+    UniqueMutationOutcome,
 };
 use crate::table::LazyRow;
 use crate::trx::{IndexScanMvccStream, TableScanMvccStream, Transaction};
@@ -132,44 +132,36 @@ impl Transaction {
             .await
     }
 
-    /// Inserts or replaces one row selected by a unique secondary index.
+    /// Mutates one latest row selected by a unique index, or observes a missing key.
+    ///
+    /// The synchronous callback runs at most once, after row ownership on a hit.
+    /// `Insert` requires a miss and must match `key_vals`; `Update` and `Delete`
+    /// require a hit. Invalid decisions return `InvalidDmlInput` even when DML
+    /// payload validation is disabled. `Skip` and empty updates release only
+    /// this invocation's provisional ownership. Updates return their resulting
+    /// physical RowID, including replacements. Absence has no gap lock; an
+    /// insertion race fails normally without retrying the callback.
+    ///
+    /// Ordinary errors roll back this statement and preserve earlier statements.
+    /// Application errors retain their payload. Dropping the operation future
+    /// triggers the existing whole-transaction cancellation cleanup.
     #[inline]
-    pub async fn table_upsert_unique_mvcc<I: TableIndexArgument>(
-        &mut self,
-        index: I,
-        cols: Vec<Val>,
-    ) -> Result<UpsertMvcc> {
-        let selector = index.into_selector();
-        self.exec(async move |stmt| stmt.table_upsert_unique_mvcc(selector, cols).await)
-            .await
-    }
-
-    /// Updates one row selected by a unique secondary-index key.
-    #[inline]
-    pub async fn table_update_unique_mvcc<I: TableIndexArgument>(
+    pub async fn table_unique_mutate_mvcc<I, F, E>(
         &mut self,
         index: I,
         key_vals: &[Val],
-        update: Vec<UpdateCol>,
-    ) -> Result<UpdateMvcc> {
+        mutate_row: F,
+    ) -> CallbackResult<UniqueMutationOutcome, E>
+    where
+        I: TableIndexArgument,
+        F: for<'row> FnOnce(Option<&mut LazyRow<'row>>) -> CallbackResult<UniqueMutation, E>,
+    {
         let selector = index.into_selector();
         self.exec(async move |stmt| {
-            stmt.table_update_unique_mvcc(selector, key_vals, update)
+            stmt.table_unique_mutate_mvcc(selector, key_vals, mutate_row)
                 .await
         })
         .await
-    }
-
-    /// Deletes one row selected by a unique secondary-index key.
-    #[inline]
-    pub async fn table_delete_unique_mvcc<I: TableIndexArgument>(
-        &mut self,
-        index: I,
-        key_vals: &[Val],
-    ) -> Result<DeleteMvcc> {
-        let selector = index.into_selector();
-        self.exec(async move |stmt| stmt.table_delete_unique_mvcc(selector, key_vals).await)
-            .await
     }
 
     /// Creates a validated caller-driven stream over one secondary-index range.
@@ -241,9 +233,9 @@ impl Transaction {
 mod tests {
     use super::*;
     use crate::catalog::{IndexID, StorageIndexFlags, StorageIndexKey, StorageIndexSpec};
-    use crate::error::{ErrorKind, OperationError};
+    use crate::error::{CallbackResult, ErrorKind, OperationError};
     use crate::lock::{LockMode, LockResource};
-    use crate::row::ops::SelectMvcc;
+    use crate::row::ops::{SelectMvcc, UniqueMutation, UpdateCol};
     use crate::table::tests::{create_table2_for_test, lightweight_test_engine};
     use crate::table::{Table, TableRuntimeLayout};
     use tempfile::TempDir;
@@ -592,32 +584,48 @@ mod tests {
 
             TableRuntimeLayout::reset_index_access_counters();
             let mut write = session.begin_trx().unwrap();
-            assert!(
+            assert!(matches!(
                 write
-                    .table_update_unique_mvcc(
+                    .table_unique_mutate_mvcc(
                         resolved,
                         &[Val::from(1)],
-                        vec![UpdateCol {
-                            idx: 1,
-                            val: Val::from("updated"),
-                        }],
+                        |entry| -> CallbackResult<_> {
+                            Ok(if entry.is_some() {
+                                UniqueMutation::Update(vec![UpdateCol {
+                                    idx: 1,
+                                    val: Val::from("updated"),
+                                }])
+                            } else {
+                                UniqueMutation::Skip
+                            })
+                        }
                     )
                     .await
-                    .unwrap()
-                    .is_updated()
-            );
+                    .unwrap(),
+                UniqueMutationOutcome::Updated(_)
+            ));
             write.rollback().await.unwrap();
             assert_eq!(TableRuntimeLayout::index_access_counters(), (0, 1, 0));
 
             TableRuntimeLayout::reset_index_access_counters();
             let mut delete = session.begin_trx().unwrap();
-            assert!(
+            assert!(matches!(
                 delete
-                    .table_delete_unique_mvcc(resolved, &[Val::from(1)])
+                    .table_unique_mutate_mvcc(
+                        resolved,
+                        &[Val::from(1)],
+                        |entry| -> CallbackResult<_> {
+                            Ok(if entry.is_some() {
+                                UniqueMutation::Delete
+                            } else {
+                                UniqueMutation::Skip
+                            })
+                        }
+                    )
                     .await
-                    .unwrap()
-                    .is_deleted()
-            );
+                    .unwrap(),
+                UniqueMutationOutcome::Deleted
+            ));
             delete.rollback().await.unwrap();
             let (map, direct, _) = TableRuntimeLayout::index_access_counters();
             assert_eq!(map, 0);
@@ -625,13 +633,31 @@ mod tests {
 
             TableRuntimeLayout::reset_index_access_counters();
             let mut upsert = session.begin_trx().unwrap();
-            assert!(
+            assert!(matches!(
                 upsert
-                    .table_upsert_unique_mvcc(resolved, row(1, "upserted"))
+                    .table_unique_mutate_mvcc(
+                        resolved,
+                        &[Val::from(1)],
+                        |entry| -> CallbackResult<_> {
+                            Ok(match entry {
+                                None => UniqueMutation::Insert(row(1, "upserted")),
+                                Some(_) => UniqueMutation::Update(vec![
+                                    UpdateCol {
+                                        idx: 0,
+                                        val: Val::from(1),
+                                    },
+                                    UpdateCol {
+                                        idx: 1,
+                                        val: Val::from("upserted"),
+                                    },
+                                ]),
+                            })
+                        }
+                    )
                     .await
-                    .unwrap()
-                    .is_updated()
-            );
+                    .unwrap(),
+                UniqueMutationOutcome::Updated(_)
+            ));
             upsert.rollback().await.unwrap();
             let (map, direct, _) = TableRuntimeLayout::index_access_counters();
             assert_eq!(map, 0);

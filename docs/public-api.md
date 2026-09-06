@@ -538,8 +538,8 @@ Prefer matching the enum when absence is expected. `unwrap_found` panics for
 
 For repeated operations, `resolve_table_index(TableIndex(table_id, index_id))`
 returns an opaque non-pinning `ResolvedTableIndex`. The token is `Copy` and can
-be passed to the same lookup, scan, stream, mutation, upsert, update, and delete
-methods in place of `TableIndex`. Admission revalidates its exact generation
+be passed to lookup, scan, stream, and mutation methods in place of
+`TableIndex`. Admission revalidates its exact generation
 directly without an ID-map lookup. Tokens may cross transaction boundaries; a
 dropped or replaced generation returns `SchemaChanged` during admission.
 
@@ -594,6 +594,11 @@ the stream value is alive.
 
 ## Writing data
 
+Use `table_unique_mutate_mvcc` for programmable unique-point writes, including
+read-modify-write, upsert, update, and delete. It also supports insertion on a
+missing key. Separate methods support insertion, batch insertion, full-table
+mutation, and index-range mutation.
+
 ### Insert and batch insert
 
 `table_insert_mvcc` accepts one complete row and returns its `RowID`.
@@ -616,35 +621,181 @@ let row_ids = trx
     .await?;
 ```
 
-### Unique-key upsert, update, and delete
-
-These methods select one logical row through a unique index:
-
-| Method | Input | Result |
-| --- | --- | --- |
-| `table_upsert_unique_mvcc` | Unique `TableIndex` or `ResolvedTableIndex` and a complete replacement row. | `UpsertMvcc::Inserted(RowID)` or `Updated(RowID)`. |
-| `table_update_unique_mvcc` | Unique key and strictly ordered sparse `UpdateCol` values. | `UpdateMvcc::Updated(RowID)` or `NotFound`. |
-| `table_delete_unique_mvcc` | Unique key. | `DeleteMvcc::Deleted` or `NotFound`. |
+### Unique-point callback mutation
 
 ```rust,ignore
-let key = [Val::from(1i32)];
+pub async fn table_unique_mutate_mvcc<I, F, E>(
+    &mut self,
+    index: I,
+    key_vals: &[Val],
+    mutate: F,
+) -> CallbackResult<UniqueMutationOutcome, E>
+where
+    I: TableIndexArgument,
+    F: for<'row> FnOnce(Option<&mut LazyRow<'row>>)
+        -> CallbackResult<UniqueMutation, E>;
+```
+
+Both `TableIndex` and `ResolvedTableIndex` identify the selected unique index.
+The synchronous callback receives `Some(&mut LazyRow)` after the engine owns the
+latest matching row for writing, or `None` after observing a missing entry.
+`row.column_count()` reports the logical width; `row.val(column_no)?` loads and
+caches a column. An out-of-range column is `InvalidDmlInput`. Borrowed column
+values and the accessor cannot escape the callback. The callback may borrow
+caller state or consume an owned payload; neither it nor its application error
+needs `Send`, `Sync`, `Clone`, `'static`, or an error-trait implementation.
+
+| Callback input | Decision | Result |
+| --- | --- | --- |
+| `None` | `Skip` | `Noop` |
+| `None` | `Insert(valid_row)` | `Inserted(new_row_id)` |
+| `None` | `Update(_)`, including an empty vector | `InvalidDmlInput` |
+| `None` | `Delete` | `InvalidDmlInput` |
+| `Some(row)` | `Skip` | `Noop` |
+| `Some(row)` | `Update(valid_changes)` | `Updated(resulting_row_id)` |
+| `Some(row)` | `Delete` | `Deleted` |
+| `Some(row)` | `Insert(_)` | `InvalidDmlInput` |
+
+`Insert` is missing-only and its selected unique key must agree with `key_vals`.
+A mismatch returns `CallbackError::Engine` containing `InvalidDmlInput`; it does
+not insert under another key. Entry-state validity and selected-key agreement
+are always enforced, even with `disable_dml_validation(true)`. Normally, full
+row shape, kinds, nullability, and sparse update ordering, column bounds, and
+types are also checked. Disabling ordinary DML validation makes these payloads
+trusted caller input, with the same caller obligations as other DML APIs.
+Malformed trusted input is outside that contract. Sparse assignments must be
+strictly ordered by column number and cannot repeat a column.
+
+`Noop` means the callback selected `Skip`; it does not distinguish a missing
+entry from an occupied entry. Record `row.is_none()` in caller state when that
+distinction matters. `Skip` cancels only this invocation's provisional ownership.
+An empty occupied update also releases provisional ownership without row,
+index, undo, or redo effects, but returns `Updated(original_row_id)`.
+Transaction-lifetime table locks remain held. Non-empty same-value assignments
+use ordinary update machinery and still return `Updated`.
+
+Outcomes describe the logical decision. In-place updates return the original
+RowID. A frozen page, insufficient hot-page space, or an immutable cold row can
+require a replacement physical row. An update implemented as delete-plus-insert
+returns `Updated(replacement_row_id)`, never `Inserted`. Only missing-entry
+insertion returns `Inserted`. Sparse updates may change the selected driver key
+and other indexed keys; point key changes apply immediately, with normal
+uniqueness checks and MVCC links to older row versions.
+
+Write callbacks read the latest acquired row, including a later committed hot
+image when current-write rules admit it, rather than an older snapshot image.
+Another active owner can cause `WriteConflict` before row exposure. Preparing
+owners are waited for, then selection/ownership is retried before calling the
+callback. Cold deletes retain point semantics: a matching delete committed
+after the writer's snapshot can cause `WriteConflict`; a delete already visible
+to that snapshot or a cold image already consumed by this transaction is missing.
+In-memory delete timestamps/ownership take precedence over durable delete bits.
+
+The callback runs at most once per invocation; admission/ownership errors may
+prevent it from running. A missing observation takes no gap lock. Another writer
+may insert before this operation acquires the unique key. Normal `DuplicateKey`
+or `WriteConflict` then fails the statement, rolls back any losing insertion,
+and does not rerun the callback or turn it into an update. Callback work and
+external side effects are never retried or rolled back by storage.
+
+Ordinary callback, validation, and storage errors roll back this statement's row
+and index effects before returning, preserving earlier successful statements.
+`CallbackError::User(E)` retains its original application payload; engine errors
+use `CallbackError::Engine`. Fatal rollback failure takes engine-error precedence
+and retains residual ownership according to the transaction cleanup contract.
+Dropping an in-flight direct-operation future triggers whole-transaction cleanup;
+do not reuse that transaction after cancellation.
+
+For `b = b + 1`, the caller defines type, null, and overflow policy. This example
+assumes `b` is column 1 and chooses to skip null/non-i32 values and overflow:
+
+```rust,ignore
+trx.table_unique_mutate_mvcc(index, &key, |entry| -> CallbackResult<_> {
+    let Some(row) = entry else { return Ok(UniqueMutation::Skip) };
+    let Some(next) = row.val(1)?.as_i32().and_then(|b| b.checked_add(1)) else {
+        return Ok(UniqueMutation::Skip);
+    };
+    Ok(UniqueMutation::Update(vec![UpdateCol { idx: 1, val: Val::from(next) }]))
+}).await?;
+```
+
+Conditional deletion can inspect just the decision column:
+
+```rust,ignore
+trx.table_unique_mutate_mvcc(index, &key, |entry| -> CallbackResult<_> {
+    Ok(match entry {
+        Some(row) => {
+            if row.val(1)?.as_i32() == Some(0) {
+                UniqueMutation::Delete
+            } else {
+                UniqueMutation::Skip
+            }
+        },
+        _ => UniqueMutation::Skip,
+    })
+}).await?;
+```
+
+Upsert is an explicit caller branch. For a two-column `(id, b)` table, this
+constructs a complete insertion row only when missing and records that observation:
+
+```rust,ignore
+let key = [Val::from(id)];
+let mut was_missing = false;
+let outcome = trx.table_unique_mutate_mvcc(index, &key, |entry| -> CallbackResult<_> {
+    was_missing = entry.is_none();
+    Ok(match entry {
+        None => UniqueMutation::Insert(vec![Val::from(id), Val::from(1i32)]),
+        Some(_) => UniqueMutation::Update(vec![UpdateCol { idx: 1, val: Val::from(2i32) }]),
+    })
+}).await?;
+```
+
+Zero-read point callbacks defer dense cache allocation. The first column read
+still initializes scratch proportional to table width. Required payload, undo,
+index, and replacement-row allocations remain. Cold deletion reads only indexed
+columns unless the callback asks for additional values.
+
+### Migrating unique-key writes
+
+`table_upsert_unique_mvcc`, `table_update_unique_mvcc`, and
+`table_delete_unique_mvcc` have been removed. Use `table_unique_mutate_mvcc` and
+match `UniqueMutationOutcome` instead of the old public result types.
+
+For update or delete, return `Skip` when the entry is missing. The result is
+`Noop`; callers that need to distinguish a miss from an occupied skip can record
+`entry.is_none()` inside the callback.
+
+```rust,ignore
 let outcome = trx
-    .table_update_unique_mvcc(
+    .table_unique_mutate_mvcc(
         TableIndex(table_id, id_index_id),
-        &key,
-        vec![UpdateCol {
-            idx: 1,
-            val: Val::from("ada"),
-        }],
+        &[Val::from(1i32)],
+        |entry| -> CallbackResult<_> {
+            Ok(match entry {
+                Some(_) => UniqueMutation::Update(vec![UpdateCol {
+                    idx: 1,
+                    val: Val::from("ada"),
+                }]),
+                None => UniqueMutation::Skip,
+            })
+        },
     )
     .await?;
 
-assert!(outcome.is_updated());
+assert!(matches!(outcome, UniqueMutationOutcome::Updated(_)));
 ```
 
-Sparse updates must contain each target column at most once and in increasing
-column-number order. An empty sparse update is a valid no-op update when its
-target row exists.
+For upsert, return `Insert` on a miss and `Update` on a hit. To replace all
+columns using an existing owned row, consume its values into ordered assignments:
+`values.into_iter().enumerate().map(|(idx, val)| UpdateCol { idx, val }).collect()`.
+The lookup key is supplied separately, and an inserted row must match that key.
+
+Payload validation applies to the action returned by the callback. An empty
+occupied update returns the original RowID and cancels provisional ownership
+without physically moving the row. Cold rows already consumed by an earlier
+statement in the same transaction are missing. These follow the callback
+contract described above; the old compatibility behavior is no longer exposed.
 
 ### Callback-selected table mutation
 
@@ -914,7 +1065,7 @@ Most application-facing types are re-exported from the crate root:
 | Schema | `StorageTableSpec`, `StorageColumnSpec`, `StorageColumnFlags`, `StorageIndexSpec`, `StorageIndexKey`, `ColumnID`, `ColumnOrdinal`, `IndexOrder`, `StorageIndexFlags`, `CreateTableOutcome`, `IndexID`, `TableIndex`, `ResolvedTableIndex`, `TableIndexSelector`, `TableIndexArgument` |
 | Values | `Val`, `ValKind`, `ValType`, `MemVar` |
 | Reads | `SelectMvcc`, `ScanMvcc`, `LazyRow`, `ScanRowDecision`, `TableScanOptions`, `TableScanPlan` |
-| Writes | `UpdateCol`, `UpdateMvcc`, `UpsertMvcc`, `DeleteMvcc`, `RowMutation`, `TableMutationOutcome` |
+| Writes | `UpdateCol`, `UniqueMutation`, `UniqueMutationOutcome`, `RowMutation`, `TableMutationOutcome` |
 | Locks | `TableLockMode` |
 | Maintenance | `FreezeOutcome`, `FrozenPageBatchInfo`, `CheckpointOutcome`, `CheckpointDelayReason`, `CheckpointCancelReason`, `CatalogCheckpointOutcome`, `RedoTruncationOutcome`, `RedoTruncationBlockerInfo`, `CatalogRedoMaintenanceOutcome`, `MemIndexCleanupOutcome`, `MemIndexCleanupStats`, `MemIndexCleanupDelay`, `SecondaryMemIndexCleanupIndexStats` |
 | Errors | `Result`, `Error`, `ErrorKind`, `OperationError`, `CallbackResult`, `CallbackError` |

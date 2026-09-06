@@ -184,38 +184,47 @@ impl Update {
 
 /// MVCC update result.
 #[derive(Debug, PartialEq, Eq)]
-pub enum UpdateMvcc {
+pub(crate) enum UpdateMvcc {
     Updated(RowID),
     NotFound,
 }
 
-impl UpdateMvcc {
-    /// Returns if update with undo succeeds.
-    #[inline]
-    pub fn is_updated(&self) -> bool {
-        matches!(self, UpdateMvcc::Updated(_))
-    }
+/// Decision made after a unique-point lookup acquires its latest writable row.
+///
+/// `Insert` is valid only for a missing entry; `Update` and `Delete` require an
+/// occupied entry. `Skip` is valid in either state. Payloads remain caller-owned
+/// until the decision is returned and are consumed by the operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UniqueMutation {
+    /// Leave the entry unchanged and release this invocation's provisional lock.
+    Skip,
+    /// Insert a missing row whose selected unique key matches the lookup key.
+    Insert(Vec<Val>),
+    /// Apply ordered sparse assignments to the occupied row.
+    /// An empty update releases provisional ownership without physical effects.
+    Update(Vec<UpdateCol>),
+    /// Delete the occupied row.
+    Delete,
+}
+
+/// Logical result of a unique-point callback mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UniqueMutationOutcome {
+    /// The callback selected `Skip`, whether the entry existed or was missing.
+    Noop,
+    /// A missing-entry insertion created this physical row.
+    Inserted(RowID),
+    /// An occupied-entry update finished at this physical row, including moves.
+    Updated(RowID),
+    /// The occupied row was deleted.
+    Deleted,
 }
 
 /// MVCC unique-key upsert result.
 #[derive(Debug, PartialEq, Eq)]
-pub enum UpsertMvcc {
+pub(crate) enum UpsertMvcc {
     Inserted(RowID),
     Updated(RowID),
-}
-
-impl UpsertMvcc {
-    /// Returns whether the upsert inserted a new row.
-    #[inline]
-    pub fn is_inserted(&self) -> bool {
-        matches!(self, UpsertMvcc::Inserted(_))
-    }
-
-    /// Returns whether the upsert updated an existing row.
-    #[inline]
-    pub fn is_updated(&self) -> bool {
-        matches!(self, UpsertMvcc::Updated(_))
-    }
 }
 
 /// Common access to update values stored in undo records.
@@ -494,30 +503,15 @@ pub(crate) enum Delete {
 
 /// MVCC delete result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeleteMvcc {
+pub(crate) enum DeleteMvcc {
     Deleted,
     NotFound,
 }
 
-impl DeleteMvcc {
-    /// Returns whether the delete succeeded.
-    #[inline]
-    pub fn is_deleted(&self) -> bool {
-        matches!(self, DeleteMvcc::Deleted)
-    }
-
-    /// Returns whether the delete target was not found.
-    #[inline]
-    pub fn not_found(&self) -> bool {
-        matches!(self, DeleteMvcc::NotFound)
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{RowUpdateInput, RowUpdateView, UpdateCol, UpsertMvcc};
+    use super::{RowUpdateInput, RowUpdateView, UpdateCol};
     use crate::catalog::{StorageColumnFlags, StorageColumnSpec, TableColumnLayout, TableMetadata};
-    use crate::id::RowID;
     use crate::value::{Val, ValKind};
 
     fn update_test_layout() -> TableColumnLayout {
@@ -670,16 +664,5 @@ mod tests {
 
         let full_type_mismatch = vec![Val::from(11i32), Val::from(12i32), Val::from(43u64)];
         assert!(!RowUpdateView::FullRow(&full_type_mismatch).is_valid_for(&layout));
-    }
-
-    #[test]
-    fn upsert_mvcc_predicates_report_variant() {
-        let inserted = UpsertMvcc::Inserted(RowID::new(1));
-        assert!(inserted.is_inserted());
-        assert!(!inserted.is_updated());
-
-        let updated = UpsertMvcc::Updated(RowID::new(2));
-        assert!(updated.is_updated());
-        assert!(!updated.is_inserted());
     }
 }
