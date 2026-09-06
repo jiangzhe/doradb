@@ -2620,7 +2620,7 @@ mod tests {
     use crate::buffer::page::VersionedPageID;
     use crate::catalog::tests::wait_for_dropped_table_floor;
     use crate::catalog::{
-        CurrentTableState, IndexID, IndexSlot, ResolvedVisibleTableMetadata, StorageColumnFlags,
+        CurrentTableState, IndexSlot, ResolvedVisibleTableMetadata, StorageColumnFlags,
         StorageColumnSpec, StorageTableSpec, TableCache,
     };
     use crate::completion::{Completion, CompletionTake};
@@ -2634,7 +2634,7 @@ mod tests {
     use crate::file::cow_file::tests::old_root_drop_count;
     use crate::index::RowLocation;
     use crate::io::install_storage_backend_test_hook;
-    use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
+    use crate::row::ops::{SelectKey, SelectMvcc, UniqueMutationOutcome, UpdateCol};
     use crate::runtime::mandatory::MandatoryInternalTask;
     use crate::session::{
         Session,
@@ -5379,12 +5379,12 @@ mod tests {
             )
             .await
             .unwrap();
-            assert!(matches!(later_update, UpdateMvcc::Updated(_)));
+            assert!(matches!(later_update, UniqueMutationOutcome::Updated(_)));
             let later_cts = later_trx.commit().await.unwrap();
 
             release_tx.send(()).unwrap();
             let blocked_result = blocked_handle.join().unwrap();
-            assert!(matches!(blocked_result, UpdateMvcc::Updated(_)));
+            assert!(matches!(blocked_result, UniqueMutationOutcome::Updated(_)));
             writer_done_rx.recv().unwrap();
             let outcome = freeze_handle.join().unwrap();
             let batch = assert_freeze_created(outcome);
@@ -6197,7 +6197,7 @@ mod tests {
             )
             .await
             .unwrap();
-            assert!(matches!(update, UpdateMvcc::Updated(_)));
+            assert!(matches!(update, UniqueMutationOutcome::Updated(_)));
 
             let mut checkpoint_session = engine.new_session().unwrap();
             assert_freeze_created(
@@ -6273,7 +6273,7 @@ mod tests {
             )
             .await
             .unwrap();
-            assert!(matches!(update, UpdateMvcc::Updated(_)));
+            assert!(matches!(update, UniqueMutationOutcome::Updated(_)));
 
             let mut checkpoint_session = engine.new_session().unwrap();
             assert_freeze_created(
@@ -6530,7 +6530,7 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                    assert!(matches!(res, UpdateMvcc::Updated(_)));
+                    assert!(matches!(res, UniqueMutationOutcome::Updated(_)));
                     prefix_update_trx.commit().await.unwrap();
                 });
                 drop(prefix_update_session);
@@ -6548,7 +6548,7 @@ mod tests {
                         trx_delete_row_by_id(&mut prefix_delete_trx, table_id, &single_key(2))
                             .await
                             .unwrap();
-                    assert_eq!(res, crate::row::ops::DeleteMvcc::Deleted);
+                    assert_eq!(res, UniqueMutationOutcome::Deleted);
                     prefix_delete_trx.commit().await.unwrap();
                 });
                 drop(prefix_delete_session);
@@ -6569,7 +6569,7 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                    assert_eq!(res, crate::row::ops::DeleteMvcc::Deleted);
+                    assert_eq!(res, UniqueMutationOutcome::Deleted);
                     suffix_delete_trx.commit().await.unwrap();
                 });
                 drop(suffix_delete_session);
@@ -7087,11 +7087,10 @@ mod tests {
             let mut writer_session = engine.new_session().unwrap();
             let mut writer = writer_session.begin_trx().unwrap();
             let writer_status = transaction_status_for_test(&writer);
-            let deleted = writer
-                .table_delete_unique_mvcc(crate::TableIndex(table_id, IndexID::new(0)), &key.vals)
+            let deleted = trx_delete_row_by_id(&mut writer, table_id, &key)
                 .await
                 .unwrap();
-            assert_eq!(deleted, DeleteMvcc::Deleted);
+            assert_eq!(deleted, UniqueMutationOutcome::Deleted);
             let (undo_counts, owned_undo_addr) = transaction_delete_undo_observation(&writer);
             assert_eq!(undo_counts, (1, 1));
 
@@ -7214,7 +7213,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let UpdateMvcc::Updated(replacement_row_id) = updated else {
+            let UniqueMutationOutcome::Updated(replacement_row_id) = updated else {
                 panic!("frozen key update must produce a replacement row");
             };
             assert_ne!(replacement_row_id, old_row_id);
@@ -7362,7 +7361,7 @@ mod tests {
             let deleted = trx_delete_row_by_id(&mut writer, table_id, &key)
                 .await
                 .unwrap();
-            assert_eq!(deleted, crate::row::ops::DeleteMvcc::Deleted);
+            assert_eq!(deleted, UniqueMutationOutcome::Deleted);
             let entry = transaction_entry(&writer);
             let owner = lock_owner(&writer).unwrap();
             let writer_status = transaction_status_for_test(&writer);
@@ -7426,7 +7425,7 @@ mod tests {
             let deleted = trx_delete_row_by_id(&mut writer, table_id, &key)
                 .await
                 .unwrap();
-            assert_eq!(deleted, crate::row::ops::DeleteMvcc::Deleted);
+            assert_eq!(deleted, UniqueMutationOutcome::Deleted);
             let status = transaction_status_for_test(&writer);
             let sts = writer.sts();
             let owner = lock_owner(&writer).unwrap();
@@ -7513,7 +7512,7 @@ mod tests {
             let deleted = trx_delete_row_by_id(&mut writer, table_id, &key)
                 .await
                 .unwrap();
-            assert_eq!(deleted, crate::row::ops::DeleteMvcc::Deleted);
+            assert_eq!(deleted, UniqueMutationOutcome::Deleted);
             let entry = transaction_entry(&writer);
             let trx_id = writer.trx_id();
             let writer_status = transaction_status_for_test(&writer);
@@ -8505,7 +8504,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                assert!(matches!(update, UpdateMvcc::Updated(_)));
+                assert!(matches!(update, UniqueMutationOutcome::Updated(_)));
             }
 
             let mut checkpoint_session = engine.new_session().unwrap();
@@ -8596,7 +8595,7 @@ mod tests {
             )
             .await
             .unwrap();
-            assert!(matches!(update, UpdateMvcc::Updated(_)));
+            assert!(matches!(update, UniqueMutationOutcome::Updated(_)));
 
             let mut checkpoint_session = engine.new_session().unwrap();
             assert_freeze_created(
@@ -8715,7 +8714,7 @@ mod tests {
             let delete = trx_delete_row_by_id(&mut writer, table_id, &single_key(delayed_key))
                 .await
                 .unwrap();
-            assert_eq!(delete, crate::row::ops::DeleteMvcc::Deleted);
+            assert_eq!(delete, UniqueMutationOutcome::Deleted);
             setup
                 .wait_for_gc_horizon_after(hold.sts().saturating_sub(1))
                 .await

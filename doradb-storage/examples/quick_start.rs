@@ -1,9 +1,8 @@
 use doradb_storage::{
     CallbackResult, Engine, EngineConfig, IndexID, ScanRowDecision, StorageColumnFlags,
     StorageColumnSpec, StorageIndexFlags, StorageIndexKey, StorageIndexSpec, StorageTableSpec,
-    TableIndex, UpdateCol, Val, ValKind,
+    TableIndex, UniqueMutation, UniqueMutationOutcome, UpdateCol, Val, ValKind,
 };
-use futures::executor;
 use std::error::Error;
 use std::process::exit;
 use std::result::Result as StdResult;
@@ -12,7 +11,7 @@ use tempfile::TempDir;
 type ExampleResult<T> = StdResult<T, Box<dyn Error>>;
 
 fn main() {
-    if let Err(err) = executor::block_on(run()) {
+    if let Err(err) = smol::block_on(run()) {
         eprintln!("{err}");
         exit(1);
     }
@@ -55,23 +54,43 @@ async fn run() -> ExampleResult<()> {
     let id_one = [Val::from(1i32)];
     // Update one row by its unique id key.
     let updated = write_trx
-        .table_update_unique_mvcc(
+        .table_unique_mutate_mvcc(
             TableIndex(table_id, id_index),
             &id_one,
-            vec![UpdateCol {
-                idx: 1,
-                val: Val::from("ada"),
-            }],
+            |entry| -> CallbackResult<_> {
+                Ok(match entry {
+                    Some(_) => UniqueMutation::Update(vec![UpdateCol {
+                        idx: 1,
+                        val: Val::from("ada"),
+                    }]),
+                    None => UniqueMutation::Insert(vec![Val::from(1i32), Val::from("ada")]),
+                })
+            },
         )
         .await?;
-    assert!(updated.is_updated());
+    assert!(matches!(updated, UniqueMutationOutcome::Updated(_)));
 
     let id_two = [Val::from(2i32)];
     // Delete one row by its unique id key.
     let deleted = write_trx
-        .table_delete_unique_mvcc(TableIndex(table_id, id_index), &id_two)
+        .table_unique_mutate_mvcc(
+            TableIndex(table_id, id_index),
+            &id_two,
+            |entry| -> CallbackResult<_> {
+                Ok(match entry {
+                    Some(row) => {
+                        if row.val(1)?.as_str() == Some("bob") {
+                            UniqueMutation::Delete
+                        } else {
+                            UniqueMutation::Skip
+                        }
+                    }
+                    _ => UniqueMutation::Skip,
+                })
+            },
+        )
         .await?;
-    assert!(deleted.is_deleted());
+    assert_eq!(deleted, UniqueMutationOutcome::Deleted);
     write_trx.commit().await?;
 
     let mut read_trx = session.begin_trx()?;

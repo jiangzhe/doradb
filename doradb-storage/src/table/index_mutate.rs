@@ -5,21 +5,20 @@
 //! effect context used to resolve and mutate each candidate sequentially.
 
 use super::access::{
-    ColdLatestRow, LazyRow, LazyRowBuffer, LazyRowSource, RowIdMove, UserTableAccessor,
-    WriteIndexKeySet, read_latest_cold_row,
+    ColdLatestRow, LazyRow, LazyRowBuffer, LazyRowSource, UserTableAccessor, WriteIndexKeySet,
+    read_latest_cold_row,
 };
 use crate::buffer::guard::PageSharedGuard;
 use crate::catalog::IndexRef;
 use crate::error::{
-    CallbackResult, DataIntegrityError, DiscloseError, DiscloseResultExt, MultiDomainResultExt,
-    OperationError, Result,
+    CallbackResult, DataIntegrityError, DiscloseError, DiscloseResultExt, OperationError, Result,
 };
 use crate::id::{PageID, RowID};
 use crate::index::{LwcRowLocation, RowLocation};
 use crate::row::RowPage;
 use crate::row::ops::{RowMutation, RowUpdateInput, TableMutationOutcome, UpdateCol};
 use crate::table::dml_validator::DmlValidator;
-use crate::table::hot::{DeleteInternal, HotRowMutator, ResumeOwnedRow, UpdateRowInplace};
+use crate::table::hot::{DeleteInternal, HotRowMutator, ResumeOwnedRow};
 use crate::table::{DeleteMarker, DeletionClaim, DeletionError, TableRootSnapshot};
 use crate::trx::TrxRuntime;
 use crate::trx::row::{BoundIndexCandidate, LockRowForWrite, RowWriteAccess};
@@ -351,7 +350,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                             self.effects,
                             candidate.row_id,
                             old_row,
-                            update,
+                            RowUpdateInput::Sparse(update),
                             self.root_snapshot,
                         )
                         .await
@@ -426,7 +425,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                         update,
                     );
                 } else {
-                    self.update_owned_hot_row(candidate.row_id, page_guard, access, update)
+                    self.update_owned_hot_row(page_guard, access, update)
                         .await?;
                 }
                 Ok(None)
@@ -502,7 +501,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                         .resume_owned_row(self.effects);
                         match resumed {
                             ResumeOwnedRow::Ok(access) => {
-                                self.update_owned_hot_row(row_id, &page_guard, access, update)
+                                self.update_owned_hot_row(&page_guard, access, update)
                                     .await?;
                                 return Ok(());
                             }
@@ -546,7 +545,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                             self.effects,
                             row_id,
                             old_row,
-                            update,
+                            RowUpdateInput::Sparse(update),
                             self.root_snapshot,
                         )
                         .await
@@ -557,97 +556,24 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
         }
     }
 
-    /// Reuses the ordinary owned-hot update, move, and index-maintenance paths.
+    /// Applies a retained update through shared point/range physical machinery.
     async fn update_owned_hot_row(
         &mut self,
-        row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
         access: RowWriteAccess<'_>,
         update: Vec<UpdateCol>,
     ) -> Result<()> {
-        let accessor = self.accessor;
-        let result = HotRowMutator::new(
-            accessor.table_id(),
-            accessor.metadata(),
-            self.rt,
-            page_guard,
-            row_id,
-        )
-        .update_owned_row(self.effects, RowUpdateInput::Sparse(update), access);
-        match result {
-            UpdateRowInplace::Ok(new_row_id, index_change_cols) => {
-                debug_assert_eq!(row_id, new_row_id);
-                if !index_change_cols.is_empty() {
-                    accessor
-                        .update_indexes_only_key_change(
-                            self.rt,
-                            self.effects,
-                            row_id,
-                            page_guard,
-                            &index_change_cols,
-                            self.root_snapshot,
-                        )
-                        .await
-                        .attach("index-driven mutation hot key change")
-                        .disclose()?;
-                }
-            }
-            UpdateRowInplace::NoFreeSpaceOrFrozen(old_row_id, old_row, update) => {
-                let old_index_keys = WriteIndexKeySet::from_full_row(accessor, &old_row);
-                let move_guard = accessor
-                    .mem()
-                    .must_get_row_page_shared(self.rt.pool_guards(), page_guard.page_id())
-                    .await
-                    .disclose()?;
-                let (new_row_id, index_change_cols, new_guard) = accessor
-                    .move_update_for_space(
-                        self.rt,
-                        self.effects,
-                        old_row,
-                        update,
-                        old_row_id,
-                        move_guard,
-                    )
-                    .await
-                    .disclose()?;
-                let proof = accessor.owned_row_page_index_set_proof(
-                    old_row_id,
-                    old_index_keys,
-                    self.root_snapshot,
-                );
-                if index_change_cols.is_empty() {
-                    accessor
-                        .update_indexes_only_row_id_change(
-                            self.rt,
-                            self.effects,
-                            old_row_id,
-                            new_row_id,
-                            proof,
-                        )
-                        .await
-                        .attach("index-driven mutation hot move index update")
-                        .disclose()?;
-                } else {
-                    accessor
-                        .update_indexes_may_both_change(
-                            self.rt,
-                            self.effects,
-                            RowIdMove::new(old_row_id, new_row_id),
-                            &index_change_cols,
-                            &new_guard,
-                            proof,
-                        )
-                        .await
-                        .attach("index-driven mutation hot move index update")
-                        .disclose()?;
-                }
-            }
-            UpdateRowInplace::RowDeleted(_)
-            | UpdateRowInplace::RowNotFound(_)
-            | UpdateRowInplace::RetryInTransition(_) => {
-                unreachable!("retained owned hot row changed before physical update")
-            }
-        }
+        self.accessor
+            .update_owned_hot_row(
+                self.rt,
+                self.effects,
+                page_guard,
+                access,
+                RowUpdateInput::Sparse(update),
+                self.root_snapshot,
+            )
+            .await
+            .disclose()?;
         Ok(())
     }
 
@@ -707,8 +633,8 @@ mod tests {
     use crate::error::{DiscloseResultExt, OperationError};
     use crate::index::{IndexInsert, RowLocation};
     use crate::row::ops::{
-        DeleteMvcc, RowMutation, ScanRowDecision, SelectMvcc, TableMutationOutcome, UpdateCol,
-        UpdateMvcc,
+        RowMutation, ScanRowDecision, SelectMvcc, TableMutationOutcome, UniqueMutationOutcome,
+        UpdateCol,
     };
     use crate::session::tests::{
         SessionTestExt, assert_checkpoint_published, wait_for_session_idle,
@@ -1420,7 +1346,7 @@ mod tests {
                     )
                     .await
                     .unwrap(),
-                    UpdateMvcc::Updated(_)
+                    UniqueMutationOutcome::Updated(_)
                 ));
             }
             competitor.commit().await.unwrap();
@@ -1491,7 +1417,7 @@ mod tests {
                 trx_delete_row_by_id(&mut owner, table_id, &single_key(1i32))
                     .await
                     .unwrap(),
-                DeleteMvcc::Deleted
+                UniqueMutationOutcome::Deleted
             );
 
             let key = [Val::from(1i32)];
@@ -1548,7 +1474,7 @@ mod tests {
                 )
                 .await
                 .unwrap(),
-                UpdateMvcc::Updated(_)
+                UniqueMutationOutcome::Updated(_)
             ));
 
             let old_key = [Val::from(1i32)];
@@ -1597,7 +1523,7 @@ mod tests {
                 trx_delete_row_by_id(&mut owner, table_id, &single_key(1i32))
                     .await
                     .unwrap(),
-                DeleteMvcc::Deleted
+                UniqueMutationOutcome::Deleted
             );
             let owner_status = transaction_status_for_test(&owner);
             let prepared = prepare_transaction(owner).unwrap();

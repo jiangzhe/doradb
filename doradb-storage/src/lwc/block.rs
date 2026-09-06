@@ -1,5 +1,8 @@
 //! This module contains definition and functions of LWC(Lightweight Compression) Block.
 
+#[cfg(test)]
+pub(crate) use tests::test_decode_counts;
+
 use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
 use crate::catalog::{TableColumnLayout, TableIndexMetadata};
 use crate::error::{DataIntegrityError, DataIntegrityResult, RuntimeResult};
@@ -310,6 +313,8 @@ impl LwcBlock {
         row_idx: usize,
         col_idx: usize,
     ) -> DataIntegrityResult<Val> {
+        #[cfg(test)]
+        tests::record_decode(col_idx);
         let column = self.column(col_layout, col_idx)?;
         if column.is_null(row_idx) {
             return Ok(Val::Null);
@@ -700,6 +705,24 @@ mod tests {
     use crate::row::{InsertRow, RowPage};
     use crate::value::Val;
     use error_stack::ResultExt;
+
+    thread_local! {
+        static DECODE_COUNTS: std::cell::Cell<[usize; 4]> = const { std::cell::Cell::new([0; 4]) };
+    }
+
+    /// Returns counts for the four-column point-mutation fixture.
+    pub(crate) fn test_decode_counts() -> [usize; 4] {
+        DECODE_COUNTS.get()
+    }
+
+    /// Records immutable column decode requests on this test thread.
+    pub(super) fn record_decode(column: usize) {
+        if column < 4 {
+            let mut counts = DECODE_COUNTS.get();
+            counts[column] += 1;
+            DECODE_COUNTS.set(counts);
+        }
+    }
 
     fn row_shape_fingerprint_for(row_ids: &[RowID]) -> u128 {
         let start_row_id = row_ids.first().unwrap().as_u64();

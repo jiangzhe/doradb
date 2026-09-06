@@ -1975,7 +1975,7 @@ pub(crate) mod tests {
     use crate::file::cow_file::tests::old_root_drop_count;
     use crate::file::table_file::ActiveRoot;
     use crate::index::IndexBatchStream;
-    use crate::row::ops::{SelectKey, UpdateCol, UpdateMvcc};
+    use crate::row::ops::{SelectKey, UniqueMutationOutcome, UpdateCol};
     use crate::session::Session;
     use crate::session::tests::{
         SessionTestExt, active_operation_count, assert_checkpoint_published,
@@ -1983,6 +1983,7 @@ pub(crate) mod tests {
     };
     use crate::table::tests::{
         assert_freeze_created, expect_delete_committed, insert_one_row, insert_rows,
+        trx_update_row_by_id,
     };
     use crate::trx::MAX_SNAPSHOT_TS;
     use crate::trx::purge::PurgeTestEvent;
@@ -2336,14 +2337,8 @@ pub(crate) mod tests {
         update: Vec<UpdateCol>,
     ) -> RowID {
         let mut trx = session.begin_trx().unwrap();
-        let result = trx
-            .table_update_unique_mvcc(
-                crate::TableIndex(table_id, IndexID::new(0)),
-                &key.vals,
-                update,
-            )
-            .await;
-        let Ok(UpdateMvcc::Updated(row_id)) = result else {
+        let result = trx_update_row_by_id(&mut trx, table_id, key, update).await;
+        let Ok(UniqueMutationOutcome::Updated(row_id)) = result else {
             panic!("update should succeed: {result:?}");
         };
         trx.commit().await.unwrap();

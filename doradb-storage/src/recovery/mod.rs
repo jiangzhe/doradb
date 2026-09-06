@@ -1352,7 +1352,7 @@ mod tests {
     use crate::recovery::{RecoveryResources, RowRecoveryMap, TableReplayBounds};
     use crate::row::RowRead;
     use crate::row::ops::{
-        DeleteMvcc, RowMutation, ScanRowDecision, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc,
+        RowMutation, ScanRowDecision, SelectKey, SelectMvcc, UniqueMutationOutcome, UpdateCol,
     };
     use crate::serde::Ser;
     use crate::session::tests::{SessionTestExt, assert_checkpoint_published};
@@ -3008,7 +3008,7 @@ mod tests {
                     val: Val::from(&s2[..]),
                 };
                 let res = trx_update_row_by_id(&mut trx, table_id, &key, vec![uc]).await;
-                assert!(matches!(res, Ok(UpdateMvcc::Updated(_))));
+                assert!(matches!(res, Ok(UniqueMutationOutcome::Updated(_))));
                 trx.commit().await.unwrap();
             }
             // delete
@@ -3016,7 +3016,7 @@ mod tests {
                 let mut trx = session.begin_trx().unwrap();
                 let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(i as u32)]);
                 let res = trx_delete_row_by_id(&mut trx, table_id, &key).await;
-                assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
+                assert!(matches!(res, Ok(UniqueMutationOutcome::Deleted)));
                 trx.commit().await.unwrap();
             }
 
@@ -3478,7 +3478,7 @@ mod tests {
             let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(7u32)]);
             let mut trx = session.begin_trx().unwrap();
             let delete = trx_delete_row_by_id(&mut trx, table.table_id(), &key).await;
-            assert!(matches!(delete, Ok(DeleteMvcc::Deleted)));
+            assert!(matches!(delete, Ok(UniqueMutationOutcome::Deleted)));
             trx.commit().await.unwrap();
 
             let mut trx = session.begin_trx().unwrap();
@@ -3631,7 +3631,7 @@ mod tests {
             let delete_key = SelectKey::new(IndexSlot::new(0), vec![Val::from(2u32)]);
             let mut trx = session.begin_trx().unwrap();
             let delete = trx_delete_row_by_id(&mut trx, table.table_id(), &delete_key).await;
-            assert!(matches!(delete, Ok(DeleteMvcc::Deleted)));
+            assert!(matches!(delete, Ok(UniqueMutationOutcome::Deleted)));
             trx.commit().await.unwrap();
 
             drop(table);
@@ -4042,7 +4042,7 @@ mod tests {
                 &SelectKey::new(IndexSlot::new(0), vec![Val::from(0u32)]),
             )
             .await;
-            assert!(matches!(delete, Ok(DeleteMvcc::Deleted)));
+            assert!(matches!(delete, Ok(UniqueMutationOutcome::Deleted)));
             let delete_cts = delete_trx.commit().await.unwrap();
 
             checkpoint_session
@@ -4187,7 +4187,7 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let key0 = SelectKey::new(IndexSlot::new(0), vec![Val::from(0u32)]);
             let delete = trx_delete_row_by_id(&mut trx, table.table_id(), &key0).await;
-            assert!(matches!(delete, Ok(DeleteMvcc::Deleted)));
+            assert!(matches!(delete, Ok(UniqueMutationOutcome::Deleted)));
             trx.commit().await.unwrap();
 
             let marker0_ts = match table.deletion_buffer().get(RowID::new(0)).unwrap() {
@@ -4202,7 +4202,7 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let key1 = SelectKey::new(IndexSlot::new(0), vec![Val::from(1u32)]);
             let delete = trx_delete_row_by_id(&mut trx, table.table_id(), &key1).await;
-            assert!(matches!(delete, Ok(DeleteMvcc::Deleted)));
+            assert!(matches!(delete, Ok(UniqueMutationOutcome::Deleted)));
             trx.commit().await.unwrap();
             let marker1_ts = match table.deletion_buffer().get(RowID::new(1)).unwrap() {
                 DeleteMarker::Committed(ts) => ts,
@@ -4701,7 +4701,7 @@ mod tests {
             for i in 0..64u32 {
                 let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(i)]);
                 let delete = trx_delete_row_by_id(&mut trx, table.table_id(), &key).await;
-                assert!(matches!(delete, Ok(DeleteMvcc::Deleted)));
+                assert!(matches!(delete, Ok(UniqueMutationOutcome::Deleted)));
             }
             trx.commit().await.unwrap();
 

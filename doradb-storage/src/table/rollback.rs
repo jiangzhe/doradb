@@ -435,7 +435,7 @@ mod tests {
     use crate::engine::Engine;
     use crate::id::RowID;
     use crate::index::RowLocation;
-    use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
+    use crate::row::ops::{SelectKey, SelectMvcc, UniqueMutationOutcome, UpdateCol};
     use crate::session::tests::{SessionTestExt, assert_checkpoint_published};
     use crate::table::CheckpointOutcome;
     use crate::table::tests::*;
@@ -469,7 +469,7 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let res = trx_delete_row_by_id(&mut trx, table_id, &key).await;
-            assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
+            assert!(matches!(res, Ok(UniqueMutationOutcome::Deleted)));
             assert_unique_index_entry(
                 &table_for_internal_assertion(&engine, table_id),
                 &session.pool_guards(),
@@ -515,7 +515,7 @@ mod tests {
             session.wait_for_gc_horizon_after(target_ts).await.unwrap();
             let mut trx_delete = session.begin_trx().unwrap();
             let res = trx_delete_row_by_id(&mut trx_delete, table_id, &key).await;
-            assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
+            assert!(matches!(res, Ok(UniqueMutationOutcome::Deleted)));
 
             let mut checkpoint_session = engine.new_session().unwrap();
             let outcome = checkpoint_session.checkpoint_table(table_id).await.unwrap();
@@ -844,7 +844,7 @@ mod tests {
                     val: Val::from(0i32),
                 }];
                 let res = trx_update_row_by_id(&mut trx, table_id, &key, update).await;
-                assert!(matches!(res, Ok(UpdateMvcc::Updated(_))));
+                assert!(matches!(res, Ok(UniqueMutationOutcome::Updated(_))));
                 trx.rollback().await.unwrap();
 
                 let mut trx = session.begin_trx().unwrap();
@@ -858,7 +858,7 @@ mod tests {
                 let mut trx = session.begin_trx().unwrap();
                 let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(0i32)]);
                 let res = trx_delete_row_by_id(&mut trx, table_id, &key).await;
-                assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
+                assert!(matches!(res, Ok(UniqueMutationOutcome::Deleted)));
                 trx.rollback().await.unwrap();
 
                 let mut trx = session.begin_trx().unwrap();
@@ -872,7 +872,7 @@ mod tests {
                 let mut trx = session.begin_trx().unwrap();
                 let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(3i32)]);
                 let res = trx_delete_row_by_id(&mut trx, table_id, &key).await;
-                assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
+                assert!(matches!(res, Ok(UniqueMutationOutcome::Deleted)));
                 let res = trx
                     .table_insert_mvcc(table_id, vec![Val::from(3), Val::from(3)])
                     .await;

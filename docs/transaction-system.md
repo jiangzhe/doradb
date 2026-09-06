@@ -595,6 +595,22 @@ and whole-transaction cleanup path. Application payloads do not enter mandatory
 cleanup, and the separate private transaction runner retains its typed fatal
 boundary.
 
+Unique-point `table_unique_mutate_mvcc` uses index write admission and
+transaction-lifetime `TableData(IX)`, with MemIndex-first point lookup. Its
+`FnOnce` callback receives an owned current row or a missing observation without
+a gap lock. Selection and prepare/transition retries precede the callback.
+Missing-only insertion must agree with the selected key. Hot actions retain the
+write access through decision and undo conversion; cold actions synchronously
+register a fresh claim's provisional undo before calling user code. An earlier
+same-transaction cold marker denotes a consumed image and cannot be cancelled
+by a later callback. Point cold deletion committed after the writer's STS can
+conflict, preserving timestamp information before durable-delete membership.
+`Skip` and empty updates cancel only the new provisional ownership. Empty
+updates return the original RowID without physical movement. The callback method
+is the sole public unique-key mutation boundary.
+Point driver-key changes apply immediately. Updates that physically insert a
+replacement return `UniqueMutationOutcome::Updated` with the replacement RowID.
+
 Sequential full-table MVCC mutation acquires transaction-lifetime
 `TableMetadata(S)` followed by `TableData(X)` before it captures the table root
 and original hot-page worklist or invokes its row callback. The callback may

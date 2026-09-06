@@ -15,8 +15,8 @@ use crate::lock::{LockMode, LockResource};
 use crate::log::redo::{RedoLogs, RowRedo};
 use crate::obs;
 use crate::row::ops::{
-    DeleteMvcc, RowMutation, ScanMvcc, SelectMvcc, TableMutationOutcome, UpdateCol, UpdateMvcc,
-    UpsertMvcc,
+    DeleteMvcc, RowMutation, ScanMvcc, SelectMvcc, TableMutationOutcome, UniqueMutation,
+    UniqueMutationOutcome, UpdateCol,
 };
 use crate::session::TrxAttachment;
 use crate::table::{DmlValidator, LazyRow};
@@ -967,62 +967,17 @@ impl<'stmt> Statement<'stmt> {
         Ok(row_ids)
     }
 
-    /// Inserts or replaces one catalog-owned user-table row by table id and unique key.
-    ///
-    /// Strong table-runtime access is internal and operation-local.
-    #[inline]
-    pub(super) async fn table_upsert_unique_mvcc(
-        mut self,
-        selector: TableIndexSelector,
-        cols: Vec<Val>,
-    ) -> Result<UpsertMvcc> {
-        const OPERATION: &str = "table_upsert_unique_mvcc";
-        let table_id = selector.table_id();
-        let AdmittedUserIndex {
-            table,
-            layout,
-            index,
-        } = self
-            .admit_user_index(selector, true, OPERATION)
-            .await
-            .disclose()?;
-        if !self.dml_validation_disabled {
-            let validator = DmlValidator::new(layout.metadata());
-            validator
-                .validate_full_row(&cols)
-                .change_context(OperationError::InvalidDmlInput)
-                .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
-                .disclose()?;
-            validator
-                .validate_unique_index(index.slot())
-                .change_context(OperationError::InvalidDmlInput)
-                .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
-                .disclose()?;
-        }
-        self.acquire_table_write_data_lock(table_id)
-            .await
-            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
-            .disclose()?;
-        let (rt, effects) = self.runtime_and_effects_mut();
-        table
-            .accessor_with_layout(&layout)
-            .upsert_unique_mvcc(rt, effects, index, cols, false)
-            .await
-            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
-            .disclose()
-    }
-
-    /// Updates one catalog-owned user-table row by table id and unique key.
-    ///
-    /// Strong table-runtime access is internal and operation-local.
-    #[inline]
-    pub(super) async fn table_update_unique_mvcc(
+    /// Admits one unique-point callback through the ordinary statement lifecycle.
+    pub(super) async fn table_unique_mutate_mvcc<F, E>(
         mut self,
         selector: TableIndexSelector,
         key_vals: &[Val],
-        update: Vec<UpdateCol>,
-    ) -> Result<UpdateMvcc> {
-        const OPERATION: &str = "table_update_unique_mvcc";
+        mutate_row: F,
+    ) -> CallbackResult<UniqueMutationOutcome, E>
+    where
+        F: for<'row> FnOnce(Option<&mut LazyRow<'row>>) -> CallbackResult<UniqueMutation, E>,
+    {
+        const OPERATION: &str = "table_unique_mutate_mvcc";
         let table_id = selector.table_id();
         let AdmittedUserIndex {
             table,
@@ -1032,53 +987,16 @@ impl<'stmt> Statement<'stmt> {
             .admit_user_index(selector, true, OPERATION)
             .await
             .disclose()?;
-        if !self.dml_validation_disabled {
-            let validator = DmlValidator::new(layout.metadata());
-            validator
-                .validate_unique_key(index.slot(), key_vals)
-                .change_context(OperationError::InvalidDmlInput)
-                .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
-                .disclose()?;
-            validator
-                .validate_sparse_update(&update)
-                .change_context(OperationError::InvalidDmlInput)
-                .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
-                .disclose()?;
-        }
-        self.acquire_table_write_data_lock(table_id)
-            .await
-            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+        let validate = !self.dml_validation_disabled;
+        let validator = DmlValidator::new(layout.metadata());
+        // Uniqueness is part of this operation's semantic contract, including
+        // trusted-payload mode. Ordinary key/payload validation remains optional.
+        validator
+            .validate_unique_index(index.slot())
+            .change_context(OperationError::InvalidDmlInput)
             .disclose()?;
-        let (rt, effects) = self.runtime_and_effects_mut();
-        table
-            .accessor_with_layout(&layout)
-            .update_unique_mvcc(rt, effects, index, key_vals, update, false)
-            .await
-            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
-            .disclose()
-    }
-
-    /// Deletes one catalog-owned user-table row by table id and unique key.
-    ///
-    /// Strong table-runtime access is internal and operation-local.
-    #[inline]
-    pub(super) async fn table_delete_unique_mvcc(
-        mut self,
-        selector: TableIndexSelector,
-        key_vals: &[Val],
-    ) -> Result<DeleteMvcc> {
-        const OPERATION: &str = "table_delete_unique_mvcc";
-        let table_id = selector.table_id();
-        let AdmittedUserIndex {
-            table,
-            layout,
-            index,
-        } = self
-            .admit_user_index(selector, true, OPERATION)
-            .await
-            .disclose()?;
-        if !self.dml_validation_disabled {
-            DmlValidator::new(layout.metadata())
+        if validate {
+            validator
                 .validate_unique_key(index.slot(), key_vals)
                 .change_context(OperationError::InvalidDmlInput)
                 .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
@@ -1091,10 +1009,8 @@ impl<'stmt> Statement<'stmt> {
         let (rt, effects) = self.runtime_and_effects_mut();
         table
             .accessor_with_layout(&layout)
-            .delete_unique_mvcc(rt, effects, index, key_vals)
+            .unique_mutate_mvcc(rt, effects, index, key_vals, validate, mutate_row)
             .await
-            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
-            .disclose()
     }
 
     /// Inserts one catalog-table row through the foreground lock-aware path.
@@ -1555,6 +1471,7 @@ pub(crate) mod tests {
     use crate::log::redo::RowRedoKind;
     use crate::row::RowPage;
     use crate::row::ops::SelectKey;
+    use crate::row::ops::{UpdateMvcc, UpsertMvcc};
     use crate::session::{SessionState, tests as session_tests};
     use crate::table::tests::{
         lock_hot_row_then_wait_and_error_operation, transition_delete_operation,
