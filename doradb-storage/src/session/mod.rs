@@ -11,7 +11,7 @@ use crate::catalog::{
     ValidatedCreateTable, create_index_catalog_write_targets, create_table_catalog_write_targets,
     drop_index_catalog_write_targets, drop_table_catalog_write_targets,
     prepare_catalog_checkpoint_operation, reject_non_user_table_id,
-    reject_user_table_primary_key_index, validated_index_ddl_target,
+    reject_user_table_primary_key_index,
 };
 use crate::engine::{EngineAdmission, EngineCore, EngineLifecycle};
 use crate::error::{
@@ -299,16 +299,12 @@ impl PreparedMaintenanceScope {
     }
 
     /// Resolve and retain the authoritative current-live table under locks.
-    pub(crate) async fn resolve_user_table(
-        &self,
-        table_id: TableID,
-    ) -> OperationResult<Arc<Table>> {
+    pub(crate) fn resolve_user_table(&self, table_id: TableID) -> OperationResult<Arc<Table>> {
         let table = self
             .operation
             .runtime
             .catalog()
-            .validate_user_table_live(table_id)
-            .await?;
+            .validate_user_table_live(table_id)?;
         self.operation.runtime.state().cache_user_table(&table);
         Ok(table)
     }
@@ -1199,10 +1195,11 @@ impl Session {
         .attach_with(|| format!("prepare CREATE INDEX locks: table_id={table_id}"))
         .disclose()?;
         let engine = scope.engine();
-        let table =
-            validated_index_ddl_target(engine, engine.pool_guards(), table_id, "create_index")
-                .await
-                .disclose()?;
+        let table = engine
+            .catalog()
+            .validate_user_table_live(table_id)
+            .attach("operation=create_index")
+            .disclose()?;
         engine.poisoner.ensure_healthy().disclose()?;
         let gates = IndexDdlGateScope::acquire(Arc::clone(&table), engine.catalog_guard())
             .await
@@ -1249,10 +1246,11 @@ impl Session {
                 .attach_with(|| format!("prepare DROP INDEX locks: table_id={table_id}"))
                 .disclose()?;
         let engine = scope.engine();
-        let table =
-            validated_index_ddl_target(engine, engine.pool_guards(), table_id, "drop_index")
-                .await
-                .disclose()?;
+        let table = engine
+            .catalog()
+            .validate_user_table_live(table_id)
+            .attach("operation=drop_index")
+            .disclose()?;
         engine.poisoner.ensure_healthy().disclose()?;
         let gates = IndexDdlGateScope::acquire(Arc::clone(&table), engine.catalog_guard())
             .await
@@ -1532,7 +1530,6 @@ impl Session {
             .disclose()?;
         let table = scope
             .resolve_user_table(table_id)
-            .await
             .attach_with(|| format!("operation=freeze_table, table_id={table_id}"))
             .disclose()?;
         scope.engine().poisoner.ensure_healthy().disclose()?;
@@ -1572,7 +1569,6 @@ impl Session {
             .disclose()?;
         let table = scope
             .resolve_user_table(table_id)
-            .await
             .attach_with(|| format!("operation=checkpoint_table, table_id={table_id}"))
             .disclose()?;
         scope.engine().poisoner.ensure_healthy().disclose()?;
@@ -1724,7 +1720,6 @@ impl Session {
             .disclose()?;
         let table = scope
             .resolve_user_table(table_id)
-            .await
             .attach_with(|| format!("operation=cleanup_secondary_mem_indexes, table_id={table_id}"))
             .disclose()?;
         scope.engine().poisoner.ensure_healthy().disclose()?;
@@ -1988,7 +1983,7 @@ impl SessionOperationPin {
             self.kind().label()
         );
         self.acquire_maintenance_table(table_id).await?;
-        let table = self.resolve_user_table(table_id).await?;
+        let table = self.resolve_user_table(table_id)?;
         Ok(SessionTable {
             table,
             session: self,
@@ -2073,15 +2068,8 @@ impl SessionOperationPin {
 
     /// Resolve a live user table from authoritative current catalog state.
     #[inline]
-    pub(crate) async fn resolve_user_table(
-        &self,
-        table_id: TableID,
-    ) -> OperationResult<Arc<Table>> {
-        let table = self
-            .runtime
-            .catalog()
-            .validate_user_table_live(table_id)
-            .await?;
+    pub(crate) fn resolve_user_table(&self, table_id: TableID) -> OperationResult<Arc<Table>> {
+        let table = self.runtime.catalog().validate_user_table_live(table_id)?;
         self.runtime.state().cache_user_table(&table);
         Ok(table)
     }
@@ -2106,7 +2094,7 @@ impl SessionOperationPin {
         fresh
             .acquire(LockResource::TableData(table_id), mode)
             .await?;
-        engine.catalog().validate_user_table_live(table_id).await?;
+        engine.catalog().validate_user_table_live(table_id)?;
         fresh.disarm();
         Ok(())
     }
@@ -4173,7 +4161,7 @@ pub(crate) mod tests {
         let table = session
             .engine()
             .catalog()
-            .get_table_now(table_id)
+            .get_table(table_id)
             .expect("test table should exist");
         let effective_ts = table.file().active_root_unchecked().effective_ts();
         let min_active_sts = session.engine().trx_sys.calc_min_active_sts_for_gc();
@@ -6180,15 +6168,7 @@ pub(crate) mod tests {
             let engine = Engine::bootstrap(EngineConfig::default().storage_root(&main_dir))
                 .await
                 .unwrap();
-            assert!(
-                engine
-                    .inner()
-                    .core
-                    .catalog()
-                    .get_table(table_id)
-                    .await
-                    .is_some()
-            );
+            assert!(engine.inner().core.catalog().get_table(table_id).is_some());
             assert!(
                 engine
                     .inner()
@@ -6361,13 +6341,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
             let table_id = create_rotated_redo_table(&engine, &main_dir, log_file_stem, 2).await;
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table(table_id)
-                .await
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             let root_floor = table.redo_replay_floor_snapshot();
             drop(table);
             let mut session = engine.new_session().unwrap();
@@ -6817,27 +6791,13 @@ pub(crate) mod tests {
             let table_id = create_rotated_redo_table(&engine, &main_dir, log_file_stem, 1).await;
             let mut session = engine.new_session().unwrap();
             session.checkpoint_catalog().await.unwrap();
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table(table_id)
-                .await
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             let expected_floor = table.redo_replay_floor_snapshot();
             drop(table);
 
             session.drop_table(table_id).await.unwrap();
 
-            assert!(
-                engine
-                    .inner()
-                    .core
-                    .catalog()
-                    .get_table(table_id)
-                    .await
-                    .is_none()
-            );
+            assert!(engine.inner().core.catalog().get_table(table_id).is_none());
             assert_eq!(session.list_table_ids().unwrap(), Vec::<TableID>::new());
             let plan = engine.inner().trx_sys.plan_redo_truncation().unwrap();
             assert!(

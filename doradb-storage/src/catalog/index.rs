@@ -37,9 +37,9 @@ use std::any::Any;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 #[cfg(test)]
-pub(crate) use tests::IndexDdlTestController;
+use tests::CreateIndexTestFailure;
 #[cfg(test)]
-use tests::{CreateIndexTestFailure, IndexDdlTestPhase};
+pub(crate) use tests::{IndexDdlTestController, IndexDdlTestPhase};
 
 const CREATE_INDEX_CATALOG_WRITE_TARGETS: [TableID; 3] = [
     TABLE_ID_TABLES,
@@ -1201,6 +1201,16 @@ impl AcceptedCreateIndex {
             .index_ddl_test
             .reach_phase(IndexDdlTestPhase::CreateCatalogStaged)
             .await;
+        #[cfg(test)]
+        if let Err(err) = engine
+            .index_ddl_test
+            .maybe_fail_phase(IndexDdlTestPhase::CreateCatalogStaged)
+        {
+            if let Err(cleanup) = progress.rollback_before_catalog_commit(guards).await {
+                return Err(CompletionErrorBridge::capture_runtime_or_fatal(cleanup));
+            }
+            return Err(CompletionErrorBridge::capture(err));
+        }
         let create_cts = progress
             .commit_catalog(guards)
             .await
@@ -1210,6 +1220,22 @@ impl AcceptedCreateIndex {
             .index_ddl_test
             .reach_phase(IndexDdlTestPhase::CreateCatalogCommitted)
             .await;
+        #[cfg(test)]
+        if let Err(err) = engine
+            .index_ddl_test
+            .maybe_fail_phase(IndexDdlTestPhase::CreateCatalogCommitted)
+        {
+            return Err(CompletionErrorBridge::capture_runtime_or_fatal(
+                progress
+                    .cleanup_after_catalog_commit_failure(
+                        engine,
+                        guards,
+                        "test_CatalogCommitted",
+                        RuntimeOrFatalError::from(err),
+                    )
+                    .await,
+            ));
+        }
 
         if let Err(err) = engine
             .trx_sys
@@ -1232,6 +1258,22 @@ impl AcceptedCreateIndex {
             .index_ddl_test
             .reach_phase(IndexDdlTestPhase::CreateRootPublished)
             .await;
+        #[cfg(test)]
+        if let Err(err) = engine
+            .index_ddl_test
+            .maybe_fail_phase(IndexDdlTestPhase::CreateRootPublished)
+        {
+            return Err(CompletionErrorBridge::capture_runtime_or_fatal(
+                progress
+                    .cleanup_after_catalog_commit_failure(
+                        engine,
+                        guards,
+                        "test_RootPublished",
+                        RuntimeOrFatalError::from(err),
+                    )
+                    .await,
+            ));
+        }
 
         let new_layout = progress.take_layout_for_install();
         if engine
@@ -1449,6 +1491,16 @@ impl AcceptedDropIndex {
             .index_ddl_test
             .reach_phase(IndexDdlTestPhase::DropCatalogStaged)
             .await;
+        #[cfg(test)]
+        if let Err(err) = engine
+            .index_ddl_test
+            .maybe_fail_phase(IndexDdlTestPhase::DropCatalogStaged)
+        {
+            if let Err(cleanup) = progress.rollback_before_catalog_commit().await {
+                return Err(CompletionErrorBridge::capture_runtime_or_fatal(cleanup));
+            }
+            return Err(CompletionErrorBridge::capture(err));
+        }
         let drop_cts = progress
             .commit_catalog()
             .await
@@ -1458,6 +1510,21 @@ impl AcceptedDropIndex {
             .index_ddl_test
             .reach_phase(IndexDdlTestPhase::DropCatalogCommitted)
             .await;
+        #[cfg(test)]
+        if let Err(err) = engine
+            .index_ddl_test
+            .maybe_fail_phase(IndexDdlTestPhase::DropCatalogCommitted)
+        {
+            return Err(CompletionErrorBridge::capture_runtime_or_fatal(
+                progress
+                    .cleanup_after_catalog_commit_failure(
+                        &engine.poisoner,
+                        "test_CatalogCommitted",
+                        RuntimeOrFatalError::from(err),
+                    )
+                    .await,
+            ));
+        }
 
         if let Err(err) = engine
             .trx_sys
@@ -1479,6 +1546,21 @@ impl AcceptedDropIndex {
             .index_ddl_test
             .reach_phase(IndexDdlTestPhase::DropRootPublished)
             .await;
+        #[cfg(test)]
+        if let Err(err) = engine
+            .index_ddl_test
+            .maybe_fail_phase(IndexDdlTestPhase::DropRootPublished)
+        {
+            return Err(CompletionErrorBridge::capture_runtime_or_fatal(
+                progress
+                    .cleanup_after_catalog_commit_failure(
+                        &engine.poisoner,
+                        "test_RootPublished",
+                        RuntimeOrFatalError::from(err),
+                    )
+                    .await,
+            ));
+        }
 
         let new_layout = progress.take_layout_for_install();
         if engine
@@ -1925,8 +2007,9 @@ pub(crate) mod tests {
         AfterRuntimeStaged,
     }
 
+    /// Accepted DDL boundaries available to deterministic concurrency fixtures.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(super) enum IndexDdlTestPhase {
+    pub(crate) enum IndexDdlTestPhase {
         CreateBeforeFirstEffect,
         CreatePrivateTransactionBegun,
         CreateColdCollectionComplete,
@@ -1964,6 +2047,7 @@ pub(crate) mod tests {
     struct IndexDdlTestState {
         create_failure: parking_lot::Mutex<Option<CreateIndexTestFailure>>,
         panic_phase: parking_lot::Mutex<Option<IndexDdlTestPhase>>,
+        failure_phase: parking_lot::Mutex<Option<IndexDdlTestPhase>>,
         gate: parking_lot::Mutex<Option<IndexDdlTestGate>>,
         publication_gate: parking_lot::Mutex<Option<IndexDdlPublicationGate>>,
     }
@@ -1986,11 +2070,27 @@ pub(crate) mod tests {
             Ok(())
         }
 
+        /// Injects a typed failure at one catalog staging or publication boundary.
+        pub(crate) fn set_failure_phase(&self, phase: IndexDdlTestPhase) {
+            *self.state.failure_phase.lock() = Some(phase);
+        }
+
+        pub(super) fn maybe_fail_phase(&self, phase: IndexDdlTestPhase) -> RuntimeResult<()> {
+            let mut failure = self.state.failure_phase.lock();
+            if *failure == Some(phase) {
+                *failure = None;
+                return Err(Report::new(RuntimeError::IndexAccess)
+                    .attach("operation=test_index_phase_failure"));
+            }
+            Ok(())
+        }
+
         fn set_create_failure(&self, failure: Option<CreateIndexTestFailure>) {
             *self.state.create_failure.lock() = failure;
         }
 
-        fn install_gate(
+        /// Pauses accepted DDL at one semantic boundary.
+        pub(crate) fn install_gate(
             &self,
             phase: IndexDdlTestPhase,
         ) -> (flume::Receiver<()>, flume::Sender<()>) {
@@ -2012,7 +2112,8 @@ pub(crate) mod tests {
             *self.state.panic_phase.lock() = phase;
         }
 
-        fn install_publication_gate(
+        /// Pauses while layout and current state are being atomically published.
+        pub(crate) fn install_publication_gate(
             &self,
             kind: IndexDdlKind,
         ) -> (flume::Receiver<()>, flume::Sender<()>) {
@@ -2190,7 +2291,7 @@ pub(crate) mod tests {
             .inner()
             .core
             .catalog()
-            .get_table_now(table_id)
+            .get_table(table_id)
             .expect("test table should exist")
     }
 
@@ -3753,13 +3854,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
             let table_id = table2(&engine).await;
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table(table_id)
-                .await
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             let mut session = engine.new_session().unwrap();
             let row_id = insert_one_row(
                 table_id,
@@ -3797,13 +3892,7 @@ pub(crate) mod tests {
             ))
             .await
             .unwrap();
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table(table_id)
-                .await
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             assert_eq!(table.metadata().idx.index_slot_count_u32(), 2);
             assert!(table.metadata().idx.index_spec(IndexSlot::new(1)).is_some());
             let session = engine.new_session().unwrap();
@@ -3832,13 +3921,7 @@ pub(crate) mod tests {
                     .await
                     .unwrap();
             let table_id = table2(&engine).await;
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table(table_id)
-                .await
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             let mut session = engine.new_session().unwrap();
 
             assert_eq!(
@@ -3893,13 +3976,7 @@ pub(crate) mod tests {
             let engine = Engine::bootstrap(lightweight_test_engine_config(main_dir, log_stem))
                 .await
                 .unwrap();
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table(table_id)
-                .await
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             assert_eq!(table.metadata().idx.index_slot_count_u32(), 2);
             assert!(table.metadata().idx.index_spec(IndexSlot::new(1)).is_none());
             assert_eq!(

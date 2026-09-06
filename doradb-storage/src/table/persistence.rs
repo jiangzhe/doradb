@@ -3114,14 +3114,7 @@ mod tests {
             redo_cts
         };
         assert!(checkpoint_redo_cts < drop_session.last_cts());
-        assert!(
-            engine
-                .inner()
-                .core
-                .catalog()
-                .get_table_now(table_id)
-                .is_none()
-        );
+        assert!(engine.inner().core.catalog().get_table(table_id).is_none());
     }
 
     async fn assert_transition_route_registration_case(case: TransitionRouteRegistrationCase) {
@@ -6164,14 +6157,7 @@ mod tests {
             release_tx.send_async(()).await.unwrap();
             assert_freeze_created(freeze.await.unwrap());
             drop_table.await.unwrap();
-            assert!(
-                engine
-                    .inner()
-                    .core
-                    .catalog()
-                    .get_table_now(table_id)
-                    .is_none()
-            );
+            assert!(engine.inner().core.catalog().get_table(table_id).is_none());
         });
     }
 
@@ -6414,14 +6400,7 @@ mod tests {
                 redo_cts
             };
             assert!(checkpoint_redo_cts < drop_session.last_cts());
-            assert!(
-                engine
-                    .inner()
-                    .core
-                    .catalog()
-                    .get_table_now(table_id)
-                    .is_none()
-            );
+            assert!(engine.inner().core.catalog().get_table(table_id).is_none());
         });
     }
 
@@ -8001,7 +7980,7 @@ mod tests {
                 .inner()
                 .core
                 .catalog()
-                .get_table_now(table_id)
+                .get_table(table_id)
                 .expect("test table should exist");
             let mut session = engine.new_session().unwrap();
             let name = "z".repeat(512);

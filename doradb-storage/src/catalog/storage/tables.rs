@@ -35,6 +35,18 @@ pub(crate) struct Tables<'a> {
 }
 
 impl Tables<'_> {
+    /// Resets the parent-row lookup counter for one table on the calling thread.
+    #[cfg(test)]
+    pub(crate) fn reset_lookup_count(table_id: TableID) {
+        tests::reset_lookup_count(table_id);
+    }
+
+    /// Returns this thread's parent-row lookup count for the selected table.
+    #[cfg(test)]
+    pub(crate) fn lookup_count() -> usize {
+        tests::lookup_count()
+    }
+
     /// List all table rows from uncommitted-visible catalog state.
     pub(crate) async fn list_uncommitted(
         &self,
@@ -76,6 +88,8 @@ impl Tables<'_> {
         guards: &PoolGuards,
         table_id: TableID,
     ) -> RuntimeResult<Option<TableObject>> {
+        #[cfg(test)]
+        tests::record_lookup(table_id);
         let key_vals = [Val::from(table_id)];
         let vals = self
             .table
@@ -253,7 +267,30 @@ mod tests {
     use crate::catalog::tests::{open_catalog_test_engine, table1};
     use crate::log::redo::DDLRedo;
     use crate::session::tests::SessionTestExt;
+    use std::cell::Cell;
     use tempfile::TempDir;
+
+    thread_local! {
+        static TABLE_LOOKUPS: Cell<(Option<TableID>, usize)> = const { Cell::new((None, 0)) };
+    }
+
+    /// Selects a table and clears its foreground lookup count.
+    pub(super) fn reset_lookup_count(table_id: TableID) {
+        TABLE_LOOKUPS.set((Some(table_id), 0));
+    }
+
+    /// Returns the selected table's foreground lookup count.
+    pub(super) fn lookup_count() -> usize {
+        TABLE_LOOKUPS.get().1
+    }
+
+    /// Records a parent-row lookup for the selected table on this thread.
+    pub(super) fn record_lookup(table_id: TableID) {
+        let (target, count) = TABLE_LOOKUPS.get();
+        if target == Some(table_id) {
+            TABLE_LOOKUPS.set((target, count + 1));
+        }
+    }
 
     #[test]
     fn test_tables_delete_by_id() {

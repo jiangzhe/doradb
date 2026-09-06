@@ -46,8 +46,8 @@ use crate::buffer::{
 };
 use crate::component::{Component, ComponentRegistry, MetaPool, ShelfScope};
 use crate::error::{
-    DataIntegrityError, DataIntegrityResult, FatalError, OperationError, OperationResult,
-    RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
+    DataIntegrityError, DataIntegrityResult, FatalError, OperationError, OperationOrRuntimeResult,
+    OperationResult, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
 };
 use crate::file::fs::FileSystem;
 use crate::id::{RowID, TableID, TrxID};
@@ -70,6 +70,10 @@ use std::ops::Deref;
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
+#[cfg(test)]
+pub(crate) use tests::{
+    current_table_lookup_count, full_current_table_lookup_count, reset_current_table_lookup_count,
+};
 
 /// First table id allocated to user-managed tables.
 pub(crate) const USER_TABLE_ID_START: TableID = TableID::new(0);
@@ -177,6 +181,7 @@ struct IndexLayoutPublication<'a> {
     expected_table: &'a Arc<Table>,
     expected_old_layout: &'a Arc<TableRuntimeLayout>,
     new_layout: TableRuntimeLayout,
+    managed_definition: Option<&'a Arc<ManagedTableDefinition>>,
 }
 
 /// Catalog contains metadata of user tables.
@@ -416,10 +421,9 @@ impl Catalog {
             })?,
         );
         let metadata = table.metadata();
-        let old = self.user_tables.insert(
-            table_id,
-            UserTableEntry::new_live(TrxID::new(0), metadata, table),
-        );
+        let old = self
+            .user_tables
+            .insert(table_id, UserTableEntry::new_recovery_live(metadata, table));
         assert!(
             old.is_none(),
             "catalog reload invariant violated: table runtime inserted concurrently, table_id={table_id}"
@@ -467,35 +471,135 @@ impl Catalog {
     pub(crate) async fn validate_live_table_descriptors(
         &self,
         guards: &PoolGuards,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeResult<Vec<TableDescriptorObject>> {
         let descriptors = self
             .storage
             .table_descriptors()
             .list_uncommitted(guards)
             .await?;
-        for descriptor in descriptors {
+        for descriptor in &descriptors {
             let table_id = descriptor.table_id;
             let (_, metadata) = self
                 .user_table_metadata_from_catalog(guards, table_id)
                 .await?;
-            validate_table_descriptor_against_metadata(&descriptor, table_id, &metadata)
+            validate_table_descriptor_against_metadata(descriptor, table_id, &metadata)
                 .change_context(RuntimeError::CatalogAccess)
                 .attach_with(|| {
                     format!("operation=validate_live_table_descriptors, table_id={table_id}")
                 })?;
         }
+        Ok(descriptors)
+    }
+
+    /// Hydrates every managed runtime only after final recovery reconciliation.
+    pub(crate) fn hydrate_recovered_managed_definitions(
+        &self,
+        descriptors: Vec<TableDescriptorObject>,
+    ) -> DataIntegrityResult<()> {
+        let mut remaining = FastHashMap::default();
+        for descriptor in descriptors {
+            let table_id = descriptor.table_id;
+            if remaining.insert(table_id, descriptor).is_some() {
+                return Err(
+                    Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                        "duplicate recovered descriptor: table_id={table_id}"
+                    )),
+                );
+            }
+        }
+        // Snapshot runtimes first: projection and hashing never hold map guards.
+        for table in self.snapshot_live_user_tables() {
+            let table_id = table.table_id();
+            let descriptor = remaining.remove(&table_id);
+            if table.definition_kind().is_managed() != descriptor.is_some() {
+                return Err(
+                    Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                        "recovered descriptor ownership mismatch: table_id={table_id}"
+                    )),
+                );
+            }
+            if let Some(descriptor) = descriptor {
+                let definition = Arc::new(ManagedTableDefinition::recover(
+                    table_id,
+                    &table.metadata(),
+                    descriptor,
+                )?);
+                let mut entry = self.user_tables.get_mut(&table_id).ok_or_else(|| {
+                    Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                        "recovered definition runtime is absent: table_id={table_id}"
+                    ))
+                })?;
+                entry.hydrate_recovered_definition(definition)?;
+            }
+            let current = self.resolve_user_table_current(table_id).ok_or_else(|| {
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                    "recovered current state is absent: table_id={table_id}"
+                ))
+            })?;
+            current.managed_definition(table_id)?;
+        }
+        if !remaining.is_empty() {
+            return Err(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                    "recovered descriptors without live runtimes: count={}",
+                    remaining.len()
+                )),
+            );
+        }
         Ok(())
     }
 
-    /// Get a user-table runtime handle by table id.
-    #[inline]
-    pub(crate) async fn get_table(&self, table_id: TableID) -> Option<Arc<Table>> {
-        self.get_table_now(table_id)
+    /// Returns a binding target's admitted definition without cloning its full current state.
+    ///
+    /// The caller must hold target metadata admission. Missing or unmanaged targets
+    /// are binding integrity failures; generation validation preserves its native report.
+    pub(crate) fn binding_target_definition(
+        &self,
+        table_id: TableID,
+    ) -> DataIntegrityResult<Arc<ManagedTableDefinition>> {
+        let invalid_target = |reason| {
+            Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
+                "managed table binding integrity failure: table_id={table_id}, reason={reason}"
+            ))
+        };
+        #[cfg(test)]
+        tests::record_current_table_lookup(table_id);
+        let entry = self
+            .user_tables
+            .get(&table_id)
+            .ok_or_else(|| invalid_target("current runtime is missing"))?;
+        let current = entry
+            .current_state_ref()
+            .ok_or_else(|| invalid_target("current runtime is missing"))?;
+        current
+            .managed_definition(table_id)?
+            .cloned()
+            .ok_or_else(|| invalid_target("binding targets an unmanaged runtime"))
+    }
+
+    /// Captures an admitted managed DDL generation, preserving target error semantics.
+    pub(crate) fn current_managed_definition(
+        &self,
+        table_id: TableID,
+    ) -> OperationOrRuntimeResult<Arc<ManagedTableDefinition>> {
+        let table_not_found = || {
+            Report::new(OperationError::TableNotFound).attach(format!(
+                "managed definition target is absent: table_id={table_id}"
+            ))
+        };
+        #[cfg(test)]
+        tests::record_current_table_lookup(table_id);
+        let entry = self
+            .user_tables
+            .get(&table_id)
+            .ok_or_else(table_not_found)?;
+        let current = entry.current_state_ref().ok_or_else(table_not_found)?;
+        current.require_managed_definition(table_id)
     }
 
     /// Get a user-table runtime handle synchronously by table id.
     #[inline]
-    pub(crate) fn get_table_now(&self, table_id: TableID) -> Option<Arc<Table>> {
+    pub(crate) fn get_table(&self, table_id: TableID) -> Option<Arc<Table>> {
         self.current_live_user_table(table_id)
     }
 
@@ -523,6 +627,8 @@ impl Catalog {
         if table_id.is_catalog() {
             return None;
         }
+        #[cfg(test)]
+        tests::record_full_current_table_lookup(table_id);
         self.user_tables
             .get(&table_id)
             .and_then(|entry| entry.value().resolve_current())
@@ -531,8 +637,11 @@ impl Catalog {
     /// Return the direct current live runtime without consulting history.
     #[inline]
     pub(crate) fn current_live_user_table(&self, table_id: TableID) -> Option<Arc<Table>> {
-        self.resolve_user_table_current(table_id)
-            .and_then(|current| current.live_table().map(Arc::clone))
+        #[cfg(test)]
+        tests::record_current_table_lookup(table_id);
+        self.user_tables
+            .get(&table_id)
+            .and_then(|entry| entry.current_live_table())
     }
 
     /// Snapshot all current live user-table runtimes without retaining map guards.
@@ -683,15 +792,43 @@ impl Catalog {
 
     /// Validates that a user-table runtime exists and still admits foreground work.
     #[inline]
-    pub(crate) async fn validate_user_table_live(
+    pub(crate) fn validate_user_table_live(
         &self,
         table_id: TableID,
     ) -> OperationResult<Arc<Table>> {
-        let table = self.get_table(table_id).await.ok_or_else(|| {
+        let table = self.get_table(table_id).ok_or_else(|| {
             Report::new(OperationError::TableNotFound).attach(format!("table_id={table_id}"))
         })?;
         table.check_foreground_live()?;
         Ok(table)
+    }
+
+    /// Validates an admitted current table and clones only its runtime and optional definition.
+    ///
+    /// The caller must retain target metadata admission while using the returned pair.
+    /// Consistency checks borrow current metadata under the catalog entry guard.
+    pub(crate) fn validate_user_table_current(
+        &self,
+        table_id: TableID,
+    ) -> OperationOrRuntimeResult<(Arc<Table>, Option<Arc<ManagedTableDefinition>>)> {
+        let table_not_found =
+            || Report::new(OperationError::TableNotFound).attach(format!("table_id={table_id}"));
+        #[cfg(test)]
+        tests::record_current_table_lookup(table_id);
+        let entry = self
+            .user_tables
+            .get(&table_id)
+            .ok_or_else(table_not_found)?;
+        let current = entry.current_state_ref().ok_or_else(table_not_found)?;
+        let table = current.live_table().ok_or_else(table_not_found)?;
+        table.check_foreground_live()?;
+        let definition = current
+            .managed_definition(table_id)
+            .change_context(RuntimeError::CatalogAccess)
+            .attach(format!(
+                "operation=read_managed_definition, table_id={table_id}"
+            ))?;
+        Ok((Arc::clone(table), definition.cloned()))
     }
 
     /// Get a catalog-table runtime handle by table id.
@@ -702,12 +839,25 @@ impl Catalog {
 
     /// Insert a user table runtime into the in-memory cache.
     #[inline]
-    pub(crate) fn insert_user_table(&self, effective_cts: TrxID, table: Arc<Table>) -> bool {
+    pub(crate) fn insert_user_table(
+        &self,
+        effective_cts: TrxID,
+        table: Arc<Table>,
+        definition: Option<Arc<ManagedTableDefinition>>,
+    ) -> bool {
         let table_id = table.table_id();
         let metadata = table.metadata();
+        if !managed_definition_matches(&table, &metadata, definition.as_ref()) {
+            return false;
+        }
         match self.user_tables.entry(table_id) {
             Vacant(entry) => {
-                entry.insert(UserTableEntry::new_live(effective_cts, metadata, table));
+                entry.insert(UserTableEntry::new_live(
+                    effective_cts,
+                    metadata,
+                    table,
+                    definition,
+                ));
                 true
             }
             Occupied(_) => false,
@@ -740,6 +890,7 @@ impl Catalog {
             expected_table: plan.table(),
             expected_old_layout: plan.old_layout(),
             new_layout,
+            managed_definition: plan.definition_effects().managed_definition(),
         };
         self.install_index_layout_and_publish_history(
             publication,
@@ -770,6 +921,7 @@ impl Catalog {
             expected_table: plan.table(),
             expected_old_layout: plan.old_layout(),
             new_layout,
+            managed_definition: plan.definition_effects().managed_definition(),
         };
         self.install_index_layout_and_publish_history(
             publication,
@@ -801,12 +953,23 @@ impl Catalog {
             expected_table,
             expected_old_layout,
             new_layout,
+            managed_definition: definition,
         } = publication;
         let table_id = expected_table.table_id();
         new_layout.assert_valid();
         let new_layout = Arc::new(new_layout);
         match self.user_tables.entry(table_id) {
             Occupied(mut entry) => {
+                let current = entry.get().current_state_ref()?;
+                if current.managed_definition(table_id).is_err()
+                    || !managed_definition_matches(
+                        expected_table,
+                        new_layout.metadata(),
+                        definition,
+                    )
+                {
+                    return None;
+                }
                 let expected_metadata = expected_old_layout.metadata_arc();
                 if !entry.get_mut().prepare_publish_live(
                     effective_cts,
@@ -818,9 +981,11 @@ impl Catalog {
                 install_layout(Arc::clone(&new_layout))?;
                 #[cfg(test)]
                 test_hook.0.reach_publication_interval(test_hook.1);
-                entry
-                    .get_mut()
-                    .commit_publish_live(effective_cts, Arc::clone(new_layout.metadata_arc()));
+                entry.get_mut().commit_publish_live(
+                    effective_cts,
+                    Arc::clone(new_layout.metadata_arc()),
+                    definition.cloned(),
+                );
             }
             Vacant(_) => return None,
         }
@@ -1166,9 +1331,8 @@ impl<'a> TableCache<'a> {
     /// If table is not cached, this method loads it from catalog and caches
     /// positive/negative lookup result.
     #[inline]
-    pub(crate) async fn get_user_table(&mut self, table_id: TableID) -> Option<&Table> {
+    pub(crate) fn get_user_table(&mut self, table_id: TableID) -> Option<&Table> {
         self.get_user_entry_mut(table_id)
-            .await
             .map(|binding| binding.table())
     }
 
@@ -1203,7 +1367,7 @@ impl<'a> TableCache<'a> {
     /// Index maintenance paths use this mutable entry to lazily pin one
     /// user-table layout snapshot for repeated same-table index operations.
     #[inline]
-    pub(crate) async fn get_user_entry_mut(
+    pub(crate) fn get_user_entry_mut(
         &mut self,
         table_id: TableID,
     ) -> Option<&mut UserTableCacheEntry> {
@@ -1215,7 +1379,7 @@ impl<'a> TableCache<'a> {
                 if self.missing.contains(&table_id) {
                     return None;
                 }
-                match self.catalog.get_table(table_id).await {
+                match self.catalog.get_table(table_id) {
                     Some(table) => {
                         let res = vac.insert(UserTableCacheEntry::new(table));
                         Some(res)
@@ -1238,8 +1402,8 @@ impl<'a> TableCache<'a> {
     /// This method is intended for rollback paths where table id in undo log
     /// must always map to an existing table.
     #[inline]
-    pub(crate) async fn must_get_user_table(&mut self, table_id: TableID) -> &Table {
-        match self.get_user_table(table_id).await {
+    pub(crate) fn must_get_user_table(&mut self, table_id: TableID) -> &Table {
+        match self.get_user_table(table_id) {
             Some(table) => table,
             None => panic!("table {table_id} not found in catalog"),
         }
@@ -1262,11 +1426,11 @@ impl<'a> TableCache<'a> {
     /// This method is intended for rollback paths where table id in undo log
     /// must always map to an existing table.
     #[inline]
-    pub(crate) async fn must_get_user_entry_mut(
+    pub(crate) fn must_get_user_entry_mut(
         &mut self,
         table_id: TableID,
     ) -> &mut UserTableCacheEntry {
-        match self.get_user_entry_mut(table_id).await {
+        match self.get_user_entry_mut(table_id) {
             Some(entry) => entry,
             None => panic!("table {table_id} not found in catalog"),
         }
@@ -1402,10 +1566,32 @@ pub(crate) mod tests {
     use crate::trx::MIN_SNAPSHOT_TS;
     use crate::trx::purge::PurgeTestEvent;
     use crate::value::{Val, ValKind};
+    use std::cell::Cell;
     use std::fs::OpenOptions;
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
+
+    thread_local! {
+        static CURRENT_TABLE_LOOKUPS: Cell<(Option<TableID>, usize)> = const { Cell::new((None, 0)) };
+        static FULL_CURRENT_TABLE_LOOKUPS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Starts counting all current-table lookup paths for one table on this thread.
+    pub(crate) fn reset_current_table_lookup_count(table_id: TableID) {
+        CURRENT_TABLE_LOOKUPS.set((Some(table_id), 0));
+        FULL_CURRENT_TABLE_LOOKUPS.set(0);
+    }
+
+    /// Returns this thread's lookup count for the selected table.
+    pub(crate) fn current_table_lookup_count() -> usize {
+        CURRENT_TABLE_LOOKUPS.get().1
+    }
+
+    /// Returns this thread's full-state lookup count for the selected table.
+    pub(crate) fn full_current_table_lookup_count() -> usize {
+        FULL_CURRENT_TABLE_LOOKUPS.get()
+    }
 
     /// Asserts dropped table runtime in tests.
     #[inline]
@@ -1651,6 +1837,22 @@ pub(crate) mod tests {
 
         drop(session);
         table_id
+    }
+
+    /// Records a lookup only for the table selected on the calling thread.
+    pub(super) fn record_current_table_lookup(table_id: TableID) {
+        let (target, count) = CURRENT_TABLE_LOOKUPS.get();
+        if target == Some(table_id) {
+            CURRENT_TABLE_LOOKUPS.set((target, count + 1));
+        }
+    }
+
+    /// Records a lookup that clones the complete current state for the selected table.
+    pub(super) fn record_full_current_table_lookup(table_id: TableID) {
+        record_current_table_lookup(table_id);
+        if CURRENT_TABLE_LOOKUPS.get().0 == Some(table_id) {
+            FULL_CURRENT_TABLE_LOOKUPS.set(FULL_CURRENT_TABLE_LOOKUPS.get() + 1);
+        }
     }
 
     fn corrupt_page_checksum(path: impl AsRef<Path>, page_id: u64) {
@@ -1967,13 +2169,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap()
                 .table_id();
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table(table_id)
-                .await
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             assert_eq!(table.metadata().idx.index_slot_count_u32(), 2);
             assert_eq!(
                 table
@@ -1997,13 +2193,7 @@ pub(crate) mod tests {
             drop(engine);
 
             let engine = open_catalog_test_engine(main_dir.clone(), Some(log_stem)).await;
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table(table_id)
-                .await
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             assert_eq!(table.metadata().idx.index_slot_count_u32(), 2);
             assert_eq!(
                 table
@@ -2047,13 +2237,7 @@ pub(crate) mod tests {
             drop(engine);
 
             let engine = open_catalog_test_engine(main_dir, Some(log_stem)).await;
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table(table_id)
-                .await
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             assert_eq!(table.metadata().idx.index_slot_count_u32(), 2);
             assert_eq!(table.metadata().idx.active_index_count(), 2);
             assert_eq!(
@@ -2077,12 +2261,7 @@ pub(crate) mod tests {
                 open_catalog_test_engine(temp_dir.path().to_path_buf(), Some("redo-floor-borrow"))
                     .await;
             let table_id = table1(&engine).await;
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table_now(table_id)
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             let owners_before = Arc::strong_count(&table);
 
             let (live, dropped) = engine
@@ -2453,14 +2632,12 @@ pub(crate) mod tests {
                 .core
                 .catalog()
                 .get_table(checkpointed_table_id)
-                .await
                 .unwrap();
             let replay_only_table = engine
                 .inner()
                 .core
                 .catalog()
                 .get_table(replay_only_table_id)
-                .await
                 .unwrap();
             assert_freeze_created(
                 session

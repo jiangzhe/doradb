@@ -47,3 +47,11 @@ This backlog changes the cost of full resolution by removing descriptor-row
 reads. Binding-key lookup remains catalog-backed, so the benchmark should
 reassess the resulting bottlenecks after implementation rather than carry
 forward conclusions from the earlier uncached path.
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000298-cache-managed-table-definitions-in-current-catalog-state.md
+- Closed By: backlog close
+- Reference: User decision
+- Closed At: 2026-09-06

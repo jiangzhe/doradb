@@ -2878,7 +2878,6 @@ impl TrxInner {
         engine
             .catalog()
             .validate_user_table_live(table_id)
-            .await
             .attach_with(|| format!("operation={operation}"))?;
         fresh.disarm();
         Ok(())
@@ -6978,13 +6977,7 @@ pub(crate) mod tests {
             )
             .await;
             let table_id = catalog_tests::table2(&engine).await;
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table(table_id)
-                .await
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             let large = "r".repeat(48 * 1024);
 
             fn precommit_with_cold_row_undo(

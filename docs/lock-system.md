@@ -120,7 +120,8 @@ The current implementation uses the following table-level mapping:
 | CREATE INDEX | target `X`; catalog slots 0,2,3 `S` | target `X`; catalog slots 0,2,3 `IX` | prepared DDL operation, then mandatory owner |
 | DROP INDEX | target `X`; catalog slots 2,3 `S` | target `X`; catalog slots 2,3 `IX` | prepared DDL operation, then mandatory owner |
 | Binding probe | slot 5 `S` | slot 5 `IS` | short caller-owned operation |
-| Binding final resolution | target `S`; slot 5 `S`, plus slot 3 in full mode | matching catalog slots `IS` | short caller-owned operation |
+| Binding final resolution, narrow or full | target `S`; slot 5 `S` | slot 5 `IS` | short caller-owned operation |
+| Managed DDL definition preflight | target `S` | none | short caller-owned operation |
 | List table bindings | target `S`; slot 5 `S` | slot 5 `IS` | short caller-owned operation |
 
 On first touch, metadata protection belongs directly to the transaction:

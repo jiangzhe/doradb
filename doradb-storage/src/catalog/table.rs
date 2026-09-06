@@ -10,15 +10,15 @@ use crate::catalog::storage::{
 };
 use crate::catalog::{
     Catalog, CatalogDefinitionEffects, ColumnID, ColumnOrdinal, ID_DOMAIN_END, IndexID, IndexRef,
-    IndexSlot, TableBinding, TableBindingObject, TableDescriptorObject,
+    IndexSlot, ManagedTableDefinition, TableBinding, TableBindingObject,
 };
 use crate::component::EnginePools;
 use crate::engine::EngineCore;
 use crate::error::{
     CompletionErrorBridge, CompletionResult, DataIntegrityError, DataIntegrityResult, FatalError,
-    FatalResult, InternalError, InternalResult, IoResult, OperationError, OperationOrRuntimeResult,
-    OperationResult, QuadError, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult,
-    RuntimeResult,
+    FatalResult, InternalError, InternalResult, IoResult, MultiDomainResultExt, OperationError,
+    OperationOrRuntimeResult, OperationResult, QuadError, RuntimeError, RuntimeOrFatalError,
+    RuntimeOrFatalResult, RuntimeResult,
 };
 use crate::file::fs::FileSystem;
 use crate::file::table_file::{MutableTableFile, TableFile};
@@ -139,13 +139,12 @@ impl ValidatedCreateTable {
         descriptor: Box<[u8]>,
         bindings: Box<[TableBinding]>,
     ) -> CreateTablePlan {
-        let descriptor = TableDescriptorObject {
+        let definition = Arc::new(ManagedTableDefinition::for_ddl(
             table_id,
-            descriptor_revision: 0,
-            compiled_storage_epoch: self.metadata.storage_epoch,
-            storage_schema_fingerprint: self.metadata.storage_schema_fingerprint(),
-            payload: descriptor,
-        };
+            &self.metadata,
+            0,
+            descriptor,
+        ));
         let bindings = bindings
             .into_vec()
             .into_iter()
@@ -162,7 +161,7 @@ impl ValidatedCreateTable {
         self.into_plan_with_effects(
             table_id,
             TableDefinitionKind::Managed,
-            CatalogDefinitionEffects::insert(descriptor, bindings),
+            CatalogDefinitionEffects::insert(definition, bindings),
         )
     }
 
@@ -406,7 +405,11 @@ impl CreateTableProgress {
         );
         // The table id was atomically allocated and this DDL owns the metadata
         // gate through commit, so no cache entry can exist for this runtime.
-        if !catalog.insert_user_table(create_cts, table) {
+        if !catalog.insert_user_table(
+            create_cts,
+            table,
+            self.plan.definition_effects.managed_definition().cloned(),
+        ) {
             self.phase = CreateTablePhase::Aborted;
             return false;
         }
@@ -2317,44 +2320,20 @@ pub(crate) fn reject_non_user_table_id(
     )))
 }
 
-/// Ensure the user-table catalog row exists for a DDL operation.
+/// Returns the current table and optional definition after validating live catalog state.
+///
+/// The caller must hold target metadata admission until it finishes using the pair.
 #[inline]
-pub(crate) async fn ensure_user_table_catalog_row(
+pub(crate) fn validated_current_user_table(
     engine: &EngineCore,
-    guards: &PoolGuards,
     table_id: TableID,
     operation: &'static str,
-) -> OperationOrRuntimeResult<()> {
-    if engine
-        .catalog()
-        .storage
-        .tables()
-        .find_uncommitted_by_id(guards, table_id)
-        .await?
-        .is_some()
-    {
-        return Ok(());
-    }
-    Err(Report::new(OperationError::TableNotFound)
-        .attach(format!("{operation} catalog lookup: table_id={table_id}"))
-        .into())
-}
-
-/// Return the validated runtime table for an index-DDL target.
-pub(crate) async fn validated_index_ddl_target(
-    engine: &EngineCore,
-    guards: &PoolGuards,
-    table_id: TableID,
-    operation: &'static str,
-) -> OperationOrRuntimeResult<Arc<Table>> {
+) -> OperationOrRuntimeResult<(Arc<Table>, Option<Arc<ManagedTableDefinition>>)> {
     reject_non_user_table_id(table_id, operation)?;
-    let table = engine
+    engine
         .catalog()
-        .validate_user_table_live(table_id)
-        .await
-        .attach_with(|| format!("operation={operation}"))?;
-    ensure_user_table_catalog_row(engine, guards, table_id, operation).await?;
-    Ok(table)
+        .validate_user_table_current(table_id)
+        .attach_with(|| format!("operation={operation}"))
 }
 
 /// Reject primary-key flags in public user-table DDL for now.
@@ -2860,14 +2839,7 @@ pub(crate) mod tests {
     }
 
     fn assert_no_user_table_publication(engine: &Engine, table_id: TableID) {
-        assert!(
-            engine
-                .inner()
-                .core
-                .catalog()
-                .get_table_now(table_id)
-                .is_none()
-        );
+        assert!(engine.inner().core.catalog().get_table(table_id).is_none());
         assert!(
             engine
                 .inner()
@@ -2900,6 +2872,7 @@ pub(crate) mod tests {
             effective_cts,
             metadata,
             table: current_table,
+            ..
         } = engine
             .inner()
             .core
@@ -2940,6 +2913,7 @@ pub(crate) mod tests {
             effective_cts,
             metadata,
             table: current_table,
+            ..
         } = engine
             .inner()
             .core
@@ -3732,15 +3706,7 @@ pub(crate) mod tests {
             let verify_session = engine.new_session().unwrap();
             let guards = verify_session.pool_guards();
             for table_id in [table_id1, table_id2] {
-                assert!(
-                    engine
-                        .inner()
-                        .core
-                        .catalog()
-                        .get_table(table_id)
-                        .await
-                        .is_some()
-                );
+                assert!(engine.inner().core.catalog().get_table(table_id).is_some());
                 assert!(
                     engine
                         .inner()
@@ -4661,15 +4627,7 @@ pub(crate) mod tests {
             );
             assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Dropping);
             assert_checkpoint_workflow_closed(&table);
-            assert!(
-                engine
-                    .inner()
-                    .core
-                    .catalog()
-                    .get_table(table_id)
-                    .await
-                    .is_some()
-            );
+            assert!(engine.inner().core.catalog().get_table(table_id).is_some());
             assert_eq!(active_operation_count(&engine.inner().session_registry), 0);
             assert!(!drop_session.in_trx().unwrap());
         });
@@ -4787,15 +4745,7 @@ pub(crate) mod tests {
                 assert!(rendered.contains(&format!("table_id={table_id}")));
 
                 assert_table_ddl_snapshot_unchanged(&before, &engine, table_id, &table);
-                assert!(
-                    engine
-                        .inner()
-                        .core
-                        .catalog()
-                        .get_table(table_id)
-                        .await
-                        .is_some()
-                );
+                assert!(engine.inner().core.catalog().get_table(table_id).is_some());
                 assert!(has_lock_entry(
                     &engine,
                     owner,
@@ -4858,7 +4808,6 @@ pub(crate) mod tests {
                     .core
                     .catalog()
                     .get_table(other_table_id)
-                    .await
                     .is_none()
             );
             assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Dropping);
@@ -4905,7 +4854,6 @@ pub(crate) mod tests {
                     .core
                     .catalog()
                     .get_table(created_table_id)
-                    .await
                     .is_some()
             );
             assert!(
@@ -5023,14 +4971,7 @@ pub(crate) mod tests {
                 .lock_table(table_id, TableLockMode::Shared)
                 .await
                 .unwrap();
-            assert!(
-                engine
-                    .inner()
-                    .core
-                    .catalog()
-                    .get_table_now(table_id)
-                    .is_some()
-            );
+            assert!(engine.inner().core.catalog().get_table(table_id).is_some());
             verify_session.unlock_table(table_id).unwrap();
             verify_session.drop_table(table_id).await.unwrap();
             assert!(engine.inner().poisoner.poison_error().is_none());
@@ -5470,15 +5411,7 @@ pub(crate) mod tests {
                 session_id,
                 LockResource::TableData(table_id),
             ));
-            assert!(
-                engine
-                    .inner()
-                    .core
-                    .catalog()
-                    .get_table(table_id)
-                    .await
-                    .is_none()
-            );
+            assert!(engine.inner().core.catalog().get_table(table_id).is_none());
             assert!(
                 engine
                     .inner()
@@ -5634,14 +5567,7 @@ pub(crate) mod tests {
                 None
             );
             assert_dropped_table_floor(engine.inner().core.catalog(), table_id);
-            assert!(
-                engine
-                    .inner()
-                    .core
-                    .catalog()
-                    .get_table_now(table_id)
-                    .is_none()
-            );
+            assert!(engine.inner().core.catalog().get_table(table_id).is_none());
             assert!(Path::new(&table_file_path).exists());
 
             engine
@@ -5918,15 +5844,7 @@ pub(crate) mod tests {
             ))
             .await
             .unwrap();
-            assert!(
-                engine
-                    .inner()
-                    .core
-                    .catalog()
-                    .get_table(table_id)
-                    .await
-                    .is_none()
-            );
+            assert!(engine.inner().core.catalog().get_table(table_id).is_none());
             assert!(!Path::new(&table_file_path).exists());
         });
     }

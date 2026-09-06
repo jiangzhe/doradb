@@ -585,7 +585,7 @@ mod tests {
                 .inner()
                 .core
                 .catalog()
-                .get_table_now(table_id)
+                .get_table(table_id)
                 .expect("created table should still be loaded");
             table_for_internal_lifecycle
                 .start_drop_lifecycle()
@@ -659,23 +659,7 @@ mod tests {
             ))
             .await
             .unwrap();
-            assert!(
-                engine
-                    .inner()
-                    .core
-                    .catalog()
-                    .get_table(table_id)
-                    .await
-                    .is_none()
-            );
-            assert!(
-                engine
-                    .inner()
-                    .core
-                    .catalog()
-                    .get_table_now(table_id)
-                    .is_none()
-            );
+            assert!(engine.inner().core.catalog().get_table(table_id).is_none());
             assert!(
                 engine
                     .inner()
@@ -779,15 +763,7 @@ mod tests {
             ))
             .await
             .unwrap();
-            assert!(
-                engine
-                    .inner()
-                    .core
-                    .catalog()
-                    .get_table(table_id)
-                    .await
-                    .is_none()
-            );
+            assert!(engine.inner().core.catalog().get_table(table_id).is_none());
             wait_path_exists(&table_file_path, false).await;
         });
     }

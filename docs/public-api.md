@@ -254,7 +254,8 @@ when the exact key is absent. A successful `ResolvedTableBinding` always
 contains the assigned table ID and an opaque, equality-comparable
 `TableDefinitionVersion`. With `include_full_schema == true`, it also contains
 one coherent `ManagedTableDefinitionSnapshot` holding the stable-ID numeric
-schema and exact descriptor bytes. The false path performs only binding and
+schema and exact descriptor bytes copied from the current immutable runtime
+definition. Both modes avoid descriptor-row reads. The false path performs only binding and
 constant-size runtime validation; it does not load central numeric metadata or
 copy the full schema or descriptor. `list_table_bindings(table_id)` returns the
 table's bindings sorted by namespace and key, or `OperationError::TableNotFound`

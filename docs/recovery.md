@@ -165,6 +165,22 @@ before final table-root reconciliation, so a catalog definition that is
 legitimately newer than a checkpointed table root remains eligible for the
 existing replay reconciliation path.
 
+After final loaded-table metadata reconciliation and index-lifecycle
+classification, recovery consumes the validated descriptors to hydrate each
+live managed catalog entry. Construction checks the envelope against final
+runtime metadata and builds the immutable schema projection outside map guards.
+Installation changes neither effective CTS nor metadata history or layout.
+Every managed runtime requires exactly one descriptor, unmanaged runtimes require
+none, and leftover descriptors or duplicate hydration fail bootstrap. Runtime
+construction before this point may contain an unhydrated managed entry; no
+foreground operation is admitted until hydration succeeds.
+
+Descriptor presence defines durable managed ownership. A checkpointed table
+without a descriptor or bindings is a valid unmanaged table; missing-descriptor
+corruption is detectable only when surviving bindings or an already classified
+managed runtime supply ownership evidence. Durable catalog and projected
+checkpoint validation continue to inspect rows independently of the cache.
+
 ### Create Table
 
 `CREATE TABLE` publishes its initial table-file root before the catalog

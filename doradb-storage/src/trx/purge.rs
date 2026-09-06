@@ -451,7 +451,7 @@ impl TransactionSystem {
                         };
                         purge_undo_chain_from_page(page_guard, undo, min_active_sts);
                     } else {
-                        let Some(table) = table_cache.get_user_table(undo.table_id).await else {
+                        let Some(table) = table_cache.get_user_table(undo.table_id) else {
                             continue;
                         };
                         let page_guard = if let Some(page_id) = undo.page_id {
@@ -491,7 +491,7 @@ impl TransactionSystem {
                             )
                             .await?
                     } else {
-                        let Some(table) = table_cache.get_user_entry_mut(ip.table_id).await else {
+                        let Some(table) = table_cache.get_user_entry_mut(ip.table_id) else {
                             continue;
                         };
                         table
@@ -1760,12 +1760,7 @@ mod tests {
             let (_temp_dir, engine) =
                 purge_test_engine("drop_runtime_unique_assertion", 1, 1).await;
             let table_id = table1(&engine).await;
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table_now(table_id)
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             let expected_strong_count = Arc::strong_count(&table) + 1;
 
             let panic = match catch_unwind(AssertUnwindSafe(|| {
@@ -2635,13 +2630,7 @@ mod tests {
             .unwrap();
 
             let table_id = table1(&engine).await;
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table(table_id)
-                .await
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
             trx.table_insert_mvcc(table_id, vec![Val::from(1001i32)])
@@ -2727,13 +2716,7 @@ mod tests {
             .unwrap();
 
             let table_id = table1(&engine).await;
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table(table_id)
-                .await
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
             trx.table_insert_mvcc(table_id, vec![Val::from(1002i32)])
@@ -2823,13 +2806,7 @@ mod tests {
             .unwrap();
 
             let table_id = table1(&engine).await;
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table(table_id)
-                .await
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
             trx.table_insert_mvcc(table_id, vec![Val::from(1003i32)])
@@ -2938,13 +2915,7 @@ mod tests {
             .unwrap();
 
             let table_id = table1(&engine).await;
-            let table = engine
-                .inner()
-                .core
-                .catalog()
-                .get_table(table_id)
-                .await
-                .unwrap();
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
             trx.table_insert_mvcc(table_id, vec![Val::from(1004i32)])

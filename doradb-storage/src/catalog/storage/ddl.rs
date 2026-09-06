@@ -194,15 +194,20 @@ impl CatalogStorage {
         effects: &CatalogDefinitionEffects,
     ) -> RuntimeOrFatalResult<()> {
         match effects.descriptor() {
-            TableDescriptorEffect::Insert(descriptor) => {
-                self.table_descriptors().insert(trx, descriptor).await?;
+            TableDescriptorEffect::Insert(definition) => {
+                self.table_descriptors()
+                    .insert(trx, definition.descriptor())
+                    .await?;
             }
-            TableDescriptorEffect::Replace(descriptor) => {
-                let replaced = self.table_descriptors().replace(trx, descriptor).await?;
+            TableDescriptorEffect::Replace(definition) => {
+                let replaced = self
+                    .table_descriptors()
+                    .replace(trx, definition.descriptor())
+                    .await?;
                 if !replaced {
                     return invalid_drop_catalog_state(format!(
                         "managed descriptor replacement target is missing: table_id={}",
-                        descriptor.table_id
+                        definition.descriptor().table_id
                     ));
                 }
             }
@@ -259,8 +264,10 @@ impl CatalogStorage {
         effects: &CatalogDefinitionEffects,
     ) -> QuadResult<()> {
         match effects.descriptor() {
-            TableDescriptorEffect::Insert(descriptor) => {
-                self.table_descriptors().insert(trx, descriptor).await?;
+            TableDescriptorEffect::Insert(definition) => {
+                self.table_descriptors()
+                    .insert(trx, definition.descriptor())
+                    .await?;
             }
             TableDescriptorEffect::None => {}
             TableDescriptorEffect::Replace(_) | TableDescriptorEffect::DeleteIfPresent(_) => {
@@ -307,12 +314,13 @@ mod tests {
     use crate::catalog::storage::tests::begin_catalog_test_trx;
     use crate::catalog::tests::open_catalog_test_engine;
     use crate::catalog::{
-        BindingNamespaceID, StorageColumnFlags, StorageColumnSpec, TableBindingObject,
-        TableDescriptorObject,
+        BindingNamespaceID, ManagedTableDefinition, StorageColumnFlags, StorageColumnSpec,
+        TableBindingObject,
     };
     use crate::error::{OperationError, QuadError};
     use crate::session::tests::SessionTestExt;
     use crate::value::ValKind;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     #[test]
@@ -333,15 +341,14 @@ mod tests {
                 vec![],
             )
             .unwrap();
-            let descriptor = TableDescriptorObject {
-                table_id: candidate_table_id,
-                descriptor_revision: 0,
-                compiled_storage_epoch: metadata.storage_epoch,
-                storage_schema_fingerprint: metadata.storage_schema_fingerprint(),
-                payload: Box::from(&b"candidate"[..]),
-            };
+            let definition = Arc::new(ManagedTableDefinition::for_ddl(
+                candidate_table_id,
+                &metadata,
+                0,
+                Box::from(&b"candidate"[..]),
+            ));
             let effects = CatalogDefinitionEffects::insert(
-                descriptor,
+                definition,
                 vec![TableBindingObject {
                     namespace_id,
                     binding_key: binding_key.clone(),
