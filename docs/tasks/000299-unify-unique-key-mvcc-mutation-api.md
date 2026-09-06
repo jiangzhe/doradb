@@ -230,6 +230,13 @@ predate adapter removal.
 ## Open Questions
 
 No blocking questions or deferred in-scope implementation work remain.
+A follow-up review identified an inherited stale-RowID race in current-write
+unique selection during concurrent row replacement. Its fix is deferred to
+[backlog 000196](../backlogs/000196-resolve-stale-unique-point-lookups-across-row-replacement.md)
+for separate design of Move undo with re-lookup versus a successor RowID in
+Delete undo. The interim retry implementation and regression tests were
+withdrawn from this task; the race remains unresolved here.
+
 A sparse/inline cache and further reduction of the shortest point-dispatch cost
 remain possible future optimizations; this task deliberately retains deferred
 dense storage. A point/range API merger
