@@ -13,7 +13,7 @@ use super::index_stream::{
     UniqueDiskTreeCandidateStream, UniqueMemIndexCandidateStream,
 };
 use super::non_unique_index::{GuardedNonUniqueMemIndex, IndexMask, NonUniqueMemIndex};
-use super::unique_index::{GuardedUniqueMemIndex, UniqueMemIndex};
+use super::unique_index::{GuardedUniqueMemIndex, UniqueLookupObservation, UniqueMemIndex};
 use crate::buffer::{BufferPool, PoolGuard, PoolGuards, ReadonlyBufferPool};
 use crate::catalog::{IndexSlot, TableIndexMetadata, TableMetadata};
 use crate::error::{InternalError, RuntimeError, RuntimeResult, SecondaryIndexBinding};
@@ -587,6 +587,35 @@ impl<'a, 'g, P: BufferPool> UniqueSecondaryIndex<'a, 'g, P> {
 }
 
 impl<P: BufferPool> UniqueSecondaryIndex<'_, '_, P> {
+    /// Retains MemTree evidence even when an immutable DiskTree supplies the row.
+    ///
+    /// The observation always belongs to the MemTree leaf searched for `key`.
+    /// A competing write can insert an owner or delete shadow there, superseding
+    /// the DiskTree result and invalidating the original miss observation.
+    /// The captured DiskTree root is immutable and retained by the caller, so it
+    /// needs no separate optimistic observation. Leaf validation is conservative:
+    /// unrelated writes to that same leaf can invalidate the observation too.
+    #[inline]
+    pub(crate) async fn lookup_observed<'lookup>(
+        &'lookup self,
+        key: &'lookup [Val],
+    ) -> RuntimeResult<(Option<(RowID, bool)>, UniqueLookupObservation<'lookup>)> {
+        let (candidate, observation) = self.mem.lookup_observed(key).await?;
+        if candidate.is_some() {
+            return Ok((candidate, observation));
+        }
+        let Some(disk) = self.open()? else {
+            return Ok((None, observation));
+        };
+        #[cfg(test)]
+        {
+            use crate::table::record_unique_disk_lookup;
+            record_unique_disk_lookup();
+        }
+        let candidate = disk.lookup(key).await?.map(|row_id| (row_id, false));
+        Ok((candidate, observation))
+    }
+
     /// Lookup one unique owner across MemIndex and the captured DiskTree root.
     #[inline]
     pub(crate) async fn lookup(
@@ -602,8 +631,8 @@ impl<P: BufferPool> UniqueSecondaryIndex<'_, '_, P> {
         };
         #[cfg(test)]
         {
-            use crate::table::record_point_disk_lookup;
-            record_point_disk_lookup();
+            use crate::table::record_unique_disk_lookup;
+            record_unique_disk_lookup();
         }
         Ok(disk.lookup(key).await?.map(|row_id| (row_id, false)))
     }
@@ -1440,6 +1469,30 @@ mod tests {
                 Some((RowID::new(20), false))
             );
 
+            // A witnessed MemTree miss must remain evidence while DiskTree supplies A.
+            let (disk_candidate, disk_observation) = bound.lookup_observed(&key2).await.unwrap();
+            assert_eq!(disk_candidate, Some((RowID::new(20), false)));
+            assert!(disk_observation.is_valid());
+            let replacement_mem = index.unique_mem().unwrap().bind(&index_guard);
+            assert!(
+                replacement_mem
+                    .insert_if_not_exists(&key2, RowID::new(200), false, TrxID::new(4))
+                    .await
+                    .unwrap()
+                    .is_ok()
+            );
+            assert!(!disk_observation.is_valid());
+            assert_eq!(
+                bound.lookup_observed(&key2).await.unwrap().0,
+                Some((RowID::new(200), false))
+            );
+            assert!(
+                replacement_mem
+                    .compare_delete(&key2, RowID::new(200), true, TrxID::new(4))
+                    .await
+                    .unwrap()
+            );
+
             let mem_bound = index.unique_mem().unwrap().bind(&index_guard);
             assert!(
                 mem_bound
@@ -1458,6 +1511,9 @@ mod tests {
                 bound.lookup(&key3, TrxID::new(4)).await.unwrap(),
                 Some((RowID::new(30), true))
             );
+            let (shadow, observation) = bound.lookup_observed(&key3).await.unwrap();
+            assert_eq!(shadow, Some((RowID::new(30), true)));
+            assert!(observation.is_valid());
             assert!(matches!(
                 bound
                     .insert_if_not_exists_observed(&key4, RowID::new(400), false, TrxID::new(5))

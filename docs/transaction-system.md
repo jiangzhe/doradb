@@ -595,21 +595,122 @@ and whole-transaction cleanup path. Application payloads do not enter mandatory
 cleanup, and the separate private transaction runner retains its typed fatal
 boundary.
 
-Unique-point `table_unique_mutate_mvcc` uses index write admission and
-transaction-lifetime `TableData(IX)`, with MemIndex-first point lookup. Its
+`table_unique_mutate_mvcc` uses index write admission and
+transaction-lifetime `TableData(IX)`, with MemIndex-first unique lookup. Its
 `FnOnce` callback receives an owned current row or a missing observation without
 a gap lock. Selection and prepare/transition retries precede the callback.
 Missing-only insertion must agree with the selected key. Hot actions retain the
 write access through decision and undo conversion; cold actions synchronously
 register a fresh claim's provisional undo before calling user code. An earlier
 same-transaction cold marker denotes a consumed image and cannot be cancelled
-by a later callback. Point cold deletion committed after the writer's STS can
+by a later callback. Cold deletion committed after the writer's STS can
 conflict, preserving timestamp information before durable-delete membership.
 `Skip` and empty updates cancel only the new provisional ownership. Empty
 updates return the original RowID without physical movement. The callback method
 is the sole public unique-key mutation boundary.
-Point driver-key changes apply immediately. Updates that physically insert a
+Unique driver-key changes apply immediately. Updates that physically insert a
 replacement return `UniqueMutationOutcome::Updated` with the replacement RowID.
+
+Read-current unique selection starts with an observed MemTree-first lookup,
+then acquires the current matching row. Rejecting a physical row does not
+establish logical absence: the same transaction may have transferred its key
+to another RowID. Ownership admission precedes interpreting mutable key/delete
+state. A foreign active owner conflicts and a preparing owner settles through
+the existing poison-aware wait, including on an authoritative successor.
+
+The unique mutator retains its selected index and key for the whole operation.
+Each successful index lookup creates a `CurrentRowSelection` with a fixed
+snapshot timestamp and original index observation. Its position stores the
+candidate RowID and whether it came from the index or a forward link. `decide()`
+reads this context and concrete `RowInspection` findings; only `advance()` changes
+the position. Returning to the initial RowID through a link remains forward
+traversal. A composite index miss validates its observation directly, without
+creating a selection object. A direct MemTable miss uses the already-validated
+MemTree result. A fresh lookup creates a new selection context.
+
+Hot Delete and Update undo carry plain, lazily allocated `ForwardLinks`, an
+optional boxed slice of `ForwardHint { index: IndexRef, row_id: RowID }`. Each
+slot describes the surviving successor for that exact version's departed key.
+For example, changing `{100, k=1}` to `{100, k=2}` and inserting `{200, k=1}` in
+one transaction installs a link to 200 on the Update that removed key 1 from
+100. The backward IndexBranch on 200 still serves old snapshots. Source keys
+come from the Delete image or reconstructed Update before-images; links do not
+copy key values, and exact IndexRef identity protects against slot reuse.
+
+Only the source entry's owning transaction publishes a link. Source discovery
+can find an Update beneath newer undo entries, but owning the newest head does
+not authorize modifying a committed older entry. After initializing the
+destination and backward branches, the writer exchanges the index mapping,
+registers normal index undo, records the previous source slot, and installs the
+new slot synchronously. Source page access is prepared before the exchange;
+its row write latch protects publication. No row latch or mutable payload
+borrow crosses an await.
+
+Each destination's `OwnedRowUndo` keeps an initially empty restoration list
+beside its boxed snapshot-visible `RowUndo`. Records identify the source RowID,
+page generation, exact undo entry and owner, IndexRef, and optional previous
+link. Several indexes may transfer keys from different source rows. Keeping the
+list on the owning wrapper lets publication append rollback records without
+borrowing any snapshot-visible destination fields. Snapshot views project only
+immutable Update columns and backward-chain fields, excluding both forward
+stores. Mutating an Update's links never borrows its entire before-image payload.
+
+Index rollback precedes row rollback. Before reverting each destination row,
+restore its source slots in reverse publication order, including removing a
+newly created slot. Keep the destination and unfinished records owned across
+awaits, cancellation, and failures. This prevents a failed later statement from
+leaving a stale link in an earlier surviving Delete or Update. A missing source
+page alone does not permit skipping restoration; a published cold route proves
+that its former hot link is no longer reachable by current selection.
+
+Hot selection follows as many successors as required. It first checks the live
+current image; on rejection it reconstructs the latest departure of the selected
+key and reads only that entry's slot. It never searches older occurrences for a
+link after finding a newer terminal removal. This handles repeated keys and
+RowID revisits without a visited-RowID stop rule. A surviving same-transaction
+transfer must have a link; a committed removal without a successor establishes
+a genuine absence boundary in that version's history. An independent later
+insertion does not modify committed source undo. Matching-row ownership ends
+selection and invokes the callback once without post-row index validation.
+
+Terminal rejection still validates the original index observation. The lookup
+can capture an uncommitted destination just before its writer rolls back,
+restoring a different index owner and unlinking the captured claim's undo. The
+remaining row history may be empty or contain an older, unrelated same-key
+terminal or forward chain. Neither proves absence for that lookup. A valid
+observation permits terminal Missing; invalidation triggers a fresh root-bound
+lookup, with no one-hop cap on subsequent forwarding. The same check applies
+after multiple hot hops. No additional routing state is retained after rollback.
+
+The original index-selected candidate retains the strict confirmed
+`delete_cts < reader_sts` early-missing shortcut, before reading link storage.
+It applies to exact Delete undo and CDB markers, not arbitrary Update/Lock head
+timestamps, unconfirmed status, equality, or a forwarded target's CTS used as
+proof about the original candidate.
+
+Cold rows have no forward metadata. Composite lookup misses, cold rejection,
+and failed conditional CDB claims after block loading retain index validation.
+An invalid observation triggers fresh root-bound selection before a committed
+cold-delete conflict becomes final. Stable newer cold deletion retains
+WriteConflict; equality retains Missing. CDB markers precede durable membership,
+and consumed markers never become newly cancellable claims. A rejected cold or
+missing forward target triggers fresh selection only when the original index
+observation is invalid. A valid observation is an invariant violation: the
+transfer must publish its index target before another transaction follows its
+link. Rollback can expose an older link whose target becomes cold after the
+reader copies its RowID, but rollback also invalidates the original observation.
+
+Snapshots and scans retain their inverse operations and backward IndexBranches.
+Forward links and restoration records are never serialized. The reader's active
+STS protects needed hot departure history under the existing purge horizon;
+checkpoint routing handles transitions to CDB. Every selection iteration that
+continues with a forward hop or fresh lookup yields once, then checks engine
+health before further selection. Settled prepare/transition waits reach the same
+loop tail. There is no initial check or yield in the selection loop, no attempt
+counter, and no added yield on a terminal result. Row guards are released before
+yielding; existing prepare/transition waits and cancellation owners remain.
+Finite transfers settle without a static forwarding cycle; unlimited churn has no starvation
+freedom guarantee.
 
 Sequential full-table MVCC mutation acquires transaction-lifetime
 `TableMetadata(S)` followed by `TableData(X)` before it captures the table root
@@ -646,7 +747,7 @@ required because a foreign uncommitted delete or key change is a write conflict
 or prepare wait, not evidence that the index candidate is stale. The shared
 hot-row write helper validates every otherwise admissible head, including one
 owned by the same transaction, and installs the provisional undo only after
-validation succeeds. Keyed point update/delete therefore also reject an old
+validation succeeds. Unique update/delete therefore also reject an old
 index key after an in-place key change by the same transaction.
 
 The selected index range is a weak monotonic current-read traversal, without

@@ -108,7 +108,7 @@ impl StreamStmtState {
                 })
                 .disclose()?;
         }
-        let runtime = layout.secondary_index(index).disclose()?;
+        let runtime = layout.expect_secondary_index(index);
         let unique = runtime.is_unique();
         let encoder = runtime.key_encoder_arc();
         let range = if unique {
@@ -118,9 +118,7 @@ impl StreamStmtState {
         };
         let rt = self.runtime();
         let accessor = table.accessor_with_layout(&layout);
-        let candidate_stream = accessor
-            .index_scan_candidates(rt, index, range)
-            .disclose()?;
+        let candidate_stream = accessor.index_scan_candidates(rt, index, range);
         debug_assert_eq!(candidate_stream.index_ref(), index);
         let state = IndexScanMvccStreamState {
             candidate_stream,

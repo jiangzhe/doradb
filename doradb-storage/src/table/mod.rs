@@ -54,7 +54,9 @@ pub(crate) use storage::ColumnStorage;
 #[cfg(test)]
 pub(crate) use tests::{test_hooks, test_user_table_id};
 #[cfg(test)]
-pub(crate) use unique_mutate::record_point_disk_lookup;
+pub(crate) use unique_mutate::{
+    record_forward_hint, record_lookup_validation, record_unique_disk_lookup, record_unique_lookup,
+};
 
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards, PoolRole, ReadonlyBufferPool};
@@ -2361,6 +2363,26 @@ pub(crate) mod tests {
         }
     }
 
+    /// Collects a snapshot scan for shared visibility and duplicate-image assertions.
+    pub(crate) async fn scan_table_rows(
+        trx: &mut Transaction,
+        table_id: TableID,
+        read_set: &[usize],
+    ) -> Vec<Vec<Val>> {
+        let mut stream = trx
+            .table_scan_mvcc_stream(table_id, read_set, |_| -> CallbackResult<_> {
+                Ok(ScanRowDecision::Include)
+            })
+            .await
+            .unwrap();
+        let mut rows = Vec::new();
+        while let Some(vals) = stream.next().await.unwrap() {
+            rows.push(vals);
+        }
+        drop(stream);
+        rows
+    }
+
     /// Returns user table id for tests.
     #[inline]
     pub(crate) fn test_user_table_id(offset: u64) -> TableID {
@@ -2485,7 +2507,7 @@ pub(crate) mod tests {
         insert: Vec<Val>,
         page_guard: &PageSharedGuard<RowPage>,
         row_id: RowID,
-        key: &SelectKey,
+        _key: &SelectKey,
         update: Vec<UpdateCol>,
     ) -> Result<(bool, bool)> {
         let layout = table.layout_snapshot();
@@ -2502,13 +2524,7 @@ pub(crate) mod tests {
         );
         let update_retry = matches!(
             HotRowMutator::new(table.mem.table_id(), metadata, rt, page_guard, row_id,)
-                .update_inplace(
-                    effects,
-                    key.index_slot,
-                    &key.vals,
-                    crate::row::ops::RowUpdateInput::Sparse(update),
-                    false,
-                )
+                .update_known_row(effects, crate::row::ops::RowUpdateInput::Sparse(update))
                 .await
                 .disclose()?,
             UpdateRowInplace::RetryInTransition(_)
@@ -2523,13 +2539,13 @@ pub(crate) mod tests {
         table: &Table,
         page_guard: &PageSharedGuard<RowPage>,
         row_id: RowID,
-        key: &SelectKey,
+        _key: &SelectKey,
     ) -> Result<bool> {
         let layout = table.layout_snapshot();
         let metadata = layout.metadata();
         Ok(matches!(
             HotRowMutator::new(table.mem.table_id(), metadata, rt, page_guard, row_id,)
-                .delete(effects, key.index_slot, &key.vals, false,)
+                .delete_known_row(effects)
                 .await
                 .disclose()?,
             DeleteInternal::RetryInTransition
@@ -3460,25 +3476,6 @@ pub(crate) mod tests {
             .wait_for_gc_horizon_after(max_delete_cts)
             .await
             .unwrap();
-    }
-
-    async fn scan_table_rows(
-        trx: &mut Transaction,
-        table_id: TableID,
-        read_set: &[usize],
-    ) -> Vec<Vec<Val>> {
-        let mut stream = trx
-            .table_scan_mvcc_stream(table_id, read_set, |_| -> CallbackResult<_> {
-                Ok(ScanRowDecision::Include)
-            })
-            .await
-            .unwrap();
-        let mut rows = Vec::new();
-        while let Some(vals) = stream.next().await.unwrap() {
-            rows.push(vals);
-        }
-        drop(stream);
-        rows
     }
 
     fn assert_invalid_dml_input(err: Error) {

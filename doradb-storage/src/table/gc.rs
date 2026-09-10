@@ -389,7 +389,7 @@ impl Table {
 
         for (index_ref, index) in layout.active_secondary_indexes() {
             let index_slot = index_ref.slot();
-            if !snapshot.root_index_is_active(index_slot) || !layout.validate_index_ref(index_ref) {
+            if !snapshot.root_index_is_active(index_slot) {
                 continue;
             }
             let secondary_root = snapshot.secondary_index_root(index_slot);
@@ -698,25 +698,8 @@ impl Table {
         index_ref: IndexRef,
         row: ResolvedColumnRow,
     ) -> RuntimeResult<Vec<Val>> {
-        if !cleanup_context
-            .snapshot
-            .layout()
-            .validate_index_ref(index_ref)
-        {
-            return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
-                    "cleanup index generation mismatch: table_id={}, index={index_ref}",
-                    self.table_id()
-                ))
-                .change_context(RuntimeError::TableAccess));
-        }
         let metadata = cleanup_context.metadata;
-        let index_spec = metadata.idx.index_spec(index_ref.slot()).unwrap_or_else(|| {
-            panic!(
-                "active cleanup index must exist in captured metadata: table_id={}, index={index_ref}",
-                self.table_id()
-            )
-        });
+        let index_spec = metadata.idx.expect_index_spec(index_ref);
         let read_set = index_spec
             .keys
             .iter()

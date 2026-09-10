@@ -166,16 +166,7 @@ impl Table {
         let metadata = layout.metadata();
         let index_pool_guard = self.mem.index_pool_guard(guards);
         for (index_slot, index_spec) in metadata.idx.active_indexes() {
-            let sec_idx = layout
-                .index_entry_at_slot(index_slot)
-                .map(super::RuntimeIndexEntry::runtime)
-                .change_context(RuntimeError::TableAccess)
-                .attach_with(|| {
-                    format!(
-                        "operation=populate_index_via_row_page, table_id={}, page_id={page_id}, index_slot={index_slot}",
-                        self.table_id()
-                    )
-                })?;
+            let sec_idx = layout.expect_secondary_index(index_spec.index);
             let read_set: Vec<_> = index_spec
                 .keys
                 .iter()

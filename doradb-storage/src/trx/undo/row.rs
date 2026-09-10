@@ -1,13 +1,13 @@
 use crate::buffer::PoolGuards;
 use crate::buffer::page::VersionedPageID;
-use crate::catalog::{ResolvedIndexKey, TableCache};
+use crate::catalog::{IndexRef, ResolvedIndexKey, TableCache};
 use crate::error::RuntimeOrFatalResult as Result;
 use crate::id::{RowID, TableID, TrxID};
 use crate::poison::EnginePoisoner;
 use crate::row::ops::{UndoCol, UpdateCol};
 use crate::runtime::{POLL_BUDGET, yield_now};
 use crate::trx::{
-    MIN_SNAPSHOT_TS, PrepareListenerResult, SharedTrxStatus, StmtNo, trx_is_committed,
+    MIN_SNAPSHOT_TS, PrepareListenerResult, SharedTrxStatus, StmtNo, TrxContext, trx_is_committed,
 };
 use std::fmt;
 use std::ops::{Deref, DerefMut};
@@ -62,7 +62,7 @@ pub(crate) enum RowUndoKind {
     ///
     /// 3. Delete -> Update.
     ///
-    Delete,
+    Delete(ForwardLinks),
     /// Update a hot row in place.
     ///
     /// Only changed columns are copied as before-images. Readers that cannot
@@ -84,19 +84,212 @@ pub(crate) enum RowUndoKind {
     /// update(instead of insert) entry to it.
     /// In this way, we may not need to change secondary index.
     ///
-    Update(Vec<UndoCol>),
+    Update(UpdateUndo),
+}
+
+impl RowUndoKind {
+    /// Creates Delete undo with no allocated successor storage.
+    #[inline]
+    pub(crate) fn delete() -> Self {
+        Self::Delete(ForwardLinks::default())
+    }
+
+    /// Creates Update undo with immutable before-images and no forward allocation.
+    #[inline]
+    pub(crate) fn update(cols: Vec<UndoCol>) -> Self {
+        Self::Update(UpdateUndo {
+            cols,
+            forward: ForwardLinks::default(),
+        })
+    }
 }
 
 impl fmt::Debug for RowUndoKind {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            RowUndoKind::Delete => f.pad("Delete"),
+            RowUndoKind::Delete(_) => f.pad("Delete"),
             RowUndoKind::Insert => f.pad("Insert"),
             RowUndoKind::Lock => f.pad("Lock"),
             RowUndoKind::Update(_) => f.pad("Update"),
         }
     }
+}
+
+/// Surviving destination for one departed key in an exact index generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ForwardHint {
+    /// Index identity and physical slot; slots alone can be reused after DROP.
+    pub(crate) index: IndexRef,
+    /// Successor whose latest ownership, key and deletion state must be checked.
+    pub(crate) row_id: RowID,
+}
+
+/// Plain per-index successors for one exact Delete or Update departure.
+/// The source writer publishes and restores slots under the source row latch.
+/// Snapshot views exclude this storage; departure before-images supply the key.
+#[derive(Default)]
+pub(crate) struct ForwardLinks {
+    successors: Option<Box<[ForwardHint]>>,
+}
+
+impl ForwardLinks {
+    /// Copies the previous slot for destination-owned rollback bookkeeping.
+    #[inline]
+    pub(crate) fn hint(&self, index: IndexRef) -> Option<ForwardHint> {
+        self.successors
+            .as_deref()?
+            .iter()
+            .find(|hint| hint.index == index)
+            .copied()
+    }
+
+    /// Returns one exact-index successor without allocating.
+    #[inline]
+    pub(crate) fn successor(&self, index: IndexRef) -> Option<RowID> {
+        self.successors
+            .as_deref()?
+            .iter()
+            .find_map(|hint| (hint.index == index).then_some(hint.row_id))
+    }
+
+    /// Updates one link through exclusive access to its writer-owned departure.
+    /// The caller serializes source-row access and publishes only after index undo.
+    #[inline]
+    pub(crate) fn set_successor(&mut self, hint: ForwardHint) {
+        if let Some(stored) = self
+            .successors
+            .as_deref_mut()
+            .and_then(|slots| slots.iter_mut().find(|stored| stored.index == hint.index))
+        {
+            *stored = hint;
+        } else {
+            let mut slots = self.successors.take().map_or_else(Vec::new, Vec::from);
+            slots.push(hint);
+            self.successors = Some(slots.into_boxed_slice());
+        }
+    }
+
+    /// Restores an overwritten slot or removes a slot created by a failed effect.
+    #[inline]
+    pub(crate) fn restore(&mut self, index: IndexRef, previous: Option<ForwardHint>) {
+        if let Some(hint) = previous {
+            assert_eq!(
+                hint.index, index,
+                "forward rollback index must match its before-image"
+            );
+            self.set_successor(hint);
+        } else if let Some(slots) = self.successors.take() {
+            let mut slots = slots.into_vec();
+            slots.retain(|hint| hint.index != index);
+            self.successors = (!slots.is_empty()).then(|| slots.into_boxed_slice());
+        }
+    }
+}
+
+/// In-place before-images and separately borrowed current-write successors.
+pub(crate) struct UpdateUndo {
+    /// Immutable column before-images used by snapshots and rollback.
+    pub(crate) cols: Vec<UndoCol>,
+    forward: ForwardLinks,
+}
+
+impl UpdateUndo {
+    /// Reads successors under the same source row latch as its before-images.
+    #[inline]
+    pub(crate) fn forward(&self) -> &ForwardLinks {
+        &self.forward
+    }
+}
+
+/// Identity and ownership of one exact hot departure, including a buried Update.
+#[derive(Clone)]
+pub(crate) struct HotForwardSource {
+    /// Exact source page generation to pin before the index exchange.
+    pub(crate) page_id: VersionedPageID,
+    /// Source physical row whose write latch protects direct link access.
+    pub(crate) row_id: RowID,
+    entry: RowUndoRef,
+    owner: Arc<SharedTrxStatus>,
+}
+
+impl HotForwardSource {
+    /// Captures an exact Delete/Update entry owned by this still-active writer.
+    /// The source row latch protects discovery; transaction ownership protects
+    /// the entry until the operation finishes, including across insertion awaits.
+    #[inline]
+    pub(crate) fn new(ctx: &TrxContext, head: &RowUndoHead, entry: &RowUndoRef) -> Option<Self> {
+        if !ctx.is_same_trx(head) {
+            return None;
+        }
+        let mut main = &head.next.main;
+        loop {
+            if main.entry.0 == entry.0 {
+                break;
+            }
+            main = &main.entry.as_ref().next.as_ref()?.main;
+        }
+        let UndoStatus::Ref(owner) = &main.status else {
+            return None;
+        };
+        if !Arc::ptr_eq(owner, ctx.status())
+            || !matches!(
+                entry.as_ref().kind,
+                RowUndoKind::Delete(_) | RowUndoKind::Update(_)
+            )
+        {
+            return None;
+        }
+        Some(Self {
+            page_id: entry.as_ref().page_id?,
+            row_id: entry.as_ref().row_id,
+            entry: entry.clone(),
+            owner: Arc::clone(owner),
+        })
+    }
+
+    /// Checks source identity without borrowing the shared undo payload.
+    #[inline]
+    pub(crate) fn matches(&self, entry: &RowUndoRef) -> bool {
+        self.entry.0 == entry.0
+    }
+
+    /// Confirms that a reachable source version still has its publishing owner.
+    #[inline]
+    pub(crate) fn owns(&self, status: &UndoStatus) -> bool {
+        !trx_is_committed(self.owner.ts())
+            && matches!(status, UndoStatus::Ref(owner) if Arc::ptr_eq(owner, &self.owner))
+    }
+}
+
+/// Before-image of a source slot, retained by the destination's undo owner.
+pub(crate) struct ForwardLinkUndo {
+    /// Exact source whose writer outlives reverse destination rollback.
+    pub(crate) source: HotForwardSource,
+    /// Index slot to remove when there was no previous link.
+    pub(crate) index: IndexRef,
+    /// Previous source link, restored before undoing the destination.
+    pub(crate) previous: Option<ForwardHint>,
+}
+
+/// Snapshot operation view that never borrows mutable successor storage.
+pub(crate) enum RowUndoKindView<'a> {
+    /// Provisional write with no inverse row change.
+    Lock,
+    /// Insertion whose inverse hides the row.
+    Insert,
+    /// Deletion whose inverse restores visibility without reading its hints.
+    Delete,
+    /// Immutable before-images for an in-place update.
+    Update(&'a [UndoCol]),
+}
+
+/// Disjoint operation and older-chain fields needed by backward snapshot traversal.
+pub(crate) struct RowUndoView<'a> {
+    /// Inverse operation, excluding mutable routing metadata.
+    pub(crate) kind: RowUndoKindView<'a>,
+    /// Older version state protected by the existing MVCC lifetime protocol.
+    pub(crate) next: Option<&'a NextRowUndo>,
 }
 
 /// Outcome of one exact-page hot row-undo rollback attempt.
@@ -183,6 +376,18 @@ impl RowUndoLogs {
                 }
                 if entry.table_id.is_catalog() {
                     let table = table_cache.must_get_catalog_table(entry.table_id);
+                    while let Some(undo) = entry.forward_undo.last() {
+                        let result = table
+                            .mem
+                            .try_restore_forward_link(undo, context.pool_guards)
+                            .await?;
+                        assert_eq!(
+                            result,
+                            RowUndoRollbackAttempt::Applied,
+                            "catalog forward source must remain hot during rollback"
+                        );
+                        entry.forward_undo.pop();
+                    }
                     if entry.page_id.is_some() {
                         match table
                             .mem
@@ -202,6 +407,30 @@ impl RowUndoLogs {
                     }
                 } else {
                     let table = table_cache.must_get_user_table(entry.table_id);
+                    while let Some(undo) = entry.forward_undo.last() {
+                        let source_id = undo.source.row_id;
+                        if source_id < table.mem.pivot_row_id() {
+                            // Cold routing has no forward fields. The old hot
+                            // payload is no longer reachable by current selection.
+                            entry.forward_undo.pop();
+                            continue;
+                        }
+                        match table
+                            .mem
+                            .try_restore_forward_link(undo, context.pool_guards)
+                            .await?
+                        {
+                            RowUndoRollbackAttempt::Applied => {
+                                entry.forward_undo.pop();
+                            }
+                            RowUndoRollbackAttempt::PageMissing
+                            | RowUndoRollbackAttempt::Transition => {
+                                table
+                                    .wait_transition_route_or_poison(context.poisoner, source_id)
+                                    .await?;
+                            }
+                        }
+                    }
                     loop {
                         if entry.page_id.is_none() {
                             table.deletion_buffer().remove(entry.row_id);
@@ -260,20 +489,24 @@ impl DerefMut for RowUndoLogs {
 /// Garbage collector will make sure the deletion of entries is
 /// safe, because no transaction will access entries that is
 /// supposed to be deleted.
-pub(crate) struct OwnedRowUndo(Box<RowUndo>);
+pub(crate) struct OwnedRowUndo {
+    entry: Box<RowUndo>,
+    // This owner-only journal is never reachable through snapshot RowUndoRef.
+    forward_undo: Vec<ForwardLinkUndo>,
+}
 
 impl Deref for OwnedRowUndo {
     type Target = RowUndo;
     #[inline]
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.entry
     }
 }
 
 impl DerefMut for OwnedRowUndo {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.entry
     }
 }
 
@@ -295,13 +528,22 @@ impl OwnedRowUndo {
             kind,
             next: None,
         };
-        OwnedRowUndo(Box::new(entry))
+        OwnedRowUndo {
+            entry: Box::new(entry),
+            forward_undo: Vec::new(),
+        }
     }
 
     /// Return a non-owning reference that can be stored in row version chains.
     #[inline]
     pub(crate) fn leak(&self) -> RowUndoRef {
-        RowUndoRef(NonNull::from(self.0.as_ref()))
+        RowUndoRef(NonNull::from(self.entry.as_ref()))
+    }
+
+    /// Registers a source before-image without borrowing snapshot-visible fields.
+    #[inline]
+    pub(crate) fn push_forward_undo(&mut self, undo: ForwardLinkUndo) {
+        self.forward_undo.push(undo);
     }
 }
 
@@ -324,14 +566,60 @@ unsafe impl Send for RowUndoRef {}
 unsafe impl Sync for RowUndoRef {}
 
 impl RowUndoRef {
-    /// Returns reference of underlying undo log.
-    /// This method is safe because GC operation always clear this reference
-    /// from next undo list.
-    /// So we won't have chance to access a deleted undo log.
+    /// Reads only the fields needed by snapshots following another row's branch.
+    /// A shared reference to the whole undo would also borrow its mutable hints.
+    #[inline]
+    pub(crate) fn snapshot_view(&self) -> RowUndoView<'_> {
+        let entry = self.0.as_ptr();
+        // SAFETY: MVCC keeps this entry and the traversed older chain alive. The
+        // source row latch protects main-branch reads; published cross-row branches
+        // target finalized operation kinds. A source writer changes only its
+        // forward field, never its discriminant or before-images. The projections
+        // borrow Update columns and `next`, leaving both link stores unborrowed.
+        unsafe {
+            let kind = match (*entry).kind {
+                RowUndoKind::Lock => RowUndoKindView::Lock,
+                RowUndoKind::Insert => RowUndoKindView::Insert,
+                RowUndoKind::Delete(_) => RowUndoKindView::Delete,
+                RowUndoKind::Update(UpdateUndo { ref cols, .. }) => RowUndoKindView::Update(cols),
+            };
+            RowUndoView {
+                kind,
+                next: (*entry).next.as_ref(),
+            }
+        }
+    }
+
+    /// Projects only forward storage without borrowing before-images or the chain.
+    ///
+    /// # Safety
+    /// The caller must hold the source row's write latch and prove this is the
+    /// active writer's exact reachable Delete/Update entry. Cross-row snapshot
+    /// readers must use `snapshot_view`, which does not borrow forward storage.
+    #[inline]
+    pub(in crate::trx) unsafe fn forward_mut(&mut self) -> Option<&mut ForwardLinks> {
+        // SAFETY: the caller establishes exclusive access to the forward field.
+        // Match the raw place directly so neither RowUndo nor RowUndoKind is
+        // borrowed mutably alongside snapshot references to disjoint fields.
+        unsafe {
+            match (*self.0.as_ptr()).kind {
+                RowUndoKind::Delete(ref mut delete) => Some(delete),
+                RowUndoKind::Update(UpdateUndo {
+                    ref mut forward, ..
+                }) => Some(forward),
+                _ => None,
+            }
+        }
+    }
+
+    /// Returns the whole undo while its source row latch protects shared access.
+    /// Cross-row snapshot traversal must use `snapshot_view` instead because
+    /// the source writer can still update forward links. GC clears unreachable
+    /// references before freeing their entries.
     #[inline]
     pub(crate) fn as_ref(&self) -> &RowUndo {
-        // SAFETY: `RowUndoRef` invariants guarantee the pointed entry stays valid while
-        // reachable from version chains.
+        // SAFETY: the source row latch serializes access, and `RowUndoRef`
+        // invariants keep the entry alive while reachable from version chains.
         unsafe { self.0.as_ref() }
     }
 
@@ -657,5 +945,67 @@ impl RowUndoHead {
             UndoStatus::Ref(status) => status.prepare_listener(),
             _ => PrepareListenerResult::NotPreparing,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ForwardHint, ForwardLinks, OwnedRowUndo, RowUndo, RowUndoKind};
+    use crate::catalog::{IndexID, IndexRef, IndexSlot};
+    use crate::id::RowID;
+    use std::mem::size_of;
+
+    #[test]
+    fn test_delete_successors_are_lazy_exact_and_bounded() {
+        let mut delete = ForwardLinks::default();
+        let first = IndexRef::new(IndexID::new(7), IndexSlot::new(0));
+        let second = IndexRef::new(IndexID::new(8), IndexSlot::new(1));
+        let recycled = IndexRef::new(IndexID::new(9), IndexSlot::new(0));
+        assert_eq!(delete.successor(first), None);
+        assert!(delete.successors.is_none());
+        delete.set_successor(ForwardHint {
+            index: first,
+            row_id: RowID::new(10),
+        });
+        delete.set_successor(ForwardHint {
+            index: second,
+            row_id: RowID::new(20),
+        });
+        let allocated = delete.successors.as_deref().unwrap().as_ptr();
+        let previous = delete.hint(first);
+        delete.set_successor(ForwardHint {
+            index: first,
+            row_id: RowID::new(30),
+        });
+        assert_eq!(delete.successor(first), Some(RowID::new(30)));
+        assert_eq!(delete.successor(second), Some(RowID::new(20)));
+        assert_eq!(delete.successor(recycled), None);
+        assert_eq!(delete.successors.as_deref().unwrap().len(), 2);
+        assert_eq!(delete.successors.as_deref().unwrap().as_ptr(), allocated);
+        delete.restore(first, previous);
+        assert_eq!(delete.successor(first), Some(RowID::new(10)));
+        assert_eq!(delete.successor(second), Some(RowID::new(20)));
+        delete.restore(first, None);
+        assert_eq!(delete.successor(first), None);
+        assert_eq!(delete.successor(second), Some(RowID::new(20)));
+        delete.restore(second, None);
+        assert!(delete.successors.is_none());
+        assert_eq!(
+            size_of::<RowUndoKind>(),
+            40,
+            "Update contains before-images and lazy forward storage"
+        );
+        assert_eq!(size_of::<ForwardLinks>(), 16);
+        assert_eq!(size_of::<ForwardHint>(), 16);
+        assert_eq!(
+            size_of::<RowUndo>(),
+            136,
+            "snapshot-visible undo excludes the restoration journal"
+        );
+        assert_eq!(
+            size_of::<OwnedRowUndo>(),
+            32,
+            "the owner retains a Box and a lazily allocated Vec"
+        );
     }
 }

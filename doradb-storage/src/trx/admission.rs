@@ -80,36 +80,19 @@ impl TransactionTableBinding {
                         "operation={operation}, table_id={table_id}, index_id={index_id}"
                     ))
                 })?;
-            let visible_spec = self
-                .visible
-                .metadata()
-                .idx
-                .index_spec(visible_index.slot())
-                .expect("visible index presence was established above");
+            let visible_spec = self.visible.metadata().idx.expect_index_spec(visible_index);
             let index = selector.resolve(&self.layout, operation)?;
             if index != visible_index {
                 return Err(Report::new(OperationError::SchemaChanged).attach(format!(
                     "operation={operation}, table_id={table_id}, visible_index={visible_index}, current_index={index}"
                 )));
             }
-            let current_spec = self
-                .layout
-                .metadata()
-                .idx
-                .index_spec(index.slot())
-                .ok_or_else(|| {
-                    Report::new(OperationError::SchemaChanged).attach(format!(
-                        "operation={operation}, table_id={table_id}, index={index}"
-                    ))
-                })?;
+            let current_spec = self.layout.metadata().idx.expect_index_spec(index);
             assert_eq!(
                 visible_spec, current_spec,
                 "stable index specification changed across metadata versions: table_id={table_id}, index={index}"
             );
-            assert!(
-                self.layout.index_entry(index).is_ok(),
-                "active current index is missing its runtime: table_id={table_id}, index={index}"
-            );
+            self.layout.expect_index_entry(index);
             admitted_index = Some(index);
         }
 
@@ -349,6 +332,7 @@ pub(super) async fn admit_user_index(
 mod tests {
     use super::*;
     use crate::CallbackResult;
+    use crate::catalog::table::tests::metadata_with_replacement_index;
     use crate::catalog::tests::table2;
     use crate::catalog::{
         IndexID, IndexSlot, StorageIndexFlags, StorageIndexKey, StorageIndexSpec, TableIndex,
@@ -532,7 +516,7 @@ mod tests {
             );
             let replacement = Arc::new(TableRuntimeLayout::from_entries(
                 current.generation() + 1,
-                Arc::clone(current.metadata_arc()),
+                metadata_with_replacement_index(current.metadata(), replacement_ref),
                 vec![Some(RuntimeIndexEntry::new(replacement_ref, runtime))].into_boxed_slice(),
             ));
             {

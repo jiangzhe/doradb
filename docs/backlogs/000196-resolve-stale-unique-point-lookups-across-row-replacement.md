@@ -16,7 +16,7 @@ undo for direct forwarding. No design is selected by this backlog.
 - [Task 000008: Replace Move with Delete+Insert](../tasks/000008-replace-move-with-delete-insert.md)
   and commit `416d8a6a1ef56a1684f56022842264bcda53913c`, which removed the old
   `Move(bool)` and cross-row main-chain traversal.
-- `doradb-storage/src/table/unique_mutate.rs`: `UniquePointMutator::execute`.
+- `doradb-storage/src/table/unique_mutate.rs`: `UniqueMutator::execute`.
 - `doradb-storage/src/table/hot.rs`: `lock_for_write`, `finish_update_owned`,
   and `prepare_move_update`.
 - `doradb-storage/src/table/access.rs`: `move_update_for_space`,

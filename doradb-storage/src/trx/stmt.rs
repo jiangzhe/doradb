@@ -21,8 +21,8 @@ use crate::row::ops::{
 use crate::session::TrxAttachment;
 use crate::table::{DmlValidator, LazyRow};
 use crate::trx::undo::{
-    IndexUndo, IndexUndoKind, IndexUndoLogs, OwnedRowUndo, RowUndoKind, RowUndoLogs,
-    RowUndoRollbackContext,
+    ForwardLinkUndo, IndexUndo, IndexUndoKind, IndexUndoLogs, OwnedRowUndo, RowUndoKind,
+    RowUndoLogs, RowUndoRollbackContext,
 };
 use crate::trx::{
     FatalRollbackRetention, NON_FOREGROUND_STMT_NO, SessionOperationCheckout, StmtNo, TrxEffects,
@@ -172,6 +172,20 @@ impl StmtEffects {
         self.row_undo
             .last()
             .expect("owned row mutation requires a newest ordinary row undo")
+    }
+
+    /// Registers a published source link on the current destination's undo owner.
+    #[inline]
+    pub(crate) fn push_forward_undo(&mut self, row_id: RowID, undo: ForwardLinkUndo) {
+        let destination = self
+            .row_undo
+            .last_mut()
+            .expect("forward destination owns row undo");
+        assert_eq!(
+            destination.row_id, row_id,
+            "forward destination must be the current row effect"
+        );
+        destination.push_forward_undo(undo);
     }
 
     /// Requires that no operation-local deferred ownership remains.
@@ -1540,6 +1554,14 @@ pub(crate) mod tests {
         stmt.effects
     }
 
+    /// Lends disjoint runtime and effects borrows to focused statement tests.
+    #[inline]
+    pub(in crate::trx) fn statement_runtime_and_effects_mut<'borrow>(
+        stmt: &'borrow mut Statement<'_>,
+    ) -> (TrxRuntime<'borrow>, &'borrow mut StmtEffects) {
+        stmt.runtime_and_effects_mut()
+    }
+
     #[inline]
     fn empty_stmt_effects() -> StmtEffects {
         StmtEffects {
@@ -1866,7 +1888,7 @@ pub(crate) mod tests {
             TableID::new(41),
             None,
             RowID::new(1),
-            RowUndoKind::Delete,
+            RowUndoKind::delete(),
         ));
         trx_effects.index_undo_mut().push(IndexUndo {
             table_id: TableID::new(41),
@@ -1938,7 +1960,7 @@ pub(crate) mod tests {
                 table_id,
                 None,
                 row_id,
-                RowUndoKind::Delete,
+                RowUndoKind::delete(),
             ));
 
             pause_next_index_rollback();
@@ -2236,7 +2258,7 @@ pub(crate) mod tests {
                             TableID::new(99_999_999),
                             None,
                             RowID::new(24),
-                            RowUndoKind::Delete,
+                            RowUndoKind::delete(),
                         ));
                         effects.push_delete_index_undo(
                             TableID::new(12),

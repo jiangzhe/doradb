@@ -49,11 +49,13 @@ impl RuntimeIndexEntry {
 }
 
 /// Selector admitted by exact runtime lookup.
+#[cfg(test)]
 pub(crate) trait LayoutIndexSelector {
     /// Resolves this selector to an exact active user-index generation.
     fn resolve(self, layout: &TableRuntimeLayout) -> RuntimeResult<IndexRef>;
 }
 
+#[cfg(test)]
 impl LayoutIndexSelector for IndexRef {
     #[inline]
     fn resolve(self, layout: &TableRuntimeLayout) -> RuntimeResult<IndexRef> {
@@ -164,7 +166,7 @@ impl TableRuntimeLayout {
             self.metadata.idx.index_slot_count()
         );
 
-        for (index_slot, _) in self.metadata.idx.active_indexes() {
+        for (index_slot, index_spec) in self.metadata.idx.active_indexes() {
             let entry = self
                 .secondary_indexes
                 .get(index_slot.as_usize())
@@ -174,6 +176,14 @@ impl TableRuntimeLayout {
                 "table runtime layout invariant violated: active metadata index missing runtime slot, index_slot={index_slot}"
             );
             let entry = entry.expect("active metadata entry was asserted present");
+            assert_eq!(
+                entry.index_ref(),
+                index_spec.index,
+                "table runtime layout invariant violated: metadata/runtime identity mismatch, generation={}, metadata_index={}, runtime_index={}",
+                self.generation,
+                index_spec.index,
+                entry.index_ref()
+            );
             assert_eq!(
                 entry.index_ref().slot(),
                 index_slot,
@@ -308,6 +318,40 @@ impl TableRuntimeLayout {
             .ok_or_else(|| self.index_access_error(index))
     }
 
+    /// Returns an entry already resolved against this retained layout.
+    /// Layout ownership keeps the exact generation active throughout execution.
+    #[inline]
+    pub(crate) fn expect_index_entry(&self, index: IndexRef) -> &RuntimeIndexEntry {
+        let entry = self
+            .secondary_indexes
+            .get(index.slot().as_usize())
+            .and_then(Option::as_ref)
+            .unwrap_or_else(|| {
+                panic!(
+                    "retained index runtime invariant violated: missing entry, generation={}, index={index}, index_slot_count={}",
+                    self.generation,
+                    self.index_slot_count()
+                )
+            });
+        assert_eq!(
+            entry.index_ref(),
+            index,
+            "retained index runtime invariant violated: generation mismatch, generation={}, requested_index={index}, actual_index={}",
+            self.generation,
+            entry.index_ref()
+        );
+        entry
+    }
+
+    /// Returns the runtime for an exact reference resolved against this retained layout.
+    #[inline]
+    pub(crate) fn expect_secondary_index(
+        &self,
+        index: IndexRef,
+    ) -> &SecondaryIndex<EvictableBufferPool> {
+        self.expect_index_entry(index).runtime()
+    }
+
     /// Returns one active secondary-index entry by an already trusted slot.
     #[inline]
     pub(crate) fn index_entry_at_slot(&self, slot: IndexSlot) -> RuntimeResult<&RuntimeIndexEntry> {
@@ -337,6 +381,7 @@ impl TableRuntimeLayout {
     }
 
     /// Returns one active secondary-index runtime by exact reference.
+    #[cfg(test)]
     #[inline]
     pub(crate) fn secondary_index<I: LayoutIndexSelector>(
         &self,
@@ -352,9 +397,9 @@ impl TableRuntimeLayout {
         &self,
         index: IndexRef,
         vals: Vec<Val>,
-    ) -> RuntimeResult<ResolvedIndexKey> {
-        self.secondary_index(index)?;
-        Ok(user_key_from_index_ref(index, vals))
+    ) -> ResolvedIndexKey {
+        self.expect_index_entry(index);
+        user_key_from_index_ref(index, vals)
     }
 
     /// Iterates exact active references paired with their runtimes.
@@ -374,6 +419,7 @@ impl TableRuntimeLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::table::tests::metadata_with_replacement_index;
     use crate::catalog::{
         ActiveIndexSpec, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
         StorageIndexSpec,
@@ -383,6 +429,7 @@ mod tests {
     use crate::trx::purge::PurgeTestEvent;
     use crate::value::ValKind;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::ptr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
@@ -462,6 +509,22 @@ mod tests {
                     .as_ref()
                     .unwrap()
                     .runtime_arc(),
+            );
+
+            let mismatched_ref = IndexRef::new(IndexID::new(100), IndexSlot::new(0));
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| {
+                    TableRuntimeLayout::from_entries(
+                        layout.generation() + 1,
+                        Arc::clone(layout.metadata_arc()),
+                        vec![Some(RuntimeIndexEntry::new(
+                            mismatched_ref,
+                            Arc::clone(&runtime),
+                        ))]
+                        .into_boxed_slice(),
+                    )
+                }))
+                .is_err()
             );
 
             assert!(
@@ -560,7 +623,7 @@ mod tests {
             let replacement_ref = IndexRef::new(IndexID::new(100), slot);
             let replacement = TableRuntimeLayout::from_entries(
                 current.generation() + 1,
-                Arc::clone(current.metadata_arc()),
+                metadata_with_replacement_index(current.metadata(), replacement_ref),
                 vec![Some(RuntimeIndexEntry::new(replacement_ref, runtime))].into_boxed_slice(),
             );
 
@@ -573,6 +636,71 @@ mod tests {
             assert!(!replacement.validate_index_ref(old_ref));
             assert!(replacement.validate_index_ref(replacement_ref));
             assert_eq!(TableRuntimeLayout::index_access_counters(), (2, 2, 0));
+        });
+    }
+
+    #[test]
+    fn retained_index_access_requires_exact_active_generation() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "retained_index_invariants").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let current = table_for_internal_assertion(&engine, table_id).layout_snapshot();
+            let index = current.resolve_index_id(IndexID::new(0)).unwrap();
+            let runtime = Arc::clone(current.expect_index_entry(index).runtime_arc());
+            let metadata = Arc::new(
+                TableMetadata::try_new_with_index_slot_count(
+                    table2_columns(),
+                    vec![ActiveIndexSpec::new(
+                        index,
+                        StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::UK),
+                    )],
+                    IndexSlot::new(2),
+                )
+                .unwrap(),
+            );
+            let layout = TableRuntimeLayout::new(
+                current.generation() + 1,
+                metadata,
+                vec![Some(Arc::clone(&runtime)), None].into_boxed_slice(),
+            );
+
+            TableRuntimeLayout::reset_index_access_counters();
+            assert_eq!(layout.metadata().idx.expect_index_spec(index).index, index);
+            assert!(ptr::eq(
+                layout.expect_secondary_index(index),
+                runtime.as_ref()
+            ));
+            assert_eq!(TableRuntimeLayout::index_access_counters(), (0, 0, 0));
+
+            for (case, invalid) in [
+                (
+                    "replaced generation",
+                    IndexRef::new(IndexID::new(100), index.slot()),
+                ),
+                (
+                    "inactive slot",
+                    IndexRef::new(IndexID::new(1), IndexSlot::new(1)),
+                ),
+                (
+                    "absent slot",
+                    IndexRef::new(IndexID::new(2), IndexSlot::new(2)),
+                ),
+            ] {
+                assert!(
+                    catch_unwind(AssertUnwindSafe(|| layout.expect_secondary_index(invalid)))
+                        .is_err(),
+                    "runtime must reject {case}: index={invalid}"
+                );
+                assert!(
+                    catch_unwind(AssertUnwindSafe(|| layout
+                        .metadata()
+                        .idx
+                        .expect_index_spec(invalid)))
+                    .is_err(),
+                    "metadata must reject {case}: index={invalid}"
+                );
+            }
         });
     }
 

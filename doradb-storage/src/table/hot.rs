@@ -1,16 +1,20 @@
+use super::index_key_is_changed;
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
-use crate::catalog::{CatalogSelectKey, IndexSlot, TableMetadata, catalog_key_from_active_ordinal};
+use crate::catalog::{CatalogSelectKey, IndexRef, IndexSlot, TableMetadata};
 use crate::error::{FatalResult, OperationError, OperationOrFatalResult};
 use crate::id::{RowID, TableID};
 use crate::log::redo::{RowRedo, RowRedoKind};
 use crate::map::FastHashMap;
+use crate::poison::PoisonAwareListener;
 use crate::row::ops::{RowUpdateInput, SelectKey, UndoCol, UpdateCol, UpdateRow};
 use crate::row::{RowPage, RowRead, var_len_for_insert};
-use crate::trx::TrxRuntime;
 use crate::trx::row::{BoundIndexCandidate, LockRowForWrite, LockUndo, RowWriteAccess};
 use crate::trx::stmt::StmtEffects;
-use crate::trx::undo::{IndexBranch, IndexBranchTarget, RowUndoKind};
+use crate::trx::undo::{
+    ForwardHint, ForwardLinkUndo, HotForwardSource, IndexBranch, IndexBranchTarget, RowUndoKind,
+};
 use crate::trx::ver_map::RowPageState;
+use crate::trx::{TrxContext, TrxRuntime};
 use crate::value::Val;
 use error_stack::Report;
 use std::mem::replace;
@@ -48,6 +52,26 @@ pub(super) enum ResumeOwnedRow<'a> {
     Ok(RowWriteAccess<'a>),
     /// Checkpoint transition requires authoritative route publication first.
     RetryInTransition,
+}
+
+/// Non-waiting admission shared by index-selected rows and forward targets.
+pub(super) enum HotRowLock<'a> {
+    /// The latest live row matches the requested key and is owned for mutation.
+    Owned(RowWriteAccess<'a>),
+    /// The original index candidate has a confirmed Delete CTS below reader STS.
+    /// Absence is established without inspecting successors or validating the index.
+    DeletedBeforeSnapshot,
+    /// The newest departure of this key supplies the next row to inspect.
+    Successor(RowID),
+    /// Neither absence nor a successor is established. Validate the original
+    /// index observation: stale means retry; stable means missing.
+    Unresolved,
+    /// Another active transaction owns the row.
+    WriteConflict,
+    /// Another transaction is preparing; release the attempt before waiting.
+    Preparing(PoisonAwareListener),
+    /// Checkpoint transition requires authoritative route publication first.
+    Transition,
 }
 
 /// Hot row-page insert context shared by catalog and user-table accessors.
@@ -144,11 +168,13 @@ impl<'m, 'r> RowInserter<'m, 'r> {
 
 /// Prepared replacement state for a hot-row move update.
 pub(super) struct PreparedHotMoveUpdate {
+    /// Exact writer-owned Delete captured before replacement insertion.
+    pub(super) source: HotForwardSource,
     /// Replacement row values to insert as the new hot row.
     pub(super) row: Vec<Val>,
     /// Indexed columns changed by the update, keyed by column number.
     pub(super) index_change_cols: FastHashMap<usize, Val>,
-    /// Runtime unique-index branches linking the replacement to the old row.
+    /// Backward history for unique keys unchanged by this move.
     pub(super) index_branches: Vec<IndexBranch>,
 }
 
@@ -162,6 +188,59 @@ pub(super) struct HotRowMutator<'m, 'r, 'g> {
 }
 
 impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
+    /// Admits ownership before reading the mutable key/deletion state.
+    /// Authoritative successors use the same ownership rules as index candidates.
+    #[inline]
+    pub(super) fn try_lock_current(
+        &self,
+        effects: &mut StmtEffects,
+        index: IndexRef,
+        key: &[Val],
+        original_candidate: bool,
+    ) -> HotRowLock<'g> {
+        #[cfg(test)]
+        {
+            use super::test_hooks::run_test_hot_row_write_before_state_lock_hook;
+            run_test_hot_row_write_before_state_lock_hook();
+        }
+        let page = self.page_guard.page();
+        let state = self.page_guard.unwrap_vmap().read_state();
+        if *state == RowPageState::Transition {
+            return HotRowLock::Transition;
+        }
+        let spec = self.metadata.idx.expect_index_spec(index);
+        let mut access = self
+            .page_guard
+            .write_row_with_state_guard(page.row_idx(self.row_id), state);
+        match access.lock_undo(
+            self.rt,
+            effects,
+            self.table_id,
+            self.page_guard.versioned_page_id(),
+            self.row_id,
+            |row| !row.is_deleted() && !row.is_key_different(self.metadata.col.as_ref(), spec, key),
+        ) {
+            LockUndo::Ok => HotRowLock::Owned(access),
+            LockUndo::WriteConflict => HotRowLock::WriteConflict,
+            LockUndo::Preparing(listener) => HotRowLock::Preparing(listener),
+            LockUndo::InvalidIndex => {
+                // Only an original candidate can use its pre-lookup CTS proof.
+                // Forwarded targets must resolve their own departure.
+                if original_candidate
+                    && access
+                        .current_delete_cts()
+                        .is_some_and(|cts| cts < self.rt.sts())
+                {
+                    return HotRowLock::DeletedBeforeSnapshot;
+                }
+                match access.current_successor(self.metadata, index, key) {
+                    Some(row_id) => HotRowLock::Successor(row_id),
+                    None => HotRowLock::Unresolved,
+                }
+            }
+        }
+    }
+
     /// Create a hot-row mutator for one page row, metadata snapshot, and transaction.
     #[inline]
     pub(super) fn new(
@@ -260,9 +339,7 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
         if !page.row_id_in_valid_range(row_id) {
             return Ok(LockRowForWrite::InvalidIndex);
         }
-        let Some(index_spec) = self.metadata.idx.index_spec(candidate.index.slot()) else {
-            return Ok(LockRowForWrite::InvalidIndex);
-        };
+        let index_spec = self.metadata.idx.expect_index_spec(candidate.index);
         let ver_map = page_guard.unwrap_vmap();
         loop {
             let state_guard = ver_map.read_state();
@@ -346,27 +423,6 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
         ResumeOwnedRow::Ok(access)
     }
 
-    /// Delete the hot row after validating that it belongs to the page.
-    #[inline]
-    pub(super) async fn delete(
-        &self,
-        effects: &mut StmtEffects,
-        index_slot: IndexSlot,
-        key_vals: &[Val],
-        log_by_key: bool,
-    ) -> OperationOrFatalResult<DeleteInternal> {
-        let redo_kind = if log_by_key {
-            RowRedoKind::DeleteByPrimaryKey(catalog_key_from_active_ordinal(
-                index_slot.as_usize(),
-                key_vals.to_vec(),
-            ))
-        } else {
-            RowRedoKind::Delete(Some(self.page_guard.page_id()))
-        };
-        self.delete_inner(effects, Some((index_slot, key_vals)), redo_kind)
-            .await
-    }
-
     /// Delete one known page/row without revalidating an index lookup key.
     #[inline]
     pub(super) async fn delete_known_row(
@@ -396,7 +452,7 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
     }
 
     #[inline]
-    fn finish_delete_owned(
+    pub(super) fn finish_delete_owned(
         &self,
         effects: &mut StmtEffects,
         mut access: RowWriteAccess<'g>,
@@ -406,7 +462,7 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
             return DeleteInternal::NotFound;
         }
         access.delete_row();
-        effects.update_last_row_undo(RowUndoKind::Delete);
+        effects.update_last_row_undo(RowUndoKind::delete());
         drop(access);
         effects.insert_row_redo(
             self.table_id,
@@ -448,22 +504,6 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
                 Ok(self.finish_delete_owned(effects, access, redo_kind))
             }
         }
-    }
-
-    /// Update a locked hot row in place, or report move-update state.
-    #[inline]
-    pub(super) async fn update_inplace(
-        &self,
-        effects: &mut StmtEffects,
-        index_slot: IndexSlot,
-        key_vals: &[Val],
-        update: RowUpdateInput,
-        log_by_key: bool,
-    ) -> OperationOrFatalResult<UpdateRowInplace> {
-        let redo_key = log_by_key
-            .then(|| catalog_key_from_active_ordinal(index_slot.as_usize(), key_vals.to_vec()));
-        self.update_known_row_inner(effects, update, Some((index_slot, key_vals)), redo_key)
-            .await
     }
 
     /// Update one known page/row without revalidating an index lookup key.
@@ -530,7 +570,7 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
     }
 
     #[inline]
-    fn finish_update_owned(
+    pub(super) fn finish_update_owned(
         &self,
         effects: &mut StmtEffects,
         update: RowUpdateInput,
@@ -550,7 +590,7 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
         match access.update_row(self.metadata.col.as_ref(), update.as_view(), frozen) {
             UpdateRow::NoFreeSpaceOrFrozen(old_row) => {
                 access.delete_row();
-                effects.update_last_row_undo(RowUndoKind::Delete);
+                effects.update_last_row_undo(RowUndoKind::delete());
                 drop(access);
                 effects.insert_row_redo(
                     self.table_id,
@@ -582,7 +622,7 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
                         redo_cols.push(UpdateCol { idx, val });
                     }
                 }
-                effects.update_last_row_undo(RowUndoKind::Update(undo_cols));
+                effects.update_last_row_undo(RowUndoKind::update(undo_cols));
                 drop(access);
                 if !redo_cols.is_empty() {
                     effects.insert_row_redo(
@@ -648,20 +688,25 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
                 }
             }
         };
-        let index_branches = {
-            // Unique indexes keep only the latest owner in MemIndex. When a
-            // move update changes RowID, the new hot row's insert undo carries
-            // runtime branches back to the deleted old hot row so older
-            // snapshots can still resolve the previous unique-key owner.
+        let (index_branches, source) = {
+            // Unchanged unique keys use direct RowID exchange, so their backward
+            // history must be installed with the destination. Changed keys use
+            // ordinary insertion, which discovers their actual previous owners
+            // and builds their branches before claiming the index entry.
             let old_access = old_guard.read_row_by_id(old_id);
             let undo_head = old_access.undo_head().expect("undo head");
             debug_assert!(self.rt.is_same_trx(undo_head));
             let old_entry = old_access.first_undo_entry().expect("old undo entry");
-            debug_assert!(matches!(old_entry.as_ref().kind, RowUndoKind::Delete));
-            self.metadata
+            debug_assert!(matches!(old_entry.as_ref().kind, RowUndoKind::Delete(_)));
+            let source = HotForwardSource::new(self.rt.ctx(), undo_head, &old_entry)
+                .expect("move source is the writer's exact Delete head");
+            let branches = self
+                .metadata
                 .idx
                 .active_indexes()
-                .filter(|(_, index)| index.unique())
+                .filter(|(_, index)| {
+                    index.unique() && !index_key_is_changed(index, &index_change_cols)
+                })
                 .map(|(index_slot, index)| {
                     let vals = index
                         .keys
@@ -681,12 +726,64 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
                         undo_vals.clone(),
                     )
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (branches, source)
         };
         PreparedHotMoveUpdate {
+            source,
             row: new_row,
             index_change_cols,
             index_branches,
         }
     }
+}
+
+/// Publishes an optional hint after index exchange and normal index undo registration.
+/// The caller pins the source page before the exchange; only this synchronous
+/// update takes its row write latch. Transaction ownership protects the source
+/// and initialized destination until the operation completes. No row write latch
+/// or mutable payload borrow crosses an await; cancellation uses registered undo.
+#[inline]
+pub(super) fn publish_forward_hint(
+    ctx: &TrxContext,
+    effects: &mut StmtEffects,
+    source: Option<&HotForwardSource>,
+    page: Option<&PageSharedGuard<RowPage>>,
+    hint: ForwardHint,
+) {
+    let (Some(source), Some(page)) = (source, page) else {
+        return;
+    };
+    assert_eq!(
+        page.versioned_page_id(),
+        source.page_id,
+        "forward hint source page must match its captured generation"
+    );
+    let mut access = page.write_row_by_id(source.row_id);
+    if access.page_state() == RowPageState::Transition {
+        return;
+    }
+    assert!(
+        access.owned_by_trx(ctx),
+        "forward source must remain writer-owned"
+    );
+    assert_ne!(
+        source.row_id, hint.row_id,
+        "a forward transfer must have a different destination"
+    );
+    let published = access.with_forward_source(source, |links| {
+        effects.push_forward_undo(
+            hint.row_id,
+            ForwardLinkUndo {
+                source: source.clone(),
+                index: hint.index,
+                previous: links.hint(hint.index),
+            },
+        );
+        links.set_successor(hint);
+    });
+    assert!(
+        published.is_some(),
+        "forward publication requires the exact owned departure"
+    );
 }

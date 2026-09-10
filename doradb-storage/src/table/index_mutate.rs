@@ -222,11 +222,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                 ))
                 .disclose().into());
         }
-        let index_spec = accessor
-            .metadata()
-            .idx
-            .require_index_spec(candidate.index.slot())
-            .expect("IndexWrite admission must retain an active index spec");
+        let index_spec = accessor.metadata().idx.expect_index_spec(candidate.index);
         let key_vals = block
             .decode_index_key_values(accessor.metadata().col.as_ref(), index_spec, row_idx)
             .attach_with(|| format!("file={file_kind}, block=lwc_block, block_id={block_id}"))
@@ -578,8 +574,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
             .accessor
             .metadata()
             .idx
-            .require_index_spec(candidate.index.slot())
-            .expect("IndexWrite admission must retain an active index spec");
+            .expect_index_spec(candidate.index);
         let mut key_vals = Vec::with_capacity(index_spec.keys.len());
         for key in &index_spec.keys {
             let column_no = key.column_ordinal.as_usize();

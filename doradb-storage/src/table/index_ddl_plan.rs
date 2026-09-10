@@ -453,11 +453,7 @@ impl Table {
                 "drop index target not found: table_id={table_id}, index_id={index_id}, reason=inactive_runtime_layout"
             ))
         })?;
-        old_layout.secondary_index(index).map_err(|report| {
-            report
-                .change_context(RuntimeError::CatalogAccess)
-                .attach("operation=drop_index, phase=validate_runtime")
-        })?;
+        old_layout.expect_index_entry(index);
         let new_metadata = Arc::new(old_metadata.without_index(index)?);
         let mut secondary_index_slots = active_root.secondary_index_slots.clone();
         secondary_index_slots[index.slot().as_usize()] = SecondaryIndexSlot::Retired(index.id());

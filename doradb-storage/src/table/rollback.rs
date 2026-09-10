@@ -195,7 +195,7 @@ impl IndexRollback for UserTableRollback<'_> {
         row_id: RowID,
         ts: TrxID,
     ) -> RuntimeResult<bool> {
-        let index = self.layout.secondary_index(key.index)?;
+        let index = self.layout.expect_secondary_index(key.index);
         index
             .unique_mem()?
             .bind(index_pool_guard)
@@ -212,7 +212,7 @@ impl IndexRollback for UserTableRollback<'_> {
         ignore_del_mask: bool,
         ts: TrxID,
     ) -> RuntimeResult<bool> {
-        let index = self.layout.secondary_index(key.index)?;
+        let index = self.layout.expect_secondary_index(key.index);
         index
             .unique_mem()?
             .bind(index_pool_guard)
@@ -229,7 +229,7 @@ impl IndexRollback for UserTableRollback<'_> {
         new_row_id: RowID,
         ts: TrxID,
     ) -> RuntimeResult<IndexCompareExchange> {
-        let index = self.layout.secondary_index(key.index)?;
+        let index = self.layout.expect_secondary_index(key.index);
         index
             .unique_mem()?
             .bind(index_pool_guard)
@@ -245,7 +245,7 @@ impl IndexRollback for UserTableRollback<'_> {
         row_id: RowID,
         ts: TrxID,
     ) -> RuntimeResult<bool> {
-        let index = self.layout.secondary_index(key.index)?;
+        let index = self.layout.expect_secondary_index(key.index);
         index
             .non_unique_mem()?
             .bind(index_pool_guard)
@@ -261,7 +261,7 @@ impl IndexRollback for UserTableRollback<'_> {
         row_id: RowID,
         ts: TrxID,
     ) -> RuntimeResult<bool> {
-        let index = self.layout.secondary_index(key.index)?;
+        let index = self.layout.expect_secondary_index(key.index);
         index
             .non_unique_mem()?
             .bind(index_pool_guard)
@@ -278,7 +278,7 @@ impl IndexRollback for UserTableRollback<'_> {
         ignore_del_mask: bool,
         ts: TrxID,
     ) -> RuntimeResult<bool> {
-        let index = self.layout.secondary_index(key.index)?;
+        let index = self.layout.expect_secondary_index(key.index);
         index
             .non_unique_mem()?
             .bind(index_pool_guard)

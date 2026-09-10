@@ -3,14 +3,37 @@ use crate::catalog::TableIndexMetadata;
 use crate::error::RuntimeResult;
 use crate::id::{RowID, TrxID};
 use crate::index::btree::{BTreeDelete, BTreeInsert, BTreeReplaceOrInsert, BTreeUpdate};
-use crate::index::btree::{BTreeKey, BTreeU64};
+use crate::index::btree::{BTreeKey, BTreeLookupObservation, BTreeU64};
 use crate::index::index_stream::UniqueMemIndexCandidateStream;
 use crate::index::mem_index::{MemIndex, MemIndexCleanupScan, UniqueMemIndexCleanupSpec};
 use crate::index::util::Maskable;
 use crate::index::{BTreeKeyEncoder, IndexCompareExchange, IndexInsert, KeyRange};
 use crate::quiescent::QuiescentGuard;
 use crate::value::{Val, ValType};
+use std::marker::PhantomData;
 use std::ops::Deref;
+
+/// Original MemTree leaf evidence for one selected index/key and root lifetime.
+/// It covers the leaf where a competing write could replace or insert the key,
+/// including when a MemTree miss leads to a DiskTree candidate.
+/// The phantom borrow prevents retaining evidence beyond its bound lookup handle.
+pub(crate) struct UniqueLookupObservation<'a> {
+    leaf: BTreeLookupObservation,
+    selected: PhantomData<&'a [Val]>,
+}
+
+impl UniqueLookupObservation<'_> {
+    /// Checks the original version without payload access or refreshed evidence.
+    #[inline]
+    pub(crate) fn is_valid(&self) -> bool {
+        #[cfg(test)]
+        {
+            use crate::table::record_lookup_validation;
+            record_lookup_validation();
+        }
+        self.leaf.is_valid()
+    }
+}
 
 /// Generic unique-index implementation backed by a generic B-Tree.
 pub(crate) struct UniqueMemIndex<P: 'static>(MemIndex<P>);
@@ -193,6 +216,32 @@ impl<P: BufferPool> GuardedUniqueMemIndex<'_, '_, P> {
             .lookup_optimistic::<BTreeU64>(self.pool_guard, k.as_bytes())
             .await?
             .map(|res| (res.value().to_row_id(), res.is_deleted())))
+    }
+
+    /// Retains the original leaf observation for current-row selection.
+    #[inline]
+    pub(crate) async fn lookup_observed<'lookup>(
+        &'lookup self,
+        key: &'lookup [Val],
+    ) -> RuntimeResult<(Option<(RowID, bool)>, UniqueLookupObservation<'lookup>)> {
+        #[cfg(test)]
+        {
+            use crate::table::record_unique_lookup;
+            record_unique_lookup();
+        }
+        let key = self.index.encoder().encode(key);
+        let (value, observation) = self
+            .index
+            .tree()
+            .lookup_observed::<BTreeU64>(self.pool_guard, key.as_bytes())
+            .await?;
+        Ok((
+            value.map(|v| (v.value().to_row_id(), v.is_deleted())),
+            UniqueLookupObservation {
+                leaf: observation,
+                selected: PhantomData,
+            },
+        ))
     }
 
     /// Insert a unique key unless another owner already exists.

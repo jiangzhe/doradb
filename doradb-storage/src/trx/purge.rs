@@ -1521,7 +1521,7 @@ where
 
 #[inline]
 fn promote_delete_marker_if_needed(table: &Table, undo: &OwnedRowUndo) {
-    if matches!(&undo.kind, RowUndoKind::Delete) {
+    if matches!(&undo.kind, RowUndoKind::Delete(_)) {
         table
             .deletion_buffer()
             .promote_delete_marker_if_committed(undo.row_id);
@@ -2659,7 +2659,7 @@ mod tests {
                 table.table_id(),
                 None,
                 row_id,
-                RowUndoKind::Delete,
+                RowUndoKind::delete(),
             ));
             let trx = CommittedTrx {
                 cts: TrxID::new(100),
@@ -2745,7 +2745,7 @@ mod tests {
                 table.table_id(),
                 None,
                 row_id,
-                RowUndoKind::Delete,
+                RowUndoKind::delete(),
             ));
             let trx = CommittedTrx {
                 cts: TrxID::new(100),
@@ -2858,7 +2858,7 @@ mod tests {
                 table.table_id(),
                 Some(stale_page_id),
                 row_id,
-                RowUndoKind::Delete,
+                RowUndoKind::delete(),
             ));
             let trx = CommittedTrx {
                 cts: TrxID::new(100),
@@ -2967,7 +2967,7 @@ mod tests {
                 table.table_id(),
                 Some(stale_page_id),
                 row_id,
-                RowUndoKind::Delete,
+                RowUndoKind::delete(),
             ));
             let trx = CommittedTrx {
                 cts: TrxID::new(100),

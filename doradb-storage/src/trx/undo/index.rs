@@ -155,8 +155,8 @@ pub(in crate::trx) struct IndexPurgeEntry {
 mod tests {
     use super::*;
     use crate::catalog::{
-        CATALOG_TABLE_ID_START, IndexID, IndexRef, IndexSlot, catalog_key_from_active_ordinal,
-        resolve_catalog_key, user_key_from_index_ref,
+        CATALOG_TABLE_ID_START, IndexID, IndexRef, IndexSlot, catalog_index_ref,
+        user_key_from_index_ref,
     };
 
     fn create_test_key(index: IndexRef) -> ResolvedIndexKey {
@@ -228,7 +228,7 @@ mod tests {
             table_id: CATALOG_TABLE_ID_START,
             row_id: RowID::new(7),
             kind: IndexUndoKind::DeferDelete(
-                resolve_catalog_key(catalog_key_from_active_ordinal(3, vec![])),
+                ResolvedIndexKey::new(catalog_index_ref(IndexSlot::new(3)), vec![]),
                 true,
             ),
         });

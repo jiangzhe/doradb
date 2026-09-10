@@ -51,7 +51,7 @@ pub(crate) use secondary_index::{
     InMemorySecondaryIndex, IndexCompareExchange, IndexInsert, NonUniqueSecondaryIndex,
     SecondaryDiskTreeRuntime, SecondaryIndex, UniqueInsertAttempt, UniqueSecondaryIndex,
 };
-pub(crate) use unique_index::{GuardedUniqueMemIndex, UniqueMemIndex};
+pub(crate) use unique_index::{GuardedUniqueMemIndex, UniqueLookupObservation, UniqueMemIndex};
 
 /// Proof-bound secondary-index root with no standalone address accessor.
 struct ProvenIndexRoot<'op> {

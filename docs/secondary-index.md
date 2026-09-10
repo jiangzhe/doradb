@@ -205,6 +205,47 @@ Interpretation:
   every snapshot; readers still route the retained row id through the normal
   row/deletion visibility path
 
+Read-current unique row selection retains the original validated MemIndex
+leaf guard, including a witnessed miss when consulting an immutable DiskTree
+root. Both live and delete-shadow MemIndex hits end tree selection. The
+observation holds no shared/exclusive leaf latch across row access or IO and
+checks the captured latch version and frame generation without rereading page
+payload. It is evidence for that lookup, not authority to replace an index
+entry. The ordinary value-only lookup remains available to snapshot readers.
+
+Hot row selection resolves rejected rows through authoritative forward links
+on the exact Delete or Update where the selected key was last removed. Each
+surviving same-transaction transfer publishes its successor, including an
+in-place rekey followed by another row claiming the old key. The destination's
+undo owner records the previous source slot and restores it before undoing that
+destination. No committed foreign source is modified.
+
+Selection follows multiple hot successors, checking each current image before
+its newest matching departure. Repeated RowIDs do not stop traversal or justify
+reusing an older departure. Successful hot acquisition needs no post-row index
+validation, including when unrelated entries change the observed leaf.
+
+Terminal hot rejection retains original-observation validation even after
+multiple forward hops. The initial lookup can capture an uncommitted destination
+whose claim disappears on rollback, leaving no history or an older same-key
+history that cannot prove current absence. Stable validation permits Missing;
+invalidation reselects the owner from the index. This also avoids additional
+routing retention after rollback.
+
+Composite misses and cold-row rejection likewise validate the observation, except
+for the confirmed original-candidate `delete_cts < reader_sts` early-missing
+proof. A MemIndex insertion after a witnessed miss invalidates the DiskTree
+candidate. Splits, merges, compaction, frame reuse and even `A -> B -> A` mapping
+restoration invalidate the original evidence. These checks are conservative;
+invalidation triggers reselection, not an immediate WriteConflict.
+
+CDB has no forward fields. If a hot successor reaches a cold rejection,
+reselect it through a fresh root-bound lookup rather than treating its CTS as
+proof about the earlier index candidate. Retain the existing cold
+Missing/WriteConflict policy after stable validation. All selection work
+precedes the single callback invocation. Unique snapshots retain backward
+IndexBranch reconstruction, and keyless scans never follow forward links.
+
 ### 5.4 Non-Unique MemIndex Entries
 
 For a non-unique index, `MemIndex` stores exact entries keyed by

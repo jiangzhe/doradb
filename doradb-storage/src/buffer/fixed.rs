@@ -774,6 +774,44 @@ mod tests {
     }
 
     #[test]
+    fn test_page_optimistic_guard_validation_checks_version_and_generation() {
+        smol::block_on(async {
+            let pool = test_pool();
+            let pool_guard = FixedBufferPool::create_base_guard(&pool);
+            let page_id = allocate_test_row_page(&pool, &pool_guard).await;
+            let g = pool
+                .get_page::<RowPageIndexNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
+                .await
+                .unwrap()
+                .downgrade();
+            assert!(g.validate_bool());
+
+            let writer = pool
+                .get_page::<RowPageIndexNode>(&pool_guard, page_id, LatchFallbackMode::Exclusive)
+                .await
+                .unwrap()
+                .lock_exclusive_async()
+                .await
+                .unwrap();
+            drop(writer);
+            assert!(!g.validate_bool());
+            let g = g.facade().downgrade();
+            assert!(
+                !g.validate_bool(),
+                "converting an optimistic guard must preserve its original version"
+            );
+            drop(g);
+
+            let (g, page_id, held_version) = stale_optimistic_guard(&pool, &pool_guard).await;
+            assert_eq!(pool.arena.frame(page_id).latch.version_acq(), held_version);
+            assert!(
+                !g.validate_bool(),
+                "generation mismatch must invalidate an unchanged latch version"
+            );
+        })
+    }
+
+    #[test]
     fn test_page_optimistic_guard_checked_upgrades_reject_generation_mismatch() {
         smol::block_on(async {
             let pool = test_pool();
