@@ -12,8 +12,8 @@ undo for direct forwarding. No design is selected by this backlog.
 
 ## Reference
 
-- [Task 000299: Unify Unique-Key MVCC Mutation API](../tasks/000299-unify-unique-key-mvcc-mutation-api.md).
-- [Task 000008: Replace Move with Delete+Insert](../tasks/000008-replace-move-with-delete-insert.md)
+- [Task 000299: Unify Unique-Key MVCC Mutation API](../../tasks/000299-unify-unique-key-mvcc-mutation-api.md).
+- [Task 000008: Replace Move with Delete+Insert](../../tasks/000008-replace-move-with-delete-insert.md)
   and commit `416d8a6a1ef56a1684f56022842264bcda53913c`, which removed the old
   `Move(bool)` and cross-row main-chain traversal.
 - `doradb-storage/src/table/unique_mutate.rs`: `UniqueMutator::execute`.
@@ -31,7 +31,7 @@ undo for direct forwarding. No design is selected by this backlog.
 
 ## Deferred From (Optional)
 
-[Task 000299](../tasks/000299-unify-unique-key-mvcc-mutation-api.md),
+[Task 000299](../../tasks/000299-unify-unique-key-mvcc-mutation-api.md),
 follow-up concurrency review of the unified unique-key mutation API on branch
 `unique-mutate`.
 
@@ -159,3 +159,11 @@ None. Use hooks/channels and authoritative predicates, not timing sleeps.
 The backlog preserves design evidence, not a maintained benchmark or raw
 benchmark report. The final implementation and regression suite belong to the
 future task.
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000300-fix-stale-unique-read-current-lookups-across-row-replacement.md; transition cleanup defects and shared mutation execution remain deferred in backlogs 000199 and 000198.
+- Closed By: backlog close
+- Reference: [Task 000300](../../tasks/000300-fix-stale-unique-read-current-lookups-across-row-replacement.md)
+- Closed At: 2026-09-10

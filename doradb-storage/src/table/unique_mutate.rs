@@ -643,7 +643,8 @@ mod tests {
     use futures::FutureExt;
     use smol::future::yield_now;
     use std::cell::{Cell, RefCell};
-    use std::panic::AssertUnwindSafe;
+    use std::mem::replace;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::rc::Rc;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -862,6 +863,69 @@ mod tests {
         new_id
     }
 
+    fn moved_key_update(key: i32, other_key: Option<i32>) -> UniqueMutation {
+        let mut update = vec![UpdateCol {
+            idx: 0,
+            val: Val::from(key),
+        }];
+        if let Some(other_key) = other_key {
+            update.push(UpdateCol {
+                idx: 1,
+                val: Val::from(other_key),
+            });
+        }
+        update.push(UpdateCol {
+            idx: 3,
+            val: Val::from(vec![b'm'; 48_000]),
+        });
+        UniqueMutation::Update(update)
+    }
+
+    async fn assert_moved_key_branches(
+        table: &Table,
+        guards: &PoolGuards,
+        destination: RowID,
+        expected: &[(u16, RowID, &str)],
+    ) {
+        let RowLocation::RowPage(page_id) = table.mem.find_row(guards, destination).await.unwrap()
+        else {
+            panic!("move destination must remain hot");
+        };
+        let page = table
+            .mem
+            .must_get_row_page_shared(guards, page_id)
+            .await
+            .unwrap();
+        let access = page.read_row_by_id(destination);
+        let branches = &access.undo_head().unwrap().next.indexes;
+        assert_eq!(
+            branches.len(),
+            expected.len(),
+            "one branch per retained unique-key history"
+        );
+        for &(slot, source, kind) in expected {
+            let branch = branches
+                .iter()
+                .find(|branch| branch.key.index.slot() == IndexSlot::new(slot))
+                .unwrap();
+            let IndexBranchTarget::Hot { entry, .. } = &branch.target else {
+                panic!("fixture requires a hot predecessor");
+            };
+            let entry = entry.as_ref();
+            assert_eq!(entry.row_id, source, "index_slot={slot}");
+            let links = match (&entry.kind, kind) {
+                (RowUndoKind::Delete(links), "delete") => links,
+                (RowUndoKind::Update(update), "update") => update.forward(),
+                _ => panic!("wrong departure kind for index_slot={slot}: expected={kind}"),
+            };
+            assert_eq!(
+                links.successor(branch.key.index),
+                Some(destination),
+                "index_slot={slot}"
+            );
+        }
+    }
+
     #[test]
     fn test_unique_current_decide_preserves_position_and_advance_preserves_evidence() {
         smol::block_on(async {
@@ -914,8 +978,7 @@ mod tests {
             for inspection in rejected_targets() {
                 // An unchanged index and a rejected non-hot forward target
                 // contradict the transfer contract; retrying cannot fix it.
-                let result =
-                    std::panic::catch_unwind(AssertUnwindSafe(|| forwarded.decide(inspection)));
+                let result = catch_unwind(AssertUnwindSafe(|| forwarded.decide(inspection)));
                 assert!(
                     result.is_err(),
                     "stable lookup must not retry a rejected forward target"
@@ -1864,69 +1927,6 @@ mod tests {
         });
     }
 
-    fn moved_key_update(key: i32, other_key: Option<i32>) -> UniqueMutation {
-        let mut update = vec![UpdateCol {
-            idx: 0,
-            val: Val::from(key),
-        }];
-        if let Some(other_key) = other_key {
-            update.push(UpdateCol {
-                idx: 1,
-                val: Val::from(other_key),
-            });
-        }
-        update.push(UpdateCol {
-            idx: 3,
-            val: Val::from(vec![b'm'; 48_000]),
-        });
-        UniqueMutation::Update(update)
-    }
-
-    async fn assert_moved_key_branches(
-        table: &Table,
-        guards: &PoolGuards,
-        destination: RowID,
-        expected: &[(u16, RowID, &str)],
-    ) {
-        let RowLocation::RowPage(page_id) = table.mem.find_row(guards, destination).await.unwrap()
-        else {
-            panic!("move destination must remain hot");
-        };
-        let page = table
-            .mem
-            .must_get_row_page_shared(guards, page_id)
-            .await
-            .unwrap();
-        let access = page.read_row_by_id(destination);
-        let branches = &access.undo_head().unwrap().next.indexes;
-        assert_eq!(
-            branches.len(),
-            expected.len(),
-            "one branch per retained unique-key history"
-        );
-        for &(slot, source, kind) in expected {
-            let branch = branches
-                .iter()
-                .find(|branch| branch.key.index.slot() == IndexSlot::new(slot))
-                .unwrap();
-            let IndexBranchTarget::Hot { entry, .. } = &branch.target else {
-                panic!("fixture requires a hot predecessor");
-            };
-            let entry = entry.as_ref();
-            assert_eq!(entry.row_id, source, "index_slot={slot}");
-            let links = match (&entry.kind, kind) {
-                (RowUndoKind::Delete(links), "delete") => links,
-                (RowUndoKind::Update(update), "update") => update.forward(),
-                _ => panic!("wrong departure kind for index_slot={slot}: expected={kind}"),
-            };
-            assert_eq!(
-                links.successor(branch.key.index),
-                Some(destination),
-                "index_slot={slot}"
-            );
-        }
-    }
-
     #[test]
     fn test_unique_moved_key_reuse_follows_earlier_update() {
         smol::block_on(async {
@@ -2430,10 +2430,7 @@ mod tests {
                             // the exact timestamp and ownership boundaries.
                             let saved_status = {
                                 let mut head = page.unwrap_vmap().write_latch(row_idx);
-                                std::mem::replace(
-                                    &mut head.as_mut().unwrap().next.main.status,
-                                    status,
-                                )
+                                replace(&mut head.as_mut().unwrap().next.main.status, status)
                             };
                             let before = CURRENT_LOOKUP_COUNTS.get();
                             let hot =
