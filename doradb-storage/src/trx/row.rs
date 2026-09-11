@@ -11,8 +11,8 @@ use crate::row::ops::{ReadRow, RowUpdateView, SelectKey, UndoCol, UndoVal, Updat
 use crate::row::{Row, RowMut, RowPage, RowRead};
 use crate::trx::stmt::StmtEffects;
 use crate::trx::undo::{
-    IndexBranch, IndexBranchTarget, MainBranch, NextRowUndo, OwnedRowUndo, RowUndoHead,
-    RowUndoKind, RowUndoRef, UndoStatus,
+    ForwardLinks, HotForwardSource, IndexBranch, IndexBranchTarget, MainBranch, NextRowUndo,
+    OwnedRowUndo, RowUndoHead, RowUndoKind, RowUndoKindView, RowUndoRef, UndoStatus,
 };
 use crate::trx::ver_map::{RowPageState, RowVersionMap, RowVersionReadGuard, RowVersionWriteGuard};
 use crate::trx::{
@@ -177,9 +177,7 @@ impl<'a> RowReadAccess<'a> {
         if row.is_deleted() {
             return ReadRow::NotFound;
         }
-        let Some(index_spec) = metadata.idx.index_spec(candidate.index.slot()) else {
-            return ReadRow::InvalidIndex;
-        };
+        let index_spec = metadata.idx.expect_index_spec(candidate.index);
         let key_vals = index_spec
             .keys
             .iter()
@@ -245,9 +243,9 @@ impl<'a> RowReadAccess<'a> {
                 }
                 RowUndoKind::Update(undo_vals) => {
                     debug_assert!(!deleted);
-                    undo_update(undo_vals);
+                    undo_update(&undo_vals.cols);
                 }
-                RowUndoKind::Delete => {
+                RowUndoKind::Delete(_) => {
                     deleted = false;
                 }
             }
@@ -297,9 +295,7 @@ impl<'a> RowReadAccess<'a> {
                         return self.read_row_latest_index_candidate(metadata, read_set, candidate);
                     }
 
-                    let Some(index_spec) = metadata.idx.index_spec(candidate.index.slot()) else {
-                        return ReadRow::InvalidIndex;
-                    };
+                    let index_spec = metadata.idx.expect_index_spec(candidate.index);
                     let mut next = &undo_head.next;
                     let read_set: BTreeSet<usize> = read_set.iter().copied().collect();
                     let user_key_idx_map: FastHashMap<usize, usize> = index_spec
@@ -345,7 +341,7 @@ impl<'a> RowReadAccess<'a> {
                                             candidate,
                                         );
                                     }
-                                    entry = hot_entry.as_ref();
+                                    entry = hot_entry.snapshot_view();
                                 }
                                 IndexBranchTarget::ColdTerminal { delete_cts } => {
                                     if let Some(delete_cts) = delete_cts
@@ -361,23 +357,23 @@ impl<'a> RowReadAccess<'a> {
                                 }
                             }
                         } else {
-                            entry = next.main.entry.as_ref();
+                            entry = next.main.entry.snapshot_view();
                         }
-                        match &entry.kind {
-                            RowUndoKind::Lock => (),
-                            RowUndoKind::Insert => {
+                        match entry.kind {
+                            RowUndoKindView::Lock => (),
+                            RowUndoKindView::Insert => {
                                 debug_assert!(!ver.deleted);
                                 ver.deleted = true;
                             }
-                            RowUndoKind::Update(undo_vals) => {
+                            RowUndoKindView::Update(undo_vals) => {
                                 debug_assert!(!ver.deleted);
                                 ver.undo_update(undo_vals);
                             }
-                            RowUndoKind::Delete => {
+                            RowUndoKindView::Delete => {
                                 ver.deleted = false;
                             }
                         }
-                        match entry.next.as_ref() {
+                        match entry.next {
                             None => {
                                 if ver.deleted {
                                     return ReadRow::NotFound;
@@ -479,7 +475,7 @@ impl<'a> RowReadAccess<'a> {
                     // the newest version).
                     debug_assert!(matches!(
                         undo_head.next.main.entry.as_ref().kind,
-                        RowUndoKind::Delete
+                        RowUndoKind::Delete(_)
                     ));
                     // Collect old row to calculate delta for link.
                     let old_row = row.clone_vals(metadata.col.as_ref());
@@ -507,11 +503,11 @@ impl<'a> RowReadAccess<'a> {
                         }
                         RowUndoKind::Update(undo_vals) => {
                             debug_assert!(!deleted);
-                            for uc in undo_vals {
+                            for uc in &undo_vals.cols {
                                 vals[uc.idx] = uc.val.clone();
                             }
                         }
-                        RowUndoKind::Delete => {
+                        RowUndoKind::Delete(_) => {
                             debug_assert!(deleted);
                             deleted = false;
                         }
@@ -595,9 +591,9 @@ impl<'a> RowReadAccess<'a> {
                             }
                             RowUndoKind::Update(undo_vals) => {
                                 debug_assert!(!ver.deleted);
-                                ver.undo_update(undo_vals);
+                                ver.undo_update(&undo_vals.cols);
                             }
-                            RowUndoKind::Delete => {
+                            RowUndoKind::Delete(_) => {
                                 debug_assert!(ver.deleted);
                                 ver.deleted = false;
                             }
@@ -809,9 +805,7 @@ impl RowVersion {
         row: Row<'_>,
         candidate: &BoundIndexCandidate<'_>,
     ) -> ReadRow {
-        let Some(index_spec) = metadata.idx.index_spec(candidate.index.slot()) else {
-            return ReadRow::InvalidIndex;
-        };
+        let index_spec = metadata.idx.expect_index_spec(candidate.index);
         let matches_candidate = if let Some(undo_key) = self
             .key_tracker
             .as_ref()
@@ -946,6 +940,122 @@ impl<'a> RowWriteAccess<'a> {
         self.page.row(self.row_idx)
     }
 
+    /// Reads only a confirmed Delete head after current-write admission rejected it.
+    #[inline]
+    pub(crate) fn current_delete_cts(&self) -> Option<TrxID> {
+        if !self.row().is_deleted() {
+            return None;
+        }
+        let head = self.guard.as_ref()?;
+        let RowUndoKind::Delete(_) = &head.next.main.entry.as_ref().kind else {
+            return None;
+        };
+        let ts = head.ts();
+        trx_is_committed(ts).then_some(ts)
+    }
+
+    /// Projects an owned departure's links while this access holds its row latch.
+    /// The closure cannot retain a payload borrow beyond the source access.
+    #[inline]
+    pub(crate) fn with_forward_source<R>(
+        &mut self,
+        source: &HotForwardSource,
+        update: impl FnOnce(&mut ForwardLinks) -> R,
+    ) -> Option<R> {
+        if self.page_state() == RowPageState::Transition
+            || self.page.row_id(self.row_idx) != source.row_id
+        {
+            return None;
+        }
+        let head = self.guard.as_ref()?;
+        if !source.owns(&head.next.main.status) {
+            return None;
+        }
+        let mut main = &head.next.main;
+        while !source.matches(&main.entry) {
+            main = &main.entry.as_ref().next.as_ref()?.main;
+        }
+        if !source.owns(&main.status) {
+            return None;
+        }
+        let mut entry = main.entry.clone();
+        // SAFETY: the source row latch serializes link access, and this exact
+        // reachable entry still has its original writer. Snapshot views borrow
+        // only immutable before-images/chain fields, excluding both link stores.
+        let links = unsafe { entry.forward_mut() }?;
+        Some(update(links))
+    }
+
+    /// Finds the newest removal of the requested key and reads only its successor.
+    /// Current-row ownership must have been classified before calling this method.
+    #[inline]
+    pub(crate) fn current_successor(
+        &self,
+        metadata: &TableMetadata,
+        index: IndexRef,
+        key: &[Val],
+    ) -> Option<RowID> {
+        #[cfg(test)]
+        use crate::table::record_forward_hint;
+
+        let spec = metadata.idx.expect_index_spec(index);
+        let head = self.guard.as_ref()?;
+        let row = self.row();
+        if row.is_deleted()
+            && !row.is_key_different(metadata.col.as_ref(), spec, key)
+            && let RowUndoKind::Delete(links) = &head.next.main.entry.as_ref().kind
+        {
+            #[cfg(test)]
+            record_forward_hint();
+            return links.successor(index);
+        }
+        let mut version = KeyVersion {
+            deleted: row.is_deleted(),
+            mvcc_key: SelectKey::new(
+                index.slot(),
+                spec.keys
+                    .iter()
+                    .map(|col| row.val(metadata.col.as_ref(), col.column_ordinal.as_usize()))
+                    .collect(),
+            ),
+            mapping: spec
+                .keys
+                .iter()
+                .enumerate()
+                .map(|(i, col)| (col.column_ordinal.as_usize(), i))
+                .collect(),
+        };
+        let mut entry = &head.next.main.entry;
+        loop {
+            let undo = entry.as_ref();
+            let links = match &undo.kind {
+                RowUndoKind::Lock => None,
+                RowUndoKind::Insert => {
+                    version.deleted = true;
+                    None
+                }
+                RowUndoKind::Delete(links) => {
+                    version.deleted = false;
+                    Some(links)
+                }
+                RowUndoKind::Update(update) => {
+                    version.undo_update(&update.cols);
+                    Some(update.forward())
+                }
+            };
+            if !version.deleted && version.mvcc_key.vals == key {
+                // This is the latest departure, so an absent link ends this
+                // chain. The current row selector still validates the original lookup
+                // before concluding absence; a rolled-back claim can expose
+                // unrelated older history. Never search an older occurrence.
+                #[cfg(test)]
+                record_forward_hint();
+                return links.and_then(|links| links.successor(index));
+            }
+            entry = &undo.next.as_ref()?.main.entry;
+        }
+    }
+
     /// Returns a mutable row view for an update with the supplied variable range.
     #[inline]
     pub(crate) fn row_mut(&self, var_offset: usize, var_end: usize) -> RowMut<'_> {
@@ -957,6 +1067,14 @@ impl<'a> RowWriteAccess<'a> {
     #[inline]
     pub(crate) fn page_state(&self) -> RowPageState {
         *self._state_guard
+    }
+
+    /// Returns whether the caller already owns the destination's write chain.
+    #[inline]
+    pub(crate) fn owned_by_trx(&self, ctx: &TrxContext) -> bool {
+        self.guard
+            .as_ref()
+            .is_some_and(|head| ctx.is_same_trx(head))
     }
 
     /// Returns whether the latest hot-row image was produced by this statement.
@@ -1243,7 +1361,7 @@ impl<'a> RowWriteAccess<'a> {
                 debug_assert!(res);
                 self.page.inc_approx_deleted();
             }
-            RowUndoKind::Delete => {
+            RowUndoKind::Delete(_) => {
                 dirty.store(true, Ordering::Release);
                 // The row-page image still carries the deleted row values.
                 // Clearing the bit restores the pre-delete latest image.
@@ -1252,12 +1370,12 @@ impl<'a> RowWriteAccess<'a> {
                 self.page.dec_approx_deleted();
             }
             RowUndoKind::Update(undo_cols) => {
-                if !undo_cols.is_empty() {
+                if !undo_cols.cols.is_empty() {
                     dirty.store(true, Ordering::Release);
                 }
                 // Restore changed columns from before-images and prefer to
                 // reuse the variable-length space captured by the undo entry.
-                for uc in undo_cols {
+                for uc in &undo_cols.cols {
                     self.page.update_col(
                         metadata.col.as_ref(),
                         self.row_idx,
@@ -1339,16 +1457,17 @@ pub(crate) mod tests {
     use crate::catalog::{
         ActiveIndexSpec, CATALOG_TABLE_ID_START, IndexID, IndexSlot, StorageColumnFlags,
         StorageColumnSpec, StorageIndexFlags, StorageIndexKey, StorageIndexSpec, catalog_index_ref,
-        resolve_catalog_key,
     };
+    use crate::id::PageID;
     use crate::trx::tests::{commit_shared_trx_status, shared_trx_status};
-    use crate::trx::undo::{MainBranch, NextRowUndo, RowUndoHead, UndoStatus};
+    use crate::trx::undo::{ForwardHint, MainBranch, NextRowUndo, RowUndoHead, UndoStatus};
     use crate::trx::{
         MIN_ACTIVE_TRX_ID, MvccReadView, NON_FOREGROUND_STMT_NO, ver_map::RowVersionMap,
     };
     use crate::value::{ValKind, ValType};
     use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::sync::Arc;
+    use std::sync::{Arc, mpsc};
+    use std::thread;
 
     /// Returns row write access for tests.
     pub(crate) fn test_row_write_access<'a>(
@@ -1521,12 +1640,12 @@ pub(crate) mod tests {
             let undo_kind = match kind {
                 CaseKind::Lock => RowUndoKind::Lock,
                 CaseKind::Insert => RowUndoKind::Insert,
-                CaseKind::Update => RowUndoKind::Update(vec![UndoCol {
+                CaseKind::Update => RowUndoKind::update(vec![UndoCol {
                     idx: 0,
                     val: Val::from(9i32),
                     var_offset: None,
                 }]),
-                CaseKind::Delete => RowUndoKind::Delete,
+                CaseKind::Delete => RowUndoKind::delete(),
             };
             let undo = OwnedRowUndo::new(
                 NON_FOREGROUND_STMT_NO,
@@ -1586,7 +1705,7 @@ pub(crate) mod tests {
             TableID::new(1),
             None,
             RowID::new(100),
-            RowUndoKind::Update(vec![UndoCol {
+            RowUndoKind::update(vec![UndoCol {
                 idx: 0,
                 val: Val::from(7i32),
                 var_offset: None,
@@ -1597,7 +1716,7 @@ pub(crate) mod tests {
             TableID::new(1),
             None,
             RowID::new(100),
-            RowUndoKind::Update(vec![UndoCol {
+            RowUndoKind::update(vec![UndoCol {
                 idx: 0,
                 val: Val::from(8i32),
                 var_offset: None,
@@ -1637,6 +1756,45 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_index_candidate_requires_resolved_metadata() {
+        let metadata = sparse_metadata();
+        let page = row_page(&metadata);
+        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+        let encoder = BTreeKeyEncoder::new(vec![ValType::new(ValKind::I32, false)]);
+        let key = [Val::from(10i32)];
+        // Slot 1 is inactive. A caller cannot admit this candidate against metadata.
+        let index = IndexRef::new(IndexID::new(1), IndexSlot::new(1));
+        let candidate = BoundIndexCandidate::new(
+            index,
+            true,
+            &encoder,
+            IndexLookupCandidate {
+                encoded_key: encoder.encode(&key),
+                row_id: RowID::new(100),
+            },
+        );
+        {
+            let access = test_row_read_access(&page, &row_ver, 0);
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| {
+                    access.read_row_latest_index_candidate(&metadata, &[0], &candidate)
+                }))
+                .is_err(),
+                "missing resolved metadata must not report a key mismatch"
+            );
+        }
+        let dirty = AtomicBool::new(false);
+        let access = test_row_write_access(&page, &row_ver, &dirty, 0);
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                access.current_successor(&metadata, index, &key)
+            }))
+            .is_err(),
+            "missing resolved metadata must not report an absent successor"
+        );
+    }
+
+    #[test]
     fn test_index_candidate_mvcc_follows_catalog_branch_to_previous_owner() {
         let metadata = sparse_metadata();
         let page = row_page(&metadata);
@@ -1654,7 +1812,7 @@ pub(crate) mod tests {
         );
         let index_slot = IndexSlot::new(0);
         head.next.indexes.push(IndexBranch::new(
-            resolve_catalog_key(SelectKey::new(index_slot, vec![Val::from(10i32)])),
+            ResolvedIndexKey::new(catalog_index_ref(index_slot), vec![Val::from(10i32)]),
             IndexBranchTarget::ColdTerminal { delete_cts: None },
             vec![UpdateCol {
                 idx: 1,
@@ -1717,6 +1875,219 @@ pub(crate) mod tests {
 
         assert!(candidate.matches_branch(&exact));
         assert!(!candidate.matches_branch(&stale));
+    }
+
+    #[test]
+    fn test_forward_hint_mutation_preserves_borrowed_snapshot_branch() {
+        for update_source in [false, true] {
+            let metadata = sparse_metadata();
+            let page = row_page(&metadata);
+            assert!(
+                page.insert(metadata.col.as_ref(), &[Val::from(10i32), Val::from(30i32)])
+                    .is_ok()
+            );
+            let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+            let dirty = AtomicBool::new(false);
+            let writer = test_trx_context(TrxID::new(10));
+            let reader = test_trx_context(TrxID::new(20));
+            let page_id = Some(VersionedPageID {
+                page_id: PageID::new(0),
+                generation: 1,
+            });
+            let index = IndexRef::new(IndexID::new(0), IndexSlot::new(0));
+            let other_index = IndexRef::new(IndexID::new(1), IndexSlot::new(1));
+            let original = OwnedRowUndo::new(
+                NON_FOREGROUND_STMT_NO,
+                TableID::new(1),
+                page_id,
+                RowID::new(100),
+                RowUndoKind::update(vec![UndoCol {
+                    idx: 0,
+                    val: Val::from(9i32),
+                    var_offset: None,
+                }]),
+            );
+            let mut deleted = OwnedRowUndo::new(
+                NON_FOREGROUND_STMT_NO,
+                TableID::new(1),
+                page_id,
+                RowID::new(100),
+                if update_source {
+                    RowUndoKind::update(vec![UndoCol {
+                        idx: 0,
+                        val: Val::from(10i32),
+                        var_offset: None,
+                    }])
+                } else {
+                    RowUndoKind::delete()
+                },
+            );
+            deleted.next = Some(NextRowUndo::new(MainBranch {
+                entry: original.leak(),
+                status: UndoStatus::Committed(TrxID::new(1)),
+            }));
+            let inserted = OwnedRowUndo::new(
+                NON_FOREGROUND_STMT_NO,
+                TableID::new(1),
+                page_id,
+                RowID::new(101),
+                RowUndoKind::Insert,
+            );
+            *row_ver.write_latch(0) = Some(Box::new(RowUndoHead::new(
+                Arc::clone(&writer.status),
+                deleted.leak(),
+            )));
+            *row_ver.write_latch(1) = Some(Box::new(RowUndoHead::new(
+                Arc::clone(&writer.status),
+                inserted.leak(),
+            )));
+            if update_source {
+                let access = test_row_write_access(&page, &row_ver, &dirty, 0);
+                access
+                    .row_mut(
+                        page.header.var_field_offset(),
+                        page.header.var_field_offset(),
+                    )
+                    .update_col(metadata.col.as_ref(), 0, &Val::from(11i32));
+            } else {
+                test_row_write_access(&page, &row_ver, &dirty, 0).delete_row();
+            }
+            let source = {
+                let access = test_row_read_access(&page, &row_ver, 0);
+                let head = access.undo_head().unwrap();
+                assert!(HotForwardSource::new(&reader, head, &deleted.leak()).is_none());
+                assert!(HotForwardSource::new(&writer, head, &original.leak()).is_none());
+                HotForwardSource::new(&writer, head, &deleted.leak()).unwrap()
+            };
+            test_row_write_access(&page, &row_ver, &dirty, 1).link_for_unique_index(
+                ResolvedIndexKey::new(index, vec![Val::from(10i32)]),
+                writer.trx_id(),
+                deleted.leak(),
+                vec![UpdateCol {
+                    idx: 1,
+                    val: Val::from(20i32),
+                }],
+            );
+
+            assert!(!test_row_write_access(&page, &row_ver, &dirty, 0).owned_by_trx(&reader));
+            assert!(
+                test_row_write_access(&page, &row_ver, &dirty, 1)
+                    .with_forward_source(&source, |_| ())
+                    .is_none()
+            );
+            *row_ver.write_state() = RowPageState::Transition;
+            assert!(
+                test_row_write_access(&page, &row_ver, &dirty, 0)
+                    .with_forward_source(&source, |_| ())
+                    .is_none()
+            );
+            *row_ver.write_state() = RowPageState::Active;
+            let saved = row_ver.write_latch(0).take();
+            assert!(
+                test_row_write_access(&page, &row_ver, &dirty, 0)
+                    .with_forward_source(&source, |_| ())
+                    .is_none()
+            );
+            *row_ver.write_latch(0) = saved;
+
+            let encoder = BTreeKeyEncoder::new(vec![ValType::new(ValKind::I32, false)]);
+            let candidate = BoundIndexCandidate::new(
+                index,
+                true,
+                &encoder,
+                IndexLookupCandidate {
+                    encoded_key: encoder.encode(&[Val::from(10i32)]),
+                    row_id: RowID::new(101),
+                },
+            );
+            // Hold only the destination's read latch, just as an older snapshot does
+            // when following its backward branch. Keep the source's projected view
+            // borrowed throughout each writer update on the other row.
+            let access = test_row_read_access(&page, &row_ver, 1);
+            let IndexBranchTarget::Hot { entry, .. } =
+                &access.undo_head().unwrap().next.indexes[0].target
+            else {
+                panic!("replacement must retain the old hot owner")
+            };
+            let view = entry.snapshot_view();
+            let changes = [
+                (
+                    index,
+                    Some(ForwardHint {
+                        index,
+                        row_id: RowID::new(101),
+                    }),
+                ),
+                (
+                    other_index,
+                    Some(ForwardHint {
+                        index: other_index,
+                        row_id: RowID::new(102),
+                    }),
+                ),
+                (
+                    index,
+                    Some(ForwardHint {
+                        index,
+                        row_id: RowID::new(103),
+                    }),
+                ),
+                (
+                    index,
+                    Some(ForwardHint {
+                        index,
+                        row_id: RowID::new(101),
+                    }),
+                ),
+                (other_index, None),
+                (index, None),
+            ];
+            let (published, updates) = mpsc::sync_channel(0);
+            let (read_done, reads) = mpsc::sync_channel(0);
+            thread::scope(|scope| {
+                let (page, row_ver, dirty, writer, source) =
+                    (&page, &row_ver, &dirty, &writer, &source);
+                scope.spawn(move || {
+                    for (index, previous) in changes {
+                        {
+                            let mut access = test_row_write_access(page, row_ver, dirty, 0);
+                            assert!(access.owned_by_trx(writer));
+                            access
+                                .with_forward_source(source, |links| {
+                                    links.restore(index, previous);
+                                    assert_eq!(links.hint(index), previous);
+                                })
+                                .unwrap();
+                        }
+                        // Each acknowledgement proves the reader used its retained
+                        // view after publication; timing does not establish readiness.
+                        published.send(()).unwrap();
+                        reads.recv().unwrap();
+                    }
+                });
+                for _ in changes {
+                    updates.recv().unwrap();
+                    match &view.kind {
+                        RowUndoKindView::Update(cols) if update_source => {
+                            assert_eq!(cols[0].val, Val::from(10i32))
+                        }
+                        RowUndoKindView::Delete if !update_source => (),
+                        _ => panic!("snapshot must retain only the original inverse operation"),
+                    }
+                    assert_eq!(view.next.unwrap().main.status.ts(), TrxID::new(1));
+                    let ReadRow::Ok(vals) = access.read_row_mvcc_index_candidate(
+                        &reader,
+                        &metadata,
+                        &[0, 1],
+                        &candidate,
+                    ) else {
+                        panic!("hint mutation must preserve the older snapshot image")
+                    };
+                    assert_eq!(vals, vec![Val::from(10i32), Val::from(20i32)]);
+                    read_done.send(()).unwrap();
+                }
+            });
+        }
     }
 
     #[test]

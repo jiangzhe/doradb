@@ -2,6 +2,7 @@ use crate::catalog::{IndexSlot, TableColumnLayout};
 use crate::id::RowID;
 use crate::row::{Row, RowMut};
 use crate::serde::{Deser, DeserResult, MinBytesHint, Ser, Serde, min_bytes_hint};
+use crate::trx::undo::HotForwardSource;
 use crate::value::Val;
 use std::iter::Enumerate;
 use std::{mem, slice, vec};
@@ -153,10 +154,20 @@ impl InsertRow {
 }
 
 /// Result of linking a unique-index entry to an older row version.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LinkForUniqueIndex {
-    Linked,
+    Linked(Option<HotForwardSource>),
     NotNeeded,
+}
+
+impl LinkForUniqueIndex {
+    /// Returns the source to pin before index exchange and find again under its row latch.
+    #[inline]
+    pub(crate) fn source(&self) -> Option<&HotForwardSource> {
+        match self {
+            Self::Linked(source) => source.as_ref(),
+            Self::NotNeeded => None,
+        }
+    }
 }
 
 /// Row-page in-place update result.

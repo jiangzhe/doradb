@@ -1071,6 +1071,24 @@ impl TableIndexLayout {
         self.index_specs.get(slot)
     }
 
+    /// Returns metadata for an exact reference resolved against this retained layout.
+    /// Absence or a different generation violates the caller's layout ownership contract.
+    #[inline]
+    pub(crate) fn expect_index_spec(&self, index: IndexRef) -> &TableIndexMetadata {
+        let spec = self.index_spec(index.slot()).unwrap_or_else(|| {
+            panic!(
+                "retained index metadata invariant violated: missing spec, index={index}, index_slot_count={}",
+                self.index_slot_count()
+            )
+        });
+        assert_eq!(
+            spec.index, index,
+            "retained index metadata invariant violated: generation mismatch, requested_index={index}, actual_index={}",
+            spec.index
+        );
+        spec
+    }
+
     /// Requires one active secondary-index spec by physical slot.
     #[inline]
     pub(crate) fn require_index_spec(
@@ -2763,6 +2781,36 @@ pub(crate) mod tests {
         file_exists: bool,
         lifecycle: TableTerminal,
         poisoned: bool,
+    }
+
+    /// Builds coherent replacement metadata for exact-generation layout fixtures.
+    pub(crate) fn metadata_with_replacement_index(
+        metadata: &TableMetadata,
+        index: IndexRef,
+    ) -> Arc<TableMetadata> {
+        let mut metadata = metadata.clone();
+        let mut indexes = metadata
+            .idx
+            .index_specs
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        indexes
+            .iter_mut()
+            .find(|spec| spec.index.slot() == index.slot())
+            .expect("replacement fixture requires an active slot")
+            .index = index;
+        metadata.idx = TableIndexLayout::build(
+            &metadata.col,
+            metadata
+                .idx
+                .next_index_id
+                .max(u64::from(index.id().get()) + 1),
+            metadata.idx.index_slot_count,
+            indexes,
+        )
+        .unwrap();
+        Arc::new(metadata)
     }
 
     /// Resets the test-only storage-schema fingerprint counter.

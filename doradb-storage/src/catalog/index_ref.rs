@@ -222,6 +222,11 @@ impl From<IndexSlot> for u32 {
 /// User indexes retain their stable generation identity. Catalog indexes use a
 /// synthetic identity numerically equal to their fixed slot; catalog-owned
 /// constructors and consumers enforce that invariant.
+///
+/// This pair carries identity, not layout ownership. Admission validates it against
+/// the layout retained by execution; metadata and runtime must then remain present
+/// in that layout. Reusable selectors, deferred purge, and retired DDL generations
+/// still require boundary checks before accessing an active index.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct IndexRef {
     id: IndexID,
@@ -429,12 +434,6 @@ pub(crate) fn catalog_index_slot(index: IndexRef) -> CatalogIndexNo {
         "catalog index reference identity must equal its fixed slot: index={index}"
     );
     index.slot()
-}
-
-/// Qualifies a catalog selection key for transaction-retained runtime state.
-#[inline]
-pub(crate) fn resolve_catalog_key(key: CatalogSelectKey) -> ResolvedIndexKey {
-    ResolvedIndexKey::new(catalog_index_ref(key.index_slot), key.vals)
 }
 
 /// Builds a catalog key after metadata has established an active fixed ordinal.

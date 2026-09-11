@@ -1215,10 +1215,7 @@ impl SecondaryCheckpointSidecar {
         let indexes = layout
             .active_secondary_indexes()
             .map(|(index, _)| {
-                let index_spec = metadata
-                    .idx
-                    .index_spec(index.slot())
-                    .expect("active layout entry has a validated metadata specification");
+                let index_spec = metadata.idx.expect_index_spec(index);
                 ActiveSecondaryIndexSidecar {
                     index,
                     key_cols: index_spec
@@ -1796,27 +1793,14 @@ impl Table {
             let index = active.index;
             // The sidecar is built directly from this immutable metadata
             // snapshot, so each recorded active index must still exist.
-            assert!(
-                metadata.idx.index_spec(index.slot()).is_some(),
-                "secondary checkpoint sidecar index missing from metadata: table_id={}, index={index}",
-                self.table_id()
-            );
+            metadata.idx.expect_index_spec(index);
             let index_sidecar = &mut active.sidecar;
             index_sidecar.normalize();
             if !index_sidecar.has_work() {
                 continue;
             }
             let old_root = mutable_file.secondary_index_root(index.slot());
-            if !layout.validate_index_ref(index) {
-                return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
-                    .attach(format!(
-                        "secondary checkpoint sidecar generation mismatch: table_id={}, index={index}",
-                        self.table_id()
-                    ))
-                    .change_context(RuntimeError::CheckpointExecution)
-                    .into());
-            }
-            let runtime = layout.secondary_index(index)?.disk_runtime();
+            let runtime = layout.expect_secondary_index(index).disk_runtime();
             let new_root = match index_sidecar {
                 SecondaryIndexSidecar::Unique { puts, deletes, .. } => {
                     // Use one writer per affected index so same-run puts and
@@ -7145,7 +7129,7 @@ mod tests {
             assert_eq!(undo_head.next.main.entry.as_ref().row_id, row_id);
             assert!(matches!(
                 undo_head.next.main.entry.as_ref().kind,
-                RowUndoKind::Delete
+                RowUndoKind::Delete(_)
             ));
             let UndoStatus::Ref(head_status) = &undo_head.next.main.status else {
                 panic!("active rollback undo must retain shared transaction status");
@@ -7300,7 +7284,7 @@ mod tests {
                 .expect("old transition row must retain delete undo");
             assert!(matches!(
                 old_head.next.main.entry.as_ref().kind,
-                RowUndoKind::Delete
+                RowUndoKind::Delete(_)
             ));
             let UndoStatus::Ref(old_status) = &old_head.next.main.status else {
                 panic!("old move owner must retain shared status");
@@ -7661,7 +7645,7 @@ mod tests {
                 table_id,
                 Some(stale_page_id),
                 row_id,
-                RowUndoKind::Delete,
+                RowUndoKind::delete(),
             ));
             let mut table_cache = TableCache::new(engine.inner().core.catalog());
             let pool_guards = session.pool_guards();
@@ -7726,7 +7710,7 @@ mod tests {
                 table_id,
                 Some(stale_page_id),
                 row_id,
-                RowUndoKind::Delete,
+                RowUndoKind::delete(),
             ));
             let mut table_cache = TableCache::new(engine.inner().core.catalog());
             let pool_guards = session.pool_guards();
@@ -7787,7 +7771,7 @@ mod tests {
                 table_id,
                 Some(versioned_page_id),
                 row_id,
-                RowUndoKind::Delete,
+                RowUndoKind::delete(),
             );
             let row_idx = page_guard.page().row_idx(row_id);
             *page_guard.unwrap_vmap().write_latch(row_idx) = Some(Box::new(RowUndoHead::new(
@@ -7817,7 +7801,7 @@ mod tests {
                 table_id,
                 None,
                 cold_origin_row_id,
-                RowUndoKind::Delete,
+                RowUndoKind::delete(),
             ));
             let before = engine.inner().poisoner.test_observation_counts();
             cold_origin_logs
@@ -7842,7 +7826,7 @@ mod tests {
                 table_id,
                 Some(versioned_page_id),
                 row_id,
-                RowUndoKind::Delete,
+                RowUndoKind::delete(),
             ));
             let before = engine.inner().poisoner.test_observation_counts();
             below_pivot_logs

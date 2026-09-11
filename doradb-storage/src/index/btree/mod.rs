@@ -40,6 +40,18 @@ pub(crate) type ExclusiveStrategy = ExclusiveLockStrategy<BTreeNode>;
 /// Optimistic latch strategy used by B-tree lookup helpers.
 pub(crate) type OptimisticStrategy = OptimisticLockStrategy<BTreeNode>;
 
+/// Original leaf version and frame lifetime retained by a key lookup.
+/// This owns no leaf latch and never refreshes the captured version.
+pub(crate) struct BTreeLookupObservation(PageOptimisticGuard<BTreeNode>);
+
+impl BTreeLookupObservation {
+    /// Checks the original version and frame generation without reading payload.
+    #[inline]
+    pub(crate) fn is_valid(&self) -> bool {
+        self.0.validate_bool()
+    }
+}
+
 macro_rules! verify_result {
     ($expr:expr) => {
         match $expr {
@@ -243,6 +255,16 @@ impl<P: BufferPool> GenericBTree<P> {
         pool_guard: &PoolGuard,
         key: &[u8],
     ) -> RuntimeResult<Option<V>> {
+        Ok(self.lookup_observed(pool_guard, key).await?.0)
+    }
+
+    /// Reads a value and retains the optimistic evidence from that same read.
+    #[inline]
+    pub(crate) async fn lookup_observed<V: BTreeValue>(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[u8],
+    ) -> RuntimeResult<(Option<V>, BTreeLookupObservation)> {
         loop {
             let res = self.try_lookup_optimistic(pool_guard, key).await?;
             let res = verify_continue!(res);
@@ -600,7 +622,7 @@ impl<P: BufferPool> GenericBTree<P> {
         &self,
         pool_guard: &PoolGuard,
         key: &[u8],
-    ) -> RuntimeResult<Validation<Option<V>>> {
+    ) -> RuntimeResult<Validation<(Option<V>, BTreeLookupObservation)>> {
         let g = self
             .find_leaf::<OptimisticStrategy>(pool_guard, key)
             .await?;
@@ -617,7 +639,8 @@ impl<P: BufferPool> GenericBTree<P> {
             })
             .and_then(|inner| inner)
         );
-        Ok(Valid(value))
+        debug_assert!(!g.is_shared() && !g.is_exclusive());
+        Ok(Valid((value, BTreeLookupObservation(g.downgrade()))))
     }
 
     /// Try to split node bottom up.
@@ -2614,12 +2637,21 @@ mod tests {
                 assert_eq!(tree.height(), 2);
                 delete_wide_rows(&tree, &pool_guard, WIDE_HEIGHT2_ROWS, TrxID::new(202)).await;
 
+                let (_, observation) = tree
+                    .lookup_observed::<BTreeU64>(&pool_guard, &wide_test_key(0))
+                    .await
+                    .unwrap();
+                assert!(observation.is_valid());
                 let config = BTreeCompactConfig::new(1.0, 1.0).unwrap();
                 let purge_list = tree
                     .compact_all::<BTreeU64>(&pool_guard, config)
                     .await
                     .unwrap();
 
+                assert!(
+                    !observation.is_valid(),
+                    "leaf compaction/merge invalidates retained evidence"
+                );
                 for g in purge_list {
                     pool.deallocate_page(g);
                 }
@@ -2643,6 +2675,97 @@ mod tests {
         smol::block_on(async {
             run_lookup_against_map(true).await;
         })
+    }
+
+    #[test]
+    fn test_btree_observed_lookup_detects_aba_and_retirement() {
+        smol::block_on(async {
+            let pool = owned_index_pool(20 * 1024 * 1024);
+            let guard = (*pool).create_base_guard();
+            let tree = BTree::new(pool.guard(), &guard, false, TrxID::new(1))
+                .await
+                .unwrap();
+            let (value, missing) = tree
+                .lookup_observed::<BTreeU64>(&guard, b"k")
+                .await
+                .unwrap();
+            assert_eq!(value, None);
+            assert!(missing.is_valid());
+            tree.insert(&guard, b"k", BTreeU64::from(1u64), false, TrxID::new(2))
+                .await
+                .unwrap();
+            assert!(
+                !missing.is_valid(),
+                "insertion invalidates observed absence"
+            );
+            let (value, original) = tree
+                .lookup_observed::<BTreeU64>(&guard, b"k")
+                .await
+                .unwrap();
+            assert_eq!(value, Some(BTreeU64::from(1u64)));
+            for (old, new) in [(1u64, 2u64), (2, 1)] {
+                assert_eq!(
+                    tree.replace_or_insert(
+                        &guard,
+                        b"k",
+                        BTreeU64::from(old),
+                        BTreeU64::from(new),
+                        TrxID::new(3)
+                    )
+                    .await
+                    .unwrap(),
+                    BTreeReplaceOrInsert::Replaced
+                );
+            }
+            assert_eq!(
+                tree.lookup_optimistic::<BTreeU64>(&guard, b"k")
+                    .await
+                    .unwrap(),
+                value
+            );
+            assert!(
+                !original.is_valid(),
+                "restoring RowID cannot refresh the original observation"
+            );
+            let (_, retired) = tree
+                .lookup_observed::<BTreeU64>(&guard, b"k")
+                .await
+                .unwrap();
+            assert!(retired.is_valid());
+            tree.destory(&guard).await.unwrap();
+            let replacement = BTree::new(pool.guard(), &guard, false, TrxID::new(4))
+                .await
+                .unwrap();
+            assert!(
+                !retired.is_valid(),
+                "frame retirement/reuse invalidates retained evidence"
+            );
+            let split_key =
+                wide_test_key(next_wide_split_key(&replacement, &guard, TrxID::new(5)).await);
+            let (_, before_split) = replacement
+                .lookup_observed::<BTreeU64>(&guard, &split_key)
+                .await
+                .unwrap();
+            assert!(before_split.is_valid());
+            assert!(
+                replacement
+                    .insert(
+                        &guard,
+                        &split_key,
+                        BTreeU64::from(3u64),
+                        false,
+                        TrxID::new(6)
+                    )
+                    .await
+                    .unwrap()
+                    .is_ok()
+            );
+            assert!(
+                !before_split.is_valid(),
+                "leaf splitting invalidates the original observation"
+            );
+            replacement.destory(&guard).await.unwrap();
+        });
     }
 
     #[test]

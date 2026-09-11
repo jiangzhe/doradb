@@ -219,7 +219,7 @@ adapter removal and the final helper extraction.
 
 ## Open Questions
 
-- [Backlog 000196](../backlogs/000196-resolve-stale-unique-point-lookups-across-row-replacement.md):
+- [Backlog 000196](../backlogs/closed/000196-resolve-stale-unique-point-lookups-across-row-replacement.md):
   design a replacement-aware unique access protocol; the inherited race remains
   unresolved in this task.
 - [Backlog 000197](../backlogs/000197-investigate-benchmark-update-template-lifecycle-timeout.md):

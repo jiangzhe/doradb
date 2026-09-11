@@ -744,7 +744,7 @@ fn scan_frozen_page(
                         marker = Some(DeleteMarker::Ref(Arc::clone(shared)));
                     }
                 }
-                RowUndoKind::Delete => {
+                RowUndoKind::Delete(_) => {
                     // Like Lock, pre-fence ownership blocks only initial
                     // readiness. Stable-plan refresh represents later deletes.
                     // The newest Delete alone determines cutoff visibility:
@@ -1153,9 +1153,9 @@ pub(crate) mod tests {
         let cutoff_ts = TrxID::new(50);
         let cases = [
             (RowUndoKind::Lock, MIN_ACTIVE_TRX_ID + 10, false),
-            (RowUndoKind::Delete, MIN_ACTIVE_TRX_ID + 10, true),
+            (RowUndoKind::delete(), MIN_ACTIVE_TRX_ID + 10, true),
             (RowUndoKind::Insert, MIN_ACTIVE_TRX_ID + 30, false),
-            (RowUndoKind::Update(vec![]), MIN_ACTIVE_TRX_ID + 30, false),
+            (RowUndoKind::update(vec![]), MIN_ACTIVE_TRX_ID + 30, false),
         ];
 
         for (kind, active_ts, deleted) in cases {
@@ -1178,7 +1178,7 @@ pub(crate) mod tests {
     #[test]
     fn test_stable_frozen_analyzer_represents_pre_fence_ownership() {
         let cutoff_ts = TrxID::new(50);
-        for (kind, latest_deleted) in [(RowUndoKind::Lock, false), (RowUndoKind::Delete, true)] {
+        for (kind, latest_deleted) in [(RowUndoKind::Lock, false), (RowUndoKind::delete(), true)] {
             let status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 10));
             let fixture = frozen_analyzer_fixture(
                 vec![
@@ -1198,7 +1198,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_stable_frozen_analyzer_still_rejects_unresolved_image() {
-        for kind in [RowUndoKind::Insert, RowUndoKind::Update(vec![])] {
+        for kind in [RowUndoKind::Insert, RowUndoKind::update(vec![])] {
             let fixture = frozen_analyzer_fixture(
                 vec![(
                     kind,
@@ -1215,7 +1215,7 @@ pub(crate) mod tests {
         let status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 30));
         let fixture = frozen_analyzer_fixture(
             vec![
-                (RowUndoKind::Delete, UndoStatus::Ref(Arc::clone(&status))),
+                (RowUndoKind::delete(), UndoStatus::Ref(Arc::clone(&status))),
                 (RowUndoKind::Insert, UndoStatus::Committed(TrxID::new(5))),
             ],
             true,
@@ -1240,7 +1240,7 @@ pub(crate) mod tests {
         let fixture = frozen_analyzer_fixture(
             vec![
                 (RowUndoKind::Lock, UndoStatus::Ref(Arc::clone(&lock_status))),
-                (RowUndoKind::Delete, UndoStatus::Committed(TrxID::new(25))),
+                (RowUndoKind::delete(), UndoStatus::Committed(TrxID::new(25))),
                 (RowUndoKind::Insert, UndoStatus::Committed(TrxID::new(5))),
             ],
             true,
@@ -1259,7 +1259,7 @@ pub(crate) mod tests {
             vec![
                 (RowUndoKind::Lock, UndoStatus::Committed(TrxID::new(30))),
                 (
-                    RowUndoKind::Delete,
+                    RowUndoKind::delete(),
                     UndoStatus::Ref(Arc::clone(&delete_status)),
                 ),
                 (RowUndoKind::Insert, UndoStatus::Committed(TrxID::new(5))),

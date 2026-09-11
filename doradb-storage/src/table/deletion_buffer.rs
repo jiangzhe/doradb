@@ -39,6 +39,37 @@ pub(crate) enum DeletionClaim {
     Preparing(PoisonAwareListener),
 }
 
+/// Current ownership and deletion state, preserving committed deletion timestamps.
+pub(crate) enum DeletionState {
+    /// No marker or durable deletion exists at initial inspection.
+    Available,
+    /// This invocation installed a fresh marker and must register undo.
+    Acquired,
+    /// An earlier operation of this transaction already consumed the row.
+    Consumed,
+    /// Confirmed committed deletion, with CTS unless only durable state remains.
+    Deleted(Option<TrxID>),
+    /// Another active transaction owns the selected physical row.
+    WriteConflict,
+    /// Preparing ownership requires an authoritative retry after settlement.
+    Preparing(PoisonAwareListener),
+}
+
+impl DeletionState {
+    /// Preserves the generic idempotent claim contract for existing consumers.
+    #[inline]
+    fn into_claim(self, sts: TrxID) -> Result<DeletionClaim, DeletionError> {
+        match self {
+            Self::Acquired | Self::Consumed => Ok(DeletionClaim::Acquired),
+            Self::Deleted(Some(cts)) if cts > sts => Err(DeletionError::WriteConflict),
+            Self::Deleted(_) => Err(DeletionError::AlreadyDeleted),
+            Self::WriteConflict => Err(DeletionError::WriteConflict),
+            Self::Preparing(listener) => Ok(DeletionClaim::Preparing(listener)),
+            Self::Available => unreachable!("conditional claim resolves vacancy"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExistingDeletion {
     Acquired,
@@ -153,49 +184,75 @@ impl ColumnDeletionBuffer {
         snapshot_sts: TrxID,
         durable_deleted: bool,
     ) -> Result<DeletionClaim, DeletionError> {
+        self.claim_current(row_id, status, durable_deleted)
+            .into_claim(snapshot_sts)
+    }
+
+    /// Inspects marker precedence without reserving the immutable row.
+    #[inline]
+    pub(crate) fn current_state(
+        &self,
+        row_id: RowID,
+        status: &Arc<SharedTrxStatus>,
+        durable_deleted: bool,
+    ) -> DeletionState {
+        match self.get(row_id) {
+            Some(marker) => Self::classify_current(&marker, status),
+            None if durable_deleted => DeletionState::Deleted(None),
+            None => DeletionState::Available,
+        }
+    }
+
+    /// Atomically claims vacancy while retaining the exact reason for rejection.
+    #[inline]
+    pub(crate) fn claim_current(
+        &self,
+        row_id: RowID,
+        status: Arc<SharedTrxStatus>,
+        durable_deleted: bool,
+    ) -> DeletionState {
         match self.entries.entry(row_id) {
-            Entry::Occupied(entry) => match entry.get() {
-                DeleteMarker::Ref(existing) => {
-                    match Self::classify_ref(existing, &status, snapshot_sts) {
-                        ExistingDeletion::Acquired => Ok(DeletionClaim::Acquired),
-                        ExistingDeletion::AlreadyDeleted => Err(DeletionError::AlreadyDeleted),
-                        ExistingDeletion::WriteConflict => Err(DeletionError::WriteConflict),
-                        ExistingDeletion::ForeignActive => {
-                            match existing.prepare_listener() {
-                                PrepareListenerResult::NotPreparing => {
-                                    // Commit can publish its timestamp just before
-                                    // prepare completion clears the flag.
-                                    Self::foreground_committed_result(existing.ts(), snapshot_sts)
-                                        .unwrap_or(Err(DeletionError::WriteConflict))
-                                }
-                                PrepareListenerResult::Registered(listener) => {
-                                    Ok(DeletionClaim::Preparing(listener))
-                                }
-                                PrepareListenerResult::Completed(listener) => {
-                                    // Completion won registration. Reclassify a
-                                    // committed owner under the CDB entry guard; an
-                                    // active timestamp requires an immediate retry so
-                                    // rollback removal or fatal poison can be observed.
-                                    Self::foreground_committed_result(existing.ts(), snapshot_sts)
-                                        .unwrap_or(Ok(DeletionClaim::Preparing(listener)))
-                                }
-                            }
-                        }
-                    }
-                }
-                DeleteMarker::Committed(ts) => {
-                    Self::foreground_result(Self::classify_committed(*ts, snapshot_sts))
-                }
-            },
+            Entry::Occupied(entry) => Self::classify_current(entry.get(), &status),
             Entry::Vacant(entry) => {
-                // A present in-memory marker is always the newest authority.
-                // Only after proving the entry is vacant may durable delete
-                // membership be treated as final for this writer.
                 if durable_deleted {
-                    return Err(DeletionError::AlreadyDeleted);
+                    return DeletionState::Deleted(None);
                 }
                 entry.insert(DeleteMarker::Ref(status));
-                Ok(DeletionClaim::Acquired)
+                DeletionState::Acquired
+            }
+        }
+    }
+
+    #[inline]
+    fn classify_current(marker: &DeleteMarker, status: &Arc<SharedTrxStatus>) -> DeletionState {
+        let existing = match marker {
+            DeleteMarker::Committed(cts) => return DeletionState::Deleted(Some(*cts)),
+            DeleteMarker::Ref(existing) => existing,
+        };
+        let ts = existing.ts();
+        if trx_is_committed(ts) {
+            return DeletionState::Deleted(Some(ts));
+        }
+        if Arc::ptr_eq(existing, status) {
+            return DeletionState::Consumed;
+        }
+        match existing.prepare_listener() {
+            PrepareListenerResult::Registered(listener) => DeletionState::Preparing(listener),
+            PrepareListenerResult::Completed(listener) => {
+                let ts = existing.ts();
+                if trx_is_committed(ts) {
+                    DeletionState::Deleted(Some(ts))
+                } else {
+                    DeletionState::Preparing(listener)
+                }
+            }
+            PrepareListenerResult::NotPreparing => {
+                let ts = existing.ts();
+                if trx_is_committed(ts) {
+                    DeletionState::Deleted(Some(ts))
+                } else {
+                    DeletionState::WriteConflict
+                }
             }
         }
     }
@@ -237,26 +294,6 @@ impl ColumnDeletionBuffer {
                 Err(DeletionError::WriteConflict)
             }
         }
-    }
-
-    #[inline]
-    fn foreground_result(classification: ExistingDeletion) -> Result<DeletionClaim, DeletionError> {
-        match classification {
-            ExistingDeletion::Acquired => Ok(DeletionClaim::Acquired),
-            ExistingDeletion::AlreadyDeleted => Err(DeletionError::AlreadyDeleted),
-            ExistingDeletion::WriteConflict | ExistingDeletion::ForeignActive => {
-                Err(DeletionError::WriteConflict)
-            }
-        }
-    }
-
-    #[inline]
-    fn foreground_committed_result(
-        ts: TrxID,
-        snapshot_sts: TrxID,
-    ) -> Option<Result<DeletionClaim, DeletionError>> {
-        trx_is_committed(ts)
-            .then(|| Self::foreground_result(Self::classify_committed(ts, snapshot_sts)))
     }
 
     /// Inserts a compact committed delete marker for a cold row.
@@ -649,6 +686,60 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn test_current_claim_preserves_committed_cts_and_consumed_state() {
+        for compact in [false, true] {
+            let buffer = ColumnDeletionBuffer::new();
+            let row_id = RowID::new(1);
+            let owner = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 40));
+            let requester = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 41));
+            buffer
+                .put_ref(row_id, Arc::clone(&owner), MAX_SNAPSHOT_TS)
+                .unwrap();
+            assert!(matches!(
+                buffer.claim_current(row_id, Arc::clone(&owner), true),
+                DeletionState::Consumed
+            ));
+            assert!(matches!(
+                buffer.claim_current(row_id, Arc::clone(&requester), true),
+                DeletionState::WriteConflict
+            ));
+            prepare_shared_trx_status(&owner);
+            let cts = TrxID::new(40);
+            commit_preparing_shared_trx_status(&owner, cts);
+            if compact {
+                buffer.put_committed(row_id, cts).unwrap();
+            }
+            for durable in [false, true] {
+                for sts in [TrxID::new(39), cts, cts + 1] {
+                    assert!(
+                        matches!(buffer.current_state(row_id, &requester, durable), DeletionState::Deleted(Some(actual)) if actual == cts)
+                    );
+                    assert!(
+                        matches!(buffer.claim_current(row_id, Arc::clone(&requester), durable), DeletionState::Deleted(Some(actual)) if actual == cts)
+                    );
+                    let expected = if sts < cts {
+                        DeletionError::WriteConflict
+                    } else {
+                        DeletionError::AlreadyDeleted
+                    };
+                    assert!(
+                        matches!(buffer.claim_ref(row_id, Arc::clone(&requester), sts, durable), Err(error) if error == expected)
+                    );
+                }
+            }
+            buffer.remove(row_id);
+            assert!(matches!(
+                buffer.claim_current(row_id, Arc::clone(&requester), true),
+                DeletionState::Deleted(None)
+            ));
+            assert!(
+                buffer.get(row_id).is_none(),
+                "failed claims install no marker"
+            );
+        }
     }
 
     #[test]

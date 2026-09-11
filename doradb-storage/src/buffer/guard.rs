@@ -566,6 +566,12 @@ impl<T> PageOptimisticGuard<T> {
         frame_ref(&self.bf).page_id
     }
 
+    /// Checks the original latch version and frame generation without refreshing either.
+    #[inline]
+    pub(crate) fn validate_bool(&self) -> bool {
+        self.raw.validate() && self.generation_matches()
+    }
+
     #[inline]
     fn generation_matches(&self) -> bool {
         generation_matches(&self.bf, self.captured_generation)

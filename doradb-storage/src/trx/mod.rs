@@ -3716,7 +3716,7 @@ pub(crate) mod tests {
         },
     };
     use crate::table::{MemTable, Table, TableScanRuntime, TableScanWorklist, test_user_table_id};
-    use crate::trx::stmt::tests as stmt_tests;
+    use crate::trx::stmt::{StmtEffects, tests as stmt_tests};
     use crate::trx::sys::tests::{
         TerminalRollbackTestHookGuard, fatal_rollback_retention_count,
         install_terminal_rollback_test_hook, retains_precommit_row_undo,
@@ -3852,6 +3852,18 @@ pub(crate) mod tests {
             let _stmt = stmt;
             pending::<()>().await;
             Ok(())
+        })
+        .await
+    }
+
+    /// Inspect a statement's runtime and effects through production settlement.
+    pub(crate) async fn with_statement_runtime<T>(
+        trx: &mut Transaction,
+        inspect: impl FnOnce(TrxRuntime<'_>, &mut StmtEffects) -> T,
+    ) -> Result<T> {
+        trx.exec(async |mut stmt| {
+            let (rt, effects) = stmt_tests::statement_runtime_and_effects_mut(&mut stmt);
+            Ok(inspect(rt, effects))
         })
         .await
     }
@@ -5467,7 +5479,7 @@ pub(crate) mod tests {
                     TableID::new(11),
                     None,
                     RowID::new(22),
-                    RowUndoKind::Delete,
+                    RowUndoKind::delete(),
                 ));
                 inner.index_undo_mut().push(IndexUndo {
                     table_id: TableID::new(11),
@@ -5810,7 +5822,7 @@ pub(crate) mod tests {
                     TableID::new(12),
                     None,
                     RowID::new(23),
-                    RowUndoKind::Delete,
+                    RowUndoKind::delete(),
                 ));
                 effects.push_delete_index_undo(
                     TableID::new(12),
@@ -6995,7 +7007,7 @@ pub(crate) mod tests {
                             table_id,
                             None,
                             RowID::new(cts.as_u64()),
-                            RowUndoKind::Delete,
+                            RowUndoKind::delete(),
                         ));
                     },
                 )
