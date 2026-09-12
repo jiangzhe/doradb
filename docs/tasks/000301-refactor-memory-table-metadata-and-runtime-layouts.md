@@ -11,38 +11,33 @@ github_issue: 1057
 ## Summary
 
 Separated physical row storage from operation-visible metadata and index
-runtimes. User tables now own `RowStore<EvictableBufferPool>` alongside their
-persisted storage and swappable runtime layouts. Complete memory/catalog tables
-own a RowStore and one fixed `TableRuntimeLayout<InMemorySecondaryIndex<I>>`.
+runtimes. User tables own RowStore alongside persisted storage and swappable
+runtime layouts. Complete memory/catalog tables own RowStore and one fixed
+instance of the same generic layout.
 
-The generic layout supplies shared metadata/index lookup and paired iteration.
-Construction validates exact runtime bindings and catalog fixed-slot identities;
-user layout installation and access validate the stable column allocation.
-Small layout-based key-derivation and rollback cleanups preserve existing
-mutation execution and statement contracts.
-
-This completes the metadata prerequisite for unique-mutation sharing. The
-mutation execution redesign remains a separately reviewed follow-up.
+The layout supplies exact index binding, paired metadata/runtime iteration,
+and cached indexed-column reads. Shared mutation-key derivation and narrower
+rollback access preserve the existing user and memory execution contracts.
+This completes the metadata prerequisite for later unique-mutation sharing.
 
 ## Context
 
 User Table previously embedded an incomplete MemTable with empty index slots
-and construction-time full metadata. Its physical helpers needed only column
-layout, while current index metadata belonged to a captured user runtime layout.
-Standalone MemTable separately owned metadata and memory indexes, and repeatedly
-selected catalog versus user index identity during mutation.
+and construction-time full metadata. Physical helpers needed only column
+layout, while current index metadata belonged to a captured user layout.
+Standalone MemTable separately owned metadata and indexes and selected catalog
+versus user identity during mutation. These differences obscured the inputs
+and ownership boundaries required by shared execution.
 
-Those ownership differences obscured the inputs required by prospective shared
-mutation methods. The work was split into independently usable deliverables:
-this metadata/resource refactor, followed by an evaluation of mutation sharing
-against the resulting concrete interfaces.
+The user split the work into this independently reviewable metadata/resource
+refactor and a later mutation-sharing design based on its concrete interfaces.
 
 Source Backlogs:
 
 - `docs/backlogs/000198-share-unique-mutation-execution-across-user-and-mem-catalog-tables.md`
 
-Backlog 000198 intentionally remains open. This prerequisite does not satisfy
-its unique-mutation sharing deliverable or authorize automatic source closure.
+Backlog 000198 intentionally remains open under that two-stage scope. Its
+unique-mutation execution deliverable is not completed by this prerequisite.
 This task has no parent RFC.
 
 Issue Labels:
@@ -51,277 +46,223 @@ Issue Labels:
 - priority:medium
 - codex
 
-The result preserves the distinct catalog/user access surfaces established by
-[task 000151](000151-split-catalog-user-runtime-layout-accessors.md), the stable
-column ownership from
-[task 000152](000152-split-table-metadata-column-index-layouts.md), and the
-mutation contracts established by tasks 000299 and 000300. Current ownership
-and operation contracts are documented in [architecture](../architecture.md),
+The result preserves the catalog/user access split from
+[task 000151](000151-split-catalog-user-runtime-layout-accessors.md), stable
+column ownership from [task 000152](000152-split-table-metadata-column-index-layouts.md),
+and mutation contracts from tasks 000299 and 000300. Durable subsystem contracts
+are recorded in [architecture](../architecture.md),
 [transactions](../transaction-system.md), and [index design](../index-design.md).
 
 ## Goals
 
-1. Bind immutable metadata and exact active runtimes in one generic layout.
-2. Limit physical RowStore ownership to table identity, columns, and row resources.
-3. Validate catalog identities before index allocation and preserve memory
-   user-table IDs independently of physical slots and pool types.
-4. Preserve user admission, root compatibility, index retirement, and cleanup.
-5. Make small shared-layout improvements while preserving mutation behavior.
+- Bind immutable metadata and exact active runtimes in one generic layout.
+- Limit physical ownership to table identity, stable columns, and row resources.
+- Validate catalog identities before allocation while preserving memory-user
+  IndexIDs independently of slots and pool types.
+- Preserve admission, root compatibility, index retirement, statement effects,
+  and resource cleanup while sharing small layout-based operations.
 
 ## Non-Goals
 
-- Consolidating unique selection/retry loops, callback dispatch, move
-  continuation, or secondary-index effect sequencing.
-- Introducing a general table capability trait, MutationAccess, a memory
-  accessor, or a shared mutation executor.
-- Removing existing MemTable update/delete/upsert methods, result types,
-  statement test wrappers, or catalog convenience contracts.
-- Public memory-table admission, dynamic catalog layouts, column DDL, index
-  identity allocation changes, or new public mutation APIs.
-- Changes to persistence formats, catalog key redo, checkpoint/recovery,
-  user DDL publication, retirement, ownership proofs, or statement settlement.
-- Transition/undo repairs tracked by
-  [backlog 000199](../backlogs/000199-repair-dangling-row-undo-ref-and-deferred-lock-to-delete-mismatch.md).
+- Unifying unique selection/retry loops, action dispatch, move continuation,
+  or secondary-index execution and effect sequencing.
+- Adding a general table capability trait, memory accessor, shared mutation
+  executor, public memory-table admission, or new public mutation APIs.
+- Removing existing MemTable mutation entry points or catalog convenience APIs.
+- Dynamic catalog layouts, column DDL, index identity allocation changes,
+  persistence format changes, or revised DDL publication/settlement protocols.
+- Making populated-store destruction infallible or repairing transition/undo
+  issues tracked by [backlog 000199](../backlogs/000199-repair-dangling-row-undo-ref-and-deferred-lock-to-delete-mismatch.md).
 
 ## Rejected Alternatives
 
 - Combining metadata ownership and mutation unification would interleave
-  identity changes with execution changes and prevent independent review of
-  the prerequisite.
-- Retaining full metadata in RowStore would preserve a non-authoritative copy
-  of user index metadata after DDL.
-- Separate fixed-memory layouts or another metadata/runtime container beneath
-  both layout types would duplicate one coherent immutable binding contract.
+  identity and execution changes, preventing independent prerequisite review.
+- Keeping full metadata in RowStore would retain a non-authoritative copy of
+  user index metadata after DDL.
+- Separate memory layouts or another shared metadata container would duplicate
+  the coherent immutable binding already supplied by the generic layout.
+- A flat MutationAccess-style capability trait would hide resource and policy
+  boundaries. The implementation shares owned components and explicit inputs.
 
 ## Plan
 
-The final architecture uses composition with explicit resource boundaries:
+The shipped design uses composition with explicit resource boundaries:
 
 | Component | Owned data and responsibility |
 |---|---|
-| `RowStore<D>` | TableID, stable column Arc, row-pool owner/role, block index, physical pages and routing |
-| `TableRuntimeLayout<R>` | Generation, full metadata Arc, sparse exact runtime entries, active ID-to-slot map |
-| `RuntimeIndexEntry<R>` | Exact IndexRef and runtime owner; conditional Clone, borrowing, consuming extraction |
-| `MemTable<D, I>` | RowStore, directly owned fixed memory layout, index-pool role, existing memory operations |
-| `Table` / `UserTableAccessor` | Persisted storage, swappable/admitted user layout, root and operation contracts |
-| `CatalogTable` | Existing fixed-pool MemTable wrapper and catalog convenience contracts |
-| Statements / `StmtEffects` | Existing effect registration, rollback, redo, and settlement |
+| `RowStore<D>` | TableID, stable column Arc, row pool/role, block index, physical pages and routing |
+| `TableRuntimeLayout<R>` | Generation, full metadata Arc, sparse exact runtime entries, ID-to-slot map, indexed-column read set |
+| `RuntimeIndexEntry<R>` | Exact IndexRef and runtime owner, with conditional cloning and borrowed/consuming access |
+| `MemTable<D, I>` | RowStore, fixed memory layout, index-pool role, existing memory operations |
+| `Table` / `UserTableAccessor` | Persisted storage, swappable/admitted user layout, roots and operation contracts |
+| `CatalogTable` | Complete fixed-pool MemTable and catalog convenience contracts |
+| Statements / `StmtEffects` | Effect registration, rollback, redo, and settlement |
 
-### Physical storage
+### Physical storage and construction
 
-Table construction separates preparation from assembly. `Table::new` accepts
-prepared RowStore, ColumnStorage, runtime layout, index lifecycle state, and
-definition kind. `MemTable::new` accepts RowStore, its fixed layout, and the
-index-pool role. Both constructors are synchronous and return the assembled
-owner directly. They check column allocation compatibility because row storage
-and layout now arrive independently; user assembly also checks that layout
-metadata belongs to the loaded file root.
+RowStore retains only `Arc<TableColumnLayout>` for row-byte interpretation.
+It owns physical allocation/reuse, routing, scans and snapshots, retirement,
+forward-source access, and hot undo. User insert-page selection and the decision
+to emit page-creation redo remain user policies. Callers select RowStore
+explicitly; no forwarding trait or new Deref layer hides its ownership.
 
-CREATE and recovery prepare user components from the loaded file root's
-metadata, timestamp, and routing boundaries. Root/lifecycle and column-storage
-validation precede secondary-index allocation. CatalogTable validates fixed
-index identities before building its indexes and assembling the memory owner.
-Existing index builders retain partial-failure cleanup; the preparation paths
-also reclaim the row-page index if secondary-index construction fails.
-CREATE and recovery assemble RowStore only after secondary-index construction
-succeeds. All three preparation paths reclaim the unpublished empty block index
-through `BlockIndex::destroy_empty`, preserving the original build error unchanged.
-This cleanup asserts an empty leaf root and deallocates its fixed-pool page
-without IO or a recoverable failure. General populated-store destruction retains
-its fallible row-page access.
+Captured scan pages are reopened through a descriptor-based RowStore method
+that validates their row range. The raw optional shared getter is private;
+known ownership contracts use the invariant-based getter. Captured-page access
+retains RuntimeResult because reopening evicted pages can require IO.
+Physical undo consumes the stable column layout; RowVersionMap ownership is
+unchanged.
 
-RowStore owns only `Arc<TableColumnLayout>` for row-byte interpretation. It
-provides page access/allocation, insert-page reuse, physical scans and snapshot
-descriptors, retired-page cleanup, and exact hot undo/forward-source access.
-Captured scan pages are reopened through a descriptor-based method that owns
-the existing row-range validation and RuntimeResult error behavior. Its raw
-optional shared-page getter is private.
-`RowWriteAccess::rollback_first_undo` now accepts column layout directly.
-RowVersionMap's column ownership remains unchanged.
+Table and MemTable constructors synchronously assemble prepared components.
+Table receives RowStore, ColumnStorage, layout, index lifecycle state, and
+definition kind; MemTable receives RowStore, fixed layout, and index-pool role.
+Assembly checks column allocation compatibility. Table additionally checks
+that supplied metadata belongs to its loaded file root.
 
-Callers select physical storage explicitly through `row_store`; no forwarding
-trait or new Deref layer hides the split. User session insert-page selection
-and the decision to emit physical page-creation redo remain user policies.
-Physical allocation still accepts the existing explicit redo context.
+CREATE and recovery prepare components from one loaded root's metadata,
+timestamp, and routing boundaries. Root/lifecycle and column-storage validation
+precede secondary-index allocation. CatalogTable validates fixed identities
+before building indexes. RowStore is assembled after successful index building.
 
-### Immutable layout access
+If index building fails, all three preparation paths reclaim their unpublished
+empty block index through `BlockIndex::destroy_empty` and return the original
+error unchanged. The owning row-page index asserts an empty leaf root and
+reclaims its fixed-pool page without IO or a recoverable cleanup failure.
+General populated-store destruction retains fallible row-page access.
+Existing secondary-index builders retain their staged cleanup behavior.
 
-The default runtime owner remains `Arc<SecondaryIndex<EvictableBufferPool>>`,
-preserving ordinary user layout type spellings. Memory layouts directly own
-InMemorySecondaryIndex values and stay at generation zero. They introduce no
-layout mutex, per-index Arc, or per-operation layout reconstruction.
+### Immutable layout and identity
 
-Common assembly validates sparse slot shape, exact metadata/entry references,
-and the ID map. Storage-specific constructors additionally validate runtime
-kind; user constructors retain physical-slot validation. The shared access
-surface requires no runtime capability trait.
+User layouts keep the default Arc-owned dual-tree runtime type. Memory layouts
+directly own InMemorySecondaryIndex values at generation zero, without a
+layout mutex, per-index Arc, or per-operation reconstruction.
 
-Both paths borrow the existing layout for metadata, ID resolution, exact entry
-lookup, and active iteration. `active_indexes()` pairs each specification with
-its exact runtime entry in physical-slot order. Runtime-only user iteration
-remains available. The generic layout precomputes its sorted, deduplicated
-indexed-column read set during common assembly and stores it as Box<[usize]>.
-Readers borrow a slice, avoiding per-row allocation and sorting. Replacement
-layouts compute their own sets; retained layouts keep their original sets.
+Common assembly validates sparse slots, exact metadata/entry references, and
+the ID map. Storage-specific construction checks runtime kind; user runtimes
+also validate physical slots. Active iteration pairs specifications and exact
+runtime entries in physical-slot order without allocating an access container.
 
-### Identity and admission
+The layout caches a sorted, deduplicated `Box<[usize]>` indexed-column read set
+during assembly. Consumers borrow a slice instead of allocating and sorting
+per row. Replacement layouts compute their own set; retained layouts keep the
+set corresponding to their original metadata.
 
-Catalog construction requires each metadata IndexRef to equal
-`catalog_index_ref(slot)` before allocating indexes. Inconsistent trusted input
-is rejected, with no silent ID rewrite. Memory user tables retain their exact
-metadata IDs, including IDs different from slots. Pool role and memory
-residency do not determine identity.
+Catalog metadata must use `catalog_index_ref(slot)` before index allocation;
+invalid trusted input is rejected without rewriting IDs. Memory user tables
+retain metadata-assigned identities even when IDs differ from slots. Pool
+role and memory residency do not identify the table family.
 
-MemTable resolves retained keys, branches, and undo identities through its
-fixed layout entries. Catalog consumers retain the existing checked conversion
-to fixed-slot keys where key-based redo requires that representation.
+Column Arc compatibility proves row-byte compatibility. Owning construction
+and existing table-qualified admission establish table identity; bare
+IndexRefs, column pointers, and layout generations cannot replace admission.
+User metadata-pointer and sparse-root checks remain in force. Historical
+catalog metadata, durable roots, and managed definitions keep their owners.
 
-Table construction, user layout installation, and user accessor construction
-check column Arc compatibility. This proves row-byte compatibility; owning
-construction and existing table-qualified admission establish table identity.
-Bare IndexRefs, equal column pointers, and layout generation are insufficient
-substitutes for that admission.
+### Shared keys and rollback
 
-User access retains the existing metadata-pointer and sparse-root compatibility
-checks. Captured persisted roots, exact index references, and layout versions
-remain separate concepts. Historical catalog metadata, durable file metadata,
-and managed definitions retain their existing owners.
+WriteIndexKey and WriteIndexKeySet borrow a generic layout through their
+constructors while preserving exact IndexRefs, private fields, active-slot
+order, the layout lifetime, and owned values. Full-row, physical-row, and
+indexed-value derivation share that binding. Physical extraction reads under
+one row guard and avoids an intermediate SelectKey vector and hash map.
 
-### Local access and cleanup improvements
+User access retains cold decoding and OwnedRowIndexSetProof. Memory/catalog
+MVCC insert and delete consume complete shared key sets, converting each key
+to SelectKey at existing slot-based helpers. The fixed memory layout preserves
+that slot's identity. Nontransactional operations and selective updates retain
+their algorithms. Key derivation provides neither table admission nor row
+ownership and does not unify mutation execution.
 
-WriteIndexKey and WriteIndexKeySet live in a shared table module. Their full-row,
-physical-row, and indexed-value constructors borrow TableRuntimeLayout<R> and
-use paired iteration without carrying R in the key types. Exact references,
-private fields, layout borrow lifetime, complete active-slot order, and owned
-values are preserved. Physical extraction reads under one row guard and no
-longer builds an intermediate SelectKey vector and hash map.
+Memory index-update loops use paired layout iteration without changing effect
+order. IndexRollback requests its index guard directly and no longer requires
+an entire MemTable or associated row/index pool types. Memory rollback resolves
+exact entries through MemTable's layout; the user adapter borrows its retained
+layout. Inverse operations and reverse undo order remain unchanged.
 
-User access owns cold decoding and OwnedRowIndexSetProof. Memory/catalog MVCC
-insert and delete use the shared complete key sets, then convert individual
-keys to SelectKey at the existing mutation-helper boundary. This conversion
-uses the resolved slot, whose identity remains fixed by the immutable memory
-layout. Nontransactional operations, selective updates, index execution, redo,
-and undo registration keep their existing algorithms. Shared key derivation
-does not grant table admission or row ownership, and unique-mutation execution
-sharing remains the separate follow-up.
-
-Existing memory index-update loops use paired specification/runtime iteration.
-Their selection and effect sequencing remain unchanged. Actual runtime reads,
-row acquisition, cold decoding, root capture, and index effects stay with their
-existing execution owners.
-
-IndexRollback requests an index guard directly, removing its associated row
-and index pool types and whole-MemTable dependency. Its memory implementation
-belongs to MemTable, so catalog and standalone memory rollback resolve exact
-layout entries. The user adapter borrows only the retained user layout. The
-existing inverse index operations and reverse undo order are preserved.
-
-Memory destruction consumes directly owned runtime entries before row storage.
-Fixed catalog tables retain their pool-shutdown lifetime; explicit destruction
-also remains available for standalone memory owners. User destruction retains
-current/retired runtime handling and Arc uniqueness checks. Staged memory-index
-construction keeps its existing failure cleanup.
+Explicit memory destruction consumes index owners before row storage. Catalog
+tables retain their pool-shutdown lifetime. User destruction preserves current
+and retired index handling and Arc uniqueness checks.
 
 ## Implementation Notes
 
-Implemented the metadata/runtime ownership foundation and small layout-based
-access cleanups, preserving the separate user and memory mutation drivers.
-Physical consumers in DDL, scans, checkpoint, recovery, purge, and rollback now
-use RowStore. No persistence formats or public mutation contracts changed.
+Implemented the metadata/runtime ownership prerequisite, shared layout-based
+key derivation, and narrower rollback access while preserving separate user
+and memory mutation drivers. DDL, scans, checkpoint, recovery, purge, and undo
+now use the physical RowStore owner. Public contracts and formats are unchanged.
 
-Regressions cover generic binding validation, memory layout identity
-and cleanup, construction rejection, exact mutation undo, and retained-layout
-key derivation. Existing root/layout tests additionally reject incompatible
-column allocations. A standalone memory-user regression applies the actual
-recorded index and row undo directly to its owner inside statement settlement;
-it does not introduce public memory-table admission or a test capability trait.
-A two-page catalog pool regression verifies cleanup of both the prepared
-row-page index and a partially built secondary-index batch on pool exhaustion.
-Empty-index cleanup tests cover zero and nonzero starting row IDs and reject
-populated roots before deallocation.
-Key regressions cover empty user/memory layouts, sparse composite and overlapping
-keys, and owned values extracted from live or deleted physical rows. The exact
-memory-index identity regression now exercises insert, update, and delete undo.
+Review extended the original foundation with prepared-component constructors,
+shared WriteIndexKeySet consumers for catalog MVCC insert/delete, and eager
+indexed-column caching. These changes use the generic layout without selecting
+shared unique-mutation execution or weakening user root/ownership proofs.
 
-Validation completed on 2026-09-12 before the empty-index cleanup follow-up:
+Construction cleanup review established that the three failed-build paths own
+only an empty fixed-pool root. Their former fallible destruction/logging branches
+were replaced by the infallible empty-index operation, preserving the primary
+error. Destruction of populated stores remains a separate contract because it
+can fetch evicted pages.
 
-- Workspace nextest: **2,002 passed**.
-- Alternate `libaio` storage nextest: **1,886 passed**.
-- Formatting and strict workspace/all-target Clippy: passed.
-- Branch style audit: passed for **24 tracked Rust files**.
-- Public-error audit and unsafe inventory: identical to tracked baselines.
-- Git whitespace checks: passed.
+Final validation for the implementation on 2026-09-12:
 
-Empty-index cleanup follow-up validation on 2026-09-12: **2,003 workspace tests**
-and **4 focused tests** passed, along with formatting, strict workspace/all-target
-Clippy, and Git whitespace checks.
+- Workspace nextest: **2,003 passed**, including **4 focused** construction and
+  destruction tests checked separately.
+- Formatting, strict workspace/all-target Clippy, and whitespace checks: passed.
+- Resolve style gate: **28 branch-diff Rust files** passed against origin/main.
+- Alternate `libaio` validation before indexed-column caching and empty-index
+  cleanup: **1,886 passed**. These final refinements did not change backend code.
+- Earlier foundation validation matched public-error and unsafe baselines.
 
-Before the constructor follow-up, focused line coverage across the five core
-files was **92.68%** overall:
-
-| File | Line coverage |
-|---|---:|
-| `table/row_store.rs` | 86.45% |
-| `table/layout.rs` | 97.73% |
-| `table/mem_table.rs` | 88.47% |
-| `table/access.rs` | 95.02% |
-| `table/rollback.rs` | 86.75% |
-
-All five exceeded the repository's 80% focused review bar. Existing mutation,
-DDL, cleanup, catalog redo, and restart regressions passed on both backends.
+Before constructor and key-derivation follow-ups, focused coverage across
+RowStore, layout, MemTable, access, and rollback was **92.68%** overall; every
+file exceeded 80%. This records the earlier measurement, not final coverage.
+CodeRabbit review was unavailable because its CLI was not installed.
 
 ## Impacts
 
-- Table and catalog runtimes now share the physical row owner and immutable
-  metadata/runtime binding while keeping their distinct operation lifecycles.
-- Physical storage consumers select RowStore explicitly; logical index access
-  selects the owning or admitted layout.
-- Catalog fixed identities are validated earlier. Layout-based lookup and key
-  derivation preserve exact IDs through sparse slots and retained generations.
-- Existing memory entry points, catalog wrappers, user root checks, statement
-  errors, undo/redo order, and resource cleanup remain available.
+- Physical storage and immutable metadata/runtime binding are reusable owned
+  components with distinct user and memory operation lifecycles.
+- Catalog identities are validated before allocation; sparse and retained
+  layouts preserve exact IDs through derivation and rollback.
+- Borrowed layout access and precomputed read sets avoid repeated allocation
+  and sorting. Physical key copying avoids redundant temporary containers.
+- Existing mutation entry points, undo/redo ordering, statement errors, DDL
+  admission, persistence formats, and recovery protocols are preserved.
 
 ## Test Cases
 
-- Generic sparse binding rejects missing/inactive entries, mismatched IDs or
-  slots, duplicate identities, and inconsistent ID maps.
-- Empty, dense, and sparse access exposes matching metadata/runtime entries in
-  slot order; constructors reject incorrect runtime kinds and user slots.
-- Catalog identity mismatch is rejected before index allocation. Fixed pools
-  also support memory user IDs different from slots without reclassification.
-- Catalog secondary-index build failure preserves its resource error and
+- Sparse binding rejects missing/inactive entries, mismatched IDs or slots,
+  duplicate identities, invalid ID maps, and incorrect runtime kinds.
+- Empty, dense, and sparse layouts expose matching metadata/runtime pairs and
+  sorted read sets; retained and replacement layouts keep exact identities.
+- Catalog identity mismatch is rejected before allocation. Fixed pools support
+  memory user IDs different from slots without reclassification.
+- Two-page catalog exhaustion preserves CatalogAccess/BufferPoolFull and
   reclaims both staged secondary indexes and the prepared row-page index.
-- Memory user key mutation records exact IDs and restores original index/row
-  state through rollback. Explicit destruction reclaims memory index and row pages.
-- Column allocation mismatch fails binding; existing admitted user layouts and
-  slot-reuse generations preserve correct row decoding and key identities.
-- Full-row and indexed-value key derivation agree while retaining old versus
-  replacement index identity across sparse layouts.
-- Physical key derivation agrees with full-row and indexed-value derivation
-  for sparse and dense memory layouts; copied values survive page-guard release
-  and include keys from deleted rows without visibility filtering.
-- Existing user hot/cold, memory update/delete/upsert, moves, forward traversal,
-  callback/cancellation, catalog, DDL, checkpoint, and restart tests remain green.
+- Empty-index cleanup reclaims roots at zero/nonzero row boundaries and rejects
+  populated roots before deallocation; general destruction tests remain green.
+- Full-row, indexed-value, and physical key derivation agree for sparse/dense,
+  composite, overlapping, and empty layouts. Copied values survive guard release
+  and include deleted physical rows without applying visibility filtering.
+- Memory insert/update/delete record exact identities and restore row/index
+  state through actual statement undo. Explicit destruction reclaims resources.
+- Incompatible column allocations fail binding. Existing hot/cold mutation,
+  moves, forward traversal, callbacks/cancellation, catalog, DDL, checkpoint,
+  rollback, and restart regressions passed.
 
 ## Open Questions
 
-No unresolved implementation questions remain for this prerequisite.
+No unresolved implementation questions remain for this metadata prerequisite.
 
-Unique-mutation execution sharing remains tracked by
-[backlog 000198](../backlogs/000198-share-unique-mutation-execution-across-user-and-mem-catalog-tables.md),
-which stays open. The follow-up starts from the implemented RowStore, generic
-layout, complete MemTable, and exact identity bindings.
+Unique-mutation execution sharing remains in
+[backlog 000198](../backlogs/000198-share-unique-mutation-execution-across-user-and-mem-catalog-tables.md).
+Deferred From: task 000301, following the prerequisite split from task 000300.
+Deferral Context: metadata ownership required independent review before
+selecting shared execution contracts. The follow-up starts from RowStore, the
+generic layout, complete MemTable, and shared key derivation; its backlog
+records those delivered inputs and remaining execution responsibilities.
 
-Deferred From: task 000301, the metadata prerequisite for mutation sharing.
-Deferral Context: metadata ownership required independent implementation and
-review before selecting shared execution contracts. Evaluate current-row
-selection, callback/action validation, concrete hot operations and move
-preparation, remaining key calculations, and complete index effects against
-these concrete inputs. User roots, cold claims, routing/waits, allocation,
-proof consumption, and statement settlement retain distinct responsibilities.
-
-A user hot-row update may claim a key previously owned by a cold row. Physical
-residency alone therefore cannot define a shared index-mutation interface.
-The follow-up must choose methods by complete inputs, ownership, effects, and
-cleanup; this task does not select one retry loop or one mutation executor.
-Dynamic memory/catalog layouts, column DDL, and backlog 000199 remain separate.
+A hot user update can claim a key previously owned by a cold row, so physical
+residency alone cannot define shared index mutation. Future methods must have
+complete inputs, ownership, effects, and cleanup boundaries. User roots, cold
+claims, routing/waits, allocation, proof consumption, and statement settlement
+retain distinct responsibilities until that design is reviewed.
