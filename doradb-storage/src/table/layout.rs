@@ -1,50 +1,53 @@
-use crate::buffer::EvictableBufferPool;
+use crate::buffer::{BufferPool, EvictableBufferPool};
 use crate::catalog::{
-    IndexID, IndexRef, IndexSlot, ResolvedIndexKey, TableMetadata, user_key_from_index_ref,
+    IndexID, IndexRef, IndexSlot, ResolvedIndexKey, TableColumnLayout, TableIndexMetadata,
+    TableMetadata, user_key_from_index_ref,
 };
 use crate::error::{InternalError, RuntimeError, RuntimeResult};
-use crate::index::SecondaryIndex;
+use crate::index::{InMemorySecondaryIndex, SecondaryIndex};
 use crate::map::FastHashMap;
 use crate::value::Val;
 use error_stack::Report;
 use std::sync::Arc;
 
-/// One exact active user-index generation and its runtime owner.
+/// One exact active index identity and its runtime owner.
 #[derive(Clone)]
-pub(crate) struct RuntimeIndexEntry {
+pub(crate) struct RuntimeIndexEntry<R = Arc<SecondaryIndex<EvictableBufferPool>>> {
     index: IndexRef,
-    runtime: Arc<SecondaryIndex<EvictableBufferPool>>,
+    runtime: R,
 }
 
-impl RuntimeIndexEntry {
+impl<R> RuntimeIndexEntry<R> {
     /// Creates one exact runtime entry.
     #[inline]
-    pub(crate) fn new(index: IndexRef, runtime: Arc<SecondaryIndex<EvictableBufferPool>>) -> Self {
+    pub(crate) fn new(index: IndexRef, runtime: R) -> Self {
         Self { index, runtime }
     }
 
-    /// Returns this entry's generation-qualified identity.
+    /// Returns this entry's exact table-local identity.
     #[inline]
     pub(crate) const fn index_ref(&self) -> IndexRef {
         self.index
     }
 
-    /// Returns the owned secondary-index runtime.
+    /// Borrows the owned index runtime.
     #[inline]
-    pub(crate) fn runtime(&self) -> &SecondaryIndex<EvictableBufferPool> {
-        &self.runtime
-    }
-
-    /// Returns a shared owner of the secondary-index runtime.
-    #[inline]
-    pub(crate) fn runtime_arc(&self) -> &Arc<SecondaryIndex<EvictableBufferPool>> {
+    pub(crate) fn runtime(&self) -> &R {
         &self.runtime
     }
 
     /// Consumes this entry and returns its runtime owner.
     #[inline]
-    pub(crate) fn into_runtime(self) -> Arc<SecondaryIndex<EvictableBufferPool>> {
+    pub(crate) fn into_runtime(self) -> R {
         self.runtime
+    }
+}
+
+impl<R> RuntimeIndexEntry<Arc<R>> {
+    /// Returns a shared owner of the index runtime.
+    #[inline]
+    pub(crate) fn runtime_arc(&self) -> &Arc<R> {
+        &self.runtime
     }
 }
 
@@ -73,12 +76,16 @@ impl LayoutIndexSelector for IndexSlot {
     }
 }
 
-/// Immutable metadata and secondary-index runtime snapshot for a user table.
-pub(crate) struct TableRuntimeLayout {
+/// Fixed layout directly owning a memory table's index runtimes.
+pub(crate) type MemTableLayout<I> = TableRuntimeLayout<InMemorySecondaryIndex<I>>;
+
+/// Immutable binding between table metadata and exact active index runtimes.
+pub(crate) struct TableRuntimeLayout<R = Arc<SecondaryIndex<EvictableBufferPool>>> {
     generation: u64,
     metadata: Arc<TableMetadata>,
-    secondary_indexes: Box<[Option<RuntimeIndexEntry>]>,
+    secondary_indexes: Box<[Option<RuntimeIndexEntry<R>>]>,
     slot_by_id: FastHashMap<IndexID, IndexSlot>,
+    indexed_columns: Box<[usize]>,
 }
 
 impl TableRuntimeLayout {
@@ -94,47 +101,135 @@ impl TableRuntimeLayout {
         tests::index_access_counters()
     }
 
-    /// Create a validated user-table runtime layout snapshot.
+    /// Creates a validated user-table layout from newly bound runtimes.
     #[inline]
     pub(crate) fn new(
         generation: u64,
         metadata: Arc<TableMetadata>,
         secondary_indexes: Box<[Option<Arc<SecondaryIndex<EvictableBufferPool>>>]>,
     ) -> Self {
-        let entries = secondary_indexes
-            .into_vec()
-            .into_iter()
-            .enumerate()
-            .map(|(slot, runtime)| {
-                runtime.map(|runtime| {
-                    let slot = IndexSlot::try_from(slot).unwrap_or_else(|_| {
-                        panic!(
-                            "table runtime layout slot exceeds persisted u16 domain: slot={slot}"
-                        )
-                    });
-                    let index = metadata
-                        .idx
-                        .index_spec(slot)
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "table runtime layout has runtime for inactive metadata slot: slot={slot}"
-                            )
-                        })
-                        .index;
-                    RuntimeIndexEntry::new(index, runtime)
-                })
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        Self::from_entries(generation, metadata, entries)
+        let layout = Self::from_runtimes(generation, metadata, secondary_indexes);
+        layout.assert_user_runtimes();
+        layout
     }
 
-    /// Creates a validated layout from exact generation-qualified entries.
+    /// Creates a validated user layout from exact retained runtime entries.
     #[inline]
     pub(crate) fn from_entries(
         generation: u64,
         metadata: Arc<TableMetadata>,
         secondary_indexes: Box<[Option<RuntimeIndexEntry>]>,
+    ) -> Self {
+        let layout = Self::assemble(generation, metadata, secondary_indexes);
+        layout.assert_user_runtimes();
+        layout
+    }
+
+    /// Checks user runtime slots and kinds against the immutable binding.
+    #[inline]
+    pub(crate) fn assert_valid(&self) {
+        self.assert_shape();
+        self.assert_user_runtimes();
+    }
+
+    fn assert_user_runtimes(&self) {
+        for entry in self.secondary_indexes.iter().flatten() {
+            let spec = self.metadata.idx.expect_index_spec(entry.index_ref());
+            assert_eq!(
+                entry.runtime().index_slot(),
+                spec.index.slot(),
+                "table runtime layout invariant violated: runtime index slot mismatch, index={}",
+                spec.index
+            );
+            assert_eq!(
+                entry.runtime().is_unique(),
+                spec.unique(),
+                "table runtime layout invariant violated: runtime index kind mismatch, index={}",
+                spec.index
+            );
+        }
+    }
+
+    /// Returns the runtime for an exact reference resolved against this retained layout.
+    #[inline]
+    pub(crate) fn expect_secondary_index(
+        &self,
+        index: IndexRef,
+    ) -> &SecondaryIndex<EvictableBufferPool> {
+        self.expect_index_entry(index).runtime()
+    }
+
+    /// Returns one active secondary-index runtime by exact reference.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn secondary_index<I: LayoutIndexSelector>(
+        &self,
+        index: I,
+    ) -> RuntimeResult<&SecondaryIndex<EvictableBufferPool>> {
+        let index = index.resolve(self)?;
+        self.index_entry(index)
+            .map(|entry| entry.runtime().as_ref())
+    }
+
+    /// Iterates exact active references paired with their user runtimes.
+    #[inline]
+    pub(crate) fn active_secondary_indexes(
+        &self,
+    ) -> impl Iterator<Item = (IndexRef, &SecondaryIndex<EvictableBufferPool>)> + '_ {
+        #[cfg(test)]
+        tests::record_active_iteration();
+        self.secondary_indexes
+            .iter()
+            .flatten()
+            .map(|entry| (entry.index_ref(), entry.runtime().as_ref()))
+    }
+}
+
+impl<I: BufferPool> TableRuntimeLayout<InMemorySecondaryIndex<I>> {
+    /// Binds memory indexes built from this table's fixed metadata.
+    #[inline]
+    pub(crate) fn new_memory(
+        metadata: Arc<TableMetadata>,
+        secondary_indexes: Box<[Option<InMemorySecondaryIndex<I>>]>,
+    ) -> Self {
+        let layout = Self::from_runtimes(0, metadata, secondary_indexes);
+        for entry in layout.secondary_indexes.iter().flatten() {
+            let spec = layout.metadata.idx.expect_index_spec(entry.index_ref());
+            assert_eq!(
+                entry.runtime().is_unique(),
+                spec.unique(),
+                "memory table layout invariant violated: runtime index kind mismatch, index={}",
+                spec.index
+            );
+        }
+        layout
+    }
+}
+
+impl<R> TableRuntimeLayout<R> {
+    fn from_runtimes(
+        generation: u64,
+        metadata: Arc<TableMetadata>,
+        secondary_indexes: Box<[Option<R>]>,
+    ) -> Self {
+        let entries = secondary_indexes.into_vec().into_iter().enumerate()
+            .map(|(slot, runtime)| runtime.map(|runtime| {
+                let slot = IndexSlot::try_from(slot).unwrap_or_else(|_| {
+                    panic!("table runtime layout slot exceeds u16: slot={slot}")
+                });
+                let spec = metadata.idx.index_spec(slot).unwrap_or_else(|| {
+                    panic!("table runtime layout has runtime for inactive metadata slot: slot={slot}")
+                });
+                RuntimeIndexEntry::new(spec.index, runtime)
+            }))
+            .collect::<Vec<_>>().into_boxed_slice();
+        Self::assemble(generation, metadata, entries)
+    }
+
+    fn assemble(
+        generation: u64,
+        metadata: Arc<TableMetadata>,
+        secondary_indexes: Box<[Option<RuntimeIndexEntry<R>>]>,
     ) -> Self {
         let mut slot_by_id = FastHashMap::default();
         for entry in secondary_indexes.iter().flatten() {
@@ -145,19 +240,27 @@ impl TableRuntimeLayout {
                 entry.index_ref()
             );
         }
+        let mut indexed_columns = metadata
+            .idx
+            .index_columns()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        indexed_columns.sort_unstable();
         let layout = Self {
             generation,
             metadata,
             secondary_indexes,
             slot_by_id,
+            indexed_columns: indexed_columns.into_boxed_slice(),
         };
-        layout.assert_valid();
+        layout.assert_shape();
         layout
     }
 
-    /// Assert layout shape against metadata and index runtime identity.
+    /// Checks the immutable metadata, sparse entries, and exact identity map.
     #[inline]
-    pub(crate) fn assert_valid(&self) {
+    fn assert_shape(&self) {
         assert_eq!(
             self.secondary_indexes.len(),
             self.metadata.idx.index_slot_count(),
@@ -210,26 +313,6 @@ impl TableRuntimeLayout {
                 "table runtime layout invariant violated: runtime slot has no active metadata spec, index={}",
                 entry.index_ref()
             );
-            assert_eq!(
-                entry.runtime().index_slot(),
-                index_slot,
-                "table runtime layout invariant violated: runtime index slot mismatch, index={}, runtime_index_slot={}",
-                entry.index_ref(),
-                entry.runtime().index_slot()
-            );
-            let index_spec = self
-                .metadata
-                .idx
-                .index_spec(index_slot)
-                .expect("runtime slot was already proven active");
-            assert_eq!(
-                entry.runtime().is_unique(),
-                index_spec.unique(),
-                "table runtime layout invariant violated: runtime index kind mismatch, index={}, runtime_unique={}, metadata_unique={}",
-                entry.index_ref(),
-                entry.runtime().is_unique(),
-                index_spec.unique()
-            );
         }
 
         assert_eq!(
@@ -276,13 +359,13 @@ impl TableRuntimeLayout {
 
     /// Returns the sparse secondary-index runtime slots.
     #[inline]
-    pub(crate) fn secondary_indexes(&self) -> &[Option<RuntimeIndexEntry>] {
+    pub(crate) fn secondary_indexes(&self) -> &[Option<RuntimeIndexEntry<R>>] {
         &self.secondary_indexes
     }
 
     /// Consumes the layout and returns its secondary-index runtime slots.
     #[inline]
-    pub(crate) fn into_secondary_indexes(self) -> Box<[Option<RuntimeIndexEntry>]> {
+    pub(crate) fn into_secondary_indexes(self) -> Box<[Option<RuntimeIndexEntry<R>>]> {
         self.secondary_indexes
     }
 
@@ -310,7 +393,7 @@ impl TableRuntimeLayout {
 
     /// Returns one exact active secondary-index entry.
     #[inline]
-    pub(crate) fn index_entry(&self, index: IndexRef) -> RuntimeResult<&RuntimeIndexEntry> {
+    pub(crate) fn index_entry(&self, index: IndexRef) -> RuntimeResult<&RuntimeIndexEntry<R>> {
         self.secondary_indexes
             .get(index.slot().as_usize())
             .and_then(Option::as_ref)
@@ -321,7 +404,7 @@ impl TableRuntimeLayout {
     /// Returns an entry already resolved against this retained layout.
     /// Layout ownership keeps the exact generation active throughout execution.
     #[inline]
-    pub(crate) fn expect_index_entry(&self, index: IndexRef) -> &RuntimeIndexEntry {
+    pub(crate) fn expect_index_entry(&self, index: IndexRef) -> &RuntimeIndexEntry<R> {
         let entry = self
             .secondary_indexes
             .get(index.slot().as_usize())
@@ -343,18 +426,12 @@ impl TableRuntimeLayout {
         entry
     }
 
-    /// Returns the runtime for an exact reference resolved against this retained layout.
-    #[inline]
-    pub(crate) fn expect_secondary_index(
-        &self,
-        index: IndexRef,
-    ) -> &SecondaryIndex<EvictableBufferPool> {
-        self.expect_index_entry(index).runtime()
-    }
-
     /// Returns one active secondary-index entry by an already trusted slot.
     #[inline]
-    pub(crate) fn index_entry_at_slot(&self, slot: IndexSlot) -> RuntimeResult<&RuntimeIndexEntry> {
+    pub(crate) fn index_entry_at_slot(
+        &self,
+        slot: IndexSlot,
+    ) -> RuntimeResult<&RuntimeIndexEntry<R>> {
         self.secondary_indexes
             .get(slot.as_usize())
             .and_then(Option::as_ref)
@@ -380,17 +457,6 @@ impl TableRuntimeLayout {
             .attach("operation=resolve_secondary_index_runtime")
     }
 
-    /// Returns one active secondary-index runtime by exact reference.
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn secondary_index<I: LayoutIndexSelector>(
-        &self,
-        index: I,
-    ) -> RuntimeResult<&SecondaryIndex<EvictableBufferPool>> {
-        let index = index.resolve(self)?;
-        self.index_entry(index).map(RuntimeIndexEntry::runtime)
-    }
-
     /// Qualifies a validated active positional key for retained user state.
     #[inline]
     pub(crate) fn resolve_active_user_key(
@@ -402,23 +468,43 @@ impl TableRuntimeLayout {
         user_key_from_index_ref(index, vals)
     }
 
-    /// Iterates exact active references paired with their runtimes.
+    /// Iterates active metadata and its exact runtime entry in physical-slot order.
     #[inline]
-    pub(crate) fn active_secondary_indexes(
+    pub(crate) fn active_indexes(
         &self,
-    ) -> impl Iterator<Item = (IndexRef, &SecondaryIndex<EvictableBufferPool>)> + '_ {
+    ) -> impl Iterator<Item = (&TableIndexMetadata, &RuntimeIndexEntry<R>)> + '_ {
         #[cfg(test)]
         tests::record_active_iteration();
-        self.secondary_indexes
-            .iter()
-            .flatten()
-            .map(|entry| (entry.index_ref(), entry.runtime()))
+        self.secondary_indexes.iter().flatten().map(|entry| {
+            (
+                self.metadata.idx.expect_index_spec(entry.index_ref()),
+                entry,
+            )
+        })
+    }
+
+    /// Borrows the active indexed columns precomputed in decoding order.
+    #[inline]
+    pub(crate) fn indexed_column_read_set(&self) -> &[usize] {
+        &self.indexed_columns
+    }
+
+    /// Checks row-byte compatibility with an owning table's physical storage.
+    /// Table ownership is established separately by construction and admission.
+    #[inline]
+    pub(crate) fn assert_column_layout(&self, columns: &Arc<TableColumnLayout>) {
+        assert!(
+            Arc::ptr_eq(&self.metadata.col, columns),
+            "table runtime layout invariant violated: column allocation mismatch, generation={}",
+            self.generation
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::FixedBufferPool;
     use crate::catalog::table::tests::metadata_with_replacement_index;
     use crate::catalog::{
         ActiveIndexSpec, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
@@ -483,6 +569,145 @@ mod tests {
         )
     }
 
+    fn sparse_binding_metadata() -> Arc<TableMetadata> {
+        Arc::new(
+            TableMetadata::try_new_with_index_slot_count(
+                table2_columns(),
+                vec![
+                    ActiveIndexSpec::new(
+                        IndexRef::new(IndexID::new(73), IndexSlot::new(0)),
+                        StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::UK),
+                    ),
+                    ActiveIndexSpec::new(
+                        IndexRef::new(IndexID::new(29), IndexSlot::new(2)),
+                        StorageIndexSpec::new(
+                            vec![StorageIndexKey::new(1)],
+                            StorageIndexFlags::empty(),
+                        ),
+                    ),
+                ],
+                IndexSlot::new(3),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn generic_layout_rejects_inconsistent_entries_and_identity_maps() {
+        let metadata = sparse_binding_metadata();
+        let first = metadata.idx.index_spec(IndexSlot::new(0)).unwrap().index;
+        let last = metadata.idx.index_spec(IndexSlot::new(2)).unwrap().index;
+        let entry = |index| Some(RuntimeIndexEntry::new(index, ()));
+        for (case, entries) in [
+            ("wrong count", vec![entry(first)]),
+            ("missing runtime", vec![entry(first), None, None]),
+            (
+                "inactive runtime",
+                vec![
+                    entry(first),
+                    entry(IndexRef::new(IndexID::new(81), IndexSlot::new(1))),
+                    entry(last),
+                ],
+            ),
+            (
+                "wrong id",
+                vec![
+                    entry(IndexRef::new(IndexID::new(81), first.slot())),
+                    None,
+                    entry(last),
+                ],
+            ),
+            ("wrong slot", vec![entry(last), None, entry(first)]),
+            (
+                "duplicate id",
+                vec![
+                    entry(first),
+                    None,
+                    entry(IndexRef::new(first.id(), last.slot())),
+                ],
+            ),
+        ] {
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| {
+                    TableRuntimeLayout::assemble(
+                        0,
+                        Arc::clone(&metadata),
+                        entries.into_boxed_slice(),
+                    )
+                }))
+                .is_err(),
+                "layout accepted {case}"
+            );
+        }
+
+        for case in ["missing id", "extra id", "wrong slot"] {
+            let mut layout = TableRuntimeLayout::from_runtimes(
+                0,
+                Arc::clone(&metadata),
+                vec![Some(()), None, Some(())].into_boxed_slice(),
+            );
+            match case {
+                "missing id" => {
+                    layout.slot_by_id.remove(&first.id());
+                }
+                "extra id" => {
+                    layout.slot_by_id.insert(IndexID::new(81), first.slot());
+                }
+                "wrong slot" => {
+                    layout.slot_by_id.insert(first.id(), last.slot());
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| layout.assert_shape())).is_err(),
+                "layout accepted {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_layout_binds_paired_entries_and_column_allocation() {
+        let metadata = sparse_binding_metadata();
+        let layout = TableRuntimeLayout::from_runtimes(
+            9,
+            Arc::clone(&metadata),
+            vec![Some(73), None, Some(29)].into_boxed_slice(),
+        );
+        let pairs = layout
+            .active_indexes()
+            .map(|(spec, entry)| {
+                assert_eq!(spec.index, entry.index_ref());
+                assert!(ptr::eq(
+                    spec,
+                    metadata.idx.expect_index_spec(entry.index_ref())
+                ));
+                assert!(ptr::eq(
+                    entry,
+                    layout.index_entry(entry.index_ref()).unwrap()
+                ));
+                (entry.index_ref().slot(), *entry.runtime())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pairs,
+            vec![(IndexSlot::new(0), 73), (IndexSlot::new(2), 29)]
+        );
+        assert_eq!(layout.indexed_column_read_set(), &[0, 1]);
+        assert_eq!(
+            layout.resolve_index_id(IndexID::new(73)),
+            Some(metadata.idx.index_spec(IndexSlot::new(0)).unwrap().index)
+        );
+        assert!(layout.index_entry_at_slot(IndexSlot::new(1)).is_err());
+        layout.assert_column_layout(&metadata.col);
+        let equal_but_distinct_columns = Arc::new(metadata.col.as_ref().clone());
+        assert!(
+            catch_unwind(AssertUnwindSafe(
+                || layout.assert_column_layout(&equal_but_distinct_columns)
+            ))
+            .is_err()
+        );
+    }
+
     #[test]
     fn runtime_layout_accepts_matching_empty_index_shape() {
         let metadata = metadata_without_indexes();
@@ -492,9 +717,16 @@ mod tests {
             Vec::<Option<Arc<SecondaryIndex<EvictableBufferPool>>>>::new().into_boxed_slice(),
         );
 
+        let memory =
+            MemTableLayout::<FixedBufferPool>::new_memory(Arc::clone(&metadata), Box::new([]));
+        assert_eq!(memory.generation(), 0);
+        assert_eq!(memory.active_indexes().count(), 0);
+        assert!(memory.indexed_column_read_set().is_empty());
+
         assert_eq!(layout.generation(), 7);
         assert_eq!(layout.metadata().idx.index_slot_count(), 0);
         assert_eq!(layout.index_slot_count(), 0);
+        assert!(layout.indexed_column_read_set().is_empty());
     }
 
     #[test]

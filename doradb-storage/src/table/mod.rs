@@ -5,6 +5,7 @@ mod dml_validator;
 mod gc;
 mod hot;
 mod index_ddl_plan;
+mod index_key;
 mod index_lifecycle;
 mod index_mutate;
 mod layout;
@@ -15,6 +16,7 @@ mod partition_stream;
 mod persistence;
 mod recover;
 mod rollback;
+mod row_store;
 mod scan_cursor;
 mod scan_plan;
 mod scan_root;
@@ -32,17 +34,21 @@ pub use gc::{
     SecondaryMemIndexCleanupIndexStats,
 };
 pub(crate) use index_ddl_plan::{CreateIndexPlan, DropIndexPlan};
-use index_lifecycle::TableIndexLifecycleState;
-pub(crate) use index_lifecycle::{CurrentDefinitionAllocatorView, IndexPlacement};
-pub(crate) use layout::{RuntimeIndexEntry, TableRuntimeLayout};
+pub(crate) use index_lifecycle::{
+    CurrentDefinitionAllocatorView, IndexPlacement, TableIndexLifecycleState,
+};
+pub(crate) use layout::{MemTableLayout, RuntimeIndexEntry, TableRuntimeLayout};
 pub use lifecycle::CheckpointCancelReason;
 #[cfg(test)]
 pub(crate) use lifecycle::TableTerminal;
 pub(crate) use lifecycle::{TableDropDrain, TableLifecycle};
-pub(crate) use mem_table::{IndexLookupCriteria, MemTable, NoTrxUpsertChange, RowPageDescriptor};
+pub(crate) use mem_table::{
+    IndexLookupCriteria, MemTable, NoTrxUpsertChange, build_in_memory_secondary_indexes,
+};
 pub use partition_stream::TableScanPartitionStream;
 pub use persistence::*;
 pub(crate) use rollback::IndexRollback;
+pub(crate) use row_store::{RowPageDescriptor, RowStore};
 pub(crate) use scan_cursor::{
     TableScanCursor, TableScanCursorAdvance, TableScanRangeCursor, TableScanWorklistCursor,
 };
@@ -59,7 +65,7 @@ pub(crate) use unique_mutate::{
 };
 
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
-use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards, PoolRole, ReadonlyBufferPool};
+use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards, ReadonlyBufferPool};
 use crate::catalog::{IndexRef, IndexSlot, SecondaryIndexSlot, TableIndexMetadata, TableMetadata};
 use crate::error::{
     DataIntegrityError, DataIntegrityResult, OperationResult, RuntimeError, RuntimeResult,
@@ -67,8 +73,7 @@ use crate::error::{
 use crate::file::table_file::{ActiveRoot, TableFile};
 use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
 use crate::index::{
-    BlockIndex, NonUniqueMemIndex, RowLocation, SecondaryDiskTreeRuntime, SecondaryIndex,
-    UniqueMemIndex,
+    NonUniqueMemIndex, RowLocation, SecondaryDiskTreeRuntime, SecondaryIndex, UniqueMemIndex,
 };
 use crate::map::FastHashMap;
 use crate::obs;
@@ -185,8 +190,8 @@ struct IndexLifecycleInstallContext<'a> {
 
 /// Runtime handle for a user table, combining in-memory and persisted storage.
 pub(crate) struct Table {
-    /// Hot row-store and in-memory index runtime.
-    pub(crate) mem: MemTable<EvictableBufferPool, EvictableBufferPool>,
+    /// Physical hot row storage with stable column metadata.
+    pub(crate) row_store: RowStore<EvictableBufferPool>,
     /// Persisted column-store runtime and table file binding.
     pub(crate) storage: ColumnStorage,
     definition_kind: TableDefinitionKind,
@@ -217,81 +222,48 @@ impl Table {
         RETIREMENT_REGISTRY_ACCESSES.load(Ordering::Relaxed)
     }
 
-    /// Create a new table.
+    /// Assembles prepared user-table components from one loaded file root.
     #[inline]
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "construction binds distinct pool, identity, definition, index, and storage capabilities"
-    )]
-    pub(crate) async fn new(
-        mem_pool: QuiescentGuard<EvictableBufferPool>,
-        index_pool: QuiescentGuard<EvictableBufferPool>,
-        index_pool_guard: &PoolGuard,
-        table_id: TableID,
+    pub(crate) fn new(
+        row_store: RowStore<EvictableBufferPool>,
+        storage: ColumnStorage,
+        layout: TableRuntimeLayout,
+        index_lifecycle: TableIndexLifecycleState,
         definition_kind: TableDefinitionKind,
-        blk_idx: BlockIndex,
-        file: Arc<TableFile>,
-        disk_pool: QuiescentGuard<ReadonlyBufferPool>,
-    ) -> RuntimeResult<Self> {
-        // `catalog_load_boundary`: runtime table construction uses the loaded
-        // root to seed metadata and hot/cold secondary-index state.
-        let active_root = file.active_root_unchecked();
-        let index_lifecycle = TableIndexLifecycleState::from_active_root(active_root)
-            .change_context(RuntimeError::TableAccess)
-            .attach_with(|| format!("operation=build_index_lifecycle, table_id={table_id}"))?;
-        let metadata = Arc::clone(&active_root.metadata);
-        let secondary_index_count = metadata.idx.index_slot_count();
-        let sec_idx = build_dual_tree_secondary_indexes(
-            index_pool,
-            index_pool_guard,
-            Arc::clone(&metadata),
-            Arc::clone(&file),
-            disk_pool.clone(),
-            active_root.root_ts,
-        )
-        .await
-        .change_context(RuntimeError::TableAccess)
-        .attach_with(|| format!("operation=build_secondary_indexes, table_id={table_id}"))?;
-        let mem = MemTable {
-            table_id,
-            metadata: Arc::clone(&metadata),
-            mem_pool: mem_pool.clone(),
-            row_pool_role: mem_pool.row_pool_role(),
-            index_pool_role: PoolRole::Index,
-            blk_idx,
-            sec_idx: Box::new([]),
-        };
-        let storage = ColumnStorage::new(file, disk_pool)
-            .change_context(RuntimeError::TableAccess)
-            .attach_with(|| format!("operation=create_column_storage, table_id={table_id}"))?;
+    ) -> Self {
+        let table_id = row_store.table_id();
+        let secondary_index_count = layout.index_slot_count();
+        layout.assert_column_layout(row_store.column_layout());
+        // `catalog_load_boundary`: independently prepared components must bind
+        // the same metadata allocation before the table is published.
+        assert!(
+            Arc::ptr_eq(
+                layout.metadata_arc(),
+                &storage.file().active_root_unchecked().metadata
+            ),
+            "table construction requires the loaded root metadata: table_id={table_id}"
+        );
         assert_eq!(
             storage.secondary_index_runtimes().len(),
             secondary_index_count,
             "table construction invariant violated: cold runtime slots do not match metadata, runtime_slots={}, metadata_slots={secondary_index_count}",
             storage.secondary_index_runtimes().len()
         );
-        assert_eq!(
-            sec_idx.len(),
-            secondary_index_count,
-            "table construction invariant violated: hot runtime slots do not match metadata, runtime_slots={}, metadata_slots={secondary_index_count}",
-            sec_idx.len()
-        );
-        let layout = TableRuntimeLayout::new(0, Arc::clone(&metadata), sec_idx);
-        Ok(Table {
-            mem,
+        Table {
+            row_store,
             storage,
             definition_kind,
             layout: Mutex::new(Arc::new(layout)),
             index_lifecycle: Mutex::new(index_lifecycle),
             lifecycle: TableLifecycle::new(),
             checkpoint_workflow: TableCheckpointWorkflow::new(),
-        })
+        }
     }
 
     /// Returns the logical table id of this user-table runtime.
     #[inline]
     pub fn table_id(&self) -> TableID {
-        self.mem.table_id()
+        self.row_store.table_id()
     }
 
     /// Returns the immutable definition-owner family of this table.
@@ -354,7 +326,7 @@ impl Table {
     #[inline]
     pub(crate) async fn destroy_dropped_runtime(self, guards: &PoolGuards) -> RuntimeResult<()> {
         let Table {
-            mem,
+            row_store,
             storage: _storage,
             definition_kind: _definition_kind,
             layout,
@@ -402,7 +374,7 @@ impl Table {
             });
             index.destroy(index_pool_guard).await?;
         }
-        mem.destroy(guards).await
+        row_store.destroy(guards).await
     }
 
     /// Build a lightweight operation accessor over an already captured layout.
@@ -562,6 +534,7 @@ impl Table {
         {
             return None;
         }
+        new_layout.assert_column_layout(self.row_store.column_layout());
         // Code needing both locks always takes layout before lifecycle.
         let mut lifecycle = self.index_lifecycle.lock();
         let active_root = self.file().active_root_unchecked();
@@ -690,7 +663,7 @@ impl Table {
         guards: &PoolGuards,
         row_id: RowID,
     ) -> RuntimeResult<RowLocation> {
-        self.mem
+        self.row_store
             .blk_idx
             .find_row(
                 guards.meta_guard(),
@@ -712,9 +685,9 @@ impl Table {
     #[inline]
     pub(crate) async fn total_row_pages(&self, guards: &PoolGuards) -> RuntimeResult<usize> {
         let mut res = 0usize;
-        let pivot_row_id = self.mem.pivot_row_id();
+        let pivot_row_id = self.row_store.pivot_row_id();
         let meta_pool_guard = guards.meta_guard();
-        let mut cursor = self.mem.blk_idx().mem_cursor(meta_pool_guard);
+        let mut cursor = self.row_store.blk_idx().mem_cursor(meta_pool_guard);
         cursor.seek(pivot_row_id).await?;
         while let Some(leaf) = cursor.next().await? {
             // A cursor leaf is protected by its held parent and cannot be stale
@@ -740,8 +713,8 @@ impl Table {
         // Admitted table scans always carry the metadata guard; catalog-only
         // bundles are partial only for roles the catalog does not access.
         let meta_pool_guard = guards.meta_guard();
-        let pivot_row_id = self.mem.pivot_row_id();
-        let mut cursor = self.mem.blk_idx().mem_cursor(meta_pool_guard);
+        let pivot_row_id = self.row_store.pivot_row_id();
+        let mut cursor = self.row_store.blk_idx().mem_cursor(meta_pool_guard);
         cursor.seek(pivot_row_id).await?;
         while let Some(leaf) = cursor.next().await? {
             let g = leaf.lock_shared_async().await.unwrap_or_else(|| {
@@ -757,7 +730,7 @@ impl Table {
                     continue;
                 }
                 let page_guard = self
-                    .mem
+                    .row_store
                     .must_get_row_page_shared(guards, page_entry.page_id)
                     .await?;
                 if !page_action(page_guard) {
@@ -1328,23 +1301,6 @@ fn read_latest_index_key(
         new_key.vals[pos] = val;
     }
     new_key
-}
-
-/// Copy every active index key from the current physical row image.
-///
-/// A successful hot delete retains logical write ownership through its undo
-/// head and changes only the row delete bit. Its caller can therefore use one
-/// row read guard to copy stable key values before releasing the page guard.
-#[inline]
-fn read_physical_index_keys_for_delete(
-    metadata: &TableMetadata,
-    page_guard: &PageSharedGuard<RowPage>,
-    row_id: RowID,
-) -> Vec<SelectKey> {
-    let access = page_guard.read_row_by_id(row_id);
-    metadata
-        .idx
-        .keys_for_delete(metadata.col.as_ref(), access.row())
 }
 
 #[inline]
@@ -2513,7 +2469,7 @@ pub(crate) mod tests {
         let layout = table.layout_snapshot();
         let metadata = layout.metadata();
         let insert_retry = matches!(
-            RowInserter::new(table.mem.table_id(), metadata, rt).insert_to_page(
+            RowInserter::new(table.row_store.table_id(), metadata, rt).insert_to_page(
                 effects,
                 insert_page_guard,
                 insert,
@@ -2523,7 +2479,7 @@ pub(crate) mod tests {
             InsertRowIntoPage::NoSpaceOrFrozen(_, _, _)
         );
         let update_retry = matches!(
-            HotRowMutator::new(table.mem.table_id(), metadata, rt, page_guard, row_id,)
+            HotRowMutator::new(table.row_store.table_id(), metadata, rt, page_guard, row_id,)
                 .update_known_row(effects, crate::row::ops::RowUpdateInput::Sparse(update))
                 .await
                 .disclose()?,
@@ -2544,7 +2500,7 @@ pub(crate) mod tests {
         let layout = table.layout_snapshot();
         let metadata = layout.metadata();
         Ok(matches!(
-            HotRowMutator::new(table.mem.table_id(), metadata, rt, page_guard, row_id,)
+            HotRowMutator::new(table.row_store.table_id(), metadata, rt, page_guard, row_id,)
                 .delete_known_row(effects)
                 .await
                 .disclose()?,
@@ -2569,7 +2525,7 @@ pub(crate) mod tests {
         let layout = table.layout_snapshot();
         let locked = {
             match HotRowMutator::new(
-                table.mem.table_id(),
+                table.row_store.table_id(),
                 layout.metadata(),
                 rt,
                 &page_guard,
@@ -3502,12 +3458,12 @@ pub(crate) mod tests {
             let guards = session.pool_guards();
 
             table
-                .mem
+                .row_store
                 .blk_idx
                 .update_column_root(RowID::new(1), BlockID::new(77))
                 .await;
             let _ = table
-                .mem
+                .row_store
                 .blk_idx
                 .find_row(
                     guards.meta_guard(),

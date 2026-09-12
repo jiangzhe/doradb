@@ -3,6 +3,7 @@ use super::{
         DeleteInternal, HotRowMutator, InsertRowIntoPage, RowInserter, UpdateRowInplace,
         publish_forward_hint,
     },
+    index_key::{WriteIndexKey, WriteIndexKeySet},
     index_mutate::IndexMutator,
     unique_mutate::UniqueMutator,
 };
@@ -11,9 +12,9 @@ use crate::buffer::{EvictableBufferPool, PoolGuards};
 use crate::catalog::{IndexRef, IndexSlot, ResolvedIndexKey, TableColumnLayout, TableMetadata};
 use crate::error::{
     CallbackResult, DataIntegrityError, DataIntegrityResult, DiscloseError, DiscloseResultExt,
-    InternalError, MultiDomainResultExt, OperationError, OperationOrFatalResult,
-    OperationOrRuntimeError, OperationOrRuntimeResult, OperationResult, QuadResult, Result,
-    RuntimeError, RuntimeOrFatalResult, RuntimeResult,
+    MultiDomainResultExt, OperationError, OperationOrFatalResult, OperationOrRuntimeError,
+    OperationOrRuntimeResult, OperationResult, QuadResult, Result, RuntimeError,
+    RuntimeOrFatalResult, RuntimeResult,
 };
 use crate::file::FileKind;
 use crate::file::cow_file::SUPER_BLOCK_ID;
@@ -32,15 +33,15 @@ use crate::lwc::{LwcBlock, PersistedLwcBlock, PreparedLwcBlock};
 use crate::map::{FastHashMap, FastHashSet};
 use crate::poison::PoisonAwareListener;
 use crate::row::ops::{
-    LinkForUniqueIndex, ReadRow, RowMutation, RowUpdateInput, ScanMvcc, SelectKey, SelectMvcc,
+    LinkForUniqueIndex, ReadRow, RowMutation, RowUpdateInput, ScanMvcc, SelectMvcc,
     TableMutationOutcome, UniqueMutation, UniqueMutationOutcome, UpdateCol,
 };
 use crate::row::{Row, RowPage, RowRead, estimate_max_row_count};
 use crate::table::{
     ColdVisibilityOverride, ColumnDeletionBuffer, ColumnStorage, DeleteMarker, DeletionClaim,
-    DeletionError, DeletionState, DmlValidator, MemTable, RowPageDescriptor, Table,
+    DeletionError, DeletionState, DmlValidator, RowPageDescriptor, RowStore, Table,
     TableRootSnapshot, TableRuntimeLayout, TableScanRootView, index_key_is_changed,
-    index_key_vals_replace, read_latest_index_key, read_physical_index_keys_for_delete, row_len,
+    index_key_vals_replace, read_latest_index_key, row_len,
 };
 use crate::trx::row::{
     BoundIndexCandidate, FindOldVersion, MainBranchMvcc, ReadLatestRow, RowReadAccess,
@@ -55,7 +56,6 @@ use crate::trx::{
 };
 use crate::value::Val;
 use error_stack::{Report, ResultExt};
-use std::marker::PhantomData;
 use std::mem;
 use std::ops::RangeBounds;
 use std::ptr::addr_eq;
@@ -322,7 +322,7 @@ impl<'row> LazyRow<'row> {
         for &column_no in metadata.idx.index_columns() {
             let _ = self.val_inner(column_no)?;
         }
-        let keys = WriteIndexKeySet::from_full_row(accessor, &self.buffer.values);
+        let keys = WriteIndexKeySet::from_full_row(accessor.layout(), &self.buffer.values);
         let access = self.into_hot_write_access();
         Ok((access, keys))
     }
@@ -357,7 +357,7 @@ impl<'row> LazyRow<'row> {
         for &column_no in metadata.idx.index_columns() {
             let _ = self.val_inner(column_no)?;
         }
-        let keys = WriteIndexKeySet::from_full_row(accessor, &self.buffer.values);
+        let keys = WriteIndexKeySet::from_full_row(accessor.layout(), &self.buffer.values);
         self.reset();
         Ok(keys)
     }
@@ -497,7 +497,7 @@ impl<'runtime> TableScanRuntime<'runtime> {
 
     /// Returns the retained session pool guards.
     #[inline]
-    fn pool_guards(self) -> &'runtime PoolGuards {
+    pub(super) fn pool_guards(self) -> &'runtime PoolGuards {
         self.pool_guards
     }
 }
@@ -646,212 +646,6 @@ enum PendingColdMutation<'op> {
     },
 }
 
-/// One mutation key derived from an admitted foreground write accessor.
-///
-/// The lifetime marker keeps the key within the admitted layout lifetime. The
-/// resolved reference is the sole identity and physical-slot source. Raw key
-/// values are exposed only when `UserTableAccessor` consumes them at leaf
-/// index, undo, or runtime-link boundaries.
-#[derive(Debug, PartialEq, Eq)]
-struct WriteIndexKey<'op> {
-    index: IndexRef,
-    vals: Vec<Val>,
-    _layout: PhantomData<&'op TableRuntimeLayout>,
-}
-
-impl<'op> WriteIndexKey<'op> {
-    #[inline]
-    fn new(layout: &'op TableRuntimeLayout, key: SelectKey) -> Self {
-        let SelectKey { index_slot, vals } = key;
-        let index = layout
-            .index_entry_at_slot(index_slot)
-            .unwrap_or_else(|err| {
-                panic!(
-                    "write index key must reference an active layout entry: layout_generation={}, index_slot={index_slot}, error={err:?}",
-                    layout.generation()
-                )
-            })
-            .index_ref();
-        Self {
-            index,
-            vals,
-            _layout: PhantomData,
-        }
-    }
-
-    #[inline]
-    fn index_slot(&self) -> IndexSlot {
-        self.index.slot()
-    }
-
-    #[inline]
-    fn index_ref(&self) -> IndexRef {
-        self.index
-    }
-
-    #[inline]
-    fn vals(&self) -> &[Val] {
-        &self.vals
-    }
-
-    #[inline]
-    fn with_vals(&self, vals: Vec<Val>) -> Self {
-        Self {
-            index: self.index,
-            vals,
-            _layout: PhantomData,
-        }
-    }
-
-    #[inline]
-    fn into_parts(self) -> (IndexRef, Vec<Val>) {
-        (self.index, self.vals)
-    }
-}
-
-/// Complete mutation keys derived from one admitted foreground write accessor.
-///
-/// Private constructors preserve active stable-index order. The accessor
-/// lifetime remains attached from construction through either new-side claims
-/// or old-row ownership proof construction.
-pub(super) struct WriteIndexKeySet<'op> {
-    keys: Vec<WriteIndexKey<'op>>,
-}
-
-impl<'op> WriteIndexKeySet<'op> {
-    /// Decodes only indexed columns from a retained immutable point row.
-    pub(super) fn from_cold_row(
-        accessor: &UserTableAccessor<'op>,
-        block: &LwcBlock,
-        row_idx: usize,
-    ) -> DataIntegrityResult<Self> {
-        let read_set = accessor.indexed_column_read_set();
-        let values =
-            block.decode_row_values(accessor.metadata().col.as_ref(), row_idx, &read_set)?;
-        Ok(Self::from_indexed_values(accessor, &read_set, values))
-    }
-
-    #[inline]
-    pub(super) fn from_full_row(accessor: &UserTableAccessor<'op>, row: &[Val]) -> Self {
-        let keys = accessor
-            .layout()
-            .active_secondary_indexes()
-            .map(|(index, _)| {
-                let spec = accessor.metadata().idx.expect_index_spec(index);
-                let vals = spec
-                    .keys
-                    .iter()
-                    .map(|key| row[key.column_ordinal.as_usize()].clone())
-                    .collect();
-                WriteIndexKey {
-                    index,
-                    vals,
-                    _layout: PhantomData,
-                }
-            })
-            .collect();
-        Self { keys }
-    }
-
-    #[inline]
-    pub(super) fn from_physical_row(
-        accessor: &UserTableAccessor<'op>,
-        page_guard: &PageSharedGuard<RowPage>,
-        row_id: RowID,
-    ) -> Self {
-        let mut raw_keys =
-            read_physical_index_keys_for_delete(accessor.metadata(), page_guard, row_id)
-                .into_iter()
-                .map(|key| (key.index_slot, key))
-                .collect::<FastHashMap<_, _>>();
-        let keys = accessor
-            .layout()
-            .active_secondary_indexes()
-            .map(|(index, _)| {
-                let index_slot = index.slot();
-                let key = raw_keys.remove(&index_slot).unwrap_or_else(|| {
-                    panic!(
-                        "physical row key set missing active layout entry: table_id={}, index={index}, row_id={row_id}",
-                        accessor.table_id()
-                    )
-                });
-                WriteIndexKey {
-                    index,
-                    vals: key.vals,
-                    _layout: PhantomData,
-                }
-            })
-            .collect();
-        assert!(
-            raw_keys.is_empty(),
-            "physical row key set has inactive entries"
-        );
-        Self { keys }
-    }
-
-    #[inline]
-    pub(super) fn from_indexed_values(
-        accessor: &UserTableAccessor<'op>,
-        read_set: &[usize],
-        vals: Vec<Val>,
-    ) -> Self {
-        let table_id = accessor.table_id();
-        assert_eq!(
-            read_set.len(),
-            vals.len(),
-            "indexed-column read must return one value per requested column: table_id={table_id}, read_set_len={}, value_count={}",
-            read_set.len(),
-            vals.len()
-        );
-        let indexed_vals = read_set
-            .iter()
-            .copied()
-            .zip(vals)
-            .collect::<FastHashMap<_, _>>();
-        let keys = accessor
-            .layout()
-            .active_secondary_indexes()
-            .map(|(index_ref, _)| {
-                let index_spec = accessor
-                    .metadata()
-                    .idx
-                    .expect_index_spec(index_ref);
-                let vals = index_spec
-                    .keys
-                    .iter()
-                    .map(|key| {
-                        indexed_vals
-                            .get(&(key.column_ordinal.as_usize()))
-                            .cloned()
-                            .unwrap_or_else(|| {
-                                panic!(
-                                    "active index column must be present in the metadata-derived read set: table_id={table_id}, index={index_ref}, column_no={}",
-                                    key.column_ordinal
-                                )
-                            })
-                    })
-                    .collect();
-                WriteIndexKey {
-                    index: index_ref,
-                    vals,
-                    _layout: PhantomData,
-                }
-            })
-            .collect();
-        Self { keys }
-    }
-
-    #[inline]
-    fn as_slice(&self) -> &[WriteIndexKey<'op>] {
-        &self.keys
-    }
-
-    #[inline]
-    fn into_keys(self) -> impl Iterator<Item = WriteIndexKey<'op>> {
-        self.keys.into_iter()
-    }
-}
-
 /// Root-relative storage contract for one owned current row's old index set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OwnedRowIndexStorage {
@@ -972,6 +766,7 @@ impl<'op> UserTableAccessor<'op> {
     /// Create a user-table accessor over an externally pinned layout snapshot.
     #[inline]
     pub(crate) fn new(table: &'op Table, layout: &'op TableRuntimeLayout) -> Self {
+        layout.assert_column_layout(table.row_store.column_layout());
         UserTableAccessor {
             table,
             storage: &table.storage,
@@ -979,8 +774,9 @@ impl<'op> UserTableAccessor<'op> {
         }
     }
 
+    /// Returns the runtime layout retained for this accessor's operation.
     #[inline]
-    fn layout(&self) -> &TableRuntimeLayout {
+    pub(super) fn layout(&self) -> &'op TableRuntimeLayout {
         self.layout
     }
 
@@ -995,8 +791,8 @@ impl<'op> UserTableAccessor<'op> {
     }
 
     #[inline]
-    pub(super) fn mem(&self) -> &MemTable<EvictableBufferPool, EvictableBufferPool> {
-        &self.table.mem
+    pub(super) fn row_store(&self) -> &RowStore<EvictableBufferPool> {
+        &self.table.row_store
     }
 
     #[inline]
@@ -1325,7 +1121,7 @@ impl<'op> UserTableAccessor<'op> {
     }
     #[inline]
     pub(super) fn table_id(&self) -> TableID {
-        self.mem().table_id()
+        self.row_store().table_id()
     }
 
     #[inline]
@@ -1338,7 +1134,7 @@ impl<'op> UserTableAccessor<'op> {
     where
         F: FnMut(PageSharedGuard<RowPage>) -> bool,
     {
-        self.mem()
+        self.row_store()
             .scan_from(guards, start_row_id, page_action)
             .await
     }
@@ -1519,7 +1315,7 @@ impl<'op> UserTableAccessor<'op> {
                 }
                 RowLocation::RowPage(page_id) => {
                     let Some(page_guard) = self
-                        .mem()
+                        .row_store()
                         .try_get_validated_row_page_shared_result(
                             rt.pool_guards(),
                             page_id,
@@ -1646,17 +1442,19 @@ impl<'op> UserTableAccessor<'op> {
             })
     }
 
-    #[inline]
-    fn indexed_column_read_set(&self) -> Vec<usize> {
-        let mut read_set = self
-            .metadata()
-            .idx
-            .index_columns()
-            .iter()
-            .copied()
-            .collect::<Vec<_>>();
-        read_set.sort_unstable();
-        read_set
+    /// Decodes only indexed columns from a retained immutable point row.
+    pub(super) fn index_keys_from_cold_row(
+        &self,
+        block: &LwcBlock,
+        row_idx: usize,
+    ) -> DataIntegrityResult<WriteIndexKeySet<'op>> {
+        let read_set = self.layout().indexed_column_read_set();
+        let values = block.decode_row_values(self.metadata().col.as_ref(), row_idx, read_set)?;
+        Ok(WriteIndexKeySet::from_indexed_values(
+            self.layout(),
+            read_set,
+            values,
+        ))
     }
 
     #[inline]
@@ -1667,11 +1465,15 @@ impl<'op> UserTableAccessor<'op> {
         row_idx: usize,
         row_shape_fingerprint: u128,
     ) -> RuntimeResult<WriteIndexKeySet<'op>> {
-        let read_set = self.indexed_column_read_set();
+        let read_set = self.layout().indexed_column_read_set();
         let vals = self
-            .read_lwc_row(guards, block_id, row_idx, row_shape_fingerprint, &read_set)
+            .read_lwc_row(guards, block_id, row_idx, row_shape_fingerprint, read_set)
             .await?;
-        Ok(WriteIndexKeySet::from_indexed_values(self, &read_set, vals))
+        Ok(WriteIndexKeySet::from_indexed_values(
+            self.layout(),
+            read_set,
+            vals,
+        ))
     }
 
     #[inline]
@@ -1945,7 +1747,10 @@ impl<'op> UserTableAccessor<'op> {
     ) -> RuntimeResult<()> {
         debug_assert!(old_row_id != new_row_id);
         let metadata = self.metadata();
-        let source_page = self.mem().pin_forward_source(rt, Some(source)).await?;
+        let source_page = self
+            .row_store()
+            .pin_forward_source(rt, Some(source))
+            .await?;
         assert_eq!(
             proof.row_id,
             old_row_id,
@@ -1993,7 +1798,7 @@ impl<'op> UserTableAccessor<'op> {
         debug_assert!(row_id_move.old != row_id_move.new);
         let metadata = self.metadata();
         let source_page = self
-            .mem()
+            .row_store()
             .pin_forward_source(rt, Some(row_id_move.source))
             .await?;
         assert_eq!(
@@ -2113,7 +1918,7 @@ impl<'op> UserTableAccessor<'op> {
                         IndexPurgeDecision::Keep => return Ok(false),
                         IndexPurgeDecision::RowPage(page_id) => {
                             let Some(page_guard) = self
-                                .mem()
+                                .row_store()
                                 .try_get_validated_row_page_shared_result(guards, page_id, row_id)
                                 .await?
                             else {
@@ -2177,7 +1982,7 @@ impl<'op> UserTableAccessor<'op> {
                         IndexPurgeDecision::Keep => return Ok(false),
                         IndexPurgeDecision::RowPage(page_id) => {
                             let Some(page_guard) = self
-                                .mem()
+                                .row_store()
                                 .try_get_validated_row_page_shared_result(guards, page_id, row_id)
                                 .await?
                             else {
@@ -2210,7 +2015,7 @@ impl<'op> UserTableAccessor<'op> {
     ) -> RuntimeOrFatalResult<PageSharedGuard<RowPage>> {
         if let Some(page_id) = rt.load_active_insert_page(self.table_id()) {
             let page_guard = self
-                .mem()
+                .row_store()
                 .get_row_page_versioned_shared(rt.pool_guards(), page_id)
                 .await?;
             if let Some(page_guard) = page_guard {
@@ -2218,7 +2023,7 @@ impl<'op> UserTableAccessor<'op> {
             }
         }
         let redo_ctx = self.row_page_create_redo_ctx(rt);
-        self.mem()
+        self.row_store()
             .try_get_insert_page_with_redo(rt.pool_guards(), row_count, redo_ctx)
             .await
     }
@@ -2373,7 +2178,7 @@ impl<'op> UserTableAccessor<'op> {
                     // deleted owner that older snapshots still need, or a true
                     // duplicate visible to this transaction.
                     let Some(old_guard) = self
-                        .mem()
+                        .row_store()
                         .try_get_validated_row_page_shared_result(rt.pool_guards(), page_id, old_id)
                         .await?
                     else {
@@ -2506,7 +2311,7 @@ impl<'op> UserTableAccessor<'op> {
                         .await?
                     {
                         link @ (LinkForUniqueIndex::NotNeeded | LinkForUniqueIndex::Linked(_)) => {
-                            let source_page = self.mem().pin_forward_source(rt, link.source()).await?;
+                            let source_page = self.row_store().pin_forward_source(rt, link.source()).await?;
                             // Claim the latest mapping if it still points to
                             // the owner inspected above. A concurrent purge may
                             // remove the entry first, so retry insertion.
@@ -3015,7 +2820,7 @@ impl<'op> UserTableAccessor<'op> {
                         .await?
                     {
                         link @ (LinkForUniqueIndex::NotNeeded | LinkForUniqueIndex::Linked(_)) => {
-                            let source_page = self.mem().pin_forward_source(rt, link.source()).await?;
+                            let source_page = self.row_store().pin_forward_source(rt, link.source()).await?;
                             // Claim the latest mapping if it still points to
                             // the owner inspected above. A concurrent purge may
                             // remove the entry first, so retry insertion.
@@ -3207,7 +3012,7 @@ impl<'op> UserTableAccessor<'op> {
             .change_context(RuntimeError::TableAccess)
             .attach("operation=capture_table_scan_worklist, phase=compile_cold_entries")?;
         let (_, hot_pages) = self
-            .mem()
+            .row_store()
             .snapshot_original_row_pages_from(runtime.pool_guards(), pivot_row_id)
             .await
             .attach("operation=capture_table_scan_worklist, phase=capture_hot_pages")?;
@@ -3315,56 +3120,6 @@ impl<'op> UserTableAccessor<'op> {
         ))
     }
 
-    /// Reopens and validates one captured hot row page for bounded processing.
-    pub(crate) async fn load_table_scan_hot_page(
-        &self,
-        runtime: TableScanRuntime<'_>,
-        descriptor: RowPageDescriptor,
-    ) -> RuntimeResult<PageSharedGuard<RowPage>> {
-        let page_guard = self
-            .mem()
-            .get_row_page_shared(runtime.pool_guards(), descriptor.page_id)
-            .await
-            .attach_with(|| {
-                format!(
-                    "operation=load_table_scan_hot_page, page_id={}",
-                    descriptor.page_id
-                )
-            })?
-            .ok_or_else(|| {
-                Report::new(InternalError::CapturedRowPageUnavailable)
-                    .attach(format!(
-                        "captured page is missing: table_id={}, page_id={}, start_row_id={}, end_row_id={}",
-                        self.table_id(),
-                        descriptor.page_id,
-                        descriptor.start_row_id,
-                        descriptor.end_row_id
-                    ))
-                    .change_context(RuntimeError::TableAccess)
-            })?;
-        let page = page_guard.page();
-        let row_end = page
-            .header
-            .start_row_id
-            .checked_add(page.header.row_count() as u64);
-        if page.header.start_row_id != descriptor.start_row_id
-            || row_end.is_none_or(|row_end| row_end > descriptor.end_row_id)
-        {
-            return Err(Report::new(InternalError::CapturedRowPageUnavailable)
-                .attach(format!(
-                    "captured page identity changed: table_id={}, page_id={}, expected_start={}, expected_end={}, actual_start={}, actual_rows={}",
-                    self.table_id(),
-                    descriptor.page_id,
-                    descriptor.start_row_id,
-                    descriptor.end_row_id,
-                    page.header.start_row_id,
-                    page.header.row_count()
-                ))
-                .change_context(RuntimeError::TableAccess));
-        }
-        Ok(page_guard)
-    }
-
     /// Creates a lazy callback row for one visible hot row version.
     #[inline]
     pub(crate) fn table_scan_hot_row<'row>(
@@ -3466,7 +3221,7 @@ impl<'op> UserTableAccessor<'op> {
         // before any replacement rows can change scan boundaries.
         let root_snapshot = self.root_snapshot(rt.ctx());
         let (upper_bound, original_pages) = self
-            .mem()
+            .row_store()
             .snapshot_original_row_pages_from(rt.pool_guards(), root_snapshot.pivot_row_id())
             .await
             .disclose()?;
@@ -3703,7 +3458,7 @@ impl<'op> UserTableAccessor<'op> {
         for page_idx in 0..state.tracker.page_count() {
             let descriptor = state.tracker.page(page_idx);
             let page_guard = self
-                .mem()
+                .row_store()
                 .must_get_row_page_shared(rt.pool_guards(), descriptor.page_id)
                 .await
                 .disclose()?;
@@ -3729,7 +3484,7 @@ impl<'op> UserTableAccessor<'op> {
             for row_id_raw in descriptor.start_row_id.as_u64()..scan_end.as_u64() {
                 let row_id = RowID::new(row_id_raw);
                 let page_guard = self
-                    .mem()
+                    .row_store()
                     .must_get_row_page_shared(rt.pool_guards(), descriptor.page_id)
                     .await
                     .disclose()?;
@@ -3886,7 +3641,7 @@ impl<'op> UserTableAccessor<'op> {
         mut access: RowWriteAccess<'_>,
     ) {
         effects.cancel_last_row_undo_lock(|undo| {
-            access.rollback_first_undo(self.metadata(), undo);
+            access.rollback_first_undo(self.row_store().column_layout(), undo);
         });
     }
 
@@ -4002,9 +3757,9 @@ impl<'op> UserTableAccessor<'op> {
                 Ok(new_row_id)
             }
             UpdateRowInplace::NoFreeSpaceOrFrozen(old_row_id, old_row, update) => {
-                let old_index_keys = WriteIndexKeySet::from_full_row(accessor, &old_row);
+                let old_index_keys = WriteIndexKeySet::from_full_row(accessor.layout(), &old_row);
                 let move_guard = accessor
-                    .mem()
+                    .row_store()
                     .must_get_row_page_shared(rt.pool_guards(), page_guard.page_id())
                     .await?;
                 let (new_row_id, index_change_cols, new_guard, source) = accessor
@@ -4055,12 +3810,12 @@ impl<'op> UserTableAccessor<'op> {
         update: RowUpdateInput,
         root_snapshot: &TableRootSnapshot<'_>,
     ) -> QuadResult<InsertedRow> {
-        let old_index_keys = WriteIndexKeySet::from_full_row(self, &old_row);
+        let old_index_keys = WriteIndexKeySet::from_full_row(self.layout(), &old_row);
         self.finish_owned_cold_delete_effects(rt, effects, row_id, old_index_keys, root_snapshot)
             .await
             .attach("index-driven mutation cold update delete effects")?;
         let new_row = self.build_cold_update_row(old_row, update);
-        let new_index_keys = WriteIndexKeySet::from_full_row(self, &new_row);
+        let new_index_keys = WriteIndexKeySet::from_full_row(self.layout(), &new_row);
         let (new_row_id, new_guard) = self
             .insert_row_internal(rt, effects, new_row, RowUndoKind::Insert, Vec::new())
             .await?;
@@ -4134,12 +3889,12 @@ impl<'op> UserTableAccessor<'op> {
         self.claim_known_cold_row(rt, row_id)
             .await
             .attach("full-table mutation cold update marker ownership")?;
-        let old_index_keys = WriteIndexKeySet::from_full_row(self, &old_row);
+        let old_index_keys = WriteIndexKeySet::from_full_row(self.layout(), &old_row);
         self.install_cold_delete_effects(rt, effects, row_id, old_index_keys, root_snapshot)
             .await
             .attach("full-table mutation cold update delete effects")?;
         let new_row = self.build_cold_update_row(old_row, RowUpdateInput::Sparse(update));
-        let new_index_keys = WriteIndexKeySet::from_full_row(self, &new_row);
+        let new_index_keys = WriteIndexKeySet::from_full_row(self.layout(), &new_row);
         let (new_row_id, new_guard) = self
             .insert_row_internal(rt, effects, new_row, RowUndoKind::Insert, Vec::new())
             .await?;
@@ -4240,7 +3995,7 @@ impl<'op> UserTableAccessor<'op> {
                 // The move result already owns the complete old row image.
                 // Capture its full old index set before replacement preparation
                 // consumes the values.
-                let old_index_keys = WriteIndexKeySet::from_full_row(self, &old_row);
+                let old_index_keys = WriteIndexKeySet::from_full_row(self.layout(), &old_row);
                 let (new_row_id, index_change_cols, new_guard, source) = self
                     .move_update_for_space(rt, effects, old_row, update, old_row_id, page_guard)
                     .await?;
@@ -4442,7 +4197,7 @@ impl<'op> UserTableAccessor<'op> {
                 .enumerate()
                 .all(|(idx, val)| self.metadata().col.col_type_match(idx, val))
         });
-        let keys = WriteIndexKeySet::from_full_row(self, &cols);
+        let keys = WriteIndexKeySet::from_full_row(self.layout(), &cols);
         let root_snapshot = self.root_snapshot(rt.ctx());
         // Insert always creates a hot RowStore row. The insert undo head makes
         // the new row invisible to older snapshots and is also the rollback
@@ -4736,7 +4491,7 @@ pub(super) fn read_latest_cold_row(
 mod tests {
     use super::{
         ColdDeleteMask, ColdLatestRow, InsertedRow, LazyRow, LazyRowBuffer,
-        OrdinalVisibilityOverride, ScanBoundaryTracker, cold_row_visible_mvcc,
+        OrdinalVisibilityOverride, ScanBoundaryTracker, WriteIndexKeySet, cold_row_visible_mvcc,
         read_latest_cold_row,
     };
     use crate::buffer::BufferPool;
@@ -4745,7 +4500,7 @@ mod tests {
     use crate::catalog::tests::table4;
     use crate::catalog::{
         IndexID, IndexRef, IndexSlot, SecondaryIndexSlot, StorageColumnFlags, StorageColumnSpec,
-        StorageIndexFlags, StorageIndexKey, StorageIndexSpec, StorageTableSpec,
+        StorageIndexFlags, StorageIndexKey, StorageIndexSpec, StorageTableSpec, TableMetadata,
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
@@ -4771,7 +4526,7 @@ mod tests {
     };
     use crate::table::tests::*;
     use crate::table::{CheckpointOutcome, FreezeOutcome};
-    use crate::table::{ColumnDeletionBuffer, DeleteMarker, Table};
+    use crate::table::{ColumnDeletionBuffer, DeleteMarker, Table, TableRuntimeLayout};
     use crate::trx::sys::tests::fatal_rollback_retention_count;
     use crate::trx::tests::{
         commit_preparing_shared_trx_status, lock_hot_row_then_wait_and_error,
@@ -5134,6 +4889,61 @@ mod tests {
     }
 
     #[test]
+    fn test_layout_key_derivation_preserves_sparse_and_retained_index_identities() {
+        use crate::catalog::{ActiveIndexSpec, IndexID};
+        use crate::table::RuntimeIndexEntry;
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "layout_key_derivation").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let original = table.layout_snapshot();
+            let old_entry = original.index_entry_at_slot(IndexSlot::new(0)).unwrap();
+            let replacement_ref = IndexRef::new(IndexID::new(73), IndexSlot::new(0));
+            let mut metadata = TableMetadata::try_new_with_index_slot_count(
+                vec![
+                    StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+                    StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
+                ],
+                vec![ActiveIndexSpec::new(
+                    replacement_ref,
+                    StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::UK),
+                )],
+                IndexSlot::new(2),
+            )
+            .unwrap();
+            metadata.col = Arc::clone(&original.metadata().col);
+            let replacement = TableRuntimeLayout::from_entries(
+                original.generation() + 1,
+                Arc::new(metadata),
+                vec![
+                    Some(RuntimeIndexEntry::new(
+                        replacement_ref,
+                        Arc::clone(old_entry.runtime_arc()),
+                    )),
+                    None,
+                ]
+                .into_boxed_slice(),
+            );
+            let row = vec![Val::from(7i32), Val::from("unindexed")];
+            let retained_keys = WriteIndexKeySet::from_full_row(&original, &row);
+            let new_keys = WriteIndexKeySet::from_full_row(&replacement, &row);
+            let read_set = replacement.indexed_column_read_set();
+            assert_eq!(read_set, &[0]);
+            let indexed_keys =
+                WriteIndexKeySet::from_indexed_values(&replacement, read_set, vec![row[0].clone()]);
+            assert_eq!(new_keys.as_slice(), indexed_keys.as_slice());
+            assert_eq!(new_keys.as_slice().len(), 1);
+            assert_eq!(new_keys.as_slice()[0].index_ref(), replacement_ref);
+            assert_eq!(new_keys.as_slice()[0].vals(), &[Val::from(7i32)]);
+            assert_eq!(
+                retained_keys.as_slice()[0].index_ref(),
+                old_entry.index_ref()
+            );
+        });
+    }
+
+    #[test]
     fn test_foreground_root_layout_compatibility_uses_identity_and_slot_shape() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
@@ -5145,6 +4955,19 @@ mod tests {
             let root = table.file().active_root_unchecked().clone();
 
             accessor.assert_foreground_root_layout_compatible(&root);
+            let mut incompatible_columns = layout.metadata().clone();
+            incompatible_columns.col = Arc::new(incompatible_columns.col.as_ref().clone());
+            let incompatible_layout = TableRuntimeLayout::from_entries(
+                layout.generation(),
+                Arc::new(incompatible_columns),
+                layout.secondary_indexes().to_vec().into_boxed_slice(),
+            );
+            assert!(
+                catch_unwind(AssertUnwindSafe(
+                    || table.accessor_with_layout(&incompatible_layout)
+                ))
+                .is_err()
+            );
 
             let mut identity_mismatch = root.clone();
             identity_mismatch.metadata = Arc::new(identity_mismatch.metadata.as_ref().clone());
@@ -9125,7 +8948,7 @@ mod tests {
             session.save_active_insert_page(table_id, replacement_page);
             let table = table_for_internal_assertion(&engine, table_id);
             let page_guard = table
-                .mem
+                .row_store
                 .get_row_page_versioned_shared(&session.pool_guards(), replacement_page)
                 .await
                 .unwrap()
@@ -9160,7 +8983,7 @@ mod tests {
             );
 
             let page_guard = table
-                .mem
+                .row_store
                 .get_row_page_versioned_shared(&session.pool_guards(), replacement_page)
                 .await
                 .unwrap()
@@ -9314,7 +9137,7 @@ mod tests {
                 .await
                 .unwrap();
             let (_, expected_hot_pages) = table
-                .mem
+                .row_store
                 .snapshot_original_row_pages_from(&guards, expected_pivot)
                 .await
                 .unwrap();
@@ -9650,8 +9473,8 @@ mod tests {
             let accessor = table.accessor_with_layout(&layout);
             let scan_guards = writer_session.pool_guards();
             let (_, pages) = accessor
-                .mem()
-                .snapshot_original_row_pages_from(&scan_guards, accessor.mem().pivot_row_id())
+                .row_store()
+                .snapshot_original_row_pages_from(&scan_guards, accessor.row_store().pivot_row_id())
                 .await
                 .unwrap();
             assert_eq!(pages.len(), 1);
@@ -9673,7 +9496,7 @@ mod tests {
             let exclusive_guards = writer_session.pool_guards();
             let mut exclusive = Box::pin(
                 accessor
-                    .mem()
+                    .row_store()
                     .must_get_row_page_exclusive(&exclusive_guards, page_id),
             );
             assert!(futures::poll!(exclusive.as_mut()).is_pending());
@@ -9698,7 +9521,7 @@ mod tests {
             let exclusive_guards = writer_session.pool_guards();
             let mut exclusive = Box::pin(
                 accessor
-                    .mem()
+                    .row_store()
                     .must_get_row_page_exclusive(&exclusive_guards, page_id),
             );
             assert!(futures::poll!(exclusive.as_mut()).is_pending());
@@ -10303,14 +10126,14 @@ mod tests {
                 panic!("uncommitted lock should remain as marker ref");
             };
             assert!(Arc::ptr_eq(&marker_status, &writer_status));
-            assert!(row_id >= table.mem.pivot_row_id());
+            assert!(row_id >= table.row_store.pivot_row_id());
 
             publish_route_tx.send_async(()).await.unwrap();
             assert!(matches!(
                 checkpoint.await.unwrap(),
                 CheckpointOutcome::Published { .. }
             ));
-            assert!(row_id < table.mem.pivot_row_id());
+            assert!(row_id < table.row_store.pivot_row_id());
 
             return_error_tx.send_async(()).await.unwrap();
             let res: Result<()> = statement.await;
@@ -10345,7 +10168,7 @@ mod tests {
             let cached_page = session.load_active_insert_page(table_id).unwrap();
             assert!(
                 table_for_internal_assertion(&engine, table_id)
-                    .mem
+                    .row_store
                     .get_row_page_versioned_shared(&session.pool_guards(), cached_page)
                     .await
                     .unwrap()
@@ -10421,7 +10244,7 @@ mod tests {
             };
             wait_for_checkpoint_purge(&session, redo_cts).await;
             let reclaimed = table_for_internal_assertion(&engine, table_id)
-                .mem
+                .row_store
                 .get_row_page_versioned_shared(&session.pool_guards(), cached_page)
                 .await
                 .unwrap()
@@ -10478,7 +10301,7 @@ mod tests {
             };
             wait_for_checkpoint_purge(&session, redo_cts).await;
             let reclaimed = table_for_internal_assertion(&engine, table_id)
-                .mem
+                .row_store
                 .get_row_page_versioned_shared(&session.pool_guards(), stale_page)
                 .await
                 .unwrap()
@@ -10518,7 +10341,7 @@ mod tests {
 
             let stale_guard = table_for_internal_assertion(&engine, table_id)
                 .accessor_with_layout(&layout)
-                .mem()
+                .row_store()
                 .try_get_validated_row_page_shared_result(
                     &session.pool_guards(),
                     stale_page.page_id,
@@ -10535,7 +10358,7 @@ mod tests {
 
             let reused_guard = table_for_internal_assertion(&engine, table_id)
                 .accessor_with_layout(&layout)
-                .mem()
+                .row_store()
                 .try_get_validated_row_page_shared_result(
                     &session.pool_guards(),
                     stale_page.page_id,
@@ -10578,7 +10401,9 @@ mod tests {
                 )
                 .await;
                 if test_frame_kind(
-                    &table_for_internal_assertion(&engine, table_id).mem.mem_pool,
+                    &table_for_internal_assertion(&engine, table_id)
+                        .row_store
+                        .mem_pool,
                     cached_page.page_id,
                 ) == FrameKind::Evicted
                 {
@@ -10589,7 +10414,9 @@ mod tests {
             let mut evicted = false;
             for _ in 0..20 {
                 if test_frame_kind(
-                    &table_for_internal_assertion(&engine, table_id).mem.mem_pool,
+                    &table_for_internal_assertion(&engine, table_id)
+                        .row_store
+                        .mem_pool,
                     cached_page.page_id,
                 ) == FrameKind::Evicted
                 {
@@ -10663,7 +10490,9 @@ mod tests {
                 )
                 .await;
                 if test_frame_kind(
-                    &table_for_internal_assertion(&engine, table_id).mem.mem_pool,
+                    &table_for_internal_assertion(&engine, table_id)
+                        .row_store
+                        .mem_pool,
                     cached_page.page_id,
                 ) == FrameKind::Evicted
                 {
@@ -10674,7 +10503,9 @@ mod tests {
             let mut evicted = false;
             for _ in 0..20 {
                 if test_frame_kind(
-                    &table_for_internal_assertion(&engine, table_id).mem.mem_pool,
+                    &table_for_internal_assertion(&engine, table_id)
+                        .row_store
+                        .mem_pool,
                     cached_page.page_id,
                 ) == FrameKind::Evicted
                 {
@@ -10789,7 +10620,9 @@ mod tests {
                 )
                 .await;
                 if test_frame_kind(
-                    &table_for_internal_assertion(&engine, table_id).mem.mem_pool,
+                    &table_for_internal_assertion(&engine, table_id)
+                        .row_store
+                        .mem_pool,
                     cached_page.page_id,
                 ) == FrameKind::Evicted
                 {
@@ -10800,7 +10633,9 @@ mod tests {
             let mut evicted = false;
             for _ in 0..20 {
                 if test_frame_kind(
-                    &table_for_internal_assertion(&engine, table_id).mem.mem_pool,
+                    &table_for_internal_assertion(&engine, table_id)
+                        .row_store
+                        .mem_pool,
                     cached_page.page_id,
                 ) == FrameKind::Evicted
                 {

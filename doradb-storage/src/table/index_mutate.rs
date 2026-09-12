@@ -5,9 +5,9 @@
 //! effect context used to resolve and mutate each candidate sequentially.
 
 use super::access::{
-    ColdLatestRow, LazyRow, LazyRowBuffer, LazyRowSource, UserTableAccessor, WriteIndexKeySet,
-    read_latest_cold_row,
+    ColdLatestRow, LazyRow, LazyRowBuffer, LazyRowSource, UserTableAccessor, read_latest_cold_row,
 };
+use super::index_key::WriteIndexKeySet;
 use crate::buffer::guard::PageSharedGuard;
 use crate::catalog::IndexRef;
 use crate::error::{
@@ -114,7 +114,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
     {
         let accessor = self.accessor;
         let Some(page_guard) = accessor
-            .mem()
+            .row_store()
             .try_get_validated_row_page_shared_result(
                 self.rt.pool_guards(),
                 page_id,
@@ -466,7 +466,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                 }
                 RowLocation::RowPage(page_id) => {
                     let Some(page_guard) = accessor
-                        .mem()
+                        .row_store()
                         .try_get_validated_row_page_shared_result(
                             self.rt.pool_guards(),
                             page_id,

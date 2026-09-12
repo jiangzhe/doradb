@@ -57,8 +57,10 @@ use crate::poison::EnginePoisoner;
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
 use crate::row::Row;
 use crate::table::{
-    CreateIndexPlan, DropIndexPlan, IndexLookupCriteria, LiveTableRedoReplayFloor, MemTable, Table,
-    TableDefinitionKind, TableRedoReplayFloor, TableRuntimeLayout,
+    ColumnStorage, CreateIndexPlan, DropIndexPlan, IndexLookupCriteria, LiveTableRedoReplayFloor,
+    MemTable, MemTableLayout, RowStore, Table, TableDefinitionKind, TableIndexLifecycleState,
+    TableRedoReplayFloor, TableRuntimeLayout, build_dual_tree_secondary_indexes,
+    build_in_memory_secondary_indexes,
 };
 use crate::trx::retention::PendingDroppedTableRedoFloor;
 use crate::trx::undo::IndexUndo;
@@ -100,20 +102,41 @@ impl CatalogTable {
         blk_idx: BlockIndex,
         metadata: Arc<TableMetadata>,
     ) -> RuntimeResult<Self> {
-        let mem = MemTable::new(
+        // Catalog redo uses fixed index slots. Reject an inconsistent trusted
+        // schema before allocating any secondary-index pages.
+        for (slot, spec) in metadata.idx.active_indexes() {
+            assert_eq!(
+                spec.index,
+                catalog_index_ref(slot),
+                "catalog table construction requires fixed index identity: table_id={table_id}, index={}",
+                spec.index
+            );
+        }
+        let indexes = match build_in_memory_secondary_indexes(
             mem_pool.clone(),
-            mem_pool.row_pool_role(),
-            mem_pool,
-            PoolRole::Meta,
             meta_pool_guard,
-            table_id,
-            metadata,
-            blk_idx,
+            &metadata,
             MIN_SNAPSHOT_TS,
         )
         .await
         .change_context(RuntimeError::CatalogAccess)
-        .attach_with(|| format!("operation=create_catalog_table, table_id={table_id}"))?;
+        .attach_with(|| format!("operation=create_catalog_table, table_id={table_id}"))
+        {
+            Ok(indexes) => indexes,
+            Err(err) => {
+                blk_idx.destroy_empty(meta_pool_guard).await;
+                return Err(err);
+            }
+        };
+        let layout = MemTableLayout::new_memory(metadata, indexes);
+        let row_store = RowStore::new(
+            table_id,
+            Arc::clone(&layout.metadata().col),
+            mem_pool.clone(),
+            mem_pool.row_pool_role(),
+            blk_idx,
+        );
+        let mem = MemTable::new(row_store, layout, PoolRole::Meta);
         Ok(CatalogTable { mem })
     }
 
@@ -383,6 +406,19 @@ impl Catalog {
                 ));
         };
 
+        let metadata = Arc::clone(&active_root.metadata);
+        let index_lifecycle = TableIndexLifecycleState::from_active_root(active_root)
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!("operation=reload_create_table, phase=build_index_lifecycle, table_id={table_id}")
+            })?;
+        let storage = ColumnStorage::new(Arc::clone(&table_file), disk_pool.clone())
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=reload_create_table, phase=build_column_storage, table_id={table_id}"
+                )
+            })?;
         let row_id_bound = active_root.pivot_row_id;
         let meta_pool_guard = guards.meta_guard();
         let index_pool_guard = guards.index_guard();
@@ -401,25 +437,42 @@ impl Catalog {
                 table.table_id
             )
         })?;
-        let table = Arc::new(
-            Table::new(
-                mem_pool.clone(),
-                index_pool.clone(),
-                index_pool_guard,
-                table.table_id,
-                definition_kind,
-                blk_idx,
-                table_file,
-                disk_pool.clone(),
+        let indexes = match build_dual_tree_secondary_indexes(
+            index_pool,
+            index_pool_guard,
+            Arc::clone(&metadata),
+            Arc::clone(&table_file),
+            disk_pool,
+            active_root.root_ts,
+        )
+        .await
+        .change_context(RuntimeError::CatalogAccess)
+        .attach_with(|| {
+            format!(
+                "operation=reload_create_table, phase=build_secondary_indexes, table_id={table_id}"
             )
-            .await
-            .change_context(RuntimeError::CatalogAccess)
-            .attach_with(|| {
-                format!(
-                    "operation=reload_create_table, phase=build_table_runtime, table_id={table_id}"
-                )
-            })?,
+        }) {
+            Ok(indexes) => indexes,
+            Err(err) => {
+                blk_idx.destroy_empty(meta_pool_guard).await;
+                return Err(err);
+            }
+        };
+        let row_store = RowStore::new(
+            table_id,
+            Arc::clone(&metadata.col),
+            mem_pool.clone(),
+            mem_pool.row_pool_role(),
+            blk_idx,
         );
+        let layout = TableRuntimeLayout::new(0, metadata, indexes);
+        let table = Arc::new(Table::new(
+            row_store,
+            storage,
+            layout,
+            index_lifecycle,
+            definition_kind,
+        ));
         let metadata = table.metadata();
         let old = self
             .user_tables
@@ -675,7 +728,7 @@ impl Catalog {
             return;
         };
         if ptr::eq(expected_table.as_ptr(), table) {
-            table.mem.cache_insert_page_version(page_id);
+            table.row_store.cache_insert_page_version(page_id);
         }
     }
 

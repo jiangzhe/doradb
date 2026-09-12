@@ -122,15 +122,35 @@ interpreting opaque bytes. It hydrates managed definitions after final catalog
 and table-file reconciliation, including tables without bindings, before
 foreground admission.
 
-Metadata ownership serves several distinct lifetimes. Runtime-layout metadata
-is pointer-identical to current catalog metadata. Superseded history keeps
+Metadata ownership serves several distinct lifetimes. Active user runtime-layout
+metadata is pointer-identical to current catalog metadata. Superseded history keeps
 logical schema versions, and each table-file root describes its durable numeric
-schema. The embedded `MemTable` retains construction-time metadata for row-page
-helpers; current index interpretation belongs to captured runtime layouts.
-Index DDL reuses the immutable column-layout allocation. The embedded metadata
-is broader than those row helpers require, but these owners remain separate.
-The managed definition owns its projection and envelope, with no metadata or
-executable-runtime reference.
+schema. Physical `RowStore<D>` owns table identity, row-pool resources, the block
+index, and only the stable `Arc<TableColumnLayout>` needed to interpret row
+bytes. Index DDL reuses that column allocation; layout installation and user
+accessor construction check its compatibility with the row store.
+
+`TableRuntimeLayout<R>` binds immutable metadata to exact active index runtimes,
+including sparse slots and the index-ID map. User `Table` combines a RowStore,
+ColumnStorage, and a swappable shared layout whose entries own Arcs of dual-tree
+indexes. A complete `MemTable` combines a RowStore with one fixed generation-zero
+layout that directly owns its memory indexes. CatalogTable wraps that complete
+memory table. Catalog construction validates fixed slot-derived index identities
+before index allocation; memory user tables retain metadata-assigned identities
+even when their IDs differ from their slots.
+
+Table and MemTable constructors synchronously assemble prepared components.
+Creation and recovery own asynchronous index construction; user preparation
+validates the loaded file root before allocating secondary indexes. Assembly
+checks compatibility between the supplied row store and layout. CatalogTable
+owns fixed catalog identity validation and memory-index construction.
+
+Both access paths borrow their existing layout for metadata, exact index lookup,
+and paired metadata/runtime iteration. The owning table and operation admission
+establish table identity; column allocation compatibility and a bare IndexRef
+serve narrower purposes. Layouts acquire neither persisted roots nor row
+ownership. The managed definition owns its projection and envelope, with no
+metadata or executable-runtime reference.
 
 ### Redo Log File
 

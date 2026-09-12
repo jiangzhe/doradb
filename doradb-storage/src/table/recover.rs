@@ -43,7 +43,7 @@ impl Table {
         // Since we always dispatch rows of one page to same thread,
         // we can just hold exclusive lock on this page and process all rows in it.
         let mut page_guard = self
-            .mem
+            .row_store
             .must_get_row_page_exclusive(guards, page_id)
             .await?;
 
@@ -81,7 +81,7 @@ impl Table {
                 })?;
         }
         let mut page_guard = self
-            .mem
+            .row_store
             .must_get_row_page_exclusive(guards, page_id)
             .await?;
 
@@ -139,7 +139,7 @@ impl Table {
                 ))
         })?;
         let mut page_guard = self
-            .mem
+            .row_store
             .must_get_row_page_exclusive(guards, page_id)
             .await?;
 
@@ -161,10 +161,13 @@ impl Table {
         guards: &PoolGuards,
         page_id: PageID,
     ) -> RuntimeResult<()> {
-        let page_guard = self.mem.must_get_row_page_shared(guards, page_id).await?;
+        let page_guard = self
+            .row_store
+            .must_get_row_page_shared(guards, page_id)
+            .await?;
         let layout = self.layout_snapshot();
         let metadata = layout.metadata();
-        let index_pool_guard = self.mem.index_pool_guard(guards);
+        let index_pool_guard = guards.index_guard();
         for (index_slot, index_spec) in metadata.idx.active_indexes() {
             let sec_idx = layout.expect_secondary_index(index_spec.index);
             let read_set: Vec<_> = index_spec
@@ -354,7 +357,7 @@ mod tests {
             let table = table_for_internal_assertion(&engine, table_id);
             let metadata = table.metadata();
             let mut page_guard = table
-                .mem
+                .row_store
                 .get_insert_page_exclusive(&session.pool_guards(), 2)
                 .await
                 .unwrap();
@@ -405,7 +408,7 @@ mod tests {
             let session = engine.new_session().unwrap();
             let metadata = table_for_internal_assertion(&engine, table_id).metadata();
             let mut page_guard = table_for_internal_assertion(&engine, table_id)
-                .mem
+                .row_store
                 .get_insert_page_exclusive(&session.pool_guards(), 2)
                 .await
                 .unwrap();

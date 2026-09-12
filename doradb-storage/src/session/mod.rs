@@ -4475,8 +4475,8 @@ pub(crate) mod tests {
 
     async fn catalog_row_page_count(table: &CatalogTable, guards: &PoolGuards) -> usize {
         let mut count = 0usize;
-        let pivot_row_id = table.pivot_row_id();
-        let mut cursor = table.blk_idx().mem_cursor(guards.meta_guard());
+        let pivot_row_id = table.row_store.pivot_row_id();
+        let mut cursor = table.row_store.blk_idx().mem_cursor(guards.meta_guard());
         cursor.seek(pivot_row_id).await.unwrap();
         while let Some(leaf) = cursor.next().await.unwrap() {
             let guard = leaf.lock_shared_async().await.unwrap();

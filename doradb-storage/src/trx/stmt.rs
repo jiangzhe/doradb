@@ -1828,6 +1828,176 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_memory_user_layout_preserves_exact_identity_through_mutation_and_rollback() {
+        use crate::buffer::PoolRole;
+        use crate::catalog::{
+            ActiveIndexSpec, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags,
+            StorageIndexKey, StorageIndexSpec, TableMetadata,
+        };
+        use crate::file::cow_file::SUPER_BLOCK_ID;
+        use crate::index::BlockIndex;
+        use crate::row::ops::DeleteMvcc;
+        use crate::session::tests::SessionTestExt;
+        use crate::table::tests::lightweight_test_engine;
+        use crate::table::{
+            IndexRollback, MemTableLayout, RowStore, build_in_memory_secondary_indexes,
+            test_user_table_id,
+        };
+        use crate::trx::MIN_SNAPSHOT_TS;
+        use crate::trx::undo::{IndexUndoKind, RowUndoRollbackAttempt, take_index_undo};
+        use crate::value::{Val, ValKind};
+
+        #[derive(Clone, Copy)]
+        enum Mutation {
+            Insert,
+            Update,
+            Delete,
+        }
+
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "memory_layout_rollback").await;
+            let mut session = engine.new_session().unwrap();
+            let guards = session.pool_guards();
+            let pools = &engine.inner().pools;
+            let index = IndexRef::new(IndexID::new(73), IndexSlot::new(0));
+            let metadata = Arc::new(
+                TableMetadata::try_new_with_index_slot_count(
+                    vec![StorageColumnSpec::new(
+                        ValKind::I32,
+                        StorageColumnFlags::empty(),
+                    )],
+                    vec![ActiveIndexSpec::new(
+                        index,
+                        StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::UK),
+                    )],
+                    IndexSlot::new(2),
+                )
+                .unwrap(),
+            );
+            let block_index = BlockIndex::new(
+                pools.meta.clone(),
+                guards.meta_guard(),
+                RowID::new(0),
+                SUPER_BLOCK_ID,
+            )
+            .await
+            .unwrap();
+            let indexes = build_in_memory_secondary_indexes(
+                pools.index.clone(),
+                guards.index_guard(),
+                &metadata,
+                MIN_SNAPSHOT_TS,
+            )
+            .await
+            .unwrap();
+            let row_store = RowStore::new(
+                test_user_table_id(100_301),
+                Arc::clone(&metadata.col),
+                pools.mem.clone(),
+                pools.mem.row_pool_role(),
+                block_index,
+            );
+            let layout = MemTableLayout::new_memory(metadata, indexes);
+            let table = MemTable::new(row_store, layout, PoolRole::Index);
+            let old_values = vec![Val::from(1i32)];
+            table
+                .insert_no_trx(&guards, &old_values, false)
+                .await
+                .unwrap();
+            let old_entry = table
+                .require_unique_index(&guards, index.slot())
+                .unwrap()
+                .lookup(&old_values, MIN_SNAPSHOT_TS)
+                .await
+                .unwrap()
+                .unwrap();
+
+            for mutation in [Mutation::Insert, Mutation::Update, Mutation::Delete] {
+                let mut trx = session.begin_trx().unwrap();
+                trx.exec::<_, Error, _>(async |mut stmt| {
+                    prepare_raw_table_write(&mut stmt, table.table_id()).await?;
+                    let (rt, effects) = stmt.runtime_and_effects_mut();
+                    let expected_undo_count = match mutation {
+                        Mutation::Insert => {
+                            let row_id = table.insert_mvcc(rt, effects, vec![Val::from(2i32)])
+                                .await.unwrap();
+                            assert_ne!(row_id, old_entry.0);
+                            1
+                        }
+                        Mutation::Update => {
+                            let updated = table.update_unique_mvcc(
+                                rt, effects, index.slot(), &old_values,
+                                vec![UpdateCol { idx: 0, val: Val::from(2i32) }], false,
+                            ).await.unwrap();
+                            assert!(matches!(updated, UpdateMvcc::Updated(_)));
+                            2
+                        }
+                        Mutation::Delete => {
+                            assert_eq!(table.delete_unique_mvcc(
+                                rt, effects, index.slot(), &old_values, false,
+                            ).await.unwrap(), DeleteMvcc::Deleted);
+                            1
+                        }
+                    };
+                    if !matches!(mutation, Mutation::Delete) {
+                        assert!(table.require_unique_index(rt.pool_guards(), index.slot())
+                            .unwrap().lookup(&[Val::from(2i32)], MIN_SNAPSHOT_TS)
+                            .await.unwrap().is_some());
+                    }
+
+                    // Standalone memory user tables are not catalog-cache entries.
+                    // Apply their actual recorded effects to the owning runtime,
+                    // then let ordinary statement settlement observe empty buffers.
+                    let undo = take_index_undo(&mut effects.index_undo);
+                    assert_eq!(undo.len(), expected_undo_count);
+                    for entry in undo.iter().rev() {
+                        let key = match &entry.kind {
+                            IndexUndoKind::InsertUnique(key, _)
+                            | IndexUndoKind::DeferDelete(key, _) => key,
+                            _ => panic!("memory mutation should insert or defer deletion of an exact index key"),
+                        };
+                        assert_eq!(key.index, index);
+                        table
+                            .rollback_index_entry(entry, rt.pool_guards(), rt.sts())
+                            .await
+                            .unwrap();
+                    }
+                    while let Some(mut undo) = effects.row_undo.pop() {
+                        assert_eq!(
+                            table
+                                .row_store
+                                .try_rollback_hot_row_undo(&mut undo, rt.pool_guards())
+                                .await
+                                .unwrap(),
+                            RowUndoRollbackAttempt::Applied
+                        );
+                    }
+                    effects.clear_redo();
+                    Ok(())
+                })
+                .await
+                .unwrap();
+                trx.rollback().await.unwrap();
+
+                let index = table.require_unique_index(&guards, index.slot()).unwrap();
+                assert_eq!(
+                    index.lookup(&old_values, MIN_SNAPSHOT_TS).await.unwrap(),
+                    Some(old_entry)
+                );
+                assert_eq!(
+                    index
+                        .lookup(&[Val::from(2i32)], MIN_SNAPSHOT_TS)
+                        .await
+                        .unwrap(),
+                    None
+                );
+            }
+            table.destroy(&guards).await.unwrap();
+        });
+    }
+
+    #[test]
     fn test_stmt_effects_empty() {
         let effects = empty_stmt_effects();
         assert_stmt_effects_empty(&effects);

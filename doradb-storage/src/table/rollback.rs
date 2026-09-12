@@ -1,6 +1,6 @@
 use super::{MemTable, Table, TableRuntimeLayout};
-use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool, PoolGuard, PoolGuards};
-use crate::catalog::{CatalogTable, ResolvedIndexKey, catalog_index_slot};
+use crate::buffer::{BufferPool, PoolGuard, PoolGuards};
+use crate::catalog::ResolvedIndexKey;
 use crate::error::RuntimeResult;
 use crate::id::{RowID, TrxID};
 use crate::index::IndexCompareExchange;
@@ -10,18 +10,13 @@ use crate::trx::undo::{IndexUndo, IndexUndoKind};
 /// Rollback adapter for table-specific secondary-index runtimes.
 ///
 /// User tables route rollback through dual-tree secondary indexes, while
-/// catalog tables keep using their in-memory generic indexes. Implementors
+/// memory tables use their fixed layout entries, including catalog tables. Implementors
 /// provide the primitive index operations; the shared rollback body applies
 /// undo entries in reverse order and preserves the exact old index value
 /// recorded in the undo log.
 pub(crate) trait IndexRollback {
-    /// Row buffer pool type owned by the table runtime.
-    type RowPool: BufferPool + 'static;
-    /// Secondary-index buffer pool type owned by the table runtime.
-    type IndexPool: BufferPool + 'static;
-
-    /// Returns the shared MemTable metadata and index-pool binding.
-    fn mem_table(&self) -> &MemTable<Self::RowPool, Self::IndexPool>;
+    /// Selects the guard for this owner's secondary-index pool.
+    fn index_pool_guard<'g>(&self, guards: &'g PoolGuards) -> &'g PoolGuard;
 
     /// Marks an existing unique entry as deleted.
     async fn unique_mask_as_deleted(
@@ -87,8 +82,7 @@ pub(crate) trait IndexRollback {
         guards: &PoolGuards,
         ts: TrxID,
     ) -> RuntimeResult<()> {
-        let table = self.mem_table();
-        let index_pool_guard = table.index_pool_guard(guards);
+        let index_pool_guard = self.index_pool_guard(guards);
         match &entry.kind {
             IndexUndoKind::InsertUnique(key, merge_old_deleted) => {
                 if *merge_old_deleted {
@@ -174,17 +168,13 @@ pub(crate) trait IndexRollback {
 }
 
 struct UserTableRollback<'a> {
-    table: &'a Table,
     layout: &'a TableRuntimeLayout,
 }
 
 impl IndexRollback for UserTableRollback<'_> {
-    type RowPool = EvictableBufferPool;
-    type IndexPool = EvictableBufferPool;
-
     #[inline]
-    fn mem_table(&self) -> &MemTable<Self::RowPool, Self::IndexPool> {
-        &self.table.mem
+    fn index_pool_guard<'g>(&self, guards: &'g PoolGuards) -> &'g PoolGuard {
+        guards.index_guard()
     }
 
     #[inline]
@@ -297,22 +287,16 @@ impl Table {
         guards: &PoolGuards,
         ts: TrxID,
     ) -> RuntimeResult<()> {
-        UserTableRollback {
-            table: self,
-            layout,
-        }
-        .rollback_index_entry(entry, guards, ts)
-        .await
+        UserTableRollback { layout }
+            .rollback_index_entry(entry, guards, ts)
+            .await
     }
 }
 
-impl IndexRollback for CatalogTable {
-    type RowPool = FixedBufferPool;
-    type IndexPool = FixedBufferPool;
-
+impl<D: BufferPool, I: BufferPool> IndexRollback for MemTable<D, I> {
     #[inline]
-    fn mem_table(&self) -> &MemTable<Self::RowPool, Self::IndexPool> {
-        &self.mem
+    fn index_pool_guard<'g>(&self, guards: &'g PoolGuards) -> &'g PoolGuard {
+        self.index_pool_guard(guards)
     }
 
     #[inline]
@@ -323,11 +307,12 @@ impl IndexRollback for CatalogTable {
         row_id: RowID,
         ts: TrxID,
     ) -> RuntimeResult<bool> {
-        self.mem
-            .require_sec_idx(catalog_index_slot(key.index))?
+        self.layout
+            .index_entry(key.index)?
+            .runtime()
             .unique()
             // The undo variant is emitted from this index's immutable kind.
-            .expect("unique rollback undo referenced a non-unique catalog index")
+            .expect("unique rollback undo referenced a non-unique memory index")
             .bind(index_pool_guard)
             .mask_as_deleted(&key.vals, row_id, ts)
             .await
@@ -342,11 +327,12 @@ impl IndexRollback for CatalogTable {
         ignore_del_mask: bool,
         ts: TrxID,
     ) -> RuntimeResult<bool> {
-        self.mem
-            .require_sec_idx(catalog_index_slot(key.index))?
+        self.layout
+            .index_entry(key.index)?
+            .runtime()
             .unique()
             // The undo variant is emitted from this index's immutable kind.
-            .expect("unique rollback undo referenced a non-unique catalog index")
+            .expect("unique rollback undo referenced a non-unique memory index")
             .bind(index_pool_guard)
             .compare_delete(&key.vals, row_id, ignore_del_mask, ts)
             .await
@@ -361,11 +347,12 @@ impl IndexRollback for CatalogTable {
         new_row_id: RowID,
         ts: TrxID,
     ) -> RuntimeResult<IndexCompareExchange> {
-        self.mem
-            .require_sec_idx(catalog_index_slot(key.index))?
+        self.layout
+            .index_entry(key.index)?
+            .runtime()
             .unique()
             // The undo variant is emitted from this index's immutable kind.
-            .expect("unique rollback undo referenced a non-unique catalog index")
+            .expect("unique rollback undo referenced a non-unique memory index")
             .bind(index_pool_guard)
             .compare_exchange(&key.vals, old_row_id, new_row_id, ts)
             .await
@@ -379,11 +366,12 @@ impl IndexRollback for CatalogTable {
         row_id: RowID,
         ts: TrxID,
     ) -> RuntimeResult<bool> {
-        self.mem
-            .require_sec_idx(catalog_index_slot(key.index))?
+        self.layout
+            .index_entry(key.index)?
+            .runtime()
             .non_unique()
             // The undo variant is emitted from this index's immutable kind.
-            .expect("non-unique rollback undo referenced a unique catalog index")
+            .expect("non-unique rollback undo referenced a unique memory index")
             .bind(index_pool_guard)
             .mask_as_deleted(&key.vals, row_id, ts)
             .await
@@ -397,11 +385,12 @@ impl IndexRollback for CatalogTable {
         row_id: RowID,
         ts: TrxID,
     ) -> RuntimeResult<bool> {
-        self.mem
-            .require_sec_idx(catalog_index_slot(key.index))?
+        self.layout
+            .index_entry(key.index)?
+            .runtime()
             .non_unique()
             // The undo variant is emitted from this index's immutable kind.
-            .expect("non-unique rollback undo referenced a unique catalog index")
+            .expect("non-unique rollback undo referenced a unique memory index")
             .bind(index_pool_guard)
             .mask_as_active(&key.vals, row_id, ts)
             .await
@@ -416,11 +405,12 @@ impl IndexRollback for CatalogTable {
         ignore_del_mask: bool,
         ts: TrxID,
     ) -> RuntimeResult<bool> {
-        self.mem
-            .require_sec_idx(catalog_index_slot(key.index))?
+        self.layout
+            .index_entry(key.index)?
+            .runtime()
             .non_unique()
             // The undo variant is emitted from this index's immutable kind.
-            .expect("non-unique rollback undo referenced a unique catalog index")
+            .expect("non-unique rollback undo referenced a unique memory index")
             .bind(index_pool_guard)
             .compare_delete(&key.vals, row_id, ignore_del_mask, ts)
             .await

@@ -944,7 +944,7 @@ where
                 format!("operation=checkpoint_table, phase=publish_table_root, table_id={table_id}")
             })?;
         table
-            .mem
+            .row_store
             .blk_idx()
             .update_column_root(published_pivot_row_id, published_column_root)
             .await;
@@ -2320,7 +2320,7 @@ impl Table {
         start_row_id: RowID,
     ) -> RuntimeResult<Option<TrxID>> {
         let mut heap_redo_start_ts = None;
-        self.mem
+        self.row_store
             .scan_from(guards, start_row_id, |page_guard| {
                 heap_redo_start_ts = Some(page_guard.unwrap_vmap().create_cts());
                 false
@@ -2370,7 +2370,7 @@ impl Table {
                 };
                 let appended = {
                     let page_guard = self
-                        .mem
+                        .row_store
                         .must_get_row_page_shared(guards, prepared.page_id)
                         .await?;
                     let page = page_guard.page();
@@ -2442,7 +2442,7 @@ impl Table {
                     current_end = prepared.end_row_id;
                     let rebuilt_appended = {
                         let page_guard = self
-                            .mem
+                            .row_store
                             .must_get_row_page_shared(guards, prepared.page_id)
                             .await?;
                         let page = page_guard.page();
@@ -2923,7 +2923,7 @@ mod tests {
             RowLocation::LwcBlock(..) => panic!("test row should still be hot"),
         };
         let page_guard = table
-            .mem
+            .row_store
             .must_get_row_page_shared(&guards, page_id)
             .await
             .unwrap();
@@ -3003,7 +3003,7 @@ mod tests {
 
     async fn hot_page_state(table: &Table, guards: &PoolGuards, page_id: PageID) -> RowPageState {
         let page_guard = table
-            .mem
+            .row_store
             .must_get_row_page_shared(guards, page_id)
             .await
             .unwrap();
@@ -3118,7 +3118,7 @@ mod tests {
                 let hook_table = Arc::clone(&table);
                 install_before_listener_hook(move || async move {
                     hook_table
-                        .mem
+                        .row_store
                         .blk_idx()
                         .update_column_root(row_id + 1, SUPER_BLOCK_ID)
                         .await;
@@ -3135,7 +3135,7 @@ mod tests {
                             | TransitionRouteRegistrationCase::RouteAndPoison
                     ) {
                         hook_table
-                            .mem
+                            .row_store
                             .blk_idx()
                             .update_column_root(row_id + 1, SUPER_BLOCK_ID)
                             .await;
@@ -3278,7 +3278,7 @@ mod tests {
             .unwrap();
         for page_id in &retired_page_ids {
             let page = table
-                .mem
+                .row_store
                 .must_get_row_page_shared(&checkpoint_session.pool_guards(), *page_id)
                 .await
                 .unwrap();
@@ -3643,7 +3643,11 @@ mod tests {
             let table = table_for_internal_assertion(&engine, table_id);
             let metadata = table.metadata();
             let guards = session.pool_guards();
-            let page_guard = table.mem.try_get_insert_page(&guards, 1).await.unwrap();
+            let page_guard = table
+                .row_store
+                .try_get_insert_page(&guards, 1)
+                .await
+                .unwrap();
             let page = page_guard.page();
             let payload_len =
                 page.header.var_field_offset() - usize::from(page.header.fix_field_end);
@@ -3720,7 +3724,11 @@ mod tests {
             let guards = session.pool_guards();
 
             let first = {
-                let page_guard = table.mem.try_get_insert_page(&guards, 1).await.unwrap();
+                let page_guard = table
+                    .row_store
+                    .try_get_insert_page(&guards, 1)
+                    .await
+                    .unwrap();
                 let page = page_guard.page();
                 let max_row_count = usize::from(page.header.max_row_count);
                 for value in 0..max_row_count {
@@ -3741,7 +3749,11 @@ mod tests {
                 }
             };
             let second = {
-                let page_guard = table.mem.try_get_insert_page(&guards, 1).await.unwrap();
+                let page_guard = table
+                    .row_store
+                    .try_get_insert_page(&guards, 1)
+                    .await
+                    .unwrap();
                 let page = page_guard.page();
                 assert!(
                     page.insert(metadata.col.as_ref(), &[Val::from(999u32)])
@@ -4133,7 +4145,7 @@ mod tests {
             let page_ids = table.checkpoint_workflow.frozen_page_ids().unwrap();
             assert_eq!(page_ids.len(), 1);
             let page_guard = table
-                .mem
+                .row_store
                 .must_get_row_page_shared(&session.pool_guards(), page_ids[0])
                 .await
                 .unwrap();
@@ -5183,7 +5195,7 @@ mod tests {
                 let table = table_for_internal_assertion(&engine, table_id);
                 let page_id = hot_page_ids(&table, &session.pool_guards()).await[0];
                 let page_guard = table
-                    .mem
+                    .row_store
                     .must_get_row_page_shared(&session.pool_guards(), page_id)
                     .await
                     .unwrap();
@@ -5713,7 +5725,7 @@ mod tests {
             assert_root_metadata_unchanged(&root_before_delay, &table);
 
             let page_guard = table
-                .mem
+                .row_store
                 .must_get_row_page_shared(&session.pool_guards(), first_frozen_page)
                 .await
                 .unwrap();
@@ -6426,12 +6438,12 @@ mod tests {
             let frozen_page_count = frozen_page_ids.len();
             let first_frozen_page_id = frozen_page_ids[0];
             let first_frozen_page = table
-                .mem
+                .row_store
                 .must_get_row_page_shared(&frozen_foreground.pool_guards(), first_frozen_page_id)
                 .await
                 .unwrap();
             let second_frozen_page = table
-                .mem
+                .row_store
                 .must_get_row_page_shared(&frozen_foreground.pool_guards(), frozen_page_ids[1])
                 .await
                 .unwrap();
@@ -6678,12 +6690,12 @@ mod tests {
             let first_page_id = page_ids[0];
             let second_page_id = page_ids[1];
             let first_page = table
-                .mem
+                .row_store
                 .must_get_row_page_shared(&session.pool_guards(), first_page_id)
                 .await
                 .unwrap();
             let second_page = table
-                .mem
+                .row_store
                 .must_get_row_page_shared(&session.pool_guards(), second_page_id)
                 .await
                 .unwrap();
@@ -6752,7 +6764,7 @@ mod tests {
             for page_id in &page_ids {
                 page_guards.push(Some(
                     table
-                        .mem
+                        .row_store
                         .must_get_row_page_shared(&session.pool_guards(), *page_id)
                         .await
                         .unwrap(),
@@ -6802,7 +6814,7 @@ mod tests {
             let page_ids = table.checkpoint_workflow.frozen_page_ids().unwrap();
             let first_page_id = page_ids[0];
             let first_page = table
-                .mem
+                .row_store
                 .must_get_row_page_shared(&session.pool_guards(), first_page_id)
                 .await
                 .unwrap();
@@ -6872,7 +6884,7 @@ mod tests {
             let page_ids = table.checkpoint_workflow.frozen_page_ids().unwrap();
             let first_page_id = page_ids[0];
             let first_page = table
-                .mem
+                .row_store
                 .must_get_row_page_shared(&session.pool_guards(), first_page_id)
                 .await
                 .unwrap();
@@ -7105,9 +7117,9 @@ mod tests {
             assert!(after_wait.0 > before_wait.0);
             assert!(after_wait.1 > before_wait.1);
 
-            assert!(row_id >= table.mem.pivot_row_id());
+            assert!(row_id >= table.row_store.pivot_row_id());
             let page_guard = table
-                .mem
+                .row_store
                 .must_get_row_page_shared(&writer_session.pool_guards(), page_id)
                 .await
                 .unwrap();
@@ -7162,7 +7174,7 @@ mod tests {
                 before_wait.1 + 1,
                 "one route publication must require exactly one registered wait"
             );
-            assert!(row_id < table.mem.pivot_row_id());
+            assert!(row_id < table.row_store.pivot_row_id());
             assert!(table.deletion_buffer().get(row_id).is_none());
 
             let mut reader = reader_session.begin_trx().unwrap();
@@ -7212,7 +7224,7 @@ mod tests {
                 }
             };
             let replacement_guard = table
-                .mem
+                .row_store
                 .must_get_row_page_shared(&writer_session.pool_guards(), replacement_page_id)
                 .await
                 .unwrap();
@@ -7253,7 +7265,7 @@ mod tests {
             wait_for_route_listener(&engine, listener_before).await;
 
             let replacement_guard = table
-                .mem
+                .row_store
                 .must_get_row_page_shared(&writer_session.pool_guards(), replacement_page_id)
                 .await
                 .unwrap();
@@ -7268,7 +7280,7 @@ mod tests {
             drop(replacement_guard);
 
             let old_guard = table
-                .mem
+                .row_store
                 .must_get_row_page_shared(&writer_session.pool_guards(), old_page_id.page_id)
                 .await
                 .unwrap();
@@ -7520,7 +7532,7 @@ mod tests {
             wait_for_route_listener(&engine, listener_before).await;
 
             let page_guard = table
-                .mem
+                .row_store
                 .must_get_row_page_shared(&writer_session.pool_guards(), page_id.page_id)
                 .await
                 .unwrap();
@@ -7575,7 +7587,7 @@ mod tests {
             ));
 
             let page_guard = table
-                .mem
+                .row_store
                 .must_get_row_page_shared(&writer_session.pool_guards(), page_id.page_id)
                 .await
                 .unwrap();
@@ -7673,7 +7685,7 @@ mod tests {
                 std::task::Poll::Pending
             ));
             table
-                .mem
+                .row_store
                 .blk_idx()
                 .update_column_root(row_id + 1, SUPER_BLOCK_ID)
                 .await;
@@ -7760,7 +7772,7 @@ mod tests {
             let mut table_cache = TableCache::new(engine.inner().core.catalog());
 
             let page_guard = table
-                .mem
+                .row_store
                 .must_get_row_page_shared(&pool_guards, page_id)
                 .await
                 .unwrap();
@@ -7812,7 +7824,7 @@ mod tests {
             assert!(cold_origin_logs.is_empty());
 
             table
-                .mem
+                .row_store
                 .blk_idx()
                 .update_column_root(row_id + 1, SUPER_BLOCK_ID)
                 .await;
@@ -8431,7 +8443,7 @@ mod tests {
             assert!(unresolved_status);
             assert_root_metadata_unchanged(&root_before, &table);
             let page_guard = table
-                .mem
+                .row_store
                 .must_get_row_page_shared(&checkpoint_session.pool_guards(), frozen_page_id)
                 .await
                 .unwrap();

@@ -1340,7 +1340,7 @@ impl<'a> RowWriteAccess<'a> {
     #[inline]
     pub(crate) fn rollback_first_undo(
         &mut self,
-        metadata: &TableMetadata,
+        column_layout: &TableColumnLayout,
         owned_entry: &mut OwnedRowUndo,
     ) {
         let dirty = self.dirty;
@@ -1377,7 +1377,7 @@ impl<'a> RowWriteAccess<'a> {
                 // reuse the variable-length space captured by the undo entry.
                 for uc in &undo_cols.cols {
                     self.page.update_col(
-                        metadata.col.as_ref(),
+                        column_layout,
                         self.row_idx,
                         uc.idx,
                         &uc.val,
@@ -2215,7 +2215,7 @@ pub(crate) mod tests {
         // Statement rollback and full transaction rollback share this row
         // restoration boundary, so exercise two independent rollback passes.
         test_row_write_access(&page, &row_ver, &dirty, 0)
-            .rollback_first_undo(&metadata, &mut rollback_undo);
+            .rollback_first_undo(&metadata.col, &mut rollback_undo);
         let mut trx_rollback_undo = OwnedRowUndo::new(
             NON_FOREGROUND_STMT_NO,
             TableID::new(1),
@@ -2228,7 +2228,7 @@ pub(crate) mod tests {
             trx_rollback_undo.leak(),
         )));
         test_row_write_access(&page, &row_ver, &dirty, 0)
-            .rollback_first_undo(&metadata, &mut trx_rollback_undo);
+            .rollback_first_undo(&metadata.col, &mut trx_rollback_undo);
 
         let purge_undo = OwnedRowUndo::new(
             NON_FOREGROUND_STMT_NO,
@@ -2307,7 +2307,7 @@ pub(crate) mod tests {
         {
             let mut access = test_row_write_access(&page, &row_ver, &dirty, 0);
             assert_eq!(row_ver.frozen_mutation_version(), prepared_version + 1);
-            access.rollback_first_undo(&metadata, &mut rollback_undo);
+            access.rollback_first_undo(&metadata.col, &mut rollback_undo);
         }
         assert_eq!(row_ver.frozen_mutation_version(), prepared_version + 2);
 
@@ -2325,7 +2325,7 @@ pub(crate) mod tests {
         let prepared_version = row_ver.frozen_mutation_version();
         // Then model the identical boundary reached by transaction rollback.
         test_row_write_access(&page, &row_ver, &dirty, 0)
-            .rollback_first_undo(&metadata, &mut trx_rollback_undo);
+            .rollback_first_undo(&metadata.col, &mut trx_rollback_undo);
         assert_eq!(row_ver.frozen_mutation_version(), prepared_version + 2);
 
         let purge_undo = OwnedRowUndo::new(

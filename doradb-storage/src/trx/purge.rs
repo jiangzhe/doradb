@@ -442,7 +442,10 @@ impl TransactionSystem {
                             continue;
                         };
                         let page_guard = if let Some(page_id) = undo.page_id {
-                            table.get_row_page_versioned_shared(guards, page_id).await?
+                            table
+                                .row_store
+                                .get_row_page_versioned_shared(guards, page_id)
+                                .await?
                         } else {
                             None
                         };
@@ -456,7 +459,7 @@ impl TransactionSystem {
                         };
                         let page_guard = if let Some(page_id) = undo.page_id {
                             table
-                                .mem
+                                .row_store
                                 .get_row_page_versioned_shared(guards, page_id)
                                 .await?
                         } else {
@@ -544,7 +547,11 @@ impl TransactionSystem {
                 let _ = self.poisoner.poison(report);
                 return false;
             };
-            let page_ids = match table.mem.unlink_retired_row_pages(guards, &batch).await {
+            let page_ids = match table
+                .row_store
+                .unlink_retired_row_pages(guards, &batch)
+                .await
+            {
                 Ok(page_ids) if page_ids.as_ref() == batch.page_ids.as_ref() => page_ids,
                 Ok(page_ids) => {
                     let report = Report::new(FatalError::PurgeAccess).attach(format!(
@@ -576,7 +583,7 @@ impl TransactionSystem {
                 }
             };
             if let Err(report) = table
-                .mem
+                .row_store
                 .deallocate_retired_row_pages(guards, &page_ids)
                 .await
             {
@@ -2832,10 +2839,10 @@ mod tests {
                 RowLocation::LwcBlock(..) | RowLocation::NotFound => unreachable!(),
             };
             let page_guard = table
-                .mem
+                .row_store
                 .mem_pool()
                 .get_page::<RowPage>(
-                    &table.mem.mem_pool().create_base_guard(),
+                    &table.row_store.mem_pool().create_base_guard(),
                     page_id,
                     LatchFallbackMode::Shared,
                 )
@@ -2941,10 +2948,10 @@ mod tests {
                 RowLocation::LwcBlock(..) | RowLocation::NotFound => unreachable!(),
             };
             let page_guard = table
-                .mem
+                .row_store
                 .mem_pool()
                 .get_page::<RowPage>(
-                    &table.mem.mem_pool().create_base_guard(),
+                    &table.row_store.mem_pool().create_base_guard(),
                     page_id,
                     LatchFallbackMode::Shared,
                 )

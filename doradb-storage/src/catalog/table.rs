@@ -32,7 +32,10 @@ use crate::row::{Row, RowRead};
 use crate::runtime::mandatory::{AcceptedExecution, MandatoryTaskMetadata, PreparedExecution};
 use crate::serde::{Deser, DeserResult, MinBytesHint, Ser, Serde, min_bytes_hint};
 use crate::session::{AcceptedDdlScope, PreparedDdlScope};
-use crate::table::{IndexPlacement, Table, TableDefinitionKind, TableRedoReplayFloor};
+use crate::table::{
+    ColumnStorage, IndexPlacement, RowStore, Table, TableDefinitionKind, TableIndexLifecycleState,
+    TableRedoReplayFloor, TableRuntimeLayout, build_dual_tree_secondary_indexes,
+};
 use crate::trx::PrivateTransaction;
 use crate::trx::sys::TransactionSystem;
 use crate::value::{Val, ValKind, ValType};
@@ -343,7 +346,26 @@ impl CreateTableProgress {
             panic!("published table file is present before runtime build");
         };
         let table_file = Arc::clone(table_file);
+        // `catalog_load_boundary`: the unpublished runtime is prepared from one
+        // loaded root, including its metadata, index timestamp, and routing.
         let active_root = table_file.active_root_unchecked();
+        let metadata = Arc::clone(&active_root.metadata);
+        let index_lifecycle = TableIndexLifecycleState::from_active_root(active_root)
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=create_table, phase=build_index_lifecycle, table_id={}",
+                    self.table_id
+                )
+            })?;
+        let storage = ColumnStorage::new(Arc::clone(&table_file), pools.disk.clone())
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=create_table, phase=build_column_storage, table_id={}",
+                    self.table_id
+                )
+            })?;
         let blk_idx = BlockIndex::new(
             pools.meta.clone(),
             guards.meta_guard(),
@@ -358,26 +380,43 @@ impl CreateTableProgress {
                 self.table_id
             )
         })?;
-        let table = Arc::new(
-            Table::new(
-                pools.mem.clone(),
-                pools.index.clone(),
-                guards.index_guard(),
-                self.table_id,
-                self.plan.definition_kind,
-                blk_idx,
-                table_file,
-                pools.disk.clone(),
+        let indexes = match build_dual_tree_secondary_indexes(
+            pools.index.clone(),
+            guards.index_guard(),
+            Arc::clone(&metadata),
+            Arc::clone(&table_file),
+            pools.disk.clone(),
+            active_root.root_ts,
+        )
+        .await
+        .change_context(RuntimeError::CatalogAccess)
+        .attach_with(|| {
+            format!(
+                "operation=create_table, phase=build_secondary_indexes, table_id={}",
+                self.table_id
             )
-            .await
-            .change_context(RuntimeError::CatalogAccess)
-            .attach_with(|| {
-                format!(
-                    "operation=create_table, phase=build_runtime, table_id={}",
-                    self.table_id
-                )
-            })?,
+        }) {
+            Ok(indexes) => indexes,
+            Err(err) => {
+                blk_idx.destroy_empty(guards.meta_guard()).await;
+                return Err(err);
+            }
+        };
+        let row_store = RowStore::new(
+            self.table_id,
+            Arc::clone(&metadata.col),
+            pools.mem.clone(),
+            pools.mem.row_pool_role(),
+            blk_idx,
         );
+        let layout = TableRuntimeLayout::new(0, metadata, indexes);
+        let table = Arc::new(Table::new(
+            row_store,
+            storage,
+            layout,
+            index_lifecycle,
+            self.plan.definition_kind,
+        ));
         self.staged_table = Some(table);
         self.phase = CreateTablePhase::RuntimeBuilt;
         Ok(())

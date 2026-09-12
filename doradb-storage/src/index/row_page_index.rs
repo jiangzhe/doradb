@@ -459,6 +459,39 @@ impl RowPageIndex {
         self.root_page_id
     }
 
+    /// Reclaims the empty root owned by an unpublished construction attempt.
+    ///
+    /// The root must remain an empty leaf. Fixed-pool access and deallocation
+    /// perform no IO, so a broken ownership or shape contract is an invariant
+    /// violation rather than a recoverable cleanup failure.
+    #[inline]
+    pub(super) async fn destroy_empty(self, meta_pool_guard: &PoolGuard) {
+        let page_id = self.root_page_id;
+        let guard = self
+            .pool
+            .must_get_page::<RowPageIndexNode>(
+                meta_pool_guard,
+                page_id,
+                LatchFallbackMode::Exclusive,
+            )
+            .await
+            .lock_exclusive_async()
+            .await
+            .unwrap_or_else(|| {
+                panic!(
+                    "owned row-page-index root could not be locked during empty destroy: page_id={page_id}"
+                )
+            });
+        let page = guard.page();
+        assert!(
+            page.is_leaf() && page.leaf_is_empty(),
+            "row-page-index construction cleanup requires an empty leaf root: page_id={page_id}, height={}, count={}",
+            page.header.height,
+            page.header.count
+        );
+        self.pool.deallocate_page(guard);
+    }
+
     /// Destroy this row-page index and its still-hot row pages at or above the pivot.
     #[inline]
     pub(crate) async fn destroy<B: BufferPool>(
@@ -2251,6 +2284,28 @@ mod tests {
     }
 
     #[test]
+    fn test_row_page_index_destroy_empty_reclaims_root() {
+        smol::block_on(async {
+            let meta_pool = owned_index_pool(64 * 1024 * 1024);
+            let meta_guard = (*meta_pool).create_base_guard();
+            for start_row_id in [RowID::new(0), RowID::new(100)] {
+                let index = RowPageIndex::new(meta_pool.guard(), &meta_guard, start_row_id)
+                    .await
+                    .unwrap();
+                assert_eq!((*meta_pool).allocated(), 1);
+
+                index.destroy_empty(&meta_guard).await;
+
+                assert_eq!(
+                    (*meta_pool).allocated(),
+                    0,
+                    "empty root was not reclaimed: start_row_id={start_row_id}"
+                );
+            }
+        });
+    }
+
+    #[test]
     fn test_row_page_index_destroy_reclaims_leaf_row_pages_and_root() {
         smol::block_on(async {
             let meta_pool = owned_index_pool(64 * 1024 * 1024);
@@ -2288,42 +2343,51 @@ mod tests {
     }
 
     #[test]
-    fn test_row_page_index_destroy_rejects_entry_below_pivot_before_deallocation() {
+    fn test_row_page_index_destroy_rejects_invalid_state_before_deallocation() {
         smol::block_on(async {
-            let meta_pool = owned_index_pool(64 * 1024 * 1024);
-            let mem_pool = owned_mem_pool(64 * 1024 * 1024);
-            let meta_guard = (*meta_pool).create_base_guard();
-            let mem_guard = (*mem_pool).create_base_guard();
-            let metadata = make_test_metadata();
-            let index = RowPageIndex::new(meta_pool.guard(), &meta_guard, RowID::new(0))
-                .await
-                .unwrap();
-            for _ in 0..2 {
-                drop(
-                    index
-                        .get_insert_page_exclusive(
-                            &meta_guard,
-                            &*mem_pool,
-                            &mem_guard,
-                            &metadata.col,
-                            100,
-                        )
-                        .await
-                        .unwrap(),
-                );
-            }
+            for empty_only in [false, true] {
+                let meta_pool = owned_index_pool(64 * 1024 * 1024);
+                let mem_pool = owned_mem_pool(64 * 1024 * 1024);
+                let meta_guard = (*meta_pool).create_base_guard();
+                let mem_guard = (*mem_pool).create_base_guard();
+                let metadata = make_test_metadata();
+                let index = RowPageIndex::new(meta_pool.guard(), &meta_guard, RowID::new(0))
+                    .await
+                    .unwrap();
+                for _ in 0..2 {
+                    drop(
+                        index
+                            .get_insert_page_exclusive(
+                                &meta_guard,
+                                &*mem_pool,
+                                &mem_guard,
+                                &metadata.col,
+                                100,
+                            )
+                            .await
+                            .unwrap(),
+                    );
+                }
 
-            let panic = AssertUnwindSafe(index.destroy(
-                &meta_guard,
-                &*mem_pool,
-                &mem_guard,
-                RowID::new(100),
-            ))
-            .catch_unwind()
-            .await;
-            assert!(panic.is_err());
-            assert_eq!((*meta_pool).allocated(), 1);
-            assert_eq!((*mem_pool).allocated(), 2);
+                let panic = AssertUnwindSafe(async {
+                    if empty_only {
+                        index.destroy_empty(&meta_guard).await;
+                        Ok(())
+                    } else {
+                        index
+                            .destroy(&meta_guard, &*mem_pool, &mem_guard, RowID::new(100))
+                            .await
+                    }
+                })
+                .catch_unwind()
+                .await;
+                assert!(
+                    panic.is_err(),
+                    "invalid destroy state was accepted: empty_only={empty_only}"
+                );
+                assert_eq!((*meta_pool).allocated(), 1, "empty_only={empty_only}");
+                assert_eq!((*mem_pool).allocated(), 2, "empty_only={empty_only}");
+            }
         });
     }
 
