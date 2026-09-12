@@ -100,6 +100,14 @@ impl BlockIndex {
         self.root.wait_route_since(observed_epoch).await;
     }
 
+    /// Reclaims the empty hot index owned by an unpublished construction attempt.
+    ///
+    /// The row-page index must still consist of one empty leaf root.
+    #[inline]
+    pub(crate) async fn destroy_empty(self, meta_pool_guard: &PoolGuard) {
+        self.row.destroy_empty(meta_pool_guard).await;
+    }
+
     /// Destroy the in-memory row-page index owned by this facade.
     #[inline]
     pub(crate) async fn destroy<B: BufferPool>(

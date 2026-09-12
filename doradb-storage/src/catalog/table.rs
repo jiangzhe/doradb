@@ -380,13 +380,6 @@ impl CreateTableProgress {
                 self.table_id
             )
         })?;
-        let row_store = RowStore::new(
-            self.table_id,
-            Arc::clone(&metadata.col),
-            pools.mem.clone(),
-            pools.mem.row_pool_role(),
-            blk_idx,
-        );
         let indexes = match build_dual_tree_secondary_indexes(
             pools.index.clone(),
             guards.index_guard(),
@@ -405,18 +398,17 @@ impl CreateTableProgress {
         }) {
             Ok(indexes) => indexes,
             Err(err) => {
-                if let Err(report) = row_store.destroy(guards).await {
-                    let report = report.attach(format!(
-                        "operation=create_table, phase=cleanup_row_store, table_id={}",
-                        self.table_id
-                    ));
-                    obs::error!(
-                        "event=table_construction_cleanup component=catalog action=destroy_row_store result=error error={report:?}"
-                    );
-                }
+                blk_idx.destroy_empty(guards.meta_guard()).await;
                 return Err(err);
             }
         };
+        let row_store = RowStore::new(
+            self.table_id,
+            Arc::clone(&metadata.col),
+            pools.mem.clone(),
+            pools.mem.row_pool_role(),
+            blk_idx,
+        );
         let layout = TableRuntimeLayout::new(0, metadata, indexes);
         let table = Arc::new(Table::new(
             row_store,

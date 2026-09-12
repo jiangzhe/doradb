@@ -123,6 +123,12 @@ validation precede secondary-index allocation. CatalogTable validates fixed
 index identities before building its indexes and assembling the memory owner.
 Existing index builders retain partial-failure cleanup; the preparation paths
 also reclaim the row-page index if secondary-index construction fails.
+CREATE and recovery assemble RowStore only after secondary-index construction
+succeeds. All three preparation paths reclaim the unpublished empty block index
+through `BlockIndex::destroy_empty`, preserving the original build error unchanged.
+This cleanup asserts an empty leaf root and deallocates its fixed-pool page
+without IO or a recoverable failure. General populated-store destruction retains
+its fallible row-page access.
 
 RowStore owns only `Arc<TableColumnLayout>` for row-byte interpretation. It
 provides page access/allocation, insert-page reuse, physical scans and snapshot
@@ -223,7 +229,7 @@ access cleanups, preserving the separate user and memory mutation drivers.
 Physical consumers in DDL, scans, checkpoint, recovery, purge, and rollback now
 use RowStore. No persistence formats or public mutation contracts changed.
 
-Ten new regressions cover generic binding validation, memory layout identity
+Regressions cover generic binding validation, memory layout identity
 and cleanup, construction rejection, exact mutation undo, and retained-layout
 key derivation. Existing root/layout tests additionally reject incompatible
 column allocations. A standalone memory-user regression applies the actual
@@ -231,11 +237,13 @@ recorded index and row undo directly to its owner inside statement settlement;
 it does not introduce public memory-table admission or a test capability trait.
 A two-page catalog pool regression verifies cleanup of both the prepared
 row-page index and a partially built secondary-index batch on pool exhaustion.
+Empty-index cleanup tests cover zero and nonzero starting row IDs and reject
+populated roots before deallocation.
 Key regressions cover empty user/memory layouts, sparse composite and overlapping
 keys, and owned values extracted from live or deleted physical rows. The exact
 memory-index identity regression now exercises insert, update, and delete undo.
 
-Validation completed on 2026-09-12:
+Validation completed on 2026-09-12 before the empty-index cleanup follow-up:
 
 - Workspace nextest: **2,002 passed**.
 - Alternate `libaio` storage nextest: **1,886 passed**.
@@ -243,6 +251,10 @@ Validation completed on 2026-09-12:
 - Branch style audit: passed for **24 tracked Rust files**.
 - Public-error audit and unsafe inventory: identical to tracked baselines.
 - Git whitespace checks: passed.
+
+Empty-index cleanup follow-up validation on 2026-09-12: **2,003 workspace tests**
+and **4 focused tests** passed, along with formatting, strict workspace/all-target
+Clippy, and Git whitespace checks.
 
 Before the constructor follow-up, focused line coverage across the five core
 files was **92.68%** overall:

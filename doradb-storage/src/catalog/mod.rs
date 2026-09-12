@@ -53,7 +53,6 @@ use crate::file::fs::FileSystem;
 use crate::id::{RowID, TableID, TrxID};
 use crate::index::BlockIndex;
 use crate::map::{FastDashMap, FastHashMap, FastHashSet};
-use crate::obs;
 use crate::poison::EnginePoisoner;
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
 use crate::row::Row;
@@ -125,17 +124,7 @@ impl CatalogTable {
         {
             Ok(indexes) => indexes,
             Err(err) => {
-                if let Err(report) = blk_idx
-                    .destroy(meta_pool_guard, &*mem_pool, meta_pool_guard)
-                    .await
-                {
-                    let report = report.attach(format!(
-                        "operation=cleanup_catalog_row_store, table_id={table_id}"
-                    ));
-                    obs::error!(
-                        "event=table_construction_cleanup component=catalog action=destroy_row_store result=error error={report:?}"
-                    );
-                }
+                blk_idx.destroy_empty(meta_pool_guard).await;
                 return Err(err);
             }
         };
@@ -448,13 +437,6 @@ impl Catalog {
                 table.table_id
             )
         })?;
-        let row_store = RowStore::new(
-            table_id,
-            Arc::clone(&metadata.col),
-            mem_pool.clone(),
-            mem_pool.row_pool_role(),
-            blk_idx,
-        );
         let indexes = match build_dual_tree_secondary_indexes(
             index_pool,
             index_pool_guard,
@@ -472,17 +454,17 @@ impl Catalog {
         }) {
             Ok(indexes) => indexes,
             Err(err) => {
-                if let Err(report) = row_store.destroy(guards).await {
-                    let report = report.attach(format!(
-                        "operation=reload_create_table, phase=cleanup_row_store, table_id={table_id}"
-                    ));
-                    obs::error!(
-                        "event=table_construction_cleanup component=catalog action=destroy_row_store result=error error={report:?}"
-                    );
-                }
+                blk_idx.destroy_empty(meta_pool_guard).await;
                 return Err(err);
             }
         };
+        let row_store = RowStore::new(
+            table_id,
+            Arc::clone(&metadata.col),
+            mem_pool.clone(),
+            mem_pool.row_pool_role(),
+            blk_idx,
+        );
         let layout = TableRuntimeLayout::new(0, metadata, indexes);
         let table = Arc::new(Table::new(
             row_store,
