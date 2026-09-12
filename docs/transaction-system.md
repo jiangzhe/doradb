@@ -580,6 +580,22 @@ secondary-index write undo. Repeated operations reuse the binding and
 transaction lock cache rather than re-entering the metadata resolver or lock
 manager.
 
+UserTableAccessor borrows that admitted `TableRuntimeLayout` and the table's
+physical RowStore. Memory/catalog operations borrow their complete MemTable's
+fixed `TableRuntimeLayout<InMemorySecondaryIndex<I>>`. The generic layout
+supplies metadata, exact index lookup, and paired specification/runtime
+iteration; it does not acquire transaction locks, capture persisted roots, or
+claim rows. Column-layout allocation identity checks row-byte compatibility,
+while owning-table construction and admission establish the table binding.
+
+Full-row and indexed-value key derivation use the retained layout directly and
+preserve exact IndexRefs, active slot order, and the operation lifetime. Row
+ownership and user persisted-root proofs remain separate mutation inputs.
+Physical hot undo uses RowStore's column layout; index rollback selects its
+index guard directly and resolves memory indexes through their fixed layout.
+Catalog key-based redo, statement settlement, and the existing user and memory
+mutation drivers retain their contracts.
+
 Public programmable row callbacks return `CallbackResult<Decision, E>`.
 Engine row-access failures convert to `CallbackError::Engine`; application
 failures are wrapped explicitly in `CallbackError::User`. The public statement

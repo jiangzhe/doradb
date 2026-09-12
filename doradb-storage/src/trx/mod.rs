@@ -7045,14 +7045,18 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
                 trx.commit().await.unwrap();
-                if test_frame_kind(&table.mem.mem_pool, cached_page.page_id) == FrameKind::Evicted {
+                if test_frame_kind(&table.row_store.mem_pool, cached_page.page_id)
+                    == FrameKind::Evicted
+                {
                     break;
                 }
             }
             // Timer audit: buffer-eviction/I/O test coordination.
             let mut evicted = false;
             for _ in 0..20 {
-                if test_frame_kind(&table.mem.mem_pool, cached_page.page_id) == FrameKind::Evicted {
+                if test_frame_kind(&table.row_store.mem_pool, cached_page.page_id)
+                    == FrameKind::Evicted
+                {
                     evicted = true;
                     break;
                 }

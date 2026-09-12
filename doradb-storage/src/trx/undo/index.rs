@@ -5,6 +5,9 @@ use crate::id::{RowID, TableID, TrxID};
 use crate::runtime::{POLL_BUDGET, yield_now};
 use crate::table::IndexRollback;
 
+#[cfg(test)]
+pub(in crate::trx) use tests::take_index_undo;
+
 /// Buffer of index undo entries accumulated for rollback and GC handoff.
 #[derive(Default)]
 pub(crate) struct IndexUndoLogs(Vec<IndexUndo>);
@@ -158,6 +161,12 @@ mod tests {
         CATALOG_TABLE_ID_START, IndexID, IndexRef, IndexSlot, catalog_index_ref,
         user_key_from_index_ref,
     };
+    use std::mem::take;
+
+    /// Takes recorded index effects for direct-owner rollback regression tests.
+    pub(in crate::trx) fn take_index_undo(logs: &mut IndexUndoLogs) -> Vec<IndexUndo> {
+        take(&mut logs.0)
+    }
 
     fn create_test_key(index: IndexRef) -> ResolvedIndexKey {
         user_key_from_index_ref(index, vec![])

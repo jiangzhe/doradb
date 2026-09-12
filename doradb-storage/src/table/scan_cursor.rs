@@ -165,7 +165,8 @@ where
             },
             TableScanUnit::Hot(descriptor) => TableScanUnitState::Hot {
                 page_guard: accessor
-                    .load_table_scan_hot_page(runtime, *descriptor)
+                    .row_store()
+                    .get_captured_row_page_shared(runtime.pool_guards(), *descriptor)
                     .await?,
                 next_row: 0,
             },

@@ -120,24 +120,28 @@ impl Table {
     ) -> FatalResult<()> {
         loop {
             poisoner.ensure_healthy()?;
-            if row_id < self.mem.blk_idx().pivot_row_id() {
+            if row_id < self.row_store.blk_idx().pivot_row_id() {
                 return Ok(());
             }
-            let route_epoch = self.mem.blk_idx().route_epoch();
+            let route_epoch = self.row_store.blk_idx().route_epoch();
             #[cfg(test)]
             tests::run_before_listener_hook().await;
             let poison_listener = poisoner.listener();
             #[cfg(test)]
             tests::run_after_listener_hook().await;
             poisoner.ensure_healthy()?;
-            if row_id < self.mem.blk_idx().pivot_row_id() {
+            if row_id < self.row_store.blk_idx().pivot_row_id() {
                 return Ok(());
             }
 
             // The route epoch is only a wake hint. The pivot remains the
             // authoritative route, and the final health check makes an
             // already-published checkpoint failure win the wake race.
-            let route_wait = self.mem.blk_idx().wait_route_since(route_epoch).fuse();
+            let route_wait = self
+                .row_store
+                .blk_idx()
+                .wait_route_since(route_epoch)
+                .fuse();
             let poison_wait = poison_listener.fuse();
             futures::pin_mut!(route_wait);
             futures::pin_mut!(poison_wait);
@@ -156,7 +160,7 @@ impl Table {
         let mut page_guards = Vec::with_capacity(frozen_pages.len());
         for page_info in frozen_pages {
             page_guards.push(
-                self.mem
+                self.row_store
                     .must_get_row_page_shared(guards, page_info.page_id)
                     .await?,
             );

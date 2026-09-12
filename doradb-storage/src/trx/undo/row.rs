@@ -378,7 +378,7 @@ impl RowUndoLogs {
                     let table = table_cache.must_get_catalog_table(entry.table_id);
                     while let Some(undo) = entry.forward_undo.last() {
                         let result = table
-                            .mem
+                            .row_store
                             .try_restore_forward_link(undo, context.pool_guards)
                             .await?;
                         assert_eq!(
@@ -390,7 +390,7 @@ impl RowUndoLogs {
                     }
                     if entry.page_id.is_some() {
                         match table
-                            .mem
+                            .row_store
                             .try_rollback_hot_row_undo(entry, context.pool_guards)
                             .await?
                         {
@@ -409,14 +409,14 @@ impl RowUndoLogs {
                     let table = table_cache.must_get_user_table(entry.table_id);
                     while let Some(undo) = entry.forward_undo.last() {
                         let source_id = undo.source.row_id;
-                        if source_id < table.mem.pivot_row_id() {
+                        if source_id < table.row_store.pivot_row_id() {
                             // Cold routing has no forward fields. The old hot
                             // payload is no longer reachable by current selection.
                             entry.forward_undo.pop();
                             continue;
                         }
                         match table
-                            .mem
+                            .row_store
                             .try_restore_forward_link(undo, context.pool_guards)
                             .await?
                         {
@@ -436,12 +436,12 @@ impl RowUndoLogs {
                             table.deletion_buffer().remove(entry.row_id);
                             break;
                         }
-                        if entry.row_id < table.mem.pivot_row_id() {
+                        if entry.row_id < table.row_store.pivot_row_id() {
                             table.deletion_buffer().remove(entry.row_id);
                             break;
                         }
                         match table
-                            .mem
+                            .row_store
                             .try_rollback_hot_row_undo(entry, context.pool_guards)
                             .await?
                         {

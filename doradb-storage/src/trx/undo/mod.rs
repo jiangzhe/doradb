@@ -2,6 +2,8 @@ mod index;
 mod row;
 
 pub(super) use index::IndexPurgeEntry;
+#[cfg(test)]
+pub(super) use index::take_index_undo;
 pub(crate) use index::{IndexUndo, IndexUndoKind, IndexUndoLogs};
 pub(crate) use row::*;
 

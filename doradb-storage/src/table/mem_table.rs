@@ -1,39 +1,35 @@
 use super::access::RowIdMove;
+use super::index_key::WriteIndexKeySet;
+use super::layout::{MemTableLayout, RuntimeIndexEntry};
+use super::row_store::RowStore;
 use super::unique_mutate::{CurrentRowDecision, CurrentRowSelection, RowInspection};
 use super::{
-    DmlValidator, TableKind, UpdateUniqueMvcc,
+    DmlValidator, UpdateUniqueMvcc,
     hot::{
         DeleteInternal, HotRowLock, HotRowMutator, InsertRowIntoPage, RowInserter,
         UpdateRowInplace, publish_forward_hint,
     },
-    index_key_is_changed, index_key_replace, read_latest_index_key,
-    read_physical_index_keys_for_delete, row_len, unique_key_from_full_row,
-    validate_page_row_range,
+    index_key_is_changed, index_key_replace, read_latest_index_key, row_len,
+    unique_key_from_full_row, validate_page_row_range,
 };
-use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
-use crate::buffer::page::VersionedPageID;
-use crate::buffer::{
-    BufferPool, PoolGuard, PoolGuards, PoolRole, RowPoolRole, get_page_versioned_shared,
-};
+use crate::buffer::guard::{PageGuard, PageSharedGuard};
+use crate::buffer::{BufferPool, PoolGuard, PoolGuards, PoolRole};
 use crate::catalog::{
     CatalogSelectKey, IndexRef, IndexSlot, PrimaryKeyMatchError, ResolvedIndexKey,
-    TableColumnLayout, TableIndexMetadata, TableMetadata, catalog_index_ref,
-    catalog_key_from_active_ordinal,
+    TableColumnLayout, TableIndexMetadata, TableMetadata, catalog_key_from_active_ordinal,
 };
 use crate::error::{
-    DataIntegrityError, InternalError, InternalResult, MultiDomainResultExt, OperationError,
+    DataIntegrityError, InternalError, MultiDomainResultExt, OperationError,
     OperationOrRuntimeError, OperationOrRuntimeResult, QuadResult, RecoveryDuplicateKey,
-    RuntimeError, RuntimeOrFatalResult, RuntimeOrFatalResultExt, RuntimeResult,
-    SecondaryIndexBinding,
+    RuntimeError, RuntimeResult, SecondaryIndexBinding,
 };
 use crate::id::{PageID, RowID, TableID, TrxID};
-use crate::index::util::{Maskable, RowPageCreateRedoCtx};
+use crate::index::util::Maskable;
 use crate::index::{
-    BTreeKeyEncoder, BlockIndex, GuardedNonUniqueMemIndex, GuardedUniqueMemIndex,
-    InMemorySecondaryIndex, IndexBatchStream, IndexCompareExchange, IndexInsert,
-    IndexLookupCandidate, KeyRange, RowLocation,
+    BTreeKeyEncoder, GuardedNonUniqueMemIndex, GuardedUniqueMemIndex, InMemorySecondaryIndex,
+    IndexBatchStream, IndexCompareExchange, IndexInsert, IndexLookupCandidate, KeyRange,
+    RowLocation,
 };
-use crate::latch::LatchFallbackMode;
 use crate::log::redo::RowRedoKind;
 use crate::map::FastHashMap;
 use crate::obs;
@@ -46,16 +42,11 @@ use crate::row::{Row, RowPage, RowRead, estimate_max_row_count, var_len_for_inse
 use crate::runtime::yield_now;
 use crate::trx::row::FindOldVersion;
 use crate::trx::stmt::StmtEffects;
-use crate::trx::undo::{
-    ForwardHint, ForwardLinkUndo, HotForwardSource, IndexBranch, OwnedRowUndo, RowUndoKind,
-    RowUndoRollbackAttempt,
-};
-use crate::trx::ver_map::RowPageState;
-use crate::trx::{MIN_SNAPSHOT_TS, RetiredRowPageBatch, TrxRuntime};
+use crate::trx::undo::{ForwardHint, HotForwardSource, IndexBranch, RowUndoKind};
+use crate::trx::{MIN_SNAPSHOT_TS, TrxRuntime};
 use crate::value::Val;
 use error_stack::{Report, ResultExt};
 use std::mem::take;
-use std::sync::Arc;
 
 struct NoTrxIndexRefresh {
     old_keys: Vec<SelectKey>,
@@ -102,120 +93,50 @@ pub(crate) enum NoTrxUpsertChange {
     },
 }
 
-/// Snapshot descriptor for one original hot row page.
-///
-/// The descriptor contains only stable block-index identity and the reserved
-/// RowID range. Callers reopen the page when they are ready to scan it, so no
-/// block-index leaf latch or row-page guard survives the snapshot operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RowPageDescriptor {
-    /// Buffer-pool page identity recorded by the row-page index.
-    pub(crate) page_id: PageID,
-    /// Inclusive first RowID reserved for the page.
-    pub(crate) start_row_id: RowID,
-    /// Exclusive RowID reservation boundary for the page.
-    pub(crate) end_row_id: RowID,
-}
-
-/// Shared in-memory table core used by both catalog and user tables.
-///
-/// `MemTable` owns only hot row-store state: row pages in a buffer pool,
-/// the row-id-to-page block index, and optional in-memory secondary indexes.
-/// It intentionally has no column-store, table-file, disk-cache, or runtime
-/// layout ownership. User tables embed it inside [`Table`] and layer persisted
-/// column storage plus user-only runtime layout on top; catalog tables wrap it
-/// with fixed buffer pools and expose its base access methods through `Deref`.
-///
-/// The essential composition is:
-///
-/// 1. `table_id` and `metadata` identify the logical table and immutable row
-///    shape used by row pages and index keys.
-///
-/// 2. `mem_pool` plus `row_pool_role` locate and validate the row-page buffer
-///    pool used for inserts, scans, and row lookup.
-///
-/// 3. `blk_idx` maps row-id ranges to hot row pages and tracks the pivot row id
-///    separating hot rows from rows that user tables may have checkpointed into
-///    column storage.
-///
-/// 4. `sec_idx` plus `index_pool_role` own the in-memory secondary-index slots
-///    for indexes that currently participate in hot-row access.
+/// Complete fixed-schema memory table with directly owned index runtimes.
+/// Physical pages use only the row store's stable column layout; logical
+/// operations use the immutable metadata/runtime binding in `layout`.
 pub(crate) struct MemTable<D: 'static, I: 'static> {
-    /// Logical table id for this in-memory runtime.
-    pub(crate) table_id: TableID,
-    /// Immutable table metadata used for row and index interpretation.
-    pub(crate) metadata: Arc<TableMetadata>,
-    /// Buffer pool that owns in-memory row pages.
-    pub(crate) mem_pool: QuiescentGuard<D>,
-    /// Pool role used for row-page buffer access.
-    pub(crate) row_pool_role: RowPoolRole,
-    /// Pool role used for in-memory secondary indexes.
+    /// Physical row pages and routing for this table.
+    pub(crate) row_store: RowStore<D>,
+    /// Fixed metadata and exact active memory-index runtimes.
+    pub(super) layout: MemTableLayout<I>,
+    /// Pool role used by the directly owned indexes.
     pub(crate) index_pool_role: PoolRole,
-    /// Hot row-id to row-page index.
-    pub(crate) blk_idx: BlockIndex,
-    /// Sparse secondary-index runtimes for active in-memory indexes.
-    pub(crate) sec_idx: Box<[Option<InMemorySecondaryIndex<I>>]>,
 }
 
 impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
-    /// Create a MemTable with freshly built in-memory secondary indexes.
-    #[expect(clippy::too_many_arguments, reason = "code style")]
+    /// Assembles prepared row storage and a fixed memory-index layout.
     #[inline]
-    pub(crate) async fn new(
-        mem_pool: QuiescentGuard<D>,
-        row_pool_role: RowPoolRole,
-        index_pool: QuiescentGuard<I>,
+    pub(crate) fn new(
+        row_store: RowStore<D>,
+        layout: MemTableLayout<I>,
         index_pool_role: PoolRole,
-        index_pool_guard: &PoolGuard,
-        table_id: TableID,
-        metadata: Arc<TableMetadata>,
-        blk_idx: BlockIndex,
-        index_ts: TrxID,
-    ) -> RuntimeResult<Self> {
-        let sec_idx =
-            build_in_memory_secondary_indexes(index_pool, index_pool_guard, &metadata, index_ts)
-                .await
-                .change_context(RuntimeError::TableAccess)
-                .attach_with(|| format!("operation=create_mem_table, table_id={table_id}"))?;
-        Ok(MemTable {
-            table_id,
-            metadata: Arc::clone(&metadata),
-            mem_pool,
-            row_pool_role,
+    ) -> Self {
+        layout.assert_column_layout(row_store.column_layout());
+        MemTable {
+            row_store,
+            layout,
             index_pool_role,
-            blk_idx,
-            sec_idx,
-        })
+        }
     }
 
     /// Returns the logical table id of this runtime.
     #[inline]
     pub(crate) fn table_id(&self) -> TableID {
-        self.table_id
+        self.row_store.table_id()
     }
 
     /// Returns the immutable metadata for this table.
     #[inline]
     pub(crate) fn metadata(&self) -> &TableMetadata {
-        &self.metadata
-    }
-
-    /// Returns the buffer pool used for in-memory row pages.
-    #[inline]
-    pub(crate) fn mem_pool(&self) -> &D {
-        &self.mem_pool
-    }
-
-    /// Returns the row page index used by this table.
-    #[inline]
-    pub(crate) fn blk_idx(&self) -> &BlockIndex {
-        &self.blk_idx
+        self.layout.metadata()
     }
 
     /// Returns the secondary-index array owned by this table.
     #[inline]
-    pub(crate) fn sec_idx(&self) -> &[Option<InMemorySecondaryIndex<I>>] {
-        &self.sec_idx
+    pub(crate) fn sec_idx(&self) -> &[Option<RuntimeIndexEntry<InMemorySecondaryIndex<I>>>] {
+        self.layout.secondary_indexes()
     }
 
     /// Return an active secondary-index runtime by physical slot.
@@ -224,17 +145,9 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         &self,
         index_slot: IndexSlot,
     ) -> RuntimeResult<&InMemorySecondaryIndex<I>> {
-        self.sec_idx
-            .get(index_slot.as_usize())
-            .and_then(Option::as_ref)
-            .ok_or_else(|| Report::new(InternalError::SecondaryIndexOutOfBounds))
-            .attach_with(|| {
-                format!(
-                    "index_slot={index_slot}, index_count={}",
-                    self.sec_idx.len()
-                )
-            })
-            .change_context(RuntimeError::IndexAccess)
+        self.layout
+            .index_entry_at_slot(index_slot)
+            .map(RuntimeIndexEntry::runtime)
             .attach_with(|| {
                 format!(
                     "operation=require_secondary_index, table_id={}, index_slot={index_slot}",
@@ -260,6 +173,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         self.sec_idx()[index_slot.as_usize()]
             .as_ref()
             .expect("active index slot")
+            .runtime()
             .is_unique()
     }
 
@@ -310,27 +224,6 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         }
     }
 
-    /// Returns the row-id boundary between persisted and in-memory rows.
-    #[inline]
-    pub(crate) fn pivot_row_id(&self) -> RowID {
-        self.blk_idx.pivot_row_id()
-    }
-
-    #[inline]
-    fn meta_pool_guard<'a>(&self, guards: &'a PoolGuards) -> &'a PoolGuard {
-        // Every table runtime owns a metadata index, so every admitted table
-        // operation carries the metadata guard. Catalog-only bundles are
-        // intentionally partial but still include this role.
-        guards.meta_guard()
-    }
-
-    #[inline]
-    fn row_pool_guard<'a>(&self, guards: &'a PoolGuards) -> &'a PoolGuard {
-        // Catalog row pages use Meta; user-table row pages use Mem. Runtime
-        // construction installs the guard matching this immutable role.
-        guards.row_guard(self.row_pool_role)
-    }
-
     /// Return the pool guard used by in-memory secondary indexes.
     #[inline]
     pub(crate) fn index_pool_guard<'a>(&self, guards: &'a PoolGuards) -> &'a PoolGuard {
@@ -340,20 +233,23 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     }
 
     /// Destroy all mutable memory structures owned by this table runtime.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "fixed catalog tables live until pool shutdown; standalone memory tables need explicit cleanup"
+        )
+    )]
     #[inline]
     pub(crate) async fn destroy(self, guards: &PoolGuards) -> RuntimeResult<()> {
-        let row_pool_guard = self.row_pool_guard(guards);
         let index_pool_guard = self.index_pool_guard(guards);
-        let meta_pool_guard = self.meta_pool_guard(guards);
         let table_id = self.table_id();
         let MemTable {
-            mem_pool,
-            blk_idx,
-            sec_idx,
-            ..
+            row_store, layout, ..
         } = self;
-        for index in sec_idx.into_iter().flatten() {
-            index
+        for entry in layout.into_secondary_indexes().into_iter().flatten() {
+            entry
+                .into_runtime()
                 .destroy(index_pool_guard)
                 .await
                 .change_context(RuntimeError::TableAccess)
@@ -361,615 +257,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                     format!("operation=destroy_secondary_index, table_id={table_id}")
                 })?;
         }
-        blk_idx
-            .destroy(meta_pool_guard, &*mem_pool, row_pool_guard)
-            .await
-            .change_context(RuntimeError::TableAccess)
-            .attach_with(|| format!("operation=destroy_block_index, table_id={table_id}"))
-    }
-
-    /// Unlinks one exact checkpoint-retired row-page prefix from the hot index.
-    #[inline]
-    pub(crate) async fn unlink_retired_row_pages(
-        &self,
-        guards: &PoolGuards,
-        batch: &RetiredRowPageBatch,
-    ) -> RuntimeResult<Box<[PageID]>> {
-        let result = self
-            .blk_idx
-            .prune_checkpoint_prefix(
-                self.meta_pool_guard(guards),
-                batch.start_row_id,
-                batch.end_row_id,
-                &batch.page_ids,
-            )
-            .await
-            .change_context(RuntimeError::TableAccess)
-            .attach_with(|| {
-                format!(
-                    "operation=unlink_retired_row_pages, table_id={}, start_row_id={}, end_row_id={}",
-                    self.table_id(), batch.start_row_id, batch.end_row_id
-                )
-            })?;
-        Ok(result.page_ids)
-    }
-
-    /// Physically deallocates row pages already unlinked from the hot index.
-    #[inline]
-    pub(crate) async fn deallocate_retired_row_pages(
-        &self,
-        guards: &PoolGuards,
-        page_ids: &[PageID],
-    ) -> RuntimeResult<()> {
-        let row_pool_guard = self.row_pool_guard(guards);
-        for page_id in page_ids {
-            let page_guard = self
-                .mem_pool
-                .get_page::<RowPage>(row_pool_guard, *page_id, LatchFallbackMode::Exclusive)
-                .await?
-                .lock_exclusive_async()
-                .await
-                .unwrap_or_else(|| {
-                    panic!(
-                        "unlinked retired row page could not be locked for deallocation: table_id={}, page_id={page_id}",
-                        self.table_id()
-                    )
-                });
-            self.mem_pool.deallocate_page(page_guard);
-        }
-        Ok(())
-    }
-
-    /// Lock an in-memory row page for shared access if it is present.
-    #[inline]
-    pub(crate) async fn get_row_page_shared(
-        &self,
-        guards: &PoolGuards,
-        page_id: PageID,
-    ) -> RuntimeResult<Option<PageSharedGuard<RowPage>>> {
-        Ok(self
-            .mem_pool()
-            .get_page::<RowPage>(
-                self.row_pool_guard(guards),
-                page_id,
-                LatchFallbackMode::Shared,
-            )
-            .await
-            .change_context(RuntimeError::TableAccess)
-            .attach_with(|| {
-                format!(
-                    "operation=get_row_page_shared, table_id={}, page_id={page_id}",
-                    self.table_id()
-                )
-            })?
-            .lock_shared_async()
-            .await)
-    }
-
-    /// Lock a specific row-page version for shared access if it is present.
-    #[inline]
-    pub(crate) async fn get_row_page_versioned_shared(
-        &self,
-        guards: &PoolGuards,
-        page_id: VersionedPageID,
-    ) -> RuntimeResult<Option<PageSharedGuard<RowPage>>> {
-        get_page_versioned_shared::<RowPage, _>(
-            self.mem_pool(),
-            self.row_pool_guard(guards),
-            page_id,
-        )
-        .await
-    }
-
-    /// Pins an optional exact source page before an index exchange can publish a hint.
-    /// A reclaimed source must have a published cold route, which retains fallback.
-    #[inline]
-    pub(super) async fn pin_forward_source(
-        &self,
-        rt: TrxRuntime<'_>,
-        source: Option<&HotForwardSource>,
-    ) -> RuntimeResult<Option<PageSharedGuard<RowPage>>> {
-        let Some(source) = source else {
-            return Ok(None);
-        };
-        let page = self
-            .get_row_page_versioned_shared(rt.pool_guards(), source.page_id)
-            .await?;
-        assert!(
-            page.is_some()
-                || (!self.table_id().is_catalog() && source.row_id < self.pivot_row_id()),
-            "missing forward source requires published cold routing: table_id={}, row_id={}",
-            self.table_id(),
-            source.row_id
-        );
-        Ok(page)
-    }
-
-    /// Restores one exact source slot before rolling back its destination row.
-    #[inline]
-    pub(crate) async fn try_restore_forward_link(
-        &self,
-        undo: &ForwardLinkUndo,
-        guards: &PoolGuards,
-    ) -> RuntimeResult<RowUndoRollbackAttempt> {
-        let Some(page) = self
-            .get_row_page_versioned_shared(guards, undo.source.page_id)
-            .await?
-        else {
-            return Ok(RowUndoRollbackAttempt::PageMissing);
-        };
-        let mut access = page.write_row_by_id(undo.source.row_id);
-        if access.page_state() == RowPageState::Transition {
-            return Ok(RowUndoRollbackAttempt::Transition);
-        }
-        let restored = access.with_forward_source(&undo.source, |links| {
-            links.restore(undo.index, undo.previous);
-        });
-        assert!(
-            restored.is_some(),
-            "forward rollback requires its exact writer-owned source: table_id={}, row_id={}, index={}",
-            self.table_id(),
-            undo.source.row_id,
-            undo.index
-        );
-        Ok(RowUndoRollbackAttempt::Applied)
-    }
-
-    /// Try to roll back one row undo record against its exact hot page.
-    #[inline]
-    pub(crate) async fn try_rollback_hot_row_undo(
-        &self,
-        entry: &mut OwnedRowUndo,
-        guards: &PoolGuards,
-    ) -> RuntimeResult<RowUndoRollbackAttempt> {
-        let page_id = entry
-            .page_id
-            .expect("hot row-undo rollback requires an original page generation");
-        let page_guard = self.get_row_page_versioned_shared(guards, page_id).await?;
-        let Some(page_guard) = page_guard else {
-            return Ok(RowUndoRollbackAttempt::PageMissing);
-        };
-        let page = page_guard.page();
-        let state_guard = page_guard.unwrap_vmap().read_state();
-        if *state_guard == RowPageState::Transition {
-            return Ok(RowUndoRollbackAttempt::Transition);
-        }
-        let metadata = self.metadata();
-        let mut access =
-            page_guard.write_row_with_state_guard(page.row_idx(entry.row_id), state_guard);
-        access.rollback_first_undo(metadata, entry);
-        Ok(RowUndoRollbackAttempt::Applied)
-    }
-
-    /// Lock an in-memory row page for exclusive access if it is present.
-    #[inline]
-    pub(crate) async fn get_row_page_exclusive(
-        &self,
-        guards: &PoolGuards,
-        page_id: PageID,
-    ) -> RuntimeResult<Option<PageExclusiveGuard<RowPage>>> {
-        Ok(self
-            .mem_pool()
-            .get_page::<RowPage>(
-                self.row_pool_guard(guards),
-                page_id,
-                LatchFallbackMode::Exclusive,
-            )
-            .await
-            .change_context(RuntimeError::TableAccess)
-            .attach_with(|| {
-                format!(
-                    "operation=get_row_page_exclusive, table_id={}, page_id={page_id}",
-                    self.table_id()
-                )
-            })?
-            .lock_exclusive_async()
-            .await)
-    }
-
-    /// Lock an existing in-memory row page for shared access.
-    #[inline]
-    pub(crate) async fn must_get_row_page_shared(
-        &self,
-        guards: &PoolGuards,
-        page_id: PageID,
-    ) -> RuntimeResult<PageSharedGuard<RowPage>> {
-        let guard = self.get_row_page_shared(guards, page_id).await?;
-        Ok(guard.unwrap_or_else(|| {
-            panic!(
-                "required published row page could not be locked shared: table_id={}, page_id={page_id}",
-                self.table_id()
-            )
-        }))
-    }
-
-    /// Lock an existing in-memory row page for exclusive access.
-    #[inline]
-    pub(crate) async fn must_get_row_page_exclusive(
-        &self,
-        guards: &PoolGuards,
-        page_id: PageID,
-    ) -> RuntimeResult<PageExclusiveGuard<RowPage>> {
-        let guard = self.get_row_page_exclusive(guards, page_id).await?;
-        Ok(guard.unwrap_or_else(|| {
-            panic!(
-                "required published row page could not be locked exclusive: table_id={}, page_id={page_id}",
-                self.table_id()
-            )
-        }))
-    }
-
-    /// Find or allocate a shared insert page with enough row capacity.
-    #[inline]
-    pub(crate) async fn try_get_insert_page(
-        &self,
-        guards: &PoolGuards,
-        count: usize,
-    ) -> RuntimeResult<PageSharedGuard<RowPage>> {
-        let meta_pool_guard = self.meta_pool_guard(guards);
-        let row_pool_guard = self.row_pool_guard(guards);
-        self.blk_idx
-            .try_get_insert_page(
-                meta_pool_guard,
-                self.mem_pool(),
-                row_pool_guard,
-                &self.metadata.col,
-                count,
-            )
-            .await
-            .change_context(RuntimeError::TableAccess)
-            .attach_with(|| {
-                format!(
-                    "operation=get_insert_page, table_id={}, row_capacity={count}",
-                    self.table_id()
-                )
-            })
-    }
-
-    /// Find or allocate a shared insert page and publish physical creation redo.
-    #[inline]
-    pub(crate) async fn try_get_insert_page_with_redo(
-        &self,
-        guards: &PoolGuards,
-        count: usize,
-        redo_ctx: RowPageCreateRedoCtx<'_>,
-    ) -> RuntimeOrFatalResult<PageSharedGuard<RowPage>> {
-        let meta_pool_guard = self.meta_pool_guard(guards);
-        let row_pool_guard = self.row_pool_guard(guards);
-        self.blk_idx
-            .try_get_insert_page_with_redo(
-                meta_pool_guard,
-                self.mem_pool(),
-                row_pool_guard,
-                &self.metadata.col,
-                count,
-                redo_ctx,
-            )
-            .await
-            .change_runtime_context(RuntimeError::TableAccess)
-            .attach_with(|| {
-                format!(
-                    "operation=get_insert_page_with_redo, table_id={}, row_capacity={count}",
-                    self.table_id()
-                )
-            })
-    }
-
-    /// Find or allocate an exclusive insert page with enough row capacity.
-    #[inline]
-    pub(crate) async fn get_insert_page_exclusive(
-        &self,
-        guards: &PoolGuards,
-        count: usize,
-    ) -> RuntimeResult<PageExclusiveGuard<RowPage>> {
-        let meta_pool_guard = self.meta_pool_guard(guards);
-        let row_pool_guard = self.row_pool_guard(guards);
-        self.blk_idx
-            .get_insert_page_exclusive(
-                meta_pool_guard,
-                self.mem_pool(),
-                row_pool_guard,
-                &self.metadata.col,
-                count,
-            )
-            .await
-            .change_context(RuntimeError::TableAccess)
-            .attach_with(|| {
-                format!(
-                    "operation=get_exclusive_insert_page, table_id={}, row_capacity={count}",
-                    self.table_id()
-                )
-            })
-    }
-
-    /// Allocate and lock a row page at an exact page id.
-    #[inline]
-    pub(crate) async fn allocate_row_page_at(
-        &self,
-        guards: &PoolGuards,
-        count: usize,
-        page_id: PageID,
-    ) -> RuntimeResult<PageExclusiveGuard<RowPage>> {
-        let meta_pool_guard = self.meta_pool_guard(guards);
-        let row_pool_guard = self.row_pool_guard(guards);
-        self.blk_idx
-            .allocate_row_page_at(
-                meta_pool_guard,
-                self.mem_pool(),
-                row_pool_guard,
-                &self.metadata.col,
-                count,
-                page_id,
-            )
-            .await
-            .change_context(RuntimeError::TableAccess)
-            .attach_with(|| {
-                format!(
-                    "operation=allocate_row_page, table_id={}, page_id={page_id}, row_capacity={count}",
-                    self.table_id()
-                )
-            })
-    }
-
-    /// Cache an exclusive insert page for subsequent inserts.
-    #[inline]
-    pub(crate) fn cache_exclusive_insert_page(&self, guard: PageExclusiveGuard<RowPage>) {
-        self.blk_idx.cache_exclusive_insert_page(guard)
-    }
-
-    /// Cache an insert-page version for subsequent inserts.
-    #[inline]
-    pub(crate) fn cache_insert_page_version(&self, page_id: VersionedPageID) {
-        self.blk_idx.cache_insert_page_version(page_id)
-    }
-
-    /// Scans in-memory row pages at or above the current table pivot.
-    ///
-    /// The pivot must be an exact row-page start boundary, unless it equals
-    /// the current row-page-index end and there are no pages left to scan.
-    pub(crate) async fn scan<F>(&self, guards: &PoolGuards, page_action: F) -> RuntimeResult<()>
-    where
-        F: FnMut(PageSharedGuard<RowPage>) -> bool,
-    {
-        let meta_pool_guard = self.meta_pool_guard(guards);
-        let start_row_id = self.pivot_row_id();
-        self.scan_from_with_meta_guard(
-            guards,
-            meta_pool_guard,
-            start_row_id,
-            "mem_scan",
-            page_action,
-        )
-        .await
-    }
-
-    /// Scans in-memory row pages at or above an explicit row-page start boundary.
-    ///
-    /// This intentionally does not consult the current pivot. Callers use it
-    /// when a previously captured table-root snapshot defines the hot-row
-    /// boundary for the scan. The boundary must be an exact row-page start,
-    /// unless it equals the current row-page-index end and there are no pages
-    /// left to scan.
-    pub(crate) async fn scan_from<F>(
-        &self,
-        guards: &PoolGuards,
-        start_row_id: RowID,
-        page_action: F,
-    ) -> RuntimeResult<()>
-    where
-        F: FnMut(PageSharedGuard<RowPage>) -> bool,
-    {
-        let meta_pool_guard = self.meta_pool_guard(guards);
-        self.scan_from_with_meta_guard(
-            guards,
-            meta_pool_guard,
-            start_row_id,
-            "mem_scan_from",
-            page_action,
-        )
-        .await
-    }
-
-    /// Snapshot original row-page descriptors at or above an explicit boundary.
-    ///
-    /// The returned RowID is the exclusive row-page-index upper bound observed
-    /// with the descriptor list. The start must be an exact page boundary, with
-    /// the current index end accepted as an empty snapshot.
-    pub(crate) async fn snapshot_original_row_pages_from(
-        &self,
-        guards: &PoolGuards,
-        start_row_id: RowID,
-    ) -> RuntimeResult<(RowID, Vec<RowPageDescriptor>)> {
-        let operation = "snapshot_original_row_pages";
-        let meta_pool_guard = self.meta_pool_guard(guards);
-        let mut cursor = self.blk_idx.mem_cursor(meta_pool_guard);
-        cursor
-            .seek(start_row_id)
-            .await
-            .change_context(RuntimeError::TableAccess)
-            .attach_with(|| {
-                format!(
-                    "operation={operation}, phase=seek_row_page_index, table_id={}, start_row_id={start_row_id}",
-                    self.table_id()
-                )
-            })?;
-        let mut entries = Vec::new();
-        let mut upper_bound = start_row_id;
-        let mut first_leaf = true;
-        while let Some(leaf) = cursor
-            .next()
-            .await
-            .change_context(RuntimeError::TableAccess)
-            .attach_with(|| {
-                format!(
-                    "operation={operation}, phase=read_row_page_index, table_id={}",
-                    self.table_id()
-                )
-            })?
-        {
-            let guard = leaf.lock_shared_async().await.unwrap_or_else(|| {
-                panic!(
-                    "cursor-held row-page-index leaf could not be locked: operation={operation}, table_id={}, start_row_id={start_row_id}",
-                    self.table_id()
-                )
-            });
-            let page = guard.page();
-            debug_assert!(page.is_leaf());
-            let leaf_entries = page.leaf_entries();
-            let start_idx = if first_leaf {
-                first_leaf = false;
-                if leaf_entries.is_empty() {
-                    if page.header.start_row_id != start_row_id {
-                        return invalid_scan_start(self.table_id(), start_row_id)
-                            .change_context(RuntimeError::TableAccess)
-                            .attach_with(|| {
-                                format!("operation={operation}, table_id={}", self.table_id())
-                            });
-                    }
-                    upper_bound = page.header.end_row_id;
-                    continue;
-                }
-                match leaf_entries.binary_search_by_key(&start_row_id, |entry| entry.row_id) {
-                    Ok(idx) => idx,
-                    Err(_) if page.header.end_row_id == start_row_id => {
-                        upper_bound = start_row_id;
-                        continue;
-                    }
-                    Err(_) => {
-                        return invalid_scan_start(self.table_id(), start_row_id)
-                            .change_context(RuntimeError::TableAccess)
-                            .attach_with(|| {
-                                format!("operation={operation}, table_id={}", self.table_id())
-                            });
-                    }
-                }
-            } else {
-                0
-            };
-            entries.extend_from_slice(&leaf_entries[start_idx..]);
-            upper_bound = page.header.end_row_id;
-        }
-
-        let mut pages = Vec::with_capacity(entries.len());
-        for (idx, entry) in entries.iter().enumerate() {
-            let end_row_id = entries
-                .get(idx + 1)
-                .map(|next| next.row_id)
-                .unwrap_or(upper_bound);
-            assert!(
-                entry.row_id < end_row_id,
-                "block index must produce an increasing original row-page range: table_id={}, start_row_id={}, end_row_id={end_row_id}",
-                self.table_id(),
-                entry.row_id
-            );
-            pages.push(RowPageDescriptor {
-                page_id: entry.page_id,
-                start_row_id: entry.row_id,
-                end_row_id,
-            });
-        }
-        Ok((upper_bound, pages))
-    }
-
-    async fn scan_from_with_meta_guard<F>(
-        &self,
-        guards: &PoolGuards,
-        meta_pool_guard: &PoolGuard,
-        start_row_id: RowID,
-        operation: &'static str,
-        mut page_action: F,
-    ) -> RuntimeResult<()>
-    where
-        F: FnMut(PageSharedGuard<RowPage>) -> bool,
-    {
-        let mut cursor = self.blk_idx.mem_cursor(meta_pool_guard);
-        cursor
-            .seek(start_row_id)
-            .await
-            .change_context(RuntimeError::TableAccess)
-            .attach_with(|| {
-                format!(
-                    "operation={operation}, phase=seek_row_page_index, table_id={}, start_row_id={start_row_id}",
-                    self.table_id()
-                )
-            })?;
-        let mut first_leaf = true;
-        while let Some(leaf) = cursor
-            .next()
-            .await
-            .change_context(RuntimeError::TableAccess)
-            .attach_with(|| {
-                format!(
-                    "operation={operation}, phase=read_row_page_index, table_id={}",
-                    self.table_id()
-                )
-            })?
-        {
-            let g = leaf.lock_shared_async().await.unwrap_or_else(|| {
-                panic!(
-                    "cursor-held row-page-index leaf could not be locked: operation={operation}, table_id={}, start_row_id={start_row_id}",
-                    self.table_id()
-                )
-            });
-            debug_assert!(g.page().is_leaf());
-            let page = g.page();
-            let entries = page.leaf_entries();
-            let start_idx = if first_leaf {
-                first_leaf = false;
-                if entries.is_empty() {
-                    if page.header.start_row_id == start_row_id {
-                        return Ok(());
-                    }
-                    return invalid_scan_start(self.table_id(), start_row_id)
-                        .change_context(RuntimeError::TableAccess)
-                        .attach_with(|| {
-                            format!("operation={operation}, table_id={}", self.table_id())
-                        });
-                }
-                match entries.binary_search_by_key(&start_row_id, |entry| entry.row_id) {
-                    Ok(idx) => idx,
-                    Err(_) if page.header.end_row_id == start_row_id => return Ok(()),
-                    Err(_) => {
-                        return invalid_scan_start(self.table_id(), start_row_id)
-                            .change_context(RuntimeError::TableAccess)
-                            .attach_with(|| {
-                                format!("operation={operation}, table_id={}", self.table_id())
-                            });
-                    }
-                }
-            } else {
-                0
-            };
-            for page_entry in &entries[start_idx..] {
-                let page_guard = self
-                    .must_get_row_page_shared(guards, page_entry.page_id)
-                    .await?;
-                if !page_action(page_guard) {
-                    return Ok(());
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Find the current hot-row location in the in-memory block index.
-    #[inline]
-    pub(crate) async fn find_row(
-        &self,
-        guards: &PoolGuards,
-        row_id: RowID,
-    ) -> RuntimeResult<RowLocation> {
-        let meta_pool_guard = self.meta_pool_guard(guards);
-        self.blk_idx
-            .find_mem_row(meta_pool_guard, row_id)
-            .await
-            .change_context(RuntimeError::TableAccess)
-            .attach_with(|| {
-                format!(
-                    "operation=find_row, table_id={}, row_id={row_id}",
-                    self.table_id()
-                )
-            })
+        row_store.destroy(guards).await
     }
 
     #[inline]
@@ -980,21 +268,12 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     /// Resolves one metadata-proven active slot to its catalog or user index identity.
     #[inline]
     fn resolved_index_ref(&self, index_slot: IndexSlot) -> IndexRef {
-        match self.table_id().kind() {
-            TableKind::Catalog => catalog_index_ref(index_slot),
-            TableKind::User => self
-                .metadata
-                .idx
-                .index_spec(index_slot)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "metadata-proven user index slot is inactive: table_id={}, index_slot={}",
-                        self.table_id(),
-                        index_slot
-                    )
-                })
-                .index,
-        }
+        self.layout.index_entry_at_slot(index_slot)
+            .unwrap_or_else(|err| panic!(
+                "metadata-proven memory index slot is inactive: table_id={}, index_slot={index_slot}, error={err:?}",
+                self.table_id()
+            ))
+            .index_ref()
     }
 
     /// Attaches key values to the resolved identity for retained transaction state.
@@ -1241,11 +520,13 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         let inserter = RowInserter::new(self.table_id(), metadata, rt);
         loop {
             let page_guard = self
+                .row_store
                 .try_get_insert_page(rt.pool_guards(), row_count)
                 .await?;
             match inserter.insert_to_page(effects, page_guard, insert, undo_kind, index_branches) {
                 InsertRowIntoPage::Ok(row_id, page_guard) => {
-                    self.cache_insert_page_version(page_guard.versioned_page_id());
+                    self.row_store
+                        .cache_insert_page_version(page_guard.versioned_page_id());
                     return Ok((row_id, page_guard));
                 }
                 InsertRowIntoPage::NoSpaceOrFrozen(ins, uk, ib) => {
@@ -1270,13 +551,14 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         debug_assert!(old_id != new_id);
         let guards = rt.pool_guards();
         let (old_guard, old_id) = loop {
-            match self.find_row(guards, old_id).await {
+            match self.row_store.find_row(guards, old_id).await {
                 Ok(RowLocation::NotFound) => return Ok(LinkForUniqueIndex::NotNeeded),
                 Ok(RowLocation::LwcBlock(..)) => {
                     catalog_lwc_invariant("link_unique_index", self.table_id(), old_id);
                 }
                 Ok(RowLocation::RowPage(page_id)) => {
                     let Some(old_guard) = self
+                        .row_store
                         .try_get_validated_row_page_shared_result(guards, page_id, old_id)
                         .await?
                     else {
@@ -1390,7 +672,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                         .await?
                     {
                         link @ (LinkForUniqueIndex::NotNeeded | LinkForUniqueIndex::Linked(_)) => {
-                            let source_page = self.pin_forward_source(rt, link.source()).await?;
+                            let source_page = self.row_store.pin_forward_source(rt, link.source()).await?;
                             let index_old_row_id = if deleted {
                                 old_row_id.deleted()
                             } else {
@@ -1476,9 +758,12 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
         row_id: RowID,
-        keys: Vec<SelectKey>,
+        keys: WriteIndexKeySet<'_>,
     ) -> RuntimeResult<()> {
-        for key in keys {
+        for key in keys.into_keys() {
+            let (index, vals) = key.into_parts();
+            // The fixed memory layout keeps this slot bound to the same IndexRef.
+            let key = SelectKey::new(index.slot(), vals);
             let index_slot = key.index_slot;
             let spec = self
                 .metadata()
@@ -1571,29 +856,12 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     }
 
     #[inline]
-    pub(super) async fn try_get_validated_row_page_shared_result(
-        &self,
-        guards: &PoolGuards,
-        page_id: PageID,
-        row_id: RowID,
-    ) -> RuntimeResult<Option<PageSharedGuard<RowPage>>> {
-        let Some(page_guard) = self.get_row_page_shared(guards, page_id).await? else {
-            return Ok(None);
-        };
-        if validate_page_row_range(&page_guard, page_id, row_id) {
-            Ok(Some(page_guard))
-        } else {
-            Ok(None)
-        }
-    }
-
-    #[inline]
     async fn index_purge_decision(
         &self,
         guards: &PoolGuards,
         row_id: RowID,
     ) -> RuntimeResult<Option<PageID>> {
-        match self.find_row(guards, row_id).await? {
+        match self.row_store.find_row(guards, row_id).await? {
             RowLocation::NotFound => Ok(None),
             RowLocation::LwcBlock(..) => {
                 catalog_lwc_invariant("index_purge", self.table_id(), row_id)
@@ -1650,7 +918,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                                 )
                             });
                     };
-                    let Some(page_guard) = self
+                    let Some(page_guard) = self.row_store
                         .try_get_validated_row_page_shared_result(guards, page_id, row_id)
                         .await?
                     else {
@@ -1724,7 +992,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                                 )
                             });
                     };
-                    let Some(page_guard) = self
+                    let Some(page_guard) = self.row_store
                         .try_get_validated_row_page_shared_result(guards, page_id, row_id)
                         .await?
                     else {
@@ -1788,7 +1056,10 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         let row_len = row_len(metadata, cols);
         let row_count = estimate_max_row_count(row_len, metadata.col.col_count());
         loop {
-            let mut page_guard = self.get_insert_page_exclusive(guards, row_count).await?;
+            let mut page_guard = self
+                .row_store
+                .get_insert_page_exclusive(guards, row_count)
+                .await?;
             let page_id = page_guard.page_id();
             let page = page_guard.page_mut();
             debug_assert!(metadata.col.col_count() == page.header.col_count as usize);
@@ -1810,7 +1081,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                 self.insert_index_slot_no_trx(guards, key, row_id).await?;
             }
             row.finish_insert();
-            self.cache_exclusive_insert_page(page_guard);
+            self.row_store.cache_exclusive_insert_page(page_guard);
             return Ok((page_id, row_id));
         }
     }
@@ -1957,7 +1228,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                     .change_context(RuntimeError::TableAccess)
                     .attach("operation=validate_catalog_primary_key_payload"));
             }
-            Some((row_id, _)) => match self.find_row(guards, row_id).await? {
+            Some((row_id, _)) => match self.row_store.find_row(guards, row_id).await? {
                 RowLocation::NotFound => {
                     return Err(Report::new(DataIntegrityError::InvalidPayload)
                         .attach(format!(
@@ -1970,7 +1241,10 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                     catalog_lwc_invariant("delete_primary_key_no_trx", self.table_id(), row_id);
                 }
                 RowLocation::RowPage(page_id) => {
-                    let page_guard = self.must_get_row_page_exclusive(guards, page_id).await?;
+                    let page_guard = self
+                        .row_store
+                        .must_get_row_page_exclusive(guards, page_id)
+                        .await?;
                     (page_guard, row_id)
                 }
             },
@@ -2087,7 +1361,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                     .change_context(RuntimeError::TableAccess)
                     .attach("operation=validate_catalog_primary_key_payload"));
             }
-            Some((row_id, _)) => match self.find_row(guards, row_id).await? {
+            Some((row_id, _)) => match self.row_store.find_row(guards, row_id).await? {
                 RowLocation::NotFound => {
                     return Err(Report::new(DataIntegrityError::InvalidPayload)
                         .attach(format!(
@@ -2100,7 +1374,10 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                     catalog_lwc_invariant("update_primary_key_no_trx", self.table_id(), row_id);
                 }
                 RowLocation::RowPage(page_id) => {
-                    let page_guard = self.must_get_row_page_exclusive(guards, page_id).await?;
+                    let page_guard = self
+                        .row_store
+                        .must_get_row_page_exclusive(guards, page_id)
+                        .await?;
                     (page_guard, row_id)
                 }
             },
@@ -2203,16 +1480,17 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     where
         F: for<'m, 'p> FnMut(&'m TableColumnLayout, Row<'p>) -> bool,
     {
-        self.scan(guards, |page_guard| {
-            let col_layout = page_guard.unwrap_vmap().column_layout.as_ref();
-            for row_access in page_guard.read_all_rows() {
-                if !row_action(col_layout, row_access.row()) {
-                    return false;
+        self.row_store
+            .scan(guards, |page_guard| {
+                let col_layout = page_guard.unwrap_vmap().column_layout.as_ref();
+                for row_access in page_guard.read_all_rows() {
+                    if !row_action(col_layout, row_access.row()) {
+                        return false;
+                    }
                 }
-            }
-            true
-        })
-        .await
+                true
+            })
+            .await
     }
 
     /// Index lookup unique row including uncommitted version.
@@ -2244,13 +1522,16 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         let sts = MIN_SNAPSHOT_TS;
         let (page_guard, row_id) = match index.lookup(key_vals, sts).await? {
             None => return Ok(None),
-            Some((row_id, _)) => match self.find_row(guards, row_id).await? {
+            Some((row_id, _)) => match self.row_store.find_row(guards, row_id).await? {
                 RowLocation::NotFound => return Ok(None),
                 RowLocation::LwcBlock(..) => {
                     catalog_lwc_invariant("unique_uncommitted_lookup", self.table_id(), row_id);
                 }
                 RowLocation::RowPage(page_id) => {
-                    let page_guard = self.must_get_row_page_shared(guards, page_id).await?;
+                    let page_guard = self
+                        .row_store
+                        .must_get_row_page_shared(guards, page_id)
+                        .await?;
                     (page_guard, row_id)
                 }
             },
@@ -2411,7 +1692,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     where
         F: for<'m, 'p> FnMut(&'m TableColumnLayout, Row<'p>) -> bool,
     {
-        let page_id = match self.find_row(guards, candidate.row_id).await? {
+        let page_id = match self.row_store.find_row(guards, candidate.row_id).await? {
             RowLocation::NotFound => return Ok(true),
             RowLocation::LwcBlock(..) => {
                 return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
@@ -2423,7 +1704,10 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             }
             RowLocation::RowPage(page_id) => page_id,
         };
-        let page_guard = self.must_get_row_page_shared(guards, page_id).await?;
+        let page_guard = self
+            .row_store
+            .must_get_row_page_shared(guards, page_id)
+            .await?;
         if !page_guard.page().row_id_in_valid_range(candidate.row_id) {
             return Ok(true);
         }
@@ -2471,13 +1755,16 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                 .enumerate()
                 .all(|(idx, val)| self.metadata().col.col_type_match(idx, val))
         });
-        let keys = self.metadata().idx.keys_for_insert(&cols);
+        let keys = WriteIndexKeySet::from_full_row(&self.layout, &cols);
         let (row_id, page_guard) = self
             .insert_row_internal(rt, effects, cols, RowUndoKind::Insert, Vec::new())
             .await?;
         // Catalog row allocation can already contribute Runtime-or-Fatal;
         // preserve index Operation-or-Runtime until this existing mixed seam.
-        for key in keys {
+        for key in keys.into_keys() {
+            let (index, vals) = key.into_parts();
+            // The fixed memory layout keeps this slot bound to the same IndexRef.
+            let key = SelectKey::new(index.slot(), vals);
             self.insert_index(rt, effects, key, row_id, &page_guard)
                 .await
                 .attach("catalog insert MVCC secondary index claim")?;
@@ -2590,7 +1877,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                 loop {
                     let row_id = selection.row_id();
                     let inspection = 'inspect: {
-                        let page_guard = match self.find_row(guards, row_id).await? {
+                        let page_guard = match self.row_store.find_row(guards, row_id).await? {
                             RowLocation::NotFound => break 'inspect RowInspection::MissingRoute,
                             RowLocation::LwcBlock(..) => {
                                 catalog_lwc_invariant("update_unique_mvcc", self.table_id(), row_id)
@@ -2598,7 +1885,10 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                             RowLocation::RowPage(page_id) => {
                                 // Standalone memory tables keep published row pages
                                 // allocated for the lifetime of the table.
-                                let page = self.must_get_row_page_shared(guards, page_id).await?;
+                                let page = self
+                                    .row_store
+                                    .must_get_row_page_shared(guards, page_id)
+                                    .await?;
                                 assert!(
                                     validate_page_row_range(&page, page_id, row_id),
                                     "standalone MemTable update row page does not match selected row: table_id={}, page_id={page_id}, row_id={row_id}",
@@ -2794,8 +2084,9 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         index_change_cols: &FastHashMap<usize, Val>,
     ) -> OperationOrRuntimeResult<()> {
         let metadata = self.metadata();
-        for (index_slot, index_schema) in metadata.idx.active_indexes() {
-            debug_assert_eq!(self.sec_idx_is_unique(index_slot), index_schema.unique());
+        for (index_schema, entry) in self.layout.active_indexes() {
+            let index_slot = entry.index_ref().slot();
+            debug_assert_eq!(entry.runtime().is_unique(), index_schema.unique());
             if index_key_is_changed(index_schema, index_change_cols) {
                 let new_key = read_latest_index_key(metadata, index_slot, page_guard, row_id);
                 let old_key = index_key_replace(index_schema, &new_key, index_change_cols);
@@ -2827,9 +2118,10 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     ) -> RuntimeResult<()> {
         debug_assert!(old_row_id != new_row_id);
         let metadata = self.metadata();
-        let source_page = self.pin_forward_source(rt, Some(source)).await?;
-        for (index_slot, index_schema) in metadata.idx.active_indexes() {
-            debug_assert_eq!(self.sec_idx_is_unique(index_slot), index_schema.unique());
+        let source_page = self.row_store.pin_forward_source(rt, Some(source)).await?;
+        for (index_schema, entry) in self.layout.active_indexes() {
+            let index_slot = entry.index_ref().slot();
+            debug_assert_eq!(entry.runtime().is_unique(), index_schema.unique());
             let key = read_latest_index_key(metadata, index_slot, page_guard, new_row_id);
             if index_schema.unique() {
                 self.update_unique_index_only_row_id_change(
@@ -2872,9 +2164,10 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         } = movement;
         debug_assert!(old_row_id != new_row_id);
         let metadata = self.metadata();
-        let source_page = self.pin_forward_source(rt, Some(source)).await?;
-        for (index_slot, index_schema) in metadata.idx.active_indexes() {
-            debug_assert_eq!(self.sec_idx_is_unique(index_slot), index_schema.unique());
+        let source_page = self.row_store.pin_forward_source(rt, Some(source)).await?;
+        for (index_schema, entry) in self.layout.active_indexes() {
+            let index_slot = entry.index_ref().slot();
+            debug_assert_eq!(entry.runtime().is_unique(), index_schema.unique());
             let key = read_latest_index_key(metadata, index_slot, page_guard, new_row_id);
             if index_key_is_changed(index_schema, index_change_cols) {
                 let old_key = index_key_replace(index_schema, &key, index_change_cols);
@@ -3137,7 +2430,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                         .await?
                     {
                         link @ (LinkForUniqueIndex::NotNeeded | LinkForUniqueIndex::Linked(_)) => {
-                            let source_page = self.pin_forward_source(rt, link.source()).await?;
+                            let source_page = self.row_store.pin_forward_source(rt, link.source()).await?;
                             match index
                                 .compare_exchange(
                                     &new_key.vals,
@@ -3280,7 +2573,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                 loop {
                     let row_id = selection.row_id();
                     let inspection = 'inspect: {
-                        let page_guard = match self.find_row(guards, row_id).await? {
+                        let page_guard = match self.row_store.find_row(guards, row_id).await? {
                             RowLocation::NotFound => break 'inspect RowInspection::MissingRoute,
                             RowLocation::LwcBlock(..) => {
                                 catalog_lwc_invariant("delete_unique_mvcc", self.table_id(), row_id)
@@ -3288,7 +2581,10 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                             RowLocation::RowPage(page_id) => {
                                 // Standalone memory tables keep published row pages
                                 // allocated for the lifetime of the table.
-                                let page = self.must_get_row_page_shared(guards, page_id).await?;
+                                let page = self
+                                    .row_store
+                                    .must_get_row_page_shared(guards, page_id)
+                                    .await?;
                                 assert!(
                                     validate_page_row_range(&page, page_id, row_id),
                                     "standalone MemTable delete row page does not match selected row: table_id={}, page_id={page_id}, row_id={row_id}",
@@ -3357,8 +2653,8 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                                 // and deletion changed only the row bit. Copy every key
                                 // with one read guard, then release the page latch and
                                 // buffer pin before awaiting secondary-index masking.
-                                let index_keys = read_physical_index_keys_for_delete(
-                                    self.metadata(),
+                                let index_keys = WriteIndexKeySet::from_physical_row(
+                                    &self.layout,
                                     &page_guard,
                                     row_id,
                                 );
@@ -3704,22 +3000,15 @@ fn validate_primary_key_no_trx_key<'a>(
     }
 }
 
-#[inline]
-fn invalid_scan_start<T>(table_id: TableID, start_row_id: RowID) -> InternalResult<T> {
-    Err(Report::new(InternalError::RowPageScanStartInvalid))
-        .attach_with(|| {
-            format!(
-                "table_id={table_id}, start_row_id={start_row_id}, row-page scan start is not a row-page boundary"
-            )
-        })
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{MemTable, NoTrxUpsertChange, catalog_lwc_invariant};
+    use super::{
+        MemTable, MemTableLayout, NoTrxUpsertChange, RowStore, build_in_memory_secondary_indexes,
+        catalog_lwc_invariant,
+    };
     use crate::buffer::guard::PageGuard;
     use crate::buffer::page::VersionedPageID;
-    use crate::buffer::{BufferPool, EvictableBufferPool};
+    use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool};
     use crate::buffer::{PoolGuards, PoolRole};
     use crate::catalog::catalog_key_from_active_ordinal;
     use crate::catalog::{
@@ -3734,6 +3023,7 @@ mod tests {
     use crate::file::cow_file::SUPER_BLOCK_ID;
     use crate::id::{RowID, TableID, TrxID};
     use crate::index::{BlockIndex, IndexLookupCandidate, RowLocation};
+    use crate::quiescent::QuiescentBox;
     use crate::row::RowRead;
     use crate::row::ops::{DeleteMvcc, ReadRow, SelectKey, UpdateCol, UpdateMvcc, UpsertMvcc};
     use crate::session::{
@@ -3756,7 +3046,7 @@ mod tests {
     use crate::value::{Val, ValKind};
     use futures::FutureExt;
     use std::cell::Cell;
-    use std::panic::AssertUnwindSafe;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::ptr::addr_eq;
     use std::rc::Rc;
     use std::sync::Arc;
@@ -3840,19 +3130,23 @@ mod tests {
         )
         .await
         .unwrap();
-        MemTable::new(
-            mem_pool.clone(),
-            mem_pool.row_pool_role(),
+        let indexes = build_in_memory_secondary_indexes(
             engine.inner().pools.index.clone(),
-            PoolRole::Index,
             &index_guard,
-            mem_table_id,
-            metadata,
-            blk_idx,
+            &metadata,
             MIN_SNAPSHOT_TS,
         )
         .await
-        .unwrap()
+        .unwrap();
+        let row_store = RowStore::new(
+            mem_table_id,
+            Arc::clone(&metadata.col),
+            mem_pool.clone(),
+            mem_pool.row_pool_role(),
+            blk_idx,
+        );
+        let layout = MemTableLayout::new_memory(metadata, indexes);
+        MemTable::new(row_store, layout, PoolRole::Index)
     }
 
     fn name_key(value: &str) -> SelectKey {
@@ -3940,6 +3234,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(row, expected);
+    }
+
+    fn fixed_memory_test_pool() -> QuiescentBox<FixedBufferPool> {
+        QuiescentBox::new(FixedBufferPool::with_capacity(PoolRole::Meta, 1024 * 1024).unwrap())
+    }
+
+    fn fixed_layout_metadata(index_id: u32, sparse: bool) -> Arc<TableMetadata> {
+        use crate::catalog::{ActiveIndexSpec, IndexID, IndexRef};
+        let last_slot = if sparse { 2 } else { 1 };
+        Arc::new(
+            TableMetadata::try_new_with_index_slot_count(
+                vec![
+                    StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+                    StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+                ],
+                vec![
+                    ActiveIndexSpec::new(
+                        IndexRef::new(IndexID::new(index_id), IndexSlot::new(0)),
+                        StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::UK),
+                    ),
+                    ActiveIndexSpec::new(
+                        IndexRef::new(
+                            IndexID::new(index_id + u32::from(last_slot)),
+                            IndexSlot::new(last_slot),
+                        ),
+                        StorageIndexSpec::new(
+                            vec![StorageIndexKey::new(1)],
+                            StorageIndexFlags::empty(),
+                        ),
+                    ),
+                ],
+                IndexSlot::new(last_slot + 1),
+            )
+            .unwrap(),
+        )
     }
 
     #[test]
@@ -4056,12 +3385,14 @@ mod tests {
             );
             let guards = session.pool_guards();
             let index_ref = table.resolved_index_ref(IndexSlot::new(0));
-            let RowLocation::RowPage(source_page) = table.find_row(&guards, source).await.unwrap()
+            let RowLocation::RowPage(source_page) =
+                table.row_store.find_row(&guards, source).await.unwrap()
             else {
                 panic!("source must remain hot")
             };
             {
                 let page = table
+                    .row_store
                     .must_get_row_page_shared(&guards, source_page)
                     .await
                     .unwrap();
@@ -4074,12 +3405,16 @@ mod tests {
             }
             // Settle the reader's empty update before inspecting the insertion head.
             reader.commit().await.unwrap();
-            let RowLocation::RowPage(destination_page) =
-                table.find_row(&guards, destination.get()).await.unwrap()
+            let RowLocation::RowPage(destination_page) = table
+                .row_store
+                .find_row(&guards, destination.get())
+                .await
+                .unwrap()
             else {
                 panic!("destination must remain hot")
             };
             let page = table
+                .row_store
                 .must_get_row_page_shared(&guards, destination_page)
                 .await
                 .unwrap();
@@ -5074,6 +4409,7 @@ mod tests {
             .await;
 
             let page_id = match mem_table
+                .row_store
                 .find_row(&session.pool_guards(), row_id)
                 .await
                 .unwrap()
@@ -5083,6 +4419,7 @@ mod tests {
                 RowLocation::LwcBlock(..) => panic!("standalone MemTable should not use LWC"),
             };
             let page_guard = mem_table
+                .row_store
                 .must_get_row_page_shared(&session.pool_guards(), page_id)
                 .await
                 .unwrap();
@@ -5299,6 +4636,7 @@ mod tests {
                     .await
                     .unwrap();
                 let mut page_guard = mem_table
+                    .row_store
                     .must_get_row_page_exclusive(&session.pool_guards(), page_id)
                     .await
                     .unwrap();
@@ -5386,6 +4724,7 @@ mod tests {
             )
             .await;
             let page_id = match mem_table
+                .row_store
                 .find_row(&session.pool_guards(), row_id)
                 .await
                 .unwrap()
@@ -5397,6 +4736,7 @@ mod tests {
 
             for state in [RowPageState::Active, RowPageState::Frozen] {
                 let page_guard = mem_table
+                    .row_store
                     .must_get_row_page_shared(&session.pool_guards(), page_id)
                     .await
                     .unwrap();
@@ -5418,12 +4758,14 @@ mod tests {
 
                 assert_eq!(
                     mem_table
+                        .row_store
                         .try_rollback_hot_row_undo(&mut undo, &session.pool_guards())
                         .await
                         .unwrap(),
                     RowUndoRollbackAttempt::Applied
                 );
                 let page_guard = mem_table
+                    .row_store
                     .must_get_row_page_shared(&session.pool_guards(), page_id)
                     .await
                     .unwrap();
@@ -5432,6 +4774,7 @@ mod tests {
             }
 
             let page_guard = mem_table
+                .row_store
                 .must_get_row_page_shared(&session.pool_guards(), page_id)
                 .await
                 .unwrap();
@@ -5459,12 +4802,14 @@ mod tests {
 
             assert_eq!(
                 mem_table
+                    .row_store
                     .try_rollback_hot_row_undo(&mut undo, &session.pool_guards())
                     .await
                     .unwrap(),
                 RowUndoRollbackAttempt::Transition
             );
             let page_guard = mem_table
+                .row_store
                 .must_get_row_page_shared(&session.pool_guards(), page_id)
                 .await
                 .unwrap();
@@ -5495,6 +4840,7 @@ mod tests {
             drop(page_guard);
             assert_eq!(
                 mem_table
+                    .row_store
                     .try_rollback_hot_row_undo(&mut undo, &session.pool_guards())
                     .await
                     .unwrap(),
@@ -5502,6 +4848,7 @@ mod tests {
             );
 
             let page_guard = mem_table
+                .row_store
                 .must_get_row_page_shared(&session.pool_guards(), page_id)
                 .await
                 .unwrap();
@@ -5520,6 +4867,7 @@ mod tests {
             );
             assert_eq!(
                 mem_table
+                    .row_store
                     .try_rollback_hot_row_undo(&mut stale_undo, &session.pool_guards())
                     .await
                     .unwrap(),
@@ -5588,7 +4936,7 @@ mod tests {
             let mut later_pivot = captured_pivot;
             let mut explicit_count = 0usize;
             table
-                .mem
+                .row_store
                 .scan_from(&session.pool_guards(), captured_pivot, |page_guard| {
                     let page = page_guard.page();
                     explicit_count += page.header.approx_non_deleted();
@@ -5602,7 +4950,7 @@ mod tests {
 
             let interior_start = captured_pivot + 2;
             let err = table
-                .mem
+                .row_store
                 .scan_from(&session.pool_guards(), interior_start, |_| true)
                 .await
                 .unwrap_err();
@@ -5617,15 +4965,15 @@ mod tests {
             // later checkpoint may reclaim pages once no transaction root protects
             // them, which is outside this helper's direct contract.
             table
-                .mem
+                .row_store
                 .blk_idx()
                 .update_column_root(later_pivot, SUPER_BLOCK_ID)
                 .await;
-            assert_eq!(table.mem.pivot_row_id(), later_pivot);
+            assert_eq!(table.row_store.pivot_row_id(), later_pivot);
 
             let mut current_hot_pages = 0usize;
             table
-                .mem
+                .row_store
                 .scan(&session.pool_guards(), |_| {
                     current_hot_pages += 1;
                     true
@@ -5633,6 +4981,184 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(current_hot_pages, 0);
+        });
+    }
+
+    #[test]
+    fn test_fixed_memory_layout_identity_and_resource_cleanup() {
+        use crate::catalog::{CATALOG_TABLE_ID_START, CatalogTable};
+
+        smol::block_on(async {
+            for (table_id, index_id) in [(CATALOG_TABLE_ID_START, 0), (test_user_table_id(301), 73)]
+            {
+                for sparse in [false, true] {
+                    let pool = fixed_memory_test_pool();
+                    let guards = PoolGuards::builder()
+                        .push(PoolRole::Meta, pool.create_base_guard())
+                        .build();
+                    let metadata = fixed_layout_metadata(index_id, sparse);
+                    let block_index = BlockIndex::new(
+                        pool.guard(),
+                        guards.meta_guard(),
+                        RowID::new(0),
+                        SUPER_BLOCK_ID,
+                    )
+                    .await
+                    .unwrap();
+                    let table = if table_id.is_catalog() {
+                        CatalogTable::new(
+                            pool.guard(),
+                            guards.meta_guard(),
+                            table_id,
+                            block_index,
+                            Arc::clone(&metadata),
+                        )
+                        .await
+                        .unwrap()
+                        .mem
+                    } else {
+                        let indexes = build_in_memory_secondary_indexes(
+                            pool.guard(),
+                            guards.meta_guard(),
+                            &metadata,
+                            MIN_SNAPSHOT_TS,
+                        )
+                        .await
+                        .unwrap();
+                        let row_store = RowStore::new(
+                            table_id,
+                            Arc::clone(&metadata.col),
+                            pool.guard(),
+                            pool.row_pool_role(),
+                            block_index,
+                        );
+                        let layout = MemTableLayout::new_memory(Arc::clone(&metadata), indexes);
+                        MemTable::new(row_store, layout, PoolRole::Meta)
+                    };
+                    assert_eq!(table.layout.generation(), 0);
+                    assert!(Arc::ptr_eq(&metadata, table.layout.metadata_arc()));
+                    assert!(Arc::ptr_eq(&metadata.col, table.row_store.column_layout()));
+                    let indexes = table
+                        .layout
+                        .active_indexes()
+                        .map(|(spec, entry)| {
+                            assert_eq!(entry.index_ref(), spec.index);
+                            assert_eq!(entry.runtime().is_unique(), spec.unique());
+                            assert_eq!(table.resolved_index_ref(spec.index.slot()), spec.index);
+                            spec.index
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(indexes.len(), 2);
+                    assert_eq!(indexes[0].id().get(), index_id);
+                    table
+                        .insert_no_trx(&guards, &[Val::from(1i32), Val::from(2i32)], false)
+                        .await
+                        .unwrap();
+                    assert!(
+                        table
+                            .require_unique_index(&guards, IndexSlot::new(0))
+                            .unwrap()
+                            .lookup(&[Val::from(1i32)], MIN_SNAPSHOT_TS)
+                            .await
+                            .unwrap()
+                            .is_some()
+                    );
+                    assert!(pool.allocated() > 0);
+                    table.destroy(&guards).await.unwrap();
+                    assert_eq!(
+                        pool.allocated(),
+                        0,
+                        "fixed memory destruction must reclaim row and index pages"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn test_memory_layout_rejects_mismatched_runtime_kinds() {
+        smol::block_on(async {
+            let pool = fixed_memory_test_pool();
+            let guard = pool.create_base_guard();
+            let metadata = fixed_layout_metadata(73, true);
+            let mut indexes =
+                build_in_memory_secondary_indexes(pool.guard(), &guard, &metadata, MIN_SNAPSHOT_TS)
+                    .await
+                    .unwrap();
+            indexes.swap(0, 2);
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| MemTableLayout::new_memory(
+                    metadata, indexes
+                )))
+                .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn test_catalog_identity_is_rejected_before_index_allocation() {
+        use crate::catalog::{CATALOG_TABLE_ID_START, CatalogTable};
+
+        smol::block_on(async {
+            let pool = fixed_memory_test_pool();
+            let guard = pool.create_base_guard();
+            let block_index = BlockIndex::new(pool.guard(), &guard, RowID::new(0), SUPER_BLOCK_ID)
+                .await
+                .unwrap();
+            let allocated_before = pool.allocated();
+            let result = AssertUnwindSafe(CatalogTable::new(
+                pool.guard(),
+                &guard,
+                CATALOG_TABLE_ID_START,
+                block_index,
+                fixed_layout_metadata(73, false),
+            ))
+            .catch_unwind()
+            .await;
+            assert!(result.is_err());
+            assert_eq!(
+                pool.allocated(),
+                allocated_before,
+                "invalid catalog identity allocated index pages"
+            );
+        });
+    }
+
+    #[test]
+    fn test_catalog_construction_reclaims_row_store_on_index_build_failure() {
+        use crate::buffer::frame::BufferFrame;
+        use crate::buffer::page::Page;
+        use crate::catalog::{CATALOG_TABLE_ID_START, CatalogTable};
+        use std::mem::size_of;
+
+        smol::block_on(async {
+            // The row-page index and first secondary index fit; the second
+            // secondary index exhausts the pool and must release both owners.
+            let pool_bytes = 2 * (size_of::<BufferFrame>() + size_of::<Page>());
+            let pool = QuiescentBox::new(
+                FixedBufferPool::with_capacity(PoolRole::Meta, pool_bytes).unwrap(),
+            );
+            let guard = pool.create_base_guard();
+            let block_index = BlockIndex::new_catalog(pool.guard(), &guard).await.unwrap();
+            assert_eq!(pool.allocated(), 1);
+            let result = CatalogTable::new(
+                pool.guard(),
+                &guard,
+                CATALOG_TABLE_ID_START,
+                block_index,
+                fixed_layout_metadata(0, false),
+            )
+            .await;
+            let err = match result {
+                Ok(_) => panic!("second secondary index must exhaust the two-page catalog pool"),
+                Err(err) => err,
+            };
+            assert_eq!(err.current_context(), &RuntimeError::CatalogAccess);
+            assert_eq!(
+                err.downcast_ref::<ResourceError>(),
+                Some(&ResourceError::BufferPoolFull)
+            );
+            assert_eq!(pool.allocated(), 0);
         });
     }
 

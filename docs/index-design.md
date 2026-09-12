@@ -46,6 +46,21 @@ durable, runtime, and provisional gates have all cleared, while stable index IDs
 remain monotonically consumed. This lifecycle lock is not consulted by
 foreground lookup, scan, insert, update, or delete.
 
+`TableRuntimeLayout<R>` is the common immutable metadata/runtime binding for
+user and memory tables. Construction validates sparse slot shape, exact index
+references, the active ID map, and runtime kind; user runtimes also validate
+their physical slots. Active iteration pairs each specification with its exact
+runtime entry in physical-slot order. These operations borrow the existing
+layout without allocating an operation-local runtime container.
+
+User layouts share dual-tree index owners across DDL generations. Fixed memory
+layouts directly own their indexes and remain at generation zero. Catalog
+metadata must identify every active index by its fixed slot before runtimes are
+built. A memory user table instead keeps its metadata-assigned IndexIDs. Pool
+type and memory residency do not select the identity rule. Table admission and
+ownership qualify this table-local binding; persisted-root and row-ownership
+proofs remain with the callers that perform index reads and mutations.
+
 ### Mutable B-tree deletion and layout ownership
 
 The caller that owns an index entry also owns the semantic proof that permits

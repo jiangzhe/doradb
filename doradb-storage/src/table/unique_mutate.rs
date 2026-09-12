@@ -2,9 +2,10 @@
 //!
 //! Read-current selection is shared with MemTable; snapshot readers never use it.
 
-use super::access::{LazyRow, LazyRowBuffer, LazyRowSource, UserTableAccessor, WriteIndexKeySet};
+use super::access::{LazyRow, LazyRowBuffer, LazyRowSource, UserTableAccessor};
 use super::deletion_buffer::DeletionState;
 use super::hot::{DeleteInternal, HotRowLock, HotRowMutator};
+use super::index_key::WriteIndexKeySet;
 use super::{DmlValidator, TableRootSnapshot, validate_page_row_range};
 use crate::buffer::guard::PageSharedGuard;
 use crate::catalog::IndexRef;
@@ -218,7 +219,7 @@ impl<'a, 'op, 'r> UniqueMutator<'a, 'op, 'r> {
                             // This active transaction prevents checkpoint
                             // retirement from reclaiming the selected hot page.
                             let page = accessor
-                                .mem()
+                                .row_store()
                                 .must_get_row_page_shared(rt.pool_guards(), page_id)
                                 .await
                                 .disclose()?;
@@ -455,7 +456,7 @@ impl<'a, 'op, 'r> UniqueMutator<'a, 'op, 'r> {
                     matches!(result, DeleteInternal::Ok),
                     "retained unique row must remain deletable: row_id={row_id}"
                 );
-                let keys = WriteIndexKeySet::from_physical_row(accessor, page, row_id);
+                let keys = WriteIndexKeySet::from_physical_row(accessor.layout(), page, row_id);
                 return Ok(HotMutationResult::Deleted(keys));
             }
             UniqueMutation::Insert(_) => unreachable!("validated occupied actions cannot insert"),
@@ -523,7 +524,8 @@ impl<'a, 'op, 'r> UniqueMutator<'a, 'op, 'r> {
             UniqueMutation::Delete => {
                 // Decode indexed columns directly; a constant delete never
                 // initializes dense callback scratch.
-                let keys = WriteIndexKeySet::from_cold_row(accessor, block, location.row_idx)
+                let keys = accessor
+                    .index_keys_from_cold_row(block, location.row_idx)
                     .change_context(RuntimeError::TableAccess)
                     .disclose()?;
                 drop(persisted);
@@ -887,12 +889,13 @@ mod tests {
         destination: RowID,
         expected: &[(u16, RowID, &str)],
     ) {
-        let RowLocation::RowPage(page_id) = table.mem.find_row(guards, destination).await.unwrap()
+        let RowLocation::RowPage(page_id) =
+            table.row_store.find_row(guards, destination).await.unwrap()
         else {
             panic!("move destination must remain hot");
         };
         let page = table
-            .mem
+            .row_store
             .must_get_row_page_shared(guards, page_id)
             .await
             .unwrap();
@@ -1050,7 +1053,7 @@ mod tests {
             };
             let mut trx = session.begin_trx().unwrap();
             let mut page = table
-                .mem
+                .row_store
                 .must_get_row_page_exclusive(&guards, page_id)
                 .await
                 .unwrap();
@@ -1073,7 +1076,7 @@ mod tests {
             .await;
 
             let mut page = table
-                .mem
+                .row_store
                 .must_get_row_page_exclusive(&guards, page_id)
                 .await
                 .unwrap();
@@ -1165,7 +1168,7 @@ mod tests {
             // Match the production reader after ownership admission rejects the
             // source's restored current key and exposes its old departure.
             let page = table
-                .mem
+                .row_store
                 .must_get_row_page_shared(&guards, source_page)
                 .await
                 .unwrap();
@@ -1750,7 +1753,7 @@ mod tests {
                 "only source restoration may block before the destination is undone"
             );
             let exclusive = table
-                .mem
+                .row_store
                 .get_row_page_exclusive(&guards, source_page.page_id)
                 .await
                 .unwrap()
@@ -2109,13 +2112,13 @@ mod tests {
                 );
                 let guards = session.pool_guards();
                 let RowLocation::RowPage(page_id) =
-                    table.mem.find_row(&guards, ids[0]).await.unwrap()
+                    table.row_store.find_row(&guards, ids[0]).await.unwrap()
                 else {
                     panic!("source must remain hot")
                 };
                 {
                     let page = table
-                        .mem
+                        .row_store
                         .must_get_row_page_shared(&guards, page_id)
                         .await
                         .unwrap();
@@ -2386,12 +2389,12 @@ mod tests {
                 let layout = table.layout_snapshot();
                 let guards = session.pool_guards();
                 let RowLocation::RowPage(page_id) =
-                    table.mem.find_row(&guards, ids[0]).await.unwrap()
+                    table.row_store.find_row(&guards, ids[0]).await.unwrap()
                 else {
                     panic!("deleted source must remain hot");
                 };
                 let page = table
-                    .mem
+                    .row_store
                     .must_get_row_page_shared(&guards, page_id)
                     .await
                     .unwrap();
@@ -3176,7 +3179,7 @@ mod tests {
                         "yield must follow the first rejection before another lookup or row inspection"
                     );
                     let page = table
-                        .mem
+                        .row_store
                         .must_get_row_page_shared(&guards, source_page)
                         .await
                         .unwrap();

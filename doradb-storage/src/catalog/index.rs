@@ -242,7 +242,7 @@ impl<'a> CreateIndexCollector<'a> {
         assert_create_index_block_index_snapshot(
             table.table_id(),
             (pivot_row_id, column_block_index_root),
-            table.mem.blk_idx().column_route_snapshot(),
+            table.row_store.blk_idx().column_route_snapshot(),
         );
         let key_encoder =
             secondary_disk_tree_encoder(layout.metadata(), index_spec, !index_spec.unique());

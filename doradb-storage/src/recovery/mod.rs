@@ -958,7 +958,7 @@ impl<'a> RecoveryCoordinator<'a> {
             .change_context(RuntimeError::Recovery)?;
         let count = end_row_id - start_row_id;
         let mut page_guard = table
-            .mem
+            .row_store
             .allocate_row_page_at(&self.resources.pool_guards, count as usize, page_id)
             .await?;
         // Here we switch row page to recover mode.
