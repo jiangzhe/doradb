@@ -41,6 +41,7 @@ pub(crate) enum IndexInsert {
 impl IndexInsert {
     /// Returns whether the insert attempt succeeded.
     #[inline]
+    #[cfg(test)]
     pub(crate) fn is_ok(&self) -> bool {
         matches!(self, IndexInsert::Ok(_))
     }
@@ -809,20 +810,6 @@ impl<'a, 'g, P: BufferPool> NonUniqueSecondaryIndex<'a, 'g, P> {
         ts: TrxID,
     ) -> RuntimeResult<IndexMask> {
         self.mem.mask_if_present(key, row_id, ts).await
-    }
-
-    /// Insert one exact entry into MemIndex without consulting DiskTree.
-    #[inline]
-    pub(crate) async fn insert_mem_if_not_exists(
-        &self,
-        key: &[Val],
-        row_id: RowID,
-        merge_if_match_deleted: bool,
-        ts: TrxID,
-    ) -> RuntimeResult<IndexInsert> {
-        self.mem
-            .insert_if_not_exists(key, row_id, merge_if_match_deleted, ts)
-            .await
     }
 }
 
@@ -1899,11 +1886,9 @@ mod tests {
                 root
             );
             assert_eq!(index.disk_runtime().index_slot(), IndexSlot::new(1));
+            let non_unique_mem_bound = index.non_unique_mem().unwrap().bind(&index_guard);
             assert!(
-                index
-                    .non_unique_mem()
-                    .unwrap()
-                    .bind(&index_guard)
+                non_unique_mem_bound
                     .lookup_unique(&key1, RowID::new(12), TrxID::new(3))
                     .await
                     .unwrap()
@@ -1911,8 +1896,8 @@ mod tests {
             );
             let hot_insert_start = disk_pool.global_stats();
             assert_eq!(
-                bound
-                    .insert_mem_if_not_exists(&key1, RowID::new(100), false, TrxID::new(4))
+                non_unique_mem_bound
+                    .insert_if_not_exists(&key1, RowID::new(100), false, TrxID::new(4))
                     .await
                     .unwrap(),
                 IndexInsert::Ok(false)
@@ -1927,8 +1912,8 @@ mod tests {
                     .unwrap()
             );
             assert_eq!(
-                bound
-                    .insert_mem_if_not_exists(&key1, RowID::new(10), false, TrxID::new(4))
+                non_unique_mem_bound
+                    .insert_if_not_exists(&key1, RowID::new(10), false, TrxID::new(4))
                     .await
                     .unwrap(),
                 IndexInsert::Ok(false)
@@ -1969,7 +1954,6 @@ mod tests {
                     .unwrap(),
                 None
             );
-            let non_unique_mem_bound = index.non_unique_mem().unwrap().bind(&index_guard);
             assert!(
                 non_unique_mem_bound
                     .mask_as_active(&key1, RowID::new(10), TrxID::new(5))
@@ -1985,15 +1969,15 @@ mod tests {
                 test_row_ids([10, 11, 12])
             );
             assert!(
-                bound
-                    .insert_mem_if_not_exists(&key1, RowID::new(13), false, TrxID::new(6))
+                non_unique_mem_bound
+                    .insert_if_not_exists(&key1, RowID::new(13), false, TrxID::new(6))
                     .await
                     .unwrap()
                     .is_ok()
             );
             assert_eq!(
-                bound
-                    .insert_mem_if_not_exists(&key2, RowID::new(20), false, TrxID::new(7))
+                non_unique_mem_bound
+                    .insert_if_not_exists(&key2, RowID::new(20), false, TrxID::new(7))
                     .await
                     .unwrap(),
                 IndexInsert::Ok(false)
@@ -2245,9 +2229,10 @@ mod tests {
                 );
                 drop(stream);
 
+                let non_unique_mem_bound = index.non_unique_mem().unwrap().bind(&index_guard);
                 assert!(
-                    bound
-                        .insert_mem_if_not_exists(&key1, RowID::new(13), false, TrxID::new(5))
+                    non_unique_mem_bound
+                        .insert_if_not_exists(&key1, RowID::new(13), false, TrxID::new(5))
                         .await
                         .unwrap()
                         .is_ok()

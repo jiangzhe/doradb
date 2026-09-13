@@ -436,18 +436,6 @@ pub(crate) fn catalog_index_slot(index: IndexRef) -> CatalogIndexNo {
     index.slot()
 }
 
-/// Builds a catalog key after metadata has established an active fixed ordinal.
-#[inline]
-pub(crate) fn catalog_key_from_active_ordinal(
-    index_ordinal: usize,
-    vals: Vec<Val>,
-) -> CatalogSelectKey {
-    let index_slot = CatalogIndexNo::try_from(index_ordinal).unwrap_or_else(|_| {
-        panic!("active catalog index ordinal exceeds u16: index_ordinal={index_ordinal}")
-    });
-    CatalogSelectKey::new(index_slot, vals)
-}
-
 /// Builds a retained user key from an already admitted exact reference.
 #[inline]
 pub(crate) fn user_key_from_index_ref(index: IndexRef, vals: Vec<Val>) -> ResolvedIndexKey {

@@ -1,4 +1,4 @@
-use super::index_key_is_changed;
+use super::{DmlValidator, index_key_is_changed};
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::catalog::{CatalogSelectKey, IndexRef, IndexSlot, TableMetadata};
 use crate::error::{FatalResult, OperationError, OperationOrFatalResult};
@@ -6,7 +6,7 @@ use crate::id::{RowID, TableID};
 use crate::log::redo::{RowRedo, RowRedoKind};
 use crate::map::FastHashMap;
 use crate::poison::PoisonAwareListener;
-use crate::row::ops::{RowUpdateInput, SelectKey, UndoCol, UpdateCol, UpdateRow};
+use crate::row::ops::{SelectKey, UndoCol, UpdateCol, UpdateRow};
 use crate::row::{RowPage, RowRead, var_len_for_insert};
 use crate::trx::row::{BoundIndexCandidate, LockRowForWrite, LockUndo, RowWriteAccess};
 use crate::trx::stmt::StmtEffects;
@@ -33,10 +33,10 @@ pub(super) enum UpdateRowInplace {
     // for other columns in the changed index, we can read value(old and new are same)
     // from current page.
     Ok(RowID, FastHashMap<usize, Val>),
-    RowNotFound(RowUpdateInput),
-    RowDeleted(RowUpdateInput),
-    RetryInTransition(RowUpdateInput),
-    NoFreeSpaceOrFrozen(RowID, Vec<Val>, RowUpdateInput),
+    RowNotFound,
+    RowDeleted,
+    RetryInTransition,
+    NoFreeSpaceOrFrozen(RowID, Vec<Val>, Vec<UpdateCol>),
 }
 
 /// Result of deleting one hot row.
@@ -511,28 +511,17 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
     pub(super) async fn update_known_row(
         &self,
         effects: &mut StmtEffects,
-        update: RowUpdateInput,
+        update: Vec<UpdateCol>,
     ) -> OperationOrFatalResult<UpdateRowInplace> {
         self.update_known_row_inner(effects, update, None, None)
             .await
-    }
-
-    /// Update a row whose provisional undo lock and write latch are retained.
-    #[inline]
-    pub(super) fn update_owned_row(
-        &self,
-        effects: &mut StmtEffects,
-        update: RowUpdateInput,
-        access: RowWriteAccess<'g>,
-    ) -> UpdateRowInplace {
-        self.finish_update_owned(effects, update, None, access)
     }
 
     #[inline]
     async fn update_known_row_inner(
         &self,
         effects: &mut StmtEffects,
-        update: RowUpdateInput,
+        update: Vec<UpdateCol>,
         lookup_key: Option<(IndexSlot, &[Val])>,
         redo_key: Option<CatalogSelectKey>,
     ) -> OperationOrFatalResult<UpdateRowInplace> {
@@ -540,13 +529,15 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
         let row_id = self.row_id;
         let page = page_guard.page();
         debug_assert!(
-            update.as_view().is_valid_for(self.metadata.col.as_ref()),
+            DmlValidator::new(self.metadata)
+                .validate_sparse_update(&update)
+                .is_ok(),
             "row update values must be ordered, in range, and type-compatible"
         );
         if row_id < page.header.start_row_id
             || row_id >= page.header.start_row_id + page.header.max_row_count as u64
         {
-            return Ok(UpdateRowInplace::RowNotFound(update));
+            return Ok(UpdateRowInplace::RowNotFound);
         }
         // Modification is a current read: update the latest physical page
         // image, never an older version reconstructed from MVCC undo. The image
@@ -554,11 +545,11 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
         // path also rejects stale index candidates whose latest key differs.
         let mut lock_row = self.lock_for_write(effects, lookup_key).await?;
         match &mut lock_row {
-            LockRowForWrite::InvalidIndex => Ok(UpdateRowInplace::RowNotFound(update)),
+            LockRowForWrite::InvalidIndex => Ok(UpdateRowInplace::RowNotFound),
             LockRowForWrite::WriteConflict => Err(Report::new(OperationError::WriteConflict)
                 .attach("update MVCC row-page write lock")
                 .into()),
-            LockRowForWrite::RetryInTransition => Ok(UpdateRowInplace::RetryInTransition(update)),
+            LockRowForWrite::RetryInTransition => Ok(UpdateRowInplace::RetryInTransition),
             LockRowForWrite::Ok(access) => {
                 let access = access
                     .take()
@@ -573,21 +564,23 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
     pub(super) fn finish_update_owned(
         &self,
         effects: &mut StmtEffects,
-        update: RowUpdateInput,
+        update: Vec<UpdateCol>,
         redo_key: Option<CatalogSelectKey>,
         mut access: RowWriteAccess<'g>,
     ) -> UpdateRowInplace {
         let row_id = self.row_id;
         let page_id = self.page_guard.page_id();
         debug_assert!(
-            update.as_view().is_valid_for(self.metadata.col.as_ref()),
+            DmlValidator::new(self.metadata)
+                .validate_sparse_update(&update)
+                .is_ok(),
             "row update values must be ordered, in range, and type-compatible"
         );
         if access.row().is_deleted() {
-            return UpdateRowInplace::RowDeleted(update);
+            return UpdateRowInplace::RowDeleted;
         }
         let frozen = access.page_state() == RowPageState::Frozen;
-        match access.update_row(self.metadata.col.as_ref(), update.as_view(), frozen) {
+        match access.update_row(self.metadata.col.as_ref(), &update, frozen) {
             UpdateRow::NoFreeSpaceOrFrozen(old_row) => {
                 access.delete_row();
                 effects.update_last_row_undo(RowUndoKind::delete());
@@ -645,7 +638,7 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
     pub(super) fn prepare_move_update<F>(
         &self,
         old_row: Vec<Val>,
-        update: RowUpdateInput,
+        update: Vec<UpdateCol>,
         mut branch: F,
     ) -> PreparedHotMoveUpdate
     where
@@ -658,35 +651,18 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
         // `Delete`, so this path is logically delete-old plus insert-new.
         let (new_row, undo_vals, index_change_cols) = {
             let mut index_change_cols = FastHashMap::default();
-            match update {
-                RowUpdateInput::Sparse(update) => {
-                    let mut undo_vals = Vec::with_capacity(update.len());
-                    let mut row = old_row;
-                    for UpdateCol { idx, val } in update {
-                        if row[idx] != val {
-                            let old_val = replace(&mut row[idx], val);
-                            if self.metadata.idx.index_columns().contains(&idx) {
-                                index_change_cols.insert(idx, old_val.clone());
-                            }
-                            undo_vals.push(UpdateCol { idx, val: old_val });
-                        }
+            let mut undo_vals = Vec::with_capacity(update.len());
+            let mut row = old_row;
+            for UpdateCol { idx, val } in update {
+                if row[idx] != val {
+                    let old_val = replace(&mut row[idx], val);
+                    if self.metadata.idx.index_columns().contains(&idx) {
+                        index_change_cols.insert(idx, old_val.clone());
                     }
-                    (row, undo_vals, index_change_cols)
-                }
-                RowUpdateInput::FullRow(row) => {
-                    let mut undo_vals = Vec::with_capacity(row.len());
-                    debug_assert!(row.len() == old_row.len());
-                    for (idx, old_val) in old_row.into_iter().enumerate() {
-                        if old_val != row[idx] {
-                            if self.metadata.idx.index_columns().contains(&idx) {
-                                index_change_cols.insert(idx, old_val.clone());
-                            }
-                            undo_vals.push(UpdateCol { idx, val: old_val });
-                        }
-                    }
-                    (row, undo_vals, index_change_cols)
+                    undo_vals.push(UpdateCol { idx, val: old_val });
                 }
             }
+            (row, undo_vals, index_change_cols)
         };
         let (index_branches, source) = {
             // Unchanged unique keys use direct RowID exchange, so their backward

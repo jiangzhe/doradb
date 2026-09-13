@@ -794,12 +794,12 @@ fn merge_update_cols(vals: &mut Vec<UpdateCol>, upd_cols: Vec<UpdateCol>) {
 mod tests {
     use super::*;
     use crate::buffer::test_page_id;
-    use crate::catalog::catalog_key_from_active_ordinal;
+    use crate::catalog::CatalogIndexNo;
     use crate::error::DataIntegrityError;
 
     #[test]
     fn test_catalog_keyed_row_redo_golden_bytes() {
-        let key = catalog_key_from_active_ordinal(1, vec![Val::U64(11)]);
+        let key = CatalogSelectKey::new(CatalogIndexNo::new(1), vec![Val::U64(11)]);
         let delete = RowRedo {
             row_id: RowID::new(7),
             kind: RowRedoKind::DeleteByPrimaryKey(key.clone()),
@@ -1040,7 +1040,7 @@ mod tests {
 
     #[test]
     fn test_row_redo_variants_round_trip_and_reject_truncation() {
-        let key = catalog_key_from_active_ordinal(0, vec![Val::U64(7)]);
+        let key = CatalogSelectKey::new(CatalogIndexNo::new(0), vec![Val::U64(7)]);
         let cases = [
             RowRedo {
                 row_id: RowID::new(1),
@@ -1306,7 +1306,7 @@ mod tests {
 
     #[test]
     fn test_row_redo_kind_update_by_primary_key_serde() {
-        let key = catalog_key_from_active_ordinal(0, vec![Val::U64(7)]);
+        let key = CatalogSelectKey::new(CatalogIndexNo::new(0), vec![Val::U64(7)]);
         let kind = RowRedoKind::UpdateByPrimaryKey(
             key.clone(),
             vec![
@@ -1348,7 +1348,7 @@ mod tests {
 
     #[test]
     fn test_table_dml_update_by_primary_key_merge() {
-        let key = catalog_key_from_active_ordinal(0, vec![Val::U64(1)]);
+        let key = CatalogSelectKey::new(CatalogIndexNo::new(0), vec![Val::U64(1)]);
         let mut table = TableDML::default();
         table.insert(RowRedo {
             row_id: RowID::new(10),

@@ -605,7 +605,10 @@ mod tests {
                 UniqueMutationOutcome::Updated(_)
             ));
             write.rollback().await.unwrap();
-            assert_eq!(TableRuntimeLayout::index_access_counters(), (0, 1, 0));
+            // The shared hot key-change pass pairs metadata with existing
+            // runtimes. Selector admission still uses one direct validation
+            // and no IndexID map lookup.
+            assert_eq!(TableRuntimeLayout::index_access_counters(), (0, 1, 1));
 
             TableRuntimeLayout::reset_index_access_counters();
             let mut delete = session.begin_trx().unwrap();

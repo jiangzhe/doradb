@@ -383,7 +383,7 @@ impl RowPage {
         if self.row(row_idx).is_deleted() {
             return Update::Deleted;
         }
-        let var_len = self.var_len_for_update(row_idx, RowUpdateView::Sparse(cols));
+        let var_len = self.var_len_for_update(row_idx, cols);
         let var_offset = if let Some(var_offset) = self.request_free_space(var_len) {
             var_offset
         } else {
@@ -416,11 +416,11 @@ impl RowPage {
 
     /// Returns additional variable-length bytes needed to update an existing row.
     #[inline]
-    pub(crate) fn var_len_for_update(&self, row_idx: usize, update: RowUpdateView<'_>) -> usize {
+    pub(crate) fn var_len_for_update(&self, row_idx: usize, update: &[UpdateCol]) -> usize {
         let row = self.row(row_idx);
         update
             .iter()
-            .map(|item| match item.val {
+            .map(|item| match &item.val {
                 Val::VarByte(var) => {
                     let col = row.var(item.idx);
                     let orig_var_len = PageVar::outline_len(col);
@@ -1391,7 +1391,7 @@ pub(crate) trait RowRead {
 
     /// Returns additional variable length space required for this update.
     #[inline]
-    fn var_len_for_update(&self, update: RowUpdateView<'_>) -> usize {
+    fn var_len_for_update(&self, update: &[UpdateCol]) -> usize {
         self.page().var_len_for_update(self.row_idx(), update)
     }
 

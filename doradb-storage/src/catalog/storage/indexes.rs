@@ -14,7 +14,7 @@ use crate::error::{
 };
 use crate::id::TableID;
 use crate::map::FastHashSet;
-use crate::row::ops::DeleteMvcc;
+use crate::row::ops::{UniqueMutation, UniqueMutationOutcome};
 use crate::row::{Row, RowRead};
 use crate::table::IndexLookupCriteria;
 use crate::trx::PrivateTransaction;
@@ -76,14 +76,20 @@ impl Indexes<'_> {
     ) -> RuntimeOrFatalResult<bool> {
         let key_vals = vec![Val::from(table_id), Val::from(index_id.get())];
         let res = trx
-            .catalog_delete_primary_key_mvcc(self.table, PK_NO_INDEXES, key_vals)
+            .catalog_primary_key_mutate_mvcc(self.table, PK_NO_INDEXES, key_vals, |row| {
+                Ok(if row.is_some() {
+                    UniqueMutation::Delete
+                } else {
+                    UniqueMutation::Skip
+                })
+            })
             .await
             .attach_with(|| {
                 format!(
                     "operation=catalog_indexes_delete, table_id={table_id}, index_id={index_id}"
                 )
             })?;
-        Ok(matches!(res, DeleteMvcc::Deleted))
+        Ok(matches!(res, UniqueMutationOutcome::Deleted))
     }
 
     /// Deletes all active indexes for one table.

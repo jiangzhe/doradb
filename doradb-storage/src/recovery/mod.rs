@@ -1327,10 +1327,11 @@ mod tests {
     use crate::catalog::storage::publish_first_redo_log_seq_for_test;
     use crate::catalog::storage::tests::begin_catalog_test_trx;
     use crate::catalog::{
-        ActiveIndexSpec, ColumnID, ColumnOrdinal, IndexID, IndexObject, IndexOrder, IndexRef,
-        IndexSlot, SecondaryIndexRoot, SecondaryIndexSlot, StorageColumnFlags, StorageColumnSpec,
-        StorageIndexFlags, StorageIndexKey, StorageIndexSpec, StorageTableSpec, TableIndexKeySpec,
-        TableMetadata, TableObject, USER_TABLE_ID_START, catalog_key_from_active_ordinal,
+        ActiveIndexSpec, CatalogIndexNo, CatalogSelectKey, ColumnID, ColumnOrdinal, IndexID,
+        IndexObject, IndexOrder, IndexRef, IndexSlot, SecondaryIndexRoot, SecondaryIndexSlot,
+        StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
+        StorageIndexSpec, StorageTableSpec, TableIndexKeySpec, TableMetadata, TableObject,
+        USER_TABLE_ID_START,
     };
     use crate::component::EnginePools;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
@@ -2086,15 +2087,15 @@ mod tests {
         let cases = [
             (
                 "DeleteByPrimaryKey",
-                RowRedoKind::DeleteByPrimaryKey(catalog_key_from_active_ordinal(
-                    0,
+                RowRedoKind::DeleteByPrimaryKey(CatalogSelectKey::new(
+                    CatalogIndexNo::new(0),
                     vec![Val::from(42u64)],
                 )),
             ),
             (
                 "UpdateByPrimaryKey",
                 RowRedoKind::UpdateByPrimaryKey(
-                    catalog_key_from_active_ordinal(0, vec![Val::from(42u64)]),
+                    CatalogSelectKey::new(CatalogIndexNo::new(0), vec![Val::from(42u64)]),
                     vec![UpdateCol {
                         idx: 1,
                         val: Val::from(7u64),

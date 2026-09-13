@@ -1,5 +1,5 @@
 use crate::catalog::{IndexSlot, PrimaryKeyMatchError, TableIndexMetadata, TableMetadata};
-use crate::row::ops::{RowUpdateView, UpdateCol};
+use crate::row::ops::UpdateCol;
 use crate::value::Val;
 use error_stack::Report;
 use std::ops::{Bound, RangeBounds};
@@ -100,7 +100,6 @@ impl<'m> DmlValidator<'m> {
             }
             last_idx = Some(update_col.idx);
         }
-        debug_assert!(RowUpdateView::Sparse(update).is_valid_for(self.metadata.col.as_ref()));
         Ok(())
     }
 
@@ -269,5 +268,63 @@ impl<'m> DmlValidator<'m> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DmlValidationError, DmlValidator};
+    use crate::catalog::{StorageColumnFlags, StorageColumnSpec, TableMetadata};
+    use crate::row::ops::UpdateCol;
+    use crate::value::{Val, ValKind};
+
+    #[test]
+    fn test_sparse_update_validates_order_bounds_and_types() {
+        let metadata = TableMetadata::try_new(
+            vec![
+                StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
+            ],
+            vec![],
+        )
+        .unwrap();
+        let validator = DmlValidator::new(&metadata);
+        let cases = [
+            ("empty", vec![], true),
+            (
+                "ordered",
+                vec![(0, Val::from(10i32)), (2, Val::from(42u64))],
+                true,
+            ),
+            (
+                "unordered",
+                vec![(2, Val::from(42u64)), (0, Val::from(10i32))],
+                false,
+            ),
+            (
+                "duplicate column",
+                vec![(0, Val::from(10i32)), (0, Val::from(11i32))],
+                false,
+            ),
+            ("out of range", vec![(3, Val::from(42u64))], false),
+            ("type mismatch", vec![(0, Val::from("not an i32"))], false),
+            ("non-nullable column", vec![(0, Val::Null)], false),
+        ];
+        for (case, cols, valid) in cases {
+            let update: Vec<UpdateCol> = cols
+                .into_iter()
+                .map(|(idx, val)| UpdateCol { idx, val })
+                .collect();
+            let result = validator.validate_sparse_update(&update);
+            assert_eq!(result.is_ok(), valid, "case={case}, result={result:?}");
+            if let Err(err) = result {
+                assert_eq!(
+                    err.current_context(),
+                    &DmlValidationError::SparseUpdate,
+                    "case={case}"
+                );
+            }
+        }
     }
 }

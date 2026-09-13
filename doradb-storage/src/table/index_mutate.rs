@@ -16,7 +16,7 @@ use crate::error::{
 use crate::id::{PageID, RowID};
 use crate::index::{LwcRowLocation, RowLocation};
 use crate::row::RowPage;
-use crate::row::ops::{RowMutation, RowUpdateInput, TableMutationOutcome, UpdateCol};
+use crate::row::ops::{RowMutation, TableMutationOutcome, UpdateCol};
 use crate::table::dml_validator::DmlValidator;
 use crate::table::hot::{DeleteInternal, HotRowMutator, ResumeOwnedRow};
 use crate::table::{DeleteMarker, DeletionClaim, DeletionError, TableRootSnapshot};
@@ -337,7 +337,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                             self.effects,
                             candidate.row_id,
                             old_row,
-                            RowUpdateInput::Sparse(update),
+                            update,
                             self.root_snapshot,
                         )
                         .await
@@ -532,7 +532,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                             self.effects,
                             row_id,
                             old_row,
-                            RowUpdateInput::Sparse(update),
+                            update,
                             self.root_snapshot,
                         )
                         .await
@@ -556,7 +556,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                 self.effects,
                 page_guard,
                 access,
-                RowUpdateInput::Sparse(update),
+                update,
                 self.root_snapshot,
             )
             .await

@@ -7,7 +7,7 @@ use crate::index::{BTreeKey, BTreeKeyEncoder, IndexLookupCandidate};
 use crate::map::FastHashMap;
 use crate::poison::PoisonAwareListener;
 use crate::recovery::RowRecoveryMap;
-use crate::row::ops::{ReadRow, RowUpdateView, SelectKey, UndoCol, UndoVal, UpdateCol, UpdateRow};
+use crate::row::ops::{ReadRow, SelectKey, UndoCol, UndoVal, UpdateCol, UpdateRow};
 use crate::row::{Row, RowMut, RowPage, RowRead};
 use crate::trx::stmt::StmtEffects;
 use crate::trx::undo::{
@@ -1107,7 +1107,7 @@ impl<'a> RowWriteAccess<'a> {
     pub(crate) fn update_row(
         &self,
         col_layout: &TableColumnLayout,
-        update: RowUpdateView<'_>,
+        update: &[UpdateCol],
         frozen: bool,
     ) -> UpdateRow<'_> {
         if frozen {
