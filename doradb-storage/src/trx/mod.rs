@@ -53,7 +53,8 @@ use crate::error::{
     CompletionErrorBridge, DiscloseError, DiscloseResultExt, Error, FatalError, FatalResult,
     LifecycleError, LifecycleOrFatalError, LifecycleOrFatalResult, LifecycleResult,
     MultiDomainResultExt, OperationOrFatalResult, OperationResult, QuadResult, ResourceError,
-    Result, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, SharedFatalError,
+    Result, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
+    SharedFatalError,
 };
 use crate::id::{RowID, SessionID, SessionOperationKey, TableID, TrxID};
 use crate::lock::{
@@ -66,8 +67,9 @@ use crate::map::FastHashMap;
 use crate::notify::EventNotifyOnDrop;
 use crate::obs;
 use crate::poison::PoisonAwareListener;
-use crate::row::ops::DeleteMvcc;
+use crate::row::ops::{UniqueMutation, UniqueMutationOutcome};
 use crate::session::{SessionRuntime, TrxAttachment, WeakSessionRef};
+use crate::table::LazyRow;
 use crate::trx::undo::{
     IndexPurgeEntry, IndexUndoLogs, RowUndoHead, RowUndoLogs, RowUndoRollbackContext, UndoStatus,
 };
@@ -522,14 +524,18 @@ impl PrivateTransaction {
 
     /// Delete one exact catalog primary-key row through one owned statement.
     #[inline]
-    pub(crate) async fn catalog_delete_primary_key_mvcc(
+    pub(crate) async fn catalog_primary_key_mutate_mvcc<F>(
         &mut self,
         table: &CatalogTable,
-        index_slot: CatalogIndexNo,
+        index: CatalogIndexNo,
         key_vals: Vec<Val>,
-    ) -> RuntimeOrFatalResult<DeleteMvcc> {
+        decide: F,
+    ) -> RuntimeOrFatalResult<UniqueMutationOutcome>
+    where
+        F: for<'row> FnOnce(Option<&mut LazyRow<'row>>) -> RuntimeResult<UniqueMutation>,
+    {
         self.exec(async move |stmt| {
-            stmt.catalog_delete_primary_key_mvcc(table, index_slot, &key_vals, true)
+            stmt.catalog_primary_key_mutate_mvcc(table, index, &key_vals, decide)
                 .await
         })
         .await
@@ -558,7 +564,7 @@ impl PrivateTransaction {
         index_slot: CatalogIndexNo,
         key_vals: Vec<Val>,
         cols: Vec<Val>,
-    ) -> RuntimeOrFatalResult<DeleteMvcc> {
+    ) -> RuntimeOrFatalResult<bool> {
         self.exec(async move |stmt| {
             stmt.catalog_replace_primary_key_mvcc(table, index_slot, &key_vals, cols)
                 .await
@@ -3705,7 +3711,7 @@ pub(crate) mod tests {
     use crate::log::redo::{RowRedo, RowRedoKind};
     use crate::quiescent::QuiescentGuard;
     use crate::row::RowPage;
-    use crate::row::ops::{DeleteMvcc, SelectKey, UpdateCol, UpdateMvcc, UpsertMvcc};
+    use crate::row::ops::{SelectKey, UniqueMutationOutcome, UpdateCol};
     use crate::session::{
         Session, SessionRegistry, SessionShutdownWait,
         tests::{
@@ -3883,7 +3889,7 @@ pub(crate) mod tests {
         trx: &mut Transaction,
         mem_table: &MemTable<EvictableBufferPool, EvictableBufferPool>,
         cols: Vec<Val>,
-    ) -> Result<UpsertMvcc> {
+    ) -> Result<UniqueMutationOutcome> {
         trx.exec(async move |stmt| {
             stmt_tests::mem_table_upsert_unique_mvcc(stmt, mem_table, cols).await
         })
@@ -3896,7 +3902,7 @@ pub(crate) mod tests {
         mem_table: &MemTable<EvictableBufferPool, EvictableBufferPool>,
         key: &SelectKey,
         update: Vec<UpdateCol>,
-    ) -> Result<UpdateMvcc> {
+    ) -> Result<UniqueMutationOutcome> {
         trx.exec(async move |stmt| {
             stmt_tests::mem_table_update_unique_mvcc(stmt, mem_table, key, update).await
         })
@@ -3908,28 +3914,9 @@ pub(crate) mod tests {
         trx: &mut Transaction,
         mem_table: &MemTable<EvictableBufferPool, EvictableBufferPool>,
         key: &SelectKey,
-    ) -> Result<DeleteMvcc> {
+    ) -> Result<UniqueMutationOutcome> {
         trx.exec(async move |stmt| {
             stmt_tests::mem_table_delete_unique_mvcc(stmt, mem_table, key).await
-        })
-        .await
-    }
-
-    /// Apply one index-only key change through production statement settlement.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn mem_table_duplicate_index_key_change(
-        trx: &mut Transaction,
-        mem_table: &MemTable<EvictableBufferPool, EvictableBufferPool>,
-        page_guard: PageSharedGuard<RowPage>,
-        row_id: RowID,
-        old_key: SelectKey,
-        new_key: SelectKey,
-    ) -> Result<()> {
-        trx.exec(async move |stmt| {
-            stmt_tests::mem_table_duplicate_index_key_change(
-                stmt, mem_table, page_guard, row_id, old_key, new_key,
-            )
-            .await
         })
         .await
     }

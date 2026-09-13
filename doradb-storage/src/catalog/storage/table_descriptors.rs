@@ -11,7 +11,7 @@ use crate::error::{
 };
 use crate::id::TableID;
 use crate::row::RowRead;
-use crate::row::ops::DeleteMvcc;
+use crate::row::ops::{UniqueMutation, UniqueMutationOutcome};
 use crate::trx::PrivateTransaction;
 use crate::value::{Val, ValKind};
 use error_stack::{Report, ResultExt};
@@ -146,7 +146,7 @@ impl TableDescriptors<'_> {
                     descriptor.table_id
                 )
             })?;
-        Ok(matches!(result, DeleteMvcc::Deleted))
+        Ok(result)
     }
 
     /// Deletes a descriptor if the dropped table was managed.
@@ -156,16 +156,23 @@ impl TableDescriptors<'_> {
         table_id: TableID,
     ) -> RuntimeOrFatalResult<bool> {
         let result = trx
-            .catalog_delete_primary_key_mvcc(
+            .catalog_primary_key_mutate_mvcc(
                 self.table,
                 PK_NO_TABLE_DESCRIPTORS,
                 vec![Val::from(table_id)],
+                |row| {
+                    Ok(if row.is_some() {
+                        UniqueMutation::Delete
+                    } else {
+                        UniqueMutation::Skip
+                    })
+                },
             )
             .await
             .attach_with(|| {
                 format!("operation=catalog_table_descriptors_delete, table_id={table_id}")
             })?;
-        Ok(matches!(result, DeleteMvcc::Deleted))
+        Ok(matches!(result, UniqueMutationOutcome::Deleted))
     }
 }
 

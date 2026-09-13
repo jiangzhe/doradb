@@ -13,8 +13,6 @@ use crate::error::{
     RuntimeOrFatalResult, RuntimeResult,
 };
 use crate::id::TableID;
-#[cfg(test)]
-use crate::row::ops::DeleteMvcc;
 use crate::row::{Row, RowRead};
 use crate::table::IndexLookupCriteria;
 use crate::trx::PrivateTransaction;
@@ -81,26 +79,6 @@ impl Columns<'_> {
                 .attach("operation=list_catalog_columns, phase=decode_row"));
         }
         Ok(res)
-    }
-
-    /// Delete a column by `(table_id, column_id)`.
-    #[cfg(test)]
-    pub(crate) async fn delete_by_id(
-        &self,
-        trx: &mut PrivateTransaction,
-        table_id: TableID,
-        column_id: ColumnID,
-    ) -> RuntimeOrFatalResult<bool> {
-        let key_vals = vec![Val::from(table_id), Val::from(column_id.get())];
-        let res = trx
-            .catalog_delete_primary_key_mvcc(self.table, PK_NO_COLUMNS, key_vals)
-            .await
-            .attach_with(|| {
-                format!(
-                    "operation=catalog_columns_delete, table_id={table_id}, column_id={column_id}"
-                )
-            })?;
-        Ok(matches!(res, DeleteMvcc::Deleted))
     }
 
     /// Delete all columns for one table and return the number of deleted rows.
@@ -276,163 +254,6 @@ mod tests {
     use crate::log::redo::DDLRedo;
     use crate::session::tests::SessionTestExt;
     use tempfile::TempDir;
-
-    #[test]
-    fn test_columns_delete_by_id() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_path_buf();
-            let engine = open_catalog_test_engine(main_dir, None).await;
-            let session = engine.new_session().unwrap();
-
-            let col_42_0 = ColumnObject {
-                table_id: TableID::new(42),
-                column_id: ColumnID::new(0),
-                storage_ordinal: ColumnOrdinal::new(0),
-                value_kind: ValKind::U32,
-                value_flags: StorageColumnFlags::empty(),
-            };
-            let col_42_1 = ColumnObject {
-                table_id: TableID::new(42),
-                column_id: ColumnID::new(1),
-                storage_ordinal: ColumnOrdinal::new(1),
-                value_kind: ValKind::U64,
-                value_flags: StorageColumnFlags::empty(),
-            };
-            let col_43_0 = ColumnObject {
-                table_id: TableID::new(43),
-                column_id: ColumnID::new(0),
-                storage_ordinal: ColumnOrdinal::new(0),
-                value_kind: ValKind::U16,
-                value_flags: StorageColumnFlags::empty(),
-            };
-
-            let mut trx = begin_catalog_test_trx(&session);
-            engine
-                .inner()
-                .core
-                .catalog()
-                .storage
-                .columns()
-                .insert_batch(trx.trx(), &[col_42_0, col_42_1, col_43_0])
-                .await
-                .unwrap();
-            trx.commit(DDLRedo::CreateTable(TableID::new(42))).await;
-
-            let mut trx = begin_catalog_test_trx(&session);
-            assert!(
-                engine
-                    .inner()
-                    .core
-                    .catalog()
-                    .storage
-                    .columns()
-                    .delete_by_id(trx.trx(), TableID::new(42), ColumnID::new(1))
-                    .await
-                    .unwrap()
-            );
-            assert!(
-                !engine
-                    .inner()
-                    .core
-                    .catalog()
-                    .storage
-                    .columns()
-                    .delete_by_id(trx.trx(), TableID::new(42), ColumnID::new(9))
-                    .await
-                    .unwrap()
-            );
-            trx.commit(DDLRedo::DropTable(TableID::new(42))).await;
-
-            let cols_42 = engine
-                .inner()
-                .core
-                .catalog()
-                .storage
-                .columns()
-                .list_uncommitted_by_table_id(&session.pool_guards(), TableID::new(42))
-                .await
-                .unwrap();
-            assert_eq!(cols_42.len(), 1);
-            assert_eq!(cols_42[0].column_id, ColumnID::new(0));
-
-            let cols_43 = engine
-                .inner()
-                .core
-                .catalog()
-                .storage
-                .columns()
-                .list_uncommitted_by_table_id(&session.pool_guards(), TableID::new(43))
-                .await
-                .unwrap();
-            assert_eq!(cols_43.len(), 1);
-            assert_eq!(cols_43[0].column_id, ColumnID::new(0));
-
-            let mut trx = begin_catalog_test_trx(&session);
-            assert!(
-                !engine
-                    .inner()
-                    .core
-                    .catalog()
-                    .storage
-                    .columns()
-                    .delete_by_id(trx.trx(), TableID::new(42), ColumnID::new(1))
-                    .await
-                    .unwrap()
-            );
-            assert!(
-                engine
-                    .inner()
-                    .core
-                    .catalog()
-                    .storage
-                    .columns()
-                    .delete_by_id(trx.trx(), TableID::new(42), ColumnID::new(0))
-                    .await
-                    .unwrap()
-            );
-            assert!(
-                engine
-                    .inner()
-                    .core
-                    .catalog()
-                    .storage
-                    .columns()
-                    .delete_by_id(trx.trx(), TableID::new(43), ColumnID::new(0))
-                    .await
-                    .unwrap()
-            );
-            trx.commit(DDLRedo::DropTable(TableID::new(42))).await;
-
-            assert!(
-                engine
-                    .inner()
-                    .core
-                    .catalog()
-                    .storage
-                    .columns()
-                    .list_uncommitted_by_table_id(&session.pool_guards(), TableID::new(42))
-                    .await
-                    .unwrap()
-                    .is_empty()
-            );
-            assert!(
-                engine
-                    .inner()
-                    .core
-                    .catalog()
-                    .storage
-                    .columns()
-                    .list_uncommitted_by_table_id(&session.pool_guards(), TableID::new(43))
-                    .await
-                    .unwrap()
-                    .is_empty()
-            );
-
-            drop(session);
-            drop(engine);
-        });
-    }
 
     #[test]
     fn test_columns_delete_by_table_id_counts_and_is_idempotent() {

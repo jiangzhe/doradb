@@ -13,7 +13,7 @@ use crate::error::{
     RuntimeOrFatalResult, RuntimeResult,
 };
 use crate::id::TableID;
-use crate::row::ops::DeleteMvcc;
+use crate::row::ops::{UniqueMutation, UniqueMutationOutcome};
 use crate::row::{Row, RowRead};
 use crate::trx::PrivateTransaction;
 use crate::value::Val;
@@ -140,10 +140,16 @@ impl Tables<'_> {
         id: TableID,
     ) -> RuntimeOrFatalResult<bool> {
         let res = trx
-            .catalog_delete_primary_key_mvcc(self.table, PK_NO_TABLES, vec![Val::from(id)])
+            .catalog_primary_key_mutate_mvcc(self.table, PK_NO_TABLES, vec![Val::from(id)], |row| {
+                Ok(if row.is_some() {
+                    UniqueMutation::Delete
+                } else {
+                    UniqueMutation::Skip
+                })
+            })
             .await
             .attach_with(|| format!("operation=catalog_tables_delete, table_id={id}"))?;
-        Ok(matches!(res, DeleteMvcc::Deleted))
+        Ok(matches!(res, UniqueMutationOutcome::Deleted))
     }
 
     /// Replace the table metadata row through one delete-then-insert statement.
@@ -169,7 +175,7 @@ impl Tables<'_> {
                     obj.table_id
                 )
             })?;
-        Ok(matches!(res, DeleteMvcc::Deleted))
+        Ok(res)
     }
 }
 

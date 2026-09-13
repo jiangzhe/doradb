@@ -7,10 +7,10 @@ Centralize unique MVCC row selection and mutation execution for user tables and 
 ## Reference
 
 - User discussion on 2026-09-10 during task000300 review: repeated changes to hot-row selection exposed duplicate orchestration in MemTable and UniqueMutator. The user selected removal of legacy MemTable APIs and a separate follow-up, then requested a backlog item without further design.
-- [Task 000300: Fix stale unique read-current lookups across row replacement](../tasks/000300-fix-stale-unique-read-current-lookups-across-row-replacement.md).
-- [Task 000301: Refactor Memory Table Metadata and Runtime Layouts](../tasks/000301-refactor-memory-table-metadata-and-runtime-layouts.md), the implemented metadata prerequisite that intentionally leaves this execution work open.
-- [Task 000299: Unify Unique-Key MVCC Mutation API](../tasks/000299-unify-unique-key-mvcc-mutation-api.md), which explicitly retained internal catalog/MemTable contracts.
-- Historical context: [closed backlog 000140](closed/000140-share-table-accessor-lookup-mvcc-logic.md), implemented by [task000204](../tasks/000204-share-table-lookup-mutation-paths.md).
+- [Task 000300: Fix stale unique read-current lookups across row replacement](../../tasks/000300-fix-stale-unique-read-current-lookups-across-row-replacement.md).
+- [Task 000301: Refactor Memory Table Metadata and Runtime Layouts](../../tasks/000301-refactor-memory-table-metadata-and-runtime-layouts.md), the implemented metadata prerequisite that intentionally leaves this execution work open.
+- [Task 000299: Unify Unique-Key MVCC Mutation API](../../tasks/000299-unify-unique-key-mvcc-mutation-api.md), which explicitly retained internal catalog/MemTable contracts.
+- Historical context: [closed backlog 000140](000140-share-table-accessor-lookup-mvcc-logic.md), implemented by [task000204](../../tasks/000204-share-table-lookup-mutation-paths.md).
 - `doradb-storage/src/table/unique_mutate.rs`: UniqueMutator, CurrentRowSelection, callback and owned-action dispatch.
 - `doradb-storage/src/table/mem_table.rs`: update_unique_mvcc_input, update_unique_mvcc, upsert_unique_mvcc, delete_unique_mvcc, move-update and index-maintenance continuations.
 - `doradb-storage/src/table/hot.rs` and `doradb-storage/src/table/access.rs`: shared row admission, owned hot/cold mutation, lazy rows, and user-table layout/root handling.
@@ -18,9 +18,9 @@ Centralize unique MVCC row selection and mutation execution for user tables and 
 
 ## Deferred From (Optional)
 
-[Task 000300](../tasks/000300-fix-stale-unique-read-current-lookups-across-row-replacement.md), implementation review in worktree `.worktrees/000300`.
+[Task 000300](../../tasks/000300-fix-stale-unique-read-current-lookups-across-row-replacement.md), implementation review in worktree `.worktrees/000300`.
 
-[Task 000301](../tasks/000301-refactor-memory-table-metadata-and-runtime-layouts.md), the independently implemented metadata prerequisite selected during review in worktree `.worktrees/000301`.
+[Task 000301](../../tasks/000301-refactor-memory-table-metadata-and-runtime-layouts.md), the independently implemented metadata prerequisite selected during review in worktree `.worktrees/000301`.
 
 ## Deferral Context (Optional)
 
@@ -45,3 +45,19 @@ Both user-table and mem/catalog unique mutations use one selection and action-di
 ## Notes (Optional)
 
 The open backlog duplicate scan matched 000087 (recovery replay), 000104 (CREATE INDEX builds), 000109 (block reclamation policy), and 000196 (stale unique lookup correctness) by shared keywords; none covers this execution/API consolidation. Backlog000196 remains the correctness source for task000300. Closed backlog000140 is historical context, not an open item to merge or reopen.
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000302-share-unique-mutation-and-insert-execution-across-catalog-and-user-tables.md.
+
+  The shared unique driver and hot/insert executor now serve both table families,
+  with typed catalog callbacks and atomic batch/replacement compositions. User
+  review superseded the original full-row update-input requirement: callback
+  upsert uses full-row Insert on absence and sparse Update on occupancy, so the
+  unused update wrappers were removed. Behavioral coverage and validation are
+  recorded in the resolved task.
+
+- Closed By: backlog close
+- Reference: docs/tasks/000302-share-unique-mutation-and-insert-execution-across-catalog-and-user-tables.md
+- Closed At: 2026-09-13

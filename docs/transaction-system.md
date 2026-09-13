@@ -593,8 +593,29 @@ preserve exact IndexRefs, active slot order, and the operation lifetime. Row
 ownership and user persisted-root proofs remain separate mutation inputs.
 Physical hot undo uses RowStore's column layout; index rollback selects its
 index guard directly and resolves memory indexes through their fixed layout.
-Catalog key-based redo, statement settlement, and the existing user and memory
-mutation drivers retain their contracts.
+A borrowed `MutationExecutor` shares hot actions, physical insertion retries,
+complete index insertion, and move continuations. `HotUpdatePage` distinguishes
+the pin transferred by unique selection from pins retained by scan cursors.
+Move preparation releases its source pin before replacement allocation. Complete
+insertion derives keys once before page retries; moves perform physical
+insertion followed by their own index continuation.
+
+`UniqueMutator` drives both user and memory/catalog current selection. Each user
+attempt captures a compatible root through UserTableAccessor; memory attempts
+have no persisted-root state. Cold selection and action continuation remain in
+the user accessor. Cold replacement inserts under the same root that governed
+its deletion effects.
+
+Private catalog primary-key callbacks return typed Runtime reports and use the
+same decisions and outcomes as public unique mutation. The driver retains a
+native Quad carrier until the catalog policy boundary; application callbacks
+retain their separate public Engine/User carrier. Catalog validation is always
+enabled, and the selected primary key is captured before callback updates for
+key-based redo. Batch deletion admits and locks once in one statement.
+Replacement deletes if present, then inserts unconditionally in that same
+statement and returns whether an old row existed. Direct insertion adds no
+point lookup. Ordinary catalog operation errors remain invariant failures;
+optimistic batch insertion preserves expected duplicate and write conflicts.
 
 Public programmable row callbacks return `CallbackResult<Decision, E>`.
 Engine row-access failures convert to `CallbackError::Engine`; application

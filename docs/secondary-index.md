@@ -496,10 +496,13 @@ Root-bound writes are deliberately narrower:
 - consuming a Mem observation uses `compare_exchange_mem`;
 - consuming a Disk observation uses `replace_or_insert_mem`, which atomically
   revalidates a competing Mem owner or inserts on true Mem absence;
-- proof-bound non-unique insertion uses `insert_mem_if_not_exists`;
 - proof-bound non-unique masking uses `mask_mem_if_present` and retains
   `Masked`, `AlreadyMasked`, or `NotFound`;
 - physical purge uses `compare_delete_mem`.
+
+Hot non-unique insertion binds a guarded MemIndex directly and calls
+`insert_if_not_exists` after the shared executor checks that the destination
+row is hot.
 
 Rollback, recovery, catalog build, and catalog-table access bind guarded
 MemIndex views directly. Their inherent mutation methods cannot probe
@@ -524,6 +527,23 @@ before another transaction can independently own the row.
 This current-row completeness invariant applies to every active secondary
 index. Unique and non-unique `CREATE INDEX` both establish it from current
 committed rows only, using one captured root and pivot for the cold/hot split.
+
+Shared hot execution borrows unique/non-unique MemIndex runtimes from each
+layout's exact entries. A consuming `OwnedHotIndexSet` retains the complete key
+set and, for user tables, the captured-root borrow. Its user constructor consumes
+only RowPage/MemRequired authority; CDB ownership cannot create this hot proof,
+even for a cold row above an older root's pivot. Memory construction binds
+stable hot ownership to the fixed layout. Shared masking and unchanged-key
+replacement require the exact active MemIndex owner and fail a release
+invariant on absence or mismatch.
+
+Hot destination claims share one insertion/exchange loop. Memory claims retain
+the exact runtime, key, owner, and delete state; composite claims consume the
+existing `UniqueOwnerObservation` without a second DiskTree read. Shared hot
+history inspection builds backward branches, pins any writer-owned departure,
+registers exchange undo, and publishes its forward link synchronously. User
+code alone decides whether a cold owner is reusable and builds its terminal
+branch. Repeated in-place rekeying retains same-RowID delete-shadow merging.
 
 After definitive RowPage write ownership or current-LWC validation plus CDB
 ownership, operations that consume every old index entry create one opaque,

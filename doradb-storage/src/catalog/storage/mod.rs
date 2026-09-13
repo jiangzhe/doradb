@@ -1479,7 +1479,7 @@ pub(crate) mod tests {
         ManagedCreateTableDefinition, ManagedTableInterpreter, StorageColumnFlags,
         StorageColumnSpec, StorageTableDefinition, StorageTableSpec, TableBinding,
     };
-    use crate::catalog::{CatalogSelectKey, catalog_key_from_active_ordinal};
+    use crate::catalog::{CatalogIndexNo, CatalogSelectKey};
     use crate::error::{
         DataIntegrityError, DiscloseResultExt, Result, RuntimeError, RuntimeOrFatalError,
     };
@@ -2116,7 +2116,7 @@ pub(crate) mod tests {
         smol::block_on(async {
             assert_checkpoint_rejects_delete_key(
                 "catalog-delete-key-non-primary",
-                catalog_key_from_active_ordinal(1, vec![Val::from(USER_TABLE_ID_START)]),
+                CatalogSelectKey::new(CatalogIndexNo::new(1), vec![Val::from(USER_TABLE_ID_START)]),
                 "catalog checkpoint delete key is not primary key",
             )
             .await;
@@ -2128,8 +2128,8 @@ pub(crate) mod tests {
         smol::block_on(async {
             assert_checkpoint_rejects_delete_key(
                     "catalog-delete-key-value-count",
-                    catalog_key_from_active_ordinal(
-                        0,
+                    CatalogSelectKey::new(
+                        CatalogIndexNo::new(0),
                         vec![Val::from(USER_TABLE_ID_START), Val::from(0u16)],
                     ),
                     "catalog checkpoint delete key value count 2 does not match primary key column count 1",
@@ -2638,8 +2638,8 @@ pub(crate) mod tests {
                     },
                     CatalogRedoEntry {
                         table_id: TABLE_ID_TABLES,
-                        kind: RowRedoKind::DeleteByPrimaryKey(catalog_key_from_active_ordinal(
-                            0,
+                        kind: RowRedoKind::DeleteByPrimaryKey(CatalogSelectKey::new(
+                            CatalogIndexNo::new(0),
                             vec![Val::from(table_id)],
                         )),
                     },
@@ -2692,7 +2692,10 @@ pub(crate) mod tests {
                     CatalogRedoEntry {
                         table_id: TABLE_ID_TABLES,
                         kind: RowRedoKind::UpdateByPrimaryKey(
-                            catalog_key_from_active_ordinal(0, vec![Val::from(table_id)]),
+                            CatalogSelectKey::new(
+                                CatalogIndexNo::new(0),
+                                vec![Val::from(table_id)],
+                            ),
                             vec![UpdateCol {
                                 idx: 4,
                                 val: Val::from(7u32),
@@ -2740,7 +2743,10 @@ pub(crate) mod tests {
                     CatalogRedoEntry {
                         table_id: TABLE_ID_TABLES,
                         kind: RowRedoKind::UpdateByPrimaryKey(
-                            catalog_key_from_active_ordinal(0, vec![Val::from(table_id)]),
+                            CatalogSelectKey::new(
+                                CatalogIndexNo::new(0),
+                                vec![Val::from(table_id)],
+                            ),
                             vec![UpdateCol {
                                 idx: 0,
                                 val: Val::from(table_id),
@@ -2798,7 +2804,7 @@ pub(crate) mod tests {
                 vec![CatalogRedoEntry {
                     table_id: TABLE_ID_TABLES,
                     kind: RowRedoKind::UpdateByPrimaryKey(
-                        catalog_key_from_active_ordinal(0, vec![Val::from(table_id)]),
+                        CatalogSelectKey::new(CatalogIndexNo::new(0), vec![Val::from(table_id)]),
                         vec![UpdateCol {
                             idx: 4,
                             val: Val::from(9u32),
@@ -2894,8 +2900,8 @@ pub(crate) mod tests {
             let table_id = USER_TABLE_ID_START + 42;
             let table_ops = vec![
                 RowRedoKind::Insert(PageID::new(0), catalog_table_vals(table_id, 0)),
-                RowRedoKind::DeleteByPrimaryKey(catalog_key_from_active_ordinal(
-                    0,
+                RowRedoKind::DeleteByPrimaryKey(CatalogSelectKey::new(
+                    CatalogIndexNo::new(0),
                     vec![Val::from(table_id)],
                 )),
             ];
@@ -2952,8 +2958,8 @@ pub(crate) mod tests {
             let table_id = USER_TABLE_ID_START + 4242;
             let table_ops = vec![
                 RowRedoKind::Insert(PageID::new(0), catalog_table_vals(table_id, 0)),
-                RowRedoKind::DeleteByPrimaryKey(catalog_key_from_active_ordinal(
-                    0,
+                RowRedoKind::DeleteByPrimaryKey(CatalogSelectKey::new(
+                    CatalogIndexNo::new(0),
                     vec![Val::from(table_id)],
                 )),
             ];

@@ -11,6 +11,7 @@ mod index_mutate;
 mod layout;
 mod lifecycle;
 mod mem_table;
+mod mutate;
 mod page_transition;
 mod partition_stream;
 mod persistence;
@@ -78,7 +79,7 @@ use crate::index::{
 use crate::map::FastHashMap;
 use crate::obs;
 use crate::quiescent::QuiescentGuard;
-use crate::row::ops::{RowUpdateInput, RowUpdateView, SelectKey, UpdateCol};
+use crate::row::ops::{SelectKey, UpdateCol};
 use crate::row::{RowPage, RowRead, var_len_for_insert};
 use crate::runtime::yield_now;
 use crate::trx::{ActiveSnapshotRegistration, PrivateSnapshot, TrxReadProof};
@@ -868,7 +869,7 @@ impl Table {
                 "row is deleted",
             ));
         }
-        let var_len = page.var_len_for_update(row_idx, RowUpdateView::Sparse(cols));
+        let var_len = page.var_len_for_update(row_idx, cols);
         let (var_offset, var_end) = if let Some(var_offset) = page.request_free_space(var_len) {
             (var_offset, var_offset + var_len)
         } else {
@@ -1114,11 +1115,6 @@ impl SecondaryIndexScopedBuilder {
             .collect::<Vec<_>>()
             .into_boxed_slice()
     }
-}
-
-enum UpdateUniqueMvcc {
-    Updated(RowID),
-    NotFound(RowUpdateInput),
 }
 
 /// Build user-table dual-tree secondary indexes from fresh MemIndex backends
@@ -2297,8 +2293,9 @@ pub(crate) mod tests {
         ) -> RuntimeResult<IndexInsert> {
             let index = self.layout.secondary_index(self.index_slot)?;
             index
-                .bind_non_unique_unchecked(self.guards, self.root)?
-                .insert_mem_if_not_exists(key, row_id, merge_if_match_deleted, ts)
+                .non_unique_mem()?
+                .bind(self.guards.index_guard())
+                .insert_if_not_exists(key, row_id, merge_if_match_deleted, ts)
                 .await
         }
 
@@ -2316,6 +2313,21 @@ pub(crate) mod tests {
                 .bind_non_unique_unchecked(self.guards, self.root)?
                 .mask_mem_if_present(key, row_id, ts)
                 .await
+        }
+    }
+
+    /// Chooses insertion or ordered sparse assignments for callback upsert tests.
+    pub(crate) fn upsert_action(occupied: bool, values: Vec<Val>) -> UniqueMutation {
+        if occupied {
+            UniqueMutation::Update(
+                values
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, val)| UpdateCol { idx, val })
+                    .collect(),
+            )
+        } else {
+            UniqueMutation::Insert(values)
         }
     }
 
@@ -2480,10 +2492,10 @@ pub(crate) mod tests {
         );
         let update_retry = matches!(
             HotRowMutator::new(table.row_store.table_id(), metadata, rt, page_guard, row_id,)
-                .update_known_row(effects, crate::row::ops::RowUpdateInput::Sparse(update))
+                .update_known_row(effects, update)
                 .await
                 .disclose()?,
-            UpdateRowInplace::RetryInTransition(_)
+            UpdateRowInplace::RetryInTransition
         );
         Ok((insert_retry, update_retry))
     }

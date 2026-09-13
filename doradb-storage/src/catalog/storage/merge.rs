@@ -444,7 +444,6 @@ mod tests {
     use super::super::tables::catalog_definition_of_tables;
     use super::*;
     use crate::catalog::USER_TABLE_ID_START;
-    use crate::catalog::catalog_key_from_active_ordinal;
     use crate::error::DataIntegrityError;
     use crate::id::{RowID, TableID};
     use crate::value::ValKind;
@@ -499,7 +498,7 @@ mod tests {
             .unwrap();
         let tables_select_key = tables_key_builder
             .key_from_select_key(
-                &catalog_key_from_active_ordinal(0, vec![Val::from(tables_table_id)]),
+                &CatalogSelectKey::new(CatalogIndexNo::new(0), vec![Val::from(tables_table_id)]),
                 "test",
             )
             .unwrap();
@@ -513,8 +512,8 @@ mod tests {
         let columns_key = columns_key_builder.key_from_row(&columns_vals).unwrap();
         let columns_select_key = columns_key_builder
             .key_from_select_key(
-                &catalog_key_from_active_ordinal(
-                    0,
+                &CatalogSelectKey::new(
+                    CatalogIndexNo::new(0),
                     vec![
                         Val::from(columns_table_id),
                         Val::from(u32::from(columns_no)),
@@ -531,8 +530,9 @@ mod tests {
         let metadata = &catalog_definition_of_tables().metadata;
         let base_table_id = USER_TABLE_ID_START + 1;
         let new_table_id = USER_TABLE_ID_START + 2;
-        let base_key = catalog_key_from_active_ordinal(0, vec![Val::from(base_table_id)]);
-        let new_key = catalog_key_from_active_ordinal(0, vec![Val::from(new_table_id)]);
+        let base_key =
+            CatalogSelectKey::new(CatalogIndexNo::new(0), vec![Val::from(base_table_id)]);
+        let new_key = CatalogSelectKey::new(CatalogIndexNo::new(0), vec![Val::from(new_table_id)]);
 
         let mut folded = folded_tables_with_base(Vec::new());
         folded
@@ -611,8 +611,9 @@ mod tests {
         let metadata = &catalog_definition_of_tables().metadata;
         let base_table_id = USER_TABLE_ID_START + 31;
         let new_table_id = USER_TABLE_ID_START + 32;
-        let base_key = catalog_key_from_active_ordinal(0, vec![Val::from(base_table_id)]);
-        let new_key = catalog_key_from_active_ordinal(0, vec![Val::from(new_table_id)]);
+        let base_key =
+            CatalogSelectKey::new(CatalogIndexNo::new(0), vec![Val::from(base_table_id)]);
+        let new_key = CatalogSelectKey::new(CatalogIndexNo::new(0), vec![Val::from(new_table_id)]);
 
         let mut folded = folded_tables_with_base(vec![(base_table_id, 0)]);
         folded
@@ -644,8 +645,9 @@ mod tests {
         let metadata = &catalog_definition_of_tables().metadata;
         let base_table_id = USER_TABLE_ID_START + 11;
         let new_table_id = USER_TABLE_ID_START + 12;
-        let base_key = catalog_key_from_active_ordinal(0, vec![Val::from(base_table_id)]);
-        let new_key = catalog_key_from_active_ordinal(0, vec![Val::from(new_table_id)]);
+        let base_key =
+            CatalogSelectKey::new(CatalogIndexNo::new(0), vec![Val::from(base_table_id)]);
+        let new_key = CatalogSelectKey::new(CatalogIndexNo::new(0), vec![Val::from(new_table_id)]);
 
         let mut folded = folded_tables_with_base(vec![(base_table_id, 0)]);
         assert!(

@@ -48,6 +48,7 @@ doradb-storage/src/table/access.rs,UserTableAccessor::mutate_cold_rows_mvcc,12
 doradb-storage/src/table/access.rs,UserTableAccessor::mutate_hot_rows_mvcc,7
 doradb-storage/src/table/access.rs,UserTableAccessor::table_index_mutate_mvcc,2
 doradb-storage/src/table/access.rs,UserTableAccessor::table_mutate_mvcc,1
+doradb-storage/src/table/access.rs,UserTableAccessor::unique_mutate_mvcc,1
 doradb-storage/src/table/index_mutate.rs,IndexMutator::apply_deferred_index_update,5
 doradb-storage/src/table/index_mutate.rs,IndexMutator::mutate_cold_index_candidate,12
 doradb-storage/src/table/index_mutate.rs,IndexMutator::mutate_hot_index_candidate,5
@@ -57,10 +58,6 @@ doradb-storage/src/table/index_mutate.rs,IndexMutator::unique_driver_key_changed
 doradb-storage/src/table/index_mutate.rs,IndexMutator::update_owned_hot_row,1
 doradb-storage/src/table/partition_stream.rs,TableScanPartitionStream::peer_abort,1
 doradb-storage/src/table/partition_stream.rs,TableScanPartitionStreamState::load_pending,1
-doradb-storage/src/table/unique_mutate.rs,UniqueMutator::execute,12
-doradb-storage/src/table/unique_mutate.rs,UniqueMutator::mutate_missing,2
-doradb-storage/src/table/unique_mutate.rs,UniqueMutator::mutate_owned_cold_row,5
-doradb-storage/src/table/unique_mutate.rs,UniqueMutator::mutate_owned_hot_row,2
 doradb-storage/src/trx/interface.rs,Transaction::table_index_scan_mvcc_stream,1
 doradb-storage/src/trx/interface.rs,Transaction::table_scan_mvcc_stream,1
 doradb-storage/src/trx/mod.rs,Transaction::commit,2

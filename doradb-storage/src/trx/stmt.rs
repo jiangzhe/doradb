@@ -1,4 +1,5 @@
 use crate::buffer::PoolGuards;
+use crate::catalog::{CatalogSelectKey, catalog_index_ref};
 use crate::id::{RowID, TableID, TrxID};
 
 use crate::catalog::{
@@ -7,16 +8,15 @@ use crate::catalog::{
 };
 use crate::error::{
     CallbackResult, DiscloseResultExt, FatalError, FatalResult, MultiDomainResultExt,
-    OperationError, OperationOrFatalError, OperationOrFatalResult, OperationOrRuntimeError,
-    OperationOrRuntimeResult, OperationResult, QuadError, QuadResult, Result, RuntimeError,
-    RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
+    OperationError, OperationOrFatalError, OperationOrFatalResult, OperationResult, QuadError,
+    QuadResult, Result, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
 };
 use crate::lock::{LockMode, LockResource};
 use crate::log::redo::{RedoLogs, RowRedo};
 use crate::obs;
 use crate::row::ops::{
-    DeleteMvcc, RowMutation, ScanMvcc, SelectMvcc, TableMutationOutcome, UniqueMutation,
-    UniqueMutationOutcome, UpdateCol,
+    RowMutation, ScanMvcc, SelectMvcc, TableMutationOutcome, UniqueMutation, UniqueMutationOutcome,
+    UpdateCol,
 };
 use crate::session::TrxAttachment;
 use crate::table::{DmlValidator, LazyRow};
@@ -1064,11 +1064,9 @@ impl<'stmt> Statement<'stmt> {
         narrow_catalog_operation_or_fatal(table_id, data_lock)?;
         let (rt, effects) = self.runtime_and_effects_mut();
         let result = table.insert_mvcc(rt, effects, cols).await;
-        Ok(narrow_catalog_operation_or_runtime(
-            table_id,
-            result,
-            || format!("operation={OPERATION}, table_id={table_id}"),
-        )?)
+        narrow_catalog_quad_result(table_id, result, || {
+            format!("operation={OPERATION}, table_id={table_id}")
+        })
     }
 
     /// Inserts an ordered catalog batch through one consumed statement.
@@ -1103,7 +1101,7 @@ impl<'stmt> Statement<'stmt> {
         let (rt, effects) = self.runtime_and_effects_mut();
         for (batch_index, row) in rows.into_iter().enumerate() {
             let result = table.insert_mvcc(rt, effects, row).await;
-            narrow_catalog_operation_or_runtime(table_id, result, || {
+            narrow_catalog_quad_result(table_id, result, || {
                 format!("operation={OPERATION}, table_id={table_id}, batch_index={batch_index}")
             })?;
         }
@@ -1153,30 +1151,36 @@ impl<'stmt> Statement<'stmt> {
         Ok(())
     }
 
-    /// Deletes one catalog-table row through the foreground lock-aware path.
+    /// Mutates one catalog primary-key entry through a typed current-row callback.
     #[inline]
-    pub(super) async fn catalog_delete_primary_key_mvcc(
+    pub(super) async fn catalog_primary_key_mutate_mvcc<F>(
         mut self,
         table: &CatalogTable,
         index_slot: CatalogIndexNo,
         key_vals: &[Val],
-        log_by_key: bool,
-    ) -> RuntimeOrFatalResult<DeleteMvcc> {
-        self.catalog_delete_primary_key_mvcc_inner(table, index_slot, key_vals, log_by_key)
+        decide: F,
+    ) -> RuntimeOrFatalResult<UniqueMutationOutcome>
+    where
+        F: for<'row> FnOnce(Option<&mut LazyRow<'row>>) -> RuntimeResult<UniqueMutation>,
+    {
+        self.catalog_primary_key_mutate_mvcc_inner(table, index_slot, key_vals, decide)
             .await
     }
 
-    /// Performs one catalog delete while narrowing each native error carrier at
+    /// Performs one catalog decision while narrowing each native error carrier at
     /// its owning boundary.
     #[inline]
-    async fn catalog_delete_primary_key_mvcc_inner(
+    async fn catalog_primary_key_mutate_mvcc_inner<F>(
         &mut self,
         table: &CatalogTable,
         index_slot: CatalogIndexNo,
         key_vals: &[Val],
-        log_by_key: bool,
-    ) -> RuntimeOrFatalResult<DeleteMvcc> {
-        const OPERATION: &str = "catalog_delete_primary_key_mvcc";
+        decide: F,
+    ) -> RuntimeOrFatalResult<UniqueMutationOutcome>
+    where
+        F: for<'row> FnOnce(Option<&mut LazyRow<'row>>) -> RuntimeResult<UniqueMutation>,
+    {
+        const OPERATION: &str = "catalog_primary_key_mutate_mvcc";
         let table_id = table.table_id();
         let metadata_lock = self
             .acquire_table_write_metadata_lock(table_id)
@@ -1195,7 +1199,14 @@ impl<'stmt> Statement<'stmt> {
         narrow_catalog_operation_or_fatal(table_id, data_lock)?;
         let (rt, effects) = self.runtime_and_effects_mut();
         let result = table
-            .delete_unique_mvcc(rt, effects, index_slot, key_vals, log_by_key)
+            .unique_mutate_mvcc(
+                rt,
+                effects,
+                catalog_index_ref(index_slot),
+                key_vals,
+                Some(CatalogSelectKey::new(index_slot, key_vals.to_vec())),
+                |row| decide(row).map_err(QuadError::from),
+            )
             .await;
         narrow_catalog_quad_result(table_id, result, || {
             format!("operation={OPERATION}, table_id={table_id}, index_slot={index_slot}")
@@ -1236,14 +1247,27 @@ impl<'stmt> Statement<'stmt> {
         let mut deleted = 0;
         for (batch_index, key_vals) in keys.iter().enumerate() {
             let result = table
-                .delete_unique_mvcc(rt, effects, index_slot, key_vals, true)
+                .unique_mutate_mvcc(
+                    rt,
+                    effects,
+                    catalog_index_ref(index_slot),
+                    key_vals,
+                    Some(CatalogSelectKey::new(index_slot, key_vals.clone())),
+                    |row| {
+                        Ok(if row.is_some() {
+                            UniqueMutation::Delete
+                        } else {
+                            UniqueMutation::Skip
+                        })
+                    },
+                )
                 .await;
             let result = narrow_catalog_quad_result(table_id, result, || {
                 format!(
                     "operation={OPERATION}, table_id={table_id}, index_slot={index_slot}, batch_index={batch_index}"
                 )
             })?;
-            deleted += usize::from(matches!(result, DeleteMvcc::Deleted));
+            deleted += usize::from(matches!(result, UniqueMutationOutcome::Deleted));
         }
         Ok(deleted)
     }
@@ -1256,7 +1280,7 @@ impl<'stmt> Statement<'stmt> {
         index_slot: CatalogIndexNo,
         key_vals: &[Val],
         cols: Vec<Val>,
-    ) -> RuntimeOrFatalResult<DeleteMvcc> {
+    ) -> RuntimeOrFatalResult<bool> {
         const OPERATION: &str = "catalog_replace_primary_key_mvcc";
         let table_id = table.table_id();
         let metadata_lock = self
@@ -1282,16 +1306,29 @@ impl<'stmt> Statement<'stmt> {
         narrow_catalog_operation_or_fatal(table_id, data_lock)?;
         let (rt, effects) = self.runtime_and_effects_mut();
         let delete_result = table
-            .delete_unique_mvcc(rt, effects, index_slot, key_vals, true)
+            .unique_mutate_mvcc(
+                rt,
+                effects,
+                catalog_index_ref(index_slot),
+                key_vals,
+                Some(CatalogSelectKey::new(index_slot, key_vals.to_vec())),
+                |row| {
+                    Ok(if row.is_some() {
+                        UniqueMutation::Delete
+                    } else {
+                        UniqueMutation::Skip
+                    })
+                },
+            )
             .await;
         let deleted = narrow_catalog_quad_result(table_id, delete_result, || {
             format!("operation={OPERATION}, table_id={table_id}, phase=delete")
         })?;
         let insert_result = table.insert_mvcc(rt, effects, cols).await;
-        narrow_catalog_operation_or_runtime(table_id, insert_result, || {
+        narrow_catalog_quad_result(table_id, insert_result, || {
             format!("operation={OPERATION}, table_id={table_id}, phase=insert")
         })?;
-        Ok(deleted)
+        Ok(matches!(deleted, UniqueMutationOutcome::Deleted))
     }
 }
 
@@ -1375,34 +1412,11 @@ fn narrow_catalog_operation_or_fatal<T>(
     }
 }
 
-/// Assert the impossible Operation arm of a catalog insert result and assign
-/// catalog Runtime ownership before returning it.
-#[inline]
-fn narrow_catalog_operation_or_runtime<T, F>(
-    table_id: TableID,
-    result: OperationOrRuntimeResult<T>,
-    attachment: F,
-) -> RuntimeResult<T>
-where
-    F: FnOnce() -> String,
-{
-    match result {
-        Ok(value) => Ok(value),
-        Err(OperationOrRuntimeError::Operation(report)) => {
-            let report = report.attach(attachment());
-            panic!("catalog mutation invariant violated: table_id={table_id}, error={report:?}")
-        }
-        Err(OperationOrRuntimeError::Runtime(report)) => Err(report
-            .change_context(RuntimeError::CatalogAccess)
-            .attach(attachment())),
-    }
-}
-
 /// Preserve unique-key races expected by an optimistic catalog insertion.
 #[inline]
 fn preserve_expected_catalog_insert_error<T, F>(
     table_id: TableID,
-    result: OperationOrRuntimeResult<T>,
+    result: QuadResult<T>,
     attachment: F,
 ) -> QuadResult<T>
 where
@@ -1410,7 +1424,7 @@ where
 {
     match result {
         Ok(value) => Ok(value),
-        Err(OperationOrRuntimeError::Operation(report))
+        Err(QuadError::Operation(report))
             if matches!(
                 *report.current_context(),
                 OperationError::DuplicateKey | OperationError::WriteConflict
@@ -1418,21 +1432,25 @@ where
         {
             Err(QuadError::Operation(report.attach(attachment())))
         }
-        Err(OperationOrRuntimeError::Operation(report)) => {
+        Err(QuadError::Operation(report)) => {
             let report = report.attach(attachment());
             panic!(
                 "catalog mutation invariant violated outside expected unique-key race: table_id={table_id}, error={report:?}"
             )
         }
-        Err(OperationOrRuntimeError::Runtime(report)) => Err(QuadError::Runtime(
+        Err(QuadError::Runtime(report)) => Err(QuadError::Runtime(
             report
                 .change_context(RuntimeError::CatalogAccess)
                 .attach(attachment()),
         )),
+        Err(QuadError::Fatal(report)) => Err(QuadError::Fatal(report.attach(attachment()))),
+        Err(QuadError::Lifecycle(report)) => panic!(
+            "catalog insertion lifecycle invariant violated: table_id={table_id}, error={report:?}"
+        ),
     }
 }
 
-/// Narrow the generic table-delete carrier immediately at the catalog boundary.
+/// Narrows shared execution errors at the catalog policy boundary.
 #[inline]
 fn narrow_catalog_quad_result<T, F>(
     table_id: TableID,
@@ -1484,18 +1502,17 @@ pub(crate) mod tests {
     use crate::lock::tests::debug_snapshot;
     use crate::log::redo::RowRedoKind;
     use crate::row::RowPage;
-    use crate::row::ops::SelectKey;
-    use crate::row::ops::{UpdateMvcc, UpsertMvcc};
+    use crate::row::ops::{SelectKey, UniqueMutationOutcome};
     use crate::session::{SessionState, tests as session_tests};
     use crate::table::tests::{
         lock_hot_row_then_wait_and_error_operation, transition_delete_operation,
-        transition_insert_update_operation,
+        transition_insert_update_operation, upsert_action,
     };
     use crate::table::{MemTable, Table};
     use crate::trx::sys::tests as sys_tests;
     use crate::trx::undo::tests::{pause_next_index_rollback, pause_next_row_rollback};
-    use crate::trx::undo::{OwnedRowUndo, RowUndoKind};
-    use crate::trx::{MIN_ACTIVE_TRX_ID, Transaction};
+    use crate::trx::undo::{OwnedRowUndo, RowUndoKind, RowUndoRollbackAttempt};
+    use crate::trx::{MIN_ACTIVE_TRX_ID, PrivateTransaction, Transaction};
     use error_stack::Report;
     use futures::FutureExt;
     use std::cell::Cell;
@@ -1600,12 +1617,23 @@ pub(crate) mod tests {
         mut stmt: Statement<'_>,
         mem_table: &MemTable<EvictableBufferPool, EvictableBufferPool>,
         cols: Vec<Val>,
-    ) -> Result<UpsertMvcc> {
-        let table_id = mem_table.table_id();
-        prepare_raw_table_write(&mut stmt, table_id).await?;
+    ) -> Result<UniqueMutationOutcome> {
+        prepare_raw_table_write(&mut stmt, mem_table.table_id()).await?;
+        let spec = mem_table
+            .metadata()
+            .idx
+            .require_index_spec(IndexSlot::new(0))
+            .unwrap();
+        let key: Vec<Val> = spec
+            .keys
+            .iter()
+            .map(|key| cols[key.column_ordinal.as_usize()].clone())
+            .collect();
         let (rt, effects) = stmt.runtime_and_effects_mut();
         mem_table
-            .upsert_unique_mvcc(rt, effects, IndexSlot::new(0), cols, false)
+            .unique_mutate_mvcc(rt, effects, spec.index, &key, None, |row| {
+                Ok(upsert_action(row.is_some(), cols))
+            })
             .await
             .disclose()
     }
@@ -1616,14 +1644,42 @@ pub(crate) mod tests {
         mem_table: &MemTable<EvictableBufferPool, EvictableBufferPool>,
         key: &SelectKey,
         update: Vec<UpdateCol>,
-    ) -> Result<UpdateMvcc> {
-        let table_id = mem_table.table_id();
-        prepare_raw_table_write(&mut stmt, table_id).await?;
+    ) -> Result<UniqueMutationOutcome> {
+        prepare_raw_table_write(&mut stmt, mem_table.table_id()).await?;
+        let index = mem_table
+            .metadata()
+            .idx
+            .require_index_spec(key.index_slot)
+            .unwrap()
+            .index;
         let (rt, effects) = stmt.runtime_and_effects_mut();
-        mem_table
-            .update_unique_mvcc(rt, effects, key.index_slot, &key.vals, update, false)
-            .await
-            .disclose()
+        let result = mem_table
+            .unique_mutate_mvcc(rt, effects, index, &key.vals, None, |row| {
+                Ok(if row.is_some() {
+                    UniqueMutation::Update(update)
+                } else {
+                    UniqueMutation::Skip
+                })
+            })
+            .await;
+        if result.is_err() {
+            // Standalone tables are absent from the catalog cache used by the
+            // statement runner. These failures precede the first index effect;
+            // restore the real row undo before returning to normal settlement.
+            assert!(effects.index_undo.is_empty());
+            while let Some(mut undo) = effects.row_undo.pop() {
+                assert_eq!(
+                    mem_table
+                        .row_store
+                        .try_rollback_hot_row_undo(&mut undo, rt.pool_guards())
+                        .await
+                        .unwrap(),
+                    RowUndoRollbackAttempt::Applied
+                );
+            }
+            effects.clear_redo();
+        }
+        result.disclose()
     }
 
     /// Delete through a standalone MemTable using production statement settlement.
@@ -1631,31 +1687,23 @@ pub(crate) mod tests {
         mut stmt: Statement<'_>,
         mem_table: &MemTable<EvictableBufferPool, EvictableBufferPool>,
         key: &SelectKey,
-    ) -> Result<DeleteMvcc> {
-        let table_id = mem_table.table_id();
-        prepare_raw_table_write(&mut stmt, table_id).await?;
+    ) -> Result<UniqueMutationOutcome> {
+        prepare_raw_table_write(&mut stmt, mem_table.table_id()).await?;
+        let index = mem_table
+            .metadata()
+            .idx
+            .require_index_spec(key.index_slot)
+            .unwrap()
+            .index;
         let (rt, effects) = stmt.runtime_and_effects_mut();
         mem_table
-            .delete_unique_mvcc(rt, effects, key.index_slot, &key.vals, false)
-            .await
-            .disclose()
-    }
-
-    /// Apply one standalone MemTable index-only key change.
-    #[allow(clippy::too_many_arguments)]
-    pub(in crate::trx) async fn mem_table_duplicate_index_key_change(
-        mut stmt: Statement<'_>,
-        mem_table: &MemTable<EvictableBufferPool, EvictableBufferPool>,
-        page_guard: PageSharedGuard<RowPage>,
-        row_id: RowID,
-        old_key: SelectKey,
-        new_key: SelectKey,
-    ) -> Result<()> {
-        let table_id = mem_table.table_id();
-        prepare_raw_table_write(&mut stmt, table_id).await?;
-        let (rt, effects) = stmt.runtime_and_effects_mut();
-        mem_table
-            .update_unique_index_only_key_change(rt, effects, old_key, new_key, row_id, &page_guard)
+            .unique_mutate_mvcc(rt, effects, index, &key.vals, None, |row| {
+                Ok(if row.is_some() {
+                    UniqueMutation::Delete
+                } else {
+                    UniqueMutation::Skip
+                })
+            })
             .await
             .disclose()
     }
@@ -1827,6 +1875,47 @@ pub(crate) mod tests {
         assert!(rendered.contains(operation));
     }
 
+    fn catalog_callback_row(id: u64, epoch: u64) -> Vec<Val> {
+        vec![
+            Val::from(TableID::new(id)),
+            Val::from(epoch),
+            Val::from(0u64),
+            Val::from(0u64),
+            Val::from(0u32),
+        ]
+    }
+
+    fn catalog_effect_counts(trx: &PrivateTransaction) -> (usize, usize, usize) {
+        let effects = &trx.checkout().inner().effects;
+        (
+            effects.row_undo.len(),
+            effects.index_undo.len(),
+            effects.redo.dml.values().map(|dml| dml.rows.len()).sum(),
+        )
+    }
+
+    async fn catalog_callback_current(
+        table: &CatalogTable,
+        trx: &PrivateTransaction,
+        id: u64,
+    ) -> Option<(RowID, Vec<Val>)> {
+        use crate::row::RowRead;
+        table
+            .index_lookup_unique_uncommitted(
+                trx.pool_guards(),
+                CatalogIndexNo::new(0),
+                &[Val::from(TableID::new(id))],
+                |columns, row| {
+                    (
+                        row.row_id(),
+                        (0..5).map(|column| row.val(columns, column)).collect(),
+                    )
+                },
+            )
+            .await
+            .unwrap()
+    }
+
     #[test]
     fn test_memory_user_layout_preserves_exact_identity_through_mutation_and_rollback() {
         use crate::buffer::PoolRole;
@@ -1836,7 +1925,7 @@ pub(crate) mod tests {
         };
         use crate::file::cow_file::SUPER_BLOCK_ID;
         use crate::index::BlockIndex;
-        use crate::row::ops::DeleteMvcc;
+        use crate::row::ops::UniqueMutationOutcome;
         use crate::session::tests::SessionTestExt;
         use crate::table::tests::lightweight_test_engine;
         use crate::table::{
@@ -1926,17 +2015,17 @@ pub(crate) mod tests {
                             1
                         }
                         Mutation::Update => {
-                            let updated = table.update_unique_mvcc(
-                                rt, effects, index.slot(), &old_values,
-                                vec![UpdateCol { idx: 0, val: Val::from(2i32) }], false,
+                            let updated = table.unique_mutate_mvcc(
+                                rt, effects, index, &old_values, None,
+                                |_| Ok(UniqueMutation::Update(vec![UpdateCol { idx: 0, val: Val::from(2i32) }])),
                             ).await.unwrap();
-                            assert!(matches!(updated, UpdateMvcc::Updated(_)));
+                            assert!(matches!(updated, UniqueMutationOutcome::Updated(_)));
                             2
                         }
                         Mutation::Delete => {
-                            assert_eq!(table.delete_unique_mvcc(
-                                rt, effects, index.slot(), &old_values, false,
-                            ).await.unwrap(), DeleteMvcc::Deleted);
+                            assert_eq!(table.unique_mutate_mvcc(
+                                rt, effects, index, &old_values, None, |_| Ok(UniqueMutation::Delete),
+                            ).await.unwrap(), UniqueMutationOutcome::Deleted);
                             1
                         }
                     };
@@ -2156,6 +2245,366 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_catalog_callback_actions_redo_and_runtime_rollback() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("catalog_callback_actions").await;
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .storage
+                .get_catalog_table(TABLE_ID_TABLES)
+                .unwrap();
+            let session = engine.new_session().unwrap();
+            let mut trx = begin_catalog_test_trx(&session);
+            table
+                .insert_no_trx(trx.trx().pool_guards(), &catalog_callback_row(42, 1), false)
+                .await
+                .unwrap();
+            let calls = Cell::new(0);
+            let pk = CatalogIndexNo::new(0);
+            for (id, occupied, action) in [
+                (99, false, UniqueMutation::Skip),
+                (42, true, UniqueMutation::Skip),
+                (42, true, UniqueMutation::Update(Vec::new())),
+            ] {
+                let outcome = trx
+                    .trx()
+                    .catalog_primary_key_mutate_mvcc(
+                        &table,
+                        pk,
+                        vec![Val::from(TableID::new(id))],
+                        |row| {
+                            calls.set(calls.get() + 1);
+                            assert_eq!(row.is_some(), occupied);
+                            Ok(action)
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    outcome,
+                    UniqueMutationOutcome::Noop | UniqueMutationOutcome::Updated(_)
+                ));
+                assert_eq!(catalog_effect_counts(trx.trx()), (0, 0, 0));
+            }
+            assert_eq!(calls.get(), 3);
+            let inserted = trx
+                .trx()
+                .catalog_primary_key_mutate_mvcc(
+                    &table,
+                    pk,
+                    vec![Val::from(TableID::new(44))],
+                    |row| {
+                        assert!(row.is_none());
+                        Ok(UniqueMutation::Insert(catalog_callback_row(44, 0)))
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(matches!(inserted, UniqueMutationOutcome::Inserted(_)));
+            let before = catalog_effect_counts(trx.trx());
+            let err = trx
+                .trx()
+                .catalog_primary_key_mutate_mvcc(
+                    &table,
+                    pk,
+                    vec![Val::from(TableID::new(42))],
+                    |row| {
+                        let row = row.unwrap();
+                        assert_eq!(
+                            row.val_inner(1)
+                                .change_context(RuntimeError::CatalogAccess)?,
+                            &Val::from(1u64)
+                        );
+                        Err(Report::new(RuntimeError::TableAccess)
+                            .attach("catalog callback retained error"))
+                    },
+                )
+                .await
+                .unwrap_err();
+            let RuntimeOrFatalError::Runtime(report) = err else {
+                panic!("callback Runtime changed domain")
+            };
+            assert_eq!(*report.current_context(), RuntimeError::CatalogAccess);
+            let diagnostic = format!("{report:?}");
+            assert!(diagnostic.contains("catalog callback retained error"));
+            assert_eq!(catalog_effect_counts(trx.trx()), before);
+            assert!(
+                catalog_callback_current(&table, trx.trx(), 44)
+                    .await
+                    .is_some()
+            );
+
+            let outcome = trx
+                .trx()
+                .catalog_primary_key_mutate_mvcc(
+                    &table,
+                    pk,
+                    vec![Val::from(TableID::new(42))],
+                    |row| {
+                        assert!(row.is_some());
+                        Ok(UniqueMutation::Update(vec![UpdateCol {
+                            idx: 0,
+                            val: Val::from(TableID::new(43)),
+                        }]))
+                    },
+                )
+                .await
+                .unwrap();
+            let UniqueMutationOutcome::Updated(row_id) = outcome else {
+                panic!("expected occupied update")
+            };
+            let redo =
+                &trx.trx().checkout().inner().effects.redo.dml[&TABLE_ID_TABLES].rows[&row_id];
+            assert!(
+                matches!(&redo.kind, RowRedoKind::UpdateByPrimaryKey(key, _) if key == &CatalogSelectKey::new(pk, vec![Val::from(TableID::new(42))]))
+            );
+            assert!(
+                catalog_callback_current(&table, trx.trx(), 42)
+                    .await
+                    .is_none()
+            );
+            assert_eq!(
+                catalog_callback_current(&table, trx.trx(), 43)
+                    .await
+                    .unwrap()
+                    .1,
+                catalog_callback_row(43, 1)
+            );
+            let outcome = trx
+                .trx()
+                .catalog_primary_key_mutate_mvcc(
+                    &table,
+                    pk,
+                    vec![Val::from(TableID::new(43))],
+                    |_| Ok(UniqueMutation::Delete),
+                )
+                .await
+                .unwrap();
+            assert_eq!(outcome, UniqueMutationOutcome::Deleted);
+            assert!(
+                matches!(&trx.trx().checkout().inner().effects.redo.dml[&TABLE_ID_TABLES].rows[&row_id].kind, RowRedoKind::DeleteByPrimaryKey(key) if key == &CatalogSelectKey::new(pk, vec![Val::from(TableID::new(42))]))
+            );
+            trx.rollback().await;
+        });
+    }
+
+    #[test]
+    fn test_catalog_replacement_allocation_failure_and_batch_atomicity() {
+        use crate::buffer::BufferPool;
+        use crate::buffer::page::Page;
+        use crate::index::RowLocation;
+        use crate::trx::ver_map::RowPageState;
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("catalog_replacement_atomicity").await;
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .storage
+                .get_catalog_table(TABLE_ID_TABLES)
+                .unwrap();
+            let session = engine.new_session().unwrap();
+            let mut trx = begin_catalog_test_trx(&session);
+            let pk = CatalogIndexNo::new(0);
+            table
+                .insert_no_trx(trx.trx().pool_guards(), &catalog_callback_row(42, 1), false)
+                .await
+                .unwrap();
+            let old_id = catalog_callback_current(&table, trx.trx(), 42)
+                .await
+                .unwrap()
+                .0;
+            trx.trx()
+                .catalog_insert_mvcc(&table, catalog_callback_row(44, 0))
+                .await
+                .unwrap();
+            let before = catalog_effect_counts(trx.trx());
+            // Force the insertion half to allocate a new row page, then exhaust
+            // its actual fixed pool. Deletion and rollback still use existing pages.
+            let RowLocation::RowPage(page_id) = table
+                .row_store
+                .find_row(trx.trx().pool_guards(), old_id)
+                .await
+                .unwrap()
+            else {
+                panic!("catalog row must be hot")
+            };
+            let page = table
+                .row_store
+                .must_get_row_page_shared(trx.trx().pool_guards(), page_id)
+                .await
+                .unwrap();
+            *page.unwrap_vmap().write_state() = RowPageState::Frozen;
+            drop(page);
+            let pool = &engine.inner().pools.meta;
+            let mut reserved = Vec::new();
+            loop {
+                match pool
+                    .allocate_page::<Page>(trx.trx().pool_guards().meta_guard())
+                    .await
+                {
+                    Ok(page) => reserved.push(page),
+                    Err(report) => {
+                        assert_eq!(
+                            report.downcast_ref::<ResourceError>(),
+                            Some(&ResourceError::BufferPoolFull)
+                        );
+                        break;
+                    }
+                }
+            }
+            let err = trx
+                .trx()
+                .catalog_replace_primary_key_mvcc(
+                    &table,
+                    pk,
+                    vec![Val::from(TableID::new(42))],
+                    catalog_callback_row(42, 2),
+                )
+                .await
+                .unwrap_err();
+            let RuntimeOrFatalError::Runtime(report) = err else {
+                panic!("allocation Runtime changed domain")
+            };
+            assert_eq!(
+                report.downcast_ref::<ResourceError>(),
+                Some(&ResourceError::BufferPoolFull)
+            );
+            assert_eq!(catalog_effect_counts(trx.trx()), before);
+            assert_eq!(
+                catalog_callback_current(&table, trx.trx(), 42).await,
+                Some((old_id, catalog_callback_row(42, 1)))
+            );
+            assert!(
+                catalog_callback_current(&table, trx.trx(), 44)
+                    .await
+                    .is_some()
+            );
+            for page in reserved {
+                pool.deallocate_page(page);
+            }
+
+            for (id, expected) in [(42, true), (99, false)] {
+                assert_eq!(
+                    trx.trx()
+                        .catalog_replace_primary_key_mvcc(
+                            &table,
+                            pk,
+                            vec![Val::from(TableID::new(id))],
+                            catalog_callback_row(id, 2)
+                        )
+                        .await
+                        .unwrap(),
+                    expected
+                );
+                let current = catalog_callback_current(&table, trx.trx(), id)
+                    .await
+                    .unwrap();
+                assert_ne!(current.0, old_id);
+                assert_eq!(current.1, catalog_callback_row(id, 2));
+            }
+            let before = catalog_effect_counts(trx.trx());
+            let err = trx
+                .trx()
+                .catalog_try_insert_unique_batch_mvcc(
+                    &table,
+                    vec![catalog_callback_row(100, 0), catalog_callback_row(44, 0)],
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, QuadError::Operation(ref report) if *report.current_context() == OperationError::DuplicateKey)
+            );
+            assert_eq!(catalog_effect_counts(trx.trx()), before);
+            assert!(
+                catalog_callback_current(&table, trx.trx(), 100)
+                    .await
+                    .is_none()
+            );
+            let count = trx
+                .trx()
+                .catalog_delete_primary_key_batch_mvcc(
+                    &table,
+                    pk,
+                    [42, 99, 999]
+                        .map(|id| vec![Val::from(TableID::new(id))])
+                        .to_vec(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(count, 2);
+            assert!(
+                catalog_callback_current(&table, trx.trx(), 44)
+                    .await
+                    .is_some()
+            );
+            trx.rollback().await;
+        });
+    }
+
+    #[test]
+    fn test_catalog_callback_always_validates_actions_and_payloads() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("catalog_callback_validation").await;
+            let table = engine
+                .inner()
+                .core
+                .catalog()
+                .storage
+                .get_catalog_table(TABLE_ID_TABLES)
+                .unwrap();
+            let session = engine.new_session().unwrap();
+            let pk = CatalogIndexNo::new(0);
+            for (occupied, action) in [
+                (false, UniqueMutation::Delete),
+                (false, UniqueMutation::Update(Vec::new())),
+                (false, UniqueMutation::Insert(catalog_callback_row(99, 0))),
+                (
+                    false,
+                    UniqueMutation::Insert(vec![Val::from(TableID::new(42))]),
+                ),
+                (true, UniqueMutation::Insert(catalog_callback_row(42, 0))),
+                (
+                    true,
+                    UniqueMutation::Update(vec![UpdateCol {
+                        idx: 1,
+                        val: Val::from("invalid epoch"),
+                    }]),
+                ),
+            ] {
+                let mut trx = begin_catalog_test_trx(&session);
+                if occupied {
+                    trx.trx()
+                        .catalog_insert_mvcc(&table, catalog_callback_row(42, 0))
+                        .await
+                        .unwrap();
+                }
+                let calls = Cell::new(0);
+                let panic = AssertUnwindSafe(trx.trx().catalog_primary_key_mutate_mvcc(
+                    &table,
+                    pk,
+                    vec![Val::from(TableID::new(42))],
+                    |row| {
+                        calls.set(calls.get() + 1);
+                        assert_eq!(row.is_some(), occupied);
+                        Ok(action)
+                    },
+                ))
+                .catch_unwind()
+                .await;
+                assert!(
+                    panic.is_err(),
+                    "invalid catalog decision must violate its invariant"
+                );
+                assert_eq!(calls.get(), 1);
+                trx.rollback().await;
+            }
+        });
+    }
+
+    #[test]
     fn test_catalog_native_impossible_domains_violate_invariant() {
         let table_id = TableID::new(42);
 
@@ -2176,11 +2625,10 @@ pub(crate) mod tests {
             .is_err()
         );
 
-        let insert: OperationOrRuntimeResult<()> =
-            Err(Report::new(OperationError::DuplicateKey).into());
+        let insert: QuadResult<()> = Err(Report::new(OperationError::DuplicateKey).into());
         assert!(
             catch_unwind(AssertUnwindSafe(|| {
-                let _ = narrow_catalog_operation_or_runtime(table_id, insert, || {
+                let _ = narrow_catalog_quad_result(table_id, insert, || {
                     "operation=test_catalog_insert".to_owned()
                 });
             }))
@@ -2188,7 +2636,7 @@ pub(crate) mod tests {
         );
 
         for expected in [OperationError::DuplicateKey, OperationError::WriteConflict] {
-            let insert: OperationOrRuntimeResult<()> = Err(Report::new(expected).into());
+            let insert: QuadResult<()> = Err(Report::new(expected).into());
             let Err(QuadError::Operation(report)) =
                 preserve_expected_catalog_insert_error(table_id, insert, || {
                     "operation=test_expected_catalog_insert".to_owned()
@@ -2199,7 +2647,7 @@ pub(crate) mod tests {
             assert_eq!(*report.current_context(), expected);
         }
 
-        let unexpected_insert: OperationOrRuntimeResult<()> =
+        let unexpected_insert: QuadResult<()> =
             Err(Report::new(OperationError::InvalidDmlInput).into());
         assert!(
             catch_unwind(AssertUnwindSafe(|| {
@@ -2235,15 +2683,18 @@ pub(crate) mod tests {
     #[test]
     fn test_catalog_native_runtime_errors_preserve_stack() {
         let table_id = TableID::new(42);
-        let insert: OperationOrRuntimeResult<()> = Err(OperationOrRuntimeError::Runtime(
+        let insert: QuadResult<()> = Err(QuadError::Runtime(
             Report::new(ResourceError::BufferPoolFull)
                 .attach("pool_role=Meta")
                 .change_context(RuntimeError::TableAccess),
         ));
-        let err = narrow_catalog_operation_or_runtime(table_id, insert, || {
+        let err = narrow_catalog_quad_result(table_id, insert, || {
             "operation=test_catalog_insert".to_owned()
         })
         .unwrap_err();
+        let RuntimeOrFatalError::Runtime(err) = err else {
+            panic!("runtime catalog failure changed domain")
+        };
         assert_catalog_runtime_stack(&err, "operation=test_catalog_insert");
 
         let delete: QuadResult<()> = Err(Report::new(ResourceError::BufferPoolFull)
@@ -2371,10 +2822,11 @@ pub(crate) mod tests {
             let mut trx = begin_catalog_test_trx(&session);
             let key = SelectKey::new(IndexSlot::new(1), vec![Val::from(TableID::new(42))]);
 
-            let panic = AssertUnwindSafe(trx.trx().catalog_delete_primary_key_mvcc(
+            let panic = AssertUnwindSafe(trx.trx().catalog_primary_key_mutate_mvcc(
                 catalog_table.as_ref(),
                 key.index_slot,
                 key.vals,
+                |_| Ok(UniqueMutation::Delete),
             ))
             .catch_unwind()
             .await

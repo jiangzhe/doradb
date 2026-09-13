@@ -1,23 +1,20 @@
-//! Unique row selection, retained ownership, and logical action dispatch.
+//! Unique current-row selection for user and complete memory tables.
 //!
-//! Read-current selection is shared with MemTable; snapshot readers never use it.
-
-use super::access::{LazyRow, LazyRowBuffer, LazyRowSource, UserTableAccessor};
-use super::deletion_buffer::DeletionState;
-use super::hot::{DeleteInternal, HotRowLock, HotRowMutator};
+//! Selection retries retain original lookup evidence; decisions run at most once.
+use super::access::{ColdRowSelection, LazyRow, LazyRowBuffer, LazyRowSource};
+use super::hot::{DeleteInternal, HotRowLock, HotRowMutator, UpdateRowInplace};
 use super::index_key::WriteIndexKeySet;
-use super::{DmlValidator, TableRootSnapshot, validate_page_row_range};
+use super::mutate::{HotUpdatePage, MemIndexRuntime, MutationAttempt, MutationExecutor};
+use super::{DmlValidator, validate_page_row_range};
+use crate::buffer::BufferPool;
 use crate::buffer::guard::PageSharedGuard;
-use crate::catalog::IndexRef;
-use crate::error::{
-    CallbackResult, DataIntegrityError, DiscloseError, DiscloseResultExt, OperationError,
-    OperationOrRuntimeResult, OperationResult, RuntimeError,
-};
+use crate::catalog::{CatalogSelectKey, IndexRef, TableMetadata};
+use crate::error::{OperationError, OperationResult, QuadError};
 use crate::id::{RowID, TrxID};
-use crate::index::{LwcRowLocation, RowLocation, UniqueLookupObservation};
-use crate::lwc::PersistedLwcBlock;
+use crate::index::{RowLocation, UniqueLookupObservation};
+use crate::log::redo::RowRedoKind;
 use crate::poison::PoisonAwareListener;
-use crate::row::ops::{RowUpdateInput, UniqueMutation, UniqueMutationOutcome};
+use crate::row::ops::{UniqueMutation, UniqueMutationOutcome};
 use crate::row::{RowPage, RowRead};
 use crate::runtime::yield_now;
 use crate::trx::TrxRuntime;
@@ -25,7 +22,10 @@ use crate::trx::row::RowWriteAccess;
 use crate::trx::stmt::StmtEffects;
 use crate::value::Val;
 use error_stack::{Report, ResultExt};
+use std::result::Result as StdResult;
 
+#[cfg(test)]
+pub(super) use tests::run_current_cold_hook;
 #[cfg(test)]
 pub(crate) use tests::{
     record_forward_hint, record_lookup_validation, record_unique_disk_lookup, record_unique_lookup,
@@ -137,71 +137,141 @@ enum SelectionWait {
     Transition(RowID),
 }
 
-/// Cold admission retains either fresh ownership or the reason to retry/reject.
-enum ColdRowSelection {
-    Owned(PersistedLwcBlock),
-    Rejected(RowInspection),
-    Preparing(PoisonAwareListener),
-}
-
-/// Hot deletes defer index maintenance until the caller releases the row page.
-enum HotMutationResult<'op> {
-    Completed(UniqueMutationOutcome),
-    Deleted(WriteIndexKeySet<'op>),
-}
-
-/// Operation-scoped unique mutation executor; guards and roots remain attempt-local.
-pub(super) struct UniqueMutator<'a, 'op, 'r> {
-    accessor: &'a UserTableAccessor<'op>,
-    rt: TrxRuntime<'r>,
-    effects: &'a mut StmtEffects,
+/// Validates entry/action agreement and payload policy at the decision boundary.
+pub(super) struct MutationValidator<'a> {
+    metadata: &'a TableMetadata,
     index: IndexRef,
     key_vals: &'a [Val],
     validator: Option<DmlValidator<'a>>,
 }
 
-impl<'a, 'op, 'r> UniqueMutator<'a, 'op, 'r> {
+impl MutationValidator<'_> {
+    /// Checks logical action shape even when ordinary payload checks are disabled.
+    pub(super) fn validate_action(
+        &self,
+        occupied: bool,
+        action: &UniqueMutation,
+    ) -> OperationResult<()> {
+        let key = self.key_vals;
+        if matches!(
+            (occupied, action),
+            (true, UniqueMutation::Insert(_))
+                | (false, UniqueMutation::Update(_) | UniqueMutation::Delete)
+        ) {
+            return Err(Report::new(OperationError::InvalidDmlInput)
+                .attach("unique mutation action is invalid for the observed entry state"));
+        }
+        match action {
+            UniqueMutation::Insert(row) => {
+                if let Some(validator) = &self.validator {
+                    validator
+                        .validate_full_row(row)
+                        .change_context(OperationError::InvalidDmlInput)?;
+                }
+                let spec = self.metadata.idx.expect_index_spec(self.index);
+                if spec.keys.len() != key.len()
+                    || !spec.keys.iter().zip(key).all(|(column, expected)| {
+                        row.get(column.column_ordinal.as_usize()) == Some(expected)
+                    })
+                {
+                    return Err(Report::new(OperationError::InvalidDmlInput)
+                        .attach("inserted row must match the selected unique key"));
+                }
+            }
+            UniqueMutation::Update(update) => {
+                if let Some(validator) = &self.validator {
+                    validator
+                        .validate_sparse_update(update)
+                        .change_context(OperationError::InvalidDmlInput)?;
+                }
+            }
+            _ => (),
+        }
+        Ok(())
+    }
+}
+
+/// Decision-scoped transaction effects and validation retained after selection.
+pub(super) struct MutationDecision<'a, 'r> {
+    pub(super) rt: TrxRuntime<'r>,
+    pub(super) effects: &'a mut StmtEffects,
+    pub(super) validator: &'a MutationValidator<'a>,
+    pub(super) redo_key: Option<CatalogSelectKey>,
+}
+
+/// Hot deletes release the page before their asynchronous index effects.
+enum HotMutationResult<'op> {
+    Completed(UniqueMutationOutcome),
+    Updated(UpdateRowInplace),
+    Deleted(WriteIndexKeySet<'op>),
+}
+
+/// One shared selection/retry driver with attempt-local user roots.
+pub(super) struct UniqueMutator<'a, 'op, 'r, D: 'static, R> {
+    executor: MutationExecutor<'op, D, R>,
+    rt: TrxRuntime<'r>,
+    effects: &'a mut StmtEffects,
+    index: IndexRef,
+    key_vals: &'a [Val],
+    validator: MutationValidator<'a>,
+    redo_key: Option<CatalogSelectKey>,
+}
+
+impl<'a, 'op: 'a, 'r, D: BufferPool, R: MemIndexRuntime> UniqueMutator<'a, 'op, 'r, D, R> {
+    /// Binds the owner's executor, selected key, and optional catalog redo identity.
     pub(super) fn new(
-        accessor: &'a UserTableAccessor<'op>,
+        executor: MutationExecutor<'op, D, R>,
         rt: TrxRuntime<'r>,
         effects: &'a mut StmtEffects,
         index: IndexRef,
         key_vals: &'a [Val],
         validate: bool,
+        redo_key: Option<CatalogSelectKey>,
     ) -> Self {
+        let metadata = executor.metadata();
         Self {
-            accessor,
+            executor,
             rt,
             effects,
             index,
             key_vals,
-            validator: validate.then(|| DmlValidator::new(accessor.metadata())),
+            validator: MutationValidator {
+                metadata,
+                index,
+                key_vals,
+                validator: validate.then(|| DmlValidator::new(metadata)),
+            },
+            redo_key,
         }
     }
-
-    /// Retries only selection; invoking the callback commits to the selected entry.
-    #[inline]
-    pub(super) async fn execute<F, E>(
+    /// Retries selection before invoking exactly one synchronous decision.
+    pub(super) async fn execute<F, CE, M>(
         mut self,
         mutate_row: F,
-    ) -> CallbackResult<UniqueMutationOutcome, E>
+        map_error: M,
+    ) -> StdResult<UniqueMutationOutcome, CE>
     where
-        F: for<'row> FnOnce(Option<&mut LazyRow<'row>>) -> CallbackResult<UniqueMutation, E>,
+        F: for<'row> FnOnce(Option<&mut LazyRow<'row>>) -> StdResult<UniqueMutation, CE>,
+        M: Fn(QuadError) -> CE,
     {
-        let accessor = self.accessor;
+        let accessor = &self.executor;
         let rt = self.rt;
         let key_vals = self.key_vals;
         let poisoner = &rt.engine().poisoner;
         'retry: loop {
             // Both prepare and transition waits release the entire attempt first.
             let wait = 'attempt: {
-                let root = accessor.root_snapshot(rt.ctx());
-                let handle =
-                    accessor.snapshot_index_read_handle(rt.pool_guards(), &root, self.index);
-                let index = handle.bind_unique().disclose()?;
-                let (candidate, observation) = index.lookup_observed(key_vals).await.disclose()?;
+                let attempt = accessor.begin_attempt(rt.ctx());
+                let root = attempt.root();
+                let index = accessor
+                    .bind_unique(rt.pool_guards(), self.index, root)
+                    .map_err(|err| map_error(err.into()))?;
+                let (candidate, observation) = index
+                    .lookup_observed(key_vals)
+                    .await
+                    .map_err(|err| map_error(err.into()))?;
                 let Some((row_id, _)) = candidate else {
-                    if observation.is_valid() {
+                    if matches!(attempt, MutationAttempt::Memory) || observation.is_valid() {
                         break 'retry;
                     }
                     break 'attempt None;
@@ -212,7 +282,7 @@ impl<'a, 'op, 'r> UniqueMutator<'a, 'op, 'r> {
                     let inspection = match accessor
                         .resolve_row_location(rt.pool_guards(), row_id)
                         .await
-                        .disclose()?
+                        .map_err(|err| map_error(err.into()))?
                     {
                         RowLocation::NotFound => RowInspection::MissingRoute,
                         RowLocation::RowPage(page_id) => 'inspect: {
@@ -222,7 +292,7 @@ impl<'a, 'op, 'r> UniqueMutator<'a, 'op, 'r> {
                                 .row_store()
                                 .must_get_row_page_shared(rt.pool_guards(), page_id)
                                 .await
-                                .disclose()?;
+                                .map_err(|err| map_error(err.into()))?;
                             assert!(
                                 validate_page_row_range(&page, page_id, row_id),
                                 "unique mutation row page does not match selected row: table_id={}, page_id={page_id}, row_id={row_id}",
@@ -250,10 +320,11 @@ impl<'a, 'op, 'r> UniqueMutator<'a, 'op, 'r> {
                                     break 'inspect RowInspection::HotUnresolved;
                                 }
                                 HotRowLock::WriteConflict => {
-                                    return Err(Report::new(OperationError::WriteConflict)
-                                        .attach("unique mutation hot-row ownership")
-                                        .disclose()
-                                        .into());
+                                    return Err(map_error(
+                                        Report::new(OperationError::WriteConflict)
+                                            .attach("unique mutation hot-row ownership")
+                                            .into(),
+                                    ));
                                 }
                                 HotRowLock::Preparing(listener) => {
                                     break 'attempt Some(SelectionWait::Preparing(listener));
@@ -263,34 +334,85 @@ impl<'a, 'op, 'r> UniqueMutator<'a, 'op, 'r> {
                                 }
                             };
                             drop(selection);
-                            return match self
-                                .mutate_owned_hot_row(&page, access, &root, mutate_row)
-                                .await?
-                            {
+                            return match Self::mutate_owned_hot_row(
+                                accessor,
+                                MutationDecision {
+                                    rt,
+                                    effects: self.effects,
+                                    validator: &self.validator,
+                                    redo_key: self.redo_key.take(),
+                                },
+                                &page,
+                                access,
+                                mutate_row,
+                                &map_error,
+                            )? {
+                                HotMutationResult::Updated(update) => {
+                                    let (row_id, _) = accessor
+                                        .continue_hot_update(
+                                            rt,
+                                            self.effects,
+                                            HotUpdatePage::Owned(page),
+                                            update,
+                                            root,
+                                        )
+                                        .await
+                                        .map_err(&map_error)?;
+                                    Ok(UniqueMutationOutcome::Updated(row_id))
+                                }
                                 HotMutationResult::Completed(outcome) => Ok(outcome),
                                 HotMutationResult::Deleted(keys) => {
-                                    let proof = accessor
-                                        .owned_row_page_index_set_proof(row_id, keys, &root);
+                                    let proof = accessor.owned_hot_index_set(
+                                        self.effects,
+                                        row_id,
+                                        keys,
+                                        root,
+                                    );
                                     drop(page);
                                     accessor
                                         .defer_delete_owned_row_index_set(rt, self.effects, proof)
                                         .await
-                                        .disclose()?;
+                                        .map_err(|err| map_error(err.into()))?;
                                     Ok(UniqueMutationOutcome::Deleted)
                                 }
                             };
                         }
                         RowLocation::LwcBlock(location) => {
-                            match self.select_cold_row(row_id, location).await.disclose()? {
+                            let MutationAttempt::User(user) = &attempt else {
+                                unreachable!("memory mutation cannot select cold row");
+                            };
+                            match user
+                                .accessor
+                                .select_cold_row(
+                                    rt,
+                                    self.effects,
+                                    self.index,
+                                    key_vals,
+                                    row_id,
+                                    location,
+                                )
+                                .await
+                                .map_err(|err| map_error(err.into()))?
+                            {
                                 ColdRowSelection::Rejected(inspection) => inspection,
                                 ColdRowSelection::Preparing(listener) => {
                                     break 'attempt Some(SelectionWait::Preparing(listener));
                                 }
                                 ColdRowSelection::Owned(persisted) => {
                                     drop(selection);
-                                    return self
+                                    return user
+                                        .accessor
                                         .mutate_owned_cold_row(
-                                            row_id, location, persisted, &root, mutate_row,
+                                            MutationDecision {
+                                                rt,
+                                                effects: self.effects,
+                                                validator: &self.validator,
+                                                redo_key: None,
+                                            },
+                                            persisted,
+                                            &user.root,
+                                            mutate_row,
+                                            &map_error,
                                         )
                                         .await;
                                 }
@@ -300,120 +422,62 @@ impl<'a, 'op, 'r> UniqueMutator<'a, 'op, 'r> {
                     match selection.decide(inspection) {
                         CurrentRowDecision::Missing => break 'retry,
                         CurrentRowDecision::Conflict => {
-                            return Err(Report::new(OperationError::WriteConflict)
-                                .attach("stable unique lookup cold deletion")
-                                .disclose()
-                                .into());
+                            return Err(map_error(
+                                Report::new(OperationError::WriteConflict)
+                                    .attach("stable unique lookup cold deletion")
+                                    .into(),
+                            ));
                         }
                         CurrentRowDecision::Retry => break 'attempt None,
                         CurrentRowDecision::Hint(target) => selection.advance(target),
                     }
                     yield_now().await;
-                    poisoner.ensure_healthy().disclose()?;
+                    poisoner
+                        .ensure_healthy()
+                        .map_err(|err| map_error(err.into()))?;
                 }
             };
             if let Some(wait) = wait {
                 match wait {
                     SelectionWait::Preparing(listener) => {
-                        rt.wait_prepare_or_poison(listener).await.disclose()?;
+                        rt.wait_prepare_or_poison(listener)
+                            .await
+                            .map_err(|err| map_error(err.into()))?;
                     }
                     SelectionWait::Transition(row_id) => {
                         accessor
-                            .table()
-                            .wait_transition_route_or_poison(poisoner, row_id)
+                            .wait_transition(rt, row_id)
                             .await
-                            .disclose()?;
+                            .map_err(|err| map_error(err.into()))?;
                     }
                 }
             }
             yield_now().await;
-            poisoner.ensure_healthy().disclose()?;
+            poisoner
+                .ensure_healthy()
+                .map_err(|err| map_error(err.into()))?;
         }
-        self.mutate_missing(mutate_row).await
+        self.mutate_missing(mutate_row, &map_error).await
     }
 
-    /// Checks the immutable image between initial inspection and an undo-backed claim.
-    async fn select_cold_row(
-        &mut self,
-        row_id: RowID,
-        location: LwcRowLocation,
-    ) -> OperationOrRuntimeResult<ColdRowSelection> {
-        let accessor = self.accessor;
-        let rt = self.rt;
-        #[cfg(test)]
-        tests::run_current_cold_hook(false);
-        match accessor.lwc_deletion_buffer().current_state(
-            row_id,
-            rt.status(),
-            location.durable_deleted,
-        ) {
-            DeletionState::Available => (),
-            DeletionState::Consumed => {
-                return Ok(ColdRowSelection::Rejected(RowInspection::ColdConsumed));
-            }
-            DeletionState::Deleted(cts) => {
-                return Ok(ColdRowSelection::Rejected(RowInspection::ColdDeleted(cts)));
-            }
-            DeletionState::WriteConflict => {
-                return Err(Report::new(OperationError::WriteConflict)
-                    .attach("unique mutation cold-row ownership")
-                    .into());
-            }
-            DeletionState::Preparing(listener) => return Ok(ColdRowSelection::Preparing(listener)),
-            DeletionState::Acquired => unreachable!("inspection cannot acquire a marker"),
-        }
-        let persisted = accessor
-            .column_storage()
-            .load_lwc_block(rt.pool_guards().disk_guard(), location.block_id)
-            .await
-            .change_context(RuntimeError::TableAccess)?;
-        let block = persisted.block();
-        if block.row_shape_fingerprint() != location.row_shape_fingerprint {
-            return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
-                    "unique lookup row shape mismatch: block_id={}",
-                    location.block_id
-                ))
-                .change_context(RuntimeError::TableAccess)
-                .into());
-        }
-        let spec = accessor.metadata().idx.expect_index_spec(self.index);
-        let actual_key = block
-            .decode_index_key_values(accessor.metadata().col.as_ref(), spec, location.row_idx)
-            .change_context(RuntimeError::TableAccess)?;
-        if actual_key != self.key_vals {
-            return Ok(ColdRowSelection::Rejected(RowInspection::ColdKeyMismatch));
-        }
-        drop(actual_key);
-        #[cfg(test)]
-        tests::run_current_cold_hook(true);
-        match accessor.claim_current_cold_row(rt, self.effects, row_id, location.durable_deleted) {
-            DeletionState::Acquired => Ok(ColdRowSelection::Owned(persisted)),
-            DeletionState::Consumed => Ok(ColdRowSelection::Rejected(RowInspection::ColdConsumed)),
-            DeletionState::Deleted(cts) => {
-                Ok(ColdRowSelection::Rejected(RowInspection::ColdDeleted(cts)))
-            }
-            DeletionState::WriteConflict => Err(Report::new(OperationError::WriteConflict)
-                .attach("unique mutation cold-row claim")
-                .into()),
-            DeletionState::Preparing(listener) => Ok(ColdRowSelection::Preparing(listener)),
-            DeletionState::Available => unreachable!("conditional claim resolves vacancy"),
-        }
-    }
-
-    /// Invokes the callback while retaining the hot row's write access.
-    async fn mutate_owned_hot_row<F, E>(
-        &mut self,
+    fn mutate_owned_hot_row<F, CE, M>(
+        accessor: &MutationExecutor<'op, D, R>,
+        decision: MutationDecision<'_, '_>,
         page: &PageSharedGuard<RowPage>,
         access: RowWriteAccess<'_>,
-        root: &TableRootSnapshot<'_>,
         mutate_row: F,
-    ) -> CallbackResult<HotMutationResult<'op>, E>
+        map_error: &M,
+    ) -> StdResult<HotMutationResult<'op>, CE>
     where
-        F: for<'row> FnOnce(Option<&mut LazyRow<'row>>) -> CallbackResult<UniqueMutation, E>,
+        F: for<'row> FnOnce(Option<&mut LazyRow<'row>>) -> StdResult<UniqueMutation, CE>,
+        M: Fn(QuadError) -> CE,
     {
-        let accessor = self.accessor;
-        let rt = self.rt;
+        let MutationDecision {
+            rt,
+            effects,
+            validator,
+            mut redo_key,
+        } = decision;
         let row_id = access.row().row_id();
         let width = accessor.metadata().col.col_count();
         let mut buffer = LazyRowBuffer::new_deferred(width);
@@ -424,34 +488,35 @@ impl<'a, 'op, 'r> UniqueMutator<'a, 'op, 'r> {
         let mut row = LazyRow::new(source, &mut buffer, width);
         let action = mutate_row(Some(&mut row))?;
         let access = row.into_hot_write_access();
-        self.validate_action(true, &action).disclose()?;
+        validator
+            .validate_action(true, &action)
+            .map_err(|err| map_error(err.into()))?;
         let outcome = match action {
             UniqueMutation::Skip => {
-                accessor.cancel_owned_hot_row(self.effects, access);
+                accessor.cancel_owned_hot_row(effects, access);
                 UniqueMutationOutcome::Noop
             }
             UniqueMutation::Update(ref cols) if cols.is_empty() => {
-                accessor.cancel_owned_hot_row(self.effects, access);
+                accessor.cancel_owned_hot_row(effects, access);
                 UniqueMutationOutcome::Updated(row_id)
             }
             UniqueMutation::Update(input) => {
-                let result = accessor
-                    .update_owned_hot_row(
-                        rt,
-                        self.effects,
-                        page,
-                        access,
-                        RowUpdateInput::Sparse(input),
-                        root,
-                    )
-                    .await
-                    .disclose()?;
-                UniqueMutationOutcome::Updated(result)
+                let update =
+                    HotRowMutator::new(accessor.table_id(), accessor.metadata(), rt, page, row_id)
+                        .finish_update_owned(effects, input, redo_key.take(), access);
+                return Ok(HotMutationResult::Updated(update));
             }
             UniqueMutation::Delete => {
                 let result =
                     HotRowMutator::new(accessor.table_id(), accessor.metadata(), rt, page, row_id)
-                        .delete_owned_row(self.effects, access);
+                        .finish_delete_owned(
+                            effects,
+                            access,
+                            redo_key
+                                .take()
+                                .map(RowRedoKind::DeleteByPrimaryKey)
+                                .unwrap_or(RowRedoKind::Delete(Some(page.page_id()))),
+                        );
                 assert!(
                     matches!(result, DeleteInternal::Ok),
                     "retained unique row must remain deletable: row_id={row_id}"
@@ -464,141 +529,29 @@ impl<'a, 'op, 'r> UniqueMutator<'a, 'op, 'r> {
         Ok(HotMutationResult::Completed(outcome))
     }
 
-    /// Invokes the callback after a fresh cold claim and applies its action.
-    async fn mutate_owned_cold_row<F, E>(
-        &mut self,
-        row_id: RowID,
-        location: LwcRowLocation,
-        persisted: PersistedLwcBlock,
-        root: &TableRootSnapshot<'_>,
-        mutate_row: F,
-    ) -> CallbackResult<UniqueMutationOutcome, E>
-    where
-        F: for<'row> FnOnce(Option<&mut LazyRow<'row>>) -> CallbackResult<UniqueMutation, E>,
-    {
-        let accessor = self.accessor;
-        let rt = self.rt;
-        let width = accessor.metadata().col.col_count();
-        let mut buffer = LazyRowBuffer::new_deferred(width);
-        let block = persisted.block();
-        let source = || LazyRowSource::Cold {
-            block,
-            column_layout: accessor.metadata().col.as_ref(),
-            row_idx: location.row_idx,
-            file_kind: accessor.column_storage().file().file_kind(),
-            block_id: location.block_id,
-        };
-        let action = {
-            let mut row = LazyRow::new(source(), &mut buffer, width);
-            mutate_row(Some(&mut row))?
-        };
-        self.validate_action(true, &action).disclose()?;
-        match action {
-            UniqueMutation::Skip => {
-                accessor.cancel_owned_cold_row(rt, self.effects, row_id);
-                Ok(UniqueMutationOutcome::Noop)
-            }
-            UniqueMutation::Update(ref cols) if cols.is_empty() => {
-                accessor.cancel_owned_cold_row(rt, self.effects, row_id);
-                Ok(UniqueMutationOutcome::Updated(row_id))
-            }
-            UniqueMutation::Update(input) => {
-                let old = LazyRow::new_prepared(source(), &mut buffer, width)
-                    .into_full_row()
-                    .change_context(RuntimeError::TableAccess)
-                    .disclose()?;
-                drop(persisted);
-                let result = accessor
-                    .update_owned_cold_row(
-                        rt,
-                        self.effects,
-                        row_id,
-                        old,
-                        RowUpdateInput::Sparse(input),
-                        root,
-                    )
-                    .await
-                    .disclose()?;
-                Ok(UniqueMutationOutcome::Updated(result.row_id()))
-            }
-            UniqueMutation::Delete => {
-                // Decode indexed columns directly; a constant delete never
-                // initializes dense callback scratch.
-                let keys = accessor
-                    .index_keys_from_cold_row(block, location.row_idx)
-                    .change_context(RuntimeError::TableAccess)
-                    .disclose()?;
-                drop(persisted);
-                accessor
-                    .finish_owned_cold_delete_effects(rt, self.effects, row_id, keys, root)
-                    .await
-                    .disclose()?;
-                Ok(UniqueMutationOutcome::Deleted)
-            }
-            UniqueMutation::Insert(_) => unreachable!("validated occupied actions cannot insert"),
-        }
-    }
-
-    /// Invokes the callback once absence is confirmed by the selection loop.
-    async fn mutate_missing<F, E>(
+    async fn mutate_missing<F, CE, M>(
         &mut self,
         mutate_row: F,
-    ) -> CallbackResult<UniqueMutationOutcome, E>
+        map_error: &M,
+    ) -> StdResult<UniqueMutationOutcome, CE>
     where
-        F: for<'row> FnOnce(Option<&mut LazyRow<'row>>) -> CallbackResult<UniqueMutation, E>,
+        F: for<'row> FnOnce(Option<&mut LazyRow<'row>>) -> StdResult<UniqueMutation, CE>,
+        M: Fn(QuadError) -> CE,
     {
         let action = mutate_row(None)?;
-        self.validate_action(false, &action).disclose()?;
+        self.validator
+            .validate_action(false, &action)
+            .map_err(|err| map_error(err.into()))?;
         match action {
             UniqueMutation::Skip => Ok(UniqueMutationOutcome::Noop),
             UniqueMutation::Insert(row) => self
-                .accessor
+                .executor
                 .insert_mvcc(self.rt, self.effects, row)
                 .await
                 .map(UniqueMutationOutcome::Inserted)
-                .disclose()
-                .map_err(Into::into),
+                .map_err(map_error),
             _ => unreachable!("validated missing actions can only skip or insert"),
         }
-    }
-
-    fn validate_action(&self, occupied: bool, action: &UniqueMutation) -> OperationResult<()> {
-        let key = self.key_vals;
-        if matches!(
-            (occupied, action),
-            (true, UniqueMutation::Insert(_))
-                | (false, UniqueMutation::Update(_) | UniqueMutation::Delete)
-        ) {
-            return Err(Report::new(OperationError::InvalidDmlInput)
-                .attach("unique mutation action is invalid for the observed entry state"));
-        }
-        match action {
-            UniqueMutation::Insert(row) => {
-                if let Some(validator) = &self.validator {
-                    validator
-                        .validate_full_row(row)
-                        .change_context(OperationError::InvalidDmlInput)?;
-                }
-                let spec = self.accessor.metadata().idx.expect_index_spec(self.index);
-                if spec.keys.len() != key.len()
-                    || !spec.keys.iter().zip(key).all(|(column, expected)| {
-                        row.get(column.column_ordinal.as_usize()) == Some(expected)
-                    })
-                {
-                    return Err(Report::new(OperationError::InvalidDmlInput)
-                        .attach("inserted row must match the selected unique key"));
-                }
-            }
-            UniqueMutation::Update(update) => {
-                if let Some(validator) = &self.validator {
-                    validator
-                        .validate_sparse_update(update)
-                        .change_context(OperationError::InvalidDmlInput)?;
-                }
-            }
-            _ => (),
-        }
-        Ok(())
     }
 }
 
@@ -683,7 +636,8 @@ mod tests {
     }
 
     /// Fires a one-shot hook at initial inspection or the late claim boundary.
-    pub(super) fn run_current_cold_hook(after_load: bool) {
+    /// Runs the one-shot semantic gate around cold-image validation.
+    pub(crate) fn run_current_cold_hook(after_load: bool) {
         let hook = CURRENT_COLD_HOOK.with(|slot| {
             let mut slot = slot.borrow_mut();
             if slot.as_ref().is_some_and(|(late, _)| *late == after_load) {

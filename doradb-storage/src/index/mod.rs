@@ -49,7 +49,8 @@ pub(crate) use row_page_index::RowPageIndexNode;
 pub(crate) use row_page_index::{LwcRowLocation, RowLocation};
 pub(crate) use secondary_index::{
     InMemorySecondaryIndex, IndexCompareExchange, IndexInsert, NonUniqueSecondaryIndex,
-    SecondaryDiskTreeRuntime, SecondaryIndex, UniqueInsertAttempt, UniqueSecondaryIndex,
+    SecondaryDiskTreeRuntime, SecondaryIndex, UniqueInsertAttempt, UniqueOwnerObservation,
+    UniqueSecondaryIndex,
 };
 pub(crate) use unique_index::{GuardedUniqueMemIndex, UniqueLookupObservation, UniqueMemIndex};
 

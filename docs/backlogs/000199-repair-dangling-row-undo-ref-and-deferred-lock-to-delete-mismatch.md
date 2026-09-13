@@ -10,7 +10,7 @@ Fix two checkpoint-transition correctness bugs found during task000300 review: r
 - [Task 000300](../tasks/000300-fix-stale-unique-read-current-lookups-across-row-replacement.md): current unique read-current and forward-link work.
 - [Task 000272](../tasks/000272-row-undo-rollback-through-page-transition.md) and [closed backlog 000185](closed/000185-row-undo-rollback-through-page-transition.md): introduced transition-route waiting and cold-marker-only rollback completion. This follow-up corrects the retained-page lifetime assumption; do not reopen the old item as if its implementation had not shipped.
 - [Task 000219](../tasks/000219-optimize-frozen-page-checkpoint-transition-planning.md): frozen mutation tracking, prepared visibility plans, and transition publication.
-- [Related backlog 000198](000198-share-unique-mutation-execution-across-user-and-mem-catalog-tables.md) concerns broader mutation-engine consolidation and remains separate.
+- [Related backlog 000198](closed/000198-share-unique-mutation-execution-across-user-and-mem-catalog-tables.md) concerns broader mutation-engine consolidation and remains separate.
 - `doradb-storage/src/trx/undo/row.rs`: `RowUndoLogs::rollback`, `OwnedRowUndo`, `RowUndoRef`, `ForwardLinkUndo`.
 - `doradb-storage/src/table/mem_table.rs`: exact-generation page access, `try_restore_forward_link`, `try_rollback_hot_row_undo`, retained-page deallocation.
 - `doradb-storage/src/table/index_mutate.rs`: `apply_deferred_index_update`; `table/access.rs`: `finish_owned_cold_delete_effects`, `update_owned_cold_row`, snapshot candidate lookup.

@@ -152,6 +152,21 @@ serve narrower purposes. Layouts acquire neither persisted roots nor row
 ownership. The managed definition owns its projection and envelope, with no
 metadata or executable-runtime reference.
 
+Foreground user and memory/catalog tables share `table/mutate.rs` execution
+through a borrowed `MutationExecutor`. It uses the owner's RowStore and exact
+runtime layout for hot updates, moves, insertion retries, and mutable-index
+effects. `unique_mutate.rs` owns one current-row selection/retry driver and
+invokes each decision at most once. Memory indexes are borrowed directly;
+user indexes expose their mutable half without cloning index owners.
+
+UserTableAccessor retains root capture, cold selection and decoding, CDB
+ownership, persisted-index proof consumption, and cold-owner inspection during
+hot unique-key claims. Cold replacement calls shared insertion under its
+captured root. User insert-page caching and page-creation redo remain distinct
+from memory/catalog free-list allocation. Catalog point callbacks, batch
+deletion, and delete-then-insert replacement retain their private statement
+boundaries and key-based redo.
+
 ### Redo Log File
 
 **Redo Log File** contains all committed data of recent transactions.
