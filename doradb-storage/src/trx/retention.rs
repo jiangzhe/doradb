@@ -310,7 +310,9 @@ impl TransactionSystem {
                 .await
             {
                 Ok(marker) => marker,
-                Err(err) if err.downcast_ref::<IoError>().is_some() => {
+                Err(RuntimeOrFatalError::Runtime(err))
+                    if err.downcast_ref::<IoError>().is_some() =>
+                {
                     let report = err
                         .change_context(FatalError::CheckpointWrite)
                         .attach("publish redo retention marker IO failure");
@@ -322,7 +324,7 @@ impl TransactionSystem {
                         self.poisoner.poison(report).into_report(),
                     ));
                 }
-                Err(err) => return Err(RuntimeOrFatalError::from(err)),
+                Err(err) => return Err(err),
             }
         } else {
             previous_first_retained_file_seq
@@ -499,7 +501,9 @@ impl TransactionSystem {
                     .await
                 {
                     Ok(marker) => marker,
-                    Err(err) if err.downcast_ref::<IoError>().is_some() => {
+                    Err(RuntimeOrFatalError::Runtime(err))
+                        if err.downcast_ref::<IoError>().is_some() =>
+                    {
                         let report = err
                             .change_context(FatalError::CheckpointWrite)
                             .attach("publish combined redo retention marker IO failure");
@@ -511,7 +515,7 @@ impl TransactionSystem {
                             self.poisoner.poison(report).into_report(),
                         ));
                     }
-                    Err(err) => return Err(RuntimeOrFatalError::from(err)),
+                    Err(err) => return Err(err),
                 };
             }
             CatalogCheckpointOutcome::Noop

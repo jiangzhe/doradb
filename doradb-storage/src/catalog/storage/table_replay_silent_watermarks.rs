@@ -9,7 +9,7 @@ use crate::catalog::{
 };
 use crate::error::{
     DataIntegrityError, DataIntegrityResult, MultiDomainResultExt, RuntimeError,
-    RuntimeOrFatalResult, RuntimeResult,
+    RuntimeOrFatalResult, RuntimeOrFatalResultExt,
 };
 use crate::id::{TableID, TrxID};
 use crate::row::RowRead;
@@ -44,7 +44,7 @@ impl TableReplaySilentWatermarks<'_> {
         &self,
         guards: &PoolGuards,
         table_id: TableID,
-    ) -> RuntimeResult<Option<SilentWatermarkObject>> {
+    ) -> RuntimeOrFatalResult<Option<SilentWatermarkObject>> {
         let key_vals = [Val::from(table_id)];
         let vals = self
             .table
@@ -59,7 +59,7 @@ impl TableReplaySilentWatermarks<'_> {
                 },
             )
             .await
-            .change_context(RuntimeError::CatalogAccess)
+            .change_runtime_context(RuntimeError::CatalogAccess)
             .attach_with(|| format!("operation=find_silent_watermark, table_id={table_id}"))?;
         vals.map(|vals| table_replay_silent_watermark_object_from_vals(&vals))
             .transpose()
@@ -67,6 +67,7 @@ impl TableReplaySilentWatermarks<'_> {
             .attach_with(|| {
                 format!("operation=find_silent_watermark, phase=decode_row, table_id={table_id}")
             })
+            .map_err(Into::into)
     }
 
     /// Upsert one caller-supplied monotonic live watermark without transaction state.
@@ -79,7 +80,7 @@ impl TableReplaySilentWatermarks<'_> {
         guards: &PoolGuards,
         obj: &SilentWatermarkObject,
         on_change: F,
-    ) -> RuntimeResult<()>
+    ) -> RuntimeOrFatalResult<()>
     where
         F: FnOnce(NoTrxUpsertChange),
     {
@@ -100,7 +101,7 @@ impl TableReplaySilentWatermarks<'_> {
                 on_change,
             )
             .await
-            .change_context(RuntimeError::CatalogAccess)
+            .change_runtime_context(RuntimeError::CatalogAccess)
             .attach_with(|| {
                 format!(
                     "operation=upsert_silent_watermark_no_trx, table_id={}",

@@ -14,7 +14,9 @@ pub(crate) enum RowPageState {
     Active = 0,
     /// Page is frozen and no longer accepts ordinary row growth.
     Frozen = 1,
-    /// Page is being converted by checkpoint.
+    /// Checkpoint fixes columns and its prepared bitmap. Only exact-owner
+    /// Lock/Delete completion, rollback, and recorded forward-slot restoration
+    /// may change live row metadata; ordinary foreground writes must reroute.
     Transition = 2,
 }
 

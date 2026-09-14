@@ -7,8 +7,8 @@ use crate::catalog::{
 use crate::engine::EngineCore;
 use crate::error::{
     CompletionErrorBridge, CompletionResult, DataIntegrityError, DataIntegrityResult, FatalError,
-    OperationError, OperationOrRuntimeResult, OperationResult, RuntimeError, RuntimeOrFatalError,
-    RuntimeOrFatalResult, RuntimeResult,
+    MultiDomainResultExt, OperationError, OperationResult, QuadResult, RuntimeError,
+    RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeOrFatalResultExt, RuntimeResult,
 };
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::file::meta_block::validate_secondary_index_state;
@@ -259,7 +259,7 @@ impl<'a> CreateIndexCollector<'a> {
 
     // Future improvement: stream/batch and parallelize this cold-row build to
     // avoid materializing every persisted row. See docs/backlogs/000104.
-    async fn collect_current_cold(&self) -> OperationOrRuntimeResult<Vec<CreateIndexRowEntry>> {
+    async fn collect_current_cold(&self) -> QuadResult<Vec<CreateIndexRowEntry>> {
         let table = self.table;
         let guards = self.guards;
         let metadata = self.layout.metadata();
@@ -358,7 +358,7 @@ impl<'a> CreateIndexCollector<'a> {
         Ok(rows)
     }
 
-    async fn collect_current_hot(&self) -> RuntimeResult<Vec<CreateIndexRowEntry>> {
+    async fn collect_current_hot(&self) -> RuntimeOrFatalResult<Vec<CreateIndexRowEntry>> {
         let mut rows = Vec::new();
         self.table
             .accessor_with_layout(self.layout)
@@ -425,7 +425,7 @@ impl<'a> CreateIndexRuntimeBuilder<'a> {
         self,
         disk_runtime: SecondaryDiskTreeRuntime,
         hot_rows: Vec<CreateIndexRowEntry>,
-    ) -> OperationOrRuntimeResult<SecondaryIndex<EvictableBufferPool>> {
+    ) -> QuadResult<SecondaryIndex<EvictableBufferPool>> {
         let Self {
             index_pool,
             index_guard,
@@ -449,10 +449,12 @@ impl<'a> CreateIndexRuntimeBuilder<'a> {
         .await;
         if let Err(err) = insert_res {
             if let Err(report) = mem.destroy(index_guard).await {
-                let report = report.attach(format!(
-                    "operation=rollback_create_unique_index_build, index_slot={}",
-                    disk_runtime.index_slot()
-                ));
+                let report = report.attach_with(|| {
+                    format!(
+                        "operation=rollback_create_unique_index_build, index_slot={}",
+                        disk_runtime.index_slot()
+                    )
+                });
                 obs::error!(
                     "event=index_ddl_cleanup component=catalog_index action=destroy_unpublished result=error error={report:?}"
                 );
@@ -469,7 +471,7 @@ impl<'a> CreateIndexRuntimeBuilder<'a> {
         self,
         disk_runtime: SecondaryDiskTreeRuntime,
         hot_rows: Vec<CreateIndexRowEntry>,
-    ) -> OperationOrRuntimeResult<SecondaryIndex<EvictableBufferPool>> {
+    ) -> QuadResult<SecondaryIndex<EvictableBufferPool>> {
         #[cfg(test)]
         use tests::CreateIndexTestFailure;
 
@@ -502,14 +504,16 @@ impl<'a> CreateIndexRuntimeBuilder<'a> {
                 )
                 .await
             }
-            Err(err) => Err(err),
+            Err(err) => Err(err.into()),
         };
         if let Err(err) = insert_res {
             if let Err(report) = mem.destroy(index_guard).await {
-                let report = report.attach(format!(
-                    "operation=rollback_create_non_unique_index_build, index_slot={}",
-                    disk_runtime.index_slot()
-                ));
+                let report = report.attach_with(|| {
+                    format!(
+                        "operation=rollback_create_non_unique_index_build, index_slot={}",
+                        disk_runtime.index_slot()
+                    )
+                });
                 obs::error!(
                     "event=index_ddl_cleanup component=catalog_index action=destroy_unpublished result=error error={report:?}"
                 );
@@ -725,10 +729,12 @@ impl CreateIndexProgress {
             // Preserve the existing best-effort cleanup policy. A destroy
             // failure is observed but does not replace the DDL source.
             if let Err(report) = destroy_uninstalled_staged_index(index, guards).await {
-                let report = report.attach(format!(
-                    "operation=cleanup_create_index_staged_runtime, table_id={}, index={}",
-                    self.table_id, self.index
-                ));
+                let report = report.attach_with(|| {
+                    format!(
+                        "operation=cleanup_create_index_staged_runtime, table_id={}, index={}",
+                        self.table_id, self.index
+                    )
+                });
                 obs::error!(
                     "event=index_ddl_cleanup component=catalog_index action=destroy_staged result=error error={report:?}"
                 );
@@ -1070,7 +1076,7 @@ impl AcceptedCreateIndex {
                 if let Err(cleanup) = progress.rollback_before_catalog_commit(guards).await {
                     return Err(CompletionErrorBridge::capture_runtime_or_fatal(cleanup));
                 }
-                return Err(CompletionErrorBridge::capture_operation_or_runtime(err));
+                return Err(CompletionErrorBridge::capture_quad(err));
             }
         };
         #[cfg(test)]
@@ -1130,7 +1136,7 @@ impl AcceptedCreateIndex {
                 if let Err(cleanup) = progress.rollback_before_catalog_commit(guards).await {
                     return Err(CompletionErrorBridge::capture_runtime_or_fatal(cleanup));
                 }
-                return Err(CompletionErrorBridge::capture(err));
+                return Err(CompletionErrorBridge::capture_runtime_or_fatal(err));
             }
         };
         #[cfg(test)]
@@ -1157,7 +1163,7 @@ impl AcceptedCreateIndex {
                 if let Err(cleanup) = progress.rollback_before_catalog_commit(guards).await {
                     return Err(CompletionErrorBridge::capture_runtime_or_fatal(cleanup));
                 }
-                return Err(CompletionErrorBridge::capture_operation_or_runtime(err));
+                return Err(CompletionErrorBridge::capture_quad(err));
             }
         }
         #[cfg(test)]
@@ -1244,12 +1250,7 @@ impl AcceptedCreateIndex {
         {
             return Err(CompletionErrorBridge::capture_runtime_or_fatal(
                 progress
-                    .cleanup_after_catalog_commit_failure(
-                        engine,
-                        guards,
-                        "table_root_publish",
-                        RuntimeOrFatalError::from(err),
-                    )
+                    .cleanup_after_catalog_commit_failure(engine, guards, "table_root_publish", err)
                     .await,
             ));
         }
@@ -1536,7 +1537,7 @@ impl AcceptedDropIndex {
                     .cleanup_after_catalog_commit_failure(
                         &engine.poisoner,
                         "table_root_publish",
-                        RuntimeOrFatalError::from(err),
+                        err,
                     )
                     .await,
             ));
@@ -1788,7 +1789,7 @@ async fn insert_create_index_unique_hot_rows(
     hot_rows: &[CreateIndexRowEntry],
     build_ts: TrxID,
     #[cfg(test)] test: &tests::IndexDdlTestController,
-) -> OperationOrRuntimeResult<()> {
+) -> QuadResult<()> {
     for (row_no, row) in hot_rows.iter().enumerate() {
         match mem
             .bind(index_guard)
@@ -1820,7 +1821,7 @@ async fn insert_create_index_non_unique_hot_rows(
     hot_rows: &[CreateIndexRowEntry],
     build_ts: TrxID,
     #[cfg(test)] test: &tests::IndexDdlTestController,
-) -> RuntimeResult<()> {
+) -> RuntimeOrFatalResult<()> {
     for (row_no, row) in hot_rows.iter().enumerate() {
         match mem
             .bind(index_guard)
@@ -1900,7 +1901,7 @@ fn build_dropped_index_runtime_layout(
 async fn destroy_uninstalled_staged_index(
     index: Arc<SecondaryIndex<EvictableBufferPool>>,
     guards: &PoolGuards,
-) -> RuntimeResult<()> {
+) -> RuntimeOrFatalResult<()> {
     let Ok(index) = Arc::try_unwrap(index) else {
         // Preserve the existing best-effort cleanup policy. A surviving
         // internal reference leaves ownership with that reference.
@@ -1909,7 +1910,7 @@ async fn destroy_uninstalled_staged_index(
     index
         .destroy(guards.index_guard())
         .await
-        .change_context(RuntimeError::CatalogAccess)
+        .change_runtime_context(RuntimeError::CatalogAccess)
         .attach("operation=destroy_uninstalled_create_index_runtime")
 }
 

@@ -1,6 +1,6 @@
 use crate::buffer::PoolGuards;
 use crate::catalog::{ResolvedIndexKey, TableCache};
-use crate::error::RuntimeResult as Result;
+use crate::error::RuntimeOrFatalResult as Result;
 use crate::id::{RowID, TableID, TrxID};
 use crate::runtime::{POLL_BUDGET, yield_now};
 use crate::table::IndexRollback;
@@ -63,8 +63,11 @@ impl IndexUndoLogs {
                     .expect("non-empty index undo buffer must have a last entry");
                 #[cfg(test)]
                 {
-                    use super::tests::maybe_pause_index_rollback;
+                    use super::tests::{
+                        RollbackTarget, maybe_fail_rollback, maybe_pause_index_rollback,
+                    };
                     maybe_pause_index_rollback().await;
+                    maybe_fail_rollback(RollbackTarget::Index)?;
                 }
                 if entry.table_id.is_catalog() {
                     let table = table_cache.must_get_catalog_table(entry.table_id);

@@ -115,7 +115,7 @@ impl BlockIndex {
         meta_pool_guard: &PoolGuard,
         mem_pool: &B,
         mem_pool_guard: &PoolGuard,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         let pivot_row_id = self.root.pivot_row_id();
         self.row
             .destroy(meta_pool_guard, mem_pool, mem_pool_guard, pivot_row_id)
@@ -145,7 +145,7 @@ impl BlockIndex {
         mem_pool_guard: &PoolGuard,
         col_layout: &Arc<TableColumnLayout>,
         count: usize,
-    ) -> RuntimeResult<PageSharedGuard<RowPage>> {
+    ) -> RuntimeOrFatalResult<PageSharedGuard<RowPage>> {
         self.row
             .get_insert_page(meta_pool_guard, mem_pool, mem_pool_guard, col_layout, count)
             .await
@@ -183,7 +183,7 @@ impl BlockIndex {
         mem_pool_guard: &PoolGuard,
         col_layout: &Arc<TableColumnLayout>,
         count: usize,
-    ) -> RuntimeResult<PageExclusiveGuard<RowPage>> {
+    ) -> RuntimeOrFatalResult<PageExclusiveGuard<RowPage>> {
         self.row
             .get_insert_page_exclusive(meta_pool_guard, mem_pool, mem_pool_guard, col_layout, count)
             .await
@@ -201,7 +201,7 @@ impl BlockIndex {
         col_layout: &Arc<TableColumnLayout>,
         count: usize,
         page_id: PageID,
-    ) -> RuntimeResult<PageExclusiveGuard<RowPage>> {
+    ) -> RuntimeOrFatalResult<PageExclusiveGuard<RowPage>> {
         self.row
             .allocate_row_page_at(
                 meta_pool_guard,
@@ -258,7 +258,7 @@ impl BlockIndex {
         disk_pool_guard: Option<&PoolGuard>,
         row_id: RowID,
         storage: Option<&ColumnStorage>,
-    ) -> RuntimeResult<RowLocation> {
+    ) -> RuntimeOrFatalResult<RowLocation> {
         debug_assert!(!row_id.is_deleted());
         match self.root.guide(row_id) {
             BlockIndexRoute::Column {
@@ -305,7 +305,7 @@ impl BlockIndex {
         row_id: RowID,
         pivot_row_id: RowID,
         root_block_id: BlockID,
-    ) -> RuntimeResult<RowLocation> {
+    ) -> RuntimeOrFatalResult<RowLocation> {
         // A column route can only be published for a user table, whose runtime
         // resolves both persisted storage and the matching disk-pool guard.
         let index = ColumnBlockIndex::new(
@@ -338,6 +338,7 @@ mod tests {
         StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
         StorageIndexSpec, TableMetadata,
     };
+    use crate::error::RuntimeOrFatalError;
     use crate::error::{IoError, RuntimeError, RuntimeResult, Validation};
     use crate::file::test_block_id;
     use crate::latch::LatchFallbackMode;
@@ -365,6 +366,7 @@ mod tests {
     }
 
     impl BufferPool for FailingInsertPagePool {
+        type Error = Report<RuntimeError>;
         #[inline]
         fn capacity(&self) -> usize {
             self.inner.capacity()
@@ -557,6 +559,9 @@ mod tests {
             let err = match res {
                 Ok(_) => panic!("expected cached insert-page reload failure"),
                 Err(err) => err,
+            };
+            let RuntimeOrFatalError::Runtime(err) = err else {
+                panic!("expected Runtime error, got {err:?}");
             };
             assert_eq!(err.current_context(), &RuntimeError::IndexAccess);
             assert!(err.downcast_ref::<IoError>().is_some());

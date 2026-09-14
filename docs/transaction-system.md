@@ -696,9 +696,10 @@ Index rollback precedes row rollback. Before reverting each destination row,
 restore its source slots in reverse publication order, including removing a
 newly created slot. Keep the destination and unfinished records owned across
 awaits, cancellation, and failures. This prevents a failed later statement from
-leaving a stale link in an earlier surviving Delete or Update. A missing source
-page alone does not permit skipping restoration; a published cold route proves
-that its former hot link is no longer reachable by current selection.
+leaving a stale link in an earlier surviving Delete or Update. Restoration
+always opens the exact original generation, including after Transition or cold
+publication. A transitioned source must be an active Delete. Restoring its
+recorded slot never releases that source's undo or CDB ownership.
 
 Hot selection follows as many successors as required. It first checks the live
 current image; on rejection it reconstructs the latest departure of the selected
@@ -803,8 +804,12 @@ undo box without rerunning the callback. It then applies deferred updates in
 callback order through the ordinary hot/cold update, row-move, index,
 uniqueness, redo, and rollback paths. A hot lock captured by checkpoint
 transition resumes through the same transaction's cold deletion-buffer marker
-after authoritative route publication. Same-key updates and all other actions
-remain immediate.
+after authoritative route publication. Finalization reopens its original page
+and validates the same active Lock head, statement, clear live delete bit, and
+CDB Ref. Under page-state, row, and CDB guards it sets the live bit, increments
+the deleted count once, and changes that same undo to Delete. Its page identity
+stays intact; cold Delete redo still records `None`. Same-key updates and all
+other actions remain immediate.
 
 This delayed list is memory-only, uncapped, and proportional to the number and
 payload size of unique-driver key-changing updates. Row locks are retained
@@ -1088,14 +1093,21 @@ precommit performs no rollback or active-STS removal.
 - Row undo is rolled back in reverse order. `Insert` marks the hot row deleted,
   `Delete` clears the delete bit, `Update` restores before-image columns, and
   a pure `Lock` leaves row data unchanged.
-- User-table row undo resolves each entry from the current hot/cold pivot. A
-  cold-origin or already-published cold row removes its transaction-owned
-  deletion marker. An exact hot page is unlinked synchronously. If that page is
-  in checkpoint transition, or its recorded generation is temporarily absent
-  while the pivot remains hot, rollback retains the current boxed undo,
-  releases every page and row guard, and waits for either authoritative route
-  publication or engine poison before retrying from the pivot. The entry is
-  popped only after hot unlink or cold-marker removal succeeds.
+- User-table rollback opens each hot-origin undo's exact original page generation,
+  independently of the pivot. It validates the row, exact head, active status
+  allocation, operation kind, and physical inverse before mutation. Transition
+  allows only existing Lock/Delete inverses. The page-state read lock, row latch,
+  and CDB entry guard span inverse application and exact unlink. A same-owner
+  active main predecessor keeps the marker; final live-row restoration removes
+  only the matching active Ref. Index branches and forward links confer no
+  main-row ownership. Original cold claims remove only their own guarded Ref.
+- Each owning box and unfinished source journal stays vector-owned across page
+  access and cancellation. Source before-images restore in reverse order before
+  the destination inverse; pop follows successful unlink without an await gap.
+  Missing generations, marker mismatches, or invalid inverse state return typed
+  access failure with unresolved ownership retained. Rollback does not wait for
+  checkpoint publication. Safe cleanup can finish after engine poison; actual
+  cleanup failure retains residuals and returns the canonical first fatal reason.
 - Index undo removes inserted claims, restores merged delete-masked claims, and
   unmasks deferred deletes so MemIndex returns to the pre-transaction state.
 - Runtime unique-key branches are transaction-local MVCC aids. They are kept

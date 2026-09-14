@@ -1,9 +1,8 @@
 use crate::buffer::PoolGuards;
 use crate::buffer::page::VersionedPageID;
 use crate::catalog::{IndexRef, ResolvedIndexKey, TableCache};
-use crate::error::RuntimeOrFatalResult as Result;
+use crate::error::RuntimeOrFatalResult;
 use crate::id::{RowID, TableID, TrxID};
-use crate::poison::EnginePoisoner;
 use crate::row::ops::{UndoCol, UpdateCol};
 use crate::runtime::{POLL_BUDGET, yield_now};
 use crate::trx::{
@@ -258,6 +257,7 @@ impl HotForwardSource {
     #[inline]
     pub(crate) fn owns(&self, status: &UndoStatus) -> bool {
         !trx_is_committed(self.owner.ts())
+            && !self.owner.terminal()
             && matches!(status, UndoStatus::Ref(owner) if Arc::ptr_eq(owner, &self.owner))
     }
 }
@@ -292,7 +292,7 @@ pub(crate) struct RowUndoView<'a> {
     pub(crate) next: Option<&'a NextRowUndo>,
 }
 
-/// Outcome of one exact-page hot row-undo rollback attempt.
+/// Memory/catalog exact-page rollback outcome under its separate lifecycle policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RowUndoRollbackAttempt {
     /// The exact undo was synchronously unlinked from the hot row.
@@ -307,16 +307,16 @@ pub(crate) enum RowUndoRollbackAttempt {
 #[derive(Clone, Copy)]
 pub(crate) struct RowUndoRollbackContext<'a> {
     pool_guards: &'a PoolGuards,
-    poisoner: &'a EnginePoisoner,
+    status: &'a Arc<SharedTrxStatus>,
 }
 
 impl<'a> RowUndoRollbackContext<'a> {
     /// Build rollback authority from the terminal or statement owner.
     #[inline]
-    pub(crate) fn new(pool_guards: &'a PoolGuards, poisoner: &'a EnginePoisoner) -> Self {
+    pub(crate) fn new(pool_guards: &'a PoolGuards, status: &'a Arc<SharedTrxStatus>) -> Self {
         Self {
             pool_guards,
-            poisoner,
+            status,
         }
     }
 }
@@ -357,7 +357,7 @@ impl RowUndoLogs {
         &mut self,
         table_cache: &mut TableCache<'_>,
         context: RowUndoRollbackContext<'_>,
-    ) -> Result<()> {
+    ) -> RuntimeOrFatalResult<()> {
         let mut budget = POLL_BUDGET;
         while !self.0.is_empty() {
             {
@@ -371,21 +371,19 @@ impl RowUndoLogs {
                     .expect("non-empty row undo buffer must have a last entry");
                 #[cfg(test)]
                 {
-                    use super::tests::maybe_pause_row_rollback;
+                    use super::tests::{
+                        RollbackTarget, maybe_fail_rollback, maybe_pause_row_rollback,
+                    };
                     maybe_pause_row_rollback().await;
+                    maybe_fail_rollback(RollbackTarget::Row)?;
                 }
                 if entry.table_id.is_catalog() {
                     let table = table_cache.must_get_catalog_table(entry.table_id);
                     while let Some(undo) = entry.forward_undo.last() {
-                        let result = table
+                        table
                             .row_store
                             .try_restore_forward_link(undo, context.pool_guards)
                             .await?;
-                        assert_eq!(
-                            result,
-                            RowUndoRollbackAttempt::Applied,
-                            "catalog forward source must remain hot during rollback"
-                        );
                         entry.forward_undo.pop();
                     }
                     if entry.page_id.is_some() {
@@ -408,52 +406,15 @@ impl RowUndoLogs {
                 } else {
                     let table = table_cache.must_get_user_table(entry.table_id);
                     while let Some(undo) = entry.forward_undo.last() {
-                        let source_id = undo.source.row_id;
-                        if source_id < table.row_store.pivot_row_id() {
-                            // Cold routing has no forward fields. The old hot
-                            // payload is no longer reachable by current selection.
-                            entry.forward_undo.pop();
-                            continue;
-                        }
-                        match table
+                        table
                             .row_store
                             .try_restore_forward_link(undo, context.pool_guards)
-                            .await?
-                        {
-                            RowUndoRollbackAttempt::Applied => {
-                                entry.forward_undo.pop();
-                            }
-                            RowUndoRollbackAttempt::PageMissing
-                            | RowUndoRollbackAttempt::Transition => {
-                                table
-                                    .wait_transition_route_or_poison(context.poisoner, source_id)
-                                    .await?;
-                            }
-                        }
+                            .await?;
+                        entry.forward_undo.pop();
                     }
-                    loop {
-                        if entry.page_id.is_none() {
-                            table.deletion_buffer().remove(entry.row_id);
-                            break;
-                        }
-                        if entry.row_id < table.row_store.pivot_row_id() {
-                            table.deletion_buffer().remove(entry.row_id);
-                            break;
-                        }
-                        match table
-                            .row_store
-                            .try_rollback_hot_row_undo(entry, context.pool_guards)
-                            .await?
-                        {
-                            RowUndoRollbackAttempt::Applied => break,
-                            RowUndoRollbackAttempt::PageMissing
-                            | RowUndoRollbackAttempt::Transition => {
-                                table
-                                    .wait_transition_route_or_poison(context.poisoner, entry.row_id)
-                                    .await?;
-                            }
-                        }
-                    }
+                    table
+                        .rollback_row_undo(entry, context.pool_guards, context.status)
+                        .await?;
                 }
             }
             self.0.pop();
@@ -566,6 +527,12 @@ unsafe impl Send for RowUndoRef {}
 unsafe impl Sync for RowUndoRef {}
 
 impl RowUndoRef {
+    /// Compares allocation identity without dereferencing either undo pointer.
+    #[inline]
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+
     /// Reads only the fields needed by snapshots following another row's branch.
     /// A shared reference to the whole undo would also borrow its mutable hints.
     #[inline]

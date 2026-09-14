@@ -7,10 +7,10 @@ Fix two checkpoint-transition correctness bugs found during task000300 review: r
 ## Reference
 
 - User discussion on 2026-09-10 in worktree `.worktrees/000300`: investigation started from repeated `table.mem.pivot_row_id()` calls during forward-link rollback. The user confirmed both bugs and requested a backlog item after reviewing the transition impact.
-- [Task 000300](../tasks/000300-fix-stale-unique-read-current-lookups-across-row-replacement.md): current unique read-current and forward-link work.
-- [Task 000272](../tasks/000272-row-undo-rollback-through-page-transition.md) and [closed backlog 000185](closed/000185-row-undo-rollback-through-page-transition.md): introduced transition-route waiting and cold-marker-only rollback completion. This follow-up corrects the retained-page lifetime assumption; do not reopen the old item as if its implementation had not shipped.
-- [Task 000219](../tasks/000219-optimize-frozen-page-checkpoint-transition-planning.md): frozen mutation tracking, prepared visibility plans, and transition publication.
-- [Related backlog 000198](closed/000198-share-unique-mutation-execution-across-user-and-mem-catalog-tables.md) concerns broader mutation-engine consolidation and remains separate.
+- [Task 000300](../../tasks/000300-fix-stale-unique-read-current-lookups-across-row-replacement.md): current unique read-current and forward-link work.
+- [Task 000272](../../tasks/000272-row-undo-rollback-through-page-transition.md) and [closed backlog 000185](000185-row-undo-rollback-through-page-transition.md): introduced transition-route waiting and cold-marker-only rollback completion. This follow-up corrects the retained-page lifetime assumption; do not reopen the old item as if its implementation had not shipped.
+- [Task 000219](../../tasks/000219-optimize-frozen-page-checkpoint-transition-planning.md): frozen mutation tracking, prepared visibility plans, and transition publication.
+- [Related backlog 000198](000198-share-unique-mutation-execution-across-user-and-mem-catalog-tables.md) concerns broader mutation-engine consolidation and remains separate.
 - `doradb-storage/src/trx/undo/row.rs`: `RowUndoLogs::rollback`, `OwnedRowUndo`, `RowUndoRef`, `ForwardLinkUndo`.
 - `doradb-storage/src/table/mem_table.rs`: exact-generation page access, `try_restore_forward_link`, `try_rollback_hot_row_undo`, retained-page deallocation.
 - `doradb-storage/src/table/index_mutate.rs`: `apply_deferred_index_update`; `table/access.rs`: `finish_owned_cold_delete_effects`, `update_owned_cold_row`, snapshot candidate lookup.
@@ -21,7 +21,7 @@ Fix two checkpoint-transition correctness bugs found during task000300 review: r
 
 ## Deferred From (Optional)
 
-[Task 000300](../tasks/000300-fix-stale-unique-read-current-lookups-across-row-replacement.md), implementation review in worktree `.worktrees/000300`.
+[Task 000300](../../tasks/000300-fix-stale-unique-read-current-lookups-across-row-replacement.md), implementation review in worktree `.worktrees/000300`.
 
 ## Deferral Context (Optional)
 
@@ -89,3 +89,10 @@ Task000272 and its closed source backlog document the previous wait-and-route po
 
 An initial broad-title duplicate scan matched open items 000075, 000095, 000114, 000146, 000196, and 000198 through generic keywords. Their scopes were inspected and differ from these two bugs. The final, specific-title scan covered 51 open documents and returned no candidates.
 
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000303-repair-dangling-row-undo-and-deferred-lock-to-delete-mismatch.md
+- Closed By: backlog close
+- Reference: User decision
+- Closed At: 2026-09-14

@@ -1,7 +1,7 @@
 use crate::buffer::{PoolGuard, ReadonlyBufferPool};
 use crate::error::{
     DataIntegrityError, DataIntegrityResult, MultiDomainResultExt, RuntimeError,
-    RuntimeOrFatalResult, RuntimeResult,
+    RuntimeOrFatalResult, RuntimeOrFatalResultExt, RuntimeResult,
 };
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, COLUMN_DELETION_BLOB_BLOCK_SPEC, max_payload_len, validate_block,
@@ -387,7 +387,7 @@ impl<'a> ColumnDeletionBlobReader<'a> {
     pub(crate) async fn read_framed_blob(
         &self,
         blob_ref: BlobRef,
-    ) -> RuntimeResult<(ColumnAuxBlobHeader, Vec<u8>)> {
+    ) -> RuntimeOrFatalResult<(ColumnAuxBlobHeader, Vec<u8>)> {
         let mut bytes = self.read_raw(blob_ref).await?;
         if bytes.len() < COLUMN_AUX_BLOB_HEADER_SIZE {
             return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
@@ -395,7 +395,7 @@ impl<'a> ColumnDeletionBlobReader<'a> {
                 blob_ref.start_block_id, blob_ref.start_offset, blob_ref.byte_len
             ))
             .change_context(RuntimeError::IndexAccess)
-            .attach("operation=read_framed_column_deletion_blob"));
+            .attach("operation=read_framed_column_deletion_blob").into());
         }
         let header = ColumnAuxBlobHeader::decode(&bytes[..COLUMN_AUX_BLOB_HEADER_SIZE])
             .change_context(RuntimeError::IndexAccess)
@@ -416,7 +416,8 @@ impl<'a> ColumnDeletionBlobReader<'a> {
                 .attach(format!(
                     "operation=read_framed_column_deletion_blob, start_block_id={}",
                     blob_ref.start_block_id
-                )));
+                ))
+                .into());
         }
         let payload = bytes.split_off(COLUMN_AUX_BLOB_HEADER_SIZE);
         Ok((header, payload))
@@ -427,7 +428,7 @@ impl<'a> ColumnDeletionBlobReader<'a> {
         &self,
         blob_ref: BlobRef,
         mut visit: impl FnMut(BlockID),
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         if blob_ref.start_block_id == SUPER_BLOCK_ID || blob_ref.byte_len == 0 {
             return Err(Report::new(DataIntegrityError::InvalidPayload)
                 .attach(format!(
@@ -435,7 +436,8 @@ impl<'a> ColumnDeletionBlobReader<'a> {
                     blob_ref.start_block_id, blob_ref.byte_len
                 ))
                 .change_context(RuntimeError::IndexAccess)
-                .attach("operation=collect_column_deletion_blob_blocks"));
+                .attach("operation=collect_column_deletion_blob_blocks")
+                .into());
         }
         let file_kind = self.file_kind;
         let start_offset = blob_ref.start_offset as usize;
@@ -462,7 +464,7 @@ impl<'a> ColumnDeletionBlobReader<'a> {
                     validate_persisted_blob_page,
                 )
                 .await
-                .change_context(RuntimeError::IndexAccess)
+                .change_runtime_context(RuntimeError::IndexAccess)
                 .attach_with(|| {
                     format!(
                         "operation=collect_column_deletion_blob_blocks, file={file_kind}, block_id={block_id}"
@@ -483,7 +485,7 @@ impl<'a> ColumnDeletionBlobReader<'a> {
                         "file={file_kind}, block=column_deletion_blob, block_id={block_id}, blob offset {offset} exceeds used size {used_size}"
                     ))
                     .change_context(RuntimeError::IndexAccess)
-                    .attach("operation=collect_column_deletion_blob_blocks"));
+                    .attach("operation=collect_column_deletion_blob_blocks").into());
             }
             let available = used_size - offset;
             if available == 0 && remaining > 0 {
@@ -492,7 +494,7 @@ impl<'a> ColumnDeletionBlobReader<'a> {
                         "file={file_kind}, block=column_deletion_blob, block_id={block_id}, blob reference reaches empty page before reading all bytes"
                     ))
                     .change_context(RuntimeError::IndexAccess)
-                    .attach("operation=collect_column_deletion_blob_blocks"));
+                    .attach("operation=collect_column_deletion_blob_blocks").into());
             }
             remaining -= remaining.min(available);
             if remaining == 0 {
@@ -504,7 +506,7 @@ impl<'a> ColumnDeletionBlobReader<'a> {
                         "file={file_kind}, block=column_deletion_blob, block_id={block_id}, blob chain ended before reading all bytes"
                     ))
                     .change_context(RuntimeError::IndexAccess)
-                    .attach("operation=collect_column_deletion_blob_blocks"));
+                    .attach("operation=collect_column_deletion_blob_blocks").into());
             }
             block_id = header.next_block_id;
             offset = 0;
@@ -512,7 +514,7 @@ impl<'a> ColumnDeletionBlobReader<'a> {
         Ok(())
     }
 
-    async fn read_raw(&self, blob_ref: BlobRef) -> RuntimeResult<Vec<u8>> {
+    async fn read_raw(&self, blob_ref: BlobRef) -> RuntimeOrFatalResult<Vec<u8>> {
         if blob_ref.start_block_id == SUPER_BLOCK_ID || blob_ref.byte_len == 0 {
             return Err(Report::new(DataIntegrityError::InvalidPayload)
                 .attach(format!(
@@ -520,7 +522,8 @@ impl<'a> ColumnDeletionBlobReader<'a> {
                     blob_ref.start_block_id, blob_ref.byte_len
                 ))
                 .change_context(RuntimeError::IndexAccess)
-                .attach("operation=read_column_deletion_blob"));
+                .attach("operation=read_column_deletion_blob")
+                .into());
         }
         let file_kind = self.file_kind;
         let mut out = Vec::with_capacity(blob_ref.byte_len as usize);
@@ -539,7 +542,7 @@ impl<'a> ColumnDeletionBlobReader<'a> {
                     validate_persisted_blob_page,
                 )
                 .await
-                .change_context(RuntimeError::IndexAccess)
+                .change_runtime_context(RuntimeError::IndexAccess)
                 .attach_with(|| {
                     format!(
                         "operation=read_column_deletion_blob, file={file_kind}, block_id={block_id}"
@@ -559,7 +562,7 @@ impl<'a> ColumnDeletionBlobReader<'a> {
                         "file={file_kind}, block=column_deletion_blob, block_id={block_id}, blob offset {offset} exceeds used size {used_size}"
                     ))
                     .change_context(RuntimeError::IndexAccess)
-                    .attach("operation=read_column_deletion_blob"));
+                    .attach("operation=read_column_deletion_blob").into());
             }
             let available = used_size - offset;
             if available == 0 && remaining > 0 {
@@ -568,7 +571,7 @@ impl<'a> ColumnDeletionBlobReader<'a> {
                         "file={file_kind}, block=column_deletion_blob, block_id={block_id}, blob reference reaches empty page before reading all bytes"
                     ))
                     .change_context(RuntimeError::IndexAccess)
-                    .attach("operation=read_column_deletion_blob"));
+                    .attach("operation=read_column_deletion_blob").into());
             }
             let take = remaining.min(available);
             let body_start = COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE + offset;
@@ -584,7 +587,7 @@ impl<'a> ColumnDeletionBlobReader<'a> {
                         "file={file_kind}, block=column_deletion_blob, block_id={block_id}, blob chain ended before reading all bytes"
                     ))
                     .change_context(RuntimeError::IndexAccess)
-                    .attach("operation=read_column_deletion_blob"));
+                    .attach("operation=read_column_deletion_blob").into());
             }
             block_id = header.next_block_id;
             offset = 0;

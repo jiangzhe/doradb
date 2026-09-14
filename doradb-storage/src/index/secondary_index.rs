@@ -16,7 +16,10 @@ use super::non_unique_index::{GuardedNonUniqueMemIndex, IndexMask, NonUniqueMemI
 use super::unique_index::{GuardedUniqueMemIndex, UniqueLookupObservation, UniqueMemIndex};
 use crate::buffer::{BufferPool, PoolGuard, PoolGuards, ReadonlyBufferPool};
 use crate::catalog::{IndexSlot, TableIndexMetadata, TableMetadata};
-use crate::error::{InternalError, RuntimeError, RuntimeResult, SecondaryIndexBinding};
+use crate::error::{
+    InternalError, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
+    SecondaryIndexBinding,
+};
 use crate::file::table_file::TableFile;
 use crate::id::{BlockID, RowID, TrxID};
 use crate::index::util::Maskable;
@@ -26,6 +29,7 @@ use crate::value::{Val, ValType};
 use error_stack::Report;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, VecDeque};
+use std::result::Result as StdResult;
 use std::sync::Arc;
 
 /// Result of attempting to insert a secondary-index entry.
@@ -84,7 +88,7 @@ impl<P: BufferPool> InMemorySecondaryIndex<P> {
         index_spec: &TableIndexMetadata,
         ty_infer: F,
         ts: TrxID,
-    ) -> RuntimeResult<Self> {
+    ) -> StdResult<Self, P::Error> {
         if index_spec.unique() {
             let index =
                 UniqueMemIndex::new(index_pool, index_pool_guard, index_spec, ty_infer, ts).await?;
@@ -99,7 +103,7 @@ impl<P: BufferPool> InMemorySecondaryIndex<P> {
 
     /// Destroy this in-memory secondary index and reclaim all pages it owns.
     #[inline]
-    pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> RuntimeResult<()> {
+    pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> StdResult<(), P::Error> {
         match self {
             Self::Unique(index) => index.destroy(pool_guard).await,
             Self::NonUnique(index) => index.destroy(pool_guard).await,
@@ -279,7 +283,7 @@ impl SecondaryDiskTreeRuntime {
         root_block_id: BlockID,
         disk_pool_guard: &PoolGuard,
         out: &mut BTreeSet<BlockID>,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         match &self.kind {
             SecondaryDiskTreeRuntimeKind::Unique(runtime) => {
                 runtime
@@ -319,7 +323,7 @@ pub(crate) enum SecondaryIndex<P: 'static> {
 impl<P: BufferPool> SecondaryIndex<P> {
     /// Destroy the mutable MemIndex owned by this composite index.
     #[inline]
-    pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> RuntimeResult<()> {
+    pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> StdResult<(), P::Error> {
         match self {
             Self::Unique { mem, .. } => mem.destroy(pool_guard).await,
             Self::NonUnique { mem, .. } => mem.destroy(pool_guard).await,
@@ -492,7 +496,7 @@ impl<'a, 'g, P: BufferPool> UniqueSecondaryIndex<'a, 'g, P> {
         old_row_id: RowID,
         new_row_id: RowID,
         ts: TrxID,
-    ) -> RuntimeResult<IndexCompareExchange> {
+    ) -> StdResult<IndexCompareExchange, P::Error> {
         self.mem
             .compare_exchange(key, old_row_id, new_row_id, ts)
             .await
@@ -506,7 +510,7 @@ impl<'a, 'g, P: BufferPool> UniqueSecondaryIndex<'a, 'g, P> {
         expected_row_id: RowID,
         new_row_id: RowID,
         ts: TrxID,
-    ) -> RuntimeResult<IndexCompareExchange> {
+    ) -> StdResult<IndexCompareExchange, P::Error> {
         self.mem
             .replace_or_insert(key, expected_row_id, new_row_id, ts)
             .await
@@ -526,12 +530,22 @@ impl<'a, 'g, P: BufferPool> UniqueSecondaryIndex<'a, 'g, P> {
         row_id: RowID,
         merge_if_match_deleted: bool,
         ts: TrxID,
-    ) -> RuntimeResult<UniqueInsertAttempt<'a, 'g, 'k, P>> {
+    ) -> RuntimeOrFatalResult<UniqueInsertAttempt<'a, 'g, 'k, P>> {
         debug_assert!(!row_id.is_deleted());
-        if let Some((owner_row_id, deleted)) = self.mem.lookup(key, ts).await? {
+        if let Some((owner_row_id, deleted)) = self
+            .mem
+            .lookup(key, ts)
+            .await
+            .map_err(Into::<RuntimeOrFatalError>::into)?
+        {
             if merge_if_match_deleted && deleted && owner_row_id == row_id {
                 return Ok(
-                    match self.mem.insert_if_not_exists(key, row_id, true, ts).await? {
+                    match self
+                        .mem
+                        .insert_if_not_exists(key, row_id, true, ts)
+                        .await
+                        .map_err(Into::<RuntimeOrFatalError>::into)?
+                    {
                         IndexInsert::Ok(merged) => UniqueInsertAttempt::Inserted { merged },
                         IndexInsert::DuplicateKey(owner_row_id, deleted) => {
                             UniqueInsertAttempt::Occupied(UniqueOwnerObservation {
@@ -570,7 +584,8 @@ impl<'a, 'g, P: BufferPool> UniqueSecondaryIndex<'a, 'g, P> {
             match self
                 .mem
                 .insert_if_not_exists(key, row_id, false, ts)
-                .await?
+                .await
+                .map_err(Into::<RuntimeOrFatalError>::into)?
             {
                 IndexInsert::Ok(merged) => UniqueInsertAttempt::Inserted { merged },
                 IndexInsert::DuplicateKey(owner_row_id, deleted) => {
@@ -600,8 +615,12 @@ impl<P: BufferPool> UniqueSecondaryIndex<'_, '_, P> {
     pub(crate) async fn lookup_observed<'lookup>(
         &'lookup self,
         key: &'lookup [Val],
-    ) -> RuntimeResult<(Option<(RowID, bool)>, UniqueLookupObservation<'lookup>)> {
-        let (candidate, observation) = self.mem.lookup_observed(key).await?;
+    ) -> RuntimeOrFatalResult<(Option<(RowID, bool)>, UniqueLookupObservation<'lookup>)> {
+        let (candidate, observation) = self
+            .mem
+            .lookup_observed(key)
+            .await
+            .map_err(Into::<RuntimeOrFatalError>::into)?;
         if candidate.is_some() {
             return Ok((candidate, observation));
         }
@@ -623,8 +642,13 @@ impl<P: BufferPool> UniqueSecondaryIndex<'_, '_, P> {
         &self,
         key: &[Val],
         ts: TrxID,
-    ) -> RuntimeResult<Option<(RowID, bool)>> {
-        if let Some(hit) = self.mem.lookup(key, ts).await? {
+    ) -> RuntimeOrFatalResult<Option<(RowID, bool)>> {
+        if let Some(hit) = self
+            .mem
+            .lookup(key, ts)
+            .await
+            .map_err(Into::<RuntimeOrFatalError>::into)?
+        {
             return Ok(Some(hit));
         }
         let Some(disk) = self.open()? else {
@@ -646,7 +670,7 @@ impl<P: BufferPool> UniqueSecondaryIndex<'_, '_, P> {
         old_row_id: RowID,
         ignore_del_mask: bool,
         ts: TrxID,
-    ) -> RuntimeResult<bool> {
+    ) -> StdResult<bool, P::Error> {
         debug_assert!(!old_row_id.is_deleted());
         self.mem
             .compare_delete(key, old_row_id, ignore_del_mask, ts)
@@ -659,13 +683,16 @@ impl<P: BufferPool> UniqueSecondaryIndex<'_, '_, P> {
         &'a self,
         range: &'a KeyRange,
         ts: TrxID,
-    ) -> RuntimeResult<
+    ) -> RuntimeOrFatalResult<
         SecondaryIndexCandidateStream<
             UniqueMemIndexCandidateStream<'a, P>,
             UniqueDiskTreeCandidateStream<'a, 'a>,
         >,
     > {
-        let mem = self.mem.index_scan_candidates(range, ts)?;
+        let mem = self
+            .mem
+            .index_scan_candidates(range, ts)
+            .map_err(Into::<RuntimeOrFatalError>::into)?;
         let disk = self.open()?.map(|disk| disk.scan_candidate_stream(range));
         Ok(SecondaryIndexCandidateStream::new(mem, disk))
     }
@@ -729,7 +756,7 @@ impl<'a, 'g, 'k, P: BufferPool> UniqueOwnerObservation<'a, 'g, 'k, P> {
         self,
         new_row_id: RowID,
         ts: TrxID,
-    ) -> RuntimeResult<IndexCompareExchange> {
+    ) -> StdResult<IndexCompareExchange, P::Error> {
         debug_assert!(!new_row_id.is_deleted());
         let expected_row_id = if self.deleted {
             self.owner_row_id.deleted()
@@ -808,7 +835,7 @@ impl<'a, 'g, P: BufferPool> NonUniqueSecondaryIndex<'a, 'g, P> {
         key: &[Val],
         row_id: RowID,
         ts: TrxID,
-    ) -> RuntimeResult<IndexMask> {
+    ) -> StdResult<IndexMask, P::Error> {
         self.mem.mask_if_present(key, row_id, ts).await
     }
 }
@@ -821,8 +848,13 @@ impl<P: BufferPool> NonUniqueSecondaryIndex<'_, '_, P> {
         key: &[Val],
         row_id: RowID,
         ts: TrxID,
-    ) -> RuntimeResult<Option<bool>> {
-        if let Some(mem_hit) = self.mem.lookup_unique(key, row_id, ts).await? {
+    ) -> RuntimeOrFatalResult<Option<bool>> {
+        if let Some(mem_hit) = self
+            .mem
+            .lookup_unique(key, row_id, ts)
+            .await
+            .map_err(Into::<RuntimeOrFatalError>::into)?
+        {
             return Ok(Some(mem_hit));
         }
         let Some(disk) = self.open()? else {
@@ -843,7 +875,7 @@ impl<P: BufferPool> NonUniqueSecondaryIndex<'_, '_, P> {
         row_id: RowID,
         ignore_del_mask: bool,
         ts: TrxID,
-    ) -> RuntimeResult<bool> {
+    ) -> StdResult<bool, P::Error> {
         debug_assert!(!row_id.is_deleted());
         self.mem
             .compare_delete(key, row_id, ignore_del_mask, ts)
@@ -856,13 +888,16 @@ impl<P: BufferPool> NonUniqueSecondaryIndex<'_, '_, P> {
         &'a self,
         range: &'a KeyRange,
         ts: TrxID,
-    ) -> RuntimeResult<
+    ) -> RuntimeOrFatalResult<
         SecondaryIndexCandidateStream<
             NonUniqueMemIndexCandidateStream<'a, P>,
             NonUniqueDiskTreeCandidateStream<'a, 'a>,
         >,
     > {
-        let mem = self.mem.index_scan_candidates(range, ts)?;
+        let mem = self
+            .mem
+            .index_scan_candidates(range, ts)
+            .map_err(Into::<RuntimeOrFatalError>::into)?;
         let disk = self.open()?.map(|disk| disk.scan_candidate_stream(range));
         Ok(SecondaryIndexCandidateStream::new(mem, disk))
     }
@@ -873,13 +908,16 @@ impl<P: BufferPool> NonUniqueSecondaryIndex<'_, '_, P> {
         &'a self,
         range: &'a KeyRange,
         ts: TrxID,
-    ) -> RuntimeResult<
+    ) -> RuntimeOrFatalResult<
         SecondaryIndexCandidateStream<
             NonUniqueMemIndexCandidateStream<'a, P>,
             NonUniqueDiskTreeCandidateStream<'a, 'a>,
         >,
     > {
-        let mem = self.mem.equal_scan_candidates(range, ts)?;
+        let mem = self
+            .mem
+            .equal_scan_candidates(range, ts)
+            .map_err(Into::<RuntimeOrFatalError>::into)?;
         let disk = self.open()?.map(|disk| disk.scan_candidate_stream(range));
         Ok(SecondaryIndexCandidateStream::new(mem, disk))
     }
@@ -923,7 +961,7 @@ where
         }
     }
 
-    async fn ensure_mem(&mut self) -> RuntimeResult<bool> {
+    async fn ensure_mem(&mut self) -> RuntimeOrFatalResult<bool> {
         loop {
             if !self.mem_buf.is_empty() {
                 return Ok(true);
@@ -941,7 +979,7 @@ where
         }
     }
 
-    async fn ensure_disk(&mut self) -> RuntimeResult<bool> {
+    async fn ensure_disk(&mut self) -> RuntimeOrFatalResult<bool> {
         loop {
             if !self.disk_buf.is_empty() {
                 return Ok(true);
@@ -996,7 +1034,7 @@ where
         }
     }
 
-    async fn next_mem_batch(&mut self) -> RuntimeResult<Option<Vec<IndexLookupCandidate>>> {
+    async fn next_mem_batch(&mut self) -> RuntimeOrFatalResult<Option<Vec<IndexLookupCandidate>>> {
         if !self.ensure_mem().await? {
             self.state = DualTreeStreamState::Done;
             return Ok(None);
@@ -1006,7 +1044,7 @@ where
         Ok(Some(out))
     }
 
-    async fn next_disk_batch(&mut self) -> RuntimeResult<Option<Vec<IndexLookupCandidate>>> {
+    async fn next_disk_batch(&mut self) -> RuntimeOrFatalResult<Option<Vec<IndexLookupCandidate>>> {
         if !self.ensure_disk().await? {
             self.state = DualTreeStreamState::Done;
             return Ok(None);
@@ -1016,7 +1054,9 @@ where
         Ok(Some(out))
     }
 
-    async fn next_merged_batch(&mut self) -> RuntimeResult<Option<Vec<IndexLookupCandidate>>> {
+    async fn next_merged_batch(
+        &mut self,
+    ) -> RuntimeOrFatalResult<Option<Vec<IndexLookupCandidate>>> {
         let mut out = Vec::new();
         loop {
             if !self.ensure_mem().await? {
@@ -1055,7 +1095,7 @@ where
     M: IndexBatchStream<IndexLookupCandidate>,
     D: IndexBatchStream<IndexLookupCandidate>,
 {
-    async fn next_batch(&mut self) -> RuntimeResult<Option<Vec<IndexLookupCandidate>>> {
+    async fn next_batch(&mut self) -> RuntimeOrFatalResult<Option<Vec<IndexLookupCandidate>>> {
         match self.state {
             DualTreeStreamState::Both => self.next_merged_batch().await,
             DualTreeStreamState::MemOnly => self.next_mem_batch().await,
@@ -1104,7 +1144,7 @@ mod tests {
 
     impl IndexBatchStream<IndexLookupCandidate> for TestCandidateStream {
         #[inline]
-        async fn next_batch(&mut self) -> RuntimeResult<Option<Vec<IndexLookupCandidate>>> {
+        async fn next_batch(&mut self) -> RuntimeOrFatalResult<Option<Vec<IndexLookupCandidate>>> {
             Ok(self.batches.pop_front())
         }
     }
@@ -1112,7 +1152,7 @@ mod tests {
     struct NeverPolledDiskStream;
 
     impl IndexBatchStream<IndexLookupCandidate> for NeverPolledDiskStream {
-        async fn next_batch(&mut self) -> RuntimeResult<Option<Vec<IndexLookupCandidate>>> {
+        async fn next_batch(&mut self) -> RuntimeOrFatalResult<Option<Vec<IndexLookupCandidate>>> {
             panic!("absent DiskTree source must not be polled")
         }
     }
@@ -1201,7 +1241,7 @@ mod tests {
     async fn non_unique_disk_tree_scan_rows(
         tree: &NonUniqueDiskTree<'_>,
         range: &KeyRange,
-    ) -> RuntimeResult<Vec<RowID>> {
+    ) -> RuntimeOrFatalResult<Vec<RowID>> {
         let mut stream = tree.scan_candidate_stream(range);
         let mut rows = Vec::new();
         while let Some(batch) = stream.next_batch().await? {

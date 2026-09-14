@@ -1,3 +1,4 @@
+use super::deletion_buffer::DeletionDisposition;
 use super::mutate::{HotUpdatePage, MutationExecutor, OwnedHotIndexSet, UserMutationAttempt};
 use super::unique_mutate::{MutationDecision, RowInspection};
 use super::{
@@ -11,9 +12,9 @@ use crate::buffer::{EvictableBufferPool, PoolGuards};
 use crate::catalog::{IndexRef, IndexSlot, ResolvedIndexKey, TableColumnLayout, TableMetadata};
 use crate::error::{
     CallbackError, CallbackResult, DataIntegrityError, DataIntegrityResult, DiscloseError,
-    DiscloseResultExt, MultiDomainResultExt, OperationError, OperationOrFatalResult,
-    OperationOrRuntimeResult, OperationResult, QuadError, QuadResult, Result, RuntimeError,
-    RuntimeOrFatalResult, RuntimeResult,
+    DiscloseResultExt, InternalError, MultiDomainResultExt, OperationError, OperationOrFatalResult,
+    OperationResult, QuadError, QuadResult, Result, RuntimeError, RuntimeOrFatalResult,
+    RuntimeOrFatalResultExt, RuntimeResult,
 };
 use crate::file::FileKind;
 use crate::file::cow_file::SUPER_BLOCK_ID;
@@ -46,6 +47,7 @@ use crate::trx::row::{
 };
 use crate::trx::stmt::StmtEffects;
 use crate::trx::undo::{OwnedRowUndo, RowUndoKind};
+use crate::trx::ver_map::RowPageState;
 use crate::trx::{
     MIN_SNAPSHOT_TS, MvccReadView, MvccVisibility, PrepareListenerResult, SharedTrxStatus,
     TrxContext, TrxRuntime, trx_is_committed,
@@ -1060,7 +1062,7 @@ impl<'op> UserTableAccessor<'op> {
         row_id: RowID,
         keys: WriteIndexKeySet<'op>,
         root_snapshot: &'snapshot TableRootSnapshot<'ctx>,
-    ) -> RuntimeResult<OwnedRowIndexSetProof<'op, 'snapshot, 'ctx>> {
+    ) -> RuntimeOrFatalResult<OwnedRowIndexSetProof<'op, 'snapshot, 'ctx>> {
         let proof = self.owned_row_index_set_proof(
             row_id,
             keys,
@@ -1092,7 +1094,7 @@ impl<'op> UserTableAccessor<'op> {
             let resolved = column_index
                 .locate_and_resolve_row(row_id)
                 .await
-                .change_context(RuntimeError::TableAccess)
+                .change_runtime_context(RuntimeError::TableAccess)
                 .attach_with(|| {
                     format!(
                         "operation=construct_owned_cdb_index_set_proof, table_id={}, row_id={row_id}, pivot_row_id={}",
@@ -1157,7 +1159,7 @@ impl<'op> UserTableAccessor<'op> {
         &self,
         guards: &PoolGuards,
         row_id: RowID,
-    ) -> RuntimeResult<RowLocation> {
+    ) -> RuntimeOrFatalResult<RowLocation> {
         self.table.find_row(guards, row_id).await
     }
 
@@ -1187,7 +1189,7 @@ impl<'op> UserTableAccessor<'op> {
         guards: &PoolGuards,
         start_row_id: RowID,
         page_action: F,
-    ) -> RuntimeResult<()>
+    ) -> RuntimeOrFatalResult<()>
     where
         F: FnMut(PageSharedGuard<RowPage>) -> bool,
     {
@@ -1232,7 +1234,7 @@ impl<'op> UserTableAccessor<'op> {
         rt: TrxRuntime<'_>,
         candidate: BoundIndexCandidate<'_>,
         read_set: &[usize],
-    ) -> RuntimeResult<SelectMvcc> {
+    ) -> RuntimeOrFatalResult<SelectMvcc> {
         let index = candidate.index;
         loop {
             let location = self
@@ -1259,7 +1261,7 @@ impl<'op> UserTableAccessor<'op> {
                     let persisted = storage
                         .load_lwc_block(rt.pool_guards().disk_guard(), block_id)
                         .await
-                        .change_context(RuntimeError::TableAccess)
+                        .change_runtime_context(RuntimeError::TableAccess)
                         .attach_with(|| {
                             format!(
                                 "operation=index_lookup_candidate_row_mvcc, table_id={}, index={index}, row_id={}",
@@ -1278,7 +1280,7 @@ impl<'op> UserTableAccessor<'op> {
                                 "operation=index_lookup_candidate_row_mvcc, table_id={}, index={index}, row_id={}",
                                 self.table_id(),
                                 candidate.row_id
-                            )));
+                            )).into());
                     }
                     let index_spec = self.metadata().idx.expect_index_spec(index);
                     let key_vals = block
@@ -1362,13 +1364,13 @@ impl<'op> UserTableAccessor<'op> {
         row_idx: usize,
         row_shape_fingerprint: u128,
         read_set: &[usize],
-    ) -> RuntimeResult<Vec<Val>> {
+    ) -> RuntimeOrFatalResult<Vec<Val>> {
         let storage = self.column_storage();
         let file_kind = storage.file().file_kind();
         let persisted = storage
             .load_lwc_block(guards.disk_guard(), block_id)
             .await
-            .change_context(RuntimeError::TableAccess)
+            .change_runtime_context(RuntimeError::TableAccess)
             .attach_with(|| {
                 format!(
                     "operation=read_lwc_row, table_id={}, block_id={block_id}, row_idx={row_idx}",
@@ -1385,7 +1387,7 @@ impl<'op> UserTableAccessor<'op> {
                 .attach(format!(
                     "operation=read_lwc_row, table_id={}, row_idx={row_idx}",
                     self.table_id()
-                )));
+                )).into());
         }
         block
             .decode_row_values(self.metadata().col.as_ref(), row_idx, read_set)
@@ -1395,7 +1397,7 @@ impl<'op> UserTableAccessor<'op> {
                     "operation=read_lwc_row, table_id={}, row_idx={row_idx}, file={file_kind}, block=lwc_block, block_id={block_id}",
                     self.table_id()
                 )
-            })
+            }).map_err(Into::into)
     }
 
     #[inline]
@@ -1405,13 +1407,13 @@ impl<'op> UserTableAccessor<'op> {
         block_id: BlockID,
         row_idx: usize,
         row_shape_fingerprint: u128,
-    ) -> RuntimeResult<Vec<Val>> {
+    ) -> RuntimeOrFatalResult<Vec<Val>> {
         let storage = self.column_storage();
         let file_kind = storage.file().file_kind();
         let persisted = storage
             .load_lwc_block(guards.disk_guard(), block_id)
             .await
-            .change_context(RuntimeError::TableAccess)
+            .change_runtime_context(RuntimeError::TableAccess)
             .attach_with(|| {
                 format!(
                     "operation=read_lwc_full_row, table_id={}, block_id={block_id}, row_idx={row_idx}",
@@ -1428,7 +1430,7 @@ impl<'op> UserTableAccessor<'op> {
                 .attach(format!(
                     "operation=read_lwc_full_row, table_id={}, row_idx={row_idx}",
                     self.table_id()
-                )));
+                )).into());
         }
         block
             .decode_full_row_values(self.metadata().col.as_ref(), row_idx)
@@ -1438,7 +1440,7 @@ impl<'op> UserTableAccessor<'op> {
                     "operation=read_lwc_full_row, table_id={}, row_idx={row_idx}, file={file_kind}, block=lwc_block, block_id={block_id}",
                     self.table_id()
                 )
-            })
+            }).map_err(Into::into)
     }
 
     /// Decodes only indexed columns from a retained immutable point row.
@@ -1463,7 +1465,7 @@ impl<'op> UserTableAccessor<'op> {
         block_id: BlockID,
         row_idx: usize,
         row_shape_fingerprint: u128,
-    ) -> RuntimeResult<WriteIndexKeySet<'op>> {
+    ) -> RuntimeOrFatalResult<WriteIndexKeySet<'op>> {
         let read_set = self.layout().indexed_column_read_set();
         let vals = self
             .read_lwc_row(guards, block_id, row_idx, row_shape_fingerprint, read_set)
@@ -1484,7 +1486,7 @@ impl<'op> UserTableAccessor<'op> {
         block_id: BlockID,
         row_idx: usize,
         row_shape_fingerprint: u128,
-    ) -> RuntimeResult<bool> {
+    ) -> RuntimeOrFatalResult<bool> {
         let read_set = self
             .metadata()
             .idx
@@ -1507,7 +1509,7 @@ impl<'op> UserTableAccessor<'op> {
         key_vals: &[Val],
         row_id: RowID,
         min_active_sts: TrxID,
-    ) -> RuntimeResult<IndexPurgeDecision> {
+    ) -> RuntimeOrFatalResult<IndexPurgeDecision> {
         // This path is physical GC cleanup for a previously delete-marked
         // secondary-index entry. A cold delete marker proves that every key for
         // the row is unreachable only after its transaction is committed and
@@ -1576,7 +1578,7 @@ impl<'op> UserTableAccessor<'op> {
         key_vals: &[Val],
         row_id: RowID,
         min_active_sts: TrxID,
-    ) -> RuntimeResult<bool> {
+    ) -> RuntimeOrFatalResult<bool> {
         let index_slot = index_ref.slot();
         let (page_guard, row_id, index) = loop {
             let root = self.unchecked_secondary_root(index_slot);
@@ -1637,7 +1639,7 @@ impl<'op> UserTableAccessor<'op> {
         key_vals: &[Val],
         row_id: RowID,
         min_active_sts: TrxID,
-    ) -> RuntimeResult<bool> {
+    ) -> RuntimeOrFatalResult<bool> {
         let index_slot = index_ref.slot();
         let (page_guard, row_id, index) = loop {
             let root = self.unchecked_secondary_root(index_slot);
@@ -1719,7 +1721,7 @@ impl<'op> UserTableAccessor<'op> {
         &self,
         rt: TrxRuntime<'_>,
         row_id: RowID,
-    ) -> RuntimeResult<Option<LwcRowLocation>> {
+    ) -> RuntimeOrFatalResult<Option<LwcRowLocation>> {
         // The normal LWC delete/update path first writes the CDB marker and
         // then masks index entries. Another transaction can observe the small
         // window before masking completes. A marker is the newest authority;
@@ -1744,7 +1746,7 @@ impl<'op> UserTableAccessor<'op> {
         key_vals: &[Val],
         target: UniqueIndexLinkTarget<'_>,
         location: LwcRowLocation,
-    ) -> OperationOrRuntimeResult<LinkForUniqueIndex> {
+    ) -> QuadResult<LinkForUniqueIndex> {
         let index_slot = index_ref.slot();
         let deletion_buffer = self.lwc_deletion_buffer();
         // Convert the CDB marker into the delete timestamp carried by a cold
@@ -1825,7 +1827,7 @@ impl<'op> UserTableAccessor<'op> {
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
         entry: OwnedOldIndexEntry<'_, '_, '_>,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         let OwnedOldIndexEntry {
             row_id,
             pivot_row_id,
@@ -1903,7 +1905,7 @@ impl<'op> UserTableAccessor<'op> {
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
         proof: OwnedRowIndexSetProof<'_, '_, '_>,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         if proof.ownership == OwnedRowMutationOwnership::RowPage {
             return MutationExecutor::user(self)
                 .defer_delete_owned_row_index_set(rt, effects, OwnedHotIndexSet::from_user(proof))
@@ -1934,7 +1936,7 @@ impl<'op> UserTableAccessor<'op> {
         guards: &PoolGuards,
         start_row_id: RowID,
         mut row_action: F,
-    ) -> RuntimeResult<()>
+    ) -> RuntimeOrFatalResult<()>
     where
         F: for<'m, 'p> FnMut(&'m TableColumnLayout, Row<'p>) -> bool,
     {
@@ -1956,7 +1958,7 @@ impl<'op> UserTableAccessor<'op> {
         runtime: TableScanRuntime<'_>,
         root: &impl TableScanRootView,
         read_view: &MvccReadView,
-    ) -> RuntimeResult<TableScanWorklist> {
+    ) -> RuntimeOrFatalResult<TableScanWorklist> {
         let column_root = root.column_block_index_root();
         let pivot_row_id = root.pivot_row_id();
         let scan_entries = if column_root == SUPER_BLOCK_ID || pivot_row_id == RowID::new(0) {
@@ -2004,7 +2006,7 @@ impl<'op> UserTableAccessor<'op> {
         &self,
         runtime: TableScanRuntime<'_>,
         descriptor: &ColdBlockScanDescriptor,
-    ) -> RuntimeResult<TableScanColdPage> {
+    ) -> RuntimeOrFatalResult<TableScanColdPage> {
         let storage = self.column_storage();
         let file_kind = storage.file().file_kind();
         let disk_guard = runtime.pool_guards().disk_guard();
@@ -2551,8 +2553,8 @@ impl<'op> UserTableAccessor<'op> {
 
     /// Claims an eligible cold row and records provisional undo before returning.
     ///
-    /// Callers first exclude existing same-transaction markers. Serialized
-    /// statement execution then makes an acquired claim fresh for this invocation.
+    /// Only a fresh marker acquires independently removable undo. An existing
+    /// same-transaction marker belongs to its earlier claim and stays consumed.
     /// Preparing and failed claims do not register undo; callers own their retries.
     #[inline]
     pub(super) fn claim_cold_row_for_write(
@@ -2643,7 +2645,7 @@ impl<'op> UserTableAccessor<'op> {
         row_id: RowID,
         index_keys: WriteIndexKeySet<'op>,
         root_snapshot: &TableRootSnapshot<'_>,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         effects.push_row_undo(OwnedRowUndo::new(
             effects.stmt_no(),
             self.table_id(),
@@ -2674,8 +2676,8 @@ impl<'op> UserTableAccessor<'op> {
         row_id: RowID,
         index_keys: WriteIndexKeySet<'op>,
         root_snapshot: &TableRootSnapshot<'_>,
-    ) -> RuntimeResult<()> {
-        effects.update_last_row_undo(RowUndoKind::delete());
+    ) -> RuntimeOrFatalResult<()> {
+        self.finalize_owned_cold_lock(rt, effects, row_id).await?;
         effects.insert_row_redo(
             self.table_id(),
             RowRedo {
@@ -2688,6 +2690,69 @@ impl<'op> UserTableAccessor<'op> {
             .await?;
         self.defer_delete_owned_row_index_set(rt, effects, proof)
             .await
+    }
+
+    async fn finalize_owned_cold_lock(
+        &self,
+        rt: TrxRuntime<'_>,
+        effects: &mut StmtEffects,
+        row_id: RowID,
+    ) -> RuntimeOrFatalResult<()> {
+        // Keep the stable undo owner in statement effects throughout exact-page
+        // access. Cancellation before/after the local change leaves Lock/Delete
+        // with its corresponding physical inverse.
+        let undo = effects.last_row_undo();
+        let page_id = undo.page_id;
+        let diagnostic = || {
+            format!(
+                "operation=finalize_owned_cold_lock, table_id={}, row_id={row_id}, page_id={page_id:?}",
+                self.table_id()
+            )
+        };
+        if undo.table_id != self.table_id()
+            || undo.row_id != row_id
+            || undo.stmt_no != effects.stmt_no()
+            || !matches!(undo.kind, RowUndoKind::Lock)
+        {
+            return Err(Report::new(InternalError::RowUndoState)
+                .attach(format!("unexpected statement undo: table_id={}, row_id={}, stmt_no={}, expected_stmt_no={}, kind={:?}",
+                    undo.table_id, undo.row_id, undo.stmt_no, effects.stmt_no(), undo.kind))
+                .change_context(RuntimeError::TableAccess).attach(diagnostic()).into());
+        }
+        if let Some(page_id) = page_id {
+            let page = self
+                .row_store()
+                .get_row_page_for_undo(rt.pool_guards(), page_id, row_id)
+                .await?;
+            let mut access = page.write_row_by_id(row_id);
+            access
+                .validate_undo_head(effects.last_row_undo(), rt.status())
+                .change_context(RuntimeError::TableAccess)
+                .attach_with(diagnostic)?;
+            if access.page_state() != RowPageState::Transition || access.row().is_deleted() {
+                return Err(Report::new(InternalError::RowUndoState)
+                    .attach(format!("hot cold-finalization requires a live Transition Lock: state={:?}, deleted={}",
+                        access.page_state(), access.row().is_deleted()))
+                    .change_context(RuntimeError::TableAccess).attach(diagnostic()).into());
+            }
+            self.lwc_deletion_buffer()
+                .reconcile_owned(row_id, rt.status(), || {
+                    access.delete_row();
+                    effects.update_last_row_undo(RowUndoKind::delete());
+                    DeletionDisposition::Keep
+                })
+                .change_context(RuntimeError::TableAccess)
+                .attach_with(diagnostic)?;
+        } else {
+            self.lwc_deletion_buffer()
+                .reconcile_owned(row_id, rt.status(), || {
+                    effects.update_last_row_undo(RowUndoKind::delete());
+                    DeletionDisposition::Keep
+                })
+                .change_context(RuntimeError::TableAccess)
+                .attach_with(diagnostic)?;
+        }
+        Ok(())
     }
 
     /// Reuses the ordinary owned-hot update, move, and index-maintenance paths.
@@ -2747,19 +2812,21 @@ impl<'op> UserTableAccessor<'op> {
         let deletion_buffer = self.lwc_deletion_buffer();
         self.debug_assert_table_write_lock_held(rt);
         loop {
-            match deletion_buffer.claim_ref(row_id, Arc::clone(rt.status()), rt.sts(), false) {
-                Ok(DeletionClaim::Acquired) => return Ok(()),
-                Ok(DeletionClaim::Preparing(listener)) => {
+            match deletion_buffer.claim_current(row_id, Arc::clone(rt.status()), false) {
+                DeletionState::Acquired => return Ok(()),
+                DeletionState::Preparing(listener) => {
                     rt.wait_prepare_or_poison(listener).await?;
                 }
-                Err(DeletionError::WriteConflict) => {
-                    return Err(Report::new(OperationError::WriteConflict).into());
-                }
-                Err(DeletionError::AlreadyDeleted) => {
+                DeletionState::Consumed
+                | DeletionState::Deleted(_)
+                | DeletionState::WriteConflict => {
+                    // The scan excludes consumed rows before invoking mutation.
+                    // Never turn an idempotent claim into a second undo owner.
                     return Err(Report::new(OperationError::WriteConflict)
                         .attach("full-table mutation cold row changed after visibility")
                         .into());
                 }
+                DeletionState::Available => unreachable!("conditional cold claim resolves vacancy"),
             }
         }
     }
@@ -2887,7 +2954,7 @@ impl<'op> UserTableAccessor<'op> {
         index_ref: IndexRef,
         key_vals: &[Val],
         user_read_set: &[usize],
-    ) -> RuntimeResult<SelectMvcc> {
+    ) -> RuntimeOrFatalResult<SelectMvcc> {
         let index_slot = index_ref.slot();
         debug_assert!(index_slot.as_usize() < self.sec_idx_len());
         debug_assert!(self.metadata().idx.expect_index_spec(index_ref).unique());
@@ -2930,7 +2997,7 @@ impl<'op> UserTableAccessor<'op> {
         index_ref: IndexRef,
         key_vals: &[Val],
         read_set: &[usize],
-    ) -> RuntimeResult<ScanMvcc> {
+    ) -> RuntimeOrFatalResult<ScanMvcc> {
         let index_slot = index_ref.slot();
         debug_assert!(index_slot.as_usize() < self.sec_idx_len());
         // Index scan should be applied to non-unique index.
@@ -2978,7 +3045,7 @@ impl<'op> UserTableAccessor<'op> {
         index_ref: IndexRef,
         range: R,
         read_set: &[usize],
-    ) -> RuntimeResult<ScanMvcc>
+    ) -> RuntimeOrFatalResult<ScanMvcc>
     where
         R: RangeBounds<&'r [Val]>,
     {
@@ -3085,7 +3152,7 @@ impl<'op> UserTableAccessor<'op> {
         row_id: RowID,
         unique: bool,
         min_active_sts: TrxID,
-    ) -> RuntimeResult<bool> {
+    ) -> RuntimeOrFatalResult<bool> {
         // Undo can outlive the secondary index that produced it. Once the
         // exact generation is inactive, row-level purge has no per-entry cleanup to do.
         if !self.validates_index_ref(index_ref) {
@@ -3131,7 +3198,7 @@ impl<'op> UserTableAccessor<'op> {
         key_vals: &[Val],
         row_id: RowID,
         location: LwcRowLocation,
-    ) -> OperationOrRuntimeResult<ColdRowSelection> {
+    ) -> QuadResult<ColdRowSelection> {
         let accessor = self;
         #[cfg(test)]
         run_current_cold_hook(false);
@@ -3159,7 +3226,7 @@ impl<'op> UserTableAccessor<'op> {
             .column_storage()
             .load_lwc_block(rt.pool_guards().disk_guard(), location.block_id)
             .await
-            .change_context(RuntimeError::TableAccess)?;
+            .change_runtime_context(RuntimeError::TableAccess)?;
         let block = persisted.block();
         if block.row_shape_fingerprint() != location.row_shape_fingerprint {
             return Err(Report::new(DataIntegrityError::InvalidPayload)

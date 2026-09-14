@@ -12,7 +12,10 @@ use super::table_replay_silent_watermarks::TABLE_ID_TABLE_REPLAY_SILENT_WATERMAR
 use super::tables::{TABLE_ID_TABLES, table_object_from_vals};
 use crate::buffer::{PoolGuard, PoolGuards};
 use crate::catalog::{CatalogIndexNo, catalog_table_slot, reconstruct_user_table_metadata};
-use crate::error::{DataIntegrityError, DataIntegrityResult, RuntimeError, RuntimeResult};
+use crate::error::{
+    DataIntegrityError, DataIntegrityResult, MultiDomainResultExt, RuntimeError,
+    RuntimeOrFatalResult, RuntimeOrFatalResultExt,
+};
 use crate::file::multi_table_file::{CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc};
 use crate::id::TableID;
 use crate::map::{FastHashMap, FastHashSet};
@@ -63,7 +66,7 @@ impl CatalogStorage {
     pub(crate) async fn validate_live_catalog_parent_integrity(
         &self,
         guards: &PoolGuards,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         let mut parents = FastHashSet::default();
         self.visit_live_catalog_parent_column(guards, TABLE_ID_TABLES, 0, "live", |table_id| {
             parents.insert(table_id);
@@ -96,7 +99,7 @@ impl CatalogStorage {
         roots: &[CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
         disk_guard: &PoolGuard,
         measurement: &CatalogCheckpointMeasurement,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         let operation = "operation=validate_projected_catalog_integrity";
         let mut parents = FastHashSet::default();
         let mut tables = FastHashMap::default();
@@ -219,7 +222,7 @@ impl CatalogStorage {
         table_id: TableID,
         disk_guard: &PoolGuard,
         measurement: &CatalogCheckpointMeasurement,
-    ) -> RuntimeResult<Vec<super::RowRecord>> {
+    ) -> RuntimeOrFatalResult<Vec<super::RowRecord>> {
         let slot = catalog_table_slot(table_id).expect("catalog table has a root slot");
         self.load_rows_from_root(
             self.tables[slot].metadata(),
@@ -237,7 +240,7 @@ impl CatalogStorage {
         parent_column: usize,
         view: &'static str,
         mut visitor: F,
-    ) -> RuntimeResult<()>
+    ) -> RuntimeOrFatalResult<()>
     where
         F: FnMut(TableID) -> DataIntegrityResult<()>,
     {
@@ -264,7 +267,7 @@ impl CatalogStorage {
                 true
             })
             .await
-            .change_context(RuntimeError::CatalogAccess)
+            .change_runtime_context(RuntimeError::CatalogAccess)
             .attach_with(|| {
                 format!(
                     "operation=validate_catalog_parent_integrity, view={view}, table_id={table_id}"
@@ -273,7 +276,8 @@ impl CatalogStorage {
         if let Some(err) = visit_error {
             return Err(err
                 .change_context(RuntimeError::CatalogAccess)
-                .attach("operation=validate_catalog_parent_integrity"));
+                .attach("operation=validate_catalog_parent_integrity")
+                .into());
         }
         Ok(())
     }
@@ -292,7 +296,7 @@ impl CatalogStorage {
         trx: &PrivateTransaction,
         satellite_table_id: TableID,
         table_id: TableID,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         let Some(spec) = CATALOG_SATELLITES
             .iter()
             .copied()
@@ -302,7 +306,7 @@ impl CatalogStorage {
                 .attach(format!(
                     "unknown catalog satellite: view=locked_current, satellite_table_id={satellite_table_id}, table_id={table_id}"
                 ))
-                .change_context(RuntimeError::CatalogAccess));
+                .change_context(RuntimeError::CatalogAccess).into());
         };
         let key = [Val::from(table_id)];
         let mut found = false;
@@ -321,7 +325,8 @@ impl CatalogStorage {
             return Ok(());
         }
         Err(orphan_error(spec, table_id, "locked_current")
-            .change_context(RuntimeError::CatalogAccess))
+            .change_context(RuntimeError::CatalogAccess)
+            .into())
     }
 
     /// Proves that DROP's staged locked-current view contains no row owned by
@@ -330,7 +335,7 @@ impl CatalogStorage {
         &self,
         trx: &PrivateTransaction,
         table_id: TableID,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         let exact = [Val::from(table_id)];
         self.require_lookup_empty(
             trx,
@@ -398,7 +403,7 @@ impl CatalogStorage {
         criteria: IndexLookupCriteria<'_>,
         name: &'static str,
         table_id: TableID,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         let slot = catalog_table_slot(catalog_table_id).ok_or_else(|| {
             Report::new(DataIntegrityError::InvalidRootInvariant)
                 .attach(format!(
@@ -418,7 +423,7 @@ impl CatalogStorage {
                 .attach(format!(
                     "DROP staged catalog row survived: view=locked_current, satellite={name}, satellite_table_id={catalog_table_id}, table_id={table_id}"
                 ))
-                .change_context(RuntimeError::CatalogAccess));
+                .change_context(RuntimeError::CatalogAccess).into());
         }
         Ok(())
     }
@@ -503,6 +508,7 @@ mod tests {
     use crate::catalog::storage::tests::begin_catalog_test_trx;
     use crate::catalog::tests::open_catalog_test_engine;
     use crate::error::DataIntegrityError;
+    use crate::error::RuntimeOrFatalError;
     use crate::session::tests::{SessionTestExt, begin_test_mandatory_private_trx};
     use tempfile::TempDir;
 
@@ -575,6 +581,9 @@ mod tests {
                     .validate_live_catalog_parent_integrity(&session.pool_guards())
                     .await
                     .unwrap_err();
+                let RuntimeOrFatalError::Runtime(err) = err else {
+                    panic!("expected Runtime error, got {err:?}");
+                };
                 let report = format!("{err:?}");
                 assert_eq!(
                     err.downcast_ref::<DataIntegrityError>().copied(),
@@ -628,6 +637,9 @@ mod tests {
                 )
                 .await
                 .unwrap_err();
+            let RuntimeOrFatalError::Runtime(err) = err else {
+                panic!("expected Runtime error, got {err:?}");
+            };
             assert_eq!(
                 err.downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidRootInvariant)
@@ -663,6 +675,9 @@ mod tests {
                 .validate_live_catalog_parent_integrity(&session.pool_guards())
                 .await
                 .unwrap_err();
+            let RuntimeOrFatalError::Runtime(error) = error else {
+                panic!("expected Runtime error, got {error:?}");
+            };
             assert_eq!(
                 error.downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidRootInvariant)
@@ -684,6 +699,9 @@ mod tests {
                 .require_catalog_parent(&trx, TABLE_ID_COLUMNS, TableID::new(1))
                 .await
                 .unwrap_err();
+            let RuntimeOrFatalError::Runtime(err) = err else {
+                panic!("expected Runtime error, got {err:?}");
+            };
             assert_eq!(
                 err.downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidRootInvariant)
@@ -718,6 +736,9 @@ mod tests {
                 .validate_drop_table_absence(transaction.trx(), table_id)
                 .await
                 .unwrap_err();
+            let RuntimeOrFatalError::Runtime(err) = err else {
+                panic!("expected Runtime error, got {err:?}");
+            };
             let report = format!("{err:?}");
             assert_eq!(
                 err.downcast_ref::<DataIntegrityError>().copied(),

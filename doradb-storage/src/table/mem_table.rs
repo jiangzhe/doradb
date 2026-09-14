@@ -13,7 +13,8 @@ use crate::catalog::{
     TableIndexMetadata, TableMetadata,
 };
 use crate::error::{
-    DataIntegrityError, InternalError, QuadResult, RecoveryDuplicateKey, RuntimeError,
+    DataIntegrityError, InternalError, MultiDomainResultExt, QuadResult, RecoveryDuplicateKey,
+    RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeOrFatalResultExt,
     RuntimeResult, SecondaryIndexBinding,
 };
 use crate::id::{PageID, RowID, TableID, TrxID};
@@ -32,6 +33,7 @@ use crate::value::Val;
 use error_stack::{Report, ResultExt};
 use std::convert::identity;
 use std::mem::take;
+use std::result::Result as StdResult;
 
 struct NoTrxIndexRefresh {
     old_keys: Vec<SelectKey>,
@@ -217,7 +219,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         )
     )]
     #[inline]
-    pub(crate) async fn destroy(self, guards: &PoolGuards) -> RuntimeResult<()> {
+    pub(crate) async fn destroy(self, guards: &PoolGuards) -> RuntimeOrFatalResult<()> {
         let index_pool_guard = self.index_pool_guard(guards);
         let table_id = self.table_id();
         let MemTable {
@@ -228,7 +230,8 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                 .into_runtime()
                 .destroy(index_pool_guard)
                 .await
-                .change_context(RuntimeError::TableAccess)
+                .map_err(Into::<RuntimeOrFatalError>::into)
+                .change_runtime_context(RuntimeError::TableAccess)
                 .attach_with(|| {
                     format!("operation=destroy_secondary_index, table_id={table_id}")
                 })?;
@@ -254,7 +257,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         guards: &PoolGuards,
         key: SelectKey,
         row_id: RowID,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         if self
             .metadata()
             .idx
@@ -272,13 +275,15 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             let res = self
                 .require_unique_index(guards, key.index_slot)?
                 .insert_if_not_exists(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
-                .await?;
+                .await
+                .map_err(Into::<RuntimeOrFatalError>::into)?;
             ensure_no_trx_index_insert(key.index_slot, res)?;
         } else {
             let res = self
                 .require_non_unique_index(guards, key.index_slot)?
                 .insert_if_not_exists(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
-                .await?;
+                .await
+                .map_err(Into::<RuntimeOrFatalError>::into)?;
             ensure_no_trx_index_insert(key.index_slot, res)?;
         }
         Ok(())
@@ -291,7 +296,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         index_slot: IndexSlot,
         key_vals: &[Val],
         row_id: RowID,
-    ) -> RuntimeResult<bool> {
+    ) -> RuntimeOrFatalResult<bool> {
         let spec = self
             .metadata()
             .idx
@@ -307,12 +312,14 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             Ok(self
                 .require_unique_index(guards, index_slot)?
                 .compare_delete(key_vals, row_id, true, MIN_SNAPSHOT_TS)
-                .await?)
+                .await
+                .map_err(Into::<RuntimeOrFatalError>::into)?)
         } else {
             Ok(self
                 .require_non_unique_index(guards, index_slot)?
                 .compare_delete(key_vals, row_id, true, MIN_SNAPSHOT_TS)
-                .await?)
+                .await
+                .map_err(Into::<RuntimeOrFatalError>::into)?)
         }
     }
 
@@ -323,7 +330,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         row_id: RowID,
         old_keys: &[SelectKey],
         new_keys: &[SelectKey],
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         if old_keys.len() != new_keys.len() {
             return Err(Report::new(DataIntegrityError::InvalidPayload)
                 .attach(format!(
@@ -332,7 +339,8 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                     new_keys.len()
                 ))
                 .change_context(RuntimeError::TableAccess)
-                .attach("operation=validate_catalog_primary_key_payload"));
+                .attach("operation=validate_catalog_primary_key_payload")
+                .into());
         }
         for (old_key, new_key) in old_keys.iter().zip(new_keys) {
             if old_key.index_slot != new_key.index_slot {
@@ -342,7 +350,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                         old_key.index_slot, new_key.index_slot
                     ))
                     .change_context(RuntimeError::TableAccess)
-                    .attach("operation=validate_catalog_primary_key_payload"));
+                    .attach("operation=validate_catalog_primary_key_payload").into());
             }
             if old_key == new_key {
                 continue;
@@ -359,7 +367,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                         old_key.index_slot
                     ))
                     .change_context(RuntimeError::TableAccess)
-                    .attach("operation=validate_catalog_primary_key_payload"));
+                    .attach("operation=validate_catalog_primary_key_payload").into());
             }
         }
         Ok(())
@@ -370,7 +378,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         &self,
         guards: &PoolGuards,
         row_id: RowID,
-    ) -> RuntimeResult<Option<PageID>> {
+    ) -> RuntimeOrFatalResult<Option<PageID>> {
         match self.row_store.find_row(guards, row_id).await? {
             RowLocation::NotFound => Ok(None),
             RowLocation::LwcBlock(..) => {
@@ -388,7 +396,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         key_vals: &[Val],
         row_id: RowID,
         _min_active_sts: TrxID,
-    ) -> RuntimeResult<bool> {
+    ) -> RuntimeOrFatalResult<bool> {
         let index = self
             .require_unique_index(guards, index_slot)
             .change_context(RuntimeError::TableAccess)
@@ -403,7 +411,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             match index
                 .lookup(key_vals, sts)
                 .await
-                .change_context(RuntimeError::TableAccess)
+                .map_err(Into::<RuntimeOrFatalError>::into).change_runtime_context(RuntimeError::TableAccess)
                 .attach_with(|| {
                     format!(
                         "operation=delete_unique_index, phase=lookup, table_id={}, index_slot={index_slot}, row_id={row_id}",
@@ -420,7 +428,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                         return index
                             .compare_delete(key_vals, row_id, false, MIN_SNAPSHOT_TS)
                             .await
-                            .change_context(RuntimeError::TableAccess)
+                            .map_err(Into::<RuntimeOrFatalError>::into).change_runtime_context(RuntimeError::TableAccess)
                             .attach_with(|| {
                                 format!(
                                     "operation=delete_unique_index, phase=remove_unreachable_key, table_id={}, index_slot={index_slot}, row_id={row_id}",
@@ -443,7 +451,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             return index
                 .compare_delete(key_vals, row_id, false, MIN_SNAPSHOT_TS)
                 .await
-                .change_context(RuntimeError::TableAccess)
+                .map_err(Into::<RuntimeOrFatalError>::into).change_runtime_context(RuntimeError::TableAccess)
                 .attach_with(|| {
                     format!(
                         "operation=delete_unique_index, phase=remove_unreferenced_key, table_id={}, index_slot={index_slot}, row_id={row_id}",
@@ -462,7 +470,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         key_vals: &[Val],
         row_id: RowID,
         _min_active_sts: TrxID,
-    ) -> RuntimeResult<bool> {
+    ) -> RuntimeOrFatalResult<bool> {
         let index = self
             .require_non_unique_index(guards, index_slot)
             .change_context(RuntimeError::TableAccess)
@@ -477,7 +485,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             match index
                 .lookup_unique(key_vals, row_id, sts)
                 .await
-                .change_context(RuntimeError::TableAccess)
+                .map_err(Into::<RuntimeOrFatalError>::into).change_runtime_context(RuntimeError::TableAccess)
                 .attach_with(|| {
                     format!(
                         "operation=delete_non_unique_index, phase=lookup, table_id={}, index_slot={index_slot}, row_id={row_id}",
@@ -494,7 +502,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                         return index
                             .compare_delete(key_vals, row_id, false, MIN_SNAPSHOT_TS)
                             .await
-                            .change_context(RuntimeError::TableAccess)
+                            .map_err(Into::<RuntimeOrFatalError>::into).change_runtime_context(RuntimeError::TableAccess)
                             .attach_with(|| {
                                 format!(
                                     "operation=delete_non_unique_index, phase=remove_unreachable_key, table_id={}, index_slot={index_slot}, row_id={row_id}",
@@ -517,7 +525,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             return index
                 .compare_delete(key_vals, row_id, false, MIN_SNAPSHOT_TS)
                 .await
-                .change_context(RuntimeError::TableAccess)
+                .map_err(Into::<RuntimeOrFatalError>::into).change_runtime_context(RuntimeError::TableAccess)
                 .attach_with(|| {
                     format!(
                         "operation=delete_non_unique_index, phase=remove_unreferenced_key, table_id={}, index_slot={index_slot}, row_id={row_id}",
@@ -535,7 +543,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         guards: &PoolGuards,
         cols: &[Val],
         disable_dml_validation: bool,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         self.insert_no_trx_location(guards, cols, disable_dml_validation)
             .await?;
         Ok(())
@@ -547,7 +555,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         guards: &PoolGuards,
         cols: &[Val],
         disable_dml_validation: bool,
-    ) -> RuntimeResult<(PageID, RowID)> {
+    ) -> RuntimeOrFatalResult<(PageID, RowID)> {
         let metadata = self.metadata();
         if !disable_dml_validation {
             DmlValidator::new(metadata)
@@ -608,7 +616,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         cols: Vec<Val>,
         disable_dml_validation: bool,
         on_change: F,
-    ) -> RuntimeResult<()>
+    ) -> RuntimeOrFatalResult<()>
     where
         F: FnOnce(NoTrxUpsertChange),
     {
@@ -705,7 +713,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         index_slot: IndexSlot,
         key_vals: &[Val],
         disable_dml_validation: bool,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         let metadata = self.metadata();
         let index_spec = if disable_dml_validation {
             metadata
@@ -728,7 +736,11 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         };
         let index = self.require_unique_index(guards, index_slot)?;
         let sts = MIN_SNAPSHOT_TS;
-        let (mut page_guard, row_id) = match index.lookup(key_vals, sts).await? {
+        let (mut page_guard, row_id) = match index
+            .lookup(key_vals, sts)
+            .await
+            .map_err(Into::<RuntimeOrFatalError>::into)?
+        {
             None => {
                 return Err(Report::new(DataIntegrityError::InvalidPayload)
                     .attach(format!(
@@ -736,7 +748,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                         index_slot, key_vals
                     ))
                     .change_context(RuntimeError::TableAccess)
-                    .attach("operation=validate_catalog_primary_key_payload"));
+                    .attach("operation=validate_catalog_primary_key_payload").into());
             }
             Some((row_id, _)) => match self.row_store.find_row(guards, row_id).await? {
                 RowLocation::NotFound => {
@@ -745,7 +757,8 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                             "delete primary key no-trx row location missing: row_id={row_id}"
                         ))
                         .change_context(RuntimeError::TableAccess)
-                        .attach("operation=validate_catalog_primary_key_payload"));
+                        .attach("operation=validate_catalog_primary_key_payload")
+                        .into());
                 }
                 RowLocation::LwcBlock(..) => {
                     catalog_lwc_invariant("delete_primary_key_no_trx", self.table_id(), row_id);
@@ -767,7 +780,8 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                     "delete primary key no-trx row is deleted: row_id={row_id}"
                 ))
                 .change_context(RuntimeError::TableAccess)
-                .attach("operation=validate_catalog_primary_key_payload"));
+                .attach("operation=validate_catalog_primary_key_payload")
+                .into());
         }
         let row = page.row(row_idx);
         if row.is_key_different(metadata.col.as_ref(), index_spec, key_vals) {
@@ -776,7 +790,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                     "delete primary key no-trx row key mismatch: row_id={row_id}, index_slot={index_slot}",
                 ))
                 .change_context(RuntimeError::TableAccess)
-                .attach("operation=validate_catalog_primary_key_payload"));
+                .attach("operation=validate_catalog_primary_key_payload").into());
         }
         let keys = self
             .metadata()
@@ -811,7 +825,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         key_vals: &[Val],
         update: &[UpdateCol],
         disable_dml_validation: bool,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         self.update_primary_key_no_trx_location(
             guards,
             index_slot,
@@ -831,7 +845,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         key_vals: &[Val],
         update: &[UpdateCol],
         disable_dml_validation: bool,
-    ) -> RuntimeResult<(PageID, RowID)> {
+    ) -> RuntimeOrFatalResult<(PageID, RowID)> {
         let metadata = self.metadata();
         let index_spec = if disable_dml_validation {
             metadata
@@ -861,7 +875,11 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
 
         let index = self.require_unique_index(guards, index_slot)?;
         let sts = MIN_SNAPSHOT_TS;
-        let (mut page_guard, row_id) = match index.lookup(key_vals, sts).await? {
+        let (mut page_guard, row_id) = match index
+            .lookup(key_vals, sts)
+            .await
+            .map_err(Into::<RuntimeOrFatalError>::into)?
+        {
             None => {
                 return Err(Report::new(DataIntegrityError::InvalidPayload)
                     .attach(format!(
@@ -869,7 +887,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                         index_slot, key_vals
                     ))
                     .change_context(RuntimeError::TableAccess)
-                    .attach("operation=validate_catalog_primary_key_payload"));
+                    .attach("operation=validate_catalog_primary_key_payload").into());
             }
             Some((row_id, _)) => match self.row_store.find_row(guards, row_id).await? {
                 RowLocation::NotFound => {
@@ -878,7 +896,8 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                             "update primary key no-trx row location missing: row_id={row_id}"
                         ))
                         .change_context(RuntimeError::TableAccess)
-                        .attach("operation=validate_catalog_primary_key_payload"));
+                        .attach("operation=validate_catalog_primary_key_payload")
+                        .into());
                 }
                 RowLocation::LwcBlock(..) => {
                     catalog_lwc_invariant("update_primary_key_no_trx", self.table_id(), row_id);
@@ -900,7 +919,8 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                     "update primary key no-trx row id out of page range: row_id={row_id}"
                 ))
                 .change_context(RuntimeError::TableAccess)
-                .attach("operation=validate_catalog_primary_key_payload"));
+                .attach("operation=validate_catalog_primary_key_payload")
+                .into());
         }
         let row_idx = page.row_idx(row_id);
         let row = page.row(row_idx);
@@ -910,7 +930,8 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                     "update primary key no-trx row is deleted: row_id={row_id}"
                 ))
                 .change_context(RuntimeError::TableAccess)
-                .attach("operation=validate_catalog_primary_key_payload"));
+                .attach("operation=validate_catalog_primary_key_payload")
+                .into());
         }
         if row.is_key_different(metadata.col.as_ref(), index_spec, key_vals) {
             return Err(Report::new(DataIntegrityError::InvalidPayload)
@@ -918,7 +939,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                     "update primary key no-trx row key mismatch: row_id={row_id}, index_slot={index_slot}",
                 ))
                 .change_context(RuntimeError::TableAccess)
-                .attach("operation=validate_catalog_primary_key_payload"));
+                .attach("operation=validate_catalog_primary_key_payload").into());
         }
         let var_len = page.var_len_for_update(row_idx, update);
         match page.request_free_space(var_len) {
@@ -986,7 +1007,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         &self,
         guards: &PoolGuards,
         mut row_action: F,
-    ) -> RuntimeResult<()>
+    ) -> RuntimeOrFatalResult<()>
     where
         F: for<'m, 'p> FnMut(&'m TableColumnLayout, Row<'p>) -> bool,
     {
@@ -1011,7 +1032,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         index_slot: IndexSlot,
         key_vals: &[Val],
         row_action: F,
-    ) -> RuntimeResult<Option<R>>
+    ) -> RuntimeOrFatalResult<Option<R>>
     where
         for<'m, 'p> F: FnOnce(&'m TableColumnLayout, Row<'p>) -> R,
     {
@@ -1030,7 +1051,11 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         ));
         let index = self.require_unique_index(guards, index_slot)?;
         let sts = MIN_SNAPSHOT_TS;
-        let (page_guard, row_id) = match index.lookup(key_vals, sts).await? {
+        let (page_guard, row_id) = match index
+            .lookup(key_vals, sts)
+            .await
+            .map_err(Into::<RuntimeOrFatalError>::into)?
+        {
             None => return Ok(None),
             Some((row_id, _)) => match self.row_store.find_row(guards, row_id).await? {
                 RowLocation::NotFound => return Ok(None),
@@ -1076,7 +1101,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         index_slot: IndexSlot,
         criteria: IndexLookupCriteria<'_>,
         mut row_action: F,
-    ) -> RuntimeResult<()>
+    ) -> RuntimeOrFatalResult<()>
     where
         F: for<'m, 'p> FnMut(&'m TableColumnLayout, Row<'p>) -> bool,
     {
@@ -1086,14 +1111,16 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                     "locked current catalog lookup selected missing index: table_id={}, index_slot={index_slot}",
                     self.table_id()
                 ))
-                .change_context(RuntimeError::CatalogAccess));
+                .change_context(RuntimeError::CatalogAccess).into());
         };
         match criteria {
             IndexLookupCriteria::UniqueExact(key) => {
                 self.validate_current_catalog_lookup(index_slot, index_spec, key, true)?;
                 let index = self.require_unique_index(guards, index_slot)?;
                 let range = index.key_encoder().encode_range(key..=key);
-                let stream = index.index_scan_candidates(&range, MIN_SNAPSHOT_TS)?;
+                let stream = index
+                    .index_scan_candidates(&range, MIN_SNAPSHOT_TS)
+                    .map_err(Into::<RuntimeOrFatalError>::into)?;
                 self.visit_current_catalog_candidates(
                     guards,
                     index_spec,
@@ -1108,7 +1135,9 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                 self.validate_current_catalog_lookup(index_slot, index_spec, upper, true)?;
                 let index = self.require_unique_index(guards, index_slot)?;
                 let range = index.key_encoder().encode_range(lower..=upper);
-                let stream = index.index_scan_candidates(&range, MIN_SNAPSHOT_TS)?;
+                let stream = index
+                    .index_scan_candidates(&range, MIN_SNAPSHOT_TS)
+                    .map_err(Into::<RuntimeOrFatalError>::into)?;
                 self.visit_current_catalog_candidates(
                     guards,
                     index_spec,
@@ -1125,7 +1154,9 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                 self.validate_current_catalog_lookup(index_slot, index_spec, key, false)?;
                 let index = self.require_non_unique_index(guards, index_slot)?;
                 let range = index.key_encoder().encode_non_unique_equal_range(key);
-                let stream = index.equal_scan_candidates(&range, MIN_SNAPSHOT_TS)?;
+                let stream = index
+                    .equal_scan_candidates(&range, MIN_SNAPSHOT_TS)
+                    .map_err(Into::<RuntimeOrFatalError>::into)?;
                 self.visit_current_catalog_candidates(
                     guards,
                     index_spec,
@@ -1145,7 +1176,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         row_match: CurrentCatalogRowMatch<'_>,
         mut stream: S,
         row_action: &mut F,
-    ) -> RuntimeResult<()>
+    ) -> RuntimeOrFatalResult<()>
     where
         S: IndexBatchStream<IndexLookupCandidate>,
         F: for<'m, 'p> FnMut(&'m TableColumnLayout, Row<'p>) -> bool,
@@ -1198,7 +1229,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         row_match: CurrentCatalogRowMatch<'_>,
         candidate: IndexLookupCandidate,
         row_action: &mut F,
-    ) -> RuntimeResult<bool>
+    ) -> RuntimeOrFatalResult<bool>
     where
         F: for<'m, 'p> FnMut(&'m TableColumnLayout, Row<'p>) -> bool,
     {
@@ -1210,7 +1241,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                         "catalog current index candidate resolved to cold storage: table_id={}, row_id={}",
                         self.table_id(), candidate.row_id
                     ))
-                    .change_context(RuntimeError::CatalogAccess));
+                    .change_context(RuntimeError::CatalogAccess).into());
             }
             RowLocation::RowPage(page_id) => page_id,
         };
@@ -1299,7 +1330,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         row_id: RowID,
         unique: bool,
         min_active_sts: TrxID,
-    ) -> RuntimeResult<bool> {
+    ) -> RuntimeOrFatalResult<bool> {
         let Some(index_schema) = self.metadata().idx.index_spec(index_slot) else {
             return Ok(false);
         };
@@ -1338,9 +1369,9 @@ impl<P: BufferPool> InMemorySecondaryIndexScopedBuilder<P> {
     async fn push_or_rollback(
         &mut self,
         index_slot: IndexSlot,
-        built: RuntimeResult<InMemorySecondaryIndex<P>>,
+        built: StdResult<InMemorySecondaryIndex<P>, P::Error>,
         pool_guard: &PoolGuard,
-    ) -> RuntimeResult<()> {
+    ) -> StdResult<(), P::Error> {
         match built {
             Ok(index) => {
                 debug_assert!(self.staged[index_slot.as_usize()].is_none());
@@ -1366,7 +1397,7 @@ impl<P: BufferPool> InMemorySecondaryIndexScopedBuilder<P> {
             // Keep the original construction error as the function result,
             // but observe this terminal best-effort cleanup report first.
             if let Err(report) = index.destroy(pool_guard).await {
-                let report = report.attach(format!(
+                let report = Into::<RuntimeOrFatalError>::into(report).attach_with(|| format!(
                     "operation=rollback_in_memory_secondary_index_build, index_slot={index_slot}"
                 ));
                 obs::error!(
@@ -1389,7 +1420,7 @@ pub(crate) async fn build_in_memory_secondary_indexes<I: BufferPool + 'static>(
     index_pool_guard: &PoolGuard,
     metadata: &TableMetadata,
     index_ts: TrxID,
-) -> RuntimeResult<Box<[Option<InMemorySecondaryIndex<I>>]>> {
+) -> StdResult<Box<[Option<InMemorySecondaryIndex<I>>]>, I::Error> {
     let mut builder = InMemorySecondaryIndexScopedBuilder::new(metadata.idx.index_slot_count());
     for (index_slot, index_spec) in metadata.idx.active_indexes() {
         let ty_infer = |col_no: usize| metadata.col.col_type(col_no);
@@ -1617,6 +1648,7 @@ mod tests {
         StorageIndexFlags, StorageIndexKey, StorageIndexSpec, TableMetadata,
     };
     use crate::engine::Engine;
+    use crate::error::RuntimeOrFatalError;
     use crate::error::{
         DataIntegrityError, InternalError, LifecycleError, OperationError, ResourceError,
         RuntimeError,
@@ -2402,6 +2434,9 @@ mod tests {
                 .delete_primary_key_no_trx(&guards, key.index_slot, &key.vals, false)
                 .await
                 .unwrap_err();
+            let RuntimeOrFatalError::Runtime(err) = err else {
+                panic!("expected Runtime error, got {err:?}");
+            };
 
             assert_eq!(
                 err.downcast_ref::<DataIntegrityError>().copied(),
@@ -2439,6 +2474,9 @@ mod tests {
                 .delete_primary_key_no_trx(&guards, key.index_slot, &key.vals, false)
                 .await
                 .unwrap_err();
+            let RuntimeOrFatalError::Runtime(err) = err else {
+                panic!("expected Runtime error, got {err:?}");
+            };
             assert_eq!(
                 err.downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidPayload)
@@ -2471,6 +2509,9 @@ mod tests {
                 .insert_no_trx(&guards, &[Val::from(1i32), Val::from("short")], false)
                 .await
                 .unwrap_err();
+            let RuntimeOrFatalError::Runtime(err) = err else {
+                panic!("expected Runtime error, got {err:?}");
+            };
             assert_eq!(err.current_context(), &RuntimeError::TableAccess);
             assert_eq!(
                 err.downcast_ref::<DataIntegrityError>().copied(),
@@ -2536,6 +2577,9 @@ mod tests {
                 )
                 .await
                 .unwrap_err();
+            let RuntimeOrFatalError::Runtime(err) = err else {
+                panic!("expected Runtime error, got {err:?}");
+            };
             assert_eq!(err.current_context(), &RuntimeError::TableAccess);
             assert_eq!(
                 err.downcast_ref::<DataIntegrityError>().copied(),
@@ -2672,6 +2716,9 @@ mod tests {
                 )
                 .await
                 .unwrap_err();
+            let RuntimeOrFatalError::Runtime(err) = err else {
+                panic!("expected Runtime error, got {err:?}");
+            };
             assert_eq!(err.current_context(), &RuntimeError::TableAccess);
             assert_eq!(
                 err.downcast_ref::<DataIntegrityError>().copied(),
@@ -2766,6 +2813,9 @@ mod tests {
                 )
                 .await
                 .unwrap_err();
+            let RuntimeOrFatalError::Runtime(err) = err else {
+                panic!("expected Runtime error, got {err:?}");
+            };
             assert_eq!(err.current_context(), &RuntimeError::TableAccess);
             assert_eq!(
                 err.downcast_ref::<DataIntegrityError>().copied(),
@@ -3534,6 +3584,9 @@ mod tests {
                 .scan_from(&session.pool_guards(), interior_start, |_| true)
                 .await
                 .unwrap_err();
+            let RuntimeOrFatalError::Runtime(err) = err else {
+                panic!("expected Runtime error, got {err:?}");
+            };
             assert_eq!(err.current_context(), &RuntimeError::TableAccess);
             assert_eq!(
                 err.downcast_ref::<InternalError>().copied(),

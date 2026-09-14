@@ -5,8 +5,8 @@ use crate::catalog::{
     USER_TABLE_ID_LIMIT, USER_TABLE_ID_START, catalog_table_id_from_slot, catalog_table_slot,
 };
 use crate::error::{
-    CompletionResult, DataIntegrityError, DataIntegrityResult, IoResult, ResourceError,
-    ResourceResult, RuntimeError, RuntimeResult,
+    CompletionResult, DataIntegrityError, DataIntegrityResult, IoResult, MultiDomainResultExt,
+    ResourceError, ResourceResult, RuntimeError, RuntimeOrFatalResult, RuntimeResult,
 };
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, BlockIntegritySpec, max_payload_len, validate_block,
@@ -266,7 +266,7 @@ impl MultiTableFile {
         &self,
         disk_pool: &QuiescentGuard<ReadonlyBufferPool>,
         disk_guard: &PoolGuard,
-    ) -> RuntimeResult<MultiTableActiveRoot> {
+    ) -> RuntimeOrFatalResult<MultiTableActiveRoot> {
         self.file
             .load_active_root_from_pool(FileKind::CatalogMultiTableFile, disk_pool, disk_guard)
             .await
@@ -279,7 +279,7 @@ impl MultiTableFile {
         active_root: &MultiTableActiveRoot,
         file_path: &str,
         background_writes: &IOClient<BackgroundWriteRequest>,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         self.file
             .reconcile_loaded_root_capacity(active_root, file_path, background_writes)
             .await
@@ -484,7 +484,7 @@ impl MutableMultiTableFile {
     #[inline]
     pub(crate) async fn commit(
         self,
-    ) -> RuntimeResult<(Arc<MultiTableFile>, Option<OldMultiTableRoot>)> {
+    ) -> RuntimeOrFatalResult<(Arc<MultiTableFile>, Option<OldMultiTableRoot>)> {
         let MutableMultiTableFile {
             file,
             new_root,
@@ -505,7 +505,7 @@ impl MutableMultiTableFile {
     #[inline]
     pub(crate) async fn commit_prepared(
         self,
-    ) -> RuntimeResult<(Arc<MultiTableFile>, Option<OldMultiTableRoot>)> {
+    ) -> RuntimeOrFatalResult<(Arc<MultiTableFile>, Option<OldMultiTableRoot>)> {
         let MutableMultiTableFile {
             file,
             new_root,
@@ -724,6 +724,7 @@ fn build_super_block(slot_no: u64, checkpoint_cts: TrxID, meta_block_id: BlockID
 mod tests {
     use super::*;
     use crate::buffer::global_readonly_pool_scope;
+    use crate::error::RuntimeOrFatalError;
     use crate::error::{DataIntegrityError, DiscloseResultExt, Result, RuntimeError};
     use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
     use crate::file::test_block_id;
@@ -766,10 +767,13 @@ mod tests {
     }
 
     fn assert_multi_table_meta_corruption(
-        err: Report<RuntimeError>,
+        err: RuntimeOrFatalError,
         page_id: BlockID,
         expected: DataIntegrityError,
     ) {
+        let RuntimeOrFatalError::Runtime(err) = err else {
+            panic!("expected Runtime error, got {err:?}");
+        };
         assert_eq!(
             err.downcast_ref::<RuntimeError>().copied(),
             Some(RuntimeError::FileRootAccess)
@@ -1077,6 +1081,9 @@ mod tests {
                 .await
                 .err()
                 .expect("short catalog file must fail to open");
+            let RuntimeOrFatalError::Runtime(err) = err else {
+                panic!("expected Runtime error, got {err:?}");
+            };
             assert_eq!(err.current_context(), &RuntimeError::FileRootAccess);
             assert_eq!(
                 err.downcast_ref::<DataIntegrityError>().copied(),

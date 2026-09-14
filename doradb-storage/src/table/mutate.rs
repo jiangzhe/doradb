@@ -19,7 +19,7 @@ use crate::buffer::guard::PageSharedGuard;
 use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuards, PoolRole};
 use crate::catalog::{IndexRef, ResolvedIndexKey, TableMetadata};
 use crate::error::{
-    FatalResult, MultiDomainResultExt, OperationError, OperationOrRuntimeResult, QuadResult,
+    FatalResult, MultiDomainResultExt, OperationError, QuadResult, RuntimeOrFatalError,
     RuntimeOrFatalResult, RuntimeResult,
 };
 use crate::id::{RowID, TableID};
@@ -314,7 +314,7 @@ impl<'op, D: BufferPool, R: MemIndexRuntime> MutationExecutor<'op, D, R> {
         &self,
         guards: &PoolGuards,
         row_id: RowID,
-    ) -> RuntimeResult<RowLocation> {
+    ) -> RuntimeOrFatalResult<RowLocation> {
         match self.family {
             MutationFamily::Memory => match self.rows.find_row(guards, row_id).await? {
                 RowLocation::LwcBlock(_) => panic!(
@@ -600,7 +600,7 @@ impl<'op, D: BufferPool, R: MemIndexRuntime> MutationExecutor<'op, D, R> {
         page_guard: &PageSharedGuard<RowPage>,
         index_change_cols: &FastHashMap<usize, Val>,
         root_snapshot: Option<&TableRootSnapshot<'_>>,
-    ) -> OperationOrRuntimeResult<()> {
+    ) -> QuadResult<()> {
         let metadata = self.metadata();
         for (index_schema, entry) in self.layout.active_indexes() {
             let index_slot = entry.index_ref().slot();
@@ -648,7 +648,7 @@ impl<'op, D: BufferPool, R: MemIndexRuntime> MutationExecutor<'op, D, R> {
         new_row_id: RowID,
         proof: OwnedHotIndexSet<'_, '_, '_>,
         source: &HotForwardSource,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         debug_assert!(old_row_id != new_row_id);
         let metadata = self.metadata();
         let source_page = self
@@ -697,7 +697,7 @@ impl<'op, D: BufferPool, R: MemIndexRuntime> MutationExecutor<'op, D, R> {
         index_change_cols: &FastHashMap<usize, Val>,
         page_guard: &PageSharedGuard<RowPage>,
         proof: OwnedHotIndexSet<'_, '_, '_>,
-    ) -> OperationOrRuntimeResult<()> {
+    ) -> QuadResult<()> {
         debug_assert!(row_id_move.old != row_id_move.new);
         let metadata = self.metadata();
         let source_page = self
@@ -793,7 +793,7 @@ impl<'op, D: BufferPool, R: MemIndexRuntime> MutationExecutor<'op, D, R> {
         key_vals: &[Val],
         target: UniqueIndexLinkTarget<'_>,
         resolved_lwc: Option<LwcRowLocation>,
-    ) -> OperationOrRuntimeResult<LinkForUniqueIndex> {
+    ) -> QuadResult<LinkForUniqueIndex> {
         let index_slot = index_ref.slot();
         debug_assert!(old_id != target.row_id);
         let mut resolved_lwc = resolved_lwc;
@@ -926,7 +926,7 @@ impl<'op, D: BufferPool, R: MemIndexRuntime> MutationExecutor<'op, D, R> {
         target: UniqueIndexLinkTarget<'_>,
         root: Option<&TableRootSnapshot<'_>>,
         merge: bool,
-    ) -> OperationOrRuntimeResult<()> {
+    ) -> QuadResult<()> {
         let row_id = target.row_id;
         let page = target.guard;
         self.assert_new_hot_row(row_id, root);
@@ -995,13 +995,14 @@ impl<'op, D: BufferPool, R: MemIndexRuntime> MutationExecutor<'op, D, R> {
         row_id: RowID,
         root: Option<&TableRootSnapshot<'_>>,
         merge: bool,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         self.assert_new_hot_row(row_id, root);
         let (index, vals) = key.into_parts();
         match self
             .non_unique_mem(rt.pool_guards(), index)
             .insert_if_not_exists(&vals, row_id, merge, rt.sts())
-            .await?
+            .await
+            .map_err(Into::<RuntimeOrFatalError>::into)?
         {
             IndexInsert::Ok(merged) => {
                 self.push_insert_non_unique_index_undo(rt, effects, row_id, index, vals, merged)
@@ -1019,7 +1020,7 @@ impl<'op, D: BufferPool, R: MemIndexRuntime> MutationExecutor<'op, D, R> {
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
         entry: OwnedHotIndexEntry<'_, '_, '_>,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         let row_id = entry.row_id;
         let (index, vals) = entry.key.into_parts();
         let unique = self.sec_idx_is_unique(index);
@@ -1029,7 +1030,8 @@ impl<'op, D: BufferPool, R: MemIndexRuntime> MutationExecutor<'op, D, R> {
             let result = self
                 .unique_mem(rt.pool_guards(), index)
                 .compare_exchange(&vals, row_id, row_id.deleted(), rt.sts())
-                .await?;
+                .await
+                .map_err(Into::<RuntimeOrFatalError>::into)?;
             assert_eq!(
                 result,
                 IndexCompareExchange::Ok,
@@ -1040,7 +1042,8 @@ impl<'op, D: BufferPool, R: MemIndexRuntime> MutationExecutor<'op, D, R> {
             let result = self
                 .non_unique_mem(rt.pool_guards(), index)
                 .mask_if_present(&vals, row_id, rt.sts())
-                .await?;
+                .await
+                .map_err(Into::<RuntimeOrFatalError>::into)?;
             assert_eq!(
                 result,
                 IndexMask::Masked,
@@ -1059,7 +1062,7 @@ impl<'op, D: BufferPool, R: MemIndexRuntime> MutationExecutor<'op, D, R> {
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
         proof: OwnedHotIndexSet<'_, '_, '_>,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         for entry in proof.into_entries() {
             self.defer_delete_owned_old_index_entry(rt, effects, entry)
                 .await?;
@@ -1074,14 +1077,15 @@ impl<'op, D: BufferPool, R: MemIndexRuntime> MutationExecutor<'op, D, R> {
         effects: &mut StmtEffects,
         entry: OwnedHotIndexEntry<'_, '_, '_>,
         new_row_id: RowID,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         self.assert_new_hot_row(new_row_id, entry.root_snapshot);
         let old_row_id = entry.row_id;
         let (index, vals) = entry.key.into_parts();
         let result = self
             .unique_mem(rt.pool_guards(), index)
             .compare_exchange(&vals, old_row_id, new_row_id, rt.sts())
-            .await?;
+            .await
+            .map_err(Into::<RuntimeOrFatalError>::into)?;
         assert_eq!(
             result,
             IndexCompareExchange::Ok,
@@ -1106,7 +1110,7 @@ impl<'op, D: BufferPool, R: MemIndexRuntime> MutationExecutor<'op, D, R> {
         effects: &mut StmtEffects,
         entry: OwnedHotIndexEntry<'_, '_, '_>,
         new_row_id: RowID,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         let new_key = entry.key.with_vals(entry.key.vals().to_vec());
         self.update_non_unique_index_key_and_row_id_change(rt, effects, entry, new_key, new_row_id)
             .await
@@ -1121,7 +1125,7 @@ impl<'op, D: BufferPool, R: MemIndexRuntime> MutationExecutor<'op, D, R> {
         key: WriteIndexKey<'_>,
         new_row_id: RowID,
         page: &PageSharedGuard<RowPage>,
-    ) -> OperationOrRuntimeResult<()> {
+    ) -> QuadResult<()> {
         self.insert_unique_index(
             rt,
             effects,
@@ -1144,7 +1148,7 @@ impl<'op, D: BufferPool, R: MemIndexRuntime> MutationExecutor<'op, D, R> {
         entry: OwnedHotIndexEntry<'_, '_, '_>,
         key: WriteIndexKey<'_>,
         new_row_id: RowID,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         self.insert_non_unique_index(rt, effects, key, new_row_id, entry.root_snapshot, false)
             .await?;
         self.defer_delete_owned_old_index_entry(rt, effects, entry)
@@ -1159,7 +1163,7 @@ impl<'op, D: BufferPool, R: MemIndexRuntime> MutationExecutor<'op, D, R> {
         entry: OwnedHotIndexEntry<'_, '_, '_>,
         key: WriteIndexKey<'_>,
         page: &PageSharedGuard<RowPage>,
-    ) -> OperationOrRuntimeResult<()> {
+    ) -> QuadResult<()> {
         self.insert_unique_index(
             rt,
             effects,
@@ -1181,7 +1185,7 @@ impl<'op, D: BufferPool, R: MemIndexRuntime> MutationExecutor<'op, D, R> {
         effects: &mut StmtEffects,
         entry: OwnedHotIndexEntry<'_, '_, '_>,
         key: WriteIndexKey<'_>,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         self.insert_non_unique_index(rt, effects, key, entry.row_id, entry.root_snapshot, true)
             .await?;
         self.defer_delete_owned_old_index_entry(rt, effects, entry)
@@ -1332,9 +1336,9 @@ impl<'a, 'g, P: BufferPool> MutationIndex<'a, 'g, P> {
     pub(super) async fn lookup_observed<'lookup>(
         &'lookup self,
         key: &'lookup [Val],
-    ) -> RuntimeResult<(Option<(RowID, bool)>, UniqueLookupObservation<'lookup>)> {
+    ) -> RuntimeOrFatalResult<(Option<(RowID, bool)>, UniqueLookupObservation<'lookup>)> {
         match self {
-            Self::Memory(index) => index.lookup_observed(key).await,
+            Self::Memory(index) => index.lookup_observed(key).await.map_err(Into::into),
             Self::User(index) => index.lookup_observed(key).await,
         }
     }
@@ -1346,11 +1350,12 @@ impl<'a, 'g, P: BufferPool> MutationIndex<'a, 'g, P> {
         row_id: RowID,
         merge: bool,
         rt: TrxRuntime<'_>,
-    ) -> RuntimeResult<ClaimAttempt<'a, 'g, 'k, P>> {
+    ) -> RuntimeOrFatalResult<ClaimAttempt<'a, 'g, 'k, P>> {
         Ok(match self {
             Self::Memory(index) => match index
                 .insert_if_not_exists(key, row_id, merge, rt.sts())
-                .await?
+                .await
+                .map_err(Into::<RuntimeOrFatalError>::into)?
             {
                 IndexInsert::Ok(merged) => ClaimAttempt::Inserted(merged),
                 IndexInsert::DuplicateKey(owner, deleted) => {
@@ -1400,23 +1405,22 @@ impl<P: BufferPool> MutationClaim<'_, '_, '_, P> {
         self,
         row_id: RowID,
         rt: TrxRuntime<'_>,
-    ) -> RuntimeResult<IndexCompareExchange> {
+    ) -> RuntimeOrFatalResult<IndexCompareExchange> {
         match self {
             Self::Memory {
                 index,
                 key,
                 owner,
                 deleted,
-            } => {
-                index
-                    .compare_exchange(
-                        key,
-                        if deleted { owner.deleted() } else { owner },
-                        row_id,
-                        rt.sts(),
-                    )
-                    .await
-            }
+            } => index
+                .compare_exchange(
+                    key,
+                    if deleted { owner.deleted() } else { owner },
+                    row_id,
+                    rt.sts(),
+                )
+                .await
+                .map_err(Into::into),
             Self::User(observation) => observation.replace(row_id, rt.sts()).await,
         }
     }

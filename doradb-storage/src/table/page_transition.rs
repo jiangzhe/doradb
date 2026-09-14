@@ -8,7 +8,7 @@ use super::{DeleteMarker, Table};
 use crate::bitmap::Bitmap;
 use crate::buffer::PoolGuards;
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
-use crate::error::{FatalResult, RuntimeResult};
+use crate::error::{FatalResult, RuntimeOrFatalResult};
 use crate::id::{PageID, RowID, TableID, TrxID};
 use crate::poison::EnginePoisoner;
 use crate::row::RowPage;
@@ -156,7 +156,7 @@ impl Table {
         &self,
         guards: &PoolGuards,
         frozen_pages: &[FrozenPage],
-    ) -> RuntimeResult<Vec<PageSharedGuard<RowPage>>> {
+    ) -> RuntimeOrFatalResult<Vec<PageSharedGuard<RowPage>>> {
         let mut page_guards = Vec::with_capacity(frozen_pages.len());
         for page_info in frozen_pages {
             page_guards.push(
@@ -879,6 +879,7 @@ pub(crate) mod tests {
     use crate::bitmap::Bitmap;
     use crate::catalog::{StorageColumnFlags, StorageColumnSpec, TableMetadata};
     use crate::id::RowID;
+    use crate::row::RowRead;
     use crate::trx::row::tests::test_row_write_access;
     use crate::trx::tests::{commit_shared_trx_status, shared_trx_status};
     use crate::trx::undo::{
@@ -891,7 +892,7 @@ pub(crate) mod tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
 
     type RouteWaitHook =
@@ -1084,6 +1085,89 @@ pub(crate) mod tests {
             &maintenance_test,
         )
         .into_plan(cutoff_ts, observed_version)
+    }
+
+    #[test]
+    fn test_transition_cleanup_preserves_prepared_bitmap_and_borrowed_columns() {
+        for deferred_lock in [false, true] {
+            let status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 20));
+            let kind = if deferred_lock {
+                RowUndoKind::Lock
+            } else {
+                RowUndoKind::delete()
+            };
+            let mut fixture = frozen_analyzer_fixture(
+                vec![
+                    (kind, UndoStatus::Ref(Arc::clone(&status))),
+                    (RowUndoKind::Insert, UndoStatus::Committed(TrxID::new(5))),
+                ],
+                !deferred_lock,
+            );
+            fixture
+                .page
+                .header
+                .approx_deleted
+                .store(u16::from(!deferred_lock), Ordering::Relaxed);
+            let plan = run_stable_frozen_analyzer(&fixture, TrxID::new(10)).unwrap();
+            let bitmap = plan.del_bitmap.clone();
+            assert!(!bitmap.bitmap_get(0));
+            *fixture.map.write_state() = RowPageState::Transition;
+            let layout = Arc::clone(&fixture.map.column_layout);
+            let view = fixture
+                .page
+                .vector_view_with_del_bitmap(&layout, plan.del_bitmap.clone())
+                .unwrap();
+            let values = fixture.page.row(0).vals_for_read_set(&layout, &[0]);
+            let dirty = AtomicBool::new(false);
+            let mut access = test_row_write_access(&fixture.page, &fixture.map, &dirty, 0);
+            let undo = &mut fixture._undo_owners[0];
+            if deferred_lock {
+                access.validate_undo_head(undo, &status).unwrap();
+                access.delete_row();
+                undo.kind = RowUndoKind::delete();
+            }
+            assert!(fixture.page.is_deleted(0));
+            assert_eq!(view.rows_non_deleted(), 1);
+            assert!(!access.validate_undo_rollback(undo, &status).unwrap());
+            access.rollback_first_undo(&layout, undo);
+            drop(access);
+            assert!(!fixture.page.is_deleted(0));
+            assert_eq!(
+                fixture.page.header.approx_deleted.load(Ordering::Relaxed),
+                0
+            );
+            assert_eq!(fixture.page.row(0).vals_for_read_set(&layout, &[0]), values);
+            assert_eq!(fixture.page.header.row_count(), 1);
+            assert_eq!(plan.del_bitmap, bitmap);
+            assert_eq!(view.rows_non_deleted(), 1);
+            assert!(
+                fixture
+                    .map
+                    .read_latch(0)
+                    .as_ref()
+                    .unwrap()
+                    .next
+                    .main
+                    .entry
+                    .ptr_eq(&fixture._undo_owners[1].leak())
+            );
+        }
+    }
+
+    #[test]
+    fn test_transition_readiness_rejects_unresolved_image_beneath_lock_and_delete() {
+        for image in [RowUndoKind::Insert, RowUndoKind::update(vec![])] {
+            let owner = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 20));
+            let fixture = frozen_analyzer_fixture(
+                vec![
+                    (RowUndoKind::Lock, UndoStatus::Ref(Arc::clone(&owner))),
+                    (RowUndoKind::delete(), UndoStatus::Ref(Arc::clone(&owner))),
+                    (image, UndoStatus::Ref(owner)),
+                ],
+                true,
+            );
+            assert!(run_stable_frozen_analyzer(&fixture, TrxID::new(10)).is_none());
+        }
     }
 
     #[test]

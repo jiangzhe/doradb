@@ -10,7 +10,7 @@ use crate::catalog::{
 };
 use crate::error::{
     DataIntegrityError, DataIntegrityResult, MultiDomainResultExt, RuntimeError,
-    RuntimeOrFatalResult, RuntimeResult,
+    RuntimeOrFatalResult, RuntimeOrFatalResultExt,
 };
 use crate::id::TableID;
 use crate::row::ops::{UniqueMutation, UniqueMutationOutcome};
@@ -51,7 +51,7 @@ impl Tables<'_> {
     pub(crate) async fn list_uncommitted(
         &self,
         guards: &PoolGuards,
-    ) -> RuntimeResult<Vec<TableObject>> {
+    ) -> RuntimeOrFatalResult<Vec<TableObject>> {
         let mut res = vec![];
         let mut decode_error = None;
         self.table
@@ -71,12 +71,13 @@ impl Tables<'_> {
                 }
             })
             .await
-            .change_context(RuntimeError::CatalogAccess)
+            .change_runtime_context(RuntimeError::CatalogAccess)
             .attach("operation=list_catalog_tables")?;
         if let Some(err) = decode_error {
             return Err(err
                 .change_context(RuntimeError::CatalogAccess)
-                .attach("operation=list_catalog_tables, phase=decode_row"));
+                .attach("operation=list_catalog_tables, phase=decode_row")
+                .into());
         }
         Ok(res)
     }
@@ -87,7 +88,7 @@ impl Tables<'_> {
         &self,
         guards: &PoolGuards,
         table_id: TableID,
-    ) -> RuntimeResult<Option<TableObject>> {
+    ) -> RuntimeOrFatalResult<Option<TableObject>> {
         #[cfg(test)]
         tests::record_lookup(table_id);
         let key_vals = [Val::from(table_id)];
@@ -99,7 +100,7 @@ impl Tables<'_> {
                     .collect::<Vec<_>>()
             })
             .await
-            .change_context(RuntimeError::CatalogAccess)
+            .change_runtime_context(RuntimeError::CatalogAccess)
             .attach_with(|| format!("operation=find_catalog_table, table_id={table_id}"))?;
         vals.map(|vals| table_object_from_vals(&vals))
             .transpose()
@@ -107,6 +108,7 @@ impl Tables<'_> {
             .attach_with(|| {
                 format!("operation=find_catalog_table, phase=decode_row, table_id={table_id}")
             })
+            .map_err(Into::into)
     }
 
     /// Insert a table row whose primary key is owned by the current DDL.

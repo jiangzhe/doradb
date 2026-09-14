@@ -28,7 +28,7 @@ Each selected RowPage moves monotonically through three states:
 | --- | --- | --- |
 | `ACTIVE` | Accepts normal inserts, updates, deletes, and locks | Candidate for a future frozen prefix |
 | `FROZEN` | Rejects new insert/update payload changes; delete/lock metadata may still change while existing writers drain | Source of readiness analysis and transition planning |
-| `TRANSITION` | Payload is immutable; foreground access follows transition routing | Source of LWC construction until the new root is installed |
+| `TRANSITION` | Column values, null/variable storage, row count, and prepared bitmap are fixed; existing ownership permits only latched cleanup or Lock-to-Delete completion | Source of LWC construction until the new root is installed |
 
 Every row or undo mutation allowed on a frozen page is bracketed by paired
 mutation-version increments. The value is a change detector, not an odd/even
@@ -137,6 +137,24 @@ is released immediately. During this phase the batch may contain a growing
 `TRANSITION` prefix followed by a `FROZEN` suffix. Once the first page changes
 state, unexpected analysis, marker, build, publication, or system-commit
 failure is fatal and wakes transition-route waiters through storage poison.
+
+Transition fixes column values, null bits, variable-length storage, row count,
+and the checkpoint-owned prepared deletion bitmap. Existing active Lock/Delete
+ownership may still complete or roll back under the original row latch;
+recorded forward-link before-images may be restored there. New ownership,
+column writes, and new forward-link publication remain prohibited. An active
+Insert/Update below leading Lock/Delete entries still blocks readiness.
+
+Cleanup acquires the exact original page, page-state read lock, row write
+latch, then CDB entry guard. If it wins while Frozen, paired mutation-version
+bumps invalidate stale plans. If checkpoint wins, cleanup sees Transition and
+its installed markers together. It may change live delete metadata and unlink
+undo, but cannot change the prepared bitmap or borrowed columns. An active
+Delete has live/prepared bits 1/0; rollback changes them to 0/0. Deferred Lock
+completion changes 0/0 to 1/0, with rollback returning to 0/0.
+
+Root publication never reinstalls a marker removed by cleanup. LWC membership,
+split retries, and secondary-index collection all retain the prepared bitmap.
 
 ## LWC and Secondary-Index Construction
 

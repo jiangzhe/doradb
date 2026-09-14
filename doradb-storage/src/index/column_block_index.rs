@@ -1,7 +1,7 @@
 use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
 use crate::error::{
     DataIntegrityError, DataIntegrityResult, MultiDomainResultExt, RuntimeError,
-    RuntimeOrFatalResult, RuntimeResult,
+    RuntimeOrFatalResult, RuntimeOrFatalResultExt, RuntimeResult,
 };
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, COLUMN_BLOCK_INDEX_BLOCK_SPEC, max_payload_len, validate_block,
@@ -666,7 +666,7 @@ impl DeferredColumnScanDeletes {
         file: &Arc<SparseFile>,
         disk_pool: &QuiescentGuard<ReadonlyBufferPool>,
         disk_pool_guard: &PoolGuard,
-    ) -> RuntimeResult<Vec<u32>> {
+    ) -> RuntimeOrFatalResult<Vec<u32>> {
         let reader = ColumnDeletionBlobReader::new(file_kind, file, disk_pool, disk_pool_guard);
         let (header, payload) = reader.read_framed_blob(self.blob_ref).await?;
         if header.blob_kind() != COLUMN_AUX_BLOB_KIND_DELETE_DELTAS
@@ -679,7 +679,7 @@ impl DeferredColumnScanDeletes {
                     self.blob_ref.start_block_id
                 ))
                 .change_context(RuntimeError::IndexAccess)
-                .attach("operation=load_column_scan_delete_ordinals"));
+                .attach("operation=load_column_scan_delete_ordinals").into());
         }
         let values = decode_u32_bytes_strict(&payload, self.del_count)
             .attach_with(|| {
@@ -702,7 +702,8 @@ impl DeferredColumnScanDeletes {
                             self.blob_ref.start_block_id
                         ))
                         .change_context(RuntimeError::IndexAccess)
-                        .attach("operation=load_column_scan_delete_ordinals"));
+                        .attach("operation=load_column_scan_delete_ordinals")
+                        .into());
                 }
                 Ok(values)
             }
@@ -725,7 +726,8 @@ impl DeferredColumnScanDeletes {
                                 .attach("operation=load_column_scan_delete_ordinals")
                         })
                     })
-                    .collect()
+                    .collect::<RuntimeResult<Vec<_>>>()
+                    .map_err(Into::into)
             }
         }
     }
@@ -1549,7 +1551,7 @@ impl<'a> ColumnBlockIndex<'a> {
     }
 
     #[inline]
-    async fn read_node(&self, block_id: BlockID) -> RuntimeResult<ValidatedColumnBlockNode> {
+    async fn read_node(&self, block_id: BlockID) -> RuntimeOrFatalResult<ValidatedColumnBlockNode> {
         let g = self
             .disk_pool
             .read_validated_block(
@@ -1560,7 +1562,7 @@ impl<'a> ColumnBlockIndex<'a> {
                 validate_persisted_column_block_index_page,
             )
             .await
-            .change_context(RuntimeError::IndexAccess)
+            .change_runtime_context(RuntimeError::IndexAccess)
             .attach_with(|| {
                 format!(
                     "operation=read_column_block_index_node, file={}, block_id={block_id}",
@@ -1632,7 +1634,7 @@ impl<'a> ColumnBlockIndex<'a> {
     pub(crate) async fn locate_block(
         &self,
         row_id: RowID,
-    ) -> RuntimeResult<Option<ColumnLeafEntry>> {
+    ) -> RuntimeOrFatalResult<Option<ColumnLeafEntry>> {
         if self.root_block_id == SUPER_BLOCK_ID || row_id >= self.end_row_id {
             return Ok(None);
         }
@@ -1683,7 +1685,7 @@ impl<'a> ColumnBlockIndex<'a> {
     pub(crate) async fn locate_and_resolve_row(
         &self,
         row_id: RowID,
-    ) -> RuntimeResult<Option<ResolvedColumnRow>> {
+    ) -> RuntimeOrFatalResult<Option<ResolvedColumnRow>> {
         if self.root_block_id == SUPER_BLOCK_ID || row_id >= self.end_row_id {
             return Ok(None);
         }
@@ -1748,7 +1750,7 @@ impl<'a> ColumnBlockIndex<'a> {
     pub(crate) async fn load_delete_deltas_and_row_ids(
         &self,
         entry: &ColumnLeafEntry,
-    ) -> RuntimeResult<(Vec<u32>, Vec<RowID>)> {
+    ) -> RuntimeOrFatalResult<(Vec<u32>, Vec<RowID>)> {
         let node = self.read_node(entry.leaf_block_id).await?;
         let view = self.read_entry_view(&node, entry)?;
         let row_set = self
@@ -1797,7 +1799,7 @@ impl<'a> ColumnBlockIndex<'a> {
         view: &LeafEntryView<'_>,
         row_set: &LogicalRowSet,
         block_id: BlockID,
-    ) -> RuntimeResult<LogicalDeleteSet> {
+    ) -> RuntimeOrFatalResult<LogicalDeleteSet> {
         let delete_set = self
             .node_result(block_id, decode_logical_delete_set_base(view, row_set))
             .change_context(RuntimeError::IndexAccess)
@@ -1819,11 +1821,13 @@ impl<'a> ColumnBlockIndex<'a> {
             self.disk_pool_guard,
         );
         let (header, payload) = reader.read_framed_blob(blob_ref).await.map_err(|err| {
-            err.attach(format!(
-                "decode column deletion blob: file={}, start_block_id={}",
-                self.file_kind(),
-                blob_ref.start_block_id
-            ))
+            err.attach_with(|| {
+                format!(
+                    "decode column deletion blob: file={}, start_block_id={}",
+                    self.file_kind(),
+                    blob_ref.start_block_id
+                )
+            })
         })?;
         if header.blob_kind() != COLUMN_AUX_BLOB_KIND_DELETE_DELTAS
             || header.codec_kind() != COLUMN_AUX_BLOB_CODEC_U32_DELTA_LIST
@@ -1848,7 +1852,7 @@ impl<'a> ColumnBlockIndex<'a> {
                     blob_ref.start_block_id
                 ))
                 .change_context(RuntimeError::IndexAccess)
-                .attach("operation=decode_column_delete_set"));
+                .attach("operation=decode_column_delete_set").into());
         }
         let row_id_deltas = decode_delete_rows(&payload, del_count, domain, row_set)
             .attach_with(|| {
@@ -1871,7 +1875,7 @@ impl<'a> ColumnBlockIndex<'a> {
     async fn load_rewrite_context(
         &self,
         start_row_id: RowID,
-    ) -> RuntimeResult<(LogicalRowSet, ColumnDeleteDomain)> {
+    ) -> RuntimeOrFatalResult<(LogicalRowSet, ColumnDeleteDomain)> {
         assert_ne!(
             self.root_block_id, SUPER_BLOCK_ID,
             "column block-index invariant violated: rewrite context requested from empty root, start_row_id={start_row_id}"
@@ -1936,7 +1940,7 @@ impl<'a> ColumnBlockIndex<'a> {
     }
 
     /// Collects all leaf entries in ascending `start_row_id` order.
-    pub(crate) async fn collect_leaf_entries(&self) -> RuntimeResult<Vec<ColumnLeafEntry>> {
+    pub(crate) async fn collect_leaf_entries(&self) -> RuntimeOrFatalResult<Vec<ColumnLeafEntry>> {
         if self.root_block_id == SUPER_BLOCK_ID {
             return Ok(Vec::new());
         }
@@ -1968,7 +1972,8 @@ impl<'a> ColumnBlockIndex<'a> {
                                 self.file_kind()
                             ))
                             .change_context(RuntimeError::IndexAccess)
-                            .attach("operation=collect_column_leaf_entries"));
+                            .attach("operation=collect_column_leaf_entries")
+                            .into());
                     }
                     last_end = Some(entry.end_row_id());
                     entries.push(entry);
@@ -1985,7 +1990,8 @@ impl<'a> ColumnBlockIndex<'a> {
                             self.file_kind()
                         ))
                         .change_context(RuntimeError::IndexAccess)
-                        .attach("operation=collect_column_leaf_entries"));
+                        .attach("operation=collect_column_leaf_entries")
+                        .into());
                 }
                 stack.push(child_block_id);
             }
@@ -1998,7 +2004,9 @@ impl<'a> ColumnBlockIndex<'a> {
     /// Each leaf prefix plane and entry payload is decoded while its owning
     /// node is already resident. External delete blobs intentionally remain
     /// unread until execution reaches their block.
-    pub(crate) async fn collect_scan_entries(&self) -> RuntimeResult<Vec<ColumnBlockScanEntry>> {
+    pub(crate) async fn collect_scan_entries(
+        &self,
+    ) -> RuntimeOrFatalResult<Vec<ColumnBlockScanEntry>> {
         if self.root_block_id == SUPER_BLOCK_ID {
             return Ok(Vec::new());
         }
@@ -2030,7 +2038,8 @@ impl<'a> ColumnBlockIndex<'a> {
                                 self.file_kind()
                             ))
                             .change_context(RuntimeError::IndexAccess)
-                            .attach("operation=collect_column_scan_entries"));
+                            .attach("operation=collect_column_scan_entries")
+                            .into());
                     }
                     last_end = Some(entry.end_row_id);
                     entries.push(entry);
@@ -2046,7 +2055,8 @@ impl<'a> ColumnBlockIndex<'a> {
                             self.file_kind()
                         ))
                         .change_context(RuntimeError::IndexAccess)
-                        .attach("operation=collect_column_scan_entries"));
+                        .attach("operation=collect_column_scan_entries")
+                        .into());
                 }
                 stack.push(child_block_id);
             }
@@ -2062,7 +2072,7 @@ impl<'a> ColumnBlockIndex<'a> {
     pub(crate) async fn collect_reachable_blocks(
         &self,
         out: &mut BTreeSet<BlockID>,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         if self.root_block_id == SUPER_BLOCK_ID {
             return Ok(());
         }
@@ -2120,7 +2130,8 @@ impl<'a> ColumnBlockIndex<'a> {
                             self.file_kind()
                         ))
                         .change_context(RuntimeError::IndexAccess)
-                        .attach("operation=collect_column_reachable_blocks"));
+                        .attach("operation=collect_column_reachable_blocks")
+                        .into());
                 }
                 stack.push(child_block_id);
             }

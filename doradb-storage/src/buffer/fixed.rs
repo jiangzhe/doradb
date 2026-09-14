@@ -144,6 +144,8 @@ impl FixedBufferPool {
 }
 
 impl BufferPool for FixedBufferPool {
+    type Error = Report<RuntimeError>;
+
     #[inline]
     fn capacity(&self) -> usize {
         self.size

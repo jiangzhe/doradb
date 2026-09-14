@@ -24,7 +24,8 @@ use crate::catalog::{
     TableColumnLayout, classify_index_ddl_root,
 };
 use crate::error::{
-    DataIntegrityError, DataIntegrityResult, IoResult, RuntimeError, RuntimeResult,
+    DataIntegrityError, DataIntegrityResult, IoResult, MultiDomainResultExt, RuntimeError,
+    RuntimeOrFatalResult, RuntimeOrFatalResultExt, RuntimeResult,
 };
 use crate::id::{PageID, RowID, TableID, TrxID};
 use crate::latch::LatchFallbackMode;
@@ -97,7 +98,7 @@ impl<'a> RecoveryCoordinator<'a> {
 
     /// Replay redo, rebuild indexes, and return recovery outcomes plus redo startup.
     #[inline]
-    pub(crate) async fn recover_all(self) -> RuntimeResult<(TrxID, RedoLogFinalizer)> {
+    pub(crate) async fn recover_all(self) -> RuntimeOrFatalResult<(TrxID, RedoLogFinalizer)> {
         obs::info!("event=recovery_lifecycle component=recovery action=start result=ok");
         self.recover_all_inner()
             .await
@@ -115,7 +116,7 @@ impl<'a> RecoveryCoordinator<'a> {
             })
     }
 
-    async fn recover_all_inner(mut self) -> RuntimeResult<(TrxID, RedoLogFinalizer)> {
+    async fn recover_all_inner(mut self) -> RuntimeOrFatalResult<(TrxID, RedoLogFinalizer)> {
         obs::info!(
             "event=recovery_phase component=recovery phase=checkpoint_bootstrap action=start result=ok"
         );
@@ -200,7 +201,7 @@ impl<'a> RecoveryCoordinator<'a> {
             .storage
             .validate_live_catalog_parent_integrity(&self.resources.pool_guards)
             .await
-            .change_context(RuntimeError::Recovery)
+            .change_runtime_context(RuntimeError::Recovery)
             .inspect(|_| {
                 obs::info!("event=recovery_phase component=recovery phase=catalog_parent_validation action=finish result=ok");
             })
@@ -217,7 +218,7 @@ impl<'a> RecoveryCoordinator<'a> {
             .catalog
             .validate_live_table_descriptors(&self.resources.pool_guards)
             .await
-            .change_context(RuntimeError::Recovery)
+            .change_runtime_context(RuntimeError::Recovery)
             .attach("operation=recovery, phase=managed_descriptor_validation")?;
         // 3. Ensure catalog metadata caught up with table-file roots.
         obs::info!(
@@ -341,7 +342,7 @@ impl<'a> RecoveryCoordinator<'a> {
         );
     }
 
-    async fn bootstrap_checkpointed_user_tables(&mut self) -> RuntimeResult<()> {
+    async fn bootstrap_checkpointed_user_tables(&mut self) -> RuntimeOrFatalResult<()> {
         let snapshot = self.resources.catalog.storage.checkpoint_snapshot();
         self.timeline
             .seed_catalog_checkpoint(snapshot.catalog_replay_start_ts);
@@ -525,7 +526,7 @@ impl<'a> RecoveryCoordinator<'a> {
             })
     }
 
-    async fn replay_log(&mut self, log: TrxLog) -> RuntimeResult<()> {
+    async fn replay_log(&mut self, log: TrxLog) -> RuntimeOrFatalResult<()> {
         // sequentially replay redo log.
         let (header, RedoLogs { ddl, dml }) = log.into_inner();
         self.timeline.max_recovered_cts = self.timeline.max_recovered_cts.max(header.cts);
@@ -541,7 +542,7 @@ impl<'a> RecoveryCoordinator<'a> {
         Ok(())
     }
 
-    async fn recover_indexes_and_refresh_pages(&mut self) -> RuntimeResult<()> {
+    async fn recover_indexes_and_refresh_pages(&mut self) -> RuntimeOrFatalResult<()> {
         // Checkpointed cold secondary-index state is already available through
         // the table's DiskTree roots. Rebuild only hot row-page MemIndex state.
         for (table_id, pages) in &self.recovered_tables {
@@ -559,7 +560,7 @@ impl<'a> RecoveryCoordinator<'a> {
         Ok(())
     }
 
-    async fn validate_loaded_table_metadata(&mut self) -> RuntimeResult<()> {
+    async fn validate_loaded_table_metadata(&mut self) -> RuntimeOrFatalResult<()> {
         let table_ids = self
             .timeline
             .table_bounds
@@ -593,7 +594,7 @@ impl<'a> RecoveryCoordinator<'a> {
                         catalog_metadata.idx.index_slot_count_u32(),
                         active_root.metadata.idx.index_slot_count_u32()
                     ))
-                    .change_context(RuntimeError::Recovery));
+                    .change_context(RuntimeError::Recovery).into());
             }
             self.pending_index_ddl_reconciliations.remove(&table_id);
             table
@@ -613,7 +614,7 @@ impl<'a> RecoveryCoordinator<'a> {
                 .attach(format!(
                     "pending index-DDL reconciliation left after recovered metadata validation: table_id={table_id}"
                 ))
-                .change_context(RuntimeError::Recovery));
+                .change_context(RuntimeError::Recovery).into());
         }
         Ok(())
     }
@@ -643,7 +644,7 @@ impl<'a> RecoveryCoordinator<'a> {
         &self,
         col_layout: Arc<TableColumnLayout>,
         page_id: PageID,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         let mut page_guard = self
             .resources
             .pools
@@ -673,7 +674,7 @@ impl<'a> RecoveryCoordinator<'a> {
         ddl: Box<DDLRedo>,
         dml: BTreeMap<TableID, TableDML>,
         cts: TrxID,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         match *ddl {
             DDLRedo::CreateTable(table_id) => {
                 self.replay_create_table_ddl(table_id, dml, cts).await?
@@ -732,7 +733,7 @@ impl<'a> RecoveryCoordinator<'a> {
         table_id: TableID,
         dml: BTreeMap<TableID, TableDML>,
         cts: TrxID,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         if !self.should_replay_catalog(cts) {
             return Ok(());
         }
@@ -779,7 +780,7 @@ impl<'a> RecoveryCoordinator<'a> {
         table_id: TableID,
         dml: BTreeMap<TableID, TableDML>,
         cts: TrxID,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         if !self.should_replay_catalog(cts) {
             return Ok(());
         }
@@ -836,7 +837,7 @@ impl<'a> RecoveryCoordinator<'a> {
         index: IndexRef,
         dml: BTreeMap<TableID, TableDML>,
         cts: TrxID,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         if !self.should_replay_catalog(cts) {
             return Ok(());
         }
@@ -882,7 +883,7 @@ impl<'a> RecoveryCoordinator<'a> {
         index: IndexRef,
         dml: BTreeMap<TableID, TableDML>,
         cts: TrxID,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         if !self.should_replay_catalog(cts) {
             return Ok(());
         }
@@ -929,7 +930,7 @@ impl<'a> RecoveryCoordinator<'a> {
         end_row_id: RowID,
         dml: BTreeMap<TableID, TableDML>,
         cts: TrxID,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         debug_assert!(dml.is_empty());
         if self
             .classify_user_table_redo(table_id, cts, "replay create row page")
@@ -1019,7 +1020,7 @@ impl<'a> RecoveryCoordinator<'a> {
         table_id: TableID,
         dml: BTreeMap<TableID, TableDML>,
         cts: TrxID,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         if !self.should_replay_catalog(cts) {
             return Ok(());
         }
@@ -1061,7 +1062,7 @@ impl<'a> RecoveryCoordinator<'a> {
         &mut self,
         dml: BTreeMap<TableID, TableDML>,
         cts: TrxID,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         for (table_id, table_dml) in dml {
             if table_id.is_catalog() {
                 if !self.should_replay_catalog(cts) {
@@ -1114,7 +1115,7 @@ impl<'a> RecoveryCoordinator<'a> {
     async fn replay_catalog_modifications(
         &mut self,
         dml: BTreeMap<TableID, TableDML>,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         for (table_id, table_dml) in dml {
             let table = self
                 .resources
@@ -1136,7 +1137,7 @@ impl<'a> RecoveryCoordinator<'a> {
         &mut self,
         table: &CatalogTable,
         rows: &BTreeMap<RowID, RowRedo>,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         for row in rows.values() {
             match &row.kind {
                 RowRedoKind::Insert(_, vals) => {
@@ -1185,7 +1186,7 @@ impl<'a> RecoveryCoordinator<'a> {
         table: &Table,
         rows: &BTreeMap<RowID, RowRedo>,
         cts: TrxID,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         let heap_redo_start_ts = self
             .table_heap_redo_start_ts(table_id)
             .change_context(RuntimeError::Recovery)?;
@@ -1243,7 +1244,8 @@ impl<'a> RecoveryCoordinator<'a> {
                 }
                 RowRedoKind::DeleteByPrimaryKey(_) | RowRedoKind::UpdateByPrimaryKey(..) => {
                     return Err(invalid_user_table_keyed_redo(table_id, row, cts)
-                        .change_context(RuntimeError::Recovery));
+                        .change_context(RuntimeError::Recovery)
+                        .into());
                 }
             }
         }
@@ -1336,6 +1338,7 @@ mod tests {
     use crate::component::EnginePools;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
+    use crate::error::RuntimeOrFatalError;
     use crate::error::{CompletionErrorBridge, DataIntegrityError, Error, ErrorKind, RuntimeError};
     use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
@@ -1365,7 +1368,7 @@ mod tests {
     use crate::trx::MIN_SNAPSHOT_TS;
     use crate::value::Val;
     use crate::value::ValKind;
-    use error_stack::Report;
+
     use std::collections::BTreeMap;
     use std::fs::{self, File, OpenOptions};
     use std::io::{Read, Seek, SeekFrom, Write};
@@ -1405,11 +1408,14 @@ mod tests {
     }
 
     fn assert_table_runtime_data_integrity(
-        err: Report<RuntimeError>,
+        err: RuntimeOrFatalError,
         block_kind: &str,
         block_id: BlockID,
         expected: DataIntegrityError,
     ) {
+        let RuntimeOrFatalError::Runtime(err) = err else {
+            panic!("expected Runtime error, got {err:?}");
+        };
         let report = format!("{err:?}");
         assert_eq!(
             err.current_context(),
@@ -2264,6 +2270,9 @@ mod tests {
                 .replay_log(unknown_table_dml_log(unknown_table_id, TrxID::new(10)))
                 .await
                 .unwrap_err();
+            let RuntimeOrFatalError::Runtime(err) = err else {
+                panic!("expected Runtime error, got {err:?}");
+            };
             assert_eq!(*err.current_context(), RuntimeError::Recovery);
             assert_eq!(
                 err.downcast_ref::<DataIntegrityError>().copied(),
@@ -2281,6 +2290,9 @@ mod tests {
                 ))
                 .await
                 .unwrap_err();
+            let RuntimeOrFatalError::Runtime(err) = err else {
+                panic!("expected Runtime error, got {err:?}");
+            };
             assert_eq!(*err.current_context(), RuntimeError::Recovery);
             assert_eq!(
                 err.downcast_ref::<DataIntegrityError>().copied(),

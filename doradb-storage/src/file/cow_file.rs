@@ -4,7 +4,8 @@ use crate::buffer::{PoolGuard, ReadonlyBufferPool, ReadonlyWriteLease, begin_wri
 use crate::completion::Completion;
 use crate::error::{
     CompletionResult, DataIntegrityError, DataIntegrityResult, InternalResult, IoError, IoResult,
-    ResourceError, ResourceResult, RuntimeError, RuntimeResult,
+    MultiDomainResultExt, ResourceError, ResourceResult, RuntimeError, RuntimeOrFatalResult,
+    RuntimeOrFatalResultExt, RuntimeResult,
 };
 use crate::file::block_integrity::max_payload_len;
 use crate::file::fs::BackgroundWriteRequest;
@@ -695,7 +696,7 @@ impl<M> CowFile<M> {
         active_root: &ActiveRoot<M>,
         file_path: &str,
         background_writes: &IOClient<BackgroundWriteRequest>,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         let file_kind = self.codec.file_kind;
         let file_id = self.file.file_id();
         let expected_len = active_root
@@ -719,7 +720,7 @@ impl<M> CowFile<M> {
                 .attach(format!(
                     "file_kind={file_kind}, file_id={file_id}, file_path={file_path}, expected_len={expected_len}, actual_len={actual_len}"
                 ))
-                .change_context(RuntimeError::FileRootAccess));
+                .change_context(RuntimeError::FileRootAccess).into());
         }
 
         self.file
@@ -734,8 +735,8 @@ impl<M> CowFile<M> {
             .await
             .map_err(|bridge| {
                 bridge
-                    .replace_context(RuntimeError::FileRootAccess)
-                    .attach(format!(
+                    .into_runtime_or_fatal(RuntimeError::FileRootAccess)
+                    .attach_with(|| format!(
                         "operation=reconcile_cow_file_capacity, phase=fsync, file_kind={file_kind}, file_id={file_id}, file_path={file_path}, expected_len={expected_len}, actual_len={actual_len}"
                     ))
             })?;
@@ -773,13 +774,13 @@ impl<M> CowFile<M> {
         file_kind: FileKind,
         disk_pool: &QuiescentGuard<ReadonlyBufferPool>,
         disk_guard: &PoolGuard,
-    ) -> RuntimeResult<ActiveRoot<M>> {
+    ) -> RuntimeOrFatalResult<ActiveRoot<M>> {
         let file_id = self.file.file_id();
         let _ = disk_pool.invalidate_block(disk_guard, file_id, SUPER_BLOCK_ID);
         let super_block_guard = disk_pool
             .read_raw_block(file_kind, &self.file, disk_guard, SUPER_BLOCK_ID)
             .await
-            .change_context(RuntimeError::FileRootAccess)
+            .change_runtime_context(RuntimeError::FileRootAccess)
             .attach_with(|| {
                 format!(
                     "operation=load_file_root, file_kind={file_kind}, file_id={file_id}, phase=read_super_block, block_id={SUPER_BLOCK_ID}"
@@ -804,7 +805,7 @@ impl<M> CowFile<M> {
         let meta_block_guard = disk_pool
             .read_raw_block(file_kind, &self.file, disk_guard, meta_block_id)
             .await
-            .change_context(RuntimeError::FileRootAccess)
+            .change_runtime_context(RuntimeError::FileRootAccess)
             .attach_with(|| {
                 format!(
                     "operation=load_file_root, file_kind={file_kind}, file_id={file_id}, phase=read_meta_block, block_id={meta_block_id}"
@@ -849,7 +850,7 @@ impl<M> CowFile<M> {
         background_writes: &IOClient<BackgroundWriteRequest>,
         mut new_root: MutableCowRoot<M>,
         write_barrier: CowWriteBarrier<'_>,
-    ) -> RuntimeResult<Option<OldCowRoot<M>>> {
+    ) -> RuntimeOrFatalResult<Option<OldCowRoot<M>>> {
         let file_id = self.file.file_id();
         self.reserve_publish_meta_block(
             &mut new_root,
@@ -873,7 +874,7 @@ impl<M> CowFile<M> {
         background_writes: &IOClient<BackgroundWriteRequest>,
         new_root: MutableCowRoot<M>,
         write_barrier: CowWriteBarrier<'_>,
-    ) -> RuntimeResult<Option<OldCowRoot<M>>> {
+    ) -> RuntimeOrFatalResult<Option<OldCowRoot<M>>> {
         let file_id = self.file.file_id();
         let meta_block_id = new_root.root.meta_block_id;
         self.assert_prepared_publish_root(&new_root);
@@ -896,8 +897,8 @@ impl<M> CowFile<M> {
             .await
             .map_err(|bridge| {
                 bridge
-                    .replace_context(RuntimeError::FileRootAccess)
-                    .attach(format!(
+                    .into_runtime_or_fatal(RuntimeError::FileRootAccess)
+                    .attach_with(|| format!(
                     "operation=publish_file_root, file_id={file_id}, phase=write_meta_block, block_id={meta_block_id}"
                 ))
             })?;
@@ -908,8 +909,8 @@ impl<M> CowFile<M> {
             .await
             .map_err(|bridge| {
                 bridge
-                    .replace_context(RuntimeError::FileRootAccess)
-                    .attach(format!(
+                    .into_runtime_or_fatal(RuntimeError::FileRootAccess)
+                    .attach_with(|| format!(
                     "operation=publish_file_root, file_id={file_id}, phase=write_super_block, block_id={SUPER_BLOCK_ID}, slot_no={}",
                     new_root.root.slot_no
                 ))
@@ -920,10 +921,10 @@ impl<M> CowFile<M> {
             .await
             .map_err(|bridge| {
                 bridge
-                    .replace_context(RuntimeError::FileRootAccess)
-                    .attach(format!(
-                        "operation=publish_file_root, file_id={file_id}, phase=fsync"
-                    ))
+                    .into_runtime_or_fatal(RuntimeError::FileRootAccess)
+                    .attach_with(|| {
+                        format!("operation=publish_file_root, file_id={file_id}, phase=fsync")
+                    })
             })?;
         obs::debug!(
             "event=cow_root_publish component=cow_file action=fsync result=ok file_id={} duration_nanos={}",

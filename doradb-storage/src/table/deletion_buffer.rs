@@ -11,11 +11,13 @@
 //! checkpointing can flush committed markers to disk, but markers may remain
 //! here until they are no longer needed to make old snapshots visible.
 
+use crate::error::{InternalError, InternalResult};
 use crate::id::{RowID, TrxID};
 use crate::map::FastDashMap;
 use crate::poison::PoisonAwareListener;
 use crate::trx::{MvccVisibility, PrepareListenerResult, SharedTrxStatus, trx_is_committed};
 use dashmap::mapref::entry::Entry;
+use error_stack::Report;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -32,11 +34,19 @@ pub(crate) enum DeletionError {
 
 /// Result of a foreground cold-row ownership claim.
 pub(crate) enum DeletionClaim {
-    /// The caller installed or already owns the delete marker.
+    /// The caller installed a fresh delete marker.
     Acquired,
     /// A foreign owner is preparing; consume the poison-aware token, then retry
     /// from authoritative row and marker state.
     Preparing(PoisonAwareListener),
+}
+
+/// Disposition of an existing marker after synchronous owner cleanup.
+pub(super) enum DeletionDisposition {
+    /// The restored main row chain still belongs to this transaction.
+    Keep,
+    /// The transaction has discharged its final ownership of this row.
+    Remove,
 }
 
 /// Current ownership and deletion state, preserving committed deletion timestamps.
@@ -56,11 +66,12 @@ pub(crate) enum DeletionState {
 }
 
 impl DeletionState {
-    /// Preserves the generic idempotent claim contract for existing consumers.
+    /// Maps current state to a fresh foreground claim without duplicating ownership.
     #[inline]
     fn into_claim(self, sts: TrxID) -> Result<DeletionClaim, DeletionError> {
         match self {
-            Self::Acquired | Self::Consumed => Ok(DeletionClaim::Acquired),
+            Self::Acquired => Ok(DeletionClaim::Acquired),
+            Self::Consumed => Err(DeletionError::AlreadyDeleted),
             Self::Deleted(Some(cts)) if cts > sts => Err(DeletionError::WriteConflict),
             Self::Deleted(_) => Err(DeletionError::AlreadyDeleted),
             Self::WriteConflict => Err(DeletionError::WriteConflict),
@@ -505,16 +516,6 @@ impl ColumnDeletionBuffer {
         row_ids
     }
 
-    /// Removes the marker for `row_id` without checking ownership.
-    ///
-    /// This is intended for rollback after the caller has proven the undo entry
-    /// belongs to the transaction being undone. It is not a general committed
-    /// marker GC policy.
-    #[inline]
-    pub(crate) fn remove(&self, row_id: RowID) {
-        self.entries.remove(&row_id);
-    }
-
     /// Removes an active marker only when it still belongs to `status`.
     ///
     /// This is the inverse of a provisional foreground claim that has not yet
@@ -526,7 +527,8 @@ impl ColumnDeletionBuffer {
             Entry::Occupied(entry) => {
                 let owned = matches!(
                     entry.get(),
-                    DeleteMarker::Ref(existing) if Arc::ptr_eq(existing, status)
+                    DeleteMarker::Ref(existing)
+                        if Arc::ptr_eq(existing, status) && !trx_is_committed(existing.ts()) && !existing.terminal()
                 );
                 if owned {
                     entry.remove();
@@ -535,6 +537,37 @@ impl ColumnDeletionBuffer {
             }
             Entry::Vacant(_) => false,
         }
+    }
+
+    /// Validates active ownership and reconciles the same guarded map entry.
+    /// The engine-internal closure must be synchronous and infallible: no I/O,
+    /// page/index acquisition, await, or user callback may run while guarded.
+    pub(super) fn reconcile_owned(
+        &self,
+        row_id: RowID,
+        status: &Arc<SharedTrxStatus>,
+        reconcile: impl FnOnce() -> DeletionDisposition,
+    ) -> InternalResult<()> {
+        let Entry::Occupied(entry) = self.entries.entry(row_id) else {
+            return Err(Report::new(InternalError::RowUndoState)
+                .attach(format!("CDB marker absent: row_id={row_id}")));
+        };
+        let owned = matches!(entry.get(), DeleteMarker::Ref(existing)
+            if Arc::ptr_eq(existing, status) && !trx_is_committed(existing.ts()) && !existing.terminal());
+        if !owned {
+            let actual_ts = match entry.get() {
+                DeleteMarker::Ref(existing) => existing.ts(),
+                DeleteMarker::Committed(ts) => *ts,
+            };
+            return Err(Report::new(InternalError::RowUndoState).attach(format!(
+                "CDB marker is foreign or committed: row_id={row_id}, expected_ts={}, actual_ts={actual_ts}",
+                status.ts()
+            )));
+        }
+        if matches!(reconcile(), DeletionDisposition::Remove) {
+            entry.remove();
+        }
+        Ok(())
     }
 }
 
@@ -551,6 +584,13 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::thread::spawn;
+
+    impl ColumnDeletionBuffer {
+        /// Removes a marker for fault injection and isolated CDB fixtures.
+        pub(crate) fn remove(&self, row_id: RowID) {
+            self.entries.remove(&row_id);
+        }
+    }
 
     #[test]
     fn test_delete_marker_is_globally_purgeable_with_is_lazy() {
@@ -798,7 +838,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             buffer.claim_ref(RowID::new(2), Arc::clone(&requester), MAX_SNAPSHOT_TS, true,),
-            Ok(DeletionClaim::Acquired)
+            Err(DeletionError::AlreadyDeleted)
         ));
 
         buffer.put_committed(RowID::new(3), TrxID::new(30)).unwrap();

@@ -10,7 +10,7 @@ use crate::catalog::{
 };
 use crate::error::{
     DataIntegrityError, DataIntegrityResult, MultiDomainResultExt, RuntimeError,
-    RuntimeOrFatalResult, RuntimeResult,
+    RuntimeOrFatalResult, RuntimeOrFatalResultExt,
 };
 use crate::id::TableID;
 use crate::row::{Row, RowRead};
@@ -19,7 +19,6 @@ use crate::trx::PrivateTransaction;
 use crate::value::Val;
 use crate::value::ValKind;
 use error_stack::Report;
-use error_stack::ResultExt;
 use std::sync::OnceLock;
 
 const COL_NO_COLUMNS_TABLE_ID: usize = 0;
@@ -52,7 +51,7 @@ impl Columns<'_> {
         &self,
         guards: &PoolGuards,
         table_id: TableID,
-    ) -> RuntimeResult<Vec<ColumnObject>> {
+    ) -> RuntimeOrFatalResult<Vec<ColumnObject>> {
         let mut res = vec![];
         let mut decode_error = None;
         self.table
@@ -71,12 +70,13 @@ impl Columns<'_> {
                 true
             })
             .await
-            .change_context(RuntimeError::CatalogAccess)
+            .change_runtime_context(RuntimeError::CatalogAccess)
             .attach_with(|| format!("operation=list_catalog_columns, table_id={table_id}"))?;
         if let Some(err) = decode_error {
             return Err(err
                 .change_context(RuntimeError::CatalogAccess)
-                .attach("operation=list_catalog_columns, phase=decode_row"));
+                .attach("operation=list_catalog_columns, phase=decode_row")
+                .into());
         }
         Ok(res)
     }
@@ -105,7 +105,7 @@ impl Columns<'_> {
         &self,
         trx: &PrivateTransaction,
         table_id: TableID,
-    ) -> RuntimeResult<Vec<ColumnObject>> {
+    ) -> RuntimeOrFatalResult<Vec<ColumnObject>> {
         let lower = [Val::from(table_id), Val::from(0u32)];
         let upper = [Val::from(table_id), Val::from(u32::MAX)];
         let mut columns = Vec::new();
@@ -136,7 +136,8 @@ impl Columns<'_> {
         if let Some(err) = decode_error {
             return Err(err
                 .change_context(RuntimeError::CatalogAccess)
-                .attach("operation=list_locked_catalog_columns, phase=decode_row"));
+                .attach("operation=list_locked_catalog_columns, phase=decode_row")
+                .into());
         }
         Ok(columns)
     }

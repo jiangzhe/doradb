@@ -18,7 +18,7 @@ use crate::error::{
     CompletionErrorBridge, CompletionResult, DataIntegrityError, DataIntegrityResult, FatalError,
     FatalResult, InternalError, InternalResult, IoResult, MultiDomainResultExt, OperationError,
     OperationOrRuntimeResult, OperationResult, QuadError, RuntimeError, RuntimeOrFatalError,
-    RuntimeOrFatalResult, RuntimeResult,
+    RuntimeOrFatalResult, RuntimeOrFatalResultExt,
 };
 use crate::file::fs::FileSystem;
 use crate::file::table_file::{MutableTableFile, TableFile};
@@ -306,7 +306,7 @@ impl CreateTableProgress {
     }
 
     #[inline]
-    async fn publish_file(&mut self, trx_sys: &TransactionSystem) -> RuntimeResult<()> {
+    async fn publish_file(&mut self, trx_sys: &TransactionSystem) -> RuntimeOrFatalResult<()> {
         debug_assert_eq!(self.phase, CreateTablePhase::CatalogStaged);
         let root_ts = self
             .trx
@@ -323,7 +323,7 @@ impl CreateTableProgress {
         let table_file = trx_sys
             .publish_table_file_root(*mutable_file, root_ts, true)
             .await
-            .change_context(RuntimeError::CatalogAccess)
+            .change_runtime_context(RuntimeError::CatalogAccess)
             .attach_with(|| {
                 format!(
                     "operation=create_table, phase=publish_file, table_id={}",
@@ -340,7 +340,7 @@ impl CreateTableProgress {
         &mut self,
         pools: &EnginePools,
         guards: &PoolGuards,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         debug_assert_eq!(self.phase, CreateTablePhase::FilePublished);
         let Some(CreateTableFile::Published(table_file)) = self.file.as_ref() else {
             panic!("published table file is present before runtime build");
@@ -389,7 +389,7 @@ impl CreateTableProgress {
             active_root.root_ts,
         )
         .await
-        .change_context(RuntimeError::CatalogAccess)
+        .change_runtime_context(RuntimeError::CatalogAccess)
         .attach_with(|| {
             format!(
                 "operation=create_table, phase=build_secondary_indexes, table_id={}",
@@ -469,7 +469,7 @@ impl CreateTableProgress {
         table_fs.delete_user_table_file(self.table_id)
     }
 
-    async fn destroy_staged_runtime(&mut self, guards: &PoolGuards) -> RuntimeResult<()> {
+    async fn destroy_staged_runtime(&mut self, guards: &PoolGuards) -> RuntimeOrFatalResult<()> {
         let Some(table) = self.staged_table.take() else {
             return Ok(());
         };
@@ -553,7 +553,7 @@ impl CreateTableProgress {
         if let Err(err) = self.destroy_staged_runtime(guards).await {
             let cleanup = poison_error_source(
                 &engine.poisoner,
-                RuntimeOrFatalError::from(err),
+                err,
                 FatalError::Poisoned,
                 format!(
                     "create table cleanup failed: table_id={}, operation={operation}, cleanup_operation=runtime_destroy, source_error={source_debug}",
@@ -610,7 +610,7 @@ impl CreateTableProgress {
             self.phase = CreateTablePhase::Aborted;
             return poison_error_source(
                 &engine.poisoner,
-                RuntimeOrFatalError::from(err),
+                err,
                 FatalError::Poisoned,
                 format!(
                     "create table cleanup failed: table_id={}, operation={operation}, cleanup_operation=runtime_destroy_after_root_publish, source_error={source_debug}",
@@ -2664,6 +2664,7 @@ pub(crate) mod tests {
         StorageIndexFlags, StorageIndexKey, StorageIndexSpec, StorageTableSpec, TableMetadata,
     };
     use crate::engine::Engine;
+    use crate::error::RuntimeResult;
     use crate::error::{
         DataIntegrityError, DiscloseError, Error, ErrorKind, FatalError, IoError, LifecycleError,
         OperationError, RuntimeError,

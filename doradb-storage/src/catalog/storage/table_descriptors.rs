@@ -7,7 +7,7 @@ use crate::catalog::{
 };
 use crate::error::{
     DataIntegrityError, DataIntegrityResult, MultiDomainResultExt, RuntimeError,
-    RuntimeOrFatalResult, RuntimeResult,
+    RuntimeOrFatalResult, RuntimeOrFatalResultExt,
 };
 use crate::id::TableID;
 use crate::row::RowRead;
@@ -45,7 +45,7 @@ impl TableDescriptors<'_> {
         &self,
         guards: &PoolGuards,
         table_id: TableID,
-    ) -> RuntimeResult<Option<TableDescriptorObject>> {
+    ) -> RuntimeOrFatalResult<Option<TableDescriptorObject>> {
         #[cfg(test)]
         tests::record_lookup();
         let key = [Val::from(table_id)];
@@ -62,7 +62,7 @@ impl TableDescriptors<'_> {
                 },
             )
             .await
-            .change_context(RuntimeError::CatalogAccess)
+            .change_runtime_context(RuntimeError::CatalogAccess)
             .attach_with(|| format!("operation=find_table_descriptor, table_id={table_id}"))?;
         vals.map(|vals| table_descriptor_object_from_vals(&vals))
             .transpose()
@@ -70,13 +70,14 @@ impl TableDescriptors<'_> {
             .attach_with(|| {
                 format!("operation=find_table_descriptor, phase=decode_row, table_id={table_id}")
             })
+            .map_err(Into::into)
     }
 
     /// Lists and validates all current uncommitted-visible descriptor rows.
     pub(crate) async fn list_uncommitted(
         &self,
         guards: &PoolGuards,
-    ) -> RuntimeResult<Vec<TableDescriptorObject>> {
+    ) -> RuntimeOrFatalResult<Vec<TableDescriptorObject>> {
         let mut descriptors = Vec::new();
         let mut decode_error = None;
         self.table
@@ -99,12 +100,13 @@ impl TableDescriptors<'_> {
                 }
             })
             .await
-            .change_context(RuntimeError::CatalogAccess)
+            .change_runtime_context(RuntimeError::CatalogAccess)
             .attach("operation=list_table_descriptors")?;
         if let Some(err) = decode_error {
             return Err(err
                 .change_context(RuntimeError::CatalogAccess)
-                .attach("operation=list_table_descriptors, phase=decode_row"));
+                .attach("operation=list_table_descriptors, phase=decode_row")
+                .into());
         }
         Ok(descriptors)
     }

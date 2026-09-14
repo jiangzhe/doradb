@@ -212,6 +212,18 @@ impl EnginePoisoner {
         self.publish_shared(SharedFatalError::capture(report))
     }
 
+    /// Poisons runtime admission and returns the engine's first shared fatal error.
+    /// The returned error may precede the supplied report if another failure
+    /// already poisoned the engine.
+    #[inline]
+    pub(crate) fn poison_and_get_first(&self, report: Report<FatalError>) -> SharedFatalError {
+        self.poison(report);
+        // Publication stores a reason before setting the sticky poison flag.
+        // Neither is cleared, so a completed publication guarantees this lookup.
+        self.shared_poison_error()
+            .expect("engine poison publication must retain its first fatal error")
+    }
+
     /// Publishes an already captured shared Fatal error without reconstructing it.
     #[inline]
     pub(crate) fn poison_shared(&self, local: SharedFatalError) -> SharedFatalError {
@@ -276,6 +288,7 @@ pub(crate) fn healthy_test_poisoner() -> &'static EnginePoisoner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::RuntimeError;
     use std::sync::Arc;
     use std::sync::Barrier;
     use std::sync::atomic::AtomicBool;
@@ -336,55 +349,80 @@ mod tests {
     }
 
     #[test]
+    fn test_poison_and_get_first_preserves_original_report() {
+        let poisoner = EnginePoisoner::new();
+        let first = poisoner.poison_and_get_first(
+            Report::new(RuntimeError::TableAccess)
+                .attach("original rollback access source")
+                .change_context(FatalError::RollbackAccess),
+        );
+        let identity = first.test_identity();
+        let later = poisoner.poison_and_get_first(
+            Report::new(FatalError::CheckpointWrite).attach("later checkpoint failure"),
+        );
+
+        for error in [first, later, poisoner.shared_poison_error().unwrap()] {
+            assert_eq!(error.test_identity(), identity);
+            let report = error.into_report();
+            assert_eq!(*report.current_context(), FatalError::RollbackAccess);
+            assert_eq!(
+                report.downcast_ref::<RuntimeError>(),
+                Some(&RuntimeError::TableAccess)
+            );
+            assert!(format!("{report:?}").contains("original rollback access source"));
+        }
+    }
+
+    #[test]
     fn test_poison_concurrent_callers_share_first_error() {
-        let poisoner = Arc::new(EnginePoisoner::new());
-        let barrier = Arc::new(Barrier::new(3));
+        for return_first in [false, true] {
+            let poisoner = Arc::new(EnginePoisoner::new());
+            let reasons = [FatalError::RedoWrite, FatalError::RedoSync];
+            let barrier = Arc::new(Barrier::new(reasons.len() + 1));
+            let workers: Vec<_> = reasons
+                .into_iter()
+                .map(|reason| {
+                    let barrier = Arc::clone(&barrier);
+                    let poisoner = Arc::clone(&poisoner);
+                    spawn(move || {
+                        barrier.wait();
+                        let report = Report::new(reason);
+                        if return_first {
+                            poisoner.poison_and_get_first(report)
+                        } else {
+                            poisoner.poison(report)
+                        }
+                    })
+                })
+                .collect();
 
-        let worker_a_barrier = Arc::clone(&barrier);
-        let worker_a_poisoner = Arc::clone(&poisoner);
-        let worker_a = spawn(move || {
-            worker_a_barrier.wait();
-            worker_a_poisoner.poison(Report::new(FatalError::RedoWrite).attach("writer"))
-        });
-
-        let worker_b_barrier = Arc::clone(&barrier);
-        let worker_b_poisoner = Arc::clone(&poisoner);
-        let worker_b = spawn(move || {
-            worker_b_barrier.wait();
-            worker_b_poisoner.poison(Report::new(FatalError::RedoSync).attach("sync"))
-        });
-
-        barrier.wait();
-
-        let err_a = worker_a.join().unwrap();
-        let err_b = worker_b.join().unwrap();
-        let stored_error = poisoner
-            .poison_reason
-            .lock()
-            .as_ref()
-            .cloned()
-            .expect("poisoned engine must retain the first fatal error");
-        let stored = poisoner.poison_error().unwrap();
-        let stored_reason = *stored.current_context();
-
-        assert!(poisoner.poisoned.load(Ordering::Acquire));
-        assert!(
-            stored_error.test_identity() == err_a.test_identity()
-                || stored_error.test_identity() == err_b.test_identity()
-        );
-        assert_eq!(err_a.reason(), FatalError::RedoWrite);
-        assert_eq!(err_b.reason(), FatalError::RedoSync);
-        assert_eq!(stored_error.reason(), stored_reason);
-        assert!(
-            poisoner
-                .ensure_healthy()
-                .as_ref()
-                .is_err_and(|err| *err.current_context() == stored_reason)
-        );
-        assert!(matches!(
-            stored_reason,
-            FatalError::RedoWrite | FatalError::RedoSync
-        ));
+            barrier.wait();
+            let errors: Vec<_> = workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect();
+            let stored = poisoner.shared_poison_error().unwrap();
+            assert!(reasons.contains(&stored.reason()));
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.test_identity() == stored.test_identity())
+            );
+            for (error, local_reason) in errors.into_iter().zip(reasons) {
+                if return_first {
+                    assert_eq!(error.test_identity(), stored.test_identity());
+                    assert_eq!(error.reason(), stored.reason());
+                } else {
+                    assert_eq!(error.reason(), local_reason);
+                }
+            }
+            assert!(
+                poisoner
+                    .ensure_healthy()
+                    .as_ref()
+                    .is_err_and(|err| *err.current_context() == stored.reason())
+            );
+        }
     }
 
     #[test]

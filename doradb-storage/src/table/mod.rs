@@ -23,6 +23,10 @@ mod scan_plan;
 mod scan_root;
 mod storage;
 mod unique_mutate;
+use crate::error::{
+    DataIntegrityError, DataIntegrityResult, MultiDomainResultExt, OperationResult, RuntimeError,
+    RuntimeOrFatalResult, RuntimeOrFatalResultExt, RuntimeResult,
+};
 pub use access::LazyRow;
 pub(crate) use access::*;
 pub use checkpoint_workflow::{FreezeOutcome, FrozenPageBatchInfo};
@@ -68,9 +72,6 @@ pub(crate) use unique_mutate::{
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards, ReadonlyBufferPool};
 use crate::catalog::{IndexRef, IndexSlot, SecondaryIndexSlot, TableIndexMetadata, TableMetadata};
-use crate::error::{
-    DataIntegrityError, DataIntegrityResult, OperationResult, RuntimeError, RuntimeResult,
-};
 use crate::file::table_file::{ActiveRoot, TableFile};
 use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
 use crate::index::{
@@ -325,7 +326,10 @@ impl Table {
     /// purge caller treats failure as fatal storage poison rather than retrying
     /// inline.
     #[inline]
-    pub(crate) async fn destroy_dropped_runtime(self, guards: &PoolGuards) -> RuntimeResult<()> {
+    pub(crate) async fn destroy_dropped_runtime(
+        self,
+        guards: &PoolGuards,
+    ) -> RuntimeOrFatalResult<()> {
         let Table {
             row_store,
             storage: _storage,
@@ -553,7 +557,7 @@ impl Table {
     pub(crate) async fn cleanup_retired_secondary_indexes(
         &self,
         guards: &PoolGuards,
-    ) -> RuntimeResult<usize> {
+    ) -> RuntimeOrFatalResult<usize> {
         let index_pool_guard = guards.index_guard();
         let mut cleaned = 0usize;
         loop {
@@ -663,7 +667,7 @@ impl Table {
         &self,
         guards: &PoolGuards,
         row_id: RowID,
-    ) -> RuntimeResult<RowLocation> {
+    ) -> RuntimeOrFatalResult<RowLocation> {
         self.row_store
             .blk_idx
             .find_row(
@@ -673,7 +677,7 @@ impl Table {
                 Some(&self.storage),
             )
             .await
-            .change_context(RuntimeError::TableAccess)
+            .change_runtime_context(RuntimeError::TableAccess)
             .attach_with(|| {
                 format!(
                     "operation=find_row, table_id={}, row_id={row_id}",
@@ -705,7 +709,7 @@ impl Table {
         Ok(res)
     }
 
-    async fn mem_scan<F>(&self, guards: &PoolGuards, mut page_action: F) -> RuntimeResult<()>
+    async fn mem_scan<F>(&self, guards: &PoolGuards, mut page_action: F) -> RuntimeOrFatalResult<()>
     where
         F: FnMut(PageSharedGuard<RowPage>) -> bool,
     {
@@ -1097,9 +1101,9 @@ impl SecondaryIndexScopedBuilder {
             // Keep the original construction error as the function result,
             // but observe this terminal best-effort cleanup report first.
             if let Err(report) = index.destroy(pool_guard).await {
-                let report = report.attach(format!(
-                    "operation=rollback_secondary_index_build, index_slot={index_slot}"
-                ));
+                let report = report.attach_with(|| {
+                    format!("operation=rollback_secondary_index_build, index_slot={index_slot}")
+                });
                 obs::error!(
                     "event=secondary_index_cleanup component=table action=destroy_staged result=error error={report:?}"
                 );
@@ -1127,7 +1131,7 @@ pub(crate) async fn build_dual_tree_secondary_indexes(
     file: Arc<TableFile>,
     disk_pool: QuiescentGuard<ReadonlyBufferPool>,
     index_ts: TrxID,
-) -> RuntimeResult<Box<[Option<Arc<SecondaryIndex<EvictableBufferPool>>>]>> {
+) -> RuntimeOrFatalResult<Box<[Option<Arc<SecondaryIndex<EvictableBufferPool>>>]>> {
     let mut builder = SecondaryIndexScopedBuilder::new(metadata.idx.index_slot_count());
     for (index_slot, index_spec) in metadata.idx.active_indexes() {
         let runtime = match SecondaryDiskTreeRuntime::new(
@@ -1139,7 +1143,7 @@ pub(crate) async fn build_dual_tree_secondary_indexes(
             Ok(runtime) => runtime,
             Err(err) => {
                 builder.rollback(index_pool_guard).await;
-                return Err(err);
+                return Err(err.into());
             }
         };
         let ty_infer = |col_no: usize| metadata.col.col_type(col_no);
@@ -1347,7 +1351,8 @@ pub(crate) mod tests {
     use crate::engine::Engine;
     use crate::error::{
         CallbackResult, CompletionErrorBridge, DataIntegrityError, DiscloseError,
-        DiscloseResultExt, Error, FatalError, OperationError, Result, RuntimeResult,
+        DiscloseResultExt, Error, FatalError, OperationError, Result, RuntimeOrFatalResult,
+        RuntimeResult,
     };
     use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
     use crate::file::cow_file::{COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID};
@@ -2195,7 +2200,7 @@ pub(crate) mod tests {
             &self,
             key: &[Val],
             ts: TrxID,
-        ) -> RuntimeResult<Option<(RowID, bool)>> {
+        ) -> RuntimeOrFatalResult<Option<(RowID, bool)>> {
             let index = self.layout.secondary_index(self.index_slot)?;
             index
                 .bind_unique_unchecked(self.guards, self.root)?
@@ -2212,7 +2217,7 @@ pub(crate) mod tests {
             row_id: RowID,
             merge_if_match_deleted: bool,
             ts: TrxID,
-        ) -> RuntimeResult<IndexInsert> {
+        ) -> RuntimeOrFatalResult<IndexInsert> {
             let index = self.layout.secondary_index(self.index_slot)?;
             index
                 .unique_mem()?
@@ -2229,7 +2234,7 @@ pub(crate) mod tests {
             key: &[Val],
             row_id: RowID,
             ts: TrxID,
-        ) -> RuntimeResult<bool> {
+        ) -> RuntimeOrFatalResult<bool> {
             let index = self.layout.secondary_index(self.index_slot)?;
             index
                 .unique_mem()?
@@ -2255,7 +2260,7 @@ pub(crate) mod tests {
             key: &[Val],
             res: &mut Vec<RowID>,
             ts: TrxID,
-        ) -> RuntimeResult<()> {
+        ) -> RuntimeOrFatalResult<()> {
             let index = self.layout.secondary_index(self.index_slot)?;
             let range = index.key_encoder().encode_non_unique_equal_range(key);
             let bound = index.bind_non_unique_unchecked(self.guards, self.root)?;
@@ -2273,7 +2278,7 @@ pub(crate) mod tests {
             key: &[Val],
             row_id: RowID,
             ts: TrxID,
-        ) -> RuntimeResult<Option<bool>> {
+        ) -> RuntimeOrFatalResult<Option<bool>> {
             let index = self.layout.secondary_index(self.index_slot)?;
             index
                 .bind_non_unique_unchecked(self.guards, self.root)?
@@ -2290,7 +2295,7 @@ pub(crate) mod tests {
             row_id: RowID,
             merge_if_match_deleted: bool,
             ts: TrxID,
-        ) -> RuntimeResult<IndexInsert> {
+        ) -> RuntimeOrFatalResult<IndexInsert> {
             let index = self.layout.secondary_index(self.index_slot)?;
             index
                 .non_unique_mem()?
@@ -2307,7 +2312,7 @@ pub(crate) mod tests {
             key: &[Val],
             row_id: RowID,
             ts: TrxID,
-        ) -> RuntimeResult<IndexMask> {
+        ) -> RuntimeOrFatalResult<IndexMask> {
             let index = self.layout.secondary_index(self.index_slot)?;
             index
                 .bind_non_unique_unchecked(self.guards, self.root)?

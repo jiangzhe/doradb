@@ -1,7 +1,7 @@
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::buffer::page::VersionedPageID;
 use crate::catalog::{IndexRef, IndexSlot, ResolvedIndexKey, TableColumnLayout, TableMetadata};
-use crate::error::{OperationError, OperationResult};
+use crate::error::{InternalError, InternalResult, OperationError, OperationResult};
 use crate::id::{RowID, TableID, TrxID};
 use crate::index::{BTreeKey, BTreeKeyEncoder, IndexLookupCandidate};
 use crate::map::FastHashMap;
@@ -11,8 +11,8 @@ use crate::row::ops::{ReadRow, SelectKey, UndoCol, UndoVal, UpdateCol, UpdateRow
 use crate::row::{Row, RowMut, RowPage, RowRead};
 use crate::trx::stmt::StmtEffects;
 use crate::trx::undo::{
-    ForwardLinks, HotForwardSource, IndexBranch, IndexBranchTarget, MainBranch, NextRowUndo,
-    OwnedRowUndo, RowUndoHead, RowUndoKind, RowUndoKindView, RowUndoRef, UndoStatus,
+    ForwardLinkUndo, ForwardLinks, HotForwardSource, IndexBranch, IndexBranchTarget, MainBranch,
+    NextRowUndo, OwnedRowUndo, RowUndoHead, RowUndoKind, RowUndoKindView, RowUndoRef, UndoStatus,
 };
 use crate::trx::ver_map::{RowPageState, RowVersionMap, RowVersionReadGuard, RowVersionWriteGuard};
 use crate::trx::{
@@ -870,7 +870,7 @@ pub(crate) struct RowWriteAccess<'a> {
     dirty: &'a AtomicBool,
     row_idx: usize,
     guard: RowVersionWriteGuard<'a>,
-    _state_guard: RwLockReadGuard<'a, RowPageState>,
+    state_guard: RwLockReadGuard<'a, RowPageState>,
     frozen_version_map: Option<&'a RowVersionMap>,
 }
 
@@ -923,7 +923,7 @@ impl<'a> RowWriteAccess<'a> {
             dirty,
             row_idx,
             guard,
-            _state_guard: state_guard,
+            state_guard,
             frozen_version_map,
         }
     }
@@ -962,9 +962,40 @@ impl<'a> RowWriteAccess<'a> {
         source: &HotForwardSource,
         update: impl FnOnce(&mut ForwardLinks) -> R,
     ) -> Option<R> {
-        if self.page_state() == RowPageState::Transition
-            || self.page.row_id(self.row_idx) != source.row_id
-        {
+        if self.page_state() == RowPageState::Transition {
+            return None;
+        }
+        self.with_existing_forward_source(source, update)
+    }
+
+    /// Restores only the recorded slot of an existing active departure.
+    /// Transition permits Delete cleanup, but never new link publication.
+    pub(crate) fn restore_forward_link(&mut self, undo: &ForwardLinkUndo) -> InternalResult<()> {
+        let restored = self.with_existing_forward_source(&undo.source, |links| {
+            if links.hint(undo.index).is_none()
+                || undo.previous.is_some_and(|hint| hint.index != undo.index)
+            {
+                return false;
+            }
+            links.restore(undo.index, undo.previous);
+            true
+        });
+        if restored != Some(true) {
+            return Err(Report::new(InternalError::RowUndoState).attach(format!(
+                "forward source ownership, kind, or slot mismatch: state={:?}, index={}",
+                self.page_state(),
+                undo.index
+            )));
+        }
+        Ok(())
+    }
+
+    fn with_existing_forward_source<R>(
+        &mut self,
+        source: &HotForwardSource,
+        update: impl FnOnce(&mut ForwardLinks) -> R,
+    ) -> Option<R> {
+        if self.page.row_id(self.row_idx) != source.row_id {
             return None;
         }
         let head = self.guard.as_ref()?;
@@ -976,6 +1007,12 @@ impl<'a> RowWriteAccess<'a> {
             main = &main.entry.as_ref().next.as_ref()?.main;
         }
         if !source.owns(&main.status) {
+            return None;
+        }
+        if self.page_state() == RowPageState::Transition
+            && (!matches!(main.entry.as_ref().kind, RowUndoKind::Delete(_))
+                || !self.row().is_deleted())
+        {
             return None;
         }
         let mut entry = main.entry.clone();
@@ -1066,7 +1103,7 @@ impl<'a> RowWriteAccess<'a> {
     /// Returns the row page state observed by this write access.
     #[inline]
     pub(crate) fn page_state(&self) -> RowPageState {
-        *self._state_guard
+        *self.state_guard
     }
 
     /// Returns whether the caller already owns the destination's write chain.
@@ -1336,7 +1373,116 @@ impl<'a> RowWriteAccess<'a> {
         }
     }
 
-    /// Rollback first undo log in the chain.
+    /// Checks exact active ownership before any cleanup mutation or unlink.
+    pub(crate) fn validate_undo_head(
+        &self,
+        entry: &OwnedRowUndo,
+        status: &Arc<SharedTrxStatus>,
+    ) -> InternalResult<()> {
+        let owned = self.guard.as_ref().is_some_and(|head| {
+            head.next.main.entry.ptr_eq(&entry.leak())
+                && matches!(&head.next.main.status, UndoStatus::Ref(owner)
+                    if Arc::ptr_eq(owner, status) && !trx_is_committed(owner.ts()) && !owner.terminal())
+        });
+        if !owned || self.row().row_id() != entry.row_id {
+            return Err(Report::new(InternalError::RowUndoState).attach(format!(
+                "undo head or active owner mismatch: head_present={}, expected_ts={}, state={:?}",
+                self.guard.is_some(),
+                status.ts(),
+                self.page_state()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validates the physical inverse and reports surviving main-row ownership.
+    /// Transition cleanup may change only existing Lock/Delete metadata.
+    pub(crate) fn validate_undo_rollback(
+        &self,
+        entry: &OwnedRowUndo,
+        status: &Arc<SharedTrxStatus>,
+    ) -> InternalResult<bool> {
+        // The page-state read lock and row write latch keep these observations
+        // stable. Validate exact active ownership before inspecting the inverse.
+        self.validate_undo_head(entry, status)?;
+        let deleted = self.row().is_deleted();
+        let transition = self.page_state() == RowPageState::Transition;
+        // Delete rollback needs a set bit; Lock preserves either bit value.
+        // An unresolved Insert/Update image must have blocked Transition.
+        let valid_inverse = match &entry.kind {
+            RowUndoKind::Lock => true,
+            RowUndoKind::Delete(_) => deleted,
+            RowUndoKind::Insert | RowUndoKind::Update(_) => !transition && !deleted,
+        };
+        // Unlinking exposes the immediate main predecessor. Only its active
+        // ownership by this same status allocation requires keeping the CDB Ref.
+        // Head validation already proved this status active, and exclusive
+        // transaction ownership prevents completion during rollback.
+        // Index branches and forward links do not establish main-row ownership.
+        // E.g. Lock(S2) -> Delete(S1) keeps ownership when both statements are
+        // in the same transaction; Delete -> committed Insert releases it.
+        let keep_owner = entry.next.as_ref().is_some_and(|next| {
+            matches!(&next.main.status, UndoStatus::Ref(owner)
+                if Arc::ptr_eq(owner, status))
+        });
+        // E.g. Lock(T1) -> Lock(T2, active) cannot be a valid owned main chain.
+        if entry
+            .next
+            .as_ref()
+            .is_some_and(|next| !trx_is_committed(next.main.status.ts()))
+            && !keep_owner
+        {
+            return Err(Report::new(InternalError::RowUndoState)
+                .attach("row inverse would expose a foreign active main predecessor"));
+        }
+        // This prediction is used only for Transition's permitted Lock/Delete
+        // inverses: Lock preserves deletion, while Delete restores a live row.
+        let restored_deleted = matches!(entry.kind, RowUndoKind::Lock) && deleted;
+        // A Lock can expose an earlier same-owner Delete. Releasing the final
+        // transition marker instead requires restoration of a live base row.
+        let mut valid_predecessor = keep_owner || !restored_deleted;
+        if transition {
+            // Skip Locks to find the operation defining the predecessor's
+            // physical state. If the chain ends, the ownership check above is
+            // sufficient; otherwise the restored bit must agree with that state.
+            // E.g. Delete -> None restores a live base row and releases ownership.
+            let mut next = entry.next.as_ref();
+            while let Some(predecessor) = next {
+                let undo = predecessor.main.entry.as_ref();
+                match undo.kind {
+                    // Delete -> Lock -> committed Insert checks the Insert image.
+                    RowUndoKind::Lock => next = undo.next.as_ref(),
+                    RowUndoKind::Delete(_) => {
+                        // Lock -> Delete preserves deletion; Delete -> Delete
+                        // fails because the inverse would clear the older Delete.
+                        valid_predecessor &= restored_deleted;
+                        break;
+                    }
+                    RowUndoKind::Insert | RowUndoKind::Update(_) => {
+                        // The surviving image is live, and Transition readiness
+                        // requires its image-producing operation to be committed.
+                        // Delete -> committed Update is valid; Lock -> active
+                        // Update indicates that Transition admitted an unresolved image.
+                        valid_predecessor &=
+                            !restored_deleted && trx_is_committed(predecessor.main.status.ts());
+                        break;
+                    }
+                }
+            }
+        }
+        if !valid_inverse || (transition && !valid_predecessor) {
+            return Err(Report::new(InternalError::RowUndoState).attach(format!(
+                "invalid row inverse: state={:?}, kind={:?}, deleted={deleted}, keep_owner={keep_owner}, valid_predecessor={valid_predecessor}",
+                self.page_state(), entry.kind
+            )));
+        }
+        // Both boolean values mean validation succeeded. The caller checks the
+        // actual CDB owner under its entry guard before applying the inverse and
+        // keeping/removing the marker. Nothing has been mutated here.
+        Ok(keep_owner)
+    }
+
+    /// Rollback first undo log in the chain after the owner validates its inverse.
     #[inline]
     pub(crate) fn rollback_first_undo(
         &mut self,

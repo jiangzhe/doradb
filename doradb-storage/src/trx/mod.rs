@@ -646,9 +646,22 @@ pub(crate) enum PrepareListenerResult {
 
 /// Shared transaction timestamp state referenced by row undo heads.
 pub(crate) struct SharedTrxStatus {
+    /// Zero only in a private ready status; initialized to a transaction id
+    /// `>= MIN_ACTIVE_TRX_ID` before sharing. Ordered commit replaces that id with
+    /// a CTS below `MIN_ACTIVE_TRX_ID` for MVCC visibility. Rollback leaves the id
+    /// unchanged; `terminal` records its completion.
     ts: AtomicU64,
+    /// Marks an ordered commit attempt in progress, including rollback after
+    /// failed precommit. Cleared when commit or cleanup finishes, including
+    /// fatal retention, to wake prepare waiters. Clearing it does not imply a
+    /// successful transaction outcome; waiters must recheck status and poison.
     preparing: AtomicBool,
     prepare_ev: Mutex<Option<EventNotifyOnDrop>>,
+    /// Sticky successful completion flag for this status allocation. Ordered
+    /// commit sets it after publishing its CTS; rollback and effect-free
+    /// completion set it without changing `ts`. It remains false during rollback
+    /// and after rollback failure. An uncommitted `ts` alone therefore does not
+    /// prove active ownership.
     terminal: AtomicBool,
     terminal_ev: Event,
 }
@@ -2845,12 +2858,6 @@ impl TrxInner {
         self.ctx().gc_no()
     }
 
-    /// Returns mutable access to transaction row undo logs.
-    #[inline]
-    pub(crate) fn row_undo_mut(&mut self) -> &mut RowUndoLogs {
-        self.effects.row_undo_mut()
-    }
-
     /// Returns mutable access to transaction index undo logs.
     #[inline]
     pub(crate) fn index_undo_mut(&mut self) -> &mut IndexUndoLogs {
@@ -3185,6 +3192,7 @@ impl PrecommitTrxPayload {
     async fn rollback(&mut self, attachment: &TrxAttachment) -> RuntimeOrFatalResult<()> {
         let PrecommitTrxPayload::User {
             sts,
+            status,
             row_undo,
             index_undo,
             ..
@@ -3194,8 +3202,7 @@ impl PrecommitTrxPayload {
         };
         let trx_sys = &attachment.engine().trx_sys;
         let pool_guards = attachment.pool_guards();
-        let rollback_context =
-            RowUndoRollbackContext::new(pool_guards, &attachment.engine().poisoner);
+        let rollback_context = RowUndoRollbackContext::new(pool_guards, status);
         let mut table_cache = TableCache::new(&trx_sys.catalog);
         index_undo
             .rollback(&mut table_cache, pool_guards, *sts)
@@ -3367,32 +3374,20 @@ impl PrecommitTrx {
         if let (Some(payload), Some(attachment)) = (self.payload.as_mut(), self.attachment.as_ref())
         {
             if let Err(err) = payload.rollback(attachment).await {
-                match err {
-                    RuntimeOrFatalError::Runtime(report) => {
-                        let poisoner = attachment.engine().poisoner.clone();
-                        let prepare_status = self.finish_failed_precommit_with_retention();
-                        let report = report
-                            .change_context(FatalError::RollbackAccess)
-                            .attach("failed-precommit rollback failed");
-                        obs::error!(
-                            "event=engine_poison component=trx action=poison result=error error={:?}",
-                            report
-                        );
-                        let _ = poisoner.poison(report);
-                        if let Some(status) = prepare_status {
-                            status.finish_preparing();
-                        }
-                    }
-                    RuntimeOrFatalError::Fatal(report) => {
-                        let prepare_status = self.finish_failed_precommit_with_retention();
-                        obs::error!(
-                            "event=trx_cleanup component=trx action=retain result=error error={:?}",
-                            report.attach("failed-precommit row rollback failed")
-                        );
-                        if let Some(status) = prepare_status {
-                            status.finish_preparing();
-                        }
-                    }
+                let poisoner = attachment.engine().poisoner.clone();
+                let prepare_status = self.finish_failed_precommit_with_retention();
+                if let RuntimeOrFatalError::Runtime(report) = err {
+                    let report = report
+                        .change_context(FatalError::RollbackAccess)
+                        .attach("failed-precommit rollback failed");
+                    obs::error!(
+                        "event=engine_poison component=trx action=poison result=error error={:?}",
+                        report
+                    );
+                    let _ = poisoner.poison(report);
+                }
+                if let Some(status) = prepare_status {
+                    status.finish_preparing();
                 }
                 return FailedPrecommitRollbackOutcome::FailedRetained;
             }
@@ -3858,6 +3853,23 @@ pub(crate) mod tests {
             let _stmt = stmt;
             pending::<()>().await;
             Ok(())
+        })
+        .await
+    }
+
+    /// Pauses an inserted statement before returning an error through normal settlement.
+    pub(crate) async fn insert_then_fail_statement(
+        trx: &mut Transaction,
+        table_id: TableID,
+        values: Vec<Val>,
+        inserted: flume::Sender<RowID>,
+        fail: flume::Receiver<()>,
+    ) -> Result<()> {
+        trx.exec(async move |stmt| {
+            let row_id = stmt.table_insert_mvcc(table_id, values).await?;
+            inserted.send_async(row_id).await.unwrap();
+            fail.recv_async().await.unwrap();
+            Err(Report::new(OperationError::InvalidDmlInput).disclose())
         })
         .await
     }
@@ -5461,7 +5473,7 @@ pub(crate) mod tests {
             let (_session, mut trx) = begin_production_test_transaction(&engine);
             add_pseudo_redo_log_entry(&mut trx).await;
             with_transaction_inner_mut(&mut trx, "test_prepare_payload", |inner| {
-                inner.row_undo_mut().push(OwnedRowUndo::new(
+                inner.effects_mut().row_undo_mut().push(OwnedRowUndo::new(
                     NON_FOREGROUND_STMT_NO,
                     TableID::new(11),
                     None,
@@ -6757,6 +6769,58 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_terminal_rollback_preserves_storage_fatal() {
+        use crate::trx::undo::tests::{
+            RollbackTarget, assert_storage_io_failure, force_next_rollback_error,
+            stage_rollback_test_effects, storage_io_failure,
+        };
+
+        let _hook_lock = terminal_rollback_hook_test_lock().lock().unwrap();
+        for target in [RollbackTarget::Index, RollbackTarget::Row] {
+            smol::block_on(async {
+                let (_temp_dir, engine) = test_engine("terminal_rollback_storage_fatal").await;
+                let (_session, mut trx) = begin_production_test_transaction(&engine);
+                let entry = transaction_entry(&trx);
+                let trx_id = trx.trx_id();
+                trx.exec::<_, Error, _>(async |mut stmt| {
+                    stage_rollback_test_effects(
+                        stmt_tests::statement_effects_mut(&mut stmt),
+                        target,
+                    );
+                    Ok(())
+                })
+                .await
+                .unwrap();
+                let poisoner = engine.inner().poisoner.clone();
+                let _hook = install_terminal_rollback_test_hook(Arc::new(move |id, operation| {
+                    if id == trx_id && operation == "rollback active transaction" {
+                        poisoner.poison(Report::new(FatalError::CheckpointWrite));
+                        let fatal = poisoner.poison(storage_io_failure());
+                        force_next_rollback_error(target, fatal.into_report().into());
+                    }
+                }));
+                let error = trx.rollback().await.unwrap_err();
+                assert_storage_io_failure(&error);
+                assert!(crate::trx::sys::tests::retains_active_row_undo(
+                    &engine.inner().trx_sys,
+                    TableID::new(99_999_999),
+                    RowID::new(24)
+                ));
+                assert_eq!(
+                    *engine
+                        .inner()
+                        .poisoner
+                        .poison_error()
+                        .unwrap()
+                        .current_context(),
+                    FatalError::CheckpointWrite
+                );
+                remove_session_for_test(&engine.inner().session_registry, entry.key().session_id());
+            });
+        }
+    }
+
+    #[test]
     fn test_dropped_terminal_rollback_waiter_completes_worker_cleanup() {
         let _hook_lock = terminal_rollback_hook_test_lock().lock().unwrap();
         smol::block_on(async {
@@ -6989,7 +7053,7 @@ pub(crate) mod tests {
                     &mut trx,
                     "test_failed_precommit_retained_cold_row_undo",
                     |inner| {
-                        inner.row_undo_mut().push(OwnedRowUndo::new(
+                        inner.effects_mut().row_undo_mut().push(OwnedRowUndo::new(
                             NON_FOREGROUND_STMT_NO,
                             table_id,
                             None,

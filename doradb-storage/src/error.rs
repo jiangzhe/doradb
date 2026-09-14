@@ -458,6 +458,8 @@ pub(crate) enum FatalError {
 /// Fieldless internal-domain errors used beneath typed crate-private owners.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ThisError)]
 pub(crate) enum InternalError {
+    #[error("row undo ownership or physical state mismatch")]
+    RowUndoState,
     #[error("secondary index binding mismatch")]
     SecondaryIndexBindingMismatch,
     #[error("buffer page already allocated")]
@@ -675,12 +677,14 @@ impl CompletionErrorBridge {
         }))
     }
 
-    /// Captures either native report in an Operation-or-Runtime carrier.
+    /// Captures the native report selected by a common integration carrier.
     #[inline]
-    pub(crate) fn capture_operation_or_runtime(error: OperationOrRuntimeError) -> Self {
+    pub(crate) fn capture_quad(error: QuadError) -> Self {
         match error {
-            OperationOrRuntimeError::Operation(report) => Self::capture(report),
-            OperationOrRuntimeError::Runtime(report) => Self::capture(report),
+            QuadError::Operation(report) => Self::capture(report),
+            QuadError::Runtime(report) => Self::capture(report),
+            QuadError::Lifecycle(report) => Self::capture(report),
+            QuadError::Fatal(report) => Self::capture(report),
         }
     }
 
@@ -3079,26 +3083,21 @@ mod tests {
 
     #[test]
     fn test_completion_bridge_captures_multi_domain_carriers() {
-        let operation = CompletionErrorBridge::capture_operation_or_runtime(
-            OperationOrRuntimeError::Operation(
-                Report::new(OperationError::IndexNotFound).attach("operation carrier"),
+        use std::mem::discriminant;
+        for error in [
+            QuadError::Operation(
+                Report::new(OperationError::IndexNotFound).attach("carrier source"),
             ),
-        );
-        assert_eq!(
-            operation.downcast_ref::<OperationError>().copied(),
-            Some(OperationError::IndexNotFound)
-        );
-        assert!(format!("{operation:?}").contains("operation carrier"));
-
-        let operation_runtime =
-            CompletionErrorBridge::capture_operation_or_runtime(OperationOrRuntimeError::Runtime(
-                Report::new(RuntimeError::IndexAccess).attach("operation runtime carrier"),
-            ));
-        assert_eq!(
-            operation_runtime.downcast_ref::<RuntimeError>().copied(),
-            Some(RuntimeError::IndexAccess)
-        );
-        assert!(format!("{operation_runtime:?}").contains("operation runtime carrier"));
+            QuadError::Runtime(Report::new(RuntimeError::IndexAccess).attach("carrier source")),
+            QuadError::Lifecycle(Report::new(LifecycleError::Shutdown).attach("carrier source")),
+            QuadError::Fatal(Report::new(FatalError::StorageIo).attach("carrier source")),
+        ] {
+            let domain = discriminant(&error);
+            let restored =
+                CompletionErrorBridge::capture_quad(error).into_quad(RuntimeError::TableAccess);
+            assert_eq!(discriminant(&restored), domain);
+            assert!(format!("{restored:?}").contains("carrier source"));
+        }
 
         let runtime =
             CompletionErrorBridge::capture_runtime_or_fatal(RuntimeOrFatalError::Runtime(
