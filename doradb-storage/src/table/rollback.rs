@@ -1,11 +1,17 @@
+use super::deletion_buffer::DeletionDisposition;
 use super::{MemTable, Table, TableRuntimeLayout};
 use crate::buffer::{BufferPool, PoolGuard, PoolGuards};
 use crate::catalog::ResolvedIndexKey;
-use crate::error::RuntimeResult;
+use crate::error::{InternalError, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult};
 use crate::id::{RowID, TrxID};
 use crate::index::IndexCompareExchange;
 use crate::index::util::Maskable;
-use crate::trx::undo::{IndexUndo, IndexUndoKind};
+use crate::trx::SharedTrxStatus;
+use crate::trx::undo::{IndexUndo, IndexUndoKind, OwnedRowUndo, RowUndoKind};
+use crate::trx::ver_map::RowPageState;
+use error_stack::{Report, ResultExt};
+use std::result::Result as StdResult;
+use std::sync::Arc;
 
 /// Rollback adapter for table-specific secondary-index runtimes.
 ///
@@ -15,6 +21,9 @@ use crate::trx::undo::{IndexUndo, IndexUndoKind};
 /// undo entries in reverse order and preserves the exact old index value
 /// recorded in the undo log.
 pub(crate) trait IndexRollback {
+    /// Native error from the index runtime.
+    type Error: Into<RuntimeOrFatalError>;
+
     /// Selects the guard for this owner's secondary-index pool.
     fn index_pool_guard<'g>(&self, guards: &'g PoolGuards) -> &'g PoolGuard;
 
@@ -25,7 +34,7 @@ pub(crate) trait IndexRollback {
         key: &ResolvedIndexKey,
         row_id: RowID,
         ts: TrxID,
-    ) -> RuntimeResult<bool>;
+    ) -> StdResult<bool, Self::Error>;
 
     /// Removes a unique entry when the current value matches `row_id`.
     async fn unique_compare_delete(
@@ -35,7 +44,7 @@ pub(crate) trait IndexRollback {
         row_id: RowID,
         ignore_del_mask: bool,
         ts: TrxID,
-    ) -> RuntimeResult<bool>;
+    ) -> StdResult<bool, Self::Error>;
 
     /// Atomically replaces a unique entry when the current value matches.
     async fn unique_compare_exchange(
@@ -45,7 +54,7 @@ pub(crate) trait IndexRollback {
         old_row_id: RowID,
         new_row_id: RowID,
         ts: TrxID,
-    ) -> RuntimeResult<IndexCompareExchange>;
+    ) -> StdResult<IndexCompareExchange, Self::Error>;
 
     /// Marks an existing non-unique exact entry as deleted.
     async fn non_unique_mask_as_deleted(
@@ -54,7 +63,7 @@ pub(crate) trait IndexRollback {
         key: &ResolvedIndexKey,
         row_id: RowID,
         ts: TrxID,
-    ) -> RuntimeResult<bool>;
+    ) -> StdResult<bool, Self::Error>;
 
     /// Marks an existing non-unique exact entry as active.
     async fn non_unique_mask_as_active(
@@ -63,7 +72,7 @@ pub(crate) trait IndexRollback {
         key: &ResolvedIndexKey,
         row_id: RowID,
         ts: TrxID,
-    ) -> RuntimeResult<bool>;
+    ) -> StdResult<bool, Self::Error>;
 
     /// Removes a non-unique exact entry when the current value matches.
     async fn non_unique_compare_delete(
@@ -73,7 +82,7 @@ pub(crate) trait IndexRollback {
         row_id: RowID,
         ignore_del_mask: bool,
         ts: TrxID,
-    ) -> RuntimeResult<bool>;
+    ) -> StdResult<bool, Self::Error>;
 
     /// Rolls back one secondary-index undo entry against this table runtime.
     async fn rollback_index_entry(
@@ -81,7 +90,7 @@ pub(crate) trait IndexRollback {
         entry: &IndexUndo,
         guards: &PoolGuards,
         ts: TrxID,
-    ) -> RuntimeResult<()> {
+    ) -> StdResult<(), Self::Error> {
         let index_pool_guard = self.index_pool_guard(guards);
         match &entry.kind {
             IndexUndoKind::InsertUnique(key, merge_old_deleted) => {
@@ -172,6 +181,8 @@ struct UserTableRollback<'a> {
 }
 
 impl IndexRollback for UserTableRollback<'_> {
+    type Error = RuntimeOrFatalError;
+
     #[inline]
     fn index_pool_guard<'g>(&self, guards: &'g PoolGuards) -> &'g PoolGuard {
         guards.index_guard()
@@ -184,7 +195,7 @@ impl IndexRollback for UserTableRollback<'_> {
         key: &ResolvedIndexKey,
         row_id: RowID,
         ts: TrxID,
-    ) -> RuntimeResult<bool> {
+    ) -> RuntimeOrFatalResult<bool> {
         let index = self.layout.expect_secondary_index(key.index);
         index
             .unique_mem()?
@@ -201,7 +212,7 @@ impl IndexRollback for UserTableRollback<'_> {
         row_id: RowID,
         ignore_del_mask: bool,
         ts: TrxID,
-    ) -> RuntimeResult<bool> {
+    ) -> RuntimeOrFatalResult<bool> {
         let index = self.layout.expect_secondary_index(key.index);
         index
             .unique_mem()?
@@ -218,7 +229,7 @@ impl IndexRollback for UserTableRollback<'_> {
         old_row_id: RowID,
         new_row_id: RowID,
         ts: TrxID,
-    ) -> RuntimeResult<IndexCompareExchange> {
+    ) -> RuntimeOrFatalResult<IndexCompareExchange> {
         let index = self.layout.expect_secondary_index(key.index);
         index
             .unique_mem()?
@@ -234,7 +245,7 @@ impl IndexRollback for UserTableRollback<'_> {
         key: &ResolvedIndexKey,
         row_id: RowID,
         ts: TrxID,
-    ) -> RuntimeResult<bool> {
+    ) -> RuntimeOrFatalResult<bool> {
         let index = self.layout.expect_secondary_index(key.index);
         index
             .non_unique_mem()?
@@ -250,7 +261,7 @@ impl IndexRollback for UserTableRollback<'_> {
         key: &ResolvedIndexKey,
         row_id: RowID,
         ts: TrxID,
-    ) -> RuntimeResult<bool> {
+    ) -> RuntimeOrFatalResult<bool> {
         let index = self.layout.expect_secondary_index(key.index);
         index
             .non_unique_mem()?
@@ -267,7 +278,7 @@ impl IndexRollback for UserTableRollback<'_> {
         row_id: RowID,
         ignore_del_mask: bool,
         ts: TrxID,
-    ) -> RuntimeResult<bool> {
+    ) -> RuntimeOrFatalResult<bool> {
         let index = self.layout.expect_secondary_index(key.index);
         index
             .non_unique_mem()?
@@ -278,6 +289,70 @@ impl IndexRollback for UserTableRollback<'_> {
 }
 
 impl Table {
+    /// Discharges original row ownership before its undo allocation can be freed.
+    /// Page-state, row, and CDB guards serialize cleanup with Transition publication.
+    pub(crate) async fn rollback_row_undo(
+        &self,
+        entry: &mut OwnedRowUndo,
+        guards: &PoolGuards,
+        status: &Arc<SharedTrxStatus>,
+    ) -> RuntimeOrFatalResult<()> {
+        let diagnostic = || {
+            format!(
+                "operation=rollback_row_undo, table_id={}, undo_table_id={}, row_id={}, page_id={:?}, kind={:?}",
+                self.table_id(),
+                entry.table_id,
+                entry.row_id,
+                entry.page_id,
+                entry.kind
+            )
+        };
+        if entry.table_id != self.table_id() {
+            return Err(Report::new(InternalError::RowUndoState)
+                .change_context(RuntimeError::TableAccess)
+                .attach(diagnostic())
+                .into());
+        }
+        let Some(page_id) = entry.page_id else {
+            if !matches!(entry.kind, RowUndoKind::Lock | RowUndoKind::Delete(_))
+                || entry.next.is_some()
+            {
+                return Err(Report::new(InternalError::RowUndoState)
+                    .change_context(RuntimeError::TableAccess)
+                    .attach(diagnostic())
+                    .into());
+            }
+            return self
+                .deletion_buffer()
+                .reconcile_owned(entry.row_id, status, || DeletionDisposition::Remove)
+                .change_context(RuntimeError::TableAccess)
+                .attach_with(diagnostic)
+                .map_err(Into::into);
+        };
+        let page = self
+            .row_store
+            .get_row_page_for_undo(guards, page_id, entry.row_id)
+            .await?;
+        let mut access = page.write_row_by_id(entry.row_id);
+        let keep_owner = access
+            .validate_undo_rollback(entry, status)
+            .change_context(RuntimeError::TableAccess)
+            .attach_with(diagnostic)?;
+        if access.page_state() == RowPageState::Transition {
+            let table_id = entry.table_id;
+            let row_id = entry.row_id;
+            self.deletion_buffer().reconcile_owned(row_id, status, || {
+                access.rollback_first_undo(self.row_store.column_layout(), entry);
+                if keep_owner { DeletionDisposition::Keep } else { DeletionDisposition::Remove }
+            }).change_context(RuntimeError::TableAccess).attach_with(|| format!(
+                "operation=rollback_row_undo, table_id={table_id}, row_id={row_id}, page_id={page_id:?}"
+            ))?;
+        } else {
+            access.rollback_first_undo(self.row_store.column_layout(), entry);
+        }
+        Ok(())
+    }
+
     /// Roll back one secondary-index undo entry against a pinned runtime layout.
     #[inline]
     pub(crate) async fn rollback_index_entry_with_layout(
@@ -286,7 +361,7 @@ impl Table {
         entry: &IndexUndo,
         guards: &PoolGuards,
         ts: TrxID,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         UserTableRollback { layout }
             .rollback_index_entry(entry, guards, ts)
             .await
@@ -294,6 +369,8 @@ impl Table {
 }
 
 impl<D: BufferPool, I: BufferPool> IndexRollback for MemTable<D, I> {
+    type Error = I::Error;
+
     #[inline]
     fn index_pool_guard<'g>(&self, guards: &'g PoolGuards) -> &'g PoolGuard {
         self.index_pool_guard(guards)
@@ -306,7 +383,7 @@ impl<D: BufferPool, I: BufferPool> IndexRollback for MemTable<D, I> {
         key: &ResolvedIndexKey,
         row_id: RowID,
         ts: TrxID,
-    ) -> RuntimeResult<bool> {
+    ) -> StdResult<bool, Self::Error> {
         self.layout
             .index_entry(key.index)?
             .runtime()
@@ -326,7 +403,7 @@ impl<D: BufferPool, I: BufferPool> IndexRollback for MemTable<D, I> {
         row_id: RowID,
         ignore_del_mask: bool,
         ts: TrxID,
-    ) -> RuntimeResult<bool> {
+    ) -> StdResult<bool, Self::Error> {
         self.layout
             .index_entry(key.index)?
             .runtime()
@@ -346,7 +423,7 @@ impl<D: BufferPool, I: BufferPool> IndexRollback for MemTable<D, I> {
         old_row_id: RowID,
         new_row_id: RowID,
         ts: TrxID,
-    ) -> RuntimeResult<IndexCompareExchange> {
+    ) -> StdResult<IndexCompareExchange, Self::Error> {
         self.layout
             .index_entry(key.index)?
             .runtime()
@@ -365,7 +442,7 @@ impl<D: BufferPool, I: BufferPool> IndexRollback for MemTable<D, I> {
         key: &ResolvedIndexKey,
         row_id: RowID,
         ts: TrxID,
-    ) -> RuntimeResult<bool> {
+    ) -> StdResult<bool, Self::Error> {
         self.layout
             .index_entry(key.index)?
             .runtime()
@@ -384,7 +461,7 @@ impl<D: BufferPool, I: BufferPool> IndexRollback for MemTable<D, I> {
         key: &ResolvedIndexKey,
         row_id: RowID,
         ts: TrxID,
-    ) -> RuntimeResult<bool> {
+    ) -> StdResult<bool, Self::Error> {
         self.layout
             .index_entry(key.index)?
             .runtime()
@@ -404,7 +481,7 @@ impl<D: BufferPool, I: BufferPool> IndexRollback for MemTable<D, I> {
         row_id: RowID,
         ignore_del_mask: bool,
         ts: TrxID,
-    ) -> RuntimeResult<bool> {
+    ) -> StdResult<bool, Self::Error> {
         self.layout
             .index_entry(key.index)?
             .runtime()

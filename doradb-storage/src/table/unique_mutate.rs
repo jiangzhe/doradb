@@ -392,7 +392,7 @@ impl<'a, 'op: 'a, 'r, D: BufferPool, R: MemIndexRuntime> UniqueMutator<'a, 'op, 
                                     location,
                                 )
                                 .await
-                                .map_err(|err| map_error(err.into()))?
+                                .map_err(&map_error)?
                             {
                                 ColdRowSelection::Rejected(inspection) => inspection,
                                 ColdRowSelection::Preparing(listener) => {
@@ -1720,7 +1720,8 @@ mod tests {
                 .rollback(&mut cache, &guards, sts)
                 .await
                 .unwrap();
-            let context = RowUndoRollbackContext::new(&guards, &engine.inner().poisoner);
+            let status = Arc::clone(checkout.inner().ctx().status());
+            let context = RowUndoRollbackContext::new(&guards, &status);
             let mut rollback = Box::pin(
                 checkout
                     .inner_mut()

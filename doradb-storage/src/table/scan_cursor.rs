@@ -3,7 +3,7 @@ use super::{
     TableScanColdPage, TableScanRuntime, TableScanUnit, TableScanWorklist,
 };
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
-use crate::error::{Error, RuntimeResult};
+use crate::error::{Error, RuntimeOrFatalResult};
 use crate::id::{BlockID, RowID};
 use crate::row::RowPage;
 use crate::row::ops::ScanRowDecision;
@@ -150,7 +150,7 @@ where
         runtime: TableScanRuntime<'_>,
         table: &Table,
         layout: &TableRuntimeLayout,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         let unit = match &self.current {
             TableScanUnitState::Pending(unit) => unit.clone(),
             _ => panic!("table scan cursor load requires a persistent pending descriptor"),

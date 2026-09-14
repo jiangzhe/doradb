@@ -1,6 +1,8 @@
 #[cfg(test)]
 use crate::error::RuntimeError;
-use crate::error::{DiscloseError, DiscloseResultExt, Error, OperationError, Result};
+use crate::error::{
+    DiscloseError, DiscloseResultExt, Error, MultiDomainResultExt, OperationError, Result,
+};
 use crate::id::TableID;
 use crate::row::ops::{ScanRowDecision, ScanRowDecision::Include};
 use crate::table::{
@@ -11,7 +13,7 @@ use crate::trx::read_snapshot::{
     ReadSnapshotExecutionCheckout, ReadSnapshotExecutionTable, SnapshotExecutionFailure,
 };
 use crate::value::Val;
-use error_stack::{Report, ResultExt};
+use error_stack::Report;
 use std::sync::Arc;
 
 const _: fn() = || {

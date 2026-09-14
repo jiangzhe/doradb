@@ -17,12 +17,13 @@ use crate::buffer::{ReadSubmission, ReadonlyWriteLease};
 use crate::completion::Completion;
 use crate::error::{
     CompletionErrorBridge, CompletionResult, IoError, IoResult, ResourceError, ResourceResult,
+    SharedFatalError,
 };
 use crate::free_list::FreeList;
 use crate::io::DirectBuf;
 use crate::io::{
-    BackendError, IOClient, IOKind, IOQueue, IOSubmission, Operation, STORAGE_SECTOR_SIZE,
-    StdIoResult, align_to_sector_size,
+    IOClient, IOKind, IOQueue, IOSubmission, Operation, STORAGE_SECTOR_SIZE, StdIoResult,
+    align_to_sector_size,
 };
 use error_stack::Report;
 use libc::{O_CREAT, O_DIRECT, O_EXCL, O_RDWR, O_TRUNC, close, fstat, ftruncate, open, stat};
@@ -319,15 +320,11 @@ impl WriteSubmission {
 
     /// Fail a table write before backend submission accepted it.
     #[inline]
-    pub(crate) fn fail(mut self, err: &BackendError) {
+    pub(crate) fn fail(mut self, err: &SharedFatalError) {
         drop(self.buf);
         drop(self.write_lease.take());
-        let report = err.to_report().attach(format!(
-            "submit table file write: op_kind=write, key={:?}",
-            self.key
-        ));
         self.completion
-            .complete(Err(CompletionErrorBridge::capture(report)));
+            .complete(Err(err.clone().into_completion_bridge()));
     }
 }
 
@@ -348,31 +345,23 @@ impl PreparedWriteSubmission {
 
     /// Fail a prepared table write before backend submission accepted it.
     #[inline]
-    fn fail_backend_not_accepted(mut self, err: &BackendError) {
+    fn fail_backend_not_accepted(mut self, err: &SharedFatalError) {
         drop(
             self.operation
                 .take_buf()
                 .expect("prepared table write must still own its direct buffer"),
         );
         self.release_write_lease();
-        let report = err.to_report().attach(format!(
-            "submit table file write: op_kind=write, key={:?}",
-            self.key
-        ));
         self.completion
-            .complete(Err(CompletionErrorBridge::capture(report)));
+            .complete(Err(err.clone().into_completion_bridge()));
     }
 
     /// Fail an accepted table write while retaining kernel-facing memory.
     #[inline]
-    fn fail_backend_submitted(&mut self, err: &BackendError) {
+    fn fail_backend_submitted(&mut self, err: &SharedFatalError) {
         self.release_write_lease();
-        let report = err.to_report().attach(format!(
-            "complete submitted table file write: op_kind=write, key={:?}",
-            self.key
-        ));
         self.completion
-            .complete(Err(CompletionErrorBridge::capture(report)));
+            .complete(Err(err.clone().into_completion_bridge()));
     }
 }
 
@@ -417,13 +406,9 @@ impl SyncSubmission {
 
     /// Fail a table sync before backend submission accepted it.
     #[inline]
-    pub(crate) fn fail(self, err: &BackendError) {
-        let report = err.to_report().attach(format!(
-            "submit table file fsync: op_kind=fsync, file_id={}",
-            self.file.file_id()
-        ));
+    pub(crate) fn fail(self, err: &SharedFatalError) {
         self.completion
-            .complete(Err(CompletionErrorBridge::capture(report)));
+            .complete(Err(err.clone().into_completion_bridge()));
     }
 }
 
@@ -437,24 +422,16 @@ pub(crate) struct PreparedSyncSubmission {
 impl PreparedSyncSubmission {
     /// Fail a prepared table sync before backend submission accepted it.
     #[inline]
-    fn fail_backend_not_accepted(self, err: &BackendError) {
-        let report = err.to_report().attach(format!(
-            "submit table file fsync: op_kind=fsync, file_id={}",
-            self._file.file_id()
-        ));
+    fn fail_backend_not_accepted(self, err: &SharedFatalError) {
         self.completion
-            .complete(Err(CompletionErrorBridge::capture(report)));
+            .complete(Err(err.clone().into_completion_bridge()));
     }
 
     /// Fail an accepted table sync.
     #[inline]
-    fn fail_backend_submitted(&mut self, err: &BackendError) {
-        let report = err.to_report().attach(format!(
-            "complete submitted table file fsync: op_kind=fsync, file_id={}",
-            self._file.file_id()
-        ));
+    fn fail_backend_submitted(&mut self, err: &SharedFatalError) {
         self.completion
-            .complete(Err(CompletionErrorBridge::capture(report)));
+            .complete(Err(err.clone().into_completion_bridge()));
     }
 }
 
@@ -552,10 +529,10 @@ impl TableFsStateMachine {
 
     /// Fail one prepared submission before backend submission accepted it.
     #[inline]
-    pub(crate) fn fail_submission_with_backend_error(
+    pub(crate) fn fail_submission_with_fatal(
         &mut self,
         sub: TableFsSubmission,
-        err: &BackendError,
+        err: &SharedFatalError,
     ) -> IOKind {
         match sub {
             TableFsSubmission::Write(sub) => {
@@ -567,10 +544,7 @@ impl TableFsStateMachine {
                 IOKind::Fsync
             }
             TableFsSubmission::Read(sub) => {
-                let report = err
-                    .to_report()
-                    .attach("submit readonly table read: op_kind=read");
-                sub.fail(CompletionErrorBridge::capture(report));
+                sub.fail(err.clone().into_completion_bridge());
                 IOKind::Read
             }
         }
@@ -579,10 +553,10 @@ impl TableFsStateMachine {
     /// Fail one already-submitted table-file operation without releasing
     /// kernel-facing memory.
     #[inline]
-    pub(crate) fn fail_submitted_with_backend_error(
+    pub(crate) fn fail_submitted_with_fatal(
         &mut self,
         sub: &mut TableFsSubmission,
-        err: &BackendError,
+        err: &SharedFatalError,
     ) -> IOKind {
         match sub {
             TableFsSubmission::Write(sub) => {
@@ -594,10 +568,7 @@ impl TableFsStateMachine {
                 IOKind::Fsync
             }
             TableFsSubmission::Read(sub) => {
-                let report = err
-                    .to_report()
-                    .attach("complete submitted readonly table read: op_kind=read");
-                sub.fail_backend_submitted(CompletionErrorBridge::capture(report));
+                sub.fail_backend_submitted(err.clone().into_completion_bridge());
                 IOKind::Read
             }
         }
@@ -880,6 +851,7 @@ mod tests {
         StorageIndexSpec, USER_TABLE_ID_START,
     };
     use crate::compression::BitPackable;
+    use crate::error::FatalError;
     use crate::error::{DiscloseResultExt, MultiDomainResultExt, RuntimeError};
     use crate::file::fs::tests::{TestFileSystem, build_test_fs};
     use crate::file::table_file::TableFile;
@@ -1419,22 +1391,28 @@ mod tests {
             let Some(submission) = queue.pop_front() else {
                 panic!("expected one prepared table fsync submission");
             };
-            let backend_report = BackendError::submit(
-                "test_backend",
-                StdIoError::from_raw_os_error(libc::EIO),
-                2,
-                1,
-                1,
+            let backend_report = SharedFatalError::capture(
+                BackendError::submit(
+                    "test_backend",
+                    StdIoError::from_raw_os_error(libc::EIO),
+                    2,
+                    1,
+                    1,
+                )
+                .to_report()
+                .change_context(FatalError::StorageIo),
             );
-            let kind =
-                state_machine.fail_submission_with_backend_error(submission, &backend_report);
+            let kind = state_machine.fail_submission_with_fatal(submission, &backend_report);
 
             assert_eq!(kind, IOKind::Fsync);
             let completion = waiter
                 .wait_result()
                 .await
                 .expect_err("pre-submit fsync failure should complete with backend error")
-                .replace_context(RuntimeError::FileRootAccess);
+                .into_fatal_report();
+            assert_eq!(*completion.current_context(), FatalError::StorageIo);
+            assert!(!completion.contains::<RuntimeError>());
+            assert!(completion.contains::<IoError>());
             let failure = completion
                 .downcast_ref::<BackendError>()
                 .expect("completion error must preserve backend failure attachment");
@@ -1442,8 +1420,6 @@ mod tests {
             assert_eq!(failure.op(), "submit");
             assert_eq!(failure.raw_errno(), Some(libc::EIO));
             assert_eq!(failure.call_count(), 2);
-            let output = format!("{completion:?}");
-            assert!(output.contains("op_kind=fsync"), "{output}");
             drop(table_file);
             drop(fs);
         });

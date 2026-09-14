@@ -633,7 +633,7 @@ impl TransactionSystem {
         pools: EnginePools,
         table_fs: QuiescentGuard<FileSystem>,
         catalog: QuiescentGuard<Catalog>,
-    ) -> RuntimeResult<(Self, PendingTransactionWorkerStartups)> {
+    ) -> RuntimeOrFatalResult<(Self, PendingTransactionWorkerStartups)> {
         let (config, file_prefix) = validated.into_parts();
         debug_assert!(config.purge_threads != 0);
         debug_assert!(
@@ -1050,7 +1050,7 @@ impl TransactionSystem {
         mutable_file: MutableTableFile,
         root_ts: TrxID,
         try_delete_if_fail: bool,
-    ) -> RuntimeResult<Arc<TableFile>> {
+    ) -> RuntimeOrFatalResult<Arc<TableFile>> {
         let (table_file, old_root) = mutable_file.commit(root_ts, try_delete_if_fail).await?;
         self.mark_published_table_root(&table_file, old_root);
         Ok(table_file)
@@ -1359,9 +1359,7 @@ impl TransactionSystem {
     ) -> FatalResult<ReleasedTransactionLocks> {
         let sts = inner.sts();
         let gc_no = inner.gc_no();
-        let status = Arc::clone(inner.ctx().status());
         let pool_guards = attachment.pool_guards();
-        let rollback_context = RowUndoRollbackContext::new(pool_guards, &self.poisoner);
         let mut table_cache = TableCache::new(&self.catalog);
         if let Err(err) = inner
             .index_undo_mut()
@@ -1375,6 +1373,10 @@ impl TransactionSystem {
             attachment.notify_operation_transition();
             let retention = inner.retain_and_discard_after_fatal_rollback(attachment);
             self.retain_fatal_rollback(retention);
+            let err = match err {
+                RuntimeOrFatalError::Runtime(report) => report,
+                RuntimeOrFatalError::Fatal(report) => return Err(report),
+            };
             let report = err
                 .change_context(FatalError::RollbackAccess)
                 .attach(format!("{operation}: index undo rollback failed"));
@@ -1382,14 +1384,19 @@ impl TransactionSystem {
                 "event=engine_poison component=trx action=poison result=error error={:?}",
                 report
             );
-            let error = self.poisoner.poison(report);
-            return Err(error.into_report());
+            return Err(self.poisoner.poison_and_get_first(report).into_report());
         }
-        if let Err(err) = inner
-            .row_undo_mut()
-            .rollback(&mut table_cache, rollback_context)
-            .await
-        {
+        // Borrow status and effects separately until row rollback completes,
+        // before failure retention or terminal cleanup mutates the whole core.
+        let row_rollback = {
+            let TrxInner { ctx, effects, .. } = inner;
+            let rollback_context = RowUndoRollbackContext::new(pool_guards, ctx.status());
+            effects
+                .row_undo_mut()
+                .rollback(&mut table_cache, rollback_context)
+                .await
+        };
+        if let Err(err) = row_rollback {
             drop(table_cache);
             // Publish the irreversible blocker before session rollback can
             // detach this operation from the registry.
@@ -1397,21 +1404,18 @@ impl TransactionSystem {
             attachment.notify_operation_transition();
             let retention = inner.retain_and_discard_after_fatal_rollback(attachment);
             self.retain_fatal_rollback(retention);
-            return match err {
-                RuntimeOrFatalError::Runtime(report) => {
-                    let report = report
-                        .change_context(FatalError::RollbackAccess)
-                        .attach(format!("{operation}: row undo rollback failed"));
-                    obs::error!(
-                        "event=engine_poison component=trx action=poison result=error error={:?}",
-                        report
-                    );
-                    Err(self.poisoner.poison(report).into_report())
-                }
-                RuntimeOrFatalError::Fatal(report) => {
-                    Err(report.attach(format!("{operation}: row undo rollback failed")))
-                }
+            let err = match err {
+                RuntimeOrFatalError::Runtime(report) => report,
+                RuntimeOrFatalError::Fatal(report) => return Err(report),
             };
+            let report = err
+                .change_context(FatalError::RollbackAccess)
+                .attach(format!("{operation}: row undo rollback failed"));
+            obs::error!(
+                "event=engine_poison component=trx action=poison result=error error={:?}",
+                report
+            );
+            return Err(self.poisoner.poison_and_get_first(report).into_report());
         }
         // Rollback access can pin table/layout/index state in its operation
         // cache. Release those owners before bindings and transaction locks.
@@ -1420,7 +1424,7 @@ impl TransactionSystem {
         inner.clear_table_bindings();
         self.record_rollback_for_purge(gc_no, sts);
         let released = inner.release_transaction_locks(attachment);
-        status.finish_terminal();
+        inner.ctx().status().finish_terminal();
         Ok(released)
     }
 
@@ -1692,7 +1696,7 @@ impl Component for TransactionSystem {
     type Config = ValidatedTrxSysConfig;
     type Owned = Self;
     type Access = QuiescentGuard<Self>;
-    type Error = Report<RuntimeError>;
+    type Error = RuntimeOrFatalError;
 
     const NAME: &'static str = "trx_sys";
 
@@ -1701,7 +1705,7 @@ impl Component for TransactionSystem {
         config: Self::Config,
         registry: &mut ComponentRegistry,
         mut shelf: ShelfScope<'_, Self>,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         let meta_pool = registry.dependency::<MetaPool>();
         let index_pool = registry.dependency::<IndexPool>();
         let mem_pool = registry.dependency::<MemPool>();

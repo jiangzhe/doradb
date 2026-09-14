@@ -3,7 +3,9 @@ use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::catalog::{
     Catalog, DroppedTableFileCleanup, DroppedTableRuntime, TableCache, catalog_index_slot,
 };
-use crate::error::{FatalError, FatalResult, RuntimeError, RuntimeResult};
+use crate::error::{
+    FatalError, FatalResult, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
+};
 use crate::file::table_file::OldRoot;
 use crate::id::{TableID, TrxID};
 use crate::map::{FastHashMap, FastHashSet};
@@ -373,7 +375,8 @@ impl TransactionSystem {
             .await
         {
             Ok(retired_row_pages) => Ok(retired_row_pages),
-            Err(err) => {
+            Err(RuntimeOrFatalError::Fatal(report)) => Err(report),
+            Err(RuntimeOrFatalError::Runtime(err)) => {
                 let report = err
                     .change_context(FatalError::PurgeAccess)
                     .attach("purge transaction-list access failed");
@@ -427,7 +430,7 @@ impl TransactionSystem {
         guards: &PoolGuards,
         trx_list: Vec<CommittedTrx>,
         min_active_sts: TrxID,
-    ) -> RuntimeResult<Vec<RetiredRowPageBatch>> {
+    ) -> RuntimeOrFatalResult<Vec<RetiredRowPageBatch>> {
         let mut table_cache = TableCache::new(catalog);
         let purge_trx_count = trx_list.len();
         let mut purge_row_count = 0;
@@ -587,6 +590,10 @@ impl TransactionSystem {
                 .deallocate_retired_row_pages(guards, &page_ids)
                 .await
             {
+                let report = match report {
+                    RuntimeOrFatalError::Runtime(report) => report,
+                    RuntimeOrFatalError::Fatal(_) => return false,
+                };
                 let report = report
                     .change_context(FatalError::PurgeDeallocate)
                     .attach(format!(
@@ -614,7 +621,7 @@ impl TransactionSystem {
         &self,
         guards: &PoolGuards,
         min_active_sts: TrxID,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         for DroppedTableRuntime {
             table_id,
             drop_cts,
@@ -1183,7 +1190,7 @@ impl PurgeDispatcher {
         &mut self,
         trx_sys: &TransactionSystem,
         guards: &PoolGuards,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         let table_ids = self
             .retired_index_runtime_tables
             .iter()
@@ -1337,6 +1344,10 @@ impl PurgeDispatcher {
                     .process_retired_index_runtimes(trx_sys, &pool_guards)
                     .await
                 {
+                    let err = match err {
+                        RuntimeOrFatalError::Runtime(report) => report,
+                        RuntimeOrFatalError::Fatal(_) => return,
+                    };
                     let report = err
                         .change_context(FatalError::PurgeDeallocate)
                         .attach("retired secondary-index runtime destruction failed");
@@ -1355,6 +1366,10 @@ impl PurgeDispatcher {
                     .process_dropped_table_gc(&pool_guards, curr_sts)
                     .await
                 {
+                    let err = match err {
+                        RuntimeOrFatalError::Runtime(report) => report,
+                        RuntimeOrFatalError::Fatal(_) => return,
+                    };
                     let report = err
                         .change_context(FatalError::PurgeDeallocate)
                         .attach("dropped-table garbage collection failed");

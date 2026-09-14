@@ -606,6 +606,7 @@ mod tests {
         TABLE_ID_TABLE_BINDINGS, TABLE_ID_TABLE_DESCRIPTORS, TableBindingObject,
         TableDescriptorObject, TableDescriptors, Tables,
     };
+    use crate::error::RuntimeOrFatalError;
     use crate::id::TrxID;
     use crate::id::{SessionID, TableID};
     use crate::lock::tests::TestLockOwner;
@@ -3224,6 +3225,9 @@ mod tests {
                     .await
                     .err()
                     .unwrap();
+                let RuntimeOrFatalError::Runtime(error) = error else {
+                    panic!("expected Runtime error, got {error:?}");
+                };
                 assert!(error.contains::<crate::error::DataIntegrityError>());
                 assert!(session.checkpoint_catalog().await.is_err());
                 assert!(

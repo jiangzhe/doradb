@@ -3,7 +3,7 @@ use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuard, PoolGuards};
 use crate::catalog::{IndexID, IndexRef, IndexSlot, TableMetadata};
 use crate::error::{
     CompletionErrorBridge, CompletionResult, DataIntegrityError, RuntimeError, RuntimeOrFatalError,
-    RuntimeOrFatalResult, RuntimeResult,
+    RuntimeOrFatalResult,
 };
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::id::{BlockID, RowID, TableID, TrxID};
@@ -193,7 +193,7 @@ enum MemIndexCleanupPhase {
 
 enum CleanupIteration {
     Retry,
-    Finished(RuntimeResult<MemIndexCleanupOutcome>),
+    Finished(RuntimeOrFatalResult<MemIndexCleanupOutcome>),
 }
 
 struct MemIndexCleanupExecution {
@@ -324,7 +324,7 @@ async fn execute_mem_index_cleanup_inner(
                 yield_now().await;
             }
             CleanupIteration::Finished(cleanup_res) => {
-                return cleanup_res.map_err(RuntimeOrFatalError::from);
+                return cleanup_res;
             }
         }
     }
@@ -358,7 +358,7 @@ impl Table {
         guards: &PoolGuards,
         snapshot: &MemIndexCleanupSnapshot<'_>,
         clean_live_entries: bool,
-    ) -> RuntimeResult<MemIndexCleanupOutcome> {
+    ) -> RuntimeOrFatalResult<MemIndexCleanupOutcome> {
         debug_assert!(snapshot.deletion_cutoff_ts() <= snapshot.root_ts());
 
         let root_is_older_than_active_horizon = snapshot.root_is_older_than_active_horizon();
@@ -431,7 +431,7 @@ impl Table {
         index: &SecondaryIndex<EvictableBufferPool>,
         secondary_root: Option<BlockID>,
         stats: &mut SecondaryMemIndexCleanupIndexStats,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         let disk = secondary_root
             .map(|root| {
                 index
@@ -511,7 +511,7 @@ impl Table {
         index: &SecondaryIndex<EvictableBufferPool>,
         secondary_root: Option<BlockID>,
         stats: &mut SecondaryMemIndexCleanupIndexStats,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         let disk = secondary_root
             .map(|root| {
                 index
@@ -610,7 +610,7 @@ impl Table {
         index_ref: IndexRef,
         index: &UniqueMemIndex<EvictableBufferPool>,
         entry: &MemIndexEntry,
-    ) -> RuntimeResult<bool> {
+    ) -> RuntimeOrFatalResult<bool> {
         match self
             .cleanup_delete_overlay_proof(cleanup_context, index_ref, entry.row_id)
             .await?
@@ -630,7 +630,7 @@ impl Table {
         index_ref: IndexRef,
         index: &NonUniqueMemIndex<EvictableBufferPool>,
         entry: &MemIndexEntry,
-    ) -> RuntimeResult<bool> {
+    ) -> RuntimeOrFatalResult<bool> {
         match self
             .cleanup_delete_overlay_proof(cleanup_context, index_ref, entry.row_id)
             .await?
@@ -649,7 +649,7 @@ impl Table {
         cleanup_context: &MemIndexCleanupContext<'_, '_>,
         index_ref: IndexRef,
         row_id: RowID,
-    ) -> RuntimeResult<DeleteOverlayProof> {
+    ) -> RuntimeOrFatalResult<DeleteOverlayProof> {
         let snapshot = cleanup_context.snapshot;
         // A globally purgeable row tombstone proves the delete overlay is no
         // longer protecting any transaction-visible row, independent of where
@@ -697,7 +697,7 @@ impl Table {
         cleanup_context: &MemIndexCleanupContext<'_, '_>,
         index_ref: IndexRef,
         row: ResolvedColumnRow,
-    ) -> RuntimeResult<Vec<Val>> {
+    ) -> RuntimeOrFatalResult<Vec<Val>> {
         let metadata = cleanup_context.metadata;
         let index_spec = metadata.idx.expect_index_spec(index_ref);
         let read_set = index_spec
@@ -722,7 +722,8 @@ impl Table {
                 .attach(format!(
                     "operation=cleanup_secondary_mem_indexes, table_id={}, index={index_ref}",
                     self.table_id()
-                )));
+                ))
+                .into());
         }
         block
             .decode_row_values(metadata.col.as_ref(), row.row_idx(), &read_set)
@@ -734,6 +735,7 @@ impl Table {
                     self.table_id()
                 )
             })
+            .map_err(Into::into)
     }
 }
 
@@ -743,7 +745,7 @@ async fn compare_delete_unique_cleanup_entry<P: BufferPool>(
     index_pool_guard: &PoolGuard,
     entry: &MemIndexEntry,
     min_active_sts: TrxID,
-) -> RuntimeResult<CleanupDecision> {
+) -> RuntimeOrFatalResult<CleanupDecision> {
     if index
         .compare_delete_encoded_entry(
             index_pool_guard,
@@ -752,7 +754,8 @@ async fn compare_delete_unique_cleanup_entry<P: BufferPool>(
             entry.deleted,
             min_active_sts,
         )
-        .await?
+        .await
+        .map_err(Into::<RuntimeOrFatalError>::into)?
     {
         Ok(CleanupDecision::Remove)
     } else {
@@ -766,7 +769,7 @@ async fn compare_delete_non_unique_cleanup_entry<P: BufferPool>(
     index_pool_guard: &PoolGuard,
     entry: &MemIndexEntry,
     min_active_sts: TrxID,
-) -> RuntimeResult<CleanupDecision> {
+) -> RuntimeOrFatalResult<CleanupDecision> {
     if index
         .compare_delete_encoded_entry(
             index_pool_guard,
@@ -774,7 +777,8 @@ async fn compare_delete_non_unique_cleanup_entry<P: BufferPool>(
             entry.deleted,
             min_active_sts,
         )
-        .await?
+        .await
+        .map_err(Into::<RuntimeOrFatalError>::into)?
     {
         Ok(CleanupDecision::Remove)
     } else {

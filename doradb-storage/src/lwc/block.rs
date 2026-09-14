@@ -1,11 +1,11 @@
 //! This module contains definition and functions of LWC(Lightweight Compression) Block.
 
+use crate::error::{DataIntegrityError, DataIntegrityResult, RuntimeOrFatalResult};
 #[cfg(test)]
 pub(crate) use tests::test_decode_counts;
 
 use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
 use crate::catalog::{TableColumnLayout, TableIndexMetadata};
-use crate::error::{DataIntegrityError, DataIntegrityResult, RuntimeResult};
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, LWC_BLOCK_SPEC, max_payload_len, validate_block,
 };
@@ -341,7 +341,7 @@ impl PersistedLwcBlock {
         disk_pool: &QuiescentGuard<ReadonlyBufferPool>,
         disk_pool_guard: &PoolGuard,
         block_id: BlockID,
-    ) -> RuntimeResult<Self> {
+    ) -> RuntimeOrFatalResult<Self> {
         let guard = disk_pool
             .read_validated_block(
                 file_kind,

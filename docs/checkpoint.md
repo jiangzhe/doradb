@@ -300,3 +300,21 @@ Checkpoint correctness rests on three boundaries:
    rows providing fieldwise silent overlays.
 3. Volatile workflow, wait, and cleanup state coordinates publication but does
    not change persistent formats or recovery rules.
+
+## Retained-Page Cleanup and the Published Image
+
+Transition publication and marker installation share the page-state write lock.
+Cleanup takes its read lock before the row latch and CDB entry guard. Frozen
+cleanup invalidates optimistic plans through the paired mutation version;
+Transition cleanup changes only existing Lock/Delete ownership, live delete
+bits/counts, and recorded forward slots. Column values and the prepared bitmap
+remain fixed throughout encoding. LWC rows, split retries, and companion index
+membership use that prepared bitmap even when live metadata changes.
+
+An originally hot undo keeps its exact page generation after the pivot moves.
+Rollback restores and unlinks it there before releasing ownership, independently
+of root publication. Deferred hot-to-cold completion updates that page's live
+delete state and the same undo under its row latch, preserving cold Delete redo.
+Root publication does not reinstall removed CDB markers. A checkpoint failure
+can leave cleanup safe; only required access or ownership failure forces undo
+retention, with the original fatal reason preserved.

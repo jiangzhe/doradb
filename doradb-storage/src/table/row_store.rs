@@ -4,8 +4,8 @@ use crate::buffer::page::VersionedPageID;
 use crate::buffer::{BufferPool, PoolGuard, PoolGuards, RowPoolRole, get_page_versioned_shared};
 use crate::catalog::TableColumnLayout;
 use crate::error::{
-    InternalError, InternalResult, MultiDomainResultExt, RuntimeError, RuntimeOrFatalResult,
-    RuntimeOrFatalResultExt, RuntimeResult,
+    InternalError, InternalResult, MultiDomainResultExt, RuntimeError, RuntimeOrFatalError,
+    RuntimeOrFatalResult, RuntimeOrFatalResultExt, RuntimeResult,
 };
 use crate::id::{PageID, RowID, TableID};
 use crate::index::util::RowPageCreateRedoCtx;
@@ -104,14 +104,14 @@ impl<D: BufferPool> RowStore<D> {
 
     /// Destroys the hot block index and its row pages after index cleanup.
     #[inline]
-    pub(crate) async fn destroy(self, guards: &PoolGuards) -> RuntimeResult<()> {
+    pub(crate) async fn destroy(self, guards: &PoolGuards) -> RuntimeOrFatalResult<()> {
         let row_pool_guard = self.row_pool_guard(guards);
         let meta_pool_guard = guards.meta_guard();
         let table_id = self.table_id;
         self.blk_idx
             .destroy(meta_pool_guard, &*self.mem_pool, row_pool_guard)
             .await
-            .change_context(RuntimeError::TableAccess)
+            .change_runtime_context(RuntimeError::TableAccess)
             .attach_with(|| format!("operation=destroy_block_index, table_id={table_id}"))
     }
 
@@ -147,13 +147,13 @@ impl<D: BufferPool> RowStore<D> {
         &self,
         guards: &PoolGuards,
         page_ids: &[PageID],
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         let row_pool_guard = self.row_pool_guard(guards);
         for page_id in page_ids {
             let page_guard = self
                 .mem_pool
                 .get_page::<RowPage>(row_pool_guard, *page_id, LatchFallbackMode::Exclusive)
-                .await?
+                .await.map_err(Into::<RuntimeOrFatalError>::into)?
                 .lock_exclusive_async()
                 .await
                 .unwrap_or_else(|| {
@@ -174,7 +174,7 @@ impl<D: BufferPool> RowStore<D> {
         &self,
         guards: &PoolGuards,
         page_id: PageID,
-    ) -> RuntimeResult<Option<PageSharedGuard<RowPage>>> {
+    ) -> RuntimeOrFatalResult<Option<PageSharedGuard<RowPage>>> {
         Ok(self
             .mem_pool()
             .get_page::<RowPage>(
@@ -183,7 +183,8 @@ impl<D: BufferPool> RowStore<D> {
                 LatchFallbackMode::Shared,
             )
             .await
-            .change_context(RuntimeError::TableAccess)
+            .map_err(Into::<RuntimeOrFatalError>::into)
+            .change_runtime_context(RuntimeError::TableAccess)
             .attach_with(|| {
                 format!(
                     "operation=get_row_page_shared, table_id={}, page_id={page_id}",
@@ -199,7 +200,7 @@ impl<D: BufferPool> RowStore<D> {
         &self,
         guards: &PoolGuards,
         descriptor: RowPageDescriptor,
-    ) -> RuntimeResult<PageSharedGuard<RowPage>> {
+    ) -> RuntimeOrFatalResult<PageSharedGuard<RowPage>> {
         let page_guard = self
             .get_row_page_shared(guards, descriptor.page_id)
             .await
@@ -238,7 +239,7 @@ impl<D: BufferPool> RowStore<D> {
                     page.header.start_row_id,
                     page.header.row_count()
                 ))
-                .change_context(RuntimeError::TableAccess));
+                .change_context(RuntimeError::TableAccess).into());
         }
         Ok(page_guard)
     }
@@ -249,13 +250,48 @@ impl<D: BufferPool> RowStore<D> {
         &self,
         guards: &PoolGuards,
         page_id: VersionedPageID,
-    ) -> RuntimeResult<Option<PageSharedGuard<RowPage>>> {
+    ) -> RuntimeOrFatalResult<Option<PageSharedGuard<RowPage>>> {
         get_page_versioned_shared::<RowPage, _>(
             self.mem_pool(),
             self.row_pool_guard(guards),
             page_id,
         )
         .await
+        .map_err(Into::into)
+    }
+
+    /// Pins the exact retained generation and validates the initialized row range.
+    /// Active writer registration prevents retirement until cleanup discharges undo.
+    pub(super) async fn get_row_page_for_undo(
+        &self,
+        guards: &PoolGuards,
+        page_id: VersionedPageID,
+        row_id: RowID,
+    ) -> RuntimeOrFatalResult<PageSharedGuard<RowPage>> {
+        let page = self.get_row_page_versioned_shared(guards, page_id).await
+            .attach_with(|| format!(
+                "operation=get_row_page_for_undo, table_id={}, row_id={row_id}, page_id={page_id:?}",
+                self.table_id()
+            ))?;
+        let Some(page) = page else {
+            return Err(Report::new(InternalError::RowUndoState)
+                .change_context(RuntimeError::TableAccess)
+                .attach(format!(
+                    "operation=get_row_page_for_undo, table_id={}, row_id={row_id}, page_id={page_id:?}, generation missing",
+                    self.table_id()
+                )).into());
+        };
+        let header = &page.page().header;
+        if row_id < header.start_row_id || row_id >= header.start_row_id + header.row_count() as u64
+        {
+            return Err(Report::new(InternalError::RowUndoState)
+                .change_context(RuntimeError::TableAccess)
+                .attach(format!(
+                    "operation=get_row_page_for_undo, table_id={}, row_id={row_id}, page_id={page_id:?}, actual_start={}, actual_count={}",
+                    self.table_id(), header.start_row_id, header.row_count()
+                )).into());
+        }
+        Ok(page)
     }
 
     /// Pins an optional exact source page before an index exchange can publish a hint.
@@ -265,7 +301,7 @@ impl<D: BufferPool> RowStore<D> {
         &self,
         rt: TrxRuntime<'_>,
         source: Option<&HotForwardSource>,
-    ) -> RuntimeResult<Option<PageSharedGuard<RowPage>>> {
+    ) -> RuntimeOrFatalResult<Option<PageSharedGuard<RowPage>>> {
         let Some(source) = source else {
             return Ok(None);
         };
@@ -288,28 +324,17 @@ impl<D: BufferPool> RowStore<D> {
         &self,
         undo: &ForwardLinkUndo,
         guards: &PoolGuards,
-    ) -> RuntimeResult<RowUndoRollbackAttempt> {
-        let Some(page) = self
-            .get_row_page_versioned_shared(guards, undo.source.page_id)
-            .await?
-        else {
-            return Ok(RowUndoRollbackAttempt::PageMissing);
-        };
+    ) -> RuntimeOrFatalResult<()> {
+        let page = self
+            .get_row_page_for_undo(guards, undo.source.page_id, undo.source.row_id)
+            .await?;
         let mut access = page.write_row_by_id(undo.source.row_id);
-        if access.page_state() == RowPageState::Transition {
-            return Ok(RowUndoRollbackAttempt::Transition);
-        }
-        let restored = access.with_forward_source(&undo.source, |links| {
-            links.restore(undo.index, undo.previous);
-        });
-        assert!(
-            restored.is_some(),
-            "forward rollback requires its exact writer-owned source: table_id={}, row_id={}, index={}",
-            self.table_id(),
-            undo.source.row_id,
-            undo.index
-        );
-        Ok(RowUndoRollbackAttempt::Applied)
+        access.restore_forward_link(undo)
+            .change_context(RuntimeError::TableAccess)
+            .attach_with(|| format!(
+                "operation=restore_forward_link, table_id={}, row_id={}, page_id={:?}, index={}",
+                self.table_id(), undo.source.row_id, undo.source.page_id, undo.index
+            )).map_err(Into::into)
     }
 
     /// Try to roll back one row undo record against its exact hot page.
@@ -318,7 +343,7 @@ impl<D: BufferPool> RowStore<D> {
         &self,
         entry: &mut OwnedRowUndo,
         guards: &PoolGuards,
-    ) -> RuntimeResult<RowUndoRollbackAttempt> {
+    ) -> RuntimeOrFatalResult<RowUndoRollbackAttempt> {
         let page_id = entry
             .page_id
             .expect("hot row-undo rollback requires an original page generation");
@@ -344,7 +369,7 @@ impl<D: BufferPool> RowStore<D> {
         &self,
         guards: &PoolGuards,
         page_id: PageID,
-    ) -> RuntimeResult<Option<PageExclusiveGuard<RowPage>>> {
+    ) -> RuntimeOrFatalResult<Option<PageExclusiveGuard<RowPage>>> {
         Ok(self
             .mem_pool()
             .get_page::<RowPage>(
@@ -353,7 +378,8 @@ impl<D: BufferPool> RowStore<D> {
                 LatchFallbackMode::Exclusive,
             )
             .await
-            .change_context(RuntimeError::TableAccess)
+            .map_err(Into::<RuntimeOrFatalError>::into)
+            .change_runtime_context(RuntimeError::TableAccess)
             .attach_with(|| {
                 format!(
                     "operation=get_row_page_exclusive, table_id={}, page_id={page_id}",
@@ -370,7 +396,7 @@ impl<D: BufferPool> RowStore<D> {
         &self,
         guards: &PoolGuards,
         page_id: PageID,
-    ) -> RuntimeResult<PageSharedGuard<RowPage>> {
+    ) -> RuntimeOrFatalResult<PageSharedGuard<RowPage>> {
         let guard = self.get_row_page_shared(guards, page_id).await?;
         Ok(guard.unwrap_or_else(|| {
             panic!(
@@ -386,7 +412,7 @@ impl<D: BufferPool> RowStore<D> {
         &self,
         guards: &PoolGuards,
         page_id: PageID,
-    ) -> RuntimeResult<PageExclusiveGuard<RowPage>> {
+    ) -> RuntimeOrFatalResult<PageExclusiveGuard<RowPage>> {
         let guard = self.get_row_page_exclusive(guards, page_id).await?;
         Ok(guard.unwrap_or_else(|| {
             panic!(
@@ -402,7 +428,7 @@ impl<D: BufferPool> RowStore<D> {
         &self,
         guards: &PoolGuards,
         count: usize,
-    ) -> RuntimeResult<PageSharedGuard<RowPage>> {
+    ) -> RuntimeOrFatalResult<PageSharedGuard<RowPage>> {
         let meta_pool_guard = guards.meta_guard();
         let row_pool_guard = self.row_pool_guard(guards);
         self.blk_idx
@@ -414,7 +440,7 @@ impl<D: BufferPool> RowStore<D> {
                 count,
             )
             .await
-            .change_context(RuntimeError::TableAccess)
+            .change_runtime_context(RuntimeError::TableAccess)
             .attach_with(|| {
                 format!(
                     "operation=get_insert_page, table_id={}, row_capacity={count}",
@@ -458,7 +484,7 @@ impl<D: BufferPool> RowStore<D> {
         &self,
         guards: &PoolGuards,
         count: usize,
-    ) -> RuntimeResult<PageExclusiveGuard<RowPage>> {
+    ) -> RuntimeOrFatalResult<PageExclusiveGuard<RowPage>> {
         let meta_pool_guard = guards.meta_guard();
         let row_pool_guard = self.row_pool_guard(guards);
         self.blk_idx
@@ -470,7 +496,7 @@ impl<D: BufferPool> RowStore<D> {
                 count,
             )
             .await
-            .change_context(RuntimeError::TableAccess)
+            .change_runtime_context(RuntimeError::TableAccess)
             .attach_with(|| {
                 format!(
                     "operation=get_exclusive_insert_page, table_id={}, row_capacity={count}",
@@ -486,7 +512,7 @@ impl<D: BufferPool> RowStore<D> {
         guards: &PoolGuards,
         count: usize,
         page_id: PageID,
-    ) -> RuntimeResult<PageExclusiveGuard<RowPage>> {
+    ) -> RuntimeOrFatalResult<PageExclusiveGuard<RowPage>> {
         let meta_pool_guard = guards.meta_guard();
         let row_pool_guard = self.row_pool_guard(guards);
         self.blk_idx
@@ -499,7 +525,7 @@ impl<D: BufferPool> RowStore<D> {
                 page_id,
             )
             .await
-            .change_context(RuntimeError::TableAccess)
+            .change_runtime_context(RuntimeError::TableAccess)
             .attach_with(|| {
                 format!(
                     "operation=allocate_row_page, table_id={}, page_id={page_id}, row_capacity={count}",
@@ -524,7 +550,11 @@ impl<D: BufferPool> RowStore<D> {
     ///
     /// The pivot must be an exact row-page start boundary, unless it equals
     /// the current row-page-index end and there are no pages left to scan.
-    pub(crate) async fn scan<F>(&self, guards: &PoolGuards, page_action: F) -> RuntimeResult<()>
+    pub(crate) async fn scan<F>(
+        &self,
+        guards: &PoolGuards,
+        page_action: F,
+    ) -> RuntimeOrFatalResult<()>
     where
         F: FnMut(PageSharedGuard<RowPage>) -> bool,
     {
@@ -552,7 +582,7 @@ impl<D: BufferPool> RowStore<D> {
         guards: &PoolGuards,
         start_row_id: RowID,
         page_action: F,
-    ) -> RuntimeResult<()>
+    ) -> RuntimeOrFatalResult<()>
     where
         F: FnMut(PageSharedGuard<RowPage>) -> bool,
     {
@@ -675,7 +705,7 @@ impl<D: BufferPool> RowStore<D> {
         start_row_id: RowID,
         operation: &'static str,
         mut page_action: F,
-    ) -> RuntimeResult<()>
+    ) -> RuntimeOrFatalResult<()>
     where
         F: FnMut(PageSharedGuard<RowPage>) -> bool,
     {
@@ -721,7 +751,8 @@ impl<D: BufferPool> RowStore<D> {
                         .change_context(RuntimeError::TableAccess)
                         .attach_with(|| {
                             format!("operation={operation}, table_id={}", self.table_id())
-                        });
+                        })
+                        .map_err(Into::into);
                 }
                 match entries.binary_search_by_key(&start_row_id, |entry| entry.row_id) {
                     Ok(idx) => idx,
@@ -731,7 +762,8 @@ impl<D: BufferPool> RowStore<D> {
                             .change_context(RuntimeError::TableAccess)
                             .attach_with(|| {
                                 format!("operation={operation}, table_id={}", self.table_id())
-                            });
+                            })
+                            .map_err(Into::into);
                     }
                 }
             } else {
@@ -776,7 +808,7 @@ impl<D: BufferPool> RowStore<D> {
         guards: &PoolGuards,
         page_id: PageID,
         row_id: RowID,
-    ) -> RuntimeResult<Option<PageSharedGuard<RowPage>>> {
+    ) -> RuntimeOrFatalResult<Option<PageSharedGuard<RowPage>>> {
         let Some(page_guard) = self.get_row_page_shared(guards, page_id).await? else {
             return Ok(None);
         };

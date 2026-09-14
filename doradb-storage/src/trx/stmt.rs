@@ -353,7 +353,7 @@ impl StmtEffects {
         table_cache: &mut TableCache<'_>,
         pool_guards: &PoolGuards,
         sts: TrxID,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         #[cfg(test)]
         tests::maybe_force_stmt_index_rollback_error()?;
         self.index_undo
@@ -1335,14 +1335,14 @@ impl<'stmt> Statement<'stmt> {
 /// Roll back one statement's effects using shared public/private mechanics.
 #[inline]
 async fn rollback_effects(
-    inner: &mut TrxInner,
+    inner: &TrxInner,
     attachment: &TrxAttachment,
     effects: &mut StmtEffects,
 ) -> FatalResult<()> {
     let sts = inner.sts();
     let engine = attachment.engine();
     let pool_guards = attachment.pool_guards();
-    let rollback_context = RowUndoRollbackContext::new(pool_guards, &engine.poisoner);
+    let rollback_context = RowUndoRollbackContext::new(pool_guards, inner.ctx().status());
     let mut table_cache = TableCache::new(engine.catalog());
     if let Err(err) = effects
         .rollback_index(&mut table_cache, pool_guards, sts)
@@ -1350,6 +1350,10 @@ async fn rollback_effects(
     {
         let retention = effects.take_for_fatal_retention();
         engine.trx_sys.retain_fatal_rollback(retention);
+        let err = match err {
+            RuntimeOrFatalError::Runtime(report) => report,
+            RuntimeOrFatalError::Fatal(report) => return Err(report),
+        };
         let report = err
             .change_context(FatalError::RollbackAccess)
             .attach("statement index rollback failed");
@@ -1357,7 +1361,7 @@ async fn rollback_effects(
             "event=engine_poison component=trx action=poison result=error error={:?}",
             report
         );
-        return Err(engine.poisoner.poison(report).into_report());
+        return Err(engine.poisoner.poison_and_get_first(report).into_report());
     }
     if let Err(err) = effects
         .rollback_row(&mut table_cache, rollback_context)
@@ -1365,21 +1369,18 @@ async fn rollback_effects(
     {
         let retention = effects.take_for_fatal_retention();
         engine.trx_sys.retain_fatal_rollback(retention);
-        return match err {
-            RuntimeOrFatalError::Runtime(report) => {
-                let report = report
-                    .change_context(FatalError::RollbackAccess)
-                    .attach("statement row rollback failed");
-                obs::error!(
-                    "event=engine_poison component=trx action=poison result=error error={:?}",
-                    report
-                );
-                Err(engine.poisoner.poison(report).into_report())
-            }
-            RuntimeOrFatalError::Fatal(report) => {
-                Err(report.attach("statement row rollback failed"))
-            }
+        let err = match err {
+            RuntimeOrFatalError::Runtime(report) => report,
+            RuntimeOrFatalError::Fatal(report) => return Err(report),
         };
+        let report = err
+            .change_context(FatalError::RollbackAccess)
+            .attach("statement row rollback failed");
+        obs::error!(
+            "event=engine_poison component=trx action=poison result=error error={:?}",
+            report
+        );
+        return Err(engine.poisoner.poison_and_get_first(report).into_report());
     }
     effects.clear_redo();
     Ok(())
@@ -2231,7 +2232,7 @@ pub(crate) mod tests {
 
             pause_next_row_rollback();
             let rollback_context =
-                RowUndoRollbackContext::new(&pool_guards, &engine.inner().poisoner);
+                RowUndoRollbackContext::new(&pool_guards, checkout.inner().ctx().status());
             let mut row_rollback =
                 Box::pin(effects.rollback_row(&mut table_cache, rollback_context));
             assert!(futures::poll!(row_rollback.as_mut()).is_pending());
@@ -2846,7 +2847,71 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_statement_rollback_preserves_storage_fatal() {
+        use crate::trx::undo::tests::{
+            RollbackTarget, assert_storage_io_failure, force_next_rollback_error,
+            stage_rollback_test_effects, storage_io_failure,
+        };
+
+        for target in [RollbackTarget::Index, RollbackTarget::Row] {
+            for prior_poison in [false, true] {
+                smol::block_on(async {
+                    let (_temp_dir, engine) = test_engine("stmt_rollback_storage_fatal").await;
+                    let (mut trx, _session_state) = test_trx(&engine, TrxID::new(52));
+                    let session_id = trx.operation_key.session_id();
+                    let result: CallbackResult<(), String> = trx
+                        .exec(async |mut stmt| {
+                            stage_rollback_test_effects(statement_effects_mut(&mut stmt), target);
+                            if prior_poison {
+                                engine
+                                    .inner()
+                                    .poisoner
+                                    .poison(Report::new(FatalError::CheckpointWrite));
+                            }
+                            let failure = engine.inner().poisoner.poison(storage_io_failure());
+                            force_next_rollback_error(target, failure.into_report().into());
+                            Err(CallbackError::User(
+                                "initiating statement failure".to_owned(),
+                            ))
+                        })
+                        .await;
+                    let error = result
+                        .unwrap_err()
+                        .into_engine()
+                        .expect("rollback Fatal takes precedence");
+                    assert_storage_io_failure(&error);
+                    assert!(sys_tests::retains_statement_row_undo(
+                        &engine.inner().trx_sys,
+                        TableID::new(99_999_999),
+                        RowID::new(24)
+                    ));
+                    assert_eq!(
+                        *engine
+                            .inner()
+                            .poisoner
+                            .poison_error()
+                            .unwrap()
+                            .current_context(),
+                        if prior_poison {
+                            FatalError::CheckpointWrite
+                        } else {
+                            FatalError::StorageIo
+                        }
+                    );
+                    assert!(trx.commit().await.is_err());
+                    session_tests::remove_session_for_test(
+                        &engine.inner().session_registry,
+                        session_id,
+                    );
+                });
+            }
+        }
+    }
+
+    #[test]
     fn test_statement_index_rollback_failure_poisons_and_discards_transaction() {
+        use crate::trx::undo::tests::{RollbackTarget, stage_rollback_test_effects};
+
         for user_failure in [false, true] {
             smol::block_on(async {
                 let (_temp_dir, engine) = test_engine("redo_stmt_index_rollback_fail").await;
@@ -2874,22 +2939,9 @@ pub(crate) mod tests {
                         // statement rollback ever runs row rollback before index
                         // rollback, this test fails before the injected index
                         // rollback error can discard the statement safely.
-                        let effects = statement_effects_mut(&mut stmt);
-                        effects.push_row_undo(OwnedRowUndo::new(
-                            effects.stmt_no(),
-                            TableID::new(99_999_999),
-                            None,
-                            RowID::new(24),
-                            RowUndoKind::delete(),
-                        ));
-                        effects.push_delete_index_undo(
-                            TableID::new(12),
-                            RowID::new(23),
-                            user_key_from_index_ref(
-                                IndexRef::new(IndexID::new(0), IndexSlot::new(0)),
-                                vec![],
-                            ),
-                            true,
+                        stage_rollback_test_effects(
+                            statement_effects_mut(&mut stmt),
+                            RollbackTarget::Index,
                         );
                         Err(if user_failure {
                             CallbackError::User("initiating user failure".to_owned())

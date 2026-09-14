@@ -198,7 +198,7 @@ impl TableFile {
         &self,
         disk_pool: &QuiescentGuard<ReadonlyBufferPool>,
         disk_guard: &PoolGuard,
-    ) -> RuntimeResult<ActiveRoot> {
+    ) -> RuntimeOrFatalResult<ActiveRoot> {
         self.file
             .load_active_root_from_pool(FileKind::TableFile, disk_pool, disk_guard)
             .await
@@ -211,7 +211,7 @@ impl TableFile {
         active_root: &ActiveRoot,
         file_path: &str,
         background_writes: &IOClient<BackgroundWriteRequest>,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         self.file
             .reconcile_loaded_root_capacity(active_root, file_path, background_writes)
             .await
@@ -444,7 +444,7 @@ impl MutableTableFile {
         self,
         root_ts: TrxID,
         try_delete_if_fail: bool,
-    ) -> RuntimeResult<(Arc<TableFile>, Option<OldRoot>)> {
+    ) -> RuntimeOrFatalResult<(Arc<TableFile>, Option<OldRoot>)> {
         let MutableTableFile {
             file: table_file,
             mut new_root,
@@ -829,6 +829,7 @@ mod tests {
         IndexID, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
         StorageIndexSpec,
     };
+    use crate::error::RuntimeOrFatalError;
     use crate::error::{
         DataIntegrityError, DiscloseError, DiscloseResultExt, Error, ErrorKind, Result,
         RuntimeError,
@@ -1865,6 +1866,9 @@ mod tests {
                 .await
                 .err()
                 .expect("short table file must fail to open");
+            let RuntimeOrFatalError::Runtime(err) = err else {
+                panic!("expected Runtime error, got {err:?}");
+            };
             assert_eq!(err.current_context(), &RuntimeError::FileRootAccess);
             assert_eq!(
                 err.downcast_ref::<DataIntegrityError>().copied(),

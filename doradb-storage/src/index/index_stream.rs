@@ -9,7 +9,9 @@ use super::disk_tree::{
 };
 use crate::buffer::BufferPool;
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
-use crate::error::{DataIntegrityError, RuntimeError, RuntimeResult};
+use crate::error::{
+    DataIntegrityError, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
+};
 use crate::id::RowID;
 use crate::index::btree::{BTreeKey, BTreeNode, BTreeNodeCursor, BTreeU64, KeyRange};
 use crate::index::util::Maskable;
@@ -18,11 +20,12 @@ use std::borrow::Borrow;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::mem;
+use std::result::Result as StdResult;
 
 /// Async batch stream returned by indexes.
 pub(crate) trait IndexBatchStream<T> {
     /// Return the next non-empty batch, or `None` when exhausted.
-    fn next_batch(&mut self) -> impl Future<Output = RuntimeResult<Option<Vec<T>>>>;
+    fn next_batch(&mut self) -> impl Future<Output = RuntimeOrFatalResult<Option<Vec<T>>>>;
 }
 
 /// Candidate emitted by a secondary-index scan before row MVCC visibility.
@@ -96,40 +99,45 @@ impl<F: DiskTreeSpec> IndexScanLeaf for DiskTreeLeaf<F> {
 
 /// Cursor adapter used by generic index scan streams.
 pub(crate) trait IndexLeafCursor {
+    /// Native access failures from the backing index.
+    type Error: Into<RuntimeOrFatalError>;
+
     /// Leaf item returned by this cursor.
     type Leaf: IndexScanLeaf;
 
     /// Seek to the first leaf that may contain `key`.
-    fn seek(&mut self, key: &[u8]) -> impl Future<Output = RuntimeResult<()>>;
+    fn seek(&mut self, key: &[u8]) -> impl Future<Output = StdResult<(), Self::Error>>;
 
     /// Return the next leaf item.
-    fn next_leaf(&mut self) -> impl Future<Output = RuntimeResult<Option<Self::Leaf>>>;
+    fn next_leaf(&mut self) -> impl Future<Output = StdResult<Option<Self::Leaf>, Self::Error>>;
 }
 
 impl<'a, P: BufferPool> IndexLeafCursor for BTreeNodeCursor<'a, P> {
     type Leaf = PageSharedGuard<BTreeNode>;
+    type Error = P::Error;
 
     #[inline]
-    async fn seek(&mut self, key: &[u8]) -> RuntimeResult<()> {
+    async fn seek(&mut self, key: &[u8]) -> StdResult<(), Self::Error> {
         BTreeNodeCursor::seek(self, key).await
     }
 
     #[inline]
-    async fn next_leaf(&mut self) -> RuntimeResult<Option<Self::Leaf>> {
+    async fn next_leaf(&mut self) -> StdResult<Option<Self::Leaf>, Self::Error> {
         BTreeNodeCursor::next(self).await
     }
 }
 
 impl<'a, F: DiskTreeSpec> IndexLeafCursor for DiskTreeNodeCursor<'a, F> {
     type Leaf = DiskTreeLeaf<F>;
+    type Error = RuntimeOrFatalError;
 
     #[inline]
-    async fn seek(&mut self, key: &[u8]) -> RuntimeResult<()> {
+    async fn seek(&mut self, key: &[u8]) -> RuntimeOrFatalResult<()> {
         DiskTreeNodeCursor::seek(self, key).await
     }
 
     #[inline]
-    async fn next_leaf(&mut self) -> RuntimeResult<Option<Self::Leaf>> {
+    async fn next_leaf(&mut self) -> RuntimeOrFatalResult<Option<Self::Leaf>> {
         DiskTreeNodeCursor::next_leaf(self).await
     }
 }
@@ -336,16 +344,24 @@ where
     }
 
     /// Return the next leaf-bounded projected batch.
-    pub(crate) async fn next_batch(&mut self) -> RuntimeResult<Option<Vec<S::Output>>> {
+    pub(crate) async fn next_batch(&mut self) -> RuntimeOrFatalResult<Option<Vec<S::Output>>> {
         if self.exhausted {
             return Ok(None);
         }
         if !self.started {
             let lower_seek_key = self.range.borrow().lower_seek_key();
-            self.cursor.seek(lower_seek_key).await?;
+            self.cursor
+                .seek(lower_seek_key)
+                .await
+                .map_err(Into::<RuntimeOrFatalError>::into)?;
             self.started = true;
         }
-        while let Some(leaf) = self.cursor.next_leaf().await? {
+        while let Some(leaf) = self
+            .cursor
+            .next_leaf()
+            .await
+            .map_err(Into::<RuntimeOrFatalError>::into)?
+        {
             let node = leaf.node();
             let mut outputs = Vec::new();
             let range = self.range.borrow();
@@ -380,7 +396,7 @@ where
     R: Borrow<KeyRange>,
 {
     #[inline]
-    async fn next_batch(&mut self) -> RuntimeResult<Option<Vec<S::Output>>> {
+    async fn next_batch(&mut self) -> RuntimeOrFatalResult<Option<Vec<S::Output>>> {
         IndexScanStream::next_batch(self).await
     }
 }

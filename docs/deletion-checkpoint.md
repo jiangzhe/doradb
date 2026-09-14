@@ -51,6 +51,23 @@ unused prepare listener. Successful failed-precommit rollback removes its cold
 marker before prepare completion wakes foreground waiters; fatal cleanup wakes
 them only after engine poison is published.
 
+A foreground claim installs undo only for a fresh marker. A same-transaction
+consumed row does not acquire another independently removable claim. Cleanup
+validates an active Ref by status allocation while holding the map entry guard,
+then synchronously keeps or removes that same entry. For transitioned hot rows,
+page pin, page-state read lock, and row write latch precede the CDB guard. The
+inverse and exact undo unlink happen inside this guarded reconciliation; no
+await, I/O, index access, other page acquisition, or user callback occurs there.
+A surviving same-owner active main predecessor keeps the Ref. Final restoration
+of a live row removes it. Forward-slot restoration leaves source ownership
+untouched. Absent, foreign, or committed markers fail before any row mutation.
+
+Deletion checkpoint selects only committed markers below its fixed cutoff.
+Active markers are ineligible, and a later writer commit receives a later CTS.
+Removing a rolled-back active marker therefore cannot withdraw a committed
+delete already selected for checkpoint. Transition installs staged markers once;
+root publication never recreates a marker that cleanup has removed.
+
 ### Persistent Delete Metadata
 
 Each `ColumnBlockIndex` leaf describes one LWC RowID range and stores a sorted

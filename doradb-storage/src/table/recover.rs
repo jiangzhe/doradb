@@ -1,7 +1,8 @@
 use crate::buffer::PoolGuards;
 use crate::catalog::IndexSlot;
 use crate::error::{
-    DataIntegrityError, DataIntegrityResult, RecoveryDuplicateKey, RuntimeError, RuntimeResult,
+    DataIntegrityError, DataIntegrityResult, RecoveryDuplicateKey, RuntimeError,
+    RuntimeOrFatalResult,
 };
 use crate::id::{PageID, RowID, TrxID};
 use crate::index::IndexInsert;
@@ -22,7 +23,7 @@ impl Table {
         cols: &[Val],
         cts: TrxID,
         disable_dml_validation: bool,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         let layout = self.layout_snapshot();
         let metadata = layout.metadata();
         if !disable_dml_validation {
@@ -68,7 +69,7 @@ impl Table {
         update: &[UpdateCol],
         cts: TrxID,
         disable_dml_validation: bool,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         let layout = self.layout_snapshot();
         let metadata = layout.metadata();
         if !disable_dml_validation {
@@ -104,7 +105,7 @@ impl Table {
         page_id: Option<PageID>,
         row_id: RowID,
         cts: TrxID,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         // `recovery_bootstrap_unchecked`: restart recovery runs without
         // surviving user transactions, so it binds the current loaded root
         // directly for cold-row delete replay predicates.
@@ -122,7 +123,8 @@ impl Table {
                         .attach(format!(
                             "operation=recover_row_delete, table_id={}, row_id={row_id}",
                             self.table_id()
-                        )));
+                        ))
+                        .into());
                 }
             }
         }
@@ -160,7 +162,7 @@ impl Table {
         &self,
         guards: &PoolGuards,
         page_id: PageID,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         let page_guard = self
             .row_store
             .must_get_row_page_shared(guards, page_id)
@@ -264,6 +266,7 @@ mod tests {
     };
     use crate::catalog::{IndexSlot, TableMetadata, USER_TABLE_ID_START};
     use crate::engine::Engine;
+    use crate::error::RuntimeOrFatalError;
     use crate::error::{DataIntegrityError, RecoveryDuplicateKey, RuntimeError};
     use crate::id::RowID;
     use crate::id::{PageID, TrxID};
@@ -339,6 +342,9 @@ mod tests {
                 .recover_row_delete(&session.pool_guards(), None, row_id, cts + 1)
                 .await
                 .unwrap_err();
+            let RuntimeOrFatalError::Runtime(err) = err else {
+                panic!("expected Runtime error, got {err:?}");
+            };
             assert_eq!(
                 err.downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidRootInvariant)
@@ -382,6 +388,9 @@ mod tests {
                 .recover_row_delete(&session.pool_guards(), None, row_id, delete_cts)
                 .await
                 .unwrap_err();
+            let RuntimeOrFatalError::Runtime(err) = err else {
+                panic!("expected Runtime error, got {err:?}");
+            };
             assert_eq!(*err.current_context(), RuntimeError::TableAccess);
             assert_eq!(
                 err.downcast_ref::<DataIntegrityError>().copied(),
@@ -521,6 +530,9 @@ mod tests {
                 )
                 .await
                 .unwrap_err();
+            let RuntimeOrFatalError::Runtime(err) = err else {
+                panic!("expected Runtime error, got {err:?}");
+            };
             assert_eq!(*err.current_context(), RuntimeError::TableAccess);
             assert_eq!(
                 err.downcast_ref::<DataIntegrityError>().copied(),
@@ -545,6 +557,9 @@ mod tests {
                 )
                 .await
                 .unwrap_err();
+            let RuntimeOrFatalError::Runtime(err) = err else {
+                panic!("expected Runtime error, got {err:?}");
+            };
             assert_eq!(*err.current_context(), RuntimeError::TableAccess);
             assert_eq!(
                 err.downcast_ref::<DataIntegrityError>().copied(),

@@ -1,6 +1,7 @@
 use crate::buffer::{BufferPool, PoolGuard};
 use crate::catalog::TableIndexMetadata;
-use crate::error::RuntimeResult;
+use std::result::Result as StdResult;
+
 use crate::id::{RowID, TrxID};
 use crate::index::btree::{BTreeDelete, BTreeInsert, BTreeReplaceOrInsert, BTreeUpdate};
 use crate::index::btree::{BTreeKey, BTreeLookupObservation, BTreeU64};
@@ -56,7 +57,7 @@ impl<P: BufferPool> UniqueMemIndex<P> {
         index_spec: &TableIndexMetadata,
         ty_infer: F,
         ts: TrxID,
-    ) -> RuntimeResult<Self> {
+    ) -> StdResult<Self, P::Error> {
         debug_assert!(index_spec.unique());
         debug_assert!(!index_spec.keys.is_empty());
         let types = index_spec
@@ -80,7 +81,7 @@ impl<P: BufferPool> UniqueMemIndex<P> {
 
     /// Destroy this unique index and reclaim all backing tree pages.
     #[inline]
-    pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> RuntimeResult<()> {
+    pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> StdResult<(), P::Error> {
         self.0.destroy(pool_guard).await
     }
 
@@ -96,7 +97,7 @@ impl<P: BufferPool> UniqueMemIndex<P> {
         expected_row_id: RowID,
         new_row_id: RowID,
         ts: TrxID,
-    ) -> RuntimeResult<IndexCompareExchange> {
+    ) -> StdResult<IndexCompareExchange, P::Error> {
         debug_assert!(!new_row_id.is_deleted());
         let key = self.encoder().encode(key);
         Ok(
@@ -155,7 +156,7 @@ impl<P: BufferPool> UniqueMemIndex<P> {
         row_id: RowID,
         deleted: bool,
         ts: TrxID,
-    ) -> RuntimeResult<bool> {
+    ) -> StdResult<bool, P::Error> {
         debug_assert!(!row_id.is_deleted());
         Ok(matches!(
             self.tree()
@@ -196,7 +197,7 @@ impl<P: BufferPool> GuardedUniqueMemIndex<'_, '_, P> {
         expected_row_id: RowID,
         new_row_id: RowID,
         ts: TrxID,
-    ) -> RuntimeResult<IndexCompareExchange> {
+    ) -> StdResult<IndexCompareExchange, P::Error> {
         self.index
             .replace_or_insert(self.pool_guard, key, expected_row_id, new_row_id, ts)
             .await
@@ -208,7 +209,7 @@ impl<P: BufferPool> GuardedUniqueMemIndex<'_, '_, P> {
         &self,
         key: &[Val],
         _ts: TrxID,
-    ) -> RuntimeResult<Option<(RowID, bool)>> {
+    ) -> StdResult<Option<(RowID, bool)>, P::Error> {
         let k = self.index.encoder().encode(key);
         Ok(self
             .index
@@ -223,7 +224,7 @@ impl<P: BufferPool> GuardedUniqueMemIndex<'_, '_, P> {
     pub(crate) async fn lookup_observed<'lookup>(
         &'lookup self,
         key: &'lookup [Val],
-    ) -> RuntimeResult<(Option<(RowID, bool)>, UniqueLookupObservation<'lookup>)> {
+    ) -> StdResult<(Option<(RowID, bool)>, UniqueLookupObservation<'lookup>), P::Error> {
         #[cfg(test)]
         {
             use crate::table::record_unique_lookup;
@@ -252,7 +253,7 @@ impl<P: BufferPool> GuardedUniqueMemIndex<'_, '_, P> {
         row_id: RowID,
         merge_if_match_deleted: bool,
         ts: TrxID,
-    ) -> RuntimeResult<IndexInsert> {
+    ) -> StdResult<IndexInsert, P::Error> {
         debug_assert!(!row_id.is_deleted());
         let k = self.index.encoder().encode(key);
         self.insert_encoded_if_not_exists(&k, row_id, merge_if_match_deleted, ts)
@@ -267,7 +268,7 @@ impl<P: BufferPool> GuardedUniqueMemIndex<'_, '_, P> {
         row_id: RowID,
         merge_if_match_deleted: bool,
         ts: TrxID,
-    ) -> RuntimeResult<IndexInsert> {
+    ) -> StdResult<IndexInsert, P::Error> {
         debug_assert!(!row_id.is_deleted());
         Ok(
             match self
@@ -298,7 +299,7 @@ impl<P: BufferPool> GuardedUniqueMemIndex<'_, '_, P> {
         row_id: RowID,
         ignore_del_mask: bool,
         ts: TrxID,
-    ) -> RuntimeResult<bool> {
+    ) -> StdResult<bool, P::Error> {
         debug_assert!(!row_id.is_deleted());
         let k = self.index.encoder().encode(key);
         Ok(
@@ -328,7 +329,7 @@ impl<P: BufferPool> GuardedUniqueMemIndex<'_, '_, P> {
         key: &[Val],
         row_id: RowID,
         ts: TrxID,
-    ) -> RuntimeResult<bool> {
+    ) -> StdResult<bool, P::Error> {
         debug_assert!(!row_id.is_deleted());
         Ok(matches!(
             self.compare_exchange(key, row_id, row_id.deleted(), ts)
@@ -345,7 +346,7 @@ impl<P: BufferPool> GuardedUniqueMemIndex<'_, '_, P> {
         old_row_id: RowID,
         new_row_id: RowID,
         ts: TrxID,
-    ) -> RuntimeResult<IndexCompareExchange> {
+    ) -> StdResult<IndexCompareExchange, P::Error> {
         let k = self.index.encoder().encode(key);
         Ok(
             match self
@@ -376,7 +377,7 @@ impl<P: BufferPool> GuardedUniqueMemIndex<'_, '_, P> {
         &'a self,
         range: &'a KeyRange,
         _ts: TrxID,
-    ) -> RuntimeResult<UniqueMemIndexCandidateStream<'a, P>> {
+    ) -> StdResult<UniqueMemIndexCandidateStream<'a, P>, P::Error> {
         Ok(UniqueMemIndexCandidateStream::new(
             self.index.tree().cursor(self.pool_guard, 0),
             range,

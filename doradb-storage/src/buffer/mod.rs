@@ -15,7 +15,8 @@ mod util;
 pub(crate) use self::arena::outstanding_base_guard_count as test_outstanding_base_guard_count;
 #[cfg(test)]
 pub(crate) use self::evict::tests::{
-    dispatch_dirty_pages_for_test as test_dispatch_dirty_pages, frame_kind as test_frame_kind,
+    dispatch_dirty_pages_for_test as test_dispatch_dirty_pages,
+    evict_existing_page_for_test as test_evict_existing_page, frame_kind as test_frame_kind,
     io_backend_stats_handle_identity as test_io_backend_stats_handle_identity,
     persist_and_evict_page_for_test as test_persist_and_evict_page,
 };
@@ -47,8 +48,9 @@ use crate::component::{
     ShelfScope,
 };
 use crate::conf::EvictableBufferPoolConfig;
-use crate::error::Validation;
-use crate::error::{DataIntegrityResult, RuntimeError, RuntimeResult};
+use crate::error::{
+    DataIntegrityResult, RuntimeError, RuntimeOrFatalError, RuntimeResult, Validation,
+};
 use crate::file::FileKind;
 use crate::file::fs::{FileSystem, FileSystemWorkers};
 use crate::id::{BlockID, PageID};
@@ -56,8 +58,10 @@ use crate::latch::LatchFallbackMode;
 use crate::quiescent::QuiescentBox;
 use crate::stats::BufferPoolCounters;
 use error_stack::{Report, ResultExt};
+use std::fmt::Debug;
 use std::future::Future;
 use std::mem::size_of;
+use std::result::Result as StdResult;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -197,6 +201,9 @@ impl BufferPoolStatsHandle {
 
 /// Abstraction of buffer pool.
 pub(crate) trait BufferPool: Send + Sync {
+    /// Native access failures; pools that perform I/O also preserve Fatal.
+    type Error: Debug + Send + From<Report<RuntimeError>> + Into<RuntimeOrFatalError>;
+
     /// Returns the maximum number of pages that can be allocated.
     fn capacity(&self) -> usize;
 
@@ -219,14 +226,14 @@ pub(crate) trait BufferPool: Send + Sync {
     fn allocate_page<T: BufferPage>(
         &self,
         guard: &PoolGuard,
-    ) -> impl Future<Output = RuntimeResult<PageExclusiveGuard<T>>> + Send;
+    ) -> impl Future<Output = StdResult<PageExclusiveGuard<T>, Self::Error>> + Send;
 
     /// Allocate a new page at given id(offset);
     fn allocate_page_at<T: BufferPage>(
         &self,
         guard: &PoolGuard,
         page_id: PageID,
-    ) -> impl Future<Output = RuntimeResult<PageExclusiveGuard<T>>> + Send;
+    ) -> impl Future<Output = StdResult<PageExclusiveGuard<T>, Self::Error>> + Send;
 
     /// Get page.
     fn get_page<T: BufferPage>(
@@ -234,7 +241,7 @@ pub(crate) trait BufferPool: Send + Sync {
         guard: &PoolGuard,
         page_id: PageID,
         mode: LatchFallbackMode,
-    ) -> impl Future<Output = RuntimeResult<FacadePageGuard<T>>> + Send;
+    ) -> impl Future<Output = StdResult<FacadePageGuard<T>, Self::Error>> + Send;
 
     /// Get page by versioned page identity.
     /// Returns None if page is unavailable or version mismatches.
@@ -243,7 +250,7 @@ pub(crate) trait BufferPool: Send + Sync {
         guard: &PoolGuard,
         id: VersionedPageID,
         mode: LatchFallbackMode,
-    ) -> impl Future<Output = RuntimeResult<Option<FacadePageGuard<T>>>> + Send;
+    ) -> impl Future<Output = StdResult<Option<FacadePageGuard<T>>, Self::Error>> + Send;
 
     /// Deallocate page.
     fn deallocate_page<T: BufferPage>(&self, g: PageExclusiveGuard<T>);
@@ -258,7 +265,7 @@ pub(crate) trait BufferPool: Send + Sync {
         p_guard: &FacadePageGuard<T>,
         page_id: PageID,
         mode: LatchFallbackMode,
-    ) -> impl Future<Output = RuntimeResult<Validation<FacadePageGuard<T>>>> + Send;
+    ) -> impl Future<Output = StdResult<Validation<FacadePageGuard<T>>, Self::Error>> + Send;
 }
 
 /// Return the resident page count for a valid evictable-pool sizing request.
@@ -303,7 +310,7 @@ pub(crate) async fn get_page_versioned_shared<T: BufferPage, B: BufferPool>(
     pool: &B,
     guard: &PoolGuard,
     id: VersionedPageID,
-) -> RuntimeResult<Option<PageSharedGuard<T>>> {
+) -> StdResult<Option<PageSharedGuard<T>>, B::Error> {
     let Some(guard) = pool
         .get_page_versioned::<T>(guard, id, LatchFallbackMode::Shared)
         .await?

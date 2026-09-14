@@ -11,7 +11,8 @@ use super::index_key::WriteIndexKeySet;
 use crate::buffer::guard::PageSharedGuard;
 use crate::catalog::IndexRef;
 use crate::error::{
-    CallbackResult, DataIntegrityError, DiscloseError, DiscloseResultExt, OperationError, Result,
+    CallbackResult, DataIntegrityError, DiscloseError, DiscloseResultExt, MultiDomainResultExt,
+    OperationError, Result,
 };
 use crate::id::{PageID, RowID};
 use crate::index::{LwcRowLocation, RowLocation};
@@ -19,12 +20,11 @@ use crate::row::RowPage;
 use crate::row::ops::{RowMutation, TableMutationOutcome, UpdateCol};
 use crate::table::dml_validator::DmlValidator;
 use crate::table::hot::{DeleteInternal, HotRowMutator, ResumeOwnedRow};
-use crate::table::{DeleteMarker, DeletionClaim, DeletionError, TableRootSnapshot};
+use crate::table::{DeletionClaim, DeletionError, TableRootSnapshot};
 use crate::trx::TrxRuntime;
 use crate::trx::row::{BoundIndexCandidate, LockRowForWrite, RowWriteAccess};
 use crate::trx::stmt::StmtEffects;
 use error_stack::{Report, ResultExt};
-use std::sync::Arc;
 
 /// Whether candidate processing finished or must restart row-location resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -517,15 +517,6 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                         )
                         .await
                         .disclose()?;
-                    let owns_marker = matches!(
-                        accessor.lwc_deletion_buffer().get(row_id),
-                        Some(DeleteMarker::Ref(status)) if Arc::ptr_eq(&status, self.rt.status())
-                    );
-                    assert!(
-                        owns_marker,
-                        "deferred cold index update must retain its transaction-owned deletion marker: table_id={}, row_id={row_id}",
-                        accessor.table_id()
-                    );
                     accessor
                         .update_owned_cold_row(
                             self.rt,
@@ -595,22 +586,29 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
 #[cfg(test)]
 mod tests {
     use crate::CallbackResult;
+    use crate::buffer::guard::PageGuard;
+    use crate::buffer::test_evict_existing_page;
     use crate::catalog::tests::{table3, table4};
     use crate::error::{DiscloseResultExt, OperationError};
     use crate::index::{IndexInsert, RowLocation};
+    use crate::row::RowRead;
     use crate::row::ops::{
         RowMutation, ScanRowDecision, SelectMvcc, TableMutationOutcome, UniqueMutationOutcome,
         UpdateCol,
     };
     use crate::session::tests::{
-        SessionTestExt, assert_checkpoint_published, wait_for_session_idle,
+        SessionTestExt, assert_checkpoint_published, wait_for_checkpoint_purge,
+        wait_for_purge_handoff, wait_for_session_idle,
     };
-    use crate::table::DeleteMarker;
     use crate::table::tests::*;
+    use crate::table::{CheckpointOutcome, DeleteMarker};
     use crate::trx::MAX_SNAPSHOT_TS;
+    use crate::trx::MvccReadView;
+    use crate::trx::row::MainBranchMvcc;
     use crate::trx::tests::{
         prepare_event_is_installed, prepare_transaction, transaction_status_for_test,
     };
+    use crate::trx::undo::RowUndoKind;
     use crate::value::Val;
     use smol::future::yield_now;
     use std::cell::{Cell, RefCell};
@@ -692,6 +690,36 @@ mod tests {
                 .unwrap(),
         );
 
+        wait_for_checkpoint_purge(&maintenance_session, maintenance_session.last_cts()).await;
+        let table = table_for_internal_assertion(&engine, table_id);
+        let guards = maintenance_session.pool_guards();
+        let RowLocation::RowPage(page_id) = table.find_row(&guards, row_id).await.unwrap() else {
+            panic!("source must initially be hot");
+        };
+        let retained = table
+            .row_store
+            .must_get_row_page_shared(&guards, page_id)
+            .await
+            .unwrap();
+        let original_generation = retained.versioned_page_id();
+        let metadata = table.metadata();
+        let original_values = retained
+            .read_row_by_id(row_id)
+            .row()
+            .vals_for_read_set(metadata.col.as_ref(), &[0, 1]);
+        let mut old_session = engine.new_session().unwrap();
+        let mut old_reader = old_session.begin_trx().unwrap();
+        let old_view = MvccReadView::ownerless(old_reader.sts());
+        let (_, descriptors) = table
+            .row_store
+            .snapshot_original_row_pages_from(&guards, table.row_store.pivot_row_id())
+            .await
+            .unwrap();
+        let captured = *descriptors
+            .iter()
+            .find(|descriptor| descriptor.page_id == page_id)
+            .unwrap();
+        let mut callback_count = 0;
         let resume = pause_next_deferred_application();
         let mut writer_session = engine.new_session().unwrap();
         let mut writer = writer_session.begin_trx().unwrap();
@@ -700,6 +728,7 @@ mod tests {
             crate::TableIndex(table_id, crate::IndexID::new(0)),
             ..,
             |row| -> CallbackResult<_> {
+                callback_count += 1;
                 assert_eq!(row.val(0)?.as_i32(), Some(1));
                 Ok(RowMutation::Update(vec![UpdateCol {
                     idx: 0,
@@ -709,7 +738,30 @@ mod tests {
         ));
         poll_until_deferred_application_pauses(mutation.as_mut()).await;
 
-        assert_checkpoint_published(&mut maintenance_session, table_id).await;
+        let original_undo = retained.read_row_by_id(row_id).first_undo_entry().unwrap();
+        {
+            let access = retained.read_row_by_id(row_id);
+            assert!(matches!(original_undo.as_ref().kind, RowUndoKind::Lock));
+            assert!(!access.row().is_deleted());
+            assert_eq!(
+                retained
+                    .page()
+                    .header
+                    .approx_deleted
+                    .load(Ordering::Relaxed),
+                0
+            );
+        }
+        let CheckpointOutcome::Published { redo_cts, .. } = maintenance_session
+            .checkpoint_table_with_wait(table_id)
+            .await
+            .unwrap()
+        else {
+            panic!("checkpoint must publish deferred source");
+        };
+        wait_for_purge_handoff(&maintenance_session, redo_cts)
+            .await
+            .unwrap();
         let table = table_for_internal_assertion(&engine, table_id);
         assert!(matches!(
             table
@@ -723,16 +775,118 @@ mod tests {
             Some(DeleteMarker::Ref(status)) if Arc::ptr_eq(&status, &writer_status)
         ));
 
+        drop(retained);
+        test_evict_existing_page(engine.inner().pools.mem.clone(), page_id).await;
         resume.send_async(()).await.unwrap();
         let outcome = mutation.as_mut().await.unwrap();
         assert_eq!(outcome.update_count, 1);
         drop(mutation);
+        let retained = table
+            .row_store
+            .get_row_page_for_undo(&guards, original_generation, row_id)
+            .await
+            .unwrap();
+        assert_eq!(callback_count, 1);
+        {
+            let access = retained.read_row_by_id(row_id);
+            assert!(access.first_undo_entry().unwrap().ptr_eq(&original_undo));
+            assert!(matches!(
+                original_undo.as_ref().kind,
+                RowUndoKind::Delete(_)
+            ));
+            assert_eq!(original_undo.as_ref().page_id, Some(original_generation));
+            assert!(access.row().is_deleted());
+            assert_eq!(
+                retained
+                    .page()
+                    .header
+                    .approx_deleted
+                    .load(Ordering::Relaxed),
+                1
+            );
+            assert_eq!(
+                access
+                    .row()
+                    .vals_for_read_set(metadata.col.as_ref(), &[0, 1]),
+                original_values
+            );
+            assert!(matches!(
+                access.resolve_main_branch_mvcc(&old_view, |_| panic!("columns must stay fixed")),
+                MainBranchMvcc::Historical
+            ));
+        }
         if commit {
             writer.commit().await.unwrap();
         } else {
             writer.rollback().await.unwrap();
         }
 
+        {
+            let access = retained.read_row_by_id(row_id);
+            if !commit {
+                // Check structure before any potentially freed pointer dereference.
+                assert!(access.first_undo_entry().is_none());
+                assert!(!access.row().is_deleted());
+                assert_eq!(
+                    retained
+                        .page()
+                        .header
+                        .approx_deleted
+                        .load(Ordering::Relaxed),
+                    0
+                );
+                assert!(table.deletion_buffer().get(row_id).is_none());
+            }
+            assert_eq!(
+                access
+                    .row()
+                    .vals_for_read_set(metadata.col.as_ref(), &[0, 1]),
+                original_values
+            );
+            assert!(matches!(
+                access.resolve_main_branch_mvcc(&old_view, |_| panic!("columns must stay fixed")),
+                MainBranchMvcc::Historical | MainBranchMvcc::Latest
+            ));
+        }
+        assert_eq!(
+            scan_table_pairs(&mut old_reader, table_id).await,
+            vec![(1, "original".to_owned())]
+        );
+        let scan_page = table
+            .row_store
+            .get_captured_row_page_shared(&guards, captured)
+            .await
+            .unwrap();
+        let scan_access = scan_page.read_row_by_id(row_id);
+        assert!(matches!(
+            scan_access.resolve_main_branch_mvcc(&old_view, |_| panic!(
+                "captured scan columns must stay fixed"
+            )),
+            MainBranchMvcc::Latest | MainBranchMvcc::Historical
+        ));
+        assert_eq!(
+            scan_access
+                .row()
+                .vals_for_read_set(metadata.col.as_ref(), &[0, 1]),
+            original_values
+        );
+        drop(scan_access);
+        drop(scan_page);
+        assert_eq!(retained.versioned_page_id(), original_generation);
+        drop(retained);
+        old_reader.commit().await.unwrap();
+        maintenance_session
+            .wait_for_purge_completion_after(redo_cts)
+            .await
+            .unwrap();
+        assert!(
+            table
+                .row_store
+                .get_row_page_versioned_shared(&guards, original_generation)
+                .await
+                .unwrap()
+                .is_none()
+        );
         let mut reader = maintenance_session.begin_trx().unwrap();
         let expected = if commit {
             vec![(101, "original".to_owned())]
@@ -740,6 +894,24 @@ mod tests {
             vec![(1, "original".to_owned())]
         };
         assert_eq!(scan_table_pairs(&mut reader, table_id).await, expected);
+        reader.commit().await.unwrap();
+        drop(table);
+        drop(guards);
+        drop(writer_session);
+        drop(old_session);
+        drop(maintenance_session);
+        engine.shutdown();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, stem).await;
+        let mut session = engine.new_session().unwrap();
+        let mut reader = session.begin_trx().unwrap();
+        assert_eq!(scan_table_pairs(&mut reader, table_id).await, expected);
+        let expected_key = if commit { 101 } else { 1 };
+        assert!(matches!(
+            trx_select_row_mvcc_by_id(&mut reader, table_id, &single_key(expected_key), &[0, 1])
+                .await
+                .unwrap(),
+            SelectMvcc::Found(_)
+        ));
         reader.commit().await.unwrap();
     }
 
@@ -1102,7 +1274,95 @@ mod tests {
     }
 
     #[test]
-    fn test_table_index_mutate_mvcc_cancellation_retains_deferred_undo_ownership() {
+    fn test_deferred_transition_duplicate_rolls_back_finalized_delete() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let stem = "deferred-transition-duplicate";
+            let engine = lightweight_test_engine(&temp_dir, stem).await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut maintenance = engine.new_session().unwrap();
+            insert_rows(table_id, &mut maintenance, 1, 1, "original").await;
+            insert_rows(table_id, &mut maintenance, 101, 1, "collision").await;
+            assert_freeze_created(
+                maintenance
+                    .freeze_table(table_id, usize::MAX)
+                    .await
+                    .unwrap(),
+            );
+            wait_for_checkpoint_purge(&maintenance, maintenance.last_cts()).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let guards = maintenance.pool_guards();
+            let key = single_key(1);
+            let row_id = bound_unique_index(&table, &guards, key.index_slot)
+                .lookup(&key.vals, MAX_SNAPSHOT_TS)
+                .await
+                .unwrap()
+                .unwrap()
+                .0;
+            let RowLocation::RowPage(page_id) = table.find_row(&guards, row_id).await.unwrap()
+            else {
+                panic!("source must be hot")
+            };
+            let retained = table
+                .row_store
+                .must_get_row_page_shared(&guards, page_id)
+                .await
+                .unwrap();
+            let resume = pause_next_deferred_application();
+            let mut writer_session = engine.new_session().unwrap();
+            let mut writer = writer_session.begin_trx().unwrap();
+            let bound = [Val::from(1i32)];
+            let mut calls = 0;
+            let mut mutation = Box::pin(writer.table_index_mutate_mvcc(
+                crate::TableIndex(table_id, crate::IndexID::new(0)),
+                &bound[..]..=&bound[..],
+                |_| -> CallbackResult<_> {
+                    calls += 1;
+                    Ok(RowMutation::Update(vec![UpdateCol {
+                        idx: 0,
+                        val: Val::from(101i32),
+                    }]))
+                },
+            ));
+            poll_until_deferred_application_pauses(mutation.as_mut()).await;
+            assert_checkpoint_published(&mut maintenance, table_id).await;
+            resume.send_async(()).await.unwrap();
+            let error = mutation.as_mut().await.unwrap_err();
+            let crate::CallbackError::Engine(error) = error;
+            assert_eq!(error.operation_error(), Some(OperationError::DuplicateKey));
+            drop(mutation);
+            assert_eq!(calls, 1);
+            assert!(retained.read_row_by_id(row_id).first_undo_entry().is_none());
+            assert!(!retained.read_row_by_id(row_id).row().is_deleted());
+            assert_eq!(
+                retained
+                    .page()
+                    .header
+                    .approx_deleted
+                    .load(Ordering::Relaxed),
+                0
+            );
+            assert!(table.deletion_buffer().get(row_id).is_none());
+            writer.commit().await.unwrap();
+            drop(retained);
+            drop(guards);
+            drop(table);
+            drop(writer_session);
+            drop(maintenance);
+            engine.shutdown();
+            let engine = lightweight_test_engine(&temp_dir, stem).await;
+            let mut session = engine.new_session().unwrap();
+            let mut reader = session.begin_trx().unwrap();
+            assert_eq!(
+                scan_table_pairs(&mut reader, table_id).await,
+                vec![(1, "original".to_owned()), (101, "collision".to_owned())]
+            );
+            reader.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_table_index_mutate_mvcc_transition_cancellation_retains_deferred_undo_ownership() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "index_mutate_deferred_cancel").await;
@@ -1110,6 +1370,8 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 1, 1, "original").await;
 
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+            let mut maintenance = engine.new_session().unwrap();
             let resume = pause_next_deferred_application();
             let session_id = session.id();
             let mut writer = session.begin_trx().unwrap();
@@ -1124,6 +1386,7 @@ mod tests {
                 },
             ));
             poll_until_deferred_application_pauses(mutation.as_mut()).await;
+            assert_checkpoint_published(&mut maintenance, table_id).await;
             drop(resume);
             drop(mutation);
 

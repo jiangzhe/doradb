@@ -1,8 +1,8 @@
 use crate::buffer::EvictableBufferPool;
 use crate::catalog::{IndexRef, TableIndexSelector};
 use crate::error::{
-    CallbackResult, DiscloseResultExt, OperationError, OperationOrFatalResult, Result,
-    RuntimeResult,
+    CallbackResult, DiscloseResultExt, MultiDomainResultExt, OperationError,
+    OperationOrFatalResult, Result, RuntimeOrFatalResult,
 };
 use crate::id::TableID;
 use crate::index::{
@@ -243,7 +243,7 @@ impl<'trx> IndexScanMvccStream<'trx> {
     }
 
     #[inline]
-    async fn fill_candidates(&mut self) -> RuntimeResult<bool> {
+    async fn fill_candidates(&mut self) -> RuntimeOrFatalResult<bool> {
         if !self.candidates.is_empty() {
             return Ok(true);
         }
@@ -264,7 +264,7 @@ impl<'trx> IndexScanMvccStream<'trx> {
     }
 
     #[inline]
-    async fn next_candidate(&mut self) -> RuntimeResult<Option<IndexLookupCandidate>> {
+    async fn next_candidate(&mut self) -> RuntimeOrFatalResult<Option<IndexLookupCandidate>> {
         if self.fill_candidates().await? {
             Ok(self.candidates.pop_front())
         } else {
@@ -276,7 +276,7 @@ impl<'trx> IndexScanMvccStream<'trx> {
     async fn lookup_candidate(
         &mut self,
         candidate: IndexLookupCandidate,
-    ) -> RuntimeResult<SelectMvcc> {
+    ) -> RuntimeOrFatalResult<SelectMvcc> {
         let state = self
             .state
             .as_mut()

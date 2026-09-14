@@ -4,6 +4,7 @@ use crate::buffer::guard::{
 use crate::buffer::page::{BufferPage, PAGE_SIZE, VersionedPageID, assert_buffer_page};
 use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard, get_page_versioned_shared};
 use crate::catalog::TableColumnLayout;
+use crate::error::{MultiDomainResultExt, RuntimeOrFatalResultExt};
 use crate::error::{
     RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult, Validation,
     Validation::{Invalid, Valid},
@@ -500,7 +501,7 @@ impl RowPageIndex {
         mem_pool: &B,
         mem_pool_guard: &PoolGuard,
         pivot_row_id: RowID,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         self.validate_destroy_pivot(meta_pool_guard, pivot_row_id)
             .await?;
         let mut stack = vec![(self.root_page_id, false)];
@@ -547,7 +548,7 @@ impl RowPageIndex {
                             LatchFallbackMode::Exclusive,
                         )
                         .await
-                        .change_context(RuntimeError::IndexAccess)
+                        .map_err(Into::<RuntimeOrFatalError>::into).change_runtime_context(RuntimeError::IndexAccess)
                         .attach_with(|| {
                             format!("operation=destroy_row_page_index, row_page_id={row_page_id}")
                         })?
@@ -940,11 +941,11 @@ impl RowPageIndex {
         mem_pool_guard: &PoolGuard,
         col_layout: &Arc<TableColumnLayout>,
         count: usize,
-    ) -> RuntimeResult<PageSharedGuard<RowPage>> {
+    ) -> RuntimeOrFatalResult<PageSharedGuard<RowPage>> {
         if let Some(free_page) = self
             .get_insert_page_from_free_list(mem_pool, mem_pool_guard)
             .await
-            .change_context(RuntimeError::IndexAccess)
+            .change_runtime_context(RuntimeError::IndexAccess)
             .attach_with(|| format!("operation=get_insert_row_page, row_count={count}"))?
         {
             return Ok(free_page);
@@ -952,13 +953,14 @@ impl RowPageIndex {
         let mut new_page = mem_pool
             .allocate_page::<RowPage>(mem_pool_guard)
             .await
-            .change_context(RuntimeError::IndexAccess)
+            .map_err(Into::<RuntimeOrFatalError>::into)
+            .change_runtime_context(RuntimeError::IndexAccess)
             .attach_with(|| format!("operation=get_insert_row_page, row_count={count}"))?;
         if let Err(err) = self
             .insert_page_guard(meta_pool_guard, col_layout, count, None, &mut new_page)
             .await
         {
-            return Err(cleanup_failed_no_redo_insert_page(mem_pool, new_page, err));
+            return Err(cleanup_failed_no_redo_insert_page(mem_pool, new_page, err).into());
         }
         Ok(new_page.downgrade_shared())
     }
@@ -977,7 +979,7 @@ impl RowPageIndex {
         if let Some(free_page) = self
             .get_insert_page_from_free_list(mem_pool, mem_pool_guard)
             .await
-            .change_context(RuntimeError::IndexAccess)
+            .change_runtime_context(RuntimeError::IndexAccess)
             .attach_with(|| format!("operation=get_insert_row_page_with_redo, row_count={count}"))?
         {
             return Ok(free_page);
@@ -986,7 +988,8 @@ impl RowPageIndex {
         let mut new_page = mem_pool
             .allocate_page::<RowPage>(mem_pool_guard)
             .await
-            .change_context(RuntimeError::IndexAccess)
+            .map_err(Into::<RuntimeOrFatalError>::into)
+            .change_runtime_context(RuntimeError::IndexAccess)
             .attach_with(|| {
                 format!("operation=get_insert_row_page_with_redo, row_count={count}")
             })?;
@@ -1014,11 +1017,11 @@ impl RowPageIndex {
         mem_pool_guard: &PoolGuard,
         col_layout: &Arc<TableColumnLayout>,
         count: usize,
-    ) -> RuntimeResult<PageExclusiveGuard<RowPage>> {
+    ) -> RuntimeOrFatalResult<PageExclusiveGuard<RowPage>> {
         if let Some(free_page) = self
             .get_insert_page_exclusive_from_free_list(mem_pool, mem_pool_guard)
             .await
-            .change_context(RuntimeError::IndexAccess)
+            .change_runtime_context(RuntimeError::IndexAccess)
             .attach_with(|| format!("operation=get_exclusive_insert_row_page, row_count={count}"))?
         {
             return Ok(free_page);
@@ -1027,7 +1030,8 @@ impl RowPageIndex {
         let mut new_page = mem_pool
             .allocate_page::<RowPage>(mem_pool_guard)
             .await
-            .change_context(RuntimeError::IndexAccess)
+            .map_err(Into::<RuntimeOrFatalError>::into)
+            .change_runtime_context(RuntimeError::IndexAccess)
             .attach_with(|| {
                 format!("operation=get_exclusive_insert_row_page, row_count={count}")
             })?;
@@ -1035,7 +1039,7 @@ impl RowPageIndex {
             .insert_page_guard(meta_pool_guard, col_layout, count, None, &mut new_page)
             .await
         {
-            return Err(cleanup_failed_no_redo_insert_page(mem_pool, new_page, err));
+            return Err(cleanup_failed_no_redo_insert_page(mem_pool, new_page, err).into());
         }
         Ok(new_page)
     }
@@ -1051,11 +1055,12 @@ impl RowPageIndex {
         col_layout: &Arc<TableColumnLayout>,
         count: usize,
         page_id: PageID,
-    ) -> RuntimeResult<PageExclusiveGuard<RowPage>> {
+    ) -> RuntimeOrFatalResult<PageExclusiveGuard<RowPage>> {
         let mut new_page = mem_pool
             .allocate_page_at::<RowPage>(mem_pool_guard, page_id)
             .await
-            .change_context(RuntimeError::IndexAccess)
+            .map_err(Into::<RuntimeOrFatalError>::into)
+            .change_runtime_context(RuntimeError::IndexAccess)
             .attach_with(|| {
                 format!(
                     "operation=allocate_recovery_row_page, page_id={page_id}, row_count={count}"
@@ -1065,7 +1070,7 @@ impl RowPageIndex {
             .insert_page_guard(meta_pool_guard, col_layout, count, None, &mut new_page)
             .await
         {
-            return Err(cleanup_failed_no_redo_insert_page(mem_pool, new_page, err));
+            return Err(cleanup_failed_no_redo_insert_page(mem_pool, new_page, err).into());
         }
         Ok(new_page)
     }
@@ -1169,7 +1174,7 @@ impl RowPageIndex {
         &self,
         mem_pool: &B,
         mem_pool_guard: &PoolGuard,
-    ) -> RuntimeResult<Option<PageSharedGuard<RowPage>>> {
+    ) -> RuntimeOrFatalResult<Option<PageSharedGuard<RowPage>>> {
         loop {
             let page_id = {
                 let mut g = self.insert_free_list.lock();
@@ -1179,7 +1184,9 @@ impl RowPageIndex {
                 page_id
             };
             let Some(page_guard) =
-                get_page_versioned_shared::<RowPage, _>(mem_pool, mem_pool_guard, page_id).await?
+                get_page_versioned_shared::<RowPage, _>(mem_pool, mem_pool_guard, page_id)
+                    .await
+                    .map_err(Into::<RuntimeOrFatalError>::into)?
             else {
                 continue;
             };
@@ -1192,7 +1199,7 @@ impl RowPageIndex {
         &self,
         mem_pool: &B,
         mem_pool_guard: &PoolGuard,
-    ) -> RuntimeResult<Option<PageExclusiveGuard<RowPage>>> {
+    ) -> RuntimeOrFatalResult<Option<PageExclusiveGuard<RowPage>>> {
         loop {
             let page_id = {
                 let mut g = self.insert_free_list.lock();
@@ -1207,7 +1214,8 @@ impl RowPageIndex {
                     page_id,
                     LatchFallbackMode::Exclusive,
                 )
-                .await?
+                .await
+                .map_err(Into::<RuntimeOrFatalError>::into)?
             else {
                 continue;
             };
@@ -1908,6 +1916,7 @@ mod tests {
     }
 
     impl BufferPool for FailingInsertPagePool {
+        type Error = Report<RuntimeError>;
         #[inline]
         fn capacity(&self) -> usize {
             self.inner.capacity()
@@ -2418,6 +2427,9 @@ mod tests {
                 Ok(_) => panic!("expected free-list page reload failure"),
                 Err(err) => err,
             };
+            let RuntimeOrFatalError::Runtime(err) = err else {
+                panic!("expected Runtime error, got {err:?}");
+            };
             assert_eq!(err.current_context(), &RuntimeError::IndexAccess);
             assert!(err.downcast_ref::<IoError>().is_some());
         });
@@ -2456,6 +2468,9 @@ mod tests {
                 Ok(_) => panic!("expected exclusive free-list page reload failure"),
                 Err(err) => err,
             };
+            let RuntimeOrFatalError::Runtime(err) = err else {
+                panic!("expected Runtime error, got {err:?}");
+            };
             assert_eq!(err.current_context(), &RuntimeError::IndexAccess);
             assert!(err.downcast_ref::<IoError>().is_some());
             assert!(blk_idx.insert_free_list.lock().is_empty());
@@ -2481,6 +2496,9 @@ mod tests {
             {
                 Ok(_) => panic!("metadata split should fail in one-page meta pool"),
                 Err(err) => err,
+            };
+            let RuntimeOrFatalError::Runtime(err) = err else {
+                panic!("expected Runtime error, got {err:?}");
             };
             assert_eq!(err.current_context(), &RuntimeError::IndexAccess);
             assert_eq!(
@@ -2510,6 +2528,9 @@ mod tests {
             {
                 Ok(_) => panic!("metadata split should fail in one-page meta pool"),
                 Err(err) => err,
+            };
+            let RuntimeOrFatalError::Runtime(err) = err else {
+                panic!("expected Runtime error, got {err:?}");
             };
             assert_eq!(err.current_context(), &RuntimeError::IndexAccess);
             assert_eq!(
@@ -2547,6 +2568,9 @@ mod tests {
             {
                 Ok(_) => panic!("metadata split should fail in one-page meta pool"),
                 Err(err) => err,
+            };
+            let RuntimeOrFatalError::Runtime(err) = err else {
+                panic!("expected Runtime error, got {err:?}");
             };
             assert_eq!(err.current_context(), &RuntimeError::IndexAccess);
             assert_eq!(

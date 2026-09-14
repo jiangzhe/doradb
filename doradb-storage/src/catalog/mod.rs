@@ -7,6 +7,11 @@ pub(crate) mod spec;
 pub(crate) mod storage;
 pub(crate) mod table;
 
+use crate::error::{
+    DataIntegrityError, DataIntegrityResult, FatalError, MultiDomainResultExt, OperationError,
+    OperationOrRuntimeResult, OperationResult, RuntimeError, RuntimeOrFatalError,
+    RuntimeOrFatalResult, RuntimeOrFatalResultExt, RuntimeResult,
+};
 pub(crate) use checkpoint::*;
 pub use checkpoint::{
     CatalogCheckpointOutcome, CatalogCheckpointReport, CatalogTableCheckpointChange,
@@ -45,10 +50,6 @@ use crate::buffer::{
     ReadonlyBufferPool,
 };
 use crate::component::{Component, ComponentRegistry, MetaPool, ShelfScope};
-use crate::error::{
-    DataIntegrityError, DataIntegrityResult, FatalError, OperationError, OperationOrRuntimeResult,
-    OperationResult, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
-};
 use crate::file::fs::FileSystem;
 use crate::id::{RowID, TableID, TrxID};
 use crate::index::BlockIndex;
@@ -148,7 +149,7 @@ impl CatalogTable {
         index_slot: CatalogIndexNo,
         criteria: IndexLookupCriteria<'_>,
         row_action: F,
-    ) -> RuntimeResult<()>
+    ) -> RuntimeOrFatalResult<()>
     where
         F: for<'m, 'p> FnMut(&'m TableColumnLayout, Row<'p>) -> bool,
     {
@@ -158,12 +159,12 @@ impl CatalogTable {
                     "locked current catalog lookup lacks metadata-S or data-IX authority: table_id={}, index_slot={index_slot}",
                     self.table_id()
                 ))
-                .change_context(RuntimeError::CatalogAccess));
+                .change_context(RuntimeError::CatalogAccess).into());
         }
         self.mem
             .catalog_index_lookup_current(trx.pool_guards(), index_slot, criteria, row_action)
             .await
-            .change_context(RuntimeError::CatalogAccess)
+            .change_runtime_context(RuntimeError::CatalogAccess)
             .attach_with(|| {
                 format!(
                     "operation=index_lookup_current_locked, table_id={}, index_slot={index_slot}",
@@ -226,7 +227,7 @@ impl Catalog {
         poisoner: QuiescentGuard<EnginePoisoner>,
         config: CatalogConfig,
         bootstrap_guards: &PoolGuards,
-    ) -> RuntimeResult<Self> {
+    ) -> RuntimeOrFatalResult<Self> {
         let snapshot = storage.checkpoint_snapshot();
         storage
             .bootstrap_from_checkpoint(
@@ -304,10 +305,7 @@ impl Catalog {
         &self,
         prepared: PreparedCatalogCheckpoint,
     ) -> RuntimeOrFatalResult<CatalogCheckpointReport> {
-        let report = prepared
-            .commit(&self.storage)
-            .await
-            .map_err(RuntimeOrFatalError::from)?;
+        let report = prepared.commit(&self.storage).await?;
         let CatalogCheckpointOutcome::Published {
             catalog_replay_start_ts,
         } = report.outcome
@@ -344,7 +342,7 @@ impl Catalog {
         disk_pool: QuiescentGuard<ReadonlyBufferPool>,
         guards: &PoolGuards,
         table_id: TableID,
-    ) -> RuntimeResult<bool> {
+    ) -> RuntimeOrFatalResult<bool> {
         assert!(
             !self.user_tables.contains_key(&table_id),
             "catalog reload invariant violated: table runtime already exists, table_id={table_id}"
@@ -370,7 +368,7 @@ impl Catalog {
         let table_file = table_fs
             .open_table_file(table.table_id, disk_pool.clone(), guards.disk_guard())
             .await
-            .change_context(RuntimeError::CatalogAccess)
+            .change_runtime_context(RuntimeError::CatalogAccess)
             .attach_with(|| {
                 format!(
                     "operation=reload_create_table, phase=open_table_file, table_id={}",
@@ -403,7 +401,8 @@ impl Catalog {
                 .attach(format!(
                     "operation=reload_create_table, phase=validate_metadata, table_id={}",
                     table.table_id
-                ));
+                ))
+                .map_err(Into::into);
         };
 
         let metadata = Arc::clone(&active_root.metadata);
@@ -446,7 +445,7 @@ impl Catalog {
             active_root.root_ts,
         )
         .await
-        .change_context(RuntimeError::CatalogAccess)
+        .change_runtime_context(RuntimeError::CatalogAccess)
         .attach_with(|| {
             format!(
                 "operation=reload_create_table, phase=build_secondary_indexes, table_id={table_id}"
@@ -489,7 +488,7 @@ impl Catalog {
         &self,
         guards: &PoolGuards,
         table_id: TableID,
-    ) -> RuntimeResult<(TableObject, TableMetadata)> {
+    ) -> RuntimeOrFatalResult<(TableObject, TableMetadata)> {
         let table = self
             .storage
             .tables()
@@ -524,7 +523,7 @@ impl Catalog {
     pub(crate) async fn validate_live_table_descriptors(
         &self,
         guards: &PoolGuards,
-    ) -> RuntimeResult<Vec<TableDescriptorObject>> {
+    ) -> RuntimeOrFatalResult<Vec<TableDescriptorObject>> {
         let descriptors = self
             .storage
             .table_descriptors()
@@ -1209,7 +1208,7 @@ impl Component for Catalog {
     type Config = CatalogConfig;
     type Owned = Self;
     type Access = QuiescentGuard<Self>;
-    type Error = Report<RuntimeError>;
+    type Error = RuntimeOrFatalError;
 
     const NAME: &'static str = "catalog";
 
@@ -1218,7 +1217,7 @@ impl Component for Catalog {
         config: Self::Config,
         registry: &mut ComponentRegistry,
         _shelf: ShelfScope<'_, Self>,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         let meta_pool = registry.dependency::<MetaPool>();
         let table_fs = registry.dependency::<FileSystem>();
         let disk_pool = registry.dependency::<DiskPool>();
@@ -1328,7 +1327,7 @@ impl UserTableCacheEntry {
         entry: &IndexUndo,
         guards: &PoolGuards,
         ts: TrxID,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         let table = &self.table;
         let layout = self
             .user_layout
@@ -1347,7 +1346,7 @@ impl UserTableCacheEntry {
         row_id: RowID,
         unique: bool,
         min_active_sts: TrxID,
-    ) -> RuntimeResult<bool> {
+    ) -> RuntimeOrFatalResult<bool> {
         let table = &self.table;
         let layout = self
             .user_layout

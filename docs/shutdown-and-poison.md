@@ -61,8 +61,9 @@ report immediately; `poisoned == true` with no stored reason is an invariant
 violation.
 
 Concurrent or repeated poison calls do not replace the canonical reason and do
-not emit another poison wake. Each publisher still retains and receives its
-own local Fatal report. This distinction is intentional:
+not emit another poison wake. `poison()` and `poison_shared()` return the
+publisher's local Fatal report; `poison_and_get_first()` returns the stored
+first failure. This distinction is intentional:
 
 - engine admission and unrelated waiters report the first canonical failure;
 - a producer that discovers a later fatal failure may return its own local
@@ -78,7 +79,10 @@ registration plus sticky health rechecks.
 At the API level, `poison_error()` and `ensure_healthy()` reconstruct the
 canonical first report, `listener()` supplies only the wake hint, `poison()`
 captures a local typed report, and `poison_shared()` republishes an already
-captured shared Fatal without rebuilding it.
+captured shared Fatal without rebuilding it. `poison_and_get_first()` publishes
+a local report and returns the cached first shared Fatal for rollback callers.
+Completed publication guarantees a stored reason, so this method requires no
+fallback to the local error.
 
 ### Fatal reasons
 
@@ -104,6 +108,18 @@ Fatal is a policy decision, not a synonym for I/O failure. The owning policy
 boundary stacks the appropriate `FatalError` over the initiating I/O,
 Runtime, DataIntegrity, Resource, panic, or invariant evidence. An already
 Fatal report passes through unchanged.
+
+A shared storage backend progress failure is captured once as
+`FatalError::StorageIo -> IoError -> BackendError` before failing affected
+requests. Request completions clone that shared failure. Buffer and file
+consumers reconstruct its Fatal arm without adding Runtime. Ordinary individual
+request I/O failures still acquire the consuming Runtime context. Pool-generic
+code exposes the pool's native associated error: fixed pools remain Runtime,
+while evictable pools and persisted reads can return Runtime or Fatal.
+
+The operation receives the failure that interrupted it, even when engine poison
+already retains a different first Fatal. Health checks continue to return that
+first report; forwarding an incoming Fatal does not republish or replace it.
 
 ### What poison does
 
@@ -420,23 +436,28 @@ own health checks.
 
 ### Row-page transition routing
 
-A writer or row-undo rollback that finds its original hot row page in
-`TRANSITION` cannot retry until the checkpoint publishes a cold route. An
-exact-generation page miss is the same unresolved route for rollback while
-the pivot still classifies the row as hot. Checkpoint failure after transition
-may prevent publication, so the shared table waiter races route-epoch progress
-with poison and checks health before and after the race. The checkpoint's
-irreversible guard is responsible for poisoning if it exits without a safe
-route publication.
+Foreground mutation that encounters `TRANSITION` waits for authoritative cold
+routing when it needs the LWC image. The shared table waiter races route-epoch
+progress with poison and checks health before and after the race. The
+checkpoint's irreversible guard publishes poison if it cannot publish a safe
+route. The caller releases page and row guards, retains its statement effects,
+and retries from the pivot; the epoch is only a wake hint. A final successful
+health check authorizes immediate retry. Shutdown drains the accepted operation.
 
-The caller releases page-state and row guards before waiting and retries from
-the authoritative pivot after progress; the route epoch is only a wake hint.
-Foreground mutation retains its statement owner. Rollback retains the current
-boxed undo in `RowUndoLogs`, and the enclosing statement effects, terminal
-claim, abandoned cleanup job, or failed-precommit payload owns cancellation or
-fatal retention. A final successful health check authorizes the immediate
-synchronous retry. Clean shutdown does not cancel either accepted owner;
-shutdown drains the session operation or mandatory cleanup task.
+Row-undo cleanup no longer belongs to this wait family. It accesses the exact
+retained generation through existing buffer pin/reload waits, including on
+Transition pages before publication. The current undo and source journal own
+cancellation across page access; local inverse, unlink, marker reconciliation,
+and pop have no intervening await. Between-entry cooperative yields retain the
+remaining vector. Missing generations and invalid ownership/state are Runtime
+access failures, not route waits. Policy owners retain unsafe residuals on
+Runtime and Fatal failures alike. Statement and terminal rollback forward an
+incoming Fatal unchanged. A Runtime failure is promoted to `RollbackAccess`;
+publication then returns the cached first fatal reason if one already exists.
+Failed-precommit cleanup also retains incoming Fatal failures without publishing
+them again; the original redo failure remains its waiter's outcome. Safe cleanup
+may complete despite checkpoint poison and never clears that poison or releases
+active STS before required cleanup finishes.
 
 ### Maintenance progress and checkpoint retry
 
@@ -468,7 +489,7 @@ one row or add a new documented category.
 | Queued logical-lock acquisition | blocker release promotes FIFO prefix and completes success-only waiter | race poison only after entering `Waiting`; return first Fatal and cancel exact pending state | no direct cancellation; graceful session drain waits | `PendingClaimGuard`, then `FreshClaimsGuard` for an acquired prefix |
 | Read-snapshot metadata acquisition | blocker release grants metadata-S, or the exact snapshot entry publishes sticky abort and wakes its listener | the underlying logical-lock wait retains its poison-aware Fatal behavior and cancels exact pending state | close, abandonment, or shutdown requests snapshot abort; a retained checked-out build remains a visible blocker until polled or dropped | pending acquisition guard first, then build checkout and snapshot terminal claim close the accepted prefix |
 | Hot/cold foreign prepare | owner commit or rollback drops the injected prepare notifier | registered and completion-race paths check poison before retry | no direct cancellation; active owner drains | row access/CDB guards plus statement/transaction owner |
-| Row-page transition route | checkpoint publishes a newer route epoch; pivot is authoritative | route-or-poison race; fatal checkpoint guard supplies poison | no direct cancellation; active or mandatory owner drains | foreground row attempt, or vector-owned row undo plus statement/terminal/precommit owner |
+| Row-page transition route | checkpoint publishes a newer route epoch; pivot is authoritative | route-or-poison race; fatal checkpoint guard supplies poison | no direct cancellation; active or mandatory owner drains | foreground row attempt and its statement owner |
 | GC/purge progress and checkpoint retry | monotonic progress, transaction terminal state, or table lifecycle change | poison terminates observation as Fatal | shutdown listener terminates observation | detached listeners and `SessionObserverPin` |
 | Mandatory caller capacity | permit release or admission close | capacity wait races poison; a won permit is acceptance | admission close wakes with Lifecycle shutdown | prepared caller owner before acceptance; mandatory supervisor after it |
 | I/O, page-I/O, redo, group-commit, mandatory-result, and CPU-task completions | owning service publishes success or a typed completion failure; a successful CPU-pool send is acceptance | CPU submission uses the poisoner's atomic fast check and returns cached poison when observed; a racing poison may admit bounded extra work, and accepted ownership is still drained | after outer mandatory drain, private FIFO stop messages follow accepted CPU work and the component owner joins every worker | request owner, completion bridge, and service-specific quarantine/retention; CPU job plus checkpoint queue own encode cleanup |

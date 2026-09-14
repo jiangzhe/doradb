@@ -2,7 +2,8 @@
 
 use crate::buffer::guard::PageGuard;
 use crate::buffer::{BufferPool, PoolGuard};
-use crate::error::RuntimeResult;
+use std::result::Result as StdResult;
+
 use crate::id::{RowID, TrxID};
 use crate::index::btree::{
     BTreeByte, BTreeKey, BTreeKeyEncoder, BTreeNode, BTreeNodeCursor, BTreeU64, GenericBTree,
@@ -27,7 +28,7 @@ impl<P: BufferPool> MemIndex<P> {
         index_pool_guard: &PoolGuard,
         types: Vec<ValType>,
         ts: TrxID,
-    ) -> RuntimeResult<Self> {
+    ) -> StdResult<Self, P::Error> {
         let encoder = BTreeKeyEncoder::new(types);
         let tree = GenericBTree::new(index_pool, index_pool_guard, true, ts).await?;
         Ok(Self::with_encoder(tree, encoder))
@@ -53,7 +54,7 @@ impl<P: BufferPool> MemIndex<P> {
 
     /// Destroy this MemIndex and reclaim all backing tree pages.
     #[inline]
-    pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> RuntimeResult<()> {
+    pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> StdResult<(), P::Error> {
         self.tree.destory(pool_guard).await
     }
 
@@ -175,7 +176,7 @@ where
 
     /// Return the next leaf-bounded cleanup candidate batch.
     #[inline]
-    pub(crate) async fn next_batch(&mut self) -> RuntimeResult<Option<MemIndexCleanupBatch>> {
+    pub(crate) async fn next_batch(&mut self) -> StdResult<Option<MemIndexCleanupBatch>, P::Error> {
         if !self.started {
             self.cursor.seek(&[]).await?;
             self.started = true;

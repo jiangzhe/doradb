@@ -1,6 +1,7 @@
 use crate::buffer::{BufferPool, PoolGuard};
 use crate::catalog::TableIndexMetadata;
-use crate::error::RuntimeResult;
+use std::result::Result as StdResult;
+
 use crate::id::{RowID, TrxID};
 use crate::index::btree::{
     BTREE_BYTE_ZERO, BTreeByte, BTreeDelete, BTreeInsert, BTreeKey, BTreeUpdate,
@@ -46,7 +47,7 @@ impl<P: BufferPool> NonUniqueMemIndex<P> {
         index_spec: &TableIndexMetadata,
         ty_infer: F,
         ts: TrxID,
-    ) -> RuntimeResult<Self> {
+    ) -> StdResult<Self, P::Error> {
         debug_assert!(!index_spec.unique());
         debug_assert!(!index_spec.keys.is_empty());
         let mut types: Vec<_> = index_spec
@@ -75,7 +76,7 @@ impl<P: BufferPool> NonUniqueMemIndex<P> {
 
     /// Destroy this non-unique index and reclaim all backing tree pages.
     #[inline]
-    pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> RuntimeResult<()> {
+    pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> StdResult<(), P::Error> {
         self.0.destroy(pool_guard).await
     }
 
@@ -121,7 +122,7 @@ impl<P: BufferPool> NonUniqueMemIndex<P> {
         encoded_key: &[u8],
         deleted: bool,
         ts: TrxID,
-    ) -> RuntimeResult<bool> {
+    ) -> StdResult<bool, P::Error> {
         Ok(matches!(
             self.tree()
                 .delete_exact(pool_guard, encoded_key, BTREE_BYTE_ZERO, deleted, ts)
@@ -152,7 +153,7 @@ impl<P: BufferPool> GuardedNonUniqueMemIndex<'_, '_, P> {
         key: &[Val],
         row_id: RowID,
         ts: TrxID,
-    ) -> RuntimeResult<IndexMask> {
+    ) -> StdResult<IndexMask, P::Error> {
         debug_assert!(!row_id.is_deleted());
         let k = self.index.encoder().encode_pair(key, Val::from(row_id));
         Ok(
@@ -182,7 +183,7 @@ impl<P: BufferPool> GuardedNonUniqueMemIndex<'_, '_, P> {
         key: &[Val],
         row_id: RowID,
         _ts: TrxID,
-    ) -> RuntimeResult<Option<bool>> {
+    ) -> StdResult<Option<bool>, P::Error> {
         let k = self.index.encoder().encode_pair(key, Val::from(row_id));
         Ok(self
             .index
@@ -200,7 +201,7 @@ impl<P: BufferPool> GuardedNonUniqueMemIndex<'_, '_, P> {
         row_id: RowID,
         merge_if_match_deleted: bool,
         ts: TrxID,
-    ) -> RuntimeResult<IndexInsert> {
+    ) -> StdResult<IndexInsert, P::Error> {
         debug_assert!(!row_id.is_deleted());
         let k = self.index.encoder().encode_pair(key, Val::from(row_id));
         self.insert_encoded_if_not_exists(&k, row_id, merge_if_match_deleted, ts)
@@ -217,7 +218,7 @@ impl<P: BufferPool> GuardedNonUniqueMemIndex<'_, '_, P> {
         row_id: RowID,
         merge_if_match_deleted: bool,
         ts: TrxID,
-    ) -> RuntimeResult<IndexInsert> {
+    ) -> StdResult<IndexInsert, P::Error> {
         debug_assert!(!row_id.is_deleted());
         Ok(
             match self
@@ -245,7 +246,7 @@ impl<P: BufferPool> GuardedNonUniqueMemIndex<'_, '_, P> {
         key: &[Val],
         row_id: RowID,
         ts: TrxID,
-    ) -> RuntimeResult<bool> {
+    ) -> StdResult<bool, P::Error> {
         Ok(matches!(
             self.mask_if_present(key, row_id, ts).await?,
             IndexMask::Masked
@@ -259,7 +260,7 @@ impl<P: BufferPool> GuardedNonUniqueMemIndex<'_, '_, P> {
         key: &[Val],
         row_id: RowID,
         ts: TrxID,
-    ) -> RuntimeResult<bool> {
+    ) -> StdResult<bool, P::Error> {
         debug_assert!(!row_id.is_deleted());
         let k = self.index.encoder().encode_pair(key, Val::from(row_id));
         Ok(
@@ -289,7 +290,7 @@ impl<P: BufferPool> GuardedNonUniqueMemIndex<'_, '_, P> {
         row_id: RowID,
         ignore_del_mask: bool,
         ts: TrxID,
-    ) -> RuntimeResult<bool> {
+    ) -> StdResult<bool, P::Error> {
         debug_assert!(!row_id.is_deleted());
         let k = self.index.encoder().encode_pair(key, Val::from(row_id));
         Ok(
@@ -317,7 +318,7 @@ impl<P: BufferPool> GuardedNonUniqueMemIndex<'_, '_, P> {
         &'a self,
         range: &'a KeyRange,
         _ts: TrxID,
-    ) -> RuntimeResult<NonUniqueMemIndexCandidateStream<'a, P>> {
+    ) -> StdResult<NonUniqueMemIndexCandidateStream<'a, P>, P::Error> {
         Ok(NonUniqueMemIndexCandidateStream::new(
             self.index.tree().cursor(self.pool_guard, 0),
             range,
@@ -330,7 +331,7 @@ impl<P: BufferPool> GuardedNonUniqueMemIndex<'_, '_, P> {
         &'a self,
         range: &'a KeyRange,
         _ts: TrxID,
-    ) -> RuntimeResult<NonUniqueMemIndexCandidateStream<'a, P>> {
+    ) -> StdResult<NonUniqueMemIndexCandidateStream<'a, P>, P::Error> {
         Ok(NonUniqueMemIndexCandidateStream::new(
             self.index.tree().cursor(self.pool_guard, 0),
             range,

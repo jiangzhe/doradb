@@ -281,3 +281,20 @@ Use the narrowest proof owned by the component being collected:
   ownership, while its file unlink uses the durable catalog-absence boundary
 - user-table table-file, LWC replacement, `ColumnBlockIndex`, and `DiskTree`
   page GC use table-file CoW root reachability
+
+## Retained Row Pages During Undo Cleanup
+
+A writer remains registered until required rollback has restored source links
+and unlinked every hot-origin undo from its exact page generation. Page
+retirement is submitted by a system transaction ordered after checkpoint root
+publication. Before submission there is no retirement batch; afterward
+`Global_Min_STS <= writer.STS < retirement.CTS` prevents reclaiming that page
+while cleanup owns undo. Captured readers independently retain the same page
+through their active snapshots. Eviction can require reload but preserves the
+frame generation and version map; it is not reclamation. No permanent pin is
+needed, and a genuine generation miss is a cleanup failure even below the pivot.
+
+Cold-route publication does not remove references from retained hot pages.
+Successful rollback must unlink those references before freeing their boxes.
+After cleanup and captured-reader release, ordinary purge can retire the page
+index and reclaim the frame using the existing horizon and retirement fences.

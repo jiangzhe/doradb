@@ -1,9 +1,11 @@
 //! Resumable B-tree node cursor traversal.
 
+use std::result::Result as StdResult;
+
 use super::{BTreeCoupling, BTreeNode, GenericBTree, SharedStrategy};
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::buffer::{BufferPool, PoolGuard};
-use crate::error::RuntimeResult;
+
 use crate::id::PageID;
 use crate::latch::LatchFallbackMode;
 
@@ -47,7 +49,7 @@ impl BTreeNodeCursorState {
         tree: &GenericBTree<P>,
         pool_guard: &PoolGuard,
         key: &[u8],
-    ) -> RuntimeResult<()> {
+    ) -> StdResult<(), P::Error> {
         self.coupling
             .seek_and_lock(tree, pool_guard, self.height, key)
             .await
@@ -59,7 +61,7 @@ impl BTreeNodeCursorState {
         &mut self,
         tree: &GenericBTree<P>,
         pool_guard: &PoolGuard,
-    ) -> RuntimeResult<Option<PageSharedGuard<BTreeNode>>> {
+    ) -> StdResult<Option<PageSharedGuard<BTreeNode>>, P::Error> {
         if let Some(g) = self.coupling.node.take() {
             return Ok(Some(g));
         }
@@ -126,13 +128,13 @@ impl<'a, P: BufferPool> BTreeNodeCursor<'a, P> {
 
     /// Seek to the first node at this cursor height that may contain `key`.
     #[inline]
-    pub(crate) async fn seek(&mut self, key: &[u8]) -> RuntimeResult<()> {
+    pub(crate) async fn seek(&mut self, key: &[u8]) -> StdResult<(), P::Error> {
         self.state.seek(self.tree, self.pool_guard, key).await
     }
 
     /// Fetch next node.
     #[inline]
-    pub(crate) async fn next(&mut self) -> RuntimeResult<Option<PageSharedGuard<BTreeNode>>> {
+    pub(crate) async fn next(&mut self) -> StdResult<Option<PageSharedGuard<BTreeNode>>, P::Error> {
         self.state.next(self.tree, self.pool_guard).await
     }
 }

@@ -15,7 +15,7 @@ use super::secondary_index::{SecondaryIndex, SecondaryIndexCandidateStream};
 use super::unique_index::UniqueMemIndex;
 use super::{BTreeKey, IndexBatchStream, IndexLookupCandidate, KeyRange};
 use crate::buffer::{BufferPool, PoolGuard, PoolGuards};
-use crate::error::RuntimeResult;
+use crate::error::{RuntimeOrFatalResult, RuntimeResult};
 use crate::table::TableRootSnapshot;
 
 enum MutationMemSource<'scan, P: BufferPool + 'static> {
@@ -33,7 +33,7 @@ impl<P: BufferPool + 'static> MutationMemSource<'_, P> {
     async fn next_batch(
         &self,
         range: &KeyRange,
-    ) -> RuntimeResult<Option<Vec<IndexLookupCandidate>>> {
+    ) -> RuntimeOrFatalResult<Option<Vec<IndexLookupCandidate>>> {
         match self {
             Self::Unique {
                 mem,
@@ -68,7 +68,7 @@ struct MutationMemCandidateSource<'scan, P: BufferPool + 'static> {
 impl<P: BufferPool + 'static> IndexBatchStream<IndexLookupCandidate>
     for MutationMemCandidateSource<'_, P>
 {
-    async fn next_batch(&mut self) -> RuntimeResult<Option<Vec<IndexLookupCandidate>>> {
+    async fn next_batch(&mut self) -> RuntimeOrFatalResult<Option<Vec<IndexLookupCandidate>>> {
         let entries = match &self.last_batch_key {
             Some(key) => {
                 let range = self.original_range.resume_after(key.clone());
@@ -103,7 +103,7 @@ enum MutationDiskSource<'scan> {
 
 impl IndexBatchStream<IndexLookupCandidate> for MutationDiskSource<'_> {
     #[inline]
-    async fn next_batch(&mut self) -> RuntimeResult<Option<Vec<IndexLookupCandidate>>> {
+    async fn next_batch(&mut self) -> RuntimeOrFatalResult<Option<Vec<IndexLookupCandidate>>> {
         match self {
             Self::Unique(stream) => stream.next_batch().await,
             Self::NonUnique(stream) => stream.next_batch().await,
@@ -172,7 +172,7 @@ impl<P: BufferPool + 'static> IndexBatchStream<IndexLookupCandidate>
     for BorrowedIndexMutationStream<'_, '_, P>
 {
     #[inline]
-    async fn next_batch(&mut self) -> RuntimeResult<Option<Vec<IndexLookupCandidate>>> {
+    async fn next_batch(&mut self) -> RuntimeOrFatalResult<Option<Vec<IndexLookupCandidate>>> {
         self.inner.next_batch().await
     }
 }

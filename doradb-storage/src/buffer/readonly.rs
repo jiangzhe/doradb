@@ -17,7 +17,8 @@ use crate::buffer::{
 };
 use crate::error::{
     CompletionErrorBridge, CompletionResult, InternalError, InternalResult, IoError,
-    LifecycleError, LifecycleResult, ResourceError, ResourceResult, RuntimeError, RuntimeResult,
+    LifecycleError, LifecycleResult, MultiDomainResultExt, ResourceError, ResourceResult,
+    RuntimeError, RuntimeOrFatalResult,
 };
 use crate::file::fs::FileSystem;
 use crate::file::{BlockKey, FileKind, SparseFile};
@@ -515,7 +516,7 @@ impl QuiescentGuard<ReadonlyBufferPool> {
         file: &Arc<SparseFile>,
         guard: &PoolGuard,
         block_id: BlockID,
-    ) -> RuntimeResult<ReadonlyBlockGuard> {
+    ) -> RuntimeOrFatalResult<ReadonlyBlockGuard> {
         self.read_shared_block(file_kind, file, guard, block_id, None)
             .await
             .attach_with(|| self.read_diagnostic("read_raw_block", file_kind, file, block_id))
@@ -534,7 +535,7 @@ impl QuiescentGuard<ReadonlyBufferPool> {
         guard: &PoolGuard,
         block_id: BlockID,
         validator: ReadonlyBlockValidator,
-    ) -> RuntimeResult<ReadonlyBlockGuard> {
+    ) -> RuntimeOrFatalResult<ReadonlyBlockGuard> {
         self.read_shared_block(file_kind, file, guard, block_id, Some(validator))
             .await
             .attach_with(|| self.read_diagnostic("read_validated_block", file_kind, file, block_id))
@@ -644,7 +645,7 @@ impl QuiescentGuard<ReadonlyBufferPool> {
         file: &Arc<SparseFile>,
         guard: &PoolGuard,
         key: BlockKey,
-    ) -> RuntimeResult<(VersionedPageID, bool)> {
+    ) -> RuntimeOrFatalResult<(VersionedPageID, bool)> {
         loop {
             if let Some(residency) = self.try_get_residency(&key) {
                 return Ok((residency, true));
@@ -658,8 +659,8 @@ impl QuiescentGuard<ReadonlyBufferPool> {
             }
             let _ = inflight.wait_result().await.map_err(|bridge| {
                 bridge
-                    .replace_context(RuntimeError::BufferPageAccess)
-                    .attach(format!("wait for readonly block load: key={key:?}"))
+                    .into_runtime_or_fatal(RuntimeError::BufferPageAccess)
+                    .attach_with(|| format!("wait for readonly block load: key={key:?}"))
             })?;
             if let Some(residency) = self.try_get_residency(&key) {
                 return Ok((residency, false));
@@ -675,7 +676,7 @@ impl QuiescentGuard<ReadonlyBufferPool> {
         guard: &PoolGuard,
         key: BlockKey,
         validator: ReadonlyBlockValidator,
-    ) -> RuntimeResult<(VersionedPageID, bool)> {
+    ) -> RuntimeOrFatalResult<(VersionedPageID, bool)> {
         loop {
             if let Some(residency) = self.try_get_residency(&key) {
                 return Ok((residency, true));
@@ -695,13 +696,14 @@ impl QuiescentGuard<ReadonlyBufferPool> {
             if let Some(residency) = self.try_get_residency(&key) {
                 return Ok((residency, false));
             }
-            let _ = inflight.wait_result().await.map_err(|bridge| {
-                bridge
-                    .replace_context(RuntimeError::BufferPageAccess)
-                    .attach(format!(
+            let _ =
+                inflight.wait_result().await.map_err(|bridge| {
+                    bridge
+                    .into_runtime_or_fatal(RuntimeError::BufferPageAccess)
+                    .attach_with(|| format!(
                         "wait for validated readonly block load: file={file_kind}, key={key:?}"
                     ))
-            })?;
+                })?;
             if let Some(residency) = self.try_get_residency(&key) {
                 return Ok((residency, false));
             }
@@ -716,7 +718,7 @@ impl QuiescentGuard<ReadonlyBufferPool> {
         guard: &PoolGuard,
         block_id: BlockID,
         validation: Option<ReadonlyBlockValidator>,
-    ) -> RuntimeResult<ReadonlyBlockGuard> {
+    ) -> RuntimeOrFatalResult<ReadonlyBlockGuard> {
         let key = self.block_key(file, block_id);
         self.validate_guard(guard);
         loop {
@@ -1344,9 +1346,9 @@ pub(crate) mod tests {
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
+    use crate::error::RuntimeOrFatalError;
     use crate::error::{
         DataIntegrityError, DataIntegrityResult, LifecycleError, ResourceError, RuntimeError,
-        RuntimeResult,
     };
     use crate::file::block_integrity::{
         BLOCK_INTEGRITY_HEADER_SIZE, COLUMN_BLOCK_INDEX_BLOCK_SPEC,
@@ -1475,7 +1477,7 @@ pub(crate) mod tests {
             &self,
             guard: &PoolGuard,
             block_id: BlockID,
-        ) -> RuntimeResult<ReadonlyBlockGuard> {
+        ) -> RuntimeOrFatalResult<ReadonlyBlockGuard> {
             self.global
                 .read_raw_block(self.file_kind, &self.file, guard, block_id)
                 .await
@@ -1488,7 +1490,7 @@ pub(crate) mod tests {
             guard: &PoolGuard,
             block_id: BlockID,
             validator: ReadonlyBlockValidator,
-        ) -> RuntimeResult<ReadonlyBlockGuard> {
+        ) -> RuntimeOrFatalResult<ReadonlyBlockGuard> {
             self.global
                 .read_validated_block(self.file_kind, &self.file, guard, block_id, validator)
                 .await
@@ -1752,7 +1754,10 @@ pub(crate) mod tests {
             .is_some_and(|state| matches!(&*state, InflightBlockState::WriteBlocked))
     }
 
-    fn assert_completion_data_integrity(err: Report<RuntimeError>) {
+    fn assert_completion_data_integrity(err: RuntimeOrFatalError) {
+        let RuntimeOrFatalError::Runtime(err) = err else {
+            panic!("expected Runtime error, got {err:?}");
+        };
         assert_eq!(err.current_context(), &RuntimeError::BufferPageAccess);
         assert!(err.downcast_ref::<DataIntegrityError>().is_some());
         let report = format!("{err:?}");
@@ -2302,6 +2307,9 @@ pub(crate) mod tests {
                 Ok(_) => panic!("expected readonly write-blocked error"),
                 Err(err) => err,
             };
+            let RuntimeOrFatalError::Runtime(err) = err else {
+                panic!("expected Runtime error, got {err:?}");
+            };
             assert_eq!(err.current_context(), &RuntimeError::BufferPageAccess);
             assert_eq!(
                 err.downcast_ref::<InternalError>().copied(),
@@ -2357,6 +2365,9 @@ pub(crate) mod tests {
             let err = match disk_pool.read_raw_block(&pool_guard, block_id).await {
                 Ok(_) => panic!("expected readonly write-blocked error"),
                 Err(err) => err,
+            };
+            let RuntimeOrFatalError::Runtime(err) = err else {
+                panic!("expected Runtime error, got {err:?}");
             };
             assert_eq!(err.current_context(), &RuntimeError::BufferPageAccess);
             assert_eq!(
@@ -2873,6 +2884,9 @@ pub(crate) mod tests {
                 Ok(_) => panic!("validated read unexpectedly joined raw inflight load"),
                 Err(err) => err,
             };
+            let RuntimeOrFatalError::Runtime(err) = err else {
+                panic!("expected Runtime error, got {err:?}");
+            };
             assert_eq!(
                 err.downcast_ref::<InternalError>().copied(),
                 Some(InternalError::ReadonlyLoadClassConflict)
@@ -3199,6 +3213,9 @@ pub(crate) mod tests {
                 Err(err) => err,
             };
             for err in [&err1, &err2] {
+                let RuntimeOrFatalError::Runtime(err) = err else {
+                    panic!("expected Runtime error, got {err:?}");
+                };
                 assert_eq!(err.current_context(), &RuntimeError::BufferPageAccess);
                 assert!(err.downcast_ref::<IoError>().is_some());
                 let output = format!("{err:?}");

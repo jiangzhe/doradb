@@ -1,6 +1,6 @@
 use super::ColumnDeletionBuffer;
 use crate::buffer::{PoolGuard, ReadonlyBufferPool};
-use crate::error::{DataIntegrityError, RuntimeError, RuntimeResult};
+use crate::error::{DataIntegrityError, RuntimeError, RuntimeOrFatalResult, RuntimeResult};
 use crate::file::table_file::{ActiveRoot, TableFile};
 use crate::id::BlockID;
 use crate::index::SecondaryDiskTreeRuntime;
@@ -112,7 +112,7 @@ impl ColumnStorage {
         &self,
         disk_pool_guard: &PoolGuard,
         block_id: BlockID,
-    ) -> RuntimeResult<PersistedLwcBlock> {
+    ) -> RuntimeOrFatalResult<PersistedLwcBlock> {
         PersistedLwcBlock::load(
             self.file().file_kind(),
             self.file().sparse_file(),

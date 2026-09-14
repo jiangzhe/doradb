@@ -1,6 +1,6 @@
 use crate::buffer::PoolGuards;
 use crate::catalog::{Catalog, SilentWatermarkObject};
-use crate::error::RuntimeResult;
+use crate::error::RuntimeOrFatalResult;
 use crate::id::{PageID, RowID, TableID, TrxID};
 use crate::log::block_group::TrxLog;
 use crate::log::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind};
@@ -119,7 +119,7 @@ impl SysTrx {
         catalog: &Catalog,
         guards: &PoolGuards,
         watermark: SilentWatermarkObject,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         match self.redo.ddl.as_deref() {
             None => {
                 self.redo

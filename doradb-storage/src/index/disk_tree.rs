@@ -15,7 +15,7 @@ use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
 use crate::catalog::{TableIndexMetadata, TableMetadata};
 use crate::error::{
     DataIntegrityError, DataIntegrityResult, MultiDomainResultExt, RuntimeError,
-    RuntimeOrFatalResult, RuntimeResult,
+    RuntimeOrFatalResult, RuntimeOrFatalResultExt, RuntimeResult,
 };
 use crate::file::block_integrity::{validate_block_checksum, write_block_checksum};
 use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile, SUPER_BLOCK_ID};
@@ -669,7 +669,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
     /// The returned guard owns the readonly-buffer reference, so callers can use
     /// the no-copy node view without copying entries out of the block.
     #[inline]
-    async fn read_node(&self, block_id: BlockID) -> RuntimeResult<ValidatedDiskTreeNode<F>> {
+    async fn read_node(&self, block_id: BlockID) -> RuntimeOrFatalResult<ValidatedDiskTreeNode<F>> {
         let guard = self
             .runtime
             .disk_pool
@@ -681,7 +681,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                 F::validate_persisted_block,
             )
             .await
-            .change_context(RuntimeError::IndexAccess)
+            .change_runtime_context(RuntimeError::IndexAccess)
             .attach_with(|| {
                 format!(
                     "operation=read_secondary_disk_tree_node, file={}, block_id={block_id}",
@@ -703,7 +703,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
     ///
     /// Branch traversal follows child block ids until a leaf is reached. Empty
     /// roots and leaf misses return `Ok(None)`.
-    async fn lookup_encoded_entry(&self, key: &[u8]) -> RuntimeResult<Option<LogicalEntry>> {
+    async fn lookup_encoded_entry(&self, key: &[u8]) -> RuntimeOrFatalResult<Option<LogicalEntry>> {
         let Some(mut block_id) = self.root_block_id else {
             return Ok(None);
         };
@@ -727,7 +727,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
     pub(crate) async fn collect_reachable_blocks(
         &self,
         out: &mut BTreeSet<BlockID>,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeOrFatalResult<()> {
         let Some(root_block_id) = self.root_block_id else {
             return Ok(());
         };
@@ -750,7 +750,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                                 self.file_kind()
                             ))
                             .change_context(RuntimeError::IndexAccess)
-                            .attach("operation=collect_secondary_disk_tree_reachable_blocks"));
+                            .attach("operation=collect_secondary_disk_tree_reachable_blocks").into());
                     }
                     out.insert(child_block_id);
                 }
@@ -762,7 +762,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                             self.file_kind()
                         ))
                         .change_context(RuntimeError::IndexAccess)
-                        .attach("operation=collect_secondary_disk_tree_reachable_blocks"));
+                        .attach("operation=collect_secondary_disk_tree_reachable_blocks").into());
                 }
                 out.insert(child_block_id);
             } else {
@@ -775,7 +775,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                                 self.file_kind()
                             ))
                             .change_context(RuntimeError::IndexAccess)
-                            .attach("operation=collect_secondary_disk_tree_reachable_blocks"));
+                            .attach("operation=collect_secondary_disk_tree_reachable_blocks").into());
                     }
                     stack.push(child_block_id);
                 }
@@ -787,7 +787,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                             self.file_kind()
                         ))
                         .change_context(RuntimeError::IndexAccess)
-                        .attach("operation=collect_secondary_disk_tree_reachable_blocks"));
+                        .attach("operation=collect_secondary_disk_tree_reachable_blocks").into());
                 }
                 stack.push(child_block_id);
             }
@@ -1069,7 +1069,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         &self,
         entries: Vec<RewriteEntry>,
         range_upper_fence: Option<&[u8]>,
-    ) -> RuntimeResult<Vec<RewriteEntry>> {
+    ) -> RuntimeOrFatalResult<Vec<RewriteEntry>> {
         if entries.len() < 2 {
             return Ok(entries);
         }
@@ -1118,7 +1118,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         window: &[RewriteEntry],
         height: u16,
         upper_fence: Option<&[u8]>,
-    ) -> RuntimeResult<Vec<RewriteEntry>> {
+    ) -> RuntimeOrFatalResult<Vec<RewriteEntry>> {
         assert!(
             !window.is_empty(),
             "DiskTree rewrite invariant violated: repack window is empty"
@@ -1138,7 +1138,9 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                 }
             }
             validate_logical_entries_sorted(&entries);
-            return self.pack_leaf_rewrite_entries(&entries, upper_fence);
+            return self
+                .pack_leaf_rewrite_entries(&entries, upper_fence)
+                .map_err(Into::into);
         }
 
         let mut children = Vec::new();
@@ -1156,13 +1158,14 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         }
         validate_rewrite_entries_for_height(&children, height - 1);
         self.pack_branch_rewrite_entries(children, height, upper_fence)
+            .map_err(Into::into)
     }
 
     /// Materialize one rewrite entry's payload without reading newly written blocks.
     async fn rewrite_entry_payload(
         &self,
         entry: &RewriteEntry,
-    ) -> RuntimeResult<RewriteEntryPayload> {
+    ) -> RuntimeOrFatalResult<RewriteEntryPayload> {
         match entry {
             RewriteEntry::Pending(entry) => Ok(entry.payload.clone()),
             RewriteEntry::Block(entry) => match self.branch_entry_payload(entry).await? {
@@ -1175,7 +1178,10 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
     }
 
     /// Materialize one branch entry's payload without reading newly written blocks.
-    async fn branch_entry_payload(&self, entry: &BranchEntry) -> RuntimeResult<BranchEntryPayload> {
+    async fn branch_entry_payload(
+        &self,
+        entry: &BranchEntry,
+    ) -> RuntimeOrFatalResult<BranchEntryPayload> {
         if let Some(payload) = &entry.payload {
             return Ok(payload.clone());
         }
@@ -1192,7 +1198,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                     node.height()
                 ))
                 .change_context(RuntimeError::IndexAccess)
-                .attach("operation=decode_secondary_disk_tree_node"));
+                .attach("operation=decode_secondary_disk_tree_node").into());
         }
         if node.is_leaf() {
             let mut entries = Vec::with_capacity(node.count());
@@ -1230,7 +1236,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         mutable_file: &mut M,
         entry: RewriteEntry,
         upper_fence: Option<Vec<u8>>,
-    ) -> RuntimeResult<RewriteEntry> {
+    ) -> RuntimeOrFatalResult<RewriteEntry> {
         match entry {
             RewriteEntry::Pending(mut entry) => {
                 entry.upper_fence = upper_fence;
@@ -1592,7 +1598,7 @@ impl DiskTreeNodeCursorState {
 
     /// Seek to the first leaf that can contain `key`.
     #[inline]
-    pub(crate) async fn seek(&mut self, key: &[u8]) -> RuntimeResult<()> {
+    pub(crate) async fn seek(&mut self, key: &[u8]) -> RuntimeOrFatalResult<()> {
         self.stack.clear();
         self.seek_key.clear();
         let Some(root_block_id) = self.root_block_id else {
@@ -1610,7 +1616,7 @@ impl DiskTreeNodeCursorState {
         &mut self,
         runtime: &DiskTreeRuntime<F>,
         disk_pool_guard: &PoolGuard,
-    ) -> RuntimeResult<Option<DiskTreeLeaf<F>>> {
+    ) -> RuntimeOrFatalResult<Option<DiskTreeLeaf<F>>> {
         while let Some(block_id) = self.stack.pop() {
             let guard = Self::read_node(runtime, disk_pool_guard, block_id).await?;
             let node = guard.node();
@@ -1647,7 +1653,7 @@ impl DiskTreeNodeCursorState {
                             Self::file_kind(runtime)
                         ))
                         .change_context(RuntimeError::IndexAccess)
-                        .attach("operation=scan_secondary_disk_tree_leaf"));
+                        .attach("operation=scan_secondary_disk_tree_leaf").into());
                 }
                 // After the first leaf, remaining stack entries are right
                 // sibling subtrees and can be scanned from their lower fence.
@@ -1675,7 +1681,7 @@ impl DiskTreeNodeCursorState {
                         branch_entries.len()
                     ))
                     .change_context(RuntimeError::IndexAccess)
-                    .attach("operation=scan_secondary_disk_tree_leaf"));
+                    .attach("operation=scan_secondary_disk_tree_leaf").into());
             }
             for entry in branch_entries.into_iter().skip(start_idx).rev() {
                 self.stack.push(entry.block_id);
@@ -1689,7 +1695,7 @@ impl DiskTreeNodeCursorState {
         runtime: &DiskTreeRuntime<F>,
         disk_pool_guard: &PoolGuard,
         block_id: BlockID,
-    ) -> RuntimeResult<ValidatedDiskTreeNode<F>> {
+    ) -> RuntimeOrFatalResult<ValidatedDiskTreeNode<F>> {
         let guard = runtime
             .disk_pool
             .read_validated_block(
@@ -1726,12 +1732,12 @@ impl<'a, F: DiskTreeSpec> DiskTreeNodeCursor<'a, F> {
 
     /// Seek to the first leaf that can contain `key`.
     #[inline]
-    pub(super) async fn seek(&mut self, key: &[u8]) -> RuntimeResult<()> {
+    pub(super) async fn seek(&mut self, key: &[u8]) -> RuntimeOrFatalResult<()> {
         self.state.seek(key).await
     }
 
     /// Return the next persisted leaf and first slot that may match the seek key.
-    pub(super) async fn next_leaf(&mut self) -> RuntimeResult<Option<DiskTreeLeaf<F>>> {
+    pub(super) async fn next_leaf(&mut self) -> RuntimeOrFatalResult<Option<DiskTreeLeaf<F>>> {
         self.state
             .next_leaf(self.runtime, self.disk_pool_guard)
             .await
@@ -1752,14 +1758,14 @@ impl<'a> UniqueDiskTree<'a> {
     /// MVCC visibility; callers are expected to merge this cold-layer answer
     /// with newer index layers when serving user transactions.
     #[inline]
-    pub(crate) async fn lookup(&self, key: &[Val]) -> RuntimeResult<Option<RowID>> {
+    pub(crate) async fn lookup(&self, key: &[Val]) -> RuntimeOrFatalResult<Option<RowID>> {
         let key = self.encoder().encode(key);
         self.lookup_encoded(key.as_bytes()).await
     }
 
     /// Look up one already-encoded logical key.
     #[inline]
-    pub(crate) async fn lookup_encoded(&self, key: &[u8]) -> RuntimeResult<Option<RowID>> {
+    pub(crate) async fn lookup_encoded(&self, key: &[u8]) -> RuntimeOrFatalResult<Option<RowID>> {
         match self.lookup_encoded_entry(key).await? {
             Some(entry) => Ok(Some(entry.row_id.unwrap_or_else(|| {
                 panic!("DiskTree rewrite invariant violated: unique lookup entry has no row id")
@@ -1805,7 +1811,11 @@ pub(crate) type NonUniqueDiskTree<'a> = DiskTree<'a, NonUniqueDiskTreeSpec>;
 impl<'a> NonUniqueDiskTree<'a> {
     /// Return whether one exact `(logical_key, row_id)` entry exists.
     #[inline]
-    pub(crate) async fn contains_exact(&self, key: &[Val], row_id: RowID) -> RuntimeResult<bool> {
+    pub(crate) async fn contains_exact(
+        &self,
+        key: &[Val],
+        row_id: RowID,
+    ) -> RuntimeOrFatalResult<bool> {
         let key = self.encoder().encode_pair(key, Val::from(row_id));
         self.contains_exact_encoded(key.as_bytes()).await
     }
@@ -1813,7 +1823,7 @@ impl<'a> NonUniqueDiskTree<'a> {
     /// Return whether one already-encoded exact `(logical_key, row_id)` entry
     /// exists in the current root snapshot.
     #[inline]
-    pub(crate) async fn contains_exact_encoded(&self, key: &[u8]) -> RuntimeResult<bool> {
+    pub(crate) async fn contains_exact_encoded(&self, key: &[u8]) -> RuntimeOrFatalResult<bool> {
         Ok(self.lookup_encoded_entry(key).await?.is_some())
     }
 
@@ -2612,7 +2622,7 @@ mod tests {
 
     async fn collect_node_summaries<F: DiskTreeSpec>(
         tree: &DiskTree<'_, F>,
-    ) -> RuntimeResult<Vec<NodeSummary>> {
+    ) -> RuntimeOrFatalResult<Vec<NodeSummary>> {
         let Some(root_block_id) = tree.root_block_id else {
             return Ok(Vec::new());
         };
@@ -2644,7 +2654,7 @@ mod tests {
 
     async fn collect_leaf_blocks<F: DiskTreeSpec>(
         tree: &DiskTree<'_, F>,
-    ) -> RuntimeResult<Vec<LeafBlock>> {
+    ) -> RuntimeOrFatalResult<Vec<LeafBlock>> {
         let Some(root_block_id) = tree.root_block_id else {
             return Ok(Vec::new());
         };

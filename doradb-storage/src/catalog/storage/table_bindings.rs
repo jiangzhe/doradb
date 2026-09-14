@@ -7,9 +7,8 @@ use crate::catalog::{
     TableBinding, TableColumnLayout, TableMetadata,
 };
 use crate::error::{
-    DataIntegrityError, DataIntegrityResult, MultiDomainResultExt, OperationError,
-    OperationOrRuntimeError, OperationOrRuntimeResult, QuadResult, RuntimeError,
-    RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
+    DataIntegrityError, DataIntegrityResult, MultiDomainResultExt, OperationError, QuadError,
+    QuadResult, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeOrFatalResultExt,
 };
 use crate::id::TableID;
 use crate::row::{Row, RowRead};
@@ -37,7 +36,7 @@ impl TableBindings<'_> {
         guards: &PoolGuards,
         namespace_id: BindingNamespaceID,
         binding_key: &[u8],
-    ) -> RuntimeResult<Option<TableID>> {
+    ) -> RuntimeOrFatalResult<Option<TableID>> {
         let key = [Val::from(namespace_id.as_u64()), Val::from(binding_key)];
         let table_id = self
             .table
@@ -45,7 +44,7 @@ impl TableBindings<'_> {
                 row.val(layout, 2)
             })
             .await
-            .change_context(RuntimeError::CatalogAccess)
+            .change_runtime_context(RuntimeError::CatalogAccess)
             .attach_with(|| {
                 format!(
                     "operation=find_table_binding, namespace_id={}, binding_key_len={}",
@@ -58,6 +57,7 @@ impl TableBindings<'_> {
             .transpose()
             .change_context(RuntimeError::CatalogAccess)
             .attach("operation=find_table_binding, phase=decode_target")
+            .map_err(Into::into)
     }
 
     /// Rejects binding keys that are already present before CREATE execution.
@@ -69,14 +69,14 @@ impl TableBindings<'_> {
         &self,
         guards: &PoolGuards,
         bindings: &[TableBinding],
-    ) -> OperationOrRuntimeResult<()> {
+    ) -> QuadResult<()> {
         for binding in bindings {
             let found = self
                 .find_uncommitted_table_id(guards, binding.namespace_id(), binding.binding_key())
                 .await
-                .map_err(OperationOrRuntimeError::from)?;
+                .map_err(QuadError::from)?;
             if found.is_some() {
-                return Err(OperationOrRuntimeError::from(
+                return Err(QuadError::from(
                     Report::new(OperationError::DuplicateKey).attach(format!(
                         "managed table binding already exists: namespace_id={}, binding_key_len={}",
                         binding.namespace_id().as_u64(),
@@ -93,7 +93,7 @@ impl TableBindings<'_> {
         &self,
         guards: &PoolGuards,
         table_id: TableID,
-    ) -> RuntimeResult<Vec<TableBindingObject>> {
+    ) -> RuntimeOrFatalResult<Vec<TableBindingObject>> {
         let key = [Val::from(table_id)];
         let mut objects = Vec::new();
         let mut decode_error = None;
@@ -115,12 +115,13 @@ impl TableBindings<'_> {
                 },
             )
             .await
-            .change_context(RuntimeError::CatalogAccess)
+            .change_runtime_context(RuntimeError::CatalogAccess)
             .attach_with(|| format!("operation=list_table_bindings, table_id={table_id}"))?;
         if let Some(error) = decode_error {
             return Err(error
                 .change_context(RuntimeError::CatalogAccess)
-                .attach("operation=list_table_bindings, phase=decode_row"));
+                .attach("operation=list_table_bindings, phase=decode_row")
+                .into());
         }
         objects.sort_unstable_by(|left, right| {
             (left.namespace_id, left.binding_key.as_ref())
@@ -198,7 +199,7 @@ impl TableBindings<'_> {
         &self,
         trx: &PrivateTransaction,
         table_id: TableID,
-    ) -> RuntimeResult<Vec<TableBindingObject>> {
+    ) -> RuntimeOrFatalResult<Vec<TableBindingObject>> {
         let key = [Val::from(table_id)];
         let mut objects = Vec::new();
         let mut decode_error = None;
@@ -223,7 +224,8 @@ impl TableBindings<'_> {
         if let Some(error) = decode_error {
             return Err(error
                 .change_context(RuntimeError::CatalogAccess)
-                .attach("operation=list_locked_table_bindings, phase=decode_row"));
+                .attach("operation=list_locked_table_bindings, phase=decode_row")
+                .into());
         }
         Ok(objects)
     }
