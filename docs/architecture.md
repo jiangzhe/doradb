@@ -1,289 +1,190 @@
 # Storage Architecture
 
-## Overview
-
-Doradb storage is designed for HTAP scenario.
-
-For the storage-engine owner/runtime split, component registration order,
-shutdown sequencing, and guard-lifetime rules, see
-[Engine Component Lifetime](./engine-component-lifetime.md).
-
-The storage has two data formats:
-
-1. In-memory row pages.
-
-In-memory row pages contain hot data which are processed by recent transactions.
-Row pages support in-place updates.
-
-2. LWC blocks on disk.
-
-LWC(LightWeight Columnar) blocks on disk store warm data for persistence.
-This kind of blocks apply lightweight columnar compression, such as bitpacking and dict, to support both fast scan and random access. 
-Updates are converted to delete mask + insert. So there are also delete bitmaps stored accordingly.
-
-It has two indexes:
-
-1. Block index: Maps logical **RowID** to physical location.
-2. B+Tree index: Maps user key to **RowID**.
-
-![doradb-storage-architecture](./images/doradb-storage-architecture.png)
-
-### Row ID
-
-When new data is coming, a unique identifier is assigned to each physical row
-version, called **RowID**. A row version keeps its RowID wherever it is stored.
-
-If an update happens in the in-memory RowStore and the row page can still hold
-the new image, the modification is applied in place. The RowID is reused and
-the previous values are stored in the version chain associated with that RowID.
-If the page is frozen or cannot fit the update, the engine performs a hot move
-update: the old hot RowID is marked deleted with row undo, the replacement
-values are inserted into the RowStore with a new RowID, and runtime unique-key
-branches preserve any older hot owner needed by active snapshots.
-
-If an update targets a persisted row on disk, either in an LWC page or future
-column page, the persisted row version is immutable. The engine installs a
-cold-row delete marker for the old RowID, extracts and modifies the old values,
-and inserts the replacement values into the RowStore with a new RowID. The old
-cold RowID remains meaningful for MVCC visibility, rollback, recovery, and
-secondary-index cleanup until no active snapshot can require it.
-
-Secondary indexes are updated to make the latest logical key point to the new
-RowID. For unique indexes, runtime unique-key links may also connect the new
-hot version back to an older hot or cold owner so older snapshots can still
-resolve the correct visible row.
-
-### Block Index
-
-**Block Index** is the indirection layer between stable **RowID** identity and
-physical storage location.
-
-It allows higher layers to keep using **RowID** even when data moves between
-hot in-memory RowStore and cold persisted LWC blocks.
-
-The design is split into:
-
-- hot in-memory routing for RowStore pages
-- cold persistent CoW routing for LWC blocks
-
-The persistent side also carries cold-row delete payload and the binding needed
-to resolve a cold row inside a persisted block.
-
-For more details, see [Block Index Design](./block-index.md).
-
-### Table File
-
-**Table File** contians all persistent data of single table, including LWC pages, column pages, index pages and bitmap pages.
-
-The principal of data modification in **Table File** is to do it in Copy-on-Write way. Despite of batch insert, background tasks will be executed periodically for row-to-column data transmission, delta merge of index and bitmap.
-
-For more details, see [Table File](./table-file.md).
-
-### Catalog Persistence
-
-Catalog metadata remains cache-first at runtime: foreground lookups and DDL/DML
-operate on the in-memory catalog tables, not on persisted catalog pages.
-Durability is provided by a dedicated multi-table file, `catalog.mtb`, which
-stores checkpointed roots for all logical catalog tables plus overlay metadata
-such as `next_table_id` and `catalog_replay_start_ts`.
-
-User tables still persist to one file per table, but now use deterministic
-fixed-width hex file names. `catalog.mtb` is reserved for the catalog-wide
-checkpoint boundary and is published with the same CoW root-swap pattern used
-by user-table files.
-
-Catalog checkpoint rebuilds the `catalog.mtb` allocation map from the
-to-be-committed mutable catalog root when catalog file blocks are rewritten.
-Metadata-only checkpoints skip that reachability walk and only reclaim the
-displaced catalog meta block. Unlike user-table block reclamation, catalog
-reclamation does not retain the displaced active catalog root because
-foreground catalog access is served from in-memory catalog tables.
-
-Managed user tables add one optional row in `catalog.table_descriptors`. Its
-payload is opaque to storage and limited to 64,000 bytes; the envelope records
-a private revision plus the numeric schema epoch and canonical fingerprint.
-They may also own zero or more roleless rows in `catalog.table_bindings`, keyed
-by an opaque namespace plus at most 16,000 opaque bytes. Managed CREATE commits
-the numeric schema, descriptor, and bindings atomically. Binding resolution
-returns an optimistic `(TableID, storage_epoch)` token and may optionally copy
-one coherent stable-ID schema/descriptor snapshot; no read lock escapes the
-call. DROP removes bindings through their reverse `table_id` index.
-Each live managed catalog entry owns an immutable shared stable-ID schema
-projection and complete descriptor envelope. Binding resolution and managed-DDL
-reads use that value; descriptor rows remain authoritative for persistence and
-independent integrity validation. Managed CREATE/DROP INDEX stages descriptor
-rows from the same accepted definition that it publishes with numeric metadata
-and the runtime layout. DROP TABLE deletes the descriptor through its cascade
-and removes the current definition. Metadata history retains only numeric
-metadata, so obsolete definitions live only as long as their readers.
-
-Recovery validates envelope/schema agreement and binding ownership without
-interpreting opaque bytes. It hydrates managed definitions after final catalog
-and table-file reconciliation, including tables without bindings, before
-foreground admission.
-
-Metadata ownership serves several distinct lifetimes. Active user runtime-layout
-metadata is pointer-identical to current catalog metadata. Superseded history keeps
-logical schema versions, and each table-file root describes its durable numeric
-schema. Physical `RowStore<D>` owns table identity, row-pool resources, the block
-index, and only the stable `Arc<TableColumnLayout>` needed to interpret row
-bytes. Index DDL reuses that column allocation; layout installation and user
-accessor construction check its compatibility with the row store.
-
-`TableRuntimeLayout<R>` binds immutable metadata to exact active index runtimes,
-including sparse slots and the index-ID map. User `Table` combines a RowStore,
-ColumnStorage, and a swappable shared layout whose entries own Arcs of dual-tree
-indexes. A complete `MemTable` combines a RowStore with one fixed generation-zero
-layout that directly owns its memory indexes. CatalogTable wraps that complete
-memory table. Catalog construction validates fixed slot-derived index identities
-before index allocation; memory user tables retain metadata-assigned identities
-even when their IDs differ from their slots.
-
-Table and MemTable constructors synchronously assemble prepared components.
-Creation and recovery own asynchronous index construction; user preparation
-validates the loaded file root before allocating secondary indexes. Assembly
-checks compatibility between the supplied row store and layout. CatalogTable
-owns fixed catalog identity validation and memory-index construction.
-
-Both access paths borrow their existing layout for metadata, exact index lookup,
-and paired metadata/runtime iteration. The owning table and operation admission
-establish table identity; column allocation compatibility and a bare IndexRef
-serve narrower purposes. Layouts acquire neither persisted roots nor row
-ownership. The managed definition owns its projection and envelope, with no
-metadata or executable-runtime reference.
-
-Foreground user and memory/catalog tables share `table/mutate.rs` execution
-through a borrowed `MutationExecutor`. It uses the owner's RowStore and exact
-runtime layout for hot updates, moves, insertion retries, and mutable-index
-effects. `unique_mutate.rs` owns one current-row selection/retry driver and
-invokes each decision at most once. Memory indexes are borrowed directly;
-user indexes expose their mutable half without cloning index owners.
-
-UserTableAccessor retains root capture, cold selection and decoding, CDB
-ownership, persisted-index proof consumption, and cold-owner inspection during
-hot unique-key claims. Cold replacement calls shared insertion under its
-captured root. User insert-page caching and page-creation redo remain distinct
-from memory/catalog free-list allocation. Catalog point callbacks, batch
-deletion, and delete-then-insert replacement retain their private statement
-boundaries and key-based redo.
-
-### Redo Log File
-
-**Redo Log File** contains all committed data of recent transactions.
-
-It's different from the concept of "WAL log" in tranditional database perspective, because it only persists committed data.
-
-It does not contains "undo", therefore it does not support ARIES-style fuzzy checkpoint. The design of transactional system with logging and recovery will be introduced in a separate document.
-
-For more details, see [Redo Log](./redo-log.md).
-
-### Secondary Index
-
-**Secondary Index** is split into a hot in-memory `MemTree` and a persistent
-CoW `DiskTree`.
-
-- `MemTree` serves foreground writes and hot lookups.
-- `DiskTree` stores checkpointed cold secondary-index state.
-- `DiskTree` is updated only as companion work of table data/deletion
-  checkpoint, not by an independent MemTree flush thread.
-
-Unique and non-unique indexes use different physical models:
-
-- unique indexes keep the latest logical-key mapping
-- non-unique indexes keep exact entries keyed by logical key plus row id
-
-For more details, see [Secondary Index Design](./secondary-index.md). The
-overall index split is summarized in [Index Design](./index-design.md), and the
-RowID-based routing layer is documented in [Block Index Design](./block-index.md).
-
-## Transactional System
-
-This system employs a unique persistence and recovery model (No-Steal / No-Force) that fundamentally differs from traditional ARIES algorithms (Steal / No-Force).
-
-See [Transaction System](./transaction-system.md). Table-level metadata and
-data coordination is described in [Lock System](./lock-system.md).
-
-## CPU Thread Pool
-
-The engine owns a fixed-size `ThreadPool` for short, finite, synchronous CPU
-computations. It defaults to two named workers and accepts jobs through an
-unbounded ingress channel. The pool has no public spawning API, cancellation,
-IO, waiting, or lock-acquisition contract. A task panic poisons the engine,
-completes that task with the same typed Fatal reason, and leaves the worker
-available to drain other accepted jobs. Submission checks the engine
-poisoner's atomic healthy path before sending directly; a racing poison may
-admit bounded extra work, while an observed poison returns the cached Fatal.
-
-User-table checkpoint is the first consumer. Page residency, visibility
-analysis, borrowed vector views, secondary-index collection, table-file IO,
-and publication stay on the mandatory runtime. Once an `LwcBuilder` owns a
-complete block input, checkpoint submits serialization, compression, and
-checksum generation to the CPU pool. A checkpoint-private logical-order state
-list bounds blocks that have not reached shared IO to the worker count. Ready
-encodes become CoW data-write submissions in RowID order while later encoding
-continues; shared storage ingress and backend depth provide global write
-backpressure. The checkpoint drains every accepted encode and write before it
-builds the column index or reaches a terminal state.
-
-## Mandatory Background Runtime
-
-The engine owns one single-runner asynchronous executor for obligations that
-must reach a supervised terminal outcome after acceptance. True CPU
-parallelism belongs to the separate thread pool. Effectful session
-maintenance uses this runtime beside table and index DDL: table freeze and
-checkpoint, catalog checkpoint, redo truncation, combined catalog/redo
-maintenance, and secondary `MemIndex` cleanup all prepare their complete
-authority before mandatory admission. Caller preparation and operation-lock
-waiting remain outside runtime capacity and are cancellable. A synchronous
-consuming acceptance edge transfers all prepared resources into mandatory
-ownership before the task is detached.
-
-The same executor replaces the former sequential transaction-cleanup thread.
-Abandoned transactions, explicit terminal rollback, and failed-precommit
-rollback are independent accounted tasks, so different transactions may
-progress concurrently. Rollback within one transaction remains sequential,
-and fatal residual undo ownership is retained before poison is published.
-
-Several accepted tasks can still make cooperative progress when they await IO,
-a completion, or an explicit yield. Caller operation admission and
-engine-internal cleanup admission have separate
-RAII counters. Shutdown closes caller admission first, lets redo submit its
-final cleanup, drains the runtime, and stops purge last. See
-[Engine Component Lifetime](./engine-component-lifetime.md) for the exact
-component ordering and observer ownership contract.
-
-Engine lifecycle admission closes session operation and inspection
-registration against shutdown. After admission drops, stable session operation
-entries account effectful foreground work, per-session observer counts account
-standalone diagnostics and progress waits, and mandatory permits account
-accepted caller or internal cleanup work. Public session and transaction
-handles retain weak reachability to their exact `SessionState`. Successful
-admission returns a short-lived admitted session wrapper that alone exposes the
-normal weak-state upgrade. Consuming that wrapper produces an admitted
-`SessionRuntime`, retaining the same admission until the stable operation or
-observer proof is registered. Operation and transaction identity then resolve
-directly on the pinned state without a session-registry lookup. The state
-reaches immutable component capabilities through `EngineCore`, whose only
-registry back-reference is weak and used for cold pointer-exact removal after a
-session becomes closed and idle.
-
-## Logging, Checkpoint and Recovery
-
-This system adopts logging and recovery strategy of in-memory database system, which uses value logging and redo-only recovery.
-Table-level checkpoint is applied to overcome shortcoming of in-memory database:
-expensive checkponit and slow recovery time. Basically, a background task
-converts row pages to LWC blocks periodically with CoW update on table file.
-The LWC blocks and metadata can be treated as table-level checkpoint.
-
-Catalog checkpointing follows the same replay-boundary idea. A catalog
-checkpoint scans persisted redo from `catalog_replay_start_ts` through the
-durable upper watermark, merges the catalog-row changes into `catalog.mtb`, and
-publishes a new root with `catalog_replay_start_ts = safe_cts + 1`. On restart,
-the engine first loads checkpointed catalog rows from `catalog.mtb`, then
-preloads user tables from their table files, and finally replays only redo at
-or after the coarse replay floor derived from `catalog_replay_start_ts`, loaded
-tables' `heap_redo_start_ts` values, and loaded tables' `deletion_cutoff_ts`
-values.
-
-For publication and replay-bound details, see [Checkpoint](./checkpoint.md).
-For restart ordering and redo replay, see [Recovery](./recovery.md).
+Doradb is a storage engine for hybrid transactional and analytical processing
+(HTAP). Its central design is to keep recent, frequently changed data in a
+row-oriented memory layer while publishing older committed data into compact,
+column-oriented files. The same tables and indexes span both layers.
+
+This document explains the stable concepts, boundaries, and design rules of the
+engine. It is the entry point for understanding how the pieces fit together;
+the linked design documents are authoritative for formats, algorithms, and
+runtime details.
+
+## Architecture At A Glance
+
+Foreground transactions operate on mutable in-memory state. Commit effects
+that must survive restart are recorded in the redo log. Background checkpoints
+convert eligible committed rows into immutable LWC (Lightweight Columnar)
+blocks and publish the corresponding persistent index and deletion state
+atomically through Copy-on-Write (CoW) roots.
+
+Reads see one logical table across the hot and cold layers. Secondary indexes
+resolve logical keys to `RowID`s, and the block index resolves each `RowID` to
+its current in-memory or persisted location.
+
+```mermaid
+flowchart LR
+    Tx["Transactions<br/>MVCC and locks"]
+    Hot["Hot mutable state<br/>RowStore, MemIndex, delete state"]
+    Redo["Committed redo log"]
+    Checkpoint["Checkpoint"]
+    Cold["Checkpointed CoW state<br/>LWC, DiskTree, delete state"]
+    Reads["Point reads and scans"]
+    Secondary["Secondary indexes<br/>logical key to RowID"]
+    Block["Block index<br/>RowID to hot or cold location"]
+    Recovery["Recovery"]
+
+    Tx -->|foreground changes| Hot
+    Tx -->|recovery-visible commits| Redo
+    Hot -->|eligible committed state| Checkpoint
+    Checkpoint -->|atomic root publication| Cold
+    Reads -->|keyed lookup| Secondary
+    Secondary --> Block
+    Reads -->|table scan| Block
+    Block --> Hot
+    Block --> Cold
+    Redo --> Recovery
+    Cold --> Recovery
+    Recovery --> Hot
+```
+
+## Architectural Principles
+
+### Separate Mutable And Persistent State
+
+Foreground writes modify the hot `RowStore`, in-memory index state, and
+transient deletion state. They do not update persistent table or index pages
+in place. Persisted structures are immutable or changed through CoW
+publication, which keeps transaction latency independent of random
+persistent-page updates.
+
+### Persist Only Committed State
+
+Doradb uses a No-Steal / No-Force persistence model:
+
+- uncommitted state is not written into persistent table structures;
+- a commit does not force table and index pages to their final locations; and
+- recovery combines checkpointed committed state with committed redo, without
+  an ARIES-style undo pass over persisted pages.
+
+Undo information still exists in memory for transaction rollback and MVCC. It
+is distinct from the committed redo used for crash recovery.
+
+### Separate Logical Identity From Physical Placement
+
+A `RowID` identifies a stored row entry independently of its current location.
+Moving an entry from the hot layer into an LWC block preserves its `RowID`.
+An update that replaces an entry may allocate a new `RowID`, while the old
+entry remains available as long as transaction visibility requires it.
+
+This separation lets indexes and readers address rows without embedding page
+or block locations that checkpointing may change.
+
+### Publish A Coherent Table State
+
+Each table checkpoint publishes the table data, cold-row deletion state, and
+persistent secondary-index changes required by that checkpoint through one
+coherent root transition. A new root becomes visible only after its required
+state has been written. Readers continue using an older captured root until
+they can safely move to the new one.
+
+### Give Accepted Work A Clear Owner
+
+Preparation and admission for background operations remain caller-owned and
+cancellable until the engine accepts the obligation. Once accepted,
+maintenance and cleanup work is owned and supervised by the engine through
+completion or a reported fatal failure. CPU-bound finite work and asynchronous
+effectful work use separate execution resources. Engine shutdown closes new
+admission and drains accepted obligations in ownership order.
+
+## Storage And Identity Model
+
+### Hot And Cold Rows
+
+New rows enter the in-memory `RowStore`, which is optimized for transactional
+access and maintains the MVCC history needed by active readers. Updates that
+fit the hot representation can remain there.
+
+Checkpointing freezes eligible hot rows and encodes their committed images as
+LWC blocks. LWC is a lightweight compressed, column-oriented format designed
+to support both scans and row lookup. Persisted rows are immutable: a
+foreground update of a cold row records deletion state for the old entry and
+places the replacement in the hot layer.
+
+### Two Indexing Layers
+
+Doradb deliberately separates two indexing responsibilities:
+
+1. The **secondary index** maps a user key to one or more `RowID`s. Its mutable
+   `MemIndex` covers hot changes, while its persistent `DiskTree` covers
+   checkpointed state.
+2. The **block index** maps a `RowID` to the physical row page or persisted LWC
+   block that currently owns the entry.
+
+Together they provide one access path across different storage formats.
+Transaction and table access code, rather than the indexes alone, decides MVCC
+visibility.
+
+### Persistent Files
+
+Each user table has a table file containing its checkpointed LWC data, block
+index state, cold-row deletion state, and persistent secondary-index roots.
+Updates create new blocks and metadata roots, then atomically switch the file
+to the new root. Superseded blocks are reclaimed only after they are no longer
+reachable by readers.
+
+The catalog is kept in memory for foreground access and checkpointed into its
+own multi-table file. Catalog and user-table recovery follow the same general
+rule: load published CoW state, then apply the committed redo not already
+covered by that state.
+
+The redo log is separate from table files. It is an ordered, committed-only
+record of effects that must survive restart until checkpointed state makes the
+corresponding log history unnecessary.
+
+## Core Data Flows
+
+### Read
+
+A keyed read searches the secondary index for candidate `RowID`s, resolves
+their locations through the block index, and applies transaction visibility to
+the hot or cold representations. A table scan plans work across both storage
+layers, applies the same visibility rules, and combines the results into one
+logical stream.
+
+### Write And Commit
+
+Inserts and replacement rows are written to the hot layer. Updates and deletes
+record the in-memory history or deletion state needed by current transactions,
+and mutable index effects are applied alongside the row change. Commit orders
+the transaction and records any effect that must be recoverable before it is
+covered by a checkpoint.
+
+### Checkpoint
+
+A table checkpoint selects eligible committed hot state, writes LWC blocks and
+companion index or deletion changes, and publishes a new CoW root. Catalog
+checkpointing similarly folds committed catalog changes into the catalog file.
+Published replay boundaries allow covered redo to be excluded from future
+recovery and eventually reclaimed.
+
+### Recovery
+
+Recovery loads the last valid catalog and user-table roots, replays the
+remaining committed redo in the required order, and rebuilds volatile hot and
+in-memory index state. Foreground access starts only after the recovered
+catalog, table files, and runtime structures agree.
+
+## Component Boundaries And Further Reading
+
+| Area | Architectural responsibility | Detailed design |
+| --- | --- | --- |
+| Public API | Engine, session, transaction, data access, and maintenance contracts | [Public API](./public-api.md) |
+| Transactions and concurrency | MVCC, commit ordering, rollback, locks, and visibility | [Transaction System](./transaction-system.md), [Lock System](./lock-system.md) |
+| Indexing | Logical-key access and `RowID`-to-location routing | [Index Design](./index-design.md), [Secondary Index](./secondary-index.md), [Block Index](./block-index.md) |
+| Table persistence | CoW table-file layout and durable table roots | [Table File](./table-file.md) |
+| Durability | Committed redo, checkpoint publication, and restart reconstruction | [Redo Log](./redo-log.md), [Checkpoint](./checkpoint.md), [Recovery](./recovery.md) |
+| Checkpoint maintenance | Hot-row conversion and cold-row deletion publication | [Data Checkpoint](./data-checkpoint.md), [Deletion Checkpoint](./deletion-checkpoint.md) |
+| Memory and I/O | Page residency, eviction, and asynchronous direct I/O | [Buffer Pool](./buffer-pool.md), [Async I/O](./async-io.md) |
+| Runtime lifecycle | Component ownership, accepted work, shutdown, and failure handling | [Engine Component Lifetime](./engine-component-lifetime.md), [Shutdown And Engine Poison](./shutdown-and-poison.md) |
+| Reclamation | Removal of transaction history and unreachable storage state | [Garbage Collection](./garbage-collect.md) |
