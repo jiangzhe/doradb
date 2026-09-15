@@ -331,7 +331,7 @@ impl BlockIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
+    use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, RowVersionMapGuard};
     use crate::buffer::page::{BufferPage, VersionedPageID};
     use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard, PoolRole};
     use crate::catalog::{
@@ -439,6 +439,14 @@ mod tests {
         }
 
         #[inline]
+        async fn get_row_version_map(
+            &self,
+            guard: &PoolGuard,
+            id: VersionedPageID,
+        ) -> Option<RowVersionMapGuard> {
+            self.inner.get_row_version_map(guard, id).await
+        }
+
         fn deallocate_page<T: BufferPage>(&self, g: PageExclusiveGuard<T>) {
             self.inner.deallocate_page(g)
         }

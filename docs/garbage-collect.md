@@ -42,6 +42,25 @@ needed by active readers. Runtime unique-key links are part of that same
 lifecycle: they preserve old unique-key ownership across row chains and are not
 owned by secondary-index full-scan cleanup.
 
+Row-undo purge acquires resident `RowVersionMap` metadata by exact
+`VersionedPageID`. A shared frame latch pins its context while immutable start
+RowID and reserved capacity locate the row slot. This path never reads page
+bytes, reloads an evicted page, changes cache temperature, or marks the page
+dirty. A stale generation cannot expose a replacement map. Missing runtime
+context on a matching initialized generation is an invariant violation.
+
+The shared version-mutation access acquires the page-state read lock before
+the row write latch and brackets Frozen pruning with paired mutation-version
+increments. It releases both before index cleanup. Pruning unlinks non-owning
+undo references; the committed transaction list owns the allocations until
+row and index cleanup finish. Catalog missing generations are skipped; user
+missing generations retain committed Delete-marker promotion. An out-of-range
+RowID or empty chain on a valid map does not trigger that fallback.
+
+Secondary-index cleanup may still load current row values to prove that no
+version matches a key. Physical rollback also retains its exact-generation
+page access. Only row-undo pruning has the no-reload guarantee.
+
 Runtime unique-key links are not collectible merely because a row crossed the
 column-store pivot, disappeared from the deletion buffer, or became cold. They
 are collectible only when rollback/index-undo obligations are gone and

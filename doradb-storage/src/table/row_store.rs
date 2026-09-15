@@ -1,5 +1,5 @@
 use super::validate_page_row_range;
-use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
+use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard, RowVersionMapGuard};
 use crate::buffer::page::VersionedPageID;
 use crate::buffer::{BufferPool, PoolGuard, PoolGuards, RowPoolRole, get_page_versioned_shared};
 use crate::catalog::TableColumnLayout;
@@ -258,6 +258,18 @@ impl<D: BufferPool> RowStore<D> {
         )
         .await
         .map_err(Into::into)
+    }
+
+    /// Pins resident row-version metadata using this row store's existing pool root.
+    #[inline]
+    pub(crate) async fn get_row_version_map(
+        &self,
+        guards: &PoolGuards,
+        page_id: VersionedPageID,
+    ) -> Option<RowVersionMapGuard> {
+        self.mem_pool()
+            .get_row_version_map(self.row_pool_guard(guards), page_id)
+            .await
     }
 
     /// Pins the exact retained generation and validates the initialized row range.

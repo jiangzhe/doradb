@@ -6852,6 +6852,69 @@ mod tests {
     }
 
     #[test]
+    fn test_metadata_purge_after_preparation_forces_locked_checkpoint_rebuild() {
+        smol::block_on(async {
+            let temp = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp, "metadata-purge-rebuild").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 1, 2, "prune").await;
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+            let target = session.last_cts();
+            session
+                .wait_for_purge_completion_after(target)
+                .await
+                .unwrap();
+            wait_for_checkpoint_root_ready(&mut session, table_id).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let page_id = table.checkpoint_workflow.frozen_page_ids().unwrap()[0];
+            let page = table
+                .row_store
+                .must_get_row_page_shared(&session.pool_guards(), page_id)
+                .await
+                .unwrap();
+            let row_id = page.page().row_id(0);
+            let id = page.versioned_page_id();
+            let undo = OwnedRowUndo::new(
+                NON_FOREGROUND_STMT_NO,
+                table_id,
+                Some(id),
+                row_id,
+                RowUndoKind::Lock,
+            );
+            *page.unwrap_vmap().try_write_row(row_id).unwrap() = Some(Box::new(RowUndoHead::new(
+                Arc::new(shared_trx_status(target)),
+                undo.leak(),
+            )));
+            drop(page);
+            let metadata = table
+                .row_store
+                .get_row_version_map(&session.pool_guards(), id)
+                .await
+                .unwrap();
+            set_test_stable_page_plans_refreshed_hook(&engine, move || {
+                let mut access = metadata.version_map().try_write_row(row_id).unwrap();
+                access.purge_undo_chain(target + 1);
+                assert!(access.is_none());
+                drop(access);
+                drop(metadata);
+                drop(undo);
+            });
+            let rebuilt = Arc::new(AtomicBool::new(false));
+            let hook_rebuilt = Arc::clone(&rebuilt);
+            set_test_locked_page_plan_rebuild_hook(&engine, move |actual| {
+                assert_eq!(actual, page_id);
+                hook_rebuilt.store(true, AtomicOrdering::Relaxed);
+            });
+            assert!(matches!(
+                session.checkpoint_table(table_id).await.unwrap(),
+                CheckpointOutcome::Published { .. }
+            ));
+            assert!(rebuilt.load(AtomicOrdering::Relaxed));
+        });
+    }
+
+    #[test]
     fn test_first_page_locked_rebuild_represents_frozen_observed_pre_fence_ownership() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();

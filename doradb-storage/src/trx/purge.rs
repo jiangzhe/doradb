@@ -1,5 +1,5 @@
 use crate::buffer::PoolGuards;
-use crate::buffer::guard::{PageGuard, PageSharedGuard};
+use crate::buffer::guard::RowVersionMapGuard;
 use crate::catalog::{
     Catalog, DroppedTableFileCleanup, DroppedTableRuntime, TableCache, catalog_index_slot,
 };
@@ -11,7 +11,6 @@ use crate::id::{TableID, TrxID};
 use crate::map::{FastHashMap, FastHashSet};
 use crate::obs;
 use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
-use crate::row::RowPage;
 use crate::runtime;
 use crate::table::Table;
 use crate::thread;
@@ -444,35 +443,42 @@ impl TransactionSystem {
                         let Some(table) = table_cache.get_catalog_table(undo.table_id) else {
                             continue;
                         };
-                        let page_guard = if let Some(page_id) = undo.page_id {
-                            table
-                                .row_store
-                                .get_row_page_versioned_shared(guards, page_id)
-                                .await?
+                        let map_guard = if let Some(page_id) = undo.page_id {
+                            table.row_store.get_row_version_map(guards, page_id).await
                         } else {
                             None
                         };
-                        let Some(page_guard) = page_guard else {
+                        let Some(map_guard) = map_guard else {
+                            // An absent page ID or stale allocation leaves no
+                            // matching chain to visit. Catalog rows have no CDB
+                            // marker to promote. A matching initialized frame
+                            // without its map is rejected by the lookup above.
                             continue;
                         };
-                        purge_undo_chain_from_page(page_guard, undo, min_active_sts);
+                        purge_undo_chain_from_map(map_guard, undo, min_active_sts);
                     } else {
                         let Some(table) = table_cache.get_user_table(undo.table_id) else {
                             continue;
                         };
-                        let page_guard = if let Some(page_id) = undo.page_id {
-                            table
-                                .row_store
-                                .get_row_page_versioned_shared(guards, page_id)
-                                .await?
+                        let map_guard = if let Some(page_id) = undo.page_id {
+                            table.row_store.get_row_version_map(guards, page_id).await
                         } else {
                             None
                         };
-                        let Some(page_guard) = page_guard else {
+                        let Some(map_guard) = map_guard else {
+                            // Cold-origin undo has no page ID. Hot-origin Delete
+                            // undo can also outlive checkpoint retirement when
+                            // its writer commits after the retirement transaction.
+                            // An earlier horizon satisfying retirement CTS <
+                            // horizon <= writer CTS can reclaim the page while
+                            // retaining this undo. Its CDB marker survives and
+                            // still needs promotion here. A matching initialized
+                            // frame without a map already fails the buffer-pool
+                            // invariant during lookup above.
                             promote_delete_marker_if_needed(table, undo);
                             continue;
                         };
-                        purge_undo_chain_from_page(page_guard, undo, min_active_sts);
+                        purge_undo_chain_from_map(map_guard, undo, min_active_sts);
                     }
                 }
             }
@@ -1294,8 +1300,12 @@ impl PurgeDispatcher {
                         Err(_) => return,
                     }
                 }
-                // Wait for every remote bucket's undo/index work before the
-                // dispatcher deallocates any retired page.
+                // Wait for every remote bucket's eligible undo/index work before
+                // deallocating retired pages. Only CTS < curr_sts participates.
+                // A writer that commits after the retirement transaction stops
+                // pinning the horizon when its active STS is removed, but its
+                // undo may remain ineligible. This barrier therefore allows the
+                // later missing-map case handled in purge_trx_list_inner.
                 if let Some((done_rx, expected_remote_tasks)) = remote_results {
                     for _ in 0..expected_remote_tasks {
                         match done_rx.recv_async().await {
@@ -1551,26 +1561,28 @@ fn promote_delete_marker_if_needed(table: &Table, undo: &OwnedRowUndo) {
 }
 
 #[inline]
-fn purge_undo_chain_from_page(
-    page_guard: PageSharedGuard<RowPage>,
+fn purge_undo_chain_from_map(
+    map_guard: RowVersionMapGuard,
     undo: &OwnedRowUndo,
     min_active_sts: TrxID,
 ) {
-    let page = page_guard.page();
-    if !page.row_id_in_valid_range(undo.row_id) {
-        return;
+    if let Some(mut access) = map_guard.version_map().try_write_row(undo.row_id) {
+        access.purge_undo_chain(min_active_sts);
     }
-    let mut access = page_guard.write_row_by_id(undo.row_id);
-    access.purge_undo_chain(min_active_sts);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::page::VersionedPageID;
+    use crate::buffer::frame::FrameKind;
+    use crate::buffer::guard::PageGuard;
+    use crate::buffer::page::{PAGE_SIZE, Page, VersionedPageID};
     use crate::buffer::{BufferPool, PoolGuards, PoolRole};
+    use crate::buffer::{test_evict_existing_page, test_frame_kind};
     use crate::catalog::IndexSlot;
+    use crate::catalog::storage::TABLE_ID_TABLES;
     use crate::catalog::tests::table1;
+    use crate::catalog::{StorageColumnFlags, StorageColumnSpec, StorageTableSpec};
     use crate::conf::{DEFAULT_GC_BUCKETS, EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{FatalError, RuntimeError};
@@ -1579,6 +1591,7 @@ mod tests {
     use crate::latch::LatchFallbackMode;
     use crate::row::RowPage;
     use crate::row::ops::SelectKey;
+    use crate::session::tests::wait_for_purge_handoff;
     use crate::table::tests::{bound_unique_index, trx_delete_row_by_id};
     use crate::table::{DeleteMarker, TableRedoReplayFloor};
     use crate::trx::tests::shared_trx_status;
@@ -1586,12 +1599,185 @@ mod tests {
     use crate::trx::{
         CommittedTrxPayload, MIN_ACTIVE_TRX_ID, NON_FOREGROUND_STMT_NO, SysTrxPayload,
     };
-    use crate::value::Val;
+    use crate::value::{Val, ValKind};
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use std::time::Instant;
     use tempfile::TempDir;
+
+    async fn no_index_table(engine: &Engine) -> TableID {
+        engine
+            .new_session()
+            .unwrap()
+            .create_table(
+                StorageTableSpec {
+                    columns: vec![StorageColumnSpec::new(
+                        ValKind::VarByte,
+                        StorageColumnFlags::empty(),
+                    )],
+                },
+                vec![],
+            )
+            .await
+            .unwrap()
+            .table_id()
+    }
+
+    async fn row_page_identity(
+        table: &Table,
+        guards: &PoolGuards,
+        row_id: RowID,
+    ) -> VersionedPageID {
+        let RowLocation::RowPage(page_id) = table.find_row(guards, row_id).await.unwrap() else {
+            panic!("expected hot row {row_id}");
+        };
+        let page = table
+            .row_store
+            .must_get_row_page_shared(guards, page_id)
+            .await
+            .unwrap();
+        let map = page.unwrap_vmap();
+        let start = page.page().header.start_row_id;
+        let capacity = u64::from(page.page().header.max_row_count);
+        assert!(map.try_write_row(start).is_some());
+        assert!(map.try_write_row(start + (capacity - 1)).is_some());
+        assert!(map.try_write_row(start + capacity).is_none());
+        if start != RowID::new(0) {
+            assert!(map.try_write_row(RowID::new(start.as_u64() - 1)).is_none());
+        }
+        page.versioned_page_id()
+    }
+
+    async fn run_row_purge_residency_case(evicted: bool, workers: usize) {
+        let temp = TempDir::new().unwrap();
+        // 512 frame slots and exactly 128 resident page reservations.
+        let engine = Engine::bootstrap(
+            purge_test_engine_config(temp.path(), "row_metadata_purge", 2, workers).data_buffer(
+                EvictableBufferPoolConfig::default()
+                    .max_mem_size(128 * PAGE_SIZE + 522 * 128)
+                    .max_file_size(512 * PAGE_SIZE),
+            ),
+        )
+        .await
+        .unwrap();
+        let table_id = no_index_table(&engine).await;
+        let table = engine.inner().core.catalog().get_table(table_id).unwrap();
+        let guards = full_pool_guards(&engine);
+        let mut writer = engine.new_session().unwrap();
+        writer
+            .wait_for_purge_completion_after(engine.inner().trx_sys.purge_handoff_cts())
+            .await
+            .unwrap();
+        let initial = engine.inner().trx_sys.trx_sys_stats();
+        let mut reader = engine.new_session().unwrap();
+        let snapshot = reader.begin_trx().unwrap();
+        let row_count = if evicted { 192 } else { 4 };
+        let payload = vec![7u8; 48 * 1024];
+        let mut rows = Vec::new();
+        let mut target = TrxID::new(0);
+        for _ in 0..row_count {
+            let mut trx = writer.begin_trx().unwrap();
+            let row_id = trx
+                .table_insert_mvcc(table_id, vec![Val::from(payload.as_slice())])
+                .await
+                .unwrap();
+            target = trx.commit().await.unwrap();
+            let id = row_page_identity(&table, &guards, row_id).await;
+            rows.push((row_id, id));
+            if evicted {
+                test_evict_existing_page(engine.inner().pools.mem.clone(), id.page_id).await;
+            }
+        }
+        if evicted {
+            // Later insertion retries can revisit earlier full pages. Spill the
+            // complete final set after those foreground accesses have ended.
+            for &(_, id) in &rows {
+                if test_frame_kind(&engine.inner().pools.mem, id.page_id) != FrameKind::Evicted {
+                    test_evict_existing_page(engine.inner().pools.mem.clone(), id.page_id).await;
+                }
+            }
+        }
+        let sys = &engine.inner().trx_sys;
+        loop {
+            let handoff = sys.purge_handoff_listener();
+            if sys.purge_handoff_cts() >= target {
+                break;
+            }
+            handoff.await;
+        }
+        for &(row_id, id) in &rows {
+            let map = table
+                .row_store
+                .get_row_version_map(&guards, id)
+                .await
+                .unwrap();
+            assert!(map.version_map().try_write_row(row_id).unwrap().is_some());
+        }
+        assert_eq!(sys.trx_sys_stats().purge_row_count, initial.purge_row_count);
+        // Unrelated resident pages expose cache displacement caused by
+        // any accidental row-undo reload. Setup and spill IO precede baseline.
+        let pool = &engine.inner().pools.mem;
+        let mut pressure = Vec::new();
+        if evicted {
+            for _ in 0..96 {
+                let page = pool
+                    .allocate_page::<Page>(guards.mem_guard())
+                    .await
+                    .unwrap();
+                pressure.push(page.page_id());
+                drop(page);
+            }
+        }
+        let pressure_evicted_before = pressure
+            .iter()
+            .filter(|&&id| test_frame_kind(pool, id) == FrameKind::Evicted)
+            .count();
+        let before = pool.stats();
+        let started = Instant::now();
+        snapshot.commit().await.unwrap();
+        writer
+            .wait_for_purge_completion_after(target)
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        for &(row_id, id) in &rows {
+            let map = table
+                .row_store
+                .get_row_version_map(&guards, id)
+                .await
+                .unwrap();
+            assert!(map.version_map().try_write_row(row_id).unwrap().is_none());
+        }
+        let delta = pool.stats().delta_since(before);
+        let evicted_rows = rows
+            .iter()
+            .filter(|(_, id)| test_frame_kind(pool, id.page_id) == FrameKind::Evicted)
+            .count();
+        let displaced = pressure
+            .iter()
+            .filter(|&&id| test_frame_kind(pool, id) == FrameKind::Evicted)
+            .count();
+        eprintln!(
+            "row-purge workers={workers} evicted={evicted} rows={row_count} frame_capacity={} pressure_pages={} elapsed={elapsed:?} delta={delta:?} evicted_rows={evicted_rows} pressure_evicted_before={pressure_evicted_before} pressure_evicted_after={displaced}",
+            pool.capacity(),
+            pressure.len()
+        );
+        assert_eq!(delta.queued_reads, 0);
+        assert_eq!(delta.completed_reads, 0);
+        assert_eq!(delta.cache_misses, 0);
+        assert_eq!(delta.cache_hits, 0);
+        assert_eq!(evicted_rows, if evicted { row_count } else { 0 });
+        assert_eq!(
+            sys.trx_sys_stats().purge_row_count,
+            initial.purge_row_count + row_count
+        );
+        assert_eq!(
+            sys.trx_sys_stats().purge_index_count,
+            initial.purge_index_count
+        );
+    }
 
     #[inline]
     fn full_pool_guards(engine: &Engine) -> PoolGuards {
@@ -3710,6 +3896,170 @@ mod tests {
                 init_stats.purge_index_count + PURGE_SIZE
             );
             drop(session);
+        });
+    }
+    #[test]
+    fn test_row_purge_evicted_without_reads() {
+        smol::block_on(async {
+            for workers in [1, 2] {
+                run_row_purge_residency_case(true, workers).await;
+            }
+        });
+    }
+
+    #[test]
+    fn test_row_purge_resident_without_cache_access() {
+        smol::block_on(run_row_purge_residency_case(false, 1));
+    }
+
+    #[test]
+    fn test_row_purge_catalog_uses_resident_version_metadata() {
+        smol::block_on(async {
+            let (_temp, engine) = purge_test_engine("catalog-row-metadata", 2, 1).await;
+            let mut reader = engine.new_session().unwrap();
+            let snapshot = reader.begin_trx().unwrap();
+            no_index_table(&engine).await;
+            let guards = full_pool_guards(&engine);
+            let catalog = engine
+                .inner()
+                .core
+                .catalog()
+                .get_catalog_table(TABLE_ID_TABLES)
+                .unwrap();
+            let page = catalog
+                .row_store
+                .get_insert_page_exclusive(&guards, 1)
+                .await
+                .unwrap();
+            let id = page.versioned_page_id();
+            let row_id = page.page().header.start_row_id;
+            assert!(page.page().header.row_count() > 0);
+            assert!(page.unwrap_vmap().try_write_row(row_id).unwrap().is_some());
+            let target = page.unwrap_vmap().read_latch(0).as_ref().unwrap().ts();
+            drop(page);
+            snapshot.commit().await.unwrap();
+            wait_for_purge_handoff(&reader, target).await.unwrap();
+            reader
+                .wait_for_purge_completion_after(target)
+                .await
+                .unwrap();
+            let map = catalog
+                .row_store
+                .get_row_version_map(&guards, id)
+                .await
+                .unwrap();
+            assert!(map.version_map().try_write_row(row_id).unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn test_row_purge_valid_map_does_not_promote_delete_markers() {
+        smol::block_on(async {
+            let (_temp, engine) = purge_test_engine("valid-map-marker", 2, 1).await;
+            let table_id = no_index_table(&engine).await;
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
+            let guards = full_pool_guards(&engine);
+            let page = table
+                .row_store
+                .get_insert_page_exclusive(&guards, 4)
+                .await
+                .unwrap();
+            let id = page.versioned_page_id();
+            let start = page.page().header.start_row_id;
+            let end = start + u64::from(page.page().header.max_row_count);
+            drop(page);
+            for row_id in [start, end] {
+                let status = Arc::new(shared_trx_status(TrxID::new(100)));
+                table
+                    .deletion_buffer()
+                    .put_ref(row_id, Arc::clone(&status), MAX_SNAPSHOT_TS)
+                    .unwrap();
+                let mut row_undo = RowUndoLogs::empty();
+                row_undo.push(OwnedRowUndo::new(
+                    NON_FOREGROUND_STMT_NO,
+                    table_id,
+                    Some(id),
+                    row_id,
+                    RowUndoKind::delete(),
+                ));
+                let trx = CommittedTrx {
+                    cts: TrxID::new(100),
+                    payload: Some(CommittedTrxPayload::User {
+                        sts: TrxID::new(1),
+                        gc_no: 0,
+                        row_undo,
+                        index_gc: vec![],
+                    }),
+                };
+                engine
+                    .inner()
+                    .trx_sys
+                    .purge_trx_list(
+                        engine.inner().core.catalog(),
+                        &guards,
+                        vec![trx],
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(table.deletion_buffer().get(row_id), Some(DeleteMarker::Ref(actual)) if Arc::ptr_eq(&actual, &status))
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn test_recovered_row_metadata_preserves_nonzero_identity_and_create_cts() {
+        smol::block_on(async {
+            let temp = TempDir::new().unwrap();
+            let config = || purge_test_engine_config(temp.path(), "row_metadata_recovery", 2, 1);
+            let engine = Engine::bootstrap(config()).await.unwrap();
+            let table_id = no_index_table(&engine).await;
+            let mut expected = Vec::new();
+            {
+                let table = engine.inner().core.catalog().get_table(table_id).unwrap();
+                let guards = full_pool_guards(&engine);
+                let mut session = engine.new_session().unwrap();
+                for _ in 0..2 {
+                    let mut trx = session.begin_trx().unwrap();
+                    let row_id = trx
+                        .table_insert_mvcc(
+                            table_id,
+                            vec![Val::from(vec![3u8; 48 * 1024].as_slice())],
+                        )
+                        .await
+                        .unwrap();
+                    trx.commit().await.unwrap();
+                    let id = row_page_identity(&table, &guards, row_id).await;
+                    let map = table
+                        .row_store
+                        .get_row_version_map(&guards, id)
+                        .await
+                        .unwrap();
+                    expected.push((row_id, map.version_map().create_cts()));
+                }
+            }
+            assert!(expected[1].0 > RowID::new(0));
+            drop(engine);
+            let recovered = Engine::bootstrap(config()).await.unwrap();
+            let table = recovered
+                .inner()
+                .core
+                .catalog()
+                .get_table(table_id)
+                .unwrap();
+            let guards = full_pool_guards(&recovered);
+            for (row_id, create_cts) in expected {
+                let id = row_page_identity(&table, &guards, row_id).await;
+                let map = table
+                    .row_store
+                    .get_row_version_map(&guards, id)
+                    .await
+                    .unwrap();
+                assert_eq!(map.version_map().create_cts(), create_cts);
+                assert!(map.version_map().try_write_row(row_id).unwrap().is_none());
+            }
         });
     }
 }

@@ -35,6 +35,21 @@ mutation-version increments. The value is a change detector, not an odd/even
 seqlock: different row writers may overlap, so a plan is reusable only when the
 complete value is equal before and after preparation.
 
+`RowVersionWriteAccess` owns this contract for physical row writes and
+resident-metadata undo pruning. Both retain shared frame access, then acquire
+the page-state read lock and row write latch in that order. Frozen access
+publishes an opening increment after locking and a closing increment before
+either lock drops, including empty-chain and already-covered-horizon no-ops.
+Raw row-latch operations remain policy-neutral so checkpoint can use them
+while already holding the page-state write lock.
+
+Metadata pruning during preparation invalidates an optimistic plan. Final
+state write locking drains any in-flight modifier before comparing the full
+version and reusing or rebuilding a plan. Pruning after Transition publication
+changes only chain metadata; live bytes, prepared bitmap, borrowed columns,
+row count, and checkpoint membership remain fixed. Active and Transition
+version access does not increment the Frozen counter.
+
 ## Table-Owned Workflow
 
 One live table owns at most one canonical frozen-page batch. The workflow

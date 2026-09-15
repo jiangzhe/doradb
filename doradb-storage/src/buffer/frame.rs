@@ -1,7 +1,7 @@
 use crate::buffer::page::Page;
 use crate::catalog::TableColumnLayout;
 use crate::file::cow_file::INVALID_BLOCK_ID;
-use crate::id::{BlockID, FileID, PageID, TrxID};
+use crate::id::{BlockID, FileID, PageID, RowID, TrxID};
 use crate::latch::HybridLatch;
 use crate::recovery::RowRecoveryMap;
 use crate::trx::ver_map::RowVersionMap;
@@ -141,9 +141,15 @@ impl BufferFrame {
 
     /// Installs row-version context metadata for a row page.
     #[inline]
-    pub(crate) fn init_undo_map(&mut self, column_layout: Arc<TableColumnLayout>, max_size: usize) {
+    pub(crate) fn init_undo_map(
+        &mut self,
+        column_layout: Arc<TableColumnLayout>,
+        start_row_id: RowID,
+        max_size: usize,
+    ) {
         self.ctx = Some(Box::new(FrameContext::RowVerMap(RowVersionMap::new(
             column_layout,
+            start_row_id,
             max_size,
         ))));
     }
@@ -257,7 +263,7 @@ pub(super) enum FrameContext {
 mod tests {
     use super::BufferFrame;
     use crate::catalog::{StorageColumnFlags, StorageColumnSpec, TableMetadata};
-    use crate::id::TrxID;
+    use crate::id::{RowID, TrxID};
     use crate::value::ValKind;
     use std::sync::Arc;
 
@@ -276,7 +282,7 @@ mod tests {
     fn test_row_context_accessors_distinguish_runtime_and_recovery_maps() {
         let metadata = metadata();
         let mut frame = BufferFrame::default();
-        frame.init_undo_map(Arc::clone(&metadata.col), 1);
+        frame.init_undo_map(Arc::clone(&metadata.col), RowID::new(0), 1);
 
         assert!(Arc::ptr_eq(
             &frame.unwrap_vmap().column_layout,

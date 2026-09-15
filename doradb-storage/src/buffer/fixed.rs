@@ -1,7 +1,9 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::arena::QuiescentArena;
 use crate::buffer::frame::{BufferFrame, FrameKind};
-use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageLatchGuard};
+use crate::buffer::guard::{
+    FacadePageGuard, PageExclusiveGuard, PageLatchGuard, RowVersionMapGuard,
+};
 use crate::buffer::page::{BufferPage, Page, VersionedPageID};
 use crate::buffer::{
     BufferPool, BufferPoolStatsHandle, PoolGuard, PoolIdentity, PoolRole, RowPoolRole,
@@ -240,6 +242,15 @@ impl BufferPool for FixedBufferPool {
         }
         self.stats.record_cache_hit();
         Ok(Some(g))
+    }
+
+    #[inline]
+    async fn get_row_version_map(
+        &self,
+        guard: &PoolGuard,
+        id: VersionedPageID,
+    ) -> Option<RowVersionMapGuard> {
+        self.arena.get_row_version_map(guard, id).await
     }
 
     /// Deallocate page.
