@@ -14,7 +14,9 @@ use crate::trx::undo::{
     ForwardLinkUndo, ForwardLinks, HotForwardSource, IndexBranch, IndexBranchTarget, MainBranch,
     NextRowUndo, OwnedRowUndo, RowUndoHead, RowUndoKind, RowUndoKindView, RowUndoRef, UndoStatus,
 };
-use crate::trx::ver_map::{RowPageState, RowVersionMap, RowVersionReadGuard, RowVersionWriteGuard};
+use crate::trx::ver_map::{
+    RowPageState, RowVersionMap, RowVersionReadGuard, RowVersionWriteAccess,
+};
 use crate::trx::{
     MvccVisibility, PrepareListenerResult, SharedTrxStatus, StmtNo, TrxContext, TrxRuntime,
     trx_is_committed,
@@ -869,9 +871,7 @@ pub(crate) struct RowWriteAccess<'a> {
     page: &'a RowPage,
     dirty: &'a AtomicBool,
     row_idx: usize,
-    guard: RowVersionWriteGuard<'a>,
-    state_guard: RwLockReadGuard<'a, RowPageState>,
-    frozen_version_map: Option<&'a RowVersionMap>,
+    guard: RowVersionWriteAccess<'a>,
 }
 
 impl<'a> RowWriteAccess<'a> {
@@ -908,23 +908,12 @@ impl<'a> RowWriteAccess<'a> {
         row_idx: usize,
         state_guard: RwLockReadGuard<'a, RowPageState>,
     ) -> Self {
-        let guard = ver_map.write_latch(row_idx);
-        let frozen_version_map = if *state_guard == RowPageState::Frozen {
-            // The row latch and page-state guard are already held, so a final
-            // page-state writer cannot pass this modifier before its paired
-            // closing bump is published from `Drop`.
-            ver_map.begin_frozen_mutation();
-            Some(ver_map)
-        } else {
-            None
-        };
+        let guard = RowVersionWriteAccess::with_state_guard(ver_map, row_idx, state_guard);
         RowWriteAccess {
             page,
             dirty,
             row_idx,
             guard,
-            state_guard,
-            frozen_version_map,
         }
     }
 
@@ -1103,7 +1092,7 @@ impl<'a> RowWriteAccess<'a> {
     /// Returns the row page state observed by this write access.
     #[inline]
     pub(crate) fn page_state(&self) -> RowPageState {
-        *self.state_guard
+        self.guard.page_state()
     }
 
     /// Returns whether the caller already owns the destination's write chain.
@@ -1311,68 +1300,6 @@ impl<'a> RowWriteAccess<'a> {
         undo_head.next.indexes.push(branch);
     }
 
-    /// Purge undo chain according to minimum active STS.
-    /// This method removes out-of-date versions from the next list.
-    /// The real deletion of undo logs is performed later.
-    #[inline]
-    pub(crate) fn purge_undo_chain(&mut self, min_active_sts: TrxID) {
-        match &mut *self.guard {
-            None => (),
-            Some(undo_head) => {
-                if undo_head.purge_ts >= min_active_sts {
-                    // Another thread already prune this version chain.
-                    return;
-                }
-                undo_head.purge_ts = min_active_sts;
-
-                // Check whether the head can be purged.
-                let ts = undo_head.ts();
-                if trx_is_committed(ts) && ts < min_active_sts {
-                    // The newest hot row-page image is older than every active
-                    // snapshot. No reader can need older main or unique-index
-                    // branches, so the whole undo head can be detached.
-                    self.guard.take();
-                    return;
-                }
-                let mut entry = undo_head.next.main.entry.as_mut();
-                loop {
-                    let mut entry_next = mem::take(&mut entry.next);
-                    if entry_next.is_none() {
-                        return;
-                    }
-                    let next = entry_next.as_mut().unwrap();
-                    // purge main branch
-                    if next.main.status.can_purge(min_active_sts) {
-                        // main branch can be purged means index branches can also
-                        // be purged, because index branches have smaller timestamps.
-                        entry.next.take();
-                        return;
-                    }
-                    // purge index branches
-                    let mut idx = next.indexes.len();
-                    // remove old links.
-                    while idx > 0 {
-                        idx -= 1;
-                        if next.indexes[idx]
-                            .purge_cts()
-                            .is_some_and(|cts| cts < min_active_sts)
-                        {
-                            // This runtime unique branch only preserves an
-                            // older owner for snapshots at or before its CTS.
-                            // Once that CTS is below the oldest active
-                            // snapshot, the latest mapping alone is enough.
-                            next.indexes.swap_remove(idx);
-                        }
-                    }
-                    // update back
-                    entry.next = entry_next;
-                    // go to next version, which should be main branch.
-                    entry = entry.next.as_mut().unwrap().main.entry.as_mut();
-                }
-            }
-        }
-    }
-
     /// Checks exact active ownership before any cleanup mutation or unlink.
     pub(crate) fn validate_undo_head(
         &self,
@@ -1547,16 +1474,6 @@ impl<'a> RowWriteAccess<'a> {
     }
 }
 
-impl Drop for RowWriteAccess<'_> {
-    #[inline]
-    fn drop(&mut self) {
-        if let Some(ver_map) = self.frozen_version_map {
-            // This runs before Rust releases either retained lock field.
-            ver_map.finish_frozen_mutation();
-        }
-    }
-}
-
 /// Result of trying to install or reuse a row undo lock.
 pub(crate) enum LockUndo {
     /// The row undo lock is available or installed.
@@ -1703,7 +1620,7 @@ pub(crate) mod tests {
     fn test_read_latest_uses_committed_page_image_newer_than_snapshot() {
         let metadata = sparse_metadata();
         let page = row_page(&metadata);
-        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), page.header.start_row_id, 4);
         let status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 99));
         commit_shared_trx_status(&status, TrxID::new(10));
         install_test_undo_head(&row_ver, status);
@@ -1721,7 +1638,7 @@ pub(crate) mod tests {
     fn test_read_latest_allows_own_head_and_rejects_foreign_active_head() {
         let metadata = sparse_metadata();
         let page = row_page(&metadata);
-        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), page.header.start_row_id, 4);
         let trx_ctx = test_trx_context(TrxID::new(1));
         install_test_undo_head(&row_ver, Arc::clone(trx_ctx.status()));
         {
@@ -1742,7 +1659,7 @@ pub(crate) mod tests {
         let metadata = sparse_metadata();
         let page = row_page(&metadata);
         assert!(page.set_deleted(0, true));
-        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), page.header.start_row_id, 4);
         let status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 99));
         install_test_undo_head(&row_ver, Arc::clone(&status));
         let access = test_row_read_access(&page, &row_ver, 0);
@@ -1781,7 +1698,8 @@ pub(crate) mod tests {
             if latest_deleted {
                 assert!(page.set_deleted(0, true));
             }
-            let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+            let row_ver =
+                RowVersionMap::new(Arc::clone(&metadata.col), page.header.start_row_id, 4);
             let owner = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 10));
             let undo_kind = match kind {
                 CaseKind::Lock => RowUndoKind::Lock,
@@ -1845,7 +1763,7 @@ pub(crate) mod tests {
     fn test_ownerless_scan_replays_repeated_sparse_updates_like_foreign_reader() {
         let metadata = sparse_metadata();
         let page = row_page(&metadata);
-        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), page.header.start_row_id, 4);
         let older = OwnedRowUndo::new(
             NON_FOREGROUND_STMT_NO,
             TableID::new(1),
@@ -1905,7 +1823,7 @@ pub(crate) mod tests {
     fn test_index_candidate_requires_resolved_metadata() {
         let metadata = sparse_metadata();
         let page = row_page(&metadata);
-        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), page.header.start_row_id, 4);
         let encoder = BTreeKeyEncoder::new(vec![ValType::new(ValKind::I32, false)]);
         let key = [Val::from(10i32)];
         // Slot 1 is inactive. A caller cannot admit this candidate against metadata.
@@ -1944,7 +1862,7 @@ pub(crate) mod tests {
     fn test_index_candidate_mvcc_follows_catalog_branch_to_previous_owner() {
         let metadata = sparse_metadata();
         let page = row_page(&metadata);
-        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), page.header.start_row_id, 4);
         let newest = OwnedRowUndo::new(
             NON_FOREGROUND_STMT_NO,
             CATALOG_TABLE_ID_START,
@@ -2032,7 +1950,8 @@ pub(crate) mod tests {
                 page.insert(metadata.col.as_ref(), &[Val::from(10i32), Val::from(30i32)])
                     .is_ok()
             );
-            let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+            let row_ver =
+                RowVersionMap::new(Arc::clone(&metadata.col), page.header.start_row_id, 4);
             let dirty = AtomicBool::new(false);
             let writer = test_trx_context(TrxID::new(10));
             let reader = test_trx_context(TrxID::new(20));
@@ -2240,7 +2159,7 @@ pub(crate) mod tests {
     fn test_row_write_access_pairs_frozen_mutation_version() {
         let metadata = sparse_metadata();
         let page = row_page(&metadata);
-        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), page.header.start_row_id, 4);
         *row_ver.write_state() = RowPageState::Frozen;
         let dirty = AtomicBool::new(false);
 
@@ -2260,7 +2179,7 @@ pub(crate) mod tests {
     fn test_row_write_access_marks_dirty_for_page_image_mutations() {
         let metadata = sparse_metadata();
         let page = row_page_with_two_rows(&metadata);
-        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), page.header.start_row_id, 4);
         let dirty = AtomicBool::new(false);
 
         drop(test_row_write_access(&page, &row_ver, &dirty, 0));
@@ -2292,7 +2211,7 @@ pub(crate) mod tests {
     fn test_row_write_access_closes_frozen_version_during_unwind() {
         let metadata = sparse_metadata();
         let page = row_page(&metadata);
-        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), page.header.start_row_id, 4);
         *row_ver.write_state() = RowPageState::Frozen;
         let dirty = AtomicBool::new(false);
 
@@ -2309,7 +2228,7 @@ pub(crate) mod tests {
     fn test_overlapping_frozen_writers_do_not_use_version_parity_as_quiescence() {
         let metadata = sparse_metadata();
         let page = row_page_with_two_rows(&metadata);
-        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), page.header.start_row_id, 4);
         *row_ver.write_state() = RowPageState::Frozen;
         let dirty = AtomicBool::new(false);
 
@@ -2329,7 +2248,7 @@ pub(crate) mod tests {
     fn test_active_page_mutations_do_not_change_frozen_version() {
         let metadata = sparse_metadata();
         let page = row_page_with_two_rows(&metadata);
-        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), page.header.start_row_id, 4);
         let dirty = AtomicBool::new(false);
         assert_eq!(row_ver.inspect_state(), RowPageState::Active);
 
@@ -2387,7 +2306,10 @@ pub(crate) mod tests {
             Arc::new(shared_trx_status(TrxID::new(20))),
             purge_undo.leak(),
         )));
-        test_row_write_access(&page, &row_ver, &dirty, 1).purge_undo_chain(TrxID::new(21));
+        row_ver
+            .try_write_row(RowID::new(101))
+            .unwrap()
+            .purge_undo_chain(TrxID::new(21));
 
         assert_eq!(row_ver.frozen_mutation_version(), 0);
     }
@@ -2396,7 +2318,7 @@ pub(crate) mod tests {
     fn test_frozen_delete_rollbacks_and_purge_publish_paired_versions() {
         let metadata = sparse_metadata();
         let page = row_page_with_two_rows(&metadata);
-        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), page.header.start_row_id, 4);
         *row_ver.write_state() = RowPageState::Frozen;
         let dirty = AtomicBool::new(false);
         let repeated_status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 9));
@@ -2489,7 +2411,7 @@ pub(crate) mod tests {
         {
             let mut access = test_row_write_access(&page, &row_ver, &dirty, 1);
             assert_eq!(row_ver.frozen_mutation_version(), prepared_version + 1);
-            access.purge_undo_chain(TrxID::new(21));
+            access.guard.purge_undo_chain(TrxID::new(21));
         }
         assert_eq!(row_ver.frozen_mutation_version(), prepared_version + 2);
     }
@@ -2533,7 +2455,7 @@ pub(crate) mod tests {
     fn test_find_old_version_for_unique_key_inactive_index_returns_none() {
         let metadata = sparse_metadata();
         let page = row_page(&metadata);
-        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), page.header.start_row_id, 4);
         let access = test_row_read_access(&page, &row_ver, 0);
         let key = SelectKey::new(IndexSlot::new(1), vec![Val::from(10i32)]);
         let trx_ctx = test_trx_context(TrxID::new(1));

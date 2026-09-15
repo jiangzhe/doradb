@@ -1,6 +1,8 @@
 use crate::buffer::frame::{BufferFrame, FrameKind};
-use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageLatchGuard};
-use crate::buffer::page::{BufferPage, Page};
+use crate::buffer::guard::{
+    FacadePageGuard, PageExclusiveGuard, PageLatchGuard, RowVersionMapGuard,
+};
+use crate::buffer::page::{BufferPage, Page, VersionedPageID};
 use crate::buffer::util::{deallocate_frame_and_page_arrays, initialize_frame_and_page_arrays};
 use crate::buffer::{PoolGuard, PoolIdentity};
 use crate::error::ResourceResult;
@@ -8,6 +10,9 @@ use crate::id::PageID;
 use crate::ptr::UnsafePtr;
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
 use std::ptr::{drop_in_place, from_ref};
+
+#[cfg(test)]
+pub(crate) use self::tests::outstanding_base_guard_count;
 
 /// Cloneable guard that keeps arena frame/page mappings alive while accessed.
 #[derive(Clone)]
@@ -150,6 +155,16 @@ impl Drop for ArenaInner {
     }
 }
 
+// SAFETY: moving this owner transfers the mapping pointers without moving the
+// frames or pages. BufferFrame is Send, and mapping allocation/destruction has
+// no thread affinity. QuiescentArena drains keepalives before dropping us.
+unsafe impl Send for ArenaInner {}
+
+// SAFETY: mapping pointers and capacity are immutable after construction.
+// Shared frame access uses BufferFrame's atomics and latches; mutable page and
+// context access requires the frame latch and a matching pool keepalive.
+unsafe impl Sync for ArenaInner {}
+
 /// Quiescent owner for one stable frame/page arena.
 pub(crate) struct QuiescentArena {
     // Field order is part of the safety contract. `keepalive` must drop before
@@ -196,6 +211,8 @@ impl QuiescentArena {
     }
 
     /// Converts a matching pool guard into an arena guard.
+    /// The containing owner must remain at a stable address while arena guards
+    /// exist; production pools establish this through their QuiescentBox owner.
     #[inline]
     pub(crate) fn arena_guard(&self, guard: PoolGuard) -> ArenaGuard {
         guard.assert_matches(self.identity, "arena guard");
@@ -216,6 +233,45 @@ impl QuiescentArena {
     #[inline]
     pub(crate) fn frame(&self, page_id: PageID) -> &BufferFrame {
         self.state.frame(page_id)
+    }
+
+    /// Pins resident row metadata without consulting or loading the page image.
+    /// Returns `None` for an out-of-range, stale, or uninitialized identity.
+    /// Purge can encounter a stale identity when checkpoint retirement precedes
+    /// a later-committing writer's undo eligibility. Eviction alone preserves
+    /// both the identity and its resident version map.
+    ///
+    /// A matching initialized identity must have runtime row-version context;
+    /// absent or recovery context is an invariant violation, not missing undo.
+    pub(crate) async fn get_row_version_map(
+        &self,
+        guard: &PoolGuard,
+        id: VersionedPageID,
+    ) -> Option<RowVersionMapGuard> {
+        guard.assert_matches(self.identity, "arena row-version map");
+        let offset = usize::try_from(id.page_id.as_u64()).ok()?;
+        if offset >= self.state.capacity {
+            return None;
+        }
+        let frame = self.frame(id.page_id);
+        if frame.generation() != id.generation {
+            return None;
+        }
+        // Bind the keepalive before raw latch state, preserving reverse local
+        // drop order even if acquisition is cancelled while suspended.
+        let keepalive = guard.clone();
+        // Existing generic-latch wait: the exclusive holder produces progress.
+        // Poison/shutdown do not cancel it; the acquisition future owns wait
+        // cleanup and the pool keepalive survives until after latch release.
+        let raw = frame.latch.shared_async_raw().await;
+        let latch = PageLatchGuard::new(keepalive, raw);
+        if frame.generation() != id.generation || frame.kind() == FrameKind::Uninitialized {
+            return None;
+        }
+        // Successful under-latch validation is the access linearization point.
+        // Only now may non-atomic context be inspected. Never inspect page bytes.
+        frame.unwrap_vmap();
+        Some(RowVersionMapGuard::new(latch, self.frame_ptr(id.page_id)))
     }
 
     /// Initializes an allocated frame/page slot for logical page type `T`.
@@ -262,17 +318,188 @@ impl QuiescentArena {
 }
 
 #[cfg(test)]
-pub(crate) use self::tests::outstanding_base_guard_count;
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::buffer::test_pool_guards_share_keepalive_root;
+    use crate::catalog::{StorageColumnFlags, StorageColumnSpec, TableMetadata};
+    use crate::id::{RowID, TrxID};
+    use crate::row::RowPage;
+    use crate::value::ValKind;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::Arc;
+    use std::thread;
 
     /// Returns the number of independently created base guards.
     #[inline]
     pub(crate) fn outstanding_base_guard_count(arena: &QuiescentArena) -> usize {
         arena.keepalive.outstanding_guard_count()
+    }
+
+    fn init_row_page(arena: &QuiescentArena, guard: &PoolGuard) -> PageExclusiveGuard<RowPage> {
+        let metadata = TableMetadata::try_new(
+            vec![StorageColumnSpec::new(
+                ValKind::I32,
+                StorageColumnFlags::empty(),
+            )],
+            vec![],
+        )
+        .unwrap();
+        let mut page = arena.init_page::<RowPage>(guard, PageID::new(0));
+        page.page_mut().init(RowID::new(100), 4, &metadata.col);
+        page.bf_mut()
+            .init_undo_map(Arc::clone(&metadata.col), RowID::new(100), 4);
+        page
+    }
+
+    #[test]
+    fn test_arena_shared_metadata_future_and_owner_cross_threads() {
+        let arena = QuiescentBox::new(QuiescentArena::new(1).unwrap());
+        let root = arena.create_base_guard();
+        let page = init_row_page(&arena, &root);
+        let id = page.versioned_page_id();
+        page.unwrap_vmap().set_create_cts(TrxID::new(42));
+        drop(page);
+
+        // Sending the borrowed future requires QuiescentArena: Sync and proves
+        // that the direct async accessor still meets BufferPool's Send contract.
+        let future = arena.get_row_version_map(&root, id);
+        let map = thread::scope(|scope| {
+            scope
+                .spawn(move || smol::block_on(future))
+                .join()
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(map.version_map().create_cts(), TrxID::new(42));
+        drop(map);
+
+        // Moving the pinned owner requires QuiescentArena: Send. Its mappings
+        // and inline ArenaInner stay stable, and teardown runs on this worker.
+        thread::spawn(move || {
+            let map = smol::block_on(arena.get_row_version_map(&root, id)).unwrap();
+            assert_eq!(map.version_map().create_cts(), TrxID::new(42));
+            drop(map);
+            drop(root);
+            assert_eq!(outstanding_base_guard_count(&arena), 0);
+            drop(arena);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn test_row_metadata_latch_pins_context_and_rejects_reuse() {
+        smol::block_on(async {
+            let arena = QuiescentArena::new(1).unwrap();
+            let root = arena.create_base_guard();
+            let page = init_row_page(&arena, &root);
+            let id = page.versioned_page_id();
+            drop(page);
+            let map = arena.get_row_version_map(&root, id).await.unwrap();
+            assert!(
+                map.version_map()
+                    .try_write_row(RowID::new(100))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(arena.try_lock_page_exclusive(&root, id.page_id).is_none());
+            drop(root);
+            assert_eq!(outstanding_base_guard_count(&arena), 1);
+            drop(map);
+            assert_eq!(outstanding_base_guard_count(&arena), 0);
+
+            let root = arena.create_base_guard();
+            let mut old = arena.try_lock_page_exclusive(&root, id.page_id).unwrap();
+            old.bf_mut().ctx = None;
+            old.bf_mut().set_kind(FrameKind::Uninitialized);
+            drop(old);
+            assert!(arena.get_row_version_map(&root, id).await.is_none());
+            let new = init_row_page(&arena, &root);
+            let replacement = new.versioned_page_id();
+            new.unwrap_vmap().set_create_cts(TrxID::new(42));
+            drop(new);
+            assert!(arena.get_row_version_map(&root, id).await.is_none());
+            let map = arena.get_row_version_map(&root, replacement).await.unwrap();
+            assert_eq!(map.version_map().create_cts(), TrxID::new(42));
+            for page_id in [PageID::new(1), PageID::new(u64::MAX)] {
+                assert!(
+                    arena
+                        .get_row_version_map(&root, VersionedPageID { page_id, ..id })
+                        .await
+                        .is_none()
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn test_row_metadata_wait_revalidates_identity_and_cancellation_drains() {
+        smol::block_on(async {
+            for replace in [false, true] {
+                let arena = QuiescentArena::new(1).unwrap();
+                let root = arena.create_base_guard();
+                let mut page = init_row_page(&arena, &root);
+                let id = page.versioned_page_id();
+                let mut pending = Box::pin(arena.get_row_version_map(&root, id));
+                assert!(futures::poll!(pending.as_mut()).is_pending());
+                page.bf_mut().ctx = None;
+                page.bf_mut().set_kind(FrameKind::Uninitialized);
+                drop(page);
+                if replace {
+                    drop(init_row_page(&arena, &root));
+                }
+                assert!(pending.await.is_none());
+            }
+
+            let arena = QuiescentArena::new(1).unwrap();
+            let root = arena.create_base_guard();
+            let page = init_row_page(&arena, &root);
+            let id = page.versioned_page_id();
+            let mut pending = Box::pin(arena.get_row_version_map(&root, id));
+            assert!(futures::poll!(pending.as_mut()).is_pending());
+            drop(page);
+            assert_eq!(outstanding_base_guard_count(&arena), 1);
+            drop(pending);
+            drop(root);
+            assert_eq!(outstanding_base_guard_count(&arena), 0);
+            let root = arena.create_base_guard();
+            assert!(arena.try_lock_page_exclusive(&root, id.page_id).is_some());
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "pool guard identity mismatch")]
+    fn test_row_metadata_rejects_foreign_pool_guard() {
+        let arena = QuiescentArena::new(1).unwrap();
+        let foreign = QuiescentArena::new(1).unwrap();
+        smol::block_on(arena.get_row_version_map(
+            &foreign.create_base_guard(),
+            VersionedPageID {
+                page_id: PageID::new(0),
+                generation: 0,
+            },
+        ));
+    }
+
+    #[test]
+    fn test_row_metadata_matching_identity_requires_runtime_context() {
+        for recovery in [false, true] {
+            let arena = QuiescentArena::new(1).unwrap();
+            let root = arena.create_base_guard();
+            let mut page = arena.init_page::<RowPage>(&root, PageID::new(0));
+            let id = page.versioned_page_id();
+            if recovery {
+                page.bf_mut().init_recover_map(TrxID::new(42));
+            }
+            drop(page);
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| {
+                    smol::block_on(arena.get_row_version_map(&root, id))
+                }))
+                .is_err()
+            );
+            assert!(arena.try_lock_page_exclusive(&root, id.page_id).is_some());
+        }
     }
 
     #[test]

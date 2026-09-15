@@ -128,6 +128,38 @@ impl<T: 'static> LockStrategy for ExclusiveLockStrategy<T> {
     }
 }
 
+/// Resident version metadata pinned to one exact row-page generation.
+/// This guard grants no access to page bytes or page-latch conversions.
+pub(crate) struct RowVersionMapGuard {
+    _latch: PageLatchGuard,
+    frame: UnsafePtr<BufferFrame>,
+}
+
+impl RowVersionMapGuard {
+    /// Retains a shared latch after the arena validated the runtime row identity.
+    pub(super) fn new(latch: PageLatchGuard, frame: UnsafePtr<BufferFrame>) -> Self {
+        assert_eq!(
+            latch.state(),
+            GuardState::Shared,
+            "row-version metadata requires a shared frame latch"
+        );
+        Self {
+            _latch: latch,
+            frame,
+        }
+    }
+
+    /// Borrows the resident map for no longer than this exact-generation guard.
+    #[inline]
+    pub(crate) fn version_map(&self) -> &RowVersionMap {
+        // SAFETY: the arena checked the exact generation and runtime context
+        // under this shared frame latch. The paired pool keepalive preserves
+        // frame memory, the latch prevents context replacement/destruction,
+        // and the returned borrow cannot outlive this guard.
+        unsafe { &*self.frame.0 }.unwrap_vmap()
+    }
+}
+
 /// Raw latch guard paired with a pool keepalive.
 pub(crate) struct PageLatchGuard {
     // SAFETY: field order is part of the contract. `raw` must drop before

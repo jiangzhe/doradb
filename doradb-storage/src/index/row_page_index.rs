@@ -1103,7 +1103,7 @@ impl RowPageIndex {
                     // create and attach a new empty undo map.
                     new_page
                         .bf_mut()
-                        .init_undo_map(Arc::clone(col_layout), count);
+                        .init_undo_map(Arc::clone(col_layout), start_row_id, count);
 
                     match inserted.create_redo {
                         Ok(Some(create_cts)) => {
@@ -1870,7 +1870,7 @@ fn cleanup_failed_insert_page<B: BufferPool>(
 mod tests {
     use super::*;
     use crate::buffer::frame::BufferFrame;
-    use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
+    use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, RowVersionMapGuard};
     use crate::buffer::page::{BufferPage, Page, VersionedPageID};
     use crate::buffer::test_page_id;
     use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard, PoolRole};
@@ -1989,6 +1989,14 @@ mod tests {
         }
 
         #[inline]
+        async fn get_row_version_map(
+            &self,
+            guard: &PoolGuard,
+            id: VersionedPageID,
+        ) -> Option<RowVersionMapGuard> {
+            self.inner.get_row_version_map(guard, id).await
+        }
+
         fn deallocate_page<T: BufferPage>(&self, g: PageExclusiveGuard<T>) {
             self.inner.deallocate_page(g)
         }

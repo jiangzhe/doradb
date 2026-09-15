@@ -1030,7 +1030,7 @@ pub(crate) mod tests {
         }
         let head_status = nodes[0].1.take().unwrap();
         let head_entry = nodes[0].0.leak();
-        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), page.header.start_row_id, 4);
         *row_ver.write_state() = RowPageState::Frozen;
         *row_ver.write_latch(0) = Some(Box::new(RowUndoHead {
             next: NextRowUndo::new(MainBranch {
@@ -1155,6 +1155,52 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_metadata_purge_preserves_transition_image_and_invalidates_frozen_plan() {
+        for transition_first in [false, true] {
+            let fixture = frozen_analyzer_fixture(
+                vec![(RowUndoKind::Insert, UndoStatus::Committed(TrxID::new(5)))],
+                false,
+            );
+            let cutoff = TrxID::new(10);
+            let plan = run_stable_frozen_analyzer(&fixture, cutoff).unwrap();
+            let bitmap = plan.del_bitmap.clone();
+            let layout = &fixture.map.column_layout;
+            let values = fixture.page.row(0).vals_for_read_set(layout, &[0]);
+            let view = fixture
+                .page
+                .vector_view_with_del_bitmap(layout, bitmap.clone())
+                .unwrap();
+            if transition_first {
+                *fixture.map.write_state() = RowPageState::Transition;
+            }
+            fixture
+                .map
+                .try_write_row(RowID::new(100))
+                .unwrap()
+                .purge_undo_chain(cutoff);
+            assert!(fixture.map.read_latch(0).is_none());
+            let _state = fixture.map.write_state();
+            assert_eq!(
+                fixture.map.frozen_mutation_version(),
+                if transition_first { 0 } else { 2 }
+            );
+            assert_eq!(
+                plan.matches(
+                    fixture.page_info,
+                    cutoff,
+                    fixture.map.frozen_mutation_version()
+                ),
+                transition_first
+            );
+            assert_eq!(fixture.page.row(0).vals_for_read_set(layout, &[0]), values);
+            assert_eq!(fixture.page.header.row_count(), 1);
+            assert!(!fixture.page.is_deleted(0));
+            assert_eq!(plan.del_bitmap, bitmap);
+            assert_eq!(view.rows_non_deleted(), 1);
+        }
+    }
+
+    #[test]
     fn test_transition_readiness_rejects_unresolved_image_beneath_lock_and_delete() {
         for image in [RowUndoKind::Insert, RowUndoKind::update(vec![])] {
             let owner = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 20));
@@ -1172,67 +1218,77 @@ pub(crate) mod tests {
 
     #[test]
     fn test_frozen_mutation_finishing_during_analysis_discards_optimistic_plan() {
-        let metadata = TableMetadata::try_new(
-            vec![StorageColumnSpec::new(
-                ValKind::I32,
-                StorageColumnFlags::empty(),
-            )],
-            vec![],
-        )
-        .unwrap();
-        let mut page = RowPage::new_test_page();
-        page.init(RowID::new(100), 4, metadata.col.as_ref());
-        assert!(
-            page.insert(metadata.col.as_ref(), &[Val::from(1i32)])
-                .is_ok()
-        );
-        assert!(
-            page.insert(metadata.col.as_ref(), &[Val::from(2i32)])
-                .is_ok()
-        );
-        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
-        *row_ver.write_state() = RowPageState::Frozen;
-        let page_info = FrozenPage {
-            page_id: PageID::new(8),
-            start_row_id: RowID::new(100),
-            end_row_id: RowID::new(102),
-        };
-        let (entered_tx, entered_rx) = flume::bounded(1);
-        let (release_tx, release_rx) = flume::bounded(1);
-        let maintenance_test = MaintenanceTestController::default();
-
-        thread::scope(|scope| {
-            let writer = scope.spawn(|| {
-                let dirty = AtomicBool::new(false);
-                let mut access = test_row_write_access(&page, &row_ver, &dirty, 1);
-                entered_tx.send(()).unwrap();
-                release_rx.recv().unwrap();
-                access.delete_row();
-            });
-            entered_rx.recv().unwrap();
-            let version_before = row_ver.frozen_mutation_version();
-            assert_eq!(version_before, 1);
-            maintenance_test.install_frozen_page_scan_hook(move |_| {
-                release_tx.send(()).unwrap();
-            });
-            let analysis = scan_frozen_page(
-                &page,
-                &row_ver,
-                page_info,
-                FrozenPageScanMode::EstablishReadiness {
-                    frozen_ts: TrxID::new(20),
-                },
-                TrxID::new(20),
-                &maintenance_test,
+        for metadata_only in [false, true] {
+            let metadata = TableMetadata::try_new(
+                vec![StorageColumnSpec::new(
+                    ValKind::I32,
+                    StorageColumnFlags::empty(),
+                )],
+                vec![],
             )
-            .into_readiness_analysis(TrxID::new(20), version_before);
-            writer.join().unwrap();
-            let version_after = row_ver.frozen_mutation_version();
-            assert_eq!(version_after, 2);
-            assert!(analysis.plan.is_some());
-            let retained_plan = (version_before == version_after).then_some(analysis.plan);
-            assert!(retained_plan.is_none());
-        });
+            .unwrap();
+            let mut page = RowPage::new_test_page();
+            page.init(RowID::new(100), 4, metadata.col.as_ref());
+            assert!(
+                page.insert(metadata.col.as_ref(), &[Val::from(1i32)])
+                    .is_ok()
+            );
+            assert!(
+                page.insert(metadata.col.as_ref(), &[Val::from(2i32)])
+                    .is_ok()
+            );
+            let row_ver =
+                RowVersionMap::new(Arc::clone(&metadata.col), page.header.start_row_id, 4);
+            *row_ver.write_state() = RowPageState::Frozen;
+            let page_info = FrozenPage {
+                page_id: PageID::new(8),
+                start_row_id: RowID::new(100),
+                end_row_id: RowID::new(102),
+            };
+            let (entered_tx, entered_rx) = flume::bounded(1);
+            let (release_tx, release_rx) = flume::bounded(1);
+            let maintenance_test = MaintenanceTestController::default();
+
+            thread::scope(|scope| {
+                let writer = scope.spawn(|| {
+                    if metadata_only {
+                        let mut access = row_ver.try_write_row(RowID::new(101)).unwrap();
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        access.purge_undo_chain(TrxID::new(20));
+                    } else {
+                        let dirty = AtomicBool::new(false);
+                        let mut access = test_row_write_access(&page, &row_ver, &dirty, 1);
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        access.delete_row();
+                    }
+                });
+                entered_rx.recv().unwrap();
+                let version_before = row_ver.frozen_mutation_version();
+                assert_eq!(version_before, 1);
+                maintenance_test.install_frozen_page_scan_hook(move |_| {
+                    release_tx.send(()).unwrap();
+                });
+                let analysis = scan_frozen_page(
+                    &page,
+                    &row_ver,
+                    page_info,
+                    FrozenPageScanMode::EstablishReadiness {
+                        frozen_ts: TrxID::new(20),
+                    },
+                    TrxID::new(20),
+                    &maintenance_test,
+                )
+                .into_readiness_analysis(TrxID::new(20), version_before);
+                writer.join().unwrap();
+                let version_after = row_ver.frozen_mutation_version();
+                assert_eq!(version_after, 2);
+                assert!(analysis.plan.is_some());
+                let retained_plan = (version_before == version_after).then_some(analysis.plan);
+                assert!(retained_plan.is_none());
+            });
+        }
     }
 
     #[test]

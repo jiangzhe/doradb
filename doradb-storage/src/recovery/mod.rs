@@ -663,8 +663,11 @@ impl<'a> RecoveryCoordinator<'a> {
             .try_rmap()
             .map(|rec| rec.create_cts())
             .unwrap_or(TrxID::new(0));
+        let start_row_id = page_guard.page().header.start_row_id;
         let max_row_count = page_guard.page().header.max_row_count as usize;
-        page_guard.bf_mut().init_undo_map(col_layout, max_row_count);
+        page_guard
+            .bf_mut()
+            .init_undo_map(col_layout, start_row_id, max_row_count);
         page_guard.unwrap_vmap().set_create_cts(create_cts);
         Ok(())
     }

@@ -5,7 +5,9 @@ use crate::buffer::evictor::{
     SharedEvictionDomain, SharedEvictionDomainId, clock_collect_batch, clock_sweep_candidate,
 };
 use crate::buffer::frame::{BufferFrame, FrameKind};
-use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageGuard, PageLatchGuard};
+use crate::buffer::guard::{
+    FacadePageGuard, PageExclusiveGuard, PageGuard, PageLatchGuard, RowVersionMapGuard,
+};
 use crate::buffer::load::{PageReservation, PageReservationGuard};
 use crate::buffer::page::{BufferPage, IOKind, PAGE_SIZE, Page, PageIO, VersionedPageID};
 use crate::buffer::util::{frame_total_bytes, madvise_dontneed};
@@ -667,6 +669,15 @@ impl BufferPool for EvictableBufferPool {
                 }
             }
         }
+    }
+
+    #[inline]
+    async fn get_row_version_map(
+        &self,
+        guard: &PoolGuard,
+        id: VersionedPageID,
+    ) -> Option<RowVersionMapGuard> {
+        self.arena.get_row_version_map(guard, id).await
     }
 
     #[inline]
@@ -1860,9 +1871,10 @@ fn validate_evictable_spill_checksum(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::buffer::EvictionArbiterBuilder;
     use crate::buffer::guard::PageGuard;
     use crate::buffer::test_page_id;
+    use crate::buffer::{EvictionArbiterBuilder, FixedBufferPool};
+    use crate::catalog::{StorageColumnFlags, StorageColumnSpec, TableMetadata};
     use crate::component::RegistryBuilder;
     use crate::conf::{EngineConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
@@ -1878,9 +1890,12 @@ pub(crate) mod tests {
     use crate::file::fs::tests::{
         build_test_fs_owner_in, io_backend_stats_handle_identity as fs_stats_handle_identity,
     };
+    use crate::id::RowID;
     use crate::io::BackendError;
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
     use crate::row::RowPage;
+    use crate::trx::MAX_SNAPSHOT_TS;
+    use crate::value::ValKind;
     use futures::task::noop_waker;
     use std::env::current_dir;
     use std::future::Future;
@@ -2054,6 +2069,63 @@ pub(crate) mod tests {
         };
         runtime.dispatch_io_writes(vec![page]).await;
         assert_eq!(pool.arena.frame(page_id).kind(), FrameKind::Evicted);
+    }
+
+    async fn metadata_test_page<B: BufferPool>(
+        pool: &B,
+        root: &PoolGuard,
+    ) -> PageExclusiveGuard<RowPage> {
+        let metadata = TableMetadata::try_new(
+            vec![StorageColumnSpec::new(
+                ValKind::I32,
+                StorageColumnFlags::empty(),
+            )],
+            vec![],
+        )
+        .unwrap();
+        let mut page = pool.allocate_page::<RowPage>(root).await.unwrap();
+        page.page_mut().init(RowID::new(100), 4, &metadata.col);
+        page.bf_mut()
+            .init_undo_map(Arc::clone(&metadata.col), RowID::new(100), 4);
+        page
+    }
+
+    async fn check_metadata_pool<B: BufferPool>(pool: &B, stats: impl Fn() -> BufferPoolCounters) {
+        let root = pool.create_base_guard();
+        let page = metadata_test_page(pool, &root).await;
+        let id = page.versioned_page_id();
+        drop(page);
+        let before = stats();
+        let map = pool.get_row_version_map(&root, id).await.unwrap();
+        assert!(map.version_map().try_write_row(RowID::new(103)).is_some());
+        assert!(map.version_map().try_write_row(RowID::new(104)).is_none());
+        drop(map);
+        assert_eq!(stats(), before);
+        let page = pool
+            .get_page::<RowPage>(&root, id.page_id, LatchFallbackMode::Exclusive)
+            .await
+            .unwrap()
+            .lock_exclusive_async()
+            .await
+            .unwrap();
+        pool.deallocate_page(page);
+        assert!(pool.get_row_version_map(&root, id).await.is_none());
+        let replacement = metadata_test_page(pool, &root).await;
+        assert_eq!(replacement.page_id(), id.page_id);
+        assert_ne!(replacement.versioned_page_id(), id);
+        drop(replacement);
+        assert!(pool.get_row_version_map(&root, id).await.is_none());
+        assert!(
+            pool.get_row_version_map(
+                &root,
+                VersionedPageID {
+                    page_id: PageID::new(u64::MAX),
+                    ..id
+                }
+            )
+            .await
+            .is_none()
+        );
     }
 
     fn wait_for(mut predicate: impl FnMut() -> bool) {
@@ -2782,6 +2854,58 @@ pub(crate) mod tests {
             );
             assert_eq!(kind, StorageIOKind::Write);
             assert_eq!(owner.arena.frame(page_id).kind(), FrameKind::Hot);
+        });
+    }
+
+    #[test]
+    fn test_row_metadata_waits_for_reload_completion_without_starting_a_read() {
+        smol::block_on(async {
+            for succeeds in [false, true] {
+                let temp = TempDir::new().unwrap();
+                let (_fs_owner, pool, _storage) = build_raw_pool_for_test(
+                    EvictableBufferPoolConfig::default()
+                        .swap_file(temp.path().join("data.swp"))
+                        .max_mem_size(64usize * 1024 * 1024)
+                        .max_file_size(128usize * 1024 * 1024),
+                )
+                .unwrap();
+                let owner = QuiescentBox::new(pool);
+                let root = owner.create_base_guard();
+                let page = metadata_test_page(&*owner, &root).await;
+                let id = page.versioned_page_id();
+                drop(page);
+                let page = owner.try_lock_page_exclusive(&root, id.page_id).unwrap();
+                let image = page.page().to_vec();
+                page.bf().set_kind(FrameKind::Evicting);
+                owner.in_mem.evict_page(page);
+                let (request, completion) =
+                    make_reload_submission_for_test(&owner, &root, id.page_id, |page| {
+                        page.copy_from_slice(&image);
+                        write_block_checksum_for_test(page);
+                    });
+                let mut metadata = Box::pin(owner.get_row_version_map(&root, id));
+                assert!(futures::poll!(metadata.as_mut()).is_pending());
+                request.complete(Ok(if succeeds { PAGE_SIZE } else { 0 }));
+                assert_eq!(completion.wait_result().await.is_ok(), succeeds);
+                let before = owner.stats();
+                let map = metadata.await.unwrap();
+                assert!(
+                    map.version_map()
+                        .try_write_row(RowID::new(100))
+                        .unwrap()
+                        .is_none()
+                );
+                drop(map);
+                assert_eq!(owner.stats(), before);
+                assert_eq!(
+                    frame_kind(&owner, id.page_id),
+                    if succeeds {
+                        FrameKind::Hot
+                    } else {
+                        FrameKind::Evicted
+                    }
+                );
+            }
         });
     }
 
@@ -3676,5 +3800,76 @@ pub(crate) mod tests {
             Some(IoErrorKind::NotFound)
         );
         assert!(format!("{err:?}").contains("buffer_pool_type=evictable, buffer_pool_role=mem"));
+    }
+    #[test]
+    fn test_row_metadata_fixed_and_evictable_pool_identity() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let pool = StartedEvictPool::new(
+                EvictableBufferPoolConfig::default()
+                    .swap_file(temp_dir.path().join("data.swp"))
+                    .max_mem_size(64usize * 1024 * 1024)
+                    .max_file_size(128usize * 1024 * 1024),
+            );
+            let fixed = FixedBufferPool::with_capacity(PoolRole::Meta, 1024 * 1024).unwrap();
+            check_metadata_pool(&fixed, || fixed.stats()).await;
+            check_metadata_pool(&*pool, || pool.stats()).await;
+        });
+    }
+
+    #[test]
+    fn test_row_metadata_preserves_cool_evicted_and_writeback_state() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let pool = StartedEvictPool::new(
+                EvictableBufferPoolConfig::default()
+                    .swap_file(temp_dir.path().join("data.swp"))
+                    .max_mem_size(64usize * 1024 * 1024)
+                    .max_file_size(128usize * 1024 * 1024),
+            );
+            let root = pool.create_base_guard();
+            let page = metadata_test_page(&*pool, &root).await;
+            let id = page.versioned_page_id();
+            page.bf().set_kind(FrameKind::Cool);
+            drop(page);
+            let before = pool.stats();
+            let resident = pool.in_mem.count.load(Ordering::Acquire);
+            drop(pool.get_row_version_map(&root, id).await.unwrap());
+            assert_eq!(pool.stats(), before);
+            assert_eq!(frame_kind(&pool, id.page_id), FrameKind::Cool);
+            assert_eq!(pool.in_mem.count.load(Ordering::Acquire), resident);
+
+            // Queue metadata behind the exclusive writeback owner, then let
+            // production completion publish Evicted and release that latch.
+            let mut page = pool
+                .get_page::<Page>(&root, id.page_id, LatchFallbackMode::Exclusive)
+                .await
+                .unwrap()
+                .lock_exclusive_async()
+                .await
+                .unwrap();
+            page.bf_mut().set_kind(FrameKind::Evicting);
+            let mut pending = Box::pin(pool.get_row_version_map(&root, id));
+            assert!(futures::poll!(pending.as_mut()).is_pending());
+            let runtime = EvictableRuntime {
+                arena: pool.arena.arena_guard(root.clone()),
+                pool: pool.owner_guard().into_sync(),
+            };
+            runtime.dispatch_io_writes(vec![page]).await;
+            let before = pool.stats();
+            let resident = pool.in_mem.count.load(Ordering::Acquire);
+            let dirty = pool.arena.frame(id.page_id).is_dirty();
+            let map = pending.await.unwrap();
+            map.version_map()
+                .try_write_row(RowID::new(100))
+                .unwrap()
+                .purge_undo_chain(MAX_SNAPSHOT_TS);
+            drop(map);
+            drop(pool.get_row_version_map(&root, id).await.unwrap());
+            assert_eq!(pool.stats(), before);
+            assert_eq!(frame_kind(&pool, id.page_id), FrameKind::Evicted);
+            assert_eq!(pool.in_mem.count.load(Ordering::Acquire), resident);
+            assert_eq!(pool.arena.frame(id.page_id).is_dirty(), dirty);
+        });
     }
 }

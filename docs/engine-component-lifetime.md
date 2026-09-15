@@ -636,6 +636,30 @@ when an owned sub-operation can outlive the borrow.
 
 ## Arena And Page-Guard Lifetime Rules
 
+`ArenaInner` implements `Send` and `Sync` for its uniquely owned mappings,
+immutable pointer/capacity fields, and atomically or latch-protected frame
+access. `QuiescentArena` inherits these traits from its fields. Pool owners
+remain at stable addresses in `QuiescentBox` before publishing `ArenaGuard`,
+which points to the inline arena state. Guard draining precedes frame
+destruction and unmapping on whichever thread drops the owner.
+
+`RowVersionMapGuard` retains a shared raw frame latch paired with a clone of
+the caller's existing pool keepalive root. The common arena accessor checks
+pool provenance and capacity, then revalidates exact generation and initialized
+state under that latch before inspecting runtime context. The guard exposes
+only a lifetime-bounded version-map borrow, with no page bytes or latch
+conversion. Eviction preserves the context; exclusive retirement or reuse
+cannot destroy it until every map/row borrow and shared guard has ended.
+
+Metadata acquisition uses the existing [generic latch wait family](shutdown-and-poison.md#production-wait-classification):
+the exclusive holder releases the latch to produce progress, and successful
+under-latch identity validation establishes access. Poison and shutdown do not
+cancel this wait. Existing operation/purge ownership drains before pool
+teardown; the acquisition future owns cancellation cleanup. Local bindings
+and guard fields release raw latch state before the pool keepalive, including
+cancellation during acquisition. Metadata access performs no page-I/O wait,
+residency reservation, or temperature change.
+
 The buffer-layer lifetime rules remain:
 
 - arena metadata and frames are owned by the pool owner

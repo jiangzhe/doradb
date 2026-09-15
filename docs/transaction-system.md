@@ -1211,6 +1211,19 @@ Heap persistence relies on the **Tuple Mover** and the durability of the commit 
   - Any Undo versions in the transaction with `Commit_STS < Global_Min_STS` are obsolete (no active transaction can see them).
   - These records are unlinked and memory is reclaimed.
 
+Row-undo pruning uses a generation-checked shared frame latch to borrow the
+resident version map, including when the page body is evicted. The map stores
+immutable start RowID and reserved slot capacity; it remains frame-owned.
+`RowVersionWriteAccess` supplies the same state-lock, row-latch, and paired
+Frozen mutation bookkeeping used by physical `RowWriteAccess`. Its scope
+contains no await, I/O, page/index acquisition, or user callback. The map and
+chain borrows end before the frame latch is released.
+
+Pruning detaches main and unique-index history only under the existing strict
+horizon. Transaction undo logs continue owning every `RowUndo` allocation;
+the purge driver releases those owners after row and secondary-index cleanup.
+Secondary-index proofs and physical rollback can still reload page contents.
+
 Checkpoint-retired row pages use the same committed-payload queues and CTS
 horizon. A system payload has no STS to remove; its ordered CTS is its
 reclamation fence. Each purge round finishes eligible row-undo and index work

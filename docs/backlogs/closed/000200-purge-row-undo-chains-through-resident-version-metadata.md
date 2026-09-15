@@ -6,15 +6,15 @@ Allow undo-chain purge to access resident row-version metadata without reloading
 
 ## Reference
 
-- Review of [task 000303](../tasks/000303-repair-dangling-row-undo-and-deferred-lock-to-delete-mismatch.md): the user proposed separating cleanup that only touches version chains from physical row access and selected undo-chain purge as the starting point.
-- [Purge driver](../../doradb-storage/src/trx/purge.rs): `purge_trx_list_inner()` loads exact page generations and `purge_undo_chain_from_page()` constructs row write access.
-- [Row access](../../doradb-storage/src/trx/row.rs): `purge_undo_chain()` changes only chain metadata; `RowWriteAccess` currently provides its row latch, page-state guard, and Frozen mutation bookkeeping.
-- [Buffer eviction](../../doradb-storage/src/buffer/evict.rs), [frame context](../../doradb-storage/src/buffer/frame.rs), and [version map](../../doradb-storage/src/trx/ver_map.rs) establish the residency and lifetime constraints.
-- [Checkpoint page transition](../../doradb-storage/src/table/page_transition.rs) consumes version chains and the Frozen mutation counter when preparing and validating plans.
+- Review of [task 000303](../../tasks/000303-repair-dangling-row-undo-and-deferred-lock-to-delete-mismatch.md): the user proposed separating cleanup that only touches version chains from physical row access and selected undo-chain purge as the starting point.
+- [Purge driver](../../../doradb-storage/src/trx/purge.rs): `purge_trx_list_inner()` loads exact page generations and `purge_undo_chain_from_page()` constructs row write access.
+- [Row access](../../../doradb-storage/src/trx/row.rs): `purge_undo_chain()` changes only chain metadata; `RowWriteAccess` currently provides its row latch, page-state guard, and Frozen mutation bookkeeping.
+- [Buffer eviction](../../../doradb-storage/src/buffer/evict.rs), [frame context](../../../doradb-storage/src/buffer/frame.rs), and [version map](../../../doradb-storage/src/trx/ver_map.rs) establish the residency and lifetime constraints.
+- [Checkpoint page transition](../../../doradb-storage/src/table/page_transition.rs) consumes version chains and the Frozen mutation counter when preparing and validating plans.
 
 ## Deferred From (Optional)
 
-[Task 000303](../tasks/000303-repair-dangling-row-undo-and-deferred-lock-to-delete-mismatch.md), implementation review in worktree `.worktrees/000303`.
+[Task 000303](../../tasks/000303-repair-dangling-row-undo-and-deferred-lock-to-delete-mismatch.md), implementation review in worktree `.worktrees/000303`.
 
 ## Deferral Context (Optional)
 
@@ -49,5 +49,12 @@ Allow undo-chain purge to access resident row-version metadata without reloading
 
 ## Notes (Optional)
 
-Related [backlog 000068](000068-pin-in-transaction-evictable-row-pages-to-avoid-rollback-reload-io.md) proposes pinning pages to avoid rollback reloads. This item instead uses metadata that already survives eviction and initially changes only undo-chain purge.
+Related [backlog 000068](../000068-pin-in-transaction-evictable-row-pages-to-avoid-rollback-reload-io.md) proposes pinning pages to avoid rollback reloads. This item instead uses metadata that already survives eviction and initially changes only undo-chain purge.
 
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000304-purge-row-undo-chains-through-resident-version-metadata.md
+- Closed By: backlog close
+- Reference: User decision
+- Closed At: 2026-09-14

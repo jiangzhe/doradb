@@ -40,7 +40,9 @@ pub(crate) use readonly::{ReadSubmission, ReadonlyWriteLease, begin_write_barrie
 pub(crate) use readonly::{ReadonlyBlockGuard, ReadonlyBufferPool};
 
 use crate::DiskPool;
-use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageSharedGuard};
+use crate::buffer::guard::{
+    FacadePageGuard, PageExclusiveGuard, PageSharedGuard, RowVersionMapGuard,
+};
 use crate::buffer::page::{BufferPage, VersionedPageID};
 use crate::completion::Completion;
 use crate::component::{
@@ -251,6 +253,14 @@ pub(crate) trait BufferPool: Send + Sync {
         id: VersionedPageID,
         mode: LatchFallbackMode,
     ) -> impl Future<Output = StdResult<Option<FacadePageGuard<T>>, Self::Error>> + Send;
+
+    /// Pins exact-generation runtime row metadata without page I/O or cache effects.
+    /// Returns None for stale or uninitialized identities; invalid context panics.
+    fn get_row_version_map(
+        &self,
+        guard: &PoolGuard,
+        id: VersionedPageID,
+    ) -> impl Future<Output = Option<RowVersionMapGuard>> + Send;
 
     /// Deallocate page.
     fn deallocate_page<T: BufferPage>(&self, g: PageExclusiveGuard<T>);
