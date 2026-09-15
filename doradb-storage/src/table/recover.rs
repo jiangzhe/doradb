@@ -6,6 +6,7 @@ use crate::error::{
 };
 use crate::id::{PageID, RowID, TrxID};
 use crate::index::IndexInsert;
+use crate::recovery::RowReplayState;
 use crate::row::RowRead;
 use crate::row::ops::{ReadRow, UpdateCol};
 use crate::table::{DeletionError, DmlValidator, Table};
@@ -18,12 +19,13 @@ impl Table {
     pub(crate) async fn recover_row_insert(
         &self,
         guards: &PoolGuards,
-        page_id: PageID,
+        replay: &mut RowReplayState,
         row_id: RowID,
         cols: &[Val],
         cts: TrxID,
         disable_dml_validation: bool,
     ) -> RuntimeOrFatalResult<()> {
+        let page_id = replay.page_id();
         let layout = self.layout_snapshot();
         let metadata = layout.metadata();
         if !disable_dml_validation {
@@ -41,18 +43,17 @@ impl Table {
                 .enumerate()
                 .all(|(idx, val)| metadata.col.col_type_match(idx, val))
         });
-        // Since we always dispatch rows of one page to same thread,
-        // we can just hold exclusive lock on this page and process all rows in it.
+        // Canonical sequential replay owns the sidecar; the latch protects page bytes.
         let mut page_guard = self
             .row_store
             .must_get_row_page_exclusive(guards, page_id)
             .await?;
 
-        self.recover_row_insert_to_page(metadata, &mut page_guard, row_id, cols, cts)
+        self.recover_row_insert_to_page(metadata, &mut page_guard, replay, row_id, cols, cts)
             .change_context(RuntimeError::TableAccess)
             .attach_with(|| {
                 format!(
-                    "operation=recover_row_insert, table_id={}, page_id={page_id}, row_id={row_id}",
+                    "operation=recover_row_insert, table_id={}, page_id={page_id}, row_id={row_id}, cts={cts}",
                     self.table_id()
                 )
             })?;
@@ -64,12 +65,13 @@ impl Table {
     pub(crate) async fn recover_row_update(
         &self,
         guards: &PoolGuards,
-        page_id: PageID,
+        replay: &RowReplayState,
         row_id: RowID,
         update: &[UpdateCol],
         cts: TrxID,
         disable_dml_validation: bool,
     ) -> RuntimeOrFatalResult<()> {
+        let page_id = replay.page_id();
         let layout = self.layout_snapshot();
         let metadata = layout.metadata();
         if !disable_dml_validation {
@@ -86,11 +88,11 @@ impl Table {
             .must_get_row_page_exclusive(guards, page_id)
             .await?;
 
-        self.recover_row_update_to_page(metadata, &mut page_guard, row_id, update, cts)
+        self.recover_row_update_to_page(metadata, &mut page_guard, replay, row_id, update, cts)
             .change_context(RuntimeError::TableAccess)
             .attach_with(|| {
                 format!(
-                    "operation=recover_row_update, table_id={}, page_id={page_id}, row_id={row_id}",
+                    "operation=recover_row_update, table_id={}, page_id={page_id}, row_id={row_id}, cts={cts}",
                     self.table_id()
                 )
             })?;
@@ -102,59 +104,51 @@ impl Table {
     pub(crate) async fn recover_row_delete(
         &self,
         guards: &PoolGuards,
-        page_id: Option<PageID>,
+        replay: &RowReplayState,
         row_id: RowID,
         cts: TrxID,
     ) -> RuntimeOrFatalResult<()> {
-        // `recovery_bootstrap_unchecked`: restart recovery runs without
-        // surviving user transactions, so it binds the current loaded root
-        // directly for cold-row delete replay predicates.
-        let active_root = self.file().active_root_unchecked();
-        if row_id < active_root.pivot_row_id {
-            if cts < active_root.deletion_cutoff_ts {
-                return Ok(());
-            }
-            match self.deletion_buffer().put_committed(row_id, cts) {
-                Ok(()) => return Ok(()),
-                Err(DeletionError::AlreadyDeleted | DeletionError::WriteConflict) => {
-                    return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
-                        .attach(format!("row_id={row_id}, cts={cts}"))
-                        .change_context(RuntimeError::TableAccess)
-                        .attach(format!(
-                            "operation=recover_row_delete, table_id={}, row_id={row_id}",
-                            self.table_id()
-                        ))
-                        .into());
-                }
-            }
-        }
-
-        let page_id = page_id.ok_or_else(|| {
-            Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
-                    "hot row delete redo requires page identity: row_id={row_id}, cts={cts}"
-                ))
-                .change_context(RuntimeError::TableAccess)
-                .attach(format!(
-                    "operation=recover_row_delete, table_id={}",
-                    self.table_id()
-                ))
-        })?;
+        let page_id = replay.page_id();
         let mut page_guard = self
             .row_store
             .must_get_row_page_exclusive(guards, page_id)
             .await?;
 
-        self.recover_row_delete_to_page(&mut page_guard, row_id, cts)
+        self.recover_row_delete_to_page(&mut page_guard, replay, row_id, cts)
             .change_context(RuntimeError::TableAccess)
             .attach_with(|| {
                 format!(
-                    "operation=recover_row_delete, table_id={}, page_id={page_id}, row_id={row_id}",
+                    "operation=recover_row_delete, table_id={}, page_id={page_id}, row_id={row_id}, cts={cts}",
                     self.table_id()
                 )
             })?;
         page_guard.set_dirty(); // mark as dirty page.
         Ok(())
+    }
+
+    /// Replays a committed cold-row deletion without hot-page replay state.
+    pub(crate) fn recover_cold_row_delete(
+        &self,
+        row_id: RowID,
+        cts: TrxID,
+    ) -> DataIntegrityResult<()> {
+        // `recovery_bootstrap_unchecked`: no surviving transactions exist at startup.
+        let active_root = self.file().active_root_unchecked();
+        if row_id >= active_root.pivot_row_id {
+            return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+                .attach("cold row delete requires a row below the table pivot"));
+        }
+        if cts < active_root.deletion_cutoff_ts {
+            return Ok(());
+        }
+        self.deletion_buffer()
+            .put_committed(row_id, cts)
+            .map_err(|err| match err {
+                DeletionError::AlreadyDeleted | DeletionError::WriteConflict => {
+                    Report::new(DataIntegrityError::InvalidRootInvariant)
+                        .attach("conflicting committed cold-row deletion")
+                }
+            })
     }
 
     /// Populate index using data on row page.
@@ -258,7 +252,7 @@ pub(super) fn ensure_recovery_index_insert(
 #[cfg(test)]
 mod tests {
     use super::ensure_recovery_index_insert;
-    use crate::buffer::guard::PageGuard;
+    use crate::buffer::guard::{PageExclusiveGuard, PageGuard};
     use crate::buffer::page::PAGE_SIZE;
     use crate::catalog::tests::{
         assert_dropped_table_floor, assert_no_dropped_table_operational_state,
@@ -271,7 +265,9 @@ mod tests {
     use crate::id::RowID;
     use crate::id::{PageID, TrxID};
     use crate::index::IndexInsert;
+    use crate::recovery::RowReplayState;
     use crate::row::ops::UpdateCol;
+    use crate::row::{RowPage, RowRead};
     use crate::session::tests::{SessionTestExt, assert_checkpoint_published};
     use crate::table::{DmlValidationError, tests::*};
     use crate::trx::MAX_SNAPSHOT_TS;
@@ -279,6 +275,19 @@ mod tests {
     use error_stack::Report;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    fn replay_state(page: &PageExclusiveGuard<RowPage>) -> RowReplayState {
+        RowReplayState::new(page.page_id(), page.page().header.max_row_count as usize)
+    }
+
+    fn assert_invalid_replay(err: Report<DataIntegrityError>, reason: &str) {
+        assert_eq!(
+            *err.current_context(),
+            DataIntegrityError::InvalidRootInvariant
+        );
+        let report = format!("{err:?}");
+        assert!(report.contains(reason), "{report}");
+    }
 
     #[test]
     fn test_ensure_recovery_index_insert_accepts_ok_variants() {
@@ -325,35 +334,22 @@ mod tests {
             assert!(row_id < active_root.pivot_row_id);
             let cts = active_root.deletion_cutoff_ts;
             table
-                .recover_row_delete(&session.pool_guards(), None, row_id, cts)
-                .await
+                .recover_cold_row_delete(row_id, TrxID::new(cts.as_u64() - 1))
                 .unwrap();
-            table
-                .recover_row_delete(
-                    &session.pool_guards(),
-                    Some(PageID::from(0u64)),
-                    row_id,
-                    cts,
-                )
-                .await
-                .unwrap();
-
+            assert!(table.deletion_buffer().get(row_id).is_none());
+            table.recover_cold_row_delete(row_id, cts).unwrap();
+            table.recover_cold_row_delete(row_id, cts).unwrap();
+            let err = table.recover_cold_row_delete(row_id, cts + 1).unwrap_err();
+            assert_invalid_replay(err, "conflicting committed cold-row deletion");
             let err = table
-                .recover_row_delete(&session.pool_guards(), None, row_id, cts + 1)
-                .await
+                .recover_cold_row_delete(active_root.pivot_row_id, cts)
                 .unwrap_err();
-            let RuntimeOrFatalError::Runtime(err) = err else {
-                panic!("expected Runtime error, got {err:?}");
-            };
-            assert_eq!(
-                err.downcast_ref::<DataIntegrityError>().copied(),
-                Some(DataIntegrityError::InvalidRootInvariant)
-            );
+            assert_invalid_replay(err, "requires a row below the table pivot");
         });
     }
 
     #[test]
-    fn test_recover_hot_delete_requires_page_identity() {
+    fn test_recover_row_page_sparse_bitmap_boundaries_and_slot_history() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine =
@@ -362,150 +358,152 @@ mod tests {
             let session = engine.new_session().unwrap();
             let table = table_for_internal_assertion(&engine, table_id);
             let metadata = table.metadata();
-            let mut page_guard = table
+            let mut page = table
                 .row_store
-                .get_insert_page_exclusive(&session.pool_guards(), 2)
+                .get_insert_page_exclusive(&session.pool_guards(), 70)
                 .await
                 .unwrap();
-            let page_id = page_guard.page_id();
-            let row_id = page_guard.page().header.start_row_id;
-            let insert_cts = TrxID::new(10);
-            page_guard.bf_mut().init_recover_map(insert_cts);
-            table
-                .recover_row_insert_to_page(
-                    metadata.as_ref(),
-                    &mut page_guard,
-                    row_id,
-                    &[Val::from(1i32), Val::from("name")],
-                    insert_cts,
-                )
-                .unwrap();
-            drop(page_guard);
-
-            assert!(row_id >= table.file().active_root_unchecked().pivot_row_id);
-            let delete_cts = TrxID::new(11);
-            let err = table
-                .recover_row_delete(&session.pool_guards(), None, row_id, delete_cts)
-                .await
-                .unwrap_err();
-            let RuntimeOrFatalError::Runtime(err) = err else {
-                panic!("expected Runtime error, got {err:?}");
-            };
-            assert_eq!(*err.current_context(), RuntimeError::TableAccess);
-            assert_eq!(
-                err.downcast_ref::<DataIntegrityError>().copied(),
-                Some(DataIntegrityError::InvalidPayload)
-            );
-            let report = format!("{err:?}");
-            assert!(report.contains("requires page identity"), "{report}");
-            assert!(report.contains(&format!("row_id={row_id}")), "{report}");
-
-            table
-                .recover_row_delete(&session.pool_guards(), Some(page_id), row_id, delete_cts)
-                .await
-                .unwrap();
-        });
-    }
-
-    #[test]
-    fn test_recover_row_page_reports_invalid_replay_state() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine =
-                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
-            let table_id = create_table2_for_test(&engine).await;
-            let session = engine.new_session().unwrap();
-            let metadata = table_for_internal_assertion(&engine, table_id).metadata();
-            let mut page_guard = table_for_internal_assertion(&engine, table_id)
-                .row_store
-                .get_insert_page_exclusive(&session.pool_guards(), 2)
-                .await
-                .unwrap();
-            let row_id = page_guard.page().header.start_row_id;
-            let assert_invalid_root = |err: Report<DataIntegrityError>, reason: &str| {
-                let report = format!("{err:?}");
+            let mut replay = replay_state(&page);
+            let first = page.page().header.start_row_id;
+            let vals = [Val::from(1i32), Val::from("name")];
+            let update = [UpdateCol {
+                idx: 1,
+                val: Val::from("changed"),
+            }];
+            let mut cts = TrxID::new(10);
+            for idx in [69, 64, 63, 0] {
+                let row_id = first + idx as u64;
+                table
+                    .recover_row_insert_to_page(
+                        &metadata,
+                        &mut page,
+                        &mut replay,
+                        row_id,
+                        &vals,
+                        cts,
+                    )
+                    .unwrap();
+                assert!(replay.is_inserted(idx));
+                cts = cts + 1;
+                let err = table
+                    .recover_row_insert_to_page(
+                        &metadata,
+                        &mut page,
+                        &mut replay,
+                        row_id,
+                        &vals,
+                        cts,
+                    )
+                    .unwrap_err();
+                assert_invalid_replay(err, "row slot was already inserted");
+                cts = cts + 1;
+                table
+                    .recover_row_update_to_page(&metadata, &mut page, &replay, row_id, &update, cts)
+                    .unwrap();
                 assert_eq!(
-                    err.downcast_ref::<DataIntegrityError>().copied(),
-                    Some(DataIntegrityError::InvalidRootInvariant),
-                    "{report}"
+                    page.page().row(idx).val(&metadata.col, 1),
+                    Val::from("changed")
                 );
-                assert!(report.contains(reason), "{report}");
-                assert!(report.contains("recover row"), "{report}");
-            };
-
-            let err = table_for_internal_assertion(&engine, table_id)
-                .recover_row_insert_to_page(
-                    metadata.as_ref(),
-                    &mut page_guard,
-                    row_id,
-                    &[Val::from(1i32), Val::from("name")],
-                    TrxID::new(10),
-                )
+                assert!(replay.is_inserted(idx));
+                cts = cts + 1;
+                table
+                    .recover_row_delete_to_page(&mut page, &replay, row_id, cts)
+                    .unwrap();
+                assert!(replay.is_inserted(idx));
+                cts = cts + 1;
+                let err = table
+                    .recover_row_insert_to_page(
+                        &metadata,
+                        &mut page,
+                        &mut replay,
+                        row_id,
+                        &vals,
+                        cts,
+                    )
+                    .unwrap_err();
+                assert_invalid_replay(err, "row slot was already inserted");
+                let err = table
+                    .recover_row_update_to_page(&metadata, &mut page, &replay, row_id, &update, cts)
+                    .unwrap_err();
+                assert_invalid_replay(err, "row is deleted");
+                let err = table
+                    .recover_row_delete_to_page(&mut page, &replay, row_id, cts)
+                    .unwrap_err();
+                assert_invalid_replay(err, "row is already deleted");
+                cts = cts + 1;
+            }
+            assert_eq!(page.page().header.row_count(), 70);
+            assert!((0..70).all(|slot| page.page().is_deleted(slot)));
+            for idx in 0..70 {
+                assert_eq!(replay.is_inserted(idx), [0, 63, 64, 69].contains(&idx));
+            }
+            // Slot 70 is inside the rounded bitmap storage but outside this page.
+            for row_id in [first + 70, first + 127] {
+                let err = table
+                    .recover_row_insert_to_page(
+                        &metadata,
+                        &mut page,
+                        &mut replay,
+                        row_id,
+                        &vals,
+                        cts,
+                    )
+                    .unwrap_err();
+                assert_invalid_replay(err, "row id outside page range");
+                let err = table
+                    .recover_row_update_to_page(&metadata, &mut page, &replay, row_id, &update, cts)
+                    .unwrap_err();
+                assert_invalid_replay(err, "row id outside page range");
+                let err = table
+                    .recover_row_delete_to_page(&mut page, &replay, row_id, cts)
+                    .unwrap_err();
+                assert_invalid_replay(err, "row id outside page range");
+            }
+            let unused = first + 1;
+            let err = table
+                .recover_row_update_to_page(&metadata, &mut page, &replay, unused, &update, cts)
                 .unwrap_err();
-            assert_invalid_root(err, "missing recover map");
-
-            page_guard.bf_mut().init_recover_map(TrxID::new(10));
-            let err = table_for_internal_assertion(&engine, table_id)
-                .recover_row_insert_to_page(
-                    metadata.as_ref(),
-                    &mut page_guard,
-                    row_id,
-                    &[Val::from(1i32), Val::from(vec![b'x'; PAGE_SIZE - 1])],
-                    TrxID::new(11),
-                )
+            assert_invalid_replay(err, "missing inserted state");
+            let err = table
+                .recover_row_delete_to_page(&mut page, &replay, unused, cts)
                 .unwrap_err();
-            assert_invalid_root(err, "insufficient row page space");
-
-            table_for_internal_assertion(&engine, table_id)
-                .recover_row_insert_to_page(
-                    metadata.as_ref(),
-                    &mut page_guard,
-                    row_id,
-                    &[Val::from(1i32), Val::from("name")],
-                    TrxID::new(12),
-                )
+            assert_invalid_replay(err, "missing inserted state");
+            let huge = [Val::from(1i32), Val::from(vec![b'x'; PAGE_SIZE - 1])];
+            let err = table
+                .recover_row_insert_to_page(&metadata, &mut page, &mut replay, unused, &huge, cts)
+                .unwrap_err();
+            assert_invalid_replay(err, "insufficient row page space");
+            assert!(!replay.is_inserted(1));
+            assert!(page.page().is_deleted(1));
+            // A live physical row without its inserted bit is also invalid.
+            page.page_mut().set_deleted_exclusive(1, false);
+            let before = page.page().header.var_field_offset();
+            let err = table
+                .recover_row_insert_to_page(&metadata, &mut page, &mut replay, unused, &vals, cts)
+                .unwrap_err();
+            assert_invalid_replay(err, "row slot is not deleted");
+            assert!(!replay.is_inserted(1));
+            assert_eq!(page.page().header.var_field_offset(), before);
+            page.page_mut().set_deleted_exclusive(1, true);
+            table
+                .recover_row_insert_to_page(&metadata, &mut page, &mut replay, unused, &vals, cts)
                 .unwrap();
-            assert_eq!(page_guard.page().header.approx_non_deleted(), 1);
-
-            let err = table_for_internal_assertion(&engine, table_id)
-                .recover_row_insert_to_page(
-                    metadata.as_ref(),
-                    &mut page_guard,
-                    row_id,
-                    &[Val::from(2i32), Val::from("other")],
-                    TrxID::new(13),
-                )
-                .unwrap_err();
-            assert_invalid_root(err, "row slot is not vacant");
-
-            let err = table_for_internal_assertion(&engine, table_id)
+            let err = table
                 .recover_row_update_to_page(
-                    metadata.as_ref(),
-                    &mut page_guard,
-                    row_id + 1,
+                    &metadata,
+                    &mut page,
+                    &replay,
+                    unused,
                     &[UpdateCol {
                         idx: 1,
-                        val: Val::from("new"),
+                        val: huge[1].clone(),
                     }],
-                    TrxID::new(14),
+                    cts + 1,
                 )
                 .unwrap_err();
-            assert_invalid_root(err, "row is deleted");
-
-            table_for_internal_assertion(&engine, table_id)
-                .recover_row_delete_to_page(&mut page_guard, row_id, TrxID::new(15))
-                .unwrap();
-            assert_eq!(page_guard.page().header.approx_non_deleted(), 0);
-
-            let err = table_for_internal_assertion(&engine, table_id)
-                .recover_row_delete_to_page(&mut page_guard, row_id, TrxID::new(16))
-                .unwrap_err();
-            assert_invalid_root(err, "row is already deleted");
-
-            let err = table_for_internal_assertion(&engine, table_id)
-                .recover_row_delete_to_page(&mut page_guard, row_id + 2, TrxID::new(17))
-                .unwrap_err();
-            assert_invalid_root(err, "row id outside page range");
+            assert_invalid_replay(err, "insufficient row page space");
+            assert!(replay.is_inserted(1));
+            assert_eq!(page.page().row(1).val(&metadata.col, 1), vals[1]);
         });
     }
 
@@ -519,10 +517,11 @@ mod tests {
             let session = engine.new_session().unwrap();
             let table = table_for_internal_assertion(&engine, table_id);
 
+            let mut replay = RowReplayState::new(PageID::new(0), 2);
             let err = table
                 .recover_row_insert(
                     &session.pool_guards(),
-                    PageID::from(0u64),
+                    &mut replay,
                     RowID::new(0),
                     &[Val::from(1i32)],
                     TrxID::new(10),
@@ -543,10 +542,11 @@ mod tests {
             assert!(report.contains("recover_row_insert"), "{report}");
             assert!(report.contains(&format!("table_id={table_id}")), "{report}");
 
+            assert!(!replay.is_inserted(0));
             let err = table
                 .recover_row_update(
                     &session.pool_guards(),
-                    PageID::from(0u64),
+                    &replay,
                     RowID::new(0),
                     &[UpdateCol {
                         idx: 2,

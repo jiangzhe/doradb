@@ -295,7 +295,7 @@ impl QuiescentArena {
             let frame = guard.bf_mut();
             debug_assert_eq!(frame as *mut BufferFrame, bf.0);
             frame.page_id = page_id;
-            frame.ctx = None;
+            frame.row_ver = None;
             debug_assert_eq!(frame.kind(), FrameKind::Uninitialized);
             frame.set_kind(FrameKind::Hot);
             frame.set_dirty(true);
@@ -410,7 +410,7 @@ mod tests {
 
             let root = arena.create_base_guard();
             let mut old = arena.try_lock_page_exclusive(&root, id.page_id).unwrap();
-            old.bf_mut().ctx = None;
+            old.bf_mut().row_ver = None;
             old.bf_mut().set_kind(FrameKind::Uninitialized);
             drop(old);
             assert!(arena.get_row_version_map(&root, id).await.is_none());
@@ -442,7 +442,7 @@ mod tests {
                 let id = page.versioned_page_id();
                 let mut pending = Box::pin(arena.get_row_version_map(&root, id));
                 assert!(futures::poll!(pending.as_mut()).is_pending());
-                page.bf_mut().ctx = None;
+                page.bf_mut().row_ver = None;
                 page.bf_mut().set_kind(FrameKind::Uninitialized);
                 drop(page);
                 if replace {
@@ -483,23 +483,18 @@ mod tests {
 
     #[test]
     fn test_row_metadata_matching_identity_requires_runtime_context() {
-        for recovery in [false, true] {
-            let arena = QuiescentArena::new(1).unwrap();
-            let root = arena.create_base_guard();
-            let mut page = arena.init_page::<RowPage>(&root, PageID::new(0));
-            let id = page.versioned_page_id();
-            if recovery {
-                page.bf_mut().init_recover_map(TrxID::new(42));
-            }
-            drop(page);
-            assert!(
-                catch_unwind(AssertUnwindSafe(|| {
-                    smol::block_on(arena.get_row_version_map(&root, id))
-                }))
-                .is_err()
-            );
-            assert!(arena.try_lock_page_exclusive(&root, id.page_id).is_some());
-        }
+        let arena = QuiescentArena::new(1).unwrap();
+        let root = arena.create_base_guard();
+        let page = arena.init_page::<RowPage>(&root, PageID::new(0));
+        let id = page.versioned_page_id();
+        drop(page);
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                smol::block_on(arena.get_row_version_map(&root, id))
+            }))
+            .is_err()
+        );
+        assert!(arena.try_lock_page_exclusive(&root, id.page_id).is_some());
     }
 
     #[test]

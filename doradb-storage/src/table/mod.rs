@@ -80,6 +80,7 @@ use crate::index::{
 use crate::map::FastHashMap;
 use crate::obs;
 use crate::quiescent::QuiescentGuard;
+use crate::recovery::RowReplayState;
 use crate::row::ops::{SelectKey, UpdateCol};
 use crate::row::{RowPage, RowRead, var_len_for_insert};
 use crate::runtime::yield_now;
@@ -751,6 +752,7 @@ impl Table {
         &self,
         metadata: &TableMetadata,
         page_guard: &mut PageExclusiveGuard<RowPage>,
+        replay: &mut RowReplayState,
         row_id: RowID,
         cols: &[Val],
         cts: TrxID,
@@ -769,19 +771,22 @@ impl Table {
             ));
         }
         let row_idx = page.row_idx(row_id);
-        if !page_guard
-            .try_rmap()
-            .ok_or_else(|| {
-                recovery_page_invariant_error("insert", page_id, row_id, cts, "missing recover map")
-            })?
-            .is_vacant(row_idx)
-        {
+        if replay.is_inserted(row_idx) {
             return Err(recovery_page_invariant_error(
                 "insert",
                 page_id,
                 row_id,
                 cts,
-                "row slot is not vacant",
+                "row slot was already inserted",
+            ));
+        }
+        if !page.is_deleted(row_idx) {
+            return Err(recovery_page_invariant_error(
+                "insert",
+                page_id,
+                row_id,
+                cts,
+                "row slot is not deleted",
             ));
         }
         let var_len = var_len_for_insert(metadata.col.as_ref(), cols);
@@ -798,29 +803,17 @@ impl Table {
         };
         // update count field to include current row id.
         page_guard.page_mut().update_count_to_include_row_id(row_id);
-        // insert CTS.
-        page_guard
-            .try_rmap_mut()
-            .ok_or_else(|| {
-                recovery_page_invariant_error("insert", page_id, row_id, cts, "missing recover map")
-            })?
-            .insert_at(row_idx, cts);
         let page = page_guard.page_mut();
-        let row_idx = page.row_idx(row_id);
         let mut row = page.row_mut_exclusive(row_idx, var_offset, var_end);
-        if !row.is_deleted() {
-            return Err(recovery_page_invariant_error(
-                "insert",
-                page_id,
-                row_id,
-                cts,
-                "row slot is not deleted",
-            ));
-        }
         for (user_col_idx, user_col) in cols.iter().enumerate() {
             row.update_col(metadata.col.as_ref(), user_col_idx, user_col, false);
         }
         row.finish_insert();
+        // The exclusive sidecar borrow and the pre-write check establish a new slot.
+        assert!(
+            replay.record_insert(row_idx),
+            "recovery insert bit already set: page_id={page_id}, row_id={row_id}"
+        );
         Ok(())
     }
 
@@ -829,6 +822,7 @@ impl Table {
         &self,
         metadata: &TableMetadata,
         page_guard: &mut PageExclusiveGuard<RowPage>,
+        replay: &RowReplayState,
         row_id: RowID,
         cols: &[UpdateCol],
         cts: TrxID,
@@ -864,6 +858,15 @@ impl Table {
             ));
         }
         let row_idx = page.row_idx(row_id);
+        if !replay.is_inserted(row_idx) {
+            return Err(recovery_page_invariant_error(
+                "update",
+                page_id,
+                row_id,
+                cts,
+                "missing inserted state",
+            ));
+        }
         if page.row(row_idx).is_deleted() {
             return Err(recovery_page_invariant_error(
                 "update",
@@ -885,29 +888,6 @@ impl Table {
                 "insufficient row page space",
             ));
         };
-        if page_guard
-            .try_rmap()
-            .ok_or_else(|| {
-                recovery_page_invariant_error("update", page_id, row_id, cts, "missing recover map")
-            })?
-            .at(row_idx)
-            .is_none()
-        {
-            return Err(recovery_page_invariant_error(
-                "update",
-                page_id,
-                row_id,
-                cts,
-                "missing recover CTS",
-            ));
-        }
-        // update CTS.
-        page_guard
-            .try_rmap_mut()
-            .ok_or_else(|| {
-                recovery_page_invariant_error("update", page_id, row_id, cts, "missing recover map")
-            })?
-            .update_at(row_idx, cts);
         let page = page_guard.page_mut();
         let mut row = page.row_mut_exclusive(row_idx, var_offset, var_end);
         debug_assert_eq!(row_id, row.row_id());
@@ -923,6 +903,7 @@ impl Table {
     fn recover_row_delete_to_page(
         &self,
         page_guard: &mut PageExclusiveGuard<RowPage>,
+        replay: &RowReplayState,
         row_id: RowID,
         cts: TrxID,
     ) -> DataIntegrityResult<()> {
@@ -938,6 +919,15 @@ impl Table {
             ));
         }
         let row_idx = page.row_idx(row_id);
+        if !replay.is_inserted(row_idx) {
+            return Err(recovery_page_invariant_error(
+                "delete",
+                page_id,
+                row_id,
+                cts,
+                "missing inserted state",
+            ));
+        }
         let was_deleted = page.is_deleted(row_idx);
         if was_deleted {
             return Err(recovery_page_invariant_error(
@@ -948,28 +938,6 @@ impl Table {
                 "row is already deleted",
             ));
         }
-        if page_guard
-            .try_rmap()
-            .ok_or_else(|| {
-                recovery_page_invariant_error("delete", page_id, row_id, cts, "missing recover map")
-            })?
-            .at(row_idx)
-            .is_none()
-        {
-            return Err(recovery_page_invariant_error(
-                "delete",
-                page_id,
-                row_id,
-                cts,
-                "missing recover CTS",
-            ));
-        }
-        page_guard
-            .try_rmap_mut()
-            .ok_or_else(|| {
-                recovery_page_invariant_error("delete", page_id, row_id, cts, "missing recover map")
-            })?
-            .update_at(row_idx, cts);
         let page = page_guard.page_mut();
         page.set_deleted_exclusive(row_idx, true);
         if !was_deleted {

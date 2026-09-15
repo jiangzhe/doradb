@@ -17,33 +17,32 @@ mod row_state;
 pub(crate) mod stream;
 mod timeline;
 
-use crate::buffer::BufferPool;
 use crate::buffer::guard::PageGuard;
 use crate::catalog::{
     CatalogTable, IndexDdlKind, IndexDdlRootProof, IndexRef, ReplayVisibleIndexDdl,
-    TableColumnLayout, classify_index_ddl_root,
+    classify_index_ddl_root,
 };
 use crate::error::{
     DataIntegrityError, DataIntegrityResult, IoResult, MultiDomainResultExt, RuntimeError,
     RuntimeOrFatalResult, RuntimeOrFatalResultExt, RuntimeResult,
 };
 use crate::id::{PageID, RowID, TableID, TrxID};
-use crate::latch::LatchFallbackMode;
 use crate::log::block_group::TrxLog;
 use crate::log::redo::{DDLRedo, RedoLogs, RowRedo, RowRedoKind, TableDML};
 use crate::log::{RedoLogCreateMode, RedoLogFinalizer, next_redo_file_seq};
 use crate::map::{FastHashMap, FastHashSet};
 use crate::obs;
 use crate::recovery::stream::PlannedRedoRecovery;
-use crate::row::RowPage;
 use crate::table::{Table, TableRedoReplayFloor};
 use crate::trx::MIN_SNAPSHOT_TS;
 use stream::{RedoRecoveryRepairPolicy, RedoReplayPlanner, UnsealedSegmentTerminal};
 
 use error_stack::{Report, ResultExt};
 pub(crate) use resources::RecoveryResources;
-pub(crate) use row_state::RowRecoveryMap;
-use std::collections::{BTreeMap, BTreeSet};
+pub(crate) use row_state::RowReplayState;
+use std::collections::BTreeMap;
+use std::collections::hash_map::Entry;
+use std::mem;
 use std::sync::Arc;
 pub(crate) use timeline::{RecoveryTimeline, TableReplayBounds};
 
@@ -69,9 +68,8 @@ pub(crate) struct RecoveryCoordinator<'a> {
     timeline: RecoveryTimeline,
     /// Tables loaded from table-file metadata while catalog index DDL redo is pending.
     pending_index_ddl_reconciliations: FastHashSet<TableID>,
-    /// Hot row pages touched by redo replay, grouped by table for post-replay
-    /// index rebuild and undo-map refresh.
-    recovered_tables: FastHashMap<TableID, BTreeSet<PageID>>,
+    /// Inserted-slot history for each recovery allocation, consumed by index rebuild.
+    recovered_tables: FastHashMap<TableID, FastHashMap<PageID, RowReplayState>>,
 }
 
 impl<'a> RecoveryCoordinator<'a> {
@@ -256,19 +254,18 @@ impl<'a> RecoveryCoordinator<'a> {
                 );
             })
             .change_context(RuntimeError::Recovery)?;
-        // 5. Rebuild hot secondary-index state from recovered RowStore pages
-        //    and refresh pages to enable undo maps.
+        // 5. Rebuild hot secondary-index state from recovered RowStore pages.
         obs::info!(
-            "event=recovery_phase component=recovery phase=index_rebuild_page_refresh action=start result=ok"
+            "event=recovery_phase component=recovery phase=index_rebuild action=start result=ok"
         );
-        self.recover_indexes_and_refresh_pages()
+        self.rebuild_hot_indexes()
             .await
             .inspect(|_| {
-                obs::info!("event=recovery_phase component=recovery phase=index_rebuild_page_refresh action=finish result=ok");
+                obs::info!("event=recovery_phase component=recovery phase=index_rebuild action=finish result=ok");
             })
             .inspect_err(|err| {
                 obs::error!(
-                    "event=recovery_phase component=recovery phase=index_rebuild_page_refresh action=finish result=error error={}",
+                    "event=recovery_phase component=recovery phase=index_rebuild action=finish result=error error={}",
                     err
                 );
             })?;
@@ -542,19 +539,26 @@ impl<'a> RecoveryCoordinator<'a> {
         Ok(())
     }
 
-    async fn recover_indexes_and_refresh_pages(&mut self) -> RuntimeOrFatalResult<()> {
-        // Checkpointed cold secondary-index state is already available through
-        // the table's DiskTree roots. Rebuild only hot row-page MemIndex state.
-        for (table_id, pages) in &self.recovered_tables {
-            if let Some(table) = self.resources.catalog.get_table(*table_id) {
-                let metadata = table.metadata();
-                for page_id in pages {
-                    table
-                        .populate_index_via_row_page(&self.resources.pool_guards, *page_id)
-                        .await?;
-                    self.refresh_page(Arc::clone(&metadata.col), *page_id)
-                        .await?;
-                }
+    async fn rebuild_hot_indexes(&mut self) -> RuntimeOrFatalResult<()> {
+        // Checkpointed cold indexes already reside in DiskTree roots. Consume
+        // replay state before rebuilding hot indexes through ordinary row reads.
+        for (table_id, pages) in mem::take(&mut self.recovered_tables) {
+            let table = self
+                .resources
+                .catalog
+                .get_table(table_id)
+                .ok_or_else(|| {
+                    Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
+                        "rebuild hot indexes requires live runtime: table_id={table_id}"
+                    ))
+                })
+                .change_context(RuntimeError::Recovery)?;
+            for replay in pages.into_values() {
+                let page_id = replay.page_id();
+                drop(replay);
+                table
+                    .populate_index_via_row_page(&self.resources.pool_guards, page_id)
+                    .await?;
             }
         }
         Ok(())
@@ -638,38 +642,6 @@ impl<'a> RecoveryCoordinator<'a> {
                 &recovered_user_table_ids,
                 &deferred_drop_table_ids,
             )
-    }
-
-    async fn refresh_page(
-        &self,
-        col_layout: Arc<TableColumnLayout>,
-        page_id: PageID,
-    ) -> RuntimeOrFatalResult<()> {
-        let mut page_guard = self
-            .resources
-            .pools
-            .mem
-            .get_page::<RowPage>(
-                self.resources.pool_guards.mem_guard(),
-                page_id,
-                LatchFallbackMode::Exclusive,
-            )
-            .await?
-            .lock_exclusive_async()
-            .await
-            .unwrap();
-
-        let create_cts = page_guard
-            .try_rmap()
-            .map(|rec| rec.create_cts())
-            .unwrap_or(TrxID::new(0));
-        let start_row_id = page_guard.page().header.start_row_id;
-        let max_row_count = page_guard.page().header.max_row_count as usize;
-        page_guard
-            .bf_mut()
-            .init_undo_map(col_layout, start_row_id, max_row_count);
-        page_guard.unwrap_vmap().set_create_cts(create_cts);
-        Ok(())
     }
 
     async fn replay_ddl(
@@ -960,22 +932,28 @@ impl<'a> RecoveryCoordinator<'a> {
                     .attach(format!("replay create row page: table_id={table_id}"))
             })
             .change_context(RuntimeError::Recovery)?;
+        // Reserve the registry entry before allocation so duplicate live redo
+        // cannot overwrite either the page or its inserted-slot history.
+        let entry = self
+            .recovered_tables
+            .entry(table_id)
+            .or_default()
+            .entry(page_id);
+        let Entry::Vacant(entry) = entry else {
+            return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+                .attach(format!("duplicate recovery page registration: table_id={table_id}, page_id={page_id}, cts={cts}"))
+                .change_context(RuntimeError::Recovery).into());
+        };
         let count = end_row_id - start_row_id;
-        let mut page_guard = table
+        let page_guard = table
             .row_store
             .allocate_row_page_at(&self.resources.pool_guards, count as usize, page_id)
             .await?;
-        // Here we switch row page to recover mode.
-        page_guard.bf_mut().init_recover_map(cts);
-
-        // Record recovered pages so we can recover indexes and refresh undo map at end.
-        // Note: we do not need to recover catalog tables because they are specially handled.
-        if table_id.is_user() {
-            self.recovered_tables
-                .entry(table_id)
-                .or_default()
-                .insert(page_id);
-        }
+        page_guard.unwrap_vmap().set_create_cts(cts);
+        entry.insert(RowReplayState::new(
+            page_guard.page_id(),
+            page_guard.page().header.max_row_count as usize,
+        ));
 
         debug_assert!({
             let page = page_guard.page();
@@ -1207,10 +1185,15 @@ impl<'a> RecoveryCoordinator<'a> {
                     if !should_replay_heap_row(row.row_id, pivot_row_id, cts, heap_redo_start_ts) {
                         continue;
                     }
+                    let replay = self.recovered_tables.get_mut(&table_id)
+                        .and_then(|pages| pages.get_mut(page_id))
+                        .ok_or_else(|| Report::new(DataIntegrityError::InvalidRootInvariant)
+                            .attach(format!("missing row replay state: operation=insert, table_id={table_id}, page_id={page_id}, row_id={}, cts={cts}", row.row_id)))
+                        .change_context(RuntimeError::Recovery)?;
                     table
                         .recover_row_insert(
                             &self.resources.pool_guards,
-                            *page_id,
+                            replay,
                             row.row_id,
                             vals,
                             cts,
@@ -1222,10 +1205,15 @@ impl<'a> RecoveryCoordinator<'a> {
                     if !should_replay_heap_row(row.row_id, pivot_row_id, cts, heap_redo_start_ts) {
                         continue;
                     }
+                    let replay = self.recovered_tables.get(&table_id)
+                        .and_then(|pages| pages.get(page_id))
+                        .ok_or_else(|| Report::new(DataIntegrityError::InvalidRootInvariant)
+                            .attach(format!("missing row replay state: operation=update, table_id={table_id}, page_id={page_id}, row_id={}, cts={cts}", row.row_id)))
+                        .change_context(RuntimeError::Recovery)?;
                     table
                         .recover_row_update(
                             &self.resources.pool_guards,
-                            *page_id,
+                            replay,
                             row.row_id,
                             vals,
                             cts,
@@ -1238,11 +1226,24 @@ impl<'a> RecoveryCoordinator<'a> {
                         if cts < deletion_cutoff_ts {
                             continue;
                         }
-                    } else if cts < heap_redo_start_ts {
+                        table.recover_cold_row_delete(row.row_id, cts)
+                            .change_context(RuntimeError::Recovery)
+                            .attach_with(|| format!("operation=recover_cold_row_delete, table_id={table_id}, row_id={}, cts={cts}", row.row_id))?;
                         continue;
                     }
+                    if cts < heap_redo_start_ts {
+                        continue;
+                    }
+                    let page_id = page_id.ok_or_else(|| Report::new(DataIntegrityError::InvalidPayload)
+                        .attach(format!("hot row delete redo requires page identity: operation=delete, table_id={table_id}, row_id={}, cts={cts}", row.row_id)))
+                        .change_context(RuntimeError::Recovery)?;
+                    let replay = self.recovered_tables.get(&table_id)
+                        .and_then(|pages| pages.get(&page_id))
+                        .ok_or_else(|| Report::new(DataIntegrityError::InvalidRootInvariant)
+                            .attach(format!("missing row replay state: operation=delete, table_id={table_id}, page_id={page_id}, row_id={}, cts={cts}", row.row_id)))
+                        .change_context(RuntimeError::Recovery)?;
                     table
-                        .recover_row_delete(&self.resources.pool_guards, *page_id, row.row_id, cts)
+                        .recover_row_delete(&self.resources.pool_guards, replay, row.row_id, cts)
                         .await?;
                 }
                 RowRedoKind::DeleteByPrimaryKey(_) | RowRedoKind::UpdateByPrimaryKey(..) => {
@@ -1342,7 +1343,10 @@ mod tests {
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::RuntimeOrFatalError;
-    use crate::error::{CompletionErrorBridge, DataIntegrityError, Error, ErrorKind, RuntimeError};
+    use crate::error::{
+        CompletionErrorBridge, DataIntegrityError, Error, ErrorKind, RuntimeError,
+        RuntimeOrFatalResult,
+    };
     use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
     use crate::file::table_file::MutableTableFile;
@@ -1356,7 +1360,8 @@ mod tests {
         parse_redo_super_block, serialize_redo_super_block, slot_offset,
     };
     use crate::log::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind};
-    use crate::recovery::{RecoveryResources, RowRecoveryMap, TableReplayBounds};
+    use crate::recovery::RowReplayState;
+    use crate::recovery::{RecoveryResources, TableReplayBounds};
     use crate::row::RowRead;
     use crate::row::ops::{
         RowMutation, ScanRowDecision, SelectKey, SelectMvcc, UniqueMutationOutcome, UpdateCol,
@@ -1369,6 +1374,7 @@ mod tests {
     };
     use crate::table::{DeleteMarker, TableRedoReplayFloor};
     use crate::trx::MIN_SNAPSHOT_TS;
+    use crate::trx::ver_map::RowPageState;
     use crate::value::Val;
     use crate::value::ValKind;
 
@@ -2065,6 +2071,44 @@ mod tests {
         });
     }
 
+    fn row_recovery_for_table(engine: &Engine, table_id: TableID) -> RecoveryCoordinator<'_> {
+        let mut recovery = log_recovery_for_engine(engine, MIN_SNAPSHOT_TS);
+        recovery.timeline.table_bounds.insert(
+            table_id,
+            TableReplayBounds {
+                root_ts: MIN_SNAPSHOT_TS,
+                heap_redo_start_ts: TrxID::new(10),
+                deletion_cutoff_ts: TrxID::new(10),
+            },
+        );
+        recovery
+    }
+
+    async fn replay_test_row(
+        recovery: &mut RecoveryCoordinator<'_>,
+        table_id: TableID,
+        row_id: RowID,
+        kind: RowRedoKind,
+        cts: TrxID,
+    ) -> RuntimeOrFatalResult<()> {
+        let mut redo = RedoLogs::default();
+        redo.insert_dml(table_id, RowRedo { row_id, kind });
+        recovery.replay_dml(redo.dml, cts).await
+    }
+
+    fn assert_replay_integrity(
+        err: RuntimeOrFatalError,
+        expected: DataIntegrityError,
+        reason: &str,
+    ) {
+        let RuntimeOrFatalError::Runtime(err) = err else {
+            panic!("expected Runtime error, got {err:?}");
+        };
+        assert_eq!(err.downcast_ref::<DataIntegrityError>(), Some(&expected));
+        let report = format!("{err:?}");
+        assert!(report.contains(reason), "{report}");
+    }
+
     #[test]
     fn test_heap_replay_requires_row_at_or_above_published_pivot() {
         let pivot_row_id = RowID::new(100);
@@ -2135,23 +2179,6 @@ mod tests {
     }
 
     #[test]
-    fn test_recover_map_tracks_create_cts_and_entries() {
-        let mut map = RowRecoveryMap::new(TrxID::new(7));
-        assert_eq!(map.create_cts(), TrxID::new(7));
-        assert!(map.is_vacant(0));
-
-        map.insert_at(2, TrxID::new(11));
-        assert!(map.is_vacant(0));
-        assert!(map.is_vacant(1));
-        assert!(!map.is_vacant(2));
-        assert_eq!(map.at(2), Some(TrxID::new(11)));
-        assert_eq!(map.at(3), None);
-
-        map.update_at(2, TrxID::new(13));
-        assert_eq!(map.at(2), Some(TrxID::new(13)));
-    }
-
-    #[test]
     fn test_recovery_table_state_replay_start_uses_heap_and_deletion_floor() {
         let heap_first = TableReplayBounds {
             root_ts: TrxID::new(5),
@@ -2215,6 +2242,422 @@ mod tests {
             true,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn test_hot_replay_filters_before_requiring_registered_page() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(lightweight_recovery_engine_config(
+                temp_dir.path(),
+                "replay-sidecar-lookup",
+            ))
+            .await
+            .unwrap();
+            let table_id = create_index_ddl_base_table(&engine, vec![]).await;
+            let mut recovery = row_recovery_for_table(&engine, table_id);
+            for (kind, expected, reason) in [
+                (
+                    RowRedoKind::Insert(PageID::new(30), vec![Val::from(1i32), Val::from(2i32)]),
+                    DataIntegrityError::InvalidRootInvariant,
+                    "missing row replay state",
+                ),
+                (
+                    RowRedoKind::Update(
+                        PageID::new(30),
+                        vec![UpdateCol {
+                            idx: 0,
+                            val: Val::from(1i32),
+                        }],
+                    ),
+                    DataIntegrityError::InvalidRootInvariant,
+                    "missing row replay state",
+                ),
+                (
+                    RowRedoKind::Delete(Some(PageID::new(30))),
+                    DataIntegrityError::InvalidRootInvariant,
+                    "missing row replay state",
+                ),
+                (
+                    RowRedoKind::Delete(None),
+                    DataIntegrityError::InvalidPayload,
+                    "requires page identity",
+                ),
+            ] {
+                let table = engine.inner().core.catalog().get_table(table_id).unwrap();
+                let rows = BTreeMap::from([(
+                    RowID::new(0),
+                    RowRedo {
+                        row_id: RowID::new(0),
+                        kind,
+                    },
+                )]);
+                recovery
+                    .replay_table_dml(table_id, &table, &rows, TrxID::new(9))
+                    .await
+                    .unwrap();
+                let err = recovery
+                    .replay_table_dml(table_id, &table, &rows, TrxID::new(10))
+                    .await
+                    .unwrap_err();
+                let report = format!("{err:?}");
+                for context in [
+                    format!("table_id={table_id}"),
+                    "row_id=0".to_owned(),
+                    "cts=10".to_owned(),
+                ] {
+                    assert!(report.contains(&context), "{report}");
+                }
+                assert_replay_integrity(err, expected, reason);
+                assert!(recovery.recovered_tables.is_empty());
+            }
+        });
+    }
+
+    #[test]
+    fn test_cold_replay_ignores_hot_page_identity() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(lightweight_recovery_engine_config(
+                temp_dir.path(),
+                "replay-cold-without-sidecar",
+            ))
+            .await
+            .unwrap();
+            let table_id =
+                create_index_ddl_base_table(&engine, vec![base_unique_index_spec()]).await;
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            trx.table_insert_mvcc(table_id, vec![Val::from(1i32), Val::from(2i32)])
+                .await
+                .unwrap();
+            trx.commit().await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+            assert_checkpoint_published(&mut session, table_id).await;
+            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
+            let root = table.file().active_root_unchecked();
+            let row_id = RowID::new(0);
+            assert!(row_id < root.pivot_row_id);
+            let cts = root.deletion_cutoff_ts;
+            let mut recovery = log_recovery_for_engine(&engine, MIN_SNAPSHOT_TS);
+            recovery.track_loaded_table(table_id).unwrap();
+            // Heap inserts below the pivot are checkpoint-covered despite newer CTS.
+            let rows = BTreeMap::from([(
+                row_id,
+                RowRedo {
+                    row_id,
+                    kind: RowRedoKind::Insert(
+                        PageID::new(30),
+                        vec![Val::from(1i32), Val::from(2i32)],
+                    ),
+                },
+            )]);
+            recovery
+                .replay_table_dml(table_id, &table, &rows, cts)
+                .await
+                .unwrap();
+            for page_id in [None, Some(PageID::new(30))] {
+                replay_test_row(
+                    &mut recovery,
+                    table_id,
+                    row_id,
+                    RowRedoKind::Delete(page_id),
+                    cts,
+                )
+                .await
+                .unwrap();
+                assert!(recovery.recovered_tables.is_empty());
+                assert!(matches!(
+                    table.deletion_buffer().get(row_id),
+                    Some(DeleteMarker::Committed(actual)) if actual == cts
+                ));
+            }
+            let err = replay_test_row(
+                &mut recovery,
+                table_id,
+                row_id,
+                RowRedoKind::Delete(None),
+                cts + 1,
+            )
+            .await
+            .unwrap_err();
+            let report = format!("{err:?}");
+            assert!(
+                report.contains("operation=recover_cold_row_delete"),
+                "{report}"
+            );
+            assert_replay_integrity(
+                err,
+                DataIntegrityError::InvalidRootInvariant,
+                "conflicting committed cold-row deletion",
+            );
+        });
+    }
+
+    #[test]
+    fn test_replay_rebuild_consumes_sidecars_and_retains_version_maps() {
+        smol::block_on(async {
+            for ids in [[30, 31, 32], [32, 31, 30]] {
+                let temp_dir = TempDir::new().unwrap();
+                let engine = Engine::bootstrap(lightweight_recovery_engine_config(
+                    temp_dir.path(),
+                    "replay-sidecar-rebuild",
+                ))
+                .await
+                .unwrap();
+                let table_id = create_index_ddl_base_table(
+                    &engine,
+                    vec![base_unique_index_spec(), added_index_spec()],
+                )
+                .await;
+                let table = engine.inner().core.catalog().get_table(table_id).unwrap();
+                let mut recovery = row_recovery_for_table(&engine, table_id);
+                let mut maps = Vec::new();
+                for (n, id) in ids.into_iter().enumerate() {
+                    let page_id = PageID::new(id);
+                    let first = RowID::new(n as u64 * 70);
+                    let create_cts = TrxID::new(10 + n as u64);
+                    recovery
+                        .replay_create_row_page_ddl(
+                            table_id,
+                            page_id,
+                            first,
+                            first + 70,
+                            BTreeMap::new(),
+                            create_cts,
+                        )
+                        .await
+                        .unwrap();
+                    let page = table
+                        .row_store
+                        .must_get_row_page_shared(&recovery.resources.pool_guards, page_id)
+                        .await
+                        .unwrap();
+                    assert_eq!(page.unwrap_vmap().create_cts(), create_cts);
+                    maps.push((page_id, page.unwrap_vmap() as *const _ as usize, create_cts));
+                }
+                for (row_id, page_id, key, cts) in [
+                    (69, ids[0], 69, 13),
+                    (0, ids[0], 0, 14),
+                    (72, ids[1], 72, 15),
+                ] {
+                    replay_test_row(
+                        &mut recovery,
+                        table_id,
+                        RowID::new(row_id),
+                        RowRedoKind::Insert(
+                            PageID::new(page_id),
+                            vec![Val::from(key), Val::from(7i32)],
+                        ),
+                        TrxID::new(cts),
+                    )
+                    .await
+                    .unwrap();
+                }
+                replay_test_row(
+                    &mut recovery,
+                    table_id,
+                    RowID::new(69),
+                    RowRedoKind::Delete(Some(PageID::new(ids[0]))),
+                    TrxID::new(16),
+                )
+                .await
+                .unwrap();
+                let err = recovery
+                    .replay_create_row_page_ddl(
+                        table_id,
+                        PageID::new(ids[0]),
+                        RowID::new(0),
+                        RowID::new(70),
+                        BTreeMap::new(),
+                        TrxID::new(17),
+                    )
+                    .await
+                    .unwrap_err();
+                assert_replay_integrity(
+                    err,
+                    DataIntegrityError::InvalidRootInvariant,
+                    "duplicate recovery page registration",
+                );
+                let original = &recovery.recovered_tables[&table_id][&PageID::new(ids[0])];
+                assert!(original.is_inserted(69));
+                assert!(original.is_inserted(0));
+                assert_eq!(recovery.recovered_tables[&table_id].len(), 3);
+                recovery.rebuild_hot_indexes().await.unwrap();
+                assert!(recovery.recovered_tables.is_empty());
+                for (page_id, address, create_cts) in maps {
+                    let page = table
+                        .row_store
+                        .must_get_row_page_shared(&recovery.resources.pool_guards, page_id)
+                        .await
+                        .unwrap();
+                    assert_eq!(page.unwrap_vmap() as *const _ as usize, address);
+                    assert_eq!(page.unwrap_vmap().create_cts(), create_cts);
+                    assert_eq!(*page.unwrap_vmap().read_state(), RowPageState::Active);
+                    for slot in 0..70 {
+                        assert!(page.unwrap_vmap().read_latch(slot).is_none());
+                    }
+                }
+                let layout = table.layout_snapshot();
+                let unique = layout
+                    .expect_secondary_index(IndexRef::new(IndexID::new(0), IndexSlot::new(0)))
+                    .unique_mem()
+                    .unwrap()
+                    .bind(recovery.resources.pool_guards.index_guard());
+                let non_unique = layout
+                    .expect_secondary_index(IndexRef::new(IndexID::new(1), IndexSlot::new(1)))
+                    .non_unique_mem()
+                    .unwrap()
+                    .bind(recovery.resources.pool_guards.index_guard());
+                for key in [0i32, 69, 72] {
+                    let row_id = RowID::new(key as u64);
+                    assert_eq!(
+                        unique
+                            .lookup(&[Val::from(key)], MIN_SNAPSHOT_TS)
+                            .await
+                            .unwrap(),
+                        (key != 69).then_some((row_id, false))
+                    );
+                    assert_eq!(
+                        non_unique
+                            .lookup_unique(&[Val::from(7i32)], row_id, MIN_SNAPSHOT_TS)
+                            .await
+                            .unwrap(),
+                        (key != 69).then_some(true)
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn test_replay_drop_removes_sidecars_before_page_reuse() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(lightweight_recovery_engine_config(
+                temp_dir.path(),
+                "replay-sidecar-reuse",
+            ))
+            .await
+            .unwrap();
+            let first_table = create_index_ddl_base_table(&engine, vec![]).await;
+            let second_table = create_index_ddl_base_table(&engine, vec![]).await;
+            let mut recovery = row_recovery_for_table(&engine, first_table);
+            let bounds = recovery.timeline.table_bounds[&first_table];
+            recovery.timeline.table_bounds.insert(second_table, bounds);
+            let page_id = PageID::new(30);
+            recovery
+                .replay_create_row_page_ddl(
+                    first_table,
+                    page_id,
+                    RowID::new(0),
+                    RowID::new(70),
+                    BTreeMap::new(),
+                    TrxID::new(10),
+                )
+                .await
+                .unwrap();
+            replay_test_row(
+                &mut recovery,
+                first_table,
+                RowID::new(0),
+                RowRedoKind::Insert(page_id, vec![Val::from(1i32), Val::from(2i32)]),
+                TrxID::new(11),
+            )
+            .await
+            .unwrap();
+            recovery
+                .replay_drop_table_ddl(first_table, BTreeMap::new(), TrxID::new(12))
+                .await
+                .unwrap();
+            assert!(!recovery.recovered_tables.contains_key(&first_table));
+            recovery
+                .replay_create_row_page_ddl(
+                    second_table,
+                    page_id,
+                    RowID::new(0),
+                    RowID::new(70),
+                    BTreeMap::new(),
+                    TrxID::new(13),
+                )
+                .await
+                .unwrap();
+            let replay = &recovery.recovered_tables[&second_table][&page_id];
+            assert!(!replay.is_inserted(0));
+            replay_test_row(
+                &mut recovery,
+                second_table,
+                RowID::new(0),
+                RowRedoKind::Insert(page_id, vec![Val::from(3i32), Val::from(4i32)]),
+                TrxID::new(14),
+            )
+            .await
+            .unwrap();
+            recovery.rebuild_hot_indexes().await.unwrap();
+            assert!(recovery.recovered_tables.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_failed_index_rebuild_consumes_remaining_sidecars() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(lightweight_recovery_engine_config(
+                temp_dir.path(),
+                "replay-sidecar-failure",
+            ))
+            .await
+            .unwrap();
+            let table_id =
+                create_index_ddl_base_table(&engine, vec![base_unique_index_spec()]).await;
+            let mut recovery = row_recovery_for_table(&engine, table_id);
+            for n in 0..3 {
+                let page_id = PageID::new(30 + n);
+                recovery
+                    .replay_create_row_page_ddl(
+                        table_id,
+                        page_id,
+                        RowID::new(n * 70),
+                        RowID::new((n + 1) * 70),
+                        BTreeMap::new(),
+                        TrxID::new(10 + n * 2),
+                    )
+                    .await
+                    .unwrap();
+                if n < 2 {
+                    replay_test_row(
+                        &mut recovery,
+                        table_id,
+                        RowID::new(n * 70),
+                        RowRedoKind::Insert(page_id, vec![Val::from(1i32), Val::from(2i32)]),
+                        TrxID::new(11 + n * 2),
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+            let err = recovery.rebuild_hot_indexes().await.unwrap_err();
+            assert_replay_integrity(
+                err,
+                DataIntegrityError::UnexpectedRecoveryDuplicateKey,
+                "duplicate",
+            );
+            assert!(recovery.recovered_tables.is_empty());
+            // An orphaned group must fail even if it contains no populated rows.
+            let missing_table_id = USER_TABLE_ID_START + 999;
+            recovery
+                .recovered_tables
+                .entry(missing_table_id)
+                .or_default()
+                .insert(PageID::new(33), RowReplayState::new(PageID::new(33), 70));
+            let err = recovery.rebuild_hot_indexes().await.unwrap_err();
+            assert_replay_integrity(
+                err,
+                DataIntegrityError::InvalidRootInvariant,
+                "requires live runtime",
+            );
+            assert!(recovery.recovered_tables.is_empty());
+        });
     }
 
     #[test]
