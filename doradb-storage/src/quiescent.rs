@@ -1,3 +1,5 @@
+#[cfg(test)]
+pub(crate) use self::tests::shares_root as test_sync_guards_share_root;
 use crate::buffer::PoolIdentity;
 use std::hint::spin_loop;
 use std::ops::Deref;
@@ -299,9 +301,6 @@ fn guard_count_overflow() -> ! {
 fn guard_count_underflow() -> ! {
     panic!("quiescent guard count underflow");
 }
-
-#[cfg(test)]
-pub(crate) use self::tests::shares_root as test_sync_guards_share_root;
 
 #[cfg(test)]
 mod tests {

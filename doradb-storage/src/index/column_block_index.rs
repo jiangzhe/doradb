@@ -363,6 +363,7 @@ impl ColumnBlockBranchEntry {
 
 trait ColumnBlockNodeRead {
     fn header_ref(&self) -> &ColumnBlockNodeHeader;
+
     fn data_ref(&self) -> &[u8];
 
     #[inline]

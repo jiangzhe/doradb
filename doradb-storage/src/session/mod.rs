@@ -635,10 +635,12 @@ impl AdmittedSessionRuntime<'_> {
 pub(crate) trait SessionRuntimeAccess {
     /// Returns the retained exact session runtime.
     fn runtime(&self) -> &SessionRuntime;
+
     /// Returns immutable shared engine capabilities.
     fn engine(&self) -> &EngineCore {
         self.runtime().core()
     }
+
     /// Borrows the exact session's pool-guard roots.
     fn pool_guards(&self) -> &PoolGuards {
         self.runtime().pool_guards()
@@ -3973,14 +3975,19 @@ pub(crate) mod tests {
     pub(crate) trait SessionTestExt {
         /// Provides test-only access to `in_trx`.
         fn in_trx(&self) -> Result<bool>;
+
         /// Provides test-only access to `pool_guards`.
         fn pool_guards(&self) -> PoolGuards;
+
         /// Provides test-only access to `engine`.
         fn engine(&self) -> SessionRuntime;
+
         /// Provides test-only access to `last_cts`.
         fn last_cts(&self) -> TrxID;
+
         /// Provides test-only access to `load_active_insert_page`.
         fn load_active_insert_page(&mut self, table_id: TableID) -> Option<VersionedPageID>;
+
         /// Provides test-only access to `save_active_insert_page`.
         fn save_active_insert_page(&mut self, table_id: TableID, page_id: VersionedPageID);
     }

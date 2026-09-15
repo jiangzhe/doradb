@@ -643,6 +643,7 @@ fn check_item_scope(
     check_impl_adjacency(path, items, out);
     check_visible_docs(path, items, lines, out);
     check_function_attributes(path, items, out);
+    check_function_spacing(path, items, lines, out);
 }
 
 fn parseable_rust_content(content: &str) -> String {
@@ -1266,6 +1267,112 @@ fn check_attrs_adjacent(
     }
 }
 
+fn check_function_spacing(path: &str, items: &[Item], lines: &[String], out: &mut Vec<Violation>) {
+    check_function_pairs(
+        path,
+        items.iter().map(|item| match item {
+            Item::Fn(function) => Some((function.span(), span_line(function.sig.fn_token.span))),
+            _ => None,
+        }),
+        lines,
+        out,
+    );
+    for item in items {
+        match item {
+            Item::Impl(item_impl) => check_function_pairs(
+                path,
+                item_impl.items.iter().map(|item| match item {
+                    ImplItem::Fn(method) => {
+                        Some((method.span(), span_line(method.sig.fn_token.span)))
+                    }
+                    _ => None,
+                }),
+                lines,
+                out,
+            ),
+            Item::Trait(item_trait) => check_function_pairs(
+                path,
+                item_trait.items.iter().map(|item| match item {
+                    TraitItem::Fn(method) => {
+                        Some((method.span(), span_line(method.sig.fn_token.span)))
+                    }
+                    _ => None,
+                }),
+                lines,
+                out,
+            ),
+            _ => {}
+        }
+    }
+}
+
+fn check_function_pairs(
+    path: &str,
+    functions: impl IntoIterator<Item = Option<(Span, usize)>>,
+    lines: &[String],
+    out: &mut Vec<Violation>,
+) {
+    let mut previous = None;
+    for function in functions {
+        let Some((span, signature_line)) = function else {
+            previous = None;
+            continue;
+        };
+        if let Some(previous) = previous {
+            let empty_lines = max_empty_lines_between_functions(previous, span, lines);
+            if empty_lines != 1 {
+                out.push(violation(
+                    path,
+                    signature_line,
+                    "function-spacing",
+                    format!(
+                        "consecutive functions or methods require one empty line per gap outside comments (found {empty_lines})"
+                    ),
+                ));
+            }
+        }
+        previous = Some(span);
+    }
+}
+
+fn max_empty_lines_between_functions(previous: Span, next: Span, lines: &[String]) -> usize {
+    let end = previous.end();
+    // Item spans include documentation and attributes. Ordinary comments divide
+    // the gap into separate blank-line runs; blanks inside block comments do not
+    // contribute. Include the previous item's line tail for trailing comments.
+    let gap = lines
+        .get(end.line.saturating_sub(1)..next.start().line.saturating_sub(1))
+        .unwrap_or_default();
+    let mut block_depth = 0;
+    let mut current_run = 0;
+    let mut max_run = 0;
+    for (offset, line) in gap.iter().enumerate() {
+        if offset > 0 && block_depth == 0 && line.trim().is_empty() {
+            current_run += 1;
+            max_run = max_run.max(current_run);
+            continue;
+        }
+        current_run = 0;
+        let column = if offset == 0 { end.column } else { 0 };
+        let mut chars = line.chars().skip(column).peekable();
+        while let Some(ch) = chars.next() {
+            match (ch, chars.peek().copied()) {
+                ('/', Some('/')) if block_depth == 0 => break,
+                ('/', Some('*')) => {
+                    block_depth += 1;
+                    chars.next();
+                }
+                ('*', Some('/')) if block_depth > 0 => {
+                    block_depth -= 1;
+                    chars.next();
+                }
+                _ => {}
+            }
+        }
+    }
+    max_run
+}
+
 fn check_qualified_paths(path: &str, items: &[Item], out: &mut Vec<Violation>) {
     let mut visitor = QualifiedPathVisitor {
         file_path: path,
@@ -1439,6 +1546,180 @@ mod tests {
     fn cfg_matches(source: &str) -> bool {
         let item = syn::parse_str::<ItemMod>(source).expect("test module should parse");
         has_cfg_test(&item.attrs)
+    }
+
+    fn assert_function_spacing(source: &str, expected: &[(usize, usize)]) {
+        let violations = violations(source);
+        assert!(
+            violations.iter().all(|violation| violation.rule != "parse"),
+            "{source}\n{violations:#?}"
+        );
+        let spacing = violations
+            .iter()
+            .filter(|violation| violation.rule == "function-spacing")
+            .collect::<Vec<_>>();
+        assert_eq!(spacing.len(), expected.len(), "{source}\n{violations:#?}");
+        for (violation, &(line, count)) in spacing.iter().zip(expected) {
+            assert_eq!(violation.path, "sample.rs");
+            assert_eq!(violation.line, line, "{source}\n{violation:#?}");
+            assert!(
+                violation.message.contains(&format!("(found {count})")),
+                "{source}\n{violation:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn checks_function_spacing_in_supported_scopes() {
+        let cases = [
+            ("fn first() {}\nGAPfn second() {}\n", 2),
+            (
+                "struct Worker;\nimpl Worker {\nfn first() {}\nGAPfn second() {}\n}\n",
+                4,
+            ),
+            (
+                "struct Worker;\nimpl Task for Worker {\nfn first() {}\nGAPfn second() {}\n}\n",
+                4,
+            ),
+            ("trait Task {\nfn first();\nGAPfn second();\n}\n", 3),
+            ("trait Task {\nfn first() {}\nGAPfn second() {}\n}\n", 3),
+            ("trait Task {\nfn first();\nGAPfn second() {}\n}\n", 3),
+            (
+                "#[cfg(test)]\nmod tests {\nfn first() {}\nGAPfn second() {}\n}\n",
+                4,
+            ),
+            (
+                "#[cfg(test)]\nmod tests {\nstruct Worker;\nimpl Worker {\nfn first() {}\nGAPfn second() {}\n}\n}\n",
+                6,
+            ),
+            (
+                "#[cfg(test)]\nmod tests {\ntrait Task {\nfn first();\nGAPfn second();\n}\n}\n",
+                5,
+            ),
+        ];
+        for (template, second_line) in cases {
+            for (gap, empty_lines) in [("", 0), ("\n", 1), ("\n\n", 2)] {
+                let source = template.replace("GAP", gap);
+                let expected = if empty_lines == 1 {
+                    Vec::new()
+                } else {
+                    vec![(second_line + empty_lines, empty_lines)]
+                };
+                assert_function_spacing(&source, &expected);
+            }
+        }
+    }
+
+    #[test]
+    fn measures_function_spacing_before_docs_and_attributes() {
+        let cases: &[(&str, &[(usize, usize)])] = &[
+            ("fn first() {}\n/// Second.\nfn second() {}\n", &[(3, 0)]),
+            ("fn first() {}\n\n/// Second.\nfn second() {}\n", &[]),
+            (
+                "fn first() {}\n\n\n/// Second.\n#[inline]\nfn second() {}\n",
+                &[(6, 2)],
+            ),
+            ("fn first() {}\n#[inline]\n\nfn second() {}\n", &[(4, 0)]),
+            ("fn first() {}\n\n#[inline]\nfn second() {}\n", &[]),
+            (
+                "fn first() {}\n/** Second.\n\nMore documentation.\n*/\nfn second() {}\n",
+                &[(6, 0)],
+            ),
+            (
+                "fn first() {}\n\n/** Second.\n\nMore documentation.\n*/\nfn second() {}\n",
+                &[],
+            ),
+            (
+                "fn first() {}\n#[doc = \"Second.\n\nMore documentation.\"]\nfn second() {}\n",
+                &[(5, 0)],
+            ),
+            ("fn first() {}\n\npub(crate)\nasync fn second() {}\n", &[]),
+            (
+                "fn first() {}\npub(crate)\nasync fn second() {}\n",
+                &[(3, 0)],
+            ),
+        ];
+        for &(source, expected) in cases {
+            assert_function_spacing(source, expected);
+        }
+    }
+
+    #[test]
+    fn counts_empty_source_lines_between_functions() {
+        let cases: &[(&str, &[(usize, usize)])] = &[
+            ("fn first() {} fn second() {}\n", &[(1, 0)]),
+            ("fn first() {}\n \t \nfn second() {}\n", &[]),
+            ("fn first() {}\r\n\r\nfn second() {}\r\n", &[]),
+            ("fn first() {}\r\nfn second() {}\r\n", &[(2, 0)]),
+            ("fn first() {}\n// Second.\nfn second() {}\n", &[(3, 0)]),
+            ("fn first() {}\n\n// Second.\nfn second() {}\n", &[]),
+            ("fn first() {}\n/* Second. */\nfn second() {}\n", &[(3, 0)]),
+            ("fn first() {}\n\n/* Second. */\nfn second() {}\n", &[]),
+            ("fn first() {}\n\n// Second.\n\nfn second() {}\n", &[]),
+            (
+                "fn first() {\nlet text = \"fn example() {}\n\nfn another() {}\";\n}\nfn second() {}\n",
+                &[(6, 0)],
+            ),
+            (
+                "fn first() {}\nfn second() {}\n\n\nfn third() {}\n",
+                &[(2, 0), (5, 2)],
+            ),
+            (
+                "#!/usr/bin/env cargo\n---\n[package]\nedition = \"2024\"\n---\nfn first() {}\nfn second() {}\n",
+                &[(7, 0)],
+            ),
+        ];
+        for &(source, expected) in cases {
+            assert_function_spacing(source, expected);
+        }
+    }
+
+    #[test]
+    fn checks_blank_line_runs_outside_section_comments() {
+        let cases = [
+            ("\n\n/* Section. */\n\n", None),
+            ("\n\n// Section.\n\n", None),
+            ("\n\n/* Section.\n\nDetails.\n*/\n\n", None),
+            ("\n/* Section.\n\nDetails.\n*/\n", Some(0)),
+            ("\n\n/* Section.\n\n\nDetails.\n*/\n", None),
+            ("\n\n/* Outer.\n/* Nested.\n\n*/\n\n*/\n\n", None),
+            (" /* Section.\n\n*/\n", Some(0)),
+            (" /* Section.\n\n\n*/\n\n", None),
+            ("\n// /* Not a block comment.\n\n", None),
+            ("\n\n/* Section. */\n\n\n", Some(2)),
+            ("\n\n\n/* Section. */\n\n", Some(2)),
+            ("\n\n/* First. */ /* Second. */\n\n", None),
+            ("\n\n/* First. */\n\n// Second.\n\n", None),
+        ];
+        for (gap, empty_lines) in cases {
+            let source = format!("fn first() {{}}{gap}/// Second.\n#[inline]\nfn second() {{}}\n");
+            let expected = empty_lines
+                .map(|count| (source.lines().count(), count))
+                .into_iter()
+                .collect::<Vec<_>>();
+            assert_function_spacing(&source, &expected);
+        }
+    }
+
+    #[test]
+    fn limits_function_spacing_to_adjacent_functions_in_existing_scopes() {
+        let cases = [
+            "fn only() {}\n",
+            "fn first() {}\nconst VALUE: usize = 1;\nfn second() {}\n",
+            "fn first() {}\nstruct Worker;\nfn second() {}\n",
+            "fn first() {}\nseparator!();\nfn second() {}\n",
+            "struct Worker;\nimpl Worker {\nfn first() {}\nconst VALUE: usize = 1;\nfn second() {}\n}\n",
+            "trait Task {\nfn first();\ntype Value;\nfn second();\n}\n",
+            "struct Worker;\nimpl Worker {\nfn first() {}\n}\nimpl Worker {\nfn second() {}\n}\n",
+            "mod nested {\nfn first() {}\nfn second() {}\n}\n",
+            "#[cfg(test)]\nmod tests {\nmod nested {\nfn first() {}\nfn second() {}\n}\n}\n",
+            "fn outer() {\nfn first() {}\nfn second() {}\n}\n",
+            "fn outer() {\nstruct Worker;\nimpl Worker {\nfn first() {}\nfn second() {}\n}\n}\n",
+            "macro_rules! functions {\n() => {\nfn first() {}\nfn second() {}\n};\n}\n",
+        ];
+        for source in cases {
+            assert_function_spacing(source, &[]);
+        }
     }
 
     #[test]

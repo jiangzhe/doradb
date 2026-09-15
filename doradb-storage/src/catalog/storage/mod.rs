@@ -1631,6 +1631,7 @@ pub(crate) mod tests {
             }
         }
     }
+
     fn metadata_only_batch(replay_start_ts: TrxID) -> CatalogCheckpointBatch {
         CatalogCheckpointBatch {
             replay_start_ts,

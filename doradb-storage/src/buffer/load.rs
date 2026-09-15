@@ -17,10 +17,13 @@ use crate::id::PageID;
 pub(crate) trait PageReservation {
     /// Returns the reserved page bytes for read-only inspection before publish.
     fn page(&self) -> &Page;
+
     /// Returns the reserved page bytes for DMA or decode before publish.
     fn page_mut(&mut self) -> &mut Page;
+
     /// Publishes the reserved page into the owning pool and returns its page id.
     fn publish(self) -> PageID;
+
     /// Reverts the reservation and releases any pool-specific resources.
     fn rollback(self);
 }

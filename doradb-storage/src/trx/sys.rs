@@ -2000,6 +2000,7 @@ pub(crate) mod tests {
                 _ => false,
             })
     }
+
     fn terminal_rollback_test_hook_slot() -> &'static Mutex<Option<TerminalRollbackTestHook>> {
         static HOOK: OnceLock<Mutex<Option<TerminalRollbackTestHook>>> = OnceLock::new();
         HOOK.get_or_init(|| Mutex::new(None))
