@@ -8,7 +8,6 @@ use crate::error::{
 use crate::id::PageID;
 use crate::latch::{GuardState, LatchFallbackMode, RawHybridGuard};
 use crate::ptr::UnsafePtr;
-use crate::recovery::RowRecoveryMap;
 use crate::row::RowPage;
 use crate::trx::ver_map::RowVersionMap;
 use either::Either;
@@ -753,12 +752,6 @@ impl PageSharedGuard<RowPage> {
     pub(crate) fn unwrap_vmap(&self) -> &RowVersionMap {
         self.bf().unwrap_vmap()
     }
-
-    /// Returns the recovery map when this guard protects a recovering row page.
-    #[inline]
-    pub(crate) fn try_rmap(&self) -> Option<&RowRecoveryMap> {
-        self.bf().try_rmap()
-    }
 }
 
 // SAFETY: the guard owns one shared latch acquisition plus the pool keepalive,
@@ -885,18 +878,6 @@ impl PageExclusiveGuard<RowPage> {
     #[inline]
     pub(crate) fn unwrap_vmap(&self) -> &RowVersionMap {
         self.bf().unwrap_vmap()
-    }
-
-    /// Returns the recovery map when this guard protects a recovering row page.
-    #[inline]
-    pub(crate) fn try_rmap(&self) -> Option<&RowRecoveryMap> {
-        self.bf().try_rmap()
-    }
-
-    /// Returns the mutable recovery map for a recovering row page.
-    #[inline]
-    pub(crate) fn try_rmap_mut(&mut self) -> Option<&mut RowRecoveryMap> {
-        self.frame_mut().try_rmap_mut()
     }
 }
 

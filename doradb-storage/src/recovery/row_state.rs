@@ -1,76 +1,64 @@
-use crate::id::TrxID;
+use crate::bitmap::{Bitmap, new_bitmap};
+use crate::id::PageID;
 
-/// Per-row recovery map used while rebuilding one row page from redo.
-pub(crate) struct RowRecoveryMap {
-    create_cts: TrxID,
-    entries: Vec<Option<TrxID>>,
+/// Inserted-slot history owned by sequential recovery for one page lifetime.
+/// The coordinator removes this state before page reuse, so the page ID remains
+/// bound to its allocation throughout replay and index reconstruction.
+pub(crate) struct RowReplayState {
+    page_id: PageID,
+    inserted: Box<[u64]>,
 }
 
-impl RowRecoveryMap {
-    /// Returns a recovery map with given create CTS.
+impl RowReplayState {
+    /// Captures an allocated page's identity and reserved row capacity.
     #[inline]
-    pub(crate) fn new(create_cts: TrxID) -> Self {
-        RowRecoveryMap {
-            create_cts,
-            entries: vec![],
+    pub(crate) fn new(page_id: PageID, max_row_count: usize) -> Self {
+        Self {
+            page_id,
+            inserted: new_bitmap(max_row_count),
         }
     }
 
-    /// Returns CTS when this page is created.
+    /// Returns the row page ID.
     #[inline]
-    pub(crate) fn create_cts(&self) -> TrxID {
-        self.create_cts
+    pub(crate) fn page_id(&self) -> PageID {
+        self.page_id
     }
 
-    /// Returns whether entry of given row position is vacant.
+    /// Returns whether this slot has ever been inserted during replay.
+    /// The latched page's RowID range must establish `row_idx < max_row_count`.
     #[inline]
-    pub(crate) fn is_vacant(&self, row_idx: usize) -> bool {
-        row_idx >= self.entries.len() || self.entries[row_idx].is_none()
+    pub(crate) fn is_inserted(&self, row_idx: usize) -> bool {
+        self.inserted.bitmap_get(row_idx)
     }
 
-    /// Insert CTS at given row position.
+    /// Records a successful insert, returning whether the bit was newly set.
+    /// The latched page's RowID range must establish `row_idx < max_row_count`.
     #[inline]
-    pub(crate) fn insert_at(&mut self, row_idx: usize, cts: TrxID) {
-        while self.entries.len() <= row_idx {
-            self.entries.push(None);
-        }
-        self.entries[row_idx] = Some(cts);
-    }
-
-    /// Update CTS at given row position.
-    #[inline]
-    pub(crate) fn update_at(&mut self, row_idx: usize, cts: TrxID) {
-        debug_assert!(row_idx < self.entries.len());
-        debug_assert!(self.at(row_idx).unwrap() <= cts);
-        self.entries[row_idx].replace(cts);
-    }
-
-    /// Returns CTS at given row position.
-    #[inline]
-    pub(crate) fn at(&self, row_idx: usize) -> Option<TrxID> {
-        self.entries.get(row_idx).and_then(|v| *v)
+    pub(crate) fn record_insert(&mut self, row_idx: usize) -> bool {
+        self.inserted.bitmap_set(row_idx)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::RowRecoveryMap;
-    use crate::id::TrxID;
+    use super::RowReplayState;
+    use crate::bitmap::bitmap_required_units;
+    use crate::id::PageID;
 
     #[test]
-    fn row_recovery_map_tracks_create_vacancy_insert_and_update_cts() {
-        let mut map = RowRecoveryMap::new(TrxID::new(7));
-
-        assert_eq!(map.create_cts(), TrxID::new(7));
-        assert!(map.is_vacant(0));
-        assert_eq!(map.at(0), None);
-
-        map.insert_at(2, TrxID::new(11));
-        assert!(map.is_vacant(0));
-        assert!(!map.is_vacant(2));
-        assert_eq!(map.at(2), Some(TrxID::new(11)));
-
-        map.update_at(2, TrxID::new(13));
-        assert_eq!(map.at(2), Some(TrxID::new(13)));
+    fn test_replay_bitmap_tracks_sparse_slots() {
+        let id = PageID::new(7);
+        let mut state = RowReplayState::new(id, 70);
+        assert_eq!(state.page_id(), id);
+        assert_eq!(state.inserted.len(), bitmap_required_units(70));
+        for idx in [69, 64, 63, 0] {
+            assert!(!state.is_inserted(idx));
+            assert!(state.record_insert(idx));
+            assert!(!state.record_insert(idx));
+        }
+        for idx in 0..70 {
+            assert_eq!(state.is_inserted(idx), [0, 63, 64, 69].contains(&idx));
+        }
     }
 }

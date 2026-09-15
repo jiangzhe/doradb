@@ -96,8 +96,7 @@ Recovery proceeds in dependency order:
    table-file root.
 7. Remove provisional table files that remain absent after catalog replay,
    while preserving files queued for committed drop cleanup.
-8. Scan recovered hot RowStore pages to rebuild `MemIndex` state and initialize
-   their runtime undo maps.
+8. Scan recovered hot RowStore pages to rebuild `MemIndex` state.
 9. Repair accepted unsealed redo prefixes as required and select the next
    runtime redo file only after replay succeeds.
 
@@ -232,6 +231,17 @@ IDs, slots, or leftover unclassified states fail recovery before foreground
 admission. This reconstructs allocator proof without persisting a free list and
 allows checkpoint-covered holes to be reused immediately after restart.
 
+## Hot-Page Replay State
+
+Hot row pages retain their runtime version metadata throughout recovery.
+Redo restores page creation timestamps and committed row images without
+reconstructing pre-crash undo history.
+
+Sequential commit-order replay needs no per-row recovery timestamps. Recovery
+owns temporary insertion history separately from buffer frames to reject
+duplicate inserts, including reinsertion after deletion. This history is
+released after index reconstruction.
+
 ## Secondary-Index Reconstruction
 
 Recovery needs no `index_rec_cts` because index state is divided by storage
@@ -242,7 +252,7 @@ temperature:
 2. Heap redo reconstructs hot RowStore pages without updating `MemIndex`
    inline.
 3. After log replay, recovery scans those pages once to build the latest hot
-   `MemIndex` state and refresh their undo maps.
+   `MemIndex` state.
 4. Replayed cold deletes populate `ColumnDeletionBuffer` and shadow stale cold
    `DiskTree` entries until a later deletion checkpoint publishes matching
    `DiskTree` deletes.
@@ -260,7 +270,7 @@ Recovery is complete only after:
 - every final catalog satellite row has a live central table parent
 - provisional-file cleanup and metadata reconciliation succeed
 - every Table-local index lifecycle entry is exactly classified
-- hot `MemIndex` state and RowStore undo maps are rebuilt
+- hot `MemIndex` state is rebuilt and temporary replay state is released
 - the redo family is repaired and prepared for new appends
 
 The resulting ownership is clear: LWC, persistent delete metadata, and

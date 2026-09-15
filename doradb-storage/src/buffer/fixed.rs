@@ -258,7 +258,7 @@ impl BufferPool for FixedBufferPool {
     fn deallocate_page<T: BufferPage>(&self, mut g: PageExclusiveGuard<T>) {
         let page_id = g.page_id();
         g.page_mut().zero();
-        g.bf_mut().ctx = None;
+        g.bf_mut().row_ver = None;
         g.bf_mut().set_kind(FrameKind::Uninitialized);
         g.bf_mut().bump_generation();
         let res = self.alloc_map.deallocate(usize::from(page_id));
