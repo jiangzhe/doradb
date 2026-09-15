@@ -1,3 +1,5 @@
+#[cfg(test)]
+pub(crate) use self::tests::shares_keepalive_root;
 use crate::buffer::identity::{PoolIdentity, PoolRole, RowPoolRole};
 use crate::quiescent::SyncQuiescentGuard;
 
@@ -194,9 +196,6 @@ fn pool_guard_identity_mismatch(
 ) -> ! {
     panic!("pool guard identity mismatch in {context}: expected {expected:?}, got {actual:?}");
 }
-
-#[cfg(test)]
-pub(crate) use self::tests::shares_keepalive_root;
 
 #[cfg(test)]
 mod tests {

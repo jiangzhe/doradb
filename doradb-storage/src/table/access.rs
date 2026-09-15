@@ -1178,6 +1178,7 @@ impl<'op> UserTableAccessor<'op> {
     pub(super) fn lwc_deletion_buffer(&self) -> &ColumnDeletionBuffer {
         self.storage.deletion_buffer()
     }
+
     #[inline]
     pub(super) fn table_id(&self) -> TableID {
         self.row_store().table_id()
@@ -3179,6 +3180,7 @@ impl<'op> UserTableAccessor<'op> {
             root: self.root_snapshot(ctx),
         }
     }
+
     /// Requires a hot destination outside the captured persisted range.
     pub(super) fn assert_new_hot_row(&self, row_id: RowID, root: &TableRootSnapshot<'_>) {
         assert!(

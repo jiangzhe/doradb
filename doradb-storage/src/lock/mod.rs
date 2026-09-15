@@ -2486,6 +2486,7 @@ pub(crate) mod tests {
             });
         }
     }
+
     #[test]
     fn catalog_slots_route_twelve_resources_and_preserve_dynamic_fallback() {
         use crate::catalog::storage::layout::BUILTIN_CATALOG_TABLE_IDS;
@@ -2842,6 +2843,7 @@ pub(crate) mod tests {
             }
         }
     }
+
     #[test]
     fn mixed_snapshots_keep_queued_and_provisional_resources_until_independent_drain() {
         let manager = LockManager::new();

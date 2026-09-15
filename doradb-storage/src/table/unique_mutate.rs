@@ -244,6 +244,7 @@ impl<'a, 'op: 'a, 'r, D: BufferPool, R: MemIndexRuntime> UniqueMutator<'a, 'op, 
             redo_key,
         }
     }
+
     /// Retries selection before invoking exactly one synchronous decision.
     pub(super) async fn execute<F, CE, M>(
         mut self,

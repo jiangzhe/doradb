@@ -3801,6 +3801,7 @@ pub(crate) mod tests {
         );
         assert!(format!("{err:?}").contains("buffer_pool_type=evictable, buffer_pool_role=mem"));
     }
+
     #[test]
     fn test_row_metadata_fixed_and_evictable_pool_identity() {
         smol::block_on(async {

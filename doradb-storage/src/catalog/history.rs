@@ -760,6 +760,7 @@ mod tests {
 
     trait CurrentTableStateTestExt {
         fn live_metadata(&self) -> Option<&Arc<TableMetadata>>;
+
         fn is_dropped(&self) -> bool;
     }
 
@@ -780,7 +781,9 @@ mod tests {
 
     trait ResolvedVisibleTableMetadataTestExt {
         fn effective_cts(&self) -> TrxID;
+
         fn live(&self) -> Option<&ResolvedLiveMetadata>;
+
         fn is_tombstone(&self) -> bool;
     }
 

@@ -17,6 +17,7 @@ We follow a strict priority order for all engineering decisions:
 We rely on tooling to enforce style.
 
 *   **Formatting**: `cargo fmt` is the authority.
+*   **Function Spacing**: Separate consecutive functions or methods with exactly one empty line, before the next function's documentation or attributes. Non-documentation section comments may have one empty line on each side; blank lines inside block comments do not count as function spacing. This includes trait method declarations. `tools/style_audit.rs` enforces this at file scope and within top-level inline test modules, including their impl and trait methods.
 *   **Linting**: `cargo clippy --workspace --all-targets -- -D warnings` must pass.
 *   **Imports & Type Names**: Prefer `use` imports plus short type names to keep code concise and readable. Use fully qualified type names only when they are actually needed, such as resolving name conflicts or clarifying ambiguous paths.
 *   **Public API Documentation**: Every public `struct`, `trait`, `enum`, `const`, and `method/function` **MUST** have a descriptive `///` doc comment.

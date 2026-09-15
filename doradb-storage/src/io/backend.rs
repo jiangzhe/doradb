@@ -600,16 +600,22 @@ pub(crate) trait Backend: Sized {
 
     /// Set up one backend with the requested concurrent IO depth.
     fn setup(io_depth: usize) -> IoResult<Self>;
+
     /// Returns the configured concurrent IO depth.
     fn io_depth(&self) -> usize;
+
     /// Allocates one empty backend-owned submit batch.
     fn new_submit_batch(&self) -> Self::SubmitBatch;
+
     /// Allocates one backend-owned completion-event buffer.
     fn new_events(&self) -> Self::Events;
+
     /// Prepares one kernel submission for the given worker token and IO operation.
     fn prepare(&mut self, token: BackendToken, operation: &mut super::Operation) -> Self::Prepared;
+
     /// Appends one prepared submission to a backend-owned batch.
     fn push_prepared(&mut self, batch: &mut Self::SubmitBatch, prepared: &mut Self::Prepared);
+
     /// Submits up to `limit` staged operations from the front of `batch`.
     ///
     /// The backend must retain any unsubmitted suffix in `batch` so the worker
@@ -619,12 +625,14 @@ pub(crate) trait Backend: Sized {
         batch: &mut Self::SubmitBatch,
         limit: usize,
     ) -> BackendResult<SubmitAttempt>;
+
     /// Waits for at least `min_nr` completions and returns worker tokens plus results.
     fn wait_at_least(
         &mut self,
         events: &mut Self::Events,
         min_nr: usize,
     ) -> BackendResult<Vec<(BackendToken, StdIoResult<usize>)>>;
+
     /// Best-effort backend cleanup for already-submitted IO after a fatal
     /// progress failure.
     fn cleanup_submitted_io(&mut self, submitted: usize) -> SubmittedIoCleanup;

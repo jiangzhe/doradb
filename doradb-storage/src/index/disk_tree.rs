@@ -335,10 +335,13 @@ pub(crate) trait DiskTreeSpec: Copy + Send + Sync + 'static {
         file_kind: FileKind,
         block_id: BlockID,
     ) -> DataIntegrityResult<()>;
+
     /// Convert a normalized logical entry into the leaf value stored on disk.
     fn leaf_value(entry: &LogicalEntry) -> Self::LeafValue;
+
     /// Decode one leaf slot from a validated block into a normalized entry.
     fn leaf_entry(node: &BTreeNode, idx: usize) -> DataIntegrityResult<LogicalEntry>;
+
     /// Apply encoded batch operations to a sorted entry set.
     ///
     /// Implementations must return sorted unique keys because the writer builds

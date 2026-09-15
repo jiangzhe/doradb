@@ -3464,6 +3464,7 @@ mod tests {
         let report = Report::new(IoError::from(IoErrorKind::Other)).attach(UnknownAttachment);
         let _ = CompletionErrorBridge::capture(report);
     }
+
     #[test]
     fn test_callback_engine_conversions_preserve_reports_and_distinguish_user_error() {
         for user in [false, true] {

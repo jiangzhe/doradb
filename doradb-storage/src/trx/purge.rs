@@ -3898,6 +3898,7 @@ mod tests {
             drop(session);
         });
     }
+
     #[test]
     fn test_row_purge_evicted_without_reads() {
         smol::block_on(async {
