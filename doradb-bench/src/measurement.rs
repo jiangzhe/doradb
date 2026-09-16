@@ -250,14 +250,25 @@ pub struct RecoveryReport {
 impl RecoveryReport {
     /// Validate and copy one immutable successful storage report.
     pub(crate) fn from_storage(report: &StorageRecoveryReport) -> Result<Self> {
+        let [
+            bootstrap_elapsed_nanos,
+            engine_setup_elapsed_nanos,
+            catalog_bootstrap_elapsed_nanos,
+            transaction_bootstrap_elapsed_nanos,
+            runtime_startup_elapsed_nanos,
+        ] = durations_nanos([
+            report.bootstrap_elapsed,
+            report.engine_setup_elapsed,
+            report.catalog_bootstrap_elapsed,
+            report.transaction_bootstrap_elapsed,
+            report.runtime_startup_elapsed,
+        ])?;
         let report = Self {
-            bootstrap_elapsed_nanos: duration_nanos(report.bootstrap_elapsed)?,
-            engine_setup_elapsed_nanos: duration_nanos(report.engine_setup_elapsed)?,
-            catalog_bootstrap_elapsed_nanos: duration_nanos(report.catalog_bootstrap_elapsed)?,
-            transaction_bootstrap_elapsed_nanos: duration_nanos(
-                report.transaction_bootstrap_elapsed,
-            )?,
-            runtime_startup_elapsed_nanos: duration_nanos(report.runtime_startup_elapsed)?,
+            bootstrap_elapsed_nanos,
+            engine_setup_elapsed_nanos,
+            catalog_bootstrap_elapsed_nanos,
+            transaction_bootstrap_elapsed_nanos,
+            runtime_startup_elapsed_nanos,
             phases: RecoveryPhaseTimings::from_storage(&report.phases)?,
             work: RecoveryWorkCounts::from_storage(&report.work),
             redo: RecoveryRedoMetrics::from_storage(&report.redo)?,
@@ -296,21 +307,40 @@ pub struct RecoveryPhaseTimings {
 
 impl RecoveryPhaseTimings {
     fn from_storage(report: &StorageRecoveryPhaseTimings) -> Result<Self> {
+        let [
+            preparation_elapsed_nanos,
+            user_table_bootstrap_elapsed_nanos,
+            redo_planning_elapsed_nanos,
+            redo_replay_elapsed_nanos,
+            validation_elapsed_nanos,
+            absent_file_cleanup_elapsed_nanos,
+            hot_index_rebuild_elapsed_nanos,
+            redo_repair_planning_elapsed_nanos,
+            redo_finalize_elapsed_nanos,
+            other_elapsed_nanos,
+        ] = durations_nanos([
+            report.preparation_elapsed,
+            report.user_table_bootstrap_elapsed,
+            report.redo_planning_elapsed,
+            report.redo_replay_elapsed,
+            report.validation_elapsed,
+            report.absent_file_cleanup_elapsed,
+            report.hot_index_rebuild_elapsed,
+            report.redo_repair_planning_elapsed,
+            report.redo_finalize_elapsed,
+            report.other_elapsed,
+        ])?;
         Ok(Self {
-            preparation_elapsed_nanos: duration_nanos(report.preparation_elapsed)?,
-            user_table_bootstrap_elapsed_nanos: duration_nanos(
-                report.user_table_bootstrap_elapsed,
-            )?,
-            redo_planning_elapsed_nanos: duration_nanos(report.redo_planning_elapsed)?,
-            redo_replay_elapsed_nanos: duration_nanos(report.redo_replay_elapsed)?,
-            validation_elapsed_nanos: duration_nanos(report.validation_elapsed)?,
-            absent_file_cleanup_elapsed_nanos: duration_nanos(report.absent_file_cleanup_elapsed)?,
-            hot_index_rebuild_elapsed_nanos: duration_nanos(report.hot_index_rebuild_elapsed)?,
-            redo_repair_planning_elapsed_nanos: duration_nanos(
-                report.redo_repair_planning_elapsed,
-            )?,
-            redo_finalize_elapsed_nanos: duration_nanos(report.redo_finalize_elapsed)?,
-            other_elapsed_nanos: duration_nanos(report.other_elapsed)?,
+            preparation_elapsed_nanos,
+            user_table_bootstrap_elapsed_nanos,
+            redo_planning_elapsed_nanos,
+            redo_replay_elapsed_nanos,
+            validation_elapsed_nanos,
+            absent_file_cleanup_elapsed_nanos,
+            hot_index_rebuild_elapsed_nanos,
+            redo_repair_planning_elapsed_nanos,
+            redo_finalize_elapsed_nanos,
+            other_elapsed_nanos,
         })
     }
 }
@@ -862,38 +892,46 @@ fn duration_nanos(duration: Duration) -> Result<u64> {
         .map_err(|_| BenchError::message("measurement duration exceeds u64 nanoseconds"))
 }
 
+/// Convert a fixed-size group of durations to exact nanoseconds.
+fn durations_nanos<const N: usize>(durations: [Duration; N]) -> Result<[u64; N]> {
+    let mut nanos = [0; N];
+    for (target, duration) in nanos.iter_mut().zip(durations) {
+        *target = duration_nanos(duration)?;
+    }
+    Ok(nanos)
+}
+
+fn check_recovery_sum(actual: u64, components: &[u64]) -> Result<()> {
+    let expected = components.iter().try_fold(0u64, |total, value| {
+        total
+            .checked_add(*value)
+            .ok_or_else(|| BenchError::message("recovery metric sum overflow"))
+    })?;
+    if actual != expected {
+        return Err(BenchError::message("recovery metric accounting mismatch"));
+    }
+    Ok(())
+}
+
 fn validate_recovery_report(report: &RecoveryReport) -> Result<()> {
     if report.saturated {
         return Err(BenchError::message(
             "recovery report contains saturated diagnostics",
         ));
     }
-    let sum = |values: &[u64]| -> Result<u64> {
-        values.iter().try_fold(0u64, |total, value| {
-            total
-                .checked_add(*value)
-                .ok_or_else(|| BenchError::message("recovery metric sum overflow"))
-        })
-    };
-    let check = |actual, expected| -> Result<()> {
-        if actual != expected {
-            return Err(BenchError::message("recovery metric accounting mismatch"));
-        }
-        Ok(())
-    };
-    check(
+    check_recovery_sum(
         report.bootstrap_elapsed_nanos,
-        sum(&[
+        &[
             report.engine_setup_elapsed_nanos,
             report.catalog_bootstrap_elapsed_nanos,
             report.transaction_bootstrap_elapsed_nanos,
             report.runtime_startup_elapsed_nanos,
-        ])?,
+        ],
     )?;
     let phases = &report.phases;
-    check(
+    check_recovery_sum(
         report.transaction_bootstrap_elapsed_nanos,
-        sum(&[
+        &[
             phases.preparation_elapsed_nanos,
             phases.user_table_bootstrap_elapsed_nanos,
             phases.redo_planning_elapsed_nanos,
@@ -904,44 +942,55 @@ fn validate_recovery_report(report: &RecoveryReport) -> Result<()> {
             phases.redo_repair_planning_elapsed_nanos,
             phases.redo_finalize_elapsed_nanos,
             phases.other_elapsed_nanos,
-        ])?,
+        ],
     )?;
-    let redo = &report.redo;
-    check(
-        phases.redo_replay_elapsed_nanos,
-        sum(&[
+    validate_recovery_redo(phases.redo_replay_elapsed_nanos, &report.redo)?;
+    validate_recovery_work(&report.work)
+}
+
+fn validate_recovery_redo(replay_elapsed_nanos: u64, redo: &RecoveryRedoMetrics) -> Result<()> {
+    check_recovery_sum(
+        replay_elapsed_nanos,
+        &[
             redo.stream_refill_elapsed_nanos,
             redo.apply_and_dispatch_elapsed_nanos,
-        ])?,
+        ],
     )?;
-    check(
+    check_recovery_sum(
         redo.stream_refill_elapsed_nanos,
-        sum(&[
+        &[
             redo.receive_wait_elapsed_nanos,
             redo.group_decode_elapsed_nanos,
             redo.reader_shutdown_elapsed_nanos,
             redo.stream_other_elapsed_nanos,
-        ])?,
+        ],
     )?;
-    let work = &report.work;
-    check(
+    if redo.consumed_bytes < redo.validated_payload_bytes {
+        return Err(BenchError::message(
+            "recovery validated payload bytes exceed consumed bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_recovery_work(work: &RecoveryWorkCounts) -> Result<()> {
+    check_recovery_sum(
         work.catalog_row_ops_seen,
-        sum(&[work.catalog_row_ops_applied, work.catalog_row_ops_skipped])?,
+        &[work.catalog_row_ops_applied, work.catalog_row_ops_skipped],
     )?;
-    check(
+    check_recovery_sum(
         work.user_row_ops_seen,
-        sum(&[work.user_row_ops_applied, work.user_row_ops_skipped])?,
+        &[work.user_row_ops_applied, work.user_row_ops_skipped],
     )?;
-    check(
+    check_recovery_sum(
         work.user_row_ops_applied,
-        sum(&[
+        &[
             work.hot_inserts,
             work.hot_updates,
             work.hot_deletes,
             work.cold_deletes,
-        ])?,
-    )?;
-    Ok(())
+        ],
+    )
 }
 
 fn checked_counter(left: u64, right: u64, name: &str) -> Result<u64> {
@@ -1302,6 +1351,90 @@ mod tests {
         storage.phases.redo_replay_elapsed = duration;
         storage.redo.receive_wait_elapsed = oversized;
         assert!(RecoveryReport::from_storage(&storage).is_err());
+    }
+
+    #[test]
+    fn recovery_report_duration_conversion_preserves_field_mapping() {
+        let storage = StorageRecoveryReport {
+            bootstrap_elapsed: Duration::from_nanos(110),
+            engine_setup_elapsed: Duration::from_nanos(11),
+            catalog_bootstrap_elapsed: Duration::from_nanos(22),
+            transaction_bootstrap_elapsed: Duration::from_nanos(33),
+            runtime_startup_elapsed: Duration::from_nanos(44),
+            phases: StorageRecoveryPhaseTimings {
+                other_elapsed: Duration::from_nanos(33),
+                ..StorageRecoveryPhaseTimings::default()
+            },
+            ..StorageRecoveryReport::default()
+        };
+        let report = RecoveryReport::from_storage(&storage).unwrap();
+        assert_eq!(report.bootstrap_elapsed_nanos, 110);
+        assert_eq!(report.engine_setup_elapsed_nanos, 11);
+        assert_eq!(report.catalog_bootstrap_elapsed_nanos, 22);
+        assert_eq!(report.transaction_bootstrap_elapsed_nanos, 33);
+        assert_eq!(report.runtime_startup_elapsed_nanos, 44);
+    }
+
+    #[test]
+    fn recovery_phase_duration_conversion_preserves_field_mapping() {
+        let storage = StorageRecoveryPhaseTimings {
+            preparation_elapsed: Duration::from_nanos(1),
+            user_table_bootstrap_elapsed: Duration::from_nanos(2),
+            redo_planning_elapsed: Duration::from_nanos(3),
+            redo_replay_elapsed: Duration::from_nanos(4),
+            validation_elapsed: Duration::from_nanos(5),
+            absent_file_cleanup_elapsed: Duration::from_nanos(6),
+            hot_index_rebuild_elapsed: Duration::from_nanos(7),
+            redo_repair_planning_elapsed: Duration::from_nanos(8),
+            redo_finalize_elapsed: Duration::from_nanos(9),
+            other_elapsed: Duration::from_nanos(10),
+        };
+        let phases = RecoveryPhaseTimings::from_storage(&storage).unwrap();
+        assert_eq!(phases.preparation_elapsed_nanos, 1);
+        assert_eq!(phases.user_table_bootstrap_elapsed_nanos, 2);
+        assert_eq!(phases.redo_planning_elapsed_nanos, 3);
+        assert_eq!(phases.redo_replay_elapsed_nanos, 4);
+        assert_eq!(phases.validation_elapsed_nanos, 5);
+        assert_eq!(phases.absent_file_cleanup_elapsed_nanos, 6);
+        assert_eq!(phases.hot_index_rebuild_elapsed_nanos, 7);
+        assert_eq!(phases.redo_repair_planning_elapsed_nanos, 8);
+        assert_eq!(phases.redo_finalize_elapsed_nanos, 9);
+        assert_eq!(phases.other_elapsed_nanos, 10);
+    }
+
+    #[test]
+    fn recovery_redo_payload_cannot_exceed_consumed_bytes() {
+        for (consumed_bytes, validated_payload_bytes, valid) in [
+            (0, 0, true),
+            (64, 64, true),
+            (4096, 128, true),
+            (u64::MAX, u64::MAX, true),
+            (u64::MAX, 0, true),
+            (0, 1, false),
+            (127, 128, false),
+            (u64::MAX - 1, u64::MAX, false),
+        ] {
+            let storage = StorageRecoveryReport {
+                redo: StorageRecoveryRedoMetrics {
+                    consumed_bytes,
+                    validated_payload_bytes,
+                    ..StorageRecoveryRedoMetrics::default()
+                },
+                ..StorageRecoveryReport::default()
+            };
+            let result = RecoveryReport::from_storage(&storage);
+            assert_eq!(
+                result.is_ok(),
+                valid,
+                "consumed_bytes={consumed_bytes}, validated_payload_bytes={validated_payload_bytes}"
+            );
+            if !valid {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "recovery validated payload bytes exceed consumed bytes"
+                );
+            }
+        }
     }
 
     #[test]
